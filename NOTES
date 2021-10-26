@@ -1,0 +1,77 @@
+AFR Wideband circuit
+https://www.14point7.com/pages/software-and-documentation
+https://wbo2.com/lsu/lsuworks.htm
+
+Hydraulic brake switch
+smog block off plates 
+
+
+
+Metrics
+https://docs.datadoghq.com/api/latest/metrics/
+
+metric i.e. "system.load.1"
+uint64 timestamp
+single scalar value (double?)
+tags = List of key,value pairs. i.e. "key:value"
+
+
+Metric metadata is a separate endpoint
+https://docs.datadoghq.com/api/latest/metrics/#get-metric-metadata
+
+
+
+Monitor
+
+https://www.datadoghq.com/blog/introducing-anomaly-detection-datadog/
+
+Time series forcasting using SARIMA - 
+JS lib https://github.com/zemlyansky/arima
+C Lib https://github.com/rafat/ctsa
+
+
+
+Verdi irrigation
+NDVI as a feedback mechanism for watering
+https://webkid.io/portfolio
+https://webkid.io/blog/datablocks-node-based-editor-data-processing-visualization/
+
+https://www.hologram.io/
+Good management of connected sim cards
+
+https://c3.ai/products/c3-ai-data-vision/
+
+https://www.mapped.com/developers
+GraphQL IIoT, good ideas around mapping a space to a sensor
+https://docs.janusgraph.org/
+https://brickschema.org/
+
+
+https://www.influxdata.com/blog/industry-4-0-defined-explained/
+Interconnection — Enabling communication between devices, sensors, and people
+Information transparency — Gathering large data volumes from all points of the manufacturing process
+Technical assistance — Aggregating and visualizing data in a centralized dashboard to solve problems in real time
+Decentralized decisions — Enabling systems to perform tasks autonomously based on collected data and only exceptionally require human interference
+
+https://surfside.io/ - Data platform for Cannabis
+
+
+Ingress ->  Shard -> InMemoryStore (R/W)
+              |
+             WAL
+
+
+
+
+Measurement = table
+tag (tagKey=tagValue) = an indexed column
+
+
+myMeasurement,host=myHost testField="testData" 1556896326
+
+Decompose to index key/values
+  _measurement=myMeasurement
+  host=myHost
+  _field=testField
+
+Where to store data types for series id?
