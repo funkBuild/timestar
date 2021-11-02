@@ -6,6 +6,8 @@
 #include <atomic>
 #include <map>
 
+#include <seastar/core/coroutine.hh>
+
 #include "aligned_buffer.hpp"
 #include "tsm.hpp"
 #include "memory_store.hpp"
@@ -17,13 +19,13 @@ private:
   std::atomic<unsigned int> sequenceId = 0;
   std::vector<std::shared_ptr<TSM>> tsmFiles;
 
-  void init();
-  void openTsmFile(std::string path);
+  seastar::future<> openTsmFile(std::string path);
 public:
   std::map<unsigned int, std::shared_ptr<TSM>> sequencedTsmFiles;
 
   TSMFileManager();
 
+  seastar::future<> init();
   void queueMemstoreCompaction(std::shared_ptr<MemoryStore> memStore);
   void writeMemstore(std::shared_ptr<MemoryStore> memStore);
 

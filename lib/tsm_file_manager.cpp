@@ -7,11 +7,9 @@
 
 namespace fs = std::filesystem;
 
-TSMFileManager::TSMFileManager(){
-  init();
-}
+TSMFileManager::TSMFileManager(){}
 
-void TSMFileManager::init(){
+seastar::future<> TSMFileManager::init(){
   std::cout << "TSMFileManager init" << std::endl;
   // TODO: Scan the TSM folder for files
 
@@ -21,25 +19,24 @@ void TSMFileManager::init(){
   {
     if (endsWith(entry.path(), ".tsm")){
       std::string absolutePath = fs::canonical(fs::absolute(entry.path()));
-      openTsmFile(absolutePath);
+      co_await openTsmFile(absolutePath);
     }
   }
-
-  // TODO: Load each file into a TSM object and store
-  // TODO: Keep track of levels and sequence id's
 }
 
-void TSMFileManager::openTsmFile(std::string path){
+seastar::future<> TSMFileManager::openTsmFile(std::string path){
   std::cout << "Open TSM " << path << std::endl;
 
   try {
     std::shared_ptr<TSM> tsmFile = std::make_shared<TSM>(path);
+    co_await tsmFile->open();
+
     tsmFiles.push_back(tsmFile);
 
     // TODO: Handle conflicting sequence number, or fail loudly
     sequencedTsmFiles.insert({ tsmFile.get()->seqNum, tsmFile });
   } catch(const std::runtime_error&) {
-    return;
+    co_return;
   }
 }
 

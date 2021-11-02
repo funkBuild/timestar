@@ -35,7 +35,6 @@ public:
 
   MemoryStore(unsigned int walSequenceNumber) : sequenceNumber(walSequenceNumber) {
     std::cout << "Memory store " << sequenceNumber << " created" << std::endl;
-
     wal = std::make_unique<WAL>(this, walSequenceNumber);
   };
   ~MemoryStore() { std::cout << "Memory store " << sequenceNumber << " removed" << std::endl; };

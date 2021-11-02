@@ -7,19 +7,25 @@
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
+#include <string_view>
 
 #include <chrono>
 
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/loop.hh>
 
 typedef std::chrono::high_resolution_clock Clock;
 
 
 
-TSM::TSM(std::string absolutePath){
-  size_t filenameEndIndex = absolutePath.find_last_of(".");
-  size_t filenameStartIndex = absolutePath.find_last_of("/") + 1;
+TSM::TSM(std::string _absoluteFilePath){
+  size_t filenameEndIndex = _absoluteFilePath.find_last_of(".");
+  size_t filenameStartIndex = _absoluteFilePath.find_last_of("/") + 1;
 
-  filename = absolutePath.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex);
+  std::string filename = _absoluteFilePath.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex);
 
   size_t underscoreIndex = filename.find_last_of("_");
   if(underscoreIndex > filename.length())
@@ -32,51 +38,46 @@ TSM::TSM(std::string absolutePath){
     throw std::runtime_error("TSM invalid filename:" + filename);
   }
 
-  tsmFile = std::make_unique<std::ifstream>(absolutePath, std::ios::binary);
-
-  if(!tsmFile->is_open()){
-    std::cout << "TSM unable to open:" << absolutePath << std::endl;
-    throw std::runtime_error("TSM unable to open:" + absolutePath);
-  }
-
-  tsmFile->seekg(0, tsmFile->end);
-  length = tsmFile->tellg();
-  tsmFile->seekg(0, tsmFile->beg);
-
-  readIndex();
+  filePath = _absoluteFilePath;
 }
 
-void TSM::readIndex(){
-  // TODO: Convert to using slices
+seastar::future<> TSM::open(){
+  std::string_view filePathView{ filePath };
+  tsmFile = co_await seastar::open_file_dma(filePathView, seastar::open_flags::ro);
 
-  tsmFile->seekg(-1 * sizeof(size_t), tsmFile->end);
+  if(!tsmFile){
+    std::cout << "TSM unable to open:" << filePath << std::endl;
+    throw std::runtime_error("TSM unable to open:" + filePath);
+  }
 
-  size_t indexOffset;
-  tsmFile->read((char*)&indexOffset, sizeof(size_t));
-  tsmFile->seekg(indexOffset, tsmFile->beg); // Seek to index start
+  length = co_await tsmFile.size();
 
-  while(tsmFile->tellg() < length - sizeof(size_t)){ // End of file - sizeof(size_t) for the index offset
+  co_await readIndex();
+};
+
+
+seastar::future<> TSM::readIndex(){  
+  auto indexOffsetBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - sizeof(size_t), sizeof(size_t));
+  size_t indexOffset = *(size_t*)(indexOffsetBuf.get()); 
+  
+  auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - sizeof(size_t));
+  Slice indexSlice(indexBuf.get(), indexBuf.size());
+
+  while(indexSlice.offset < indexSlice.length_){
     TSMIndexEntry indexEntry;
 
-    uint16_t seriesIdLength;
-    tsmFile->read((char*)&seriesIdLength, 2);
+    uint16_t seriesIdLength = indexSlice.read<uint16_t>();
+    indexEntry.seriesId = indexSlice.readString(seriesIdLength);
+    indexEntry.seriesType = (TSMValueType) indexSlice.read<uint8_t>();
 
-    std::string seriesId(seriesIdLength, ' ');
-    tsmFile->read(&seriesId[0], seriesIdLength);
-    indexEntry.seriesId = seriesId;
-
-
-    tsmFile->read((char*)&indexEntry.seriesType, sizeof(uint8_t));
-
-    uint16_t indexEntryCount;
-    tsmFile->read((char*)&indexEntryCount, sizeof(uint16_t));
+    uint16_t indexEntryCount = indexSlice.read<uint16_t>();
 
     for(int i=0; i < indexEntryCount; i++){
       TSMIndexBlock indexBlock;
-      tsmFile->read((char*)&indexBlock.minTime, sizeof(uint64_t));
-      tsmFile->read((char*)&indexBlock.maxTime, sizeof(uint64_t));
-      tsmFile->read((char*)&indexBlock.offset, sizeof(uint64_t));
-      tsmFile->read((char*)&indexBlock.size, sizeof(uint32_t));
+      indexBlock.minTime = indexSlice.read<uint64_t>();
+      indexBlock.maxTime = indexSlice.read<uint64_t>();
+      indexBlock.offset = indexSlice.read<uint64_t>();
+      indexBlock.size = indexSlice.read<uint32_t>();
 
       indexEntry.indexBlocks.push_back(indexBlock);
     }
@@ -86,11 +87,11 @@ void TSM::readIndex(){
 }
 
 template <class T>
-void TSM::readSeries(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<T> &results){
+seastar::future<> TSM::readSeries(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<T> &results){
   auto it = index.find(seriesKey);
 
   if(it == index.end())
-    return;
+    co_return;
   
   std::vector<TSMIndexBlock> blocksToScan;
   std::copy_if(
@@ -102,19 +103,20 @@ void TSM::readSeries(std::string seriesKey, uint64_t startTime, uint64_t endTime
     }
   );
 
-  for(auto const& indexBlock: blocksToScan){
-    readBlock(indexBlock, startTime, endTime, results);
-  }
+  co_await seastar::parallel_for_each(blocksToScan, [&] (TSMIndexBlock indexBlock) {
+    return readBlock(indexBlock, startTime, endTime, results);
+  });
 }
 
 template <class T>
-void TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, QueryResult<T> &results){
-  SliceBuffer buffer(indexBlock.size);
+seastar::future<> TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, QueryResult<T> &results){
+  auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
+  SliceBuffer blockSlice(blockBuf.get(), blockBuf.size());
 
-  tsmFile->seekg(indexBlock.offset, tsmFile->beg);
-  tsmFile->read((char*)&buffer.data[0], indexBlock.size);
+  //tsmFile->seekg(indexBlock.offset, tsmFile->beg);
+  //tsmFile->read((char*)&buffer.data[0], indexBlock.size);
 
-  auto headerSlice = buffer.getSlice(0, 5);
+  auto headerSlice = blockSlice.getSlice(0, 5);
 
   uint8_t blockType = headerSlice.read<uint8_t>();
   uint32_t timestampSize = headerSlice.read<uint32_t>();
@@ -122,21 +124,21 @@ void TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_
 
   results.extendCapacity(timestampSize);
 
-  auto timestampsSlice = buffer.getSlice(9, timestampBytes);
+  auto timestampsSlice = blockSlice.getSlice(9, timestampBytes);
 
   auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *results.timestamps, startTime, endTime);
   size_t valueByteSize = indexBlock.size - timestampBytes - 5;
 
-  tsmFile->seekg(indexBlock.offset + 5 + timestampBytes, tsmFile->beg);
+  //tsmFile->seekg(indexBlock.offset + 5 + timestampBytes, tsmFile->beg);
 
   if constexpr (std::is_same<T, double>::value)
   {
-    auto valuesSlice = buffer.getCompressedSlice(5 + timestampBytes, valueByteSize);
+    auto valuesSlice = blockSlice.getCompressedSlice(5 + timestampBytes, valueByteSize);
 
     // TODO: Validate usage of compressedSlice
     FloatEncoder::decode(valuesSlice, nSkipped, nTimestamps, *results.values);
   } else if constexpr (std::is_same<T, bool>::value) {
-    auto valuesSlice = buffer.getSlice(5 + timestampBytes, valueByteSize);
+    auto valuesSlice = blockSlice.getSlice(5 + timestampBytes, valueByteSize);
 
     BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *results.values);
   }
@@ -151,6 +153,6 @@ std::optional<TSMValueType> TSM::getSeriesType(std::string seriesKey){
   return it->second.seriesType;
 }
 
-template void TSM::readSeries<double>(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<double> &results);
-template void TSM::readSeries<bool>(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<bool> &results);
+template seastar::future<> TSM::readSeries<double>(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<double> &results);
+template seastar::future<> TSM::readSeries<bool>(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<bool> &results);
 

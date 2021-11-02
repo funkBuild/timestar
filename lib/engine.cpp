@@ -9,8 +9,12 @@
 
 namespace fs = std::filesystem;
 
-Engine::Engine()
-{
+Engine::Engine(){};
+
+
+seastar::future<> Engine::init(){
+  co_await fileManager.init();
+
   // Search for existing WAL's
   std::string path = "./"; //TODO: Get WAL path from config
   std::vector<std::string> walFiles;
@@ -79,14 +83,16 @@ void Engine::rolloverMemoryStore()
 }
 
 
-VariantQueryResult Engine::query(std::string series, uint64_t startTime, uint64_t endTime){
+seastar::future<VariantQueryResult> Engine::query(std::string series, uint64_t startTime, uint64_t endTime){
   // TODO: Series id lookup
   // TODO: Return and enforce the type of each series
   
   // assert startTime < endTime
   
   QueryRunner runner(&fileManager);
-  return runner.runQuery(series, startTime, endTime);
+  auto result = co_await runner.runQuery(series, startTime, endTime);
+
+  co_return result;
 }
 
 template void Engine::insert<bool>(TSDBInsert<bool> insertRequest);

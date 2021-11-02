@@ -9,11 +9,11 @@
 
 class Slice {
 public:
-  uint8_t *data;
+  const uint8_t *data;
   size_t length_;
   size_t offset = 0;
 
-  Slice(uint8_t *_data, size_t _length) : data(_data), length_(_length) {};
+  Slice(const uint8_t *_data, size_t _length) : data(_data), length_(_length) {};
 
   template <class T>
   T read(){
@@ -29,13 +29,21 @@ public:
   size_t length(){
     return length_ / sizeof(T);
   }
+
+  std::string readString(size_t length){
+    std::string thisString((char *)(data + offset), length);
+
+    offset += length;
+
+    return std::move(thisString);
+  }
 };
 
 class CompressedSlice: public Slice {
 private:
   int bitOffset = 0;
 public:
-  CompressedSlice(uint8_t *_data, size_t _length) : Slice(_data, _length) {};
+  CompressedSlice(const uint8_t *_data, size_t _length) : Slice(_data, _length) {};
 
   template <typename T>
   T read(const int bits){
@@ -110,21 +118,22 @@ class SliceBuffer {
 private:
 
 public:
-  std::vector<uint8_t> data;
+  const uint8_t *data;
+  size_t length_;
+  size_t offset = 0;
 
-  SliceBuffer(unsigned int initialSize = 0){
-    if(initialSize > 0)
-      data.resize(initialSize);
-  };
+  SliceBuffer(const uint8_t *_data, size_t _length) : data(_data), length_(_length) {};
 
   Slice getSlice(size_t offset, size_t length){
-    Slice slice(&data[offset], length);
+    const uint8_t* ref = data + offset;
+    Slice slice(ref, length);
 
     return std::move(slice);
   }
 
   CompressedSlice getCompressedSlice(size_t offset, size_t length){
-    CompressedSlice slice(&data[offset], length);
+    const uint8_t* ref = data + offset;
+    CompressedSlice slice(ref, length);
 
     return std::move(slice);
   }

@@ -11,6 +11,9 @@
 #include <tuple>
 #include <optional>
 
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/file.hh>
+
 enum class TSMValueType { Float = 0, Boolean };
 
 typedef struct TSMIndexBlock {
@@ -33,9 +36,10 @@ typedef struct TSMIndexEntry {
 
 class TSM {
 private:
-  std::string filename;
-  std::unique_ptr<std::ifstream> tsmFile;
-  size_t length;
+  std::string filePath;
+  
+  seastar::file tsmFile;
+  uint64_t length = 0;
 
   // TODO: Test using tsl::htrie_map to save memory
   std::unordered_map<std::string, TSMIndexEntry> index;
@@ -45,12 +49,14 @@ public:
   unsigned int tierNum;
 
   
-  TSM(std::string _filename);
-  void readIndex();
+  TSM(std::string _absoluteFilePath);
+  seastar::future<> open();
+
+  seastar::future<> readIndex();
   template <class T>
-  void readSeries(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<T> &results);
+  seastar::future<> readSeries(std::string seriesKey, uint64_t startTime, uint64_t endTime, QueryResult<T> &results);
   template <class T>
-  void readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, QueryResult<T> &results);
+  seastar::future<> readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, QueryResult<T> &results);
   std::optional<TSMValueType> getSeriesType(std::string seriesKey);
 
   template <class T>

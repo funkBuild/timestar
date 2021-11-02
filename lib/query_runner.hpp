@@ -4,6 +4,8 @@
 #include "tsm_file_manager.hpp"
 #include "query_result.hpp"
 
+#include <seastar/core/coroutine.hh>
+
 #include <string>
 
 class QueryRunner {
@@ -11,11 +13,11 @@ private:
   TSMFileManager *fileManager;
 
   template <class T>
-  QueryResult<T> queryTsm(std::string series, uint64_t startTime, uint64_t endTime);
+  seastar::future<QueryResult<T>> queryTsm(std::string series, uint64_t startTime, uint64_t endTime);
 public:
   QueryRunner(TSMFileManager *_fileManager) : fileManager(_fileManager) {};
 
-  VariantQueryResult runQuery(std::string series, uint64_t startTime, uint64_t endTime);
+  seastar::future<VariantQueryResult> runQuery(std::string series, uint64_t startTime, uint64_t endTime);
 };
 
 #endif

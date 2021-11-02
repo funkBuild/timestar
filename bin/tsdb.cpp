@@ -113,21 +113,11 @@ int main_bench(){
 */
   return 0;
 };
-
+/*
 int main(){
   Engine engine;
-
-/*
-{
-  TSDBInsert<double> insertVal("floattest");
-  insertVal.addTag("tag", "tagValue");
-
-  for(int i=0; i < 1000000; i++)
-    insertVal.addValue(1000 * i, i*0.5);
-
-  engine.insert(insertVal);
-}
 */
+
 /*
 {
   TSDBInsert<double> insertVal("booltest");
@@ -140,19 +130,82 @@ int main(){
 }
 */
 
-  auto start_time = Clock::now();
 
-  auto result = engine.query("floattest", 500000, 52500000);
+#include <seastar/core/app-template.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/loop.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/util/closeable.hh>
 
-  auto end_time = Clock::now();
 
-  uint64_t time_diff = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-  std::cout << "Time difference: " << time_diff/1000.0 << " milliseconds" << std::endl;
 
-  std::visit([](auto&& arg) {
-    std::cout << "results.timestamps.size()=" << arg.timestamps->size() << std::endl;
-    std::cout << "results.values.size()=" << arg.values->size() << std::endl;
-  }, result);
+int main(int argc, char** argv) {
+  seastar::app_template app;
+  app.run(argc, argv, [] () -> seastar::future<> {
+    seastar::sharded<Engine> engineService;
 
-  return 0;
+    co_await engineService.start();
+
+
+    co_await engineService.invoke_on(0, [] (Engine& engine) -> seastar::future<>{
+        co_await engine.init();
+    });
+
+
+
+
+    co_await engineService.invoke_on(0, [] (Engine& engine) -> seastar::future<>{
+      auto start_time = Clock::now();
+
+      auto result = co_await engine.query("floattest", 500000, 52500000);
+
+      auto end_time = Clock::now();
+
+      uint64_t time_diff = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+      std::cout << "Time difference: " << time_diff/1000.0 << " milliseconds" << std::endl;
+
+      std::visit([](auto&& arg) {
+        std::cout << "results.timestamps.size()=" << arg.timestamps->size() << std::endl;
+        std::cout << "results.values.size()=" << arg.values->size() << std::endl;
+      }, result);
+    });
+
+
+  /*
+    {
+      TSDBInsert<double> insertVal("floattest");
+      insertVal.addTag("tag", "tagValue");
+
+      for(int i=0; i < 1000000; i++)
+        insertVal.addValue(1000 * i, i*0.5);
+
+      engine.insert(insertVal);
+    }
+  */
+
+
+/*
+    constexpr size_t aligned_size = 4096;
+    auto wbuf = seastar::temporary_buffer<char>::aligned(aligned_size, aligned_size);
+
+    auto file = co_await seastar::open_file_dma("test.file", seastar::open_flags::rw | seastar::open_flags::create);
+    //co_await file.dma_write(0, wbuf.get(), aligned_size);
+
+    auto stream = co_await seastar::make_file_output_stream(file, aligned_size);
+
+    co_await stream.write(wbuf.get(), 512);
+
+    co_await stream.flush();
+    co_await stream.close();
+
+    auto alignment = file.disk_write_dma_alignment();
+    std::cout << "alignment=" << alignment << std::endl;
+*/
+    co_await engineService.stop();
+
+  });
 }

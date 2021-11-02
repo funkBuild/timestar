@@ -10,6 +10,9 @@
 #include "tsm_file_manager.hpp"
 #include "query_result.hpp"
 
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+
 class Engine {
 private:
   TSMFileManager fileManager;
@@ -21,10 +24,14 @@ private:
 
 public:
   Engine();
+  seastar::future<> init();
+  seastar::future<> stop() {
+    return seastar::make_ready_future<>();
+  }
   template <class T>
   void insert(TSDBInsert<T> insertRequest);
   void rolloverMemoryStore();
-  VariantQueryResult query(std::string series, uint64_t startTime, uint64_t endTime);
+  seastar::future<VariantQueryResult> query(std::string series, uint64_t startTime, uint64_t endTime);
 };
 
 
