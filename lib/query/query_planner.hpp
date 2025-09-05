@@ -1,0 +1,87 @@
+#ifndef __QUERY_PLANNER_H_INCLUDED__
+#define __QUERY_PLANNER_H_INCLUDED__
+
+#include "query_parser.hpp"
+#include "leveldb_index.hpp"
+#include "series_matcher.hpp"
+#include <vector>
+#include <map>
+#include <set>
+#include <memory>
+#include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+
+namespace tsdb {
+
+// Represents a query to be executed on a specific shard
+struct ShardQuery {
+    unsigned shardId;
+    std::vector<uint64_t> seriesIds;      // Series IDs to query on this shard
+    std::set<std::string> fields;         // Fields to retrieve
+    uint64_t startTime;
+    uint64_t endTime;
+    bool requiresAllSeries;                // If true, query all matching series on shard
+};
+
+// Complete query execution plan
+struct QueryPlan {
+    std::vector<ShardQuery> shardQueries;
+    AggregationMethod aggregation;
+    uint64_t aggregationInterval = 0;  // Time interval for bucketing (0 = no bucketing)
+    std::vector<std::string> groupByTags;
+    bool requiresMerging;
+    
+    // Metadata for optimization
+    size_t estimatedSeriesCount = 0;
+    size_t estimatedPointCount = 0;
+};
+
+class QueryPlanner {
+public:
+    // Create execution plan from query request
+    // This will use the index to find matching series and map them to shards
+    seastar::future<QueryPlan> createPlan(
+        const QueryRequest& request,
+        seastar::sharded<LevelDBIndex>* indexSharded);
+    
+    // Synchronous version for testing
+    QueryPlan createPlanSync(
+        const QueryRequest& request,
+        LevelDBIndex* index);
+    
+    // Public for testing
+    bool requiresAllShards(const QueryRequest& request);
+    
+    std::string buildSeriesKeyForSharding(
+        const std::string& measurement,
+        const std::map<std::string, std::string>& tags,
+        const std::string& field);
+    
+private:
+    // Find all series IDs matching the query filters
+    seastar::future<std::map<unsigned, std::vector<uint64_t>>> findMatchingSeriesIds(
+        const QueryRequest& request,
+        seastar::sharded<LevelDBIndex>* indexSharded);
+    
+    // Synchronous version for testing
+    std::map<unsigned, std::vector<uint64_t>> findMatchingSeriesIdsSync(
+        const QueryRequest& request,
+        LevelDBIndex* index);
+    
+    // Map series IDs to their respective shards
+    std::map<unsigned, std::vector<uint64_t>> mapSeriesToShards(
+        const std::vector<uint64_t>& seriesIds,
+        const std::string& measurement,
+        const std::map<std::string, std::string>& tags,
+        const std::vector<std::string>& fields);
+    
+    // Calculate which shard a series belongs to
+    unsigned calculateShardForSeries(
+        const std::string& measurement,
+        const std::map<std::string, std::string>& tags,
+        const std::string& field);
+};
+
+} // namespace tsdb
+
+#endif // __QUERY_PLANNER_H_INCLUDED__

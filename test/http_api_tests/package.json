@@ -1,0 +1,23 @@
+{
+  "name": "tsdb-http-api-tests",
+  "version": "1.0.0",
+  "description": "HTTP API tests for TSDB",
+  "scripts": {
+    "test": "jest comprehensive_query.test.js",
+    "test:verbose": "jest comprehensive_query.test.js --verbose",
+    "test:watch": "jest comprehensive_query.test.js --watch",
+    "start-server": "../../build/bin/tsdb_http_server",
+    "test:with-server": "npm run start-server & SERVER_PID=$! && sleep 2 && npm test; kill $SERVER_PID"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 30000,
+    "verbose": true
+  }
+}

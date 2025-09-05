@@ -2,9 +2,19 @@
 #include <iostream>
 #include <random>
 
-#include "float_encoder.hpp"
-#include "integer_encoder.hpp"
-#include "simple8b.hpp"
+#include "../../../lib/encoding/float_encoder.hpp"
+#include "../../../lib/encoding/integer_encoder.hpp"
+#include "../../../lib/encoding/simple8b.hpp"
+
+#include <gtest/gtest.h>
+
+#define TEST_FUTURE(caseName, testName) \
+	static seastar::future<> caseName##_##testName##_FutureTestBody(); \
+	TEST(caseName, testName) { \
+		seastar::future<> f(caseName##_##testName##_FutureTestBody());\
+		f.get(); \
+	} \
+	static seastar::future<> caseName##_##testName##_FutureTestBody()
 
 float get_random()
 {
@@ -12,7 +22,8 @@ float get_random()
     static std::uniform_real_distribution<> dis(0, 1); // range 0 - 1
     return dis(e);
 }
-/*
+
+
 TEST(FloatTest, BasicAssertions) {
   const unsigned int test_length = 1000000;
 
@@ -26,8 +37,9 @@ TEST(FloatTest, BasicAssertions) {
 
   auto buf = FloatEncoder::encode(v);
   buf.rewind();
+  CompressedSlice slice((const uint8_t*)buf.data.data(), buf.size());
   std::vector<double> decoded;
-  FloatEncoder::decode(buf, 0, v.size(), decoded);
+  FloatEncoder::decode(slice, 0, v.size(), decoded);
 
     EXPECT_EQ(decoded.size(), v.size());
 
@@ -50,7 +62,8 @@ TEST(Simple8Test, BasicAssertions) {
   }
 
   auto buf = Simple8B::encode(v);
-  auto decoded = Simple8B::decode(buf);
+  Slice slice(buf.data.data(), buf.size());
+  auto decoded = Simple8B::decode(slice, v.size());
 
   EXPECT_EQ(decoded.size(), v.size());
 
@@ -73,9 +86,9 @@ TEST(IntegerTest, BasicAssertions) {
   }
 
   auto buf = IntegerEncoder::encode(v);
-  // buf.rewind();
+  Slice slice(buf.data.data(), buf.size());
   std::vector<uint64_t> decoded;
-  IntegerEncoder::decode(buf, decoded);
+  IntegerEncoder::decode(slice, v.size(), decoded);
 
   EXPECT_EQ(decoded.size(), v.size());
 
@@ -84,4 +97,3 @@ TEST(IntegerTest, BasicAssertions) {
     EXPECT_EQ(v[i], decoded[i]);
   }
 }
-*/

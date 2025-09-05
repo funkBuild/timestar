@@ -1,0 +1,5 @@
+if(EXISTS "/home/matt/Desktop/source/tsdb/test/tsdb_test[1]_tests.cmake")
+  include("/home/matt/Desktop/source/tsdb/test/tsdb_test[1]_tests.cmake")
+else()
+  add_test(tsdb_test_NOT_BUILT tsdb_test_NOT_BUILT)
+endif()

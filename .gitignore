@@ -1,2 +1,57 @@
-build
-.vscode
+# Build artifacts
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+
+# Test outputs
+shard_*/
+test_*.log
+*.test
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Dependencies
+_deps/
+
+# Core dumps
+core
+core.*
+
+# Executables (but not in bin/)
+/*.out
+/*.exe
+/tsdb
+/tsdb_test
+
+# Data files (but keep test data)
+*.tsm
+*.wal
+*.idx
+!/test/data/*.tsm
+!/test/data/*.wal
+
+test/http_api_tests/node_modules/
