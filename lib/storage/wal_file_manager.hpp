@@ -43,11 +43,12 @@ public:
   }
   std::optional<TSMValueType> getSeriesType(std::string &seriesKey);
   
-  // Query memory stores for data
+  // Query memory stores for data (with delete filtering)
   template <class T>
   std::optional<InMemorySeries<T>> queryMemoryStores(const std::string& seriesKey) {
     for (auto& memStore : memoryStores) {
-      auto result = memStore->querySeries<T>(seriesKey);
+      // Use filtered query to exclude deleted data
+      auto result = memStore->querySeriesFiltered<T>(seriesKey);
       if (result.has_value()) {
         return result;
       }

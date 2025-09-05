@@ -549,8 +549,8 @@ seastar::future<> WALReader::readAll(MemoryStore *store){
         tsdb::wal_log.debug("WAL recovery: DeleteRange for series={}, startTime={}, endTime={}",
                            seriesKey, startTime, endTime);
         
-        // TODO: When memory stores support deletion, apply it here:
-        // store->deleteRange(seriesKey, startTime, endTime);
+        // Apply deletion to memory store
+        store->deleteRange(seriesKey, startTime, endTime);
         
         entriesRead++;
       }

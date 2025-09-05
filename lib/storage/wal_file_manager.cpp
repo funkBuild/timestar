@@ -175,9 +175,12 @@ seastar::future<> WALFileManager::deleteFromMemoryStores(const std::string& seri
     }
   }
   
-  // TODO: In a full implementation, we would also mark these ranges as deleted
-  // in the memory stores so queries filter them out properly
-  // For now, this just ensures the deletion is persisted to WAL
+  // Apply deletion to all memory stores
+  for (auto& memStore : memoryStores) {
+    memStore->deleteRange(seriesKey, startTime, endTime);
+  }
+  
+  tsdb::wal_log.debug("Applied deleteRange to {} memory stores", memoryStores.size());
   
   co_return;
 }

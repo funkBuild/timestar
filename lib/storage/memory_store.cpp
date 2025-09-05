@@ -131,3 +131,14 @@ template void MemoryStore::insertMemory<std::string>(TSDBInsert<std::string> &in
 template bool MemoryStore::wouldExceedThreshold<double>(TSDBInsert<double> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest);
+
+void MemoryStore::deleteRange(const std::string& seriesKey, uint64_t startTime, uint64_t endTime) {
+    tsdb::memory_log.debug("Deleting range for series {} from {} to {}", 
+                          seriesKey, startTime, endTime);
+    
+    // Add the deleted range to our tracking
+    deletedRanges[seriesKey].push_back({startTime, endTime});
+    
+    // TODO: We could optimize by merging overlapping ranges, but for now
+    // we'll just track all deletions separately
+}

@@ -33,6 +33,9 @@ private:
   bool closed = false;
   // 16MB threshold for actual WAL file size on disk (uncompressed)
   static constexpr size_t WAL_SIZE_THRESHOLD = 16 * 1024 * 1024; // 16MB
+  
+  // Track deleted time ranges for each series
+  std::unordered_map<std::string, std::vector<std::pair<uint64_t, uint64_t>>> deletedRanges;
 
 public:
   const unsigned int sequenceNumber;
@@ -74,6 +77,49 @@ public:
       }, it->second);
     }
     return std::nullopt;
+  }
+  
+  // Delete data in a time range for a series
+  void deleteRange(const std::string& seriesKey, uint64_t startTime, uint64_t endTime);
+  
+  // Query method that filters out deleted data
+  template <class T>
+  std::optional<InMemorySeries<T>> querySeriesFiltered(const std::string& seriesKey) {
+    auto result = querySeries<T>(seriesKey);
+    if (!result.has_value()) {
+      return std::nullopt;
+    }
+    
+    // Check if there are any deleted ranges for this series
+    auto deletedIt = deletedRanges.find(seriesKey);
+    if (deletedIt == deletedRanges.end() || deletedIt->second.empty()) {
+      return result; // No deletions, return as-is
+    }
+    
+    // Filter out deleted data
+    InMemorySeries<T> filtered;
+    const auto& original = result.value();
+    const auto& delRanges = deletedIt->second;
+    
+    for (size_t i = 0; i < original.timestamps.size(); ++i) {
+      uint64_t ts = original.timestamps[i];
+      bool isDeleted = false;
+      
+      // Check if this timestamp falls in any deleted range
+      for (const auto& [delStart, delEnd] : delRanges) {
+        if (ts >= delStart && ts <= delEnd) {
+          isDeleted = true;
+          break;
+        }
+      }
+      
+      if (!isDeleted) {
+        filtered.timestamps.push_back(original.timestamps[i]);
+        filtered.values.push_back(original.values[i]);
+      }
+    }
+    
+    return filtered;
   }
 };
 
