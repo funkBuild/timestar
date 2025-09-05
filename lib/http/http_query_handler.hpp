@@ -9,13 +9,16 @@
 #include <seastar/http/function_handlers.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
-#include <rapidjson/document.h>
+#include <glaze/glaze.hpp>
 #include <memory>
 #include <chrono>
 #include <variant>
 
 // Forward declaration
 class Engine;
+
+// Glaze struct forward declaration
+struct GlazeQueryRequest;
 
 namespace tsdb {
 
@@ -71,7 +74,7 @@ public:
     seastar::future<QueryResponse> executeQuery(const QueryRequest& request);
     
     // Parse JSON request body (public for testing)
-    QueryRequest parseQueryRequest(const rapidjson::Document& doc);
+    QueryRequest parseQueryRequest(const GlazeQueryRequest& glazeReq);
     
     // Parse interval string like "5m", "1h", "30s" to nanoseconds
     static uint64_t parseInterval(const std::string& interval);

@@ -6,42 +6,86 @@
 using namespace seastar;
 using namespace httpd;
 
-HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const rapidjson::Value& doc) {
+// Glaze-compatible structures for JSON parsing
+struct GlazeDeleteRequest {
+    // For series key format
+    std::optional<std::string> series;
+    
+    // For structured format
+    std::optional<std::string> measurement;
+    std::optional<std::map<std::string, std::string>> tags;
+    std::optional<std::string> field;
+    std::optional<std::vector<std::string>> fields;
+    
+    // Time range (required)
+    uint64_t startTime;
+    uint64_t endTime;
+};
+
+template <>
+struct glz::meta<GlazeDeleteRequest> {
+    using T = GlazeDeleteRequest;
+    static constexpr auto value = object(
+        "series", &T::series,
+        "measurement", &T::measurement,
+        "tags", &T::tags,
+        "field", &T::field,
+        "fields", &T::fields,
+        "startTime", &T::startTime,
+        "endTime", &T::endTime
+    );
+};
+
+struct GlazeBatchDelete {
+    std::vector<GlazeDeleteRequest> deletes;
+};
+
+template <>
+struct glz::meta<GlazeBatchDelete> {
+    using T = GlazeBatchDelete;
+    static constexpr auto value = object(
+        "deletes", &T::deletes
+    );
+};
+
+// Response structures for Glaze serialization - must be at namespace scope
+struct DeleteDetailedResponse {
+    std::string status = "success";
+    int seriesDeleted;
+    int totalRequests;
+    std::optional<std::vector<std::string>> deletedSeries;
+    std::optional<int> deletedSeriesCount;
+    std::optional<std::string> note;
+};
+
+HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const GlazeDeleteRequest& glazeReq) {
     DeleteRequest req;
     req.isPattern = false;
     
     // Check for series key format
-    if (doc.HasMember("series") && doc["series"].IsString()) {
-        req.seriesKey = doc["series"].GetString();
+    if (glazeReq.series) {
+        req.seriesKey = *glazeReq.series;
         req.isStructured = false;
     }
     // Check for structured/pattern format
-    else if (doc.HasMember("measurement") && doc["measurement"].IsString()) {
-        req.measurement = doc["measurement"].GetString();
+    else if (glazeReq.measurement) {
+        req.measurement = *glazeReq.measurement;
         req.isStructured = true;
         
         // Parse tags if present
-        if (doc.HasMember("tags") && doc["tags"].IsObject()) {
-            for (auto& tag : doc["tags"].GetObject()) {
-                if (tag.value.IsString()) {
-                    req.tags[tag.name.GetString()] = tag.value.GetString();
-                }
-            }
+        if (glazeReq.tags) {
+            req.tags = *glazeReq.tags;
         }
         
         // Check for single field (backward compatibility)
-        if (doc.HasMember("field") && doc["field"].IsString()) {
-            req.field = doc["field"].GetString();
+        if (glazeReq.field) {
+            req.field = *glazeReq.field;
             req.fields.push_back(req.field);
         }
         // Check for multiple fields (pattern-based)
-        else if (doc.HasMember("fields") && doc["fields"].IsArray()) {
+        else if (glazeReq.fields) {
             req.isPattern = true;
-            for (auto& field : doc["fields"].GetArray()) {
-                if (field.IsString()) {
-                    req.fields.push_back(field.GetString());
-                }
-            }
+            req.fields = *glazeReq.fields;
             if (!req.fields.empty()) {
                 req.field = req.fields[0]; // Set first field for compatibility
             }
@@ -56,15 +100,8 @@ HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const rap
     }
     
     // Parse time range
-    if (!doc.HasMember("startTime") || !doc["startTime"].IsUint64()) {
-        throw std::runtime_error("startTime is required and must be uint64");
-    }
-    req.startTime = doc["startTime"].GetUint64();
-    
-    if (!doc.HasMember("endTime") || !doc["endTime"].IsUint64()) {
-        throw std::runtime_error("endTime is required and must be uint64");
-    }
-    req.endTime = doc["endTime"].GetUint64();
+    req.startTime = glazeReq.startTime;
+    req.endTime = glazeReq.endTime;
     
     // Validate time range
     if (req.startTime > req.endTime) {
@@ -75,33 +112,21 @@ HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const rap
 }
 
 std::string HttpDeleteHandler::createErrorResponse(const std::string& error) {
-    rapidjson::StringBuffer buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    // Create JSON object directly
+    auto response = glz::obj{"status", "error", "error", error};
     
-    writer.StartObject();
-    writer.Key("status");
-    writer.String("error");
-    writer.Key("error");
-    writer.String(error.c_str());
-    writer.EndObject();
-    
-    return buffer.GetString();
+    std::string buffer;
+    glz::write_json(response, buffer);
+    return buffer;
 }
 
 std::string HttpDeleteHandler::createSuccessResponse(int deletedCount, int totalRequests) {
-    rapidjson::StringBuffer buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    // Create JSON object directly
+    auto response = glz::obj{"status", "success", "deleted", deletedCount, "total", totalRequests};
     
-    writer.StartObject();
-    writer.Key("status");
-    writer.String("success");
-    writer.Key("deleted");
-    writer.Int(deletedCount);
-    writer.Key("total");
-    writer.Int(totalRequests);
-    writer.EndObject();
-    
-    return buffer.GetString();
+    std::string buffer;
+    glz::write_json(response, buffer);
+    return buffer;
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>>
@@ -110,23 +135,18 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
     reply->add_header("Content-Type", "application/json");
     
     try {
-        // Parse JSON body
-        rapidjson::Document doc;
-        doc.Parse(req->content.c_str());
-        
-        if (doc.HasParseError()) {
-            reply->set_status(seastar::http::reply::status_type::bad_request);
-            reply->_content = createErrorResponse("Invalid JSON");
-            co_return reply;
-        }
-        
+        // Parse JSON body using Glaze
         std::vector<DeleteRequest> deleteRequests;
         
-        // Check for batch deletes
-        if (doc.HasMember("deletes") && doc["deletes"].IsArray()) {
-            for (auto& deleteDoc : doc["deletes"].GetArray()) {
+        // Try to parse as batch delete first
+        GlazeBatchDelete batchDelete;
+        auto batch_error = glz::read_json(batchDelete, req->content);
+        
+        if (!batch_error && !batchDelete.deletes.empty()) {
+            // Batch delete request
+            for (const auto& glazeReq : batchDelete.deletes) {
                 try {
-                    deleteRequests.push_back(parseDeleteRequest(deleteDoc));
+                    deleteRequests.push_back(parseDeleteRequest(glazeReq));
                 } catch (const std::exception& e) {
                     reply->set_status(seastar::http::reply::status_type::bad_request);
                     reply->_content = createErrorResponse(std::string("Invalid delete request: ") + e.what());
@@ -134,9 +154,18 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                 }
             }
         } else {
-            // Single delete request
+            // Try single delete request
+            GlazeDeleteRequest singleDelete;
+            auto single_error = glz::read_json(singleDelete, req->content);
+            
+            if (single_error) {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = createErrorResponse("Invalid JSON: " + std::string(glz::format_error(single_error)));
+                co_return reply;
+            }
+            
             try {
-                deleteRequests.push_back(parseDeleteRequest(doc));
+                deleteRequests.push_back(parseDeleteRequest(singleDelete));
             } catch (const std::exception& e) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse(e.what());
@@ -237,35 +266,20 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
         // Return success response with detailed information
         reply->set_status(seastar::http::reply::status_type::ok);
         
-        // Create detailed response
-        rapidjson::StringBuffer buffer;
-        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-        
-        writer.StartObject();
-        writer.Key("status");
-        writer.String("success");
-        writer.Key("seriesDeleted");
-        writer.Int(totalSeriesDeleted);
-        writer.Key("totalRequests");
-        writer.Int(deleteRequests.size());
+        // Create detailed response using structured approach
+        DeleteDetailedResponse response;
+        response.seriesDeleted = totalSeriesDeleted;
+        response.totalRequests = static_cast<int>(deleteRequests.size());
         
         // Include deleted series list if not too large
         if (!allDeletedSeries.empty() && allDeletedSeries.size() <= 100) {
-            writer.Key("deletedSeries");
-            writer.StartArray();
-            for (const auto& series : allDeletedSeries) {
-                writer.String(series.c_str());
-            }
-            writer.EndArray();
+            response.deletedSeries = allDeletedSeries;
         } else if (allDeletedSeries.size() > 100) {
-            writer.Key("deletedSeriesCount");
-            writer.Int(allDeletedSeries.size());
-            writer.Key("note");
-            writer.String("Series list omitted due to size");
+            response.deletedSeriesCount = static_cast<int>(allDeletedSeries.size());
+            response.note = "Series list omitted due to size";
         }
         
-        writer.EndObject();
-        reply->_content = buffer.GetString();
+        reply->_content = glz::write_json(response).value_or("{}");
         
     } catch (const std::exception& e) {
         tsdb::http_log.error("Delete handler error: {}", e.what());

@@ -4,9 +4,7 @@
 #include <string>
 #include <memory>
 #include <variant>
-#include <rapidjson/document.h>
-#include <rapidjson/writer.h>
-#include <rapidjson/stringbuffer.h>
+#include <glaze/glaze.hpp>
 
 #include "engine.hpp"
 #include "tsdb_value.hpp"
@@ -72,7 +70,7 @@ class HttpWriteHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
     
-    // Field value variant to avoid rapidjson::Value lifetime issues
+    // Field value variant for flexible JSON parsing
     using FieldValue = std::variant<double, bool, std::string, int64_t>;
     
     struct WritePoint {
@@ -97,11 +95,11 @@ private:
         std::vector<uint64_t> timestamps;  // Array of timestamps
     };
     
-    // Parse a single write point from JSON
-    WritePoint parseWritePoint(const rapidjson::Value& point);
+    // Parse a single write point from JSON string
+    WritePoint parseWritePoint(const std::string& json);
     
     // Parse a write point that may contain arrays
-    MultiWritePoint parseMultiWritePoint(const rapidjson::Value& point);
+    MultiWritePoint parseMultiWritePoint(const glz::json_t& point);
     
     // Process a single write point - determine type and insert
     seastar::future<> processWritePoint(const WritePoint& point);

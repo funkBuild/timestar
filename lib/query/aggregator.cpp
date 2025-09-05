@@ -1,6 +1,7 @@
 #include "aggregator.hpp"
 #include <stdexcept>
 #include <cmath>
+#include <algorithm>
 
 namespace tsdb {
 
@@ -82,11 +83,107 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
         return {};
     }
     
-    // Merge all series first
-    auto [mergedTimestamps, mergedValues] = mergeSeries(series);
+    // For time-aligned aggregation, we need to group values by timestamp
+    // and apply the aggregation function at each timestamp
+    std::map<uint64_t, std::vector<double>> timeAlignedValues;
     
-    // Then aggregate
-    return aggregate(mergedTimestamps, mergedValues, method, interval);
+    // Group all values by their timestamps
+    for (const auto& [timestamps, values] : series) {
+        for (size_t i = 0; i < timestamps.size(); ++i) {
+            timeAlignedValues[timestamps[i]].push_back(values[i]);
+        }
+    }
+    
+    std::vector<AggregatedPoint> result;
+    
+    if (interval == 0) {
+        // No time bucketing
+        if (method == AggregationMethod::LATEST) {
+            // For LATEST with no interval, return all original values without aggregation
+            for (const auto& [timestamps, values] : series) {
+                for (size_t i = 0; i < timestamps.size(); ++i) {
+                    AggregatedPoint point;
+                    point.timestamp = timestamps[i];
+                    point.value = values[i];
+                    point.count = 1;
+                    result.push_back(point);
+                }
+            }
+            // Sort by timestamp since we may have mixed them from different series
+            std::sort(result.begin(), result.end(), 
+                [](const AggregatedPoint& a, const AggregatedPoint& b) {
+                    return a.timestamp < b.timestamp;
+                });
+        } else {
+            // For other aggregations, aggregate at each unique timestamp
+            for (const auto& [timestamp, vals] : timeAlignedValues) {
+                AggregatedPoint point;
+                point.timestamp = timestamp;
+                point.count = vals.size();
+                
+                switch (method) {
+                    case AggregationMethod::AVG:
+                        point.value = calculateAvg(vals);
+                        break;
+                    case AggregationMethod::MIN:
+                        point.value = calculateMin(vals);
+                        break;
+                    case AggregationMethod::MAX:
+                        point.value = calculateMax(vals);
+                        break;
+                    case AggregationMethod::SUM:
+                        point.value = calculateSum(vals);
+                        break;
+                    case AggregationMethod::LATEST:
+                        // Shouldn't reach here, handled above
+                        point.value = vals.back();
+                        break;
+                }
+                
+                result.push_back(point);
+            }
+        }
+    } else {
+        // With time bucketing
+        std::map<uint64_t, std::vector<double>> buckets;
+        
+        // Group values into time buckets
+        for (const auto& [timestamp, vals] : timeAlignedValues) {
+            uint64_t bucketTime = (timestamp / interval) * interval;
+            buckets[bucketTime].insert(buckets[bucketTime].end(), vals.begin(), vals.end());
+        }
+        
+        // Aggregate each bucket
+        for (const auto& [bucketTime, vals] : buckets) {
+            AggregatedPoint point;
+            point.timestamp = bucketTime;
+            point.count = vals.size();
+            
+            switch (method) {
+                case AggregationMethod::AVG:
+                    point.value = calculateAvg(vals);
+                    break;
+                case AggregationMethod::MIN:
+                    point.value = calculateMin(vals);
+                    break;
+                case AggregationMethod::MAX:
+                    point.value = calculateMax(vals);
+                    break;
+                case AggregationMethod::SUM:
+                    point.value = calculateSum(vals);
+                    break;
+                case AggregationMethod::LATEST: {
+                    // For LATEST in a bucket, take the last value
+                    point.value = vals.back();
+                    break;
+                }
+            }
+            
+            result.push_back(point);
+        }
+    }
+    
+    return result;
 }
 
 std::map<std::string, std::vector<AggregatedPoint>> Aggregator::aggregateGroupBy(

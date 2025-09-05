@@ -13,12 +13,7 @@ find_package (Snappy REQUIRED)
 find_package (Threads REQUIRED)
 find_package (Seastar REQUIRED)
 
-# Find RapidJSON
-find_path(RAPIDJSON_INCLUDE_DIR NAMES rapidjson/rapidjson.h)
-if(NOT RAPIDJSON_INCLUDE_DIR)
-    message(FATAL_ERROR "RapidJSON not found. Please install rapidjson-dev (Ubuntu/Debian)")
-endif()
-message(STATUS "Found RapidJSON: ${RAPIDJSON_INCLUDE_DIR}")
+# Glaze is provided via FetchContent from parent CMakeLists.txt
 
 # Find LevelDB
 find_path(LEVELDB_INCLUDE_DIR NAMES leveldb/db.h)
@@ -31,7 +26,7 @@ endif()
 message(STATUS "Found LevelDB: ${LEVELDB_LIBRARY}")
 
 add_library(libtsdb STATIC ${SRC_FILES})
-target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY})
+target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze)
 
 # Include both the lib directory and all subdirectories for header resolution
 target_include_directories(libtsdb PUBLIC 
@@ -43,6 +38,5 @@ target_include_directories(libtsdb PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/index
     ${CMAKE_CURRENT_SOURCE_DIR}/http
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
-    ${LEVELDB_INCLUDE_DIR} 
-    ${RAPIDJSON_INCLUDE_DIR}
+    ${LEVELDB_INCLUDE_DIR}
 )

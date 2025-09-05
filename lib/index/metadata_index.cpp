@@ -3,9 +3,7 @@
 #include <leveldb/options.h>
 #include <leveldb/filter_policy.h>
 #include <leveldb/cache.h>
-#include <rapidjson/document.h>
-#include <rapidjson/writer.h>
-#include <rapidjson/stringbuffer.h>
+#include <glaze/glaze.hpp>
 #include <seastar/core/smp.hh>
 #include <algorithm>
 #include <sstream>
@@ -14,70 +12,44 @@
 // Global instance
 std::unique_ptr<MetadataIndex> globalMetadataIndex;
 
+// Glaze template specialization for SeriesMetadata
+template <>
+struct glz::meta<SeriesMetadata> {
+    using T = SeriesMetadata;
+    static constexpr auto value = object(
+        "seriesId", &T::seriesId,
+        "measurement", &T::measurement,
+        "minTime", &T::minTime,
+        "maxTime", &T::maxTime,
+        "shardId", &T::shardId,
+        "tags", &T::tags,
+        "fields", &T::fields
+    );
+};
+
+// Glaze template specialization for FieldStats
+template <>
+struct glz::meta<FieldStats> {
+    using T = FieldStats;
+    static constexpr auto value = object(
+        "dataType", &T::dataType,
+        "minValue", &T::minValue,
+        "maxValue", &T::maxValue,
+        "pointCount", &T::pointCount
+    );
+};
+
 // SeriesMetadata implementation
 std::string SeriesMetadata::serialize() const {
-    rapidjson::Document doc;
-    doc.SetObject();
-    auto& allocator = doc.GetAllocator();
-    
-    doc.AddMember("seriesId", seriesId, allocator);
-    doc.AddMember("measurement", rapidjson::Value(measurement.c_str(), allocator), allocator);
-    doc.AddMember("minTime", minTime, allocator);
-    doc.AddMember("maxTime", maxTime, allocator);
-    doc.AddMember("shardId", shardId, allocator);
-    
-    // Add tags
-    rapidjson::Value tagsObj(rapidjson::kObjectType);
-    for (const auto& [k, v] : tags) {
-        tagsObj.AddMember(
-            rapidjson::Value(k.c_str(), allocator),
-            rapidjson::Value(v.c_str(), allocator),
-            allocator
-        );
-    }
-    doc.AddMember("tags", tagsObj, allocator);
-    
-    // Add fields
-    rapidjson::Value fieldsArr(rapidjson::kArrayType);
-    for (const auto& field : fields) {
-        fieldsArr.PushBack(rapidjson::Value(field.c_str(), allocator), allocator);
-    }
-    doc.AddMember("fields", fieldsArr, allocator);
-    
-    rapidjson::StringBuffer buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-    doc.Accept(writer);
-    
-    return buffer.GetString();
+    return glz::write_json(*this).value_or("{}");
 }
 
 SeriesMetadata SeriesMetadata::deserialize(const std::string& data) {
     SeriesMetadata metadata;
-    rapidjson::Document doc;
-    doc.Parse(data.c_str());
+    auto error = glz::read_json(metadata, data);
     
-    if (doc.HasParseError()) {
-        throw std::runtime_error("Failed to parse series metadata");
-    }
-    
-    metadata.seriesId = doc["seriesId"].GetUint64();
-    metadata.measurement = doc["measurement"].GetString();
-    metadata.minTime = doc["minTime"].GetInt64();
-    metadata.maxTime = doc["maxTime"].GetInt64();
-    metadata.shardId = doc["shardId"].GetUint();
-    
-    // Parse tags
-    if (doc.HasMember("tags") && doc["tags"].IsObject()) {
-        for (const auto& tag : doc["tags"].GetObject()) {
-            metadata.tags[tag.name.GetString()] = tag.value.GetString();
-        }
-    }
-    
-    // Parse fields
-    if (doc.HasMember("fields") && doc["fields"].IsArray()) {
-        for (const auto& field : doc["fields"].GetArray()) {
-            metadata.fields.push_back(field.GetString());
-        }
+    if (error) {
+        throw std::runtime_error("Failed to parse series metadata: " + std::string(glz::format_error(error)));
     }
     
     return metadata;
@@ -100,35 +72,16 @@ std::string SeriesMetadata::generateSeriesKey(const std::string& measurement,
 
 // FieldStats implementation
 std::string FieldStats::serialize() const {
-    rapidjson::Document doc;
-    doc.SetObject();
-    auto& allocator = doc.GetAllocator();
-    
-    doc.AddMember("dataType", rapidjson::Value(dataType.c_str(), allocator), allocator);
-    doc.AddMember("minValue", minValue, allocator);
-    doc.AddMember("maxValue", maxValue, allocator);
-    doc.AddMember("pointCount", pointCount, allocator);
-    
-    rapidjson::StringBuffer buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-    doc.Accept(writer);
-    
-    return buffer.GetString();
+    return glz::write_json(*this).value_or("{}");
 }
 
 FieldStats FieldStats::deserialize(const std::string& data) {
     FieldStats stats;
-    rapidjson::Document doc;
-    doc.Parse(data.c_str());
+    auto error = glz::read_json(stats, data);
     
-    if (doc.HasParseError()) {
-        throw std::runtime_error("Failed to parse field stats");
+    if (error) {
+        throw std::runtime_error("Failed to parse field stats: " + std::string(glz::format_error(error)));
     }
-    
-    stats.dataType = doc["dataType"].GetString();
-    stats.minValue = doc["minValue"].GetDouble();
-    stats.maxValue = doc["maxValue"].GetDouble();
-    stats.pointCount = doc["pointCount"].GetUint64();
     
     return stats;
 }

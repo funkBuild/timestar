@@ -2,7 +2,7 @@ const axios = require('axios');
 
 // Test configuration
 const HOST = 'localhost';
-const PORT = 8087;
+const PORT = 8086;
 const BASE_URL = `http://${HOST}:${PORT}`;
 
 const writeMultiFieldData = async (measurement, tags, fields, timestamps) => {

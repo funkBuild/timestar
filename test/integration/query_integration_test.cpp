@@ -51,7 +51,7 @@ protected:
             values.push_back(value);
         }
         
-        result.fields[field] = std::make_pair(timestamps, values);
+        result.fields[field] = std::make_pair(timestamps, FieldValues(values));
         return result;
     }
 };
@@ -88,30 +88,41 @@ TEST_F(QueryIntegrationTest, MetricsQueryWithAggregation) {
             auto& timestamps = data.first;
             auto& values = data.second;
             
-            auto aggregated = Aggregator::aggregate(
-                timestamps, values, AggregationMethod::AVG, interval);
-            
-            timestamps.clear();
-            values.clear();
-            
-            for (const auto& point : aggregated) {
-                timestamps.push_back(point.timestamp);
-                values.push_back(point.value);
+            // Only aggregate numeric (double) values
+            if (std::holds_alternative<std::vector<double>>(values)) {
+                auto& doubleValues = std::get<std::vector<double>>(values);
+                
+                auto aggregated = Aggregator::aggregate(
+                    timestamps, doubleValues, AggregationMethod::AVG, interval);
+                
+                timestamps.clear();
+                doubleValues.clear();
+                
+                for (const auto& point : aggregated) {
+                    timestamps.push_back(point.timestamp);
+                    doubleValues.push_back(point.value);
+                }
             }
         }
     }
     
     // Verify aggregation reduced data points
     for (const auto& series : mockData) {
-        auto& [timestamps, values] = series.fields.at("usage_percent");
+        auto& fieldData = series.fields.at("usage_percent");
+        auto& timestamps = fieldData.first;
+        auto& valuesVariant = fieldData.second;
+        
         // 1 hour of data in 5-minute buckets = 12 buckets
         EXPECT_LE(timestamps.size(), 12);
         EXPECT_GE(timestamps.size(), 10); // At least 10 buckets with data
         
         // Verify values are reasonable
-        for (double value : values) {
-            EXPECT_GE(value, 30.0); // CPU usage between 30-80%
-            EXPECT_LE(value, 80.0);
+        if (std::holds_alternative<std::vector<double>>(valuesVariant)) {
+            auto& values = std::get<std::vector<double>>(valuesVariant);
+            for (double value : values) {
+                EXPECT_GE(value, 30.0); // CPU usage between 30-80%
+                EXPECT_LE(value, 80.0);
+            }
         }
     }
 }
@@ -159,7 +170,11 @@ TEST_F(QueryIntegrationTest, GroupByDatacenter) {
         std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>> groupData;
         
         for (const auto* series : seriesList) {
-            groupData.push_back(series->fields.at("bytes_sent"));
+            auto& fieldData = series->fields.at("bytes_sent");
+            if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
+                groupData.push_back(std::make_pair(fieldData.first, 
+                                                  std::get<std::vector<double>>(fieldData.second)));
+            }
         }
         
         auto aggregated = Aggregator::aggregateMultiple(
@@ -202,14 +217,19 @@ TEST_F(QueryIntegrationTest, MaxTemperatureQuery) {
     uint64_t maxTimestamp = 0;
     
     for (const auto& series : sensorData) {
-        auto& [timestamps, values] = series.fields.at("celsius");
+        auto& fieldData = series.fields.at("celsius");
+        auto& timestamps = fieldData.first;
+        auto& valuesVariant = fieldData.second;
         
-        auto maxIt = std::max_element(values.begin(), values.end());
-        if (maxIt != values.end() && *maxIt > globalMax) {
-            globalMax = *maxIt;
-            size_t idx = std::distance(values.begin(), maxIt);
-            maxTimestamp = timestamps[idx];
-            maxLocation = series.tags.at("room");
+        if (std::holds_alternative<std::vector<double>>(valuesVariant)) {
+            auto& values = std::get<std::vector<double>>(valuesVariant);
+            auto maxIt = std::max_element(values.begin(), values.end());
+            if (maxIt != values.end() && *maxIt > globalMax) {
+                globalMax = *maxIt;
+                size_t idx = std::distance(values.begin(), maxIt);
+                maxTimestamp = timestamps[idx];
+                maxLocation = series.tags.at("room");
+            }
         }
     }
     
@@ -284,17 +304,23 @@ TEST_F(QueryIntegrationTest, ComplexAggregationPipeline) {
     uint64_t interval = 10 * 60 * 1000000000ULL; // 10 minutes
     
     for (auto& series : responseTimeData) {
-        auto& [timestamps, values] = series.fields.at("milliseconds");
+        auto& fieldData = series.fields.at("milliseconds");
+        auto& timestamps = fieldData.first;
+        auto& values = fieldData.second;
         
-        auto aggregated = Aggregator::aggregate(
-            timestamps, values, AggregationMethod::MAX, interval);
-        
-        timestamps.clear();
-        values.clear();
-        
-        for (const auto& point : aggregated) {
-            timestamps.push_back(point.timestamp);
-            values.push_back(point.value);
+        if (std::holds_alternative<std::vector<double>>(values)) {
+            auto& doubleValues = std::get<std::vector<double>>(values);
+            
+            auto aggregated = Aggregator::aggregate(
+                timestamps, doubleValues, AggregationMethod::MAX, interval);
+            
+            timestamps.clear();
+            doubleValues.clear();
+            
+            for (const auto& point : aggregated) {
+                timestamps.push_back(point.timestamp);
+                doubleValues.push_back(point.value);
+            }
         }
     }
     
@@ -314,10 +340,13 @@ TEST_F(QueryIntegrationTest, ComplexAggregationPipeline) {
         int count = 0;
         
         for (const auto* series : seriesList) {
-            auto& [ts, vals] = series->fields.at("milliseconds");
-            for (double val : vals) {
-                sum += val;
-                count++;
+            auto& fieldData = series->fields.at("milliseconds");
+            if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
+                auto& doubleVals = std::get<std::vector<double>>(fieldData.second);
+                for (double val : doubleVals) {
+                    sum += val;
+                    count++;
+                }
             }
         }
         
@@ -346,7 +375,7 @@ TEST_F(QueryIntegrationTest, HandleEmptyAndSparseData) {
         values.push_back(100.0 + i * 10.0);
     }
     
-    sparseSeries.fields["value"] = std::make_pair(timestamps, values);
+    sparseSeries.fields["value"] = std::make_pair(timestamps, FieldValues(values));
     
     // Aggregate with 5-minute intervals
     uint64_t interval = 5 * 60 * 1000000000ULL;
@@ -479,13 +508,19 @@ TEST_F(QueryIntegrationTest, PerformanceWithLargeDataset) {
     uint64_t interval = 60000000000ULL; // 1 minute
     
     for (auto& series : largeDataset) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+        auto& timestamps = fieldData.first;
+        auto& values = fieldData.second;
         
-        auto aggregated = Aggregator::aggregate(
-            timestamps, values, AggregationMethod::AVG, interval);
-        
-        // Just verify it completes
-        EXPECT_GT(aggregated.size(), 0);
+        if (std::holds_alternative<std::vector<double>>(values)) {
+            auto& doubleValues = std::get<std::vector<double>>(values);
+            
+            auto aggregated = Aggregator::aggregate(
+                timestamps, doubleValues, AggregationMethod::AVG, interval);
+            
+            // Just verify it completes
+            EXPECT_GT(aggregated.size(), 0);
+        }
     }
     
     auto end = std::chrono::high_resolution_clock::now();

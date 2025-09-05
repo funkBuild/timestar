@@ -45,7 +45,7 @@ public:
             }
             
             for (const auto& field : query.fields) {
-                result.fields[field] = std::make_pair(timestamps, values);
+                result.fields[field] = std::make_pair(timestamps, FieldValues(values));
             }
             
             results.push_back(result);
@@ -108,16 +108,23 @@ protected:
                     auto& timestamps = fieldData.first;
                     auto& values = fieldData.second;
                     
-                    auto aggregated = Aggregator::aggregate(
-                        timestamps, values, request.aggregation, request.aggregationInterval);
-                    
-                    timestamps.clear();
-                    values.clear();
-                    
-                    for (const auto& point : aggregated) {
-                        timestamps.push_back(point.timestamp);
-                        values.push_back(point.value);
+                    // Only aggregate numeric (double) values
+                    if (std::holds_alternative<std::vector<double>>(values)) {
+                        auto& doubleValues = std::get<std::vector<double>>(values);
+                        
+                        auto aggregated = Aggregator::aggregate(
+                            timestamps, doubleValues, request.aggregation, request.aggregationInterval);
+                        
+                        timestamps.clear();
+                        doubleValues.clear();
+                        
+                        for (const auto& point : aggregated) {
+                            timestamps.push_back(point.timestamp);
+                            doubleValues.push_back(point.value);
+                        }
                     }
+                    // For non-numeric values, aggregation doesn't apply
+                    // They remain unchanged
                 }
             }
         }
@@ -167,7 +174,12 @@ protected:
             
             for (const auto* series : groupSeries) {
                 for (const auto& [fieldName, fieldData] : series->fields) {
-                    fieldGroups[fieldName].push_back(fieldData);
+                    // Only aggregate numeric (double) values
+                    if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
+                        fieldGroups[fieldName].push_back(
+                            std::make_pair(fieldData.first, 
+                                         std::get<std::vector<double>>(fieldData.second)));
+                    }
                 }
             }
             
@@ -183,7 +195,7 @@ protected:
                     values.push_back(point.value);
                 }
                 
-                grouped.fields[fieldName] = std::make_pair(timestamps, values);
+                grouped.fields[fieldName] = std::make_pair(timestamps, FieldValues(values));
             }
             
             groupedResults.push_back(grouped);
@@ -201,7 +213,15 @@ TEST_F(QueryE2ETest, SimpleAverageQuery) {
     for (const auto& series : results) {
         EXPECT_EQ(series.measurement, "temperature");
         ASSERT_TRUE(series.fields.find("value") != series.fields.end());
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         EXPECT_EQ(timestamps.size(), 10); // 10 data points
         EXPECT_EQ(values.size(), 10);
     }
@@ -212,7 +232,15 @@ TEST_F(QueryE2ETest, MaxAggregationQuery) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         // With MAX aggregation and no interval, should get 1 point
         EXPECT_EQ(timestamps.size(), 1);
         EXPECT_EQ(values.size(), 1);
@@ -229,7 +257,15 @@ TEST_F(QueryE2ETest, MinAggregationQuery) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         EXPECT_EQ(timestamps.size(), 1);
         EXPECT_EQ(values.size(), 1);
         
@@ -243,7 +279,15 @@ TEST_F(QueryE2ETest, SumAggregationQuery) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         EXPECT_EQ(timestamps.size(), 1);
         EXPECT_EQ(values.size(), 1);
         
@@ -257,7 +301,15 @@ TEST_F(QueryE2ETest, LatestAggregationQuery) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         EXPECT_EQ(timestamps.size(), 1);
         EXPECT_EQ(values.size(), 1);
         
@@ -273,7 +325,15 @@ TEST_F(QueryE2ETest, AverageWithTimeInterval) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         // With 1 hour range and 10-minute intervals, expect 6 buckets
         // But since we only have 10 points spread across 1 hour, 
         // we might get fewer buckets
@@ -287,7 +347,15 @@ TEST_F(QueryE2ETest, MaxWithTimeInterval) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         // With 1 hour range and 15-minute intervals, expect 4 buckets
         EXPECT_GE(timestamps.size(), 1);
         EXPECT_LE(timestamps.size(), 4);
@@ -306,7 +374,15 @@ TEST_F(QueryE2ETest, MinWithTimeInterval) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         // With 1 hour range and 20-minute intervals, expect 3 buckets
         EXPECT_GE(timestamps.size(), 1);
         EXPECT_LE(timestamps.size(), 3);
@@ -318,7 +394,15 @@ TEST_F(QueryE2ETest, SumWithTimeInterval) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         // With 1 hour range and 30-minute intervals, expect 2 buckets
         EXPECT_GE(timestamps.size(), 1);
         EXPECT_LE(timestamps.size(), 2);
@@ -344,7 +428,19 @@ TEST_F(QueryE2ETest, GroupByLocation) {
         ASSERT_TRUE(series.tags.find("location") != series.tags.end());
         locations.insert(series.tags.at("location"));
         
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        
+        auto& timestamps = fieldData.first;
+
+        
+        auto& valuesVariant = fieldData.second;
+
+        
+        // Assuming numeric values for these tests
+
+        
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         EXPECT_EQ(timestamps.size(), 1); // Aggregated to single value
     }
     
@@ -363,7 +459,19 @@ TEST_F(QueryE2ETest, GroupByLocationWithInterval) {
     for (const auto& series : results) {
         ASSERT_TRUE(series.tags.find("location") != series.tags.end());
         
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        
+        auto& timestamps = fieldData.first;
+
+        
+        auto& valuesVariant = fieldData.second;
+
+        
+        // Assuming numeric values for these tests
+
+        
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         // With 30-minute intervals over 1 hour, expect 2 buckets
         EXPECT_GE(timestamps.size(), 1);
         EXPECT_LE(timestamps.size(), 2);
@@ -383,7 +491,19 @@ TEST_F(QueryE2ETest, GroupByMultipleTags) {
         EXPECT_TRUE(series.tags.find("location") != series.tags.end());
         EXPECT_TRUE(series.tags.find("host") != series.tags.end());
         
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        
+        auto& timestamps = fieldData.first;
+
+        
+        auto& valuesVariant = fieldData.second;
+
+        
+        // Assuming numeric values for these tests
+
+        
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         EXPECT_EQ(timestamps.size(), 1); // Aggregated to single sum
         EXPECT_GT(values[0], 0.0); // Sum should be positive
     }
@@ -430,7 +550,10 @@ TEST_F(QueryE2ETest, ComplexQueryWithEverything) {
         // Should have requested fields
         for (const auto& field : {"value", "humidity"}) {
             if (series.fields.find(field) != series.fields.end()) {
-                auto& [timestamps, values] = series.fields.at(field);
+                auto& fieldData = series.fields.at(field);
+                auto& timestamps = fieldData.first;
+                auto& valuesVariant = fieldData.second;
+                // Could be any type, just check timestamps
                 EXPECT_GE(timestamps.size(), 1);
                 EXPECT_LE(timestamps.size(), 4); // 15-min intervals over 1 hour
             }
@@ -463,7 +586,19 @@ TEST_F(QueryE2ETest, SingleSeriesQuery) {
     auto results = mockEngine->executeLocalQuery(singleQuery);
     ASSERT_EQ(results.size(), 1);
     
-    auto& [timestamps, values] = results[0].fields.at("value");
+    auto& fieldData = results[0].fields.at("value");
+
+    
+    auto& timestamps = fieldData.first;
+
+    
+    auto& valuesVariant = fieldData.second;
+
+    
+    // Assuming numeric values for these tests
+
+    
+    auto& values = std::get<std::vector<double>>(valuesVariant);
     EXPECT_EQ(timestamps.size(), 10);
     EXPECT_EQ(values.size(), 10);
 }
@@ -474,7 +609,15 @@ TEST_F(QueryE2ETest, VerySmallTimeInterval) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         // With only 10 points over 1 hour, most buckets will be empty
         // So we should get at most 10 buckets with data
         EXPECT_LE(timestamps.size(), 10);
@@ -488,7 +631,15 @@ TEST_F(QueryE2ETest, VeryLargeTimeInterval) {
     
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
-        auto& [timestamps, values] = series.fields.at("value");
+        auto& fieldData = series.fields.at("value");
+
+        auto& timestamps = fieldData.first;
+
+        auto& valuesVariant = fieldData.second;
+
+        // Assuming numeric values for these tests
+
+        auto& values = std::get<std::vector<double>>(valuesVariant);
         EXPECT_EQ(timestamps.size(), 1); // Single bucket
         EXPECT_GT(values[0], 0.0); // Sum should be positive
     }
@@ -564,7 +715,12 @@ TEST_F(QueryE2ETest, LargeScaleAggregation) {
     std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>> allSeries;
     for (const auto& result : results) {
         for (const auto& [field, data] : result.fields) {
-            allSeries.push_back(data);
+            // Only aggregate numeric (double) values
+            if (std::holds_alternative<std::vector<double>>(data.second)) {
+                allSeries.push_back(
+                    std::make_pair(data.first, 
+                                 std::get<std::vector<double>>(data.second)));
+            }
         }
     }
     

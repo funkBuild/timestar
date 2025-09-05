@@ -3,11 +3,12 @@
 
 #include <string>
 #include <memory>
-#include <rapidjson/document.h>
-#include <rapidjson/writer.h>
-#include <rapidjson/stringbuffer.h>
+#include <glaze/glaze.hpp>
 
 #include "engine.hpp"
+
+// Forward declaration for Glaze structure
+struct GlazeDeleteRequest;
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -85,7 +86,7 @@ private:
         bool isPattern;     // true if using pattern-based deletion
     };
     
-    DeleteRequest parseDeleteRequest(const rapidjson::Value& doc);
+    DeleteRequest parseDeleteRequest(const GlazeDeleteRequest& glazeReq);
     std::string createErrorResponse(const std::string& error);
     std::string createSuccessResponse(int deletedCount, int totalRequests);
     

@@ -1,5 +1,6 @@
 const axios = require('axios');
-const BASE_URL = 'http://localhost:8087';
+const PORT = process.env.TSDB_PORT || 8086;
+const BASE_URL = `http://localhost:${PORT}`;
 
 async function testWrite() {
   // Clear and write fresh data

@@ -4,13 +4,74 @@
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
+#include <glaze/glaze.hpp>
 
 using namespace tsdb;
+
+// Glaze-compatible structure for JSON parsing (from http_query_handler.cpp)
+struct GlazeQueryRequest {
+    std::string query;
+    std::variant<uint64_t, std::string> startTime;
+    std::variant<uint64_t, std::string> endTime;
+    std::optional<std::variant<uint64_t, std::string>> aggregationInterval;
+};
+
+template <>
+struct glz::meta<GlazeQueryRequest> {
+    using T = GlazeQueryRequest;
+    static constexpr auto value = object(
+        "query", &T::query,
+        "startTime", &T::startTime,
+        "endTime", &T::endTime,
+        "aggregationInterval", &T::aggregationInterval
+    );
+};
 
 class HttpQueryHandlerTest : public ::testing::Test {
 protected:
     void SetUp() override {}
     void TearDown() override {}
+    
+    // Helper to convert RapidJSON document to GlazeQueryRequest
+    GlazeQueryRequest rapidJsonToGlaze(const rapidjson::Document& doc) {
+        GlazeQueryRequest req;
+        
+        if (doc.HasMember("query") && doc["query"].IsString()) {
+            req.query = doc["query"].GetString();
+        }
+        
+        if (doc.HasMember("startTime")) {
+            if (doc["startTime"].IsString()) {
+                req.startTime = std::string(doc["startTime"].GetString());
+            } else if (doc["startTime"].IsUint64()) {
+                req.startTime = doc["startTime"].GetUint64();
+            }
+        }
+        
+        if (doc.HasMember("endTime")) {
+            if (doc["endTime"].IsString()) {
+                req.endTime = std::string(doc["endTime"].GetString());
+            } else if (doc["endTime"].IsUint64()) {
+                req.endTime = doc["endTime"].GetUint64();
+            }
+        }
+        
+        if (doc.HasMember("aggregationInterval")) {
+            if (doc["aggregationInterval"].IsString()) {
+                req.aggregationInterval = std::string(doc["aggregationInterval"].GetString());
+            } else if (doc["aggregationInterval"].IsUint64()) {
+                req.aggregationInterval = doc["aggregationInterval"].GetUint64();
+            }
+        } else if (doc.HasMember("interval")) {  // Support old field name
+            if (doc["interval"].IsString()) {
+                req.aggregationInterval = std::string(doc["interval"].GetString());
+            } else if (doc["interval"].IsUint64()) {
+                req.aggregationInterval = doc["interval"].GetUint64();
+            }
+        }
+        
+        return req;
+    }
     
     // Helper to create JSON string
     std::string createJsonRequest(const std::string& query, 
@@ -129,7 +190,7 @@ TEST_F(HttpQueryHandlerTest, ParseValidQueryRequest) {
     rapidjson::Document doc;
     doc.Parse(jsonStr.c_str());
     
-    QueryRequest request = handler.parseQueryRequest(doc);
+    QueryRequest request = handler.parseQueryRequest(rapidJsonToGlaze(doc));
     
     EXPECT_EQ(request.aggregation, AggregationMethod::AVG);
     EXPECT_EQ(request.measurement, "temperature");
@@ -149,7 +210,7 @@ TEST_F(HttpQueryHandlerTest, ParseQueryRequestMissingField) {
     doc.AddMember("startTime", "01-01-2024 00:00:00", allocator);
     doc.AddMember("endTime", "02-01-2024 00:00:00", allocator);
     
-    EXPECT_THROW(handler.parseQueryRequest(doc), QueryParseException);
+    EXPECT_THROW(handler.parseQueryRequest(rapidJsonToGlaze(doc)), QueryParseException);
 }
 
 TEST_F(HttpQueryHandlerTest, ParseQueryRequestInvalidTypes) {
@@ -164,7 +225,7 @@ TEST_F(HttpQueryHandlerTest, ParseQueryRequestInvalidTypes) {
     doc.AddMember("startTime", "01-01-2024 00:00:00", allocator);
     doc.AddMember("endTime", "02-01-2024 00:00:00", allocator);
     
-    EXPECT_THROW(handler.parseQueryRequest(doc), QueryParseException);
+    EXPECT_THROW(handler.parseQueryRequest(rapidJsonToGlaze(doc)), QueryParseException);
 }
 
 // Test shard determination
@@ -224,7 +285,7 @@ TEST_F(HttpQueryHandlerTest, ApplyAggregationAverage) {
     
     std::vector<uint64_t> timestamps = {1000, 2000, 3000};
     std::vector<double> values = {10.0, 20.0, 30.0};
-    series.fields["value"] = std::make_pair(timestamps, values);
+    series.fields["value"] = std::make_pair(timestamps, FieldValues(values));
     results.push_back(series);
     
     QueryRequest request;
@@ -235,8 +296,12 @@ TEST_F(HttpQueryHandlerTest, ApplyAggregationAverage) {
     handler.applyAggregation(results, request);
     
     EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0].fields["value"].second.size(), 1); // One aggregated point
-    EXPECT_DOUBLE_EQ(results[0].fields["value"].second[0], 20.0); // Average of 10,20,30
+    auto& fieldData = results[0].fields["value"];
+    if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
+        auto& aggValues = std::get<std::vector<double>>(fieldData.second);
+        EXPECT_EQ(aggValues.size(), 1); // One aggregated point
+        EXPECT_DOUBLE_EQ(aggValues[0], 20.0); // Average of 10,20,30
+    }
 }
 
 // Test group by application
@@ -346,7 +411,7 @@ TEST_F(HttpQueryHandlerTest, ParseAggregationIntervalNumeric) {
     doc.AddMember("endTime", rapidjson::Value(1704153600000000000), allocator);
     doc.AddMember("aggregationInterval", rapidjson::Value(300000000000), allocator); // 5 minutes in nanoseconds
     
-    QueryRequest request = handler.parseQueryRequest(doc);
+    QueryRequest request = handler.parseQueryRequest(rapidJsonToGlaze(doc));
     
     EXPECT_EQ(request.aggregationInterval, 300000000000ULL);
 }
@@ -363,7 +428,7 @@ TEST_F(HttpQueryHandlerTest, ParseAggregationIntervalString) {
     doc.AddMember("endTime", rapidjson::Value(1704153600000000000), allocator);
     doc.AddMember("aggregationInterval", "5m", allocator);
     
-    QueryRequest request = handler.parseQueryRequest(doc);
+    QueryRequest request = handler.parseQueryRequest(rapidJsonToGlaze(doc));
     
     EXPECT_EQ(request.aggregationInterval, 300000000000ULL); // 5 minutes in nanoseconds
 }
@@ -380,7 +445,7 @@ TEST_F(HttpQueryHandlerTest, ParseIntervalBackwardCompatibility) {
     doc.AddMember("endTime", rapidjson::Value(1704153600000000000), allocator);
     doc.AddMember("interval", "1h", allocator); // Using old field name
     
-    QueryRequest request = handler.parseQueryRequest(doc);
+    QueryRequest request = handler.parseQueryRequest(rapidJsonToGlaze(doc));
     
     EXPECT_EQ(request.aggregationInterval, 3600000000000ULL); // 1 hour in nanoseconds
 }
