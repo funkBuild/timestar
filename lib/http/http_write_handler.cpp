@@ -530,11 +530,11 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::httpd::request> req) {
                                     throw std::runtime_error(error);
                                 }
                                 co_await processMultiWritePoint(mwp);
-                                pointsWritten += mwp.timestamps.size();
+                                pointsWritten += mwp.timestamps.size() * mwp.fields.size();  // Count each timestamp * each field
                             } else {
                                 WritePoint wp = parseWritePoint(glz::write_json(point).value_or("{}"));
                                 co_await processWritePoint(wp);
-                                pointsWritten++;
+                                pointsWritten += wp.fields.size();  // Count each field as a point
                             }
                         } catch (const std::exception& e) {
                             std::cerr << "Error processing point: " << e.what() << std::endl;
@@ -567,11 +567,11 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::httpd::request> req) {
                         throw std::runtime_error(error);
                     }
                     co_await processMultiWritePoint(mwp);
-                    pointsWritten = mwp.timestamps.size();
+                    pointsWritten = mwp.timestamps.size() * mwp.fields.size();  // Count each timestamp * each field
                 } else {
                     WritePoint wp = parseWritePoint(body);
                     co_await processWritePoint(wp);
-                    pointsWritten = 1;
+                    pointsWritten = wp.fields.size();  // Count each field as a point
                 }
             }
         }

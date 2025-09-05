@@ -4,6 +4,7 @@
 #include "core/engine.hpp"
 #include "http/http_write_handler.hpp"
 #include "http/http_query_handler.hpp"
+#include "http/http_delete_handler.hpp"
 #include "utils/stop_signal.hpp"
 #include "utils/logger.hpp"
 
@@ -26,6 +27,7 @@ using namespace httpd;
 // Create handlers as globals so they can be used in set_routes
 std::unique_ptr<HttpWriteHandler> g_writeHandler;
 std::unique_ptr<tsdb::HttpQueryHandler> g_queryHandler;
+std::unique_ptr<HttpDeleteHandler> g_deleteHandler;
 
 void set_routes(routes& r) {
     // Simple test endpoints
@@ -49,8 +51,13 @@ void set_routes(routes& r) {
         g_queryHandler->registerRoutes(r);
     }
     
+    // Register delete endpoint
+    if (g_deleteHandler) {
+        g_deleteHandler->registerRoutes(r);
+    }
+    
     auto* root = new function_handler([](const_req req) {
-        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\"]}";
+        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\"]}";
     });
     r.add(operation_type::GET, url("/"), root);
 }
@@ -119,6 +126,10 @@ int main(int argc, char** argv) {
                 g_queryHandler = nullptr;
             }
             
+            // Create delete handler
+            g_deleteHandler = std::make_unique<HttpDeleteHandler>(&g_engine);
+            tsdb::http_log.info("Delete handler created");
+            
             // Create stop signal handler
             seastar_apps_lib::stop_signal stop_signal;
             
@@ -146,6 +157,7 @@ int main(int argc, char** argv) {
             tsdb::http_log.info("  GET  /health   - Health check");
             tsdb::http_log.info("  POST /write    - Write time series data");
             tsdb::http_log.info("  POST /query    - Query time series data");
+            tsdb::http_log.info("  POST /delete   - Delete time series data");
             
             // Wait for stop signal
             stop_signal.wait().get();
