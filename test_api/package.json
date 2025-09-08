@@ -1,0 +1,45 @@
+{
+  "name": "tsdb-api-tests",
+  "version": "1.0.0",
+  "description": "API tests for TSDB HTTP server",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:standalone": "node run-standalone-tests.js",
+    "test:all": "npm run test:standalone && npm run test"
+  },
+  "keywords": [
+    "tsdb",
+    "timeseries",
+    "database",
+    "testing"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/http_api_tests/**/*.test.js"
+    ],
+    "collectCoverageFrom": [
+      "http_api_tests/**/*.js",
+      "!http_api_tests/**/*.test.js",
+      "!http_api_tests/debug*.js"
+    ],
+    "coverageDirectory": "coverage",
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "html"
+    ]
+  }
+}

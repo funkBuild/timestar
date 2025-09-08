@@ -25,7 +25,8 @@ enum IndexKeyType : uint8_t {
     SERIES_METADATA = 0x05,     // series_id -> metadata
     TAG_INDEX = 0x06,           // measurement+tag_key+tag_value -> series_ids
     GROUP_BY_INDEX = 0x07,      // measurement+tag_key+tag_value -> series_ids (for group-by)
-    FIELD_STATS = 0x08          // series_id+field -> stats
+    FIELD_STATS = 0x08,         // series_id+field -> stats
+    FIELD_TYPE = 0x09           // measurement+field -> field type (float, bool, string, integer)
 };
 
 // Metadata for a time series
@@ -49,6 +50,7 @@ private:
     std::string encodeMeasurementTagsKey(const std::string& measurement);
     std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey);
     std::string encodeSeriesMetadataKey(uint64_t seriesId);
+    std::string encodeFieldTypeKey(const std::string& measurement, const std::string& field);
     
     // Helper methods for value encoding/decoding
     std::string encodeStringSet(const std::set<std::string>& strings);
@@ -87,7 +89,12 @@ public:
     seastar::future<> addField(const std::string& measurement, const std::string& field);
     seastar::future<> addTag(const std::string& measurement, const std::string& tagKey, const std::string& tagValue);
     
+    // Field type management
+    seastar::future<> setFieldType(const std::string& measurement, const std::string& field, const std::string& type);
+    seastar::future<std::string> getFieldType(const std::string& measurement, const std::string& field);
+    
     // Query support - get metadata for measurements
+    seastar::future<std::set<std::string>> getAllMeasurements();
     seastar::future<std::set<std::string>> getFields(const std::string& measurement);
     seastar::future<std::set<std::string>> getTags(const std::string& measurement);
     seastar::future<std::set<std::string>> getTagValues(const std::string& measurement, const std::string& tagKey);

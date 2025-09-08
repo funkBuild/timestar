@@ -21,7 +21,7 @@ enum class WALValueType { Float = 0, Boolean, String };
 
 class WAL {
 private:
-  static constexpr size_t WAL_BLOCK_SIZE = 65536;  // 64KB for better SSD performance
+  static constexpr size_t WAL_BLOCK_SIZE = 16384;  // 16KB to reduce memory usage with many shards
   static constexpr size_t WAL_ALIGNMENT = 4096;   // 4KB alignment for modern drives
   
   unsigned int sequenceNumber;

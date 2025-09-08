@@ -1,7 +1,9 @@
 #include "aggregator.hpp"
+#include "simd_aggregator.hpp"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 namespace tsdb {
 
@@ -97,7 +99,7 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
     std::vector<AggregatedPoint> result;
     
     if (interval == 0) {
-        // No time bucketing
+        // No time bucketing - aggregate per timestamp
         if (method == AggregationMethod::LATEST) {
             // For LATEST with no interval, return all original values without aggregation
             for (const auto& [timestamps, values] : series) {
@@ -115,7 +117,7 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
                     return a.timestamp < b.timestamp;
                 });
         } else {
-            // For other aggregations, aggregate at each unique timestamp
+            // For other aggregations with no interval, aggregate values at each timestamp
             for (const auto& [timestamp, vals] : timeAlignedValues) {
                 AggregatedPoint point;
                 point.timestamp = timestamp;
@@ -204,6 +206,10 @@ double Aggregator::calculateAvg(const std::vector<double>& values) {
     if (values.empty()) {
         return 0.0;
     }
+    // Use SIMD when available for better performance
+    if (simd::SimdAggregator::isAvx2Available()) {
+        return simd::SimdAggregator::calculateAvg(values.data(), values.size());
+    }
     double sum = std::accumulate(values.begin(), values.end(), 0.0);
     return sum / values.size();
 }
@@ -212,6 +218,10 @@ double Aggregator::calculateMin(const std::vector<double>& values) {
     if (values.empty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
+    // Use SIMD when available for better performance
+    if (simd::SimdAggregator::isAvx2Available()) {
+        return simd::SimdAggregator::calculateMin(values.data(), values.size());
+    }
     return *std::min_element(values.begin(), values.end());
 }
 
@@ -219,10 +229,18 @@ double Aggregator::calculateMax(const std::vector<double>& values) {
     if (values.empty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
+    // Use SIMD when available for better performance
+    if (simd::SimdAggregator::isAvx2Available()) {
+        return simd::SimdAggregator::calculateMax(values.data(), values.size());
+    }
     return *std::max_element(values.begin(), values.end());
 }
 
 double Aggregator::calculateSum(const std::vector<double>& values) {
+    // Use SIMD when available for better performance
+    if (simd::SimdAggregator::isAvx2Available()) {
+        return simd::SimdAggregator::calculateSum(values.data(), values.size());
+    }
     return std::accumulate(values.begin(), values.end(), 0.0);
 }
 

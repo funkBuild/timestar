@@ -97,8 +97,11 @@ public:
 
   template <class T>
   T read(){
+    if (offset + sizeof(T) > length_) {
+      throw std::runtime_error("Slice::read() - attempted to read beyond buffer bounds");
+    }
+    
     T value;
-
     std::memcpy(&value, data + offset, sizeof(T));
     offset += sizeof(T);
 
@@ -111,6 +114,10 @@ public:
   }
 
   std::string readString(size_t byteLength){
+    if (offset + byteLength > length_) {
+      throw std::runtime_error("Slice::readString() - attempted to read beyond buffer bounds");
+    }
+    
     std::string thisString((char *)(data + offset), byteLength);
 
     offset += byteLength;

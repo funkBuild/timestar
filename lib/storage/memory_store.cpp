@@ -44,7 +44,8 @@ seastar::future<> MemoryStore::removeWAL(){
 seastar::future<> MemoryStore::initFromWAL(std::string filename){
   WALReader reader(filename);
   co_await reader.readAll(this);
-  co_await initWAL();
+  // Don't initialize a new WAL here - this memory store is being recovered
+  // from an existing WAL that will be converted to TSM and removed
 }
 
 seastar::future<bool> MemoryStore::isFull(){
@@ -68,6 +69,44 @@ void MemoryStore::insertMemory(TSDBInsert<T> &insertRequest){
   }
 
   std::get<InMemorySeries<T>>(it->second).insert(insertRequest);
+  
+  // Clear tombstone ranges that overlap with inserted data
+  const std::string& seriesKey = insertRequest.seriesKey();
+  auto deletedIt = deletedRanges.find(seriesKey);
+  if (deletedIt != deletedRanges.end() && !deletedIt->second.empty()) {
+    // Find min and max timestamps from the insert
+    uint64_t minTs = *std::min_element(insertRequest.timestamps.begin(), insertRequest.timestamps.end());
+    uint64_t maxTs = *std::max_element(insertRequest.timestamps.begin(), insertRequest.timestamps.end());
+    
+    // Remove or modify tombstone ranges that overlap with [minTs, maxTs]
+    auto& ranges = deletedIt->second;
+    std::vector<std::pair<uint64_t, uint64_t>> newRanges;
+    
+    for (const auto& [rangeStart, rangeEnd] : ranges) {
+      // If no overlap, keep the range
+      if (rangeEnd < minTs || rangeStart > maxTs) {
+        newRanges.push_back({rangeStart, rangeEnd});
+      } else {
+        // There is overlap - split the range if needed
+        if (rangeStart < minTs) {
+          // Keep the part before the inserted data
+          newRanges.push_back({rangeStart, minTs - 1});
+        }
+        if (rangeEnd > maxTs) {
+          // Keep the part after the inserted data
+          newRanges.push_back({maxTs + 1, rangeEnd});
+        }
+        // The overlapping part is removed (not added to newRanges)
+      }
+    }
+    
+    ranges = std::move(newRanges);
+    
+    // Clean up empty entries
+    if (ranges.empty()) {
+      deletedRanges.erase(deletedIt);
+    }
+  }
 }
 
 template <class T>
@@ -133,11 +172,17 @@ template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRe
 template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest);
 
 void MemoryStore::deleteRange(const std::string& seriesKey, uint64_t startTime, uint64_t endTime) {
+    std::cerr << "[MEMORY_STORE_DELETE] deleteRange called for series: " << seriesKey 
+              << ", startTime=" << startTime << ", endTime=" << endTime << std::endl;
+    
     tsdb::memory_log.debug("Deleting range for series {} from {} to {}", 
                           seriesKey, startTime, endTime);
     
     // Add the deleted range to our tracking
     deletedRanges[seriesKey].push_back({startTime, endTime});
+    
+    std::cerr << "[MEMORY_STORE_DELETE] Added deleted range to tracking. Total ranges for series " 
+              << seriesKey << ": " << deletedRanges[seriesKey].size() << std::endl;
     
     // TODO: We could optimize by merging overlapping ranges, but for now
     // we'll just track all deletions separately

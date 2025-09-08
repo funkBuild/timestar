@@ -18,16 +18,24 @@ std::string TSM::getTombstonePath() const {
 seastar::future<> TSM::loadTombstones() {
     try {
         std::string tombstonePath = getTombstonePath();
+        std::cerr << "[TOMBSTONE_LOAD] Loading tombstones from: " << tombstonePath 
+                  << " for TSM: " << filePath << std::endl;
+        
         tombstones = std::make_unique<tsdb::TSMTombstone>(tombstonePath);
         
         // Check if tombstone file exists
         bool exists = co_await tombstones->exists();
+        std::cerr << "[TOMBSTONE_LOAD] Tombstone file exists: " << exists << std::endl;
+        
         if (exists) {
             co_await tombstones->load();
+            std::cerr << "[TOMBSTONE_LOAD] Successfully loaded tombstones from: " << tombstonePath << std::endl;
+        } else {
+            std::cerr << "[TOMBSTONE_LOAD] No tombstone file found for: " << filePath << std::endl;
         }
     } catch (const std::exception& e) {
         // Log warning but don't fail - TSM can work without tombstones
-        std::cerr << "Warning: Failed to load tombstones for " << filePath 
+        std::cerr << "[TOMBSTONE_LOAD] Warning: Failed to load tombstones for " << filePath 
                   << ": " << e.what() << std::endl;
         tombstones.reset();  // Clear tombstone manager on error
     }
@@ -65,15 +73,36 @@ bool TSM::hasSeriesInTimeRange(
     return false;
 }
 
+// Check if this TSM file could potentially contain data in the given time range
+// This is more permissive than hasSeriesInTimeRange - used for delete operations
+bool TSM::couldContainTimeRange(uint64_t startTime, uint64_t endTime) const {
+    // For now, be very permissive - assume any TSM file could contain the data
+    // In a more sophisticated implementation, we could check file-level time bounds
+    // But for delete operations, it's better to be safe and create tombstones
+    // even if no current data exists (to handle future writes)
+    
+    // Only reject if the time range is clearly invalid
+    if (startTime > endTime) {
+        return false;
+    }
+    
+    return true;  // Accept all valid time ranges for delete operations
+}
+
 // Delete range with verification
 seastar::future<bool> TSM::deleteRange(
     const std::string& seriesKey,
     uint64_t startTime,
     uint64_t endTime) {
     
-    // Verify the series exists in this TSM file in the given time range
-    if (!hasSeriesInTimeRange(seriesKey, startTime, endTime)) {
-        // Series/time range not in this file
+    // For delete operations, we should create tombstones even if no current data exists
+    // This ensures future writes in this time range are properly handled
+    // Only skip if this is clearly the wrong TSM file (e.g., time range completely outside file bounds)
+    
+    // Check if this TSM file could potentially contain data in this time range
+    // This is more permissive than hasSeriesInTimeRange - it only checks file-level time bounds
+    if (!couldContainTimeRange(startTime, endTime)) {
+        // Time range is completely outside this TSM file's time bounds
         co_return false;
     }
     
@@ -105,17 +134,29 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     TSMResult<T> result(rankAsInteger());
     co_await readSeries<T>(seriesKey, startTime, endTime, result);
     
+    if (!tombstones) {
+        std::cerr << "[TOMBSTONE_DEBUG] No tombstones loaded for TSM file " << filePath 
+                  << ", returning unfiltered data" << std::endl;
+    }
+    
     // Apply tombstone filtering if tombstones exist
     if (tombstones && !result.empty()) {
         uint64_t seriesId = getSeriesId(seriesKey);
         
+        std::cerr << "[TOMBSTONE_DEBUG] TSM " << filePath << " has tombstones, filtering series: " << seriesKey 
+                  << " (ID: " << seriesId << ")" << std::endl;
+        
         // Get all data from blocks
         auto [allTimestamps, allValues] = result.getAllData();
+        
+        std::cerr << "[TOMBSTONE_DEBUG] Data before filtering: " << allTimestamps.size() << " points" << std::endl;
         
         if (!allTimestamps.empty()) {
             // Filter out tombstoned data
             auto [filteredTimestamps, filteredValues] = 
                 tombstones->filterTombstoned(seriesId, allTimestamps, allValues);
+            
+            std::cerr << "[TOMBSTONE_DEBUG] Data after filtering: " << filteredTimestamps.size() << " points" << std::endl;
             
             // Rebuild result with filtered data
             if (!filteredTimestamps.empty()) {

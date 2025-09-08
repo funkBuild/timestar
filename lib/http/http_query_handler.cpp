@@ -2,6 +2,7 @@
 #include "engine.hpp"
 #include "query_parser.hpp"
 #include "query_planner.hpp"
+#include "query_runner.hpp"
 #include "aggregator.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
@@ -115,8 +116,17 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::httpd::request> req) {
         
         rep->add_header("Content-Type", "application/json");
         
+        // Log query summary after response is ready (controlled by TSDB_LOG_QUERY_PATH)
+        LOG_QUERY_PATH(tsdb::http_log, info, 
+            "[QUERY_SUMMARY] Query: '{}' | StartTime: {} | EndTime: {} | AggregationInterval: {} | ExecutionTime: {:.2f}ms",
+            glazeRequest.query,
+            queryRequest.startTime,
+            queryRequest.endTime,
+            queryRequest.aggregationInterval ? std::to_string(queryRequest.aggregationInterval) : "none",
+            response.statistics.executionTimeMs);
+        
     } catch (const std::exception& e) {
-        std::cerr << "Error handling query request: " << e.what() << std::endl;
+        LOG_QUERY_PATH(tsdb::http_log, error, "[QUERY] Error handling query request: {}", e.what());
         rep->set_status(seastar::httpd::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
         rep->add_header("Content-Type", "application/json");
@@ -265,47 +275,187 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Query plan created with {} shard queries", 
                        plan.shardQueries.size());
         
-        // Execute queries on each shard
+        // First, query shard 0 for all series metadata (centralized metadata)
+        // Get full metadata with series keys and determine which shard owns each series
+        struct SeriesMetadataWithShard {
+            uint64_t seriesId;
+            std::string seriesKey;
+            std::string measurement;
+            std::map<std::string, std::string> tags;
+            std::string field;
+            unsigned shardId;
+        };
+        
+        auto seriesWithShards = co_await engineSharded->invoke_on(0, 
+            [measurement = request.measurement, scopes = request.scopes, fields = request.fields](Engine& engine) 
+                -> seastar::future<std::vector<SeriesMetadataWithShard>> {
+                auto& index = engine.getIndex();
+                auto seriesIds = co_await index.findSeries(measurement, scopes);
+                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard 0 (metadata) found {} series IDs for measurement '{}' with {} scopes",
+                               seriesIds.size(), measurement, scopes.size());
+                
+                std::vector<SeriesMetadataWithShard> result;
+                for (uint64_t seriesId : seriesIds) {
+                    auto seriesMetaOpt = co_await index.getSeriesMetadata(seriesId);
+                    if (!seriesMetaOpt.has_value()) {
+                        continue;
+                    }
+                    
+                    const auto& meta = seriesMetaOpt.value();
+                    
+                    // Filter by fields if specified
+                    if (!fields.empty() && std::find(fields.begin(), fields.end(), meta.field) == fields.end()) {
+                        continue;
+                    }
+                    
+                    // Build series key for sharding
+                    TSDBInsert<double> temp(meta.measurement, meta.field);
+                    temp.tags = meta.tags;
+                    std::string seriesKey = temp.seriesKey();
+                    
+                    // Calculate which shard owns this series
+                    unsigned shardId = std::hash<std::string>{}(seriesKey) % seastar::smp::count;
+                    
+                    SeriesMetadataWithShard smws;
+                    smws.seriesId = seriesId;
+                    smws.seriesKey = seriesKey;
+                    smws.measurement = meta.measurement;
+                    smws.tags = meta.tags;
+                    smws.field = meta.field;
+                    smws.shardId = shardId;
+                    
+                    result.push_back(smws);
+                }
+                
+                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Filtered to {} series with metadata",
+                               result.size());
+                co_return result;
+            });
+        
+        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Total series from centralized metadata: {}", seriesWithShards.size());
+        
+        // Debug: Print series details
+        for (const auto& sm : seriesWithShards) {
+            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Series: key='{}', shard={}, measurement='{}', field='{}'",
+                           sm.seriesKey, sm.shardId, sm.measurement, sm.field);
+        }
+        
+        // Group series by shard
+        std::map<unsigned, std::vector<std::string>> seriesByShard;
+        for (const auto& sm : seriesWithShards) {
+            seriesByShard[sm.shardId].push_back(sm.seriesKey);
+        }
+        
+        // Execute queries on each shard that has series
         std::vector<seastar::future<std::vector<tsdb::SeriesResult>>> futures;
-        for (const auto& shardQuery : plan.shardQueries) {
-            auto f = engineSharded->invoke_on(shardQuery.shardId, 
-                [sq = shardQuery, measurement = request.measurement, scopes = request.scopes, 
-                 fields = request.fields](Engine& engine) -> seastar::future<std::vector<tsdb::SeriesResult>> {
-                    // Look up series IDs on this shard based on the query parameters
-                    auto& index = engine.getIndex();
+        for (const auto& [shardId, seriesKeys] : seriesByShard) {
+            auto f = engineSharded->invoke_on(shardId, 
+                [shardId, seriesKeys, startTime = request.startTime, endTime = request.endTime, 
+                 measurement = request.measurement](Engine& engine) -> seastar::future<std::vector<tsdb::SeriesResult>> {
+                    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} querying {} series keys",
+                                   shardId, seriesKeys.size());
                     
-                    // Find series matching the measurement and tag filters (scopes)
-                    auto seriesIds = co_await index.findSeries(measurement, scopes);
+                    std::vector<tsdb::SeriesResult> results;
                     
-                    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} found {} series IDs for measurement '{}' with {} scopes",
-                                   sq.shardId, seriesIds.size(), measurement, scopes.size());
-                    
-                    // Update the shard query with the found series IDs
-                    tsdb::ShardQuery localQuery = sq;
-                    localQuery.seriesIds = seriesIds;
-                    localQuery.requiresAllSeries = false;  // We have specific series IDs now
-                    
-                    // If specific fields were requested, we need to filter the series IDs
-                    // to only those that have the requested fields
-                    if (!fields.empty() && !seriesIds.empty()) {
-                        std::vector<uint64_t> filteredSeriesIds;
-                        for (uint64_t seriesId : seriesIds) {
-                            auto seriesMetaOpt = co_await index.getSeriesMetadata(seriesId);
-                            if (seriesMetaOpt.has_value()) {
-                                const auto& meta = seriesMetaOpt.value();
-                                // Check if this series has one of the requested fields
-                                if (std::find(fields.begin(), fields.end(), meta.field) != fields.end()) {
-                                    filteredSeriesIds.push_back(seriesId);
+                    // Query each series directly using series key
+                    for (const auto& seriesKey : seriesKeys) {
+                        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} querying series key: '{}'",
+                                       shardId, seriesKey);
+                        // Use engine's query method directly
+                        auto variantResult = co_await engine.query(seriesKey, startTime, endTime);
+                        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Got variant result for series '{}'", seriesKey);
+                        
+                        // Parse series key to extract measurement, tags, and field
+                        // Format: measurement,tag1=value1,tag2=value2 field
+                        // Note: space separator before field, not comma!
+                        
+                        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Parsing series key: '{}'", seriesKey);
+                        
+                        // Find the space that separates field from the rest
+                        size_t spacePos = seriesKey.find(' ');
+                        std::string field;
+                        std::string measurementAndTags;
+                        
+                        if (spacePos != std::string::npos) {
+                            measurementAndTags = seriesKey.substr(0, spacePos);
+                            field = seriesKey.substr(spacePos + 1);
+                            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Found field '{}' at position {}", field, spacePos);
+                        } else {
+                            // No field separator found - treat entire key as measurement
+                            measurementAndTags = seriesKey;
+                            LOG_QUERY_PATH(tsdb::http_log, warn, "[QUERY] No space separator found in series key");
+                        }
+                        
+                        // Parse measurement and tags from the first part
+                        size_t pos = measurementAndTags.find(',');
+                        std::string meas = (pos != std::string::npos) ? measurementAndTags.substr(0, pos) : measurementAndTags;
+                        
+                        // Extract tags from remainder
+                        std::map<std::string, std::string> tags;
+                        if (pos != std::string::npos) {
+                            std::string remainder = measurementAndTags.substr(pos + 1);
+                            std::vector<std::string> parts;
+                            std::string current;
+                            for (char c : remainder) {
+                                if (c == ',') {
+                                    parts.push_back(current);
+                                    current.clear();
+                                } else {
+                                    current += c;
+                                }
+                            }
+                            if (!current.empty()) {
+                                parts.push_back(current);
+                            }
+                            
+                            // All parts are tags
+                            for (const auto& part : parts) {
+                                size_t eqPos = part.find('=');
+                                if (eqPos != std::string::npos) {
+                                    tags[part.substr(0, eqPos)] = part.substr(eqPos + 1);
                                 }
                             }
                         }
-                        localQuery.seriesIds = filteredSeriesIds;
-                        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Filtered to {} series IDs with requested fields",
-                                       filteredSeriesIds.size());
+                        
+                        // Convert to SeriesResult format
+                        tsdb::SeriesResult seriesResult;
+                        seriesResult.measurement = measurement; // Use request measurement
+                        seriesResult.tags = tags;
+                        
+                        // Handle different result types
+                        std::visit([&seriesResult, &field, &seriesKey](auto&& result) {
+                            using T = std::decay_t<decltype(result)>;
+                            if constexpr (std::is_same_v<T, QueryResult<double>>) {
+                                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Processing double result: {} timestamps, {} values for field '{}'",
+                                             result.timestamps.size(), result.values.size(), field);
+                                if (!result.timestamps.empty()) {
+                                    std::vector<double> values(result.values.begin(), result.values.end());
+                                    seriesResult.fields[field] = std::make_pair(result.timestamps, FieldValues(values));
+                                }
+                            } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
+                                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Processing bool result: {} timestamps, {} values for field '{}'",
+                                             result.timestamps.size(), result.values.size(), field);
+                                if (!result.timestamps.empty()) {
+                                    seriesResult.fields[field] = std::make_pair(result.timestamps, FieldValues(result.values));
+                                }
+                            } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
+                                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Processing string result: {} timestamps, {} values for field '{}'",
+                                             result.timestamps.size(), result.values.size(), field);
+                                if (!result.timestamps.empty()) {
+                                    seriesResult.fields[field] = std::make_pair(result.timestamps, FieldValues(result.values));
+                                }
+                            }
+                        }, variantResult);
+                        
+                        if (!seriesResult.fields.empty()) {
+                            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Adding series result with {} fields", seriesResult.fields.size());
+                            results.push_back(seriesResult);
+                        } else {
+                            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Series result has no fields, skipping");
+                        }
                     }
                     
-                    // Now execute the query with the populated series IDs
-                    co_return co_await engine.executeLocalQuery(localQuery);
+                    co_return results;
                 });
             futures.push_back(std::move(f));
         }
@@ -338,7 +488,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 
                 // Create a single merged series
                 SeriesResult mergedSeries;
-                mergedSeries.measurement = response.series[0].measurement;
+                mergedSeries.measurement = request.measurement; // Use request measurement instead of series[0]
                 // Clear tags since we're aggregating across all series
                 mergedSeries.tags.clear();
                 
@@ -483,8 +633,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 
                 // Aggregate each group
                 for (const auto& [groupTags, seriesGroup] : groups) {
+                    if (seriesGroup.empty()) {
+                        continue; // Skip empty groups
+                    }
                     SeriesResult groupedSeries;
-                    groupedSeries.measurement = seriesGroup[0]->measurement;
+                    groupedSeries.measurement = request.measurement; // Use request measurement
                     groupedSeries.tags = groupTags; // Only keep group-by tags
                     
                     // Collect all series data in this group by field name for time-aligned aggregation

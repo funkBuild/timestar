@@ -461,6 +461,13 @@ seastar::future<> WALReader::readAll(MemoryStore *store){
 
   length = co_await walFile.size();
   
+  // Early return for empty files
+  if (length == 0) {
+    tsdb::wal_log.info("WAL recovery complete: 0 entries read, 0 partial entries discarded");
+    co_await walFile.close();
+    co_return;
+  }
+  
   // Align read size for DMA
   size_t alignedLength = ((length + 511) / 512) * 512;
   auto walBuf = co_await walFile.dma_read_exactly<uint8_t>(0, alignedLength);
@@ -481,8 +488,18 @@ seastar::future<> WALReader::readAll(MemoryStore *store){
     // Read entry length
     uint32_t entryLength = walSlice.read<uint32_t>();
     
-    // Sanity check: WAL entries should never be larger than 100MB
+    // Sanity check: Minimum valid entry size is at least 4 bytes:
+    // 1 byte type + 2 bytes series length + 1 byte minimum data
+    static constexpr uint32_t MIN_ENTRY_SIZE = 4;
     static constexpr uint32_t MAX_ENTRY_SIZE = 100 * 1024 * 1024; // 100MB
+    
+    if (entryLength < MIN_ENTRY_SIZE) {
+      tsdb::wal_log.warn("WAL recovery: Invalid entry at position {}, length {} too small (min {}), stopping recovery", 
+                         length - walSlice.bytesLeft() - sizeof(uint32_t), entryLength, MIN_ENTRY_SIZE);
+      partialEntries++;
+      break;  // Stop reading, WAL is corrupted from this point
+    }
+    
     if (entryLength > MAX_ENTRY_SIZE) {
       tsdb::wal_log.warn("WAL recovery: Corrupted entry at position {}, invalid length {} (max {}), stopping recovery", 
                          length - walSlice.bytesLeft() - sizeof(uint32_t), entryLength, MAX_ENTRY_SIZE);
@@ -543,14 +560,17 @@ seastar::future<> WALReader::readAll(MemoryStore *store){
         uint64_t startTime = entrySlice.read<uint64_t>();
         uint64_t endTime = entrySlice.read<uint64_t>();
         
+        std::cerr << "[WAL_REPLAY_DELETE] Found DeleteRange entry for series: " << seriesKey 
+                  << ", startTime=" << startTime << ", endTime=" << endTime << std::endl;
+        
         // Apply deletion to memory store
-        // Note: For now, we just log it as memory stores don't support deletion yet
-        // In a full implementation, we would mark these ranges as deleted
         tsdb::wal_log.debug("WAL recovery: DeleteRange for series={}, startTime={}, endTime={}",
                            seriesKey, startTime, endTime);
         
         // Apply deletion to memory store
         store->deleteRange(seriesKey, startTime, endTime);
+        
+        std::cerr << "[WAL_REPLAY_DELETE] Applied deleteRange to memory store for series: " << seriesKey << std::endl;
         
         entriesRead++;
       }

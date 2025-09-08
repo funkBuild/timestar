@@ -259,16 +259,29 @@ The TSDB includes an HTTP server with a JSON-based write API for data ingestion:
 
 ### Testing
 
-Use the provided Python test client:
+#### C++ Tests
+The `test/` directory contains all C++ unit and integration tests:
+```bash
+# Run all tests
+ctest
+# Or run the test binary directly
+./test/tsdb_test
+
+# Run a specific test
+./test/tsdb_test --gtest_filter=TestName*
+```
+
+#### API Tests
+The `test_api/` directory contains JavaScript and Python API tests:
 ```bash
 # Run functional tests
-python test/test_http_write.py
+python test_api/test_http_write.py
 
 # Run stress test (1000 points in batches of 100)
-python test/test_http_write.py --stress
+python test_api/test_http_write.py --stress
 
 # Test against custom host/port
-python test/test_http_write.py --host localhost --port 8086
+python test_api/test_http_write.py --host localhost --port 8086
 ```
 
 ### Starting the Server

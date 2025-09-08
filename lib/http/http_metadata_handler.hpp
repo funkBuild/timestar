@@ -1,0 +1,40 @@
+#ifndef __HTTP_METADATA_HANDLER_H_INCLUDED__
+#define __HTTP_METADATA_HANDLER_H_INCLUDED__
+
+#include <seastar/http/httpd.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/coroutine.hh>
+#include <memory>
+
+#include "engine.hpp"
+#include "logger.hpp"
+
+class HttpMetadataHandler {
+private:
+    seastar::sharded<Engine>* engineSharded;
+
+public:
+    HttpMetadataHandler(seastar::sharded<Engine>* _engineSharded);
+    
+    void registerRoutes(seastar::httpd::routes& r);
+    
+    seastar::future<std::unique_ptr<seastar::httpd::reply>> 
+        handleMeasurements(std::unique_ptr<seastar::httpd::request> req);
+    
+    seastar::future<std::unique_ptr<seastar::httpd::reply>> 
+        handleTags(std::unique_ptr<seastar::httpd::request> req);
+    
+    seastar::future<std::unique_ptr<seastar::httpd::reply>> 
+        handleFields(std::unique_ptr<seastar::httpd::request> req);
+
+private:
+    std::string createErrorResponse(const std::string& code, const std::string& message);
+    std::string formatMeasurementsResponse(const std::vector<std::string>& measurements, size_t total = 0);
+    std::string formatTagsResponse(const std::string& measurement, 
+                                   const std::unordered_map<std::string, std::vector<std::string>>& tags,
+                                   const std::string& specificTag = "");
+    std::string formatFieldsResponse(const std::string& measurement,
+                                     const std::unordered_map<std::string, std::string>& fields);
+};
+
+#endif

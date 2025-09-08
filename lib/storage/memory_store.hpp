@@ -85,15 +85,28 @@ public:
   // Query method that filters out deleted data
   template <class T>
   std::optional<InMemorySeries<T>> querySeriesFiltered(const std::string& seriesKey) {
+    std::cerr << "[MEMORY_STORE_FILTER] querySeriesFiltered called for series: " << seriesKey << std::endl;
+    
     auto result = querySeries<T>(seriesKey);
     if (!result.has_value()) {
+      std::cerr << "[MEMORY_STORE_FILTER] No data found for series: " << seriesKey << std::endl;
       return std::nullopt;
     }
+    
+    std::cerr << "[MEMORY_STORE_FILTER] Found " << result.value().timestamps.size() 
+              << " points for series: " << seriesKey << std::endl;
     
     // Check if there are any deleted ranges for this series
     auto deletedIt = deletedRanges.find(seriesKey);
     if (deletedIt == deletedRanges.end() || deletedIt->second.empty()) {
+      std::cerr << "[MEMORY_STORE_FILTER] No deleted ranges for series: " << seriesKey << std::endl;
       return result; // No deletions, return as-is
+    }
+    
+    std::cerr << "[MEMORY_STORE_FILTER] Found " << deletedIt->second.size() 
+              << " deleted ranges for series: " << seriesKey << std::endl;
+    for (const auto& [start, end] : deletedIt->second) {
+      std::cerr << "[MEMORY_STORE_FILTER]   Range: [" << start << ", " << end << "]" << std::endl;
     }
     
     // Filter out deleted data
@@ -101,6 +114,7 @@ public:
     const auto& original = result.value();
     const auto& delRanges = deletedIt->second;
     
+    int deletedCount = 0;
     for (size_t i = 0; i < original.timestamps.size(); ++i) {
       uint64_t ts = original.timestamps[i];
       bool isDeleted = false;
@@ -109,6 +123,7 @@ public:
       for (const auto& [delStart, delEnd] : delRanges) {
         if (ts >= delStart && ts <= delEnd) {
           isDeleted = true;
+          deletedCount++;
           break;
         }
       }
@@ -117,6 +132,17 @@ public:
         filtered.timestamps.push_back(original.timestamps[i]);
         filtered.values.push_back(original.values[i]);
       }
+    }
+    
+    std::cerr << "[MEMORY_STORE_FILTER] Filtered out " << deletedCount 
+              << " deleted points, returning " << filtered.timestamps.size() 
+              << " points for series: " << seriesKey << std::endl;
+    
+    // If all data was filtered out, return nullopt instead of empty series
+    if (filtered.timestamps.empty()) {
+      std::cerr << "[MEMORY_STORE_FILTER] All data filtered out, returning nullopt for series: " 
+                << seriesKey << std::endl;
+      return std::nullopt;
     }
     
     return filtered;

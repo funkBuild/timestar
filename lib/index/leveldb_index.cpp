@@ -21,6 +21,15 @@ LevelDBIndex::~LevelDBIndex() {
 }
 
 seastar::future<> LevelDBIndex::open() {
+    // Only shard 0 opens LevelDB for metadata storage
+    // Other shards will delegate metadata operations to shard 0
+    if (shardId != 0) {
+        tsdb::index_log.info("Shard {} skipping LevelDB index opening - metadata centralized on shard 0", shardId);
+        co_return;
+    }
+    
+    tsdb::index_log.info("Shard 0 opening centralized metadata LevelDB index");
+    
     // Create index directory if it doesn't exist
     std::filesystem::create_directories(indexPath);
     
@@ -170,6 +179,15 @@ std::string LevelDBIndex::encodeSeriesMetadataKey(uint64_t seriesId) {
     return key;
 }
 
+std::string LevelDBIndex::encodeFieldTypeKey(const std::string& measurement, const std::string& field) {
+    std::string key;
+    key.push_back(static_cast<char>(FIELD_TYPE));
+    key += measurement;
+    key.push_back('\0');
+    key += field;
+    return key;
+}
+
 std::string LevelDBIndex::encodeSeriesMetadata(const SeriesMetadata& metadata) {
     std::stringstream ss;
     ss << metadata.measurement << '\0';
@@ -205,8 +223,13 @@ SeriesMetadata LevelDBIndex::decodeSeriesMetadata(const std::string& encoded) {
 seastar::future<uint64_t> LevelDBIndex::getOrCreateSeriesId(std::string measurement,
                                                            std::map<std::string, std::string> tags,
                                                            std::string field) {
+    // Only shard 0 handles series ID generation and metadata indexing
+    if (shardId != 0) {
+        throw std::runtime_error("getOrCreateSeriesId called on non-zero shard " + std::to_string(shardId) + " - series ID generation only supported on shard 0. This needs to be delegated from Engine level.");
+    }
+    
     if (!db) {
-        throw std::runtime_error("Database not opened before getOrCreateSeriesId");
+        throw std::runtime_error("Database not opened on shard 0 for getOrCreateSeriesId");
     }
     
     // First check if series already exists
@@ -317,6 +340,15 @@ seastar::future<std::optional<uint64_t>> LevelDBIndex::getSeriesId(const std::st
 }
 
 seastar::future<> LevelDBIndex::addField(const std::string& measurement, const std::string& field) {
+    // Metadata operations only supported on shard 0
+    if (shardId != 0) {
+        throw std::runtime_error("addField called on non-zero shard " + std::to_string(shardId) + " - metadata operations only supported on shard 0");
+    }
+    
+    if (!db) {
+        throw std::runtime_error("Database not opened on shard 0 for addField");
+    }
+    
     std::string key = encodeMeasurementFieldsKey(measurement);
     
     // Get existing fields
@@ -333,6 +365,15 @@ seastar::future<> LevelDBIndex::addField(const std::string& measurement, const s
 }
 
 seastar::future<> LevelDBIndex::addTag(const std::string& measurement, const std::string& tagKey, const std::string& tagValue) {
+    // Metadata operations only supported on shard 0
+    if (shardId != 0) {
+        throw std::runtime_error("addTag called on non-zero shard " + std::to_string(shardId) + " - metadata operations only supported on shard 0");
+    }
+    
+    if (!db) {
+        throw std::runtime_error("Database not opened on shard 0 for addTag");
+    }
+    
     leveldb::WriteBatch batch;
     
     // Add to measurement tags
@@ -353,7 +394,55 @@ seastar::future<> LevelDBIndex::addTag(const std::string& measurement, const std
     }
 }
 
+seastar::future<std::set<std::string>> LevelDBIndex::getAllMeasurements() {
+    // Metadata queries only supported on shard 0
+    if (shardId != 0) {
+        throw std::runtime_error("getAllMeasurements called on non-zero shard " + std::to_string(shardId) + " - metadata queries only supported on shard 0");
+    }
+    
+    if (!db) {
+        throw std::runtime_error("Database not opened on shard 0 for getAllMeasurements");
+    }
+    
+    std::set<std::string> measurements;
+    
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+    
+    // Seek to start of MEASUREMENT_FIELDS keys
+    std::string startKey;
+    startKey.push_back(static_cast<char>(MEASUREMENT_FIELDS));
+    it->Seek(startKey);
+    
+    while (it->Valid()) {
+        leveldb::Slice key = it->key();
+        
+        // Check if still in MEASUREMENT_FIELDS range
+        if (key.size() == 0 || static_cast<uint8_t>(key[0]) != MEASUREMENT_FIELDS) {
+            break;
+        }
+        
+        // Extract measurement name (skip the key type byte)
+        std::string measurement(key.data() + 1, key.size() - 1);
+        measurements.insert(measurement);
+        
+        it->Next();
+    }
+    
+    if (!it->status().ok()) {
+        throw std::runtime_error("Iterator error while getting measurements: " + it->status().ToString());
+    }
+    
+    tsdb::index_log.debug("Found {} measurements in index", measurements.size());
+    co_return measurements;
+}
+
 seastar::future<std::set<std::string>> LevelDBIndex::getFields(const std::string& measurement) {
+    // For non-zero shards with centralized metadata, return empty
+    // This is expected behavior - only shard 0 has metadata
+    if (shardId != 0 || !db) {
+        co_return std::set<std::string>{};
+    }
+    
     std::string key = encodeMeasurementFieldsKey(measurement);
     std::string value;
     
@@ -368,7 +457,60 @@ seastar::future<std::set<std::string>> LevelDBIndex::getFields(const std::string
     }
 }
 
+seastar::future<> LevelDBIndex::setFieldType(const std::string& measurement, const std::string& field, const std::string& type) {
+    // Only shard 0 manages metadata
+    if (shardId != 0) {
+        throw std::runtime_error("setFieldType called on non-zero shard " + std::to_string(shardId) + " - metadata management only supported on shard 0");
+    }
+    
+    if (!db) {
+        throw std::runtime_error("Database not opened on shard 0 for setFieldType");
+    }
+    
+    std::string key = encodeFieldTypeKey(measurement, field);
+    leveldb::Status status = db->Put(leveldb::WriteOptions(), key, type);
+    
+    if (!status.ok()) {
+        throw std::runtime_error("Failed to set field type: " + status.ToString());
+    }
+    
+    co_return;
+}
+
+seastar::future<std::string> LevelDBIndex::getFieldType(const std::string& measurement, const std::string& field) {
+    // Only shard 0 has metadata
+    if (shardId != 0) {
+        throw std::runtime_error("getFieldType called on non-zero shard " + std::to_string(shardId) + " - metadata queries only supported on shard 0");
+    }
+    
+    if (!db) {
+        throw std::runtime_error("Database not opened on shard 0 for getFieldType");
+    }
+    
+    std::string key = encodeFieldTypeKey(measurement, field);
+    std::string value;
+    
+    leveldb::Status status = db->Get(leveldb::ReadOptions(), key, &value);
+    
+    if (status.ok()) {
+        co_return value;
+    } else if (status.IsNotFound()) {
+        co_return "unknown";  // Default to unknown if not set
+    } else {
+        throw std::runtime_error("Failed to get field type: " + status.ToString());
+    }
+}
+
 seastar::future<std::set<std::string>> LevelDBIndex::getTags(const std::string& measurement) {
+    // Metadata queries only supported on shard 0
+    if (shardId != 0) {
+        throw std::runtime_error("getTags called on non-zero shard " + std::to_string(shardId) + " - metadata queries only supported on shard 0");
+    }
+    
+    if (!db) {
+        throw std::runtime_error("Database not opened on shard 0 for getTags");
+    }
+    
     std::string key = encodeMeasurementTagsKey(measurement);
     std::string value;
     
@@ -384,6 +526,15 @@ seastar::future<std::set<std::string>> LevelDBIndex::getTags(const std::string& 
 }
 
 seastar::future<std::set<std::string>> LevelDBIndex::getTagValues(const std::string& measurement, const std::string& tagKey) {
+    // Metadata queries only supported on shard 0
+    if (shardId != 0) {
+        throw std::runtime_error("getTagValues called on non-zero shard " + std::to_string(shardId) + " - metadata queries only supported on shard 0");
+    }
+    
+    if (!db) {
+        throw std::runtime_error("Database not opened on shard 0 for getTagValues");
+    }
+    
     std::string key = encodeTagValuesKey(measurement, tagKey);
     std::string value;
     
@@ -481,7 +632,8 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::getAllSeriesForMeasurement(
         std::vector<uint64_t> seriesIds;
         
         if (!db) {
-            tsdb::index_log.error("Database not opened in getAllSeriesForMeasurement");
+            // For non-zero shards with centralized metadata, return empty
+            // This is expected behavior - only shard 0 has metadata
             return seriesIds;
         }
         

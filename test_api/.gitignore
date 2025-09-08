@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+*.log
+.DS_Store
+package-lock.json
+.env
+.env.local
+.env.test
+*.tmp

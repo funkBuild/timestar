@@ -5,6 +5,7 @@
 #include "http/http_write_handler.hpp"
 #include "http/http_query_handler.hpp"
 #include "http/http_delete_handler.hpp"
+#include "http/http_metadata_handler.hpp"
 #include "utils/stop_signal.hpp"
 #include "utils/logger.hpp"
 
@@ -18,6 +19,7 @@
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
+#include <seastar/util/backtrace.hh>
 
 using namespace seastar;
 using namespace httpd;
@@ -28,6 +30,7 @@ using namespace httpd;
 std::unique_ptr<HttpWriteHandler> g_writeHandler;
 std::unique_ptr<tsdb::HttpQueryHandler> g_queryHandler;
 std::unique_ptr<HttpDeleteHandler> g_deleteHandler;
+std::unique_ptr<HttpMetadataHandler> g_metadataHandler;
 
 void set_routes(routes& r) {
     // Simple test endpoints
@@ -56,8 +59,13 @@ void set_routes(routes& r) {
         g_deleteHandler->registerRoutes(r);
     }
     
+    // Register metadata endpoint
+    if (g_metadataHandler) {
+        g_metadataHandler->registerRoutes(r);
+    }
+    
     auto* root = new function_handler([](const_req req) {
-        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\"]}";
+        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\"]}";
     });
     r.add(operation_type::GET, url("/"), root);
 }
@@ -97,9 +105,13 @@ int main(int argc, char** argv) {
                 tsdb::http_log.info("Engine init completed on all shards");
             } catch (const std::bad_alloc& e) {
                 tsdb::http_log.error("bad_alloc during Engine init: {}", e.what());
+                // Print backtrace for debugging according to Seastar docs
+                tsdb::http_log.error("Backtrace:\n{}", current_backtrace());
                 throw;
             } catch (const std::exception& e) {
                 tsdb::http_log.error("Exception during Engine init: {}", e.what());
+                // Print backtrace for debugging
+                tsdb::http_log.error("Backtrace:\n{}", current_backtrace());
                 throw;
             }
             
@@ -129,6 +141,10 @@ int main(int argc, char** argv) {
             // Create delete handler
             g_deleteHandler = std::make_unique<HttpDeleteHandler>(&g_engine);
             tsdb::http_log.info("Delete handler created");
+            
+            // Create metadata handler
+            g_metadataHandler = std::make_unique<HttpMetadataHandler>(&g_engine);
+            tsdb::http_log.info("Metadata handler created");
             
             // Create stop signal handler
             seastar_apps_lib::stop_signal stop_signal;

@@ -50,14 +50,20 @@ seastar::future<> WALFileManager::init(Engine &engine,
     seastar::shared_ptr store = seastar::make_shared<MemoryStore>(seqNum);
     co_await store->initFromWAL(walFilename);
 
-    // Write to TSM
+    // Write to TSM if there's data
     // NOTE: We always have to write the WAL to TSM since WAL's can't be resumed due to make_file_output_stream 
     if (!store->isEmpty()) {
       tsdb::wal_log.info("Writing memory store {} to TSM", seqNum);
       co_await convertWalToTsm(store);
+    } else {
+      tsdb::wal_log.info("WAL {} is empty, removing without creating TSM", seqNum);
     }
 
-    co_await store->removeWAL();
+    // Always remove the WAL file after recovery regardless of whether it had data
+    co_await seastar::remove_file(walFilename);
+    
+    // Explicitly release the temporary memory store to free resources
+    store = nullptr;
   }
 
   if(memoryStores.size() == 0){

@@ -238,14 +238,14 @@ seastar::future<> TSMTombstone::flush() {
         // Sort and merge entries before writing
         sortAndMergeEntries();
         
-        // Open file for writing
-        tombstoneFile = co_await seastar::open_file_dma(
+        // Use output stream for small tombstone files (avoids DMA alignment issues)
+        auto output_stream = co_await seastar::open_file_dma(
             tombstonePath,
-            seastar::open_flags::rw | seastar::open_flags::create | 
+            seastar::open_flags::wo | seastar::open_flags::create | 
             seastar::open_flags::truncate
-        );
-        
-        isOpen = true;
+        ).then([](seastar::file f) {
+            return seastar::make_file_output_stream(std::move(f));
+        });
         
         // Prepare header
         TombstoneHeader header;
@@ -255,37 +255,25 @@ seastar::future<> TSMTombstone::flush() {
         header.headerChecksum = 0;
         header.headerChecksum = calculateHeaderChecksum(header);
         
-        // Write header
-        auto headerBuf = seastar::temporary_buffer<char>::aligned(
-            4096, TombstoneHeader::SIZE);  // Use 4K alignment
-        std::memcpy(headerBuf.get_write(), &header, TombstoneHeader::SIZE);
-        co_await tombstoneFile.dma_write(0, headerBuf.get(), TombstoneHeader::SIZE);
+        // Write header using output stream
+        co_await output_stream.write(reinterpret_cast<const char*>(&header), TombstoneHeader::SIZE);
         
-        // Write entries
-        size_t offset = TombstoneHeader::SIZE;
+        // Write entries using output stream
         for (auto& entry : entries) {
             // Update checksum
             entry.checksum = 0;
             entry.checksum = calculateChecksum(entry);
             
-            auto entryBuf = seastar::temporary_buffer<char>::aligned(
-                4096, TombstoneEntry::SIZE);  // Use 4K alignment
-            std::memcpy(entryBuf.get_write(), &entry, TombstoneEntry::SIZE);
-            co_await tombstoneFile.dma_write(offset, entryBuf.get(), TombstoneEntry::SIZE);
-            
-            offset += TombstoneEntry::SIZE;
+            co_await output_stream.write(reinterpret_cast<const char*>(&entry), TombstoneEntry::SIZE);
         }
         
-        // Write file checksum
+        // Write file checksum using output stream
         uint64_t fileChecksum = calculateFileChecksum();
-        auto footerBuf = seastar::temporary_buffer<char>::aligned(
-            4096, sizeof(uint64_t));  // Use 4K alignment
-        std::memcpy(footerBuf.get_write(), &fileChecksum, sizeof(uint64_t));
-        co_await tombstoneFile.dma_write(offset, footerBuf.get(), sizeof(uint64_t));
+        co_await output_stream.write(reinterpret_cast<const char*>(&fileChecksum), sizeof(uint64_t));
         
         // Ensure data is written to disk
-        co_await tombstoneFile.flush();
-        co_await close();
+        co_await output_stream.flush();
+        co_await output_stream.close();
         
         isDirty = false;
         

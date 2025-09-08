@@ -139,6 +139,12 @@ public:
     uint64_t endTime
   ) const;
   
+  // Check if TSM file could contain data in time range (more permissive, for deletes)
+  bool couldContainTimeRange(
+    uint64_t startTime,
+    uint64_t endTime
+  ) const;
+  
   // Query with tombstone filtering
   template <class T>
   seastar::future<TSMResult<T>> queryWithTombstones(

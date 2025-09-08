@@ -45,7 +45,7 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
   // Now also query memory stores from WAL
   QueryResult<T> result = QueryResult<T>::fromTsmResults(tsmResults);
   
-  // Query memory stores
+  // Query memory stores - already filtered by queryMemoryStores via querySeriesFiltered
   auto memoryData = walFileManager->queryMemoryStores<T>(series);
   if (memoryData.has_value()) {
     // Filter by time range and add to results
@@ -93,21 +93,21 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey,
   LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Getting series type from WAL for series: '{}'", seriesKey);
   std::optional<TSMValueType> seriesType = walFileManager->getSeriesType(seriesKey);
   
-  std::cerr << "[QUERY_DEBUG] Series '" << seriesKey << "' type from WAL: " 
-            << (seriesType.has_value() ? std::to_string(static_cast<int>(*seriesType)) : "none") << std::endl;
+  // std::cerr << "[QUERY_DEBUG] Series '" << seriesKey << "' type from WAL: " 
+  //           << (seriesType.has_value() ? std::to_string(static_cast<int>(*seriesType)) : "none") << std::endl;
 
   if(!seriesType.has_value()) {
     LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Series type not found in WAL, trying TSM files for series: '{}'", seriesKey);
     seriesType = fileManager->getSeriesType(seriesKey);
   }
   
-  std::cerr << "[QUERY_DEBUG] Series '" << seriesKey << "' final type: " 
-            << (seriesType.has_value() ? std::to_string(static_cast<int>(*seriesType)) : "NONE") << std::endl;
+  // std::cerr << "[QUERY_DEBUG] Series '" << seriesKey << "' final type: " 
+  //           << (seriesType.has_value() ? std::to_string(static_cast<int>(*seriesType)) : "NONE") << std::endl;
 
   // If there's no type, the series doesn't exist
   if(!seriesType.has_value()) {
     LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Series type not found anywhere for series: '{}' - series doesn't exist", seriesKey);
-    std::cerr << "[QUERY_DEBUG] Series '" << seriesKey << "' NOT FOUND!" << std::endl;
+    // std::cerr << "[QUERY_DEBUG] Series '" << seriesKey << "' NOT FOUND!" << std::endl;
     throw std::runtime_error("Series not found");
   }
   

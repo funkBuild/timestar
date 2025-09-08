@@ -224,11 +224,11 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
     // Process all timestamps for this write point
     return seastar::do_for_each(boost::counting_iterator<size_t>(0),
                                  boost::counting_iterator<size_t>(point.timestamps.size()),
-        [this, &point](size_t i) {
+        [this, &point](size_t i) -> seastar::future<> {
         
         // Process each field at this timestamp
-        return seastar::do_for_each(point.fields.begin(), point.fields.end(),
-            [this, &point, i](const auto& field_pair) {
+        co_return co_await seastar::do_for_each(point.fields.begin(), point.fields.end(),
+            [this, &point, i](const auto& field_pair) -> seastar::future<> {
             const auto& fieldName = field_pair.first;
             const auto& fieldArray = field_pair.second;
             uint64_t timestamp = point.timestamps[i];
@@ -238,7 +238,7 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
             for (const auto& [tagKey, tagValue] : point.tags) {
                 seriesKey += "," + tagKey + "=" + tagValue;
             }
-            seriesKey += "," + fieldName;
+            seriesKey += " " + fieldName;  // Space separator before field, not comma!
             
             size_t shard = std::hash<std::string>{}(seriesKey) % seastar::smp::count;
             
@@ -256,7 +256,12 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
                         insert.tags = point.tags;
                         insert.addValue(timestamp, value);
                         
-                        return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+                        // First index metadata on shard 0
+                        co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                            co_await engine.indexMetadata(insert);
+                        });
+                        
+                        co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                             return engine.insert(std::move(insert));
                         });
                     }
@@ -270,7 +275,12 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
                         insert.tags = point.tags;
                         insert.addValue(timestamp, value);
                         
-                        return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+                        // First index metadata on shard 0
+                        co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                            co_await engine.indexMetadata(insert);
+                        });
+                        
+                        co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                             return engine.insert(std::move(insert));
                         });
                     }
@@ -287,7 +297,12 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
                         LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Processing array string insert - field: '{}', value: '{}', timestamp: {}, shard: {}", 
                                        fieldName, value, timestamp, shard);
                         
-                        return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+                        // First index metadata on shard 0
+                        co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                            co_await engine.indexMetadata(insert);
+                        });
+                        
+                        co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                             return engine.insert(std::move(insert));
                         });
                     }
@@ -302,13 +317,18 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
                         insert.tags = point.tags;
                         insert.addValue(timestamp, value);
                         
-                        return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+                        // First index metadata on shard 0
+                        co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                            co_await engine.indexMetadata(insert);
+                        });
+                        
+                        co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                             return engine.insert(std::move(insert));
                         });
                     }
             }
             
-            return seastar::make_ready_future<>();
+            co_return;
         });
     });
 }
@@ -365,7 +385,7 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
 seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     // Process each field in the point sequentially to avoid complex future handling
     return seastar::do_for_each(point.fields.begin(), point.fields.end(),
-        [this, &point](const auto& field_pair) {
+        [this, &point](const auto& field_pair) -> seastar::future<> {
         const auto& fieldName = field_pair.first;
         const auto& fieldValue = field_pair.second;
         
@@ -376,7 +396,7 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
         for (const auto& [tagKey, tagValue] : point.tags) {
             seriesKey += "," + tagKey + "=" + tagValue;
         }
-        seriesKey += "," + fieldName;
+        seriesKey += " " + fieldName;  // Space separator before field, not comma!
         
         // Hash the complete series key for better load distribution across all shards
         size_t shard = std::hash<std::string>{}(seriesKey) % seastar::smp::count;
@@ -388,7 +408,12 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             insert.tags = point.tags;
             insert.addValue(point.timestamp, value);
             
-            return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+            // First index metadata on shard 0
+            co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                co_await engine.indexMetadata(insert);
+            });
+            
+            co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                 return engine.insert(std::move(insert));
             });
             
@@ -398,7 +423,12 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             insert.tags = point.tags;
             insert.addValue(point.timestamp, value);
             
-            return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+            // First index metadata on shard 0
+            co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                co_await engine.indexMetadata(insert);
+            });
+            
+            co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                 return engine.insert(std::move(insert));
             });
             
@@ -412,7 +442,12 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
                            fieldName, value, point.timestamp, shard);
             LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] String series key: '{}'", insert.seriesKey());
             
-            return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+            // First index metadata on shard 0
+            co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                co_await engine.indexMetadata(insert);
+            });
+            
+            co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                 return engine.insert(std::move(insert));
             });
             
@@ -423,12 +458,17 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             insert.tags = point.tags;
             insert.addValue(point.timestamp, static_cast<double>(value));
             
-            return engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+            // First index metadata on shard 0
+            co_await engineSharded->invoke_on(0, [&insert](Engine& engine) -> seastar::future<> {
+                co_await engine.indexMetadata(insert);
+            });
+            
+            co_return co_await engineSharded->invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
                 return engine.insert(std::move(insert));
             });
         }
         
-        return seastar::make_ready_future<>();
+        co_return;
     });
 }
 
