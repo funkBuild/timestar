@@ -81,8 +81,9 @@ seastar::future<> TSM::readIndex(){
   while(indexSlice.offset < indexSlice.length_){
     TSMIndexEntry indexEntry;
 
-    uint16_t seriesIdLength = indexSlice.read<uint16_t>();
-    indexEntry.seriesId = indexSlice.readString(seriesIdLength);
+    // Read SeriesId128 (16 bytes)
+    std::string seriesIdBytes = indexSlice.readString(16);
+    indexEntry.seriesId = SeriesId128::fromBytes(seriesIdBytes);
     indexEntry.seriesType = (TSMValueType) indexSlice.read<uint8_t>();
 
     uint16_t indexEntryCount = indexSlice.read<uint16_t>();
@@ -102,8 +103,8 @@ seastar::future<> TSM::readIndex(){
 }
 
 template <class T>
-seastar::future<> TSM::readSeries(std::string seriesKey, uint64_t startTime, uint64_t endTime, TSMResult<T> &results){
-  auto it = index.find(seriesKey);
+seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results){
+  auto it = index.find(seriesId);
 
   if(it == index.end())
     co_return;
@@ -162,8 +163,8 @@ seastar::future<> TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t start
   results.appendBlock(blockResults);
 }
 
-std::optional<TSMValueType> TSM::getSeriesType(std::string &seriesKey){
-  auto it = index.find(seriesKey);
+std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId){
+  auto it = index.find(seriesId);
   
   if(it == index.end())
     return {};
@@ -171,9 +172,9 @@ std::optional<TSMValueType> TSM::getSeriesType(std::string &seriesKey){
   return it->second.seriesType;
 }
 
-template seastar::future<> TSM::readSeries<double>(std::string seriesKey, uint64_t startTime, uint64_t endTime, TSMResult<double> &results);
-template seastar::future<> TSM::readSeries<bool>(std::string seriesKey, uint64_t startTime, uint64_t endTime, TSMResult<bool> &results);
-template seastar::future<> TSM::readSeries<std::string>(std::string seriesKey, uint64_t startTime, uint64_t endTime, TSMResult<std::string> &results);
+template seastar::future<> TSM::readSeries<double>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<double> &results);
+template seastar::future<> TSM::readSeries<bool>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<bool> &results);
+template seastar::future<> TSM::readSeries<std::string>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<std::string> &results);
 
 seastar::future<> TSM::scheduleDelete() {
     // Close the file if it's open

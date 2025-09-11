@@ -180,8 +180,12 @@ TEST_F(QueryIntegrationTest, GroupByDatacenter) {
         auto aggregated = Aggregator::aggregateMultiple(
             groupData, AggregationMethod::SUM, 0);
         
-        ASSERT_EQ(aggregated.size(), 1);
-        datacenterTotals[dc] = aggregated[0].value;
+        // Sum up all the per-timestamp results to get the overall total
+        double total = 0.0;
+        for (const auto& point : aggregated) {
+            total += point.value;
+        }
+        datacenterTotals[dc] = total;
     }
     
     // Verify us-west has more total traffic (2 servers vs 1)

@@ -4,6 +4,7 @@
 #include "query_parser.hpp"
 #include "query_planner.hpp"
 #include "leveldb_index.hpp"
+#include "series_id.hpp"
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
@@ -64,8 +65,8 @@ public:
         : engineSharded(engine), indexSharded(index), planner(std::make_unique<QueryPlanner>()) {}
     
     // Main query handler
-    seastar::future<std::unique_ptr<seastar::httpd::reply>>
-    handleQuery(std::unique_ptr<seastar::httpd::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>>
+    handleQuery(std::unique_ptr<seastar::http::request> req);
     
     // Register routes with HTTP server
     void registerRoutes(seastar::httpd::routes& r);
@@ -80,7 +81,7 @@ public:
     static uint64_t parseInterval(const std::string& interval);
     
     // Format response as JSON (public for testing)
-    std::string formatQueryResponse(const QueryResponse& response);
+    std::string formatQueryResponse(const QueryResponse& response, const std::vector<std::string>& requestedFields = {});
     
     // Create error response (public for testing)
     std::string createErrorResponse(const std::string& code, const std::string& message);

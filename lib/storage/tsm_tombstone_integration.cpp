@@ -42,22 +42,21 @@ seastar::future<> TSM::loadTombstones() {
     co_return;
 }
 
-// Convert series key to numeric ID for tombstones
-uint64_t TSM::getSeriesId(const std::string& seriesKey) const {
-    // Use hash function to convert string key to numeric ID
-    // This should match the ID generation used elsewhere in the system
-    std::hash<std::string> hasher;
-    return hasher(seriesKey);
+// Get series ID hash for tombstone compatibility
+uint64_t TSM::getSeriesIdHash(const SeriesId128& seriesId) const {
+    // Use hash function to convert SeriesId128 to numeric ID for tombstones
+    std::hash<SeriesId128> hasher;
+    return hasher(seriesId);
 }
 
 // Check if series exists in the given time range
 bool TSM::hasSeriesInTimeRange(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime) const {
     
     // Check if series exists in index
-    auto it = index.find(seriesKey);
+    auto it = index.find(seriesId);
     if (it == index.end()) {
         return false;
     }
@@ -91,20 +90,43 @@ bool TSM::couldContainTimeRange(uint64_t startTime, uint64_t endTime) const {
 
 // Delete range with verification
 seastar::future<bool> TSM::deleteRange(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime) {
     
-    // For delete operations, we should create tombstones even if no current data exists
-    // This ensures future writes in this time range are properly handled
-    // Only skip if this is clearly the wrong TSM file (e.g., time range completely outside file bounds)
+    // IMPORTANT: Only add tombstones if the series actually exists in this TSM file
+    // This prevents unnecessary tombstone creation for non-existent series
     
-    // Check if this TSM file could potentially contain data in this time range
-    // This is more permissive than hasSeriesInTimeRange - it only checks file-level time bounds
-    if (!couldContainTimeRange(startTime, endTime)) {
-        // Time range is completely outside this TSM file's time bounds
+    // Check if series exists in the index of this TSM file
+    auto it = index.find(seriesId);
+    if (it == index.end()) {
+        // Series doesn't exist in this TSM file - no tombstone needed
+        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex() 
+                  << "' not found in TSM " << filePath << " - skipping tombstone" << std::endl;
         co_return false;
     }
+    
+    // Check if any index blocks overlap with the deletion time range
+    bool hasOverlap = false;
+    const auto& indexEntry = it->second;
+    for (const auto& block : indexEntry.indexBlocks) {
+        if (block.minTime <= endTime && block.maxTime >= startTime) {
+            hasOverlap = true;
+            break;
+        }
+    }
+    
+    if (!hasOverlap) {
+        // No data in the requested time range - no tombstone needed
+        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex() 
+                  << "' has no data in range [" << startTime << ", " << endTime 
+                  << "] in TSM " << filePath << " - skipping tombstone" << std::endl;
+        co_return false;
+    }
+    
+    // Series exists and has data in the time range - add tombstone
+    std::cerr << "[TSM_DELETE] Adding tombstone for series '" << seriesId.toHex() 
+              << "' in TSM " << filePath << std::endl;
     
     // Initialize tombstones if not already done
     if (!tombstones) {
@@ -112,12 +134,14 @@ seastar::future<bool> TSM::deleteRange(
     }
     
     // Add tombstone (passing nullptr for now - verification already done above)
-    uint64_t seriesId = getSeriesId(seriesKey);
-    bool added = co_await tombstones->addTombstone(seriesId, startTime, endTime, nullptr);
+    uint64_t seriesIdHash = getSeriesIdHash(seriesId);
+    bool added = co_await tombstones->addTombstone(seriesIdHash, startTime, endTime, nullptr);
     
     if (added) {
         // Persist tombstone immediately for durability
         co_await tombstones->flush();
+        std::cerr << "[TSM_DELETE] Tombstone persisted for series '" << seriesId.toHex() 
+                  << "' in TSM " << filePath << std::endl;
     }
     
     co_return added;
@@ -126,13 +150,13 @@ seastar::future<bool> TSM::deleteRange(
 // Query with tombstone filtering
 template <class T>
 seastar::future<TSMResult<T>> TSM::queryWithTombstones(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime) {
     
     // First, perform the regular query
     TSMResult<T> result(rankAsInteger());
-    co_await readSeries<T>(seriesKey, startTime, endTime, result);
+    co_await readSeries<T>(seriesId, startTime, endTime, result);
     
     if (!tombstones) {
         std::cerr << "[TOMBSTONE_DEBUG] No tombstones loaded for TSM file " << filePath 
@@ -141,10 +165,10 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     
     // Apply tombstone filtering if tombstones exist
     if (tombstones && !result.empty()) {
-        uint64_t seriesId = getSeriesId(seriesKey);
+        uint64_t seriesIdHash = getSeriesIdHash(seriesId);
         
-        std::cerr << "[TOMBSTONE_DEBUG] TSM " << filePath << " has tombstones, filtering series: " << seriesKey 
-                  << " (ID: " << seriesId << ")" << std::endl;
+        std::cerr << "[TOMBSTONE_DEBUG] TSM " << filePath << " has tombstones, filtering series: " << seriesId.toHex() 
+                  << " (Hash: " << seriesIdHash << ")" << std::endl;
         
         // Get all data from blocks
         auto [allTimestamps, allValues] = result.getAllData();
@@ -154,7 +178,7 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
         if (!allTimestamps.empty()) {
             // Filter out tombstoned data
             auto [filteredTimestamps, filteredValues] = 
-                tombstones->filterTombstoned(seriesId, allTimestamps, allValues);
+                tombstones->filterTombstoned(seriesIdHash, allTimestamps, allValues);
             
             std::cerr << "[TOMBSTONE_DEBUG] Data after filtering: " << filteredTimestamps.size() << " points" << std::endl;
             
@@ -183,8 +207,8 @@ seastar::future<> TSM::deleteTombstoneFile() {
 
 // Explicit template instantiations for supported types
 template seastar::future<TSMResult<double>> TSM::queryWithTombstones<double>(
-    const std::string&, uint64_t, uint64_t);
+    const SeriesId128&, uint64_t, uint64_t);
 template seastar::future<TSMResult<bool>> TSM::queryWithTombstones<bool>(
-    const std::string&, uint64_t, uint64_t);
+    const SeriesId128&, uint64_t, uint64_t);
 template seastar::future<TSMResult<std::string>> TSM::queryWithTombstones<std::string>(
-    const std::string&, uint64_t, uint64_t);
+    const SeriesId128&, uint64_t, uint64_t);

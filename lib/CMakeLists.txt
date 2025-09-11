@@ -12,6 +12,7 @@ file(GLOB_RECURSE SRC_FILES
 find_package (Snappy REQUIRED)
 find_package (Threads REQUIRED)
 find_package (Seastar REQUIRED)
+find_package (OpenSSL REQUIRED)
 
 # Glaze is provided via FetchContent from parent CMakeLists.txt
 
@@ -26,7 +27,7 @@ endif()
 message(STATUS "Found LevelDB: ${LEVELDB_LIBRARY}")
 
 add_library(libtsdb STATIC ${SRC_FILES})
-target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze)
+target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze OpenSSL::Crypto)
 
 # Include both the lib directory and all subdirectories for header resolution
 target_include_directories(libtsdb PUBLIC 

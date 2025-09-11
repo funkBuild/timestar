@@ -28,10 +28,15 @@ std::set<std::string> TSMCompactor::getAllSeriesKeys(
     
     std::set<std::string> allKeys;
     
-    // Collect all unique series keys from all files
+    // Collect all unique series IDs from all files and convert to string keys
     for (const auto& file : files) {
-        auto keys = file->getSeriesKeys();
-        allKeys.insert(keys.begin(), keys.end());
+        auto ids = file->getSeriesIds();
+        for (const auto& id : ids) {
+            // For compatibility with existing compactor logic, we'll work with string keys
+            // and convert to SeriesId128 when needed for TSM operations
+            // Note: This is a temporary compatibility layer
+            allKeys.insert(id.toHex()); // Use hex representation as string key
+        }
     }
     
     return allKeys;
@@ -54,8 +59,10 @@ seastar::future<> TSMCompactor::mergeSeries(
         if (file->hasTombstones()) {
             auto tombstones = file->getTombstones();
             if (tombstones) {
-                uint64_t seriesId = file->getSeriesId(seriesKey);
-                auto ranges = tombstones->getTombstoneRanges(seriesId);
+                // Convert hex string back to SeriesId128, then get hash for tombstones
+                SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
+                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
+                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
                 tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
             }
         }
@@ -130,7 +137,9 @@ seastar::future<> TSMCompactor::mergeSeries(
             
             // Write when batch is full
             if (timestamps.size() >= BATCH_SIZE) {
-                writer.writeSeries(TSM::getValueType<T>(), seriesKey, timestamps, values);
+                // Convert hex string back to SeriesId128 for TSM writing
+                SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
+                writer.writeSeries(TSM::getValueType<T>(), seriesId, timestamps, values);
                 timestamps.clear();
                 values.clear();
             }
@@ -139,7 +148,9 @@ seastar::future<> TSMCompactor::mergeSeries(
     
     // Write remaining data
     if (!timestamps.empty()) {
-        writer.writeSeries(TSM::getValueType<T>(), seriesKey, timestamps, values);
+        // Convert hex string back to SeriesId128 for TSM writing
+        SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
+        writer.writeSeries(TSM::getValueType<T>(), seriesId, timestamps, values);
     }
     
     // Log tombstone filtering stats if any points were filtered
@@ -184,8 +195,9 @@ seastar::future<std::string> TSMCompactor::compact(
     // Merge each series
     for (const std::string& seriesKey : allSeries) {
         // Determine the type of this series
-        std::string key = seriesKey;
-        auto seriesType = files[0]->getSeriesType(key);
+        // Convert hex string back to SeriesId128
+        SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
+        auto seriesType = files[0]->getSeriesType(seriesId);
         
         if (!seriesType.has_value()) {
             continue;

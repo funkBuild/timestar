@@ -4,6 +4,7 @@
 #include "logging_config.hpp"
 
 #include <stdexcept>
+#include <chrono>
 
 template <class T>
 void InMemorySeries<T>::insert(TSDBInsert<T> &insertRequest){
@@ -31,7 +32,7 @@ seastar::future<> MemoryStore::close(){
 
 seastar::future<> MemoryStore::initWAL(){
   wal = std::make_unique<WAL>(sequenceNumber);
-  co_await wal->init(this);
+  co_await wal->init(this, false); // false = not recovery, create fresh WAL
 };
 
 seastar::future<> MemoryStore::removeWAL(){
@@ -61,52 +62,15 @@ seastar::future<bool> MemoryStore::isFull(){
 template <class T>
 void MemoryStore::insertMemory(TSDBInsert<T> &insertRequest){
   // In-memory insert
-  auto it = series.find(insertRequest.seriesKey());
+  SeriesId128 seriesId = insertRequest.seriesId128();
+  auto it = series.find(seriesId);
 
   if(it == series.end()){
     InMemorySeries<T> newSeries;
-    it = series.insert({insertRequest.seriesKey(), std::move(newSeries)}).first;
+    it = series.insert({seriesId, std::move(newSeries)}).first;
   }
 
   std::get<InMemorySeries<T>>(it->second).insert(insertRequest);
-  
-  // Clear tombstone ranges that overlap with inserted data
-  const std::string& seriesKey = insertRequest.seriesKey();
-  auto deletedIt = deletedRanges.find(seriesKey);
-  if (deletedIt != deletedRanges.end() && !deletedIt->second.empty()) {
-    // Find min and max timestamps from the insert
-    uint64_t minTs = *std::min_element(insertRequest.timestamps.begin(), insertRequest.timestamps.end());
-    uint64_t maxTs = *std::max_element(insertRequest.timestamps.begin(), insertRequest.timestamps.end());
-    
-    // Remove or modify tombstone ranges that overlap with [minTs, maxTs]
-    auto& ranges = deletedIt->second;
-    std::vector<std::pair<uint64_t, uint64_t>> newRanges;
-    
-    for (const auto& [rangeStart, rangeEnd] : ranges) {
-      // If no overlap, keep the range
-      if (rangeEnd < minTs || rangeStart > maxTs) {
-        newRanges.push_back({rangeStart, rangeEnd});
-      } else {
-        // There is overlap - split the range if needed
-        if (rangeStart < minTs) {
-          // Keep the part before the inserted data
-          newRanges.push_back({rangeStart, minTs - 1});
-        }
-        if (rangeEnd > maxTs) {
-          // Keep the part after the inserted data
-          newRanges.push_back({maxTs + 1, rangeEnd});
-        }
-        // The overlapping part is removed (not added to newRanges)
-      }
-    }
-    
-    ranges = std::move(newRanges);
-    
-    // Clean up empty entries
-    if (ranges.empty()) {
-      deletedRanges.erase(deletedIt);
-    }
-  }
 }
 
 template <class T>
@@ -122,30 +86,115 @@ bool MemoryStore::wouldExceedThreshold(TSDBInsert<T> &insertRequest){
 }
 
 template <class T>
+bool MemoryStore::wouldBatchExceedThreshold(std::vector<TSDBInsert<T>> &insertRequests){
+  if(!wal || insertRequests.empty()) {
+    return false;
+  }
+  
+  size_t currentSize = wal->getCurrentSize();
+  size_t totalEstimatedSize = 0;
+  
+  for(auto& insertRequest : insertRequests) {
+    totalEstimatedSize += wal->estimateInsertSize(insertRequest);
+  }
+  
+  return (currentSize + totalEstimatedSize) >= WAL_SIZE_THRESHOLD;
+}
+
+template <class T>
 seastar::future<bool> MemoryStore::insert(TSDBInsert<T> &insertRequest){
   if(closed)
     throw std::runtime_error("MemoryStore is closed");
 
-  // Check if this insert would exceed threshold
+  // Check if this insert would exceed the 16MB WAL threshold
   bool needsRollover = wouldExceedThreshold(insertRequest);
   if(needsRollover) {
     // Don't insert - signal that rollover is needed
+    tsdb::memory_log.debug("Insert would exceed 16MB WAL limit, signaling rollover needed");
     co_return true;
   }
 
-  // WAL Insert
+  // Try to insert to WAL
   if(wal) {
-    co_await wal->insert(insertRequest);
-    LOG_INSERT_PATH(tsdb::memory_log, trace, "WAL insert completed for series: {}", insertRequest.seriesKey());
+    try {
+      co_await wal->insert(insertRequest);
+      LOG_INSERT_PATH(tsdb::memory_log, trace, "WAL insert completed for series: {}", insertRequest.seriesKey());
+    } catch (const std::runtime_error& e) {
+      // Check if it's a rollover signal from WAL
+      if (std::string(e.what()) == "WAL rollover needed") {
+        tsdb::memory_log.debug("WAL signaled rollover needed during insert");
+        co_return true;  // Signal rollover needed
+      }
+      // Otherwise, it's a real error
+      throw;
+    }
   }
 
+  // Only insert to memory if WAL write succeeded
   insertMemory(insertRequest);
   
   co_return false; // No rollover needed
 }
 
-std::optional<TSMValueType> MemoryStore::getSeriesType(std::string &seriesKey){
-  auto it = series.find(seriesKey);
+template <class T>
+seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &insertRequests){
+  if(closed)
+    throw std::runtime_error("MemoryStore is closed");
+    
+  if(insertRequests.empty()) {
+    co_return false; // No work to do
+  }
+
+  auto start_memory_batch = std::chrono::high_resolution_clock::now();
+  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] Batch insert started for {} requests", insertRequests.size());
+
+  // Check if this batch would exceed the WAL threshold
+  bool needsRollover = wouldBatchExceedThreshold(insertRequests);
+  if(needsRollover) {
+    // Don't insert - signal that rollover is needed
+    LOG_INSERT_PATH(tsdb::memory_log, debug, "Batch insert would exceed WAL limit, signaling rollover needed");
+    co_return true;
+  }
+
+  // Try to insert batch to WAL using the existing batch functionality
+  auto start_wal_insert = std::chrono::high_resolution_clock::now();
+  if(wal) {
+    try {
+      co_await wal->insertBatch(insertRequests);
+      LOG_INSERT_PATH(tsdb::memory_log, trace, "WAL batch insert completed for {} requests", insertRequests.size());
+    } catch (const std::runtime_error& e) {
+      // Check if it's a rollover signal from WAL
+      if (std::string(e.what()) == "WAL rollover needed") {
+        LOG_INSERT_PATH(tsdb::memory_log, debug, "WAL signaled rollover needed during batch insert");
+        co_return true;  // Signal rollover needed
+      }
+      // Otherwise, it's a real error
+      throw;
+    }
+  }
+  auto end_wal_insert = std::chrono::high_resolution_clock::now();
+  
+  // Only insert to memory if WAL write succeeded - process all requests in batch
+  auto start_memory_insert = std::chrono::high_resolution_clock::now();
+  for(auto& insertRequest : insertRequests) {
+    insertMemory(insertRequest);
+  }
+  auto end_memory_insert = std::chrono::high_resolution_clock::now();
+  
+  auto end_memory_batch = std::chrono::high_resolution_clock::now();
+  auto wal_insert_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_wal_insert - start_wal_insert);
+  auto memory_insert_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_insert - start_memory_insert);
+  auto total_memory_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch - start_memory_batch);
+  
+  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] WAL batch insert: {}μs", wal_insert_duration.count());
+  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] In-memory batch insert: {}μs", memory_insert_duration.count());
+  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] Total batch insert: {}μs", total_memory_duration.count());
+  
+  co_return false; // No rollover needed
+}
+
+std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128 &seriesId){
+  auto it = series.find(seriesId);
 
   if(it == series.end())
     return {};
@@ -164,26 +213,64 @@ template void InMemorySeries<std::string>::sort();
 template seastar::future<bool> MemoryStore::insert<double>(TSDBInsert<double> &insertRequest);
 template seastar::future<bool> MemoryStore::insert<bool>(TSDBInsert<bool> &insertRequest);
 template seastar::future<bool> MemoryStore::insert<std::string>(TSDBInsert<std::string> &insertRequest);
+template seastar::future<bool> MemoryStore::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests);
+template seastar::future<bool> MemoryStore::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
+template seastar::future<bool> MemoryStore::insertBatch<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests);
 template void MemoryStore::insertMemory<double>(TSDBInsert<double> &insertRequest);
 template void MemoryStore::insertMemory<bool>(TSDBInsert<bool> &insertRequest);
 template void MemoryStore::insertMemory<std::string>(TSDBInsert<std::string> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<double>(TSDBInsert<double> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest);
+template bool MemoryStore::wouldBatchExceedThreshold<double>(std::vector<TSDBInsert<double>> &insertRequests);
+template bool MemoryStore::wouldBatchExceedThreshold<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
+template bool MemoryStore::wouldBatchExceedThreshold<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests);
 
-void MemoryStore::deleteRange(const std::string& seriesKey, uint64_t startTime, uint64_t endTime) {
-    std::cerr << "[MEMORY_STORE_DELETE] deleteRange called for series: " << seriesKey 
-              << ", startTime=" << startTime << ", endTime=" << endTime << std::endl;
-    
+void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
     tsdb::memory_log.debug("Deleting range for series {} from {} to {}", 
-                          seriesKey, startTime, endTime);
+                          seriesId.toHex(), startTime, endTime);
     
-    // Add the deleted range to our tracking
-    deletedRanges[seriesKey].push_back({startTime, endTime});
+    // Find the series in memory
+    auto it = series.find(seriesId);
+    if (it == series.end()) {
+        return; // No data to delete
+    }
     
-    std::cerr << "[MEMORY_STORE_DELETE] Added deleted range to tracking. Total ranges for series " 
-              << seriesKey << ": " << deletedRanges[seriesKey].size() << std::endl;
+    // Actually remove data from memory based on variant type
+    std::visit([&](auto& inMemorySeries) {
+        using T = typename std::decay_t<decltype(inMemorySeries.values)>::value_type;
+        
+        auto& timestamps = inMemorySeries.timestamps;
+        auto& values = inMemorySeries.values;
+        
+        std::vector<uint64_t> newTimestamps;
+        std::vector<T> newValues;
+        
+        int deletedCount = 0;
+        for (size_t i = 0; i < timestamps.size(); ++i) {
+            uint64_t ts = timestamps[i];
+            
+            // Keep data that's outside the deletion range
+            if (ts < startTime || ts > endTime) {
+                newTimestamps.push_back(timestamps[i]);
+                newValues.push_back(values[i]);
+            } else {
+                deletedCount++;
+            }
+        }
+        
+        timestamps = std::move(newTimestamps);
+        values = std::move(newValues);
+        
+    }, it->second);
     
-    // TODO: We could optimize by merging overlapping ranges, but for now
-    // we'll just track all deletions separately
+    // If all data was removed, remove the series entirely
+    auto& variantSeries = it->second;
+    bool isEmpty = std::visit([](const auto& inMemorySeries) {
+        return inMemorySeries.timestamps.empty();
+    }, variantSeries);
+    
+    if (isEmpty) {
+        series.erase(it);
+    }
 }

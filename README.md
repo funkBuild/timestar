@@ -21,14 +21,13 @@ A high-performance time series database built with C++23 and the Seastar framewo
 - CMake 3.10+
 - Seastar framework (included as submodule)
 - LevelDB development libraries
-- RapidJSON development libraries
 - Snappy compression library
 
 ### Ubuntu/Debian Setup
 
 ```bash
 # Install dependencies
-sudo apt install cmake g++ libleveldb-dev rapidjson-dev libsnappy-dev
+sudo apt install cmake g++ libleveldb-dev libsnappy-dev
 
 # Clone and build
 git clone --recursive https://github.com/yourusername/tsdb.git

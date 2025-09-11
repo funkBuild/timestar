@@ -18,14 +18,14 @@ public:
     
     void registerRoutes(seastar::httpd::routes& r);
     
-    seastar::future<std::unique_ptr<seastar::httpd::reply>> 
-        handleMeasurements(std::unique_ptr<seastar::httpd::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> 
+        handleMeasurements(std::unique_ptr<seastar::http::request> req);
     
-    seastar::future<std::unique_ptr<seastar::httpd::reply>> 
-        handleTags(std::unique_ptr<seastar::httpd::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> 
+        handleTags(std::unique_ptr<seastar::http::request> req);
     
-    seastar::future<std::unique_ptr<seastar::httpd::reply>> 
-        handleFields(std::unique_ptr<seastar::httpd::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> 
+        handleFields(std::unique_ptr<seastar::http::request> req);
 
 private:
     std::string createErrorResponse(const std::string& code, const std::string& message);
@@ -34,7 +34,8 @@ private:
                                    const std::unordered_map<std::string, std::vector<std::string>>& tags,
                                    const std::string& specificTag = "");
     std::string formatFieldsResponse(const std::string& measurement,
-                                     const std::unordered_map<std::string, std::string>& fields);
+                                     const std::unordered_map<std::string, std::string>& fields,
+                                     const std::unordered_map<std::string, std::string>& tagFilters = {});
 };
 
 #endif

@@ -16,6 +16,7 @@
 #include "tsm.hpp"
 #include "tsm_writer.hpp"
 #include "tsm_result.hpp"
+#include "series_id.hpp"
 
 // Forward declarations
 class CompactionStrategy;
@@ -126,7 +127,8 @@ public:
         for (size_t i = 0; i < iterators.size(); i++) {
             auto& iter = iterators[i];
             iter.currentBlock = TSMResult<T>(iter.file->rankAsInteger());
-            co_await iter.file->template readSeries<T>(seriesKey, 0, UINT64_MAX, iter.currentBlock);
+            SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
+            co_await iter.file->template readSeries<T>(seriesId, 0, UINT64_MAX, iter.currentBlock);
             if (!iter.currentBlock.empty()) {
                 minHeap.push({iter.currentTimestamp(), i, iter.file->rankAsInteger()});
             } else {

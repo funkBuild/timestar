@@ -10,6 +10,8 @@
 #include <numeric>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/smp.hh>
+#include <iomanip>
+#include <sstream>
 
 // Glaze-compatible structures for JSON parsing  
 struct GlazeQueryRequest {
@@ -32,6 +34,57 @@ struct glz::meta<GlazeQueryRequest> {
 
 namespace tsdb {
 
+// Timing structure to track query execution steps
+struct QueryTimingInfo {
+    std::chrono::high_resolution_clock::time_point startTime;
+    std::chrono::high_resolution_clock::time_point endTime;
+    
+    // Step timings
+    double parseRequestMs = 0.0;
+    double findSeriesMs = 0.0;
+    double shardDistributionMs = 0.0;
+    double shardQueriesMs = 0.0;
+    std::vector<std::pair<unsigned, double>> perShardQueryMs;
+    double resultMergingMs = 0.0;
+    double aggregationMs = 0.0;
+    double responseFormattingMs = 0.0;
+    double totalMs = 0.0;
+    
+    // Statistics
+    size_t seriesFound = 0;
+    size_t shardsQueried = 0;
+    size_t totalPointsRetrieved = 0;
+    size_t finalPointsReturned = 0;
+    
+    std::string toString() const {
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(2);
+        ss << "\n==================== Query Timing Breakdown ===================\n";
+        ss << "Parse Request:        " << std::setw(8) << parseRequestMs << " ms\n";
+        ss << "Find Series:          " << std::setw(8) << findSeriesMs << " ms\n";
+        ss << "Shard Distribution:   " << std::setw(8) << shardDistributionMs << " ms\n";
+        ss << "Shard Queries:        " << std::setw(8) << shardQueriesMs << " ms\n";
+        if (!perShardQueryMs.empty()) {
+            ss << "  Per-shard breakdown:\n";
+            for (const auto& [shardId, ms] : perShardQueryMs) {
+                ss << "    Shard " << shardId << ":         " << std::setw(8) << ms << " ms\n";
+            }
+        }
+        ss << "Result Merging:       " << std::setw(8) << resultMergingMs << " ms\n";
+        ss << "Aggregation:          " << std::setw(8) << aggregationMs << " ms\n";
+        ss << "Response Formatting:  " << std::setw(8) << responseFormattingMs << " ms\n";
+        ss << "----------------------------------------------------------------\n";
+        ss << "Total Execution:      " << std::setw(8) << totalMs << " ms\n";
+        ss << "\n";
+        ss << "Series Found:         " << seriesFound << "\n";
+        ss << "Shards Queried:       " << shardsQueried << "\n";
+        ss << "Points Retrieved:     " << totalPointsRetrieved << "\n";
+        ss << "Points Returned:      " << finalPointsReturned << "\n";
+        ss << "================================================================\n";
+        return ss.str();
+    }
+};
+
 // Response structures for Glaze serialization - must be at namespace scope
 struct QueryFieldData {
     std::vector<uint64_t> timestamps;
@@ -40,9 +93,9 @@ struct QueryFieldData {
 
 struct QuerySeriesData {
     std::string measurement;
-    std::map<std::string, std::string> tags;
+    std::vector<std::string> groupTags;  // Changed from tags map to groupTags array
     std::map<std::string, QueryFieldData> fields;
-    std::optional<std::vector<std::pair<std::string, std::string>>> scopes;
+    // Removed scopes - filter scopes shouldn't be in series
 };
 
 struct QueryStatisticsData {
@@ -59,7 +112,7 @@ struct ScopeData {
 struct QueryFormattedResponse {
     std::string status = "success";
     std::vector<QuerySeriesData> series;
-    std::optional<std::vector<ScopeData>> scopes;
+    // Removed top-level scopes as per requirement
     QueryStatisticsData statistics;
 };
 
@@ -69,9 +122,9 @@ struct QueryErrorResponse {
     std::string error;  // Changed to string to match test expectations
 };
 
-seastar::future<std::unique_ptr<seastar::httpd::reply>>
-HttpQueryHandler::handleQuery(std::unique_ptr<seastar::httpd::request> req) {
-    auto rep = std::make_unique<seastar::httpd::reply>();
+seastar::future<std::unique_ptr<seastar::http::reply>>
+HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
+    auto rep = std::make_unique<seastar::http::reply>();
     
     try {
         // Parse JSON request body using Glaze
@@ -79,7 +132,7 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::httpd::request> req) {
         auto parse_error = glz::read_json(glazeRequest, req->content);
         
         if (parse_error) {
-            rep->set_status(seastar::httpd::reply::status_type::bad_request);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("INVALID_JSON", "Failed to parse JSON request: " + std::string(glz::format_error(parse_error)));
             rep->add_header("Content-Type", "application/json");
             co_return rep;
@@ -87,14 +140,17 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::httpd::request> req) {
         
         // Convert to QueryRequest
         QueryRequest queryRequest;
+        auto parseStart = std::chrono::high_resolution_clock::now();
         try {
             queryRequest = parseQueryRequest(glazeRequest);
         } catch (const QueryParseException& e) {
-            rep->set_status(seastar::httpd::reply::status_type::bad_request);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("INVALID_QUERY", e.what());
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
+        auto parseEnd = std::chrono::high_resolution_clock::now();
+        double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
         
         // Execute query
         auto startTime = std::chrono::high_resolution_clock::now();
@@ -106,13 +162,16 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::httpd::request> req) {
             std::chrono::duration<double, std::milli>(endTime - startTime).count();
         
         // Format response
+        auto formatStart = std::chrono::high_resolution_clock::now();
         if (response.success) {
-            rep->set_status(seastar::httpd::reply::status_type::ok);
-            rep->_content = formatQueryResponse(response);
+            rep->set_status(seastar::http::reply::status_type::ok);
+            rep->_content = formatQueryResponse(response, queryRequest.fields);
         } else {
-            rep->set_status(seastar::httpd::reply::status_type::internal_server_error);
+            rep->set_status(seastar::http::reply::status_type::internal_server_error);
             rep->_content = createErrorResponse(response.errorCode, response.errorMessage);
         }
+        auto formatEnd = std::chrono::high_resolution_clock::now();
+        double formatMs = std::chrono::duration<double, std::milli>(formatEnd - formatStart).count();
         
         rep->add_header("Content-Type", "application/json");
         
@@ -127,7 +186,7 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::httpd::request> req) {
         
     } catch (const std::exception& e) {
         LOG_QUERY_PATH(tsdb::http_log, error, "[QUERY] Error handling query request: {}", e.what());
-        rep->set_status(seastar::httpd::reply::status_type::internal_server_error);
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
         rep->add_header("Content-Type", "application/json");
     }
@@ -137,9 +196,9 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::httpd::request> req) {
 
 void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::httpd::request> req, 
-               std::unique_ptr<seastar::httpd::reply> rep) 
-            -> seastar::future<std::unique_ptr<seastar::httpd::reply>> {
+        [this](std::unique_ptr<seastar::http::request> req, 
+               std::unique_ptr<seastar::http::reply> rep) 
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
             return handleQuery(std::move(req));
         }, "json");
     
@@ -229,6 +288,10 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
     response.success = true;
     response.scopes = request.scopes;
     
+    // Initialize timing tracker
+    QueryTimingInfo timing;
+    timing.startTime = std::chrono::high_resolution_clock::now();
+    
     try {
         LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Checking pointers - engineSharded: {}, indexSharded: {}", 
                        (void*)engineSharded, (void*)indexSharded);
@@ -278,7 +341,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         // First, query shard 0 for all series metadata (centralized metadata)
         // Get full metadata with series keys and determine which shard owns each series
         struct SeriesMetadataWithShard {
-            uint64_t seriesId;
+            SeriesId128 seriesId;
             std::string seriesKey;
             std::string measurement;
             std::map<std::string, std::string> tags;
@@ -286,6 +349,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             unsigned shardId;
         };
         
+        auto findSeriesStart = std::chrono::high_resolution_clock::now();
         auto seriesWithShards = co_await engineSharded->invoke_on(0, 
             [measurement = request.measurement, scopes = request.scopes, fields = request.fields](Engine& engine) 
                 -> seastar::future<std::vector<SeriesMetadataWithShard>> {
@@ -295,7 +359,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                seriesIds.size(), measurement, scopes.size());
                 
                 std::vector<SeriesMetadataWithShard> result;
-                for (uint64_t seriesId : seriesIds) {
+                for (const SeriesId128& seriesId : seriesIds) {
                     auto seriesMetaOpt = co_await index.getSeriesMetadata(seriesId);
                     if (!seriesMetaOpt.has_value()) {
                         continue;
@@ -303,18 +367,18 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     
                     const auto& meta = seriesMetaOpt.value();
                     
-                    // Filter by fields if specified
-                    if (!fields.empty() && std::find(fields.begin(), fields.end(), meta.field) == fields.end()) {
-                        continue;
-                    }
+                    // NOTE: We no longer filter by fields at the metadata level
+                    // This allows us to return existing fields even when some requested fields are missing
+                    // Field filtering will be handled gracefully during result processing
                     
                     // Build series key for sharding
                     TSDBInsert<double> temp(meta.measurement, meta.field);
                     temp.tags = meta.tags;
                     std::string seriesKey = temp.seriesKey();
                     
-                    // Calculate which shard owns this series
-                    unsigned shardId = std::hash<std::string>{}(seriesKey) % seastar::smp::count;
+                    // Calculate which shard owns this series using SeriesId128 for consistency
+                    SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(seriesKey);
+                    unsigned shardId = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;
                     
                     SeriesMetadataWithShard smws;
                     smws.seriesId = seriesId;
@@ -332,7 +396,12 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 co_return result;
             });
         
-        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Total series from centralized metadata: {}", seriesWithShards.size());
+        auto findSeriesEnd = std::chrono::high_resolution_clock::now();
+        timing.findSeriesMs = std::chrono::duration<double, std::milli>(findSeriesEnd - findSeriesStart).count();
+        timing.seriesFound = seriesWithShards.size();
+        
+        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Total series from centralized metadata: {} (took {:.2f} ms)", 
+                       seriesWithShards.size(), timing.findSeriesMs);
         
         // Debug: Print series details
         for (const auto& sm : seriesWithShards) {
@@ -341,17 +410,23 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         }
         
         // Group series by shard
+        auto shardDistStart = std::chrono::high_resolution_clock::now();
         std::map<unsigned, std::vector<std::string>> seriesByShard;
         for (const auto& sm : seriesWithShards) {
             seriesByShard[sm.shardId].push_back(sm.seriesKey);
         }
+        auto shardDistEnd = std::chrono::high_resolution_clock::now();
+        timing.shardDistributionMs = std::chrono::duration<double, std::milli>(shardDistEnd - shardDistStart).count();
+        timing.shardsQueried = seriesByShard.size();
         
         // Execute queries on each shard that has series
-        std::vector<seastar::future<std::vector<tsdb::SeriesResult>>> futures;
+        auto shardQueriesStart = std::chrono::high_resolution_clock::now();
+        std::vector<seastar::future<std::pair<unsigned, std::pair<std::vector<tsdb::SeriesResult>, double>>>> futures;
         for (const auto& [shardId, seriesKeys] : seriesByShard) {
             auto f = engineSharded->invoke_on(shardId, 
                 [shardId, seriesKeys, startTime = request.startTime, endTime = request.endTime, 
-                 measurement = request.measurement](Engine& engine) -> seastar::future<std::vector<tsdb::SeriesResult>> {
+                 measurement = request.measurement](Engine& engine) -> seastar::future<std::pair<std::vector<tsdb::SeriesResult>, double>> {
+                    auto shardStart = std::chrono::high_resolution_clock::now();
                     LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} querying {} series keys",
                                    shardId, seriesKeys.size());
                     
@@ -361,9 +436,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     for (const auto& seriesKey : seriesKeys) {
                         LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} querying series key: '{}'",
                                        shardId, seriesKey);
-                        // Use engine's query method directly
-                        auto variantResult = co_await engine.query(seriesKey, startTime, endTime);
-                        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Got variant result for series '{}'", seriesKey);
+                        
+                        try {
+                            // Use engine's query method directly
+                            auto variantResult = co_await engine.query(seriesKey, startTime, endTime);
+                            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Got variant result for series '{}'", seriesKey);
                         
                         // Parse series key to extract measurement, tags, and field
                         // Format: measurement,tag1=value1,tag2=value2 field
@@ -447,24 +524,50 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                             }
                         }, variantResult);
                         
-                        if (!seriesResult.fields.empty()) {
-                            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Adding series result with {} fields", seriesResult.fields.size());
-                            results.push_back(seriesResult);
-                        } else {
-                            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Series result has no fields, skipping");
+                            if (!seriesResult.fields.empty()) {
+                                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Adding series result with {} fields", seriesResult.fields.size());
+                                results.push_back(seriesResult);
+                            } else {
+                                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Series result has no fields, skipping");
+                            }
+                        } catch (const std::runtime_error& e) {
+                            // Handle "Series not found" and other runtime errors gracefully
+                            if (std::string(e.what()).find("Series not found") != std::string::npos) {
+                                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Series '{}' not found on shard {} - skipping (this is normal for partial deletions)",
+                                               seriesKey, shardId);
+                            } else {
+                                LOG_QUERY_PATH(tsdb::http_log, warn, "[QUERY] Error querying series '{}' on shard {}: {} - skipping",
+                                               seriesKey, shardId, e.what());
+                            }
+                            // Continue processing other series instead of failing the entire query
+                        } catch (...) {
+                            // Handle any other exceptions
+                            LOG_QUERY_PATH(tsdb::http_log, warn, "[QUERY] Unknown error querying series '{}' on shard {} - skipping",
+                                           seriesKey, shardId);
                         }
                     }
                     
-                    co_return results;
+                    auto shardEnd = std::chrono::high_resolution_clock::now();
+                    double shardMs = std::chrono::duration<double, std::milli>(shardEnd - shardStart).count();
+                    co_return std::make_pair(results, shardMs);
+                }).then([shardId](std::pair<std::vector<tsdb::SeriesResult>, double> result) {
+                    return std::make_pair(shardId, result);
                 });
             futures.push_back(std::move(f));
         }
         
         // Wait for all shards to complete
         auto shardResults = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+        auto shardQueriesEnd = std::chrono::high_resolution_clock::now();
+        timing.shardQueriesMs = std::chrono::duration<double, std::milli>(shardQueriesEnd - shardQueriesStart).count();
         
         // Merge results from all shards
-        for (const auto& shardSeriesVec : shardResults) {
+        auto mergeStart = std::chrono::high_resolution_clock::now();
+        for (const auto& shardResult : shardResults) {
+            unsigned shardId = shardResult.first;
+            const auto& [shardSeriesVec, shardMs] = shardResult.second;
+            timing.perShardQueryMs.push_back({shardId, shardMs});
+            
             for (const auto& series : shardSeriesVec) {
                 // Copy the series directly - it's already in the right format
                 response.series.push_back(series);
@@ -472,12 +575,17 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 // Update statistics
                 for (const auto& [fieldName, fieldData] : series.fields) {
                     // Count points based on timestamps
-                    response.statistics.pointCount += fieldData.first.size();
+                    size_t points = fieldData.first.size();
+                    response.statistics.pointCount += points;
+                    timing.totalPointsRetrieved += points;
                 }
             }
         }
+        auto mergeEnd = std::chrono::high_resolution_clock::now();
+        timing.resultMergingMs = std::chrono::duration<double, std::milli>(mergeEnd - mergeStart).count();
         
         // Apply aggregation and grouping
+        auto aggregationStart = std::chrono::high_resolution_clock::now();
         if (!response.series.empty()) {
             std::vector<SeriesResult> aggregatedSeries;
             
@@ -689,12 +797,23 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             response.statistics.pointCount = 0;
             for (const auto& series : response.series) {
                 for (const auto& [fieldName, fieldData] : series.fields) {
-                    response.statistics.pointCount += fieldData.first.size();
+                    size_t points = fieldData.first.size();
+                    response.statistics.pointCount += points;
+                    timing.finalPointsReturned += points;
                 }
             }
         }
+        auto aggregationEnd = std::chrono::high_resolution_clock::now();
+        timing.aggregationMs = std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count();
         
         response.statistics.seriesCount = response.series.size();
+        
+        // Calculate total timing
+        timing.endTime = std::chrono::high_resolution_clock::now();
+        timing.totalMs = std::chrono::duration<double, std::milli>(timing.endTime - timing.startTime).count();
+        
+        // Print timing information
+        tsdb::http_log.info("{}", timing.toString());
         
     } catch (const std::exception& e) {
         response.success = false;
@@ -706,7 +825,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
     co_return response;
 }
 
-std::string HttpQueryHandler::formatQueryResponse(const QueryResponse& response) {
+std::string HttpQueryHandler::formatQueryResponse(const QueryResponse& response, const std::vector<std::string>& requestedFields) {
     // Build response JSON using structured approach
     QueryFormattedResponse formattedResponse;
     
@@ -714,36 +833,33 @@ std::string HttpQueryHandler::formatQueryResponse(const QueryResponse& response)
     for (const auto& series : response.series) {
         QuerySeriesData sd;
         sd.measurement = series.measurement;
-        sd.tags = series.tags;
         
-        // Convert fields
+        // Convert tags map to groupTags array format
+        for (const auto& [key, value] : series.tags) {
+            sd.groupTags.push_back(key + "=" + value);
+        }
+        std::sort(sd.groupTags.begin(), sd.groupTags.end());  // Sort for consistent ordering
+        
+        // Convert fields (filter by requested fields if specified)
         for (const auto& [fieldName, fieldData] : series.fields) {
+            // If specific fields were requested, only include those fields
+            if (!requestedFields.empty() && 
+                std::find(requestedFields.begin(), requestedFields.end(), fieldName) == requestedFields.end()) {
+                continue;
+            }
+            
             QueryFieldData fd;
             fd.timestamps = fieldData.first;
             fd.values = fieldData.second;
             sd.fields[fieldName] = fd;
         }
         
-        // Add scopes if present
-        if (!response.scopes.empty()) {
-            std::vector<std::pair<std::string, std::string>> scopeVec;
-            for (const auto& [name, value] : response.scopes) {
-                scopeVec.emplace_back(name, value);
-            }
-            sd.scopes = scopeVec;
+        // Only include series that have at least one field after filtering
+        if (!sd.fields.empty()) {
+            formattedResponse.series.push_back(std::move(sd));
         }
-        
-        formattedResponse.series.push_back(std::move(sd));
     }
-    
-    // Set scopes at top level if present
-    if (!response.scopes.empty()) {
-        std::vector<ScopeData> scopeVec;
-        for (const auto& [name, value] : response.scopes) {
-            scopeVec.push_back(ScopeData{name, value});
-        }
-        formattedResponse.scopes = scopeVec;
-    }
+    // Removed top-level scopes as per requirement
     
     // Set statistics
     formattedResponse.statistics.series_count = response.statistics.seriesCount;
@@ -764,7 +880,11 @@ std::string HttpQueryHandler::createErrorResponse(const std::string& code, const
 std::vector<unsigned> HttpQueryHandler::determineTargetShards(const QueryRequest& request) {
     // For now, query all shards
     std::vector<unsigned> shards;
-    for (unsigned i = 0; i < seastar::smp::count; ++i) {
+    unsigned shardCount = seastar::smp::count;
+    if (shardCount == 0) {
+        shardCount = 1; // Default for test environment
+    }
+    for (unsigned i = 0; i < shardCount; ++i) {
         shards.push_back(i);
     }
     return shards;

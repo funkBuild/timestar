@@ -9,6 +9,7 @@
 
 #include "tsdb_value.hpp"
 #include "line_parser.hpp"
+#include "series_id.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -49,22 +50,18 @@ private:
     std::string encodeMeasurementFieldsKey(const std::string& measurement);
     std::string encodeMeasurementTagsKey(const std::string& measurement);
     std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey);
-    std::string encodeSeriesMetadataKey(uint64_t seriesId);
+    std::string encodeSeriesMetadataKey(const SeriesId128& seriesId);
     std::string encodeFieldTypeKey(const std::string& measurement, const std::string& field);
     
     // Helper methods for value encoding/decoding
     std::string encodeStringSet(const std::set<std::string>& strings);
     std::set<std::string> decodeStringSet(const std::string& encoded);
-    std::string encodeSeriesId(uint64_t seriesId);
-    uint64_t decodeSeriesId(const std::string& encoded);
+    std::string encodeSeriesId(const SeriesId128& seriesId);
+    SeriesId128 decodeSeriesId(const std::string& encoded);
     std::string encodeSeriesMetadata(const SeriesMetadata& metadata);
     SeriesMetadata decodeSeriesMetadata(const std::string& encoded);
     
-    // Next series ID counter
-    uint64_t nextSeriesId = 1;
-    std::string SERIES_COUNTER_KEY = "\x00SERIES_COUNTER";
-    
-    seastar::future<> loadSeriesCounter();
+    // No longer need counter - SeriesId128 generated deterministically from SeriesKey
 
 public:
     LevelDBIndex(int shardId);
@@ -74,16 +71,16 @@ public:
     seastar::future<> close();
     
     // Series indexing - core functionality
-    seastar::future<uint64_t> getOrCreateSeriesId(std::string measurement,
-                                                  std::map<std::string, std::string> tags, 
-                                                  std::string field);
+    seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement,
+                                                     std::map<std::string, std::string> tags, 
+                                                     std::string field);
     
-    seastar::future<std::optional<uint64_t>> getSeriesId(const std::string& measurement,
-                                                         const std::map<std::string, std::string>& tags,
-                                                         const std::string& field);
+    seastar::future<std::optional<SeriesId128>> getSeriesId(const std::string& measurement,
+                                                            const std::map<std::string, std::string>& tags,
+                                                            const std::string& field);
     
     // Get metadata for a series by ID
-    seastar::future<std::optional<SeriesMetadata>> getSeriesMetadata(uint64_t seriesId);
+    seastar::future<std::optional<SeriesMetadata>> getSeriesMetadata(const SeriesId128& seriesId);
     
     // Measurement metadata indexing
     seastar::future<> addField(const std::string& measurement, const std::string& field);
@@ -101,19 +98,19 @@ public:
     
     // Bulk operations for insert batching
     template<class T>
-    seastar::future<uint64_t> indexInsert(const TSDBInsert<T>& insert);
+    seastar::future<SeriesId128> indexInsert(const TSDBInsert<T>& insert);
     
     // Series discovery for queries
-    seastar::future<std::vector<uint64_t>> findSeries(const std::string& measurement,
-                                                      const std::map<std::string, std::string>& tagFilters = {});
+    seastar::future<std::vector<SeriesId128>> findSeries(const std::string& measurement,
+                                                         const std::map<std::string, std::string>& tagFilters = {});
     
     // Find series by single tag (optimized)
-    seastar::future<std::vector<uint64_t>> findSeriesByTag(const std::string& measurement,
-                                                           const std::string& tagKey,
-                                                           const std::string& tagValue);
+    seastar::future<std::vector<SeriesId128>> findSeriesByTag(const std::string& measurement,
+                                                              const std::string& tagKey,
+                                                              const std::string& tagValue);
     
     // Group series by tag value for aggregations
-    seastar::future<std::map<std::string, std::vector<uint64_t>>> 
+    seastar::future<std::map<std::string, std::vector<SeriesId128>>> 
         getSeriesGroupedByTag(const std::string& measurement, const std::string& tagKey);
     
     // Field statistics for query optimization
@@ -124,14 +121,14 @@ public:
         uint64_t pointCount;
     };
     
-    seastar::future<> updateFieldStats(uint64_t seriesId, const std::string& field,
+    seastar::future<> updateFieldStats(const SeriesId128& seriesId, const std::string& field,
                                        const FieldStats& stats);
     
-    seastar::future<std::optional<FieldStats>> getFieldStats(uint64_t seriesId, 
-                                                             const std::string& field);
+    seastar::future<std::optional<FieldStats>> getFieldStats(const SeriesId128& seriesId, 
+                                                              const std::string& field);
     
     // Compaction support - get all series for a measurement
-    seastar::future<std::vector<uint64_t>> getAllSeriesForMeasurement(const std::string& measurement);
+    seastar::future<std::vector<SeriesId128>> getAllSeriesForMeasurement(const std::string& measurement);
     
     // Debug/maintenance
     seastar::future<size_t> getSeriesCount();

@@ -55,7 +55,7 @@ seastar::future<> LevelDBIndex::open() {
     db.reset(dbPtr);
     tsdb::index_log.info("LevelDB index opened at: {}", indexPath);
     
-    co_await loadSeriesCounter();
+    // SeriesId128 is generated deterministically from SeriesKey - no counter needed
 }
 
 seastar::future<> LevelDBIndex::close() {
@@ -66,25 +66,7 @@ seastar::future<> LevelDBIndex::close() {
     co_return;
 }
 
-seastar::future<> LevelDBIndex::loadSeriesCounter() {
-    if (!db) {
-        throw std::runtime_error("Database not opened before loading series counter");
-    }
-    std::string value;
-    leveldb::Status status = db->Get(leveldb::ReadOptions(), SERIES_COUNTER_KEY, &value);
-    
-    if (status.ok()) {
-        nextSeriesId = decodeSeriesId(value);
-    } else if (status.IsNotFound()) {
-        // First time initialization
-        nextSeriesId = 1;
-    } else {
-        throw std::runtime_error("Failed to load series counter: " + status.ToString());
-    }
-    
-    tsdb::index_log.debug("Loaded series counter: {}", nextSeriesId);
-    co_return;
-}
+// loadSeriesCounter method removed - no longer needed with deterministic SeriesId128
 
 std::string LevelDBIndex::encodeSeriesKey(const std::string& measurement,
                                          const std::map<std::string, std::string>& tags,
@@ -157,22 +139,15 @@ std::set<std::string> LevelDBIndex::decodeStringSet(const std::string& encoded) 
     return result;
 }
 
-std::string LevelDBIndex::encodeSeriesId(uint64_t seriesId) {
-    std::string encoded(sizeof(uint64_t), '\0');
-    std::memcpy(&encoded[0], &seriesId, sizeof(uint64_t));
-    return encoded;
+std::string LevelDBIndex::encodeSeriesId(const SeriesId128& seriesId) {
+    return seriesId.toBytes();
 }
 
-uint64_t LevelDBIndex::decodeSeriesId(const std::string& encoded) {
-    if (encoded.length() != sizeof(uint64_t)) {
-        throw std::runtime_error("Invalid series ID encoding");
-    }
-    uint64_t seriesId;
-    std::memcpy(&seriesId, encoded.data(), sizeof(uint64_t));
-    return seriesId;
+SeriesId128 LevelDBIndex::decodeSeriesId(const std::string& encoded) {
+    return SeriesId128::fromBytes(encoded);
 }
 
-std::string LevelDBIndex::encodeSeriesMetadataKey(uint64_t seriesId) {
+std::string LevelDBIndex::encodeSeriesMetadataKey(const SeriesId128& seriesId) {
     std::string key;
     key.push_back(static_cast<char>(SERIES_METADATA));
     key += encodeSeriesId(seriesId);
@@ -189,14 +164,33 @@ std::string LevelDBIndex::encodeFieldTypeKey(const std::string& measurement, con
 }
 
 std::string LevelDBIndex::encodeSeriesMetadata(const SeriesMetadata& metadata) {
-    std::stringstream ss;
-    ss << metadata.measurement << '\0';
-    ss << metadata.field << '\0';
-    ss << metadata.tags.size() << '\0';
-    for (const auto& [k, v] : metadata.tags) {
-        ss << k << '\0' << v << '\0';
+    try {
+        // Add defensive checks to prevent corruption-related crashes
+        if (metadata.measurement.length() > 10000 || metadata.field.length() > 10000) {
+            throw std::runtime_error("SeriesMetadata has suspiciously long strings - possible corruption");
+        }
+        
+        if (metadata.tags.size() > 1000) {
+            throw std::runtime_error("SeriesMetadata has too many tags - possible corruption");
+        }
+        
+        std::stringstream ss;
+        ss << metadata.measurement << '\0';
+        ss << metadata.field << '\0';
+        ss << metadata.tags.size() << '\0';
+        
+        for (const auto& [k, v] : metadata.tags) {
+            if (k.length() > 1000 || v.length() > 1000) {
+                throw std::runtime_error("SeriesMetadata tag key/value too long - possible corruption");
+            }
+            ss << k << '\0' << v << '\0';
+        }
+        
+        return ss.str();
+    } catch (const std::exception& e) {
+        tsdb::index_log.error("encodeSeriesMetadata failed: {}", e.what());
+        throw std::runtime_error(std::string("encodeSeriesMetadata failed: ") + e.what());
     }
-    return ss.str();
 }
 
 SeriesMetadata LevelDBIndex::decodeSeriesMetadata(const std::string& encoded) {
@@ -220,108 +214,95 @@ SeriesMetadata LevelDBIndex::decodeSeriesMetadata(const std::string& encoded) {
     return metadata;
 }
 
-seastar::future<uint64_t> LevelDBIndex::getOrCreateSeriesId(std::string measurement,
-                                                           std::map<std::string, std::string> tags,
-                                                           std::string field) {
-    // Only shard 0 handles series ID generation and metadata indexing
+seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measurement,
+                                                              std::map<std::string, std::string> tags,
+                                                              std::string field) {
+    // Only shard 0 handles series metadata indexing
     if (shardId != 0) {
-        throw std::runtime_error("getOrCreateSeriesId called on non-zero shard " + std::to_string(shardId) + " - series ID generation only supported on shard 0. This needs to be delegated from Engine level.");
+        throw std::runtime_error("getOrCreateSeriesId called on non-zero shard " + std::to_string(shardId) + " - metadata operations only supported on shard 0");
     }
     
     if (!db) {
         throw std::runtime_error("Database not opened on shard 0 for getOrCreateSeriesId");
     }
     
-    // First check if series already exists
-    return getSeriesId(measurement, tags, field).then([this, measurement = std::move(measurement), 
-                                                        tags = std::move(tags), 
-                                                        field = std::move(field)](std::optional<uint64_t> existingId) mutable {
-        if (existingId.has_value()) {
-            return seastar::make_ready_future<uint64_t>(existingId.value());
-        }
+    // Generate SeriesId128 deterministically from series key
+    std::string seriesKeyStr = encodeSeriesKey(measurement, tags, field);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKeyStr);
+    
+    // Check if series already exists in index
+    auto existingId = co_await getSeriesId(measurement, tags, field);
+    if (existingId.has_value()) {
+        co_return existingId.value();
+    }
+    
+    // Store new series metadata
+    leveldb::WriteBatch batch;
+    
+    // Add series mapping (seriesKey -> seriesId)
+    batch.Put(seriesKeyStr, encodeSeriesId(seriesId));
+    
+    // Store series metadata for reverse lookup
+    SeriesMetadata metadata;
+    metadata.measurement = measurement;
+    metadata.tags = tags;
+    metadata.field = field;
+    std::string metadataKey = encodeSeriesMetadataKey(seriesId);
+    batch.Put(metadataKey, encodeSeriesMetadata(metadata));
+    
+    // Add TAG_INDEX entries for efficient tag-based queries
+    for (const auto& tag : tags) {
+        const std::string& tagKey = tag.first;
+        const std::string& tagValue = tag.second;
         
-        // Create new series
-        uint64_t newSeriesId = nextSeriesId++;
+        // TAG_INDEX key includes series ID to make it unique per series
+        std::string tagIndexKey;
+        tagIndexKey.push_back(TAG_INDEX);
+        tagIndexKey.append(measurement);
+        tagIndexKey.push_back('\0');
+        tagIndexKey.append(tagKey);
+        tagIndexKey.push_back('\0');
+        tagIndexKey.append(tagValue);
+        tagIndexKey.push_back('\0');
+        tagIndexKey.append(encodeSeriesId(seriesId));
         
-        leveldb::WriteBatch batch;
+        batch.Put(tagIndexKey, encodeSeriesId(seriesId));
         
-        // Add series mapping
-        std::string seriesKey = encodeSeriesKey(measurement, tags, field);
-        batch.Put(seriesKey, encodeSeriesId(newSeriesId));
+        // GROUP_BY_INDEX also needs unique keys per series
+        std::string groupByKey;
+        groupByKey.push_back(GROUP_BY_INDEX);
+        groupByKey.append(measurement);
+        groupByKey.push_back('\0');
+        groupByKey.append(tagKey);
+        groupByKey.push_back('\0');
+        groupByKey.append(tagValue);
+        groupByKey.push_back('\0');
+        groupByKey.append(encodeSeriesId(seriesId));
         
-        // Store series metadata for reverse lookup
-        SeriesMetadata metadata;
-        metadata.measurement = measurement;
-        metadata.tags = tags;
-        metadata.field = field;
-        std::string metadataKey = encodeSeriesMetadataKey(newSeriesId);
-        batch.Put(metadataKey, encodeSeriesMetadata(metadata));
-        
-        // Update series counter
-        batch.Put(SERIES_COUNTER_KEY, encodeSeriesId(nextSeriesId));
-        
-        // Add TAG_INDEX entries for efficient tag-based queries
-        for (const auto& tag : tags) {
-            const std::string& tagKey = tag.first;
-            const std::string& tagValue = tag.second;
-            
-            // TAG_INDEX key includes series ID to make it unique per series
-            std::string tagIndexKey;
-            tagIndexKey.push_back(TAG_INDEX);
-            tagIndexKey.append(measurement);
-            tagIndexKey.push_back('\0');
-            tagIndexKey.append(tagKey);
-            tagIndexKey.push_back('\0');
-            tagIndexKey.append(tagValue);
-            tagIndexKey.push_back('\0');
-            tagIndexKey.append(encodeSeriesId(newSeriesId));
-            
-            batch.Put(tagIndexKey, encodeSeriesId(newSeriesId));
-            
-            // GROUP_BY_INDEX also needs unique keys per series
-            std::string groupByKey;
-            groupByKey.push_back(GROUP_BY_INDEX);
-            groupByKey.append(measurement);
-            groupByKey.push_back('\0');
-            groupByKey.append(tagKey);
-            groupByKey.push_back('\0');
-            groupByKey.append(tagValue);
-            groupByKey.push_back('\0');
-            groupByKey.append(encodeSeriesId(newSeriesId));
-            
-            batch.Put(groupByKey, encodeSeriesId(newSeriesId));
-        }
-        
-        // Write the batch
-        leveldb::Status status = db->Write(leveldb::WriteOptions(), &batch);
-        if (!status.ok()) {
-            throw std::runtime_error("Failed to write series index: " + status.ToString());
-        }
-        
-        // Chain the async operations
-        return addField(measurement, field).then([this, measurement = std::move(measurement), 
-                                                  tags = std::move(tags), newSeriesId]() mutable {
-            // Process tags
-            seastar::future<> tag_future = seastar::make_ready_future<>();
-            for (const auto& tag : tags) {
-                auto tagKey = tag.first;
-                auto tagValue = tag.second;
-                tag_future = tag_future.then([this, measurement, tagKey, tagValue]() {
-                    return addTag(measurement, tagKey, tagValue);
-                });
-            }
-            
-            return tag_future.then([newSeriesId]() {
-                tsdb::index_log.debug("Created new series ID {}", newSeriesId);
-                return seastar::make_ready_future<uint64_t>(newSeriesId);
-            });
-        });
-    });
+        batch.Put(groupByKey, encodeSeriesId(seriesId));
+    }
+    
+    // Write the batch
+    leveldb::Status status = db->Write(leveldb::WriteOptions(), &batch);
+    if (!status.ok()) {
+        throw std::runtime_error("Failed to write series index: " + status.ToString());
+    }
+    
+    // Update metadata indexes
+    co_await addField(measurement, field);
+    
+    // Process tags
+    for (const auto& tag : tags) {
+        co_await addTag(measurement, tag.first, tag.second);
+    }
+    
+    tsdb::index_log.debug("Created new series ID {} for key: {}", seriesId.toHex(), seriesKeyStr);
+    co_return seriesId;
 }
 
-seastar::future<std::optional<uint64_t>> LevelDBIndex::getSeriesId(const std::string& measurement,
-                                                                  const std::map<std::string, std::string>& tags,
-                                                                  const std::string& field) {
+seastar::future<std::optional<SeriesId128>> LevelDBIndex::getSeriesId(const std::string& measurement,
+                                                                     const std::map<std::string, std::string>& tags,
+                                                                     const std::string& field) {
     if (!db) {
         throw std::runtime_error("Database not opened before getSeriesId");
     }
@@ -550,7 +531,7 @@ seastar::future<std::set<std::string>> LevelDBIndex::getTagValues(const std::str
 }
 
 template<class T>
-seastar::future<uint64_t> LevelDBIndex::indexInsert(const TSDBInsert<T>& insert) {
+seastar::future<SeriesId128> LevelDBIndex::indexInsert(const TSDBInsert<T>& insert) {
     // Create a mutable copy to call seriesKey() method
     TSDBInsert<T> mutableInsert = insert;
     std::string seriesKeyStr = mutableInsert.seriesKey();
@@ -558,16 +539,16 @@ seastar::future<uint64_t> LevelDBIndex::indexInsert(const TSDBInsert<T>& insert)
     LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] indexInsert called for measurement: '{}', field: '{}', series key: '{}'", 
                     insert.measurement, insert.field, seriesKeyStr);
     
-    uint64_t seriesId = co_await getOrCreateSeriesId(insert.measurement, insert.tags, insert.field);
+    SeriesId128 seriesId = co_await getOrCreateSeriesId(insert.measurement, insert.tags, insert.field);
     
     LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] indexInsert completed - series ID: {} for series: '{}'", 
-                    seriesId, seriesKeyStr);
+                    seriesId.toHex(), seriesKeyStr);
     
     co_return seriesId;
 }
 
-seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeries(const std::string& measurement,
-                                                               const std::map<std::string, std::string>& tagFilters) {
+seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeries(const std::string& measurement,
+                                                                    const std::map<std::string, std::string>& tagFilters) {
     tsdb::index_log.debug("findSeries called for measurement: {}, with {} tag filters", 
                          measurement, tagFilters.size());
     
@@ -579,7 +560,7 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeries(const std::strin
     
     // With tag filters - for now still use exact match
     // TODO: Implement more sophisticated tag filtering with iterator scanning
-    std::vector<uint64_t> results;
+    std::vector<SeriesId128> results;
     
     // Get all fields for this measurement
     auto fields = co_await getFields(measurement);
@@ -591,7 +572,7 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeries(const std::strin
         if (seriesId.has_value()) {
             results.push_back(seriesId.value());
             tsdb::index_log.debug("Found series ID {} for field {} with exact tag match", 
-                                 seriesId.value(), field);
+                                 seriesId.value().toHex(), field);
         }
     }
     
@@ -600,7 +581,7 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeries(const std::strin
         tsdb::index_log.debug("No exact matches found, scanning all series and filtering");
         auto allSeries = co_await getAllSeriesForMeasurement(measurement);
         
-        for (uint64_t seriesId : allSeries) {
+        for (const SeriesId128& seriesId : allSeries) {
             auto metadata = co_await getSeriesMetadata(seriesId);
             if (metadata.has_value()) {
                 // Check if all tag filters match
@@ -615,7 +596,7 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeries(const std::strin
                 
                 if (matches) {
                     results.push_back(seriesId);
-                    tsdb::index_log.debug("Series {} matches tag filters", seriesId);
+                    tsdb::index_log.debug("Series {} matches tag filters", seriesId.toHex());
                 }
             }
         }
@@ -626,10 +607,10 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeries(const std::strin
     co_return results;
 }
 
-seastar::future<std::vector<uint64_t>> LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement) {
+seastar::future<std::vector<SeriesId128>> LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement) {
     // Don't use coroutines with LevelDB iterators
     return seastar::async([this, measurement]() {
-        std::vector<uint64_t> seriesIds;
+        std::vector<SeriesId128> seriesIds;
         
         if (!db) {
             // For non-zero shards with centralized metadata, return empty
@@ -678,9 +659,9 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::getAllSeriesForMeasurement(
             std::string value = it->value().ToString();
             if (!value.empty()) {
                 try {
-                    uint64_t seriesId = decodeSeriesId(value);
+                    SeriesId128 seriesId = decodeSeriesId(value);
                     seriesIds.push_back(seriesId);
-                    tsdb::index_log.debug("Found series ID {} for measurement {}", seriesId, measurement);
+                    tsdb::index_log.debug("Found series ID {} for measurement {}", seriesId.toHex(), measurement);
                 } catch (const std::exception& e) {
                     tsdb::index_log.error("Failed to decode series ID: {}", e.what());
                 }
@@ -702,7 +683,30 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::getAllSeriesForMeasurement(
 }
 
 seastar::future<size_t> LevelDBIndex::getSeriesCount() {
-    return seastar::make_ready_future<size_t>(nextSeriesId - 1);
+    // For SeriesId128, we need to count actual series in the index
+    // This is more expensive than before but more accurate
+    if (!db) {
+        co_return 0;
+    }
+    
+    size_t count = 0;
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+    
+    // Count SERIES_INDEX entries
+    std::string startKey;
+    startKey.push_back(static_cast<char>(SERIES_INDEX));
+    it->Seek(startKey);
+    
+    while (it->Valid()) {
+        leveldb::Slice key = it->key();
+        if (key.size() == 0 || static_cast<uint8_t>(key[0]) != SERIES_INDEX) {
+            break;
+        }
+        count++;
+        it->Next();
+    }
+    
+    co_return count;
 }
 
 seastar::future<> LevelDBIndex::compact() {
@@ -712,7 +716,7 @@ seastar::future<> LevelDBIndex::compact() {
 }
 
 // Explicit template instantiations
-seastar::future<std::optional<SeriesMetadata>> LevelDBIndex::getSeriesMetadata(uint64_t seriesId) {
+seastar::future<std::optional<SeriesMetadata>> LevelDBIndex::getSeriesMetadata(const SeriesId128& seriesId) {
     std::string metadataKey = encodeSeriesMetadataKey(seriesId);
     std::string value;
     
@@ -729,10 +733,10 @@ seastar::future<std::optional<SeriesMetadata>> LevelDBIndex::getSeriesMetadata(u
 
 // Enhanced index methods for query support
 
-seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeriesByTag(const std::string& measurement,
+seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTag(const std::string& measurement,
                                                                      const std::string& tagKey,
                                                                      const std::string& tagValue) {
-    std::vector<uint64_t> seriesIds;
+    std::vector<SeriesId128> seriesIds;
     
     // Create key prefix for TAG_INDEX: TAG_INDEX + measurement + tagKey + tagValue
     std::string keyPrefix;
@@ -753,7 +757,7 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeriesByTag(const std::
             break;
         }
         // Extract series ID from the value
-        uint64_t seriesId = decodeSeriesId(it->value().ToString());
+        SeriesId128 seriesId = decodeSeriesId(it->value().ToString());
         seriesIds.push_back(seriesId);
     }
     
@@ -766,9 +770,9 @@ seastar::future<std::vector<uint64_t>> LevelDBIndex::findSeriesByTag(const std::
     co_return seriesIds;
 }
 
-seastar::future<std::map<std::string, std::vector<uint64_t>>> 
+seastar::future<std::map<std::string, std::vector<SeriesId128>>> 
 LevelDBIndex::getSeriesGroupedByTag(const std::string& measurement, const std::string& tagKey) {
-    std::map<std::string, std::vector<uint64_t>> grouped;
+    std::map<std::string, std::vector<SeriesId128>> grouped;
     
     // Create key prefix for GROUP_BY_INDEX: GROUP_BY_INDEX + measurement + tagKey
     std::string keyPrefix;
@@ -793,7 +797,7 @@ LevelDBIndex::getSeriesGroupedByTag(const std::string& measurement, const std::s
         if (valueEnd == std::string::npos) continue;
         
         std::string tagValue = key.substr(valueStart, valueEnd - valueStart);
-        uint64_t seriesId = decodeSeriesId(it->value().ToString());
+        SeriesId128 seriesId = decodeSeriesId(it->value().ToString());
         
         grouped[tagValue].push_back(seriesId);
     }
@@ -807,7 +811,7 @@ LevelDBIndex::getSeriesGroupedByTag(const std::string& measurement, const std::s
     co_return grouped;
 }
 
-seastar::future<> LevelDBIndex::updateFieldStats(uint64_t seriesId, const std::string& field,
+seastar::future<> LevelDBIndex::updateFieldStats(const SeriesId128& seriesId, const std::string& field,
                                                  const FieldStats& stats) {
     // Create key: FIELD_STATS + seriesId + field
     std::string key;
@@ -835,7 +839,7 @@ seastar::future<> LevelDBIndex::updateFieldStats(uint64_t seriesId, const std::s
 }
 
 seastar::future<std::optional<LevelDBIndex::FieldStats>> 
-LevelDBIndex::getFieldStats(uint64_t seriesId, const std::string& field) {
+LevelDBIndex::getFieldStats(const SeriesId128& seriesId, const std::string& field) {
     // Create key: FIELD_STATS + seriesId + field
     std::string key;
     key.push_back(FIELD_STATS);
@@ -873,6 +877,6 @@ LevelDBIndex::getFieldStats(uint64_t seriesId, const std::string& field) {
     }
 }
 
-template seastar::future<uint64_t> LevelDBIndex::indexInsert<double>(const TSDBInsert<double>& insert);
-template seastar::future<uint64_t> LevelDBIndex::indexInsert<bool>(const TSDBInsert<bool>& insert);
-template seastar::future<uint64_t> LevelDBIndex::indexInsert<std::string>(const TSDBInsert<std::string>& insert);
+template seastar::future<SeriesId128> LevelDBIndex::indexInsert<double>(const TSDBInsert<double>& insert);
+template seastar::future<SeriesId128> LevelDBIndex::indexInsert<bool>(const TSDBInsert<bool>& insert);
+template seastar::future<SeriesId128> LevelDBIndex::indexInsert<std::string>(const TSDBInsert<std::string>& insert);

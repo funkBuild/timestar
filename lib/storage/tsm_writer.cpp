@@ -1,5 +1,6 @@
 #include "tsm.hpp"
 #include "tsm_writer.hpp"
+#include "series_id.hpp"
 #include "integer_encoder.hpp"
 #include "float_encoder.hpp"
 #include "bool_encoder.hpp"
@@ -21,7 +22,7 @@ void TSMWriter::writeHeader(){
 }
 
 template <class T>
-void TSMWriter::writeSeries(TSMValueType seriesType, const std::string &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values){
+void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values){
   // serializes a single series into one or more blocks. After each block, append an index entry
   // TODO: What's the optimum block size??
   TSMIndexEntry indexEntry;
@@ -29,13 +30,22 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const std::string &seriesId
   indexEntry.seriesType = seriesType;
 
   unsigned int offset = 0;
+  size_t blockCount = 0;
 
   while(offset < timestamps.size()){
     const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock));
+    size_t blockSize = end - offset;
+    
+    if (blockCount == 0) {
+      std::cerr << "[TSM_WRITER_BLOCK] Creating blocks for series '" << seriesId.toHex() 
+                << "' (" << timestamps.size() << " total points, up to " << MaxPointsPerBlock << " per block)" << std::endl;
+    }
 
     //TODO: Avoid the copy here
+    std::cerr << "[TSM_WRITER_BLOCK] Allocating vectors for block " << blockCount << " (" << blockSize << " points)" << std::endl;
     std::vector<uint64_t> blockTimestamps(timestamps.begin() + offset, timestamps.begin() + end);
     std::vector<T> blockValues(values.begin() + offset, values.begin() + end);
+    blockCount++;
 
     // TODO: Implement bool encoded
     writeBlock(seriesType, seriesId, blockTimestamps, blockValues, indexEntry);
@@ -47,7 +57,7 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const std::string &seriesId
 }
 
 template <class T>
-void TSMWriter::writeBlock(TSMValueType seriesType, const std::string &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values, TSMIndexEntry &indexEntry){
+void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values, TSMIndexEntry &indexEntry){
   size_t blockStartOffset = buffer.size();
   AlignedBuffer encodedTimestamps = IntegerEncoder::encode(timestamps);
 
@@ -96,13 +106,9 @@ void TSMWriter::writeIndex(){
   size_t indexStartOffset = buffer.size();
 
   for(auto const& indexEntry: indexEntries){
-    // Key length
-    uint16_t seriesIdLength = indexEntry.seriesId.length();
-    buffer.write(seriesIdLength);
-
-    // Key value as string
-    std::string seriesId = indexEntry.seriesId;
-    buffer.write(seriesId);
+    // Write SeriesId128 as 16 bytes (no length prefix needed since it's fixed size)
+    std::string seriesIdBytes = indexEntry.seriesId.toBytes();
+    buffer.write(seriesIdBytes);
 
     // Block type
     buffer.write((uint8_t)indexEntry.seriesType);  // uint8_t fieldType
@@ -129,38 +135,69 @@ void TSMWriter::close(){
 }
 
 void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename){
+  std::cerr << "[TSM_WRITER] Starting TSM write to file: " << filename << std::endl;
+  std::cerr << "[TSM_WRITER] Memory store has " << store.get()->series.size() << " series" << std::endl;
+  
   TSMWriter writer(filename);
+  size_t seriesProcessed = 0;
+  size_t totalPoints = 0;
 
-  for (auto& [seriesId, memStore] : store.get()->series){
+  for (auto& [seriesKey, memStore] : store.get()->series){
     TSMValueType seriesType = (TSMValueType) memStore.index();
     
-    switch(seriesType){
-      case TSMValueType::Float: {
-        auto series = std::get<InMemorySeries<double>>(memStore);
-        series.sort();
-        writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+    size_t seriesPoints = std::visit([](const auto& s) { return s.timestamps.size(); }, memStore);
+    std::cerr << "[TSM_WRITER] Processing series '" << seriesKey.toHex() << "' with " << seriesPoints << " points, type=" << static_cast<int>(seriesType) << std::endl;
+    
+    // seriesKey is now SeriesId128
+    SeriesId128 seriesId = seriesKey;
+    
+    try {
+      switch(seriesType){
+        case TSMValueType::Float: {
+          auto series = std::get<InMemorySeries<double>>(memStore);
+          std::cerr << "[TSM_WRITER] Sorting float series '" << seriesKey.toHex() << "'" << std::endl;
+          series.sort();
+          std::cerr << "[TSM_WRITER] Writing float series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
+        case TSMValueType::Boolean: {
+          auto series = std::get<InMemorySeries<bool>>(memStore);
+          std::cerr << "[TSM_WRITER] Sorting bool series '" << seriesKey.toHex() << "'" << std::endl;
+          series.sort();
+          std::cerr << "[TSM_WRITER] Writing bool series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
+        case TSMValueType::String: {
+          auto series = std::get<InMemorySeries<std::string>>(memStore);
+          std::cerr << "[TSM_WRITER] Sorting string series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          series.sort();
+          std::cerr << "[TSM_WRITER] Writing string series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
       }
-      break;
-      case TSMValueType::Boolean: {
-        auto series = std::get<InMemorySeries<bool>>(memStore);
-        series.sort();
-        writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
-      }
-      break;
-      case TSMValueType::String: {
-        auto series = std::get<InMemorySeries<std::string>>(memStore);
-        series.sort();
-        writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
-      }
-      break;
+    } catch (const std::bad_alloc& e) {
+      std::cerr << "[TSM_WRITER] BAD_ALLOC when processing series '" << seriesKey.toHex() << "' with " << seriesPoints << " points" << std::endl;
+      throw;
+    } catch (const std::exception& e) {
+      std::cerr << "[TSM_WRITER] ERROR processing series '" << seriesKey.toHex() << "': " << e.what() << std::endl;
+      throw;
     }
+    
+    seriesProcessed++;
+    totalPoints += seriesPoints;
   }
 
+  std::cerr << "[TSM_WRITER] Writing index..." << std::endl;
   writer.writeIndex();
+  std::cerr << "[TSM_WRITER] Closing file..." << std::endl;
   writer.close();
+  std::cerr << "[TSM_WRITER] TSM write complete. Processed " << seriesProcessed << " series with " << totalPoints << " total points" << std::endl;
 }
 
 // Template instantiations
-template void TSMWriter::writeSeries<double>(TSMValueType seriesType, const std::string &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<double> &values);
-template void TSMWriter::writeSeries<bool>(TSMValueType seriesType, const std::string &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<bool> &values);
-template void TSMWriter::writeSeries<std::string>(TSMValueType seriesType, const std::string &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<std::string> &values);
+template void TSMWriter::writeSeries<double>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<double> &values);
+template void TSMWriter::writeSeries<bool>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<bool> &values);
+template void TSMWriter::writeSeries<std::string>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<std::string> &values);

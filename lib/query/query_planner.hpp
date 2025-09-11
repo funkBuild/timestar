@@ -4,6 +4,7 @@
 #include "query_parser.hpp"
 #include "leveldb_index.hpp"
 #include "series_matcher.hpp"
+#include "series_id.hpp"
 #include <vector>
 #include <map>
 #include <set>
@@ -16,7 +17,7 @@ namespace tsdb {
 // Represents a query to be executed on a specific shard
 struct ShardQuery {
     unsigned shardId;
-    std::vector<uint64_t> seriesIds;      // Series IDs to query on this shard
+    std::vector<SeriesId128> seriesIds;   // Series IDs to query on this shard
     std::set<std::string> fields;         // Fields to retrieve
     uint64_t startTime;
     uint64_t endTime;
@@ -59,18 +60,18 @@ public:
     
 private:
     // Find all series IDs matching the query filters
-    seastar::future<std::map<unsigned, std::vector<uint64_t>>> findMatchingSeriesIds(
+    seastar::future<std::map<unsigned, std::vector<SeriesId128>>> findMatchingSeriesIds(
         const QueryRequest& request,
         seastar::sharded<LevelDBIndex>* indexSharded);
     
     // Synchronous version for testing
-    std::map<unsigned, std::vector<uint64_t>> findMatchingSeriesIdsSync(
+    std::map<unsigned, std::vector<SeriesId128>> findMatchingSeriesIdsSync(
         const QueryRequest& request,
         LevelDBIndex* index);
     
     // Map series IDs to their respective shards
-    std::map<unsigned, std::vector<uint64_t>> mapSeriesToShards(
-        const std::vector<uint64_t>& seriesIds,
+    std::map<unsigned, std::vector<SeriesId128>> mapSeriesToShards(
+        const std::vector<SeriesId128>& seriesIds,
         const std::string& measurement,
         const std::map<std::string, std::string>& tags,
         const std::vector<std::string>& fields);

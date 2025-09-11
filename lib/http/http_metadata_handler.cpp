@@ -3,6 +3,7 @@
 #include <seastar/core/smp.hh>
 #include <unordered_map>
 #include <algorithm>
+#include <optional>
 
 // Response struct definitions for Glaze serialization
 struct ErrorInfo {
@@ -39,6 +40,7 @@ struct FieldInfo {
 struct FieldsResponse {
     std::string measurement;
     std::unordered_map<std::string, FieldInfo> fields;
+    std::optional<std::unordered_map<std::string, std::string>> filtered_by;
 };
 
 HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharded)
@@ -49,8 +51,8 @@ HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharde
 void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
     // /measurements endpoint
     auto measurementsHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) 
-            -> seastar::future<std::unique_ptr<seastar::httpd::reply>> {
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) 
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
             return handleMeasurements(std::move(req));
         }, "json"
     );
@@ -58,8 +60,8 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
     
     // /tags endpoint
     auto tagsHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) 
-            -> seastar::future<std::unique_ptr<seastar::httpd::reply>> {
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) 
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
             return handleTags(std::move(req));
         }, "json"
     );
@@ -67,8 +69,8 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
     
     // /fields endpoint
     auto fieldsHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) 
-            -> seastar::future<std::unique_ptr<seastar::httpd::reply>> {
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) 
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
             return handleFields(std::move(req));
         }, "json"
     );
@@ -77,9 +79,9 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
     tsdb::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields");
 }
 
-seastar::future<std::unique_ptr<seastar::httpd::reply>> 
-HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::httpd::request> req) {
-    auto rep = std::make_unique<seastar::httpd::reply>();
+seastar::future<std::unique_ptr<seastar::http::reply>> 
+HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::http::request> req) {
+    auto rep = std::make_unique<seastar::http::reply>();
     
     try {
         tsdb::http_log.debug("Processing /measurements request");
@@ -124,7 +126,7 @@ HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::httpd::request>
         }
         
         // Format response
-        rep->set_status(seastar::httpd::reply::status_type::ok);
+        rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = formatMeasurementsResponse(measurements, totalCount);
         rep->add_header("Content-Type", "application/json");
         
@@ -132,7 +134,7 @@ HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::httpd::request>
         
     } catch (const std::exception& e) {
         tsdb::http_log.error("Error processing /measurements: {}", e.what());
-        rep->set_status(seastar::httpd::reply::status_type::internal_server_error);
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
         rep->add_header("Content-Type", "application/json");
     }
@@ -140,14 +142,14 @@ HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::httpd::request>
     co_return rep;
 }
 
-seastar::future<std::unique_ptr<seastar::httpd::reply>> 
-HttpMetadataHandler::handleTags(std::unique_ptr<seastar::httpd::request> req) {
-    auto rep = std::make_unique<seastar::httpd::reply>();
+seastar::future<std::unique_ptr<seastar::http::reply>> 
+HttpMetadataHandler::handleTags(std::unique_ptr<seastar::http::request> req) {
+    auto rep = std::make_unique<seastar::http::reply>();
     
     try {
         std::string measurement = req->get_query_param("measurement");
         if (measurement.empty()) {
-            rep->set_status(seastar::httpd::reply::status_type::bad_request);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
             rep->add_header("Content-Type", "application/json");
             co_return rep;
@@ -185,7 +187,7 @@ HttpMetadataHandler::handleTags(std::unique_ptr<seastar::httpd::request> req) {
             std::sort(tagsResult[tagKey].begin(), tagsResult[tagKey].end());
         }
         
-        rep->set_status(seastar::httpd::reply::status_type::ok);
+        rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = formatTagsResponse(measurement, tagsResult, specificTag);
         rep->add_header("Content-Type", "application/json");
         
@@ -193,7 +195,7 @@ HttpMetadataHandler::handleTags(std::unique_ptr<seastar::httpd::request> req) {
         
     } catch (const std::exception& e) {
         tsdb::http_log.error("Error processing /tags: {}", e.what());
-        rep->set_status(seastar::httpd::reply::status_type::internal_server_error);
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
         rep->add_header("Content-Type", "application/json");
     }
@@ -201,20 +203,41 @@ HttpMetadataHandler::handleTags(std::unique_ptr<seastar::httpd::request> req) {
     co_return rep;
 }
 
-seastar::future<std::unique_ptr<seastar::httpd::reply>> 
-HttpMetadataHandler::handleFields(std::unique_ptr<seastar::httpd::request> req) {
-    auto rep = std::make_unique<seastar::httpd::reply>();
+seastar::future<std::unique_ptr<seastar::http::reply>> 
+HttpMetadataHandler::handleFields(std::unique_ptr<seastar::http::request> req) {
+    auto rep = std::make_unique<seastar::http::reply>();
     
     try {
         std::string measurement = req->get_query_param("measurement");
         if (measurement.empty()) {
-            rep->set_status(seastar::httpd::reply::status_type::bad_request);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
         
         tsdb::http_log.debug("Processing /fields request for measurement: {}", measurement);
+        
+        // Parse optional tags parameter for filtering
+        std::string tagsParam = req->get_query_param("tags");
+        std::unordered_map<std::string, std::string> tagFilters;
+        if (!tagsParam.empty()) {
+            // Parse tags in format "key1:value1,key2:value2"
+            size_t pos = 0;
+            while (pos < tagsParam.length()) {
+                size_t colonPos = tagsParam.find(':', pos);
+                if (colonPos == std::string::npos) break;
+                
+                size_t commaPos = tagsParam.find(',', colonPos);
+                if (commaPos == std::string::npos) commaPos = tagsParam.length();
+                
+                std::string key = tagsParam.substr(pos, colonPos - pos);
+                std::string value = tagsParam.substr(colonPos + 1, commaPos - colonPos - 1);
+                tagFilters[key] = value;
+                
+                pos = commaPos + 1;
+            }
+        }
         
         // Metadata is centralized on shard 0, so query only shard 0
         auto allFields = co_await engineSharded->invoke_on(0, [measurement](Engine& engine) -> seastar::future<std::set<std::string>> {
@@ -260,15 +283,15 @@ HttpMetadataHandler::handleFields(std::unique_ptr<seastar::httpd::request> req) 
             fieldsWithTypes[field] = fieldType;
         }
         
-        rep->set_status(seastar::httpd::reply::status_type::ok);
-        rep->_content = formatFieldsResponse(measurement, fieldsWithTypes);
+        rep->set_status(seastar::http::reply::status_type::ok);
+        rep->_content = formatFieldsResponse(measurement, fieldsWithTypes, tagFilters);
         rep->add_header("Content-Type", "application/json");
         
         tsdb::http_log.debug("Returning {} fields for measurement: {}", allFields.size(), measurement);
         
     } catch (const std::exception& e) {
         tsdb::http_log.error("Error processing /fields: {}", e.what());
-        rep->set_status(seastar::httpd::reply::status_type::internal_server_error);
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
         rep->add_header("Content-Type", "application/json");
     }
@@ -324,13 +347,18 @@ std::string HttpMetadataHandler::formatTagsResponse(const std::string& measureme
 }
 
 std::string HttpMetadataHandler::formatFieldsResponse(const std::string& measurement,
-                                                     const std::unordered_map<std::string, std::string>& fields) {
+                                                     const std::unordered_map<std::string, std::string>& fields,
+                                                     const std::unordered_map<std::string, std::string>& tagFilters) {
     FieldsResponse response;
     response.measurement = measurement;
     
     for (const auto& [fieldName, fieldType] : fields) {
         response.fields[fieldName].name = fieldName;
         response.fields[fieldName].type = fieldType;
+    }
+    
+    if (!tagFilters.empty()) {
+        response.filtered_by = tagFilters;
     }
     
     std::string buffer;

@@ -13,6 +13,24 @@ const now = Date.now() * 1000000; // Convert to nanoseconds
 // Test helpers
 const closeTo = (arr, tolerance = 5) => arr.map(a => expect.closeTo(a, tolerance));
 
+// Helper function to extract tag value from groupTags array
+const getTagValue = (groupTags, tagName) => {
+  if (!groupTags) return undefined;
+  const tag = groupTags.find(t => t.startsWith(`${tagName}=`));
+  return tag ? tag.split('=')[1] : undefined;
+};
+
+// Helper to convert groupTags array to object for easier access
+const groupTagsToObject = (groupTags) => {
+  if (!groupTags) return {};
+  const obj = {};
+  groupTags.forEach(tag => {
+    const [key, value] = tag.split('=');
+    obj[key] = value;
+  });
+  return obj;
+};
+
 const average = (...arrs) => {
   const len = arrs[0].length;
   const out = Array(len).fill(0);
@@ -346,7 +364,7 @@ describe('Comprehensive TSDB Query Tests', () => {
       const result = await query(`avg:${testMeasurement}.moisture(value1,value2,value3){paddock:back-paddock}`);
       
       expect(result.status).toBe('success');
-      expect(result.scopes).toEqual([{ name: 'paddock', value: 'back-paddock' }]);
+      // Scopes are no longer at top level per new format
       expect(result.series.length).toBe(1);
       
       // Should only average aaaaa and bbbbb (both in back-paddock)
@@ -366,14 +384,15 @@ describe('Comprehensive TSDB Query Tests', () => {
       // Should have 2 series (aaaaa and bbbbb in back-paddock)
       expect(result.series.length).toBe(2);
       
-      const deviceIds = result.series.map(s => s.tags.deviceId).sort();
+      const deviceIds = result.series.map(s => getTagValue(s.groupTags, 'deviceId')).sort();
       expect(deviceIds).toEqual(['aaaaa', 'bbbbb']);
       
       // Check values for each device
       result.series.forEach(series => {
-        if (series.tags.deviceId === 'aaaaa') {
+        const deviceId = getTagValue(series.groupTags, 'deviceId');
+        if (deviceId === 'aaaaa') {
           expect(series.fields.value1.values).toEqual(closeTo(createTestFieldData(100, 1)));
-        } else if (series.tags.deviceId === 'bbbbb') {
+        } else if (deviceId === 'bbbbb') {
           expect(series.fields.value1.values).toEqual(closeTo(createTestFieldData(100, 4)));
         }
       });
@@ -386,7 +405,7 @@ describe('Comprehensive TSDB Query Tests', () => {
       // Should have 3 series (all devices)
       expect(result.series.length).toBe(3);
       
-      const deviceIds = result.series.map(s => s.tags.deviceId).sort();
+      const deviceIds = result.series.map(s => getTagValue(s.groupTags, 'deviceId')).sort();
       expect(deviceIds).toEqual(['aaaaa', 'bbbbb', 'ccccc']);
     });
     
@@ -399,8 +418,8 @@ describe('Comprehensive TSDB Query Tests', () => {
       
       // Each series should have both tags
       result.series.forEach(series => {
-        expect(series.tags.paddock).toBeDefined();
-        expect(series.tags.deviceId).toBeDefined();
+        expect(getTagValue(series.groupTags, 'paddock')).toBeDefined();
+        expect(getTagValue(series.groupTags, 'deviceId')).toBeDefined();
       });
     });
   });
@@ -569,7 +588,7 @@ describe('Comprehensive TSDB Query Tests', () => {
       expect(result2.series.length).toBe(4); // aaaaa, bbbbb, ccccc, zzzzzz
       
       // Verify new device is in results
-      const deviceIds = result2.series.map(s => s.tags.deviceId);
+      const deviceIds = result2.series.map(s => getTagValue(s.groupTags, 'deviceId'));
       expect(deviceIds).toContain('zzzzzz');
     });
   });

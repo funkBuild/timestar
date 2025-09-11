@@ -6,6 +6,7 @@
 #include <glaze/glaze.hpp>
 
 #include "engine.hpp"
+#include "series_id.hpp"
 
 // Forward declaration for Glaze structure
 struct GlazeDeleteRequest;

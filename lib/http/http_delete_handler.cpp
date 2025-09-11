@@ -116,7 +116,10 @@ std::string HttpDeleteHandler::createErrorResponse(const std::string& error) {
     auto response = glz::obj{"status", "error", "error", error};
     
     std::string buffer;
-    glz::write_json(response, buffer);
+    auto ec = glz::write_json(response, buffer);
+    if (ec) {
+        return R"({"status":"error","error":"Failed to serialize error response"})";
+    }
     return buffer;
 }
 
@@ -125,7 +128,10 @@ std::string HttpDeleteHandler::createSuccessResponse(int deletedCount, int total
     auto response = glz::obj{"status", "success", "deleted", deletedCount, "total", totalRequests};
     
     std::string buffer;
-    glz::write_json(response, buffer);
+    auto ec = glz::write_json(response, buffer);
+    if (ec) {
+        return R"({"status":"error","error":"Failed to serialize success response"})";
+    }
     return buffer;
 }
 
@@ -133,6 +139,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>>
 HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
+    
+    tsdb::http_log.info("[DELETE_HANDLER] Received delete request");
+    tsdb::http_log.info("[DELETE_HANDLER] Request body: {}", req->content);
     
     try {
         // Parse JSON body using Glaze
@@ -178,48 +187,18 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
         int totalPointsDeleted = 0;
         std::vector<std::string> allDeletedSeries;
         
+        tsdb::http_log.info("[DELETE_HANDLER] Processing {} delete requests", deleteRequests.size());
+        
         for (const auto& delReq : deleteRequests) {
+            tsdb::http_log.info("[DELETE_HANDLER] Delete request: measurement={}, tags={}, fields={}, startTime={}, endTime={}", 
+                               delReq.measurement, delReq.tags.size(), delReq.fields.size(), delReq.startTime, delReq.endTime);
             if (delReq.isPattern) {
                 // Pattern-based deletion
                 std::vector<Engine::DeleteResult> shardResults;
                 
-                // If we have exact tags and specific fields, we can target specific shards
-                if (!delReq.tags.empty() && !delReq.fields.empty()) {
-                    // Target specific shards for each field
-                    std::set<size_t> targetShards;
-                    
-                    for (const auto& field : delReq.fields) {
-                        // Build series key for sharding (same logic as write handler)
-                        std::string seriesKey = delReq.measurement;
-                        for (const auto& [tagKey, tagValue] : delReq.tags) {
-                            seriesKey += "," + tagKey + "=" + tagValue;
-                        }
-                        seriesKey += "," + field;
-                        
-                        // Calculate target shard
-                        size_t shard = std::hash<std::string>{}(seriesKey) % seastar::smp::count;
-                        targetShards.insert(shard);
-                    }
-                    
-                    // Execute on target shards only
-                    for (size_t shard : targetShards) {
-                        // Create delete request for Engine
-                        Engine::DeleteRequest engineReq;
-                        engineReq.measurement = delReq.measurement;
-                        engineReq.tags = delReq.tags;
-                        engineReq.fields = delReq.fields;
-                        engineReq.startTime = delReq.startTime;
-                        engineReq.endTime = delReq.endTime;
-                        
-                        auto result = co_await engineSharded->invoke_on(shard, [engineReq](Engine& engine) -> seastar::future<Engine::DeleteResult> {
-                            co_return co_await engine.deleteByPattern(engineReq);
-                        });
-                        
-                        if (result.seriesDeleted > 0) {
-                            shardResults.push_back(result);
-                        }
-                    }
-                } else {
+                // Always query shard 0 first for metadata, regardless of whether we have specific tags/fields
+                // This ensures we use the centralized metadata
+                if (true) {  // Changed from if (!delReq.tags.empty() && !delReq.fields.empty()) to always use this path
                     // First query shard 0 for metadata to find matching series
                     auto matchingSeries = co_await engineSharded->invoke_on(0, 
                         [measurement = delReq.measurement, tags = delReq.tags, fields = delReq.fields]
@@ -228,7 +207,7 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                             std::vector<std::pair<std::string, size_t>> seriesWithShards;
                             
                             // Find all series IDs that match the pattern
-                            std::vector<uint64_t> seriesIds;
+                            std::vector<SeriesId128> seriesIds;
                             if (tags.empty()) {
                                 seriesIds = co_await index.getAllSeriesForMeasurement(measurement);
                             } else {
@@ -236,7 +215,7 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                             }
                             
                             // Get metadata for each series to check field filters and determine shard
-                            for (uint64_t seriesId : seriesIds) {
+                            for (const SeriesId128& seriesId : seriesIds) {
                                 auto metadata = co_await index.getSeriesMetadata(seriesId);
                                 if (!metadata.has_value()) {
                                     continue;
@@ -261,8 +240,9 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                                 temp.tags = metadata->tags;
                                 std::string seriesKey = temp.seriesKey();
                                 
-                                // Calculate target shard for this series
-                                size_t shard = std::hash<std::string>{}(seriesKey) % seastar::smp::count;
+                                // Calculate target shard for this series using SeriesId128
+                                SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(seriesKey);
+                                size_t shard = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;
                                 seriesWithShards.push_back({seriesKey, shard});
                             }
                             
@@ -315,12 +295,11 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                 for (const auto& [tagKey, tagValue] : delReq.tags) {
                     fullSeriesKey += "," + tagKey + "=" + tagValue;
                 }
-                fullSeriesKey += "," + delReq.field;
+                fullSeriesKey += " " + delReq.field; // Use space separator consistent with write handler
                 
-                // Hash the full series key to determine shard
-                std::hash<std::string> hasher;
-                size_t hash = hasher(fullSeriesKey);
-                unsigned targetShard = hash % seastar::smp::count;
+                // Hash the full series key to determine shard using SeriesId128
+                SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(fullSeriesKey);
+                unsigned targetShard = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;
                 
                 // Execute delete on the target shard
                 bool deleted = co_await engineSharded->invoke_on(targetShard,
@@ -340,10 +319,9 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                     allDeletedSeries.push_back(fullSeriesKey);
                 }
             } else if (!delReq.isStructured) {
-                // Series key delete - determine shard
-                std::hash<std::string> hasher;
-                size_t hash = hasher(delReq.seriesKey);
-                unsigned targetShard = hash % seastar::smp::count;
+                // Series key delete - determine shard using SeriesId128
+                SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(delReq.seriesKey);
+                unsigned targetShard = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;
                 
                 // Execute delete on the target shard
                 bool deleted = co_await engineSharded->invoke_on(targetShard,
@@ -392,7 +370,7 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
 
 void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) -> seastar::future<std::unique_ptr<seastar::httpd::reply>> {
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
             // We don't use the provided reply, create our own
             return handleDelete(std::move(req));
         },

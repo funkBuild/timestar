@@ -4,6 +4,7 @@
 #include "memory_store.hpp"
 #include "aligned_buffer.hpp"
 #include "tsm.hpp"
+#include "series_id.hpp"
 
 #include <iostream>
 #include <vector>
@@ -24,9 +25,9 @@ public:
   TSMWriter(std::string _filename);
 
   template <class T>
-  void writeSeries(TSMValueType seriesType, const std::string &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values);
+  void writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values);
   template <class T>
-  void writeBlock(TSMValueType seriesType, const std::string &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values, TSMIndexEntry &indexEntry);
+  void writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values, TSMIndexEntry &indexEntry);
   void writeIndex();
   void writeIndexBlock(const std::vector<uint64_t> &timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset);
   void close();

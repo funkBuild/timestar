@@ -115,15 +115,20 @@ TEST_F(AggregatorTest, AggregateMultipleSeries) {
     
     auto result = Aggregator::aggregateMultiple(series, AggregationMethod::AVG, 0);
     
-    ASSERT_EQ(result.size(), 1);
-    // Should average all values: (10+20+30+15+25+35)/6 = 22.5
-    // But actually it merges by timestamp and averages duplicate timestamps
-    // So we get: timestamp 1000000000: 10.0
-    //           timestamp 2000000000: (20.0+15.0)/2 = 17.5
-    //           timestamp 3000000000: (30.0+25.0)/2 = 27.5
-    //           timestamp 4000000000: 35.0
-    // Average of all: (10.0 + 17.5 + 27.5 + 35.0)/4 = 22.5
-    EXPECT_DOUBLE_EQ(result[0].value, 22.5);
+    // With no interval, should return per-timestamp aggregation
+    ASSERT_EQ(result.size(), 4);
+    // timestamp 1000000000: 10.0 (only from series 1)
+    EXPECT_EQ(result[0].timestamp, 1000000000);
+    EXPECT_DOUBLE_EQ(result[0].value, 10.0);
+    // timestamp 2000000000: (20.0+15.0)/2 = 17.5 (both series)
+    EXPECT_EQ(result[1].timestamp, 2000000000);
+    EXPECT_DOUBLE_EQ(result[1].value, 17.5);
+    // timestamp 3000000000: (30.0+25.0)/2 = 27.5 (both series)
+    EXPECT_EQ(result[2].timestamp, 3000000000);
+    EXPECT_DOUBLE_EQ(result[2].value, 27.5);
+    // timestamp 4000000000: 35.0 (only from series 2)
+    EXPECT_EQ(result[3].timestamp, 4000000000);
+    EXPECT_DOUBLE_EQ(result[3].value, 35.0);
 }
 
 TEST_F(AggregatorTest, GroupByAggregation) {
@@ -152,15 +157,15 @@ TEST_F(AggregatorTest, GroupByAggregation) {
     EXPECT_TRUE(result.find("us-west") != result.end());
     EXPECT_TRUE(result.find("us-east") != result.end());
     
-    // Check us-west average
+    // Check us-west result (should have 10 timestamps, each with their own value)
     auto westResult = result["us-west"];
-    ASSERT_EQ(westResult.size(), 1);
-    EXPECT_DOUBLE_EQ(westResult[0].value, 19.0);
+    ASSERT_EQ(westResult.size(), 10);
+    EXPECT_DOUBLE_EQ(westResult[0].value, 10.0); // First value from timestamps/values
     
-    // Check us-east average
+    // Check us-east result (should have 10 timestamps, each with their own value)
     auto eastResult = result["us-east"];
-    ASSERT_EQ(eastResult.size(), 1);
-    EXPECT_DOUBLE_EQ(eastResult[0].value, 33.5); // Average of 20, 23, 26, 29, 32, 35, 38, 41, 44, 47
+    ASSERT_EQ(eastResult.size(), 10);
+    EXPECT_DOUBLE_EQ(eastResult[0].value, 20.0); // First value: 20.0 + 0 * 3.0
 }
 
 TEST_F(AggregatorTest, TimeIntervalWithMax) {

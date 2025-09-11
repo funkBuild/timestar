@@ -4,6 +4,7 @@
 
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/series_id.hpp"
 
 class MemoryStoreTest : public ::testing::Test {
 protected:
@@ -27,13 +28,14 @@ TEST_F(MemoryStoreTest, InsertFloatValues) {
     
     // Verify series exists
     auto seriesKey = insert.seriesKey();
-    auto seriesType = store->getSeriesType(seriesKey);
+    SeriesId128 seriesId = insert.seriesId128();
+    auto seriesType = store->getSeriesType(seriesId);
     
     ASSERT_TRUE(seriesType.has_value());
     EXPECT_EQ(seriesType.value(), TSMValueType::Float);
     
     // Verify data was inserted
-    auto it = store->series.find(seriesKey);
+    auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
     
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
@@ -54,13 +56,14 @@ TEST_F(MemoryStoreTest, InsertBooleanValues) {
     
     // Verify series exists
     auto seriesKey = insert.seriesKey();
-    auto seriesType = store->getSeriesType(seriesKey);
+    SeriesId128 seriesId = insert.seriesId128();
+    auto seriesType = store->getSeriesType(seriesId);
     
     ASSERT_TRUE(seriesType.has_value());
     EXPECT_EQ(seriesType.value(), TSMValueType::Boolean);
     
     // Verify data was inserted
-    auto it = store->series.find(seriesKey);
+    auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
     
     auto& seriesData = std::get<InMemorySeries<bool>>(it->second);
@@ -91,17 +94,20 @@ TEST_F(MemoryStoreTest, MultipleSeries) {
     EXPECT_EQ(store->series.size(), 3);
     
     std::string temp1Key = temp1.seriesKey();
-    auto temp1Type = store->getSeriesType(temp1Key);
+    SeriesId128 temp1Id = temp1.seriesId128();
+    auto temp1Type = store->getSeriesType(temp1Id);
     ASSERT_TRUE(temp1Type.has_value());
     EXPECT_EQ(temp1Type.value(), TSMValueType::Float);
     
     std::string temp2Key = temp2.seriesKey();
-    auto temp2Type = store->getSeriesType(temp2Key);
+    SeriesId128 temp2Id = temp2.seriesId128();
+    auto temp2Type = store->getSeriesType(temp2Id);
     ASSERT_TRUE(temp2Type.has_value());
     EXPECT_EQ(temp2Type.value(), TSMValueType::Float);
     
     std::string doorKey = door.seriesKey();
-    auto doorType = store->getSeriesType(doorKey);
+    SeriesId128 doorId = door.seriesId128();
+    auto doorType = store->getSeriesType(doorId);
     ASSERT_TRUE(doorType.has_value());
     EXPECT_EQ(doorType.value(), TSMValueType::Boolean);
 }
@@ -121,7 +127,8 @@ TEST_F(MemoryStoreTest, AppendToExistingSeries) {
     
     // Verify all values exist
     auto seriesKey = insert1.seriesKey();
-    auto it = store->series.find(seriesKey);
+    SeriesId128 seriesId = insert1.seriesId128();
+    auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
     
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
@@ -132,7 +139,8 @@ TEST_F(MemoryStoreTest, AppendToExistingSeries) {
 
 TEST_F(MemoryStoreTest, NonExistentSeries) {
     std::string nonExistent = "non.existent series";
-    auto seriesType = store->getSeriesType(nonExistent);
+    SeriesId128 nonExistentId = SeriesId128::fromSeriesKey(nonExistent);
+    auto seriesType = store->getSeriesType(nonExistentId);
     EXPECT_FALSE(seriesType.has_value());
 }
 
@@ -166,7 +174,8 @@ TEST_F(MemoryStoreTest, SeriesKeyFormat) {
     
     store->insertMemory(insert);
     
-    auto it = store->series.find(seriesKey);
+    SeriesId128 seriesId = insert.seriesId128();
+    auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
 }
 
@@ -183,7 +192,8 @@ TEST_F(MemoryStoreTest, SortingTimestamps) {
     store->insertMemory(insert);
     
     auto seriesKey = insert.seriesKey();
-    auto it = store->series.find(seriesKey);
+    SeriesId128 seriesId = insert.seriesId128();
+    auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
     
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);

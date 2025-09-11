@@ -8,6 +8,7 @@
 
 #include "engine.hpp"
 #include "tsdb_value.hpp"
+#include "series_id.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -95,6 +96,37 @@ private:
         std::vector<uint64_t> timestamps;  // Array of timestamps
     };
     
+    // Structure for coalescing multiple individual writes into array writes
+    struct CoalesceCandidate {
+        std::string seriesKey;  // measurement + tags + field for grouping
+        std::string measurement;
+        std::map<std::string, std::string> tags;
+        std::string fieldName;
+        TSMValueType valueType;
+        std::vector<uint64_t> timestamps;
+        
+        // Value storage by type (only one will be used based on valueType)
+        std::vector<double> doubleValues;
+        std::vector<bool> boolValues;
+        std::vector<std::string> stringValues;
+        
+        // Helper to add a value with timestamp
+        void addValue(uint64_t timestamp, double value) {
+            timestamps.push_back(timestamp);
+            doubleValues.push_back(value);
+        }
+        
+        void addValue(uint64_t timestamp, bool value) {
+            timestamps.push_back(timestamp);
+            boolValues.push_back(value);
+        }
+        
+        void addValue(uint64_t timestamp, const std::string& value) {
+            timestamps.push_back(timestamp);
+            stringValues.push_back(value);
+        }
+    };
+    
     // Parse a single write point from JSON string
     WritePoint parseWritePoint(const std::string& json);
     
@@ -110,6 +142,9 @@ private:
     // Validate that all field arrays have the same length as timestamps
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);
     
+    // Coalesce multiple individual writes into efficient array writes
+    std::vector<MultiWritePoint> coalesceWrites(const glz::json_t::array_t& writes_array);
+    
     // Create error response JSON
     std::string createErrorResponse(const std::string& error);
     
@@ -120,8 +155,8 @@ public:
     HttpWriteHandler(seastar::sharded<Engine>* _engineSharded);
     
     // Main handler for write requests
-    seastar::future<std::unique_ptr<seastar::httpd::reply>> handleWrite(
-        std::unique_ptr<seastar::httpd::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleWrite(
+        std::unique_ptr<seastar::http::request> req);
     
     // Register routes with HTTP server
     void registerRoutes(seastar::httpd::routes& r);

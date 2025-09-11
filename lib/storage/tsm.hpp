@@ -4,6 +4,7 @@
 #include "query_result.hpp"
 #include "tsm_result.hpp"
 #include "tsm_tombstone.hpp"
+#include "series_id.hpp"
 
 #include <string>
 #include <memory>
@@ -26,7 +27,7 @@ typedef struct TSMIndexBlock {
 } TSMIndexBlock;
 
 typedef struct TSMIndexEntry {
-  std::string seriesId;
+  SeriesId128 seriesId;
   TSMValueType seriesType;
   std::vector<TSMIndexBlock> indexBlocks;
 
@@ -43,7 +44,7 @@ private:
   uint64_t length = 0;
 
   // TODO: Test using tsl::htrie_map to save memory
-  std::unordered_map<std::string, TSMIndexEntry> index;
+  std::unordered_map<SeriesId128, TSMIndexEntry> index;
   
   // Tombstone support
   std::unique_ptr<tsdb::TSMTombstone> tombstones;
@@ -93,19 +94,19 @@ public:
 
   seastar::future<> readIndex();
   template <class T>
-  seastar::future<> readSeries(std::string seriesKey, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
+  seastar::future<> readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   template <class T>
   seastar::future<> readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
-  std::optional<TSMValueType> getSeriesType(std::string &seriesKey);
+  std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
   
-  // Get all series keys in this file (for compaction)
-  std::vector<std::string> getSeriesKeys() const {
-    std::vector<std::string> keys;
-    keys.reserve(index.size());
-    for (const auto& [key, entry] : index) {
-      keys.push_back(key);
+  // Get all series IDs in this file (for compaction)
+  std::vector<SeriesId128> getSeriesIds() const {
+    std::vector<SeriesId128> ids;
+    ids.reserve(index.size());
+    for (const auto& [id, entry] : index) {
+      ids.push_back(id);
     }
-    return keys;
+    return ids;
   }
   
   // Get file size for compaction planning
@@ -127,14 +128,14 @@ public:
   
   // Delete range with verification
   seastar::future<bool> deleteRange(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime
   );
   
   // Check if series exists in time range (for verification)
   bool hasSeriesInTimeRange(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime
   ) const;
@@ -148,7 +149,7 @@ public:
   // Query with tombstone filtering
   template <class T>
   seastar::future<TSMResult<T>> queryWithTombstones(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime
   );
@@ -160,8 +161,8 @@ public:
   // Delete tombstone file after compaction
   seastar::future<> deleteTombstoneFile();
   
-  // Convert series key to ID for tombstones
-  uint64_t getSeriesId(const std::string& seriesKey) const;
+  // Get series ID hash for tombstone compatibility
+  uint64_t getSeriesIdHash(const SeriesId128& seriesId) const;
 };
 
 #endif

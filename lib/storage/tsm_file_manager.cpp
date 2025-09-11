@@ -3,6 +3,7 @@
 #include "tsm_writer.hpp"
 #include "util.hpp"
 #include "logger.hpp"
+#include "series_id.hpp"
 
 #include <seastar/core/thread.hh>
 #include <seastar/core/reactor.hh>
@@ -84,8 +85,11 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
 std::optional<TSMValueType> TSMFileManager::getSeriesType(std::string &seriesKey){
   std::optional<TSMValueType> seriesType;
 
+  // Convert series key to SeriesId128 for TSM operations
+  SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+  
   for (auto const &[seqNum, tsmFile] : sequencedTsmFiles){
-    seriesType = tsmFile.get()->getSeriesType(seriesKey);
+    seriesType = tsmFile.get()->getSeriesType(seriesId);
 
     if(seriesType)
       return seriesType;

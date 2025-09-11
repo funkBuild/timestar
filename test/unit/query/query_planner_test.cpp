@@ -155,8 +155,8 @@ TEST_F(QueryPlannerTest, SeriesKeyBuilding) {
         "value"
     );
     
-    // Should build consistent key with sorted tags
-    EXPECT_EQ(key, "temperature,location=us-west,sensor=temp-01,value");
+    // Should build consistent key with sorted tags and space separator for field
+    EXPECT_EQ(key, "temperature,location=us-west,sensor=temp-01 value");
     
     // Test with different tag order (should produce same key due to map sorting)
     std::map<std::string, std::string> tags;

@@ -101,7 +101,6 @@ The build system automatically selects the appropriate compiler:
 - Google Test (fetched automatically for tests)
 - Snappy compression library
 - LevelDB (install with `sudo apt install libleveldb-dev` on Ubuntu/Debian)
-- RapidJSON (install with `sudo apt install rapidjson-dev` on Ubuntu/Debian)
 - Threads library
 
 ## Data Storage

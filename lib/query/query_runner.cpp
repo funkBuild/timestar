@@ -4,6 +4,7 @@
 #include "memory_store.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "series_id.hpp"
 #include <map>
 #include <chrono>
 #include <numeric>
@@ -27,7 +28,9 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
       auto [tsmRank, tsmFile] = tsmTuple;
 
       // Use queryWithTombstones to automatically filter out deleted data
-      TSMResult<T> results = co_await tsmFile.get()->queryWithTombstones<T>(series, startTime, endTime);
+      // Convert series key to SeriesId128
+      SeriesId128 seriesId = SeriesId128::fromSeriesKey(series);
+      TSMResult<T> results = co_await tsmFile.get()->queryWithTombstones<T>(seriesId, startTime, endTime);
 
       if(results.empty())
         co_return;
@@ -45,7 +48,7 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
   // Now also query memory stores from WAL
   QueryResult<T> result = QueryResult<T>::fromTsmResults(tsmResults);
   
-  // Query memory stores - already filtered by queryMemoryStores via querySeriesFiltered
+  // Query memory stores - WAL replay ensures correct state without filtering
   auto memoryData = walFileManager->queryMemoryStores<T>(series);
   if (memoryData.has_value()) {
     // Filter by time range and add to results

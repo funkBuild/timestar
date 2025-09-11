@@ -57,7 +57,7 @@ QueryPlan QueryPlanner::createPlanSync(
     plan.groupByTags = request.groupByTags;
     
     // Find matching series IDs (synchronous version for testing)
-    std::map<unsigned, std::vector<uint64_t>> seriesByShardMap;
+    std::map<unsigned, std::vector<SeriesId128>> seriesByShardMap;
     
     // For testing, simulate finding series without actual index operations
     // This is just for unit testing the planner logic
@@ -93,29 +93,29 @@ QueryPlan QueryPlanner::createPlanSync(
     return plan;
 }
 
-seastar::future<std::map<unsigned, std::vector<uint64_t>>> 
+seastar::future<std::map<unsigned, std::vector<SeriesId128>>> 
 QueryPlanner::findMatchingSeriesIds(
     const QueryRequest& request,
     seastar::sharded<LevelDBIndex>* indexSharded) {
     
-    std::map<unsigned, std::vector<uint64_t>> result;
+    std::map<unsigned, std::vector<SeriesId128>> result;
     
     // Query each shard's index for matching series
-    std::vector<seastar::future<std::pair<unsigned, std::vector<uint64_t>>>> futures;
+    std::vector<seastar::future<std::pair<unsigned, std::vector<SeriesId128>>>> futures;
     
     unsigned shardCount = seastar::smp::count;
     if (shardCount == 0) shardCount = 1;  // Handle test environment
     
     for (unsigned shardId = 0; shardId < shardCount; ++shardId) {
         auto f = indexSharded->invoke_on(shardId, 
-            [request](LevelDBIndex& index) -> seastar::future<std::vector<uint64_t>> {
-                std::vector<uint64_t> allSeriesIds;
+            [request](LevelDBIndex& index) -> seastar::future<std::vector<SeriesId128>> {
+                std::vector<SeriesId128> allSeriesIds;
                 
                 // Get all series for this measurement, filtered by tags
                 if (request.scopes.empty()) {
                     // No tag filters, get all series for the measurement
                     co_await index.findSeries(request.measurement).then(
-                        [&allSeriesIds](std::vector<uint64_t> ids) {
+                        [&allSeriesIds](std::vector<SeriesId128> ids) {
                             allSeriesIds = std::move(ids);
                             return seastar::make_ready_future<>();
                         }
@@ -129,7 +129,7 @@ QueryPlanner::findMatchingSeriesIds(
                         co_await index.findSeriesByTag(request.measurement, 
                                                        firstTag->first, 
                                                        firstTag->second).then(
-                            [&allSeriesIds](std::vector<uint64_t> ids) {
+                            [&allSeriesIds](std::vector<SeriesId128> ids) {
                                 allSeriesIds = std::move(ids);
                                 return seastar::make_ready_future<>();
                             }
@@ -143,8 +143,8 @@ QueryPlanner::findMatchingSeriesIds(
                 
                 // Filter by requested fields if specific fields are requested
                 if (!request.requestsAllFields()) {
-                    std::vector<uint64_t> filteredIds;
-                    for (uint64_t seriesId : allSeriesIds) {
+                    std::vector<SeriesId128> filteredIds;
+                    for (const SeriesId128& seriesId : allSeriesIds) {
                         // Get metadata to check the field
                         auto metadata = co_await index.getSeriesMetadata(seriesId);
                         if (metadata.has_value()) {
@@ -159,7 +159,7 @@ QueryPlanner::findMatchingSeriesIds(
                 }
                 
                 co_return allSeriesIds;
-            }).then([shardId](std::vector<uint64_t> ids) {
+            }).then([shardId](std::vector<SeriesId128> ids) {
                 return std::make_pair(shardId, ids);
             });
         
@@ -178,12 +178,12 @@ QueryPlanner::findMatchingSeriesIds(
     co_return result;
 }
 
-std::map<unsigned, std::vector<uint64_t>> 
+std::map<unsigned, std::vector<SeriesId128>> 
 QueryPlanner::findMatchingSeriesIdsSync(
     const QueryRequest& request,
     LevelDBIndex* index) {
     
-    std::map<unsigned, std::vector<uint64_t>> result;
+    std::map<unsigned, std::vector<SeriesId128>> result;
     
     // If no index provided, use mock implementation for unit tests
     if (!index) {
@@ -200,13 +200,21 @@ QueryPlanner::findMatchingSeriesIdsSync(
             }
             
             // For each field, simulate a series ID
-            uint64_t mockSeriesId = 1000;
+            uint64_t mockId = 1000;
             for (const auto& field : queryFields) {
                 // Calculate which shard this series belongs to
                 unsigned shardId = calculateShardForSeries(
                     request.measurement, request.scopes, field);
                 
-                result[shardId].push_back(mockSeriesId++);
+                // Create a mock SeriesId128 from a proper series key
+                std::string mockSeriesKey = request.measurement;
+                for (const auto& [tagKey, tagValue] : request.scopes) {
+                    mockSeriesKey += "," + tagKey + "=" + tagValue;
+                }
+                mockSeriesKey += " " + field; // Use space separator consistently
+                SeriesId128 mockSeriesId = SeriesId128::fromSeriesKey(mockSeriesKey);
+                result[shardId].push_back(mockSeriesId);
+                mockId++;
             }
         }
         return result;
@@ -231,16 +239,16 @@ QueryPlanner::findMatchingSeriesIdsSync(
     return result;
 }
 
-std::map<unsigned, std::vector<uint64_t>> QueryPlanner::mapSeriesToShards(
-    const std::vector<uint64_t>& seriesIds,
+std::map<unsigned, std::vector<SeriesId128>> QueryPlanner::mapSeriesToShards(
+    const std::vector<SeriesId128>& seriesIds,
     const std::string& measurement,
     const std::map<std::string, std::string>& tags,
     const std::vector<std::string>& fields) {
     
-    std::map<unsigned, std::vector<uint64_t>> shardMap;
+    std::map<unsigned, std::vector<SeriesId128>> shardMap;
     
     // For each series ID, determine its shard
-    for (uint64_t seriesId : seriesIds) {
+    for (const SeriesId128& seriesId : seriesIds) {
         // In a real implementation, we would need to look up the series metadata
         // to determine which field this series ID corresponds to
         // For now, distribute based on series ID hash
@@ -248,7 +256,9 @@ std::map<unsigned, std::vector<uint64_t>> QueryPlanner::mapSeriesToShards(
         unsigned shardCount = seastar::smp::count;
         if (shardCount == 0) shardCount = 1;  // Handle test environment
         
-        unsigned shardId = seriesId % shardCount;
+        // Use the hash function from SeriesId128 for distribution
+        size_t hash = std::hash<SeriesId128>{}(seriesId);
+        unsigned shardId = hash % shardCount;
         shardMap[shardId].push_back(seriesId);
     }
     
@@ -260,13 +270,14 @@ unsigned QueryPlanner::calculateShardForSeries(
     const std::map<std::string, std::string>& tags,
     const std::string& field) {
     
-    // Build the series key and hash it to determine shard
+    // Build the series key and hash it to determine shard using SeriesId128
     std::string seriesKey = buildSeriesKeyForSharding(measurement, tags, field);
     
     unsigned shardCount = seastar::smp::count;
     if (shardCount == 0) shardCount = 1;  // Handle test environment
     
-    size_t hash = std::hash<std::string>{}(seriesKey);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+    size_t hash = SeriesId128::Hash{}(seriesId);
     return hash % shardCount;
 }
 
@@ -282,8 +293,8 @@ std::string QueryPlanner::buildSeriesKeyForSharding(
         seriesKey += "," + tagKey + "=" + tagValue;
     }
     
-    // Add field name
-    seriesKey += "," + field;
+    // Add field name with space separator (consistent with rest of system)
+    seriesKey += " " + field;
     
     return seriesKey;
 }

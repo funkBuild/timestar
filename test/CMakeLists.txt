@@ -23,6 +23,7 @@ set(SEASTAR_TESTS
     unit/storage/tsm_compactor_test.cpp
     unit/storage/tsm_tombstone_test.cpp
     unit/storage/tsm_string_test.cpp
+    unit/storage/wal_deletion_test.cpp
     unit/index/leveldb_index_test.cpp
     unit/index/leveldb_index_enhanced_test.cpp
     unit/index/leveldb_index_gtest.cpp
@@ -146,3 +147,6 @@ add_custom_target(test-perf
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running performance tests"
 )
+
+# Include subdirectories with standalone tests
+add_subdirectory(unit/storage)

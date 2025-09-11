@@ -7,9 +7,9 @@
 
 // Enable/disable logging in the insert (write) path
 // This includes WAL writes, memory store inserts, and TSM writes
-#ifndef TSDB_LOG_INSERT_PATH
+// #ifndef TSDB_LOG_INSERT_PATH
 #define TSDB_LOG_INSERT_PATH 1
-#endif
+// #endif
 
 // Enable/disable logging in the query (read) path
 // This includes query parsing, planning, execution, and result merging

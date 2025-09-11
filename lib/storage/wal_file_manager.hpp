@@ -23,6 +23,7 @@ private:
   TSMFileManager *tsmFileManager;
   seastar::pipe<seastar::shared_ptr<MemoryStore>> pendingWrites;
   seastar::semaphore compactionSemaphore{1}; // Only allow 1 compaction at a time
+  bool _shutdown_requested = false;
   
 public:
   WALFileManager();
@@ -30,31 +31,48 @@ public:
   seastar::future<> init(Engine &engine, TSMFileManager &_tsmFileManager);
   template <class T>
   seastar::future<> insert(TSDBInsert<T> &insertRequest);
+  template <class T>
+  seastar::future<> insertBatch(std::vector<TSDBInsert<T>> &insertRequests);
   seastar::future<> rolloverMemoryStore();
   seastar::future<> convertWalToTsm(seastar::shared_ptr<MemoryStore> store);
   seastar::future<> startTsmWriter();
   seastar::future<> close() {
-    // Ensure current memory store is properly flushed
-    if (!memoryStores.empty() && memoryStores[0]) {
-      co_await memoryStores[0]->close();
+    tsdb::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
+    _shutdown_requested = true;
+    
+    try {
+      // Send null value to signal background TSM writer to stop
+      tsdb::wal_log.info("[WAL_CLOSE] Signaling background TSM writer to stop on shard {}", shardId);
+      co_await pendingWrites.writer.write(seastar::shared_ptr<MemoryStore>{});
+      
+      // Ensure current memory store is properly flushed
+      if (!memoryStores.empty() && memoryStores[0]) {
+        tsdb::wal_log.info("[WAL_CLOSE] Closing current memory store {} on shard {}", 
+                           memoryStores[0]->sequenceNumber, shardId);
+        co_await memoryStores[0]->close();
+      }
+      tsdb::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
+    } catch (const std::exception& e) {
+      tsdb::wal_log.error("[WAL_CLOSE] Error during WAL close on shard {}: {}", shardId, e.what());
+      // Don't rethrow during shutdown to avoid hanging
     }
-    seastar::shared_ptr<MemoryStore> eofPtr = nullptr;
-    co_await pendingWrites.writer.write(std::move(eofPtr));
   }
   std::optional<TSMValueType> getSeriesType(std::string &seriesKey);
   
-  // Query memory stores for data (with delete filtering)
+  // Query memory stores for data (deletion filtering removed - WAL replay handles current state)
   template <class T>
   std::optional<InMemorySeries<T>> queryMemoryStores(const std::string& seriesKey) {
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     for (auto& memStore : memoryStores) {
-      // Use filtered query to exclude deleted data
-      auto result = memStore->querySeriesFiltered<T>(seriesKey);
+      // Direct query - no filtering needed since WAL replay maintains correct state
+      auto result = memStore->querySeries<T>(seriesId);
       if (result.has_value()) {
         return result;
       }
     }
     return std::nullopt;
   }
+  
   
   // Delete data from memory stores and write to WAL
   seastar::future<> deleteFromMemoryStores(const std::string& seriesKey, 

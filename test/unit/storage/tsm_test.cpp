@@ -9,6 +9,7 @@
 #include "../../../lib/encoding/float_encoder.hpp"
 #include "../../../lib/encoding/integer_encoder.hpp"
 #include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/series_id.hpp"
 
 namespace fs = std::filesystem;
 
@@ -43,7 +44,8 @@ TEST_F(TSMTest, BasicTSMWriterFloat) {
         values.push_back(100.0 + sin(i * 0.1) * 10.0);
     }
     
-    writer.writeSeries(TSMValueType::Float, "temperature.sensor1", timestamps, values);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("temperature.sensor1");
+    writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
     
@@ -66,7 +68,8 @@ TEST_F(TSMTest, BasicTSMWriterBoolean) {
         values.push_back(i % 2 == 0);
     }
     
-    writer.writeSeries(TSMValueType::Boolean, "status.online", timestamps, values);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("status.online");
+    writer.writeSeries(TSMValueType::Boolean, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
     
@@ -89,7 +92,8 @@ TEST_F(TSMTest, WriteMultipleSeries) {
         tempTimestamps.push_back(baseTime + i * 1000);
         tempValues.push_back(20.0 + i * 0.1);
     }
-    writer.writeSeries(TSMValueType::Float, "temperature.room1", tempTimestamps, tempValues);
+    SeriesId128 tempSeriesId = SeriesId128::fromSeriesKey("temperature.room1");
+    writer.writeSeries(TSMValueType::Float, tempSeriesId, tempTimestamps, tempValues);
     
     // Series 2: Humidity
     std::vector<uint64_t> humidTimestamps;
@@ -98,7 +102,8 @@ TEST_F(TSMTest, WriteMultipleSeries) {
         humidTimestamps.push_back(baseTime + i * 1000);
         humidValues.push_back(45.0 + i * 0.2);
     }
-    writer.writeSeries(TSMValueType::Float, "humidity.room1", humidTimestamps, humidValues);
+    SeriesId128 humidSeriesId = SeriesId128::fromSeriesKey("humidity.room1");
+    writer.writeSeries(TSMValueType::Float, humidSeriesId, humidTimestamps, humidValues);
     
     // Series 3: Door status
     std::vector<uint64_t> doorTimestamps;
@@ -107,7 +112,8 @@ TEST_F(TSMTest, WriteMultipleSeries) {
         doorTimestamps.push_back(baseTime + i * 5000);
         doorValues.push_back(i % 3 == 0);
     }
-    writer.writeSeries(TSMValueType::Boolean, "door.status", doorTimestamps, doorValues);
+    SeriesId128 doorSeriesId = SeriesId128::fromSeriesKey("door.status");
+    writer.writeSeries(TSMValueType::Boolean, doorSeriesId, doorTimestamps, doorValues);
     
     writer.writeIndex();
     writer.close();
@@ -136,7 +142,8 @@ TEST_F(TSMTest, LargeDataset) {
         values.push_back(distribution(generator));
     }
     
-    writer.writeSeries(TSMValueType::Float, "metrics.large", timestamps, values);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("metrics.large");
+    writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
     
@@ -168,7 +175,8 @@ TEST_F(TSMTest, BlockBoundaries) {
         values.push_back(i * 1.0);
     }
     
-    writer.writeSeries(TSMValueType::Float, "metrics.blocks", timestamps, values);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("metrics.blocks");
+    writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
     
@@ -193,7 +201,8 @@ TEST_F(TSMTest, ReadTSMFile) {
             TSMWriter writer(filename);
             std::vector<uint64_t> timestamps = {1000, 2000, 3000};
             std::vector<double> values = {1.0, 2.0, 3.0};
-            writer.writeSeries(TSMValueType::Float, "test.series", timestamps, values);
+            SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.series");
+            writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
             writer.writeIndex();
             writer.close();
         }

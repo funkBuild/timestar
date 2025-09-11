@@ -73,7 +73,7 @@ TEST_F(SeriesMatcherTest, WildcardMatching) {
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("server-123", "server-0?"));
     
     // Test combined wildcards
-    EXPECT_TRUE(SeriesMatcher::matchesWildcard("server-01-prod", "server-??-*"));
+    EXPECT_TRUE(SeriesMatcher::matchesWildcard("server-01-prod", "server-?""?-*"));
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("host-a-test", "host-?-*"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("host-abc-test", "host-?-*"));
 }
