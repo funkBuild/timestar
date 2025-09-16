@@ -1,0 +1,327 @@
+#ifndef __FUNCTION_MONITORING_H_INCLUDED__
+#define __FUNCTION_MONITORING_H_INCLUDED__
+
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <thread>
+#include <condition_variable>
+
+namespace tsdb::functions {
+
+// Forward declarations
+class FunctionPerformanceTracker;
+
+// Snapshot structure for returning non-atomic metrics
+struct FunctionMetricsSnapshot {
+    uint64_t total_executions{0};
+    uint64_t successful_executions{0};
+    uint64_t failed_executions{0};
+    uint64_t total_execution_time_us{0};
+    uint64_t peak_memory_bytes{0};
+    uint64_t total_memory_allocated{0};
+    uint64_t total_cpu_time_us{0};
+    uint64_t cache_hits{0};
+    uint64_t cache_misses{0};
+    uint64_t cache_evictions{0};
+    uint64_t timeout_errors{0};
+    uint64_t parameter_validation_errors{0};
+    uint64_t insufficient_data_errors{0};
+    
+    // Calculate derived metrics
+    double getSuccessRate() const {
+        return total_executions > 0 ? (double)successful_executions / total_executions : 0.0;
+    }
+    
+    double getFailureRate() const {
+        return total_executions > 0 ? (double)failed_executions / total_executions : 0.0;
+    }
+    
+    double getAverageExecutionTimeMs() const {
+        return successful_executions > 0 ? (double)total_execution_time_us / successful_executions / 1000.0 : 0.0;
+    }
+    
+    double getCacheHitRate() const {
+        uint64_t total = cache_hits + cache_misses;
+        return total > 0 ? (double)cache_hits / total : 0.0;
+    }
+    
+    double getAverageMemoryUsageMB() const {
+        return successful_executions > 0 ? (double)total_memory_allocated / successful_executions / 1024 / 1024 : 0.0;
+    }
+};
+
+// Monitoring metrics structure
+struct FunctionMetrics {
+    // Execution metrics
+    std::atomic<uint64_t> total_executions{0};
+    std::atomic<uint64_t> successful_executions{0};
+    std::atomic<uint64_t> failed_executions{0};
+    std::atomic<uint64_t> total_execution_time_us{0};
+    
+    // Resource metrics
+    std::atomic<uint64_t> peak_memory_bytes{0};
+    std::atomic<uint64_t> total_memory_allocated{0};
+    std::atomic<uint64_t> total_cpu_time_us{0};
+    
+    // Cache metrics
+    std::atomic<uint64_t> cache_hits{0};
+    std::atomic<uint64_t> cache_misses{0};
+    std::atomic<uint64_t> cache_evictions{0};
+    
+    // Quality metrics
+    std::atomic<uint64_t> timeout_errors{0};
+    std::atomic<uint64_t> parameter_validation_errors{0};
+    std::atomic<uint64_t> insufficient_data_errors{0};
+    
+    // Calculate derived metrics
+    double getSuccessRate() const {
+        uint64_t total = total_executions.load();
+        return total > 0 ? (double)successful_executions.load() / total : 0.0;
+    }
+    
+    double getFailureRate() const {
+        uint64_t total = total_executions.load();
+        return total > 0 ? (double)failed_executions.load() / total : 0.0;
+    }
+    
+    double getAverageExecutionTimeMs() const {
+        uint64_t executions = successful_executions.load();
+        return executions > 0 ? (double)total_execution_time_us.load() / executions / 1000.0 : 0.0;
+    }
+    
+    double getCacheHitRate() const {
+        uint64_t total = cache_hits.load() + cache_misses.load();
+        return total > 0 ? (double)cache_hits.load() / total : 0.0;
+    }
+    
+    double getAverageMemoryUsageMB() const {
+        uint64_t executions = successful_executions.load();
+        return executions > 0 ? (double)total_memory_allocated.load() / executions / 1024 / 1024 : 0.0;
+    }
+};
+
+// System metrics snapshot for returning non-atomic metrics  
+struct SystemMetricsSnapshot {
+    uint64_t active_function_calls{0};
+    uint64_t queued_function_calls{0};
+    uint64_t total_registry_lookups{0};
+    uint64_t registry_cache_hits{0};
+    uint64_t concurrent_execution_peak{0};
+    uint64_t system_memory_bytes{0};
+    uint64_t system_cpu_usage_percent{0};
+    uint64_t open_file_descriptors{0};
+    uint64_t http_requests_total{0};
+    uint64_t http_requests_failed{0};
+    uint64_t http_response_time_us{0};
+    
+    double getRegistryCacheHitRate() const {
+        return total_registry_lookups > 0 ? (double)registry_cache_hits / total_registry_lookups : 0.0;
+    }
+    
+    double getHttpSuccessRate() const {
+        return http_requests_total > 0 ? (double)(http_requests_total - http_requests_failed) / http_requests_total : 0.0;
+    }
+    
+    double getAverageHttpResponseTimeMs() const {
+        return http_requests_total > 0 ? (double)http_response_time_us / http_requests_total / 1000.0 : 0.0;
+    }
+};
+
+// System-wide monitoring metrics
+struct SystemMetrics {
+    std::atomic<uint64_t> active_function_calls{0};
+    std::atomic<uint64_t> queued_function_calls{0};
+    std::atomic<uint64_t> total_registry_lookups{0};
+    std::atomic<uint64_t> registry_cache_hits{0};
+    std::atomic<uint64_t> concurrent_execution_peak{0};
+    
+    // Resource monitoring
+    std::atomic<uint64_t> system_memory_bytes{0};
+    std::atomic<uint64_t> system_cpu_usage_percent{0};
+    std::atomic<uint64_t> open_file_descriptors{0};
+    
+    // Network/HTTP metrics
+    std::atomic<uint64_t> http_requests_total{0};
+    std::atomic<uint64_t> http_requests_failed{0};
+    std::atomic<uint64_t> http_response_time_us{0};
+    
+    double getRegistryCacheHitRate() const {
+        uint64_t total = total_registry_lookups.load();
+        return total > 0 ? (double)registry_cache_hits.load() / total : 0.0;
+    }
+    
+    double getHttpSuccessRate() const {
+        uint64_t total = http_requests_total.load();
+        return total > 0 ? (double)(total - http_requests_failed.load()) / total : 0.0;
+    }
+    
+    double getAverageHttpResponseTimeMs() const {
+        uint64_t requests = http_requests_total.load();
+        return requests > 0 ? (double)http_response_time_us.load() / requests / 1000.0 : 0.0;
+    }
+};
+
+// Alert thresholds configuration
+struct AlertThresholds {
+    double max_failure_rate = 0.05;           // 5% failure rate threshold
+    double max_response_time_ms = 1000.0;     // 1 second response time
+    double min_cache_hit_rate = 0.80;         // 80% cache hit rate minimum
+    double max_memory_usage_mb = 1000.0;      // 1GB memory usage per function
+    uint64_t max_concurrent_calls = 1000;     // Maximum concurrent function calls
+    uint64_t max_queue_size = 5000;           // Maximum queue size
+};
+
+// Alert types
+enum class AlertType {
+    HIGH_FAILURE_RATE,
+    SLOW_RESPONSE_TIME,
+    LOW_CACHE_HIT_RATE,
+    HIGH_MEMORY_USAGE,
+    HIGH_CONCURRENCY,
+    QUEUE_OVERLOAD,
+    SYSTEM_RESOURCE_EXHAUSTION
+};
+
+// Alert information
+struct Alert {
+    AlertType type;
+    std::string function_name;
+    std::string message;
+    std::chrono::steady_clock::time_point timestamp;
+    double severity; // 0.0 to 1.0
+    std::map<std::string, double> metrics;
+};
+
+// Production monitoring manager
+class ProductionMonitor {
+private:
+    std::map<std::string, std::unique_ptr<FunctionMetrics>> function_metrics_;
+    std::unique_ptr<SystemMetrics> system_metrics_;
+    AlertThresholds thresholds_;
+    
+    mutable std::mutex metrics_mutex_;
+    mutable std::mutex alerts_mutex_;
+    std::vector<Alert> active_alerts_;
+    std::vector<Alert> alert_history_;
+    
+    // Background monitoring thread
+    std::thread monitoring_thread_;
+    std::atomic<bool> monitoring_active_{false};
+    std::condition_variable monitoring_cv_;
+    std::mutex monitoring_mutex_;
+    
+    // Metrics collection interval
+    std::chrono::seconds collection_interval_{30}; // 30 seconds
+    
+    // System resource monitoring
+    void collectSystemMetrics();
+    void checkAlertConditions();
+    void processAlert(const Alert& alert);
+    void cleanupOldAlerts();
+    
+public:
+    ProductionMonitor();
+    ~ProductionMonitor();
+    
+    // Singleton access
+    static ProductionMonitor& getInstance();
+    
+    // Lifecycle management
+    void start();
+    void stop();
+    bool isRunning() const { return monitoring_active_.load(); }
+    
+    // Metrics registration and access
+    void registerFunction(const std::string& function_name);
+    FunctionMetrics* getFunctionMetrics(const std::string& function_name);
+    SystemMetrics* getSystemMetrics() { return system_metrics_.get(); }
+    
+    // Alert management
+    void setAlertThresholds(const AlertThresholds& thresholds);
+    std::vector<Alert> getActiveAlerts() const;
+    std::vector<Alert> getAlertHistory(std::chrono::minutes lookback = std::chrono::minutes(60)) const;
+    void acknowledgeAlert(size_t alert_id);
+    void clearAlertsForTesting(); // Clear all alerts and history for testing
+    
+    // Metrics reporting
+    std::map<std::string, FunctionMetricsSnapshot> getAllFunctionMetrics() const;
+    SystemMetricsSnapshot getSystemMetricsSnapshot() const;
+    
+    // JSON export for external monitoring systems
+    std::string exportMetricsAsJson() const;
+    std::string exportAlertsAsJson() const;
+    
+    // Health check endpoint data
+    struct HealthStatus {
+        bool healthy;
+        std::string status;
+        std::map<std::string, double> key_metrics;
+        std::vector<std::string> active_alerts;
+    };
+    HealthStatus getHealthStatus() const;
+    
+    // Configuration
+    void setCollectionInterval(std::chrono::seconds interval);
+    void enableDetailedLogging(bool enabled);
+    
+    // Resource measurement helpers (needed by FunctionExecutionTracker)
+    uint64_t getCurrentMemoryUsage();
+    uint64_t getCpuUsagePercent();
+    uint64_t getOpenFileDescriptors();
+    
+private:
+    // Background monitoring loop
+    void monitoringLoop();
+    bool detailed_logging_{false};
+};
+
+// RAII helper for automatic metric collection
+class FunctionExecutionTracker {
+private:
+    std::string function_name_;
+    std::chrono::steady_clock::time_point start_time_;
+    FunctionMetrics* metrics_;
+    ProductionMonitor* monitor_;
+    uint64_t initial_memory_;
+    
+public:
+    FunctionExecutionTracker(const std::string& function_name);
+    ~FunctionExecutionTracker();
+    
+    void recordSuccess();
+    void recordFailure();
+    void recordCacheHit();
+    void recordCacheMiss();
+    void recordParameterValidationError();
+    void recordTimeoutError();
+    void recordInsufficientDataError();
+    
+    // Disable copy/move
+    FunctionExecutionTracker(const FunctionExecutionTracker&) = delete;
+    FunctionExecutionTracker& operator=(const FunctionExecutionTracker&) = delete;
+};
+
+// Utility macros for easy integration
+#define FUNCTION_MONITOR_START(function_name) \
+    tsdb::functions::FunctionExecutionTracker __tracker(function_name)
+
+#define FUNCTION_MONITOR_SUCCESS() \
+    __tracker.recordSuccess()
+
+#define FUNCTION_MONITOR_FAILURE() \
+    __tracker.recordFailure()
+
+#define FUNCTION_MONITOR_CACHE_HIT() \
+    __tracker.recordCacheHit()
+
+#define FUNCTION_MONITOR_CACHE_MISS() \
+    __tracker.recordCacheMiss()
+
+} // namespace tsdb::functions
+
+#endif // __FUNCTION_MONITORING_H_INCLUDED__

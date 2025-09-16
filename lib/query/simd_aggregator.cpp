@@ -94,11 +94,22 @@ double SimdAggregator::calculateMin(const double* values, size_t count) {
         return scalar::calculateMin(values, count);
     }
     
-    __m256d min_vec = _mm256_set1_pd(std::numeric_limits<double>::max());
+    // Initialize min_vec with the first 4 values (or broadcast first value if less than 4)
+    __m256d min_vec;
+    size_t start_idx = 0;
+    
+    if (count >= 4) {
+        min_vec = _mm256_loadu_pd(&values[0]);
+        start_idx = 4;
+    } else {
+        // If less than 4 elements, use scalar fallback
+        return scalar::calculateMin(values, count);
+    }
+    
     size_t simd_end = count - (count % 4);
     
-    // Main SIMD loop
-    for (size_t i = 0; i < simd_end; i += 4) {
+    // Main SIMD loop - start from index 4 (or next multiple of 4)
+    for (size_t i = start_idx; i < simd_end; i += 4) {
         __m256d vals = _mm256_loadu_pd(&values[i]);
         min_vec = _mm256_min_pd(min_vec, vals);
     }
@@ -121,11 +132,22 @@ double SimdAggregator::calculateMax(const double* values, size_t count) {
         return scalar::calculateMax(values, count);
     }
     
-    __m256d max_vec = _mm256_set1_pd(std::numeric_limits<double>::lowest());
+    // Initialize max_vec with the first 4 values (or use scalar fallback if less than 4)
+    __m256d max_vec;
+    size_t start_idx = 0;
+    
+    if (count >= 4) {
+        max_vec = _mm256_loadu_pd(&values[0]);
+        start_idx = 4;
+    } else {
+        // If less than 4 elements, use scalar fallback
+        return scalar::calculateMax(values, count);
+    }
+    
     size_t simd_end = count - (count % 4);
     
-    // Main SIMD loop
-    for (size_t i = 0; i < simd_end; i += 4) {
+    // Main SIMD loop - start from index 4 (or next multiple of 4)
+    for (size_t i = start_idx; i < simd_end; i += 4) {
         __m256d vals = _mm256_loadu_pd(&values[i]);
         max_vec = _mm256_max_pd(max_vec, vals);
     }

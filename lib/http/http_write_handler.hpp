@@ -4,11 +4,13 @@
 #include <string>
 #include <memory>
 #include <variant>
+#include <chrono>
 #include <glaze/glaze.hpp>
 
 #include "engine.hpp"
 #include "tsdb_value.hpp"
 #include "series_id.hpp"
+#include "wal_file_manager.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -83,7 +85,7 @@ private:
     
     struct FieldArrays {
         std::vector<double> doubles;
-        std::vector<bool> bools;
+        std::vector<uint8_t> bools;
         std::vector<std::string> strings;
         std::vector<int64_t> integers;
         enum Type { DOUBLE, BOOL, STRING, INTEGER } type;
@@ -107,7 +109,7 @@ private:
         
         // Value storage by type (only one will be used based on valueType)
         std::vector<double> doubleValues;
-        std::vector<bool> boolValues;
+        std::vector<uint8_t> boolValues;
         std::vector<std::string> stringValues;
         
         // Helper to add a value with timestamp
@@ -127,6 +129,25 @@ private:
         }
     };
     
+    // Structure to collect timing information across all operations
+    struct AggregatedTimingInfo {
+        std::chrono::microseconds totalCompressionTime = std::chrono::microseconds(0);
+        std::chrono::microseconds totalWalWriteTime = std::chrono::microseconds(0);
+        int totalWalWriteCount = 0;
+        
+        void aggregate(const WALTimingInfo& walTiming) {
+            totalCompressionTime += walTiming.compressionTime;
+            totalWalWriteTime += walTiming.walWriteTime;
+            totalWalWriteCount += walTiming.walWriteCount;
+        }
+        
+        void aggregate(const AggregatedTimingInfo& other) {
+            totalCompressionTime += other.totalCompressionTime;
+            totalWalWriteTime += other.totalWalWriteTime;
+            totalWalWriteCount += other.totalWalWriteCount;
+        }
+    };
+    
     // Parse a single write point from JSON string
     WritePoint parseWritePoint(const std::string& json);
     
@@ -137,7 +158,7 @@ private:
     seastar::future<> processWritePoint(const WritePoint& point);
     
     // Process a multi-point write with arrays
-    seastar::future<> processMultiWritePoint(const MultiWritePoint& point);
+    seastar::future<AggregatedTimingInfo> processMultiWritePoint(const MultiWritePoint& point);
     
     // Validate that all field arrays have the same length as timestamps
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);

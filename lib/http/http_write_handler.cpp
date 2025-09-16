@@ -114,7 +114,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const g
                     fa.type = FieldArrays::BOOL;
                     for (auto& elem : arr) {
                         if (elem.is_boolean()) {
-                            fa.bools.push_back(elem.get<bool>());
+                            fa.bools.push_back(elem.get<bool>() ? 1 : 0);
                         } else {
                             throw std::runtime_error("Mixed types in field array: " + fieldName);
                         }
@@ -140,7 +140,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const g
                     fa.doubles.push_back(fieldValue.get<double>());
                 } else if (fieldValue.is_boolean()) {
                     fa.type = FieldArrays::BOOL;
-                    fa.bools.push_back(fieldValue.get<bool>());
+                    fa.bools.push_back(fieldValue.get<bool>() ? 1 : 0);
                 } else if (fieldValue.is_string()) {
                     fa.type = FieldArrays::STRING;
                     auto str_value = fieldValue.get<std::string>();
@@ -218,6 +218,18 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     size_t totalWritesProcessed = 0;
     
     LOG_INSERT_PATH(tsdb::http_log, debug, "[COALESCE] Processing {} writes for coalescing", writes_array.size());
+    
+    // TEMPORARY: Disable coalescing to isolate crash cause  
+    LOG_INSERT_PATH(tsdb::http_log, info, "[COALESCE] Coalescing disabled for debugging - returning empty result");
+    std::vector<MultiWritePoint> empty_result;
+    auto end_coalesce_debug = std::chrono::high_resolution_clock::now();
+    auto coalesce_duration_debug = std::chrono::duration_cast<std::chrono::microseconds>(end_coalesce_debug - start_coalesce);
+    
+    LOG_INSERT_PATH(tsdb::http_log, info, 
+        "[COALESCE] Processed {} writes -> {} array writes + {} individual writes ({}μs)", 
+        writes_array.size(), 0, writes_array.size(), coalesce_duration_debug.count());
+    
+    return empty_result;  // Return empty result - no coalescing
     
     // Parse writes directly from JSON objects for better performance
     for (const auto& write : writes_array) {
@@ -305,13 +317,14 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                         candidate.doubleValues.push_back(fieldValue.get<double>());
                     } else if (valueType == TSMValueType::Boolean) {
                         candidate.timestamps.push_back(timestamp);
-                        candidate.boolValues.push_back(fieldValue.get<bool>());
+                        candidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
                     } else if (valueType == TSMValueType::String) {
                         candidate.timestamps.push_back(timestamp);
                         candidate.stringValues.push_back(fieldValue.get<std::string>());
                     }
                     
-                    candidates.emplace(candidate.seriesKey, std::move(candidate));
+                    std::string keyCopy = candidate.seriesKey;  // Copy the key before move
+                    candidates.emplace(keyCopy, std::move(candidate));
                 } else {
                     // Add to existing candidate
                     CoalesceCandidate& candidate = it->second;
@@ -325,7 +338,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     if (valueType == TSMValueType::Float) {
                         candidate.doubleValues.push_back(fieldValue.get<double>());
                     } else if (valueType == TSMValueType::Boolean) {
-                        candidate.boolValues.push_back(fieldValue.get<bool>());
+                        candidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
                     } else if (valueType == TSMValueType::String) {
                         candidate.stringValues.push_back(fieldValue.get<std::string>());
                     }
@@ -366,17 +379,40 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     for (auto& [groupKey, candidateGroup] : grouped) {
         if (candidateGroup.empty()) continue;
         
-        // Sort candidates by their timestamps to find common timestamp range
-        // For simplicity, use the first candidate's timestamps as the canonical set
+        // Verify all candidates have the same timestamps to avoid data corruption
         CoalesceCandidate* firstCandidate = candidateGroup[0];
+        bool timestampsCompatible = true;
+        
+        for (size_t i = 1; i < candidateGroup.size(); i++) {
+            if (candidateGroup[i]->timestamps.size() != firstCandidate->timestamps.size()) {
+                timestampsCompatible = false;
+                break;
+            }
+            // Check if timestamps match (allowing for different ordering)
+            std::vector<uint64_t> sortedFirst = firstCandidate->timestamps;
+            std::vector<uint64_t> sortedCurrent = candidateGroup[i]->timestamps;
+            std::sort(sortedFirst.begin(), sortedFirst.end());
+            std::sort(sortedCurrent.begin(), sortedCurrent.end());
+            
+            if (sortedFirst != sortedCurrent) {
+                timestampsCompatible = false;
+                break;
+            }
+        }
+        
+        if (!timestampsCompatible) {
+            LOG_INSERT_PATH(tsdb::http_log, debug, "[COALESCE] Skipping group '{}' due to incompatible timestamps", groupKey);
+            individualWrites += candidateGroup.size();
+            continue;
+        }
         
         MultiWritePoint mwp;
         mwp.measurement = firstCandidate->measurement;
         mwp.tags = firstCandidate->tags;
         mwp.timestamps = firstCandidate->timestamps; // Use first as template
         
-        // Simple sorting without complex index shuffling
-        std::sort(mwp.timestamps.begin(), mwp.timestamps.end());
+        // NOTE: Don't sort timestamps here because field arrays are in the same original order
+        // Sorting would misalign timestamps with field values and cause memory corruption
         
         for (CoalesceCandidate* candidate : candidateGroup) {
             FieldArrays fa;
@@ -431,7 +467,7 @@ bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::str
     return true;
 }
 
-seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint& point) {
+seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint& point) {
     auto start_total = std::chrono::high_resolution_clock::now();
     
     // Group inserts by shard to reduce cross-shard operations and process them in batches
@@ -496,21 +532,45 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
             switch (fieldArray.type) {
                 case FieldArrays::DOUBLE:
                     fieldSize = fieldArray.doubles.size();
+                    if (fieldSize == 0) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Empty doubles array for field '{}'", fieldName);
+                        continue; // Skip this field entirely
+                    }
                     fieldIndex = (fieldSize > 1) ? i : 0;
+                    if (fieldIndex >= fieldSize) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Index {} out of bounds for doubles array size {}", fieldIndex, fieldSize);
+                        continue; // Skip this field entirely
+                    }
                     insert.valueType = TSMValueType::Float;
                     insert.doubleValue = fieldArray.doubles[fieldIndex];
                     break;
                     
                 case FieldArrays::BOOL:
                     fieldSize = fieldArray.bools.size();
+                    if (fieldSize == 0) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Empty bools array for field '{}'", fieldName);
+                        continue; // Skip this field entirely
+                    }
                     fieldIndex = (fieldSize > 1) ? i : 0;
+                    if (fieldIndex >= fieldSize) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Index {} out of bounds for bools array size {}", fieldIndex, fieldSize);
+                        continue; // Skip this field entirely
+                    }
                     insert.valueType = TSMValueType::Boolean;
-                    insert.boolValue = fieldArray.bools[fieldIndex];
+                    insert.boolValue = (fieldArray.bools[fieldIndex] != 0);
                     break;
                     
                 case FieldArrays::STRING:
                     fieldSize = fieldArray.strings.size();
+                    if (fieldSize == 0) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Empty strings array for field '{}'", fieldName);
+                        continue; // Skip this field entirely
+                    }
                     fieldIndex = (fieldSize > 1) ? i : 0;
+                    if (fieldIndex >= fieldSize) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Index {} out of bounds for strings array size {}", fieldIndex, fieldSize);
+                        continue; // Skip this field entirely
+                    }
                     insert.valueType = TSMValueType::String;
                     insert.stringValue = fieldArray.strings[fieldIndex];
                     LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Prepared array string insert - field: '{}', value: '{}', timestamp: {}, shard: {}", 
@@ -519,7 +579,15 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
                     
                 case FieldArrays::INTEGER:
                     fieldSize = fieldArray.integers.size();
+                    if (fieldSize == 0) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Empty integers array for field '{}'", fieldName);
+                        continue; // Skip this field entirely
+                    }
                     fieldIndex = (fieldSize > 1) ? i : 0;
+                    if (fieldIndex >= fieldSize) {
+                        LOG_INSERT_PATH(tsdb::http_log, error, "[WRITE] Index {} out of bounds for integers array size {}", fieldIndex, fieldSize);
+                        continue; // Skip this field entirely
+                    }
                     insert.valueType = TSMValueType::Float;
                     insert.doubleValue = static_cast<double>(fieldArray.integers[fieldIndex]);
                     break;
@@ -585,9 +653,12 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
     
     auto start_batch_ops = std::chrono::high_resolution_clock::now();
     
+    // Collect timing from all shards
+    AggregatedTimingInfo aggregatedTiming;
+    
     // Process all inserts grouped by shard - this creates one cross-shard call per shard instead of per insert
     co_await seastar::do_for_each(shardInserts.begin(), shardInserts.end(),
-        [this](const std::pair<const size_t, std::vector<PendingInsert>>& shardData) -> seastar::future<> {
+        [this, &aggregatedTiming](const std::pair<const size_t, std::vector<PendingInsert>>& shardData) -> seastar::future<> {
         
         const size_t shard = shardData.first;
         const auto& inserts = shardData.second;
@@ -595,7 +666,7 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
         auto shard_start = std::chrono::high_resolution_clock::now();
         
         // Process all inserts for this shard in a single cross-shard operation using batch inserts
-        co_await engineSharded->invoke_on(shard, [inserts](Engine& engine) -> seastar::future<> {
+        auto shardTiming = co_await engineSharded->invoke_on(shard, [inserts](Engine& engine) -> seastar::future<AggregatedTimingInfo> {
             
             // Group inserts by type for batch processing
             std::vector<TSDBInsert<double>> doubleInserts;
@@ -633,19 +704,29 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
                 }
             }
             
-            // Now execute batch inserts by type
+            // Now execute batch inserts by type and collect timing
+            AggregatedTimingInfo batchTiming;
+            
             if (!doubleInserts.empty()) {
-                co_await engine.insertBatch(doubleInserts);
+                auto walTiming = co_await engine.insertBatch(doubleInserts);
+                batchTiming.aggregate(walTiming);
             }
             
             if (!boolInserts.empty()) {
-                co_await engine.insertBatch(boolInserts);
+                auto walTiming = co_await engine.insertBatch(boolInserts);
+                batchTiming.aggregate(walTiming);
             }
             
             if (!stringInserts.empty()) {
-                co_await engine.insertBatch(stringInserts);
+                auto walTiming = co_await engine.insertBatch(stringInserts);
+                batchTiming.aggregate(walTiming);
             }
+            
+            co_return batchTiming;
         });
+        
+        // Aggregate timing from this shard
+        aggregatedTiming.aggregate(shardTiming);
         
         auto shard_end = std::chrono::high_resolution_clock::now();
         auto shard_duration = std::chrono::duration_cast<std::chrono::microseconds>(shard_end - shard_start);
@@ -656,6 +737,7 @@ seastar::future<> HttpWriteHandler::processMultiWritePoint(const MultiWritePoint
     auto end_total = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
     
+    co_return aggregatedTiming;
 }
 
 HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string& json) {
@@ -934,10 +1016,12 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                     // Process all array writes (both existing and coalesced)
                     auto walStartTime = std::chrono::steady_clock::now();
                     int walWriteCount = 0;
+                    AggregatedTimingInfo batchTiming;
                     
                     for (auto& mwp : arrayWrites) {
                         try {
-                            co_await processMultiWritePoint(mwp);
+                            auto timing = co_await processMultiWritePoint(mwp);
+                            batchTiming.aggregate(timing);
                             pointsWritten += mwp.timestamps.size() * mwp.fields.size();
                             walWriteCount += mwp.fields.size(); // One WAL write per field type
                         } catch (const std::exception& e) {
@@ -947,7 +1031,8 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                     
                     for (auto& mwp : coalescedWrites) {
                         try {
-                            co_await processMultiWritePoint(mwp);
+                            auto timing = co_await processMultiWritePoint(mwp);
+                            batchTiming.aggregate(timing);
                             pointsWritten += mwp.timestamps.size() * mwp.fields.size();
                             walWriteCount += mwp.fields.size(); // One WAL write per field type
                         } catch (const std::exception& e) {
@@ -1022,9 +1107,13 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                     auto batchEndTime = std::chrono::steady_clock::now();
                     auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(batchEndTime - batchStartTime);
                     
-                    // Log detailed timing breakdown
-                    tsdb::http_log.info("[WRITE_TIMING] Total: {}μs, Coalesce: {}μs, WAL: {}μs, WAL_writes: {}, Points: {} (batch write)", 
-                                       totalDuration.count(), coalesceDuration.count(), walDuration.count(), walWriteCount, pointsWritten);
+                    // Calculate actual WAL time excluding compression
+                    auto actualWalTime = batchTiming.totalWalWriteTime;
+                    auto compressionTime = batchTiming.totalCompressionTime;
+                    
+                    // Log detailed timing breakdown with compression time
+                    tsdb::http_log.info("[WRITE_TIMING] Total: {}μs, Coalesce: {}μs, Compression: {}μs, WAL: {}μs, WAL_writes: {}, Points: {} (batch write)", 
+                                       totalDuration.count(), coalesceDuration.count(), compressionTime.count(), actualWalTime.count(), batchTiming.totalWalWriteCount, pointsWritten);
                 }
             } else {
                 // Single write - check for arrays
@@ -1051,15 +1140,15 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                     if (!validateArraySizes(mwp, error)) {
                         throw std::runtime_error(error);
                     }
-                    co_await processMultiWritePoint(mwp);
+                    auto timing = co_await processMultiWritePoint(mwp);
                     auto walEndTime = std::chrono::steady_clock::now();
                     auto walDuration = std::chrono::duration_cast<std::chrono::microseconds>(walEndTime - walStartTime);
                     pointsWritten = mwp.timestamps.size() * mwp.fields.size();  // Count each timestamp * each field
                     
-                    // Log timing for single array write
+                    // Log timing for single array write with compression details
                     auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(walEndTime - batchStartTime);
-                    tsdb::http_log.info("[WRITE_TIMING] Total: {}μs, WAL: {}μs, WAL_writes: {}, Points: {} (single array write)", 
-                                       totalDuration.count(), walDuration.count(), mwp.fields.size(), pointsWritten);
+                    tsdb::http_log.info("[WRITE_TIMING] Total: {}μs, Compression: {}μs, WAL: {}μs, WAL_writes: {}, Points: {} (single array write)", 
+                                       totalDuration.count(), timing.totalCompressionTime.count(), timing.totalWalWriteTime.count(), timing.totalWalWriteCount, pointsWritten);
                 } else {
                     auto walStartTime = std::chrono::steady_clock::now();
                     WritePoint wp = parseWritePoint(body);
