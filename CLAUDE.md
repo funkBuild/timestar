@@ -16,9 +16,7 @@ cmake ..
 # Build the project
 make -j$(nproc)
 
-# Run tests
-ctest
-# Or run the test binary directly
+# Run tests (from build directory)
 ./test/tsdb_test
 
 # Run a specific test
@@ -26,6 +24,81 @@ ctest
 
 # Run string tests safely (avoids seastar segfaults)
 ./run_string_tests.sh
+```
+
+## Running Tests
+
+### C++ Unit Tests
+
+The project includes comprehensive C++ unit tests using Google Test:
+
+```bash
+# From the build directory, run all tests
+./test/tsdb_test
+
+# Run specific test suites
+./test/tsdb_test --gtest_filter=MemoryStoreTest*
+./test/tsdb_test --gtest_filter=TSMTest*
+./test/tsdb_test --gtest_filter=QueryParserTest*
+
+# List all available tests
+./test/tsdb_test --gtest_list_tests
+
+# Run with verbose output
+./test/tsdb_test --gtest_print_time=1
+```
+
+Test coverage includes:
+- Storage components (TSM, WAL, MemoryStore)
+- Encoding algorithms (Float, Boolean, String, Integer)
+- Query system (Parser, Planner, Aggregator, Runner)
+- HTTP handlers (Write, Query, Metadata)
+- Index system (LevelDB metadata index)
+- End-to-end integration tests
+
+### API Integration Tests
+
+The `test_api/` directory contains JavaScript-based API integration tests:
+
+```bash
+# Start the TSDB server first
+./bin/tsdb_http_server --port 8086
+
+# In another terminal, navigate to test_api directory
+cd test_api/
+
+# Install dependencies (first time only)
+npm install
+
+# Run Jest test suite (46 tests)
+npm test
+
+# Run standalone integration tests (8 tests)
+npm run test:standalone
+
+# Run all tests
+npm run test:all
+
+# Run tests with coverage
+npm run test:coverage
+
+# Watch mode for development
+npm run test:watch
+```
+
+Test files include:
+- `http_api_tests/comprehensive_query.test.js` - Query functionality tests
+- `http_api_tests/metadata_api.test.js` - Metadata API tests
+- `http_api_tests/delete_and_reinsert.test.js` - Delete operation tests
+- Standalone tests for specific features (strings, booleans, parsing, etc.)
+
+### Expected Test Results
+
+When all tests pass, you should see:
+- **C++ Tests**: 207 tests from 21 test suites, all passing
+- **Jest Tests**: 46 tests from 3 test suites, all passing
+- **Standalone Tests**: 8 tests, all passing
+
 ```
 
 ## Key Executables

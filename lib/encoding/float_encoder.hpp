@@ -4,8 +4,8 @@
 #include <vector>
 #include <cstdint>
 
-#include "compressed_buffer.hpp"
-#include "slice_buffer.hpp"
+#include "storage/compressed_buffer.hpp"
+#include "storage/slice_buffer.hpp"
 
 class FloatEncoder {
 private:

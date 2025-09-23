@@ -150,3 +150,4 @@ add_custom_target(test-perf
 
 # Include subdirectories with standalone tests
 add_subdirectory(unit/storage)
+add_subdirectory(benchmark)

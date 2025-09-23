@@ -30,6 +30,13 @@ class MemoryStore;
 enum class WALType { Write = 0, Delete, DeleteRange, Close };
 enum class WALValueType { Float = 0, Boolean, String };
 
+// Structure to track timing information for WAL operations
+struct WALTimingInfo {
+    std::chrono::microseconds compressionTime{0};
+    std::chrono::microseconds walWriteTime{0};
+    int walWriteCount{0};
+};
+
 class WAL {
 private:
   // WAL sizing policy
