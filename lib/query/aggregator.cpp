@@ -411,9 +411,8 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    // Group series by (measurement, groupByTags, field)
-    // Key: "measurement|tag1=val1,tag2=val2|fieldName"
-    std::map<std::string, PartialAggregationResult> partialResults;
+    // OPTIMIZATION: Use hash-based keys instead of string concatenation
+    std::unordered_map<size_t, PartialAggregationResult> partialResults;
 
     for (const auto& series : seriesResults) {
         for (const auto& [fieldName, fieldData] : series.fields) {
@@ -427,39 +426,60 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 
             const auto& doubleValues = std::get<std::vector<double>>(values);
 
-            // Build group key
-            std::string groupKey = series.measurement + "|";
-
-            // Extract only the groupByTags
+            // Extract only the groupByTags (tags map is already sorted)
             std::map<std::string, std::string> relevantTags;
-            if (groupByTags.empty()) {
-                // No grouping - all series merged together
-                groupKey += "|" + fieldName;
-            } else {
-                // Include groupBy tags in key
-                std::vector<std::string> tagPairs;
+            if (!groupByTags.empty()) {
                 for (const auto& tagName : groupByTags) {
                     auto it = series.tags.find(tagName);
                     if (it != series.tags.end()) {
-                        tagPairs.push_back(tagName + "=" + it->second);
                         relevantTags[tagName] = it->second;
                     }
                 }
-                std::sort(tagPairs.begin(), tagPairs.end());
-                groupKey += fmt::format("{}", fmt::join(tagPairs, ",")) + "|" + fieldName;
             }
 
+            // Compute hash-based group key
+            std::hash<std::string> hasher;
+            size_t groupKeyHash = hasher(series.measurement);
+
+            // OPTIMIZATION: Tags are already sorted, no need to re-sort
+            for (const auto& [k, v] : relevantTags) {
+                groupKeyHash ^= hasher(k) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+                groupKeyHash ^= hasher(v) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+            }
+            groupKeyHash ^= hasher(fieldName) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+
             // Get or create partial result for this group
-            auto& partial = partialResults[groupKey];
+            auto& partial = partialResults[groupKeyHash];
             if (partial.measurement.empty()) {
                 partial.measurement = series.measurement;
                 partial.tags = relevantTags;
                 partial.fieldName = fieldName;
+                partial.groupKeyHash = groupKeyHash;
+
+                // OPTIMIZATION: Pre-allocate buckets if using intervals
+                if (interval > 0 && !timestamps.empty()) {
+                    // Estimate number of buckets from time range
+                    uint64_t timeRange = timestamps.back() - timestamps.front();
+                    size_t estimatedBuckets = (timeRange / interval) + 1;
+                    partial.buckets.reserve(static_cast<size_t>(estimatedBuckets * 1.2)); // 20% buffer
+                }
             }
 
             // Add data to buckets or raw vectors
             if (interval > 0) {
-                // Bucketed aggregation - group by time buckets
+                // OPTIMIZATION: Count points per bucket first, then allocate once
+                std::unordered_map<uint64_t, size_t> bucketCounts;
+                for (const auto& ts : timestamps) {
+                    uint64_t bucketTime = (ts / interval) * interval;
+                    bucketCounts[bucketTime]++;
+                }
+
+                // Reserve space for each bucket
+                for (const auto& [bucketTime, count] : bucketCounts) {
+                    partial.buckets[bucketTime].reserve(count);
+                }
+
+                // Now fill buckets (no reallocation)
                 for (size_t i = 0; i < timestamps.size(); ++i) {
                     uint64_t bucketTime = (timestamps[i] / interval) * interval;
                     partial.buckets[bucketTime].push_back(doubleValues[i]);
@@ -467,6 +487,8 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                 }
             } else {
                 // No interval - keep all timestamps and values for time-aligned aggregation
+                partial.timestamps.reserve(partial.timestamps.size() + timestamps.size());
+                partial.values.reserve(partial.values.size() + doubleValues.size());
                 partial.timestamps.insert(partial.timestamps.end(), timestamps.begin(), timestamps.end());
                 partial.values.insert(partial.values.end(), doubleValues.begin(), doubleValues.end());
                 partial.totalPoints += doubleValues.size();
@@ -480,7 +502,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
     // Convert map to vector and record timing
     std::vector<PartialAggregationResult> result;
     result.reserve(partialResults.size());
-    for (auto& [key, partial] : partialResults) {
+    for (auto& [hash, partial] : partialResults) {
         partial.partialAggregationTimeMs = duration;
         result.push_back(std::move(partial));
     }
@@ -498,25 +520,15 @@ std::vector<AggregatedPoint> Aggregator::mergePartialAggregations(
 
     std::vector<AggregatedPoint> result;
 
-    // Group partial results by (measurement, tags, field)
-    std::map<std::string, std::vector<const PartialAggregationResult*>> groups;
+    // OPTIMIZATION: Group partial results by hash instead of string concatenation
+    std::unordered_map<size_t, std::vector<const PartialAggregationResult*>> groups;
 
     for (const auto& partial : partialResults) {
-        // Build group key
-        std::string groupKey = partial.measurement + "|";
-
-        std::vector<std::string> tagPairs;
-        for (const auto& [k, v] : partial.tags) {
-            tagPairs.push_back(k + "=" + v);
-        }
-        std::sort(tagPairs.begin(), tagPairs.end());
-        groupKey += fmt::format("{}", fmt::join(tagPairs, ",")) + "|" + partial.fieldName;
-
-        groups[groupKey].push_back(&partial);
+        groups[partial.groupKeyHash].push_back(&partial);
     }
 
     // Merge each group
-    for (const auto& [groupKey, groupPartials] : groups) {
+    for (const auto& [groupHash, groupPartials] : groups) {
         if (groupPartials.empty()) {
             continue;
         }
@@ -525,16 +537,31 @@ std::vector<AggregatedPoint> Aggregator::mergePartialAggregations(
         bool hasBuckets = !groupPartials[0]->buckets.empty();
 
         if (hasBuckets) {
-            // Merge bucketed data
-            std::unordered_map<uint64_t, std::vector<double>> mergedBuckets;
-
+            // OPTIMIZATION: Pre-count bucket sizes, then allocate once
+            std::unordered_map<uint64_t, size_t> bucketSizes;
             for (const auto* partial : groupPartials) {
                 for (const auto& [bucketTime, values] : partial->buckets) {
-                    mergedBuckets[bucketTime].insert(
-                        mergedBuckets[bucketTime].end(),
-                        values.begin(), values.end());
+                    bucketSizes[bucketTime] += values.size();
                 }
             }
+
+            // OPTIMIZATION: Pre-allocate merged buckets
+            std::unordered_map<uint64_t, std::vector<double>> mergedBuckets;
+            mergedBuckets.reserve(bucketSizes.size());
+            for (const auto& [bucketTime, size] : bucketSizes) {
+                mergedBuckets[bucketTime].reserve(size);
+            }
+
+            // Merge bucketed data (no reallocation)
+            for (const auto* partial : groupPartials) {
+                for (const auto& [bucketTime, values] : partial->buckets) {
+                    auto& bucket = mergedBuckets[bucketTime];
+                    bucket.insert(bucket.end(), values.begin(), values.end());
+                }
+            }
+
+            // OPTIMIZATION: Pre-allocate result vector
+            result.reserve(result.size() + mergedBuckets.size());
 
             // Apply final aggregation to each bucket
             for (const auto& [bucketTime, values] : mergedBuckets) {
@@ -619,6 +646,158 @@ std::vector<AggregatedPoint> Aggregator::mergePartialAggregations(
         [](const AggregatedPoint& a, const AggregatedPoint& b) {
             return a.timestamp < b.timestamp;
         });
+
+    return result;
+}
+
+std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGrouped(
+    const std::vector<PartialAggregationResult>& partialResults,
+    AggregationMethod method) {
+
+    if (partialResults.empty()) {
+        return {};
+    }
+
+    std::vector<GroupedAggregationResult> result;
+
+    // OPTIMIZATION: Group partial results by hash instead of string concatenation
+    std::unordered_map<size_t, std::vector<const PartialAggregationResult*>> groups;
+
+    for (const auto& partial : partialResults) {
+        groups[partial.groupKeyHash].push_back(&partial);
+    }
+
+    // Pre-allocate result
+    result.reserve(groups.size());
+
+    // Merge each group and preserve metadata
+    for (const auto& [groupHash, groupPartials] : groups) {
+        if (groupPartials.empty()) {
+            continue;
+        }
+
+        // Create grouped result with metadata from first partial (all in group share same metadata)
+        GroupedAggregationResult groupedResult;
+        groupedResult.measurement = groupPartials[0]->measurement;
+        groupedResult.tags = groupPartials[0]->tags;
+        groupedResult.fieldName = groupPartials[0]->fieldName;
+
+        // Check if we're using buckets or raw timestamps
+        bool hasBuckets = !groupPartials[0]->buckets.empty();
+
+        if (hasBuckets) {
+            // OPTIMIZATION: Pre-count bucket sizes, then allocate once
+            std::unordered_map<uint64_t, size_t> bucketSizes;
+            for (const auto* partial : groupPartials) {
+                for (const auto& [bucketTime, values] : partial->buckets) {
+                    bucketSizes[bucketTime] += values.size();
+                }
+            }
+
+            // OPTIMIZATION: Pre-allocate merged buckets
+            std::unordered_map<uint64_t, std::vector<double>> mergedBuckets;
+            mergedBuckets.reserve(bucketSizes.size());
+            for (const auto& [bucketTime, size] : bucketSizes) {
+                mergedBuckets[bucketTime].reserve(size);
+            }
+
+            // Merge bucketed data (no reallocation)
+            for (const auto* partial : groupPartials) {
+                for (const auto& [bucketTime, values] : partial->buckets) {
+                    auto& bucket = mergedBuckets[bucketTime];
+                    bucket.insert(bucket.end(), values.begin(), values.end());
+                }
+            }
+
+            // OPTIMIZATION: Pre-allocate points vector
+            groupedResult.points.reserve(mergedBuckets.size());
+
+            // Apply final aggregation to each bucket
+            for (const auto& [bucketTime, values] : mergedBuckets) {
+                AggregatedPoint point;
+                point.timestamp = bucketTime;
+                point.count = values.size();
+
+                switch (method) {
+                    case AggregationMethod::AVG:
+                        point.value = calculateAvg(values);
+                        break;
+                    case AggregationMethod::MIN:
+                        point.value = calculateMin(values);
+                        break;
+                    case AggregationMethod::MAX:
+                        point.value = calculateMax(values);
+                        break;
+                    case AggregationMethod::SUM:
+                        point.value = calculateSum(values);
+                        break;
+                    case AggregationMethod::LATEST:
+                        point.value = values.back();
+                        break;
+                }
+
+                groupedResult.points.push_back(point);
+            }
+
+            // Sort points by timestamp
+            std::sort(groupedResult.points.begin(), groupedResult.points.end(),
+                [](const AggregatedPoint& a, const AggregatedPoint& b) {
+                    return a.timestamp < b.timestamp;
+                });
+
+        } else {
+            // Merge time-aligned data (interval == 0)
+            std::map<uint64_t, std::vector<double>> timeAlignedValues;
+
+            for (const auto* partial : groupPartials) {
+                for (size_t i = 0; i < partial->timestamps.size(); ++i) {
+                    timeAlignedValues[partial->timestamps[i]].push_back(partial->values[i]);
+                }
+            }
+
+            if (method == AggregationMethod::LATEST) {
+                // For LATEST, just return all values
+                for (const auto& [timestamp, values] : timeAlignedValues) {
+                    for (double value : values) {
+                        AggregatedPoint point;
+                        point.timestamp = timestamp;
+                        point.value = value;
+                        point.count = 1;
+                        groupedResult.points.push_back(point);
+                    }
+                }
+            } else {
+                // Aggregate values at each timestamp
+                for (const auto& [timestamp, values] : timeAlignedValues) {
+                    AggregatedPoint point;
+                    point.timestamp = timestamp;
+                    point.count = values.size();
+
+                    switch (method) {
+                        case AggregationMethod::AVG:
+                            point.value = calculateAvg(values);
+                            break;
+                        case AggregationMethod::MIN:
+                            point.value = calculateMin(values);
+                            break;
+                        case AggregationMethod::MAX:
+                            point.value = calculateMax(values);
+                            break;
+                        case AggregationMethod::SUM:
+                            point.value = calculateSum(values);
+                            break;
+                        case AggregationMethod::LATEST:
+                            point.value = values.back();
+                            break;
+                    }
+
+                    groupedResult.points.push_back(point);
+                }
+            }
+        }
+
+        result.push_back(std::move(groupedResult));
+    }
 
     return result;
 }

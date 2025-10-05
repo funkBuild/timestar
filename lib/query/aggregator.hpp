@@ -22,11 +22,20 @@ struct AggregatedPoint {
     size_t count;  // Number of points aggregated
 };
 
+// Structure to hold grouped aggregation results with metadata
+// Used to preserve grouping information when converting back to SeriesResult
+struct GroupedAggregationResult {
+    std::string measurement;
+    std::map<std::string, std::string> tags;
+    std::string fieldName;
+    std::vector<AggregatedPoint> points;
+};
+
 // Structure to hold partial aggregation results from a shard
 // Used for distributed aggregation to reduce data transfer
 struct PartialAggregationResult {
     std::string measurement;
-    std::map<std::string, std::string> tags;  // Group-by tags only
+    std::map<std::string, std::string> tags;  // Group-by tags only (already sorted)
     std::string fieldName;
 
     // Partial aggregation data organized by time bucket
@@ -40,6 +49,24 @@ struct PartialAggregationResult {
     // Statistics
     size_t totalPoints = 0;
     double partialAggregationTimeMs = 0.0;
+
+    // Cached group key hash (computed once, reused multiple times)
+    size_t groupKeyHash = 0;
+
+    // Compute hash-based group key (faster than string concatenation)
+    void computeGroupKeyHash() {
+        std::hash<std::string> hasher;
+        groupKeyHash = hasher(measurement);
+
+        // Tags are already sorted in std::map, iterate in order
+        for (const auto& [k, v] : tags) {
+            // Boost hash_combine pattern
+            groupKeyHash ^= hasher(k) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+            groupKeyHash ^= hasher(v) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+        }
+
+        groupKeyHash ^= hasher(fieldName) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+    }
 };
 
 class Aggregator {
@@ -72,6 +99,11 @@ public:
 
     // Distributed aggregation - merge partial aggregations from multiple shards
     static std::vector<AggregatedPoint> mergePartialAggregations(
+        const std::vector<PartialAggregationResult>& partialResults,
+        AggregationMethod method);
+
+    // Distributed aggregation - merge with metadata preserved for easier conversion
+    static std::vector<GroupedAggregationResult> mergePartialAggregationsGrouped(
         const std::vector<PartialAggregationResult>& partialResults,
         AggregationMethod method);
 

@@ -636,62 +636,36 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merging {} partial aggregations from {} shards",
                            allPartialResults.size(), timing.shardsQueried);
 
-            // Merge all partial aggregations into final aggregated points
-            auto aggregatedPoints = Aggregator::mergePartialAggregations(
+            // OPTIMIZATION & FIX: Use grouped merge to preserve metadata associations
+            auto groupedResults = Aggregator::mergePartialAggregationsGrouped(
                 allPartialResults, request.aggregation);
 
-            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merged into {} aggregated points",
-                           aggregatedPoints.size());
+            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merged into {} grouped results",
+                           groupedResults.size());
 
-            // Convert AggregatedPoints back to SeriesResult format for response
-            // Group aggregated points by (measurement, tags, field) using metadata from partial results
-            std::map<std::string, std::pair<const PartialAggregationResult*, std::vector<const AggregatedPoint*>>> groupedPoints;
+            // OPTIMIZATION: Pre-allocate response series
+            response.series.reserve(groupedResults.size());
 
-            // First, build metadata map from partial results
-            std::map<std::string, const PartialAggregationResult*> metadataMap;
-            for (const auto& partial : allPartialResults) {
-                std::string key = partial.measurement + "|";
-                std::vector<std::string> tagPairs;
-                for (const auto& [k, v] : partial.tags) {
-                    tagPairs.push_back(k + "=" + v);
-                }
-                std::sort(tagPairs.begin(), tagPairs.end());
-                key += fmt::format("{}", fmt::join(tagPairs, ",")) + "|" + partial.fieldName;
-                metadataMap[key] = &partial;
-            }
-
-            // Group points by metadata key (all points from same group share metadata)
-            for (const auto& point : aggregatedPoints) {
-                // Since mergePartialAggregations groups by the same key, use first metadata
-                if (!metadataMap.empty()) {
-                    // Use first metadata as default (all should match for properly merged groups)
-                    auto& [key, partial] = *metadataMap.begin();
-                    groupedPoints[key].first = partial;
-                    groupedPoints[key].second.push_back(&point);
-                }
-            }
-
-            // Convert grouped points to SeriesResult objects
-            for (auto& [key, groupData] : groupedPoints) {
-                const auto* partial = groupData.first;
-                const auto& points = groupData.second;
-
+            // Convert GroupedAggregationResult to SeriesResult (metadata already preserved)
+            for (auto& groupedResult : groupedResults) {
                 SeriesResult series;
-                series.measurement = partial->measurement;
-                series.tags = partial->tags;
+                series.measurement = std::move(groupedResult.measurement);
+                series.tags = std::move(groupedResult.tags);
 
-                // Add all points to field data
+                // OPTIMIZATION: Pre-allocate and move data (no copying)
                 std::vector<uint64_t> timestamps;
                 std::vector<double> values;
-                timestamps.reserve(points.size());
-                values.reserve(points.size());
+                timestamps.reserve(groupedResult.points.size());
+                values.reserve(groupedResult.points.size());
 
-                for (const auto* point : points) {
-                    timestamps.push_back(point->timestamp);
-                    values.push_back(point->value);
+                for (const auto& point : groupedResult.points) {
+                    timestamps.push_back(point.timestamp);
+                    values.push_back(point.value);
                 }
 
-                series.fields[partial->fieldName] = std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+                series.fields[std::move(groupedResult.fieldName)] =
+                    std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+
                 response.series.push_back(std::move(series));
             }
 
