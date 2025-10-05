@@ -104,7 +104,24 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-FetchContent_MakeAvailable(glaze)
+FetchContent_Declare(
+  googlebenchmark
+  GIT_REPOSITORY https://github.com/google/benchmark.git
+  GIT_TAG v1.8.3
+  GIT_SHALLOW TRUE
+)
+
+FetchContent_Declare(
+  robin-map
+  GIT_REPOSITORY https://github.com/Tessil/robin-map.git
+  GIT_TAG v1.3.0
+  GIT_SHALLOW TRUE
+)
+
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(glaze googlebenchmark robin-map)
 
 # ─────────────────────────────── sub‑directories ─────────────────────────────
 

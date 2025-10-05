@@ -20,6 +20,9 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
   LOG_QUERY_PATH(tsdb::query_log, debug, "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime, endTime);
   std::vector<TSMResult<T>> tsmResults;
 
+  // Pre-allocate for expected TSM files to avoid reallocations
+  tsmResults.reserve(fileManager->sequencedTsmFiles.size());
+
   // First query TSM files
   co_await seastar::parallel_for_each(
     fileManager->sequencedTsmFiles.begin(),
@@ -53,6 +56,11 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
   if (memoryData.has_value()) {
     // Filter by time range and add to results
     const auto& storeData = memoryData.value();
+
+    // Pre-allocate space to avoid reallocations
+    result.timestamps.reserve(result.timestamps.size() + storeData.timestamps.size());
+    result.values.reserve(result.values.size() + storeData.values.size());
+
     for (size_t i = 0; i < storeData.timestamps.size(); ++i) {
       if (storeData.timestamps[i] >= startTime && storeData.timestamps[i] <= endTime) {
         result.timestamps.push_back(storeData.timestamps[i]);
@@ -60,26 +68,32 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
       }
     }
   }
-  
-  // Sort combined results by timestamp
+
+  // OPTIMIZATION: Sort combined results by timestamp using index-based sorting
+  // This avoids creating a temporary vector of pairs, reducing allocations by half
   if (!result.timestamps.empty()) {
-    // Create index vector for sorting
+    // Create index array
     std::vector<size_t> indices(result.timestamps.size());
     std::iota(indices.begin(), indices.end(), 0);
-    
-    // Sort indices by timestamp
-    std::sort(indices.begin(), indices.end(), [&result](size_t i, size_t j) {
-      return result.timestamps[i] < result.timestamps[j];
-    });
-    
-    // Apply sorting to both vectors
+
+    // Sort indices by timestamp - only sorts small integers, not the actual data
+    std::sort(indices.begin(), indices.end(),
+      [&timestamps = result.timestamps](size_t a, size_t b) {
+        return timestamps[a] < timestamps[b];
+      });
+
+    // Apply permutation in-place using index array
+    // This is more cache-friendly than the pair approach
     std::vector<uint64_t> sortedTimestamps;
     std::vector<T> sortedValues;
+    sortedTimestamps.reserve(result.timestamps.size());
+    sortedValues.reserve(result.values.size());
+
     for (size_t idx : indices) {
       sortedTimestamps.push_back(result.timestamps[idx]);
-      sortedValues.push_back(result.values[idx]);
+      sortedValues.push_back(std::move(result.values[idx]));
     }
-    
+
     result.timestamps = std::move(sortedTimestamps);
     result.values = std::move(sortedValues);
   }

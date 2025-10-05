@@ -39,7 +39,7 @@ TEST(FloatTest, BasicAssertions) {
   buf.rewind();
   CompressedSlice slice((const uint8_t*)buf.data.data(), buf.size());
   std::vector<double> decoded;
-  FloatEncoder::decode(slice, 0, v.size(), decoded);
+  FloatDecoder::decode(slice, 0, v.size(), decoded);
 
     EXPECT_EQ(decoded.size(), v.size());
 

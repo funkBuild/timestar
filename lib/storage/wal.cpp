@@ -3,43 +3,43 @@
 #include "wal.hpp"
 
 #include "aligned_buffer.hpp"
-#include "tsm.hpp"
-#include "integer_encoder.hpp"
-#include "float_encoder.hpp"
 #include "bool_encoder.hpp"
-#include "string_encoder.hpp"
+#include "float_encoder.hpp"
+#include "integer_encoder.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "series_id.hpp"
+#include "string_encoder.hpp"
+#include "tsm.hpp"
 
-#include <filesystem>
 #include <chrono>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <seastar/core/reactor.hh>
-#include <seastar/core/timer.hh>
 #include <seastar/core/file.hh>
-#include <seastar/core/iostream.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/iostream.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/timer.hh>
 
 namespace fs = std::filesystem;
 
 // ------------------------ WAL ------------------------
 
-WAL::WAL(unsigned int _sequenceNumber)
-    : sequenceNumber(_sequenceNumber) {}
+WAL::WAL(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {}
 
 WAL::~WAL() {
   // Note: Can't do async ops in destructor. Warn if anything left buffered.
   if (bufferPos > 0) {
-    tsdb::wal_log.warn("WAL destructor called with unflushed data ({} bytes)", bufferPos);
+    tsdb::wal_log.warn("WAL destructor called with unflushed data ({} bytes)",
+                       bufferPos);
   }
 }
 
-seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
+seastar::future<> WAL::init(MemoryStore * /*store*/, bool isRecovery) {
   std::string filename = sequenceNumberToFilename(sequenceNumber);
 
   // Ensure directory exists
@@ -50,9 +50,9 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
   }
 
   bool fileExisted = fs::exists(filename);
-  
+
   std::string_view filenameView{filename};
-  
+
   // Determine open flags based on whether this is recovery or fresh creation
   seastar::open_flags openFlags;
   if (isRecovery) {
@@ -67,9 +67,11 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     // Fresh creation mode: always truncate to start with empty file
     if (fileExisted) {
       tsdb::wal_log.warn("WAL file {} already exists when creating new WAL. "
-                         "Truncating to start fresh.", filename);
+                         "Truncating to start fresh.",
+                         filename);
     }
-    openFlags = seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate;
+    openFlags = seastar::open_flags::rw | seastar::open_flags::create |
+                seastar::open_flags::truncate;
     tsdb::wal_log.debug("Creating fresh WAL {}", filename);
   }
 
@@ -86,10 +88,10 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
   filePos = co_await walFile.size();
   currentSize = filePos;
 
-  
   if (!isRecovery && currentSize > 0) {
-    tsdb::wal_log.error("Fresh WAL {} has non-zero size {} after truncate - this is unexpected", 
-                        filename, currentSize.load());
+    tsdb::wal_log.error(
+        "Fresh WAL {} has non-zero size {} after truncate - this is unexpected",
+        filename, currentSize.load());
   }
 
   // Build buffered output stream positioned at EOF (append)
@@ -103,17 +105,19 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
 std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
   std::string path = "shard_" + std::to_string(seastar::this_shard_id()) + "/";
   std::string sequenceNumStr = std::to_string(sequenceNumber);
-  std::string filename =
-      path + std::string(10 - sequenceNumStr.length(), '0').append(sequenceNumStr).append(".wal");
+  std::string filename = path + std::string(10 - sequenceNumStr.length(), '0')
+                                    .append(sequenceNumStr)
+                                    .append(".wal");
   return filename;
 }
 
 seastar::future<> WAL::finalFlush() {
-  if (!out) co_return;
+  if (!out)
+    co_return;
   try {
-    co_await out->flush();   // drains buffers and fsyncs the sink
+    co_await out->flush(); // drains buffers and fsyncs the sink
     tsdb::wal_log.debug("WAL final flush completed, filePos={}", filePos);
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL final flush error: {}", e.what());
   }
 }
@@ -121,30 +125,46 @@ seastar::future<> WAL::finalFlush() {
 seastar::future<> WAL::close() {
   // Prevent double-close
   if (_closed || !walFile) {
-    tsdb::wal_log.debug("WAL seq={} already closed or invalid file", sequenceNumber);
+    tsdb::wal_log.debug("WAL seq={} already closed or invalid file",
+                        sequenceNumber);
     co_return;
   }
-  
+
   _closed = true;
   tsdb::wal_log.debug("WAL seq={} starting close", sequenceNumber);
 
-  // Skip Close marker and stream operations during shutdown to avoid hangs
+  // Wait for all in-flight operations to complete before closing
+  tsdb::wal_log.debug("WAL seq={} waiting for in-flight operations to complete",
+                      sequenceNumber);
+  co_await _io_gate.close();
+  tsdb::wal_log.debug("WAL seq={} all operations completed", sequenceNumber);
+
+  // Close the output stream before destroying it
+  // Note: closing the stream also closes the underlying file
   if (out) {
-    tsdb::wal_log.debug("WAL seq={} resetting output stream without close", sequenceNumber);
-    // Just reset - let the file close handle cleanup
+    tsdb::wal_log.debug("WAL seq={} closing output stream", sequenceNumber);
+    try {
+      co_await out->close();
+      tsdb::wal_log.debug("WAL seq={} output stream and file closed", sequenceNumber);
+    } catch (const std::exception &e) {
+      tsdb::wal_log.error("WAL seq={} output stream close error: {}",
+                          sequenceNumber, e.what());
+    }
     out.reset();
+  } else if (walFile) {
+    // Only close file directly if stream wasn't created
+    tsdb::wal_log.debug("WAL seq={} closing file directly", sequenceNumber);
+    try {
+      co_await walFile.flush();
+      co_await walFile.close();
+      tsdb::wal_log.debug("WAL seq={} file close completed", sequenceNumber);
+    } catch (const std::exception &e) {
+      tsdb::wal_log.error("WAL seq={} file close error: {}", sequenceNumber,
+                          e.what());
+      // Don't rethrow during shutdown
+    }
   }
 
-  // Close the underlying file
-  tsdb::wal_log.debug("WAL seq={} closing file", sequenceNumber);
-  try {
-    co_await walFile.close();
-    tsdb::wal_log.debug("WAL seq={} file close completed", sequenceNumber);
-  } catch (const std::exception& e) {
-    tsdb::wal_log.error("WAL seq={} file close error: {}", sequenceNumber, e.what());
-    // Don't rethrow during shutdown
-  }
-  
   tsdb::wal_log.debug("WAL seq={} closed successfully", sequenceNumber);
 }
 
@@ -160,27 +180,29 @@ seastar::future<> WAL::remove() {
 
 // Flush pending buffered bytes in the output stream
 seastar::future<> WAL::flushBlock() {
-  if (!out) co_return;
+  if (!out)
+    co_return;
   try {
     auto startTime = std::chrono::steady_clock::now();
 
-    co_await out->flush();   // single flush; avoid double-fsync
+    co_await out->flush(); // single flush; avoid double-fsync
 
     auto endTime = std::chrono::steady_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-    LOG_INSERT_PATH(tsdb::wal_log, debug,
-                    "WAL stream flush: pos={}, took={}ms",
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime -
+                                                                    startTime)
+                  .count();
+    LOG_INSERT_PATH(tsdb::wal_log, debug, "WAL stream flush: pos={}, took={}ms",
                     filePos, ms);
     if (ms > 100) {
       tsdb::wal_log.warn("WAL flush took {}ms - potential I/O bottleneck", ms);
     }
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL flush error: {}", e.what());
   }
 }
 
 template <class T>
-size_t WAL::estimateInsertSize(TSDBInsert<T>& insertRequest) {
+size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
   size_t estimatedSize = 0;
 
   estimatedSize += 4;  // length
@@ -189,7 +211,8 @@ size_t WAL::estimateInsertSize(TSDBInsert<T>& insertRequest) {
   estimatedSize += 1;  // value type
   estimatedSize += 4;  // # of timestamps
 
-  AlignedBuffer encodedTimestamps = IntegerEncoder::encode(insertRequest.timestamps);
+  AlignedBuffer encodedTimestamps =
+      IntegerEncoder::encode(insertRequest.timestamps);
   estimatedSize += 4 + encodedTimestamps.size();
 
   estimatedSize += 4; // values byte-size
@@ -207,8 +230,13 @@ size_t WAL::estimateInsertSize(TSDBInsert<T>& insertRequest) {
   return estimatedSize;
 }
 
-template <class T>
-seastar::future<> WAL::insert(TSDBInsert<T>& insertRequest) {
+template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
+  // Acquire semaphore to serialize writes and prevent concurrent stream access
+  auto units = co_await seastar::get_units(_io_sem, 1);
+
+  // Track this operation for clean shutdown
+  auto gate_holder = _io_gate.hold();
+
   AlignedBuffer buffer;
 
   // Reserve space for entry length (4 bytes)
@@ -230,7 +258,8 @@ seastar::future<> WAL::insert(TSDBInsert<T>& insertRequest) {
 
   // Encoded timestamps
   {
-    AlignedBuffer encodedTimestamps = IntegerEncoder::encode(insertRequest.timestamps);
+    AlignedBuffer encodedTimestamps =
+        IntegerEncoder::encode(insertRequest.timestamps);
     buffer.write((uint32_t)encodedTimestamps.size());
     buffer.write(encodedTimestamps);
   }
@@ -255,7 +284,8 @@ seastar::future<> WAL::insert(TSDBInsert<T>& insertRequest) {
   const size_t dataSize = buffer.size();
 
   // Update entry length at the beginning (excluding the length field itself)
-  const uint32_t entryLength = static_cast<uint32_t>(dataSize - sizeof(uint32_t));
+  const uint32_t entryLength =
+      static_cast<uint32_t>(dataSize - sizeof(uint32_t));
   memcpy(buffer.data.data() + lengthPos, &entryLength, sizeof(uint32_t));
 
   LOG_INSERT_PATH(tsdb::wal_log, debug,
@@ -265,16 +295,17 @@ seastar::future<> WAL::insert(TSDBInsert<T>& insertRequest) {
   // Respect the 16MiB WAL limit BEFORE writing
   const size_t projectedSize = currentSize.load() + dataSize;
   if (projectedSize > MAX_WAL_SIZE) {
-    tsdb::wal_log.debug(
-        "WAL::insert - Would exceed 16MB limit (current={}, dataSize={}, projected={}), signaling rollover needed",
-        currentSize.load(), dataSize, projectedSize);
+    tsdb::wal_log.debug("WAL::insert - Would exceed 16MB limit (current={}, "
+                        "dataSize={}, projected={}), signaling rollover needed",
+                        currentSize.load(), dataSize, projectedSize);
     throw std::runtime_error("WAL rollover needed");
   }
 
   // Stream write (unaligned)
   try {
     if (out) {
-      co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), dataSize);
+      co_await out->write(reinterpret_cast<const char *>(buffer.data.data()),
+                          dataSize);
     } else {
       throw std::runtime_error("WAL output stream is null");
     }
@@ -286,14 +317,14 @@ seastar::future<> WAL::insert(TSDBInsert<T>& insertRequest) {
     if (requiresImmediateFlush) {
       co_await out->flush();
     }
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL::insert write failed: {}", e.what());
     throw;
   }
 }
 
 template <class T>
-seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>>& insertRequests) {
+seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
   if (insertRequests.empty()) {
     co_return;
   }
@@ -302,14 +333,20 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>>& insertRequests) {
     co_return;
   }
 
+  // Acquire semaphore to serialize writes and prevent concurrent stream access
+  auto units = co_await seastar::get_units(_io_sem, 1);
+
+  // Track this operation for clean shutdown
+  auto gate_holder = _io_gate.hold();
+
   // Prepare all buffers first
   std::vector<AlignedBuffer> buffers;
   buffers.reserve(insertRequests.size());
   size_t totalSize = 0;
 
-  for (auto& insertRequest : insertRequests) {
+  for (auto &insertRequest : insertRequests) {
     AlignedBuffer buf;
-    buf.write((uint32_t)0);  // placeholder for length
+    buf.write((uint32_t)0); // placeholder for length
 
     buf.write((uint8_t)WALType::Write);
 
@@ -322,13 +359,15 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>>& insertRequests) {
     buf.write((uint32_t)insertRequest.timestamps.size());
 
     {
-      AlignedBuffer encodedTimestamps = IntegerEncoder::encode(insertRequest.timestamps);
+      AlignedBuffer encodedTimestamps =
+          IntegerEncoder::encode(insertRequest.timestamps);
       buf.write((uint32_t)encodedTimestamps.size());
       buf.write(encodedTimestamps);
     }
 
     if constexpr (std::is_same<T, double>::value) {
-      CompressedBuffer encodedFloats = FloatEncoder::encode(insertRequest.values);
+      CompressedBuffer encodedFloats =
+          FloatEncoder::encode(insertRequest.values);
       buf.write((uint32_t)encodedFloats.size());
       buf.write(encodedFloats);
     } else if constexpr (std::is_same<T, bool>::value) {
@@ -336,7 +375,8 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>>& insertRequests) {
       buf.write((uint32_t)encodedBools.size());
       buf.write(encodedBools);
     } else if constexpr (std::is_same<T, std::string>::value) {
-      AlignedBuffer encodedStrings = StringEncoder::encode(insertRequest.values);
+      AlignedBuffer encodedStrings =
+          StringEncoder::encode(insertRequest.values);
       buf.write((uint32_t)encodedStrings.size());
       buf.write(encodedStrings);
     }
@@ -348,15 +388,17 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>>& insertRequests) {
     buffers.push_back(std::move(buf));
   }
 
-  LOG_INSERT_PATH(tsdb::wal_log, debug,
-                  "WAL::insertBatch - {} entries, total size={}, currentSize={}",
-                  buffers.size(), totalSize, currentSize.load());
+  LOG_INSERT_PATH(
+      tsdb::wal_log, debug,
+      "WAL::insertBatch - {} entries, total size={}, currentSize={}",
+      buffers.size(), totalSize, currentSize.load());
 
   // WAL limit check (pre-flight)
   const size_t projected = currentSize.load() + totalSize;
   if (projected > MAX_WAL_SIZE) {
     tsdb::wal_log.debug(
-        "WAL::insertBatch - Would exceed 16MB limit (current={}, total={}, projected={}), signaling rollover",
+        "WAL::insertBatch - Would exceed 16MB limit (current={}, total={}, "
+        "projected={}), signaling rollover",
         currentSize.load(), totalSize, projected);
     throw std::runtime_error("WAL rollover needed");
   }
@@ -365,8 +407,9 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>>& insertRequests) {
     size_t written = 0;
     if (out) {
       // Write each encoded buffer; output_stream will coalesce internally.
-      for (auto& b : buffers) {
-        co_await out->write(reinterpret_cast<const char*>(b.data.data()), b.size());
+      for (auto &b : buffers) {
+        co_await out->write(reinterpret_cast<const char *>(b.data.data()),
+                            b.size());
         written += b.size();
       }
     }
@@ -377,15 +420,20 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>>& insertRequests) {
     if (requiresImmediateFlush) {
       co_await out->flush();
     }
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL::insertBatch write failed: {}", e.what());
     throw;
   }
 }
 
-seastar::future<> WAL::deleteRange(const SeriesId128& seriesId,
-                                   uint64_t startTime,
-                                   uint64_t endTime) {
+seastar::future<> WAL::deleteRange(const SeriesId128 &seriesId,
+                                   uint64_t startTime, uint64_t endTime) {
+  // Acquire semaphore to serialize writes and prevent concurrent stream access
+  auto units = co_await seastar::get_units(_io_sem, 1);
+
+  // Track this operation for clean shutdown
+  auto gate_holder = _io_gate.hold();
+
   AlignedBuffer buffer;
 
   // Reserve space for entry length (4 bytes)
@@ -411,22 +459,24 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId,
 
   try {
     if (out) {
-      co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), n);
+      co_await out->write(reinterpret_cast<const char *>(buffer.data.data()),
+                          n);
     }
     filePos += n;
     currentSize.fetch_add(n);
-    
+
     // Only flush immediately if configured for immediate mode
     if (requiresImmediateFlush) {
       co_await out->flush();
     }
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL::deleteRange write failed: {}", e.what());
     throw;
   }
 
   LOG_INSERT_PATH(tsdb::wal_log, debug,
-                  "WAL deleteRange written: series={}, startTime={}, endTime={}, size={} bytes",
+                  "WAL deleteRange written: series={}, startTime={}, "
+                  "endTime={}, size={} bytes",
                   seriesId.toHex(), startTime, endTime, n);
 }
 
@@ -438,19 +488,19 @@ void WAL::remove(unsigned int sequenceNumber) {
       tsdb::wal_log.debug("WAL file {} deleted", filename);
     else
       tsdb::wal_log.debug("WAL file {} not found", filename);
-  } catch (const std::filesystem::filesystem_error& err) {
+  } catch (const std::filesystem::filesystem_error &err) {
     tsdb::wal_log.error("Filesystem error removing WAL: {}", err.what());
   }
 }
 
 // ------------------------ WALReader ------------------------
 
-WALReader::WALReader(std::string _filename)
-    : filename(std::move(_filename)) {}
+WALReader::WALReader(std::string _filename) : filename(std::move(_filename)) {}
 
-seastar::future<> WALReader::readAll(MemoryStore* store) {
+seastar::future<> WALReader::readAll(MemoryStore *store) {
   std::string_view filenameView{filename};
-  walFile = co_await seastar::open_file_dma(filenameView, seastar::open_flags::ro);
+  walFile =
+      co_await seastar::open_file_dma(filenameView, seastar::open_flags::ro);
 
   if (!walFile) {
     tsdb::wal_log.error("Failed to open WAL file: {}", filename);
@@ -459,12 +509,14 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
 
   length = co_await walFile.size();
   if (length == 0) {
-    tsdb::wal_log.info("WAL recovery complete: 0 entries read, 0 partial entries discarded");
+    tsdb::wal_log.info(
+        "WAL recovery complete: 0 entries read, 0 partial entries discarded");
     co_await walFile.close();
     co_return;
   }
 
-  tsdb::wal_log.info("WAL recovery starting for file {} with size {} bytes", filename, length);
+  tsdb::wal_log.info("WAL recovery starting for file {} with size {} bytes",
+                     filename, length);
 
   size_t entriesRead = 0;
   size_t partialEntries = 0;
@@ -473,14 +525,14 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
   auto in = seastar::make_file_input_stream(walFile);
 
   // read_exact helper using read_up_to (no trim_front needed)
-  auto read_exact = [&in](void* dst, size_t n) -> seastar::future<bool> {
+  auto read_exact = [&in](void *dst, size_t n) -> seastar::future<bool> {
     size_t got = 0;
     while (got < n) {
       auto chunk = co_await in.read_up_to(n - got);
       if (chunk.empty()) {
         co_return false; // EOF before n bytes
       }
-      std::memcpy(static_cast<char*>(dst) + got, chunk.get(), chunk.size());
+      std::memcpy(static_cast<char *>(dst) + got, chunk.get(), chunk.size());
       got += chunk.size();
     }
     co_return true;
@@ -498,101 +550,120 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
     static constexpr uint32_t MAX_ENTRY_SIZE = 10 * 1024 * 1024; // 10MB
 
     if (entryLength < MIN_ENTRY_SIZE || entryLength > MAX_ENTRY_SIZE) {
-      tsdb::wal_log.warn("WAL recovery: suspicious entry length {}, stopping recovery", entryLength);
+      tsdb::wal_log.warn(
+          "WAL recovery: suspicious entry length {}, stopping recovery",
+          entryLength);
       partialEntries++;
       break;
     }
 
     std::vector<char> entry(entryLength);
     if (!(co_await read_exact(entry.data(), entry.size()))) {
-      tsdb::wal_log.warn("WAL recovery: partial tail entry ({} bytes), discarding", entryLength);
+      tsdb::wal_log.warn(
+          "WAL recovery: partial tail entry ({} bytes), discarding",
+          entryLength);
       partialEntries++;
       break;
     }
 
-    Slice entrySlice(reinterpret_cast<uint8_t*>(entry.data()), entry.size());
+    Slice entrySlice(reinterpret_cast<uint8_t *>(entry.data()), entry.size());
     uint8_t type = entrySlice.read<uint8_t>();
 
     switch (static_cast<WALType>(type)) {
-      case WALType::Write: {
-        // Read fixed 16-byte SeriesId128
-        std::string seriesIdBytes = entrySlice.readString(16);
-        SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
-        
-        uint8_t valueType = entrySlice.read<uint8_t>();
+    case WALType::Write: {
+      // Read fixed 16-byte SeriesId128
+      std::string seriesIdBytes = entrySlice.readString(16);
+      SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
 
-        switch (static_cast<WALValueType>(valueType)) {
-          case WALValueType::Float: {
-            try {
-              TSDBInsert<double> insertReq = readSeries<double>(entrySlice, seriesId);
-              store->insertMemory(insertReq);
-            } catch (const std::exception& e) {
-              tsdb::wal_log.error("WAL recovery: Failed to read float series '{}': {}", seriesId.toHex(), e.what());
-              partialEntries++;
-              continue;
-            }
-          } break;
-          case WALValueType::Boolean: {
-            try {
-              TSDBInsert<bool> insertReq = readSeries<bool>(entrySlice, seriesId);
-              store->insertMemory(insertReq);
-            } catch (const std::exception& e) {
-              tsdb::wal_log.error("WAL recovery: Failed to read boolean series '{}': {}", seriesId.toHex(), e.what());
-              partialEntries++;
-              continue;
-            }
-          } break;
-          case WALValueType::String: {
-            try {
-              TSDBInsert<std::string> insertReq = readSeries<std::string>(entrySlice, seriesId);
-              store->insertMemory(insertReq);
-            } catch (const std::exception& e) {
-              tsdb::wal_log.error("WAL recovery: Failed to read string series '{}': {}", seriesId.toHex(), e.what());
-              partialEntries++;
-              continue;
-            }
-          } break;
+      uint8_t valueType = entrySlice.read<uint8_t>();
+
+      switch (static_cast<WALValueType>(valueType)) {
+      case WALValueType::Float: {
+        try {
+          TSDBInsert<double> insertReq =
+              readSeries<double>(entrySlice, seriesId);
+          store->insertMemory(insertReq);
+        } catch (const std::exception &e) {
+          tsdb::wal_log.error(
+              "WAL recovery: Failed to read float series '{}': {}",
+              seriesId.toHex(), e.what());
+          partialEntries++;
+          continue;
         }
-        entriesRead++;
       } break;
-
-      case WALType::Close: {
-        co_await store->close();
-        entriesRead++;
+      case WALValueType::Boolean: {
+        try {
+          TSDBInsert<bool> insertReq = readSeries<bool>(entrySlice, seriesId);
+          store->insertMemory(insertReq);
+        } catch (const std::exception &e) {
+          tsdb::wal_log.error(
+              "WAL recovery: Failed to read boolean series '{}': {}",
+              seriesId.toHex(), e.what());
+          partialEntries++;
+          continue;
+        }
       } break;
-
-      case WALType::DeleteRange: {
-        // Read fixed 16-byte SeriesId128
-        std::string seriesIdBytes = entrySlice.readString(16);
-        SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
-        
-        uint64_t startTime = entrySlice.read<uint64_t>();
-        uint64_t endTime = entrySlice.read<uint64_t>();
-        tsdb::wal_log.debug("WAL recovery: DeleteRange for series={}, startTime={}, endTime={}",
-                            seriesId.toHex(), startTime, endTime);
-        store->deleteRange(seriesId, startTime, endTime);
-        entriesRead++;
+      case WALValueType::String: {
+        try {
+          TSDBInsert<std::string> insertReq =
+              readSeries<std::string>(entrySlice, seriesId);
+          store->insertMemory(insertReq);
+        } catch (const std::exception &e) {
+          tsdb::wal_log.error(
+              "WAL recovery: Failed to read string series '{}': {}",
+              seriesId.toHex(), e.what());
+          partialEntries++;
+          continue;
+        }
       } break;
+      }
+      entriesRead++;
+    } break;
 
-      default:
-        tsdb::wal_log.warn("WAL recovery: unknown entry type {}, stopping recovery",
-                           static_cast<int>(type));
-        partialEntries++;
-        goto recovery_complete;
+    case WALType::Close: {
+      co_await store->close();
+      entriesRead++;
+    } break;
+
+    case WALType::DeleteRange: {
+      // Read fixed 16-byte SeriesId128
+      std::string seriesIdBytes = entrySlice.readString(16);
+      SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
+
+      uint64_t startTime = entrySlice.read<uint64_t>();
+      uint64_t endTime = entrySlice.read<uint64_t>();
+      tsdb::wal_log.debug(
+          "WAL recovery: DeleteRange for series={}, startTime={}, endTime={}",
+          seriesId.toHex(), startTime, endTime);
+      store->deleteRange(seriesId, startTime, endTime);
+      entriesRead++;
+    } break;
+
+    default:
+      tsdb::wal_log.warn(
+          "WAL recovery: unknown entry type {}, stopping recovery",
+          static_cast<int>(type));
+      partialEntries++;
+      goto recovery_complete;
     }
   }
 
 recovery_complete:
-  tsdb::wal_log.info("WAL recovery complete: {} entries read, {} partial entries discarded",
-                     entriesRead, partialEntries);
+  tsdb::wal_log.info(
+      "WAL recovery complete: {} entries read, {} partial entries discarded",
+      entriesRead, partialEntries);
 
   // Close the input stream & file
-  try { co_await in.close(); } catch (...) {}
+  try {
+    co_await in.close();
+  } catch (...) {
+  }
   co_await walFile.close();
 }
 
 template <class T>
-TSDBInsert<T> WALReader::readSeries(Slice& walSlice, const SeriesId128& seriesId) {
+TSDBInsert<T> WALReader::readSeries(Slice &walSlice,
+                                    const SeriesId128 &seriesId) {
   std::string seriesKey = seriesId.toHex();
   TSDBInsert<T> insertReq = TSDBInsert<T>::fromSeriesKey(seriesKey);
 
@@ -608,17 +679,20 @@ TSDBInsert<T> WALReader::readSeries(Slice& walSlice, const SeriesId128& seriesId
     throw std::runtime_error("Invalid timestamps count in WAL entry");
   }
   if (encodedTimestampsSize > MAX_ENCODED_SIZE) {
-    tsdb::wal_log.error("WAL recovery: Invalid encoded timestamps size {} for '{}'",
-                        encodedTimestampsSize, seriesKey);
+    tsdb::wal_log.error(
+        "WAL recovery: Invalid encoded timestamps size {} for '{}'",
+        encodedTimestampsSize, seriesKey);
     throw std::runtime_error("Invalid encoded timestamps size in WAL entry");
   }
 
   auto timestampsSlice = walSlice.getSlice(encodedTimestampsSize);
-  auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampsCount, insertReq.timestamps);
+  auto [nSkipped, nTimestamps] = IntegerEncoder::decode(
+      timestampsSlice, timestampsCount, insertReq.timestamps);
 
   uint32_t valueByteSize = walSlice.read<uint32_t>();
   if (valueByteSize > MAX_ENCODED_SIZE) {
-    tsdb::wal_log.error("WAL recovery: Invalid value size {} for '{}'", valueByteSize, seriesKey);
+    tsdb::wal_log.error("WAL recovery: Invalid value size {} for '{}'",
+                        valueByteSize, seriesKey);
     throw std::runtime_error("Invalid value byte size in WAL entry");
   }
 
@@ -627,13 +701,14 @@ TSDBInsert<T> WALReader::readSeries(Slice& walSlice, const SeriesId128& seriesId
     BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, insertReq.values);
   } else if constexpr (std::is_same<T, double>::value) {
     auto valuesSlice = walSlice.getCompressedSlice(valueByteSize);
-    FloatEncoder::decode(valuesSlice, nSkipped, nTimestamps, insertReq.values);
+    FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, insertReq.values);
   } else if constexpr (std::is_same<T, std::string>::value) {
     auto valuesSlice = walSlice.getSlice(valueByteSize);
     std::vector<std::string> allStrings;
     StringEncoder::decode(valuesSlice, timestampsCount, allStrings);
     insertReq.values.reserve(nTimestamps);
-    for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
+    for (size_t i = nSkipped;
+         i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
       insertReq.values.push_back(std::move(allStrings[i]));
     }
   } else {
@@ -644,12 +719,19 @@ TSDBInsert<T> WALReader::readSeries(Slice& walSlice, const SeriesId128& seriesId
 }
 
 // Explicit instantiations
-template seastar::future<> WAL::insert<double>(TSDBInsert<double>& insertRequest);
-template seastar::future<> WAL::insert<bool>(TSDBInsert<bool>& insertRequest);
-template seastar::future<> WAL::insert<std::string>(TSDBInsert<std::string>& insertRequest);
-template size_t WAL::estimateInsertSize<double>(TSDBInsert<double>& insertRequest);
-template size_t WAL::estimateInsertSize<bool>(TSDBInsert<bool>& insertRequest);
-template size_t WAL::estimateInsertSize<std::string>(TSDBInsert<std::string>& insertRequest);
-template seastar::future<> WAL::insertBatch<double>(std::vector<TSDBInsert<double>>& insertRequests);
-template seastar::future<> WAL::insertBatch<bool>(std::vector<TSDBInsert<bool>>& insertRequests);
-template seastar::future<> WAL::insertBatch<std::string>(std::vector<TSDBInsert<std::string>>& insertRequests);
+template seastar::future<>
+WAL::insert<double>(TSDBInsert<double> &insertRequest);
+template seastar::future<> WAL::insert<bool>(TSDBInsert<bool> &insertRequest);
+template seastar::future<>
+WAL::insert<std::string>(TSDBInsert<std::string> &insertRequest);
+template size_t
+WAL::estimateInsertSize<double>(TSDBInsert<double> &insertRequest);
+template size_t WAL::estimateInsertSize<bool>(TSDBInsert<bool> &insertRequest);
+template size_t
+WAL::estimateInsertSize<std::string>(TSDBInsert<std::string> &insertRequest);
+template seastar::future<>
+WAL::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests);
+template seastar::future<>
+WAL::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
+template seastar::future<> WAL::insertBatch<std::string>(
+    std::vector<TSDBInsert<std::string>> &insertRequests);

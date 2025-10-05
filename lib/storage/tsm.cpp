@@ -54,8 +54,9 @@ seastar::future<> TSM::open(){
 
   length = co_await tsmFile.size();
 
-  co_await readIndex();
-  
+  // Use lazy loading: read sparse index + bloom filter (not full index)
+  co_await readSparseIndex();
+
   // Load tombstones if they exist
   co_await loadTombstones();
 };
@@ -71,50 +72,151 @@ uint64_t TSM::rankAsInteger(){
   return (tierNum << 60) + seqNum;
 }
 
-seastar::future<> TSM::readIndex(){  
+// Lazy loading: read sparse index + build bloom filter
+seastar::future<> TSM::readSparseIndex(){
+  // Read index offset (last 8 bytes of file)
   auto indexOffsetBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - sizeof(size_t), sizeof(size_t));
-  size_t indexOffset = *(size_t*)(indexOffsetBuf.get()); 
-  
+  size_t indexOffset = *(size_t*)(indexOffsetBuf.get());
+
+  // Read entire index section
   auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - sizeof(size_t));
   Slice indexSlice(indexBuf.get(), indexBuf.size());
 
+  // First pass: Parse index to collect series and build sparse index
+  // We need the actual count before initializing the bloom filter
+  std::vector<SeriesId128> seriesIds;
+
   while(indexSlice.offset < indexSlice.length_){
-    TSMIndexEntry indexEntry;
+    uint64_t entryStartOffset = indexOffset + indexSlice.offset;
 
-    // Read SeriesId128 (16 bytes)
+    // Read series ID (16 bytes)
     std::string seriesIdBytes = indexSlice.readString(16);
-    indexEntry.seriesId = SeriesId128::fromBytes(seriesIdBytes);
-    indexEntry.seriesType = (TSMValueType) indexSlice.read<uint8_t>();
+    SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
 
-    uint16_t indexEntryCount = indexSlice.read<uint16_t>();
+    // Read type (1 byte) and block count (2 bytes)
+    uint8_t type = indexSlice.read<uint8_t>();
+    uint16_t blockCount = indexSlice.read<uint16_t>();
 
-    for(int i=0; i < indexEntryCount; i++){
-      TSMIndexBlock indexBlock;
-      indexBlock.minTime = indexSlice.read<uint64_t>();
-      indexBlock.maxTime = indexSlice.read<uint64_t>();
-      indexBlock.offset = indexSlice.read<uint64_t>();
-      indexBlock.size = indexSlice.read<uint32_t>();
+    // Calculate size of this entry
+    // Each block: minTime(8) + maxTime(8) + offset(8) + size(4) = 28 bytes
+    uint32_t entrySize = 16 + 1 + 2 + (blockCount * 28);
 
-      indexEntry.indexBlocks.push_back(indexBlock);
-    }
+    // Skip over the blocks (don't parse them yet)
+    indexSlice.offset += blockCount * 28;
 
-    index.insert({indexEntry.seriesId, indexEntry});
+    // Store sparse entry
+    SparseIndexEntry sparseEntry{
+      .seriesId = seriesId,
+      .fileOffset = entryStartOffset,
+      .entrySize = entrySize
+    };
+    sparseIndex.insert({seriesId, sparseEntry});
+
+    // Collect series ID for bloom filter
+    seriesIds.push_back(seriesId);
   }
+
+  // Now initialize bloom filter with the ACTUAL series count
+  // This is critical for higher-tier TSM files that may have 100K+ series
+  size_t actualSeriesCount = seriesIds.size();
+
+  bloom_parameters params;
+  params.projected_element_count = actualSeriesCount;
+  params.false_positive_probability = BLOOM_FPR;
+  params.compute_optimal_parameters();
+  seriesBloomFilter = bloom_filter(params);
+
+  // Add all series to the properly-sized bloom filter
+  for(const auto& seriesId : seriesIds) {
+    seriesBloomFilter.insert(seriesId.toBytes());
+  }
+
+  tsdb::tsm_log.info("Loaded sparse index for {} (tier {}): {} series, bloom filter: {} bytes",
+                     filePath, tierNum, sparseIndex.size(), seriesBloomFilter.size());
+}
+
+// Lazy load full index entry for a series (single DMA read)
+seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& seriesId) {
+  // Step 1: Bloom filter check (fast, in-memory)
+  if (!seriesBloomFilter.contains(seriesId.toBytes())) {
+    // Definitely not in this file
+    co_return nullptr;
+  }
+
+  // Step 2: Check cache
+  auto cacheIt = fullIndexCache.find(seriesId);
+  if (cacheIt != fullIndexCache.end()) {
+    co_return &cacheIt->second;
+  }
+
+  // Step 3: Sparse index lookup
+  auto sparseIt = sparseIndex.find(seriesId);
+  if (sparseIt == sparseIndex.end()) {
+    // False positive from bloom filter (0.1% chance)
+    tsdb::tsm_log.trace("Bloom filter false positive for series {}", seriesId.toHex());
+    co_return nullptr;
+  }
+
+  // Step 4: Single DMA read for entire series entry
+  const auto& sparse = sparseIt->second;
+  auto entryBuf = co_await tsmFile.dma_read_exactly<uint8_t>(
+    sparse.fileOffset,
+    sparse.entrySize
+  );
+
+  // Step 5: Parse the full entry
+  Slice entrySlice(entryBuf.get(), entryBuf.size());
+
+  TSMIndexEntry fullEntry;
+
+  // Parse series ID (verify)
+  std::string seriesIdBytes = entrySlice.readString(16);
+  fullEntry.seriesId = SeriesId128::fromBytes(seriesIdBytes);
+
+  // Parse type and block count
+  fullEntry.seriesType = (TSMValueType)entrySlice.read<uint8_t>();
+  uint16_t blockCount = entrySlice.read<uint16_t>();
+
+  // Parse all blocks
+  fullEntry.indexBlocks.reserve(blockCount);
+  for (uint16_t i = 0; i < blockCount; i++) {
+    TSMIndexBlock block;
+    block.minTime = entrySlice.read<uint64_t>();
+    block.maxTime = entrySlice.read<uint64_t>();
+    block.offset = entrySlice.read<uint64_t>();
+    block.size = entrySlice.read<uint32_t>();
+    fullEntry.indexBlocks.push_back(block);
+  }
+
+  // Step 6: Cache it (simple FIFO eviction if needed)
+  if (fullIndexCache.size() >= MAX_CACHE_ENTRIES) {
+    // Evict first entry (can upgrade to LRU later)
+    fullIndexCache.erase(fullIndexCache.begin());
+  }
+  fullIndexCache[seriesId] = std::move(fullEntry);
+
+  tsdb::tsm_log.trace("Loaded full index entry for series {} ({} blocks)",
+                      seriesId.toHex(), blockCount);
+
+  co_return &fullIndexCache[seriesId];
 }
 
 template <class T>
 seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results){
-  auto it = index.find(seriesId);
+  // Get full index entry (uses bloom filter + sparse index + lazy load)
+  auto* indexEntry = co_await getFullIndexEntry(seriesId);
 
-  if(it == index.end())
-    co_return;
+  if (!indexEntry) {
+    co_return; // Series not in this file
+  }
 
+  // Filter blocks by time range
   std::vector<TSMIndexBlock> blocksToScan;
   std::copy_if(
-    it->second.indexBlocks.begin(),
-    it->second.indexBlocks.end(),
+    indexEntry->indexBlocks.begin(),
+    indexEntry->indexBlocks.end(),
     std::back_inserter(blocksToScan),
-    [endTime, startTime](TSMIndexBlock indexBlock){
+    [endTime, startTime](const TSMIndexBlock& indexBlock){
       return indexBlock.minTime <= endTime && startTime <= indexBlock.maxTime;
     }
   );
@@ -142,7 +244,7 @@ seastar::future<> TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t start
   if constexpr (std::is_same<T, double>::value)
   {
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
-    FloatEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+    FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
 
   } else if constexpr (std::is_same<T, bool>::value) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
@@ -164,24 +266,98 @@ seastar::future<> TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t start
 }
 
 std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId){
-  auto it = index.find(seriesId);
-  
-  if(it == index.end())
+  // Check bloom filter first
+  if (!seriesBloomFilter.contains(seriesId.toBytes())) {
     return {};
-  
-  return it->second.seriesType;
+  }
+
+  // Check cache
+  auto it = fullIndexCache.find(seriesId);
+  if(it != fullIndexCache.end()) {
+    return it->second.seriesType;
+  }
+
+  // Not in cache - caller needs to use getFullIndexEntry() first
+  return {};
+}
+
+// Phase 1.1: Get index blocks without reading data
+// Note: This returns blocks only if already loaded in cache
+// For guaranteed results, caller should await getFullIndexEntry() first
+std::vector<TSMIndexBlock> TSM::getSeriesBlocks(const SeriesId128& seriesId) const {
+  // Check cache
+  auto it = fullIndexCache.find(seriesId);
+  if (it != fullIndexCache.end()) {
+    return it->second.indexBlocks;
+  }
+
+  // Not in cache - return empty
+  return {};
+}
+
+// Phase 1.1: Read a single block and return it (not appending to results)
+template <class T>
+seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
+    const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime) {
+
+  auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
+  Slice blockSlice(blockBuf.get(), blockBuf.size());
+
+  auto headerSlice = blockSlice.getSlice(9);
+  uint8_t blockType = headerSlice.read<uint8_t>();
+  uint32_t timestampSize = headerSlice.read<uint32_t>();
+  uint32_t timestampBytes = headerSlice.read<uint32_t>();
+
+  auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
+  auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+  auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime);
+  size_t valueByteSize = indexBlock.size - timestampBytes - (sizeof(uint8_t) + 2*sizeof(uint32_t));
+
+  if constexpr (std::is_same<T, double>::value) {
+    auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
+    FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+
+  } else if constexpr (std::is_same<T, bool>::value) {
+    auto valuesSlice = blockSlice.getSlice(valueByteSize);
+    BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+
+  } else if constexpr (std::is_same<T, std::string>::value) {
+    auto valuesSlice = blockSlice.getSlice(valueByteSize);
+    std::vector<std::string> allStrings;
+    StringEncoder::decode(valuesSlice, timestampSize, allStrings);
+
+    blockResults->values->reserve(nTimestamps);
+    for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
+      blockResults->values->push_back(std::move(allStrings[i]));
+    }
+  }
+
+  co_return blockResults;
 }
 
 template seastar::future<> TSM::readSeries<double>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<double> &results);
 template seastar::future<> TSM::readSeries<bool>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<bool> &results);
 template seastar::future<> TSM::readSeries<std::string>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<std::string> &results);
 
+// Phase 1.1: Template instantiations for readSingleBlock
+template seastar::future<std::unique_ptr<TSMBlock<double>>> TSM::readSingleBlock<double>(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
+template seastar::future<std::unique_ptr<TSMBlock<bool>>> TSM::readSingleBlock<bool>(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
+template seastar::future<std::unique_ptr<TSMBlock<std::string>>> TSM::readSingleBlock<std::string>(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
+
+// Phase 2: Read compressed block bytes directly without decompression
+seastar::future<seastar::temporary_buffer<uint8_t>> TSM::readCompressedBlock(const TSMIndexBlock &indexBlock) {
+    // Read the entire block as-is (already compressed)
+    // No decompression - just read the raw bytes for zero-copy transfer
+    auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
+    co_return blockBuf;
+}
+
 seastar::future<> TSM::scheduleDelete() {
     // Close the file if it's open
     if (tsmFile) {
         co_await tsmFile.close();
     }
-    
+
     // Delete the physical file
     try {
         std::filesystem::remove(filePath);
@@ -189,7 +365,222 @@ seastar::future<> TSM::scheduleDelete() {
     } catch (const std::exception& e) {
         tsdb::tsm_log.error("Failed to delete TSM file {}: {}", filePath, e.what());
     }
-    
+
     co_return;
 }
+
+// Group blocks into contiguous batches for optimized I/O
+std::vector<BlockBatch> TSM::groupContiguousBlocks(const std::vector<TSMIndexBlock>& blocks) const {
+    std::vector<BlockBatch> batches;
+    if (blocks.empty()) {
+        return batches;
+    }
+
+    // Maximum batch size to avoid excessive memory usage (16MB)
+    constexpr uint32_t MAX_BATCH_SIZE = 16 * 1024 * 1024;
+
+    BlockBatch currentBatch;
+    currentBatch.startOffset = blocks[0].offset;
+    currentBatch.totalSize = blocks[0].size;
+    currentBatch.blocks.push_back(blocks[0]);
+
+    for (size_t i = 1; i < blocks.size(); ++i) {
+        uint64_t expectedOffset = currentBatch.startOffset + currentBatch.totalSize;
+        uint32_t newBatchSize = currentBatch.totalSize + blocks[i].size;
+
+        // Check if contiguous and within size limit
+        if (blocks[i].offset == expectedOffset && newBatchSize <= MAX_BATCH_SIZE) {
+            // Contiguous and fits - add to current batch
+            currentBatch.blocks.push_back(blocks[i]);
+            currentBatch.totalSize += blocks[i].size;
+        } else {
+            // Gap detected or size limit - finalize current batch and start new one
+            batches.push_back(std::move(currentBatch));
+            currentBatch = BlockBatch();
+            currentBatch.startOffset = blocks[i].offset;
+            currentBatch.totalSize = blocks[i].size;
+            currentBatch.blocks.push_back(blocks[i]);
+        }
+    }
+
+    // Don't forget the last batch
+    batches.push_back(std::move(currentBatch));
+
+    tsdb::tsm_log.debug("Grouped {} blocks into {} batches", blocks.size(), batches.size());
+
+    return batches;
+}
+
+// Extract block decoding logic for reuse
+template <class T>
+std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
+    Slice& blockSlice,
+    uint32_t blockSize,
+    uint64_t startTime,
+    uint64_t endTime
+) {
+    // Defensive check: ensure we have at least header size
+    if (blockSize < 9) {
+        tsdb::tsm_log.error("Block size {} is too small for header", blockSize);
+        return nullptr;
+    }
+
+    // Parse block header (9 bytes: type + timestampSize + timestampBytes)
+    auto headerSlice = blockSlice.getSlice(9);
+    uint8_t blockType = headerSlice.read<uint8_t>();
+    uint32_t timestampSize = headerSlice.read<uint32_t>();
+    uint32_t timestampBytes = headerSlice.read<uint32_t>();
+
+    // Defensive check: ensure timestampBytes is reasonable
+    if (timestampBytes > blockSize - 9) {
+        tsdb::tsm_log.error("Timestamp bytes {} exceeds block size {} - 9", timestampBytes, blockSize);
+        return nullptr;
+    }
+
+    // Decode timestamps with time-range filtering
+    auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
+    auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+    auto [nSkipped, nTimestamps] = IntegerEncoder::decode(
+        timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime
+    );
+
+    // Decode values based on type
+    size_t valueByteSize = blockSize - timestampBytes - 9;
+
+    // Defensive check
+    if (valueByteSize > blockSize) {
+        tsdb::tsm_log.error("Value byte size {} is invalid for block size {}", valueByteSize, blockSize);
+        return nullptr;
+    }
+
+    if constexpr (std::is_same<T, double>::value) {
+        auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
+        FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+    } else if constexpr (std::is_same<T, bool>::value) {
+        auto valuesSlice = blockSlice.getSlice(valueByteSize);
+        BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+    } else if constexpr (std::is_same<T, std::string>::value) {
+        auto valuesSlice = blockSlice.getSlice(valueByteSize);
+        std::vector<std::string> allStrings;
+        StringEncoder::decode(valuesSlice, timestampSize, allStrings);
+
+        blockResults->values->reserve(nTimestamps);
+        for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
+            blockResults->values->push_back(std::move(allStrings[i]));
+        }
+    }
+
+    return blockResults;
+}
+
+// Read multiple contiguous blocks with a single I/O operation
+template <class T>
+seastar::future<> TSM::readBlockBatch(
+    const BlockBatch& batch,
+    uint64_t startTime,
+    uint64_t endTime,
+    TSMResult<T>& results
+) {
+    // Performance tracking
+    auto batchReadStart = std::chrono::high_resolution_clock::now();
+
+    // Single large DMA read for entire batch
+    auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(
+        batch.startOffset,
+        batch.totalSize
+    );
+
+    auto batchReadEnd = std::chrono::high_resolution_clock::now();
+    auto readDuration = std::chrono::duration<double, std::milli>(batchReadEnd - batchReadStart);
+
+    // Process each block from the batch buffer
+    uint32_t bufferOffset = 0;
+    size_t blocksDecoded = 0;
+    for (const auto& block : batch.blocks) {
+        // Create slice into batch buffer for this specific block
+        Slice blockSlice(batchBuf.get() + bufferOffset, block.size);
+
+        // Decode block using extracted logic
+        auto blockResult = decodeBlock<T>(blockSlice, block.size, startTime, endTime);
+
+        // Only append if block has data after time filtering
+        if (blockResult && !blockResult->timestamps->empty()) {
+            results.appendBlock(blockResult);
+            blocksDecoded++;
+        }
+
+        bufferOffset += block.size;
+    }
+
+    tsdb::tsm_log.trace("Batch read: {} blocks, {} bytes in {:.2f}ms ({:.1f} MB/s)",
+                       batch.blocks.size(), batch.totalSize, readDuration.count(),
+                       (batch.totalSize / 1024.0 / 1024.0) / (readDuration.count() / 1000.0));
+
+    co_return;
+}
+
+// Optimized series read using block batching
+template <class T>
+seastar::future<> TSM::readSeriesBatched(
+    const SeriesId128& seriesId,
+    uint64_t startTime,
+    uint64_t endTime,
+    TSMResult<T>& results
+) {
+    // Get full index entry (uses bloom filter + sparse index + lazy load)
+    auto* indexEntry = co_await getFullIndexEntry(seriesId);
+    if (!indexEntry) {
+        co_return; // Series not in this file
+    }
+
+    // Step 1: Filter blocks by time range
+    std::vector<TSMIndexBlock> blocksToScan;
+    std::copy_if(
+        indexEntry->indexBlocks.begin(),
+        indexEntry->indexBlocks.end(),
+        std::back_inserter(blocksToScan),
+        [endTime, startTime](const TSMIndexBlock& indexBlock) {
+            return indexBlock.minTime <= endTime && startTime <= indexBlock.maxTime;
+        }
+    );
+
+    if (blocksToScan.empty()) {
+        co_return;
+    }
+
+    // Step 2: Blocks should already be sorted by offset from index, but verify
+    // (TSM writer ensures blocks are written in order)
+
+    // Step 3: Group into contiguous batches
+    auto batches = groupContiguousBlocks(blocksToScan);
+
+    // Log batching efficiency for performance monitoring
+    size_t totalBlocks = blocksToScan.size();
+    size_t totalBatches = batches.size();
+    if (totalBlocks > 1) {
+        double batchEfficiency = (double)totalBlocks / totalBatches;
+        tsdb::tsm_log.debug("Batch read efficiency: {:.1f} blocks/batch ({} blocks → {} batches)",
+                           batchEfficiency, totalBlocks, totalBatches);
+    }
+
+    // Step 4: Read each batch (parallel execution for non-contiguous batches)
+    co_await seastar::parallel_for_each(batches, [&](const BlockBatch& batch) {
+        return readBlockBatch(batch, startTime, endTime, results);
+    });
+
+    co_return;
+}
+
+// Template instantiations for batched reads
+template seastar::future<> TSM::readSeriesBatched<double>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<double>& results);
+template seastar::future<> TSM::readSeriesBatched<bool>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<bool>& results);
+template seastar::future<> TSM::readSeriesBatched<std::string>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<std::string>& results);
+
+template seastar::future<> TSM::readBlockBatch<double>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<double>& results);
+template seastar::future<> TSM::readBlockBatch<bool>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<bool>& results);
+template seastar::future<> TSM::readBlockBatch<std::string>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<std::string>& results);
+
+template std::unique_ptr<TSMBlock<double>> TSM::decodeBlock<double>(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
+template std::unique_ptr<TSMBlock<bool>> TSM::decodeBlock<bool>(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
+template std::unique_ptr<TSMBlock<std::string>> TSM::decodeBlock<std::string>(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
 

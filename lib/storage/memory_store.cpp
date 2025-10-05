@@ -63,14 +63,21 @@ template <class T>
 void MemoryStore::insertMemory(TSDBInsert<T> &insertRequest){
   // In-memory insert
   SeriesId128 seriesId = insertRequest.seriesId128();
-  auto it = series.find(seriesId);
 
-  if(it == series.end()){
-    InMemorySeries<T> newSeries;
-    it = series.insert({seriesId, std::move(newSeries)}).first;
+  // robin_map's operator[] returns a mutable reference, creating entry if needed
+  // Default-constructed variant will be InMemorySeries<double> (first alternative)
+  auto& variantSeries = series[seriesId];
+
+  // Check if this is a newly created entry (empty timestamps) or wrong type
+  bool isNewOrEmpty = std::visit([](const auto& s) { return s.timestamps.empty(); }, variantSeries);
+  bool isCorrectType = std::holds_alternative<InMemorySeries<T>>(variantSeries);
+
+  // If it's a new/empty entry with wrong type, initialize with correct type
+  if (isNewOrEmpty && !isCorrectType) {
+    variantSeries = InMemorySeries<T>();
   }
 
-  std::get<InMemorySeries<T>>(it->second).insert(insertRequest);
+  std::get<InMemorySeries<T>>(variantSeries).insert(insertRequest);
 }
 
 template <class T>
@@ -173,19 +180,19 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &inser
     }
   }
   auto end_wal_insert = std::chrono::high_resolution_clock::now();
-  
+
   // Only insert to memory if WAL write succeeded - process all requests in batch
   auto start_memory_insert = std::chrono::high_resolution_clock::now();
   for(auto& insertRequest : insertRequests) {
     insertMemory(insertRequest);
   }
   auto end_memory_insert = std::chrono::high_resolution_clock::now();
-  
+
   auto end_memory_batch = std::chrono::high_resolution_clock::now();
   auto wal_insert_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_wal_insert - start_wal_insert);
   auto memory_insert_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_insert - start_memory_insert);
   auto total_memory_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch - start_memory_batch);
-  
+
   LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] WAL batch insert: {}μs", wal_insert_duration.count());
   LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] In-memory batch insert: {}μs", memory_insert_duration.count());
   LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] Total batch insert: {}μs", total_memory_duration.count());
@@ -227,29 +234,32 @@ template bool MemoryStore::wouldBatchExceedThreshold<bool>(std::vector<TSDBInser
 template bool MemoryStore::wouldBatchExceedThreshold<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests);
 
 void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
-    tsdb::memory_log.debug("Deleting range for series {} from {} to {}", 
+    tsdb::memory_log.debug("Deleting range for series {} from {} to {}",
                           seriesId.toHex(), startTime, endTime);
-    
-    // Find the series in memory
-    auto it = series.find(seriesId);
-    if (it == series.end()) {
+
+    // Find the series in memory - use const find first to check existence
+    auto cit = series.find(seriesId);
+    if (cit == series.end()) {
         return; // No data to delete
     }
-    
+
+    // Access mutable reference through the map using at()
+    auto& variantSeries = series.at(seriesId);
+
     // Actually remove data from memory based on variant type
     std::visit([&](auto& inMemorySeries) {
         using T = typename std::decay_t<decltype(inMemorySeries.values)>::value_type;
-        
+
         auto& timestamps = inMemorySeries.timestamps;
         auto& values = inMemorySeries.values;
-        
+
         std::vector<uint64_t> newTimestamps;
         std::vector<T> newValues;
-        
+
         int deletedCount = 0;
         for (size_t i = 0; i < timestamps.size(); ++i) {
             uint64_t ts = timestamps[i];
-            
+
             // Keep data that's outside the deletion range
             if (ts < startTime || ts > endTime) {
                 newTimestamps.push_back(timestamps[i]);
@@ -258,19 +268,18 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
                 deletedCount++;
             }
         }
-        
+
         timestamps = std::move(newTimestamps);
         values = std::move(newValues);
-        
-    }, it->second);
-    
+
+    }, variantSeries);
+
     // If all data was removed, remove the series entirely
-    auto& variantSeries = it->second;
     bool isEmpty = std::visit([](const auto& inMemorySeries) {
         return inMemorySeries.timestamps.empty();
     }, variantSeries);
-    
+
     if (isEmpty) {
-        series.erase(it);
+        series.erase(seriesId);
     }
 }

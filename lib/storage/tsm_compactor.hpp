@@ -17,6 +17,7 @@
 #include "tsm_writer.hpp"
 #include "tsm_result.hpp"
 #include "series_id.hpp"
+#include "series_compaction_data.hpp"  // Phase 3: Parallel series processing
 
 // Forward declarations
 class CompactionStrategy;
@@ -46,53 +47,57 @@ struct CompactionPlan {
     }
 };
 
+// Phase 1.3: Include streaming block iterator
+#include "tsm_block_iterator.hpp"
+
 // Iterator for merging multiple TSM files in sorted order
 template<typename T>
 class TSMMergeIterator {
 private:
     struct SeriesIterator {
         seastar::shared_ptr<TSM> file;
-        std::string seriesKey;
-        TSMResult<T> currentBlock;
-        size_t blockIndex = 0;
+        SeriesId128 seriesId;
+        std::shared_ptr<TSMBlockIterator<T>> blockIterator;  // Phase 1.3: Use streaming iterator
+        TSMBlock<T>* currentBlock = nullptr;  // Phase 1.3: Pointer to current block
         size_t pointIndex = 0;
         bool exhausted = false;
-        
-        SeriesIterator(seastar::shared_ptr<TSM> f, const std::string& key) 
-            : file(f), seriesKey(key), currentBlock(f->rankAsInteger()) {}
-        
+
+        SeriesIterator(seastar::shared_ptr<TSM> f, const SeriesId128& id)
+            : file(f), seriesId(id) {}
+
         uint64_t currentTimestamp() const {
-            if (exhausted || blockIndex >= currentBlock.blocks.size()) {
+            if (exhausted || !currentBlock) {
                 return UINT64_MAX;
             }
-            auto block = currentBlock.blocks[blockIndex].get();
-            if (pointIndex >= block->timestamps->size()) {
+            if (pointIndex >= currentBlock->timestamps->size()) {
                 return UINT64_MAX;
             }
-            return block->timestamps->at(pointIndex);
+            return currentBlock->timestamps->at(pointIndex);
         }
-        
+
         T currentValue() const {
-            auto block = currentBlock.blocks[blockIndex].get();
-            return block->values->at(pointIndex);
+            return currentBlock->values->at(pointIndex);
         }
-        
-        void advance() {
+
+        // Phase 1.3: Async advance that loads blocks on-demand
+        seastar::future<> advance() {
             pointIndex++;
-            auto block = currentBlock.blocks[blockIndex].get();
-            if (pointIndex >= block->timestamps->size()) {
-                blockIndex++;
-                pointIndex = 0;
-                if (blockIndex >= currentBlock.blocks.size()) {
+            if (currentBlock && pointIndex >= currentBlock->timestamps->size()) {
+                // Current block exhausted, load next block
+                if (blockIterator->hasNext()) {
+                    currentBlock = co_await blockIterator->nextBlock();
+                    pointIndex = 0;
+                } else {
                     exhausted = true;
+                    currentBlock = nullptr;
                 }
             }
         }
     };
     
     std::vector<SeriesIterator> iterators;
-    std::string seriesKey;
-    
+    SeriesId128 seriesId;
+
     // Priority queue to efficiently find minimum timestamp
     // When timestamps are equal, prefer higher iterator index (newer file)
     struct QueueItem {
@@ -113,24 +118,35 @@ private:
     std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> minHeap;
     
 public:
-    TSMMergeIterator(const std::string& series, 
-                     const std::vector<seastar::shared_ptr<TSM>>& files) 
-        : seriesKey(series) {
+    TSMMergeIterator(const SeriesId128& series,
+                     const std::vector<seastar::shared_ptr<TSM>>& files)
+        : seriesId(series) {
         iterators.reserve(files.size());
         for (auto& file : files) {
             iterators.emplace_back(file, series);
         }
     }
     
+    // Phase 1.3: Streaming initialization - only read first block
     seastar::future<> init() {
-        // Initialize all iterators by reading first blocks
         for (size_t i = 0; i < iterators.size(); i++) {
             auto& iter = iterators[i];
-            iter.currentBlock = TSMResult<T>(iter.file->rankAsInteger());
-            SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
-            co_await iter.file->template readSeries<T>(seriesId, 0, UINT64_MAX, iter.currentBlock);
-            if (!iter.currentBlock.empty()) {
-                minHeap.push({iter.currentTimestamp(), i, iter.file->rankAsInteger()});
+
+            // Create block iterator (lightweight - no I/O yet)
+            iter.blockIterator = std::make_shared<TSMBlockIterator<T>>(
+                iter.file, seriesId, 0, UINT64_MAX);
+
+            // Initialize block iterator (reads index metadata only)
+            co_await iter.blockIterator->init();
+
+            // Load first block if available
+            if (iter.blockIterator->hasNext()) {
+                iter.currentBlock = co_await iter.blockIterator->nextBlock();
+                if (iter.currentBlock && !iter.currentBlock->timestamps->empty()) {
+                    minHeap.push({iter.currentTimestamp(), i, iter.file->rankAsInteger()});
+                } else {
+                    iter.exhausted = true;
+                }
             } else {
                 iter.exhausted = true;
             }
@@ -140,31 +156,37 @@ public:
     bool hasNext() const {
         return !minHeap.empty();
     }
+
+    // Phase 2.2: Getter for series ID (needed by pipeline merge)
+    const SeriesId128& getSeriesId() const {
+        return seriesId;
+    }
     
-    std::pair<uint64_t, T> next() {
+    // Phase 1.3: Async next() for streaming block loading
+    seastar::future<std::pair<uint64_t, T>> next() {
         auto item = minHeap.top();
         minHeap.pop();
-        
+
         auto& iter = iterators[item.iteratorIndex];
         T value = iter.currentValue();
-        iter.advance();
-        
+        co_await iter.advance();  // Phase 1.3: Async advance
+
         // Re-add to heap if not exhausted
         if (!iter.exhausted) {
             minHeap.push({iter.currentTimestamp(), item.iteratorIndex, iter.file->rankAsInteger()});
         }
-        
-        return {item.timestamp, value};
+
+        co_return std::make_pair(item.timestamp, value);
     }
-    
-    // Get next batch of points for efficient processing
-    std::vector<std::pair<uint64_t, T>> nextBatch(size_t maxPoints = 1000) {
+
+    // Phase 1.3: Async nextBatch for efficient processing
+    seastar::future<std::vector<std::pair<uint64_t, T>>> nextBatch(size_t maxPoints = 1000) {
         std::vector<std::pair<uint64_t, T>> batch;
         batch.reserve(maxPoints);
-        
+
         while (hasNext() && batch.size() < maxPoints) {
-            auto [timestamp, value] = next();
-            
+            auto [timestamp, value] = co_await next();  // Phase 1.3: Async
+
             // Check if there are more iterators at the same timestamp
             // and skip them (keeping the value from the highest rank/newest file)
             while (hasNext() && !minHeap.empty() && minHeap.top().timestamp == timestamp) {
@@ -172,21 +194,21 @@ public:
                 // The value we already have is from the newest file (highest rank)
                 auto dupItem = minHeap.top();
                 minHeap.pop();
-                
+
                 auto& dupIter = iterators[dupItem.iteratorIndex];
-                dupIter.advance();
-                
+                co_await dupIter.advance();  // Phase 1.3: Async
+
                 // Re-add to heap if not exhausted
                 if (!dupIter.exhausted) {
-                    minHeap.push({dupIter.currentTimestamp(), dupItem.iteratorIndex, 
+                    minHeap.push({dupIter.currentTimestamp(), dupItem.iteratorIndex,
                                  dupIter.file->rankAsInteger()});
                 }
             }
-            
+
             batch.push_back({timestamp, value});
         }
-        
-        return batch;
+
+        co_return batch;
     }
 };
 
@@ -220,13 +242,38 @@ private:
     
     // Merge series data from multiple files
     template<typename T>
-    seastar::future<> mergeSeries(const std::string& seriesKey,
+    seastar::future<> mergeSeries(const SeriesId128& seriesId,
                                   const std::vector<seastar::shared_ptr<TSM>>& sources,
                                   TSMWriter& writer,
                                   CompactionStats& stats);
-    
-    // Get all unique series keys from files
-    std::set<std::string> getAllSeriesKeys(const std::vector<seastar::shared_ptr<TSM>>& files);
+
+    // Phase 2.2: Merge series using pre-initialized iterator (for pipeline)
+    // Phase 5.2: Templated on iterator type to support specialized merges
+    template<typename T, typename MergeIterator>
+    seastar::future<> mergeSeriesWithIterator(MergeIterator& merger,
+                                               const std::vector<seastar::shared_ptr<TSM>>& sources,
+                                               TSMWriter& writer,
+                                               CompactionStats& stats);
+
+    // Phase A: Bulk-load merge (no streaming, minimal async overhead)
+    template<typename T>
+    seastar::future<> mergeSeriesBulk(const SeriesId128& seriesId,
+                                       const std::vector<seastar::shared_ptr<TSM>>& sources,
+                                       TSMWriter& writer,
+                                       CompactionStats& stats);
+
+    // Phase 3: Process series for compaction without writing (for parallel processing)
+    template<typename T>
+    seastar::future<SeriesCompactionData<T>> processSeriesForCompaction(
+        const SeriesId128& seriesId,
+        const std::vector<seastar::shared_ptr<TSM>>& sources);
+
+    // Phase 3: Write pre-processed series data to TSMWriter
+    template<typename T>
+    void writeSeriesCompactionData(TSMWriter& writer, SeriesCompactionData<T>&& data, CompactionStats& stats);
+
+    // Get all unique series IDs from files
+    std::vector<SeriesId128> getAllSeriesIds(const std::vector<seastar::shared_ptr<TSM>>& files);
     
 public:
     explicit TSMCompactor(TSMFileManager* manager);

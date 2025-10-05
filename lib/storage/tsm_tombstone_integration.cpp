@@ -54,13 +54,20 @@ bool TSM::hasSeriesInTimeRange(
     const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime) const {
-    
-    // Check if series exists in index
-    auto it = index.find(seriesId);
-    if (it == index.end()) {
+
+    // Check bloom filter first
+    if (!seriesBloomFilter.contains(seriesId.toBytes())) {
         return false;
     }
-    
+
+    // Check if series exists in cache
+    auto it = fullIndexCache.find(seriesId);
+    if (it == fullIndexCache.end()) {
+        // Not in cache - could exist but not loaded yet
+        // For tombstone operations, be conservative and assume it might exist
+        return seriesBloomFilter.contains(seriesId.toBytes());
+    }
+
     // Check if any index blocks overlap with the time range
     const auto& indexEntry = it->second;
     for (const auto& block : indexEntry.indexBlocks) {
@@ -68,7 +75,7 @@ bool TSM::hasSeriesInTimeRange(
             return true;
         }
     }
-    
+
     return false;
 }
 
@@ -93,33 +100,32 @@ seastar::future<bool> TSM::deleteRange(
     const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime) {
-    
+
     // IMPORTANT: Only add tombstones if the series actually exists in this TSM file
     // This prevents unnecessary tombstone creation for non-existent series
-    
-    // Check if series exists in the index of this TSM file
-    auto it = index.find(seriesId);
-    if (it == index.end()) {
+
+    // Load the full index entry (uses bloom filter + lazy loading)
+    auto* indexEntry = co_await getFullIndexEntry(seriesId);
+    if (!indexEntry) {
         // Series doesn't exist in this TSM file - no tombstone needed
-        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex() 
+        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex()
                   << "' not found in TSM " << filePath << " - skipping tombstone" << std::endl;
         co_return false;
     }
-    
+
     // Check if any index blocks overlap with the deletion time range
     bool hasOverlap = false;
-    const auto& indexEntry = it->second;
-    for (const auto& block : indexEntry.indexBlocks) {
+    for (const auto& block : indexEntry->indexBlocks) {
         if (block.minTime <= endTime && block.maxTime >= startTime) {
             hasOverlap = true;
             break;
         }
     }
-    
+
     if (!hasOverlap) {
         // No data in the requested time range - no tombstone needed
-        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex() 
-                  << "' has no data in range [" << startTime << ", " << endTime 
+        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex()
+                  << "' has no data in range [" << startTime << ", " << endTime
                   << "] in TSM " << filePath << " - skipping tombstone" << std::endl;
         co_return false;
     }
@@ -154,9 +160,9 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     uint64_t startTime,
     uint64_t endTime) {
     
-    // First, perform the regular query
+    // First, perform the regular query using optimized batched reads
     TSMResult<T> result(rankAsInteger());
-    co_await readSeries<T>(seriesId, startTime, endTime, result);
+    co_await readSeriesBatched<T>(seriesId, startTime, endTime, result);
     
     if (!tombstones) {
         std::cerr << "[TOMBSTONE_DEBUG] No tombstones loaded for TSM file " << filePath 

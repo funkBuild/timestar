@@ -16,6 +16,9 @@ class SimdAggregator {
 public:
     // Check if AVX2 is available at runtime
     static bool isAvx2Available();
+
+    // Check if AVX512 is available at runtime
+    static bool isAvx512Available();
     
     // SIMD-optimized sum calculation
     // ~4x faster than scalar for large arrays
@@ -56,14 +59,6 @@ public:
         uint32_t* histogram);
     
 private:
-    // Helper to reduce a __m256d vector to a single double
-    static double hsum_double_avx(__m256d v);
-    
-    // Helper to find horizontal minimum in a __m256d vector
-    static double hmin_double_avx(__m256d v);
-    
-    // Helper to find horizontal maximum in a __m256d vector  
-    static double hmax_double_avx(__m256d v);
     
     // Aligned memory allocation for optimal SIMD performance
     static double* alignedAlloc(size_t count);

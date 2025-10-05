@@ -91,7 +91,7 @@ AlignedBuffer StringEncoder::encode(const std::vector<std::string>& values) {
     result.write(count);
     
     // Write compressed data
-    result.data.insert(result.data.end(), compressed.begin(), compressed.begin() + compressedSize);
+    result.write_bytes(compressed.data(), compressedSize);
     
     return result;
 }

@@ -6,16 +6,21 @@
 namespace tsdb {
 namespace simd {
 
+// Forward declarations of helper functions
+static double hsum_double_avx(__m256d v);
+static double hmin_double_avx(__m256d v);
+static double hmax_double_avx(__m256d v);
+
 // Check CPU support for AVX2
 bool SimdAggregator::isAvx2Available() {
     unsigned int eax, ebx, ecx, edx;
     if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
         // Check for AVX support
         bool avx = (ecx & (1 << 28)) != 0;
-        
+
         if (avx && __get_cpuid_max(0, nullptr) >= 7) {
             __cpuid_count(7, 0, eax, ebx, ecx, edx);
-            // Check for AVX2 support  
+            // Check for AVX2 support
             bool avx2 = (ebx & (1 << 5)) != 0;
             return avx2;
         }
@@ -23,8 +28,21 @@ bool SimdAggregator::isAvx2Available() {
     return false;
 }
 
+// Check CPU support for AVX512
+bool SimdAggregator::isAvx512Available() {
+    unsigned int eax, ebx, ecx, edx;
+    if (__get_cpuid_max(0, nullptr) >= 7) {
+        __cpuid_count(7, 0, eax, ebx, ecx, edx);
+        // Check for AVX512F (foundation) and AVX512DQ (additional instructions)
+        bool avx512f = (ebx & (1 << 16)) != 0;
+        bool avx512dq = (ebx & (1 << 17)) != 0;
+        return avx512f && avx512dq;
+    }
+    return false;
+}
+
 // Horizontal sum of a 256-bit vector containing 4 doubles
-double SimdAggregator::hsum_double_avx(__m256d v) {
+static double hsum_double_avx(__m256d v) {
     __m128d vlow  = _mm256_castpd256_pd128(v);
     __m128d vhigh = _mm256_extractf128_pd(v, 1); // high 128
     vlow  = _mm_add_pd(vlow, vhigh);            // reduce down to 128
@@ -34,7 +52,7 @@ double SimdAggregator::hsum_double_avx(__m256d v) {
 }
 
 // Horizontal minimum of a 256-bit vector
-double SimdAggregator::hmin_double_avx(__m256d v) {
+static double hmin_double_avx(__m256d v) {
     __m128d vlow  = _mm256_castpd256_pd128(v);
     __m128d vhigh = _mm256_extractf128_pd(v, 1);
     vlow  = _mm_min_pd(vlow, vhigh);
@@ -44,7 +62,7 @@ double SimdAggregator::hmin_double_avx(__m256d v) {
 }
 
 // Horizontal maximum of a 256-bit vector
-double SimdAggregator::hmax_double_avx(__m256d v) {
+static double hmax_double_avx(__m256d v) {
     __m128d vlow  = _mm256_castpd256_pd128(v);
     __m128d vhigh = _mm256_extractf128_pd(v, 1);
     vlow  = _mm_max_pd(vlow, vhigh);
@@ -53,31 +71,65 @@ double SimdAggregator::hmax_double_avx(__m256d v) {
     return _mm_cvtsd_f64(_mm_max_sd(vlow, high64));
 }
 
-// SIMD-optimized sum calculation
-double SimdAggregator::calculateSum(const double* values, size_t count) {
-    if (count == 0) return 0.0;
-    
-    if (!isAvx2Available() || count < 8) {
-        return scalar::calculateSum(values, count);
+// AVX512-optimized sum calculation (8 doubles at a time)
+static double calculateSum_AVX512(const double* values, size_t count) {
+    __m512d sum_vec = _mm512_setzero_pd();
+    size_t simd_end = count - (count % 8);
+
+    // Main SIMD loop - process 8 doubles at a time
+    for (size_t i = 0; i < simd_end; i += 8) {
+        __m512d vals = _mm512_loadu_pd(&values[i]);
+        sum_vec = _mm512_add_pd(sum_vec, vals);
     }
-    
+
+    // Horizontal sum using AVX512 reduce
+    double sum = _mm512_reduce_add_pd(sum_vec);
+
+    // Handle remaining elements
+    for (size_t i = simd_end; i < count; ++i) {
+        sum += values[i];
+    }
+
+    return sum;
+}
+
+// AVX2-optimized sum calculation (4 doubles at a time)
+static double calculateSum_AVX2(const double* values, size_t count) {
     __m256d sum_vec = _mm256_setzero_pd();
     size_t simd_end = count - (count % 4);
-    
+
     // Main SIMD loop - process 4 doubles at a time
     for (size_t i = 0; i < simd_end; i += 4) {
         __m256d vals = _mm256_loadu_pd(&values[i]);
         sum_vec = _mm256_add_pd(sum_vec, vals);
     }
-    
+
     double sum = hsum_double_avx(sum_vec);
-    
+
     // Handle remaining elements
     for (size_t i = simd_end; i < count; ++i) {
         sum += values[i];
     }
-    
+
     return sum;
+}
+
+// SIMD-optimized sum calculation with cascading fallback
+double SimdAggregator::calculateSum(const double* values, size_t count) {
+    if (count == 0) return 0.0;
+
+    // Use AVX512 for best performance (process 8 doubles at once)
+    if (isAvx512Available() && count >= 16) {
+        return calculateSum_AVX512(values, count);
+    }
+
+    // Fall back to AVX2 (process 4 doubles at once)
+    if (isAvx2Available() && count >= 8) {
+        return calculateSum_AVX2(values, count);
+    }
+
+    // Fall back to scalar for small arrays or no SIMD support
+    return scalar::calculateSum(values, count);
 }
 
 // SIMD-optimized average calculation
@@ -86,80 +138,122 @@ double SimdAggregator::calculateAvg(const double* values, size_t count) {
     return calculateSum(values, count) / static_cast<double>(count);
 }
 
-// SIMD-optimized minimum calculation
-double SimdAggregator::calculateMin(const double* values, size_t count) {
-    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
-    
-    if (!isAvx2Available() || count < 8) {
-        return scalar::calculateMin(values, count);
+// AVX512-optimized minimum calculation (8 doubles at a time)
+static double calculateMin_AVX512(const double* values, size_t count) {
+    __m512d min_vec = _mm512_loadu_pd(&values[0]);
+    size_t simd_end = count - (count % 8);
+
+    for (size_t i = 8; i < simd_end; i += 8) {
+        __m512d vals = _mm512_loadu_pd(&values[i]);
+        min_vec = _mm512_min_pd(min_vec, vals);
     }
-    
-    // Initialize min_vec with the first 4 values (or broadcast first value if less than 4)
-    __m256d min_vec;
-    size_t start_idx = 0;
-    
-    if (count >= 4) {
-        min_vec = _mm256_loadu_pd(&values[0]);
-        start_idx = 4;
-    } else {
-        // If less than 4 elements, use scalar fallback
-        return scalar::calculateMin(values, count);
-    }
-    
-    size_t simd_end = count - (count % 4);
-    
-    // Main SIMD loop - start from index 4 (or next multiple of 4)
-    for (size_t i = start_idx; i < simd_end; i += 4) {
-        __m256d vals = _mm256_loadu_pd(&values[i]);
-        min_vec = _mm256_min_pd(min_vec, vals);
-    }
-    
-    double min_val = hmin_double_avx(min_vec);
-    
+
+    // Horizontal min using AVX512 reduce
+    double min_val = _mm512_reduce_min_pd(min_vec);
+
     // Handle remaining elements
     for (size_t i = simd_end; i < count; ++i) {
         min_val = std::min(min_val, values[i]);
     }
-    
+
     return min_val;
 }
 
-// SIMD-optimized maximum calculation
-double SimdAggregator::calculateMax(const double* values, size_t count) {
-    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
-    
-    if (!isAvx2Available() || count < 8) {
-        return scalar::calculateMax(values, count);
-    }
-    
-    // Initialize max_vec with the first 4 values (or use scalar fallback if less than 4)
-    __m256d max_vec;
-    size_t start_idx = 0;
-    
-    if (count >= 4) {
-        max_vec = _mm256_loadu_pd(&values[0]);
-        start_idx = 4;
-    } else {
-        // If less than 4 elements, use scalar fallback
-        return scalar::calculateMax(values, count);
-    }
-    
+// AVX2-optimized minimum calculation (4 doubles at a time)
+static double calculateMin_AVX2(const double* values, size_t count) {
+    __m256d min_vec = _mm256_loadu_pd(&values[0]);
     size_t simd_end = count - (count % 4);
-    
-    // Main SIMD loop - start from index 4 (or next multiple of 4)
-    for (size_t i = start_idx; i < simd_end; i += 4) {
+
+    for (size_t i = 4; i < simd_end; i += 4) {
         __m256d vals = _mm256_loadu_pd(&values[i]);
-        max_vec = _mm256_max_pd(max_vec, vals);
+        min_vec = _mm256_min_pd(min_vec, vals);
     }
-    
-    double max_val = hmax_double_avx(max_vec);
-    
+
+    double min_val = hmin_double_avx(min_vec);
+
+    // Handle remaining elements
+    for (size_t i = simd_end; i < count; ++i) {
+        min_val = std::min(min_val, values[i]);
+    }
+
+    return min_val;
+}
+
+// SIMD-optimized minimum calculation with cascading fallback
+double SimdAggregator::calculateMin(const double* values, size_t count) {
+    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
+
+    // Use AVX512 for best performance (process 8 doubles at once)
+    if (isAvx512Available() && count >= 16) {
+        return calculateMin_AVX512(values, count);
+    }
+
+    // Fall back to AVX2 (process 4 doubles at once)
+    if (isAvx2Available() && count >= 8) {
+        return calculateMin_AVX2(values, count);
+    }
+
+    // Fall back to scalar for small arrays or no SIMD support
+    return scalar::calculateMin(values, count);
+}
+
+// AVX512-optimized maximum calculation (8 doubles at a time)
+static double calculateMax_AVX512(const double* values, size_t count) {
+    __m512d max_vec = _mm512_loadu_pd(&values[0]);
+    size_t simd_end = count - (count % 8);
+
+    for (size_t i = 8; i < simd_end; i += 8) {
+        __m512d vals = _mm512_loadu_pd(&values[i]);
+        max_vec = _mm512_max_pd(max_vec, vals);
+    }
+
+    // Horizontal max using AVX512 reduce
+    double max_val = _mm512_reduce_max_pd(max_vec);
+
     // Handle remaining elements
     for (size_t i = simd_end; i < count; ++i) {
         max_val = std::max(max_val, values[i]);
     }
-    
+
     return max_val;
+}
+
+// AVX2-optimized maximum calculation (4 doubles at a time)
+static double calculateMax_AVX2(const double* values, size_t count) {
+    __m256d max_vec = _mm256_loadu_pd(&values[0]);
+    size_t simd_end = count - (count % 4);
+
+    for (size_t i = 4; i < simd_end; i += 4) {
+        __m256d vals = _mm256_loadu_pd(&values[i]);
+        max_vec = _mm256_max_pd(max_vec, vals);
+    }
+
+    double max_val = hmax_double_avx(max_vec);
+
+    // Handle remaining elements
+    for (size_t i = simd_end; i < count; ++i) {
+        max_val = std::max(max_val, values[i]);
+    }
+
+    return max_val;
+}
+
+// SIMD-optimized maximum calculation with cascading fallback
+double SimdAggregator::calculateMax(const double* values, size_t count) {
+    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
+
+    // Use AVX512 for best performance (process 8 doubles at once)
+    if (isAvx512Available() && count >= 16) {
+        return calculateMax_AVX512(values, count);
+    }
+
+    // Fall back to AVX2 (process 4 doubles at once)
+    if (isAvx2Available() && count >= 8) {
+        return calculateMax_AVX2(values, count);
+    }
+
+    // Fall back to scalar for small arrays or no SIMD support
+    return scalar::calculateMax(values, count);
 }
 
 // SIMD-optimized variance calculation

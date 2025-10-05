@@ -134,20 +134,28 @@ private:
         std::chrono::microseconds totalCompressionTime = std::chrono::microseconds(0);
         std::chrono::microseconds totalWalWriteTime = std::chrono::microseconds(0);
         int totalWalWriteCount = 0;
-        
+
         void aggregate(const WALTimingInfo& walTiming) {
             totalCompressionTime += walTiming.compressionTime;
             totalWalWriteTime += walTiming.walWriteTime;
             totalWalWriteCount += walTiming.walWriteCount;
         }
-        
+
         void aggregate(const AggregatedTimingInfo& other) {
             totalCompressionTime += other.totalCompressionTime;
             totalWalWriteTime += other.totalWalWriteTime;
             totalWalWriteCount += other.totalWalWriteCount;
         }
     };
-    
+
+    // Helper struct for metadata operations (deduplication across batch)
+    struct MetaOp {
+        TSMValueType valueType;
+        std::string measurement;
+        std::string fieldName;
+        std::map<std::string, std::string> tags;
+    };
+
     // Parse a single write point from JSON string
     WritePoint parseWritePoint(const std::string& json);
     
@@ -156,10 +164,14 @@ private:
     
     // Process a single write point - determine type and insert
     seastar::future<> processWritePoint(const WritePoint& point);
-    
+
     // Process a multi-point write with arrays
-    seastar::future<AggregatedTimingInfo> processMultiWritePoint(const MultiWritePoint& point);
-    
+    // Accepts seenMF and metaOps for cross-batch deduplication
+    seastar::future<AggregatedTimingInfo> processMultiWritePoint(
+        const MultiWritePoint& point,
+        std::unordered_set<std::string>& seenMF,
+        std::vector<MetaOp>& metaOps);
+
     // Validate that all field arrays have the same length as timestamps
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);
     

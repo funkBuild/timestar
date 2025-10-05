@@ -3,9 +3,9 @@
 
 #include <memory>
 #include <seastar/core/coroutine.hh>
-#include <unordered_map>
 #include <variant>
 #include <vector>
+#include <tsl/robin_map.h>
 
 #include "logger.hpp"
 #include "tsdb_value.hpp"
@@ -38,7 +38,8 @@ public:
   // 16MB threshold for actual WAL file size on disk (uncompressed)
   static constexpr size_t WAL_SIZE_THRESHOLD = 64 * 1024 * 1024; // 16MB
   const unsigned int sequenceNumber;
-  std::unordered_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
+  // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
+  tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
 
   MemoryStore(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {
     tsdb::memory_log.debug("Memory store {} created", sequenceNumber);

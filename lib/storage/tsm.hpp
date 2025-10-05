@@ -5,17 +5,22 @@
 #include "tsm_result.hpp"
 #include "tsm_tombstone.hpp"
 #include "series_id.hpp"
+#include "bloom_filter.hpp"
 
 #include <string>
 #include <memory>
 #include <fstream>
-#include <unordered_map>
 #include <vector>
 #include <tuple>
 #include <optional>
+#include <unordered_map>
+#include <tsl/robin_map.h>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
+
+// Forward declarations
+class Slice;
 
 enum class TSMValueType { Float = 0, Boolean, String };
 
@@ -25,6 +30,22 @@ typedef struct TSMIndexBlock {
   uint64_t offset;
   uint32_t size;
 } TSMIndexBlock;
+
+// Batch of contiguous blocks for optimized I/O
+struct BlockBatch {
+  uint64_t startOffset;           // Offset of first block in batch
+  uint32_t totalSize;             // Sum of all block sizes
+  std::vector<TSMIndexBlock> blocks;  // Blocks in this batch
+
+  BlockBatch() : startOffset(0), totalSize(0) {}
+};
+
+// Sparse index entry for lazy loading (28 bytes per series)
+struct SparseIndexEntry {
+  SeriesId128 seriesId;    // 16 bytes - for hash map key
+  uint64_t fileOffset;     // 8 bytes - where to read in file
+  uint32_t entrySize;      // 4 bytes - how much to read
+};
 
 typedef struct TSMIndexEntry {
   SeriesId128 seriesId;
@@ -43,9 +64,17 @@ private:
   seastar::file tsmFile;
   uint64_t length = 0;
 
-  // TODO: Test using tsl::htrie_map to save memory
-  std::unordered_map<SeriesId128, TSMIndexEntry> index;
-  
+  // Lazy loading: sparse index + bloom filter for memory efficiency
+  tsl::robin_map<SeriesId128, SparseIndexEntry, SeriesId128::Hash> sparseIndex;
+  bloom_filter seriesBloomFilter;
+
+  // Full index cache for hot series (LRU-like behavior)
+  mutable std::unordered_map<SeriesId128, TSMIndexEntry> fullIndexCache;
+
+  // Configuration for bloom filter and cache
+  static constexpr double BLOOM_FPR = 0.001;  // 0.1% false positive rate
+  static constexpr size_t MAX_CACHE_ENTRIES = 100;
+
   // Tombstone support
   std::unique_ptr<tsdb::TSMTombstone> tombstones;
 
@@ -92,18 +121,41 @@ public:
   // Schedule async deletion
   seastar::future<> scheduleDelete();
 
-  seastar::future<> readIndex();
+  // Lazy loading index methods
+  seastar::future<> readSparseIndex();
+  seastar::future<TSMIndexEntry*> getFullIndexEntry(const SeriesId128& seriesId);
+
   template <class T>
   seastar::future<> readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   template <class T>
+  seastar::future<> readSeriesBatched(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
+  template <class T>
   seastar::future<> readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
+  template <class T>
+  seastar::future<> readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
-  
+
+  // Block batching utilities
+  std::vector<BlockBatch> groupContiguousBlocks(const std::vector<TSMIndexBlock>& blocks) const;
+  template <class T>
+  std::unique_ptr<TSMBlock<T>> decodeBlock(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
+
+  // Phase 1.1: New methods for streaming block access
+  // Get index blocks for a series without reading data (for lazy loading)
+  std::vector<TSMIndexBlock> getSeriesBlocks(const SeriesId128& seriesId) const;
+
+  // Read a single block and return it (for on-demand loading)
+  template <class T>
+  seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
+
+  // Phase 2: Read compressed block bytes directly (zero-copy transfer)
+  seastar::future<seastar::temporary_buffer<uint8_t>> readCompressedBlock(const TSMIndexBlock &indexBlock);
+
   // Get all series IDs in this file (for compaction)
   std::vector<SeriesId128> getSeriesIds() const {
     std::vector<SeriesId128> ids;
-    ids.reserve(index.size());
-    for (const auto& [id, entry] : index) {
+    ids.reserve(sparseIndex.size());
+    for (const auto& [id, entry] : sparseIndex) {
       ids.push_back(id);
     }
     return ids;

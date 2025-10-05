@@ -2,8 +2,13 @@
 #include "tsm_file_manager.hpp"
 #include "tsm_writer.hpp"
 #include "logger.hpp"
+#include "compaction_pipeline.hpp"  // Phase 2.1: Include prefetch manager
+#include "batch_pool.hpp"  // Phase 3.3: Zero-copy batch pool
+#include "tsm_merge_specialized.hpp"  // Phase 5.1: Specialized N-way merges
+#include "bulk_block_loader.hpp"  // Phase A: Bulk loading optimization
 #include <filesystem>
 #include <set>
+#include <unordered_map>
 #include <chrono>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
@@ -23,44 +28,40 @@ std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqN
     return std::string(buffer);
 }
 
-std::set<std::string> TSMCompactor::getAllSeriesKeys(
+std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(
     const std::vector<seastar::shared_ptr<TSM>>& files) {
-    
-    std::set<std::string> allKeys;
-    
-    // Collect all unique series IDs from all files and convert to string keys
+
+    std::set<SeriesId128> uniqueIds;
+
+    // Collect all unique series IDs from all files
     for (const auto& file : files) {
         auto ids = file->getSeriesIds();
         for (const auto& id : ids) {
-            // For compatibility with existing compactor logic, we'll work with string keys
-            // and convert to SeriesId128 when needed for TSM operations
-            // Note: This is a temporary compatibility layer
-            allKeys.insert(id.toHex()); // Use hex representation as string key
+            uniqueIds.insert(id);
         }
     }
-    
-    return allKeys;
+
+    // Convert set to vector for iteration
+    return std::vector<SeriesId128>(uniqueIds.begin(), uniqueIds.end());
 }
 
 template<typename T>
 seastar::future<> TSMCompactor::mergeSeries(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     const std::vector<seastar::shared_ptr<TSM>>& sources,
     TSMWriter& writer,
     CompactionStats& stats) {
-    
+
     // Create merge iterator for this series
-    TSMMergeIterator<T> merger(seriesKey, sources);
+    TSMMergeIterator<T> merger(seriesId, sources);
     co_await merger.init();
-    
+
     // Collect all tombstones for this series from all source files
     std::vector<std::pair<uint64_t, uint64_t>> tombstoneRanges;
     for (const auto& file : sources) {
         if (file->hasTombstones()) {
             auto tombstones = file->getTombstones();
             if (tombstones) {
-                // Convert hex string back to SeriesId128, then get hash for tombstones
-                SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
                 uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
                 auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
                 tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
@@ -100,9 +101,9 @@ seastar::future<> TSMCompactor::mergeSeries(
     uint64_t lastTimestamp = 0;
     size_t tombstonesFiltered = 0;
     
-    // Process in batches
+    // Phase 1.3: Process in batches with streaming
     while (merger.hasNext()) {
-        auto batch = merger.nextBatch(BATCH_SIZE);
+        auto batch = co_await merger.nextBatch(BATCH_SIZE);  // Phase 1.3: Async nextBatch
         
         for (const auto& [ts, val] : batch) {
             stats.pointsRead++;
@@ -137,29 +138,834 @@ seastar::future<> TSMCompactor::mergeSeries(
             
             // Write when batch is full
             if (timestamps.size() >= BATCH_SIZE) {
-                // Convert hex string back to SeriesId128 for TSM writing
-                SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
                 writer.writeSeries(TSM::getValueType<T>(), seriesId, timestamps, values);
                 timestamps.clear();
                 values.clear();
             }
         }
     }
-    
+
     // Write remaining data
     if (!timestamps.empty()) {
-        // Convert hex string back to SeriesId128 for TSM writing
-        SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
         writer.writeSeries(TSM::getValueType<T>(), seriesId, timestamps, values);
     }
-    
+
     // Log tombstone filtering stats if any points were filtered
     if (tombstonesFiltered > 0) {
         tsdb::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
-                                 tombstonesFiltered, seriesKey);
+                                 tombstonesFiltered, seriesId.toHex());
     }
-    
+
     co_return;
+}
+
+// Phase 2.2: Merge series using pre-initialized iterator (for pipeline)
+// Phase 5.2: Templated on iterator type to support specialized merges
+template<typename T, typename MergeIterator>
+seastar::future<> TSMCompactor::mergeSeriesWithIterator(
+    MergeIterator& merger,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats) {
+
+    // Iterator already initialized (by prefetch pipeline or specialized merge)
+    const SeriesId128& seriesId = merger.getSeriesId();
+
+    // Collect all tombstones for this series from all source files
+    std::vector<std::pair<uint64_t, uint64_t>> tombstoneRanges;
+    for (const auto& file : sources) {
+        if (file->hasTombstones()) {
+            auto tombstones = file->getTombstones();
+            if (tombstones) {
+                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
+                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
+                tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
+            }
+        }
+    }
+
+    // Sort and merge overlapping tombstone ranges
+    if (!tombstoneRanges.empty()) {
+        std::sort(tombstoneRanges.begin(), tombstoneRanges.end());
+
+        // Merge overlapping ranges
+        std::vector<std::pair<uint64_t, uint64_t>> mergedRanges;
+        mergedRanges.push_back(tombstoneRanges[0]);
+
+        for (size_t i = 1; i < tombstoneRanges.size(); ++i) {
+            auto& last = mergedRanges.back();
+            const auto& current = tombstoneRanges[i];
+
+            if (current.first <= last.second + 1) {
+                // Overlapping or adjacent, merge
+                last.second = std::max(last.second, current.second);
+            } else {
+                // Non-overlapping, add as new range
+                mergedRanges.push_back(current);
+            }
+        }
+
+        tombstoneRanges = std::move(mergedRanges);
+    }
+
+    // Phase 3.3: Use BatchPool for zero-copy transfers to TSMWriter
+    BatchPool<T> pool(BATCH_SIZE, 10);  // Pool of 10 batches with BATCH_SIZE capacity
+    auto currentBatch = pool.acquire();
+
+    uint64_t lastTimestamp = 0;
+    size_t tombstonesFiltered = 0;
+
+    // Process in batches with streaming
+    while (merger.hasNext()) {
+        auto batch = co_await merger.nextBatch(BATCH_SIZE);
+
+        for (const auto& [ts, val] : batch) {
+            stats.pointsRead++;
+
+            // Phase 4.1: Check if this point is tombstoned using binary search O(log m)
+            bool isTombstoned = false;
+            if (!tombstoneRanges.empty()) {
+                // Binary search: find first range with startTime > ts
+                auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(), ts,
+                    [](uint64_t timestamp, const std::pair<uint64_t, uint64_t>& range) {
+                        return timestamp < range.first;  // Compare ts with startTime
+                    });
+
+                // Check the previous range (if exists) to see if ts falls within it
+                if (it != tombstoneRanges.begin()) {
+                    --it;
+                    const auto& [startTime, endTime] = *it;
+                    if (ts >= startTime && ts <= endTime) {
+                        isTombstoned = true;
+                        tombstonesFiltered++;
+                    }
+                }
+            }
+
+            if (isTombstoned) {
+                continue; // Skip tombstoned data
+            }
+
+            // Deduplicate - skip if same timestamp
+            if (ts != lastTimestamp) {
+                currentBatch->timestamps.push_back(ts);
+                currentBatch->values.push_back(val);
+                lastTimestamp = ts;
+                stats.pointsWritten++;
+            } else {
+                stats.duplicatesRemoved++;
+            }
+
+            // Phase 3.3: Write when batch is full using zero-copy move semantics
+            if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+                writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
+                                        std::move(currentBatch->timestamps),
+                                        std::move(currentBatch->values));
+                pool.release(std::move(currentBatch));  // Return to pool
+                currentBatch = pool.acquire();  // Get new batch
+            }
+        }
+    }
+
+    // Phase 3.3: Write remaining data using zero-copy move semantics
+    if (!currentBatch->timestamps.empty()) {
+        writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
+                                std::move(currentBatch->timestamps),
+                                std::move(currentBatch->values));
+    }
+    pool.release(std::move(currentBatch));  // Return final batch to pool
+
+    // Log tombstone filtering stats if any points were filtered
+    if (tombstonesFiltered > 0) {
+        tsdb::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
+                                 tombstonesFiltered, seriesId.toHex());
+    }
+
+    co_return;
+}
+
+// Phase A: Bulk-load merge - loads all blocks at once, minimizes async overhead
+template<typename T>
+seastar::future<> TSMCompactor::mergeSeriesBulk(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats) {
+
+    // Phase A: Load ALL blocks from ALL files in one batch operation
+    auto allBlocks = co_await BulkBlockLoader<T>::loadFromFiles(sources, seriesId);
+
+    if (allBlocks.empty()) {
+        co_return;  // Series not in any file
+    }
+
+    // Collect tombstones (same as before)
+    std::vector<std::pair<uint64_t, uint64_t>> tombstoneRanges;
+    for (const auto& file : sources) {
+        if (file->hasTombstones()) {
+            auto tombstones = file->getTombstones();
+            if (tombstones) {
+                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
+                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
+                tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
+            }
+        }
+    }
+
+    // Sort and merge overlapping tombstone ranges
+    if (!tombstoneRanges.empty()) {
+        std::sort(tombstoneRanges.begin(), tombstoneRanges.end());
+
+        std::vector<std::pair<uint64_t, uint64_t>> mergedRanges;
+        mergedRanges.push_back(tombstoneRanges[0]);
+
+        for (size_t i = 1; i < tombstoneRanges.size(); ++i) {
+            auto& last = mergedRanges.back();
+            const auto& current = tombstoneRanges[i];
+
+            if (current.first <= last.second + 1) {
+                last.second = std::max(last.second, current.second);
+            } else {
+                mergedRanges.push_back(current);
+            }
+        }
+
+        tombstoneRanges = std::move(mergedRanges);
+    }
+
+    // Phase 1/2: Build metadata index for block ordering optimization
+    std::vector<BlockMetadata<T>> blockMeta;
+
+    // Phase 2: Get index blocks from source files for zero-copy
+    std::vector<std::vector<TSMIndexBlock>> sourceIndexBlocks;
+    for (const auto& file : sources) {
+        sourceIndexBlocks.push_back(file->getSeriesBlocks(seriesId));
+    }
+
+    for (size_t fileIdx = 0; fileIdx < allBlocks.size(); fileIdx++) {
+        const auto& fileBlocks = allBlocks[fileIdx];
+        const auto& indexBlocks = sourceIndexBlocks[fileIdx];
+
+        // Phase 2: Build metadata from index blocks directly (no decompression needed!)
+        for (size_t blockIdx = 0; blockIdx < indexBlocks.size(); blockIdx++) {
+            const auto& indexBlock = indexBlocks[blockIdx];
+
+            BlockMetadata<T> meta;
+            // Use metadata from index - no need to decompress!
+            meta.minTime = indexBlock.minTime;
+            meta.maxTime = indexBlock.maxTime;
+            meta.fileIndex = fileIdx;
+            meta.blockIndex = blockIdx;
+            meta.blockPtr = (blockIdx < fileBlocks.blocks.size()) ? fileBlocks.blocks[blockIdx].get() : nullptr;
+            meta.fileRank = fileBlocks.fileRank;
+
+            // Phase 2: Store source file and index block for zero-copy
+            meta.sourceFile = sources[fileIdx];
+            meta.indexBlock = indexBlock;
+
+            blockMeta.push_back(meta);
+        }
+    }
+
+    // Phase 1: Sort blocks by timestamp
+    std::sort(blockMeta.begin(), blockMeta.end());
+
+    // Phase 1: Analyze overlap patterns to detect fast path opportunities
+    std::vector<MergeSegment> segments;
+    if (!blockMeta.empty()) {
+        size_t segmentStart = 0;
+        bool currentNeedsMerge = false;
+
+        for (size_t i = 1; i < blockMeta.size(); i++) {
+            bool overlaps = blockMeta[i-1].overlapsWith(blockMeta[i]);
+
+            if (i == 1) {
+                // First comparison - establish initial pattern
+                currentNeedsMerge = overlaps;
+            } else if (overlaps != currentNeedsMerge) {
+                // Pattern changed - close current segment
+                segments.push_back({segmentStart, i-1, currentNeedsMerge});
+                segmentStart = i;
+                currentNeedsMerge = overlaps;
+            }
+        }
+
+        // Close final segment
+        segments.push_back({segmentStart, blockMeta.size()-1, currentNeedsMerge});
+    }
+
+    // Phase A: Use batch pool for zero-copy
+    BatchPool<T> pool(BATCH_SIZE, 10);
+    auto currentBatch = pool.acquire();
+
+    uint64_t lastTimestamp = 0;
+    size_t tombstonesFiltered = 0;
+
+    // Phase B: Helper lambda to process batches (same logic for all merger types)
+    auto processMerge = [&](auto& merger) {
+        while (merger.hasNext()) {
+            auto batch = merger.nextBatch(BATCH_SIZE);  // NO co_await!
+
+            for (const auto& [ts, val] : batch) {
+                stats.pointsRead++;
+
+                // Phase 4.1: Binary search tombstones
+                bool isTombstoned = false;
+                if (!tombstoneRanges.empty()) {
+                    auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(), ts,
+                        [](uint64_t timestamp, const std::pair<uint64_t, uint64_t>& range) {
+                            return timestamp < range.first;
+                        });
+
+                    if (it != tombstoneRanges.begin()) {
+                        --it;
+                        const auto& [startTime, endTime] = *it;
+                        if (ts >= startTime && ts <= endTime) {
+                            isTombstoned = true;
+                            tombstonesFiltered++;
+                        }
+                    }
+                }
+
+                if (isTombstoned) {
+                    continue;
+                }
+
+                // Deduplicate
+                if (ts != lastTimestamp) {
+                    currentBatch->timestamps.push_back(ts);
+                    currentBatch->values.push_back(val);
+                    lastTimestamp = ts;
+                    stats.pointsWritten++;
+                } else {
+                    stats.duplicatesRemoved++;
+                }
+
+                // Phase 3.3: Write when batch full using zero-copy
+                if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+                    writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
+                                            std::move(currentBatch->timestamps),
+                                            std::move(currentBatch->values));
+                    pool.release(std::move(currentBatch));
+                    currentBatch = pool.acquire();
+                }
+            }
+        }
+    };
+
+    // Phase 1: Helper lambda for direct block copy (fast path - no overlap)
+    auto copyBlockDirect = [&](const TSMBlock<T>* block) {
+        // ULTRA FAST PATH: No tombstones - copy entire block at once
+        if (tombstoneRanges.empty()) {
+            const auto& timestamps = *block->timestamps;
+            const auto& values = *block->values;
+            size_t blockSize = timestamps.size();
+
+            stats.pointsRead += blockSize;
+            stats.pointsWritten += blockSize;
+
+            // Copy points in batches
+            for (size_t i = 0; i < blockSize; i++) {
+                currentBatch->timestamps.push_back(timestamps[i]);
+                currentBatch->values.push_back(values[i]);
+
+                // Write when batch full
+                if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+                    writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
+                                            std::move(currentBatch->timestamps),
+                                            std::move(currentBatch->values));
+                    pool.release(std::move(currentBatch));
+                    currentBatch = pool.acquire();
+                }
+            }
+
+            if (!timestamps.empty()) {
+                lastTimestamp = timestamps.back();
+            }
+            return;
+        }
+
+        // SLOW PATH: Have tombstones - check each point
+        for (size_t i = 0; i < block->timestamps->size(); i++) {
+            uint64_t ts = block->timestamps->at(i);
+            const T& val = block->values->at(i);
+
+            stats.pointsRead++;
+
+            // Check tombstones
+            bool isTombstoned = false;
+            auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(), ts,
+                [](uint64_t timestamp, const std::pair<uint64_t, uint64_t>& range) {
+                    return timestamp < range.first;
+                });
+
+            if (it != tombstoneRanges.begin()) {
+                --it;
+                const auto& [startTime, endTime] = *it;
+                if (ts >= startTime && ts <= endTime) {
+                    isTombstoned = true;
+                    tombstonesFiltered++;
+                }
+            }
+
+            if (isTombstoned) {
+                continue;
+            }
+
+            // Deduplicate
+            if (ts != lastTimestamp) {
+                currentBatch->timestamps.push_back(ts);
+                currentBatch->values.push_back(val);
+                lastTimestamp = ts;
+                stats.pointsWritten++;
+            } else {
+                stats.duplicatesRemoved++;
+            }
+
+            // Write when batch full
+            if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+                writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
+                                        std::move(currentBatch->timestamps),
+                                        std::move(currentBatch->values));
+                pool.release(std::move(currentBatch));
+                currentBatch = pool.acquire();
+            }
+        }
+    };
+
+    // Phase 1: Log optimization statistics
+    if (!segments.empty()) {
+        size_t fastPathBlocks = 0;
+        size_t slowPathBlocks = 0;
+        size_t fastPathSegments = 0;
+        size_t slowPathSegments = 0;
+
+        for (const auto& seg : segments) {
+            if (seg.needsMerge) {
+                slowPathSegments++;
+                slowPathBlocks += seg.blockCount();
+            } else {
+                fastPathSegments++;
+                fastPathBlocks += seg.blockCount();
+            }
+        }
+
+        tsdb::compactor_log.info(
+            "Series {}: {} blocks, {} segments ({} fast path [{} blocks], {} slow path [{} blocks])",
+            seriesId.toHex(),
+            blockMeta.size(),
+            segments.size(),
+            fastPathSegments,
+            fastPathBlocks,
+            slowPathSegments,
+            slowPathBlocks
+        );
+    }
+
+    // Phase 1/2: Check if we can use fast path for ALL blocks
+    bool allBlocksNonOverlapping = segments.empty() ||
+        std::all_of(segments.begin(), segments.end(),
+                    [](const MergeSegment& seg) { return !seg.needsMerge; });
+
+    if (allBlocksNonOverlapping && !blockMeta.empty()) {
+        // Phase 2: ZERO-COPY PATH if no tombstones
+        if (tombstoneRanges.empty()) {
+            // ULTIMATE FAST PATH: Copy compressed blocks directly (no decompress/recompress)
+
+            // Batch read all compressed blocks in parallel (avoid sequential async overhead)
+            std::vector<seastar::future<seastar::temporary_buffer<uint8_t>>> readFutures;
+            readFutures.reserve(blockMeta.size());
+
+            for (const auto& meta : blockMeta) {
+                readFutures.push_back(meta.sourceFile->readCompressedBlock(meta.indexBlock));
+            }
+
+            // Wait for all reads to complete at once
+            auto compressedBlocks = co_await seastar::when_all(readFutures.begin(), readFutures.end());
+
+            // Write all compressed blocks to destination
+            for (size_t i = 0; i < blockMeta.size(); i++) {
+                const auto& meta = blockMeta[i];
+                auto compressedData = std::move(compressedBlocks[i].get());
+
+                writer.writeCompressedBlock(
+                    TSM::getValueType<T>(),
+                    seriesId,
+                    std::move(compressedData),
+                    meta.minTime,
+                    meta.maxTime
+                );
+
+                // Zero-copy path - we don't decompress so we don't know exact point counts
+                // Stats tracking happens at byte level in calling code
+            }
+
+            // Skip batch pool - we wrote directly
+            pool.release(std::move(currentBatch));
+            co_return;
+        }
+
+        // Phase 1: FAST PATH with tombstones - decompress and filter
+        for (const auto& meta : blockMeta) {
+            copyBlockDirect(meta.blockPtr);
+        }
+    } else {
+        // SLOW PATH: At least some overlap - use existing full merge logic
+        // Fall back to Phase B specialized mergers
+        size_t fileCount = allBlocks.size();
+        if (fileCount == 2) {
+            BulkMerger2Way<T> merger(allBlocks);
+            processMerge(merger);
+        } else if (fileCount == 3) {
+            BulkMerger3Way<T> merger(allBlocks);
+            processMerge(merger);
+        } else {
+            BulkMerger<T> merger(allBlocks);
+            processMerge(merger);
+        }
+    }
+
+    // Write remaining data
+    if (!currentBatch->timestamps.empty()) {
+        writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
+                                std::move(currentBatch->timestamps),
+                                std::move(currentBatch->values));
+    }
+    pool.release(std::move(currentBatch));
+
+    // Log tombstone filtering
+    if (tombstonesFiltered > 0) {
+        tsdb::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
+                                 tombstonesFiltered, seriesId.toHex());
+    }
+
+    co_return;
+}
+
+// Phase 3: Process series for compaction without writing (enables parallel processing)
+template<typename T>
+seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompaction(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources) {
+
+    SeriesCompactionData<T> result(seriesId, TSM::getValueType<T>());
+
+    // Load ALL blocks from ALL files
+    auto allBlocks = co_await BulkBlockLoader<T>::loadFromFiles(sources, seriesId);
+
+    if (allBlocks.empty()) {
+        co_return result;  // Empty result
+    }
+
+    // Collect tombstones
+    std::vector<std::pair<uint64_t, uint64_t>> tombstoneRanges;
+    for (const auto& file : sources) {
+        if (file->hasTombstones()) {
+            auto tombstones = file->getTombstones();
+            if (tombstones) {
+                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
+                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
+                tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
+            }
+        }
+    }
+
+    // Sort and merge overlapping tombstone ranges
+    if (!tombstoneRanges.empty()) {
+        std::sort(tombstoneRanges.begin(), tombstoneRanges.end());
+
+        std::vector<std::pair<uint64_t, uint64_t>> mergedRanges;
+        mergedRanges.push_back(tombstoneRanges[0]);
+
+        for (size_t i = 1; i < tombstoneRanges.size(); ++i) {
+            auto& last = mergedRanges.back();
+            const auto& current = tombstoneRanges[i];
+
+            if (current.first <= last.second + 1) {
+                last.second = std::max(last.second, current.second);
+            } else {
+                mergedRanges.push_back(current);
+            }
+        }
+
+        tombstoneRanges = std::move(mergedRanges);
+    }
+
+    // Build metadata index
+    std::vector<BlockMetadata<T>> blockMeta;
+    std::vector<std::vector<TSMIndexBlock>> sourceIndexBlocks;
+    for (const auto& file : sources) {
+        sourceIndexBlocks.push_back(file->getSeriesBlocks(seriesId));
+    }
+
+    for (size_t fileIdx = 0; fileIdx < allBlocks.size(); fileIdx++) {
+        const auto& fileBlocks = allBlocks[fileIdx];
+        const auto& indexBlocks = sourceIndexBlocks[fileIdx];
+
+        for (size_t blockIdx = 0; blockIdx < indexBlocks.size(); blockIdx++) {
+            const auto& indexBlock = indexBlocks[blockIdx];
+
+            BlockMetadata<T> meta;
+            meta.minTime = indexBlock.minTime;
+            meta.maxTime = indexBlock.maxTime;
+            meta.fileIndex = fileIdx;
+            meta.blockIndex = blockIdx;
+            meta.blockPtr = (blockIdx < fileBlocks.blocks.size()) ? fileBlocks.blocks[blockIdx].get() : nullptr;
+            meta.fileRank = fileBlocks.fileRank;
+            meta.sourceFile = sources[fileIdx];
+            meta.indexBlock = indexBlock;
+
+            blockMeta.push_back(meta);
+        }
+    }
+
+    // Sort blocks by timestamp
+    std::sort(blockMeta.begin(), blockMeta.end());
+
+    // Analyze overlap patterns
+    std::vector<MergeSegment> segments;
+    if (!blockMeta.empty()) {
+        size_t segmentStart = 0;
+        bool currentNeedsMerge = false;
+
+        for (size_t i = 1; i < blockMeta.size(); i++) {
+            bool overlaps = blockMeta[i-1].overlapsWith(blockMeta[i]);
+
+            if (i == 1) {
+                currentNeedsMerge = overlaps;
+            } else if (overlaps != currentNeedsMerge) {
+                segments.push_back({segmentStart, i-1, currentNeedsMerge});
+                segmentStart = i;
+                currentNeedsMerge = overlaps;
+            }
+        }
+
+        segments.push_back({segmentStart, blockMeta.size()-1, currentNeedsMerge});
+    }
+
+    // Check if we can use zero-copy fast path
+    bool allBlocksNonOverlapping = segments.empty() ||
+        std::all_of(segments.begin(), segments.end(),
+                    [](const MergeSegment& seg) { return !seg.needsMerge; });
+
+    if (allBlocksNonOverlapping && !blockMeta.empty() && tombstoneRanges.empty()) {
+        // ZERO-COPY PATH: Load compressed blocks in parallel
+        result.isZeroCopy = true;
+        result.compressedBlocks.reserve(blockMeta.size());
+
+        std::vector<seastar::future<seastar::temporary_buffer<uint8_t>>> readFutures;
+        readFutures.reserve(blockMeta.size());
+
+        for (const auto& meta : blockMeta) {
+            readFutures.push_back(meta.sourceFile->readCompressedBlock(meta.indexBlock));
+        }
+
+        auto compressedData = co_await seastar::when_all(readFutures.begin(), readFutures.end());
+
+        for (size_t i = 0; i < blockMeta.size(); i++) {
+            typename SeriesCompactionData<T>::CompressedBlock block;
+            block.data = std::move(compressedData[i].get());
+            block.minTime = blockMeta[i].minTime;
+            block.maxTime = blockMeta[i].maxTime;
+            result.compressedBlocks.push_back(std::move(block));
+        }
+
+        co_return result;
+    }
+
+    // SLOW PATH: Decompress and merge (either overlap or tombstones)
+    result.isZeroCopy = false;
+    result.timestamps.reserve(BATCH_SIZE * 10);  // Pre-allocate
+    result.values.reserve(BATCH_SIZE * 10);
+
+    uint64_t lastTimestamp = 0;
+    size_t tombstonesFiltered = 0;
+
+    // Helper to process blocks
+    auto processBlock = [&](const TSMBlock<T>* block) {
+        for (size_t i = 0; i < block->timestamps->size(); i++) {
+            uint64_t ts = block->timestamps->at(i);
+            const T& val = block->values->at(i);
+
+            result.pointsRead++;
+
+            // Check tombstones
+            bool isTombstoned = false;
+            if (!tombstoneRanges.empty()) {
+                auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(), ts,
+                    [](uint64_t timestamp, const std::pair<uint64_t, uint64_t>& range) {
+                        return timestamp < range.first;
+                    });
+
+                if (it != tombstoneRanges.begin()) {
+                    --it;
+                    const auto& [startTime, endTime] = *it;
+                    if (ts >= startTime && ts <= endTime) {
+                        isTombstoned = true;
+                        tombstonesFiltered++;
+                    }
+                }
+            }
+
+            if (isTombstoned) {
+                continue;
+            }
+
+            // Deduplicate
+            if (ts != lastTimestamp) {
+                result.timestamps.push_back(ts);
+                result.values.push_back(val);
+                lastTimestamp = ts;
+                result.pointsWritten++;
+            } else {
+                result.duplicatesRemoved++;
+            }
+        }
+    };
+
+    // Process based on overlap
+    if (allBlocksNonOverlapping) {
+        // Fast path with tombstones: direct block copy
+        for (const auto& meta : blockMeta) {
+            processBlock(meta.blockPtr);
+        }
+    } else {
+        // Slow path: full merge
+        size_t fileCount = allBlocks.size();
+        if (fileCount == 2) {
+            BulkMerger2Way<T> merger(allBlocks);
+            while (merger.hasNext()) {
+                auto [ts, val] = merger.next();
+                result.pointsRead++;
+
+                // Check tombstones and deduplicate
+                bool isTombstoned = false;
+                if (!tombstoneRanges.empty()) {
+                    auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(), ts,
+                        [](uint64_t timestamp, const std::pair<uint64_t, uint64_t>& range) {
+                            return timestamp < range.first;
+                        });
+
+                    if (it != tombstoneRanges.begin()) {
+                        --it;
+                        const auto& [startTime, endTime] = *it;
+                        if (ts >= startTime && ts <= endTime) {
+                            isTombstoned = true;
+                        }
+                    }
+                }
+
+                if (!isTombstoned && ts != lastTimestamp) {
+                    result.timestamps.push_back(ts);
+                    result.values.push_back(val);
+                    lastTimestamp = ts;
+                    result.pointsWritten++;
+                } else if (ts == lastTimestamp) {
+                    result.duplicatesRemoved++;
+                }
+            }
+        } else if (fileCount == 3) {
+            BulkMerger3Way<T> merger(allBlocks);
+            while (merger.hasNext()) {
+                auto [ts, val] = merger.next();
+                result.pointsRead++;
+
+                bool isTombstoned = false;
+                if (!tombstoneRanges.empty()) {
+                    auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(), ts,
+                        [](uint64_t timestamp, const std::pair<uint64_t, uint64_t>& range) {
+                            return timestamp < range.first;
+                        });
+
+                    if (it != tombstoneRanges.begin()) {
+                        --it;
+                        const auto& [startTime, endTime] = *it;
+                        if (ts >= startTime && ts <= endTime) {
+                            isTombstoned = true;
+                        }
+                    }
+                }
+
+                if (!isTombstoned && ts != lastTimestamp) {
+                    result.timestamps.push_back(ts);
+                    result.values.push_back(val);
+                    lastTimestamp = ts;
+                    result.pointsWritten++;
+                } else if (ts == lastTimestamp) {
+                    result.duplicatesRemoved++;
+                }
+            }
+        } else {
+            BulkMerger<T> merger(allBlocks);
+            while (merger.hasNext()) {
+                auto [ts, val] = merger.next();
+                result.pointsRead++;
+
+                bool isTombstoned = false;
+                if (!tombstoneRanges.empty()) {
+                    auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(), ts,
+                        [](uint64_t timestamp, const std::pair<uint64_t, uint64_t>& range) {
+                            return timestamp < range.first;
+                        });
+
+                    if (it != tombstoneRanges.begin()) {
+                        --it;
+                        const auto& [startTime, endTime] = *it;
+                        if (ts >= startTime && ts <= endTime) {
+                            isTombstoned = true;
+                        }
+                    }
+                }
+
+                if (!isTombstoned && ts != lastTimestamp) {
+                    result.timestamps.push_back(ts);
+                    result.values.push_back(val);
+                    lastTimestamp = ts;
+                    result.pointsWritten++;
+                } else if (ts == lastTimestamp) {
+                    result.duplicatesRemoved++;
+                }
+            }
+        }
+    }
+
+    co_return result;
+}
+
+// Phase 3: Write pre-processed series data to TSMWriter
+template<typename T>
+void TSMCompactor::writeSeriesCompactionData(
+    TSMWriter& writer,
+    SeriesCompactionData<T>&& data,
+    CompactionStats& stats) {
+
+    if (data.isZeroCopy) {
+        // Zero-copy path: write compressed blocks directly
+        for (auto& block : data.compressedBlocks) {
+            writer.writeCompressedBlock(
+                data.seriesType,
+                data.seriesId,
+                std::move(block.data),
+                block.minTime,
+                block.maxTime
+            );
+        }
+    } else {
+        // Slow path: write decompressed data
+        if (!data.timestamps.empty()) {
+            writer.writeSeries(
+                data.seriesType,
+                data.seriesId,
+                data.timestamps,
+                data.values
+            );
+        }
+    }
+
+    // Update stats
+    stats.pointsRead += data.pointsRead;
+    stats.pointsWritten += data.pointsWritten;
+    stats.duplicatesRemoved += data.duplicatesRemoved;
 }
 
 seastar::future<std::string> TSMCompactor::compact(
@@ -190,27 +996,79 @@ seastar::future<std::string> TSMCompactor::compact(
     auto startTime = std::chrono::steady_clock::now();
     
     // Get all unique series across files
-    auto allSeries = getAllSeriesKeys(files);
-    
-    // Merge each series
-    for (const std::string& seriesKey : allSeries) {
-        // Determine the type of this series
-        // Convert hex string back to SeriesId128
-        SeriesId128 seriesId = SeriesId128::fromHex(seriesKey);
+    auto allSeries = getAllSeriesIds(files);
+
+    // Phase 2.2: Group series by type for pipelined processing
+    std::vector<SeriesId128> floatSeries;
+    std::vector<SeriesId128> boolSeries;
+    std::vector<SeriesId128> stringSeries;
+
+    for (const auto& seriesId : allSeries) {
         auto seriesType = files[0]->getSeriesType(seriesId);
-        
         if (!seriesType.has_value()) {
             continue;
         }
-        
-        // Merge based on type
+
         if (seriesType.value() == TSMValueType::Float) {
-            co_await mergeSeries<double>(seriesKey, files, writer, stats);
+            floatSeries.push_back(seriesId);
         } else if (seriesType.value() == TSMValueType::Boolean) {
-            co_await mergeSeries<bool>(seriesKey, files, writer, stats);
+            boolSeries.push_back(seriesId);
         } else if (seriesType.value() == TSMValueType::String) {
-            co_await mergeSeries<std::string>(seriesKey, files, writer, stats);
+            stringSeries.push_back(seriesId);
         }
+    }
+
+    // Phase 3: Parallel series processing with batching
+    // Batch size tuned for performance vs memory tradeoff
+    // Testing shows: batch_size=10 → 651ms, batch_size=20 → 541ms, batch_size=50 → 2533ms (regression)
+    const size_t SERIES_BATCH_SIZE = 20;
+
+    // Semaphore to serialize writes (TSMWriter not thread-safe)
+    seastar::semaphore writeSemaphore{1};
+
+    // Helper lambda for parallel batch processing
+    auto processBatch = [&](const auto& seriesVec, auto* typePtr) -> seastar::future<> {
+        using ValueType = std::remove_pointer_t<decltype(typePtr)>;
+
+        for (size_t i = 0; i < seriesVec.size(); i += SERIES_BATCH_SIZE) {
+            size_t batchEnd = std::min(i + SERIES_BATCH_SIZE, seriesVec.size());
+
+            // Start all series in batch in parallel
+            std::vector<seastar::future<>> processFutures;
+            processFutures.reserve(batchEnd - i);
+
+            for (size_t j = i; j < batchEnd; j++) {
+                const auto& seriesId = seriesVec[j];
+
+                // Process series and write with serialization
+                auto future = processSeriesForCompaction<ValueType>(seriesId, files)
+                    .then([this, &writer, &writeSemaphore, &stats](SeriesCompactionData<ValueType> data) {
+                        // Serialize writes with semaphore
+                        return seastar::with_semaphore(writeSemaphore, 1,
+                            [this, &writer, &stats, data = std::move(data)]() mutable {
+                                writeSeriesCompactionData(writer, std::move(data), stats);
+                            });
+                    });
+
+                processFutures.push_back(std::move(future));
+            }
+
+            // Wait for batch to complete
+            co_await seastar::when_all_succeed(processFutures.begin(), processFutures.end());
+        }
+    };
+
+    // Process all series types in parallel batches
+    if (!floatSeries.empty()) {
+        co_await processBatch(floatSeries, (double*)nullptr);
+    }
+
+    if (!boolSeries.empty()) {
+        co_await processBatch(boolSeries, (bool*)nullptr);
+    }
+
+    if (!stringSeries.empty()) {
+        co_await processBatch(stringSeries, (std::string*)nullptr);
     }
     
     // Finalize the file
@@ -392,15 +1250,96 @@ std::vector<CompactionStats> TSMCompactor::getActiveCompactionStats() const {
 
 // Explicit template instantiations
 template seastar::future<> TSMCompactor::mergeSeries<double>(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     const std::vector<seastar::shared_ptr<TSM>>& sources,
     TSMWriter& writer,
     CompactionStats& stats);
 
 template seastar::future<> TSMCompactor::mergeSeries<bool>(
-    const std::string& seriesKey,
+    const SeriesId128& seriesId,
     const std::vector<seastar::shared_ptr<TSM>>& sources,
     TSMWriter& writer,
+    CompactionStats& stats);
+
+// Phase 2.2/5.2: Template instantiations for all merge iterator types
+// Generic heap-based merges
+template seastar::future<> TSMCompactor::mergeSeriesWithIterator<double, TSMMergeIterator<double>>(
+    TSMMergeIterator<double>& merger,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+template seastar::future<> TSMCompactor::mergeSeriesWithIterator<bool, TSMMergeIterator<bool>>(
+    TSMMergeIterator<bool>& merger,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+template seastar::future<> TSMCompactor::mergeSeriesWithIterator<std::string, TSMMergeIterator<std::string>>(
+    TSMMergeIterator<std::string>& merger,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+// Phase 5.1: Specialized 2-way merges
+template seastar::future<> TSMCompactor::mergeSeriesWithIterator<double, TwoWayMergeIterator<double>>(
+    TwoWayMergeIterator<double>& merger,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+// Phase 5.1: Specialized 4-way merges
+template seastar::future<> TSMCompactor::mergeSeriesWithIterator<double, FourWayMergeIterator<double>>(
+    FourWayMergeIterator<double>& merger,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+// Phase A: Bulk merge template instantiations
+template seastar::future<> TSMCompactor::mergeSeriesBulk<double>(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+template seastar::future<> TSMCompactor::mergeSeriesBulk<bool>(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+template seastar::future<> TSMCompactor::mergeSeriesBulk<std::string>(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    TSMWriter& writer,
+    CompactionStats& stats);
+
+// Phase 3: Parallel processing template instantiations
+template seastar::future<SeriesCompactionData<double>> TSMCompactor::processSeriesForCompaction<double>(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources);
+
+template seastar::future<SeriesCompactionData<bool>> TSMCompactor::processSeriesForCompaction<bool>(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources);
+
+template seastar::future<SeriesCompactionData<std::string>> TSMCompactor::processSeriesForCompaction<std::string>(
+    const SeriesId128& seriesId,
+    const std::vector<seastar::shared_ptr<TSM>>& sources);
+
+template void TSMCompactor::writeSeriesCompactionData<double>(
+    TSMWriter& writer,
+    SeriesCompactionData<double>&& data,
+    CompactionStats& stats);
+
+template void TSMCompactor::writeSeriesCompactionData<bool>(
+    TSMWriter& writer,
+    SeriesCompactionData<bool>&& data,
+    CompactionStats& stats);
+
+template void TSMCompactor::writeSeriesCompactionData<std::string>(
+    TSMWriter& writer,
+    SeriesCompactionData<std::string>&& data,
     CompactionStats& stats);
 
 // TimeBasedCompactionStrategy implementation

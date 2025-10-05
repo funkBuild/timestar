@@ -3,46 +3,90 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <algorithm>
+
+// Static constants for optimization
+constexpr size_t AlignedBuffer::INITIAL_CAPACITY;
+constexpr size_t AlignedBuffer::GROWTH_FACTOR;
 
 template <class T>
 void AlignedBuffer::write(T value){
-  const int bytesToAdd = sizeof(T);
-  data.resize(data.size() + bytesToAdd);
+  const size_t bytesToAdd = sizeof(T);
+  const size_t new_size = current_size + bytesToAdd;
 
-  memcpy(&data.back() - bytesToAdd + 1, (uint8_t*)&value, bytesToAdd);
+  ensure_capacity(new_size);
+
+  // Direct memory copy at the correct position
+  std::memcpy(data.data() + current_size, &value, bytesToAdd);
+  current_size = new_size;
 };
 
-void AlignedBuffer::write(std::string &value){
-  const int bytesToAdd = value.length();
-  data.resize(data.size() + bytesToAdd);
+void AlignedBuffer::write(const std::string &value){
+  const size_t bytesToAdd = value.length();
+  const size_t new_size = current_size + bytesToAdd;
 
-  memcpy(&data.back() - bytesToAdd + 1, (uint8_t*)value.data(), bytesToAdd);
+  ensure_capacity(new_size);
+
+  std::memcpy(data.data() + current_size, value.data(), bytesToAdd);
+  current_size = new_size;
 };
 
-void AlignedBuffer::write(CompressedBuffer &value){
-  const int bytesToAdd = value.dataByteSize();
-  data.resize(data.size() + bytesToAdd);
+void AlignedBuffer::write(const CompressedBuffer &value){
+  const size_t bytesToAdd = value.data.size() * sizeof(uint64_t);
+  const size_t new_size = current_size + bytesToAdd;
 
-  memcpy(&data.back() - bytesToAdd + 1, (uint8_t*)&value.data[0], bytesToAdd);
+  ensure_capacity(new_size);
+
+  std::memcpy(data.data() + current_size, value.data.data(), bytesToAdd);
+  current_size = new_size;
 };
 
-void AlignedBuffer::write(AlignedBuffer &value){
-  const int bytesToAdd = value.size();
-  data.resize(data.size() + bytesToAdd);
+void AlignedBuffer::write(const AlignedBuffer &value){
+  const size_t bytesToAdd = value.current_size;
+  const size_t new_size = current_size + bytesToAdd;
 
-  memcpy(&data.back() - bytesToAdd + 1, (uint8_t*)&value.data[0], bytesToAdd);
+  ensure_capacity(new_size);
+
+  std::memcpy(data.data() + current_size, value.data.data(), bytesToAdd);
+  current_size = new_size;
 };
 
 // The data type of std::vector<bool>
 void AlignedBuffer::write(std::_Bit_reference value){
-  data.push_back((uint8_t)(value ? 1: 0));
+  if (current_size >= data.size()) {
+    ensure_capacity(current_size + 1);
+  }
+  data[current_size++] = value ? 1 : 0;
 };
+
+// Bulk write raw bytes
+void AlignedBuffer::write_bytes(const char* bytes, size_t count) {
+  const size_t new_size = current_size + count;
+
+  ensure_capacity(new_size);
+
+  std::memcpy(data.data() + current_size, bytes, count);
+  current_size = new_size;
+}
+
+void AlignedBuffer::ensure_capacity(size_t required) {
+  if (data.size() < required) {
+    size_t new_capacity = data.capacity();
+    if (new_capacity < required) {
+      // Use growth factor for better amortized performance
+      new_capacity = std::max(new_capacity * GROWTH_FACTOR, required);
+      data.reserve(new_capacity);
+    }
+    data.resize(required);
+  }
+}
 
 
 std::ofstream& operator<<(std::ofstream& os, const AlignedBuffer& buf)
 {
-  os.write((const char*)&buf.data[0], buf.data.size());
-
+  if (buf.size() > 0) {
+    os.write(reinterpret_cast<const char*>(buf.data.data()), buf.size());
+  }
   return os;
 }
 

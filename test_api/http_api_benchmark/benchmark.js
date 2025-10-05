@@ -103,75 +103,81 @@ function generateDataPoint(hostId, rackId, timestamp) {
   };
 }
 
-// Benchmark batch inserts
-async function benchmarkBatchInserts() {
-  console.log("\n=== BATCH INSERT BENCHMARK ===");
-  console.log(`Batch size: ${BATCH_SIZE} points`);
-  const stats = new BenchmarkStats(`Batch Insert (${BATCH_SIZE} points)`);
+// Helper function to generate a single batch write request
+function generateBatchWriteRequest(batchSize) {
+  const hostId = Math.floor(Math.random() * NUM_HOSTS) + 1;
+  const rackId = Math.floor(Math.random() * NUM_RACKS) + 1;
+  const writes = [];
+
+  for (let j = 0; j < batchSize; j++) {
+    const timestamp =
+      START_TIME +
+      Math.floor(Math.random() * MINUTES_PER_YEAR) * MINUTE_IN_NS;
+
+    // Generate values for each field
+    const fields = {};
+    FIELDS.forEach((field) => {
+      let value;
+      switch (field) {
+        case "cpu_usage":
+          value = 20 + Math.random() * 60; // 20-80%
+          break;
+        case "memory_usage":
+          value = 30 + Math.random() * 50; // 30-80%
+          break;
+        case "disk_io_read":
+        case "disk_io_write":
+          value = Math.random() * 100; // 0-100 MB/s
+          break;
+        case "network_in":
+        case "network_out":
+          value = Math.random() * 1000; // 0-1000 Mbps
+          break;
+        case "load_avg_1m":
+        case "load_avg_5m":
+        case "load_avg_15m":
+          value = Math.random() * 4; // 0-4 load
+          break;
+        case "temperature":
+          value = 50 + Math.random() * 30; // 50-80°C
+          break;
+        default:
+          value = Math.random() * 100;
+      }
+      fields[field] = value;
+    });
+
+    writes.push({
+      measurement: MEASUREMENT,
+      tags: {
+        host: `host-${hostId.toString().padStart(2, "0")}`,
+        rack: `rack-${rackId}`,
+      },
+      fields: fields,
+      timestamp: timestamp,
+    });
+  }
+
+  return { writes };
+}
+
+// Benchmark batch inserts with specified concurrency
+async function benchmarkBatchInsertsWithConcurrency(concurrency) {
+  const stats = new BenchmarkStats(
+    `Batch Insert (${BATCH_SIZE} points, concurrency=${concurrency})`
+  );
 
   for (let i = 0; i < BENCHMARK_ITERATIONS; i++) {
-    // Pick a random host and rack for this batch
-    const hostId = Math.floor(Math.random() * NUM_HOSTS) + 1;
-    const rackId = Math.floor(Math.random() * NUM_RACKS) + 1;
-    
-    // Build batch writes array (individual write objects)
-    const writes = [];
-    
-    for (let j = 0; j < BATCH_SIZE; j++) {
-      const timestamp =
-        START_TIME +
-        Math.floor(Math.random() * MINUTES_PER_YEAR) * MINUTE_IN_NS;
-      
-      // Generate values for each field
-      const fields = {};
-      FIELDS.forEach((field) => {
-        let value;
-        switch (field) {
-          case "cpu_usage":
-            value = 20 + Math.random() * 60; // 20-80%
-            break;
-          case "memory_usage":
-            value = 30 + Math.random() * 50; // 30-80%
-            break;
-          case "disk_io_read":
-          case "disk_io_write":
-            value = Math.random() * 100; // 0-100 MB/s
-            break;
-          case "network_in":
-          case "network_out":
-            value = Math.random() * 1000; // 0-1000 Mbps
-            break;
-          case "load_avg_1m":
-          case "load_avg_5m":
-          case "load_avg_15m":
-            value = Math.random() * 4; // 0-4 load
-            break;
-          case "temperature":
-            value = 50 + Math.random() * 30; // 50-80°C
-            break;
-          default:
-            value = Math.random() * 100;
-        }
-        fields[field] = value;
-      });
-      
-      writes.push({
-        measurement: MEASUREMENT,
-        tags: {
-          host: `host-${hostId.toString().padStart(2, "0")}`,
-          rack: `rack-${rackId}`,
-        },
-        fields: fields,
-        timestamp: timestamp
-      });
+    // Create multiple requests based on concurrency level
+    const requests = [];
+    for (let c = 0; c < concurrency; c++) {
+      const writeRequest = generateBatchWriteRequest(BATCH_SIZE);
+      requests.push(axios.post(`${BASE_URL}/write`, writeRequest));
     }
-    
-    // Create the batch-format write request
-    const writeRequest = { writes };
 
     const start = performance.now();
     try {
-      await axios.post(`${BASE_URL}/write`, writeRequest);
+      await Promise.all(requests);
     } catch (error) {
       console.error("Batch insert failed:", error.message);
       if (error.response) {
@@ -187,13 +193,51 @@ async function benchmarkBatchInserts() {
   }
 
   console.log("\n" + JSON.stringify(stats.getStats(), null, 2));
+
+  // Calculate actual data points: each write has multiple fields
+  const actualDataPoints = BATCH_SIZE * FIELDS.length * concurrency;
+  const throughput = (actualDataPoints * 1000) / parseFloat(stats.getStats().avg);
   console.log(
-    `Average throughput: ${(
-      (BATCH_SIZE * 1000) /
-      parseFloat(stats.getStats().avg)
-    ).toFixed(0)} points/sec`
+    `Average throughput: ${throughput.toFixed(0)} points/sec (${concurrency} × ${BATCH_SIZE} writes × ${FIELDS.length} fields = ${actualDataPoints} data points)`
   );
   return stats;
+}
+
+// Run batch insert benchmarks with different concurrency levels
+async function benchmarkBatchInserts() {
+  console.log("\n=== BATCH INSERT BENCHMARK (CONCURRENCY COMPARISON) ===");
+  console.log(`Batch size: ${BATCH_SIZE} points per request`);
+  console.log(`Testing concurrency levels: 1, 2, 5`);
+
+  const results = {};
+
+  // Test with concurrency = 1
+  console.log("\n--- Concurrency = 1 (sequential) ---");
+  results.concurrency1 = await benchmarkBatchInsertsWithConcurrency(1);
+
+  // Test with concurrency = 2
+  console.log("\n--- Concurrency = 2 (parallel) ---");
+  results.concurrency2 = await benchmarkBatchInsertsWithConcurrency(2);
+
+  // Test with concurrency = 5
+  console.log("\n--- Concurrency = 5 (parallel) ---");
+  results.concurrency5 = await benchmarkBatchInsertsWithConcurrency(5);
+
+  // Print comparison summary
+  console.log("\n=== CONCURRENCY COMPARISON SUMMARY ===");
+  console.log("Concurrency | Avg Latency (ms) | Throughput (points/sec)");
+  console.log("-".repeat(65));
+
+  [1, 2, 5].forEach((c) => {
+    const stats = results[`concurrency${c}`].getStats();
+    const dataPoints = BATCH_SIZE * FIELDS.length * c;
+    const throughput = ((dataPoints * 1000) / parseFloat(stats.avg)).toFixed(0);
+    console.log(
+      `     ${c}      |      ${stats.avg.padStart(6)}      |  ${throughput.padStart(12)}`
+    );
+  });
+
+  return results;
 }
 
 // Insert sample data for queries (1 year of data)
@@ -215,11 +259,11 @@ async function insertSampleData() {
     for (let minute = 0; minute < MINUTES_PER_YEAR; minute += batchSize) {
       // Build batch writes array (individual write objects)
       const writes = [];
-      
+
       const batchEnd = Math.min(minute + batchSize, MINUTES_PER_YEAR);
       for (let m = minute; m < batchEnd; m++) {
         const timestamp = yearAgo + m * MINUTE_IN_NS;
-        
+
         // Generate values for each field
         const fields = {};
         FIELDS.forEach((field) => {
@@ -252,7 +296,7 @@ async function insertSampleData() {
           }
           fields[field] = value;
         });
-        
+
         writes.push({
           measurement: MEASUREMENT,
           tags: {
@@ -260,10 +304,10 @@ async function insertSampleData() {
             rack: `rack-${rackId}`,
           },
           fields: fields,
-          timestamp: timestamp
+          timestamp: timestamp,
         });
       }
-      
+
       // Create the batch-format write request
       const writeRequest = { writes };
 
@@ -309,6 +353,7 @@ async function benchmarkQueries() {
       query: `avg:${MEASUREMENT}(cpu_usage,memory_usage){host:${hostName}}`,
       startTime: yearAgo,
       endTime: now,
+      aggregationInterval: "12h", // 12-hour buckets for year of data
     };
 
     const start = performance.now();
@@ -335,7 +380,7 @@ async function benchmarkQueries() {
       query: `avg:${MEASUREMENT}(cpu_usage,memory_usage,network_in,network_out){} by {rack}`,
       startTime: yearAgo,
       endTime: now,
-      aggregationInterval: "1h", // 1-hour buckets for year of data
+      aggregationInterval: "12h", // 12-hour buckets for year of data
     };
 
     const start = performance.now();
@@ -362,7 +407,7 @@ async function benchmarkQueries() {
       query: `avg:${MEASUREMENT}(cpu_usage,memory_usage,load_avg_1m){} by {host}`,
       startTime: yearAgo,
       endTime: now,
-      aggregationInterval: "1d", // 1-day buckets for year of data
+      aggregationInterval: "12h", // 12-hour buckets for year of data
     };
 
     const start = performance.now();
@@ -435,12 +480,10 @@ async function runBenchmarks() {
   console.log(" BENCHMARK SUMMARY");
   console.log("=".repeat(60));
 
-  console.log("\n📊 INSERT PERFORMANCE:");
-  console.log(
-    `  Batch Insert (${BATCH_SIZE} points): ${
-      results.benchmarks.batchInsert.getStats().avg
-    }ms avg`
-  );
+  console.log("\n📊 INSERT PERFORMANCE (Concurrency Comparison):");
+  console.log("  Concurrency 1: " + results.benchmarks.batchInsert.concurrency1.getStats().avg + "ms avg");
+  console.log("  Concurrency 2: " + results.benchmarks.batchInsert.concurrency2.getStats().avg + "ms avg");
+  console.log("  Concurrency 5: " + results.benchmarks.batchInsert.concurrency5.getStats().avg + "ms avg");
 
   console.log("\n📊 QUERY PERFORMANCE:");
   console.log(`  Single Host: ${queryResults.singleHost.getStats().avg}ms avg`);

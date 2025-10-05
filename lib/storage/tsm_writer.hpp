@@ -9,6 +9,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <map>
 #include <seastar/core/shared_ptr.hh>
 
 // From InfluxDB, might not be optimal
@@ -17,7 +18,8 @@
 class TSMWriter {
 private:
   AlignedBuffer buffer;
-  std::vector<TSMIndexEntry> indexEntries;
+  // std::map is optimal for this use case (small dataset, maintains sorted order)
+  std::map<SeriesId128, TSMIndexEntry> indexEntries;
   std::string filename;
 
   void writeHeader();
@@ -28,7 +30,23 @@ public:
   void writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values);
   template <class T>
   void writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values, TSMIndexEntry &indexEntry);
+
+  // Phase 3.2: Move semantics overloads for zero-copy writes
+  template <class T>
+  void writeSeriesDirect(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<T> &&values);
+  template <class T>
+  void writeBlockDirect(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<T> &&values, TSMIndexEntry &indexEntry);
+
+  // Phase 2: Write compressed block bytes directly (zero-copy transfer)
+  void writeCompressedBlock(TSMValueType seriesType, const SeriesId128 &seriesId,
+                           seastar::temporary_buffer<uint8_t> &&compressedData,
+                           uint64_t minTime, uint64_t maxTime);
+
   void writeIndex();
+
+  // Phase 4A: Parallel index building
+  void writeIndexParallel();
+
   void writeIndexBlock(const std::vector<uint64_t> &timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset);
   void close();
 

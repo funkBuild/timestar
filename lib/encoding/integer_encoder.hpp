@@ -3,20 +3,55 @@
 
 #include <vector>
 #include <cstdint>
-
+#include <string>
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
 
+/**
+ * Main IntegerEncoder class that automatically selects the best implementation
+ * based on CPU capabilities.
+ */
 class IntegerEncoder {
-private:
-
-
 public:
-  IntegerEncoder();
+    /**
+     * Encode a vector of uint64_t values using the best available implementation
+     */
+    static AlignedBuffer encode(const std::vector<uint64_t> &values);
 
-  static AlignedBuffer encode(const std::vector<uint64_t> &values);
-  static std::pair<size_t, size_t> decode(Slice &encoded, unsigned int timestampSize, std::vector<uint64_t> &values, uint64_t startTime = 0, uint64_t maxTime = UINT64_MAX);
+    /**
+     * Decode compressed data back to uint64_t values using the best available implementation
+     */
+    static std::pair<size_t, size_t> decode(Slice &encoded, unsigned int timestampSize,
+                                           std::vector<uint64_t> &values,
+                                           uint64_t startTime = 0,
+                                           uint64_t maxTime = UINT64_MAX);
 
+    /**
+     * Get the name of the encoder implementation being used
+     */
+    static std::string getImplementationName();
+
+    /**
+     * Check which implementations are available
+     */
+    static bool hasAVX512();
+    static bool hasAVX2();
+
+    /**
+     * Force a specific implementation (for testing)
+     */
+    enum Implementation {
+        AUTO,     // Automatically select best
+        BASIC,    // Force basic implementation
+        SIMD,     // Force SIMD AVX2
+        AVX512    // Force AVX-512
+    };
+
+    static void setImplementation(Implementation impl);
+
+private:
+    static Implementation selectBestImplementation();
+    static Implementation s_forced_impl;
 };
 
-#endif
+#endif // __INTEGER_ENCODER_H_INCLUDED__

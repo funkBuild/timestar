@@ -221,40 +221,58 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     if (shardId != 0) {
         throw std::runtime_error("getOrCreateSeriesId called on non-zero shard " + std::to_string(shardId) + " - metadata operations only supported on shard 0");
     }
-    
+
     if (!db) {
         throw std::runtime_error("Database not opened on shard 0 for getOrCreateSeriesId");
     }
-    
-    // Generate SeriesId128 deterministically from series key
+
+    // Generate SeriesId128 deterministically from series key (always the same for given measurement+tags+field)
     std::string seriesKeyStr = encodeSeriesKey(measurement, tags, field);
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKeyStr);
-    
-    // Check if series already exists in index
+
+    // Fast path: Check in-memory cache (no I/O)
+    {
+        std::shared_lock<std::shared_mutex> lock(cacheMutex);
+        if (indexedSeriesCache.count(seriesKeyStr) > 0) {
+            // Already indexed - just return the computed SeriesId
+            LOG_INSERT_PATH(tsdb::index_log, trace, "[INDEX] Cache hit for series: '{}'", seriesKeyStr);
+            co_return seriesId;
+        }
+    }
+
+    // Cache miss - need to check if it exists in LevelDB (handles restarts)
+    LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Cache miss for series: '{}', checking LevelDB", seriesKeyStr);
     auto existingId = co_await getSeriesId(measurement, tags, field);
     if (existingId.has_value()) {
+        // Exists in LevelDB but not in cache (likely after restart) - add to cache
+        {
+            std::unique_lock<std::shared_mutex> lock(cacheMutex);
+            indexedSeriesCache.insert(seriesKeyStr);
+        }
+        LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Series found in LevelDB, added to cache: '{}'", seriesKeyStr);
         co_return existingId.value();
     }
-    
-    // Store new series metadata
+
+    // Series doesn't exist - create it
+    LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Creating new series index: '{}'", seriesKeyStr);
+
     leveldb::WriteBatch batch;
-    
-    // Add series mapping (seriesKey -> seriesId)
-    batch.Put(seriesKeyStr, encodeSeriesId(seriesId));
-    
-    // Store series metadata for reverse lookup
+
+    // Store series metadata (seriesId -> metadata)
+    // Note: We don't store seriesKey->seriesId mapping because seriesId is deterministically
+    // calculated from seriesKey via SHA1 hash (see SeriesId128::fromSeriesKey)
     SeriesMetadata metadata;
     metadata.measurement = measurement;
     metadata.tags = tags;
     metadata.field = field;
     std::string metadataKey = encodeSeriesMetadataKey(seriesId);
     batch.Put(metadataKey, encodeSeriesMetadata(metadata));
-    
+
     // Add TAG_INDEX entries for efficient tag-based queries
     for (const auto& tag : tags) {
         const std::string& tagKey = tag.first;
         const std::string& tagValue = tag.second;
-        
+
         // TAG_INDEX key includes series ID to make it unique per series
         std::string tagIndexKey;
         tagIndexKey.push_back(TAG_INDEX);
@@ -265,9 +283,9 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
         tagIndexKey.append(tagValue);
         tagIndexKey.push_back('\0');
         tagIndexKey.append(encodeSeriesId(seriesId));
-        
+
         batch.Put(tagIndexKey, encodeSeriesId(seriesId));
-        
+
         // GROUP_BY_INDEX also needs unique keys per series
         std::string groupByKey;
         groupByKey.push_back(GROUP_BY_INDEX);
@@ -278,16 +296,22 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
         groupByKey.append(tagValue);
         groupByKey.push_back('\0');
         groupByKey.append(encodeSeriesId(seriesId));
-        
+
         batch.Put(groupByKey, encodeSeriesId(seriesId));
     }
-    
+
     // Write the batch
     leveldb::Status status = db->Write(leveldb::WriteOptions(), &batch);
     if (!status.ok()) {
         throw std::runtime_error("Failed to write series index: " + status.ToString());
     }
-    
+
+    // Add to cache now that it's written
+    {
+        std::unique_lock<std::shared_mutex> lock(cacheMutex);
+        indexedSeriesCache.insert(seriesKeyStr);
+    }
+
     // Update metadata indexes
     co_await addField(measurement, field);
     
@@ -306,17 +330,18 @@ seastar::future<std::optional<SeriesId128>> LevelDBIndex::getSeriesId(const std:
     if (!db) {
         throw std::runtime_error("Database not opened before getSeriesId");
     }
+
+    // Calculate seriesId deterministically from series key (no DB lookup needed!)
     std::string seriesKey = encodeSeriesKey(measurement, tags, field);
-    std::string value;
-    
-    leveldb::Status status = db->Get(leveldb::ReadOptions(), seriesKey, &value);
-    
-    if (status.ok()) {
-        co_return decodeSeriesId(value);
-    } else if (status.IsNotFound()) {
-        co_return std::nullopt;
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+
+    // Check if metadata exists for this seriesId to determine if series exists
+    auto metadata = co_await getSeriesMetadata(seriesId);
+
+    if (metadata.has_value()) {
+        co_return seriesId;
     } else {
-        throw std::runtime_error("Failed to get series ID: " + status.ToString());
+        co_return std::nullopt;
     }
 }
 
@@ -611,72 +636,69 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::getAllSeriesForMeasureme
     // Don't use coroutines with LevelDB iterators
     return seastar::async([this, measurement]() {
         std::vector<SeriesId128> seriesIds;
-        
+
         if (!db) {
             // For non-zero shards with centralized metadata, return empty
             // This is expected behavior - only shard 0 has metadata
             return seriesIds;
         }
-        
-        // Create key prefix for SERIES_INDEX with measurement
-        // Keys are: SERIES_INDEX + measurement + ',' + tags + ',' + field (with tags)
-        //   or: SERIES_INDEX + measurement + ' ' + field (without tags)
-        // We need to scan for both patterns
+
+        // Scan SERIES_METADATA keys (prefix 0x02) and filter by measurement
+        // Since we no longer store SERIES_INDEX mappings, we scan all metadata
+        // and check which series belong to this measurement
         std::string keyPrefix;
-        keyPrefix.push_back(SERIES_INDEX);
-        keyPrefix.append(measurement);
-        
-        tsdb::index_log.debug("Scanning for series with prefix for measurement: {}", measurement);
-        
-        // Scan all keys with this prefix
+        keyPrefix.push_back(SERIES_METADATA);
+
+        tsdb::index_log.debug("Scanning metadata for series belonging to measurement: {}", measurement);
+
         leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
         if (!it) {
             tsdb::index_log.error("Failed to create LevelDB iterator");
             return seriesIds;
         }
-        
+
+        // Start from first SERIES_METADATA key
         it->Seek(keyPrefix);
         while (it->Valid()) {
             std::string key = it->key().ToString();
-            
-            // Check if key still starts with our prefix
-            if (key.size() < keyPrefix.size() || 
-                key.substr(0, keyPrefix.size()) != keyPrefix) {
-                break;  // We've moved past our measurement
+
+            // Stop if we've moved past SERIES_METADATA keys
+            if (key.empty() || key[0] != SERIES_METADATA) {
+                break;
             }
-            
-            // Check that after the measurement we have either ',' (with tags) or ' ' (without tags)
-            if (key.size() > keyPrefix.size()) {
-                char nextChar = key[keyPrefix.size()];
-                if (nextChar != ',' && nextChar != ' ') {
-                    // This key is for a different measurement that starts with our prefix
-                    it->Next();
-                    continue;
-                }
-            }
-            
-            // Decode series ID from value
+
+            // Decode the metadata to check the measurement
             std::string value = it->value().ToString();
             if (!value.empty()) {
                 try {
-                    SeriesId128 seriesId = decodeSeriesId(value);
-                    seriesIds.push_back(seriesId);
-                    tsdb::index_log.debug("Found series ID {} for measurement {}", seriesId.toHex(), measurement);
+                    SeriesMetadata metadata = decodeSeriesMetadata(value);
+
+                    // Check if this series belongs to our measurement
+                    if (metadata.measurement == measurement) {
+                        // Extract seriesId from the key (key format: SERIES_METADATA + seriesId bytes)
+                        if (key.size() >= 17) {  // 1 byte prefix + 16 bytes seriesId
+                            std::string seriesIdBytes = key.substr(1, 16);
+                            SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
+                            seriesIds.push_back(seriesId);
+                            tsdb::index_log.debug("Found series ID {} for measurement {}",
+                                                 seriesId.toHex(), measurement);
+                        }
+                    }
                 } catch (const std::exception& e) {
-                    tsdb::index_log.error("Failed to decode series ID: {}", e.what());
+                    tsdb::index_log.error("Failed to decode series metadata: {}", e.what());
                 }
             }
-            
+
             it->Next();
         }
-        
+
         leveldb::Status status = it->status();
         if (!status.ok()) {
             tsdb::index_log.error("Iterator error: {}", status.ToString());
         }
-        
+
         delete it;
-        
+
         tsdb::index_log.info("Found {} series for measurement {}", seriesIds.size(), measurement);
         return seriesIds;
     });

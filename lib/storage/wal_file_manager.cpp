@@ -7,8 +7,8 @@
 #include <seastar/core/reactor.hh>
 
 #include <algorithm>
-#include <filesystem>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <vector>
 
@@ -208,8 +208,9 @@ seastar::future<> WALFileManager::insert(TSDBInsert<T> &insertRequest) {
 }
 
 template <class T>
-seastar::future<> WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
-  if(insertRequests.empty()) {
+seastar::future<>
+WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
+  if (insertRequests.empty()) {
     co_return; // No work to do
   }
 
@@ -223,37 +224,41 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insert
     throw std::runtime_error("No memory stores available for batch insert");
   }
 
-  // First, estimate the total size of this batch to check if it exceeds threshold
+  // First, estimate the total size of this batch to check if it exceeds
+  // threshold
   if (memoryStores[0] && memoryStores[0]->getWAL()) {
     size_t totalEstimatedSize = 0;
-    for(auto& insertRequest : insertRequests) {
-      totalEstimatedSize += memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
+    for (auto &insertRequest : insertRequests) {
+      totalEstimatedSize +=
+          memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
     }
-    
+
     if (totalEstimatedSize > MemoryStore::WAL_SIZE_THRESHOLD) {
       // This batch exceeds the entire WAL limit
-      tsdb::wal_log.error(
-          "Batch insert request of {} bytes exceeds maximum WAL size of {} bytes",
-          totalEstimatedSize, MemoryStore::WAL_SIZE_THRESHOLD);
-      throw std::runtime_error("Insert batch too large - requested " +
-                               std::to_string(totalEstimatedSize) +
-                               " bytes, exceeds WAL limit. Please reduce batch size.");
+      tsdb::wal_log.error("Batch insert request of {} bytes exceeds maximum "
+                          "WAL size of {} bytes",
+                          totalEstimatedSize, MemoryStore::WAL_SIZE_THRESHOLD);
+      throw std::runtime_error(
+          "Insert batch too large - requested " +
+          std::to_string(totalEstimatedSize) +
+          " bytes, exceeds WAL limit. Please reduce batch size.");
     }
   }
 
   LOG_INSERT_PATH(tsdb::wal_log, debug,
                   "[WAL] Inserting batch into memory store for {} requests",
                   insertRequests.size());
-  
+
   auto start_memory_batch = std::chrono::high_resolution_clock::now();
   // Try to insert batch - returns true if rollover is needed
   bool needsRollover = co_await memoryStores[0]->insertBatch(insertRequests);
   auto end_memory_batch = std::chrono::high_resolution_clock::now();
 
   if (needsRollover) {
-    LOG_INSERT_PATH(tsdb::wal_log, debug,
-                    "[WAL] Memory store rollover needed for batch of {} requests",
-                    insertRequests.size());
+    LOG_INSERT_PATH(
+        tsdb::wal_log, debug,
+        "[WAL] Memory store rollover needed for batch of {} requests",
+        insertRequests.size());
     // Rollover the WAL
     co_await rolloverMemoryStore();
 
@@ -262,25 +267,32 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insert
     if (retryResult) {
       // The batch still doesn't fit in a fresh WAL - it's too large
       size_t totalEstimatedSize = 0;
-      for(auto& insertRequest : insertRequests) {
-        totalEstimatedSize += memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
+      for (auto &insertRequest : insertRequests) {
+        totalEstimatedSize +=
+            memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
       }
-      
-      tsdb::wal_log.error(
-          "Batch insert of {} bytes too large for fresh WAL",
-          totalEstimatedSize);
-      throw std::runtime_error("Insert batch too large - requested " +
-                               std::to_string(totalEstimatedSize) +
-                               " bytes, exceeds WAL limit. Please reduce batch size.");
+
+      tsdb::wal_log.error("Batch insert of {} bytes too large for fresh WAL",
+                          totalEstimatedSize);
+      throw std::runtime_error(
+          "Insert batch too large - requested " +
+          std::to_string(totalEstimatedSize) +
+          " bytes, exceeds WAL limit. Please reduce batch size.");
     }
   }
-  
+
   auto end_wal_batch = std::chrono::high_resolution_clock::now();
-  auto memory_batch_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch - start_memory_batch);
-  auto wal_batch_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_wal_batch - start_wal_batch);
-  
-  LOG_INSERT_PATH(tsdb::wal_log, info, "[PERF] [WAL] Memory batch insert: {}μs", memory_batch_duration.count());
-  LOG_INSERT_PATH(tsdb::wal_log, info, "[PERF] [WAL] Total batch insert: {}μs", wal_batch_duration.count());
+  auto memory_batch_duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch -
+                                                            start_memory_batch);
+  auto wal_batch_duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(end_wal_batch -
+                                                            start_wal_batch);
+
+  LOG_INSERT_PATH(tsdb::wal_log, info, "[PERF] [WAL] Memory batch insert: {}μs",
+                  memory_batch_duration.count());
+  LOG_INSERT_PATH(tsdb::wal_log, info, "[PERF] [WAL] Total batch insert: {}μs",
+                  wal_batch_duration.count());
 }
 
 seastar::future<> WALFileManager::rolloverMemoryStore() {
@@ -289,8 +301,8 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
 
   // Don't check isFull() here - if rolloverMemoryStore() was called,
   // it means wouldExceedThreshold() returned true, so we need to rollover.
-  // The isFull() check could return false if the WAL is just below the threshold,
-  // causing the rollover to be skipped and the insert to fail.
+  // The isFull() check could return false if the WAL is just below the
+  // threshold, causing the rollover to be skipped and the insert to fail.
   // Removing this check ensures consistency with the threshold logic.
 
   auto previousStore = memoryStores[0];
@@ -303,8 +315,15 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
   co_await store->initWAL();
   memoryStores.insert(memoryStores.begin(), store);
 
+  tsdb::wal_log.info("New memory store {} created for shard {}",
+                     store->sequenceNumber, shardId);
+
   // Send the closed store to the background task to write it to a TSM (level 0)
   co_await pendingWrites.writer.write(std::move(previousStore));
+
+  tsdb::wal_log.info(
+      "Rollover complete, new memory store {} created for shard {}",
+      store->sequenceNumber, shardId);
 }
 
 seastar::future<>
@@ -483,7 +502,8 @@ WALFileManager::deleteFromMemoryStores(const std::string &seriesKey,
   // Apply deletion to all memory stores
   // This ensures tombstones are applied even if data arrives later
   for (auto &memStore : memoryStores) {
-    memStore->deleteRange(SeriesId128::fromSeriesKey(seriesKey), startTime, endTime);
+    memStore->deleteRange(SeriesId128::fromSeriesKey(seriesKey), startTime,
+                          endTime);
   }
 
   if (!seriesExists) {
@@ -505,9 +525,9 @@ WALFileManager::insert<double>(TSDBInsert<double> &insertRequest);
 template seastar::future<>
 WALFileManager::insert<std::string>(TSDBInsert<std::string> &insertRequest);
 
-template seastar::future<>
-WALFileManager::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
-template seastar::future<>
-WALFileManager::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests);
-template seastar::future<>
-WALFileManager::insertBatch<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests);
+template seastar::future<> WALFileManager::insertBatch<bool>(
+    std::vector<TSDBInsert<bool>> &insertRequests);
+template seastar::future<> WALFileManager::insertBatch<double>(
+    std::vector<TSDBInsert<double>> &insertRequests);
+template seastar::future<> WALFileManager::insertBatch<std::string>(
+    std::vector<TSDBInsert<std::string>> &insertRequests);

@@ -271,7 +271,7 @@ BenchmarkResult benchmarkFloatEncoder(const std::vector<double>& data) {
         decoded.clear();
         CompressedSlice slice(reinterpret_cast<const uint8_t*>(encodeBuffer.data.data()),
                              encodeBuffer.data.size() * sizeof(uint64_t));
-        FloatEncoder::decode(slice, 0, data.size(), decoded);
+        FloatDecoder::decode(slice, 0, data.size(), decoded);
     }
 
     // Benchmark encoding
@@ -289,7 +289,7 @@ BenchmarkResult benchmarkFloatEncoder(const std::vector<double>& data) {
         decoded.clear();
         CompressedSlice slice(reinterpret_cast<const uint8_t*>(encodeBuffer.data.data()),
                              encodeBuffer.data.size() * sizeof(uint64_t));
-        FloatEncoder::decode(slice, 0, data.size(), decoded);
+        FloatDecoder::decode(slice, 0, data.size(), decoded);
     }
     auto decode_end = high_resolution_clock::now();
 

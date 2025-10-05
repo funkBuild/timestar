@@ -2,12 +2,30 @@
 
 #include <iostream>
 #include <cstring>
+#include <algorithm>
+
+// Define static constants
+constexpr size_t CompressedBuffer::INITIAL_CAPACITY;
+constexpr size_t CompressedBuffer::GROWTH_FACTOR;
 
 void CompressedBuffer::write(uint64_t value, int bits){
-  if(bitOffset > 63 || offset < 0 ){
-    offset++;
-    bitOffset = 0;
-    data.push_back(0);
+  if(!initialized || bitOffset > 63) {
+    if(!initialized) {
+      initialized = true;
+      offset = 0;
+      bitOffset = 0;
+      if(data.empty()) {
+        ensure_capacity(1);
+        data.resize(1, 0);
+      }
+    } else {
+      offset++;
+      bitOffset = 0;
+      if(offset >= data.size()) {
+        ensure_capacity(1);
+        data.resize(offset + 1, 0);
+      }
+    }
   }
 
   const int leftover_bits = bits - (64 - bitOffset);
@@ -17,7 +35,11 @@ void CompressedBuffer::write(uint64_t value, int bits){
   if(leftover_bits > 0) {
     offset++;
     bitOffset = leftover_bits;
-    data.push_back(value >> (bits - leftover_bits));
+    if(offset >= data.size()) {
+      ensure_capacity(1);
+      data.resize(offset + 1, 0);
+    }
+    data[offset] = value >> (bits - leftover_bits);
   } else {
     bitOffset += bits;
   }
@@ -25,10 +47,23 @@ void CompressedBuffer::write(uint64_t value, int bits){
 
 template <int bits>
 void CompressedBuffer::write(uint64_t value){
-  if(bitOffset > 63 || offset < 0 ){
-    offset++;
-    bitOffset = 0;
-    data.push_back(0);
+  if(!initialized || bitOffset > 63) {
+    if(!initialized) {
+      initialized = true;
+      offset = 0;
+      bitOffset = 0;
+      if(data.empty()) {
+        ensure_capacity(1);
+        data.resize(1, 0);
+      }
+    } else {
+      offset++;
+      bitOffset = 0;
+      if(offset >= data.size()) {
+        ensure_capacity(1);
+        data.resize(offset + 1, 0);
+      }
+    }
   }
 
   const int leftover_bits = bits - (64 - bitOffset);
@@ -38,7 +73,11 @@ void CompressedBuffer::write(uint64_t value){
   if(leftover_bits > 0) {
     offset++;
     bitOffset = leftover_bits;
-    data.push_back(value >> (bits - leftover_bits));
+    if(offset >= data.size()) {
+      ensure_capacity(1);
+      data.resize(offset + 1, 0);
+    }
+    data[offset] = value >> (bits - leftover_bits);
   } else {
     bitOffset += bits;
   }
@@ -46,10 +85,23 @@ void CompressedBuffer::write(uint64_t value){
 
 template <uint64_t value, int bits>
 void CompressedBuffer::writeFixed(){
-  if(bitOffset > 63 || offset < 0 ){
-    offset++;
-    bitOffset = 0;
-    data.push_back(0);
+  if(!initialized || bitOffset > 63) {
+    if(!initialized) {
+      initialized = true;
+      offset = 0;
+      bitOffset = 0;
+      if(data.empty()) {
+        ensure_capacity(1);
+        data.resize(1, 0);
+      }
+    } else {
+      offset++;
+      bitOffset = 0;
+      if(offset >= data.size()) {
+        ensure_capacity(1);
+        data.resize(offset + 1, 0);
+      }
+    }
   }
 
   // Happy path for single bit writes
@@ -67,7 +119,11 @@ void CompressedBuffer::writeFixed(){
   if(leftover_bits > 0) {
     offset++;
     bitOffset = leftover_bits;
-    data.push_back(value >> (bits - leftover_bits));
+    if(offset >= data.size()) {
+      ensure_capacity(1);
+      data.resize(offset + 1, 0);
+    }
+    data[offset] = value >> (bits - leftover_bits);
   } else {
     bitOffset += bits;
   }

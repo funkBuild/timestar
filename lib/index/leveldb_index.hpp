@@ -4,8 +4,10 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <unordered_set>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 
 #include "tsdb_value.hpp"
 #include "line_parser.hpp"
@@ -42,9 +44,16 @@ private:
     std::unique_ptr<leveldb::DB> db;
     int shardId;
     std::string indexPath;
-    
+
+    // In-memory cache for indexed series (to avoid redundant LevelDB Gets)
+    // TODO: Replace with LRU cache for bounded memory usage (e.g., max 1M-10M entries)
+    // Current unbounded cache uses ~120 bytes per series key
+    // For very large deployments (>10M series), implement eviction policy
+    std::unordered_set<std::string> indexedSeriesCache;
+    mutable std::shared_mutex cacheMutex;
+
     // Helper methods for key encoding
-    std::string encodeSeriesKey(const std::string& measurement, 
+    std::string encodeSeriesKey(const std::string& measurement,
                                const std::map<std::string, std::string>& tags,
                                const std::string& field);
     std::string encodeMeasurementFieldsKey(const std::string& measurement);
@@ -78,7 +87,7 @@ public:
     seastar::future<std::optional<SeriesId128>> getSeriesId(const std::string& measurement,
                                                             const std::map<std::string, std::string>& tags,
                                                             const std::string& field);
-    
+
     // Get metadata for a series by ID
     seastar::future<std::optional<SeriesMetadata>> getSeriesMetadata(const SeriesId128& seriesId);
     

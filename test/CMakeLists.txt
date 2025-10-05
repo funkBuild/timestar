@@ -24,7 +24,6 @@ set(SEASTAR_TESTS
     unit/storage/tsm_tombstone_test.cpp
     unit/storage/tsm_string_test.cpp
     unit/storage/wal_deletion_test.cpp
-    unit/index/leveldb_index_test.cpp
     unit/index/leveldb_index_enhanced_test.cpp
     unit/index/leveldb_index_gtest.cpp
     unit/index/leveldb_index_minimal_test.cpp
@@ -43,6 +42,16 @@ set(SEASTAR_TESTS
     performance/wal_batch_performance_test.cpp
 )
 
+# Identify standalone test executables with their own main() functions
+# These are built separately in subdirectories and should NOT be included in the main test executables
+set(STANDALONE_TESTS
+    unit/storage/memory_store_async_test_runner.cpp
+    unit/storage/tsm_async_test_runner.cpp
+    unit/storage/wal_async_test_runner.cpp
+    unit/index/leveldb_async_test_runner.cpp
+    unit/query/query_parser_detailed_test.cpp
+)
+
 # Remove Seastar tests from the main test lists
 foreach(SEASTAR_TEST ${SEASTAR_TESTS})
     list(REMOVE_ITEM UNIT_STORAGE_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
@@ -50,6 +59,15 @@ foreach(SEASTAR_TEST ${SEASTAR_TESTS})
     list(REMOVE_ITEM INTEGRATION_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
     list(REMOVE_ITEM E2E_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
     list(REMOVE_ITEM PERFORMANCE_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
+endforeach()
+
+# Remove standalone tests with their own main() from the main test lists
+foreach(STANDALONE_TEST ${STANDALONE_TESTS})
+    list(REMOVE_ITEM UNIT_STORAGE_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${STANDALONE_TEST})
+    list(REMOVE_ITEM UNIT_ENCODING_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${STANDALONE_TEST})
+    list(REMOVE_ITEM UNIT_QUERY_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${STANDALONE_TEST})
+    list(REMOVE_ITEM UNIT_INDEX_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${STANDALONE_TEST})
+    list(REMOVE_ITEM UNIT_HTTP_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${STANDALONE_TEST})
 endforeach()
 
 # Combine all test sources
@@ -150,4 +168,5 @@ add_custom_target(test-perf
 
 # Include subdirectories with standalone tests
 add_subdirectory(unit/storage)
+add_subdirectory(unit/index)
 add_subdirectory(benchmark)

@@ -53,7 +53,8 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId
     offset += MaxPointsPerBlock;
   }
 
-  indexEntries.push_back(std::move(indexEntry));
+  // Phase 4A: Insert into map (keeps sorted automatically)
+  indexEntries[seriesId] = std::move(indexEntry);
 }
 
 template <class T>
@@ -86,6 +87,69 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId,
   writeIndexBlock(timestamps, indexEntry, blockStartOffset);
 }
 
+// Phase 3.2: Move semantics version for zero-copy writes from batch pool
+template <class T>
+void TSMWriter::writeSeriesDirect(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<T> &&values) {
+  // Zero-copy write - caller transfers ownership of vectors
+  // Assumes data is already properly sized (single block or caller handles splitting)
+
+  if (timestamps.size() > MaxPointsPerBlock) {
+    std::cerr << "[TSM_WRITER_DIRECT] Warning: series has " << timestamps.size()
+              << " points (>" << MaxPointsPerBlock << "), writing as multiple blocks with fallback" << std::endl;
+
+    // Fallback to copy-based approach for multi-block series
+    // (Move-from vectors become lvalues, safe to pass as const&)
+    writeSeries(seriesType, seriesId, timestamps, values);
+    return;
+  }
+
+  // Single block - use move semantics path
+  TSMIndexEntry indexEntry;
+  indexEntry.seriesId = seriesId;
+  indexEntry.seriesType = seriesType;
+
+  std::cerr << "[TSM_WRITER_DIRECT] Zero-copy write for series '" << seriesId.toHex()
+            << "' (" << timestamps.size() << " points)" << std::endl;
+
+  writeBlockDirect(seriesType, seriesId, std::move(timestamps), std::move(values), indexEntry);
+  // Phase 4A: Insert into map (keeps sorted automatically)
+  indexEntries[seriesId] = std::move(indexEntry);
+}
+
+template <class T>
+void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<T> &&values, TSMIndexEntry &indexEntry) {
+  // Phase 3.2: Zero-copy block write
+  // Rvalue reference parameters are lvalues once bound, so we can use them normally
+  // The caller has transferred ownership - no copy needed on their side
+
+  size_t blockStartOffset = buffer.size();
+
+  // Encoders take const& so they'll read from our moved-to vectors
+  AlignedBuffer encodedTimestamps = IntegerEncoder::encode(timestamps);
+
+  buffer.write((uint8_t)seriesType);
+  buffer.write((uint32_t)timestamps.size());
+  buffer.write((uint32_t)encodedTimestamps.size());
+  buffer.write(encodedTimestamps);
+
+  // Encode values based on type
+  if constexpr (std::is_same<T, double>::value) {
+    CompressedBuffer encodedFloats = FloatEncoder::encode(values);
+    buffer.write(encodedFloats);
+  } else if constexpr (std::is_same<T, bool>::value) {
+    AlignedBuffer encodedBools = BoolEncoder::encode(values);
+    buffer.write(encodedBools);
+  } else if constexpr (std::is_same<T, std::string>::value) {
+    AlignedBuffer encodedStrings = StringEncoder::encode(values);
+    buffer.write(encodedStrings);
+  } else {
+    throw std::runtime_error("Unsupported data type");
+  }
+
+  // Write index block (timestamps still valid as lvalue)
+  writeIndexBlock(timestamps, indexEntry, blockStartOffset);
+}
+
 void TSMWriter::writeIndexBlock(const std::vector<uint64_t> &timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset){
   const auto [minTime, maxTime] = std::minmax_element(begin(timestamps), end(timestamps));
   size_t blockSize = buffer.size() - blockStartOffset;
@@ -99,13 +163,44 @@ void TSMWriter::writeIndexBlock(const std::vector<uint64_t> &timestamps, TSMInde
   indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
 
+// Phase 2: Write compressed block bytes directly (zero-copy transfer)
+void TSMWriter::writeCompressedBlock(TSMValueType seriesType, const SeriesId128 &seriesId,
+                                     seastar::temporary_buffer<uint8_t> &&compressedData,
+                                     uint64_t minTime, uint64_t maxTime) {
+  // Record the starting offset for this block
+  size_t blockStartOffset = buffer.size();
+
+  // Write the compressed block bytes directly to the buffer
+  // The block is already in TSM format (header + compressed timestamps + compressed values)
+  buffer.write_bytes(reinterpret_cast<const char*>(compressedData.get()), compressedData.size());
+
+  // Phase 4A: Find or create index entry in map
+  auto& indexEntry = indexEntries[seriesId];
+  if (indexEntry.seriesId != seriesId) {
+    // First time seeing this series, initialize
+    indexEntry.seriesId = seriesId;
+    indexEntry.seriesType = seriesType;
+  }
+
+  // Create index block metadata
+  TSMIndexBlock indexBlock;
+  indexBlock.minTime = minTime;
+  indexBlock.maxTime = maxTime;
+  indexBlock.offset = blockStartOffset;
+  indexBlock.size = compressedData.size();
+
+  indexEntry.indexBlocks.push_back(std::move(indexBlock));
+}
+
 void TSMWriter::writeIndex(){
-  // Write each index entry that points to a block
-  std::sort(indexEntries.begin(), indexEntries.end());
-
+  // std::map maintains sorted order automatically
   size_t indexStartOffset = buffer.size();
+  std::cerr << "[TSM_WRITER_INDEX] Index starts at offset: " << indexStartOffset
+            << " (0x" << std::hex << indexStartOffset << std::dec << ")" << std::endl;
+  std::cerr << "[TSM_WRITER_INDEX] Writing " << indexEntries.size() << " index entries" << std::endl;
 
-  for(auto const& indexEntry: indexEntries){
+  // Iterate directly - already sorted by SeriesId128
+  for(auto const& [seriesId, indexEntry]: indexEntries){
     // Write SeriesId128 as 16 bytes (no length prefix needed since it's fixed size)
     std::string seriesIdBytes = indexEntry.seriesId.toBytes();
     buffer.write(seriesIdBytes);
@@ -125,13 +220,31 @@ void TSMWriter::writeIndex(){
     }
   }
 
+  std::cerr << "[TSM_WRITER_INDEX] Buffer size before writing offset: " << buffer.size() << std::endl;
   buffer.write(indexStartOffset);
+  std::cerr << "[TSM_WRITER_INDEX] Buffer size after writing offset: " << buffer.size() << std::endl;
+  std::cerr << "[TSM_WRITER_INDEX] Wrote index offset: " << indexStartOffset
+            << " (0x" << std::hex << indexStartOffset << std::dec << ")" << std::endl;
+}
+
+// Phase 4A: Parallel index building (placeholder for future enhancement)
+void TSMWriter::writeIndexParallel(){
+  // For now, just call the regular writeIndex
+  // Future: parallelize serialization of index entries
+  writeIndex();
 }
 
 void TSMWriter::close(){
+  std::cerr << "[TSM_WRITER_CLOSE] Writing file: " << filename << std::endl;
+  std::cerr << "[TSM_WRITER_CLOSE] Buffer size: " << buffer.size()
+            << " (0x" << std::hex << buffer.size() << std::dec << ")" << std::endl;
+  std::cerr << "[TSM_WRITER_CLOSE] Buffer capacity: " << buffer.capacity() << std::endl;
+
   std::ofstream file(filename, std::ios::binary);
   file << buffer;
   file.flush();
+
+  std::cerr << "[TSM_WRITER_CLOSE] File written successfully" << std::endl;
 }
 
 void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename){
@@ -201,3 +314,12 @@ void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename
 template void TSMWriter::writeSeries<double>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<double> &values);
 template void TSMWriter::writeSeries<bool>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<bool> &values);
 template void TSMWriter::writeSeries<std::string>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<std::string> &values);
+
+// Phase 3.2: Template instantiations for move semantics versions
+template void TSMWriter::writeSeriesDirect<double>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<double> &&values);
+template void TSMWriter::writeSeriesDirect<bool>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<bool> &&values);
+template void TSMWriter::writeSeriesDirect<std::string>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<std::string> &&values);
+
+template void TSMWriter::writeBlockDirect<double>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<double> &&values, TSMIndexEntry &indexEntry);
+template void TSMWriter::writeBlockDirect<bool>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<bool> &&values, TSMIndexEntry &indexEntry);
+template void TSMWriter::writeBlockDirect<std::string>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<std::string> &&values, TSMIndexEntry &indexEntry);

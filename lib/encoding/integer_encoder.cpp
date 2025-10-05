@@ -1,89 +1,101 @@
 #include "integer_encoder.hpp"
-#include "zigzag.hpp"
-#include "simple16.hpp"
-#include "slice_buffer.hpp"
+#include "integer/integer_encoder.hpp"       // IntegerEncoderBasic
+#include "integer/integer_encoder_simd.hpp"  // IntegerEncoderSIMD
+#include "integer/integer_encoder_avx512.hpp" // IntegerEncoderAVX512
 
-#include <iostream>
-#include <limits>
+// Static member initialization
+IntegerEncoder::Implementation IntegerEncoder::s_forced_impl = IntegerEncoder::AUTO;
 
-// Timestamp encoding - http://www.vldb.org/pvldb/vol8/p1816-teller.pdf
+AlignedBuffer IntegerEncoder::encode(const std::vector<uint64_t> &values) {
+    Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
-AlignedBuffer IntegerEncoder::encode(const std::vector<uint64_t> &values){
-  std::vector<uint64_t> encoded;
-  encoded.reserve(values.size());
+    switch (impl) {
+        case AVX512:
+            if (IntegerEncoderAVX512::isAvailable()) {
+                return IntegerEncoderAVX512::encode(values);
+            }
+            // Fall through if not available
 
-  uint64_t start_value = values[0];
-  encoded.push_back(start_value);
+        case SIMD:
+            if (IntegerEncoderSIMD::isAvailable()) {
+                return IntegerEncoderSIMD::encode(values);
+            }
+            // Fall through if not available
 
-  int64_t delta = values[1] - values[0];
-  uint64_t first_delta = ZigZag::zigzagEncode(delta);
-
-  encoded.push_back(first_delta);
-
-  for(unsigned int i = 2; i < values.size(); i++){
-    int64_t D = (values[i] - values[i-1]) - (values[i-1] - values[i-2]);
-    uint64_t encD = ZigZag::zigzagEncode(D);
-    encoded.push_back(encD);
-  }
-
-  return Simple16::encode(encoded);
+        case BASIC:
+        case AUTO:
+        default:
+            return IntegerEncoderBasic::encode(values);
+    }
 }
 
-std::pair<size_t, size_t> IntegerEncoder::decode(Slice &encoded, unsigned int timestampSize, std::vector<uint64_t> &values, uint64_t minTime, uint64_t maxTime){
-  std::vector<uint64_t> deltaValues = Simple16::decode(encoded, timestampSize);
+std::pair<size_t, size_t> IntegerEncoder::decode(Slice &encoded, unsigned int timestampSize,
+                                                std::vector<uint64_t> &values,
+                                                uint64_t minTime, uint64_t maxTime) {
+    Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
-  size_t nSkipped = 0, nAdded = 0;
-  
-  // Handle empty or invalid data
-  if (deltaValues.empty()) {
-    return {nSkipped, nAdded};
-  }
-  
-  uint64_t last_decoded = deltaValues[0];
+    switch (impl) {
+        case AVX512:
+            if (IntegerEncoderAVX512::isAvailable()) {
+                return IntegerEncoderAVX512::decode(encoded, timestampSize, values, minTime, maxTime);
+            }
+            // Fall through if not available
 
-  if(last_decoded < minTime) {
-    nSkipped++;
-  } else if(last_decoded > maxTime) {
-      return {nSkipped, nAdded};
-  } else {
-    nAdded++;
-    values.push_back(last_decoded);
-  }
+        case SIMD:
+            if (IntegerEncoderSIMD::isAvailable()) {
+                return IntegerEncoderSIMD::decode(encoded, timestampSize, values, minTime, maxTime);
+            }
+            // Fall through if not available
 
-  // Check if we have at least 2 values for delta
-  if (deltaValues.size() < 2) {
-    return {nSkipped, nAdded};
-  }
-
-  int64_t delta = ZigZag::zigzagDecode(deltaValues[1]);
-  last_decoded += delta;
-
-  if(last_decoded < minTime) {
-    nSkipped++;
-  } else if(last_decoded > maxTime) {
-      return {nSkipped, nAdded};
-  } else {
-    nAdded++;
-    values.push_back(last_decoded);
-  }
-
-  for(unsigned int i = 2; i < deltaValues.size(); i++){
-    int64_t encD = ZigZag::zigzagDecode(deltaValues[i]);
-
-    delta += encD;
-    last_decoded += delta;
-
-    if(last_decoded < minTime) {
-      nSkipped++;
-      continue;
+        case BASIC:
+        case AUTO:
+        default:
+            return IntegerEncoderBasic::decode(encoded, timestampSize, values, minTime, maxTime);
     }
+}
 
-    if(last_decoded > maxTime)
-      return {nSkipped, nAdded};
+IntegerEncoder::Implementation IntegerEncoder::selectBestImplementation() {
+    // Based on CPU capabilities: AVX-512 > AVX2 > Basic
+    if (IntegerEncoderAVX512::isAvailable()) {
+        return AVX512;
+    }
+    if (IntegerEncoderSIMD::isAvailable()) {
+        return SIMD;
+    }
+    return BASIC;
+}
 
-    nAdded++;
-    values.push_back(last_decoded);
-  }
+std::string IntegerEncoder::getImplementationName() {
+    Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
-  return {nSkipped, nAdded};
+    switch (impl) {
+        case AVX512:
+            if (IntegerEncoderAVX512::isAvailable()) {
+                return "AVX-512 (16x parallel)";
+            }
+            // Fall through
+
+        case SIMD:
+            if (IntegerEncoderSIMD::isAvailable()) {
+                return "AVX2 SIMD (8x parallel)";
+            }
+            // Fall through
+
+        case BASIC:
+        case AUTO:
+        default:
+            return "Basic Optimized";
+    }
+}
+
+bool IntegerEncoder::hasAVX512() {
+    return IntegerEncoderAVX512::isAvailable();
+}
+
+bool IntegerEncoder::hasAVX2() {
+    return IntegerEncoderSIMD::isAvailable();
+}
+
+void IntegerEncoder::setImplementation(Implementation impl) {
+    s_forced_impl = impl;
 }

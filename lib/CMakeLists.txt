@@ -30,14 +30,15 @@ add_library(libtsdb STATIC ${SRC_FILES})
 target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze OpenSSL::Crypto)
 
 # Include both the lib directory and all subdirectories for header resolution
-target_include_directories(libtsdb PUBLIC 
+target_include_directories(libtsdb PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
-    ${CMAKE_CURRENT_SOURCE_DIR}/storage  
+    ${CMAKE_CURRENT_SOURCE_DIR}/storage
     ${CMAKE_CURRENT_SOURCE_DIR}/encoding
     ${CMAKE_CURRENT_SOURCE_DIR}/query
     ${CMAKE_CURRENT_SOURCE_DIR}/index
     ${CMAKE_CURRENT_SOURCE_DIR}/http
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${LEVELDB_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include
 )

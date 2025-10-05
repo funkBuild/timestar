@@ -23,7 +23,6 @@ private:
   TSMFileManager *tsmFileManager;
   seastar::pipe<seastar::shared_ptr<MemoryStore>> pendingWrites;
   seastar::semaphore compactionSemaphore{1}; // Only allow 1 compaction at a time
-  bool _shutdown_requested = false;
   
 public:
   WALFileManager();
@@ -38,8 +37,7 @@ public:
   seastar::future<> startTsmWriter();
   seastar::future<> close() {
     tsdb::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
-    _shutdown_requested = true;
-    
+
     try {
       // Send null value to signal background TSM writer to stop
       tsdb::wal_log.info("[WAL_CLOSE] Signaling background TSM writer to stop on shard {}", shardId);

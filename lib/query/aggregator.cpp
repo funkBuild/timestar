@@ -4,6 +4,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 
 namespace tsdb {
 
@@ -80,26 +81,26 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
     const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& series,
     AggregationMethod method,
     uint64_t interval) {
-    
+
     if (series.empty()) {
         return {};
     }
-    
-    // For time-aligned aggregation, we need to group values by timestamp
-    // and apply the aggregation function at each timestamp
-    std::map<uint64_t, std::vector<double>> timeAlignedValues;
-    
-    // Group all values by their timestamps
-    for (const auto& [timestamps, values] : series) {
-        for (size_t i = 0; i < timestamps.size(); ++i) {
-            timeAlignedValues[timestamps[i]].push_back(values[i]);
-        }
-    }
-    
+
     std::vector<AggregatedPoint> result;
-    
+
     if (interval == 0) {
-        // No time bucketing - aggregate per timestamp
+        // No time bucketing - need to align by timestamp
+        // For time-aligned aggregation, we need to group values by timestamp
+        // and apply the aggregation function at each timestamp
+        std::map<uint64_t, std::vector<double>> timeAlignedValues;
+
+        // Group all values by their timestamps
+        for (const auto& [timestamps, values] : series) {
+            for (size_t i = 0; i < timestamps.size(); ++i) {
+                timeAlignedValues[timestamps[i]].push_back(values[i]);
+            }
+        }
+
         if (method == AggregationMethod::LATEST) {
             // For LATEST with no interval, return all original values without aggregation
             for (const auto& [timestamps, values] : series) {
@@ -112,7 +113,7 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
                 }
             }
             // Sort by timestamp since we may have mixed them from different series
-            std::sort(result.begin(), result.end(), 
+            std::sort(result.begin(), result.end(),
                 [](const AggregatedPoint& a, const AggregatedPoint& b) {
                     return a.timestamp < b.timestamp;
                 });
@@ -122,7 +123,7 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
                 AggregatedPoint point;
                 point.timestamp = timestamp;
                 point.count = vals.size();
-                
+
                 switch (method) {
                     case AggregationMethod::AVG:
                         point.value = calculateAvg(vals);
@@ -141,26 +142,41 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
                         point.value = vals.back();
                         break;
                 }
-                
+
                 result.push_back(point);
             }
         }
     } else {
-        // With time bucketing
-        std::map<uint64_t, std::vector<double>> buckets;
-        
-        // Group values into time buckets
-        for (const auto& [timestamp, vals] : timeAlignedValues) {
-            uint64_t bucketTime = (timestamp / interval) * interval;
-            buckets[bucketTime].insert(buckets[bucketTime].end(), vals.begin(), vals.end());
+        // OPTIMIZED: With time bucketing, go directly to buckets without time-alignment
+        // This avoids creating a huge intermediate map for millions of points
+
+        // Use unordered_map for O(1) average bucket lookup instead of O(log n)
+        std::unordered_map<uint64_t, std::vector<double>> buckets;
+
+        // Estimate number of buckets to pre-allocate hash table capacity
+        if (!series.empty() && !series[0].first.empty()) {
+            const auto& firstTimestamps = series[0].first;
+            if (firstTimestamps.size() > 1) {
+                uint64_t timeSpan = firstTimestamps.back() - firstTimestamps.front();
+                size_t estimatedBuckets = (timeSpan / interval) + 1;
+                buckets.reserve(estimatedBuckets * 1.2); // 20% buffer for variability
+            }
         }
-        
+
+        // Group values directly into time buckets from all series
+        for (const auto& [timestamps, values] : series) {
+            for (size_t i = 0; i < timestamps.size(); ++i) {
+                uint64_t bucketTime = (timestamps[i] / interval) * interval;
+                buckets[bucketTime].push_back(values[i]);
+            }
+        }
+
         // Aggregate each bucket
         for (const auto& [bucketTime, vals] : buckets) {
             AggregatedPoint point;
             point.timestamp = bucketTime;
             point.count = vals.size();
-            
+
             switch (method) {
                 case AggregationMethod::AVG:
                     point.value = calculateAvg(vals);
@@ -180,11 +196,17 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
                     break;
                 }
             }
-            
+
             result.push_back(point);
         }
+
+        // Sort result by timestamp since unordered_map doesn't maintain order
+        std::sort(result.begin(), result.end(),
+            [](const AggregatedPoint& a, const AggregatedPoint& b) {
+                return a.timestamp < b.timestamp;
+            });
     }
-    
+
     return result;
 }
 
@@ -293,42 +315,53 @@ AggregatedPoint Aggregator::aggregateBucket(
     const std::vector<double>& values,
     const std::vector<size_t>& indices,
     AggregationMethod method) {
-    
+
     AggregatedPoint point;
     point.timestamp = bucketTime;
     point.count = indices.size();
-    
-    // Extract values for this bucket
-    std::vector<double> bucketValues;
-    std::vector<uint64_t> bucketTimestamps;
-    bucketValues.reserve(indices.size());
-    bucketTimestamps.reserve(indices.size());
-    
-    for (size_t idx : indices) {
-        bucketValues.push_back(values[idx]);
-        bucketTimestamps.push_back(timestamps[idx]);
-    }
-    
-    switch (method) {
-        case AggregationMethod::AVG:
-            point.value = calculateAvg(bucketValues);
-            break;
-        case AggregationMethod::MIN:
-            point.value = calculateMin(bucketValues);
-            break;
-        case AggregationMethod::MAX:
-            point.value = calculateMax(bucketValues);
-            break;
-        case AggregationMethod::SUM:
-            point.value = calculateSum(bucketValues);
-            break;
-        case AggregationMethod::LATEST: {
-            auto latest = getLatest(bucketTimestamps, bucketValues);
-            point.value = latest.second;
-            break;
+
+    // OPTIMIZED: Only copy what we need
+    if (method == AggregationMethod::LATEST) {
+        // LATEST needs both timestamps and values
+        std::vector<double> bucketValues;
+        std::vector<uint64_t> bucketTimestamps;
+        bucketValues.reserve(indices.size());
+        bucketTimestamps.reserve(indices.size());
+
+        for (size_t idx : indices) {
+            bucketValues.push_back(values[idx]);
+            bucketTimestamps.push_back(timestamps[idx]);
+        }
+
+        auto latest = getLatest(bucketTimestamps, bucketValues);
+        point.value = latest.second;
+    } else {
+        // AVG, MIN, MAX, SUM only need values
+        std::vector<double> bucketValues;
+        bucketValues.reserve(indices.size());
+
+        for (size_t idx : indices) {
+            bucketValues.push_back(values[idx]);
+        }
+
+        switch (method) {
+            case AggregationMethod::AVG:
+                point.value = calculateAvg(bucketValues);
+                break;
+            case AggregationMethod::MIN:
+                point.value = calculateMin(bucketValues);
+                break;
+            case AggregationMethod::MAX:
+                point.value = calculateMax(bucketValues);
+                break;
+            case AggregationMethod::SUM:
+                point.value = calculateSum(bucketValues);
+                break;
+            default:
+                break;
         }
     }
-    
+
     return point;
 }
 

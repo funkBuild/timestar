@@ -38,13 +38,14 @@ public:
         const std::map<std::string, std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>>& groups,
         AggregationMethod method,
         uint64_t interval = 0);
-    
-private:
-    // Core aggregation functions
+
+    // Core aggregation functions (made public for use by optimized implementations)
     static double calculateAvg(const std::vector<double>& values);
     static double calculateMin(const std::vector<double>& values);
     static double calculateMax(const std::vector<double>& values);
     static double calculateSum(const std::vector<double>& values);
+
+private:
     static std::pair<uint64_t, double> getLatest(
         const std::vector<uint64_t>& timestamps,
         const std::vector<double>& values);
