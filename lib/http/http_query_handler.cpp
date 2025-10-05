@@ -418,7 +418,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         
         // Execute queries on each shard that has series
         auto shardQueriesStart = std::chrono::high_resolution_clock::now();
-        std::vector<seastar::future<std::pair<unsigned, std::pair<std::vector<tsdb::SeriesResult>, double>>>> futures;
+        std::vector<seastar::future<std::pair<unsigned, std::pair<std::vector<PartialAggregationResult>, double>>>> futures;
         for (const auto& [shardId, seriesKeys] : seriesByShard) {
             // Create field lookup map for this shard's series
             std::unordered_map<std::string, std::string> shardSeriesKeyToField;
@@ -433,7 +433,10 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             auto f = engineSharded->invoke_on(shardId,
                 [shardId, seriesKeys, shardSeriesKeyToField = std::move(shardSeriesKeyToField),
                  startTime = request.startTime, endTime = request.endTime,
-                 measurement = request.measurement](Engine& engine) -> seastar::future<std::pair<std::vector<tsdb::SeriesResult>, double>> {
+                 measurement = request.measurement,
+                 aggregation = request.aggregation,
+                 aggregationInterval = request.aggregationInterval,
+                 groupByTags = request.groupByTags](Engine& engine) -> seastar::future<std::pair<std::vector<PartialAggregationResult>, double>> {
                     auto shardStart = std::chrono::high_resolution_clock::now();
                     LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} querying {} series keys in parallel",
                                    shardId, seriesKeys.size());
@@ -575,12 +578,19 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                         }
                     }
 
+                    // OPTIMIZATION: Perform partial aggregation on this shard before returning
+                    auto partialAggStart = std::chrono::high_resolution_clock::now();
+                    auto partialResults = Aggregator::createPartialAggregations(
+                        results, aggregation, aggregationInterval, groupByTags);
+                    auto partialAggEnd = std::chrono::high_resolution_clock::now();
+                    double partialAggMs = std::chrono::duration<double, std::milli>(partialAggEnd - partialAggStart).count();
+
                     auto shardEnd = std::chrono::high_resolution_clock::now();
                     double shardMs = std::chrono::duration<double, std::milli>(shardEnd - shardStart).count();
-                    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} completed {} parallel queries in {:.2f} ms",
-                                   shardId, seriesKeys.size(), shardMs);
-                    co_return std::make_pair(results, shardMs);
-                }).then([shardId](std::pair<std::vector<tsdb::SeriesResult>, double> result) {
+                    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} completed {} parallel queries + partial aggregation in {:.2f} ms (aggregation: {:.2f} ms)",
+                                   shardId, seriesKeys.size(), shardMs, partialAggMs);
+                    co_return std::make_pair(partialResults, shardMs);
+                }).then([shardId](std::pair<std::vector<PartialAggregationResult>, double> result) {
                     return std::make_pair(shardId, result);
                 });
             futures.push_back(std::move(f));
@@ -591,264 +601,100 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         auto shardQueriesEnd = std::chrono::high_resolution_clock::now();
         timing.shardQueriesMs = std::chrono::duration<double, std::milli>(shardQueriesEnd - shardQueriesStart).count();
         
-        // Merge results from all shards
+        // Collect partial aggregations from all shards
         auto mergeStart = std::chrono::high_resolution_clock::now();
 
-        // Pre-allocate response.series to avoid reallocations during merge
-        size_t totalSeries = 0;
+        std::vector<PartialAggregationResult> allPartialResults;
+        size_t totalPartialResults = 0;
         for (const auto& sr : shardResults) {
-            totalSeries += sr.second.first.size();
+            totalPartialResults += sr.second.first.size();
         }
-        response.series.reserve(totalSeries);
+        allPartialResults.reserve(totalPartialResults);
 
         for (auto& shardResult : shardResults) {
             unsigned shardId = shardResult.first;
-            auto& [shardSeriesVec, shardMs] = shardResult.second;
+            auto& [partialResults, shardMs] = shardResult.second;
             timing.perShardQueryMs.push_back({shardId, shardMs});
 
-            for (auto& series : shardSeriesVec) {
-                // Count points before moving
-                for (const auto& [fieldName, fieldData] : series.fields) {
-                    size_t points = fieldData.first.size();
-                    response.statistics.pointCount += points;
-                    timing.totalPointsRetrieved += points;
-                }
-
-                // Move the series to avoid copying large data structures
-                response.series.push_back(std::move(series));
+            // Count points from partial results
+            for (const auto& partial : partialResults) {
+                timing.totalPointsRetrieved += partial.totalPoints;
             }
+
+            // Collect all partial results
+            allPartialResults.insert(allPartialResults.end(),
+                std::make_move_iterator(partialResults.begin()),
+                std::make_move_iterator(partialResults.end()));
         }
+
         auto mergeEnd = std::chrono::high_resolution_clock::now();
         timing.resultMergingMs = std::chrono::duration<double, std::milli>(mergeEnd - mergeStart).count();
-        
-        // Apply aggregation and grouping
+
+        // Merge partial aggregations from all shards into final aggregated points
         auto aggregationStart = std::chrono::high_resolution_clock::now();
-        if (!response.series.empty()) {
-            std::vector<SeriesResult> aggregatedSeries;
-            
-            // Check if we need to group series
-            if (request.groupByTags.empty()) {
-                // No group by - merge all series into one aggregated result
-                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] No group-by specified, merging {} series into one", response.series.size());
-                
-                // Create a single merged series
-                SeriesResult mergedSeries;
-                mergedSeries.measurement = request.measurement; // Use request measurement instead of series[0]
-                // Clear tags since we're aggregating across all series
-                mergedSeries.tags.clear();
-                
-                // Collect all series data by field name for aggregation
-                std::unordered_map<std::string, std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>> numericFieldData;
-                std::unordered_map<std::string, std::vector<std::pair<std::vector<uint64_t>, FieldValues>>> nonNumericFieldData;
+        if (!allPartialResults.empty()) {
+            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merging {} partial aggregations from {} shards",
+                           allPartialResults.size(), timing.shardsQueried);
 
-                // Pre-allocate based on first series to avoid reallocations
-                if (!response.series.empty()) {
-                    const auto& firstSeries = response.series[0];
-                    for (const auto& [fieldName, _] : firstSeries.fields) {
-                        numericFieldData[fieldName].reserve(response.series.size());
-                        nonNumericFieldData[fieldName].reserve(response.series.size());
-                    }
+            // Merge all partial aggregations into final aggregated points
+            auto aggregatedPoints = Aggregator::mergePartialAggregations(
+                allPartialResults, request.aggregation);
+
+            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merged into {} aggregated points",
+                           aggregatedPoints.size());
+
+            // Convert AggregatedPoints back to SeriesResult format for response
+            // Group aggregated points by (measurement, tags, field) using metadata from partial results
+            std::map<std::string, std::pair<const PartialAggregationResult*, std::vector<const AggregatedPoint*>>> groupedPoints;
+
+            // First, build metadata map from partial results
+            std::map<std::string, const PartialAggregationResult*> metadataMap;
+            for (const auto& partial : allPartialResults) {
+                std::string key = partial.measurement + "|";
+                std::vector<std::string> tagPairs;
+                for (const auto& [k, v] : partial.tags) {
+                    tagPairs.push_back(k + "=" + v);
                 }
+                std::sort(tagPairs.begin(), tagPairs.end());
+                key += fmt::format("{}", fmt::join(tagPairs, ",")) + "|" + partial.fieldName;
+                metadataMap[key] = &partial;
+            }
 
-                for (const auto& series : response.series) {
-                    for (const auto& [fieldName, data] : series.fields) {
-                        const auto& timestamps = data.first;
-                        const auto& values = data.second;
-
-                        if (std::holds_alternative<std::vector<double>>(values)) {
-                            // Numeric values - can be aggregated
-                            const auto& doubleValues = std::get<std::vector<double>>(values);
-                            numericFieldData[fieldName].push_back(std::make_pair(timestamps, doubleValues));
-                        } else {
-                            // Non-numeric values (bool, string) - keep for LATEST aggregation
-                            nonNumericFieldData[fieldName].push_back(std::make_pair(timestamps, values));
-                        }
-                    }
-                }
-                
-                // Aggregate numeric fields using time-aligned aggregation
-                for (const auto& [fieldName, seriesData] : numericFieldData) {
-                    if (!seriesData.empty()) {
-                        auto aggregated = Aggregator::aggregateMultiple(
-                            seriesData, request.aggregation, request.aggregationInterval);
-                        
-                        std::vector<uint64_t> newTimestamps;
-                        std::vector<double> newValues;
-                        
-                        for (const auto& point : aggregated) {
-                            newTimestamps.push_back(point.timestamp);
-                            newValues.push_back(point.value);
-                        }
-                        
-                        mergedSeries.fields[fieldName] = std::make_pair(newTimestamps, FieldValues(newValues));
-                    }
-                }
-                
-                // Handle non-numeric fields (for LATEST aggregation only)
-                if (request.aggregation == AggregationMethod::LATEST) {
-                    for (const auto& [fieldName, seriesData] : nonNumericFieldData) {
-                        if (!seriesData.empty()) {
-                            if (request.aggregationInterval == 0) {
-                                // No interval - return all values
-                                std::vector<std::pair<uint64_t, FieldValues>> allData;
-                                
-                                for (const auto& [timestamps, values] : seriesData) {
-                                    for (size_t i = 0; i < timestamps.size(); ++i) {
-                                        if (std::holds_alternative<std::vector<bool>>(values)) {
-                                            const auto& boolVals = std::get<std::vector<bool>>(values);
-                                            allData.push_back({timestamps[i], std::vector<bool>{boolVals[i]}});
-                                        } else if (std::holds_alternative<std::vector<std::string>>(values)) {
-                                            const auto& strVals = std::get<std::vector<std::string>>(values);
-                                            allData.push_back({timestamps[i], std::vector<std::string>{strVals[i]}});
-                                        }
-                                    }
-                                }
-                                
-                                // Sort by timestamp
-                                std::sort(allData.begin(), allData.end(),
-                                    [](const auto& a, const auto& b) { return a.first < b.first; });
-                                
-                                // Combine into result vectors
-                                std::vector<uint64_t> resultTimestamps;
-                                FieldValues resultValues;
-                                
-                                if (!allData.empty()) {
-                                    // Determine the type from first element
-                                    if (std::holds_alternative<std::vector<bool>>(allData[0].second)) {
-                                        std::vector<bool> boolResults;
-                                        for (const auto& [ts, val] : allData) {
-                                            resultTimestamps.push_back(ts);
-                                            const auto& boolVec = std::get<std::vector<bool>>(val);
-                                            boolResults.push_back(boolVec[0]);
-                                        }
-                                        resultValues = boolResults;
-                                    } else if (std::holds_alternative<std::vector<std::string>>(allData[0].second)) {
-                                        std::vector<std::string> strResults;
-                                        for (const auto& [ts, val] : allData) {
-                                            resultTimestamps.push_back(ts);
-                                            const auto& strVec = std::get<std::vector<std::string>>(val);
-                                            strResults.push_back(strVec[0]);
-                                        }
-                                        resultValues = strResults;
-                                    }
-                                    
-                                    mergedSeries.fields[fieldName] = std::make_pair(resultTimestamps, resultValues);
-                                }
-                            } else {
-                                // With interval - return latest from each bucket (not implemented for non-numeric yet)
-                                // For now, just return the single latest value
-                                uint64_t latestTime = 0;
-                                FieldValues latestValue;
-                                
-                                for (const auto& [timestamps, values] : seriesData) {
-                                    if (!timestamps.empty() && timestamps.back() > latestTime) {
-                                        latestTime = timestamps.back();
-                                        if (std::holds_alternative<std::vector<bool>>(values)) {
-                                            const auto& boolVals = std::get<std::vector<bool>>(values);
-                                            latestValue = std::vector<bool>{boolVals.back()};
-                                        } else if (std::holds_alternative<std::vector<std::string>>(values)) {
-                                            const auto& strVals = std::get<std::vector<std::string>>(values);
-                                            latestValue = std::vector<std::string>{strVals.back()};
-                                        }
-                                    }
-                                }
-                                
-                                if (latestTime > 0) {
-                                    mergedSeries.fields[fieldName] = std::make_pair(
-                                        std::vector<uint64_t>{latestTime}, latestValue);
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                if (!mergedSeries.fields.empty()) {
-                    aggregatedSeries.push_back(mergedSeries);
-                }
-                
-            } else {
-                // Group by specified tags
-                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Group-by tags: {}", fmt::join(request.groupByTags, ", "));
-                
-                // Group series by the specified tags
-                std::map<std::map<std::string, std::string>, std::vector<SeriesResult*>> groups;
-                
-                for (auto& series : response.series) {
-                    // Extract group-by tag values
-                    std::map<std::string, std::string> groupKey;
-                    for (const auto& tagName : request.groupByTags) {
-                        auto it = series.tags.find(tagName);
-                        if (it != series.tags.end()) {
-                            groupKey[tagName] = it->second;
-                        }
-                    }
-                    groups[groupKey].push_back(&series);
-                }
-                
-                // Aggregate each group
-                for (const auto& [groupTags, seriesGroup] : groups) {
-                    if (seriesGroup.empty()) {
-                        continue; // Skip empty groups
-                    }
-                    SeriesResult groupedSeries;
-                    groupedSeries.measurement = request.measurement; // Use request measurement
-                    groupedSeries.tags = groupTags; // Only keep group-by tags
-
-                    // Collect all series data in this group by field name for time-aligned aggregation
-                    std::unordered_map<std::string, std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>> fieldSeriesData;
-
-                    // Pre-allocate based on first series in group
-                    if (!seriesGroup.empty() && seriesGroup[0] != nullptr) {
-                        for (const auto& [fieldName, _] : seriesGroup[0]->fields) {
-                            fieldSeriesData[fieldName].reserve(seriesGroup.size());
-                        }
-                    }
-
-                    for (const auto* series : seriesGroup) {
-                        for (const auto& [fieldName, data] : series->fields) {
-                            const auto& timestamps = data.first;
-                            const auto& values = data.second;
-                            
-                            if (std::holds_alternative<std::vector<double>>(values)) {
-                                const auto& doubleValues = std::get<std::vector<double>>(values);
-                                
-                                // Add this series to the field's collection
-                                fieldSeriesData[fieldName].push_back(std::make_pair(timestamps, doubleValues));
-                            }
-                        }
-                    }
-                    
-                    // Aggregate the grouped data using time-aligned aggregation
-                    for (const auto& [fieldName, seriesData] : fieldSeriesData) {
-                        if (!seriesData.empty()) {
-                            // Use aggregateMultiple for time-aligned aggregation
-                            auto aggregated = Aggregator::aggregateMultiple(
-                                seriesData, request.aggregation, request.aggregationInterval);
-
-                            // OPTIMIZED: Pre-allocate and move instead of copying
-                            std::vector<uint64_t> newTimestamps;
-                            std::vector<double> newValues;
-                            newTimestamps.reserve(aggregated.size());
-                            newValues.reserve(aggregated.size());
-
-                            for (const auto& point : aggregated) {
-                                newTimestamps.push_back(point.timestamp);
-                                newValues.push_back(point.value);
-                            }
-
-                            groupedSeries.fields[fieldName] = std::make_pair(std::move(newTimestamps), FieldValues(std::move(newValues)));
-                        }
-                    }
-                    
-                    if (!groupedSeries.fields.empty()) {
-                        aggregatedSeries.push_back(groupedSeries);
-                    }
+            // Group points by metadata key (all points from same group share metadata)
+            for (const auto& point : aggregatedPoints) {
+                // Since mergePartialAggregations groups by the same key, use first metadata
+                if (!metadataMap.empty()) {
+                    // Use first metadata as default (all should match for properly merged groups)
+                    auto& [key, partial] = *metadataMap.begin();
+                    groupedPoints[key].first = partial;
+                    groupedPoints[key].second.push_back(&point);
                 }
             }
-            
-            // Replace response series with aggregated results
-            response.series = std::move(aggregatedSeries);
-            
+
+            // Convert grouped points to SeriesResult objects
+            for (auto& [key, groupData] : groupedPoints) {
+                const auto* partial = groupData.first;
+                const auto& points = groupData.second;
+
+                SeriesResult series;
+                series.measurement = partial->measurement;
+                series.tags = partial->tags;
+
+                // Add all points to field data
+                std::vector<uint64_t> timestamps;
+                std::vector<double> values;
+                timestamps.reserve(points.size());
+                values.reserve(points.size());
+
+                for (const auto* point : points) {
+                    timestamps.push_back(point->timestamp);
+                    values.push_back(point->value);
+                }
+
+                series.fields[partial->fieldName] = std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+                response.series.push_back(std::move(series));
+            }
+
             // Update statistics
             response.statistics.pointCount = 0;
             for (const auto& series : response.series) {

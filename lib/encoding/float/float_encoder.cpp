@@ -1,0 +1,138 @@
+#include "float_encoder.hpp"
+#include "../../utils/util.hpp"
+
+#include <iostream>
+#include <cassert>
+#include <cmath>
+
+CompressedBuffer FloatEncoderBasic::encode(const std::vector<double> &values){
+    CompressedBuffer buffer;
+
+    if (values.empty()) {
+        return buffer;
+    }
+
+    uint64_t last_value = *((uint64_t*)&values[0]);
+    int data_bits = 0;
+    int prev_lzb = -1;
+    int prev_tzb = -1;
+
+    buffer.write<64>(last_value);
+
+
+    for(size_t i = 1; i < values.size(); i++){
+        const uint64_t current_value = *((uint64_t*)&values[i]);
+        const uint64_t xor_value = current_value ^ last_value;
+
+
+        if(xor_value == 0){
+            buffer.writeFixed<0b0, 1>();
+        } else {
+            auto lzb = getLeadingZeroBits(xor_value);
+            const auto tzb = getTrailingZeroBits(xor_value);
+
+
+            if (data_bits != 0 && prev_lzb <= lzb && prev_tzb <= tzb ){
+                buffer.writeFixed<0b01, 2>();
+                buffer.write(xor_value >> prev_tzb, data_bits);
+            } else {
+                if(lzb > 31)
+                    lzb = 31;
+
+                data_bits = 8 * sizeof(uint64_t) - lzb - tzb;
+
+                buffer.writeFixed<0b11, 2>();
+                buffer.write<5>(lzb);
+                buffer.write<6>(data_bits == 64 ? 0 : data_bits);
+                buffer.write(xor_value >> tzb, data_bits);
+
+                prev_lzb = lzb;
+                prev_tzb = tzb;
+            }
+        }
+
+        last_value = current_value;
+    }
+
+
+    return std::move(buffer);
+};
+
+
+void FloatEncoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t length, std::vector<double> &out){
+    if (length == 0) {
+        return;
+    }
+
+    // OPTIMIZATION 1: Reserve exact space upfront to avoid reallocations
+    const size_t current_size = out.size();
+    const size_t required_capacity = current_size + length;
+
+    if (out.capacity() < required_capacity) {
+        // Reserve with some extra space to avoid frequent reallocations
+        out.reserve(required_capacity + (required_capacity >> 3)); // 12.5% extra
+    }
+
+    // Resize to exact size needed for direct memory writes
+    out.resize(required_capacity);
+    double* output_ptr = out.data() + current_size;
+
+    // OPTIMIZATION 2: Prefetch compressed data for better cache utilization
+    const uint64_t* data_ptr = values.data;
+    __builtin_prefetch(data_ptr, 0, 3);      // L1 cache
+    __builtin_prefetch(data_ptr + 8, 0, 2);  // L2 cache
+
+    uint64_t last_value = values.readFixed<uint64_t, 64>();
+    uint64_t tzb = 0;
+    uint64_t data_bits = 0;
+    unsigned int count = 0;
+
+    // Handle first value
+    if (nToSkip == 0) {
+        *output_ptr++ = reinterpret_cast<double&>(last_value);
+    } else {
+        nToSkip--;  // Account for the first value if skipping
+    }
+
+    const size_t totalLength = nToSkip + length;
+
+    // OPTIMIZATION 3: Process with better branch prediction
+    while(++count < totalLength){
+        // Prefetch next cache line periodically
+        if ((count & 0x7) == 0 && count < totalLength - 8) {
+            __builtin_prefetch(data_ptr + (count >> 2), 0, 3);
+        }
+
+        if(values.readBit()){
+            if(values.readBit()){
+                // 0b11 prefix - new bounds
+                const uint64_t control_data = values.read<uint64_t>(11);
+                const auto lzb = control_data & 0x1F;  // Lower 5 bits
+                data_bits = (control_data >> 5) & 0x3F;  // Upper 6 bits
+
+                // Handle special case: data_bits=0 represents 64 when lzb=0
+                if (data_bits == 0 && lzb == 0) {
+                    data_bits = 64;
+                    tzb = 0;
+                } else {
+                    tzb = 64 - lzb - data_bits;
+                }
+
+                const uint64_t decoded_value = values.read<uint64_t>(data_bits) << tzb;
+                last_value ^= decoded_value;
+            } else {
+                // 0b01 prefix - reusing previous bounds
+                const uint64_t decoded_value = values.read<uint64_t>(data_bits) << tzb;
+                last_value ^= decoded_value;
+            }
+        }
+        // else: 0b0 prefix - value unchanged
+
+        // OPTIMIZATION 4: Direct memory write instead of push_back
+        if(nToSkip > 0){
+            nToSkip--;
+        } else {
+            *output_ptr++ = reinterpret_cast<double&>(last_value);
+        }
+    }
+}

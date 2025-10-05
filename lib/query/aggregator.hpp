@@ -8,14 +8,38 @@
 #include <limits>
 #include <algorithm>
 #include <numeric>
+#include <unordered_map>
 
 namespace tsdb {
+
+// Forward declarations
+struct SeriesResult;
 
 // Structure to hold aggregated data points
 struct AggregatedPoint {
     uint64_t timestamp;  // Bucket start time for interval aggregation
     double value;
     size_t count;  // Number of points aggregated
+};
+
+// Structure to hold partial aggregation results from a shard
+// Used for distributed aggregation to reduce data transfer
+struct PartialAggregationResult {
+    std::string measurement;
+    std::map<std::string, std::string> tags;  // Group-by tags only
+    std::string fieldName;
+
+    // Partial aggregation data organized by time bucket
+    // Key: bucket timestamp, Value: vector of values in that bucket
+    std::unordered_map<uint64_t, std::vector<double>> buckets;
+
+    // For non-bucketed aggregation (interval == 0)
+    std::vector<uint64_t> timestamps;
+    std::vector<double> values;
+
+    // Statistics
+    size_t totalPoints = 0;
+    double partialAggregationTimeMs = 0.0;
 };
 
 class Aggregator {
@@ -38,6 +62,18 @@ public:
         const std::map<std::string, std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>>& groups,
         AggregationMethod method,
         uint64_t interval = 0);
+
+    // Distributed aggregation - create partial aggregation on shard
+    static std::vector<PartialAggregationResult> createPartialAggregations(
+        const std::vector<tsdb::SeriesResult>& seriesResults,
+        AggregationMethod method,
+        uint64_t interval,
+        const std::vector<std::string>& groupByTags);
+
+    // Distributed aggregation - merge partial aggregations from multiple shards
+    static std::vector<AggregatedPoint> mergePartialAggregations(
+        const std::vector<PartialAggregationResult>& partialResults,
+        AggregationMethod method);
 
     // Core aggregation functions (made public for use by optimized implementations)
     static double calculateAvg(const std::vector<double>& values);

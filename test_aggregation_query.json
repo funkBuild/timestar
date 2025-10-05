@@ -1,0 +1,6 @@
+{
+  "query": "avg:server.metrics(cpu_usage,memory_usage){}",
+  "startTime": 0,
+  "endTime": 9999999999999999999,
+  "aggregationInterval": "12h"
+}

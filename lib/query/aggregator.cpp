@@ -1,10 +1,13 @@
 #include "aggregator.hpp"
 #include "simd_aggregator.hpp"
+#include "http_query_handler.hpp"  // For SeriesResult
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
 #include <limits>
 #include <unordered_map>
+#include <chrono>
+#include <fmt/format.h>
 
 namespace tsdb {
 
@@ -398,6 +401,226 @@ std::pair<std::vector<uint64_t>, std::vector<double>> Aggregator::mergeSeries(
     }
     
     return {mergedTimestamps, mergedValues};
+}
+
+std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
+    const std::vector<tsdb::SeriesResult>& seriesResults,
+    AggregationMethod method,
+    uint64_t interval,
+    const std::vector<std::string>& groupByTags) {
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    // Group series by (measurement, groupByTags, field)
+    // Key: "measurement|tag1=val1,tag2=val2|fieldName"
+    std::map<std::string, PartialAggregationResult> partialResults;
+
+    for (const auto& series : seriesResults) {
+        for (const auto& [fieldName, fieldData] : series.fields) {
+            const auto& timestamps = fieldData.first;
+            const auto& values = fieldData.second;
+
+            // Only handle numeric values for now
+            if (!std::holds_alternative<std::vector<double>>(values)) {
+                continue;
+            }
+
+            const auto& doubleValues = std::get<std::vector<double>>(values);
+
+            // Build group key
+            std::string groupKey = series.measurement + "|";
+
+            // Extract only the groupByTags
+            std::map<std::string, std::string> relevantTags;
+            if (groupByTags.empty()) {
+                // No grouping - all series merged together
+                groupKey += "|" + fieldName;
+            } else {
+                // Include groupBy tags in key
+                std::vector<std::string> tagPairs;
+                for (const auto& tagName : groupByTags) {
+                    auto it = series.tags.find(tagName);
+                    if (it != series.tags.end()) {
+                        tagPairs.push_back(tagName + "=" + it->second);
+                        relevantTags[tagName] = it->second;
+                    }
+                }
+                std::sort(tagPairs.begin(), tagPairs.end());
+                groupKey += fmt::format("{}", fmt::join(tagPairs, ",")) + "|" + fieldName;
+            }
+
+            // Get or create partial result for this group
+            auto& partial = partialResults[groupKey];
+            if (partial.measurement.empty()) {
+                partial.measurement = series.measurement;
+                partial.tags = relevantTags;
+                partial.fieldName = fieldName;
+            }
+
+            // Add data to buckets or raw vectors
+            if (interval > 0) {
+                // Bucketed aggregation - group by time buckets
+                for (size_t i = 0; i < timestamps.size(); ++i) {
+                    uint64_t bucketTime = (timestamps[i] / interval) * interval;
+                    partial.buckets[bucketTime].push_back(doubleValues[i]);
+                    partial.totalPoints++;
+                }
+            } else {
+                // No interval - keep all timestamps and values for time-aligned aggregation
+                partial.timestamps.insert(partial.timestamps.end(), timestamps.begin(), timestamps.end());
+                partial.values.insert(partial.values.end(), doubleValues.begin(), doubleValues.end());
+                partial.totalPoints += doubleValues.size();
+            }
+        }
+    }
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    double duration = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+
+    // Convert map to vector and record timing
+    std::vector<PartialAggregationResult> result;
+    result.reserve(partialResults.size());
+    for (auto& [key, partial] : partialResults) {
+        partial.partialAggregationTimeMs = duration;
+        result.push_back(std::move(partial));
+    }
+
+    return result;
+}
+
+std::vector<AggregatedPoint> Aggregator::mergePartialAggregations(
+    const std::vector<PartialAggregationResult>& partialResults,
+    AggregationMethod method) {
+
+    if (partialResults.empty()) {
+        return {};
+    }
+
+    std::vector<AggregatedPoint> result;
+
+    // Group partial results by (measurement, tags, field)
+    std::map<std::string, std::vector<const PartialAggregationResult*>> groups;
+
+    for (const auto& partial : partialResults) {
+        // Build group key
+        std::string groupKey = partial.measurement + "|";
+
+        std::vector<std::string> tagPairs;
+        for (const auto& [k, v] : partial.tags) {
+            tagPairs.push_back(k + "=" + v);
+        }
+        std::sort(tagPairs.begin(), tagPairs.end());
+        groupKey += fmt::format("{}", fmt::join(tagPairs, ",")) + "|" + partial.fieldName;
+
+        groups[groupKey].push_back(&partial);
+    }
+
+    // Merge each group
+    for (const auto& [groupKey, groupPartials] : groups) {
+        if (groupPartials.empty()) {
+            continue;
+        }
+
+        // Check if we're using buckets or raw timestamps
+        bool hasBuckets = !groupPartials[0]->buckets.empty();
+
+        if (hasBuckets) {
+            // Merge bucketed data
+            std::unordered_map<uint64_t, std::vector<double>> mergedBuckets;
+
+            for (const auto* partial : groupPartials) {
+                for (const auto& [bucketTime, values] : partial->buckets) {
+                    mergedBuckets[bucketTime].insert(
+                        mergedBuckets[bucketTime].end(),
+                        values.begin(), values.end());
+                }
+            }
+
+            // Apply final aggregation to each bucket
+            for (const auto& [bucketTime, values] : mergedBuckets) {
+                AggregatedPoint point;
+                point.timestamp = bucketTime;
+                point.count = values.size();
+
+                switch (method) {
+                    case AggregationMethod::AVG:
+                        point.value = calculateAvg(values);
+                        break;
+                    case AggregationMethod::MIN:
+                        point.value = calculateMin(values);
+                        break;
+                    case AggregationMethod::MAX:
+                        point.value = calculateMax(values);
+                        break;
+                    case AggregationMethod::SUM:
+                        point.value = calculateSum(values);
+                        break;
+                    case AggregationMethod::LATEST:
+                        point.value = values.back();
+                        break;
+                }
+
+                result.push_back(point);
+            }
+        } else {
+            // Merge time-aligned data (interval == 0)
+            std::map<uint64_t, std::vector<double>> timeAlignedValues;
+
+            for (const auto* partial : groupPartials) {
+                for (size_t i = 0; i < partial->timestamps.size(); ++i) {
+                    timeAlignedValues[partial->timestamps[i]].push_back(partial->values[i]);
+                }
+            }
+
+            if (method == AggregationMethod::LATEST) {
+                // For LATEST, just return all values
+                for (const auto& [timestamp, values] : timeAlignedValues) {
+                    for (double value : values) {
+                        AggregatedPoint point;
+                        point.timestamp = timestamp;
+                        point.value = value;
+                        point.count = 1;
+                        result.push_back(point);
+                    }
+                }
+            } else {
+                // Aggregate values at each timestamp
+                for (const auto& [timestamp, values] : timeAlignedValues) {
+                    AggregatedPoint point;
+                    point.timestamp = timestamp;
+                    point.count = values.size();
+
+                    switch (method) {
+                        case AggregationMethod::AVG:
+                            point.value = calculateAvg(values);
+                            break;
+                        case AggregationMethod::MIN:
+                            point.value = calculateMin(values);
+                            break;
+                        case AggregationMethod::MAX:
+                            point.value = calculateMax(values);
+                            break;
+                        case AggregationMethod::SUM:
+                            point.value = calculateSum(values);
+                            break;
+                        case AggregationMethod::LATEST:
+                            point.value = values.back();
+                            break;
+                    }
+
+                    result.push_back(point);
+                }
+            }
+        }
+    }
+
+    // Sort result by timestamp
+    std::sort(result.begin(), result.end(),
+        [](const AggregatedPoint& a, const AggregatedPoint& b) {
+            return a.timestamp < b.timestamp;
+        });
+
+    return result;
 }
 
 } // namespace tsdb
