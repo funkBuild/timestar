@@ -48,6 +48,9 @@ void FloatDecoderSIMD::decode(CompressedSlice &encoded, size_t nToSkip, size_t l
     uint64_t data_bits = 0;
     unsigned int count = 0;
 
+    // Save original nToSkip for totalLength calculation
+    const size_t originalSkip = nToSkip;
+
     // Handle first value
     if (nToSkip == 0) {
         *output_ptr++ = reinterpret_cast<double&>(last_value);
@@ -55,7 +58,9 @@ void FloatDecoderSIMD::decode(CompressedSlice &encoded, size_t nToSkip, size_t l
         nToSkip--;  // Account for first value if skipping
     }
 
-    const size_t totalLength = nToSkip + length;
+    // Total values to process from delta stream
+    // Must use originalSkip since nToSkip may have been decremented
+    const size_t totalLength = originalSkip + length;
 
     // OPTIMIZATION 3: Process with AVX2-optimized loop structure
     // Process in groups of 4 when possible (AVX2 can handle 4 doubles)

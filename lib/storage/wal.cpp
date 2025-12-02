@@ -250,6 +250,11 @@ template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
   std::string seriesIdBytes = seriesId.toBytes();
   buffer.write(seriesIdBytes);
 
+  // Store series key string for recovery (length-prefixed)
+  std::string seriesKey = insertRequest.seriesKey();
+  buffer.write((uint32_t)seriesKey.size());
+  buffer.write(seriesKey);
+
   // Value type
   buffer.write((uint8_t)TSM::getValueType<T>());
 
@@ -354,6 +359,11 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     SeriesId128 seriesId = insertRequest.seriesId128();
     std::string seriesIdBytes = seriesId.toBytes();
     buf.write(seriesIdBytes);
+
+    // Store series key string for recovery (length-prefixed)
+    std::string seriesKey = insertRequest.seriesKey();
+    buf.write((uint32_t)seriesKey.size());
+    buf.write(seriesKey);
 
     buf.write((uint8_t)TSM::getValueType<T>());
     buf.write((uint32_t)insertRequest.timestamps.size());
@@ -575,30 +585,34 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
       std::string seriesIdBytes = entrySlice.readString(16);
       SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
 
+      // Read series key string (length-prefixed)
+      uint32_t seriesKeyLen = entrySlice.read<uint32_t>();
+      std::string seriesKey = entrySlice.readString(seriesKeyLen);
+
       uint8_t valueType = entrySlice.read<uint8_t>();
 
       switch (static_cast<WALValueType>(valueType)) {
       case WALValueType::Float: {
         try {
           TSDBInsert<double> insertReq =
-              readSeries<double>(entrySlice, seriesId);
+              readSeries<double>(entrySlice, seriesKey);
           store->insertMemory(insertReq);
         } catch (const std::exception &e) {
           tsdb::wal_log.error(
               "WAL recovery: Failed to read float series '{}': {}",
-              seriesId.toHex(), e.what());
+              seriesKey, e.what());
           partialEntries++;
           continue;
         }
       } break;
       case WALValueType::Boolean: {
         try {
-          TSDBInsert<bool> insertReq = readSeries<bool>(entrySlice, seriesId);
+          TSDBInsert<bool> insertReq = readSeries<bool>(entrySlice, seriesKey);
           store->insertMemory(insertReq);
         } catch (const std::exception &e) {
           tsdb::wal_log.error(
               "WAL recovery: Failed to read boolean series '{}': {}",
-              seriesId.toHex(), e.what());
+              seriesKey, e.what());
           partialEntries++;
           continue;
         }
@@ -606,12 +620,12 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
       case WALValueType::String: {
         try {
           TSDBInsert<std::string> insertReq =
-              readSeries<std::string>(entrySlice, seriesId);
+              readSeries<std::string>(entrySlice, seriesKey);
           store->insertMemory(insertReq);
         } catch (const std::exception &e) {
           tsdb::wal_log.error(
               "WAL recovery: Failed to read string series '{}': {}",
-              seriesId.toHex(), e.what());
+              seriesKey, e.what());
           partialEntries++;
           continue;
         }
@@ -663,8 +677,7 @@ recovery_complete:
 
 template <class T>
 TSDBInsert<T> WALReader::readSeries(Slice &walSlice,
-                                    const SeriesId128 &seriesId) {
-  std::string seriesKey = seriesId.toHex();
+                                    const std::string &seriesKey) {
   TSDBInsert<T> insertReq = TSDBInsert<T>::fromSeriesKey(seriesKey);
 
   uint32_t timestampsCount = walSlice.read<uint32_t>();

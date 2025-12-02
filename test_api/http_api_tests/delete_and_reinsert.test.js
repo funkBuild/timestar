@@ -2,6 +2,25 @@ const axios = require('axios');
 
 const BASE_URL = 'http://localhost:8086';
 
+// Helper to merge series with single fields into a single series object
+const mergeSeries = (seriesArray) => {
+  if (!seriesArray || seriesArray.length === 0) return null;
+  if (seriesArray.length === 1) return seriesArray[0];
+
+  const merged = {
+    measurement: seriesArray[0].measurement,
+    tags: seriesArray[0].tags,
+    groupTags: seriesArray[0].groupTags,
+    fields: {}
+  };
+
+  seriesArray.forEach(series => {
+    Object.assign(merged.fields, series.fields);
+  });
+
+  return merged;
+};
+
 describe('Delete and Reinsert Operations', () => {
   let testData = [];
   let deletedData = [];
@@ -48,9 +67,9 @@ describe('Delete and Reinsert Operations', () => {
     
     expect(initialQueryResponse.status).toBe(200);
     expect(initialQueryResponse.data.status).toBe('success');
-    expect(initialQueryResponse.data.series).toHaveLength(1);
-    
-    const initialSeries = initialQueryResponse.data.series[0];
+    expect(initialQueryResponse.data.series).toHaveLength(2); // One series per field
+
+    const initialSeries = mergeSeries(initialQueryResponse.data.series);
     expect(initialSeries.fields.temperature.timestamps).toHaveLength(72);
     expect(initialSeries.fields.humidity.timestamps).toHaveLength(72);
     
@@ -81,9 +100,9 @@ describe('Delete and Reinsert Operations', () => {
     
     expect(afterDeleteResponse.status).toBe(200);
     expect(afterDeleteResponse.data.status).toBe('success');
-    expect(afterDeleteResponse.data.series).toHaveLength(1);
-    
-    const afterDeleteSeries = afterDeleteResponse.data.series[0];
+    expect(afterDeleteResponse.data.series).toHaveLength(2); // One series per field
+
+    const afterDeleteSeries = mergeSeries(afterDeleteResponse.data.series);
     expect(afterDeleteSeries.fields.temperature.timestamps).toHaveLength(48); // 72 - 24 deleted
     expect(afterDeleteSeries.fields.humidity.timestamps).toHaveLength(48);
     
@@ -119,9 +138,9 @@ describe('Delete and Reinsert Operations', () => {
     
     expect(finalQueryResponse.status).toBe(200);
     expect(finalQueryResponse.data.status).toBe('success');
-    expect(finalQueryResponse.data.series).toHaveLength(1);
-    
-    const finalSeries = finalQueryResponse.data.series[0];
+    expect(finalQueryResponse.data.series).toHaveLength(2); // One series per field
+
+    const finalSeries = mergeSeries(finalQueryResponse.data.series);
     expect(finalSeries.fields.temperature.timestamps).toHaveLength(72); // Back to original count
     expect(finalSeries.fields.humidity.timestamps).toHaveLength(72);
     
@@ -181,9 +200,9 @@ describe('Delete and Reinsert Operations', () => {
     });
     
     expect(queryResponse.status).toBe(200);
-    expect(queryResponse.data.series).toHaveLength(1);
-    
-    const series = queryResponse.data.series[0];
+    expect(queryResponse.data.series).toHaveLength(2); // Only humidity and pressure remain
+
+    const series = mergeSeries(queryResponse.data.series);
     // Temperature should be missing or empty
     if (series.fields.temperature) {
       expect(series.fields.temperature.timestamps).toHaveLength(0);

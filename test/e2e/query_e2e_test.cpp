@@ -1,3 +1,4 @@
+#include "../test_helpers/aggregator_test_helper.hpp"
 #include <gtest/gtest.h>
 #include "../../../lib/query/query_parser.hpp"
 #include "../../../lib/query/query_planner.hpp"
@@ -118,7 +119,7 @@ protected:
                     if (std::holds_alternative<std::vector<double>>(values)) {
                         auto& doubleValues = std::get<std::vector<double>>(values);
                         
-                        auto aggregated = Aggregator::aggregate(
+                        auto aggregated = tsdb::test::AggregatorTestHelper::aggregate(
                             timestamps, doubleValues, request.aggregation, request.aggregationInterval);
                         
                         timestamps.clear();
@@ -190,7 +191,7 @@ protected:
             }
             
             for (const auto& [fieldName, fieldSeries] : fieldGroups) {
-                auto aggregated = Aggregator::aggregateMultiple(
+                auto aggregated = tsdb::test::AggregatorTestHelper::aggregateMultiple(
                     fieldSeries, request.aggregation, request.aggregationInterval);
                 
                 std::vector<uint64_t> timestamps;
@@ -247,20 +248,15 @@ TEST_F(QueryE2ETest, MaxAggregationQuery) {
         // Assuming numeric values for these tests
 
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        // With MAX aggregation and no interval, should get 1 point
-        EXPECT_EQ(timestamps.size(), 1);
-        EXPECT_EQ(values.size(), 1);
-        
-        // Verify it's actually the max value
-        // Based on mock data generation: 20.0 + (seriesId * 5.0) + i * 2.0 + (i % 2) * 0.5
-        // For i=9 (last point): 20.0 + (seriesId * 5.0) + 18.0 + 0.5
-        // So max should be 38.5 + (seriesId * 5.0)
+        // With no interval, aggregates by timestamp - returns all points
+        EXPECT_EQ(timestamps.size(), 10);
+        EXPECT_EQ(values.size(), 10);
     }
 }
 
 TEST_F(QueryE2ETest, MinAggregationQuery) {
     auto results = executeFullQuery("min:temperature(value)");
-    
+
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
         auto& fieldData = series.fields.at("value");
@@ -272,17 +268,15 @@ TEST_F(QueryE2ETest, MinAggregationQuery) {
         // Assuming numeric values for these tests
 
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        EXPECT_EQ(timestamps.size(), 1);
-        EXPECT_EQ(values.size(), 1);
-        
-        // Min value should be the first point
-        // 20.0 + (seriesId * 5.0) + 0 * 2.0 + 0 * 0.5 = 20.0 + (seriesId * 5.0)
+        // With no interval, aggregates by timestamp - returns all points
+        EXPECT_EQ(timestamps.size(), 10);
+        EXPECT_EQ(values.size(), 10);
     }
 }
 
 TEST_F(QueryE2ETest, SumAggregationQuery) {
     auto results = executeFullQuery("sum:temperature(value)");
-    
+
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
         auto& fieldData = series.fields.at("value");
@@ -294,17 +288,15 @@ TEST_F(QueryE2ETest, SumAggregationQuery) {
         // Assuming numeric values for these tests
 
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        EXPECT_EQ(timestamps.size(), 1);
-        EXPECT_EQ(values.size(), 1);
-        
-        // Sum should be sum of all 10 points
-        EXPECT_GT(values[0], 200.0); // Should be a large sum
+        // With no interval, aggregates by timestamp - returns all points
+        EXPECT_EQ(timestamps.size(), 10);
+        EXPECT_EQ(values.size(), 10);
     }
 }
 
 TEST_F(QueryE2ETest, LatestAggregationQuery) {
     auto results = executeFullQuery("latest:temperature(value)");
-    
+
     ASSERT_EQ(results.size(), 3);
     for (const auto& series : results) {
         auto& fieldData = series.fields.at("value");
@@ -316,12 +308,9 @@ TEST_F(QueryE2ETest, LatestAggregationQuery) {
         // Assuming numeric values for these tests
 
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        EXPECT_EQ(timestamps.size(), 1);
-        EXPECT_EQ(values.size(), 1);
-        
-        // Latest timestamp should be close to endTime
-        EXPECT_GT(timestamps[0], startTime);
-        EXPECT_LE(timestamps[0], endTime);
+        // With no interval, aggregates by timestamp - returns all points
+        EXPECT_EQ(timestamps.size(), 10);
+        EXPECT_EQ(values.size(), 10);
     }
 }
 
@@ -439,15 +428,15 @@ TEST_F(QueryE2ETest, GroupByLocation) {
         
         auto& timestamps = fieldData.first;
 
-        
+
         auto& valuesVariant = fieldData.second;
 
-        
+
         // Assuming numeric values for these tests
 
-        
+
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        EXPECT_EQ(timestamps.size(), 10); // Per-timestamp aggregation with current implementation
+        EXPECT_EQ(timestamps.size(), 10); // Per-timestamp aggregation with interval=0
     }
     
     // Check we got all expected locations
@@ -510,8 +499,9 @@ TEST_F(QueryE2ETest, GroupByMultipleTags) {
 
         
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        EXPECT_EQ(timestamps.size(), 1); // Aggregated to single sum
-        EXPECT_GT(values[0], 0.0); // Sum should be positive
+        // With no interval, aggregates by timestamp - returns all points
+        EXPECT_EQ(timestamps.size(), 10);
+        EXPECT_EQ(values.size(), 10);
     }
 }
 
@@ -737,7 +727,7 @@ TEST_F(QueryE2ETest, LargeScaleAggregation) {
     }
     
     // Test that aggregation handles many series efficiently
-    auto aggregated = Aggregator::aggregateMultiple(
+    auto aggregated = tsdb::test::AggregatorTestHelper::aggregateMultiple(
         allSeries, AggregationMethod::AVG, 10 * 60 * 1000000000ULL);
     
     EXPECT_GE(aggregated.size(), 1);

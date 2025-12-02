@@ -63,6 +63,9 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
     uint64_t data_bits = 0;
     unsigned int count = 0;
 
+    // Save original nToSkip for totalLength calculation
+    const size_t originalSkip = nToSkip;
+
     // Handle first value
     if (nToSkip == 0) {
         *output_ptr++ = reinterpret_cast<double&>(last_value);
@@ -70,7 +73,9 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
         nToSkip--;  // Account for first value if skipping
     }
 
-    const size_t totalLength = nToSkip + length;
+    // Total values to process from delta stream
+    // Must use originalSkip since nToSkip may have been decremented
+    const size_t totalLength = originalSkip + length;
 
     // OPTIMIZATION 3: Process with AVX-512-optimized loop structure
     // Process in groups of 8 when possible (AVX-512 can handle 8 doubles)

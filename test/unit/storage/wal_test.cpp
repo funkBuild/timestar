@@ -86,7 +86,10 @@ seastar::future<> testWALWriteAndRecoverFloat() {
 TEST_F(WALTest, WriteAndRecoverFloatData) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testWALWriteAndRecoverFloat().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -151,7 +154,10 @@ seastar::future<> testWALWriteAndRecoverBoolean() {
 TEST_F(WALTest, WriteAndRecoverBooleanData) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testWALWriteAndRecoverBoolean().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -209,7 +215,10 @@ seastar::future<> testWALWriteAndRecoverString() {
 TEST_F(WALTest, WriteAndRecoverStringData) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testWALWriteAndRecoverString().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -278,7 +287,10 @@ seastar::future<> testWALBatchInsert() {
 TEST_F(WALTest, BatchInsert) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testWALBatchInsert().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -340,7 +352,10 @@ seastar::future<> testWALMultipleSeries() {
 TEST_F(WALTest, MultipleSeries) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testWALMultipleSeries().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -406,7 +421,10 @@ seastar::future<> testWALDeleteRange() {
 TEST_F(WALTest, DeleteRange) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testWALDeleteRange().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {

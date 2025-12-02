@@ -209,6 +209,10 @@ seastar::future<> testTSMReadFloat(std::string filename) {
 
     // Verify series type
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.series");
+    // Load full index entry into cache first
+    auto* indexEntry = co_await tsm.getFullIndexEntry(seriesId);
+    EXPECT_NE(indexEntry, nullptr);
+
     auto seriesType = tsm.getSeriesType(seriesId);
     EXPECT_TRUE(seriesType.has_value());
     EXPECT_EQ(seriesType.value(), TSMValueType::Float);
@@ -231,9 +235,14 @@ seastar::future<> testTSMReadFloat(std::string filename) {
 
 TEST_F(TSMTest, ReadFloatData) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_read_float.tsm");
+    std::string filename = getTestFilePath("0_1.tsm");  // tier=0, seq=1
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMReadFloat(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -268,6 +277,10 @@ seastar::future<> testTSMReadBoolean(std::string filename) {
     co_await tsm.readSparseIndex();
 
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.bool");
+    // Load full index entry into cache first
+    auto* indexEntry = co_await tsm.getFullIndexEntry(seriesId);
+    EXPECT_NE(indexEntry, nullptr);
+
     auto seriesType = tsm.getSeriesType(seriesId);
     EXPECT_TRUE(seriesType.has_value());
     EXPECT_EQ(seriesType.value(), TSMValueType::Boolean);
@@ -289,9 +302,14 @@ seastar::future<> testTSMReadBoolean(std::string filename) {
 
 TEST_F(TSMTest, ReadBooleanData) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_read_bool.tsm");
+    std::string filename = getTestFilePath("0_2.tsm");  // tier=0, seq=2
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMReadBoolean(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -321,6 +339,10 @@ seastar::future<> testTSMReadString(std::string filename) {
     co_await tsm.readSparseIndex();
 
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.string");
+    // Load full index entry into cache first
+    auto* indexEntry = co_await tsm.getFullIndexEntry(seriesId);
+    EXPECT_NE(indexEntry, nullptr);
+
     auto seriesType = tsm.getSeriesType(seriesId);
     EXPECT_TRUE(seriesType.has_value());
     EXPECT_EQ(seriesType.value(), TSMValueType::String);
@@ -341,9 +363,14 @@ seastar::future<> testTSMReadString(std::string filename) {
 
 TEST_F(TSMTest, ReadStringData) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_read_string.tsm");
+    std::string filename = getTestFilePath("0_3.tsm");  // tier=0, seq=3
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMReadString(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -392,9 +419,14 @@ seastar::future<> testTSMReadTimeRange(std::string filename) {
 
 TEST_F(TSMTest, ReadTimeRange) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_read_range.tsm");
+    std::string filename = getTestFilePath("0_4.tsm");  // tier=0, seq=4
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMReadTimeRange(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -468,9 +500,14 @@ seastar::future<> testTSMReadMultipleSeries(std::string filename) {
 
 TEST_F(TSMTest, ReadMultipleSeries) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_read_multi.tsm");
+    std::string filename = getTestFilePath("0_5.tsm");  // tier=0, seq=5
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMReadMultipleSeries(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -517,9 +554,14 @@ seastar::future<> testTSMDeleteRange(std::string filename) {
 
 TEST_F(TSMTest, DeleteRange) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_delete_range.tsm");
+    std::string filename = getTestFilePath("0_6.tsm");  // tier=0, seq=6
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMDeleteRange(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -573,9 +615,14 @@ seastar::future<> testTSMQueryWithTombstones(std::string filename) {
 
 TEST_F(TSMTest, QueryWithTombstones) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_query_tombstones.tsm");
+    std::string filename = getTestFilePath("0_7.tsm");  // tier=0, seq=7
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMQueryWithTombstones(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -640,9 +687,14 @@ seastar::future<> testTSMLoadTombstones(std::string filename) {
 
 TEST_F(TSMTest, LoadTombstones) {
     seastar::app_template app;
-    std::string filename = getTestFilePath("test_load_tombstones.tsm");
+    std::string filename = getTestFilePath("0_8.tsm");  // tier=0, seq=8
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testTSMLoadTombstones(filename).then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -657,7 +709,7 @@ TEST_F(TSMTest, LoadTombstones) {
 // TSM Reference Counting Tests
 
 TEST_F(TSMTest, ReferenceCountingBasic) {
-    std::string filename = getTestFilePath("test_refcount.tsm");
+    std::string filename = getTestFilePath("0_9.tsm");  // tier=0, seq=9
 
     // Write a minimal file
     {
@@ -692,7 +744,7 @@ TEST_F(TSMTest, ReferenceCountingBasic) {
 }
 
 TEST_F(TSMTest, MarkForDeletion) {
-    std::string filename = getTestFilePath("test_mark_delete.tsm");
+    std::string filename = getTestFilePath("0_10.tsm");  // tier=0, seq=10
 
     // Write a minimal file
     {
@@ -716,7 +768,7 @@ TEST_F(TSMTest, MarkForDeletion) {
 }
 
 TEST_F(TSMTest, MarkForDeletionWithReferences) {
-    std::string filename = getTestFilePath("test_mark_delete_refs.tsm");
+    std::string filename = getTestFilePath("0_11.tsm");  // tier=0, seq=11
 
     // Write a minimal file
     {

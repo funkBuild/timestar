@@ -116,7 +116,7 @@ private:
   size_t length = 0;
 
   template <class T>
-  TSDBInsert<T> readSeries(Slice &walSlice, const SeriesId128 &seriesId);
+  TSDBInsert<T> readSeries(Slice &walSlice, const std::string &seriesKey);
 
 public:
   WALReader(std::string filename);

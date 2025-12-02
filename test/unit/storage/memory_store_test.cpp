@@ -447,7 +447,12 @@ seastar::future<> testMemoryStoreInitWAL() {
 TEST_F(MemoryStoreTest, InitWAL) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testMemoryStoreInitWAL().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -534,7 +539,12 @@ seastar::future<> testMemoryStoreInitFromWAL() {
 TEST_F(MemoryStoreTest, InitFromWAL) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testMemoryStoreInitFromWAL().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -599,7 +609,12 @@ seastar::future<> testMemoryStoreBatchInsert() {
 TEST_F(MemoryStoreTest, BatchInsert) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testMemoryStoreBatchInsert().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -647,7 +662,12 @@ seastar::future<> testMemoryStoreThresholdChecking() {
 TEST_F(MemoryStoreTest, ThresholdChecking) {
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    // Create proper argc/argv for Seastar
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+
+    auto exitCode = app.run(argc, argv, [&] {
         return testMemoryStoreThresholdChecking().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {

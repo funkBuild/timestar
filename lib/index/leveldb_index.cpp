@@ -501,7 +501,7 @@ seastar::future<std::string> LevelDBIndex::getFieldType(const std::string& measu
     if (status.ok()) {
         co_return value;
     } else if (status.IsNotFound()) {
-        co_return "unknown";  // Default to unknown if not set
+        co_return "";  // Return empty string if field type not found
     } else {
         throw std::runtime_error("Failed to get field type: " + status.ToString());
     }
@@ -705,29 +705,28 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::getAllSeriesForMeasureme
 }
 
 seastar::future<size_t> LevelDBIndex::getSeriesCount() {
-    // For SeriesId128, we need to count actual series in the index
-    // This is more expensive than before but more accurate
+    // Count SERIES_METADATA entries (one per series)
     if (!db) {
         co_return 0;
     }
-    
+
     size_t count = 0;
     std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
-    
-    // Count SERIES_INDEX entries
+
+    // Count SERIES_METADATA entries
     std::string startKey;
-    startKey.push_back(static_cast<char>(SERIES_INDEX));
+    startKey.push_back(static_cast<char>(SERIES_METADATA));
     it->Seek(startKey);
-    
+
     while (it->Valid()) {
         leveldb::Slice key = it->key();
-        if (key.size() == 0 || static_cast<uint8_t>(key[0]) != SERIES_INDEX) {
+        if (key.size() == 0 || static_cast<uint8_t>(key[0]) != SERIES_METADATA) {
             break;
         }
         count++;
         it->Next();
     }
-    
+
     co_return count;
 }
 

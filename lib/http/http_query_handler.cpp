@@ -2,7 +2,6 @@
 #include "engine.hpp"
 #include "query_parser.hpp"
 #include "query_planner.hpp"
-#include "query_runner.hpp"
 #include "aggregator.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
@@ -295,42 +294,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             response.errorMessage = "Engine pointer is null";
             co_return response;
         }
-        
-        // For now, we'll create a simple plan without using the index
-        // The Engine's executeLocalQuery will handle the actual querying
-        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Creating simple query plan without index lookup");
-        
-        QueryPlan plan;
-        plan.aggregation = request.aggregation;
-        plan.aggregationInterval = request.aggregationInterval;
-        plan.groupByTags = request.groupByTags;
-        
-        // For now, query all shards since we don't have the index to determine which shards have the data
-        unsigned shardCount = seastar::smp::count;
-        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Creating queries for {} shards", shardCount);
-        
-        for (unsigned shardId = 0; shardId < shardCount; ++shardId) {
-            ShardQuery sq;
-            sq.shardId = shardId;
-            sq.startTime = request.startTime;
-            sq.endTime = request.endTime;
-            sq.requiresAllSeries = true;  // We'll need to find series on each shard
-            
-            // Set fields to query
-            if (request.requestsAllFields()) {
-                sq.fields.clear();  // Empty means all fields
-            } else {
-                sq.fields.insert(request.fields.begin(), request.fields.end());
-            }
-            
-            plan.shardQueries.push_back(sq);
-        }
-        
-        plan.requiresMerging = shardCount > 1;
-        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Query plan created with {} shard queries", 
-                       plan.shardQueries.size());
-        
-        // First, query shard 0 for all series metadata (centralized metadata)
+
+        // Query shard 0 for all series metadata (centralized metadata)
         // Get full metadata with series keys and determine which shard owns each series
         struct SeriesMetadataWithShard {
             SeriesId128 seriesId;

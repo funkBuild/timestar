@@ -81,7 +81,10 @@ seastar::future<> runIndexTest() {
 TEST_F(LevelDBIndexTest, BasicIndexOperations) {
     seastar::app_template app;
     
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return runIndexTest().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -150,7 +153,10 @@ TEST_F(LevelDBIndexTest, SeriesIdGeneration) {
     
     seastar::app_template app;
     
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testSeriesIdGeneration().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -231,7 +237,10 @@ TEST_F(LevelDBIndexTest, MetadataIndexing) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testMetadataIndexing().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -293,7 +302,10 @@ TEST_F(LevelDBIndexTest, FindSeries) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testFindSeries().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -347,7 +359,10 @@ TEST_F(LevelDBIndexTest, FindSeriesByTag) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testFindSeriesByTag().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -411,7 +426,10 @@ TEST_F(LevelDBIndexTest, GetSeriesGroupedByTag) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testGetSeriesGroupedByTag().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -463,7 +481,10 @@ TEST_F(LevelDBIndexTest, FieldTypes) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testFieldTypes().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -537,7 +558,10 @@ TEST_F(LevelDBIndexTest, FieldStatistics) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testFieldStatistics().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -608,7 +632,10 @@ TEST_F(LevelDBIndexTest, SeriesMetadata) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testSeriesMetadata().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
@@ -654,7 +681,10 @@ TEST_F(LevelDBIndexTest, GetAllMeasurements) {
 
     seastar::app_template app;
 
-    auto exitCode = app.run(0, nullptr, [&] {
+    char prog_name[] = "test";
+    char* argv[] = { prog_name, nullptr };
+    int argc = 1;
+    auto exitCode = app.run(argc, argv, [&] {
         return testGetAllMeasurements().then([&] {
             // Future completes successfully
         }).handle_exception([&](std::exception_ptr ep) {
