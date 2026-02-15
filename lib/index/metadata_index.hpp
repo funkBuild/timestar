@@ -1,5 +1,5 @@
-#ifndef __METADATA_INDEX_H_INCLUDED__
-#define __METADATA_INDEX_H_INCLUDED__
+#ifndef METADATA_INDEX_H_INCLUDED
+#define METADATA_INDEX_H_INCLUDED
 
 #include <string>
 #include <vector>
@@ -9,12 +9,15 @@
 #include <optional>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
+#include <leveldb/filter_policy.h>
+#include <leveldb/cache.h>
 #include <seastar/core/future.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sstring.hh>
 
-// Series metadata structure
-struct SeriesMetadata {
+// Series metadata structure for the global metadata index.
+// Named MetadataSeriesInfo to avoid ODR conflict with SeriesMetadata in leveldb_index.hpp.
+struct MetadataSeriesInfo {
     uint64_t seriesId;
     std::string measurement;
     std::map<std::string, std::string> tags;
@@ -22,13 +25,13 @@ struct SeriesMetadata {
     int64_t minTime;
     int64_t maxTime;
     uint32_t shardId;
-    
+
     // Serialization
     std::string serialize() const;
-    static SeriesMetadata deserialize(const std::string& data);
-    
+    static MetadataSeriesInfo deserialize(const std::string& data);
+
     // Generate series key from measurement + tags + field
-    static std::string generateSeriesKey(const std::string& measurement, 
+    static std::string generateSeriesKey(const std::string& measurement,
                                         const std::map<std::string, std::string>& tags,
                                         const std::string& field);
 };
@@ -47,6 +50,11 @@ struct FieldStats {
 class MetadataIndex {
 private:
     std::unique_ptr<leveldb::DB> db;
+    // RAII-managed bloom filter policy and block cache to prevent memory leaks.
+    // Must be declared after db so that db is destroyed first during destruction,
+    // since LevelDB may reference these during shutdown.
+    std::unique_ptr<const leveldb::FilterPolicy> filterPolicy_;
+    std::unique_ptr<leveldb::Cache> blockCache_;
     std::string dbPath;
     std::atomic<uint64_t> nextSeriesId{1};
     
@@ -86,7 +94,7 @@ public:
                                                   const std::string& field);
     
     // Update series metadata
-    seastar::future<> updateSeriesMetadata(const SeriesMetadata& metadata);
+    seastar::future<> updateSeriesMetadata(const MetadataSeriesInfo& metadata);
     
     // Find series by measurement
     seastar::future<std::vector<uint64_t>> findSeriesByMeasurement(const std::string& measurement);
@@ -101,7 +109,7 @@ public:
                                                             const std::map<std::string, std::string>& tags);
     
     // Get series metadata
-    seastar::future<std::optional<SeriesMetadata>> getSeriesMetadata(uint64_t seriesId);
+    seastar::future<std::optional<MetadataSeriesInfo>> getSeriesMetadata(uint64_t seriesId);
     
     // Get all fields for a measurement
     seastar::future<std::set<std::string>> getMeasurementFields(const std::string& measurement);
@@ -130,13 +138,17 @@ public:
     std::string getStats() const;
 };
 
-// Global metadata index instance (singleton per node, not per shard)
+// Global metadata index instance (singleton per node, not per shard).
+// IMPORTANT: This pointer is NOT thread-safe. initGlobalMetadataIndex() and
+// shutdownGlobalMetadataIndex() MUST be called from shard 0 only. Access from
+// other shards should use seastar::smp::submit_to(0, ...) to safely interact
+// with the index.
 extern std::unique_ptr<MetadataIndex> globalMetadataIndex;
 
-// Initialize global metadata index
+// Initialize global metadata index. Must be called from shard 0 only.
 seastar::future<> initGlobalMetadataIndex(const std::string& basePath);
 
-// Shutdown global metadata index
+// Shutdown global metadata index. Must be called from shard 0 only.
 seastar::future<> shutdownGlobalMetadataIndex();
 
-#endif // __METADATA_INDEX_H_INCLUDED__
+#endif // METADATA_INDEX_H_INCLUDED

@@ -122,11 +122,46 @@ struct QueryErrorResponse {
     std::string error;  // Changed to string to match test expectations
 };
 
+std::unique_ptr<seastar::http::reply>
+HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
+    // Check body size limit
+    if (req.content.size() > MAX_QUERY_BODY_SIZE) {
+        auto rep = std::make_unique<seastar::http::reply>();
+        rep->set_status(seastar::http::reply::status_type::payload_too_large);
+        rep->_content = "{\"status\":\"error\",\"message\":\"Request body too large (max 1MB)\",\"error\":\"Request body too large (max 1MB)\"}";
+        rep->add_header("Content-Type", "application/json");
+        return rep;
+    }
+
+    // Validate Content-Type header if explicitly set
+    auto contentType = req.get_header("Content-Type");
+    if (!contentType.empty()) {
+        // Accept application/json with optional charset/parameters
+        // Convert to std::string to avoid sstring::npos vs string::npos mismatch
+        std::string contentTypeStr(contentType.data(), contentType.size());
+        if (contentTypeStr.find("application/json") == std::string::npos) {
+            auto rep = std::make_unique<seastar::http::reply>();
+            rep->set_status(seastar::http::reply::status_type::unsupported_media_type);
+            rep->_content = "{\"status\":\"error\",\"message\":\"Content-Type must be application/json\",\"error\":\"Content-Type must be application/json\"}";
+            rep->add_header("Content-Type", "application/json");
+            return rep;
+        }
+    }
+
+    return nullptr; // Validation passed
+}
+
 seastar::future<std::unique_ptr<seastar::http::reply>>
 HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
-    
+
     try {
+        // Validate request body size and content type
+        auto validationError = validateRequest(*req);
+        if (validationError) {
+            co_return validationError;
+        }
+
         // Parse JSON request body using Glaze
         GlazeQueryRequest glazeRequest;
         auto parse_error = glz::read_json(glazeRequest, req->content);
@@ -185,9 +220,9 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
             response.statistics.executionTimeMs);
         
     } catch (const std::exception& e) {
-        LOG_QUERY_PATH(tsdb::http_log, error, "[QUERY] Error handling query request: {}", e.what());
+        tsdb::http_log.error("[QUERY] Error handling query request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
+        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal query error");
         rep->add_header("Content-Type", "application/json");
     }
     
@@ -241,6 +276,11 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
         }
     }
     
+    // Validate time range
+    if (startTime >= endTime) {
+        throw QueryParseException("startTime must be less than endTime");
+    }
+
     // Parse aggregation interval if provided
     uint64_t aggregationInterval = 0;
     if (glazeReq.aggregationInterval) {
@@ -357,9 +397,17 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         timing.findSeriesMs = std::chrono::duration<double, std::milli>(findSeriesEnd - findSeriesStart).count();
         timing.seriesFound = seriesWithShards.size();
         
-        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Total series from centralized metadata: {} (took {:.2f} ms)", 
+        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Total series from centralized metadata: {} (took {:.2f} ms)",
                        seriesWithShards.size(), timing.findSeriesMs);
-        
+
+        // Enforce MAX_SERIES_COUNT limit
+        if (seriesWithShards.size() > MAX_SERIES_COUNT) {
+            response.success = false;
+            response.errorCode = "TOO_MANY_SERIES";
+            response.errorMessage = "Too many series: " + std::to_string(seriesWithShards.size()) + " exceeds limit of " + std::to_string(MAX_SERIES_COUNT);
+            co_return response;
+        }
+
         // Debug: Print series details
         for (const auto& sm : seriesWithShards) {
             LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Series: key='{}', shard={}, measurement='{}', field='{}'",
@@ -381,9 +429,16 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         timing.shardDistributionMs = std::chrono::duration<double, std::milli>(shardDistEnd - shardDistStart).count();
         timing.shardsQueried = seriesByShard.size();
         
+        // Struct to hold shard query results including both aggregatable and non-aggregatable data
+        struct ShardQueryResult {
+            std::vector<PartialAggregationResult> partialResults;
+            std::vector<SeriesResult> stringResults;  // String fields bypass aggregation
+            double shardMs = 0.0;
+        };
+
         // Execute queries on each shard that has series
         auto shardQueriesStart = std::chrono::high_resolution_clock::now();
-        std::vector<seastar::future<std::pair<unsigned, std::pair<std::vector<PartialAggregationResult>, double>>>> futures;
+        std::vector<seastar::future<std::pair<unsigned, ShardQueryResult>>> futures;
         for (const auto& [shardId, seriesKeys] : seriesByShard) {
             // Create field lookup map for this shard's series
             std::unordered_map<std::string, std::string> shardSeriesKeyToField;
@@ -401,7 +456,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                  measurement = request.measurement,
                  aggregation = request.aggregation,
                  aggregationInterval = request.aggregationInterval,
-                 groupByTags = request.groupByTags](Engine& engine) -> seastar::future<std::pair<std::vector<PartialAggregationResult>, double>> {
+                 groupByTags = request.groupByTags](Engine& engine) -> seastar::future<ShardQueryResult> {
                     auto shardStart = std::chrono::high_resolution_clock::now();
                     LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} querying {} series keys in parallel",
                                    shardId, seriesKeys.size());
@@ -478,9 +533,6 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
                     for (const auto& ctx : contexts) {
                         auto queryFuture = engine.query(ctx.seriesKey, startTime, endTime)
-                            .then([](VariantQueryResult variantResult) {
-                                return std::optional<VariantQueryResult>(std::move(variantResult));
-                            })
                             .handle_exception([seriesKey = ctx.seriesKey, shardId](std::exception_ptr eptr) -> std::optional<VariantQueryResult> {
                                 try {
                                     std::rethrow_exception(eptr);
@@ -529,7 +581,13 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                 }
                             } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
                                 if (!result.timestamps.empty()) {
-                                    seriesResult.fields[ctx.field] = std::make_pair(result.timestamps, FieldValues(result.values));
+                                    // Convert booleans to doubles (1.0/0.0) so they can be aggregated
+                                    std::vector<double> doubleValues;
+                                    doubleValues.reserve(result.values.size());
+                                    for (bool v : result.values) {
+                                        doubleValues.push_back(v ? 1.0 : 0.0);
+                                    }
+                                    seriesResult.fields[ctx.field] = std::make_pair(result.timestamps, FieldValues(std::move(doubleValues)));
                                 }
                             } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
                                 if (!result.timestamps.empty()) {
@@ -543,10 +601,30 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                         }
                     }
 
+                    // Separate string-typed results from numeric results.
+                    // String fields cannot be numerically aggregated, so they bypass
+                    // the partial aggregation and are returned directly.
+                    std::vector<tsdb::SeriesResult> stringResults;
+                    std::vector<tsdb::SeriesResult> numericResults;
+                    for (auto& sr : results) {
+                        bool hasStringField = false;
+                        for (const auto& [fn, fd] : sr.fields) {
+                            if (std::holds_alternative<std::vector<std::string>>(fd.second)) {
+                                hasStringField = true;
+                                break;
+                            }
+                        }
+                        if (hasStringField) {
+                            stringResults.push_back(std::move(sr));
+                        } else {
+                            numericResults.push_back(std::move(sr));
+                        }
+                    }
+
                     // OPTIMIZATION: Perform partial aggregation on this shard before returning
                     auto partialAggStart = std::chrono::high_resolution_clock::now();
                     auto partialResults = Aggregator::createPartialAggregations(
-                        results, aggregation, aggregationInterval, groupByTags);
+                        numericResults, aggregation, aggregationInterval, groupByTags);
                     auto partialAggEnd = std::chrono::high_resolution_clock::now();
                     double partialAggMs = std::chrono::duration<double, std::milli>(partialAggEnd - partialAggStart).count();
 
@@ -554,9 +632,13 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     double shardMs = std::chrono::duration<double, std::milli>(shardEnd - shardStart).count();
                     LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} completed {} parallel queries + partial aggregation in {:.2f} ms (aggregation: {:.2f} ms)",
                                    shardId, seriesKeys.size(), shardMs, partialAggMs);
-                    co_return std::make_pair(partialResults, shardMs);
-                }).then([shardId](std::pair<std::vector<PartialAggregationResult>, double> result) {
-                    return std::make_pair(shardId, result);
+                    ShardQueryResult sqr;
+                    sqr.partialResults = std::move(partialResults);
+                    sqr.stringResults = std::move(stringResults);
+                    sqr.shardMs = shardMs;
+                    co_return sqr;
+                }).then([shardId](ShardQueryResult result) {
+                    return std::make_pair(shardId, std::move(result));
                 });
             futures.push_back(std::move(f));
         }
@@ -570,26 +652,32 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         auto mergeStart = std::chrono::high_resolution_clock::now();
 
         std::vector<PartialAggregationResult> allPartialResults;
+        std::vector<SeriesResult> allStringResults;
         size_t totalPartialResults = 0;
         for (const auto& sr : shardResults) {
-            totalPartialResults += sr.second.first.size();
+            totalPartialResults += sr.second.partialResults.size();
         }
         allPartialResults.reserve(totalPartialResults);
 
         for (auto& shardResult : shardResults) {
             unsigned shardId = shardResult.first;
-            auto& [partialResults, shardMs] = shardResult.second;
-            timing.perShardQueryMs.push_back({shardId, shardMs});
+            auto& sqr = shardResult.second;
+            timing.perShardQueryMs.push_back({shardId, sqr.shardMs});
 
             // Count points from partial results
-            for (const auto& partial : partialResults) {
+            for (const auto& partial : sqr.partialResults) {
                 timing.totalPointsRetrieved += partial.totalPoints;
             }
 
             // Collect all partial results
             allPartialResults.insert(allPartialResults.end(),
-                std::make_move_iterator(partialResults.begin()),
-                std::make_move_iterator(partialResults.end()));
+                std::make_move_iterator(sqr.partialResults.begin()),
+                std::make_move_iterator(sqr.partialResults.end()));
+
+            // Collect string results (these bypass aggregation)
+            allStringResults.insert(allStringResults.end(),
+                std::make_move_iterator(sqr.stringResults.begin()),
+                std::make_move_iterator(sqr.stringResults.end()));
         }
 
         auto mergeEnd = std::chrono::high_resolution_clock::now();
@@ -608,16 +696,24 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merged into {} grouped results",
                            groupedResults.size());
 
-            // OPTIMIZATION: Pre-allocate response series
+            // Merge GroupedAggregationResult entries that share the same
+            // measurement+tags into a single SeriesResult with multiple fields.
+            // This is important when a query returns multiple fields for the
+            // same series (e.g., avg:measurement(){} returns value1, value2, value3).
+            std::map<std::string, size_t> seriesKeyToIndex; // measurement+tags -> index in response.series
             response.series.reserve(groupedResults.size());
 
-            // Convert GroupedAggregationResult to SeriesResult (metadata already preserved)
             for (auto& groupedResult : groupedResults) {
-                SeriesResult series;
-                series.measurement = std::move(groupedResult.measurement);
-                series.tags = std::move(groupedResult.tags);
+                // Build a key from measurement + sorted tags to identify the series
+                std::string seriesMergeKey = groupedResult.measurement;
+                for (const auto& [k, v] : groupedResult.tags) {
+                    seriesMergeKey += '\0';
+                    seriesMergeKey += k;
+                    seriesMergeKey += '=';
+                    seriesMergeKey += v;
+                }
 
-                // OPTIMIZATION: Pre-allocate and move data (no copying)
+                // Build timestamps and values for this field
                 std::vector<uint64_t> timestamps;
                 std::vector<double> values;
                 timestamps.reserve(groupedResult.points.size());
@@ -628,25 +724,122 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     values.push_back(point.value);
                 }
 
-                series.fields[std::move(groupedResult.fieldName)] =
-                    std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+                auto it = seriesKeyToIndex.find(seriesMergeKey);
+                if (it != seriesKeyToIndex.end()) {
+                    // Merge into existing SeriesResult
+                    response.series[it->second].fields[std::move(groupedResult.fieldName)] =
+                        std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+                } else {
+                    // Create new SeriesResult
+                    SeriesResult series;
+                    series.measurement = std::move(groupedResult.measurement);
+                    series.tags = std::move(groupedResult.tags);
+                    series.fields[std::move(groupedResult.fieldName)] =
+                        std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
 
-                response.series.push_back(std::move(series));
+                    seriesKeyToIndex[seriesMergeKey] = response.series.size();
+                    response.series.push_back(std::move(series));
+                }
             }
 
-            // Update statistics
-            response.statistics.pointCount = 0;
-            for (const auto& series : response.series) {
-                for (const auto& [fieldName, fieldData] : series.fields) {
-                    size_t points = fieldData.first.size();
-                    response.statistics.pointCount += points;
-                    timing.finalPointsReturned += points;
+            // Filter fields if specific fields were requested in the query
+            if (!request.fields.empty()) {
+                for (auto& series : response.series) {
+                    std::map<std::string, std::pair<std::vector<uint64_t>, FieldValues>> filteredFields;
+                    for (auto& [fieldName, fieldData] : series.fields) {
+                        if (std::find(request.fields.begin(), request.fields.end(), fieldName) != request.fields.end()) {
+                            filteredFields[fieldName] = std::move(fieldData);
+                        }
+                    }
+                    series.fields = std::move(filteredFields);
+                }
+                // Remove series that have no fields after filtering
+                response.series.erase(
+                    std::remove_if(response.series.begin(), response.series.end(),
+                        [](const SeriesResult& s) { return s.fields.empty(); }),
+                    response.series.end());
+            }
+
+        }
+        // Add string results that bypassed aggregation directly to response
+        if (!allStringResults.empty()) {
+            // Apply field filtering to string results if specific fields were requested
+            if (!request.fields.empty()) {
+                for (auto& sr : allStringResults) {
+                    std::map<std::string, std::pair<std::vector<uint64_t>, FieldValues>> filteredFields;
+                    for (auto& [fieldName, fieldData] : sr.fields) {
+                        if (std::find(request.fields.begin(), request.fields.end(), fieldName) != request.fields.end()) {
+                            filteredFields[fieldName] = std::move(fieldData);
+                        }
+                    }
+                    sr.fields = std::move(filteredFields);
+                }
+                // Remove string series with no fields after filtering
+                allStringResults.erase(
+                    std::remove_if(allStringResults.begin(), allStringResults.end(),
+                        [](const SeriesResult& s) { return s.fields.empty(); }),
+                    allStringResults.end());
+            }
+
+            // Merge string results into existing series or add as new
+            for (auto& strResult : allStringResults) {
+                std::string seriesMergeKey = strResult.measurement;
+                for (const auto& [k, v] : strResult.tags) {
+                    seriesMergeKey += '\0';
+                    seriesMergeKey += k;
+                    seriesMergeKey += '=';
+                    seriesMergeKey += v;
+                }
+
+                // Check if there's already a series with the same measurement+tags
+                bool merged = false;
+                for (auto& existingSeries : response.series) {
+                    std::string existingKey = existingSeries.measurement;
+                    for (const auto& [k, v] : existingSeries.tags) {
+                        existingKey += '\0';
+                        existingKey += k;
+                        existingKey += '=';
+                        existingKey += v;
+                    }
+                    if (existingKey == seriesMergeKey) {
+                        // Merge string fields into existing series
+                        for (auto& [fieldName, fieldData] : strResult.fields) {
+                            existingSeries.fields[fieldName] = std::move(fieldData);
+                        }
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) {
+                    response.series.push_back(std::move(strResult));
                 }
             }
         }
+
+        // Update statistics and enforce MAX_TOTAL_POINTS (covers both numeric and string results)
+        response.statistics.pointCount = 0;
+        timing.finalPointsReturned = 0;
+        for (const auto& series : response.series) {
+            for (const auto& [fieldName, fieldData] : series.fields) {
+                size_t points = fieldData.first.size();
+                response.statistics.pointCount += points;
+                timing.finalPointsReturned += points;
+            }
+        }
+
+        // Enforce MAX_TOTAL_POINTS limit
+        if (response.statistics.pointCount > MAX_TOTAL_POINTS) {
+            response.statistics.truncated = true;
+            response.statistics.truncationReason = "Total points " + std::to_string(response.statistics.pointCount) + " exceeds limit of " + std::to_string(MAX_TOTAL_POINTS);
+            response.success = false;
+            response.errorCode = "TOO_MANY_POINTS";
+            response.errorMessage = response.statistics.truncationReason;
+            co_return response;
+        }
+
         auto aggregationEnd = std::chrono::high_resolution_clock::now();
         timing.aggregationMs = std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count();
-        
+
         response.statistics.seriesCount = response.series.size();
         
         // Calculate total timing
@@ -654,7 +847,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         timing.totalMs = std::chrono::duration<double, std::milli>(timing.endTime - timing.startTime).count();
         
         // Print timing information
-        tsdb::http_log.info("{}", timing.toString());
+        LOG_QUERY_PATH(tsdb::http_log, info, "{}", timing.toString());
         
     } catch (const std::exception& e) {
         response.success = false;
@@ -739,33 +932,6 @@ std::vector<SeriesResult> HttpQueryHandler::mergeResults(std::vector<std::vector
     return merged;
 }
 
-void HttpQueryHandler::applyAggregation(std::vector<SeriesResult>& results, const QueryRequest& request) {
-    // This is a stub - actual aggregation logic would be more complex
-    // For testing purposes, we'll do basic aggregation
-    if (request.aggregationInterval == 0 && request.aggregation == AggregationMethod::AVG) {
-        // Simple average aggregation for testing
-        for (auto& series : results) {
-            for (auto& [fieldName, fieldData] : series.fields) {
-                if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
-                    auto& values = std::get<std::vector<double>>(fieldData.second);
-                    if (!values.empty()) {
-                        double sum = std::accumulate(values.begin(), values.end(), 0.0);
-                        double avg = sum / values.size();
-                        values = {avg};
-                        fieldData.first = {fieldData.first.front()};  // Keep first timestamp
-                    }
-                }
-            }
-        }
-    }
-}
-
-std::vector<SeriesResult> HttpQueryHandler::applyGroupBy(const std::vector<SeriesResult>& results, const QueryRequest& request) {
-    // For now, return results unchanged
-    // Actual group-by logic would be more complex
-    return results;
-}
-
 uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     if (interval.empty()) {
         throw QueryParseException("Interval string cannot be empty");
@@ -786,10 +952,10 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     if (unitPos == 0) {
         throw QueryParseException("Invalid interval format: no numeric value");
     }
-    
-    double value = std::stod(interval.substr(0, unitPos));
+
+    std::string valueStr = interval.substr(0, unitPos);
     std::string unit = interval.substr(unitPos);
-    
+
     // Convert to nanoseconds based on unit
     uint64_t multiplier = 0;
     if (unit == "ns") {
@@ -809,8 +975,15 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     } else {
         throw QueryParseException("Unknown time unit: " + unit);
     }
-    
-    return static_cast<uint64_t>(value * multiplier);
+
+    // Use integer arithmetic when possible to avoid floating-point precision loss
+    if (hasDecimal) {
+        double value = std::stod(valueStr);
+        return static_cast<uint64_t>(value * multiplier);
+    } else {
+        uint64_t value = std::stoull(valueStr);
+        return value * multiplier;
+    }
 }
 
 } // namespace tsdb

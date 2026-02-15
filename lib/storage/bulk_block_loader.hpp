@@ -1,5 +1,5 @@
-#ifndef __BULK_BLOCK_LOADER_H_INCLUDED__
-#define __BULK_BLOCK_LOADER_H_INCLUDED__
+#ifndef BULK_BLOCK_LOADER_H_INCLUDED
+#define BULK_BLOCK_LOADER_H_INCLUDED
 
 #include "tsm.hpp"
 #include "series_id.hpp"
@@ -10,6 +10,7 @@
 #include <memory>
 #include <cassert>
 #include <algorithm>
+#include <queue>
 
 // Phase A: Bulk Block Loading - Remove async streaming overhead
 //
@@ -68,7 +69,15 @@ public:
         SeriesBlocks<T> result(seriesId);
         result.fileRank = file->rankAsInteger();
 
-        // Get all index blocks for this series (metadata only, no I/O)
+        // Ensure the full index entry is loaded (lazy-loads from sparse index
+        // via DMA read if not already cached). getSeriesBlocks() only checks
+        // the fullIndexCache, so we must call getFullIndexEntry() first to
+        // populate it.
+        auto* indexEntry = co_await file->getFullIndexEntry(seriesId);
+        if (!indexEntry) {
+            co_return result;  // Series not in this file
+        }
+
         auto indexBlocks = file->getSeriesBlocks(seriesId);
         if (indexBlocks.empty()) {
             co_return result;  // Series not in this file
@@ -452,4 +461,4 @@ struct MergeSegment {
     size_t blockCount() const { return endIdx - startIdx + 1; }
 };
 
-#endif // __BULK_BLOCK_LOADER_H_INCLUDED__
+#endif // BULK_BLOCK_LOADER_H_INCLUDED

@@ -99,8 +99,7 @@ AlignedBuffer IntegerEncoderAVX512::encode(const std::vector<uint64_t> &values) 
             _mm512_storeu_si512((__m512i*)&encoded_batch[0], enc1);
             _mm512_storeu_si512((__m512i*)&encoded_batch[8], enc2);
 
-            // Add to output with prefetching
-            __builtin_prefetch(&encoded[encoded.size() + 16], 1, 3);
+            // Add to output
             for (size_t j = 0; j < 16; j++) {
                 encoded.push_back(encoded_batch[j]);
             }
@@ -217,9 +216,6 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
             _mm512_storeu_si512((__m512i*)&decoded_batch[0], dec1);
             _mm512_storeu_si512((__m512i*)&decoded_batch[8], dec2);
 
-            // Sequential reconstruction with prefetching
-            __builtin_prefetch(&values[values.size() + 16], 1, 3);
-
             // Use AVX-512 mask operations for range checking
             __m512i min_vec = _mm512_set1_epi64(minTime);
             __m512i max_vec = _mm512_set1_epi64(maxTime);
@@ -251,9 +247,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
             __m512i dec = zigzagDecode8_avx512(&deltaValues[i]);
             _mm512_storeu_si512((__m512i*)decoded_batch, dec);
 
-            // Unrolled reconstruction with prefetching
-            __builtin_prefetch(&values[values.size() + 8], 1, 3);
-
+            // Unrolled reconstruction
             #pragma unroll 8
             for (size_t j = 0; j < 8; j++) {
                 delta += decoded_batch[j];

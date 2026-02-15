@@ -1,4 +1,5 @@
 #include "float_decoder.hpp"
+#include <bit>
 #include <cstring>
 
 void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t length, std::vector<double> &out) {
@@ -19,22 +20,17 @@ void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
     out.resize(required_capacity);
     double* output_ptr = out.data() + current_size;
 
-    // OPTIMIZATION 2: Prefetch compressed data for better cache utilization
-    const uint64_t* data_ptr = values.data;
-    __builtin_prefetch(data_ptr, 0, 3);      // L1 cache
-    __builtin_prefetch(data_ptr + 8, 0, 2);  // L2 cache
-
     uint64_t last_value = values.readFixed<uint64_t, 64>();
     uint64_t tzb = 0;
     uint64_t data_bits = 0;
-    unsigned int count = 0;
+    size_t count = 0;
 
     // Save original nToSkip for totalLength calculation
     const size_t originalSkip = nToSkip;
 
     // Handle first value
     if (nToSkip == 0) {
-        *output_ptr++ = reinterpret_cast<double&>(last_value);
+        *output_ptr++ = std::bit_cast<double>(last_value);
     } else {
         nToSkip--;  // Account for the first value if skipping
     }
@@ -43,13 +39,7 @@ void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
     // Must use originalSkip since nToSkip may have been decremented
     const size_t totalLength = originalSkip + length;
 
-    // OPTIMIZATION 3: Process with better branch prediction
     while(++count < totalLength){
-        // Prefetch next cache line periodically
-        if ((count & 0x7) == 0 && count < totalLength - 8) {
-            __builtin_prefetch(data_ptr + (count >> 2), 0, 3);
-        }
-
         if(values.readBit()){
             if(values.readBit()){
                 // 0b11 prefix - new bounds
@@ -75,11 +65,10 @@ void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
         }
         // else: 0b0 prefix - value unchanged
 
-        // OPTIMIZATION 4: Direct memory write instead of push_back
         if(nToSkip > 0){
             nToSkip--;
         } else {
-            *output_ptr++ = reinterpret_cast<double&>(last_value);
+            *output_ptr++ = std::bit_cast<double>(last_value);
         }
     }
 }

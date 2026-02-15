@@ -1,5 +1,5 @@
-#ifndef __FLOAT_ENCODER_MAIN_H_INCLUDED__
-#define __FLOAT_ENCODER_MAIN_H_INCLUDED__
+#ifndef FLOAT_ENCODER_MAIN_H_INCLUDED
+#define FLOAT_ENCODER_MAIN_H_INCLUDED
 
 #include <vector>
 #include <string>
@@ -92,4 +92,4 @@ private:
     static Implementation s_forced_impl;
 };
 
-#endif // __FLOAT_ENCODER_MAIN_H_INCLUDED__
+#endif // FLOAT_ENCODER_MAIN_H_INCLUDED

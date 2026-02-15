@@ -15,9 +15,12 @@ LevelDBIndex::LevelDBIndex(int _shardId) : shardId(_shardId) {
 }
 
 LevelDBIndex::~LevelDBIndex() {
+    // DB must be destroyed before the filter policy since LevelDB may
+    // reference the policy during shutdown.
     if (db) {
         delete db.release();
     }
+    filterPolicy_.reset();
 }
 
 seastar::future<> LevelDBIndex::open() {
@@ -41,8 +44,9 @@ seastar::future<> LevelDBIndex::open() {
     options.write_buffer_size = 4 * 1024 * 1024; // 4MB
     options.max_open_files = 1000;
     
-    // Use bloom filter for faster lookups
-    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    // Use bloom filter for faster lookups (owned by filterPolicy_ unique_ptr for RAII cleanup)
+    filterPolicy_.reset(leveldb::NewBloomFilterPolicy(10));
+    options.filter_policy = filterPolicy_.get();
     
     leveldb::DB* dbPtr;
     leveldb::Status status = leveldb::DB::Open(options, indexPath, &dbPtr);
@@ -63,6 +67,8 @@ seastar::future<> LevelDBIndex::close() {
         delete db.release();
         db.reset();
     }
+    // Free the bloom filter policy after the DB is closed
+    filterPolicy_.reset();
     co_return;
 }
 
@@ -110,8 +116,12 @@ std::string LevelDBIndex::encodeTagValuesKey(const std::string& measurement, con
 std::string LevelDBIndex::encodeStringSet(const std::set<std::string>& strings) {
     std::ostringstream oss;
     for (const auto& str : strings) {
+        if (str.length() > UINT16_MAX) {
+            throw std::runtime_error("String length " + std::to_string(str.length()) +
+                                     " exceeds maximum encodable length of " + std::to_string(UINT16_MAX));
+        }
         // Length-prefixed encoding
-        uint16_t len = str.length();
+        uint16_t len = static_cast<uint16_t>(str.length());
         oss.write(reinterpret_cast<const char*>(&len), sizeof(len));
         oss.write(str.c_str(), len);
     }
@@ -122,7 +132,7 @@ std::set<std::string> LevelDBIndex::decodeStringSet(const std::string& encoded) 
     std::set<std::string> result;
     std::istringstream iss(encoded);
     
-    while (iss.tellg() < encoded.length()) {
+    while (iss.good() && static_cast<size_t>(iss.tellg()) < encoded.length()) {
         uint16_t len;
         iss.read(reinterpret_cast<char*>(&len), sizeof(len));
         
@@ -203,7 +213,12 @@ SeriesMetadata LevelDBIndex::decodeSeriesMetadata(const std::string& encoded) {
     std::string sizeStr;
     std::getline(ss, sizeStr, '\0');
     size_t tagCount = std::stoull(sizeStr);
-    
+
+    if (tagCount > 1000) {
+        throw std::runtime_error("tagCount " + std::to_string(tagCount) +
+                                 " exceeds maximum of 1000 - possible data corruption");
+    }
+
     for (size_t i = 0; i < tagCount; ++i) {
         std::string key, value;
         std::getline(ss, key, '\0');
@@ -231,13 +246,11 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKeyStr);
 
     // Fast path: Check in-memory cache (no I/O)
-    {
-        std::shared_lock<std::shared_mutex> lock(cacheMutex);
-        if (indexedSeriesCache.count(seriesKeyStr) > 0) {
-            // Already indexed - just return the computed SeriesId
-            LOG_INSERT_PATH(tsdb::index_log, trace, "[INDEX] Cache hit for series: '{}'", seriesKeyStr);
-            co_return seriesId;
-        }
+    // No mutex needed: Seastar's shard-per-core model guarantees single-threaded access
+    if (indexedSeriesCache.count(seriesKeyStr) > 0) {
+        // Already indexed - just return the computed SeriesId
+        LOG_INSERT_PATH(tsdb::index_log, trace, "[INDEX] Cache hit for series: '{}'", seriesKeyStr);
+        co_return seriesId;
     }
 
     // Cache miss - need to check if it exists in LevelDB (handles restarts)
@@ -245,10 +258,7 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     auto existingId = co_await getSeriesId(measurement, tags, field);
     if (existingId.has_value()) {
         // Exists in LevelDB but not in cache (likely after restart) - add to cache
-        {
-            std::unique_lock<std::shared_mutex> lock(cacheMutex);
-            indexedSeriesCache.insert(seriesKeyStr);
-        }
+        indexedSeriesCache.insert(seriesKeyStr);
         LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Series found in LevelDB, added to cache: '{}'", seriesKeyStr);
         co_return existingId.value();
     }
@@ -307,10 +317,7 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     }
 
     // Add to cache now that it's written
-    {
-        std::unique_lock<std::shared_mutex> lock(cacheMutex);
-        indexedSeriesCache.insert(seriesKeyStr);
-    }
+    indexedSeriesCache.insert(seriesKeyStr);
 
     // Update metadata indexes
     co_await addField(measurement, field);
@@ -350,21 +357,35 @@ seastar::future<> LevelDBIndex::addField(const std::string& measurement, const s
     if (shardId != 0) {
         throw std::runtime_error("addField called on non-zero shard " + std::to_string(shardId) + " - metadata operations only supported on shard 0");
     }
-    
+
     if (!db) {
         throw std::runtime_error("Database not opened on shard 0 for addField");
     }
-    
+
+    // Use in-memory cache to avoid read-modify-write race across co_await points.
+    // All synchronous operations on the cache complete atomically (no interleaving).
+    auto cacheIt = fieldsCache.find(measurement);
+    if (cacheIt != fieldsCache.end()) {
+        // Cache hit: check if field already present (common fast path)
+        if (cacheIt->second.count(field) > 0) {
+            co_return; // Already cached, nothing to do
+        }
+        cacheIt->second.insert(field);
+    } else {
+        // Cache miss: load from LevelDB and populate cache
+        auto fields = co_await getFields(measurement);
+        // Convert std::set to std::unordered_set for cache
+        std::unordered_set<std::string> fieldSet(fields.begin(), fields.end());
+        fieldSet.insert(field);
+        fieldsCache[measurement] = std::move(fieldSet);
+    }
+
+    // Write the full set to LevelDB
     std::string key = encodeMeasurementFieldsKey(measurement);
-    
-    // Get existing fields
-    auto fields = co_await getFields(measurement);
-    fields.insert(field);
-    
-    // Store updated set
-    std::string encodedFields = encodeStringSet(fields);
+    std::set<std::string> orderedFields(fieldsCache[measurement].begin(), fieldsCache[measurement].end());
+    std::string encodedFields = encodeStringSet(orderedFields);
     leveldb::Status status = db->Put(leveldb::WriteOptions(), key, encodedFields);
-    
+
     if (!status.ok()) {
         throw std::runtime_error("Failed to add field: " + status.ToString());
     }
@@ -375,25 +396,66 @@ seastar::future<> LevelDBIndex::addTag(const std::string& measurement, const std
     if (shardId != 0) {
         throw std::runtime_error("addTag called on non-zero shard " + std::to_string(shardId) + " - metadata operations only supported on shard 0");
     }
-    
+
     if (!db) {
         throw std::runtime_error("Database not opened on shard 0 for addTag");
     }
-    
+
+    // Use in-memory caches to avoid read-modify-write race across co_await points.
+    // Check tags cache
+    bool tagsNeedWrite = false;
+    auto tagsCacheIt = tagsCache.find(measurement);
+    if (tagsCacheIt != tagsCache.end()) {
+        if (tagsCacheIt->second.count(tagKey) == 0) {
+            tagsCacheIt->second.insert(tagKey);
+            tagsNeedWrite = true;
+        }
+    } else {
+        // Cache miss: load from LevelDB and populate cache
+        auto tags = co_await getTags(measurement);
+        std::unordered_set<std::string> tagSet(tags.begin(), tags.end());
+        tagsNeedWrite = (tagSet.count(tagKey) == 0);
+        tagSet.insert(tagKey);
+        tagsCache[measurement] = std::move(tagSet);
+    }
+
+    // Check tag values cache
+    bool tagValuesNeedWrite = false;
+    std::string tagValuesCacheKey = measurement + std::string(1, '\0') + tagKey;
+    auto tvCacheIt = tagValuesCache.find(tagValuesCacheKey);
+    if (tvCacheIt != tagValuesCache.end()) {
+        if (tvCacheIt->second.count(tagValue) == 0) {
+            tvCacheIt->second.insert(tagValue);
+            tagValuesNeedWrite = true;
+        }
+    } else {
+        // Cache miss: load from LevelDB and populate cache
+        auto tagValues = co_await getTagValues(measurement, tagKey);
+        std::unordered_set<std::string> tvSet(tagValues.begin(), tagValues.end());
+        tagValuesNeedWrite = (tvSet.count(tagValue) == 0);
+        tvSet.insert(tagValue);
+        tagValuesCache[tagValuesCacheKey] = std::move(tvSet);
+    }
+
+    // Only write to LevelDB if something changed
+    if (!tagsNeedWrite && !tagValuesNeedWrite) {
+        co_return;
+    }
+
     leveldb::WriteBatch batch;
-    
-    // Add to measurement tags
-    auto tags = co_await getTags(measurement);
-    tags.insert(tagKey);
-    std::string tagsKey = encodeMeasurementTagsKey(measurement);
-    batch.Put(tagsKey, encodeStringSet(tags));
-    
-    // Add to tag values
-    auto tagValues = co_await getTagValues(measurement, tagKey);
-    tagValues.insert(tagValue);
-    std::string tagValuesKey = encodeTagValuesKey(measurement, tagKey);
-    batch.Put(tagValuesKey, encodeStringSet(tagValues));
-    
+
+    if (tagsNeedWrite) {
+        std::string tagsKey = encodeMeasurementTagsKey(measurement);
+        std::set<std::string> orderedTags(tagsCache[measurement].begin(), tagsCache[measurement].end());
+        batch.Put(tagsKey, encodeStringSet(orderedTags));
+    }
+
+    if (tagValuesNeedWrite) {
+        std::string tagValuesKey = encodeTagValuesKey(measurement, tagKey);
+        std::set<std::string> orderedValues(tagValuesCache[tagValuesCacheKey].begin(), tagValuesCache[tagValuesCacheKey].end());
+        batch.Put(tagValuesKey, encodeStringSet(orderedValues));
+    }
+
     leveldb::Status status = db->Write(leveldb::WriteOptions(), &batch);
     if (!status.ok()) {
         throw std::runtime_error("Failed to add tag: " + status.ToString());
@@ -731,6 +793,7 @@ seastar::future<size_t> LevelDBIndex::getSeriesCount() {
 }
 
 seastar::future<> LevelDBIndex::compact() {
+    if (!db) co_return;
     // LevelDB handles compaction automatically, but we can trigger manual compaction
     db->CompactRange(nullptr, nullptr);
     co_return;
@@ -783,11 +846,12 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTag(const st
     }
     
     if (!it->status().ok()) {
+        std::string errMsg = it->status().ToString();
         delete it;
-        throw std::runtime_error("Failed to iterate tag index: " + it->status().ToString());
+        throw std::runtime_error("Failed to iterate tag index: " + errMsg);
     }
     delete it;
-    
+
     co_return seriesIds;
 }
 
@@ -824,11 +888,12 @@ LevelDBIndex::getSeriesGroupedByTag(const std::string& measurement, const std::s
     }
     
     if (!it->status().ok()) {
+        std::string errMsg = it->status().ToString();
         delete it;
-        throw std::runtime_error("Failed to iterate group-by index: " + it->status().ToString());
+        throw std::runtime_error("Failed to iterate group-by index: " + errMsg);
     }
     delete it;
-    
+
     co_return grouped;
 }
 

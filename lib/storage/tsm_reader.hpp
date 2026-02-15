@@ -1,5 +1,5 @@
-#ifndef __TSM_READER_H_INCLUDED__
-#define __TSM_READER_H_INCLUDED__
+#ifndef TSM_READER_H_INCLUDED
+#define TSM_READER_H_INCLUDED
 
 #include "tsm.hpp"
 #include <seastar/core/shared_ptr.hh>
@@ -56,11 +56,11 @@ public:
     
     // Read series with automatic reference management
     template <class T>
-    seastar::future<TSMResult<T>> readSeries(const std::string& seriesKey, 
-                                             uint64_t startTime, 
+    seastar::future<TSMResult<T>> readSeries(const SeriesId128& seriesId,
+                                             uint64_t startTime,
                                              uint64_t endTime) {
         TSMResult<T> results(tsm->rankAsInteger());
-        co_await tsm->readSeries<T>(seriesKey, startTime, endTime, results);
+        co_await tsm->readSeries<T>(seriesId, startTime, endTime, results);
         co_return results;
     }
 };
@@ -70,4 +70,4 @@ inline TSMReader makeTSMReader(seastar::shared_ptr<TSM> file) {
     return TSMReader(file);
 }
 
-#endif // __TSM_READER_H_INCLUDED__
+#endif // TSM_READER_H_INCLUDED

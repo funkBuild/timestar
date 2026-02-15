@@ -22,8 +22,9 @@ static inline __m256i zigzagEncode4_avx2(const int64_t* values) {
     // Shift left by 1: (x << 1)
     __m256i shifted = _mm256_slli_epi64(v, 1);
 
-    // Arithmetic shift right by 63: (x >> 63)
-    __m256i sign = _mm256_srai_epi64(v, 63);
+    // AVX2 alternative: use comparison to emulate arithmetic right shift by 63
+    __m256i zero = _mm256_setzero_si256();
+    __m256i sign = _mm256_cmpgt_epi64(zero, v); // All 1s if negative, all 0s if positive
 
     // XOR: ((x << 1) ^ -(x >> 63))
     __m256i result = _mm256_xor_si256(shifted, sign);

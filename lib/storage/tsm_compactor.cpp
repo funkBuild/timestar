@@ -3,7 +3,6 @@
 #include "tsm_writer.hpp"
 #include "logger.hpp"
 #include "compaction_pipeline.hpp"  // Phase 2.1: Include prefetch manager
-#include "batch_pool.hpp"  // Phase 3.3: Zero-copy batch pool
 #include "tsm_merge_specialized.hpp"  // Phase 5.1: Specialized N-way merges
 #include "bulk_block_loader.hpp"  // Phase A: Bulk loading optimization
 #include <filesystem>
@@ -208,9 +207,10 @@ seastar::future<> TSMCompactor::mergeSeriesWithIterator(
         tombstoneRanges = std::move(mergedRanges);
     }
 
-    // Phase 3.3: Use BatchPool for zero-copy transfers to TSMWriter
-    BatchPool<T> pool(BATCH_SIZE, 10);  // Pool of 10 batches with BATCH_SIZE capacity
-    auto currentBatch = pool.acquire();
+    std::vector<uint64_t> timestamps;
+    std::vector<T> values;
+    timestamps.reserve(BATCH_SIZE);
+    values.reserve(BATCH_SIZE);
 
     uint64_t lastTimestamp = 0;
     size_t tombstonesFiltered = 0;
@@ -248,32 +248,33 @@ seastar::future<> TSMCompactor::mergeSeriesWithIterator(
 
             // Deduplicate - skip if same timestamp
             if (ts != lastTimestamp) {
-                currentBatch->timestamps.push_back(ts);
-                currentBatch->values.push_back(val);
+                timestamps.push_back(ts);
+                values.push_back(val);
                 lastTimestamp = ts;
                 stats.pointsWritten++;
             } else {
                 stats.duplicatesRemoved++;
             }
 
-            // Phase 3.3: Write when batch is full using zero-copy move semantics
-            if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+            // Write when batch is full
+            if (timestamps.size() >= BATCH_SIZE) {
                 writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
-                                        std::move(currentBatch->timestamps),
-                                        std::move(currentBatch->values));
-                pool.release(std::move(currentBatch));  // Return to pool
-                currentBatch = pool.acquire();  // Get new batch
+                                        std::move(timestamps),
+                                        std::move(values));
+                timestamps = std::vector<uint64_t>();
+                values = std::vector<T>();
+                timestamps.reserve(BATCH_SIZE);
+                values.reserve(BATCH_SIZE);
             }
         }
     }
 
-    // Phase 3.3: Write remaining data using zero-copy move semantics
-    if (!currentBatch->timestamps.empty()) {
+    // Write remaining data
+    if (!timestamps.empty()) {
         writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
-                                std::move(currentBatch->timestamps),
-                                std::move(currentBatch->values));
+                                std::move(timestamps),
+                                std::move(values));
     }
-    pool.release(std::move(currentBatch));  // Return final batch to pool
 
     // Log tombstone filtering stats if any points were filtered
     if (tombstonesFiltered > 0) {
@@ -394,9 +395,10 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
         segments.push_back({segmentStart, blockMeta.size()-1, currentNeedsMerge});
     }
 
-    // Phase A: Use batch pool for zero-copy
-    BatchPool<T> pool(BATCH_SIZE, 10);
-    auto currentBatch = pool.acquire();
+    std::vector<uint64_t> currentTimestamps;
+    std::vector<T> currentValues;
+    currentTimestamps.reserve(BATCH_SIZE);
+    currentValues.reserve(BATCH_SIZE);
 
     uint64_t lastTimestamp = 0;
     size_t tombstonesFiltered = 0;
@@ -433,21 +435,23 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
 
                 // Deduplicate
                 if (ts != lastTimestamp) {
-                    currentBatch->timestamps.push_back(ts);
-                    currentBatch->values.push_back(val);
+                    currentTimestamps.push_back(ts);
+                    currentValues.push_back(val);
                     lastTimestamp = ts;
                     stats.pointsWritten++;
                 } else {
                     stats.duplicatesRemoved++;
                 }
 
-                // Phase 3.3: Write when batch full using zero-copy
-                if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+                // Write when batch full
+                if (currentTimestamps.size() >= BATCH_SIZE) {
                     writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
-                                            std::move(currentBatch->timestamps),
-                                            std::move(currentBatch->values));
-                    pool.release(std::move(currentBatch));
-                    currentBatch = pool.acquire();
+                                            std::move(currentTimestamps),
+                                            std::move(currentValues));
+                    currentTimestamps = std::vector<uint64_t>();
+                    currentValues = std::vector<T>();
+                    currentTimestamps.reserve(BATCH_SIZE);
+                    currentValues.reserve(BATCH_SIZE);
                 }
             }
         }
@@ -466,16 +470,18 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
 
             // Copy points in batches
             for (size_t i = 0; i < blockSize; i++) {
-                currentBatch->timestamps.push_back(timestamps[i]);
-                currentBatch->values.push_back(values[i]);
+                currentTimestamps.push_back(timestamps[i]);
+                currentValues.push_back(values[i]);
 
                 // Write when batch full
-                if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+                if (currentTimestamps.size() >= BATCH_SIZE) {
                     writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
-                                            std::move(currentBatch->timestamps),
-                                            std::move(currentBatch->values));
-                    pool.release(std::move(currentBatch));
-                    currentBatch = pool.acquire();
+                                            std::move(currentTimestamps),
+                                            std::move(currentValues));
+                    currentTimestamps = std::vector<uint64_t>();
+                    currentValues = std::vector<T>();
+                    currentTimestamps.reserve(BATCH_SIZE);
+                    currentValues.reserve(BATCH_SIZE);
                 }
             }
 
@@ -514,8 +520,8 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
 
             // Deduplicate
             if (ts != lastTimestamp) {
-                currentBatch->timestamps.push_back(ts);
-                currentBatch->values.push_back(val);
+                currentTimestamps.push_back(ts);
+                currentValues.push_back(val);
                 lastTimestamp = ts;
                 stats.pointsWritten++;
             } else {
@@ -523,12 +529,14 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
             }
 
             // Write when batch full
-            if (currentBatch->timestamps.size() >= BATCH_SIZE) {
+            if (currentTimestamps.size() >= BATCH_SIZE) {
                 writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
-                                        std::move(currentBatch->timestamps),
-                                        std::move(currentBatch->values));
-                pool.release(std::move(currentBatch));
-                currentBatch = pool.acquire();
+                                        std::move(currentTimestamps),
+                                        std::move(currentValues));
+                currentTimestamps = std::vector<uint64_t>();
+                currentValues = std::vector<T>();
+                currentTimestamps.reserve(BATCH_SIZE);
+                currentValues.reserve(BATCH_SIZE);
             }
         }
     };
@@ -600,8 +608,6 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
                 // Stats tracking happens at byte level in calling code
             }
 
-            // Skip batch pool - we wrote directly
-            pool.release(std::move(currentBatch));
             co_return;
         }
 
@@ -626,12 +632,11 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
     }
 
     // Write remaining data
-    if (!currentBatch->timestamps.empty()) {
+    if (!currentTimestamps.empty()) {
         writer.writeSeriesDirect(TSM::getValueType<T>(), seriesId,
-                                std::move(currentBatch->timestamps),
-                                std::move(currentBatch->values));
+                                std::move(currentTimestamps),
+                                std::move(currentValues));
     }
-    pool.release(std::move(currentBatch));
 
     // Log tombstone filtering
     if (tombstonesFiltered > 0) {
@@ -1077,12 +1082,16 @@ seastar::future<std::string> TSMCompactor::compact(
     
     // Calculate statistics
     auto endTime = std::chrono::steady_clock::now();
+    stats.filesCompacted = files.size();
     stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         endTime - startTime);
-    
+
+    // Store stats so executeCompaction can retrieve them
+    lastCompactStats = stats;
+
     // Atomic rename from temp to final
     fs::rename(tempPath, outputPath);
-    
+
     co_return outputPath;
 }
 
@@ -1154,12 +1163,12 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
         }
     }
     
-    // Update stats
+    // Propagate stats from the compact() call and add timing
+    active.stats = lastCompactStats;
     auto endTime = std::chrono::steady_clock::now();
     active.stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         endTime - active.startTime);
-    active.stats.filesCompacted = plan.sourceFiles.size();
-    
+
     // Remove from active list
     activeCompactions.erase(
         std::remove_if(activeCompactions.begin(), activeCompactions.end(),

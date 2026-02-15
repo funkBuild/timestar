@@ -1,5 +1,5 @@
-#ifndef __SMOOTHING_FUNCTIONS_H_INCLUDED__
-#define __SMOOTHING_FUNCTIONS_H_INCLUDED__
+#ifndef SMOOTHING_FUNCTIONS_H_INCLUDED
+#define SMOOTHING_FUNCTIONS_H_INCLUDED
 
 #include "function_types.hpp"
 #include <vector>
@@ -74,4 +74,4 @@ std::vector<double> exponentialMovingAverage(const std::vector<double>& values, 
 
 } // namespace tsdb::functions
 
-#endif // __SMOOTHING_FUNCTIONS_H_INCLUDED__
+#endif // SMOOTHING_FUNCTIONS_H_INCLUDED

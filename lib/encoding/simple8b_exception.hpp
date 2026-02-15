@@ -1,5 +1,5 @@
-#ifndef __SIMPLE8B_EXCEPTION_H_INCLUDED__
-#define __SIMPLE8B_EXCEPTION_H_INCLUDED__
+#ifndef SIMPLE8B_EXCEPTION_H_INCLUDED
+#define SIMPLE8B_EXCEPTION_H_INCLUDED
 
 #include <stdexcept>
 #include <string>

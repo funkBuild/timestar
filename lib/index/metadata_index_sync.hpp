@@ -1,5 +1,5 @@
-#ifndef __METADATA_INDEX_SYNC_H_INCLUDED__
-#define __METADATA_INDEX_SYNC_H_INCLUDED__
+#ifndef METADATA_INDEX_SYNC_H_INCLUDED
+#define METADATA_INDEX_SYNC_H_INCLUDED
 
 // Synchronous version of MetadataIndex for testing without Seastar runtime
 
@@ -105,4 +105,4 @@ public:
     std::string getStats() const;
 };
 
-#endif // __METADATA_INDEX_SYNC_H_INCLUDED__
+#endif // METADATA_INDEX_SYNC_H_INCLUDED

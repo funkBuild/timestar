@@ -1,5 +1,5 @@
-#ifndef __TSM_MERGE_SPECIALIZED_H_INCLUDED__
-#define __TSM_MERGE_SPECIALIZED_H_INCLUDED__
+#ifndef TSM_MERGE_SPECIALIZED_H_INCLUDED
+#define TSM_MERGE_SPECIALIZED_H_INCLUDED
 
 #include "tsm_block_iterator.hpp"
 #include "tsm.hpp"
@@ -280,4 +280,4 @@ public:
     }
 };
 
-#endif // __TSM_MERGE_SPECIALIZED_H_INCLUDED__
+#endif // TSM_MERGE_SPECIALIZED_H_INCLUDED

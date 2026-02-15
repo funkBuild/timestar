@@ -1,5 +1,5 @@
-#ifndef __FLOAT_ENCODER_SIMD_H_INCLUDED__
-#define __FLOAT_ENCODER_SIMD_H_INCLUDED__
+#ifndef FLOAT_ENCODER_SIMD_H_INCLUDED
+#define FLOAT_ENCODER_SIMD_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
@@ -32,4 +32,4 @@ private:
                            int& prev_tzb);
 };
 
-#endif // __FLOAT_ENCODER_SIMD_H_INCLUDED__
+#endif // FLOAT_ENCODER_SIMD_H_INCLUDED

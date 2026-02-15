@@ -1,5 +1,5 @@
-#ifndef __INTERPOLATION_FUNCTIONS_H_INCLUDED__
-#define __INTERPOLATION_FUNCTIONS_H_INCLUDED__
+#ifndef INTERPOLATION_FUNCTIONS_H_INCLUDED
+#define INTERPOLATION_FUNCTIONS_H_INCLUDED
 
 #include "function_types.hpp"
 #include <vector>
@@ -42,4 +42,4 @@ std::vector<double> linearInterpolate(const std::vector<double>& values,
 
 } // namespace tsdb::functions
 
-#endif // __INTERPOLATION_FUNCTIONS_H_INCLUDED__
+#endif // INTERPOLATION_FUNCTIONS_H_INCLUDED

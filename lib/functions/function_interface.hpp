@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_INTERFACE_H_INCLUDED__
-#define __FUNCTION_INTERFACE_H_INCLUDED__
+#ifndef FUNCTION_INTERFACE_H_INCLUDED
+#define FUNCTION_INTERFACE_H_INCLUDED
 
 #include "function_types.hpp"
 
@@ -10,4 +10,4 @@ namespace tsdb::functions {
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_INTERFACE_H_INCLUDED__
+#endif // FUNCTION_INTERFACE_H_INCLUDED

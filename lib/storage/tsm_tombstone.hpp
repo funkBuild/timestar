@@ -1,5 +1,5 @@
-#ifndef __TSM_TOMBSTONE_H_INCLUDED__
-#define __TSM_TOMBSTONE_H_INCLUDED__
+#ifndef TSM_TOMBSTONE_H_INCLUDED
+#define TSM_TOMBSTONE_H_INCLUDED
 
 #include <string>
 #include <vector>
@@ -181,4 +181,4 @@ std::pair<std::vector<uint64_t>, std::vector<T>> TSMTombstone::filterTombstoned(
 
 } // namespace tsdb
 
-#endif // __TSM_TOMBSTONE_H_INCLUDED__
+#endif // TSM_TOMBSTONE_H_INCLUDED

@@ -1,5 +1,5 @@
-#ifndef __FLOAT_ENCODER_BASIC_H_INCLUDED__
-#define __FLOAT_ENCODER_BASIC_H_INCLUDED__
+#ifndef FLOAT_ENCODER_BASIC_H_INCLUDED
+#define FLOAT_ENCODER_BASIC_H_INCLUDED
 
 #include <vector>
 #include <cstdint>

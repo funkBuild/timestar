@@ -6,15 +6,8 @@
 #include "../../../lib/encoding/integer_encoder.hpp"
 #include "../../../lib/encoding/simple8b.hpp"
 
-#include <gtest/gtest.h>
-
-#define TEST_FUTURE(caseName, testName) \
-	static seastar::future<> caseName##_##testName##_FutureTestBody(); \
-	TEST(caseName, testName) { \
-		seastar::future<> f(caseName##_##testName##_FutureTestBody());\
-		f.get(); \
-	} \
-	static seastar::future<> caseName##_##testName##_FutureTestBody()
+#include <seastar/core/app-template.hh>
+#include <seastar/core/thread.hh>
 
 float get_random()
 {
@@ -96,4 +89,14 @@ TEST(IntegerTest, BasicAssertions) {
   for(unsigned int i=0; i < std::min(decoded.size(), v.size()); i++){
     EXPECT_EQ(v[i], decoded[i]);
   }
+}
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    seastar::app_template app;
+    return app.run(argc, argv, [&] {
+        return seastar::async([&] {
+            return ::RUN_ALL_TESTS();
+        });
+    });
 }

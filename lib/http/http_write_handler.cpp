@@ -2,7 +2,6 @@
 #include "logger.hpp"
 #include "logging_config.hpp"
 
-#include <sstream>
 #include <chrono>
 #include <set>
 #include <unordered_set>
@@ -83,7 +82,7 @@ HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded)
     : engineSharded(_engineSharded) {
 }
 
-HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const glz::json_t& point) {
+HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point) {
     MultiWritePoint mwp;
     
     // Parse using Glaze structure
@@ -220,7 +219,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const g
     return mwp;
 }
 
-std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(const glz::json_t::array_t& writes_array) {
+std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(const json_value_t::array_t& writes_array) {
     // Configuration constants
     static const size_t MAX_COALESCE_SIZE = 10000;  // Max values per field array
     static const size_t MIN_COALESCE_COUNT = 2;     // Min writes needed to coalesce
@@ -240,18 +239,20 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         if (!write.is_object()) continue;
         
         try {
-            auto& writeObj = write.get<glz::json_t::object_t>();
-            
+            auto& writeObj = write.get<json_value_t::object_t>();
+
             // Extract measurement
             auto measurementIt = writeObj.find("measurement");
             if (measurementIt == writeObj.end() || !measurementIt->second.is_string()) continue;
             std::string measurement = measurementIt->second.get<std::string>();
-            
-            // Extract timestamp 
+
+            // Extract timestamp - use as<uint64_t>() to preserve precision.
+            // With json_value_t (generic_u64), integer timestamps are stored natively
+            // as uint64_t, avoiding the ~512ns precision loss from double conversion.
             uint64_t timestamp = 0;
             auto timestampIt = writeObj.find("timestamp");
             if (timestampIt != writeObj.end() && timestampIt->second.is_number()) {
-                timestamp = static_cast<uint64_t>(timestampIt->second.get<double>());
+                timestamp = timestampIt->second.as<uint64_t>();
             } else {
                 // Generate timestamp
                 auto now = std::chrono::system_clock::now();
@@ -263,7 +264,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             std::map<std::string, std::string> tags;
             auto tagsIt = writeObj.find("tags");
             if (tagsIt != writeObj.end() && tagsIt->second.is_object()) {
-                auto& tagsObj = tagsIt->second.get<glz::json_t::object_t>();
+                auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
                 for (const auto& [tagKey, tagValue] : tagsObj) {
                     if (tagValue.is_string()) {
                         tags[tagKey] = tagValue.get<std::string>();
@@ -275,7 +276,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             auto fieldsIt = writeObj.find("fields");
             if (fieldsIt == writeObj.end() || !fieldsIt->second.is_object()) continue;
             
-            auto& fieldsObj = fieldsIt->second.get<glz::json_t::object_t>();
+            auto& fieldsObj = fieldsIt->second.get<json_value_t::object_t>();
             for (const auto& [fieldName, fieldValue] : fieldsObj) {
                 // Build series key efficiently 
                 std::string seriesKey;
@@ -316,7 +317,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     // Add the first value - explicitly copy strings from JSON
                     candidate.timestamps.push_back(timestamp);
                     if (valueType == TSMValueType::Float) {
-                        candidate.doubleValues.push_back(fieldValue.get<double>());
+                        candidate.doubleValues.push_back(fieldValue.as<double>());
                     } else if (valueType == TSMValueType::Boolean) {
                         candidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
                     } else if (valueType == TSMValueType::String) {
@@ -329,19 +330,41 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     CoalesceCandidate& candidate = it->second;
 
                     if (candidate.valueType != valueType || candidate.timestamps.size() >= MAX_COALESCE_SIZE) {
-                        continue; // Skip incompatible or oversized
-                    }
+                        // Type mismatch or size overflow: create a new candidate with a
+                        // disambiguated key so the data is not silently dropped.
+                        size_t suffix = 1;
+                        std::string altKey;
+                        do {
+                            altKey = seriesKey + "#" + std::to_string(suffix++);
+                        } while (candidates.count(altKey) > 0);
 
-                    // Add value - explicitly copy strings from JSON
-                    candidate.timestamps.push_back(timestamp);
-                    if (valueType == TSMValueType::Float) {
-                        candidate.doubleValues.push_back(fieldValue.get<double>());
-                    } else if (valueType == TSMValueType::Boolean) {
-                        candidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
-                    } else if (valueType == TSMValueType::String) {
-                        // Explicitly copy string to avoid potential dangling reference
-                        std::string strValue = fieldValue.get<std::string>();
-                        candidate.stringValues.push_back(std::move(strValue));
+                        CoalesceCandidate& altCandidate = candidates[altKey];
+                        altCandidate.seriesKey = altKey;
+                        altCandidate.measurement = measurement;
+                        altCandidate.tags = tags;
+                        altCandidate.fieldName = fieldName;
+                        altCandidate.valueType = valueType;
+                        altCandidate.timestamps.push_back(timestamp);
+                        if (valueType == TSMValueType::Float) {
+                            altCandidate.doubleValues.push_back(fieldValue.as<double>());
+                        } else if (valueType == TSMValueType::Boolean) {
+                            altCandidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
+                        } else if (valueType == TSMValueType::String) {
+                            std::string strValue = fieldValue.get<std::string>();
+                            altCandidate.stringValues.push_back(std::move(strValue));
+                        }
+                    } else {
+                        // Add value - explicitly copy strings from JSON
+                        candidate.timestamps.push_back(timestamp);
+                        if (valueType == TSMValueType::Float) {
+                            candidate.doubleValues.push_back(fieldValue.as<double>());
+                        } else if (valueType == TSMValueType::Boolean) {
+                            candidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
+                        } else if (valueType == TSMValueType::String) {
+                            // Explicitly copy string to avoid potential dangling reference
+                            std::string strValue = fieldValue.get<std::string>();
+                            candidate.stringValues.push_back(std::move(strValue));
+                        }
                     }
                 }
             }
@@ -409,8 +432,34 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         }
 
         if (!timestampsCompatible) {
-            LOG_INSERT_PATH(tsdb::http_log, debug, "[COALESCE] Skipping group '{}' due to incompatible timestamps", groupKey);
-            // These will be returned as individual writes by the earlier pass
+            LOG_INSERT_PATH(tsdb::http_log, debug, "[COALESCE] Group '{}' has incompatible timestamps, emitting individual MultiWritePoints", groupKey);
+            // Timestamps are incompatible across fields, so emit each candidate
+            // as its own single-field MultiWritePoint to avoid data loss.
+            for (const auto& seriesKey : seriesKeys) {
+                auto& candidate = candidates[seriesKey];
+
+                MultiWritePoint mwp;
+                mwp.measurement = candidate.measurement;
+                mwp.tags = candidate.tags;
+                mwp.timestamps = std::move(candidate.timestamps);
+
+                FieldArrays fa;
+                fa.type = (candidate.valueType == TSMValueType::Float) ? FieldArrays::DOUBLE :
+                         (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL :
+                         FieldArrays::STRING;
+
+                if (candidate.valueType == TSMValueType::Float) {
+                    fa.doubles = std::move(candidate.doubleValues);
+                } else if (candidate.valueType == TSMValueType::Boolean) {
+                    fa.bools = std::move(candidate.boolValues);
+                } else {
+                    fa.strings = std::move(candidate.stringValues);
+                }
+
+                mwp.fields[candidate.fieldName] = std::move(fa);
+                result.push_back(std::move(mwp));
+                processedSeriesKeys.insert(seriesKey);
+            }
             continue;
         }
 
@@ -869,6 +918,9 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
 seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     auto start_total = std::chrono::high_resolution_clock::now();
 
+    // TODO: Each field does a sequential cross-shard call to indexMetadata followed by
+    // insert. This could be batched like the multi-write path (collect all MetaOps and
+    // dispatch once), but single-point writes are rare in practice.
     // Process each field in the point sequentially using a simple loop
     for (const auto& field_pair : point.fields) {
         auto start_field = std::chrono::high_resolution_clock::now();
@@ -1012,6 +1064,13 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
             }
         }
         
+        if (body.size() > MAX_WRITE_BODY_SIZE) {
+            rep->set_status(seastar::http::reply::status_type::payload_too_large);
+            rep->_content = createErrorResponse("Request body too large (max 64MB)");
+            rep->add_header("Content-Type", "application/json");
+            co_return rep;
+        }
+
         if (body.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("Empty request body");
@@ -1021,8 +1080,9 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         
         LOG_INSERT_PATH(tsdb::http_log, debug, "Received write request: {} bytes", body.size());
         
-        // Parse JSON using Glaze
-        glz::json_t doc{};
+        // Parse JSON using Glaze with u64 number mode to preserve integer precision.
+        // This prevents nanosecond timestamps from losing precision through double conversion.
+        json_value_t doc{};
         auto parse_error = glz::read_json(doc, body);
         
         if (parse_error) {
@@ -1037,32 +1097,32 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         
         // Check if it's a batch write or single write
         if (doc.is_object()) {
-            auto& obj = doc.get<glz::json_t::object_t>();
+            auto& obj = doc.get<json_value_t::object_t>();
             
             if (obj.contains("writes")) {
                 // Batch write - coalesce individual writes into efficient array writes
                 auto& writes = obj["writes"];
                 if (writes.is_array()) {
-                    auto& writes_array = writes.get<glz::json_t::array_t>();
+                    auto& writes_array = writes.get<json_value_t::array_t>();
                     
                     LOG_INSERT_PATH(tsdb::http_log, info, "[BATCH] Processing batch with {} writes", writes_array.size());
                     
                     // First, separate already-array writes from individual writes
                     std::vector<MultiWritePoint> arrayWrites;
-                    std::vector<glz::json_t> individualWrites;
+                    std::vector<json_value_t> individualWrites;
                     
                     for (auto& point : writes_array) {
                         try {
                             // Check if this point has arrays
                             bool hasArrays = false;
                             if (point.is_object()) {
-                                auto& point_obj = point.get<glz::json_t::object_t>();
+                                auto& point_obj = point.get<json_value_t::object_t>();
                                 if (point_obj.contains("timestamps")) {
                                     hasArrays = true;
                                 } else if (point_obj.contains("fields")) {
                                     auto& fields = point_obj["fields"];
                                     if (fields.is_object()) {
-                                        auto& fields_obj = fields.get<glz::json_t::object_t>();
+                                        auto& fields_obj = fields.get<json_value_t::object_t>();
                                         for (auto& [name, value] : fields_obj) {
                                             if (value.is_array()) {
                                                 hasArrays = true;
@@ -1082,11 +1142,12 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                                 }
                                 arrayWrites.push_back(std::move(mwp));
                             } else {
-                                // Individual write - collect for coalescing
-                                individualWrites.push_back(point);
+                                // Individual write - collect for coalescing.
+                                // Move from writes_array since elements are not needed after this loop.
+                                individualWrites.push_back(std::move(point));
                             }
                         } catch (const std::exception& e) {
-                            std::cerr << "Error processing point: " << e.what() << std::endl;
+                            tsdb::http_log.error("Error processing point: {}", e.what());
                             // Continue processing other points
                         }
                     }
@@ -1095,7 +1156,9 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                     auto coalesceStartTime = std::chrono::steady_clock::now();
                     std::vector<MultiWritePoint> coalescedWrites;
                     if (!individualWrites.empty()) {
-                        glz::json_t::array_t individualArray(individualWrites.begin(), individualWrites.end());
+                        json_value_t::array_t individualArray(
+                            std::make_move_iterator(individualWrites.begin()),
+                            std::make_move_iterator(individualWrites.end()));
                         coalescedWrites = coalesceWrites(individualArray);
                     }
                     auto coalesceEndTime = std::chrono::steady_clock::now();
@@ -1120,7 +1183,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                             pointsWritten += mwp.timestamps.size() * mwp.fields.size();
                             walWriteCount += mwp.fields.size(); // One WAL write per field type
                         } catch (const std::exception& e) {
-                            std::cerr << "Error processing array write: " << e.what() << std::endl;
+                            tsdb::http_log.error("Error processing array write: {}", e.what());
                         }
                     }
 
@@ -1131,7 +1194,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                             pointsWritten += mwp.timestamps.size() * mwp.fields.size();
                             walWriteCount += mwp.fields.size(); // One WAL write per field type
                         } catch (const std::exception& e) {
-                            std::cerr << "Error processing coalesced write: " << e.what() << std::endl;
+                            tsdb::http_log.error("Error processing coalesced write: {}", e.what());
                         }
                     }
 
@@ -1196,7 +1259,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                 } else if (obj.contains("fields")) {
                     auto& fields = obj["fields"];
                     if (fields.is_object()) {
-                        auto& fields_obj = fields.get<glz::json_t::object_t>();
+                        auto& fields_obj = fields.get<json_value_t::object_t>();
                         for (auto& [name, value] : fields_obj) {
                             if (value.is_array()) {
                                 hasArrays = true;
@@ -1287,7 +1350,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         rep->add_header("Content-Type", "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "Error handling write request: " << e.what() << std::endl;
+        tsdb::http_log.error("Error handling write request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse(e.what());
         rep->add_header("Content-Type", "application/json");

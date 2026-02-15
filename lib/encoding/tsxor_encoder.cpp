@@ -12,7 +12,7 @@ CompressedBuffer TsxorEncoder::encode(std::vector<double> &values){
 
   int countA = 0, countB = 0, countC = 0;
 
-  for (int i = 0; i < values.size(); i++)
+  for (size_t i = 0; i < values.size(); i++)
   {   
     uint64_t val = *((uint64_t *)&values[i]);
 
@@ -46,11 +46,12 @@ CompressedBuffer TsxorEncoder::encode(std::vector<double> &values){
 
       buffer.writeFixed<0b11, 2>();
       buffer.write<5>(lzb);
+      // Note: data_bits==64 is encoded as 0 in the 6-bit field (same convention as FloatEncoderBasic)
       buffer.write<6>(data_bits);
 
       buffer.write(xor_value >> tzb, data_bits);
     }
   }
 
-  return std::move(buffer);
+  return buffer;
 }

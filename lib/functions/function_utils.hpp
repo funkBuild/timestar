@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_UTILS_H_INCLUDED__
-#define __FUNCTION_UTILS_H_INCLUDED__
+#ifndef FUNCTION_UTILS_H_INCLUDED
+#define FUNCTION_UTILS_H_INCLUDED
 
 #include <vector>
 
@@ -10,4 +10,4 @@ std::vector<double> simpleMovingAverage(const std::vector<double>& values, int w
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_UTILS_H_INCLUDED__
+#endif // FUNCTION_UTILS_H_INCLUDED

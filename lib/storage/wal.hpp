@@ -1,12 +1,11 @@
-#ifndef __WAL_H_INCLUDED__
-#define __WAL_H_INCLUDED__
+#ifndef WAL_H_INCLUDED
+#define WAL_H_INCLUDED
 
 #include "memory_store.hpp"
 #include "series_id.hpp"
 #include "slice_buffer.hpp"
 #include "tsdb_value.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -53,8 +52,21 @@ private:
 
   // Position & accounting
   uint64_t filePos = 0;
-  std::atomic<size_t> currentSize{0};
+  // No atomic needed: WAL is a per-shard object in Seastar's shard-per-core model,
+  // only accessed from a single thread.
+  size_t currentSize = 0;
 
+  // DMA alignment tracking: Seastar's file_data_sink_impl requires that every
+  // write position is aligned to disk_write_dma_alignment (typically 4096).
+  // When we call output_stream::flush(), a partial buffer is sent to the sink,
+  // which advances _pos by a non-aligned amount.  Subsequent writes then fail
+  // the alignment assertion.  We avoid this by padding the stream to alignment
+  // before every explicit flush().
+  size_t _dma_alignment = 4096;
+  size_t _unflushed_bytes = 0; // bytes written to output_stream since last flush
+
+  // Write padding zeros to align the stream position to DMA boundary before flushing
+  seastar::future<> padToAlignment();
 
   // Flush controls
   bool requiresImmediateFlush = false; // if true, flush after each write/batch
@@ -83,7 +95,8 @@ public:
   // Insert a single series write
   template <class T> seastar::future<> insert(TSDBInsert<T> &insertRequest);
 
-  // Exact on-disk size estimation for capacity/rollover decisions
+  // Lightweight upper-bound size estimation for capacity/rollover decisions
+  // (does not perform actual encoding)
   template <class T> size_t estimateInsertSize(TSDBInsert<T> &insertRequest);
 
   // Batch insert for multiple series at once (coalesces I/O)
@@ -98,7 +111,7 @@ public:
   seastar::future<> close();
   seastar::future<> finalFlush();        // ensure all data is written & durable
   seastar::future<unsigned long> size(); // physical file size
-  size_t getCurrentSize() const { return currentSize.load(); }
+  size_t getCurrentSize() const { return currentSize; }
   seastar::future<> remove(); // remove this WAL file
 
   // Configuration
@@ -106,7 +119,7 @@ public:
 
   // Utilities
   static std::string sequenceNumberToFilename(unsigned int sequenceNumber);
-  static void remove(unsigned int sequenceNumber);
+  static seastar::future<> remove(unsigned int sequenceNumber);
 };
 
 class WALReader {
@@ -123,4 +136,4 @@ public:
   seastar::future<> readAll(MemoryStore *store);
 };
 
-#endif // __WAL_H_INCLUDED__
+#endif // WAL_H_INCLUDED

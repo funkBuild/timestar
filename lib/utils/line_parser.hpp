@@ -1,5 +1,5 @@
-#ifndef __LINE_PARSER_H_INCLUDED__
-#define __LINE_PARSER_H_INCLUDED__
+#ifndef LINE_PARSER_H_INCLUDED
+#define LINE_PARSER_H_INCLUDED
 
 #include <map>
 #include <string>

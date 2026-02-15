@@ -1,5 +1,5 @@
-#ifndef __SIMPLE16_H_INCLUDED__
-#define __SIMPLE16_H_INCLUDED__
+#ifndef SIMPLE16_H_INCLUDED
+#define SIMPLE16_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
@@ -26,16 +26,16 @@ public:
     static std::vector<uint64_t> decode(Slice &encoded, unsigned int size);
 
     template<uint64_t n, uint64_t bits>
-    static bool canPack(std::vector<uint64_t> &values, int offset);
+    static bool canPack(std::vector<uint64_t> &values, size_t offset);
 
     template<uint64_t selector, uint64_t n, uint64_t bits>
-    static uint64_t pack(std::vector<uint64_t> &values, int &offset);
+    static uint64_t pack(std::vector<uint64_t> &values, size_t &offset);
 
     template<uint64_t n, uint64_t bits>
     static inline void unpack(uint64_t value, std::vector<uint64_t> &out);
     
     // Special handling for 64-bit values
-    static void packLarge(std::vector<uint64_t> &values, int &offset, AlignedBuffer &buffer);
+    static void packLarge(std::vector<uint64_t> &values, size_t &offset, AlignedBuffer &buffer);
     static void unpackLarge(Slice &encoded, std::vector<uint64_t> &out);
 };
 

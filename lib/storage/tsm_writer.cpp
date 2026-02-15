@@ -6,9 +6,15 @@
 #include "bool_encoder.hpp"
 #include "string_encoder.hpp"
 
-#include <iostream>
+#include "logger.hpp"
+#include "logging_config.hpp"
+
 #include <algorithm>
+#include <limits>
 #include <variant>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 TSMWriter::TSMWriter(std::string _filename){
   filename = _filename;
@@ -29,7 +35,7 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId
   indexEntry.seriesId = seriesId;
   indexEntry.seriesType = seriesType;
 
-  unsigned int offset = 0;
+  size_t offset = 0;
   size_t blockCount = 0;
 
   while(offset < timestamps.size()){
@@ -37,12 +43,12 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId
     size_t blockSize = end - offset;
     
     if (blockCount == 0) {
-      std::cerr << "[TSM_WRITER_BLOCK] Creating blocks for series '" << seriesId.toHex() 
-                << "' (" << timestamps.size() << " total points, up to " << MaxPointsPerBlock << " per block)" << std::endl;
+      LOG_INSERT_PATH(tsdb::tsm_log, debug, "Creating blocks for series '{}' ({} total points, up to {} per block)",
+                      seriesId.toHex(), timestamps.size(), MaxPointsPerBlock);
     }
 
     //TODO: Avoid the copy here
-    std::cerr << "[TSM_WRITER_BLOCK] Allocating vectors for block " << blockCount << " (" << blockSize << " points)" << std::endl;
+    LOG_INSERT_PATH(tsdb::tsm_log, trace, "Allocating vectors for block {} ({} points)", blockCount, blockSize);
     std::vector<uint64_t> blockTimestamps(timestamps.begin() + offset, timestamps.begin() + end);
     std::vector<T> blockValues(values.begin() + offset, values.begin() + end);
     blockCount++;
@@ -94,8 +100,8 @@ void TSMWriter::writeSeriesDirect(TSMValueType seriesType, const SeriesId128 &se
   // Assumes data is already properly sized (single block or caller handles splitting)
 
   if (timestamps.size() > MaxPointsPerBlock) {
-    std::cerr << "[TSM_WRITER_DIRECT] Warning: series has " << timestamps.size()
-              << " points (>" << MaxPointsPerBlock << "), writing as multiple blocks with fallback" << std::endl;
+    LOG_INSERT_PATH(tsdb::tsm_log, debug, "Series has {} points (>{}), writing as multiple blocks with fallback",
+                    timestamps.size(), MaxPointsPerBlock);
 
     // Fallback to copy-based approach for multi-block series
     // (Move-from vectors become lvalues, safe to pass as const&)
@@ -108,8 +114,8 @@ void TSMWriter::writeSeriesDirect(TSMValueType seriesType, const SeriesId128 &se
   indexEntry.seriesId = seriesId;
   indexEntry.seriesType = seriesType;
 
-  std::cerr << "[TSM_WRITER_DIRECT] Zero-copy write for series '" << seriesId.toHex()
-            << "' (" << timestamps.size() << " points)" << std::endl;
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Zero-copy write for series '{}' ({} points)",
+                  seriesId.toHex(), timestamps.size());
 
   writeBlockDirect(seriesType, seriesId, std::move(timestamps), std::move(values), indexEntry);
   // Phase 4A: Insert into map (keeps sorted automatically)
@@ -195,9 +201,8 @@ void TSMWriter::writeCompressedBlock(TSMValueType seriesType, const SeriesId128 
 void TSMWriter::writeIndex(){
   // std::map maintains sorted order automatically
   size_t indexStartOffset = buffer.size();
-  std::cerr << "[TSM_WRITER_INDEX] Index starts at offset: " << indexStartOffset
-            << " (0x" << std::hex << indexStartOffset << std::dec << ")" << std::endl;
-  std::cerr << "[TSM_WRITER_INDEX] Writing " << indexEntries.size() << " index entries" << std::endl;
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Index starts at offset: {} ({:#x}), writing {} index entries",
+                  indexStartOffset, indexStartOffset, indexEntries.size());
 
   // Iterate directly - already sorted by SeriesId128
   for(auto const& [seriesId, indexEntry]: indexEntries){
@@ -209,7 +214,11 @@ void TSMWriter::writeIndex(){
     buffer.write((uint8_t)indexEntry.seriesType);  // uint8_t fieldType
 
     // num of index entries
-    buffer.write((uint16_t)indexEntry.indexBlocks.size());
+    if (indexEntry.indexBlocks.size() > std::numeric_limits<uint16_t>::max()) {
+      throw std::runtime_error("Too many blocks for series in TSM file: " +
+                               std::to_string(indexEntry.indexBlocks.size()));
+    }
+    buffer.write(static_cast<uint16_t>(indexEntry.indexBlocks.size()));
 
     // for each block
     for(auto const& block: indexEntry.indexBlocks){
@@ -220,11 +229,9 @@ void TSMWriter::writeIndex(){
     }
   }
 
-  std::cerr << "[TSM_WRITER_INDEX] Buffer size before writing offset: " << buffer.size() << std::endl;
-  buffer.write(indexStartOffset);
-  std::cerr << "[TSM_WRITER_INDEX] Buffer size after writing offset: " << buffer.size() << std::endl;
-  std::cerr << "[TSM_WRITER_INDEX] Wrote index offset: " << indexStartOffset
-            << " (0x" << std::hex << indexStartOffset << std::dec << ")" << std::endl;
+  buffer.write(static_cast<uint64_t>(indexStartOffset));
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Wrote index offset: {} ({:#x}), final buffer size: {}",
+                  indexStartOffset, indexStartOffset, buffer.size());
 }
 
 // Phase 4A: Parallel index building (placeholder for future enhancement)
@@ -235,31 +242,40 @@ void TSMWriter::writeIndexParallel(){
 }
 
 void TSMWriter::close(){
-  std::cerr << "[TSM_WRITER_CLOSE] Writing file: " << filename << std::endl;
-  std::cerr << "[TSM_WRITER_CLOSE] Buffer size: " << buffer.size()
-            << " (0x" << std::hex << buffer.size() << std::dec << ")" << std::endl;
-  std::cerr << "[TSM_WRITER_CLOSE] Buffer capacity: " << buffer.capacity() << std::endl;
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Writing file: {}, buffer size: {} ({:#x}), capacity: {}",
+                  filename, buffer.size(), buffer.size(), buffer.capacity());
 
   std::ofstream file(filename, std::ios::binary);
   file << buffer;
   file.flush();
+  file.close();
 
-  std::cerr << "[TSM_WRITER_CLOSE] File written successfully" << std::endl;
+  // Ensure data is durable on disk
+  int fd = ::open(filename.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    ::fsync(fd);
+    ::close(fd);
+  }
+
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "File written successfully: {}", filename);
 }
 
 void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename){
-  std::cerr << "[TSM_WRITER] Starting TSM write to file: " << filename << std::endl;
-  std::cerr << "[TSM_WRITER] Memory store has " << store.get()->series.size() << " series" << std::endl;
+  LOG_INSERT_PATH(tsdb::tsm_log, info, "Starting TSM write to file: {}, memory store has {} series",
+                  filename, store.get()->series.size());
   
   TSMWriter writer(filename);
   size_t seriesProcessed = 0;
   size_t totalPoints = 0;
 
-  for (auto& [seriesKey, memStore] : store.get()->series){
+  for (auto it = store.get()->series.begin(); it != store.get()->series.end(); ++it){
+    const auto& seriesKey = it->first;
+    auto& memStore = it.value();
     TSMValueType seriesType = (TSMValueType) memStore.index();
     
     size_t seriesPoints = std::visit([](const auto& s) { return s.timestamps.size(); }, memStore);
-    std::cerr << "[TSM_WRITER] Processing series '" << seriesKey.toHex() << "' with " << seriesPoints << " points, type=" << static_cast<int>(seriesType) << std::endl;
+    LOG_INSERT_PATH(tsdb::tsm_log, debug, "Processing series '{}' with {} points, type={}",
+                    seriesKey.toHex(), seriesPoints, static_cast<int>(seriesType));
     
     // seriesKey is now SeriesId128
     SeriesId128 seriesId = seriesKey;
@@ -267,35 +283,35 @@ void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename
     try {
       switch(seriesType){
         case TSMValueType::Float: {
-          auto series = std::get<InMemorySeries<double>>(memStore);
-          std::cerr << "[TSM_WRITER] Sorting float series '" << seriesKey.toHex() << "'" << std::endl;
+          auto& series = std::get<InMemorySeries<double>>(memStore);
           series.sort();
-          std::cerr << "[TSM_WRITER] Writing float series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing float series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
           writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
         }
         break;
         case TSMValueType::Boolean: {
-          auto series = std::get<InMemorySeries<bool>>(memStore);
-          std::cerr << "[TSM_WRITER] Sorting bool series '" << seriesKey.toHex() << "'" << std::endl;
+          auto& series = std::get<InMemorySeries<bool>>(memStore);
           series.sort();
-          std::cerr << "[TSM_WRITER] Writing bool series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing bool series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
           writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
         }
         break;
         case TSMValueType::String: {
-          auto series = std::get<InMemorySeries<std::string>>(memStore);
-          std::cerr << "[TSM_WRITER] Sorting string series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          auto& series = std::get<InMemorySeries<std::string>>(memStore);
           series.sort();
-          std::cerr << "[TSM_WRITER] Writing string series '" << seriesKey.toHex() << "' with " << series.timestamps.size() << " points" << std::endl;
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing string series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
           writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
         }
         break;
       }
     } catch (const std::bad_alloc& e) {
-      std::cerr << "[TSM_WRITER] BAD_ALLOC when processing series '" << seriesKey.toHex() << "' with " << seriesPoints << " points" << std::endl;
+      tsdb::tsm_log.error("BAD_ALLOC when processing series '{}' with {} points", seriesKey.toHex(), seriesPoints);
       throw;
     } catch (const std::exception& e) {
-      std::cerr << "[TSM_WRITER] ERROR processing series '" << seriesKey.toHex() << "': " << e.what() << std::endl;
+      tsdb::tsm_log.error("ERROR processing series '{}': {}", seriesKey.toHex(), e.what());
       throw;
     }
     
@@ -303,11 +319,12 @@ void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename
     totalPoints += seriesPoints;
   }
 
-  std::cerr << "[TSM_WRITER] Writing index..." << std::endl;
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Writing index...");
   writer.writeIndex();
-  std::cerr << "[TSM_WRITER] Closing file..." << std::endl;
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Closing file...");
   writer.close();
-  std::cerr << "[TSM_WRITER] TSM write complete. Processed " << seriesProcessed << " series with " << totalPoints << " total points" << std::endl;
+  LOG_INSERT_PATH(tsdb::tsm_log, info, "TSM write complete. Processed {} series with {} total points",
+                  seriesProcessed, totalPoints);
 }
 
 // Template instantiations

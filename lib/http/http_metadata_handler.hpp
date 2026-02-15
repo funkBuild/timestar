@@ -1,5 +1,5 @@
-#ifndef __HTTP_METADATA_HANDLER_H_INCLUDED__
-#define __HTTP_METADATA_HANDLER_H_INCLUDED__
+#ifndef HTTP_METADATA_HANDLER_H_INCLUDED
+#define HTTP_METADATA_HANDLER_H_INCLUDED
 
 #include <seastar/http/httpd.hh>
 #include <seastar/core/future.hh>
@@ -27,10 +27,9 @@ public:
     seastar::future<std::unique_ptr<seastar::http::reply>> 
         handleFields(std::unique_ptr<seastar::http::request> req);
 
-private:
     std::string createErrorResponse(const std::string& code, const std::string& message);
     std::string formatMeasurementsResponse(const std::vector<std::string>& measurements, size_t total = 0);
-    std::string formatTagsResponse(const std::string& measurement, 
+    std::string formatTagsResponse(const std::string& measurement,
                                    const std::unordered_map<std::string, std::vector<std::string>>& tags,
                                    const std::string& specificTag = "");
     std::string formatFieldsResponse(const std::string& measurement,

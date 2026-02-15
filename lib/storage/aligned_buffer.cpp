@@ -53,10 +53,11 @@ void AlignedBuffer::write(const AlignedBuffer &value){
 
 // The data type of std::vector<bool>
 void AlignedBuffer::write(std::_Bit_reference value){
-  if (current_size >= data.size()) {
-    ensure_capacity(current_size + 1);
-  }
-  data[current_size++] = value ? 1 : 0;
+  const size_t new_size = current_size + 1;
+  ensure_capacity(new_size);
+  uint8_t byte = value ? 1 : 0;
+  std::memcpy(data.data() + current_size, &byte, 1);
+  current_size = new_size;
 };
 
 // Bulk write raw bytes
@@ -70,13 +71,16 @@ void AlignedBuffer::write_bytes(const char* bytes, size_t count) {
 }
 
 void AlignedBuffer::ensure_capacity(size_t required) {
-  if (data.size() < required) {
-    size_t new_capacity = data.capacity();
-    if (new_capacity < required) {
+  if (required > data.size()) {
+    if (required > data.capacity()) {
       // Use growth factor for better amortized performance
-      new_capacity = std::max(new_capacity * GROWTH_FACTOR, required);
+      size_t new_capacity = std::max(data.capacity() * GROWTH_FACTOR, required);
       data.reserve(new_capacity);
     }
+    // Grow the vector's logical size so the storage is accessible.
+    // resize() value-initializes new bytes; callers overwrite them via
+    // memcpy immediately after, so the zeroing is redundant work.
+    // Eliminating it would require a default-init allocator.
     data.resize(required);
   }
 }

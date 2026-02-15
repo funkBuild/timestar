@@ -5,52 +5,57 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/util/file.hh>
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <stdexcept>
 
 namespace tsdb {
 
-TSMTombstone::TSMTombstone(const std::string& path) 
+TSMTombstone::TSMTombstone(const std::string& path)
     : tombstonePath(path) {
 }
 
 // Simple CRC32 implementation for checksums
-static uint32_t crc32_table[256];
-static bool crc32_table_initialized = false;
-
-static void init_crc32_table() {
-    if (crc32_table_initialized) return;
-    
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; j++) {
-            c = (c >> 1) ^ ((c & 1) ? 0xEDB88320 : 0);
-        }
-        crc32_table[i] = c;
-    }
-    crc32_table_initialized = true;
-}
-
+// Uses function-local static for thread-safe one-time initialization
 static uint32_t calculate_crc32(const void* data, size_t len) {
-    init_crc32_table();
-    
+    static const auto table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; j++) {
+                c = (c >> 1) ^ ((c & 1) ? 0xEDB88320 : 0);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     uint32_t crc = 0xFFFFFFFF;
-    
+
     for (size_t i = 0; i < len; i++) {
-        crc = (crc >> 8) ^ crc32_table[(crc & 0xFF) ^ bytes[i]];
+        crc = (crc >> 8) ^ table[(crc & 0xFF) ^ bytes[i]];
     }
-    
+
     return ~crc;
 }
 
 uint32_t TSMTombstone::calculateChecksum(const TombstoneEntry& entry) const {
-    // Calculate checksum of the entry data (excluding checksum field)
-    return calculate_crc32(&entry, TombstoneEntry::SIZE - sizeof(uint32_t));
+    // Serialize fields to a flat buffer to avoid undefined padding bytes
+    uint8_t buf[24]; // seriesId(8) + startTime(8) + endTime(8)
+    std::memcpy(buf, &entry.seriesId, 8);
+    std::memcpy(buf + 8, &entry.startTime, 8);
+    std::memcpy(buf + 16, &entry.endTime, 8);
+    return calculate_crc32(buf, 24);
 }
 
 uint32_t TSMTombstone::calculateHeaderChecksum(const TombstoneHeader& header) const {
-    // Calculate checksum of header (excluding checksum field)
-    return calculate_crc32(&header, TombstoneHeader::SIZE - sizeof(uint32_t));
+    // Serialize fields to a flat buffer to avoid undefined padding bytes
+    uint8_t buf[12]; // magic(4) + version(4) + entryCount(4)
+    std::memcpy(buf, &header.magic, 4);
+    std::memcpy(buf + 4, &header.version, 4);
+    std::memcpy(buf + 8, &header.entryCount, 4);
+    return calculate_crc32(buf, 12);
 }
 
 uint64_t TSMTombstone::calculateFileChecksum() const {
@@ -68,15 +73,19 @@ uint64_t TSMTombstone::calculateFileChecksum() const {
 
 void TSMTombstone::rebuildIndex() {
     seriesRanges.clear();
-    
+
     for (const auto& entry : entries) {
         seriesRanges[entry.seriesId].push_back({entry.startTime, entry.endTime});
     }
-    
+
     // Sort ranges for each series for efficient binary search
     for (auto& [seriesId, ranges] : seriesRanges) {
         std::sort(ranges.begin(), ranges.end());
     }
+
+    // Note: We do NOT merge ranges in the index itself, because isDeleted()
+    // and hasDeletedRange() work correctly with sorted unmerged ranges via
+    // binary search. Merging is done on-the-fly in getTombstoneRanges().
 }
 
 void TSMTombstone::sortAndMergeEntries() {
@@ -171,7 +180,7 @@ seastar::future<> TSMTombstone::load() {
         
         if (fileSize != expectedSize) {
             co_await close();
-            throw std::runtime_error("Tombstone file size mismatch");
+            throw std::runtime_error("Tombstone file corrupt: file size mismatch");
         }
         
         // Read entries
@@ -279,8 +288,7 @@ seastar::future<> TSMTombstone::flush() {
         
     } catch (const std::exception& e) {
         // Can't use co_await in catch block
-        throw std::runtime_error("Failed to flush tombstone file: " + 
-                                std::string(e.what()));
+        std::throw_with_nested(std::runtime_error("Failed to flush tombstone file"));
     }
 }
 
@@ -337,9 +345,11 @@ seastar::future<bool> TSMTombstone::addTombstone(
     // Add to entries
     entries.push_back(entry);
     
-    // Update index
-    seriesRanges[seriesId].push_back({startTime, endTime});
-    
+    // Update index and maintain sorted order
+    auto& ranges = seriesRanges[seriesId];
+    ranges.push_back({startTime, endTime});
+    std::sort(ranges.begin(), ranges.end());
+
     isDirty = true;
     co_return true;
 }
@@ -390,13 +400,33 @@ bool TSMTombstone::hasDeletedRange(uint64_t seriesId,
     return false;
 }
 
-std::vector<std::pair<uint64_t, uint64_t>> 
+std::vector<std::pair<uint64_t, uint64_t>>
 TSMTombstone::getTombstoneRanges(uint64_t seriesId) const {
     auto it = seriesRanges.find(seriesId);
     if (it == seriesRanges.end()) {
         return {};
     }
-    return it->second;
+
+    // Return merged ranges (overlapping and adjacent ranges combined)
+    const auto& ranges = it->second;
+    if (ranges.size() <= 1) {
+        return ranges;
+    }
+
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    merged.push_back(ranges[0]);
+
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        auto& back = merged.back();
+        if (ranges[i].first <= back.second + 1) {
+            // Overlapping or adjacent, merge
+            back.second = std::max(back.second, ranges[i].second);
+        } else {
+            merged.push_back(ranges[i]);
+        }
+    }
+
+    return merged;
 }
 
 std::set<uint64_t> TSMTombstone::getTombstonedSeries() const {

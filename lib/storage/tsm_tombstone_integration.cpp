@@ -1,4 +1,6 @@
 #include "tsm.hpp"
+#include "logger.hpp"
+#include "logging_config.hpp"
 #include <filesystem>
 #include <functional>
 
@@ -18,25 +20,24 @@ std::string TSM::getTombstonePath() const {
 seastar::future<> TSM::loadTombstones() {
     try {
         std::string tombstonePath = getTombstonePath();
-        std::cerr << "[TOMBSTONE_LOAD] Loading tombstones from: " << tombstonePath 
-                  << " for TSM: " << filePath << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Loading tombstones from: {} for TSM: {}",
+                        tombstonePath, filePath);
         
         tombstones = std::make_unique<tsdb::TSMTombstone>(tombstonePath);
         
         // Check if tombstone file exists
         bool exists = co_await tombstones->exists();
-        std::cerr << "[TOMBSTONE_LOAD] Tombstone file exists: " << exists << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Tombstone file exists: {}", exists);
         
         if (exists) {
             co_await tombstones->load();
-            std::cerr << "[TOMBSTONE_LOAD] Successfully loaded tombstones from: " << tombstonePath << std::endl;
+            LOG_INSERT_PATH(tsdb::tsm_log, debug, "Successfully loaded tombstones from: {}", tombstonePath);
         } else {
-            std::cerr << "[TOMBSTONE_LOAD] No tombstone file found for: " << filePath << std::endl;
+            LOG_INSERT_PATH(tsdb::tsm_log, trace, "No tombstone file found for: {}", filePath);
         }
     } catch (const std::exception& e) {
         // Log warning but don't fail - TSM can work without tombstones
-        std::cerr << "[TOMBSTONE_LOAD] Warning: Failed to load tombstones for " << filePath 
-                  << ": " << e.what() << std::endl;
+        tsdb::tsm_log.warn("Failed to load tombstones for {}: {}", filePath, e.what());
         tombstones.reset();  // Clear tombstone manager on error
     }
     co_return;
@@ -108,8 +109,8 @@ seastar::future<bool> TSM::deleteRange(
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry) {
         // Series doesn't exist in this TSM file - no tombstone needed
-        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex()
-                  << "' not found in TSM " << filePath << " - skipping tombstone" << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Series '{}' not found in TSM {} - skipping tombstone",
+                        seriesId.toHex(), filePath);
         co_return false;
     }
 
@@ -124,15 +125,14 @@ seastar::future<bool> TSM::deleteRange(
 
     if (!hasOverlap) {
         // No data in the requested time range - no tombstone needed
-        std::cerr << "[TSM_DELETE] Series '" << seriesId.toHex()
-                  << "' has no data in range [" << startTime << ", " << endTime
-                  << "] in TSM " << filePath << " - skipping tombstone" << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Series '{}' has no data in range [{}, {}] in TSM {} - skipping tombstone",
+                        seriesId.toHex(), startTime, endTime, filePath);
         co_return false;
     }
     
     // Series exists and has data in the time range - add tombstone
-    std::cerr << "[TSM_DELETE] Adding tombstone for series '" << seriesId.toHex() 
-              << "' in TSM " << filePath << std::endl;
+    LOG_INSERT_PATH(tsdb::tsm_log, debug, "Adding tombstone for series '{}' in TSM {}",
+                    seriesId.toHex(), filePath);
     
     // Initialize tombstones if not already done
     if (!tombstones) {
@@ -146,8 +146,8 @@ seastar::future<bool> TSM::deleteRange(
     if (added) {
         // Persist tombstone immediately for durability
         co_await tombstones->flush();
-        std::cerr << "[TSM_DELETE] Tombstone persisted for series '" << seriesId.toHex() 
-                  << "' in TSM " << filePath << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, debug, "Tombstone persisted for series '{}' in TSM {}",
+                        seriesId.toHex(), filePath);
     }
     
     co_return added;
@@ -165,32 +165,33 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     co_await readSeriesBatched<T>(seriesId, startTime, endTime, result);
     
     if (!tombstones) {
-        std::cerr << "[TOMBSTONE_DEBUG] No tombstones loaded for TSM file " << filePath 
-                  << ", returning unfiltered data" << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "No tombstones loaded for TSM file {}, returning unfiltered data", filePath);
     }
     
     // Apply tombstone filtering if tombstones exist
     if (tombstones && !result.empty()) {
         uint64_t seriesIdHash = getSeriesIdHash(seriesId);
         
-        std::cerr << "[TOMBSTONE_DEBUG] TSM " << filePath << " has tombstones, filtering series: " << seriesId.toHex() 
-                  << " (Hash: " << seriesIdHash << ")" << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "TSM {} has tombstones, filtering series: {} (Hash: {})",
+                        filePath, seriesId.toHex(), seriesIdHash);
         
         // Get all data from blocks
         auto [allTimestamps, allValues] = result.getAllData();
         
-        std::cerr << "[TOMBSTONE_DEBUG] Data before filtering: " << allTimestamps.size() << " points" << std::endl;
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Data before filtering: {} points", allTimestamps.size());
         
         if (!allTimestamps.empty()) {
             // Filter out tombstoned data
             auto [filteredTimestamps, filteredValues] = 
                 tombstones->filterTombstoned(seriesIdHash, allTimestamps, allValues);
             
-            std::cerr << "[TOMBSTONE_DEBUG] Data after filtering: " << filteredTimestamps.size() << " points" << std::endl;
+            LOG_INSERT_PATH(tsdb::tsm_log, trace, "Data after filtering: {} points", filteredTimestamps.size());
             
-            // Rebuild result with filtered data
+            // Always clear original blocks when tombstone filtering is applied
+            result.blocks.clear();
+
+            // Rebuild result with filtered data if any remains
             if (!filteredTimestamps.empty()) {
-                result.blocks.clear();
                 auto block = std::make_unique<TSMBlock<T>>(filteredTimestamps.size());
                 block->timestamps = std::make_unique<std::vector<uint64_t>>(std::move(filteredTimestamps));
                 block->values = std::make_unique<std::vector<T>>(std::move(filteredValues));

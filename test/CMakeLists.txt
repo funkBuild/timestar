@@ -14,52 +14,16 @@ file(GLOB_RECURSE UNIT_ENCODING_TESTS unit/encoding/*.cpp)
 file(GLOB_RECURSE UNIT_QUERY_TESTS unit/query/*.cpp)
 file(GLOB_RECURSE UNIT_INDEX_TESTS unit/index/*.cpp)
 file(GLOB_RECURSE UNIT_HTTP_TESTS unit/http/*.cpp)
+file(GLOB_RECURSE UNIT_CORE_TESTS unit/core/*.cpp)
 file(GLOB_RECURSE INTEGRATION_TESTS integration/*.cpp)
 file(GLOB_RECURSE E2E_TESTS e2e/*.cpp)
 file(GLOB_RECURSE PERFORMANCE_TESTS performance/*.cpp)
 
-# Identify tests that require Seastar coroutines (these need special handling)
-set(SEASTAR_TESTS
-    unit/storage/tsm_compactor_test.cpp
-    unit/storage/tsm_tombstone_test.cpp
-    unit/storage/tsm_string_test.cpp
-    unit/storage/wal_deletion_test.cpp
-    unit/index/leveldb_index_enhanced_test.cpp
-    unit/index/leveldb_index_gtest.cpp
-    unit/index/leveldb_index_minimal_test.cpp
-    unit/index/metadata_index_gtest_seastar.cpp
-    integration/test_direct_write.cpp
-    integration/simple_coroutine_test.cpp
-    integration/write_path_integration_test.cpp
-    integration/write_path_integration_gtest.cpp
-    integration/wal_tsm_rollover_test.cpp
-    integration/test_wal_rollover.cpp
-    integration/comprehensive_query_test.cpp
-    e2e/flexible_delete_test.cpp
-    e2e/delete_e2e_test.cpp
-    performance/write_performance_test.cpp
-    performance/benchmark_test.cpp
-    performance/wal_batch_performance_test.cpp
-)
-
 # Identify standalone test executables with their own main() functions
-# These are built separately in subdirectories and should NOT be included in the main test executables
+# These are built separately and should NOT be included in the main test executables
 set(STANDALONE_TESTS
-    unit/storage/memory_store_async_test_runner.cpp
-    unit/storage/tsm_async_test_runner.cpp
-    unit/storage/wal_async_test_runner.cpp
-    unit/index/leveldb_async_test_runner.cpp
     unit/query/query_parser_detailed_test.cpp
 )
-
-# Remove Seastar tests from the main test lists
-foreach(SEASTAR_TEST ${SEASTAR_TESTS})
-    list(REMOVE_ITEM UNIT_STORAGE_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
-    list(REMOVE_ITEM UNIT_INDEX_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
-    list(REMOVE_ITEM INTEGRATION_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
-    list(REMOVE_ITEM E2E_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
-    list(REMOVE_ITEM PERFORMANCE_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/${SEASTAR_TEST})
-endforeach()
 
 # Remove standalone tests with their own main() from the main test lists
 foreach(STANDALONE_TEST ${STANDALONE_TESTS})
@@ -78,6 +42,7 @@ set(TEST_SRCS
     ${UNIT_QUERY_TESTS}
     ${UNIT_INDEX_TESTS}
     ${UNIT_HTTP_TESTS}
+    ${UNIT_CORE_TESTS}
     ${INTEGRATION_TESTS}
     ${E2E_TESTS}
     ${PERFORMANCE_TESTS}
@@ -102,6 +67,7 @@ set(UNIT_TEST_SRCS
     ${UNIT_QUERY_TESTS}
     ${UNIT_INDEX_TESTS}
     ${UNIT_HTTP_TESTS}
+    ${UNIT_CORE_TESTS}
 )
 add_executable(tsdb_unit_test ${UNIT_TEST_SRCS})
 target_link_libraries(tsdb_unit_test libtsdb gtest_main)
@@ -166,7 +132,12 @@ add_custom_target(test-perf
     COMMENT "Running performance tests"
 )
 
+# Standalone HTTP handler test (for targeted testing)
+add_executable(tsdb_http_test
+    unit/http/http_query_handler_test.cpp
+)
+target_link_libraries(tsdb_http_test libtsdb gtest_main)
+target_include_directories(tsdb_http_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Include subdirectories with standalone tests
-add_subdirectory(unit/storage)
-add_subdirectory(unit/index)
 add_subdirectory(benchmark)

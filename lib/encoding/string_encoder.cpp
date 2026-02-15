@@ -14,7 +14,7 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
     uint32_t value = 0;
     uint32_t shift = 0;
     uint8_t byte;
-    
+
     do {
         if (slice.offset >= slice.length_) {
             throw std::runtime_error("Unexpected end of data while reading varint");
@@ -22,11 +22,17 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
         byte = slice.data[slice.offset++];
         value |= (uint32_t(byte & 0x7F) << shift);
         shift += 7;
-        if (shift >= 32) {
-            throw std::runtime_error("VarInt too large");
+        if (shift > 28) {
+            // We've read the 5th byte (bits 28-34), but uint32_t only holds 32 bits,
+            // so bits 32-34 are silently truncated. If the continuation bit is still
+            // set, the varint is definitely too large for uint32_t.
+            if (byte & 0x80) {
+                throw std::runtime_error("VarInt too large");
+            }
+            break;
         }
     } while (byte & 0x80);
-    
+
     return value;
 }
 
@@ -97,27 +103,27 @@ AlignedBuffer StringEncoder::encode(const std::vector<std::string>& values) {
 }
 
 void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std::string>& out) {
-    if (encoded.data.size() < 16) {
+    if (encoded.size() < 16) {
         throw std::runtime_error("Invalid encoded string buffer: too small for header");
     }
-    
+
     // Read header
     uint32_t magic;
     std::memcpy(&magic, encoded.data.data(), 4);
     if (magic != 0x53545247) {
         throw std::runtime_error("Invalid magic number in string encoding");
     }
-    
+
     uint32_t uncompressedSize;
     std::memcpy(&uncompressedSize, encoded.data.data() + 4, 4);
-    
+
     uint32_t compressedSize;
     std::memcpy(&compressedSize, encoded.data.data() + 8, 4);
-    
+
     uint32_t storedCount;
     std::memcpy(&storedCount, encoded.data.data() + 12, 4);
-    
-    if (encoded.data.size() < 16 + compressedSize) {
+
+    if (encoded.size() < 16 + compressedSize) {
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
     

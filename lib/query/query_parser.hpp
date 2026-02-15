@@ -1,5 +1,5 @@
-#ifndef __QUERY_PARSER_H_INCLUDED__
-#define __QUERY_PARSER_H_INCLUDED__
+#ifndef QUERY_PARSER_H_INCLUDED
+#define QUERY_PARSER_H_INCLUDED
 
 #include <string>
 #include <vector>
@@ -78,4 +78,4 @@ public:
 
 } // namespace tsdb
 
-#endif // __QUERY_PARSER_H_INCLUDED__
+#endif // QUERY_PARSER_H_INCLUDED

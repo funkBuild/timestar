@@ -1,9 +1,8 @@
-#ifndef __TSM_FILE_MANAGER_H_INCLUDED__
-#define __TSM_FILE_MANAGER_H_INCLUDED__
+#ifndef TSM_FILE_MANAGER_H_INCLUDED
+#define TSM_FILE_MANAGER_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
-#include <atomic>
 #include <map>
 #include <optional>
 
@@ -23,7 +22,9 @@ private:
   static constexpr size_t FILES_PER_COMPACTION = 4;
   
   int shardId;
-  std::atomic<unsigned int> nextSequenceId = 0;
+  // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
+  // only accessed from a single thread.
+  unsigned int nextSequenceId = 0;
   std::vector<seastar::shared_ptr<TSM>> tsmFiles;
   
   // Track files by tier for compaction

@@ -1,5 +1,5 @@
-#ifndef __COMPACTION_PIPELINE_H_INCLUDED__
-#define __COMPACTION_PIPELINE_H_INCLUDED__
+#ifndef COMPACTION_PIPELINE_H_INCLUDED
+#define COMPACTION_PIPELINE_H_INCLUDED
 
 #include "tsm_compactor.hpp"
 #include <seastar/core/future.hh>
@@ -115,4 +115,4 @@ private:
     }
 };
 
-#endif // __COMPACTION_PIPELINE_H_INCLUDED__
+#endif // COMPACTION_PIPELINE_H_INCLUDED

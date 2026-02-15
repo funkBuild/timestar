@@ -278,6 +278,154 @@ TEST_F(HttpQueryHandlerTest, MergeResults) {
     shardResults[1].push_back(series2);
     
     auto merged = handler.mergeResults(shardResults);
-    
+
     EXPECT_EQ(merged.size(), 2);  // Should have both series
+}
+
+// =============================================================================
+// Request Body Size Limit Tests
+// Tests for DoS prevention via request body size validation
+// =============================================================================
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestBodyWithinLimit) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+
+    auto result = handler.validateRequest(req);
+    EXPECT_EQ(result, nullptr) << "Valid small request should pass validation";
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExceedsLimit) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    // Create a body larger than 1MB
+    req.content = std::string(HttpQueryHandler::MAX_QUERY_BODY_SIZE + 1, 'x');
+
+    auto result = handler.validateRequest(req);
+    ASSERT_NE(result, nullptr) << "Oversized request should fail validation";
+
+    // Verify it returns an error about body size
+    EXPECT_NE(result->_content.find("too large"), std::string::npos);
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExactlyAtLimit) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    // Create a body exactly at the 1MB limit
+    req.content = std::string(HttpQueryHandler::MAX_QUERY_BODY_SIZE, 'x');
+
+    auto result = handler.validateRequest(req);
+    EXPECT_EQ(result, nullptr) << "Request body exactly at limit should pass validation";
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestEmptyBody) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = "";
+
+    auto result = handler.validateRequest(req);
+    EXPECT_EQ(result, nullptr) << "Empty body should pass size validation (handled later by parser)";
+}
+
+// =============================================================================
+// Content-Type Validation Tests
+// Tests for Content-Type header validation
+// =============================================================================
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestCorrectContentType) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    req._headers["Content-Type"] = "application/json";
+
+    auto result = handler.validateRequest(req);
+    EXPECT_EQ(result, nullptr) << "application/json Content-Type should pass validation";
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestContentTypeWithCharset) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    req._headers["Content-Type"] = "application/json; charset=utf-8";
+
+    auto result = handler.validateRequest(req);
+    EXPECT_EQ(result, nullptr) << "application/json with charset should pass validation";
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestNoContentType) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    // No Content-Type header set
+
+    auto result = handler.validateRequest(req);
+    EXPECT_EQ(result, nullptr) << "Missing Content-Type should pass validation (lenient)";
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentType) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    req._headers["Content-Type"] = "text/html";
+
+    auto result = handler.validateRequest(req);
+    ASSERT_NE(result, nullptr) << "text/html Content-Type should fail validation";
+
+    // Verify it returns an error mentioning content type
+    EXPECT_NE(result->_content.find("Content-Type"), std::string::npos);
+    EXPECT_NE(result->_content.find("application/json"), std::string::npos);
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypePlainText) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    req._headers["Content-Type"] = "text/plain";
+
+    auto result = handler.validateRequest(req);
+    ASSERT_NE(result, nullptr) << "text/plain Content-Type should fail validation";
+    EXPECT_NE(result->_content.find("Content-Type"), std::string::npos);
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypeXml) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    req.content = R"json({"query":"avg:temperature()","startTime":1000,"endTime":2000})json";
+    req._headers["Content-Type"] = "application/xml";
+
+    auto result = handler.validateRequest(req);
+    ASSERT_NE(result, nullptr) << "application/xml Content-Type should fail validation";
+}
+
+TEST_F(HttpQueryHandlerTest, ValidateRequestBodySizeTakesPrecedenceOverContentType) {
+    HttpQueryHandler handler(nullptr);
+
+    seastar::http::request req;
+    // Both oversized body AND wrong content type
+    req.content = std::string(HttpQueryHandler::MAX_QUERY_BODY_SIZE + 1, 'x');
+    req._headers["Content-Type"] = "text/html";
+
+    auto result = handler.validateRequest(req);
+    ASSERT_NE(result, nullptr);
+    // Body size check comes first, so the error should be about size
+    EXPECT_NE(result->_content.find("too large"), std::string::npos);
+}
+
+// =============================================================================
+// MAX_QUERY_BODY_SIZE Constant Tests
+// =============================================================================
+
+TEST_F(HttpQueryHandlerTest, MaxQueryBodySizeIs1MB) {
+    EXPECT_EQ(HttpQueryHandler::MAX_QUERY_BODY_SIZE, 1 * 1024 * 1024);
 }

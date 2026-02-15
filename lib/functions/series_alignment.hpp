@@ -1,5 +1,5 @@
-#ifndef __SERIES_ALIGNMENT_H_INCLUDED__
-#define __SERIES_ALIGNMENT_H_INCLUDED__
+#ifndef SERIES_ALIGNMENT_H_INCLUDED
+#define SERIES_ALIGNMENT_H_INCLUDED
 
 #include "function_types.hpp"
 #include <vector>
@@ -38,4 +38,4 @@ public:
 
 } // namespace tsdb::functions
 
-#endif // __SERIES_ALIGNMENT_H_INCLUDED__
+#endif // SERIES_ALIGNMENT_H_INCLUDED

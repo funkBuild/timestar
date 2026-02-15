@@ -282,8 +282,8 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
         queryLatencies.push_back(duration.count() / 1000000.0);  // Convert to ms
         
         // Count returned points
-        if (std::holds_alternative<QueryResult<double>>(result)) {
-            const auto& doubleResult = std::get<QueryResult<double>>(result);
+        if (result.has_value() && std::holds_alternative<QueryResult<double>>(*result)) {
+            const auto& doubleResult = std::get<QueryResult<double>>(*result);
             totalPointsReturned += doubleResult.timestamps.size();
             if (doubleResult.timestamps.empty()) {
                 emptyQueries++;

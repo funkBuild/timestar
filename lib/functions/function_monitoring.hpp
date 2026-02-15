@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_MONITORING_H_INCLUDED__
-#define __FUNCTION_MONITORING_H_INCLUDED__
+#ifndef FUNCTION_MONITORING_H_INCLUDED
+#define FUNCTION_MONITORING_H_INCLUDED
 
 #include <atomic>
 #include <chrono>
@@ -324,4 +324,4 @@ public:
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_MONITORING_H_INCLUDED__
+#endif // FUNCTION_MONITORING_H_INCLUDED

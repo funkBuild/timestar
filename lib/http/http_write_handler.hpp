@@ -1,5 +1,5 @@
-#ifndef __HTTP_WRITE_HANDLER_H_INCLUDED__
-#define __HTTP_WRITE_HANDLER_H_INCLUDED__
+#ifndef HTTP_WRITE_HANDLER_H_INCLUDED
+#define HTTP_WRITE_HANDLER_H_INCLUDED
 
 #include <string>
 #include <memory>
@@ -69,10 +69,20 @@
  * }
  */
 
+// Use glz::generic_u64 for JSON parsing to preserve uint64_t timestamp precision.
+// glz::json_t (glz::generic) uses num_mode::f64, which parses all numbers as double,
+// losing precision for nanosecond timestamps (double has only 53 bits of mantissa,
+// while ns timestamps require ~61 bits). generic_u64 stores integers as uint64_t/int64_t.
+using json_value_t = glz::generic_u64;
+
 class HttpWriteHandler {
+public:
+    // Security limit to prevent DoS attacks via large request bodies
+    static constexpr size_t MAX_WRITE_BODY_SIZE = 64 * 1024 * 1024; // 64MB
+
 private:
     seastar::sharded<Engine>* engineSharded;
-    
+
     // Field value variant for flexible JSON parsing
     using FieldValue = std::variant<double, bool, std::string, int64_t>;
     
@@ -160,7 +170,7 @@ private:
     WritePoint parseWritePoint(const std::string& json);
     
     // Parse a write point that may contain arrays
-    MultiWritePoint parseMultiWritePoint(const glz::json_t& point);
+    MultiWritePoint parseMultiWritePoint(const json_value_t& point);
     
     // Process a single write point - determine type and insert
     seastar::future<> processWritePoint(const WritePoint& point);
@@ -176,7 +186,7 @@ private:
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);
     
     // Coalesce multiple individual writes into efficient array writes
-    std::vector<MultiWritePoint> coalesceWrites(const glz::json_t::array_t& writes_array);
+    std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array);
     
     // Create error response JSON
     std::string createErrorResponse(const std::string& error);
@@ -195,4 +205,4 @@ public:
     void registerRoutes(seastar::httpd::routes& r);
 };
 
-#endif // __HTTP_WRITE_HANDLER_H_INCLUDED__
+#endif // HTTP_WRITE_HANDLER_H_INCLUDED

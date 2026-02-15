@@ -1,11 +1,13 @@
-#ifndef __ALIGNED_BUFFER_H_INCLUDED__
-#define __ALIGNED_BUFFER_H_INCLUDED__
+#ifndef ALIGNED_BUFFER_H_INCLUDED
+#define ALIGNED_BUFFER_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #include "compressed_buffer.hpp"
 
@@ -54,11 +56,25 @@ public:
     current_size = new_size;
   }
 
+  // Read 8 bytes as uint64_t using memcpy to avoid strict aliasing violation
   uint64_t read64(size_t offset) const {
-    return *reinterpret_cast<const uint64_t*>(data.data() + offset);
+    if (offset + sizeof(uint64_t) > current_size) {
+      throw std::runtime_error("AlignedBuffer::read64 out of bounds: offset=" +
+                               std::to_string(offset) + " size=" +
+                               std::to_string(current_size));
+    }
+    uint64_t val;
+    std::memcpy(&val, data.data() + offset, sizeof(uint64_t));
+    return val;
   }
 
+  // Read a single byte
   uint8_t read8(size_t offset) const {
+    if (offset >= current_size) {
+      throw std::runtime_error("AlignedBuffer::read8 out of bounds: offset=" +
+                               std::to_string(offset) + " size=" +
+                               std::to_string(current_size));
+    }
     return data[offset];
   }
 

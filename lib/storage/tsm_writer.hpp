@@ -1,5 +1,5 @@
-#ifndef __TSM_WRITER_H_INCLUDED__
-#define __TSM_WRITER_H_INCLUDED__
+#ifndef TSM_WRITER_H_INCLUDED
+#define TSM_WRITER_H_INCLUDED
 
 #include "memory_store.hpp"
 #include "aligned_buffer.hpp"

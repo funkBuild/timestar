@@ -6,16 +6,17 @@
 #include <glaze/glaze.hpp>
 #include <seastar/core/smp.hh>
 #include <algorithm>
+#include <cassert>
 #include <sstream>
 #include <iomanip>
 
 // Global instance
 std::unique_ptr<MetadataIndex> globalMetadataIndex;
 
-// Glaze template specialization for SeriesMetadata
+// Glaze template specialization for MetadataSeriesInfo
 template <>
-struct glz::meta<SeriesMetadata> {
-    using T = SeriesMetadata;
+struct glz::meta<MetadataSeriesInfo> {
+    using T = MetadataSeriesInfo;
     static constexpr auto value = object(
         "seriesId", &T::seriesId,
         "measurement", &T::measurement,
@@ -39,25 +40,25 @@ struct glz::meta<FieldStats> {
     );
 };
 
-// SeriesMetadata implementation
-std::string SeriesMetadata::serialize() const {
+// MetadataSeriesInfo implementation
+std::string MetadataSeriesInfo::serialize() const {
     return glz::write_json(*this).value_or("{}");
 }
 
-SeriesMetadata SeriesMetadata::deserialize(const std::string& data) {
-    SeriesMetadata metadata;
+MetadataSeriesInfo MetadataSeriesInfo::deserialize(const std::string& data) {
+    MetadataSeriesInfo metadata;
     auto error = glz::read_json(metadata, data);
-    
+
     if (error) {
         throw std::runtime_error("Failed to parse series metadata: " + std::string(glz::format_error(error)));
     }
-    
+
     return metadata;
 }
 
-std::string SeriesMetadata::generateSeriesKey(const std::string& measurement,
-                                              const std::map<std::string, std::string>& tags,
-                                              const std::string& field) {
+std::string MetadataSeriesInfo::generateSeriesKey(const std::string& measurement,
+                                                  const std::map<std::string, std::string>& tags,
+                                                  const std::string& field) {
     std::stringstream ss;
     ss << measurement;
     
@@ -92,9 +93,13 @@ MetadataIndex::MetadataIndex(const std::string& path) : dbPath(path) {
 }
 
 MetadataIndex::~MetadataIndex() {
+    // DB must be destroyed before filter policy and block cache since LevelDB
+    // may reference them during shutdown.
     if (db) {
         delete db.release();
     }
+    filterPolicy_.reset();
+    blockCache_.reset();
 }
 
 seastar::future<> MetadataIndex::init() {
@@ -103,8 +108,11 @@ seastar::future<> MetadataIndex::init() {
     options.compression = leveldb::kSnappyCompression;
     options.write_buffer_size = 4 * 1024 * 1024; // 4MB
     options.max_open_files = 100;
-    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
-    options.block_cache = leveldb::NewLRUCache(8 * 1024 * 1024); // 8MB cache
+    // Bloom filter and block cache owned by unique_ptrs for RAII cleanup
+    filterPolicy_.reset(leveldb::NewBloomFilterPolicy(10));
+    blockCache_.reset(leveldb::NewLRUCache(8 * 1024 * 1024)); // 8MB cache
+    options.filter_policy = filterPolicy_.get();
+    options.block_cache = blockCache_.get();
     
     leveldb::DB* dbPtr;
     leveldb::Status status = leveldb::DB::Open(options, dbPath, &dbPtr);
@@ -130,11 +138,17 @@ seastar::future<> MetadataIndex::init() {
 seastar::future<> MetadataIndex::close() {
     if (db) {
         // Save next series ID
-        db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", std::to_string(nextSeriesId.load()));
-        
+        auto putStatus = db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", std::to_string(nextSeriesId.load()));
+        if (!putStatus.ok()) {
+            tsdb::metadata_log.warn("Failed to persist nextSeriesId during close: {}", putStatus.ToString());
+        }
+
         delete db.release();
         tsdb::metadata_log.info("Metadata index closed");
     }
+    // Free the bloom filter policy and block cache after the DB is closed
+    filterPolicy_.reset();
+    blockCache_.reset();
     co_return;
 }
 
@@ -197,24 +211,35 @@ std::string MetadataIndex::seriesLookupKey(const std::string& seriesKey) {
 }
 
 std::vector<std::string> MetadataIndex::generateTagSubsets(const std::map<std::string, std::string>& tags) {
+    static constexpr size_t MAX_TAGS_FOR_SUBSETS = 10;
+
     std::vector<std::string> subsets;
-    
-    // Generate all non-empty subsets
-    size_t n = tags.size();
-    for (size_t mask = 1; mask < (1 << n); mask++) {
+
+    // Cap the number of tags used for subset generation to avoid O(2^n) explosion.
+    // For 20 tags this would be 1M+ subsets; with the cap at 10 it is at most 1023.
+    size_t n = std::min(tags.size(), MAX_TAGS_FOR_SUBSETS);
+
+    if (tags.size() > MAX_TAGS_FOR_SUBSETS) {
+        tsdb::metadata_log.warn("Tag count {} exceeds MAX_TAGS_FOR_SUBSETS ({}); "
+                                "only first {} tags used for composite index subsets",
+                                tags.size(), MAX_TAGS_FOR_SUBSETS, MAX_TAGS_FOR_SUBSETS);
+    }
+
+    for (size_t mask = 1; mask < (static_cast<size_t>(1) << n); mask++) {
         std::map<std::string, std::string> subset;
         size_t idx = 0;
-        
+
         for (const auto& [k, v] : tags) {
-            if (mask & (1 << idx)) {
+            if (idx >= n) break;
+            if (mask & (static_cast<size_t>(1) << idx)) {
                 subset[k] = v;
             }
             idx++;
         }
-        
+
         subsets.push_back(buildSortedTagString(subset));
     }
-    
+
     return subsets;
 }
 
@@ -222,7 +247,7 @@ seastar::future<uint64_t> MetadataIndex::getOrCreateSeriesId(const std::string& 
                                                              const std::map<std::string, std::string>& tags,
                                                              const std::string& field) {
     // Generate series key
-    std::string sKey = SeriesMetadata::generateSeriesKey(measurement, tags, field);
+    std::string sKey = MetadataSeriesInfo::generateSeriesKey(measurement, tags, field);
     std::string lookupKey = seriesLookupKey(sKey);
     
     // Check if series already exists
@@ -239,7 +264,7 @@ seastar::future<uint64_t> MetadataIndex::getOrCreateSeriesId(const std::string& 
     uint64_t seriesId = nextSeriesId.fetch_add(1);
     
     // Create metadata
-    SeriesMetadata metadata;
+    MetadataSeriesInfo metadata;
     metadata.seriesId = seriesId;
     metadata.measurement = measurement;
     metadata.tags = tags;
@@ -311,8 +336,13 @@ seastar::future<std::vector<uint64_t>> MetadataIndex::findSeriesByMeasurement(co
             seriesIds.push_back(seriesId);
         }
     }
+    if (!it->status().ok()) {
+        std::string err = it->status().ToString();
+        delete it;
+        throw std::runtime_error("Iterator error in findSeriesByMeasurement: " + err);
+    }
     delete it;
-    
+
     tsdb::metadata_log.debug("Found {} series for measurement {}", seriesIds.size(), measurement);
     co_return seriesIds;
 }
@@ -333,8 +363,13 @@ seastar::future<std::vector<uint64_t>> MetadataIndex::findSeriesByTag(const std:
             seriesIds.push_back(seriesId);
         }
     }
+    if (!it->status().ok()) {
+        std::string err = it->status().ToString();
+        delete it;
+        throw std::runtime_error("Iterator error in findSeriesByTag: " + err);
+    }
     delete it;
-    
+
     co_return seriesIds;
 }
 
@@ -354,21 +389,28 @@ seastar::future<std::vector<uint64_t>> MetadataIndex::findSeriesByTags(const std
             seriesIds.push_back(seriesId);
         }
     }
+    if (!it->status().ok()) {
+        std::string err = it->status().ToString();
+        delete it;
+        throw std::runtime_error("Iterator error in findSeriesByTags: " + err);
+    }
     delete it;
-    
+
     co_return seriesIds;
 }
 
-seastar::future<std::optional<SeriesMetadata>> MetadataIndex::getSeriesMetadata(uint64_t seriesId) {
+seastar::future<std::optional<MetadataSeriesInfo>> MetadataIndex::getSeriesMetadata(uint64_t seriesId) {
     std::string key = seriesKey(seriesId);
     std::string value;
-    
+
     leveldb::Status status = db->Get(leveldb::ReadOptions(), key, &value);
     if (status.ok()) {
-        co_return SeriesMetadata::deserialize(value);
+        co_return MetadataSeriesInfo::deserialize(value);
+    } else if (status.IsNotFound()) {
+        co_return std::nullopt;
+    } else {
+        throw std::runtime_error("Failed to get series metadata: " + status.ToString());
     }
-    
-    co_return std::nullopt;
 }
 
 std::string MetadataIndex::getStats() const {
@@ -377,8 +419,9 @@ std::string MetadataIndex::getStats() const {
     return stats;
 }
 
-// Global initialization
+// Global initialization -- must be called from shard 0 only.
 seastar::future<> initGlobalMetadataIndex(const std::string& basePath) {
+    assert(seastar::this_shard_id() == 0 && "initGlobalMetadataIndex must be called from shard 0");
     globalMetadataIndex = std::make_unique<MetadataIndex>(basePath + "/metadata");
     co_await globalMetadataIndex->init();
 }
@@ -400,8 +443,13 @@ seastar::future<std::set<std::string>> MetadataIndex::getMeasurementFields(const
             }
         }
     }
+    if (!it->status().ok()) {
+        std::string err = it->status().ToString();
+        delete it;
+        throw std::runtime_error("Iterator error in getMeasurementFields: " + err);
+    }
     delete it;
-    
+
     tsdb::metadata_log.debug("Found {} fields for measurement {}", fields.size(), measurement);
     co_return fields;
 }
@@ -423,8 +471,13 @@ seastar::future<std::set<std::string>> MetadataIndex::getMeasurementTagKeys(cons
             }
         }
     }
+    if (!it->status().ok()) {
+        std::string err = it->status().ToString();
+        delete it;
+        throw std::runtime_error("Iterator error in getMeasurementTagKeys: " + err);
+    }
     delete it;
-    
+
     tsdb::metadata_log.debug("Found {} tag keys for measurement {}", tagKeys.size(), measurement);
     co_return tagKeys;
 }
@@ -444,8 +497,13 @@ seastar::future<std::set<std::string>> MetadataIndex::getTagValues(const std::st
             tagValues.insert(tagValue);
         }
     }
+    if (!it->status().ok()) {
+        std::string err = it->status().ToString();
+        delete it;
+        throw std::runtime_error("Iterator error in getTagValues: " + err);
+    }
     delete it;
-    
+
     tsdb::metadata_log.debug("Found {} values for tag {}:{}", tagValues.size(), measurement, tagKey);
     co_return tagValues;
 }
@@ -476,22 +534,27 @@ MetadataIndex::getSeriesGroupedByTag(const std::string& measurement, const std::
         // Parse key: g:measurement:tagKey:tagValue:seriesId
         size_t valueStart = prefix.length();
         size_t lastColon = key.rfind(':');
-        
+
         if (lastColon != std::string::npos && lastColon > valueStart) {
             std::string tagValue = key.substr(valueStart, lastColon - valueStart);
             std::string idStr = key.substr(lastColon + 1);
             uint64_t seriesId = std::stoull(idStr);
-            
+
             grouped[tagValue].push_back(seriesId);
         }
     }
+    if (!it->status().ok()) {
+        std::string err = it->status().ToString();
+        delete it;
+        throw std::runtime_error("Iterator error in getSeriesGroupedByTag: " + err);
+    }
     delete it;
-    
+
     tsdb::metadata_log.debug("Found {} groups for {}:{}", grouped.size(), measurement, tagKey);
     co_return grouped;
 }
 
-seastar::future<> MetadataIndex::updateSeriesMetadata(const SeriesMetadata& metadata) {
+seastar::future<> MetadataIndex::updateSeriesMetadata(const MetadataSeriesInfo& metadata) {
     std::string key = seriesKey(metadata.seriesId);
     std::string value = metadata.serialize();
     
@@ -530,10 +593,16 @@ seastar::future<> MetadataIndex::deleteSeries(uint64_t seriesId) {
         batch.Delete("fstats:" + metadata->measurement + ":" + field + ":" + std::to_string(seriesId));
     }
     
-    // Delete series lookup
-    std::string sKey = SeriesMetadata::generateSeriesKey(metadata->measurement, metadata->tags, 
-                                                         metadata->fields.empty() ? "" : metadata->fields[0]);
-    batch.Delete(seriesLookupKey(sKey));
+    // Delete series lookup keys for ALL fields (each field has its own lookup entry)
+    for (const auto& field : metadata->fields) {
+        std::string sKey = MetadataSeriesInfo::generateSeriesKey(metadata->measurement, metadata->tags, field);
+        batch.Delete(seriesLookupKey(sKey));
+    }
+    // Also handle the edge case where fields list is empty
+    if (metadata->fields.empty()) {
+        std::string sKey = MetadataSeriesInfo::generateSeriesKey(metadata->measurement, metadata->tags, "");
+        batch.Delete(seriesLookupKey(sKey));
+    }
     
     leveldb::Status status = db->Write(leveldb::WriteOptions(), &batch);
     if (!status.ok()) {
@@ -544,7 +613,9 @@ seastar::future<> MetadataIndex::deleteSeries(uint64_t seriesId) {
     co_return;
 }
 
+// Shutdown -- must be called from shard 0 only.
 seastar::future<> shutdownGlobalMetadataIndex() {
+    assert(seastar::this_shard_id() == 0 && "shutdownGlobalMetadataIndex must be called from shard 0");
     if (globalMetadataIndex) {
         co_await globalMetadataIndex->close();
         globalMetadataIndex.reset();

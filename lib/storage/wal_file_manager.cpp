@@ -318,8 +318,18 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
   tsdb::wal_log.info("New memory store {} created for shard {}",
                      store->sequenceNumber, shardId);
 
-  // Send the closed store to the background task to write it to a TSM (level 0)
-  co_await pendingWrites.writer.write(std::move(previousStore));
+  // Synchronously convert the closed store to TSM (inline, no background task needed).
+  // This eliminates race conditions from the old pipe-based background writer.
+  if (!previousStore->isEmpty()) {
+    co_await convertWalToTsm(previousStore);
+  } else {
+    // Empty store — just remove the WAL file
+    co_await previousStore->removeWAL();
+    auto it = std::find(memoryStores.begin(), memoryStores.end(), previousStore);
+    if (it != memoryStores.end()) {
+      memoryStores.erase(it);
+    }
+  }
 
   tsdb::wal_log.info(
       "Rollover complete, new memory store {} created for shard {}",

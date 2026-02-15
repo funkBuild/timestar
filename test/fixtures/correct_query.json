@@ -1,0 +1,6 @@
+{
+  "query": "avg:server.metrics(cpu_usage,memory_usage){host:host-01}",
+  "startTime": 1728111388206000000,
+  "endTime": 1759647388206000000,
+  "aggregationInterval": "12h"
+}

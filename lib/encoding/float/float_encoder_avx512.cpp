@@ -1,4 +1,5 @@
 #include "float_encoder_avx512.hpp"
+#include <bit>
 #include <cpuid.h>
 #include <cstring>
 #include <iostream>
@@ -45,7 +46,7 @@ CompressedBuffer FloatEncoderAVX512::encode(const std::vector<double>& values) {
     size_t estimated_bits = values.size() * 66;
     buffer.reserve((estimated_bits + 63) / 64 + 16);
 
-    uint64_t last_value = *((uint64_t*)&values[0]);
+    uint64_t last_value = std::bit_cast<uint64_t>(values[0]);
     int data_bits = 0;
     int prev_lzb = -1;
     int prev_tzb = -1;
@@ -156,7 +157,7 @@ CompressedBuffer FloatEncoderAVX512::encode(const std::vector<double>& values) {
 
     // Handle remaining values with regular encoding
     for (; i < values.size(); i++) {
-        const uint64_t current_value = *((uint64_t*)&values[i]);
+        const uint64_t current_value = std::bit_cast<uint64_t>(values[i]);
         const uint64_t xor_value = current_value ^ last_value;
 
         if (xor_value == 0) {

@@ -1,5 +1,5 @@
-#ifndef __VECTORIZED_SERIES_H_INCLUDED__
-#define __VECTORIZED_SERIES_H_INCLUDED__
+#ifndef VECTORIZED_SERIES_H_INCLUDED
+#define VECTORIZED_SERIES_H_INCLUDED
 
 #include "function_types.hpp"
 #include <vector>
@@ -60,4 +60,4 @@ public:
 
 } // namespace tsdb::functions
 
-#endif // __VECTORIZED_SERIES_H_INCLUDED__
+#endif // VECTORIZED_SERIES_H_INCLUDED

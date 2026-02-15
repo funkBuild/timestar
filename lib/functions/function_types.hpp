@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_TYPES_H_INCLUDED__
-#define __FUNCTION_TYPES_H_INCLUDED__
+#ifndef FUNCTION_TYPES_H_INCLUDED
+#define FUNCTION_TYPES_H_INCLUDED
 
 #include <vector>
 #include <string>
@@ -489,4 +489,4 @@ public:
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_TYPES_H_INCLUDED__
+#endif // FUNCTION_TYPES_H_INCLUDED

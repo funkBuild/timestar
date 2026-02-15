@@ -1,5 +1,5 @@
-#ifndef __FLOAT_ENCODER_AVX512_H_INCLUDED__
-#define __FLOAT_ENCODER_AVX512_H_INCLUDED__
+#ifndef FLOAT_ENCODER_AVX512_H_INCLUDED
+#define FLOAT_ENCODER_AVX512_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
@@ -28,4 +28,4 @@ public:
     static CompressedBuffer encodeSafe(const std::vector<double>& values);
 };
 
-#endif // __FLOAT_ENCODER_AVX512_H_INCLUDED__
+#endif // FLOAT_ENCODER_AVX512_H_INCLUDED

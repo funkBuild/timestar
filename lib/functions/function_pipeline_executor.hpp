@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED__
-#define __FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED__
+#ifndef FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED
+#define FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -28,4 +28,4 @@ public:
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED__
+#endif // FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED

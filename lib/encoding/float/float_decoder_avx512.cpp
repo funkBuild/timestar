@@ -1,5 +1,6 @@
 #include "float_decoder_avx512.hpp"
 #include "float_encoder.hpp"
+#include <bit>
 #include <cpuid.h>
 #include <cstring>
 
@@ -51,24 +52,17 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
     out.resize(required_capacity);
     double* output_ptr = out.data() + current_size;
 
-    // OPTIMIZATION 2: Aggressive prefetching with AVX-512 capabilities
-    const uint64_t* data_ptr = encoded.data;
-    __builtin_prefetch(data_ptr, 0, 3);       // L1 cache
-    __builtin_prefetch(data_ptr + 8, 0, 2);   // L2 cache
-    __builtin_prefetch(data_ptr + 16, 0, 1);  // L3 cache
-    __builtin_prefetch(data_ptr + 24, 0, 0);  // AVX-512 can handle even more
-
     uint64_t last_value = encoded.readFixed<uint64_t, 64>();
     uint64_t tzb = 0;
     uint64_t data_bits = 0;
-    unsigned int count = 0;
+    size_t count = 0;
 
     // Save original nToSkip for totalLength calculation
     const size_t originalSkip = nToSkip;
 
     // Handle first value
     if (nToSkip == 0) {
-        *output_ptr++ = reinterpret_cast<double&>(last_value);
+        *output_ptr++ = std::bit_cast<double>(last_value);
     } else {
         nToSkip--;  // Account for first value if skipping
     }
@@ -79,16 +73,10 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
 
     // OPTIMIZATION 3: Process with AVX-512-optimized loop structure
     // Process in groups of 8 when possible (AVX-512 can handle 8 doubles)
-    const size_t main_loop_end = totalLength - ((totalLength - 1) % 8);
+    // Guard against underflow when totalLength <= 1 (totalLength - 1 would wrap for size_t)
+    const size_t main_loop_end = (totalLength <= 1) ? 0 : totalLength - ((totalLength - 1) % 8);
 
     while (++count < main_loop_end) {
-        // Prefetch next cache lines very aggressively
-        if ((count & 0x1F) == 0 && count < totalLength - 32) {
-            __builtin_prefetch(data_ptr + (count >> 2), 0, 3);
-            __builtin_prefetch(data_ptr + (count >> 2) + 8, 0, 2);
-            __builtin_prefetch(data_ptr + (count >> 2) + 16, 0, 1);
-        }
-
         if (encoded.readBit()) {
             if (encoded.readBit()) {
                 // 0b11 prefix - new bounds
@@ -116,7 +104,7 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
         if (nToSkip > 0) {
             nToSkip--;
         } else {
-            *output_ptr++ = reinterpret_cast<double&>(last_value);
+            *output_ptr++ = std::bit_cast<double>(last_value);
         }
     }
 
@@ -148,7 +136,7 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
         if (nToSkip > 0) {
             nToSkip--;
         } else {
-            *output_ptr++ = reinterpret_cast<double&>(last_value);
+            *output_ptr++ = std::bit_cast<double>(last_value);
         }
     }
 }

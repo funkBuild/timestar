@@ -1,5 +1,5 @@
-#ifndef __INTEGER_ENCODER_BASE_H_INCLUDED__
-#define __INTEGER_ENCODER_BASE_H_INCLUDED__
+#ifndef INTEGER_ENCODER_BASE_H_INCLUDED
+#define INTEGER_ENCODER_BASE_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
@@ -23,4 +23,4 @@ public:
     static bool isAvailable() { return true; } // Always available
 };
 
-#endif // __INTEGER_ENCODER_BASE_H_INCLUDED__
+#endif // INTEGER_ENCODER_BASE_H_INCLUDED

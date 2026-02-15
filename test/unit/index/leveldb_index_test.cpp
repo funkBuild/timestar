@@ -4,7 +4,6 @@
 #include "../../../lib/index/leveldb_index.hpp"
 #include "../../../lib/core/tsdb_value.hpp"
 
-#include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 
 class LevelDBIndexTest : public ::testing::Test {
@@ -13,7 +12,7 @@ protected:
         // Clean up any existing test index
         std::filesystem::remove_all("shard_0");
     }
-    
+
     void TearDown() override {
         // Clean up test index
         std::filesystem::remove_all("shard_0");
@@ -22,14 +21,14 @@ protected:
 
 seastar::future<> runIndexTest() {
     LevelDBIndex index(0); // Use shard 0 for testing
-    
+
     co_await index.open();
-    
+
     // Test 1: Create a series and get ID
     TSDBInsert<double> tempInsert("weather", "temperature");
     tempInsert.addTag("location", "us-midwest");
     tempInsert.addTag("host", "server-01");
-    
+
     SeriesId128 seriesId1 = co_await index.indexInsert(tempInsert);
 
     // Test 2: Same series should return same ID
@@ -43,140 +42,109 @@ seastar::future<> runIndexTest() {
 
     SeriesId128 seriesId3 = co_await index.indexInsert(humidityInsert);
     EXPECT_NE(seriesId1, seriesId3);
-    
+
     // Test 4: Check measurement fields
     auto fields = co_await index.getFields("weather");
     EXPECT_EQ(fields.size(), 2);
     EXPECT_TRUE(fields.count("temperature") > 0);
     EXPECT_TRUE(fields.count("humidity") > 0);
-    
+
     // Test 5: Check measurement tags
     auto tags = co_await index.getTags("weather");
     EXPECT_EQ(tags.size(), 2);
     EXPECT_TRUE(tags.count("location") > 0);
     EXPECT_TRUE(tags.count("host") > 0);
-    
+
     // Test 6: Check tag values
     auto locationValues = co_await index.getTagValues("weather", "location");
     EXPECT_EQ(locationValues.size(), 1);
     EXPECT_TRUE(locationValues.count("us-midwest") > 0);
-    
+
     // Test 7: Add another location
     TSDBInsert<double> tempInsert2("weather", "temperature");
     tempInsert2.addTag("location", "us-west");
     tempInsert2.addTag("host", "server-02");
-    
+
     co_await index.indexInsert(tempInsert2);
-    
+
     locationValues = co_await index.getTagValues("weather", "location");
     EXPECT_EQ(locationValues.size(), 2);
     EXPECT_TRUE(locationValues.count("us-midwest") > 0);
     EXPECT_TRUE(locationValues.count("us-west") > 0);
-    
+
     co_await index.close();
-    
+
     std::cout << "All LevelDB index tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, BasicIndexOperations) {
-    seastar::app_template app;
-    
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return runIndexTest().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-    
-    EXPECT_EQ(exitCode, 0);
+    runIndexTest().get();
 }
 
 // Additional integration tests for series ID generation
 seastar::future<> testSeriesIdGeneration() {
     LevelDBIndex index(0); // Use shard 0 for this test
-    
+
     co_await index.open();
-    
+
     // Test 1: Multiple series with same measurement, different tags
     std::string measurement = "cpu_usage";
-    
+
     std::map<std::string, std::string> tags1 = {{"host", "server-01"}, {"cpu", "cpu0"}};
     std::map<std::string, std::string> tags2 = {{"host", "server-01"}, {"cpu", "cpu1"}};
     std::map<std::string, std::string> tags3 = {{"host", "server-02"}, {"cpu", "cpu0"}};
-    
+
     SeriesId128 id1 = co_await index.getOrCreateSeriesId(measurement, tags1, "idle");
     SeriesId128 id2 = co_await index.getOrCreateSeriesId(measurement, tags2, "idle");
     SeriesId128 id3 = co_await index.getOrCreateSeriesId(measurement, tags3, "idle");
-    
+
     // All should have different IDs
     EXPECT_NE(id1, id2);
     EXPECT_NE(id1, id3);
     EXPECT_NE(id2, id3);
-    
+
     // Test 2: Same measurement and tags, different fields
     SeriesId128 id4 = co_await index.getOrCreateSeriesId(measurement, tags1, "system");
     SeriesId128 id5 = co_await index.getOrCreateSeriesId(measurement, tags1, "user");
-    
+
     // Different fields should get different IDs
     EXPECT_NE(id1, id4);
     EXPECT_NE(id1, id5);
     EXPECT_NE(id4, id5);
-    
+
     // Test 3: Verify series count
     size_t count = co_await index.getSeriesCount();
     EXPECT_EQ(count, 5);
-    
+
     co_await index.close();
-    
+
     // Test 4: Persistence - reopen and verify IDs are consistent
     LevelDBIndex index2(0);
     co_await index2.open();
-    
+
     SeriesId128 id1_check = co_await index2.getOrCreateSeriesId(measurement, tags1, "idle");
     EXPECT_EQ(id1, id1_check);
-    
+
     SeriesId128 id4_check = co_await index2.getOrCreateSeriesId(measurement, tags1, "system");
     EXPECT_EQ(id4, id4_check);
-    
+
     co_await index2.close();
-    
+
     std::cout << "Series ID generation tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, SeriesIdGeneration) {
-    std::filesystem::remove_all("shard_0");
-    
-    seastar::app_template app;
-    
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testSeriesIdGeneration().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-    
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testSeriesIdGeneration().get();
 }
 
 // Test metadata indexing
 seastar::future<> testMetadataIndexing() {
     LevelDBIndex index(0); // Use shard 0 for this test
-    
+
     co_await index.open();
-    
+
     // Create multiple series with various combinations
-    co_await index.getOrCreateSeriesId("temperature", 
+    co_await index.getOrCreateSeriesId("temperature",
         {{"location", "us-west"}, {"sensor", "temp-01"}}, "value");
     co_await index.getOrCreateSeriesId("temperature",
         {{"location", "us-west"}, {"sensor", "temp-02"}}, "value");
@@ -184,73 +152,56 @@ seastar::future<> testMetadataIndexing() {
         {{"location", "us-east"}, {"sensor", "temp-01"}}, "value");
     co_await index.getOrCreateSeriesId("temperature",
         {{"location", "us-east"}, {"sensor", "temp-01"}}, "humidity");
-    
+
     co_await index.getOrCreateSeriesId("pressure",
         {{"location", "us-west"}, {"sensor", "press-01"}}, "value");
     co_await index.getOrCreateSeriesId("pressure",
         {{"location", "us-central"}}, "value");
-    
+
     // Test field indexing
     auto tempFields = co_await index.getFields("temperature");
     EXPECT_EQ(tempFields.size(), 2);
     EXPECT_TRUE(tempFields.count("value") > 0);
     EXPECT_TRUE(tempFields.count("humidity") > 0);
-    
+
     auto pressureFields = co_await index.getFields("pressure");
     EXPECT_EQ(pressureFields.size(), 1);
     EXPECT_TRUE(pressureFields.count("value") > 0);
-    
+
     // Test tag indexing
     auto tempTags = co_await index.getTags("temperature");
     EXPECT_EQ(tempTags.size(), 2);
     EXPECT_TRUE(tempTags.count("location") > 0);
     EXPECT_TRUE(tempTags.count("sensor") > 0);
-    
+
     auto pressureTags = co_await index.getTags("pressure");
     EXPECT_EQ(pressureTags.size(), 2);
     EXPECT_TRUE(pressureTags.count("location") > 0);
     EXPECT_TRUE(pressureTags.count("sensor") > 0);
-    
+
     // Test tag value indexing
     auto tempLocations = co_await index.getTagValues("temperature", "location");
     EXPECT_EQ(tempLocations.size(), 2);
     EXPECT_TRUE(tempLocations.count("us-west") > 0);
     EXPECT_TRUE(tempLocations.count("us-east") > 0);
-    
+
     auto tempSensors = co_await index.getTagValues("temperature", "sensor");
     EXPECT_EQ(tempSensors.size(), 2);
     EXPECT_TRUE(tempSensors.count("temp-01") > 0);
     EXPECT_TRUE(tempSensors.count("temp-02") > 0);
-    
+
     auto pressureLocations = co_await index.getTagValues("pressure", "location");
     EXPECT_EQ(pressureLocations.size(), 2);
     EXPECT_TRUE(pressureLocations.count("us-west") > 0);
     EXPECT_TRUE(pressureLocations.count("us-central") > 0);
-    
+
     co_await index.close();
-    
+
     std::cout << "Metadata indexing tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, MetadataIndexing) {
-    std::filesystem::remove_all("shard_0");
-
-    seastar::app_template app;
-
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testMetadataIndexing().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testMetadataIndexing().get();
 }
 
 // Test series discovery methods
@@ -298,24 +249,7 @@ seastar::future<> testFindSeries() {
 }
 
 TEST_F(LevelDBIndexTest, FindSeries) {
-    std::filesystem::remove_all("shard_0");
-
-    seastar::app_template app;
-
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testFindSeries().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testFindSeries().get();
 }
 
 // Test optimized single-tag lookup
@@ -355,24 +289,7 @@ seastar::future<> testFindSeriesByTag() {
 }
 
 TEST_F(LevelDBIndexTest, FindSeriesByTag) {
-    std::filesystem::remove_all("shard_0");
-
-    seastar::app_template app;
-
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testFindSeriesByTag().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testFindSeriesByTag().get();
 }
 
 // Test grouping series by tag values
@@ -422,24 +339,7 @@ seastar::future<> testGetSeriesGroupedByTag() {
 }
 
 TEST_F(LevelDBIndexTest, GetSeriesGroupedByTag) {
-    std::filesystem::remove_all("shard_0");
-
-    seastar::app_template app;
-
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testGetSeriesGroupedByTag().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testGetSeriesGroupedByTag().get();
 }
 
 // Test field type management
@@ -477,24 +377,7 @@ seastar::future<> testFieldTypes() {
 }
 
 TEST_F(LevelDBIndexTest, FieldTypes) {
-    std::filesystem::remove_all("shard_0");
-
-    seastar::app_template app;
-
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testFieldTypes().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testFieldTypes().get();
 }
 
 // Test field statistics tracking
@@ -554,24 +437,7 @@ seastar::future<> testFieldStatistics() {
 }
 
 TEST_F(LevelDBIndexTest, FieldStatistics) {
-    std::filesystem::remove_all("shard_0");
-
-    seastar::app_template app;
-
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testFieldStatistics().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testFieldStatistics().get();
 }
 
 // Test series metadata retrieval
@@ -628,24 +494,7 @@ seastar::future<> testSeriesMetadata() {
 }
 
 TEST_F(LevelDBIndexTest, SeriesMetadata) {
-    std::filesystem::remove_all("shard_0");
-
-    seastar::app_template app;
-
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testSeriesMetadata().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
-
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+    testSeriesMetadata().get();
 }
 
 // Test getAllMeasurements
@@ -677,22 +526,66 @@ seastar::future<> testGetAllMeasurements() {
 }
 
 TEST_F(LevelDBIndexTest, GetAllMeasurements) {
-    std::filesystem::remove_all("shard_0");
+    testGetAllMeasurements().get();
+}
 
-    seastar::app_template app;
+// Test open/close lifecycle to verify filter policy RAII cleanup (no leaks)
+seastar::future<> testOpenCloseLifecycle() {
+    // Cycle 1: open, use, close
+    {
+        LevelDBIndex index(0);
+        co_await index.open();
 
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-    auto exitCode = app.run(argc, argv, [&] {
-        return testGetAllMeasurements().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "Test failed with exception" << std::endl;
-            throw;
-        });
-    });
+        auto id = co_await index.getOrCreateSeriesId("lifecycle_test",
+            {{"tag", "value1"}}, "field1");
+        EXPECT_TRUE(id.toHex().size() > 0);
 
-    std::filesystem::remove_all("shard_0");
-    EXPECT_EQ(exitCode, 0);
+        co_await index.close();
+    }
+
+    // Cycle 2: reopen same path, use, close
+    {
+        LevelDBIndex index(0);
+        co_await index.open();
+
+        // Previously created series should still exist
+        auto id = co_await index.getOrCreateSeriesId("lifecycle_test",
+            {{"tag", "value1"}}, "field1");
+        EXPECT_TRUE(id.toHex().size() > 0);
+
+        auto fields = co_await index.getFields("lifecycle_test");
+        EXPECT_EQ(fields.size(), 1);
+
+        co_await index.close();
+    }
+
+    // Cycle 3: open and let destructor handle cleanup (no explicit close)
+    {
+        LevelDBIndex index(0);
+        co_await index.open();
+
+        co_await index.getOrCreateSeriesId("lifecycle_test",
+            {{"tag", "value2"}}, "field2");
+
+        // Destructor should clean up db, filter policy, etc. without leaking
+    }
+
+    // Cycle 4: reopen after destructor-based cleanup to verify integrity
+    {
+        LevelDBIndex index(0);
+        co_await index.open();
+
+        auto fields = co_await index.getFields("lifecycle_test");
+        EXPECT_EQ(fields.size(), 2);
+        EXPECT_TRUE(fields.count("field1") > 0);
+        EXPECT_TRUE(fields.count("field2") > 0);
+
+        co_await index.close();
+    }
+
+    std::cout << "Open/close lifecycle tests passed!" << std::endl;
+}
+
+TEST_F(LevelDBIndexTest, OpenCloseLifecycle) {
+    testOpenCloseLifecycle().get();
 }

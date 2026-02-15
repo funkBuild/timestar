@@ -1,5 +1,5 @@
-#ifndef __MEMORY_STORE_H_INCLUDED__
-#define __MEMORY_STORE_H_INCLUDED__
+#ifndef MEMORY_STORE_H_INCLUDED
+#define MEMORY_STORE_H_INCLUDED
 
 #include <memory>
 #include <seastar/core/coroutine.hh>
@@ -36,7 +36,7 @@ private:
 
 public:
   // 16MB threshold for actual WAL file size on disk (uncompressed)
-  static constexpr size_t WAL_SIZE_THRESHOLD = 64 * 1024 * 1024; // 16MB
+  static constexpr size_t WAL_SIZE_THRESHOLD = 16 * 1024 * 1024; // 16MB
   const unsigned int sequenceNumber;
   // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
   tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
@@ -68,22 +68,24 @@ public:
   std::optional<TSMValueType> getSeriesType(const SeriesId128 &seriesId);
   WAL *getWAL() { return wal.get(); }
 
-  // Query method to get data for a series
+  // Query method to get data for a series.
+  // Returns a const pointer to avoid copying the entire series data.
+  // Returns nullptr if the series is not found or has a different type.
   template <class T>
-  std::optional<InMemorySeries<T>> querySeries(const SeriesId128 &seriesId) {
+  const InMemorySeries<T>* querySeries(const SeriesId128 &seriesId) const {
     auto it = series.find(seriesId);
     if (it != series.end()) {
       return std::visit(
-          [](auto &&arg) -> std::optional<InMemorySeries<T>> {
+          [](const auto &arg) -> const InMemorySeries<T>* {
             using SeriesType = std::decay_t<decltype(arg)>;
             if constexpr (std::is_same_v<SeriesType, InMemorySeries<T>>) {
-              return arg;
+              return &arg;
             }
-            return std::nullopt;
+            return nullptr;
           },
           it->second);
     }
-    return std::nullopt;
+    return nullptr;
   }
 
   // Delete data in a time range for a series

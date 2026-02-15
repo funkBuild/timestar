@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_REGISTRY_H_INCLUDED__
-#define __FUNCTION_REGISTRY_H_INCLUDED__
+#ifndef FUNCTION_REGISTRY_H_INCLUDED
+#define FUNCTION_REGISTRY_H_INCLUDED
 
 #include "function_types.hpp"
 #include <string>
@@ -49,4 +49,4 @@ public:
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_REGISTRY_H_INCLUDED__
+#endif // FUNCTION_REGISTRY_H_INCLUDED

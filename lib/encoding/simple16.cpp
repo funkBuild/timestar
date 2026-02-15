@@ -4,17 +4,23 @@
 #include <stdexcept>
 
 AlignedBuffer Simple16::encode(std::vector<uint64_t> &values){
-    int offset = 0;
+    size_t offset = 0;
     AlignedBuffer buffer;
 
     while(offset < values.size()){
         // Try each packing scheme from most values to least
+        // Schemes with more values for the same bit width are tried first
+        // Scheme 13: 30 values of 2 bits (strictly better than scheme 0's 28x2bit)
+        if(canPack<30, 2>(values, offset)) {
+            uint64_t val = pack<13, 30, 2>(values, offset);
+            buffer.write(val);
+        }
         // Scheme 0: 28 values of 2 bits each
-        if(canPack<28, 2>(values, offset)) {
+        else if(canPack<28, 2>(values, offset)) {
             uint64_t val = pack<0, 28, 2>(values, offset);
             buffer.write(val);
         }
-        // Scheme 1: 21 values of 3 bits each (selector 1, leaves 60 bits, 21*3=63 but we only use 60)
+        // Scheme 1: 20 values of 3 bits each
         else if(canPack<20, 3>(values, offset)) {
             uint64_t val = pack<1, 20, 3>(values, offset);
             buffer.write(val);
@@ -22,6 +28,11 @@ AlignedBuffer Simple16::encode(std::vector<uint64_t> &values){
         // Scheme 2: 15 values of 4 bits each
         else if(canPack<15, 4>(values, offset)) {
             uint64_t val = pack<2, 15, 4>(values, offset);
+            buffer.write(val);
+        }
+        // Scheme 14: 14 values of 4 bits (alternative to scheme 2)
+        else if(canPack<14, 4>(values, offset)) {
+            uint64_t val = pack<14, 14, 4>(values, offset);
             buffer.write(val);
         }
         // Scheme 3: 12 values of 5 bits each
@@ -74,23 +85,13 @@ AlignedBuffer Simple16::encode(std::vector<uint64_t> &values){
             uint64_t val = pack<12, 1, 60>(values, offset);
             buffer.write(val);
         }
-        // Scheme 13: Special - 30 values of 2 bits (for very small values)
-        else if(canPack<30, 2>(values, offset)) {
-            uint64_t val = pack<13, 30, 2>(values, offset);
-            buffer.write(val);
-        }
-        // Scheme 14: Special - 14 values of 4 bits (alternative to scheme 2)
-        else if(canPack<14, 4>(values, offset)) {
-            uint64_t val = pack<14, 14, 4>(values, offset);
-            buffer.write(val);
-        }
         // Scheme 15: Store one 64-bit value uncompressed (using two words)
         else {
             packLarge(values, offset, buffer);
         }
     }
 
-    return std::move(buffer);
+    return buffer;
 }
 
 std::vector<uint64_t> Simple16::decode(Slice &encoded, unsigned int size){
@@ -158,14 +159,14 @@ std::vector<uint64_t> Simple16::decode(Slice &encoded, unsigned int size){
 }
 
 template<uint64_t n, uint64_t bits>
-bool Simple16::canPack(std::vector<uint64_t> &values, int offset){
-    int remaining = values.size() - offset;
+bool Simple16::canPack(std::vector<uint64_t> &values, size_t offset){
+    size_t remaining = values.size() - offset;
     if(remaining < n)
         return false;
 
     uint64_t max = (1ull << bits) - 1;
 
-    for(int i = offset; i < (offset+n); i++){
+    for(size_t i = offset; i < (offset+n); i++){
         if(values[i] > max)
             return false;
     }
@@ -174,11 +175,12 @@ bool Simple16::canPack(std::vector<uint64_t> &values, int offset){
 }
 
 template<uint64_t selector, uint64_t n, uint64_t bits>
-uint64_t Simple16::pack(std::vector<uint64_t> &values, int &offset){
+uint64_t Simple16::pack(std::vector<uint64_t> &values, size_t &offset){
     uint64_t out = selector << 60;
+    constexpr uint64_t mask = (bits == 0) ? 0ULL : ((1ULL << bits) - 1);
 
     for(unsigned int i = 0; i < n; i++){
-        out |= values[offset + i] << (i*bits);
+        out |= (values[offset + i] & mask) << (i*bits);
     }
 
     offset += n;
@@ -198,7 +200,7 @@ void Simple16::unpack(uint64_t value, std::vector<uint64_t> &out){
 }
 
 // Special handling for 64-bit values
-void Simple16::packLarge(std::vector<uint64_t> &values, int &offset, AlignedBuffer &buffer) {
+void Simple16::packLarge(std::vector<uint64_t> &values, size_t &offset, AlignedBuffer &buffer) {
     // Selector 15 indicates a full 64-bit value follows
     // For simplicity, we use two words:
     // First word: selector 15 (in top 4 bits) + zeros in remaining 60 bits

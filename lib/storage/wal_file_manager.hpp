@@ -1,5 +1,5 @@
-#ifndef __WAL_FILE_MANAGER_H_INCLUDED__
-#define __WAL_FILE_MANAGER_H_INCLUDED__
+#ifndef WAL_FILE_MANAGER_H_INCLUDED
+#define WAL_FILE_MANAGER_H_INCLUDED
 
 #include <atomic>
 #include <cstdint>
@@ -39,13 +39,9 @@ public:
     tsdb::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
 
     try {
-      // Send null value to signal background TSM writer to stop
-      tsdb::wal_log.info("[WAL_CLOSE] Signaling background TSM writer to stop on shard {}", shardId);
-      co_await pendingWrites.writer.write(seastar::shared_ptr<MemoryStore>{});
-      
       // Ensure current memory store is properly flushed
       if (!memoryStores.empty() && memoryStores[0]) {
-        tsdb::wal_log.info("[WAL_CLOSE] Closing current memory store {} on shard {}", 
+        tsdb::wal_log.info("[WAL_CLOSE] Closing current memory store {} on shard {}",
                            memoryStores[0]->sequenceNumber, shardId);
         co_await memoryStores[0]->close();
       }
@@ -58,17 +54,18 @@ public:
   std::optional<TSMValueType> getSeriesType(std::string &seriesKey);
   
   // Query memory stores for data (deletion filtering removed - WAL replay handles current state)
+  // Returns a const pointer to the in-memory series, or nullptr if not found.
   template <class T>
-  std::optional<InMemorySeries<T>> queryMemoryStores(const std::string& seriesKey) {
+  const InMemorySeries<T>* queryMemoryStores(const std::string& seriesKey) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     for (auto& memStore : memoryStores) {
       // Direct query - no filtering needed since WAL replay maintains correct state
       auto result = memStore->querySeries<T>(seriesId);
-      if (result.has_value()) {
+      if (result != nullptr) {
         return result;
       }
     }
-    return std::nullopt;
+    return nullptr;
   }
   
   

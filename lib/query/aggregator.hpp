@@ -1,5 +1,5 @@
-#ifndef __AGGREGATOR_H_INCLUDED__
-#define __AGGREGATOR_H_INCLUDED__
+#ifndef AGGREGATOR_H_INCLUDED
+#define AGGREGATOR_H_INCLUDED
 
 #include "query_parser.hpp"
 #include <vector>
@@ -42,7 +42,7 @@ struct AggregationState {
         sum += other.sum;
         min = std::min(min, other.min);
         max = std::max(max, other.max);
-        if (other.latestTimestamp > latestTimestamp) {
+        if (other.latestTimestamp >= latestTimestamp) {
             latest = other.latest;
             latestTimestamp = other.latestTimestamp;
         }
@@ -55,9 +55,9 @@ struct AggregationState {
             case AggregationMethod::AVG:
                 return count > 0 ? sum / count : 0.0;
             case AggregationMethod::MIN:
-                return min;
+                return count > 0 ? min : std::numeric_limits<double>::quiet_NaN();
             case AggregationMethod::MAX:
-                return max;
+                return count > 0 ? max : std::numeric_limits<double>::quiet_NaN();
             case AggregationMethod::SUM:
                 return sum;
             case AggregationMethod::LATEST:
@@ -105,19 +105,33 @@ struct PartialAggregationResult {
     // Cached group key hash (computed once, reused multiple times)
     size_t groupKeyHash = 0;
 
-    // Compute hash-based group key (faster than string concatenation)
-    void computeGroupKeyHash() {
-        std::hash<std::string> hasher;
-        groupKeyHash = hasher(measurement);
+    // Composite group key string (guaranteed unique, used as map key)
+    std::string groupKey;
 
+    // Compute composite group key and its hash
+    void computeGroupKey() {
+        // Build a unique composite key: measurement + sorted tag k=v pairs + fieldName
+        // separated by '\0' delimiter to guarantee uniqueness
+        groupKey.clear();
+        groupKey += measurement;
         // Tags are already sorted in std::map, iterate in order
         for (const auto& [k, v] : tags) {
-            // Boost hash_combine pattern
-            groupKeyHash ^= hasher(k) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
-            groupKeyHash ^= hasher(v) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+            groupKey += '\0';
+            groupKey += k;
+            groupKey += '=';
+            groupKey += v;
         }
+        groupKey += '\0';
+        groupKey += fieldName;
 
-        groupKeyHash ^= hasher(fieldName) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+        // Also compute hash for any other uses
+        std::hash<std::string> hasher;
+        groupKeyHash = hasher(groupKey);
+    }
+
+    // Legacy: compute hash only (deprecated, prefer computeGroupKey)
+    void computeGroupKeyHash() {
+        computeGroupKey();
     }
 };
 
@@ -150,8 +164,25 @@ public:
     static double calculateMin(const std::vector<double>& values);
     static double calculateMax(const std::vector<double>& values);
     static double calculateSum(const std::vector<double>& values);
+
+    // ========================================================================
+    // LEGACY COMPATIBILITY
+    // ========================================================================
+    // Simple aggregation over a single series (timestamps + values).
+    // Provided for backward compatibility with integration tests.
+    static std::vector<AggregatedPoint> aggregate(
+        const std::vector<uint64_t>& timestamps,
+        const std::vector<double>& values,
+        AggregationMethod method,
+        uint64_t interval);
+
+    // Aggregate across multiple series (group-by merge).
+    static std::vector<AggregatedPoint> aggregateMultiple(
+        const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& groupData,
+        AggregationMethod method,
+        uint64_t interval);
 };
 
 } // namespace tsdb
 
-#endif // __AGGREGATOR_H_INCLUDED__
+#endif // AGGREGATOR_H_INCLUDED

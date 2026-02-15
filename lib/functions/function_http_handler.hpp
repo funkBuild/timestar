@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_HTTP_HANDLER_H_INCLUDED__
-#define __FUNCTION_HTTP_HANDLER_H_INCLUDED__
+#ifndef FUNCTION_HTTP_HANDLER_H_INCLUDED
+#define FUNCTION_HTTP_HANDLER_H_INCLUDED
 
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
@@ -145,4 +145,4 @@ private:
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_HTTP_HANDLER_H_INCLUDED__
+#endif // FUNCTION_HTTP_HANDLER_H_INCLUDED

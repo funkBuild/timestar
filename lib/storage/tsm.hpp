@@ -1,5 +1,5 @@
-#ifndef __TSM_H_INCLUDED__
-#define __TSM_H_INCLUDED__
+#ifndef TSM_H_INCLUDED
+#define TSM_H_INCLUDED
 
 #include "query_result.hpp"
 #include "tsm_result.hpp"
@@ -40,22 +40,18 @@ struct BlockBatch {
   BlockBatch() : startOffset(0), totalSize(0) {}
 };
 
-// Sparse index entry for lazy loading (28 bytes per series)
+// Sparse index entry for lazy loading
 struct SparseIndexEntry {
   SeriesId128 seriesId;    // 16 bytes - for hash map key
   uint64_t fileOffset;     // 8 bytes - where to read in file
   uint32_t entrySize;      // 4 bytes - how much to read
+  TSMValueType seriesType; // series value type (captured during sparse index parse)
 };
 
 typedef struct TSMIndexEntry {
   SeriesId128 seriesId;
   TSMValueType seriesType;
   std::vector<TSMIndexBlock> indexBlocks;
-
-  bool operator < (const TSMIndexEntry& str) const
-  {
-      return (seriesId > str.seriesId);
-  }
 } TSMIndexEntry;
 
 class TSM {
@@ -79,9 +75,18 @@ private:
   std::unique_ptr<tsdb::TSMTombstone> tombstones;
 
   // Reference counting for safe deletion during compaction
-  std::atomic<int32_t> refCount{0};
-  std::atomic<bool> markedForDeletion{false};
-  
+  // Plain types are safe here: Seastar's shard-per-core model guarantees
+  // no cross-thread access to the same TSM object.
+  int32_t refCount{0};
+  bool markedForDeletion{false};
+
+  // Check if deletion should be scheduled (refCount == 0 and marked)
+  void maybeScheduleDeletion() {
+    if (markedForDeletion && refCount == 0) {
+      scheduleDeletionFlag = true;
+    }
+  }
+
   // Helper to get tombstone file path
   std::string getTombstonePath() const;
 
@@ -95,25 +100,17 @@ public:
   uint64_t rankAsInteger();
   
   // Reference counting methods for non-blocking reads during compaction
-  void addRef() { refCount.fetch_add(1, std::memory_order_relaxed); }
-  void releaseRef() { 
-    if (refCount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      if (markedForDeletion.load(std::memory_order_acquire)) {
-        // Last reference released and file is marked for deletion
-        // Note: We can't directly call async function here
-        // In production, this would trigger async deletion via executor
-        scheduleDeletionFlag = true;
-      }
-    }
+  void addRef() { ++refCount; }
+  void releaseRef() {
+    --refCount;
+    maybeScheduleDeletion();
   }
-  int32_t getRefCount() const { return refCount.load(std::memory_order_relaxed); }
-  
+  int32_t getRefCount() const { return refCount; }
+
   // Mark file for deletion after compaction
-  void markForDeletion() { 
-    markedForDeletion.store(true, std::memory_order_release);
-    if (getRefCount() == 0) {
-      scheduleDeletionFlag = true;
-    }
+  void markForDeletion() {
+    markedForDeletion = true;
+    maybeScheduleDeletion();
   }
   
   bool scheduleDeletionFlag = false;
@@ -130,7 +127,7 @@ public:
   template <class T>
   seastar::future<> readSeriesBatched(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   template <class T>
-  seastar::future<> readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
+  seastar::future<> readBlock(TSMIndexBlock indexBlock, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   template <class T>
   seastar::future<> readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
@@ -166,14 +163,16 @@ public:
 
   template <class T>
   static constexpr TSMValueType getValueType(){
-    if(std::is_same<T, double>::value){
+    if constexpr (std::is_same_v<T, double>) {
       return TSMValueType::Float;
-    } else if(std::is_same<T, bool>::value){
+    } else if constexpr (std::is_same_v<T, bool>) {
       return TSMValueType::Boolean;
-    } else if(std::is_same<T, std::string>::value){
+    } else if constexpr (std::is_same_v<T, std::string>) {
       return TSMValueType::String;
+    } else {
+      static_assert(sizeof(T) == 0, "Unsupported TSM value type");
     }
-  };
+  }
   
   // Tombstone support methods
   seastar::future<> loadTombstones();

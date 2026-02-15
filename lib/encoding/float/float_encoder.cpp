@@ -1,6 +1,7 @@
 #include "float_encoder.hpp"
 #include "../../utils/util.hpp"
 
+#include <bit>
 #include <iostream>
 #include <cassert>
 #include <cmath>
@@ -12,7 +13,7 @@ CompressedBuffer FloatEncoderBasic::encode(const std::vector<double> &values){
         return buffer;
     }
 
-    uint64_t last_value = *((uint64_t*)&values[0]);
+    uint64_t last_value = std::bit_cast<uint64_t>(values[0]);
     int data_bits = 0;
     int prev_lzb = -1;
     int prev_tzb = -1;
@@ -21,7 +22,7 @@ CompressedBuffer FloatEncoderBasic::encode(const std::vector<double> &values){
 
 
     for(size_t i = 1; i < values.size(); i++){
-        const uint64_t current_value = *((uint64_t*)&values[i]);
+        const uint64_t current_value = std::bit_cast<uint64_t>(values[i]);
         const uint64_t xor_value = current_value ^ last_value;
 
 
@@ -55,7 +56,7 @@ CompressedBuffer FloatEncoderBasic::encode(const std::vector<double> &values){
     }
 
 
-    return std::move(buffer);
+    return buffer;
 };
 
 
@@ -77,32 +78,23 @@ void FloatEncoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
     out.resize(required_capacity);
     double* output_ptr = out.data() + current_size;
 
-    // OPTIMIZATION 2: Prefetch compressed data for better cache utilization
-    const uint64_t* data_ptr = values.data;
-    __builtin_prefetch(data_ptr, 0, 3);      // L1 cache
-    __builtin_prefetch(data_ptr + 8, 0, 2);  // L2 cache
-
     uint64_t last_value = values.readFixed<uint64_t, 64>();
     uint64_t tzb = 0;
     uint64_t data_bits = 0;
-    unsigned int count = 0;
+    size_t count = 0;
+
+    const size_t originalSkip = nToSkip;
 
     // Handle first value
     if (nToSkip == 0) {
-        *output_ptr++ = reinterpret_cast<double&>(last_value);
+        *output_ptr++ = std::bit_cast<double>(last_value);
     } else {
-        nToSkip--;  // Account for the first value if skipping
+        nToSkip--;
     }
 
-    const size_t totalLength = nToSkip + length;
+    const size_t totalLength = originalSkip + length;
 
-    // OPTIMIZATION 3: Process with better branch prediction
     while(++count < totalLength){
-        // Prefetch next cache line periodically
-        if ((count & 0x7) == 0 && count < totalLength - 8) {
-            __builtin_prefetch(data_ptr + (count >> 2), 0, 3);
-        }
-
         if(values.readBit()){
             if(values.readBit()){
                 // 0b11 prefix - new bounds
@@ -128,11 +120,10 @@ void FloatEncoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
         }
         // else: 0b0 prefix - value unchanged
 
-        // OPTIMIZATION 4: Direct memory write instead of push_back
         if(nToSkip > 0){
             nToSkip--;
         } else {
-            *output_ptr++ = reinterpret_cast<double&>(last_value);
+            *output_ptr++ = std::bit_cast<double>(last_value);
         }
     }
 }

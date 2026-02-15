@@ -158,3 +158,83 @@ TEST(Simple8BDebug, TestMaxValues) {
     }
 }
 
+// Tests verifying the size_t offset fix (signed/unsigned mismatch)
+
+TEST(Simple8BOffsetFix, EmptyInputProducesEmptyOutput) {
+    std::vector<uint64_t> values;
+    AlignedBuffer encoded = Simple8B::encode(values);
+    EXPECT_EQ(encoded.size(), 0u);
+}
+
+TEST(Simple8BOffsetFix, SingleValueRoundTrip) {
+    std::vector<uint64_t> values = {42};
+    AlignedBuffer encoded = Simple8B::encode(values);
+    EXPECT_GT(encoded.size(), 0u);
+
+    Slice slice(encoded.data.data(), encoded.size());
+    auto decoded = Simple8B::decode(slice, values.size());
+    ASSERT_EQ(decoded.size(), values.size());
+    EXPECT_EQ(decoded[0], 42u);
+}
+
+TEST(Simple8BOffsetFix, LargeDatasetRoundTrip) {
+    // Encode a large number of values to exercise the offset advancing through
+    // many iterations with the size_t offset type.
+    const size_t count = 100000;
+    std::vector<uint64_t> values(count);
+    for (size_t i = 0; i < count; i++) {
+        values[i] = i % 255;
+    }
+
+    AlignedBuffer encoded = Simple8B::encode(values);
+    EXPECT_GT(encoded.size(), 0u);
+
+    Slice slice(encoded.data.data(), encoded.size());
+    auto decoded = Simple8B::decode(slice, values.size());
+    ASSERT_EQ(decoded.size(), values.size());
+    for (size_t i = 0; i < count; i++) {
+        EXPECT_EQ(decoded[i], values[i]) << "Mismatch at index " << i;
+    }
+}
+
+TEST(Simple8BOffsetFix, CanPackBoundsChecking) {
+    std::vector<uint64_t> values = {1, 2, 3};
+
+    // Offset equal to size -- should return false, not trigger UB
+    bool atEnd = Simple8B::canPack<1, 60>(values, values.size());
+    EXPECT_FALSE(atEnd);
+
+    // Offset beyond size -- should return false
+    bool beyondEnd = Simple8B::canPack<1, 60>(values, values.size() + 100);
+    EXPECT_FALSE(beyondEnd);
+
+    // Valid offset
+    bool valid = Simple8B::canPack<1, 60>(values, 0);
+    EXPECT_TRUE(valid);
+}
+
+TEST(Simple8BOffsetFix, MixedBitWidthValues) {
+    // Values requiring different selectors to exercise all pack/canPack paths
+    // with the size_t offset type.
+    std::vector<uint64_t> values;
+
+    // Small values (1-bit range)
+    for (int i = 0; i < 60; i++) values.push_back(1);
+    // Medium values (8-bit range)
+    for (int i = 0; i < 7; i++) values.push_back(200);
+    // Larger values (20-bit range)
+    for (int i = 0; i < 3; i++) values.push_back(500000);
+    // Max 60-bit value
+    values.push_back((1ULL << 60) - 1);
+
+    AlignedBuffer encoded = Simple8B::encode(values);
+    EXPECT_GT(encoded.size(), 0u);
+
+    Slice slice(encoded.data.data(), encoded.size());
+    auto decoded = Simple8B::decode(slice, values.size());
+    ASSERT_EQ(decoded.size(), values.size());
+    for (size_t i = 0; i < values.size(); i++) {
+        EXPECT_EQ(decoded[i], values[i]) << "Mismatch at index " << i;
+    }
+}
+

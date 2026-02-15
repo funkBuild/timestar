@@ -1,5 +1,5 @@
-#ifndef __TSXOR_ENCODER_H_INCLUDED__
-#define __TSXOR_ENCODER_H_INCLUDED__
+#ifndef TSXOR_ENCODER_H_INCLUDED
+#define TSXOR_ENCODER_H_INCLUDED
 
 #include <vector>
 #include <cstdint>

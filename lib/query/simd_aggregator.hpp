@@ -1,5 +1,5 @@
-#ifndef __SIMD_AGGREGATOR_H_INCLUDED__
-#define __SIMD_AGGREGATOR_H_INCLUDED__
+#ifndef SIMD_AGGREGATOR_H_INCLUDED
+#define SIMD_AGGREGATOR_H_INCLUDED
 
 #include <immintrin.h>  // For AVX2 intrinsics
 #include <vector>
@@ -77,4 +77,4 @@ namespace scalar {
 } // namespace simd
 } // namespace tsdb
 
-#endif // __SIMD_AGGREGATOR_H_INCLUDED__
+#endif // SIMD_AGGREGATOR_H_INCLUDED

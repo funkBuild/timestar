@@ -1,5 +1,5 @@
-#ifndef __HTTP_DELETE_HANDLER_H_INCLUDED__
-#define __HTTP_DELETE_HANDLER_H_INCLUDED__
+#ifndef HTTP_DELETE_HANDLER_H_INCLUDED
+#define HTTP_DELETE_HANDLER_H_INCLUDED
 
 #include <string>
 #include <memory>
@@ -74,7 +74,8 @@ struct GlazeDeleteRequest;
 class HttpDeleteHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
-    
+
+public:
     struct DeleteRequest {
         std::string seriesKey;
         std::string measurement;
@@ -86,18 +87,17 @@ private:
         bool isStructured;  // true if using measurement/tags/field format
         bool isPattern;     // true if using pattern-based deletion
     };
-    
+
     DeleteRequest parseDeleteRequest(const GlazeDeleteRequest& glazeReq);
     std::string createErrorResponse(const std::string& error);
     std::string createSuccessResponse(int deletedCount, int totalRequests);
-    
-public:
-    HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded) 
+
+    HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded)
         : engineSharded(_engineSharded) {}
-    
+
     seastar::future<std::unique_ptr<seastar::http::reply>>
     handleDelete(std::unique_ptr<seastar::http::request> req);
-    
+
     void registerRoutes(seastar::httpd::routes& r);
 };
 

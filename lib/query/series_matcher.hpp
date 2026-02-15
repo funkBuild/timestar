@@ -1,5 +1,5 @@
-#ifndef __SERIES_MATCHER_H_INCLUDED__
-#define __SERIES_MATCHER_H_INCLUDED__
+#ifndef SERIES_MATCHER_H_INCLUDED
+#define SERIES_MATCHER_H_INCLUDED
 
 #include <string>
 #include <map>
@@ -36,4 +36,4 @@ private:
 
 } // namespace tsdb
 
-#endif // __SERIES_MATCHER_H_INCLUDED__
+#endif // SERIES_MATCHER_H_INCLUDED

@@ -1,5 +1,5 @@
-#ifndef __STRING_ENCODER_H_INCLUDED__
-#define __STRING_ENCODER_H_INCLUDED__
+#ifndef STRING_ENCODER_H_INCLUDED
+#define STRING_ENCODER_H_INCLUDED
 
 #include <vector>
 #include <string>
@@ -32,4 +32,4 @@ public:
     static void decode(Slice& encoded, size_t count, std::vector<std::string>& out);
 };
 
-#endif // __STRING_ENCODER_H_INCLUDED__
+#endif // STRING_ENCODER_H_INCLUDED

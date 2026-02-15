@@ -69,8 +69,8 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    // OPTIMIZATION: Use hash-based keys instead of string concatenation
-    std::unordered_map<size_t, PartialAggregationResult> partialResults;
+    // Use composite string key to avoid hash collisions
+    std::unordered_map<std::string, PartialAggregationResult> partialResults;
 
     for (const auto& series : seriesResults) {
         for (const auto& [fieldName, fieldData] : series.fields) {
@@ -95,24 +95,27 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                 }
             }
 
-            // Compute hash-based group key
-            std::hash<std::string> hasher;
-            size_t groupKeyHash = hasher(series.measurement);
-
-            // OPTIMIZATION: Tags are already sorted, no need to re-sort
+            // Build composite group key: measurement + sorted tag k=v pairs + fieldName
+            // separated by '\0' delimiter to guarantee uniqueness (no hash collisions)
+            std::string compositeKey;
+            compositeKey += series.measurement;
             for (const auto& [k, v] : relevantTags) {
-                groupKeyHash ^= hasher(k) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
-                groupKeyHash ^= hasher(v) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+                compositeKey += '\0';
+                compositeKey += k;
+                compositeKey += '=';
+                compositeKey += v;
             }
-            groupKeyHash ^= hasher(fieldName) + 0x9e3779b9 + (groupKeyHash << 6) + (groupKeyHash >> 2);
+            compositeKey += '\0';
+            compositeKey += fieldName;
 
             // Get or create partial result for this group
-            auto& partial = partialResults[groupKeyHash];
+            auto& partial = partialResults[compositeKey];
             if (partial.measurement.empty()) {
                 partial.measurement = series.measurement;
                 partial.tags = relevantTags;
                 partial.fieldName = fieldName;
-                partial.groupKeyHash = groupKeyHash;
+                partial.groupKey = compositeKey;
+                partial.groupKeyHash = std::hash<std::string>{}(compositeKey);
             }
 
             // PHASE 1 OPTIMIZATION: Two-phase aggregation - aggregate to states immediately
@@ -158,18 +161,18 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
 
     std::vector<GroupedAggregationResult> result;
 
-    // OPTIMIZATION: Group partial results by hash instead of string concatenation
-    std::unordered_map<size_t, std::vector<const PartialAggregationResult*>> groups;
+    // Group partial results by composite key string (collision-free)
+    std::unordered_map<std::string, std::vector<const PartialAggregationResult*>> groups;
 
     for (const auto& partial : partialResults) {
-        groups[partial.groupKeyHash].push_back(&partial);
+        groups[partial.groupKey].push_back(&partial);
     }
 
     // Pre-allocate result
     result.reserve(groups.size());
 
     // Merge each group and preserve metadata
-    for (const auto& [groupHash, groupPartials] : groups) {
+    for (const auto& [groupKey, groupPartials] : groups) {
         if (groupPartials.empty()) {
             continue;
         }
@@ -236,6 +239,77 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
         result.push_back(std::move(groupedResult));
     }
 
+    return result;
+}
+
+// ============================================================================
+// LEGACY COMPATIBILITY
+// ============================================================================
+
+std::vector<AggregatedPoint> Aggregator::aggregate(
+    const std::vector<uint64_t>& timestamps,
+    const std::vector<double>& values,
+    AggregationMethod method,
+    uint64_t interval) {
+
+    if (timestamps.empty() || values.empty()) {
+        return {};
+    }
+
+    if (interval > 0) {
+        // Bucketed aggregation
+        std::map<uint64_t, AggregationState> buckets;
+        for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
+            uint64_t bucketTime = (timestamps[i] / interval) * interval;
+            buckets[bucketTime].addValue(values[i], timestamps[i]);
+        }
+
+        std::vector<AggregatedPoint> result;
+        result.reserve(buckets.size());
+        for (const auto& [bucketTime, state] : buckets) {
+            result.push_back({bucketTime, state.getValue(method), state.count});
+        }
+        return result;
+    } else {
+        // No bucketing - one point per timestamp
+        std::map<uint64_t, AggregationState> states;
+        for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
+            states[timestamps[i]].addValue(values[i], timestamps[i]);
+        }
+
+        std::vector<AggregatedPoint> result;
+        result.reserve(states.size());
+        for (const auto& [ts, state] : states) {
+            result.push_back({ts, state.getValue(method), state.count});
+        }
+        return result;
+    }
+}
+
+std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
+    const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& groupData,
+    AggregationMethod method,
+    uint64_t interval) {
+
+    if (groupData.empty()) {
+        return {};
+    }
+
+    // Merge all series into one set of timestamp states
+    std::map<uint64_t, AggregationState> mergedStates;
+
+    for (const auto& [timestamps, values] : groupData) {
+        for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
+            uint64_t key = interval > 0 ? (timestamps[i] / interval) * interval : timestamps[i];
+            mergedStates[key].addValue(values[i], timestamps[i]);
+        }
+    }
+
+    std::vector<AggregatedPoint> result;
+    result.reserve(mergedStates.size());
+    for (const auto& [ts, state] : mergedStates) {
+        result.push_back({ts, state.getValue(method), state.count});
+    }
     return result;
 }
 

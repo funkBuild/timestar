@@ -1,5 +1,5 @@
-#ifndef __TSM_RESULT_H_INCLUDED__
-#define __TSM_RESULT_H_INCLUDED__
+#ifndef TSM_RESULT_H_INCLUDED
+#define TSM_RESULT_H_INCLUDED
 
 #include <vector>
 #include <stdint.h>

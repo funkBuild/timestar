@@ -52,10 +52,10 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
   QueryResult<T> result = QueryResult<T>::fromTsmResults(tsmResults);
   
   // Query memory stores - WAL replay ensures correct state without filtering
-  auto memoryData = walFileManager->queryMemoryStores<T>(series);
-  if (memoryData.has_value()) {
+  const auto* memoryData = walFileManager->queryMemoryStores<T>(series);
+  if (memoryData != nullptr) {
     // Filter by time range and add to results
-    const auto& storeData = memoryData.value();
+    const auto& storeData = *memoryData;
 
     // Pre-allocate space to avoid reallocations
     result.timestamps.reserve(result.timestamps.size() + storeData.timestamps.size());

@@ -1,5 +1,5 @@
-#ifndef __TSM_COMPACTOR_H_INCLUDED__
-#define __TSM_COMPACTOR_H_INCLUDED__
+#ifndef TSM_COMPACTOR_H_INCLUDED
+#define TSM_COMPACTOR_H_INCLUDED
 
 #include <vector>
 #include <memory>
@@ -226,6 +226,7 @@ private:
     
     TSMFileManager* fileManager;
     std::unique_ptr<CompactionStrategy> strategy;
+    CompactionStats lastCompactStats;  // Stats from the most recent compact() call
     seastar::semaphore compactionSemaphore{MAX_CONCURRENT_COMPACTIONS};
     std::atomic<bool> compactionEnabled{true};
     
@@ -406,4 +407,4 @@ public:
     }
 };
 
-#endif // __TSM_COMPACTOR_H_INCLUDED__
+#endif // TSM_COMPACTOR_H_INCLUDED

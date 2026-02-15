@@ -27,15 +27,24 @@ seastar::future<> TSMFileManager::init(){
   // Initialize compactor
   compactor = std::make_shared<TSMCompactor>(this);
   
-  // Scan the TSM folder for files if it exists
-  if (fs::exists(basePath())) {
-    for (const auto &entry : fs::directory_iterator(basePath()))
-    {
-      if (endsWith(entry.path(), ".tsm")){
-        std::string absolutePath = fs::canonical(fs::absolute(entry.path()));
-        co_await openTsmFile(absolutePath);
+  // Scan the TSM folder for files if it exists.
+  // std::filesystem calls are blocking, so run them off the reactor thread.
+  auto tsmPaths = co_await seastar::async([this] {
+    std::vector<std::string> paths;
+    auto base = basePath();
+    if (fs::exists(base)) {
+      for (const auto &entry : fs::directory_iterator(base)) {
+        if (endsWith(entry.path(), ".tsm")) {
+          paths.push_back(fs::canonical(fs::absolute(entry.path())).string());
+        }
       }
     }
+    return paths;
+  });
+
+  // Open TSM files using Seastar async I/O (must run on reactor thread)
+  for (const auto &path : tsmPaths) {
+    co_await openTsmFile(path);
   }
 }
 
@@ -54,15 +63,19 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path){
       tiers[tier].push_back(tsmFile);
     }
 
-    unsigned int tsmSeqNum = tsmFile.get()->rankAsInteger();
+    uint64_t tsmSeqNum = tsmFile.get()->rankAsInteger();
 
-    // TODO: Handle conflicting sequence number, or fail loudly
-    sequencedTsmFiles.insert({tsmSeqNum, tsmFile });
+    auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, tsmFile});
+    if (!inserted) {
+      tsdb::tsm_log.warn("Duplicate sequence number {} for TSM file: {}, existing file takes precedence",
+                          tsmSeqNum, path);
+    }
 
     if(tsmFile->seqNum >= nextSequenceId){
       nextSequenceId = tsmFile->seqNum + 1;
     }
-  } catch(const std::runtime_error&) {
+  } catch(const std::runtime_error& e) {
+    tsdb::tsm_log.error("Failed to open TSM file {}: {}", path, e.what());
     co_return;
   }
 }
@@ -72,8 +85,12 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
 
   std::string filename = "shard_" + std::to_string(shardId) + "/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
-  // TODO: Convert to coroutine using Seastar file accesses
-  TSMWriter::run(memStore, filename);
+  // TSMWriter uses blocking POSIX I/O (fopen, fwrite, fsync, fclose, rename).
+  // Wrap in seastar::async() to run on a Seastar worker thread instead of
+  // blocking the reactor thread.
+  co_await seastar::async([memStore, filename] {
+    TSMWriter::run(memStore, filename);
+  });
   co_await openTsmFile(filename);
   
   // Check if this tier needs compaction after adding the new file
@@ -131,9 +148,13 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
     tiers[tier].push_back(file);
   }
   
-  unsigned int tsmSeqNum = file->rankAsInteger();
-  sequencedTsmFiles.insert({tsmSeqNum, file});
-  
+  uint64_t tsmSeqNum = file->rankAsInteger();
+  auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, file});
+  if (!inserted) {
+    tsdb::tsm_log.warn("Duplicate sequence number {} when adding TSM file, existing file takes precedence",
+                        tsmSeqNum);
+  }
+
   if(file->seqNum >= nextSequenceId){
     nextSequenceId = file->seqNum + 1;
   }
@@ -154,7 +175,7 @@ seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shar
     }
     
     // Remove from sequenced map
-    unsigned int tsmSeqNum = file->rankAsInteger();
+    uint64_t tsmSeqNum = file->rankAsInteger();
     sequencedTsmFiles.erase(tsmSeqNum);
     
     // Mark file for deletion

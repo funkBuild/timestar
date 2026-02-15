@@ -30,32 +30,28 @@ AlignedBuffer BoolEncoder::encode(const std::vector<bool> &values){
 }
 
 void BoolEncoder::decode(Slice &encoded, size_t nToSkip, size_t length, std::vector<bool> &out){
-  //TODO: Optimize, find a better way of reading the packed bits into a vector<bool>
-  //TODO: Optimize, use encode strategy to process 64-bits at a time
-  size_t byteOffset = 0;
-  size_t numValuesLeft = nToSkip + length;
+  size_t totalBits = nToSkip + length;
+  size_t bytesNeeded = (totalBits + 7) / 8;
 
-  while(numValuesLeft-- > 0){
+  for (size_t byteIdx = 0; byteIdx < bytesNeeded; byteIdx++) {
     uint8_t byte = encoded.read<uint8_t>();
 
-    for(int i=0; i < 8; i++){
-      if(nToSkip == 0) {
+    for (int i = 0; i < 8; i++) {
+      if (nToSkip > 0) {
+        nToSkip--;
+      } else if (length > 0) {
         bool value = ((byte >> i) & 0x1) != 0;
         out.push_back(value);
-
         length--;
-        if(length == 0)
-          break;
-      } else {
-        nToSkip--;
       }
+
+      if (nToSkip == 0 && length == 0)
+        break;
     }
 
-    if(length == 0)
+    if (length == 0)
       break;
   }
-
-  return;
 }
 
 template <class T>

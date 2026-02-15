@@ -1,5 +1,5 @@
-#ifndef __QUERY_RESULT_H_INCLUDED__
-#define __QUERY_RESULT_H_INCLUDED__
+#ifndef QUERY_RESULT_H_INCLUDED
+#define QUERY_RESULT_H_INCLUDED
 
 #include <algorithm>
 #include <iostream>

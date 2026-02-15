@@ -19,6 +19,9 @@
 
 typedef std::chrono::high_resolution_clock Clock;
 
+// Block header: uint8_t type + uint32_t timestampSize + uint32_t timestampBytes
+static constexpr size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t); // 9 bytes
+
 
 
 TSM::TSM(std::string _absoluteFilePath){
@@ -69,17 +72,28 @@ seastar::future<> TSM::close() {
 }
 
 uint64_t TSM::rankAsInteger(){
+  if (tierNum >= 16) {
+    throw std::overflow_error("TSM::rankAsInteger: tierNum " + std::to_string(tierNum) +
+                              " >= 16 would overflow in (tierNum << 60)");
+  }
   return (tierNum << 60) + seqNum;
 }
 
 // Lazy loading: read sparse index + build bloom filter
 seastar::future<> TSM::readSparseIndex(){
   // Read index offset (last 8 bytes of file)
-  auto indexOffsetBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - sizeof(size_t), sizeof(size_t));
-  size_t indexOffset = *(size_t*)(indexOffsetBuf.get());
+  auto indexOffsetBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - sizeof(uint64_t), sizeof(uint64_t));
+  uint64_t indexOffset;
+  std::memcpy(&indexOffset, indexOffsetBuf.get(), sizeof(uint64_t));
+
+  // Validate indexOffset is within file bounds
+  if (indexOffset >= length - sizeof(uint64_t)) {
+    throw std::runtime_error("Corrupted TSM file: indexOffset " + std::to_string(indexOffset) +
+                             " is out of bounds (file size: " + std::to_string(length) + "): " + filePath);
+  }
 
   // Read entire index section
-  auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - sizeof(size_t));
+  auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - sizeof(uint64_t));
   Slice indexSlice(indexBuf.get(), indexBuf.size());
 
   // First pass: Parse index to collect series and build sparse index
@@ -104,11 +118,12 @@ seastar::future<> TSM::readSparseIndex(){
     // Skip over the blocks (don't parse them yet)
     indexSlice.offset += blockCount * 28;
 
-    // Store sparse entry
+    // Store sparse entry (including type for fast getSeriesType lookups)
     SparseIndexEntry sparseEntry{
       .seriesId = seriesId,
       .fileOffset = entryStartOffset,
-      .entrySize = entrySize
+      .entrySize = entrySize,
+      .seriesType = static_cast<TSMValueType>(type)
     };
     sparseIndex.insert({seriesId, sparseEntry});
 
@@ -224,14 +239,17 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
   co_await seastar::parallel_for_each(blocksToScan, [&] (TSMIndexBlock indexBlock) {
     return readBlock(indexBlock, startTime, endTime, results);
   });
+
+  // parallel_for_each does not guarantee ordering, so sort blocks by start time
+  results.sort();
 }
 
 template <class T>
-seastar::future<> TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime, TSMResult<T> &results){
+seastar::future<> TSM::readBlock(TSMIndexBlock indexBlock, uint64_t startTime, uint64_t endTime, TSMResult<T> &results){
   auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
   Slice blockSlice(blockBuf.get(), blockBuf.size());
 
-  auto headerSlice = blockSlice.getSlice(9);
+  auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
   uint8_t blockType = headerSlice.read<uint8_t>();
   uint32_t timestampSize = headerSlice.read<uint32_t>();
   uint32_t timestampBytes = headerSlice.read<uint32_t>();
@@ -239,7 +257,7 @@ seastar::future<> TSM::readBlock(const TSMIndexBlock &indexBlock, uint64_t start
   auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
   auto timestampsSlice = blockSlice.getSlice(timestampBytes);
   auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime);
-  size_t valueByteSize = indexBlock.size - timestampBytes - (sizeof(uint8_t) + 2*sizeof(uint32_t));
+  size_t valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
 
   if constexpr (std::is_same<T, double>::value)
   {
@@ -271,13 +289,18 @@ std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId){
     return {};
   }
 
-  // Check cache
+  // Check full index cache (populated after getFullIndexEntry is called)
   auto it = fullIndexCache.find(seriesId);
   if(it != fullIndexCache.end()) {
     return it->second.seriesType;
   }
 
-  // Not in cache - caller needs to use getFullIndexEntry() first
+  // Fall back to sparse index which stores the type from the initial index parse
+  auto sparseIt = sparseIndex.find(seriesId);
+  if(sparseIt != sparseIndex.end()) {
+    return sparseIt->second.seriesType;
+  }
+
   return {};
 }
 
@@ -303,7 +326,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
   auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
   Slice blockSlice(blockBuf.get(), blockBuf.size());
 
-  auto headerSlice = blockSlice.getSlice(9);
+  auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
   uint8_t blockType = headerSlice.read<uint8_t>();
   uint32_t timestampSize = headerSlice.read<uint32_t>();
   uint32_t timestampBytes = headerSlice.read<uint32_t>();
@@ -311,7 +334,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
   auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
   auto timestampsSlice = blockSlice.getSlice(timestampBytes);
   auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime);
-  size_t valueByteSize = indexBlock.size - timestampBytes - (sizeof(uint8_t) + 2*sizeof(uint32_t));
+  size_t valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
 
   if constexpr (std::is_same<T, double>::value) {
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
@@ -358,9 +381,9 @@ seastar::future<> TSM::scheduleDelete() {
         co_await tsmFile.close();
     }
 
-    // Delete the physical file
+    // Delete the physical file using async Seastar I/O (not blocking std::filesystem::remove)
     try {
-        std::filesystem::remove(filePath);
+        co_await seastar::remove_file(filePath);
         tsdb::tsm_log.info("TSM file deleted: {}", filePath);
     } catch (const std::exception& e) {
         tsdb::tsm_log.error("Failed to delete TSM file {}: {}", filePath, e.what());
@@ -420,20 +443,20 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
     uint64_t endTime
 ) {
     // Defensive check: ensure we have at least header size
-    if (blockSize < 9) {
+    if (blockSize < BLOCK_HEADER_SIZE) {
         tsdb::tsm_log.error("Block size {} is too small for header", blockSize);
         return nullptr;
     }
 
-    // Parse block header (9 bytes: type + timestampSize + timestampBytes)
-    auto headerSlice = blockSlice.getSlice(9);
+    // Parse block header (type + timestampSize + timestampBytes)
+    auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
     uint8_t blockType = headerSlice.read<uint8_t>();
     uint32_t timestampSize = headerSlice.read<uint32_t>();
     uint32_t timestampBytes = headerSlice.read<uint32_t>();
 
     // Defensive check: ensure timestampBytes is reasonable
-    if (timestampBytes > blockSize - 9) {
-        tsdb::tsm_log.error("Timestamp bytes {} exceeds block size {} - 9", timestampBytes, blockSize);
+    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE) {
+        tsdb::tsm_log.error("Timestamp bytes {} exceeds block size {} - {}", timestampBytes, blockSize, BLOCK_HEADER_SIZE);
         return nullptr;
     }
 
@@ -445,7 +468,7 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
     );
 
     // Decode values based on type
-    size_t valueByteSize = blockSize - timestampBytes - 9;
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
     // Defensive check
     if (valueByteSize > blockSize) {
@@ -567,6 +590,9 @@ seastar::future<> TSM::readSeriesBatched(
     co_await seastar::parallel_for_each(batches, [&](const BlockBatch& batch) {
         return readBlockBatch(batch, startTime, endTime, results);
     });
+
+    // parallel_for_each does not guarantee ordering, so sort blocks by start time
+    results.sort();
 
     co_return;
 }

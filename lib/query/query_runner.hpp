@@ -1,5 +1,5 @@
-#ifndef __QUERY_RUNNER_H_INCLUDED__
-#define __QUERY_RUNNER_H_INCLUDED__
+#ifndef QUERY_RUNNER_H_INCLUDED
+#define QUERY_RUNNER_H_INCLUDED
 
 #include "tsm_file_manager.hpp"
 #include "wal_file_manager.hpp"

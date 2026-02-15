@@ -1,5 +1,5 @@
-#ifndef __QUERY_PLANNER_H_INCLUDED__
-#define __QUERY_PLANNER_H_INCLUDED__
+#ifndef QUERY_PLANNER_H_INCLUDED
+#define QUERY_PLANNER_H_INCLUDED
 
 #include "query_parser.hpp"
 #include "leveldb_index.hpp"
@@ -85,4 +85,4 @@ private:
 
 } // namespace tsdb
 
-#endif // __QUERY_PLANNER_H_INCLUDED__
+#endif // QUERY_PLANNER_H_INCLUDED

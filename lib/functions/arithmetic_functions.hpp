@@ -1,5 +1,5 @@
-#ifndef __ARITHMETIC_FUNCTIONS_H_INCLUDED__
-#define __ARITHMETIC_FUNCTIONS_H_INCLUDED__
+#ifndef ARITHMETIC_FUNCTIONS_H_INCLUDED
+#define ARITHMETIC_FUNCTIONS_H_INCLUDED
 
 #include "function_types.hpp"
 #include <vector>
@@ -98,4 +98,4 @@ std::vector<double> offset(const std::vector<double>& values, double offset_valu
 
 } // namespace tsdb::functions
 
-#endif // __ARITHMETIC_FUNCTIONS_H_INCLUDED__
+#endif // ARITHMETIC_FUNCTIONS_H_INCLUDED

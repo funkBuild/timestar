@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_QUERY_PARSER_H_INCLUDED__
-#define __FUNCTION_QUERY_PARSER_H_INCLUDED__
+#ifndef FUNCTION_QUERY_PARSER_H_INCLUDED
+#define FUNCTION_QUERY_PARSER_H_INCLUDED
 
 #include <string>
 #include <vector>
@@ -15,4 +15,4 @@ public:
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_QUERY_PARSER_H_INCLUDED__
+#endif // FUNCTION_QUERY_PARSER_H_INCLUDED

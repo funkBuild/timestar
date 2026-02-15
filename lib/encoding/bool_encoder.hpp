@@ -1,5 +1,5 @@
-#ifndef __BOOL_ENCODER_H_INCLUDED__
-#define __BOOL_ENCODER_H_INCLUDED__
+#ifndef BOOL_ENCODER_H_INCLUDED
+#define BOOL_ENCODER_H_INCLUDED
 
 #include <vector>
 #include <cstdint>

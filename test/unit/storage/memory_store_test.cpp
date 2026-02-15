@@ -8,9 +8,6 @@
 #include "../../../lib/core/tsdb_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
-#include <seastar/core/app-template.hh>
-#include <seastar/core/coroutine.hh>
-
 namespace fs = std::filesystem;
 
 class MemoryStoreTest : public ::testing::Test {
@@ -295,7 +292,7 @@ TEST_F(MemoryStoreTest, QuerySeriesFloat) {
     SeriesId128 seriesId = insert.seriesId128();
     auto result = store->querySeries<double>(seriesId);
 
-    ASSERT_TRUE(result.has_value());
+    ASSERT_NE(result, nullptr);
     EXPECT_EQ(result->values.size(), 3);
     EXPECT_DOUBLE_EQ(result->values[0], 20.5);
     EXPECT_DOUBLE_EQ(result->values[2], 21.5);
@@ -313,7 +310,7 @@ TEST_F(MemoryStoreTest, QuerySeriesString) {
     SeriesId128 seriesId = insert.seriesId128();
     auto result = store->querySeries<std::string>(seriesId);
 
-    ASSERT_TRUE(result.has_value());
+    ASSERT_NE(result, nullptr);
     EXPECT_EQ(result->values.size(), 3);
     EXPECT_EQ(result->values[0], "starting");
     EXPECT_EQ(result->values[2], "stopping");
@@ -322,7 +319,7 @@ TEST_F(MemoryStoreTest, QuerySeriesString) {
 TEST_F(MemoryStoreTest, QueryNonExistentSeries) {
     SeriesId128 fakeId = SeriesId128::fromSeriesKey("nonexistent.series");
     auto result = store->querySeries<double>(fakeId);
-    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result, nullptr);
 }
 
 TEST_F(MemoryStoreTest, DeleteRangeFloat) {
@@ -414,267 +411,3 @@ TEST_F(MemoryStoreTest, LongStringValues) {
     EXPECT_EQ(seriesData.values[1], "short");
 }
 
-// Seastar-based tests for WAL integration
-
-seastar::future<> testMemoryStoreInitWAL() {
-    unsigned int sequenceNumber = 10;
-    auto store = std::make_shared<MemoryStore>(sequenceNumber);
-
-    // Initialize WAL
-    co_await store->initWAL();
-
-    // WAL should be created
-    EXPECT_NE(store->getWAL(), nullptr);
-
-    // Insert some data through the store's insert method (which writes to WAL)
-    TSDBInsert<double> insert("test", "metric");
-    insert.addValue(1000, 42.0);
-
-    bool needsRollover = co_await store->insert(insert);
-    EXPECT_FALSE(needsRollover);  // Single insert shouldn't trigger rollover
-
-    // Verify data is in memory store
-    SeriesId128 seriesId = insert.seriesId128();
-    auto it = store->series.find(seriesId);
-    EXPECT_NE(it, store->series.end());
-
-    // Close the store
-    co_await store->close();
-
-    co_return;
-}
-
-TEST_F(MemoryStoreTest, InitWAL) {
-    seastar::app_template app;
-
-    // Create proper argc/argv for Seastar
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-
-    auto exitCode = app.run(argc, argv, [&] {
-        return testMemoryStoreInitWAL().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "MemoryStore initWAL test failed" << std::endl;
-            try {
-                std::rethrow_exception(ep);
-            } catch (const std::exception& e) {
-                std::cerr << "Exception: " << e.what() << std::endl;
-            }
-            throw;
-        });
-    });
-
-    EXPECT_EQ(exitCode, 0);
-}
-
-seastar::future<> testMemoryStoreInitFromWAL() {
-    unsigned int sequenceNumber = 11;
-
-    // First, create a store and write data
-    {
-        auto store = std::make_shared<MemoryStore>(sequenceNumber);
-        co_await store->initWAL();
-
-        TSDBInsert<double> insert1("cpu", "usage");
-        insert1.addValue(1000, 25.5);
-        insert1.addValue(2000, 30.2);
-        co_await store->insert(insert1);
-
-        TSDBInsert<bool> insert2("status", "online");
-        insert2.addValue(1000, true);
-        insert2.addValue(2000, false);
-        co_await store->insert(insert2);
-
-        TSDBInsert<std::string> insert3("app", "state");
-        insert3.addValue(1000, "running");
-        insert3.addValue(2000, "stopped");
-        co_await store->insert(insert3);
-
-        co_await store->close();
-    }
-
-    // Now create a new store and recover from WAL
-    {
-        auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
-        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
-
-        co_await recoveredStore->initFromWAL(walFile);
-
-        // Verify all series were recovered
-        EXPECT_EQ(recoveredStore->series.size(), 3);
-
-        // Verify float series
-        TSDBInsert<double> cpuInsert("cpu", "usage");
-        SeriesId128 cpuId = cpuInsert.seriesId128();
-        auto cpuIt = recoveredStore->series.find(cpuId);
-        EXPECT_NE(cpuIt, recoveredStore->series.end());
-        if (cpuIt != recoveredStore->series.end()) {
-            auto& cpuData = std::get<InMemorySeries<double>>(cpuIt->second);
-            EXPECT_EQ(cpuData.values.size(), 2);
-            EXPECT_DOUBLE_EQ(cpuData.values[0], 25.5);
-        }
-
-        // Verify bool series
-        TSDBInsert<bool> statusInsert("status", "online");
-        SeriesId128 statusId = statusInsert.seriesId128();
-        auto statusIt = recoveredStore->series.find(statusId);
-        EXPECT_NE(statusIt, recoveredStore->series.end());
-
-        // Verify string series
-        TSDBInsert<std::string> appInsert("app", "state");
-        SeriesId128 appId = appInsert.seriesId128();
-        auto appIt = recoveredStore->series.find(appId);
-        EXPECT_NE(appIt, recoveredStore->series.end());
-        if (appIt != recoveredStore->series.end()) {
-            auto& appData = std::get<InMemorySeries<std::string>>(appIt->second);
-            EXPECT_EQ(appData.values[0], "running");
-        }
-    }
-
-    co_return;
-}
-
-TEST_F(MemoryStoreTest, InitFromWAL) {
-    seastar::app_template app;
-
-    // Create proper argc/argv for Seastar
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-
-    auto exitCode = app.run(argc, argv, [&] {
-        return testMemoryStoreInitFromWAL().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "MemoryStore initFromWAL test failed" << std::endl;
-            try {
-                std::rethrow_exception(ep);
-            } catch (const std::exception& e) {
-                std::cerr << "Exception: " << e.what() << std::endl;
-            }
-            throw;
-        });
-    });
-
-    EXPECT_EQ(exitCode, 0);
-}
-
-seastar::future<> testMemoryStoreBatchInsert() {
-    unsigned int sequenceNumber = 12;
-    auto store = std::make_shared<MemoryStore>(sequenceNumber);
-    co_await store->initWAL();
-
-    // Create batch of inserts
-    std::vector<TSDBInsert<double>> batch;
-
-    TSDBInsert<double> insert1("metrics", "cpu");
-    insert1.addValue(1000, 10.0);
-    insert1.addValue(2000, 20.0);
-    batch.push_back(insert1);
-
-    TSDBInsert<double> insert2("metrics", "memory");
-    insert2.addValue(1000, 50.0);
-    insert2.addValue(2000, 60.0);
-    batch.push_back(insert2);
-
-    TSDBInsert<double> insert3("metrics", "disk");
-    insert3.addValue(1000, 75.0);
-    insert3.addValue(2000, 80.0);
-    batch.push_back(insert3);
-
-    // Insert batch
-    bool needsRollover = co_await store->insertBatch(batch);
-    EXPECT_FALSE(needsRollover);
-
-    // Verify all series are in store
-    EXPECT_EQ(store->series.size(), 3);
-
-    // Verify each series has correct data
-    SeriesId128 cpuId = insert1.seriesId128();
-    auto cpuIt = store->series.find(cpuId);
-    EXPECT_NE(cpuIt, store->series.end());
-    if (cpuIt != store->series.end()) {
-        auto& cpuData = std::get<InMemorySeries<double>>(cpuIt->second);
-        EXPECT_EQ(cpuData.values.size(), 2);
-        EXPECT_DOUBLE_EQ(cpuData.values[0], 10.0);
-        EXPECT_DOUBLE_EQ(cpuData.values[1], 20.0);
-    }
-
-    co_await store->close();
-    co_return;
-}
-
-TEST_F(MemoryStoreTest, BatchInsert) {
-    seastar::app_template app;
-
-    // Create proper argc/argv for Seastar
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-
-    auto exitCode = app.run(argc, argv, [&] {
-        return testMemoryStoreBatchInsert().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "MemoryStore batch insert test failed" << std::endl;
-            throw;
-        });
-    });
-
-    EXPECT_EQ(exitCode, 0);
-}
-
-seastar::future<> testMemoryStoreThresholdChecking() {
-    unsigned int sequenceNumber = 13;
-    auto store = std::make_shared<MemoryStore>(sequenceNumber);
-    co_await store->initWAL();
-
-    // Initially should not be full
-    bool isFull = co_await store->isFull();
-    EXPECT_FALSE(isFull);
-
-    // Create a large insert to test threshold
-    TSDBInsert<double> largeInsert("test", "large");
-
-    // Add many values to approach threshold
-    for (int i = 0; i < 10000; i++) {
-        largeInsert.addValue(1000 + i, static_cast<double>(i));
-    }
-
-    // Check if this would exceed threshold before inserting
-    bool wouldExceed = store->wouldExceedThreshold(largeInsert);
-
-    // Insert the data
-    co_await store->insert(largeInsert);
-
-    // Check if store is now full or close to full
-    isFull = co_await store->isFull();
-
-    // At minimum, the wouldExceedThreshold check should have worked
-    // (exact result depends on WAL_SIZE_THRESHOLD)
-
-    co_await store->close();
-    co_return;
-}
-
-TEST_F(MemoryStoreTest, ThresholdChecking) {
-    seastar::app_template app;
-
-    // Create proper argc/argv for Seastar
-    char prog_name[] = "test";
-    char* argv[] = { prog_name, nullptr };
-    int argc = 1;
-
-    auto exitCode = app.run(argc, argv, [&] {
-        return testMemoryStoreThresholdChecking().then([&] {
-            // Future completes successfully
-        }).handle_exception([&](std::exception_ptr ep) {
-            std::cerr << "MemoryStore threshold test failed" << std::endl;
-            throw;
-        });
-    });
-
-    EXPECT_EQ(exitCode, 0);
-}

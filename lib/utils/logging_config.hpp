@@ -1,5 +1,5 @@
-#ifndef __LOGGING_CONFIG_HPP__
-#define __LOGGING_CONFIG_HPP__
+#ifndef LOGGING_CONFIG_HPP
+#define LOGGING_CONFIG_HPP
 
 // Compile-time logging configuration for TSDB
 // These defines control verbose logging in performance-critical paths
@@ -30,4 +30,4 @@
 #define LOG_QUERY_PATH(logger, level, ...) ((void)0)
 #endif
 
-#endif // __LOGGING_CONFIG_HPP__
+#endif // LOGGING_CONFIG_HPP

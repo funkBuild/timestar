@@ -1,5 +1,5 @@
-#ifndef __FUNCTION_SECURITY_H_INCLUDED__
-#define __FUNCTION_SECURITY_H_INCLUDED__
+#ifndef FUNCTION_SECURITY_H_INCLUDED
+#define FUNCTION_SECURITY_H_INCLUDED
 
 #include <string>
 #include <vector>
@@ -84,4 +84,4 @@ private:
 
 } // namespace tsdb::functions
 
-#endif // __FUNCTION_SECURITY_H_INCLUDED__
+#endif // FUNCTION_SECURITY_H_INCLUDED

@@ -1,5 +1,5 @@
-#ifndef __TSM_BLOCK_ITERATOR_H_INCLUDED__
-#define __TSM_BLOCK_ITERATOR_H_INCLUDED__
+#ifndef TSM_BLOCK_ITERATOR_H_INCLUDED
+#define TSM_BLOCK_ITERATOR_H_INCLUDED
 
 #include "tsm.hpp"
 #include "tsm_result.hpp"
@@ -107,4 +107,4 @@ public:
     }
 };
 
-#endif // __TSM_BLOCK_ITERATOR_H_INCLUDED__
+#endif // TSM_BLOCK_ITERATOR_H_INCLUDED

@@ -91,21 +91,30 @@ seastar::future<> WAL::init(MemoryStore * /*store*/, bool isRecovery) {
   if (!isRecovery && currentSize > 0) {
     tsdb::wal_log.error(
         "Fresh WAL {} has non-zero size {} after truncate - this is unexpected",
-        filename, currentSize.load());
+        filename, currentSize);
   }
 
-  // Build buffered output stream positioned at EOF (append)
-  // Use the (file, offset) overload in this Seastar version.
-  auto s = co_await seastar::make_file_output_stream(walFile);
+  // Capture DMA alignment from the file so we can pad before flushing
+  _dma_alignment = walFile.disk_write_dma_alignment();
+  _unflushed_bytes = 0;
+
+  // Build buffered output stream.  The buffer size MUST be a multiple of
+  // _dma_alignment so that automatic full-buffer flushes always land on
+  // aligned positions.  We use file_output_stream_options to set this
+  // explicitly (default 65536 is fine, it's a multiple of 4096).
+  seastar::file_output_stream_options opts;
+  opts.buffer_size = 65536; // 64 KiB, guaranteed multiple of DMA alignment
+  auto s = co_await seastar::make_file_output_stream(walFile, opts);
   out.emplace(std::move(s));
 
-  tsdb::wal_log.debug("WAL stream init: pos={}", filePos);
+  tsdb::wal_log.debug("WAL stream init: pos={}, dma_alignment={}", filePos, _dma_alignment);
 }
 
 std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
   std::string path = "shard_" + std::to_string(seastar::this_shard_id()) + "/";
   std::string sequenceNumStr = std::to_string(sequenceNumber);
-  std::string filename = path + std::string(10 - sequenceNumStr.length(), '0')
+  size_t padLen = sequenceNumStr.length() >= 10 ? 0 : 10 - sequenceNumStr.length();
+  std::string filename = path + std::string(padLen, '0')
                                     .append(sequenceNumStr)
                                     .append(".wal");
   return filename;
@@ -115,7 +124,10 @@ seastar::future<> WAL::finalFlush() {
   if (!out)
     co_return;
   try {
+    // Pad to DMA alignment before the final flush
+    co_await padToAlignment();
     co_await out->flush(); // drains buffers and fsyncs the sink
+    _unflushed_bytes = 0;
     tsdb::wal_log.debug("WAL final flush completed, filePos={}", filePos);
   } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL final flush error: {}", e.what());
@@ -174,8 +186,42 @@ seastar::future<unsigned long> WAL::size() {
 }
 
 seastar::future<> WAL::remove() {
+  // Ensure file is closed before removal to avoid dangling fd
+  if (!_closed) {
+    co_await close();
+  }
   std::string filename = WAL::sequenceNumberToFilename(sequenceNumber);
-  return seastar::remove_file(filename);
+  co_await seastar::remove_file(filename);
+}
+
+// Write padding zeros so that the total bytes written to the output stream
+// since the last flush are a multiple of _dma_alignment.  This ensures the
+// underlying file_data_sink_impl's write position stays aligned after the
+// flush, preventing the DMA alignment assertion failure on subsequent writes.
+seastar::future<> WAL::padToAlignment() {
+  if (!out || _dma_alignment <= 1)
+    co_return;
+
+  size_t remainder = _unflushed_bytes % _dma_alignment;
+  if (remainder == 0)
+    co_return; // already aligned
+
+  size_t padding = _dma_alignment - remainder;
+
+  // Write zero bytes as padding.  The WAL reader will skip entries whose
+  // length prefix is 0 (padding marker).
+  // Use a stack buffer for small pads; DMA alignment is typically 4096.
+  char zeros[4096] = {};
+  size_t written = 0;
+  while (written < padding) {
+    size_t chunk = std::min(padding - written, sizeof(zeros));
+    co_await out->write(zeros, chunk);
+    written += chunk;
+  }
+
+  _unflushed_bytes += padding;
+  filePos += padding;
+  currentSize += padding;
 }
 
 // Flush pending buffered bytes in the output stream
@@ -185,7 +231,10 @@ seastar::future<> WAL::flushBlock() {
   try {
     auto startTime = std::chrono::steady_clock::now();
 
-    co_await out->flush(); // single flush; avoid double-fsync
+    // Pad to DMA alignment before flushing to keep file sink position aligned
+    co_await padToAlignment();
+    co_await out->flush();
+    _unflushed_bytes = 0; // reset after successful flush
 
     auto endTime = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime -
@@ -203,28 +252,42 @@ seastar::future<> WAL::flushBlock() {
 
 template <class T>
 size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
+  // Lightweight upper-bound estimation without performing full encoding.
+  // This avoids the cost of encoding timestamps and values just to measure
+  // their sizes. The actual encoded data is always <= the worst-case sizes
+  // computed here, so this is safe for rollover/capacity decisions.
   size_t estimatedSize = 0;
 
-  estimatedSize += 4;  // length
+  estimatedSize += 4;  // length prefix
   estimatedSize += 1;  // WAL type
   estimatedSize += 16; // SeriesId128 (fixed 16 bytes)
+
+  // Series key string (length-prefixed)
+  std::string seriesKey = insertRequest.seriesKey();
+  estimatedSize += 4 + seriesKey.size();
+
   estimatedSize += 1;  // value type
   estimatedSize += 4;  // # of timestamps
 
-  AlignedBuffer encodedTimestamps =
-      IntegerEncoder::encode(insertRequest.timestamps);
-  estimatedSize += 4 + encodedTimestamps.size();
+  // Timestamps: worst case is uncompressed (count * sizeof(uint64_t)),
+  // plus the 4-byte encoded-size prefix
+  const size_t count = insertRequest.timestamps.size();
+  estimatedSize += 4 + count * sizeof(uint64_t);
 
-  estimatedSize += 4; // values byte-size
+  // Values: worst case depends on type, plus the 4-byte encoded-size prefix
+  estimatedSize += 4;
   if constexpr (std::is_same<T, double>::value) {
-    CompressedBuffer encodedFloats = FloatEncoder::encode(insertRequest.values);
-    estimatedSize += encodedFloats.size();
+    // Worst case: uncompressed doubles
+    estimatedSize += count * sizeof(double);
   } else if constexpr (std::is_same<T, bool>::value) {
-    AlignedBuffer encodedBools = BoolEncoder::encode(insertRequest.values);
-    estimatedSize += encodedBools.size();
+    // Worst case: one byte per bool
+    estimatedSize += count * sizeof(uint8_t);
   } else if constexpr (std::is_same<T, std::string>::value) {
-    AlignedBuffer encodedStrings = StringEncoder::encode(insertRequest.values);
-    estimatedSize += encodedStrings.size();
+    // Worst case: 4-byte varint length prefix + full string data per entry
+    // (Snappy can expand slightly, so account for that too)
+    for (const auto &s : insertRequest.values) {
+      estimatedSize += 4 + s.size();
+    }
   }
 
   return estimatedSize;
@@ -295,18 +358,18 @@ template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
 
   LOG_INSERT_PATH(tsdb::wal_log, debug,
                   "WAL::insert - dataSize={}, entryLength={}, currentSize={}",
-                  dataSize, entryLength, currentSize.load());
+                  dataSize, entryLength, currentSize);
 
   // Respect the 16MiB WAL limit BEFORE writing
-  const size_t projectedSize = currentSize.load() + dataSize;
+  const size_t projectedSize = currentSize + dataSize;
   if (projectedSize > MAX_WAL_SIZE) {
     tsdb::wal_log.debug("WAL::insert - Would exceed 16MB limit (current={}, "
                         "dataSize={}, projected={}), signaling rollover needed",
-                        currentSize.load(), dataSize, projectedSize);
+                        currentSize, dataSize, projectedSize);
     throw std::runtime_error("WAL rollover needed");
   }
 
-  // Stream write (unaligned)
+  // Stream write
   try {
     if (out) {
       co_await out->write(reinterpret_cast<const char *>(buffer.data.data()),
@@ -316,11 +379,14 @@ template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
     }
     // Update positions and size
     filePos += dataSize;
-    currentSize.fetch_add(dataSize);
+    currentSize += dataSize;
+    _unflushed_bytes += dataSize;
 
     // Only flush immediately if configured for immediate mode
     if (requiresImmediateFlush) {
+      co_await padToAlignment();
       co_await out->flush();
+      _unflushed_bytes = 0;
     }
   } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL::insert write failed: {}", e.what());
@@ -401,34 +467,38 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
   LOG_INSERT_PATH(
       tsdb::wal_log, debug,
       "WAL::insertBatch - {} entries, total size={}, currentSize={}",
-      buffers.size(), totalSize, currentSize.load());
+      buffers.size(), totalSize, currentSize);
 
   // WAL limit check (pre-flight)
-  const size_t projected = currentSize.load() + totalSize;
+  const size_t projected = currentSize + totalSize;
   if (projected > MAX_WAL_SIZE) {
     tsdb::wal_log.debug(
         "WAL::insertBatch - Would exceed 16MB limit (current={}, total={}, "
         "projected={}), signaling rollover",
-        currentSize.load(), totalSize, projected);
+        currentSize, totalSize, projected);
     throw std::runtime_error("WAL rollover needed");
   }
 
   try {
-    size_t written = 0;
     if (out) {
-      // Write each encoded buffer; output_stream will coalesce internally.
+      // Write all encoded buffers; output_stream will coalesce internally.
+      // We write all entries before updating filePos/currentSize so that
+      // if an exception is thrown mid-batch, accounting stays consistent.
       for (auto &b : buffers) {
         co_await out->write(reinterpret_cast<const char *>(b.data.data()),
                             b.size());
-        written += b.size();
       }
     }
-    filePos += written;
-    currentSize.fetch_add(written);
+    // Only update positions atomically after ALL writes succeed
+    filePos += totalSize;
+    currentSize += totalSize;
+    _unflushed_bytes += totalSize;
 
     // Only flush immediately if configured for immediate mode
     if (requiresImmediateFlush) {
+      co_await padToAlignment();
       co_await out->flush();
+      _unflushed_bytes = 0;
     }
   } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL::insertBatch write failed: {}", e.what());
@@ -473,11 +543,14 @@ seastar::future<> WAL::deleteRange(const SeriesId128 &seriesId,
                           n);
     }
     filePos += n;
-    currentSize.fetch_add(n);
+    currentSize += n;
+    _unflushed_bytes += n;
 
     // Only flush immediately if configured for immediate mode
     if (requiresImmediateFlush) {
+      co_await padToAlignment();
       co_await out->flush();
+      _unflushed_bytes = 0;
     }
   } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL::deleteRange write failed: {}", e.what());
@@ -490,16 +563,16 @@ seastar::future<> WAL::deleteRange(const SeriesId128 &seriesId,
                   seriesId.toHex(), startTime, endTime, n);
 }
 
-void WAL::remove(unsigned int sequenceNumber) {
+seastar::future<> WAL::remove(unsigned int sequenceNumber) {
   std::string filename = WAL::sequenceNumberToFilename(sequenceNumber);
 
   try {
-    if (std::filesystem::remove(filename))
-      tsdb::wal_log.debug("WAL file {} deleted", filename);
-    else
-      tsdb::wal_log.debug("WAL file {} not found", filename);
-  } catch (const std::filesystem::filesystem_error &err) {
-    tsdb::wal_log.error("Filesystem error removing WAL: {}", err.what());
+    co_await seastar::remove_file(filename);
+    tsdb::wal_log.debug("WAL file {} deleted", filename);
+  } catch (const std::exception &e) {
+    // File may not exist; log but don't propagate
+    tsdb::wal_log.debug("WAL file {} removal failed (may not exist): {}",
+                        filename, e.what());
   }
 }
 
@@ -530,6 +603,7 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
 
   size_t entriesRead = 0;
   size_t partialEntries = 0;
+  bool stopRecovery = false;
 
   // Stream the file; no aligned over-reads
   auto in = seastar::make_file_input_stream(walFile);
@@ -553,6 +627,38 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
     bool have = co_await read_exact(&entryLength, sizeof(entryLength));
     if (!have) {
       break; // normal EOF
+    }
+
+    // Skip DMA alignment padding (zero bytes written before flush).
+    // Padding consists of zero bytes, so entryLength == 0 means we are
+    // inside a padding region.  We scan forward one byte at a time until
+    // we find a non-zero byte (the start of the next real length prefix)
+    // or reach EOF.
+    if (entryLength == 0) {
+      // We already consumed 4 zero bytes.  Now scan for a non-zero byte.
+      uint8_t probe = 0;
+      bool foundNonZero = false;
+      while (co_await read_exact(&probe, 1)) {
+        if (probe != 0) {
+          foundNonZero = true;
+          break;
+        }
+      }
+      if (!foundNonZero) {
+        break; // EOF reached within padding
+      }
+      // We found a non-zero byte that is the first byte of an entryLength.
+      // Read the remaining 3 bytes of the uint32_t.
+      uint8_t remaining[3];
+      if (!(co_await read_exact(remaining, 3))) {
+        partialEntries++;
+        break;
+      }
+      // Reconstruct the entry length (little-endian)
+      entryLength = static_cast<uint32_t>(probe) |
+                    (static_cast<uint32_t>(remaining[0]) << 8) |
+                    (static_cast<uint32_t>(remaining[1]) << 16) |
+                    (static_cast<uint32_t>(remaining[2]) << 24);
     }
 
     // sanity
@@ -658,11 +764,15 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
           "WAL recovery: unknown entry type {}, stopping recovery",
           static_cast<int>(type));
       partialEntries++;
-      goto recovery_complete;
+      stopRecovery = true;
+      break;
+    }
+
+    if (stopRecovery) {
+      break;
     }
   }
 
-recovery_complete:
   tsdb::wal_log.info(
       "WAL recovery complete: {} entries read, {} partial entries discarded",
       entriesRead, partialEntries);

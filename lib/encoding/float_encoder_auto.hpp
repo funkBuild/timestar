@@ -1,5 +1,5 @@
-#ifndef __FLOAT_ENCODER_AUTO_H_INCLUDED__
-#define __FLOAT_ENCODER_AUTO_H_INCLUDED__
+#ifndef FLOAT_ENCODER_AUTO_H_INCLUDED
+#define FLOAT_ENCODER_AUTO_H_INCLUDED
 
 #include <vector>
 #include "float_encoder.hpp"
@@ -69,4 +69,4 @@ public:
     }
 };
 
-#endif // __FLOAT_ENCODER_AUTO_H_INCLUDED__
+#endif // FLOAT_ENCODER_AUTO_H_INCLUDED

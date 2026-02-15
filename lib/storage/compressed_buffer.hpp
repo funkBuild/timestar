@@ -1,5 +1,5 @@
-#ifndef __COMPRESSED_BUFFER_H_INCLUDED__
-#define __COMPRESSED_BUFFER_H_INCLUDED__
+#ifndef COMPRESSED_BUFFER_H_INCLUDED
+#define COMPRESSED_BUFFER_H_INCLUDED
 
 #include <vector>
 #include <cstdint>

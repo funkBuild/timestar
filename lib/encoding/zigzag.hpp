@@ -1,5 +1,5 @@
-#ifndef __ZIGZAG_H_INCLUDED__
-#define __ZIGZAG_H_INCLUDED__
+#ifndef ZIGZAG_H_INCLUDED
+#define ZIGZAG_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
@@ -12,29 +12,29 @@ private:
 public:
   ZigZag(){};
 
-  static std::vector<uint64_t> zigzagEncodeVector( std::vector<int64_t> input )
+  static std::vector<uint64_t> zigzagEncodeVector( const std::vector<int64_t> &input )
   {
     std::vector<uint64_t> output;
     output.resize(input.size());
 
     std::transform(input.begin(), input.end(), output.begin(), [](int64_t x) { return zigzagEncode(x); });
 
-    return std::move(output);
+    return output;
   }
 
-  static std::vector<int64_t> zigzagDecodeVector( std::vector<uint64_t> input )
+  static std::vector<int64_t> zigzagDecodeVector( const std::vector<uint64_t> &input )
   {
     std::vector<int64_t> output;
     output.resize(input.size());
 
     std::transform(input.begin(), input.end(), output.begin(), [](uint64_t x) { return zigzagDecode(x); });
 
-    return std::move(output);
+    return output;
   }
 
   static inline uint64_t zigzagEncode( int64_t x )
   {
-    return ( ( uint64_t ) x << 1 ) ^ -( ( uint64_t ) x >> 63 );
+    return (static_cast<uint64_t>(x) << 1) ^ static_cast<uint64_t>(x >> 63);
   }
 
   static inline int64_t zigzagDecode( uint64_t y )

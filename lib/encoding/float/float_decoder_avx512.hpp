@@ -1,5 +1,5 @@
-#ifndef __FLOAT_DECODER_AVX512_H_INCLUDED__
-#define __FLOAT_DECODER_AVX512_H_INCLUDED__
+#ifndef FLOAT_DECODER_AVX512_H_INCLUDED
+#define FLOAT_DECODER_AVX512_H_INCLUDED
 
 #include <vector>
 #include <cstdint>
@@ -30,4 +30,4 @@ public:
     static void decodeSafe(CompressedSlice &encoded, size_t nToSkip, size_t length, std::vector<double> &out);
 };
 
-#endif // __FLOAT_DECODER_AVX512_H_INCLUDED__
+#endif // FLOAT_DECODER_AVX512_H_INCLUDED
