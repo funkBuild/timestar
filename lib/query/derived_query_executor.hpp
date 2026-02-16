@@ -23,6 +23,7 @@
 // Forward declarations
 class Engine;
 class LevelDBIndex;
+class DerivedQueryMultiSeriesTest;
 
 namespace tsdb {
 
@@ -53,6 +54,7 @@ using DerivedQueryResultVariant = std::variant<
 
 // Executes derived metric queries
 class DerivedQueryExecutor {
+    friend class ::DerivedQueryMultiSeriesTest;
 public:
     DerivedQueryExecutor(seastar::sharded<Engine>* engine,
                         seastar::sharded<LevelDBIndex>* index = nullptr,

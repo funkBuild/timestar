@@ -358,32 +358,26 @@ SEASTAR_TEST_F(TSMCompactorTest, NewerValuesOverwriteOlderDuringCompaction) {
     co_return;
 }
 
-// Test reference counting prevents deletion during reads
-SEASTAR_TEST_F(TSMCompactorTest, ReferenceCountingPreventsDelete) {
+// Test TSMReader provides access to TSM file for reads
+SEASTAR_TEST_F(TSMCompactorTest, TSMReaderAccess) {
     // Create a TSM file
     auto tsm = self->createTestTSMFile(0, 1, "data.", 2, 50);
     co_await tsm->open();
     co_await tsm->readSparseIndex();
 
-    // Simulate an active reader
+    // TSMReader is a thin wrapper providing access to TSM file
     {
         TSMReader reader(tsm);
-        EXPECT_EQ(tsm->getRefCount(), 1);
+        // Reader should be valid
+        EXPECT_TRUE(static_cast<bool>(reader));
 
-        // Mark for deletion while reader is active
-        tsm->markForDeletion();
-
-        // File should not be deleted yet
+        // File should exist on disk
         EXPECT_TRUE(fs::exists("shard_0/tsm/00_0000000001.tsm"));
-
-        // Reader goes out of scope here
     }
 
-    // After reader is destroyed, ref count should be 0
-    EXPECT_EQ(tsm->getRefCount(), 0);
-
-    // Note: Actual deletion would be async in real implementation
-    // For testing, we're verifying the mechanism works
+    // After reader is destroyed, file should still exist (deletion is
+    // handled by removeTSMFiles -> scheduleDelete, not by reader scope)
+    EXPECT_TRUE(fs::exists("shard_0/tsm/00_0000000001.tsm"));
 
     co_return;
 }

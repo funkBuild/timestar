@@ -116,7 +116,7 @@ static double calculateSum_AVX2(const double* values, size_t count) {
 
 // SIMD-optimized sum calculation with cascading fallback
 double SimdAggregator::calculateSum(const double* values, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
 
     // Use AVX512 for best performance (process 8 doubles at once)
     if (isAvx512Available() && count >= 16) {
@@ -134,7 +134,7 @@ double SimdAggregator::calculateSum(const double* values, size_t count) {
 
 // SIMD-optimized average calculation
 double SimdAggregator::calculateAvg(const double* values, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
     return calculateSum(values, count) / static_cast<double>(count);
 }
 
@@ -427,6 +427,7 @@ void SimdAggregator::computeHistogram(
 namespace scalar {
 
 double calculateSum(const double* values, size_t count) {
+    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
     double sum = 0.0;
     for (size_t i = 0; i < count; ++i) {
         sum += values[i];
@@ -435,7 +436,7 @@ double calculateSum(const double* values, size_t count) {
 }
 
 double calculateAvg(const double* values, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0) return std::numeric_limits<double>::quiet_NaN();
     return calculateSum(values, count) / static_cast<double>(count);
 }
 

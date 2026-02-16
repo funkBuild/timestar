@@ -43,13 +43,6 @@ seastar::future<> TSM::loadTombstones() {
     co_return;
 }
 
-// Get series ID hash for tombstone compatibility
-uint64_t TSM::getSeriesIdHash(const SeriesId128& seriesId) const {
-    // Use hash function to convert SeriesId128 to numeric ID for tombstones
-    std::hash<SeriesId128> hasher;
-    return hasher(seriesId);
-}
-
 // Check if series exists in the given time range
 bool TSM::hasSeriesInTimeRange(
     const SeriesId128& seriesId,
@@ -139,9 +132,8 @@ seastar::future<bool> TSM::deleteRange(
         tombstones = std::make_unique<tsdb::TSMTombstone>(getTombstonePath());
     }
     
-    // Add tombstone (passing nullptr for now - verification already done above)
-    uint64_t seriesIdHash = getSeriesIdHash(seriesId);
-    bool added = co_await tombstones->addTombstone(seriesIdHash, startTime, endTime, nullptr);
+    // Add tombstone using the full SeriesId128 (no hash truncation)
+    bool added = co_await tombstones->addTombstone(seriesId, startTime, endTime, nullptr);
     
     if (added) {
         // Persist tombstone immediately for durability
@@ -170,20 +162,18 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     
     // Apply tombstone filtering if tombstones exist
     if (tombstones && !result.empty()) {
-        uint64_t seriesIdHash = getSeriesIdHash(seriesId);
-        
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "TSM {} has tombstones, filtering series: {} (Hash: {})",
-                        filePath, seriesId.toHex(), seriesIdHash);
-        
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "TSM {} has tombstones, filtering series: {}",
+                        filePath, seriesId.toHex());
+
         // Get all data from blocks
         auto [allTimestamps, allValues] = result.getAllData();
-        
+
         LOG_INSERT_PATH(tsdb::tsm_log, trace, "Data before filtering: {} points", allTimestamps.size());
-        
+
         if (!allTimestamps.empty()) {
-            // Filter out tombstoned data
-            auto [filteredTimestamps, filteredValues] = 
-                tombstones->filterTombstoned(seriesIdHash, allTimestamps, allValues);
+            // Filter out tombstoned data using full SeriesId128 (no hash truncation)
+            auto [filteredTimestamps, filteredValues] =
+                tombstones->filterTombstoned(seriesId, allTimestamps, allValues);
             
             LOG_INSERT_PATH(tsdb::tsm_log, trace, "Data after filtering: {} points", filteredTimestamps.size());
             

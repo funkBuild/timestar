@@ -1,7 +1,7 @@
 #include "tsxor_encoder.hpp"
 #include "util.hpp"
 
-#include <iostream>
+#include <bit>
 #include <cassert>
 #include <cmath>
 
@@ -10,19 +10,14 @@ CompressedBuffer TsxorEncoder::encode(std::vector<double> &values){
   CompressedBuffer buffer;
   Window window;
 
-  int countA = 0, countB = 0, countC = 0;
-
   for (size_t i = 0; i < values.size(); i++)
-  {   
-    uint64_t val = *((uint64_t *)&values[i]);
+  {
+    uint64_t val = std::bit_cast<uint64_t>(values[i]);
 
     if (window.contains(val))
     {
       auto offset = window.getIndexOf(val);
-      uint8_t *bytes = (uint8_t *)&offset;
-      buffer.write<8>(bytes[0]);
-
-      countA++;
+      buffer.write<8>(static_cast<uint64_t>(offset & 0xFF));
     }
     else
     {
@@ -32,12 +27,10 @@ CompressedBuffer TsxorEncoder::encode(std::vector<double> &values){
 
       //WRITE 1
       offset |= 0x80;
-      uint8_t *bytes = (uint8_t *)&offset;
-      buffer.write<8>(bytes[0]);
+      buffer.write<8>(static_cast<uint64_t>(offset & 0xFF));
 
       auto lzb = getLeadingZeroBits(xor_value);
       const auto tzb = getTrailingZeroBits(xor_value);
-
 
       if(lzb > 31)
         lzb = 31;
@@ -51,6 +44,8 @@ CompressedBuffer TsxorEncoder::encode(std::vector<double> &values){
 
       buffer.write(xor_value >> tzb, data_bits);
     }
+
+    window.insert(val);
   }
 
   return buffer;

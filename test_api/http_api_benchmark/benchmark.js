@@ -59,38 +59,51 @@ class BenchmarkStats {
   }
 }
 
-// Generate server monitoring data
-function generateDataPoint(hostId, rackId, timestamp) {
+// Generate a random field value based on field name
+function generateFieldValue(field) {
+  switch (field) {
+    case "cpu_usage":
+      return 20 + Math.random() * 60; // 20-80%
+    case "memory_usage":
+      return 30 + Math.random() * 50; // 30-80%
+    case "disk_io_read":
+    case "disk_io_write":
+      return Math.random() * 100; // 0-100 MB/s
+    case "network_in":
+    case "network_out":
+      return Math.random() * 1000; // 0-1000 Mbps
+    case "load_avg_1m":
+    case "load_avg_5m":
+    case "load_avg_15m":
+      return Math.random() * 4; // 0-4 load
+    case "temperature":
+      return 50 + Math.random() * 30; // 50-80°C
+    default:
+      return Math.random() * 100;
+  }
+}
+
+// Generate an array-format write request (timestamps + field arrays)
+// This bypasses server-side coalescing and is much more efficient.
+function generateArrayWriteRequest(batchSize, hostId, rackId, startTimestamp, minuteStep) {
+  if (!hostId) hostId = Math.floor(Math.random() * NUM_HOSTS) + 1;
+  if (!rackId) rackId = Math.floor(Math.random() * NUM_RACKS) + 1;
+
+  const timestamps = new Array(batchSize);
   const fields = {};
-  FIELDS.forEach((field) => {
-    // Generate realistic values for each field
-    switch (field) {
-      case "cpu_usage":
-        fields[field] = 20 + Math.random() * 60; // 20-80%
-        break;
-      case "memory_usage":
-        fields[field] = 30 + Math.random() * 50; // 30-80%
-        break;
-      case "disk_io_read":
-      case "disk_io_write":
-        fields[field] = Math.random() * 100; // 0-100 MB/s
-        break;
-      case "network_in":
-      case "network_out":
-        fields[field] = Math.random() * 1000; // 0-1000 Mbps
-        break;
-      case "load_avg_1m":
-      case "load_avg_5m":
-      case "load_avg_15m":
-        fields[field] = Math.random() * 4; // 0-4 load
-        break;
-      case "temperature":
-        fields[field] = 50 + Math.random() * 30; // 50-80°C
-        break;
-      default:
-        fields[field] = Math.random() * 100;
+  for (const field of FIELDS) {
+    fields[field] = new Array(batchSize);
+  }
+
+  for (let j = 0; j < batchSize; j++) {
+    timestamps[j] = startTimestamp
+      ? startTimestamp + j * (minuteStep || MINUTE_IN_NS)
+      : START_TIME + Math.floor(Math.random() * MINUTES_PER_YEAR) * MINUTE_IN_NS;
+
+    for (const field of FIELDS) {
+      fields[field][j] = generateFieldValue(field);
     }
-  });
+  }
 
   return {
     measurement: MEASUREMENT,
@@ -98,12 +111,12 @@ function generateDataPoint(hostId, rackId, timestamp) {
       host: `host-${hostId.toString().padStart(2, "0")}`,
       rack: `rack-${rackId}`,
     },
-    fields: fields,
-    timestamp: timestamp,
+    timestamps,
+    fields,
   };
 }
 
-// Helper function to generate a single batch write request
+// Legacy: generate individual-write batch (for comparison benchmarks)
 function generateBatchWriteRequest(batchSize) {
   const hostId = Math.floor(Math.random() * NUM_HOSTS) + 1;
   const rackId = Math.floor(Math.random() * NUM_RACKS) + 1;
@@ -114,38 +127,10 @@ function generateBatchWriteRequest(batchSize) {
       START_TIME +
       Math.floor(Math.random() * MINUTES_PER_YEAR) * MINUTE_IN_NS;
 
-    // Generate values for each field
     const fields = {};
-    FIELDS.forEach((field) => {
-      let value;
-      switch (field) {
-        case "cpu_usage":
-          value = 20 + Math.random() * 60; // 20-80%
-          break;
-        case "memory_usage":
-          value = 30 + Math.random() * 50; // 30-80%
-          break;
-        case "disk_io_read":
-        case "disk_io_write":
-          value = Math.random() * 100; // 0-100 MB/s
-          break;
-        case "network_in":
-        case "network_out":
-          value = Math.random() * 1000; // 0-1000 Mbps
-          break;
-        case "load_avg_1m":
-        case "load_avg_5m":
-        case "load_avg_15m":
-          value = Math.random() * 4; // 0-4 load
-          break;
-        case "temperature":
-          value = 50 + Math.random() * 30; // 50-80°C
-          break;
-        default:
-          value = Math.random() * 100;
-      }
-      fields[field] = value;
-    });
+    for (const field of FIELDS) {
+      fields[field] = generateFieldValue(field);
+    }
 
     writes.push({
       measurement: MEASUREMENT,
@@ -153,31 +138,32 @@ function generateBatchWriteRequest(batchSize) {
         host: `host-${hostId.toString().padStart(2, "0")}`,
         rack: `rack-${rackId}`,
       },
-      fields: fields,
-      timestamp: timestamp,
+      fields,
+      timestamp,
     });
   }
 
   return { writes };
 }
 
-// Benchmark batch inserts with specified concurrency
+// Benchmark batch inserts with specified concurrency using array-format writes
 async function benchmarkBatchInsertsWithConcurrency(concurrency) {
   const stats = new BenchmarkStats(
     `Batch Insert (${BATCH_SIZE} points, concurrency=${concurrency})`
   );
 
   for (let i = 0; i < BENCHMARK_ITERATIONS; i++) {
-    // Create multiple requests based on concurrency level
-    const requests = [];
+    // Pre-generate payloads before timing to measure server throughput only
+    const payloads = [];
     for (let c = 0; c < concurrency; c++) {
-      const writeRequest = generateBatchWriteRequest(BATCH_SIZE);
-      requests.push(axios.post(`${BASE_URL}/write`, writeRequest));
+      payloads.push(generateArrayWriteRequest(BATCH_SIZE));
     }
 
     const start = performance.now();
     try {
-      await Promise.all(requests);
+      await Promise.all(
+        payloads.map((p) => axios.post(`${BASE_URL}/write`, p))
+      );
     } catch (error) {
       console.error("Batch insert failed:", error.message);
       if (error.response) {
@@ -194,11 +180,11 @@ async function benchmarkBatchInsertsWithConcurrency(concurrency) {
 
   console.log("\n" + JSON.stringify(stats.getStats(), null, 2));
 
-  // Calculate actual data points: each write has multiple fields
+  // Each array write has BATCH_SIZE timestamps × FIELDS.length fields
   const actualDataPoints = BATCH_SIZE * FIELDS.length * concurrency;
   const throughput = (actualDataPoints * 1000) / parseFloat(stats.getStats().avg);
   console.log(
-    `Average throughput: ${throughput.toFixed(0)} points/sec (${concurrency} × ${BATCH_SIZE} writes × ${FIELDS.length} fields = ${actualDataPoints} data points)`
+    `Average throughput: ${throughput.toFixed(0)} points/sec (${concurrency} × ${BATCH_SIZE} timestamps × ${FIELDS.length} fields = ${actualDataPoints} data points)`
   );
   return stats;
 }
@@ -206,7 +192,7 @@ async function benchmarkBatchInsertsWithConcurrency(concurrency) {
 // Run batch insert benchmarks with different concurrency levels
 async function benchmarkBatchInserts() {
   console.log("\n=== BATCH INSERT BENCHMARK (CONCURRENCY COMPARISON) ===");
-  console.log(`Batch size: ${BATCH_SIZE} points per request`);
+  console.log(`Batch size: ${BATCH_SIZE} timestamps per request (array format)`);
   console.log(`Testing concurrency levels: 1, 2, 5`);
 
   const results = {};
@@ -241,97 +227,93 @@ async function benchmarkBatchInserts() {
 }
 
 // Insert sample data for queries (1 year of data)
+// Uses array-format writes with large batches and pipelined concurrency.
 async function insertSampleData() {
   console.log("\n=== INSERTING SAMPLE DATA FOR QUERY BENCHMARKS ===");
-  console.log(
-    "This will insert 1 year of data for all hosts (525,600 points per host)..."
-  );
 
+  const SAMPLE_BATCH_SIZE = 5000; // timestamps per request (was 100)
+  const CONCURRENCY = 4; // in-flight HTTP requests at a time
+  const totalPoints = NUM_HOSTS * MINUTES_PER_YEAR;
   const yearAgo = Date.now() * 1000000 - MINUTES_PER_YEAR * MINUTE_IN_NS;
 
-  let totalInserted = 0;
-  const batchSize = 100; // Use same batch size as benchmark
-  const totalPoints = NUM_HOSTS * MINUTES_PER_YEAR;
+  console.log(
+    `Inserting ${totalPoints.toLocaleString()} points (${NUM_HOSTS} hosts × ${MINUTES_PER_YEAR.toLocaleString()} min)`
+  );
+  console.log(
+    `Batch: ${SAMPLE_BATCH_SIZE} timestamps/req, Concurrency: ${CONCURRENCY}, Format: array writes`
+  );
 
+  let totalInserted = 0;
+  const globalStart = performance.now();
+  let lastReportTime = globalStart;
+  let lastReportPoints = 0;
+
+  // Build a queue of all work units: { hostId, rackId, minuteOffset, count }
+  const workQueue = [];
   for (let hostId = 1; hostId <= NUM_HOSTS; hostId++) {
     const rackId = ((hostId - 1) % NUM_RACKS) + 1;
+    for (let minute = 0; minute < MINUTES_PER_YEAR; minute += SAMPLE_BATCH_SIZE) {
+      const count = Math.min(SAMPLE_BATCH_SIZE, MINUTES_PER_YEAR - minute);
+      workQueue.push({ hostId, rackId, minute, count });
+    }
+  }
 
-    for (let minute = 0; minute < MINUTES_PER_YEAR; minute += batchSize) {
-      // Build batch writes array (individual write objects)
-      const writes = [];
+  // Process work queue with bounded concurrency
+  let queueIdx = 0;
 
-      const batchEnd = Math.min(minute + batchSize, MINUTES_PER_YEAR);
-      for (let m = minute; m < batchEnd; m++) {
-        const timestamp = yearAgo + m * MINUTE_IN_NS;
+  async function worker() {
+    while (queueIdx < workQueue.length) {
+      const idx = queueIdx++;
+      const { hostId, rackId, minute, count } = workQueue[idx];
+      const startTs = yearAgo + minute * MINUTE_IN_NS;
 
-        // Generate values for each field
-        const fields = {};
-        FIELDS.forEach((field) => {
-          let value;
-          switch (field) {
-            case "cpu_usage":
-              value = 20 + Math.random() * 60;
-              break;
-            case "memory_usage":
-              value = 30 + Math.random() * 50;
-              break;
-            case "disk_io_read":
-            case "disk_io_write":
-              value = Math.random() * 100;
-              break;
-            case "network_in":
-            case "network_out":
-              value = Math.random() * 1000;
-              break;
-            case "load_avg_1m":
-            case "load_avg_5m":
-            case "load_avg_15m":
-              value = Math.random() * 4;
-              break;
-            case "temperature":
-              value = 50 + Math.random() * 30;
-              break;
-            default:
-              value = Math.random() * 100;
-          }
-          fields[field] = value;
-        });
-
-        writes.push({
-          measurement: MEASUREMENT,
-          tags: {
-            host: `host-${hostId.toString().padStart(2, "0")}`,
-            rack: `rack-${rackId}`,
-          },
-          fields: fields,
-          timestamp: timestamp,
-        });
-      }
-
-      // Create the batch-format write request
-      const writeRequest = { writes };
+      const payload = generateArrayWriteRequest(count, hostId, rackId, startTs, MINUTE_IN_NS);
 
       try {
-        await axios.post(`${BASE_URL}/write`, writeRequest);
-        totalInserted += writes.length;
-        process.stdout.write(
-          `\rInserted ${totalInserted}/${totalPoints} points (${(
-            (totalInserted * 100) /
-            totalPoints
-          ).toFixed(1)}%)`
-        );
+        await axios.post(`${BASE_URL}/write`, payload);
       } catch (error) {
-        console.error("\nFailed to insert batch:", error.message);
+        console.error(`\nFailed batch host=${hostId} min=${minute}: ${error.message}`);
         if (error.response) {
           console.error("Response status:", error.response.status);
           console.error("Response data:", error.response.data);
         }
         process.exit(1);
       }
+
+      totalInserted += count;
+
+      // Report progress (throttle to avoid console spam)
+      const now = performance.now();
+      if (now - lastReportTime >= 500 || totalInserted === totalPoints) {
+        const elapsedSec = (now - globalStart) / 1000;
+        const intervalSec = (now - lastReportTime) / 1000;
+        const intervalPoints = totalInserted - lastReportPoints;
+        const instantPps = Math.round(intervalPoints / intervalSec);
+        const avgPps = Math.round(totalInserted / elapsedSec);
+        const pct = ((totalInserted * 100) / totalPoints).toFixed(1);
+
+        process.stdout.write(
+          `\r${totalInserted.toLocaleString()}/${totalPoints.toLocaleString()} (${pct}%)  ${instantPps.toLocaleString()} pts/s  avg ${avgPps.toLocaleString()} pts/s  `
+        );
+
+        lastReportTime = now;
+        lastReportPoints = totalInserted;
+      }
     }
   }
 
-  console.log("\nSample data insertion complete!");
+  // Launch concurrent workers
+  const workers = [];
+  for (let i = 0; i < CONCURRENCY; i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  const totalSec = (performance.now() - globalStart) / 1000;
+  const overallPps = Math.round(totalInserted / totalSec);
+  console.log(
+    `\nDone: ${totalInserted.toLocaleString()} points in ${totalSec.toFixed(1)}s (${overallPps.toLocaleString()} pts/s sustained)`
+  );
 }
 
 // Benchmark queries

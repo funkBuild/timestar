@@ -10,33 +10,38 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include "series_id.hpp"
 
 namespace tsdb {
 
 // Magic number for tombstone files ('TSMT' in hex)
 constexpr uint32_t TOMBSTONE_MAGIC = 0x54534D54;
-constexpr uint32_t TOMBSTONE_VERSION = 1;
+constexpr uint32_t TOMBSTONE_VERSION = 2;
+constexpr uint32_t TOMBSTONE_VERSION_V1 = 1;  // Legacy version with uint64_t seriesId
 
 // Individual tombstone entry
 struct TombstoneEntry {
-    uint64_t seriesId;      // Series identifier (8 bytes)
+    SeriesId128 seriesId;   // Series identifier (16 bytes)
     uint64_t startTime;     // Start of deletion range in nanoseconds (8 bytes)
     uint64_t endTime;       // End of deletion range in nanoseconds (8 bytes)
     uint32_t checksum;      // CRC32 checksum of entry (4 bytes)
-    
-    // Total size: 28 bytes
-    static constexpr size_t SIZE = 28;
-    
+
+    // Total size: 36 bytes (16+8+8+4)
+    static constexpr size_t SIZE = 36;
+
+    // V1 entry size for backward compatibility (uint64_t seriesId was 8 bytes)
+    static constexpr size_t V1_SIZE = 28;
+
     // Comparison operators for sorting
     bool operator<(const TombstoneEntry& other) const {
         if (seriesId != other.seriesId) return seriesId < other.seriesId;
         if (startTime != other.startTime) return startTime < other.startTime;
         return endTime < other.endTime;
     }
-    
+
     bool operator==(const TombstoneEntry& other) const {
-        return seriesId == other.seriesId && 
-               startTime == other.startTime && 
+        return seriesId == other.seriesId &&
+               startTime == other.startTime &&
                endTime == other.endTime;
     }
 };
@@ -61,7 +66,7 @@ private:
     std::vector<TombstoneEntry> entries;
     
     // Index for fast lookups: seriesId -> vector of (startTime, endTime) pairs
-    std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> seriesRanges;
+    std::map<SeriesId128, std::vector<std::pair<uint64_t, uint64_t>>> seriesRanges;
     
     seastar::file tombstoneFile;
     bool isOpen = false;
@@ -88,28 +93,28 @@ public:
     // Add a new tombstone with verification
     // Returns true if tombstone was added, false if verification failed
     seastar::future<bool> addTombstone(
-        uint64_t seriesId,
+        const SeriesId128& seriesId,
         uint64_t startTime,
         uint64_t endTime,
         TSM* tsmFile = nullptr  // Optional: for verification
     );
-    
+
     // Check if a specific point is tombstoned
-    bool isDeleted(uint64_t seriesId, uint64_t timestamp) const;
-    
+    bool isDeleted(const SeriesId128& seriesId, uint64_t timestamp) const;
+
     // Check if any part of a range is tombstoned
-    bool hasDeletedRange(uint64_t seriesId, uint64_t startTime, uint64_t endTime) const;
-    
+    bool hasDeletedRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) const;
+
     // Get all tombstone ranges for a series
-    std::vector<std::pair<uint64_t, uint64_t>> getTombstoneRanges(uint64_t seriesId) const;
-    
+    std::vector<std::pair<uint64_t, uint64_t>> getTombstoneRanges(const SeriesId128& seriesId) const;
+
     // Get all tombstoned series IDs
-    std::set<uint64_t> getTombstonedSeries() const;
+    std::set<SeriesId128> getTombstonedSeries() const;
     
     // Filter timestamps and values based on tombstones
     template<typename T>
     std::pair<std::vector<uint64_t>, std::vector<T>> filterTombstoned(
-        uint64_t seriesId,
+        const SeriesId128& seriesId,
         const std::vector<uint64_t>& timestamps,
         const std::vector<T>& values) const;
     
@@ -132,7 +137,7 @@ public:
 // Template implementation for filtering
 template<typename T>
 std::pair<std::vector<uint64_t>, std::vector<T>> TSMTombstone::filterTombstoned(
-    uint64_t seriesId,
+    const SeriesId128& seriesId,
     const std::vector<uint64_t>& timestamps,
     const std::vector<T>& values) const {
     

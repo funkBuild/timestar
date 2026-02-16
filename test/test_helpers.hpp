@@ -114,12 +114,22 @@ public:
         eng.invoke_on_all([](Engine& engine) {
             return engine.init();
         }).get();
+        // Set back-reference for cross-shard metadata indexing
+        eng.invoke_on_all([this](Engine& engine) {
+            engine.setShardedRef(&eng);
+            return seastar::make_ready_future<>();
+        }).get();
     }
 
     void startWithBackground() {
         eng.start().get();
         eng.invoke_on_all([](Engine& engine) {
             return engine.init();
+        }).get();
+        // Set back-reference for cross-shard metadata indexing
+        eng.invoke_on_all([this](Engine& engine) {
+            engine.setShardedRef(&eng);
+            return seastar::make_ready_future<>();
         }).get();
         eng.invoke_on_all([](Engine& engine) {
             return engine.startBackgroundTasks();

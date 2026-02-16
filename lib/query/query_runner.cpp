@@ -9,6 +9,7 @@
 #include <chrono>
 #include <numeric>
 #include <algorithm>
+#include <optional>
 
 #include <seastar/core/distributed.hh>
 
@@ -18,16 +19,21 @@ typedef std::chrono::high_resolution_clock Clock;
 template <class T>
 seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64_t startTime, uint64_t endTime){
   LOG_QUERY_PATH(tsdb::query_log, debug, "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime, endTime);
-  std::vector<TSMResult<T>> tsmResults;
 
-  // Pre-allocate for expected TSM files to avoid reallocations
-  tsmResults.reserve(fileManager->sequencedTsmFiles.size());
+  // Pre-allocate indexed slots to avoid concurrent push_back on a shared vector.
+  // Each coroutine writes to its own slot, eliminating the race condition where
+  // parallel_for_each coroutines could push_back concurrently after co_await points.
+  std::vector<std::optional<TSMResult<T>>> tsmSlots(fileManager->sequencedTsmFiles.size());
 
   // First query TSM files
+  size_t slotIdx = 0;
   co_await seastar::parallel_for_each(
     fileManager->sequencedTsmFiles.begin(),
     fileManager->sequencedTsmFiles.end(),
-    [&] (std::pair<unsigned int, seastar::shared_ptr<TSM>> tsmTuple) -> seastar::future<> {
+    [&tsmSlots, &series, startTime, endTime, &slotIdx] (std::pair<unsigned int, seastar::shared_ptr<TSM>> tsmTuple) -> seastar::future<> {
+      // Assign index before any suspension point - safe in cooperative scheduling
+      // because parallel_for_each invokes the lambda sequentially before yielding
+      size_t myIdx = slotIdx++;
       auto [tsmRank, tsmFile] = tsmTuple;
 
       // Use queryWithTombstones to automatically filter out deleted data
@@ -37,27 +43,35 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
 
       if(results.empty())
         co_return;
-      
+
       results.sort();
-      tsmResults.push_back(std::move(results));
+      tsmSlots[myIdx] = std::move(results);
     }
   );
+
+  // Collect non-empty results from the slots
+  std::vector<TSMResult<T>> tsmResults;
+  tsmResults.reserve(tsmSlots.size());
+  for (auto& slot : tsmSlots) {
+    if (slot.has_value()) {
+      tsmResults.push_back(std::move(*slot));
+    }
+  }
 
   // Sort by rank in descending order
   std::sort(tsmResults.begin(), tsmResults.end(), [](const auto& lhs, const auto& rhs){
     return lhs.rank > rhs.rank;
   });
 
-  // Now also query memory stores from WAL
+  // Now also query memory stores from WAL.
+  // With background TSM conversion, multiple memory stores may hold data
+  // for the same series, so we query all of them.
   QueryResult<T> result = QueryResult<T>::fromTsmResults(tsmResults);
-  
-  // Query memory stores - WAL replay ensures correct state without filtering
-  const auto* memoryData = walFileManager->queryMemoryStores<T>(series);
-  if (memoryData != nullptr) {
-    // Filter by time range and add to results
+
+  auto memoryMatches = walFileManager->queryAllMemoryStores<T>(series);
+  for (const auto* memoryData : memoryMatches) {
     const auto& storeData = *memoryData;
 
-    // Pre-allocate space to avoid reallocations
     result.timestamps.reserve(result.timestamps.size() + storeData.timestamps.size());
     result.values.reserve(result.values.size() + storeData.values.size());
 
@@ -69,27 +83,31 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
     }
   }
 
-  // OPTIMIZATION: Sort combined results by timestamp using index-based sorting
-  // This avoids creating a temporary vector of pairs, reducing allocations by half
+  // Sort combined results by timestamp and deduplicate.
+  // Deduplication is needed because during background TSM conversion, the same
+  // data may exist in both a TSM file and an in-memory store briefly.
   if (!result.timestamps.empty()) {
     // Create index array
     std::vector<size_t> indices(result.timestamps.size());
     std::iota(indices.begin(), indices.end(), 0);
 
-    // Sort indices by timestamp - only sorts small integers, not the actual data
+    // Sort indices by timestamp
     std::sort(indices.begin(), indices.end(),
       [&timestamps = result.timestamps](size_t a, size_t b) {
         return timestamps[a] < timestamps[b];
       });
 
-    // Apply permutation in-place using index array
-    // This is more cache-friendly than the pair approach
+    // Apply permutation and deduplicate by timestamp in one pass
     std::vector<uint64_t> sortedTimestamps;
     std::vector<T> sortedValues;
     sortedTimestamps.reserve(result.timestamps.size());
     sortedValues.reserve(result.values.size());
 
     for (size_t idx : indices) {
+      // Skip duplicate timestamps (keep first occurrence, which is from TSM/higher priority)
+      if (!sortedTimestamps.empty() && sortedTimestamps.back() == result.timestamps[idx]) {
+        continue;
+      }
       sortedTimestamps.push_back(result.timestamps[idx]);
       sortedValues.push_back(std::move(result.values[idx]));
     }

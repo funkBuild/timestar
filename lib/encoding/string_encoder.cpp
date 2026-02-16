@@ -1,6 +1,8 @@
 #include "string_encoder.hpp"
 #include <snappy.h>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 void StringEncoder::writeVarInt(AlignedBuffer& buffer, uint32_t value) {
     while (value >= 0x80) {
@@ -38,12 +40,22 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
 
 AlignedBuffer StringEncoder::encode(const std::vector<std::string>& values) {
     AlignedBuffer result;
-    
-    // Calculate uncompressed size
+
+    // Validate count fits in uint32_t header field
+    if (values.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("String encoder: count " + std::to_string(values.size()) +
+            " exceeds uint32_t maximum");
+    }
+
+    // Calculate uncompressed size and validate individual string lengths
     size_t uncompressedSize = 0;
     for (const auto& str : values) {
+        if (str.size() > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("String encoder: individual string length " +
+                std::to_string(str.size()) + " exceeds uint32_t maximum");
+        }
         // Calculate varint size for length
-        uint32_t len = str.size();
+        uint32_t len = static_cast<uint32_t>(str.size());
         size_t varintSize = 1;
         while (len >= 0x80) {
             varintSize++;
@@ -51,11 +63,17 @@ AlignedBuffer StringEncoder::encode(const std::vector<std::string>& values) {
         }
         uncompressedSize += varintSize + str.size();
     }
-    
+
+    // Validate total uncompressed size fits in uint32_t header field
+    if (uncompressedSize > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("String encoder: total uncompressed size " +
+            std::to_string(uncompressedSize) + " exceeds uint32_t maximum");
+    }
+
     // Create uncompressed buffer with string data
     AlignedBuffer uncompressed(uncompressedSize);
     size_t writePos = 0;
-    
+
     for (const auto& str : values) {
         // Write varint length prefix
         uint32_t len = static_cast<uint32_t>(str.size());
@@ -64,41 +82,47 @@ AlignedBuffer StringEncoder::encode(const std::vector<std::string>& values) {
             len >>= 7;
         }
         uncompressed.data[writePos++] = static_cast<uint8_t>(len & 0x7F);
-        
+
         // Write string data
         std::memcpy(uncompressed.data.data() + writePos, str.data(), str.size());
         writePos += str.size();
     }
     uncompressed.data.resize(writePos);
-    
+
     // Compress with Snappy
     size_t compressedMaxSize = snappy::MaxCompressedLength(uncompressed.data.size());
     std::vector<char> compressed(compressedMaxSize);
     size_t compressedSize;
-    
-    snappy::RawCompress(reinterpret_cast<const char*>(uncompressed.data.data()), 
+
+    snappy::RawCompress(reinterpret_cast<const char*>(uncompressed.data.data()),
                         uncompressed.data.size(),
                         compressed.data(),
                         &compressedSize);
-    
+
+    // Validate compressed size fits in uint32_t header field
+    if (compressedSize > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("String encoder: compressed size " +
+            std::to_string(compressedSize) + " exceeds uint32_t maximum");
+    }
+
     // Write header: magic_number(4) | uncompressed_size(4) | compressed_size(4) | count(4)
-    
+
     // Magic number for string encoding
     uint32_t magic = 0x53545247;  // "STRG"
     result.write(magic);
-    
+
     uint32_t uncompSize = static_cast<uint32_t>(uncompressed.data.size());
     result.write(uncompSize);
-    
+
     uint32_t compSize = static_cast<uint32_t>(compressedSize);
     result.write(compSize);
-    
+
     uint32_t count = static_cast<uint32_t>(values.size());
     result.write(count);
-    
+
     // Write compressed data
     result.write_bytes(compressed.data(), compressedSize);
-    
+
     return result;
 }
 

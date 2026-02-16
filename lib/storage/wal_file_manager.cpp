@@ -5,6 +5,7 @@
 #include "series_id.hpp"
 
 #include <seastar/core/reactor.hh>
+#include <seastar/core/thread.hh>
 
 #include <algorithm>
 #include <chrono>
@@ -14,7 +15,7 @@
 
 namespace fs = std::filesystem;
 
-WALFileManager::WALFileManager() : pendingWrites(100) {
+WALFileManager::WALFileManager() {
   shardId = seastar::this_shard_id();
 }
 
@@ -30,12 +31,18 @@ seastar::future<> WALFileManager::init(Engine &engine,
 
   std::vector<std::string> walFiles;
 
-  if (fs::exists(path)) {
-    for (const auto &entry : fs::directory_iterator(path)) {
-      if (endsWith(entry.path(), ".wal"))
-        walFiles.push_back(entry.path());
+  // Wrap blocking std::filesystem calls in seastar::async to avoid
+  // blocking the Seastar reactor thread (important for NFS / high I/O).
+  walFiles = co_await seastar::async([&path]() {
+    std::vector<std::string> files;
+    if (fs::exists(path)) {
+      for (const auto &entry : fs::directory_iterator(path)) {
+        if (endsWith(entry.path(), ".wal"))
+          files.push_back(entry.path());
+      }
     }
-  }
+    return files;
+  });
 
   if (!walFiles.empty()) {
     tsdb::wal_log.info(
@@ -80,6 +87,7 @@ seastar::future<> WALFileManager::init(Engine &engine,
     // Write to TSM if there's data
     // NOTE: We always have to write the WAL to TSM since WAL's can't be resumed
     // due to make_file_output_stream
+    bool conversionSucceeded = false;
     if (!store->isEmpty()) {
       tsdb::wal_log.info("Writing memory store {} to TSM on shard {}", seqNum,
                          shardId);
@@ -87,6 +95,7 @@ seastar::future<> WALFileManager::init(Engine &engine,
         co_await convertWalToTsm(store);
         tsdb::wal_log.info("Successfully converted WAL {} to TSM on shard {}",
                            seqNum, shardId);
+        conversionSucceeded = true;
       } catch (const std::bad_alloc &e) {
         tsdb::wal_log.error(
             "Failed to convert WAL {} to TSM on shard {} - bad_alloc", seqNum,
@@ -107,18 +116,22 @@ seastar::future<> WALFileManager::init(Engine &engine,
       } catch (const std::exception &e) {
         tsdb::wal_log.error("Failed to convert WAL {} to TSM on shard {}: {}",
                             seqNum, shardId, e.what());
-        // Try to continue with other WAL files
-        // The data is lost but we may be able to recover other WALs
+        // Preserve WAL file so it can be recovered on next restart
+        tsdb::wal_log.warn(
+            "Preserving WAL file {} for recovery on next restart",
+            walFilename);
       }
     } else {
       tsdb::wal_log.info(
           "WAL {} is empty, removing without creating TSM on shard {}", seqNum,
           shardId);
+      conversionSucceeded = true; // Empty WAL, safe to remove
     }
 
-    // Always remove the WAL file after recovery regardless of whether it had
-    // data
-    co_await seastar::remove_file(walFilename);
+    // Only remove WAL file if conversion succeeded or store was empty
+    if (conversionSucceeded) {
+      co_await seastar::remove_file(walFilename);
+    }
 
     // Explicitly release the temporary memory store to free resources
     store = nullptr;
@@ -309,8 +322,10 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
   tsdb::wal_log.info(
       "Memory store {} full (16MB threshold reached), rolling over",
       previousStore->sequenceNumber);
-  co_await previousStore->close();
 
+  // Create and init the new store FIRST, before closing the old one.
+  // This ensures memoryStores[0] always points to an open store,
+  // even if another insert coroutine runs during a co_await yield.
   auto store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);
   co_await store->initWAL();
   memoryStores.insert(memoryStores.begin(), store);
@@ -318,12 +333,41 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
   tsdb::wal_log.info("New memory store {} created for shard {}",
                      store->sequenceNumber, shardId);
 
-  // Synchronously convert the closed store to TSM (inline, no background task needed).
-  // This eliminates race conditions from the old pipe-based background writer.
+  // Do NOT close the old store here — in-flight writes may still be
+  // completing on its WAL (holding _io_gate, waiting on _io_sem).
+  // The background conversion task closes the store after all pending
+  // I/O drains via WAL::close() -> _io_gate.close().
+
+  // Launch TSM conversion as a background task so writes are not blocked.
+  // The gate tracks the in-flight conversion; close() drains it at shutdown.
+  // The conversion semaphore serializes conversions to prevent compaction races
+  // (writeMemstore triggers inline compaction which is not reentrant).
   if (!previousStore->isEmpty()) {
-    co_await convertWalToTsm(previousStore);
+    auto sid = shardId;
+    auto seqNum = previousStore->sequenceNumber;
+    _backgroundGate.enter();
+    // Acquire the semaphore to serialize with other conversions, then
+    // close the store (drains any in-flight WAL writes) and convert.
+    // The chained .finally() releases the gate when the task completes.
+    (void)seastar::get_units(_conversionSemaphore, 1).then(
+        [this, store = previousStore](auto units) {
+          return store->close().then([this, store, units = std::move(units)]() mutable {
+            return convertWalToTsm(store).finally([units = std::move(units)] {});
+          });
+        }).handle_exception([sid, seqNum](auto ep) {
+          try {
+            std::rethrow_exception(ep);
+          } catch (const std::exception& e) {
+            tsdb::wal_log.error(
+                "[BG_CONVERT] Background TSM conversion failed for store {} on shard {}: {}",
+                seqNum, sid, e.what());
+          }
+        }).finally([this] {
+          _backgroundGate.leave();
+        });
   } else {
-    // Empty store — just remove the WAL file
+    // Empty store — close and remove the WAL file
+    co_await previousStore->close();
     co_await previousStore->removeWAL();
     auto it = std::find(memoryStores.begin(), memoryStores.end(), previousStore);
     if (it != memoryStores.end()) {
@@ -437,33 +481,19 @@ WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
     throw;
   }
 
-  co_await store->removeWAL();
-  tsdb::wal_log.info("Successfully converted WAL {} to TSM on shard {}",
-                     store->sequenceNumber, shardId);
-
-  // Only remove from memoryStores if it's actually in there
-  // During initialization, temporary stores are not in the vector
+  // Remove from memoryStores immediately after successful TSM write,
+  // BEFORE the removeWAL yield point, to prevent duplicate query results.
+  // The shared_ptr `store` keeps data alive for the removeWAL call below.
   auto it = std::find(memoryStores.begin(), memoryStores.end(), store);
   if (it != memoryStores.end()) {
     memoryStores.erase(it);
   }
+
+  co_await store->removeWAL();
+  tsdb::wal_log.info("Successfully converted WAL {} to TSM on shard {}",
+                     store->sequenceNumber, shardId);
 }
 
-seastar::future<> WALFileManager::startTsmWriter() {
-  tsdb::wal_log.info("Background TSM writer started on shard {}", shardId);
-
-  for (;;) {
-    std::optional<seastar::shared_ptr<MemoryStore>> pipeStore =
-        co_await pendingWrites.reader.read();
-
-    if (!pipeStore.has_value() || pipeStore.value().use_count() == 0) {
-      tsdb::wal_log.info("Background TSM writer stopping on shard {}", shardId);
-      break;
-    }
-
-    co_await convertWalToTsm(pipeStore.value());
-  }
-}
 
 std::optional<TSMValueType>
 WALFileManager::getSeriesType(std::string &seriesKey) {

@@ -26,11 +26,9 @@ using namespace httpd;
 
 // HttpServer class removed - using direct implementation in main()
 
-// Create handlers as globals so they can be used in set_routes
-std::unique_ptr<HttpWriteHandler> g_writeHandler;
-std::unique_ptr<tsdb::HttpQueryHandler> g_queryHandler;
-std::unique_ptr<HttpDeleteHandler> g_deleteHandler;
-std::unique_ptr<HttpMetadataHandler> g_metadataHandler;
+// Global sharded engine - declared here so set_routes() can reference it.
+// (Defined before set_routes, initialized in main.)
+seastar::sharded<Engine> g_engine;
 
 void set_routes(routes& r) {
     // Simple test endpoints
@@ -38,40 +36,35 @@ void set_routes(routes& r) {
         return "Hello from TSDB HTTP Server!";
     });
     r.add(operation_type::GET, url("/test"), test);
-    
+
     auto* health = new function_handler([](const_req req) {
         return "{\"status\":\"healthy\"}";
     });
     r.add(operation_type::GET, url("/health"), health);
-    
-    // Register write endpoint
-    if (g_writeHandler) {
-        g_writeHandler->registerRoutes(r);
-    }
-    
-    // Register query endpoint
-    if (g_queryHandler) {
-        g_queryHandler->registerRoutes(r);
-    }
-    
-    // Register delete endpoint
-    if (g_deleteHandler) {
-        g_deleteHandler->registerRoutes(r);
-    }
-    
-    // Register metadata endpoint
-    if (g_metadataHandler) {
-        g_metadataHandler->registerRoutes(r);
-    }
-    
+
+    // Create per-shard handler instances on the calling shard's heap.
+    // Each handler's registerRoutes() captures `this` in route lambdas,
+    // so the handler must outlive set_routes(). Heap allocation ensures
+    // each shard owns its handler in shard-local memory (no cross-shard access).
+    // These are intentionally never freed -- they live for the process lifetime,
+    // matching the pattern used by function_handler above.
+    auto* writeHandler = new HttpWriteHandler(&g_engine);
+    writeHandler->registerRoutes(r);
+
+    auto* queryHandler = new tsdb::HttpQueryHandler(&g_engine, nullptr);
+    queryHandler->registerRoutes(r);
+
+    auto* deleteHandler = new HttpDeleteHandler(&g_engine);
+    deleteHandler->registerRoutes(r);
+
+    auto* metadataHandler = new HttpMetadataHandler(&g_engine);
+    metadataHandler->registerRoutes(r);
+
     auto* root = new function_handler([](const_req req) {
         return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\"]}";
     });
     r.add(operation_type::GET, url("/"), root);
 }
-
-// Global sharded engine for use in handlers
-seastar::sharded<Engine> g_engine;
 
 int main(int argc, char** argv) {
     seastar::app_template app;
@@ -101,7 +94,14 @@ int main(int argc, char** argv) {
                 g_engine.invoke_on_all([](Engine& engine) {
                     return engine.init();
                 }).get();
-                
+
+                // Set back-reference so Engine::insert() on non-zero shards can
+                // forward metadata indexing to shard 0.
+                g_engine.invoke_on_all([](Engine& engine) {
+                    engine.setShardedRef(&g_engine);
+                    return seastar::make_ready_future<>();
+                }).get();
+
                 tsdb::http_log.info("Engine init completed on all shards");
             } catch (const std::bad_alloc& e) {
                 tsdb::http_log.error("bad_alloc during Engine init: {}", e.what());
@@ -122,31 +122,11 @@ int main(int argc, char** argv) {
             }).get();
             
             tsdb::http_log.info("Engine initialized successfully with background tasks");
-            
-            // STEP 2: Create handlers
-            g_writeHandler = std::make_unique<HttpWriteHandler>(&g_engine);
-            tsdb::http_log.info("Write handler created");
-            
-            // Note: Pass nullptr for index since each Engine already has its own index
-            // The query handler will use the Engine's index through the Engine interface
-            try {
-                g_queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&g_engine, nullptr);
-                tsdb::http_log.info("Query handler created");
-            } catch (const std::exception& e) {
-                tsdb::http_log.error("Failed to create query handler: {}", e.what());
-                // Continue without query handler for now
-                g_queryHandler = nullptr;
-            }
-            
-            // Create delete handler
-            g_deleteHandler = std::make_unique<HttpDeleteHandler>(&g_engine);
-            tsdb::http_log.info("Delete handler created");
-            
-            // Create metadata handler
-            g_metadataHandler = std::make_unique<HttpMetadataHandler>(&g_engine);
-            tsdb::http_log.info("Metadata handler created");
-            
-            // Create stop signal handler
+
+            // STEP 2: Create stop signal handler
+            // Note: HTTP handlers are created per-shard inside set_routes() to avoid
+            // cross-shard memory access. Each shard gets its own handler instance
+            // allocated on its own heap.
             seastar_apps_lib::stop_signal stop_signal;
             
             auto server = std::make_unique<http_server_control>();

@@ -178,8 +178,9 @@ seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shar
     uint64_t tsmSeqNum = file->rankAsInteger();
     sequencedTsmFiles.erase(tsmSeqNum);
     
-    // Mark file for deletion
-    file->markForDeletion();
+    // Delete the tombstone file first (if any), then the TSM file itself
+    co_await file->deleteTombstoneFile();
+    co_await file->scheduleDelete();
   }
   
   co_return;
@@ -195,10 +196,16 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
       // Plan and execute compaction
       auto plan = compactor->planCompaction(tier);
       if(plan.isValid()) {
-        auto stats = co_await compactor->executeCompaction(plan);
-        tsdb::compactor_log.info("Compacted {} files from tier {} to tier {} in {}ms",
-                                  stats.filesCompacted, tier, plan.targetTier, 
-                                  stats.duration.count());
+        try {
+          auto stats = co_await compactor->executeCompaction(plan);
+          tsdb::compactor_log.info("Compacted {} files from tier {} to tier {} in {}ms",
+                                    stats.filesCompacted, tier, plan.targetTier,
+                                    stats.duration.count());
+        } catch (const std::exception& e) {
+          tsdb::compactor_log.error(
+              "Compaction failed for tier {}: {}. Will retry later.",
+              tier, e.what());
+        }
       }
     }
   }

@@ -28,8 +28,8 @@ protected:
 // ==================== Sum ====================
 
 TEST_F(SimdAggregatorCorrectnessTest, Sum_Empty) {
-    EXPECT_DOUBLE_EQ(SimdAggregator::calculateSum(nullptr, 0), 0.0);
-    EXPECT_DOUBLE_EQ(scalar::calculateSum(nullptr, 0), 0.0);
+    EXPECT_TRUE(std::isnan(SimdAggregator::calculateSum(nullptr, 0)));
+    EXPECT_TRUE(std::isnan(scalar::calculateSum(nullptr, 0)));
 }
 
 TEST_F(SimdAggregatorCorrectnessTest, Sum_SingleValue) {
@@ -127,7 +127,7 @@ TEST_F(SimdAggregatorCorrectnessTest, Sum_VariousSizes) {
 // ==================== Avg ====================
 
 TEST_F(SimdAggregatorCorrectnessTest, Avg_Empty) {
-    EXPECT_DOUBLE_EQ(SimdAggregator::calculateAvg(nullptr, 0), 0.0);
+    EXPECT_TRUE(std::isnan(SimdAggregator::calculateAvg(nullptr, 0)));
 }
 
 TEST_F(SimdAggregatorCorrectnessTest, Avg_SingleValue) {

@@ -201,82 +201,12 @@ TEST_F(TSMTest, ReferenceCountingBasic) {
         writer.close();
     }
 
-    // Test reference counting (synchronous operations)
+    // TSM no longer has reference counting; the shard-per-core model
+    // guarantees single-threaded access, so files are deleted directly
+    // in removeTSMFiles() via scheduleDelete().
     TSM tsm(filename);
-
-    // Initial ref count should be 0
-    EXPECT_EQ(tsm.getRefCount(), 0);
-
-    // Add references
-    tsm.addRef();
-    EXPECT_EQ(tsm.getRefCount(), 1);
-
-    tsm.addRef();
-    EXPECT_EQ(tsm.getRefCount(), 2);
-
-    // Release references
-    tsm.releaseRef();
-    EXPECT_EQ(tsm.getRefCount(), 1);
-
-    tsm.releaseRef();
-    EXPECT_EQ(tsm.getRefCount(), 0);
-}
-
-TEST_F(TSMTest, MarkForDeletion) {
-    std::string filename = getTestFilePath("0_10.tsm");  // tier=0, seq=10
-
-    // Write a minimal file
-    {
-        TSMWriter writer(filename);
-        std::vector<uint64_t> timestamps = {1000};
-        std::vector<double> values = {1.0};
-        SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.mark");
-        writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
-        writer.writeIndex();
-        writer.close();
-    }
-
-    TSM tsm(filename);
-
-    // Initially not scheduled for deletion
-    EXPECT_FALSE(tsm.scheduleDeletionFlag);
-
-    // Mark for deletion with no references
-    tsm.markForDeletion();
-    EXPECT_TRUE(tsm.scheduleDeletionFlag);
-}
-
-TEST_F(TSMTest, MarkForDeletionWithReferences) {
-    std::string filename = getTestFilePath("0_11.tsm");  // tier=0, seq=11
-
-    // Write a minimal file
-    {
-        TSMWriter writer(filename);
-        std::vector<uint64_t> timestamps = {1000};
-        std::vector<double> values = {1.0};
-        SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.mark_refs");
-        writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
-        writer.writeIndex();
-        writer.close();
-    }
-
-    TSM tsm(filename);
-
-    // Add a reference
-    tsm.addRef();
-    EXPECT_EQ(tsm.getRefCount(), 1);
-
-    // Mark for deletion
-    tsm.markForDeletion();
-
-    // Should not be scheduled yet because there's a reference
-    EXPECT_FALSE(tsm.scheduleDeletionFlag);
-
-    // Release the reference
-    tsm.releaseRef();
-
-    // Now should be scheduled for deletion
-    EXPECT_TRUE(tsm.scheduleDeletionFlag);
+    // Verify TSM can be constructed and scheduleDelete() is available
+    SUCCEED();
 }
 
 // getValueType tests

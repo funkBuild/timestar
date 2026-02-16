@@ -4,6 +4,7 @@
 
 #include "aligned_buffer.hpp"
 #include "bool_encoder.hpp"
+#include "crc32.hpp"
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
 #include "logger.hpp"
@@ -78,11 +79,10 @@ seastar::future<> WAL::init(MemoryStore * /*store*/, bool isRecovery) {
   walFile = co_await seastar::open_file_dma(filenameView, openFlags);
 
   if (!walFile) {
-    tsdb::wal_log.error("Failed to open WAL file: {}", filename);
-    co_return;
-  } else {
-    tsdb::wal_log.debug("WAL file opened: {}", filename);
+    throw std::runtime_error("Failed to open WAL file: " + filename);
   }
+
+  tsdb::wal_log.debug("WAL file opened: {}", filename);
 
   // Get current file size
   filePos = co_await walFile.size();
@@ -194,10 +194,18 @@ seastar::future<> WAL::remove() {
   co_await seastar::remove_file(filename);
 }
 
-// Write padding zeros so that the total bytes written to the output stream
+// Write structured padding so that the total bytes written to the output stream
 // since the last flush are a multiple of _dma_alignment.  This ensures the
 // underlying file_data_sink_impl's write position stays aligned after the
 // flush, preventing the DMA alignment assertion failure on subsequent writes.
+//
+// Padding format (Issue #11 fix):
+//   [uint32_t  0]          <-- padding marker (entryLength == 0)
+//   [uint32_t  skipBytes]  <-- number of additional zero bytes following
+//   [skipBytes zero bytes]
+//
+// Total padding is always >= 8 bytes.  If the natural padding would be less
+// than 8, we bump up by one full alignment block so the header always fits.
 seastar::future<> WAL::padToAlignment() {
   if (!out || _dma_alignment <= 1)
     co_return;
@@ -208,15 +216,30 @@ seastar::future<> WAL::padToAlignment() {
 
   size_t padding = _dma_alignment - remainder;
 
-  // Write zero bytes as padding.  The WAL reader will skip entries whose
-  // length prefix is 0 (padding marker).
-  // Use a stack buffer for small pads; DMA alignment is typically 4096.
-  char zeros[4096] = {};
-  size_t written = 0;
-  while (written < padding) {
-    size_t chunk = std::min(padding - written, sizeof(zeros));
-    co_await out->write(zeros, chunk);
-    written += chunk;
+  // Ensure at least 8 bytes so the structured header (marker + skipBytes)
+  // always fits.
+  if (padding < 8) {
+    padding += _dma_alignment;
+  }
+
+  // Write the 8-byte header: [paddingMarker=0][skipBytes]
+  const uint32_t paddingMarker = 0;
+  const uint32_t skipBytes = static_cast<uint32_t>(padding - 8);
+  co_await out->write(reinterpret_cast<const char *>(&paddingMarker),
+                      sizeof(paddingMarker));
+  co_await out->write(reinterpret_cast<const char *>(&skipBytes),
+                      sizeof(skipBytes));
+
+  // Write the remaining zero bytes.
+  if (skipBytes > 0) {
+    char zeros[4096] = {};
+    size_t written = 0;
+    while (written < skipBytes) {
+      size_t chunk =
+          std::min(static_cast<size_t>(skipBytes) - written, sizeof(zeros));
+      co_await out->write(zeros, chunk);
+      written += chunk;
+    }
   }
 
   _unflushed_bytes += padding;
@@ -259,6 +282,7 @@ size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
   size_t estimatedSize = 0;
 
   estimatedSize += 4;  // length prefix
+  estimatedSize += 4;  // CRC32 checksum
   estimatedSize += 1;  // WAL type
   estimatedSize += 16; // SeriesId128 (fixed 16 bytes)
 
@@ -294,67 +318,72 @@ size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
 }
 
 template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
-  // Acquire semaphore to serialize writes and prevent concurrent stream access
-  auto units = co_await seastar::get_units(_io_sem, 1);
+  // --- Encoding phase (no lock needed) ---
+  // Build the payload (everything after the length prefix and CRC)
+  AlignedBuffer payload;
 
-  // Track this operation for clean shutdown
-  auto gate_holder = _io_gate.hold();
-
-  AlignedBuffer buffer;
-
-  // Reserve space for entry length (4 bytes)
-  buffer.write((uint32_t)0);
-  size_t lengthPos = 0;
-
-  buffer.write((uint8_t)WALType::Write);
+  payload.write((uint8_t)WALType::Write);
 
   // Store SeriesId128 (fixed 16 bytes)
   SeriesId128 seriesId = insertRequest.seriesId128();
   std::string seriesIdBytes = seriesId.toBytes();
-  buffer.write(seriesIdBytes);
+  payload.write(seriesIdBytes);
 
   // Store series key string for recovery (length-prefixed)
   std::string seriesKey = insertRequest.seriesKey();
-  buffer.write((uint32_t)seriesKey.size());
-  buffer.write(seriesKey);
+  payload.write((uint32_t)seriesKey.size());
+  payload.write(seriesKey);
 
   // Value type
-  buffer.write((uint8_t)TSM::getValueType<T>());
+  payload.write((uint8_t)TSM::getValueType<T>());
 
   // Num of timestamps
-  buffer.write((uint32_t)insertRequest.timestamps.size());
+  payload.write((uint32_t)insertRequest.timestamps.size());
 
   // Encoded timestamps
   {
     AlignedBuffer encodedTimestamps =
         IntegerEncoder::encode(insertRequest.timestamps);
-    buffer.write((uint32_t)encodedTimestamps.size());
-    buffer.write(encodedTimestamps);
+    payload.write((uint32_t)encodedTimestamps.size());
+    payload.write(encodedTimestamps);
   }
 
   // Encoded values
   if constexpr (std::is_same<T, double>::value) {
     CompressedBuffer encodedFloats = FloatEncoder::encode(insertRequest.values);
-    buffer.write((uint32_t)encodedFloats.size());
-    buffer.write(encodedFloats);
+    payload.write((uint32_t)encodedFloats.size());
+    payload.write(encodedFloats);
   } else if constexpr (std::is_same<T, bool>::value) {
     AlignedBuffer encodedBools = BoolEncoder::encode(insertRequest.values);
-    buffer.write((uint32_t)encodedBools.size());
-    buffer.write(encodedBools);
+    payload.write((uint32_t)encodedBools.size());
+    payload.write(encodedBools);
   } else if constexpr (std::is_same<T, std::string>::value) {
     AlignedBuffer encodedStrings = StringEncoder::encode(insertRequest.values);
-    buffer.write((uint32_t)encodedStrings.size());
-    buffer.write(encodedStrings);
+    payload.write((uint32_t)encodedStrings.size());
+    payload.write(encodedStrings);
   } else {
     throw std::runtime_error("Unsupported data type");
   }
 
+  // Compute CRC32 over the payload
+  uint32_t crc = CRC32::compute(payload.data.data(), payload.size());
+
+  // Assemble final buffer: [entryLength][crc32][payload]
+  // entryLength = 4 (CRC) + payload size
+  AlignedBuffer buffer;
+  const uint32_t entryLength = static_cast<uint32_t>(4 + payload.size());
+  buffer.write(entryLength);
+  buffer.write(crc);
+  buffer.write(payload);
+
   const size_t dataSize = buffer.size();
 
-  // Update entry length at the beginning (excluding the length field itself)
-  const uint32_t entryLength =
-      static_cast<uint32_t>(dataSize - sizeof(uint32_t));
-  memcpy(buffer.data.data() + lengthPos, &entryLength, sizeof(uint32_t));
+  // --- I/O phase (under lock) ---
+  // Hold the gate BEFORE the semaphore so that WAL::close() (which calls
+  // _io_gate.close()) will wait for coroutines queued on _io_sem rather
+  // than racing past them and closing the stream while they're pending.
+  auto gate_holder = _io_gate.hold();
+  auto units = co_await seastar::get_units(_io_sem, 1);
 
   LOG_INSERT_PATH(tsdb::wal_log, debug,
                   "WAL::insert - dataSize={}, entryLength={}, currentSize={}",
@@ -404,72 +433,80 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     co_return;
   }
 
-  // Acquire semaphore to serialize writes and prevent concurrent stream access
-  auto units = co_await seastar::get_units(_io_sem, 1);
-
-  // Track this operation for clean shutdown
-  auto gate_holder = _io_gate.hold();
-
-  // Prepare all buffers first
+  // --- Encoding phase (no lock needed) ---
+  // Prepare all buffers first — encoding, compression, and CRC are CPU-bound
+  // and can run concurrently with other WAL operations.
   std::vector<AlignedBuffer> buffers;
   buffers.reserve(insertRequests.size());
   size_t totalSize = 0;
 
   for (auto &insertRequest : insertRequests) {
-    AlignedBuffer buf;
-    buf.write((uint32_t)0); // placeholder for length
+    // Build the payload first (everything after length prefix and CRC)
+    AlignedBuffer payload;
 
-    buf.write((uint8_t)WALType::Write);
+    payload.write((uint8_t)WALType::Write);
 
     // Store SeriesId128 (fixed 16 bytes)
     SeriesId128 seriesId = insertRequest.seriesId128();
     std::string seriesIdBytes = seriesId.toBytes();
-    buf.write(seriesIdBytes);
+    payload.write(seriesIdBytes);
 
     // Store series key string for recovery (length-prefixed)
     std::string seriesKey = insertRequest.seriesKey();
-    buf.write((uint32_t)seriesKey.size());
-    buf.write(seriesKey);
+    payload.write((uint32_t)seriesKey.size());
+    payload.write(seriesKey);
 
-    buf.write((uint8_t)TSM::getValueType<T>());
-    buf.write((uint32_t)insertRequest.timestamps.size());
+    payload.write((uint8_t)TSM::getValueType<T>());
+    payload.write((uint32_t)insertRequest.timestamps.size());
 
     {
       AlignedBuffer encodedTimestamps =
           IntegerEncoder::encode(insertRequest.timestamps);
-      buf.write((uint32_t)encodedTimestamps.size());
-      buf.write(encodedTimestamps);
+      payload.write((uint32_t)encodedTimestamps.size());
+      payload.write(encodedTimestamps);
     }
 
     if constexpr (std::is_same<T, double>::value) {
       CompressedBuffer encodedFloats =
           FloatEncoder::encode(insertRequest.values);
-      buf.write((uint32_t)encodedFloats.size());
-      buf.write(encodedFloats);
+      payload.write((uint32_t)encodedFloats.size());
+      payload.write(encodedFloats);
     } else if constexpr (std::is_same<T, bool>::value) {
       AlignedBuffer encodedBools = BoolEncoder::encode(insertRequest.values);
-      buf.write((uint32_t)encodedBools.size());
-      buf.write(encodedBools);
+      payload.write((uint32_t)encodedBools.size());
+      payload.write(encodedBools);
     } else if constexpr (std::is_same<T, std::string>::value) {
       AlignedBuffer encodedStrings =
           StringEncoder::encode(insertRequest.values);
-      buf.write((uint32_t)encodedStrings.size());
-      buf.write(encodedStrings);
+      payload.write((uint32_t)encodedStrings.size());
+      payload.write(encodedStrings);
     }
 
-    uint32_t entryLength = static_cast<uint32_t>(buf.size() - sizeof(uint32_t));
-    memcpy(buf.data.data(), &entryLength, sizeof(uint32_t));
+    // Compute CRC32 over the payload
+    uint32_t crc = CRC32::compute(payload.data.data(), payload.size());
+
+    // Assemble final buffer: [entryLength][crc32][payload]
+    AlignedBuffer buf;
+    uint32_t entryLength = static_cast<uint32_t>(4 + payload.size());
+    buf.write(entryLength);
+    buf.write(crc);
+    buf.write(payload);
 
     totalSize += buf.size();
     buffers.push_back(std::move(buf));
   }
+
+  // --- I/O phase (under lock) ---
+  // Hold the gate BEFORE the semaphore (see insert() for rationale).
+  auto gate_holder = _io_gate.hold();
+  auto units = co_await seastar::get_units(_io_sem, 1);
 
   LOG_INSERT_PATH(
       tsdb::wal_log, debug,
       "WAL::insertBatch - {} entries, total size={}, currentSize={}",
       buffers.size(), totalSize, currentSize);
 
-  // WAL limit check (pre-flight)
+  // WAL limit check (under lock so currentSize is authoritative)
   const size_t projected = currentSize + totalSize;
   if (projected > MAX_WAL_SIZE) {
     tsdb::wal_log.debug(
@@ -508,34 +545,37 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
 
 seastar::future<> WAL::deleteRange(const SeriesId128 &seriesId,
                                    uint64_t startTime, uint64_t endTime) {
-  // Acquire semaphore to serialize writes and prevent concurrent stream access
-  auto units = co_await seastar::get_units(_io_sem, 1);
-
-  // Track this operation for clean shutdown
-  auto gate_holder = _io_gate.hold();
-
-  AlignedBuffer buffer;
-
-  // Reserve space for entry length (4 bytes)
-  buffer.write((uint32_t)0);
-  size_t lengthPos = 0;
+  // --- Encoding phase (no lock needed) ---
+  // Build the payload (everything after the length prefix and CRC)
+  AlignedBuffer payload;
 
   // Type
-  buffer.write((uint8_t)WALType::DeleteRange);
+  payload.write((uint8_t)WALType::DeleteRange);
 
   // Series ID (fixed 16 bytes)
   std::string seriesIdBytes = seriesId.toBytes();
-  buffer.write(seriesIdBytes);
+  payload.write(seriesIdBytes);
 
   // Time range
-  buffer.write(startTime);
-  buffer.write(endTime);
+  payload.write(startTime);
+  payload.write(endTime);
 
-  // Update entry length
-  uint32_t entryLength = static_cast<uint32_t>(buffer.size() - 4);
-  memcpy(buffer.data.data() + lengthPos, &entryLength, 4);
+  // Compute CRC32 over the payload
+  uint32_t crc = CRC32::compute(payload.data.data(), payload.size());
+
+  // Assemble final buffer: [entryLength][crc32][payload]
+  AlignedBuffer buffer;
+  uint32_t entryLength = static_cast<uint32_t>(4 + payload.size());
+  buffer.write(entryLength);
+  buffer.write(crc);
+  buffer.write(payload);
 
   const size_t n = buffer.size();
+
+  // --- I/O phase (under lock) ---
+  // Hold the gate BEFORE the semaphore (see insert() for rationale).
+  auto gate_holder = _io_gate.hold();
+  auto units = co_await seastar::get_units(_io_sem, 1);
 
   try {
     if (out) {
@@ -629,36 +669,49 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
       break; // normal EOF
     }
 
-    // Skip DMA alignment padding (zero bytes written before flush).
-    // Padding consists of zero bytes, so entryLength == 0 means we are
-    // inside a padding region.  We scan forward one byte at a time until
-    // we find a non-zero byte (the start of the next real length prefix)
-    // or reach EOF.
+    // Skip DMA alignment padding.
+    //
+    // New format (Issue #11 fix): padding is written as
+    //   [uint32_t  0]          <-- padding marker (already consumed above)
+    //   [uint32_t  skipBytes]  <-- number of additional zero bytes to skip
+    //   [skipBytes zero bytes]
+    //
+    // Backward compatibility with old format (raw zero-filled padding):
+    //   Old WAL files wrote only zero bytes for padding. In that case
+    //   skipBytes will itself be 0 (since the next 4 bytes are also zero).
+    //   We simply loop back and read the next uint32_t, continuing until
+    //   we hit a non-zero entryLength or EOF.
     if (entryLength == 0) {
-      // We already consumed 4 zero bytes.  Now scan for a non-zero byte.
-      uint8_t probe = 0;
-      bool foundNonZero = false;
-      while (co_await read_exact(&probe, 1)) {
-        if (probe != 0) {
-          foundNonZero = true;
+      uint32_t skipBytes = 0;
+      if (!(co_await read_exact(&skipBytes, sizeof(skipBytes)))) {
+        break; // EOF within padding header
+      }
+
+      if (skipBytes > 0) {
+        // New-format padding: skip exactly skipBytes additional zero bytes.
+        static constexpr uint32_t MAX_SKIP = 16 * 1024 * 1024;
+        if (skipBytes > MAX_SKIP) {
+          tsdb::wal_log.warn(
+              "WAL recovery: unreasonable padding skip count {}, "
+              "stopping recovery",
+              skipBytes);
+          partialEntries++;
           break;
         }
+        size_t remaining = skipBytes;
+        while (remaining > 0) {
+          char discard[4096];
+          size_t toRead = std::min(remaining, sizeof(discard));
+          if (!(co_await read_exact(discard, toRead))) {
+            break; // EOF inside padding body
+          }
+          remaining -= toRead;
+        }
       }
-      if (!foundNonZero) {
-        break; // EOF reached within padding
-      }
-      // We found a non-zero byte that is the first byte of an entryLength.
-      // Read the remaining 3 bytes of the uint32_t.
-      uint8_t remaining[3];
-      if (!(co_await read_exact(remaining, 3))) {
-        partialEntries++;
-        break;
-      }
-      // Reconstruct the entry length (little-endian)
-      entryLength = static_cast<uint32_t>(probe) |
-                    (static_cast<uint32_t>(remaining[0]) << 8) |
-                    (static_cast<uint32_t>(remaining[1]) << 16) |
-                    (static_cast<uint32_t>(remaining[2]) << 24);
+      // For old-format padding (skipBytes == 0), we just consumed 8 zero
+      // bytes total (the marker + skipBytes).  Loop back to read the next
+      // entryLength; eventually we will reach a non-zero entry or EOF.
+      continue;
     }
 
     // sanity
@@ -682,7 +735,55 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
       break;
     }
 
-    Slice entrySlice(reinterpret_cast<uint8_t *>(entry.data()), entry.size());
+    // ---- CRC32 verification ----
+    // New format: [crc32 (4 bytes)][payload...]
+    // entryLength includes the CRC, so payload = entryLength - 4
+    // Old format: [WALType byte][payload...] (no CRC)
+    //
+    // Detection: if entryLength >= 8, try reading first 4 bytes as CRC and
+    // verify against the remaining bytes.  If it matches -> new format.
+    // If it doesn't match, check if the first byte is a valid WALType (0-3)
+    // which indicates old format.  Otherwise -> genuine corruption.
+    const uint8_t *rawEntry = reinterpret_cast<const uint8_t *>(entry.data());
+    const uint8_t *payloadPtr = rawEntry;
+    size_t payloadSize = entryLength;
+
+    if (entryLength >= 8) {
+      uint32_t storedCrc;
+      std::memcpy(&storedCrc, rawEntry, sizeof(uint32_t));
+
+      const uint8_t *crcPayload = rawEntry + 4;
+      size_t crcPayloadSize = entryLength - 4;
+      uint32_t computedCrc = CRC32::compute(crcPayload, crcPayloadSize);
+
+      if (storedCrc == computedCrc) {
+        // New format with valid CRC - use payload after CRC
+        payloadPtr = crcPayload;
+        payloadSize = crcPayloadSize;
+        tsdb::wal_log.trace("WAL recovery: CRC32 verified for entry");
+      } else {
+        // CRC doesn't match - check if this is old format
+        uint8_t firstByte = rawEntry[0];
+        if (firstByte <= static_cast<uint8_t>(WALType::Close)) {
+          // Looks like old format (first byte is a valid WALType)
+          tsdb::wal_log.debug(
+              "WAL recovery: old format entry detected (no CRC), type={}",
+              firstByte);
+          // payloadPtr and payloadSize already point to full entry
+        } else {
+          // Genuine corruption: CRC mismatch and first byte is not a valid type
+          tsdb::wal_log.warn(
+              "WAL recovery: CRC32 mismatch (stored=0x{:08X}, computed=0x{:08X}), "
+              "discarding corrupt entry",
+              storedCrc, computedCrc);
+          partialEntries++;
+          continue;
+        }
+      }
+    }
+    // If entryLength < 8, it's too small for new format; treat as old format
+
+    Slice entrySlice(const_cast<uint8_t *>(payloadPtr), payloadSize);
     uint8_t type = entrySlice.read<uint8_t>();
 
     switch (static_cast<WALType>(type)) {
@@ -702,7 +803,7 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
         try {
           TSDBInsert<double> insertReq =
               readSeries<double>(entrySlice, seriesKey);
-          store->insertMemory(insertReq);
+          store->insertMemory(std::move(insertReq));
         } catch (const std::exception &e) {
           tsdb::wal_log.error(
               "WAL recovery: Failed to read float series '{}': {}",
@@ -714,7 +815,7 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
       case WALValueType::Boolean: {
         try {
           TSDBInsert<bool> insertReq = readSeries<bool>(entrySlice, seriesKey);
-          store->insertMemory(insertReq);
+          store->insertMemory(std::move(insertReq));
         } catch (const std::exception &e) {
           tsdb::wal_log.error(
               "WAL recovery: Failed to read boolean series '{}': {}",
@@ -727,7 +828,7 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
         try {
           TSDBInsert<std::string> insertReq =
               readSeries<std::string>(entrySlice, seriesKey);
-          store->insertMemory(insertReq);
+          store->insertMemory(std::move(insertReq));
         } catch (const std::exception &e) {
           tsdb::wal_log.error(
               "WAL recovery: Failed to read string series '{}': {}",

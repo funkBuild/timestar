@@ -80,11 +80,11 @@ public:
     // Security limit to prevent DoS attacks via large request bodies
     static constexpr size_t MAX_WRITE_BODY_SIZE = 64 * 1024 * 1024; // 64MB
 
+    // Field value variant for flexible JSON parsing (public for validation API)
+    using FieldValue = std::variant<double, bool, std::string, int64_t>;
+
 private:
     seastar::sharded<Engine>* engineSharded;
-
-    // Field value variant for flexible JSON parsing
-    using FieldValue = std::variant<double, bool, std::string, int64_t>;
     
     struct WritePoint {
         std::string measurement;
@@ -158,13 +158,9 @@ private:
         }
     };
 
-    // Helper struct for metadata operations (deduplication across batch)
-    struct MetaOp {
-        TSMValueType valueType;
-        std::string measurement;
-        std::string fieldName;
-        std::map<std::string, std::string> tags;
-    };
+    // Helper struct for metadata operations (deduplication across batch).
+    // Aliases MetadataOp from leveldb_index.hpp for batch indexing compatibility.
+    using MetaOp = MetadataOp;
 
     // Parse a single write point from JSON string
     WritePoint parseWritePoint(const std::string& json);
@@ -196,13 +192,33 @@ private:
 
 public:
     HttpWriteHandler(seastar::sharded<Engine>* _engineSharded);
-    
+
     // Main handler for write requests
     seastar::future<std::unique_ptr<seastar::http::reply>> handleWrite(
         std::unique_ptr<seastar::http::request> req);
-    
+
     // Register routes with HTTP server
     void registerRoutes(seastar::httpd::routes& r);
+
+    // Validate that a name (measurement, tag key, field name) does not contain
+    // reserved separator characters that would corrupt key encoding.
+    // Returns empty string if valid, or an error description if invalid.
+    static std::string validateName(const std::string& name, const std::string& context);
+
+    // Validate a tag value. Same as validateName but allows spaces,
+    // since spaces don't participate in tag value key encoding.
+    // Returns empty string if valid, or an error description if invalid.
+    static std::string validateTagValue(const std::string& value, const std::string& context);
+
+    // Validate all names in a write point (measurement, tags, fields).
+    // Throws std::runtime_error if any name is invalid.
+    static void validateWritePointNames(const std::string& measurement,
+                                        const std::map<std::string, std::string>& tags,
+                                        const std::map<std::string, FieldValue>& fields);
+
+    // Parse and validate a single write point from JSON string (for testing without Seastar).
+    // Throws std::runtime_error if JSON is invalid or names contain reserved characters.
+    static void parseAndValidateWritePoint(const std::string& json);
 };
 
 #endif // HTTP_WRITE_HANDLER_H_INCLUDED

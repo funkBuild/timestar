@@ -385,7 +385,13 @@ int main(int argc, char** argv) {
         co_await engine.invoke_on_all([](Engine& e) {
             return e.init();
         });
-        
+
+        // Set back-reference for cross-shard metadata indexing
+        co_await engine.invoke_on_all([&engine](Engine& e) {
+            e.setShardedRef(&engine);
+            return seastar::make_ready_future<>();
+        });
+
         co_await engine.invoke_on_all([](Engine& e) {
             return e.startBackgroundTasks();
         });

@@ -17,7 +17,7 @@ namespace tsdb {
 
 double Aggregator::calculateAvg(const std::vector<double>& values) {
     if (values.empty()) {
-        return 0.0;
+        return std::numeric_limits<double>::quiet_NaN();
     }
     // Use SIMD when available for better performance
     if (simd::SimdAggregator::isAvx2Available()) {
@@ -50,6 +50,9 @@ double Aggregator::calculateMax(const std::vector<double>& values) {
 }
 
 double Aggregator::calculateSum(const std::vector<double>& values) {
+    if (values.empty()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
     // Use SIMD when available for better performance
     if (simd::SimdAggregator::isAvx2Available()) {
         return simd::SimdAggregator::calculateSum(values.data(), values.size());

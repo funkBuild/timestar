@@ -22,7 +22,7 @@ AlignedBuffer IntegerEncoderBasic::encode(const std::vector<uint64_t> &values) {
         return Simple16::encode(encoded);
     }
 
-    int64_t delta = values[1] - values[0];
+    int64_t delta = static_cast<int64_t>(values[1]) - static_cast<int64_t>(values[0]);
     uint64_t first_delta = ZigZag::zigzagEncode(delta);
     encoded.push_back(first_delta);
 
@@ -32,10 +32,10 @@ AlignedBuffer IntegerEncoderBasic::encode(const std::vector<uint64_t> &values) {
 
     // Process 4 values at a time when possible
     for (; i + 3 < size; i += 4) {
-        int64_t d0 = (values[i] - values[i-1]) - (values[i-1] - values[i-2]);
-        int64_t d1 = (values[i+1] - values[i]) - (values[i] - values[i-1]);
-        int64_t d2 = (values[i+2] - values[i+1]) - (values[i+1] - values[i]);
-        int64_t d3 = (values[i+3] - values[i+2]) - (values[i+2] - values[i+1]);
+        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
+        int64_t d1 = (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i])) - (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1]));
+        int64_t d2 = (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1])) - (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i]));
+        int64_t d3 = (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2])) - (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1]));
 
         encoded.push_back(ZigZag::zigzagEncode(d0));
         encoded.push_back(ZigZag::zigzagEncode(d1));
@@ -45,7 +45,7 @@ AlignedBuffer IntegerEncoderBasic::encode(const std::vector<uint64_t> &values) {
 
     // Handle remaining values
     for (; i < size; i++) {
-        int64_t D = (values[i] - values[i-1]) - (values[i-1] - values[i-2]);
+        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
         uint64_t encD = ZigZag::zigzagEncode(D);
         encoded.push_back(encD);
     }
@@ -90,7 +90,7 @@ std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned i
 
     // Second value
     int64_t delta = ZigZag::zigzagDecode(deltaValues[1]);
-    last_decoded += delta;
+    last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
 
     if (last_decoded < minTime) {
         nSkipped++;
@@ -115,7 +115,7 @@ std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned i
 
         // Reconstruct values
         delta += dd0;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -126,7 +126,7 @@ std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned i
         }
 
         delta += dd1;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -137,7 +137,7 @@ std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned i
         }
 
         delta += dd2;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -148,7 +148,7 @@ std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned i
         }
 
         delta += dd3;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -163,7 +163,7 @@ std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned i
     for (; i < size; i++) {
         int64_t encD = ZigZag::zigzagDecode(deltaValues[i]);
         delta += encD;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
 
         if (last_decoded < minTime) {
             nSkipped++;

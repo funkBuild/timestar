@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <string>
@@ -555,8 +556,12 @@ protected:
 
       while (remaining_length >= 8)
       {
-         const unsigned int& i1 = *(reinterpret_cast<const unsigned int*>(itr)); itr += sizeof(unsigned int);
-         const unsigned int& i2 = *(reinterpret_cast<const unsigned int*>(itr)); itr += sizeof(unsigned int);
+         unsigned int i1;
+         std::memcpy(&i1, itr, sizeof(unsigned int));
+         itr += sizeof(unsigned int);
+         unsigned int i2;
+         std::memcpy(&i2, itr, sizeof(unsigned int));
+         itr += sizeof(unsigned int);
 
          hash ^= (hash <<  7) ^  i1 * (hash >> 3) ^
               (~((hash << 11) + (i2 ^ (hash >> 5))));
@@ -568,7 +573,8 @@ protected:
       {
          if (remaining_length >= 4)
          {
-            const unsigned int& i = *(reinterpret_cast<const unsigned int*>(itr));
+            unsigned int i;
+            std::memcpy(&i, itr, sizeof(unsigned int));
 
             if (loop & 0x01)
                hash ^=    (hash <<  7) ^  i * (hash >> 3);
@@ -584,7 +590,8 @@ protected:
 
          if (remaining_length >= 2)
          {
-            const unsigned short& i = *(reinterpret_cast<const unsigned short*>(itr));
+            unsigned short i;
+            std::memcpy(&i, itr, sizeof(unsigned short));
 
             if (loop & 0x01)
                hash ^=    (hash <<  7) ^  i * (hash >> 3);

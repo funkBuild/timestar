@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <iostream>
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 
 class CompressedBuffer {
 private:
@@ -20,6 +22,13 @@ private:
     if (data.capacity() < required) {
       size_t new_capacity = std::max(data.capacity() * GROWTH_FACTOR, required);
       data.reserve(new_capacity);
+    }
+  }
+
+  inline void boundsCheck() const {
+    if (offset >= data.size()) {
+      throw std::out_of_range("CompressedBuffer: read past end of buffer at offset " +
+          std::to_string(offset) + ", size " + std::to_string(data.size()));
     }
   }
 

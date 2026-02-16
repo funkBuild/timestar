@@ -55,13 +55,31 @@ seastar::future<> TSM::open(){
     throw std::runtime_error("TSM unable to open:" + filePath);
   }
 
-  length = co_await tsmFile.size();
+  // Clean up file handle on any failure after successful open.
+  // GCC 14 does not support co_await in catch blocks, so we capture
+  // the exception, close outside the handler, then rethrow.
+  std::exception_ptr openError;
+  try {
+    length = co_await tsmFile.size();
 
-  // Use lazy loading: read sparse index + bloom filter (not full index)
-  co_await readSparseIndex();
+    // Use lazy loading: read sparse index + bloom filter (not full index)
+    co_await readSparseIndex();
 
-  // Load tombstones if they exist
-  co_await loadTombstones();
+    // Load tombstones if they exist
+    co_await loadTombstones();
+  } catch (...) {
+    openError = std::current_exception();
+  }
+
+  if (openError) {
+    // Close the leaked file handle before rethrowing
+    try {
+      co_await tsmFile.close();
+    } catch (...) {
+      // Ignore close errors during cleanup to avoid masking the original exception
+    }
+    std::rethrow_exception(openError);
+  }
 };
 
 seastar::future<> TSM::close() {
@@ -254,6 +272,14 @@ seastar::future<> TSM::readBlock(TSMIndexBlock indexBlock, uint64_t startTime, u
   uint32_t timestampSize = headerSlice.read<uint32_t>();
   uint32_t timestampBytes = headerSlice.read<uint32_t>();
 
+  // Validate that the block's stored type matches the template parameter
+  TSMValueType expectedType = getValueType<T>();
+  if (static_cast<TSMValueType>(blockType) != expectedType) {
+    throw std::runtime_error(
+        "TSM block type mismatch: block contains type " + std::to_string(blockType) +
+        " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
+  }
+
   auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
   auto timestampsSlice = blockSlice.getSlice(timestampBytes);
   auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime);
@@ -267,12 +293,12 @@ seastar::future<> TSM::readBlock(TSMIndexBlock indexBlock, uint64_t startTime, u
   } else if constexpr (std::is_same<T, bool>::value) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
     BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
-    
+
   } else if constexpr (std::is_same<T, std::string>::value) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
     std::vector<std::string> allStrings;
     StringEncoder::decode(valuesSlice, timestampSize, allStrings);
-    
+
     // Skip and take the appropriate strings based on nSkipped and nTimestamps
     blockResults->values->reserve(nTimestamps);
     for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
@@ -330,6 +356,14 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
   uint8_t blockType = headerSlice.read<uint8_t>();
   uint32_t timestampSize = headerSlice.read<uint32_t>();
   uint32_t timestampBytes = headerSlice.read<uint32_t>();
+
+  // Validate that the block's stored type matches the template parameter
+  TSMValueType expectedType = getValueType<T>();
+  if (static_cast<TSMValueType>(blockType) != expectedType) {
+    throw std::runtime_error(
+        "TSM block type mismatch: block contains type " + std::to_string(blockType) +
+        " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
+  }
 
   auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
   auto timestampsSlice = blockSlice.getSlice(timestampBytes);
@@ -400,7 +434,7 @@ std::vector<BlockBatch> TSM::groupContiguousBlocks(const std::vector<TSMIndexBlo
     }
 
     // Maximum batch size to avoid excessive memory usage (16MB)
-    constexpr uint32_t MAX_BATCH_SIZE = 16 * 1024 * 1024;
+    constexpr uint64_t MAX_BATCH_SIZE = 16 * 1024 * 1024;
 
     BlockBatch currentBatch;
     currentBatch.startOffset = blocks[0].offset;
@@ -409,7 +443,7 @@ std::vector<BlockBatch> TSM::groupContiguousBlocks(const std::vector<TSMIndexBlo
 
     for (size_t i = 1; i < blocks.size(); ++i) {
         uint64_t expectedOffset = currentBatch.startOffset + currentBatch.totalSize;
-        uint32_t newBatchSize = currentBatch.totalSize + blocks[i].size;
+        uint64_t newBatchSize = currentBatch.totalSize + blocks[i].size;
 
         // Check if contiguous and within size limit
         if (blocks[i].offset == expectedOffset && newBatchSize <= MAX_BATCH_SIZE) {
@@ -453,6 +487,14 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
     uint8_t blockType = headerSlice.read<uint8_t>();
     uint32_t timestampSize = headerSlice.read<uint32_t>();
     uint32_t timestampBytes = headerSlice.read<uint32_t>();
+
+    // Validate that the block's stored type matches the template parameter
+    TSMValueType expectedType = getValueType<T>();
+    if (static_cast<TSMValueType>(blockType) != expectedType) {
+        throw std::runtime_error(
+            "TSM block type mismatch: block contains type " + std::to_string(blockType) +
+            " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
+    }
 
     // Defensive check: ensure timestampBytes is reasonable
     if (timestampBytes > blockSize - BLOCK_HEADER_SIZE) {

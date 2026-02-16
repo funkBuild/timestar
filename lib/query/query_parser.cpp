@@ -114,8 +114,9 @@ uint64_t QueryParser::parseTime(const std::string& timeStr) {
     tm.tm_hour = hour;
     tm.tm_min = minute;
     tm.tm_sec = second;
-    
-    std::time_t time = std::mktime(&tm);
+    tm.tm_isdst = 0;
+
+    std::time_t time = timegm(&tm);
     if (time == -1) {
         throw QueryParseException("Failed to convert time: " + timeStr);
     }

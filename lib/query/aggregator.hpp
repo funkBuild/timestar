@@ -51,19 +51,22 @@ struct AggregationState {
 
     // Extract final aggregated value based on method
     double getValue(AggregationMethod method) const {
+        if (count == 0) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
         switch (method) {
             case AggregationMethod::AVG:
-                return count > 0 ? sum / count : 0.0;
+                return sum / count;
             case AggregationMethod::MIN:
-                return count > 0 ? min : std::numeric_limits<double>::quiet_NaN();
+                return min;
             case AggregationMethod::MAX:
-                return count > 0 ? max : std::numeric_limits<double>::quiet_NaN();
+                return max;
             case AggregationMethod::SUM:
                 return sum;
             case AggregationMethod::LATEST:
                 return latest;
             default:
-                return 0.0;
+                return std::numeric_limits<double>::quiet_NaN();
         }
     }
 };

@@ -13,7 +13,6 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
-#include <seastar/util/defer.hh>
 
 class WritePerformanceTest : public ::testing::Test {
 protected:
@@ -25,6 +24,16 @@ protected:
         cleanTestShardDirectories();
     }
 };
+
+// Helper to shut down a sharded engine using co_await (safe in coroutine context).
+// seastar::defer with .get() cannot be used in coroutines because .get() requires
+// a seastar::thread context, but coroutine destructors run on the reactor.
+static seastar::future<> shutdownShardedEngine(seastar::sharded<Engine>& engineSharded) {
+    co_await engineSharded.invoke_on_all([](Engine& engine) {
+        return engine.stop();
+    });
+    co_await engineSharded.stop();
+}
 
 // Performance test: Measure write throughput
 seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
@@ -38,77 +47,81 @@ seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
         return engine.startBackgroundTasks();
     });
 
-    auto cleanup = seastar::defer([&engineSharded] {
-        engineSharded.invoke_on_all([](Engine& engine) {
-            return engine.stop();
-        }).get();
-        engineSharded.stop().get();
-    });
+    std::exception_ptr eptr;
+    try {
+        auto startTime = std::chrono::high_resolution_clock::now();
+        std::atomic<int> totalPointsWritten{0};
 
-    auto startTime = std::chrono::high_resolution_clock::now();
-    std::atomic<int> totalPointsWritten{0};
+        // Generate random data
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<> valueDist(0.0, 100.0);
 
-    // Generate random data
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> valueDist(0.0, 100.0);
+        uint64_t baseTime = 1638202821000000000;
 
-    uint64_t baseTime = 1638202821000000000;
+        // Write data for multiple series
+        std::vector<seastar::future<>> writes;
 
-    // Write data for multiple series
-    std::vector<seastar::future<>> writes;
+        for (int s = 0; s < numSeries; s++) {
+            TSDBInsert<double> insert("metrics", "value");
+            insert.addTag("host", "server-" + std::to_string(s % 10));
+            insert.addTag("metric", "metric-" + std::to_string(s));
 
-    for (int s = 0; s < numSeries; s++) {
-        TSDBInsert<double> insert("metrics", "value");
-        insert.addTag("host", "server-" + std::to_string(s % 10));
-        insert.addTag("metric", "metric-" + std::to_string(s));
+            for (int p = 0; p < pointsPerSeries; p++) {
+                insert.addValue(baseTime + p * 1000000000, valueDist(gen));
+            }
 
-        for (int p = 0; p < pointsPerSeries; p++) {
-            insert.addValue(baseTime + p * 1000000000, valueDist(gen));
+            // Determine shard based on measurement
+            size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
+
+            writes.push_back(engineSharded.invoke_on(shard,
+                [insert = std::move(insert), &totalPointsWritten, pointsPerSeries](Engine& engine) mutable {
+                    return engine.insert(std::move(insert)).then([&totalPointsWritten, pointsPerSeries] {
+                        totalPointsWritten += pointsPerSeries;
+                    });
+                }));
         }
 
-        // Determine shard based on measurement
-        size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
+        co_await seastar::when_all(writes.begin(), writes.end());
 
-        writes.push_back(engineSharded.invoke_on(shard,
-            [insert = std::move(insert), &totalPointsWritten, pointsPerSeries](Engine& engine) mutable {
-                return engine.insert(std::move(insert)).then([&totalPointsWritten, pointsPerSeries] {
-                    totalPointsWritten += pointsPerSeries;
-                });
-            }));
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        int totalPoints = numSeries * pointsPerSeries;
+        double throughput = (totalPoints * 1000.0) / duration.count();
+
+        std::cout << "\nWrite Performance Results:" << std::endl;
+        std::cout << "  Series: " << numSeries << std::endl;
+        std::cout << "  Points per series: " << pointsPerSeries << std::endl;
+        std::cout << "  Total points: " << totalPoints << std::endl;
+        std::cout << "  Time: " << duration.count() << " ms" << std::endl;
+        std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
+                  << throughput << " points/second" << std::endl;
+
+        // Verify we can read some data back
+        auto result = co_await engineSharded.invoke_on(0, [baseTime](Engine& engine) {
+            return engine.query("metrics,host=server-0,metric=metric-0 value",
+                              baseTime, baseTime + 10 * 1000000000);
+        });
+
+        if (result.has_value() && std::holds_alternative<QueryResult<double>>(*result)) {
+            auto& floatResult = std::get<QueryResult<double>>(*result);
+            EXPECT_GT(floatResult.values.size(), 0);
+            std::cout << "  Verification: Successfully read back "
+                      << floatResult.values.size() << " points" << std::endl;
+        }
+
+        // Basic performance assertions
+        EXPECT_GT(throughput, 10000);  // Should write at least 10K points/second
+    } catch (...) {
+        eptr = std::current_exception();
     }
 
-    co_await seastar::when_all(writes.begin(), writes.end());
+    co_await shutdownShardedEngine(engineSharded);
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-
-    int totalPoints = numSeries * pointsPerSeries;
-    double throughput = (totalPoints * 1000.0) / duration.count();
-
-    std::cout << "\nWrite Performance Results:" << std::endl;
-    std::cout << "  Series: " << numSeries << std::endl;
-    std::cout << "  Points per series: " << pointsPerSeries << std::endl;
-    std::cout << "  Total points: " << totalPoints << std::endl;
-    std::cout << "  Time: " << duration.count() << " ms" << std::endl;
-    std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
-              << throughput << " points/second" << std::endl;
-
-    // Verify we can read some data back
-    auto result = co_await engineSharded.invoke_on(0, [baseTime](Engine& engine) {
-        return engine.query("metrics,host=server-0,metric=metric-0 value",
-                          baseTime, baseTime + 10 * 1000000000);
-    });
-
-    if (result.has_value() && std::holds_alternative<QueryResult<double>>(*result)) {
-        auto& floatResult = std::get<QueryResult<double>>(*result);
-        EXPECT_GT(floatResult.values.size(), 0);
-        std::cout << "  Verification: Successfully read back "
-                  << floatResult.values.size() << " points" << std::endl;
+    if (eptr) {
+        std::rethrow_exception(eptr);
     }
-
-    // Basic performance assertions
-    EXPECT_GT(throughput, 10000);  // Should write at least 10K points/second
 }
 
 TEST_F(WritePerformanceTest, BasicThroughput) {
@@ -127,58 +140,62 @@ seastar::future<> testConcurrentWrites() {
         return engine.startBackgroundTasks();
     });
 
-    auto cleanup = seastar::defer([&engineSharded] {
-        engineSharded.invoke_on_all([](Engine& engine) {
-            return engine.stop();
-        }).get();
-        engineSharded.stop().get();
-    });
+    std::exception_ptr eptr;
+    try {
+        auto startTime = std::chrono::high_resolution_clock::now();
 
-    auto startTime = std::chrono::high_resolution_clock::now();
+        // Launch many concurrent writes
+        const int numConcurrentWrites = 1000;
+        const int pointsPerWrite = 100;
+        uint64_t baseTime = 1638202821000000000;
 
-    // Launch many concurrent writes
-    const int numConcurrentWrites = 1000;
-    const int pointsPerWrite = 100;
-    uint64_t baseTime = 1638202821000000000;
+        std::vector<seastar::future<>> writes;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<> valueDist(0.0, 100.0);
 
-    std::vector<seastar::future<>> writes;
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> valueDist(0.0, 100.0);
+        for (int i = 0; i < numConcurrentWrites; i++) {
+            writes.push_back(seastar::async([&engineSharded, i, baseTime, &gen, &valueDist] {
+                TSDBInsert<double> insert("stress", "value");
+                insert.addTag("worker", std::to_string(i));
 
-    for (int i = 0; i < numConcurrentWrites; i++) {
-        writes.push_back(seastar::async([&engineSharded, i, baseTime, &gen, &valueDist] {
-            TSDBInsert<double> insert("stress", "value");
-            insert.addTag("worker", std::to_string(i));
+                for (int p = 0; p < pointsPerWrite; p++) {
+                    insert.addValue(baseTime + p * 1000000, valueDist(gen));
+                }
 
-            for (int p = 0; p < pointsPerWrite; p++) {
-                insert.addValue(baseTime + p * 1000000, valueDist(gen));
-            }
+                size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
+                engineSharded.invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
+                    return engine.insert(std::move(insert));
+                }).get();
+            }));
+        }
 
-            size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
-            engineSharded.invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
-                return engine.insert(std::move(insert));
-            }).get();
-        }));
+        co_await seastar::when_all(writes.begin(), writes.end());
+
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        int totalPoints = numConcurrentWrites * pointsPerWrite;
+        double throughput = (totalPoints * 1000.0) / duration.count();
+
+        std::cout << "\nConcurrent Write Stress Test Results:" << std::endl;
+        std::cout << "  Concurrent writes: " << numConcurrentWrites << std::endl;
+        std::cout << "  Points per write: " << pointsPerWrite << std::endl;
+        std::cout << "  Total points: " << totalPoints << std::endl;
+        std::cout << "  Time: " << duration.count() << " ms" << std::endl;
+        std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
+                  << throughput << " points/second" << std::endl;
+
+        EXPECT_GT(throughput, 5000);  // Should handle at least 5K points/second under stress
+    } catch (...) {
+        eptr = std::current_exception();
     }
 
-    co_await seastar::when_all(writes.begin(), writes.end());
+    co_await shutdownShardedEngine(engineSharded);
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-
-    int totalPoints = numConcurrentWrites * pointsPerWrite;
-    double throughput = (totalPoints * 1000.0) / duration.count();
-
-    std::cout << "\nConcurrent Write Stress Test Results:" << std::endl;
-    std::cout << "  Concurrent writes: " << numConcurrentWrites << std::endl;
-    std::cout << "  Points per write: " << pointsPerWrite << std::endl;
-    std::cout << "  Total points: " << totalPoints << std::endl;
-    std::cout << "  Time: " << duration.count() << " ms" << std::endl;
-    std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
-              << throughput << " points/second" << std::endl;
-
-    EXPECT_GT(throughput, 5000);  // Should handle at least 5K points/second under stress
+    if (eptr) {
+        std::rethrow_exception(eptr);
+    }
 }
 
 TEST_F(WritePerformanceTest, ConcurrentWrites) {
@@ -197,66 +214,70 @@ seastar::future<> testBatchWritePerformance() {
         return engine.startBackgroundTasks();
     });
 
-    auto cleanup = seastar::defer([&engineSharded] {
-        engineSharded.invoke_on_all([](Engine& engine) {
-            return engine.stop();
-        }).get();
-        engineSharded.stop().get();
-    });
+    std::exception_ptr eptr;
+    try {
+        auto startTime = std::chrono::high_resolution_clock::now();
 
-    auto startTime = std::chrono::high_resolution_clock::now();
+        const int numBatches = 100;
+        const int seriesPerBatch = 10;
+        const int pointsPerSeries = 100;
+        uint64_t baseTime = 1638202821000000000;
 
-    const int numBatches = 100;
-    const int seriesPerBatch = 10;
-    const int pointsPerSeries = 100;
-    uint64_t baseTime = 1638202821000000000;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<> valueDist(0.0, 100.0);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> valueDist(0.0, 100.0);
+        for (int batch = 0; batch < numBatches; batch++) {
+            std::vector<seastar::future<>> batchWrites;
 
-    for (int batch = 0; batch < numBatches; batch++) {
-        std::vector<seastar::future<>> batchWrites;
+            for (int s = 0; s < seriesPerBatch; s++) {
+                TSDBInsert<double> insert("batch_metrics", "value");
+                insert.addTag("batch", std::to_string(batch));
+                insert.addTag("series", std::to_string(s));
 
-        for (int s = 0; s < seriesPerBatch; s++) {
-            TSDBInsert<double> insert("batch_metrics", "value");
-            insert.addTag("batch", std::to_string(batch));
-            insert.addTag("series", std::to_string(s));
+                // Add all points at once (simulating batch write)
+                for (int p = 0; p < pointsPerSeries; p++) {
+                    insert.addValue(baseTime + p * 1000000, valueDist(gen));
+                }
 
-            // Add all points at once (simulating batch write)
-            for (int p = 0; p < pointsPerSeries; p++) {
-                insert.addValue(baseTime + p * 1000000, valueDist(gen));
+                size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
+                batchWrites.push_back(engineSharded.invoke_on(shard,
+                    [insert = std::move(insert)](Engine& engine) mutable {
+                        return engine.insert(std::move(insert));
+                    }));
             }
 
-            size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
-            batchWrites.push_back(engineSharded.invoke_on(shard,
-                [insert = std::move(insert)](Engine& engine) mutable {
-                    return engine.insert(std::move(insert));
-                }));
+            co_await seastar::when_all(batchWrites.begin(), batchWrites.end());
         }
 
-        co_await seastar::when_all(batchWrites.begin(), batchWrites.end());
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        int totalPoints = numBatches * seriesPerBatch * pointsPerSeries;
+        double throughput = (totalPoints * 1000.0) / duration.count();
+        double batchesPerSecond = (numBatches * 1000.0) / duration.count();
+
+        std::cout << "\nBatch Write Performance Results:" << std::endl;
+        std::cout << "  Batches: " << numBatches << std::endl;
+        std::cout << "  Series per batch: " << seriesPerBatch << std::endl;
+        std::cout << "  Points per series: " << pointsPerSeries << std::endl;
+        std::cout << "  Total points: " << totalPoints << std::endl;
+        std::cout << "  Time: " << duration.count() << " ms" << std::endl;
+        std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
+                  << throughput << " points/second" << std::endl;
+        std::cout << "  Batch rate: " << std::fixed << std::setprecision(1)
+                  << batchesPerSecond << " batches/second" << std::endl;
+
+        EXPECT_GT(throughput, 10000);  // Should handle at least 10K points/second in batches
+    } catch (...) {
+        eptr = std::current_exception();
     }
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+    co_await shutdownShardedEngine(engineSharded);
 
-    int totalPoints = numBatches * seriesPerBatch * pointsPerSeries;
-    double throughput = (totalPoints * 1000.0) / duration.count();
-    double batchesPerSecond = (numBatches * 1000.0) / duration.count();
-
-    std::cout << "\nBatch Write Performance Results:" << std::endl;
-    std::cout << "  Batches: " << numBatches << std::endl;
-    std::cout << "  Series per batch: " << seriesPerBatch << std::endl;
-    std::cout << "  Points per series: " << pointsPerSeries << std::endl;
-    std::cout << "  Total points: " << totalPoints << std::endl;
-    std::cout << "  Time: " << duration.count() << " ms" << std::endl;
-    std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
-              << throughput << " points/second" << std::endl;
-    std::cout << "  Batch rate: " << std::fixed << std::setprecision(1)
-              << batchesPerSecond << " batches/second" << std::endl;
-
-    EXPECT_GT(throughput, 10000);  // Should handle at least 10K points/second in batches
+    if (eptr) {
+        std::rethrow_exception(eptr);
+    }
 }
 
 TEST_F(WritePerformanceTest, BatchWritePerformance) {

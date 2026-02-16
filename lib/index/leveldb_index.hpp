@@ -20,6 +20,17 @@
 #include <leveldb/write_batch.h>
 #include <leveldb/filter_policy.h>
 
+// Forward declaration to avoid circular include with tsm.hpp
+enum class TSMValueType;
+
+// Metadata operation for batch indexing
+struct MetadataOp {
+    TSMValueType valueType;
+    std::string measurement;
+    std::string fieldName;
+    std::map<std::string, std::string> tags;
+};
+
 enum IndexKeyType : uint8_t {
     SERIES_INDEX = 0x01,        // series_key -> series_id
     MEASUREMENT_FIELDS = 0x02,   // measurement -> fields set
@@ -49,18 +60,27 @@ private:
     int shardId;
     std::string indexPath;
 
-    // In-memory cache for indexed series (to avoid redundant LevelDB Gets)
-    // TODO: Replace with LRU cache for bounded memory usage (e.g., max 1M-10M entries)
-    // Current unbounded cache uses ~120 bytes per series key
-    // For very large deployments (>10M series), implement eviction policy
+    // In-memory cache for indexed series (to avoid redundant LevelDB Gets).
+    // Bounded to prevent unbounded memory growth (~120 bytes per entry).
+    // When the cache exceeds maxSeriesCacheSize, it is cleared entirely.
+    // Eviction only causes redundant LevelDB Gets (no data loss).
+    static constexpr size_t DEFAULT_MAX_SERIES_CACHE_SIZE = 1'000'000;
+    size_t maxSeriesCacheSize = DEFAULT_MAX_SERIES_CACHE_SIZE;
     std::unordered_set<std::string> indexedSeriesCache;
 
     // In-memory caches for fields and tags to avoid read-modify-write races.
     // In Seastar's single-threaded-per-shard model, synchronous cache access
     // between co_await points eliminates interleaving.
+    // These caches are naturally bounded by the number of unique measurements x fields/tags,
+    // which is typically small (hundreds to thousands). No eviction needed.
     std::unordered_map<std::string, std::unordered_set<std::string>> fieldsCache;   // measurement -> fields
     std::unordered_map<std::string, std::unordered_set<std::string>> tagsCache;     // measurement -> tag keys
     std::unordered_map<std::string, std::unordered_set<std::string>> tagValuesCache; // measurement+\0+tagKey -> tag values
+
+    // In-memory cache for field types to avoid redundant LevelDB puts on every insert.
+    // Key: measurement + '\0' + field, Value: type string ("float", "boolean", "string")
+    // Naturally bounded by the number of unique measurement+field combinations. No eviction needed.
+    std::unordered_set<std::string> knownFieldTypes;
 
     // Helper methods for key encoding
     std::string encodeSeriesKey(const std::string& measurement,
@@ -119,6 +139,10 @@ public:
     template<class T>
     seastar::future<SeriesId128> indexInsert(const TSDBInsert<T>& insert);
 
+    // Batch metadata indexing: indexes multiple series in a single LevelDB WriteBatch.
+    // Much more efficient than calling indexInsert() in a loop for cold starts / burst writes.
+    seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops);
+
     // Series discovery for queries
     seastar::future<std::vector<SeriesId128>> findSeries(const std::string& measurement,
                                                          const std::map<std::string, std::string>& tagFilters = {});
@@ -148,6 +172,11 @@ public:
 
     // Compaction support - get all series for a measurement
     seastar::future<std::vector<SeriesId128>> getAllSeriesForMeasurement(const std::string& measurement);
+
+    // Series cache size management
+    void setMaxSeriesCacheSize(size_t maxSize) { maxSeriesCacheSize = maxSize; }
+    size_t getMaxSeriesCacheSize() const { return maxSeriesCacheSize; }
+    size_t getSeriesCacheSize() const { return indexedSeriesCache.size(); }
 
     // Debug/maintenance
     seastar::future<size_t> getSeriesCount();

@@ -286,9 +286,9 @@ TEST_F(TSMFileManagerSeastarTest, RemoveTSMFiles) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: removeTSMFiles marks files for deletion
+// Test: removeTSMFiles actually deletes TSM files from disk
 // ---------------------------------------------------------------------------
-seastar::future<> testFMRemoveMarksForDeletion(TSMFileManagerSeastarTest* self) {
+seastar::future<> testFMRemoveDeletesFiles(TSMFileManagerSeastarTest* self) {
     self->createTestTSMFile("0_1.tsm", "s.a", {1000}, {1.0});
 
     TSMFileManager mgr;
@@ -299,16 +299,15 @@ seastar::future<> testFMRemoveMarksForDeletion(TSMFileManagerSeastarTest* self) 
     if (tier0Files.size() != 1) co_return;
 
     auto fileToRemove = tier0Files[0];
-    EXPECT_FALSE(fileToRemove->scheduleDeletionFlag);
 
     co_await mgr.removeTSMFiles({ fileToRemove });
 
-    // File should be marked for deletion (and scheduled since refCount is 0)
-    EXPECT_TRUE(fileToRemove->scheduleDeletionFlag);
+    // After removeTSMFiles, the physical file should be deleted from disk
+    EXPECT_FALSE(fs::exists("shard_0/tsm/0_1.tsm"));
 }
 
-TEST_F(TSMFileManagerSeastarTest, RemoveMarksForDeletion) {
-    testFMRemoveMarksForDeletion(this).get();
+TEST_F(TSMFileManagerSeastarTest, RemoveDeletesFiles) {
+    testFMRemoveDeletesFiles(this).get();
 }
 
 // ---------------------------------------------------------------------------
@@ -653,9 +652,9 @@ TEST_F(TSMFileManagerSeastarTest, AddAndRemoveInterleaved) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Reference counting interaction with removeTSMFiles
+// Test: removeTSMFiles deletes files directly (no ref counting needed)
 // ---------------------------------------------------------------------------
-seastar::future<> testFMRefCountBlocksDeletion(TSMFileManagerSeastarTest* self) {
+seastar::future<> testFMRemoveDeletesDirectly(TSMFileManagerSeastarTest* self) {
     self->createTestTSMFile("0_1.tsm", "s.a", {1000}, {1.0});
 
     TSMFileManager mgr;
@@ -665,25 +664,20 @@ seastar::future<> testFMRefCountBlocksDeletion(TSMFileManagerSeastarTest* self) 
     EXPECT_EQ(files.size(), 1);
     if (files.size() != 1) co_return;
 
-    auto file = files[0];
+    // Verify file exists before removal
+    EXPECT_TRUE(fs::exists("shard_0/tsm/0_1.tsm"));
 
-    // Simulate an active reader by incrementing the ref count
-    file->addRef();
-    EXPECT_EQ(file->getRefCount(), 1);
+    co_await mgr.removeTSMFiles(files);
 
-    // Remove the file from the manager -- it should be marked but NOT scheduled
-    // for deletion because refCount > 0
-    co_await mgr.removeTSMFiles({ file });
+    // File should be deleted directly by removeTSMFiles
+    EXPECT_FALSE(fs::exists("shard_0/tsm/0_1.tsm"));
 
-    EXPECT_FALSE(file->scheduleDeletionFlag);
-
-    // Now release the ref -- deletion should be scheduled
-    file->releaseRef();
-    EXPECT_TRUE(file->scheduleDeletionFlag);
+    // Manager should have no files in tier 0
+    EXPECT_EQ(mgr.getFilesInTier(0).size(), 0);
 }
 
-TEST_F(TSMFileManagerSeastarTest, RefCountBlocksDeletion) {
-    testFMRefCountBlocksDeletion(this).get();
+TEST_F(TSMFileManagerSeastarTest, RemoveDeletesDirectly) {
+    testFMRemoveDeletesDirectly(this).get();
 }
 
 // ---------------------------------------------------------------------------

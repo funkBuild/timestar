@@ -9,8 +9,11 @@
 #include <numeric>
 #include <unordered_map>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/with_timeout.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/smp.hh>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 // Glaze-compatible structures for JSON parsing  
@@ -643,8 +646,20 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             futures.push_back(std::move(f));
         }
         
-        // Wait for all shards to complete
-        auto shardResults = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+        // Wait for all shards to complete, with timeout to prevent indefinite hangs
+        auto deadline = seastar::lowres_clock::now() + DEFAULT_QUERY_TIMEOUT;
+        std::vector<std::pair<unsigned, ShardQueryResult>> shardResults;
+        try {
+            shardResults = co_await seastar::with_timeout(deadline,
+                seastar::when_all_succeed(futures.begin(), futures.end()));
+        } catch (seastar::timed_out_error&) {
+            QueryResponse timeoutResponse;
+            timeoutResponse.success = false;
+            timeoutResponse.errorCode = "QUERY_TIMEOUT";
+            timeoutResponse.errorMessage = "Query timed out after " +
+                std::to_string(DEFAULT_QUERY_TIMEOUT.count()) + " seconds";
+            co_return timeoutResponse;
+        }
         auto shardQueriesEnd = std::chrono::high_resolution_clock::now();
         timing.shardQueriesMs = std::chrono::duration<double, std::milli>(shardQueriesEnd - shardQueriesStart).count();
         
@@ -972,16 +987,25 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
         multiplier = 3600ULL * 1000000000;
     } else if (unit == "d") {
         multiplier = 86400ULL * 1000000000;
+    } else if (unit.empty()) {
+        multiplier = 1;  // Bare numbers are nanoseconds
     } else {
-        throw QueryParseException("Unknown time unit: " + unit);
+        throw QueryParseException("Unknown time unit: '" + unit + "'. Supported units: ns, us, ms, s, m, h, d");
     }
 
     // Use integer arithmetic when possible to avoid floating-point precision loss
     if (hasDecimal) {
         double value = std::stod(valueStr);
-        return static_cast<uint64_t>(value * multiplier);
+        double result = value * multiplier;
+        if (result < 0 || result > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+            throw QueryParseException("Interval value overflow: " + interval + " exceeds maximum representable nanoseconds");
+        }
+        return static_cast<uint64_t>(result);
     } else {
         uint64_t value = std::stoull(valueStr);
+        if (multiplier > 1 && value > std::numeric_limits<uint64_t>::max() / multiplier) {
+            throw QueryParseException("Interval value overflow: " + interval + " exceeds maximum representable nanoseconds");
+        }
         return value * multiplier;
     }
 }

@@ -244,43 +244,14 @@ HttpMetadataHandler::handleFields(std::unique_ptr<seastar::http::request> req) {
             co_return co_await engine.getMeasurementFields(measurement);
         });
         
-        // Determine field types by querying metadata from shard 0's index
+        // Look up actual field types from the LevelDB index on shard 0
         std::unordered_map<std::string, std::string> fieldsWithTypes;
         for (const auto& field : allFields) {
-            // Try to get the field type from the index
             auto fieldType = co_await engineSharded->invoke_on(0, [measurement, field](Engine& engine) -> seastar::future<std::string> {
-                // For now, return a default based on common field names
-                // In a production system, this would query actual data or stored metadata
-                if (field.find("temperature") != std::string::npos || 
-                    field.find("humidity") != std::string::npos ||
-                    field.find("cpu") != std::string::npos ||
-                    field.find("memory") != std::string::npos ||
-                    field.find("disk") != std::string::npos ||
-                    field.find("load") != std::string::npos ||
-                    field.find("value") != std::string::npos ||
-                    field.find("usage") != std::string::npos ||
-                    field.find("revenue") != std::string::npos ||
-                    field.find("average") != std::string::npos) {
-                    co_return "float";
-                } else if (field.find("count") != std::string::npos ||
-                          field.find("transactions") != std::string::npos ||
-                          field.find("total") != std::string::npos) {
-                    co_return "integer";
-                } else if (field.find("is_") != std::string::npos ||
-                          field.find("enabled") != std::string::npos ||
-                          field.find("active") != std::string::npos ||
-                          field.find("open") != std::string::npos) {
-                    co_return "boolean";
-                } else if (field.find("name") != std::string::npos ||
-                          field.find("manager") != std::string::npos ||
-                          field.find("description") != std::string::npos ||
-                          field.find("status") != std::string::npos) {
-                    co_return "string";
-                } else {
-                    co_return "float";  // Default to float for numeric fields
-                }
+                co_return co_await engine.getIndex().getFieldType(measurement, field);
             });
-            fieldsWithTypes[field] = fieldType;
+            // Default to "float" if type was never recorded (e.g., legacy data)
+            fieldsWithTypes[field] = fieldType.empty() ? "float" : fieldType;
         }
         
         rep->set_status(seastar::http::reply::status_type::ok);

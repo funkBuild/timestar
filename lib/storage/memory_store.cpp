@@ -7,9 +7,55 @@
 #include <chrono>
 
 template <class T>
-void InMemorySeries<T>::insert(TSDBInsert<T> &insertRequest){
-  timestamps.insert(timestamps.end(), insertRequest.timestamps.begin(), insertRequest.timestamps.end());
-  values.insert(values.end(), insertRequest.values.begin(), insertRequest.values.end());
+void InMemorySeries<T>::insert(TSDBInsert<T> insertRequest){
+  if (insertRequest.timestamps.empty()) return;
+
+  size_t oldSize = timestamps.size();
+
+  if (oldSize == 0) {
+    // Series is empty -- take ownership of the entire vectors via move
+    timestamps = std::move(insertRequest.timestamps);
+    values = std::move(insertRequest.values);
+  } else {
+    // Append new data using move iterators to transfer elements
+    timestamps.insert(timestamps.end(),
+                      std::make_move_iterator(insertRequest.timestamps.begin()),
+                      std::make_move_iterator(insertRequest.timestamps.end()));
+    values.insert(values.end(),
+                  std::make_move_iterator(insertRequest.values.begin()),
+                  std::make_move_iterator(insertRequest.values.end()));
+  }
+
+  if (oldSize == 0) {
+    // First insert -- check if already sorted
+    bool sorted = true;
+    for (size_t i = 1; i < timestamps.size(); ++i) {
+      if (timestamps[i] < timestamps[i - 1]) {
+        sorted = false;
+        break;
+      }
+    }
+    if (!sorted) {
+      sort();
+    }
+    return;
+  }
+
+  // Check if new data starts at or after the last existing timestamp
+  if (timestamps[oldSize] >= timestamps[oldSize - 1]) {
+    // Boundary is fine -- check if new data itself is sorted
+    bool newDataSorted = true;
+    for (size_t i = oldSize + 1; i < timestamps.size(); ++i) {
+      if (timestamps[i] < timestamps[i - 1]) {
+        newDataSorted = false;
+        break;
+      }
+    }
+    if (newDataSorted) return;  // Everything already sorted
+  }
+
+  // Data is not sorted -- use permutation sort to keep timestamps and values paired
+  sort();
 }
 
 template <class T>
@@ -60,7 +106,7 @@ seastar::future<bool> MemoryStore::isFull(){
 }
 
 template <class T>
-void MemoryStore::insertMemory(TSDBInsert<T> &insertRequest){
+void MemoryStore::insertMemory(TSDBInsert<T> insertRequest){
   // In-memory insert
   SeriesId128 seriesId = insertRequest.seriesId128();
 
@@ -77,7 +123,7 @@ void MemoryStore::insertMemory(TSDBInsert<T> &insertRequest){
     variantSeries = InMemorySeries<T>();
   }
 
-  std::get<InMemorySeries<T>>(variantSeries).insert(insertRequest);
+  std::get<InMemorySeries<T>>(variantSeries).insert(std::move(insertRequest));
 }
 
 template <class T>
@@ -137,9 +183,10 @@ seastar::future<bool> MemoryStore::insert(TSDBInsert<T> &insertRequest){
     }
   }
 
-  // Only insert to memory if WAL write succeeded
-  insertMemory(insertRequest);
-  
+  // Only insert to memory if WAL write succeeded -- move data since WAL
+  // has already persisted it and the caller won't use it again.
+  insertMemory(std::move(insertRequest));
+
   co_return false; // No rollover needed
 }
 
@@ -181,10 +228,11 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &inser
   }
   auto end_wal_insert = std::chrono::high_resolution_clock::now();
 
-  // Only insert to memory if WAL write succeeded - process all requests in batch
+  // Only insert to memory if WAL write succeeded - move data since WAL
+  // has already persisted it and individual elements won't be reused.
   auto start_memory_insert = std::chrono::high_resolution_clock::now();
   for(auto& insertRequest : insertRequests) {
-    insertMemory(insertRequest);
+    insertMemory(std::move(insertRequest));
   }
   auto end_memory_insert = std::chrono::high_resolution_clock::now();
 
@@ -210,11 +258,11 @@ std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128 &series
 }
 
 
-template void InMemorySeries<double>::insert(TSDBInsert<double> &insertRequest);
+template void InMemorySeries<double>::insert(TSDBInsert<double> insertRequest);
 template void InMemorySeries<double>::sort();
-template void InMemorySeries<bool>::insert(TSDBInsert<bool> &insertRequest);
+template void InMemorySeries<bool>::insert(TSDBInsert<bool> insertRequest);
 template void InMemorySeries<bool>::sort();
-template void InMemorySeries<std::string>::insert(TSDBInsert<std::string> &insertRequest);
+template void InMemorySeries<std::string>::insert(TSDBInsert<std::string> insertRequest);
 template void InMemorySeries<std::string>::sort();
 
 template seastar::future<bool> MemoryStore::insert<double>(TSDBInsert<double> &insertRequest);
@@ -223,9 +271,9 @@ template seastar::future<bool> MemoryStore::insert<std::string>(TSDBInsert<std::
 template seastar::future<bool> MemoryStore::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests);
 template seastar::future<bool> MemoryStore::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
 template seastar::future<bool> MemoryStore::insertBatch<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests);
-template void MemoryStore::insertMemory<double>(TSDBInsert<double> &insertRequest);
-template void MemoryStore::insertMemory<bool>(TSDBInsert<bool> &insertRequest);
-template void MemoryStore::insertMemory<std::string>(TSDBInsert<std::string> &insertRequest);
+template void MemoryStore::insertMemory<double>(TSDBInsert<double> insertRequest);
+template void MemoryStore::insertMemory<bool>(TSDBInsert<bool> insertRequest);
+template void MemoryStore::insertMemory<std::string>(TSDBInsert<std::string> insertRequest);
 template bool MemoryStore::wouldExceedThreshold<double>(TSDBInsert<double> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest);

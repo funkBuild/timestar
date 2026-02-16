@@ -136,6 +136,8 @@ T CompressedBuffer::read(const int bits){
     bitOffset = 0;
   }
 
+  boundsCheck();
+
   const int leftover_bits = bits - (64 - bitOffset);
   const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
   const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
@@ -146,6 +148,8 @@ T CompressedBuffer::read(const int bits){
   if(leftover_bits > 0) {
     offset++;
     bitOffset = leftover_bits;
+
+    boundsCheck();
 
     const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
     value |= (data[offset] & mask) << bits_read;
@@ -164,31 +168,27 @@ T CompressedBuffer::readFixed(){
     bitOffset = 0;
   }
 
+  boundsCheck();
+
   const int leftover_bits = bits - (64 - bitOffset);
   const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
   const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
 
-//  std::cout << "READ" << std::endl;
-//  std::cout << "bitOffset=" << bitOffset << " leftover_bits=" << leftover_bits << std::endl;
-//  std::cout << "offset=" << offset << std::endl;
-
-
   uint64_t value = data[offset] >> bitOffset;
   value &= mask;
-
-// std::cout << "value=" << data[offset] << std::endl << std::endl;
-
 
   if(leftover_bits > 0) {
     offset++;
     bitOffset = leftover_bits;
+
+    boundsCheck();
 
     const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
     value |= (data[offset] & mask) << bits_read;
   } else {
     bitOffset += bits;
   }
-  
+
   return value;
 }
 
@@ -197,6 +197,8 @@ bool CompressedBuffer::readBit(){
     offset++;
     bitOffset = 0;
   }
+
+  boundsCheck();
 
   bool value = ((data[offset] >> bitOffset) & 1) == 1;
 

@@ -70,6 +70,9 @@ public:
     static constexpr size_t MAX_SERIES_COUNT = 10'000;       // Max series in response
     static constexpr size_t MAX_TOTAL_POINTS = 10'000'000;   // Max total points across all series
 
+    // Query timeout to prevent indefinite hangs from stuck shards
+    static constexpr std::chrono::seconds DEFAULT_QUERY_TIMEOUT{30};
+
     explicit HttpQueryHandler(seastar::sharded<Engine>* engine,
                             seastar::sharded<LevelDBIndex>* index = nullptr)
         : engineSharded(engine), indexSharded(index), planner(std::make_unique<QueryPlanner>()) {}

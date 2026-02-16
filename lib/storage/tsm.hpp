@@ -34,7 +34,7 @@ typedef struct TSMIndexBlock {
 // Batch of contiguous blocks for optimized I/O
 struct BlockBatch {
   uint64_t startOffset;           // Offset of first block in batch
-  uint32_t totalSize;             // Sum of all block sizes
+  uint64_t totalSize;             // Sum of all block sizes (uint64_t to avoid overflow)
   std::vector<TSMIndexBlock> blocks;  // Blocks in this batch
 
   BlockBatch() : startOffset(0), totalSize(0) {}
@@ -74,19 +74,6 @@ private:
   // Tombstone support
   std::unique_ptr<tsdb::TSMTombstone> tombstones;
 
-  // Reference counting for safe deletion during compaction
-  // Plain types are safe here: Seastar's shard-per-core model guarantees
-  // no cross-thread access to the same TSM object.
-  int32_t refCount{0};
-  bool markedForDeletion{false};
-
-  // Check if deletion should be scheduled (refCount == 0 and marked)
-  void maybeScheduleDeletion() {
-    if (markedForDeletion && refCount == 0) {
-      scheduleDeletionFlag = true;
-    }
-  }
-
   // Helper to get tombstone file path
   std::string getTombstonePath() const;
 
@@ -99,23 +86,7 @@ public:
   seastar::future<> close();
   uint64_t rankAsInteger();
   
-  // Reference counting methods for non-blocking reads during compaction
-  void addRef() { ++refCount; }
-  void releaseRef() {
-    --refCount;
-    maybeScheduleDeletion();
-  }
-  int32_t getRefCount() const { return refCount; }
-
-  // Mark file for deletion after compaction
-  void markForDeletion() {
-    markedForDeletion = true;
-    maybeScheduleDeletion();
-  }
-  
-  bool scheduleDeletionFlag = false;
-  
-  // Schedule async deletion
+  // Schedule async deletion — closes file and removes from disk
   seastar::future<> scheduleDelete();
 
   // Lazy loading index methods
@@ -211,9 +182,6 @@ public:
   
   // Delete tombstone file after compaction
   seastar::future<> deleteTombstoneFile();
-  
-  // Get series ID hash for tombstone compatibility
-  uint64_t getSeriesIdHash(const SeriesId128& seriesId) const;
 };
 
 #endif

@@ -1,15 +1,26 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 #include "../../../lib/storage/tsm_tombstone.hpp"
+#include "../../../lib/core/series_id.hpp"
 #include "../../seastar_gtest.hpp"
 
 using namespace tsdb;
 namespace fs = std::filesystem;
 
+// Helper to create distinct SeriesId128 values for testing
+static SeriesId128 makeSeriesId(int n) {
+    return SeriesId128("test_series_" + std::to_string(n));
+}
+
 class TSMTombstoneTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_tombstones";
     std::string tombstonePath;
+
+    // Pre-create SeriesId128 values for convenience
+    SeriesId128 series1 = makeSeriesId(1);
+    SeriesId128 series2 = makeSeriesId(2);
+    SeriesId128 series3 = makeSeriesId(3);
 
     void SetUp() override {
         // Create test directory
@@ -38,9 +49,9 @@ TEST_F(TSMTombstoneTest, CreateAndLoad) {
     EXPECT_FALSE(tombstone->exists().get());
 
     // Add some tombstones
-    EXPECT_TRUE(tombstone->addTombstone(1, 1000, 2000).get());
-    EXPECT_TRUE(tombstone->addTombstone(2, 3000, 4000).get());
-    EXPECT_TRUE(tombstone->addTombstone(1, 5000, 6000).get());
+    EXPECT_TRUE(tombstone->addTombstone(series1, 1000, 2000).get());
+    EXPECT_TRUE(tombstone->addTombstone(series2, 3000, 4000).get());
+    EXPECT_TRUE(tombstone->addTombstone(series1, 5000, 6000).get());
 
     // Flush to disk
     tombstone->flush().get();
@@ -60,61 +71,61 @@ TEST_F(TSMTombstoneTest, IsDeleted) {
     auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
 
     // Add tombstone ranges
-    tombstone->addTombstone(1, 1000, 2000).get();
-    tombstone->addTombstone(1, 3000, 4000).get();
-    tombstone->addTombstone(2, 5000, 6000).get();
+    tombstone->addTombstone(series1, 1000, 2000).get();
+    tombstone->addTombstone(series1, 3000, 4000).get();
+    tombstone->addTombstone(series2, 5000, 6000).get();
 
     // Test series 1
-    EXPECT_FALSE(tombstone->isDeleted(1, 999));   // Before range
-    EXPECT_TRUE(tombstone->isDeleted(1, 1000));   // Start of range
-    EXPECT_TRUE(tombstone->isDeleted(1, 1500));   // Middle of range
-    EXPECT_TRUE(tombstone->isDeleted(1, 2000));   // End of range
-    EXPECT_FALSE(tombstone->isDeleted(1, 2001));  // After range
+    EXPECT_FALSE(tombstone->isDeleted(series1, 999));   // Before range
+    EXPECT_TRUE(tombstone->isDeleted(series1, 1000));   // Start of range
+    EXPECT_TRUE(tombstone->isDeleted(series1, 1500));   // Middle of range
+    EXPECT_TRUE(tombstone->isDeleted(series1, 2000));   // End of range
+    EXPECT_FALSE(tombstone->isDeleted(series1, 2001));  // After range
 
-    EXPECT_FALSE(tombstone->isDeleted(1, 2500));  // Between ranges
-    EXPECT_TRUE(tombstone->isDeleted(1, 3500));   // In second range
+    EXPECT_FALSE(tombstone->isDeleted(series1, 2500));  // Between ranges
+    EXPECT_TRUE(tombstone->isDeleted(series1, 3500));   // In second range
 
     // Test series 2
-    EXPECT_FALSE(tombstone->isDeleted(2, 4999));  // Before range
-    EXPECT_TRUE(tombstone->isDeleted(2, 5500));   // In range
-    EXPECT_FALSE(tombstone->isDeleted(2, 6001));  // After range
+    EXPECT_FALSE(tombstone->isDeleted(series2, 4999));  // Before range
+    EXPECT_TRUE(tombstone->isDeleted(series2, 5500));   // In range
+    EXPECT_FALSE(tombstone->isDeleted(series2, 6001));  // After range
 
     // Test non-existent series
-    EXPECT_FALSE(tombstone->isDeleted(3, 1500));
+    EXPECT_FALSE(tombstone->isDeleted(series3, 1500));
 }
 
 // Test range deletion checking
 TEST_F(TSMTombstoneTest, HasDeletedRange) {
     auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
 
-    tombstone->addTombstone(1, 1000, 2000).get();
-    tombstone->addTombstone(1, 3000, 4000).get();
+    tombstone->addTombstone(series1, 1000, 2000).get();
+    tombstone->addTombstone(series1, 3000, 4000).get();
 
     // Completely outside tombstone
-    EXPECT_FALSE(tombstone->hasDeletedRange(1, 0, 999));
-    EXPECT_FALSE(tombstone->hasDeletedRange(1, 2001, 2999));
+    EXPECT_FALSE(tombstone->hasDeletedRange(series1, 0, 999));
+    EXPECT_FALSE(tombstone->hasDeletedRange(series1, 2001, 2999));
 
     // Overlapping with tombstone
-    EXPECT_TRUE(tombstone->hasDeletedRange(1, 500, 1500));   // Partial overlap
-    EXPECT_TRUE(tombstone->hasDeletedRange(1, 1500, 2500));  // Partial overlap
-    EXPECT_TRUE(tombstone->hasDeletedRange(1, 1200, 1800));  // Completely inside
-    EXPECT_TRUE(tombstone->hasDeletedRange(1, 500, 5000));   // Spans multiple
+    EXPECT_TRUE(tombstone->hasDeletedRange(series1, 500, 1500));   // Partial overlap
+    EXPECT_TRUE(tombstone->hasDeletedRange(series1, 1500, 2500));  // Partial overlap
+    EXPECT_TRUE(tombstone->hasDeletedRange(series1, 1200, 1800));  // Completely inside
+    EXPECT_TRUE(tombstone->hasDeletedRange(series1, 500, 5000));   // Spans multiple
 
     // Exact match
-    EXPECT_TRUE(tombstone->hasDeletedRange(1, 1000, 2000));
+    EXPECT_TRUE(tombstone->hasDeletedRange(series1, 1000, 2000));
 }
 
 // Test getting tombstone ranges
 TEST_F(TSMTombstoneTest, GetTombstoneRanges) {
     auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
 
-    tombstone->addTombstone(1, 3000, 4000).get();
-    tombstone->addTombstone(1, 1000, 2000).get();  // Add out of order
-    tombstone->addTombstone(1, 5000, 6000).get();
-    tombstone->addTombstone(2, 7000, 8000).get();
+    tombstone->addTombstone(series1, 3000, 4000).get();
+    tombstone->addTombstone(series1, 1000, 2000).get();  // Add out of order
+    tombstone->addTombstone(series1, 5000, 6000).get();
+    tombstone->addTombstone(series2, 7000, 8000).get();
 
     // Get ranges for series 1
-    auto ranges1 = tombstone->getTombstoneRanges(1);
+    auto ranges1 = tombstone->getTombstoneRanges(series1);
     EXPECT_EQ(ranges1.size(), 3);
 
     // Should be sorted
@@ -126,13 +137,13 @@ TEST_F(TSMTombstoneTest, GetTombstoneRanges) {
     EXPECT_EQ(ranges1[2].second, 6000);
 
     // Get ranges for series 2
-    auto ranges2 = tombstone->getTombstoneRanges(2);
+    auto ranges2 = tombstone->getTombstoneRanges(series2);
     EXPECT_EQ(ranges2.size(), 1);
     EXPECT_EQ(ranges2[0].first, 7000);
     EXPECT_EQ(ranges2[0].second, 8000);
 
     // Non-existent series
-    auto ranges3 = tombstone->getTombstoneRanges(3);
+    auto ranges3 = tombstone->getTombstoneRanges(series3);
     EXPECT_EQ(ranges3.size(), 0);
 }
 
@@ -141,15 +152,15 @@ TEST_F(TSMTombstoneTest, FilterTombstoned) {
     auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
 
     // Add tombstone ranges
-    tombstone->addTombstone(1, 2000, 3000).get();
-    tombstone->addTombstone(1, 5000, 6000).get();
+    tombstone->addTombstone(series1, 2000, 3000).get();
+    tombstone->addTombstone(series1, 5000, 6000).get();
 
     // Test data
     std::vector<uint64_t> timestamps = {1000, 2000, 2500, 3000, 4000, 5500, 7000};
     std::vector<double> values = {1.0, 2.0, 2.5, 3.0, 4.0, 5.5, 7.0};
 
     // Filter
-    auto [filteredTs, filteredVals] = tombstone->filterTombstoned(1, timestamps, values);
+    auto [filteredTs, filteredVals] = tombstone->filterTombstoned(series1, timestamps, values);
 
     // Expected: 1000, 4000, 7000 (indices 0, 4, 6)
     EXPECT_EQ(filteredTs.size(), 3);
@@ -163,7 +174,7 @@ TEST_F(TSMTombstoneTest, FilterTombstoned) {
     EXPECT_EQ(filteredVals[2], 7.0);
 
     // Test with no tombstones for series
-    auto [filteredTs2, filteredVals2] = tombstone->filterTombstoned(2, timestamps, values);
+    auto [filteredTs2, filteredVals2] = tombstone->filterTombstoned(series2, timestamps, values);
     EXPECT_EQ(filteredTs2.size(), timestamps.size());
     EXPECT_EQ(filteredVals2, values);
 }
@@ -174,12 +185,12 @@ TEST_F(TSMTombstoneTest, MergeTombstones) {
     auto tombstone2 = std::make_unique<TSMTombstone>(testDir + "/other.tombstone");
 
     // Add to first tombstone
-    tombstone1->addTombstone(1, 1000, 2000).get();
-    tombstone1->addTombstone(2, 3000, 4000).get();
+    tombstone1->addTombstone(series1, 1000, 2000).get();
+    tombstone1->addTombstone(series2, 3000, 4000).get();
 
     // Add to second tombstone
-    tombstone2->addTombstone(1, 5000, 6000).get();
-    tombstone2->addTombstone(3, 7000, 8000).get();
+    tombstone2->addTombstone(series1, 5000, 6000).get();
+    tombstone2->addTombstone(series3, 7000, 8000).get();
 
     // Merge
     tombstone1->merge(*tombstone2);
@@ -189,10 +200,10 @@ TEST_F(TSMTombstoneTest, MergeTombstones) {
     EXPECT_EQ(tombstone1->getSeriesCount(), 3);
 
     // Verify all ranges present
-    auto ranges1 = tombstone1->getTombstoneRanges(1);
+    auto ranges1 = tombstone1->getTombstoneRanges(series1);
     EXPECT_EQ(ranges1.size(), 2);
 
-    auto ranges3 = tombstone1->getTombstoneRanges(3);
+    auto ranges3 = tombstone1->getTombstoneRanges(series3);
     EXPECT_EQ(ranges3.size(), 1);
     EXPECT_EQ(ranges3[0].first, 7000);
 }
@@ -202,13 +213,13 @@ TEST_F(TSMTombstoneTest, MergeOverlappingRanges) {
     auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
 
     // Add overlapping ranges
-    tombstone->addTombstone(1, 1000, 3000).get();
-    tombstone->addTombstone(1, 2000, 4000).get();  // Overlaps
-    tombstone->addTombstone(1, 4000, 5000).get();  // Adjacent
-    tombstone->addTombstone(1, 6000, 7000).get();  // Separate
+    tombstone->addTombstone(series1, 1000, 3000).get();
+    tombstone->addTombstone(series1, 2000, 4000).get();  // Overlaps
+    tombstone->addTombstone(series1, 4000, 5000).get();  // Adjacent
+    tombstone->addTombstone(series1, 6000, 7000).get();  // Separate
 
     // After sorting and merging, should have optimized ranges
-    auto ranges = tombstone->getTombstoneRanges(1);
+    auto ranges = tombstone->getTombstoneRanges(series1);
 
     // Should merge overlapping and adjacent ranges
     // Expected: [1000-5000], [6000-7000]
@@ -224,10 +235,10 @@ TEST_F(TSMTombstoneTest, CompactTombstones) {
     auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
 
     // Add tombstones across time range
-    tombstone->addTombstone(1, 1000, 2000).get();
-    tombstone->addTombstone(1, 3000, 4000).get();
-    tombstone->addTombstone(1, 5000, 6000).get();
-    tombstone->addTombstone(2, 2500, 3500).get();
+    tombstone->addTombstone(series1, 1000, 2000).get();
+    tombstone->addTombstone(series1, 3000, 4000).get();
+    tombstone->addTombstone(series1, 5000, 6000).get();
+    tombstone->addTombstone(series2, 2500, 3500).get();
 
     // Compact tombstones in range [2000, 4000]
     // Should remove tombstones that are completely within this range
@@ -235,14 +246,14 @@ TEST_F(TSMTombstoneTest, CompactTombstones) {
 
     // Should keep [1000-2000] (partially outside) and [5000-6000] (completely outside)
     // Should remove [3000-4000] and [2500-3500]
-    auto ranges1 = tombstone->getTombstoneRanges(1);
+    auto ranges1 = tombstone->getTombstoneRanges(series1);
     EXPECT_EQ(ranges1.size(), 2);
     EXPECT_EQ(ranges1[0].first, 1000);
     EXPECT_EQ(ranges1[0].second, 2000);
     EXPECT_EQ(ranges1[1].first, 5000);
     EXPECT_EQ(ranges1[1].second, 6000);
 
-    auto ranges2 = tombstone->getTombstoneRanges(2);
+    auto ranges2 = tombstone->getTombstoneRanges(series2);
     EXPECT_EQ(ranges2.size(), 0);  // Completely removed
 }
 
@@ -251,9 +262,9 @@ TEST_F(TSMTombstoneTest, PersistenceAndChecksums) {
     // Write tombstones
     {
         auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
-        tombstone->addTombstone(1, 1000, 2000).get();
-        tombstone->addTombstone(2, 3000, 4000).get();
-        tombstone->addTombstone(3, 5000, 6000).get();
+        tombstone->addTombstone(series1, 1000, 2000).get();
+        tombstone->addTombstone(series2, 3000, 4000).get();
+        tombstone->addTombstone(series3, 5000, 6000).get();
         tombstone->flush().get();
     }
 
@@ -265,9 +276,9 @@ TEST_F(TSMTombstoneTest, PersistenceAndChecksums) {
         EXPECT_EQ(tombstone->getEntryCount(), 3);
 
         // Verify specific entries
-        EXPECT_TRUE(tombstone->isDeleted(1, 1500));
-        EXPECT_TRUE(tombstone->isDeleted(2, 3500));
-        EXPECT_TRUE(tombstone->isDeleted(3, 5500));
+        EXPECT_TRUE(tombstone->isDeleted(series1, 1500));
+        EXPECT_TRUE(tombstone->isDeleted(series2, 3500));
+        EXPECT_TRUE(tombstone->isDeleted(series3, 5500));
     }
 
     // Corrupt file and attempt to load (should handle gracefully)
@@ -299,9 +310,9 @@ TEST_F(TSMTombstoneTest, EmptyTombstone) {
     // Empty tombstone should work fine
     EXPECT_EQ(tombstone->getEntryCount(), 0);
     EXPECT_EQ(tombstone->getSeriesCount(), 0);
-    EXPECT_FALSE(tombstone->isDeleted(1, 1000));
+    EXPECT_FALSE(tombstone->isDeleted(series1, 1000));
 
-    auto ranges = tombstone->getTombstoneRanges(1);
+    auto ranges = tombstone->getTombstoneRanges(series1);
     EXPECT_EQ(ranges.size(), 0);
 
     // Should be able to flush empty tombstone
@@ -322,10 +333,11 @@ TEST_F(TSMTombstoneTest, LargeTombstoneSet) {
     const int rangesPerSeries = 10;
 
     for (int series = 1; series <= numSeries; ++series) {
+        SeriesId128 sid = makeSeriesId(series);
         for (int range = 0; range < rangesPerSeries; ++range) {
             uint64_t start = range * 10000;
             uint64_t end = start + 5000;
-            tombstone->addTombstone(series, start, end).get();
+            tombstone->addTombstone(sid, start, end).get();
         }
     }
 
@@ -333,10 +345,11 @@ TEST_F(TSMTombstoneTest, LargeTombstoneSet) {
     EXPECT_EQ(tombstone->getSeriesCount(), numSeries);
 
     // Test query performance with many tombstones
+    SeriesId128 midSeries = makeSeriesId(50);
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < 10000; ++i) {
-        tombstone->isDeleted(50, 25000);  // Middle series, middle time
+        tombstone->isDeleted(midSeries, 25000);  // Middle series, middle time
     }
 
     auto end = std::chrono::high_resolution_clock::now();

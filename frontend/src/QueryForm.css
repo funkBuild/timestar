@@ -1,0 +1,136 @@
+.query-form {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.form-section {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.form-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.form-section select,
+.form-section input[type="datetime-local"] {
+  width: 100%;
+}
+
+.form-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.form-row > * {
+  flex: 1;
+}
+
+.checkbox-list {
+  max-height: 150px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: var(--bg-input);
+}
+
+.checkbox-list label {
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.checkbox-list input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.type-badge {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 0 4px;
+  border-radius: 2px;
+  margin-left: auto;
+}
+
+.type-badge.float { background: rgba(68, 136, 204, 0.2); color: var(--badge-float); }
+.type-badge.bool { background: rgba(204, 136, 68, 0.2); color: var(--badge-bool); }
+.type-badge.string { background: rgba(68, 204, 136, 0.2); color: var(--badge-string); }
+.type-badge.int, .type-badge.integer { background: rgba(204, 68, 170, 0.2); color: var(--badge-int); }
+
+.time-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.time-inputs input {
+  width: 100%;
+  font-size: 11px;
+}
+
+.alltime-btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  margin-top: 4px;
+  align-self: flex-start;
+}
+
+.interval-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  align-items: center;
+}
+
+.interval-row input {
+  width: 80px;
+}
+
+.interval-row select {
+  width: auto;
+}
+
+.submit-section {
+  padding: 14px;
+  margin-top: auto;
+}
+
+.submit-btn {
+  width: 100%;
+  padding: 8px;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.submit-btn:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.submit-btn:disabled {
+  background: var(--bg-surface);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.query-preview {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}

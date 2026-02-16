@@ -61,8 +61,7 @@ seastar::future<> TSMCompactor::mergeSeries(
         if (file->hasTombstones()) {
             auto tombstones = file->getTombstones();
             if (tombstones) {
-                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
-                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
+                auto ranges = tombstones->getTombstoneRanges(seriesId);
                 tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
             }
         }
@@ -176,8 +175,7 @@ seastar::future<> TSMCompactor::mergeSeriesWithIterator(
         if (file->hasTombstones()) {
             auto tombstones = file->getTombstones();
             if (tombstones) {
-                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
-                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
+                auto ranges = tombstones->getTombstoneRanges(seriesId);
                 tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
             }
         }
@@ -306,8 +304,7 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
         if (file->hasTombstones()) {
             auto tombstones = file->getTombstones();
             if (tombstones) {
-                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
-                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
+                auto ranges = tombstones->getTombstoneRanges(seriesId);
                 tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
             }
         }
@@ -668,8 +665,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         if (file->hasTombstones()) {
             auto tombstones = file->getTombstones();
             if (tombstones) {
-                uint64_t seriesIdHash = file->getSeriesIdHash(seriesId);
-                auto ranges = tombstones->getTombstoneRanges(seriesIdHash);
+                auto ranges = tombstones->getTombstoneRanges(seriesId);
                 tombstoneRanges.insert(tombstoneRanges.end(), ranges.begin(), ranges.end());
             }
         }
@@ -1009,7 +1005,16 @@ seastar::future<std::string> TSMCompactor::compact(
     std::vector<SeriesId128> stringSeries;
 
     for (const auto& seriesId : allSeries) {
-        auto seriesType = files[0]->getSeriesType(seriesId);
+        // Check ALL files for series type, not just the first file.
+        // A series may only exist in files[1..N], so we must iterate
+        // until we find a file that contains this series.
+        std::optional<TSMValueType> seriesType;
+        for (const auto& file : files) {
+            seriesType = file->getSeriesType(seriesId);
+            if (seriesType.has_value()) {
+                break;
+            }
+        }
         if (!seriesType.has_value()) {
             continue;
         }
@@ -1089,8 +1094,8 @@ seastar::future<std::string> TSMCompactor::compact(
     // Store stats so executeCompaction can retrieve them
     lastCompactStats = stats;
 
-    // Atomic rename from temp to final
-    fs::rename(tempPath, outputPath);
+    // Atomic rename from temp to final (async to avoid blocking the reactor)
+    co_await seastar::rename_file(tempPath, outputPath);
 
     co_return outputPath;
 }
@@ -1194,12 +1199,18 @@ seastar::future<> TSMCompactor::runCompactionLoop() {
             if (shouldCompact(tier)) {
                 auto plan = planCompaction(tier);
                 if (plan.isValid()) {
-                    auto stats = co_await executeCompaction(plan);
-                    didCompaction = true;
-                    
-                    tsdb::compactor_log.info("Compacted {} files in tier {}, removed {} duplicates in {}ms",
-                                            stats.filesCompacted, tier, stats.duplicatesRemoved,
-                                            stats.duration.count());
+                    try {
+                        auto stats = co_await executeCompaction(plan);
+                        didCompaction = true;
+
+                        tsdb::compactor_log.info("Compacted {} files in tier {}, removed {} duplicates in {}ms",
+                                                stats.filesCompacted, tier, stats.duplicatesRemoved,
+                                                stats.duration.count());
+                    } catch (const std::exception& e) {
+                        tsdb::compactor_log.error(
+                            "Compaction failed for tier {}: {}. Will retry on next cycle.",
+                            tier, e.what());
+                    }
                 }
             }
         }

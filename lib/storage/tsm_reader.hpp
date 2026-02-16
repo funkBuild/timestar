@@ -4,40 +4,30 @@
 #include "tsm.hpp"
 #include <seastar/core/shared_ptr.hh>
 
-// RAII wrapper for TSM file access with automatic reference counting
-// This ensures reads are not blocked during compaction
+// RAII wrapper for TSM file access.
+// Seastar's shard-per-core model guarantees no cross-shard sharing of TSM
+// objects, so reference counting is unnecessary. This is a thin passthrough.
 class TSMReader {
 private:
     seastar::shared_ptr<TSM> tsm;
-    
+
 public:
-    explicit TSMReader(seastar::shared_ptr<TSM> file) : tsm(file) {
-        if (tsm) {
-            tsm->addRef();
-        }
-    }
-    
-    ~TSMReader() {
-        if (tsm) {
-            tsm->releaseRef();
-        }
-    }
-    
+    explicit TSMReader(seastar::shared_ptr<TSM> file) : tsm(std::move(file)) {}
+
+    ~TSMReader() = default;
+
     // Delete copy constructor and assignment
     TSMReader(const TSMReader&) = delete;
     TSMReader& operator=(const TSMReader&) = delete;
-    
+
     // Move constructor
     TSMReader(TSMReader&& other) noexcept : tsm(std::move(other.tsm)) {
         other.tsm = nullptr;
     }
-    
+
     // Move assignment
     TSMReader& operator=(TSMReader&& other) noexcept {
         if (this != &other) {
-            if (tsm) {
-                tsm->releaseRef();
-            }
             tsm = std::move(other.tsm);
             other.tsm = nullptr;
         }

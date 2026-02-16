@@ -70,7 +70,7 @@ AlignedBuffer IntegerEncoderAVX512::encode(const std::vector<uint64_t> &values) 
         return Simple16::encode(encoded);
     }
 
-    int64_t delta = values[1] - values[0];
+    int64_t delta = static_cast<int64_t>(values[1]) - static_cast<int64_t>(values[0]);
     encoded.push_back(ZigZag::zigzagEncode(delta));
 
     const size_t size = values.size();
@@ -88,7 +88,7 @@ AlignedBuffer IntegerEncoderAVX512::encode(const std::vector<uint64_t> &values) 
             #pragma unroll 16
             for (size_t j = 0; j < 16; j++) {
                 size_t idx = i + j;
-                deltas[j] = (values[idx] - values[idx-1]) - (values[idx-1] - values[idx-2]);
+                deltas[j] = (static_cast<int64_t>(values[idx]) - static_cast<int64_t>(values[idx-1])) - (static_cast<int64_t>(values[idx-1]) - static_cast<int64_t>(values[idx-2]));
             }
 
             // SIMD zigzag encode in two batches of 8
@@ -116,7 +116,7 @@ AlignedBuffer IntegerEncoderAVX512::encode(const std::vector<uint64_t> &values) 
             #pragma unroll 8
             for (size_t j = 0; j < 8; j++) {
                 size_t idx = i + j;
-                deltas[j] = (values[idx] - values[idx-1]) - (values[idx-1] - values[idx-2]);
+                deltas[j] = (static_cast<int64_t>(values[idx]) - static_cast<int64_t>(values[idx-1])) - (static_cast<int64_t>(values[idx-1]) - static_cast<int64_t>(values[idx-2]));
             }
 
             // SIMD zigzag encode
@@ -132,10 +132,10 @@ AlignedBuffer IntegerEncoderAVX512::encode(const std::vector<uint64_t> &values) 
 
     // Process remaining values with 4x unrolling
     for (; i + 3 < size; i += 4) {
-        int64_t d0 = (values[i] - values[i-1]) - (values[i-1] - values[i-2]);
-        int64_t d1 = (values[i+1] - values[i]) - (values[i] - values[i-1]);
-        int64_t d2 = (values[i+2] - values[i+1]) - (values[i+1] - values[i]);
-        int64_t d3 = (values[i+3] - values[i+2]) - (values[i+2] - values[i+1]);
+        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
+        int64_t d1 = (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i])) - (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1]));
+        int64_t d2 = (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1])) - (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i]));
+        int64_t d3 = (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2])) - (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1]));
 
         encoded.push_back(ZigZag::zigzagEncode(d0));
         encoded.push_back(ZigZag::zigzagEncode(d1));
@@ -145,7 +145,7 @@ AlignedBuffer IntegerEncoderAVX512::encode(const std::vector<uint64_t> &values) 
 
     // Handle remaining values
     for (; i < size; i++) {
-        int64_t D = (values[i] - values[i-1]) - (values[i-1] - values[i-2]);
+        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
         encoded.push_back(ZigZag::zigzagEncode(D));
     }
 
@@ -189,7 +189,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
 
     // Second value
     int64_t delta = ZigZag::zigzagDecode(deltaValues[1]);
-    last_decoded += delta;
+    last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
 
     if (last_decoded < minTime) {
         nSkipped++;
@@ -223,7 +223,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
             #pragma unroll 16
             for (size_t j = 0; j < 16; j++) {
                 delta += decoded_batch[j];
-                last_decoded += delta;
+                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
 
                 // Efficient range check
                 if (last_decoded < minTime) {
@@ -251,7 +251,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
             #pragma unroll 8
             for (size_t j = 0; j < 8; j++) {
                 delta += decoded_batch[j];
-                last_decoded += delta;
+                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
 
                 if (last_decoded < minTime) {
                     nSkipped++;
@@ -273,7 +273,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
         int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i+3]);
 
         delta += dd0;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -284,7 +284,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
         }
 
         delta += dd1;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -295,7 +295,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
         }
 
         delta += dd2;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -306,7 +306,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
         }
 
         delta += dd3;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
         if (last_decoded < minTime) {
             nSkipped++;
         } else if (last_decoded > maxTime) {
@@ -321,7 +321,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
     for (; i < size; i++) {
         int64_t encD = ZigZag::zigzagDecode(deltaValues[i]);
         delta += encD;
-        last_decoded += delta;
+        last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
 
         if (last_decoded < minTime) {
             nSkipped++;

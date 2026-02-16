@@ -373,8 +373,14 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(
         return subResult;
     }
 
-    // For now, we only support single-series sub-queries
-    // Take the first series result
+    if (results.size() > 1) {
+        throw DerivedQueryException(
+            "Sub-query '" + name + "' returned " +
+            std::to_string(results.size()) +
+            " series but derived queries require exactly one series. "
+            "Add more specific scope filters to narrow the result.");
+    }
+
     const auto& series = results[0];
     subResult.tags = series.tags;
 

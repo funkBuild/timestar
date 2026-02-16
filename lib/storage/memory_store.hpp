@@ -20,7 +20,7 @@ public:
   std::vector<uint64_t> timestamps;
   std::vector<T> values;
 
-  void insert(TSDBInsert<T> &insertRequest);
+  void insert(TSDBInsert<T> insertRequest);
   void sort();
 };
 
@@ -52,7 +52,7 @@ public:
   seastar::future<> removeWAL();
   seastar::future<> initFromWAL(std::string filename);
   seastar::future<> close();
-  template <class T> void insertMemory(TSDBInsert<T> &insertRequest);
+  template <class T> void insertMemory(TSDBInsert<T> insertRequest);
   template <class T>
   seastar::future<bool>
   insert(TSDBInsert<T> &insertRequest); // Returns true if WAL needs rollover

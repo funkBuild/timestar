@@ -327,3 +327,84 @@ TEST_F(AggregatorTest, IrregularTimestamps) {
     // Verify we have at least 3 buckets (minimum expected)
     EXPECT_GE(result.size(), 3);
 }
+
+// ============================================================================
+// AggregationState::getValue() - Empty set returns NaN for all methods
+// ============================================================================
+
+TEST(AggregationStateTest, EmptySetReturnsNaN_AVG) {
+    AggregationState state;  // count = 0
+    EXPECT_TRUE(std::isnan(state.getValue(AggregationMethod::AVG)));
+}
+
+TEST(AggregationStateTest, EmptySetReturnsNaN_SUM) {
+    AggregationState state;
+    EXPECT_TRUE(std::isnan(state.getValue(AggregationMethod::SUM)));
+}
+
+TEST(AggregationStateTest, EmptySetReturnsNaN_LATEST) {
+    AggregationState state;
+    EXPECT_TRUE(std::isnan(state.getValue(AggregationMethod::LATEST)));
+}
+
+TEST(AggregationStateTest, EmptySetReturnsNaN_MIN) {
+    AggregationState state;
+    EXPECT_TRUE(std::isnan(state.getValue(AggregationMethod::MIN)));
+}
+
+TEST(AggregationStateTest, EmptySetReturnsNaN_MAX) {
+    AggregationState state;
+    EXPECT_TRUE(std::isnan(state.getValue(AggregationMethod::MAX)));
+}
+
+// Non-empty sets should still return correct values
+TEST(AggregationStateTest, NonEmptySetReturnsCorrectValues) {
+    AggregationState state;
+    state.addValue(10.0, 100);
+    state.addValue(20.0, 200);
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::AVG), 15.0);
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::SUM), 30.0);
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::MIN), 10.0);
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::MAX), 20.0);
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::LATEST), 20.0);
+}
+
+// A single value of 0.0 must be distinguishable from empty (not NaN)
+TEST(AggregationStateTest, SingleZeroNotNaN) {
+    AggregationState state;
+    state.addValue(0.0, 100);
+    EXPECT_FALSE(std::isnan(state.getValue(AggregationMethod::SUM)));
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::SUM), 0.0);
+    EXPECT_FALSE(std::isnan(state.getValue(AggregationMethod::LATEST)));
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::LATEST), 0.0);
+    EXPECT_FALSE(std::isnan(state.getValue(AggregationMethod::AVG)));
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::AVG), 0.0);
+    EXPECT_FALSE(std::isnan(state.getValue(AggregationMethod::MIN)));
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::MIN), 0.0);
+    EXPECT_FALSE(std::isnan(state.getValue(AggregationMethod::MAX)));
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::MAX), 0.0);
+}
+
+// ============================================================================
+// Aggregator::calculateSum/Avg - Empty vector returns NaN
+// ============================================================================
+
+TEST(AggregationStateTest, CalculateSumEmptyReturnsNaN) {
+    std::vector<double> empty;
+    EXPECT_TRUE(std::isnan(Aggregator::calculateSum(empty)));
+}
+
+TEST(AggregationStateTest, CalculateAvgEmptyReturnsNaN) {
+    std::vector<double> empty;
+    EXPECT_TRUE(std::isnan(Aggregator::calculateAvg(empty)));
+}
+
+TEST(AggregationStateTest, CalculateMinEmptyReturnsNaN) {
+    std::vector<double> empty;
+    EXPECT_TRUE(std::isnan(Aggregator::calculateMin(empty)));
+}
+
+TEST(AggregationStateTest, CalculateMaxEmptyReturnsNaN) {
+    std::vector<double> empty;
+    EXPECT_TRUE(std::isnan(Aggregator::calculateMax(empty)));
+}

@@ -18,21 +18,20 @@ typedef std::chrono::high_resolution_clock Clock;
 template <class T> class QueryResult {
 private:
   struct TSMIterationState {
+    int tsmResultIndex;
     TSMBlock<T> *block;
     int blockIdx;
     int blockOffset;
     size_t blockSize;
     uint64_t currentTimestamp;
+    uint64_t rank;
   };
 
 public:
   std::vector<uint64_t> timestamps;
   std::vector<T> values;
 
-  QueryResult() {
-    timestamps.reserve(10000);
-    values.reserve(10000);
-  };
+  QueryResult() = default;
 
   static QueryResult fromTsmResults(std::vector<TSMResult<T>> &tsmResults) {
     QueryResult<T> results;
@@ -56,33 +55,50 @@ public:
   void mergeTsmResults(std::vector<TSMResult<T>> &tsmResults) {
     const unsigned int tsmResultSize = tsmResults.size();
 
+    // Pre-calculate total points for efficient reservation
+    size_t totalPoints = 0;
+    for (unsigned int i = 0; i < tsmResultSize; i++) {
+      for (size_t b = 0; tsmResults[i].getBlock(b) != nullptr; ++b) {
+        totalPoints += tsmResults[i].getBlock(b)->size();
+      }
+    }
+    timestamps.reserve(totalPoints);
+    values.reserve(totalPoints);
+
     std::vector<TSMIterationState> blockIterState;
 
     for (int i = 0; i < tsmResultSize; i++) {
-      TSMIterationState state = {tsmResults[i].getBlock(0), 0, 0,
-                                 tsmResults[i].getBlock(0)->size(), 0};
-
-      if (state.block == nullptr)
+      TSMBlock<T> *firstBlock = tsmResults[i].getBlock(0);
+      if (firstBlock == nullptr)
         continue;
+
+      TSMIterationState state = {i, firstBlock, 0, 0,
+                                 firstBlock->size(), 0, tsmResults[i].rank};
 
       state.currentTimestamp = state.block->timestampAt(state.blockOffset);
 
       blockIterState.push_back(state);
     }
 
+    const size_t iterStateSize = blockIterState.size();
+
     while (true) {
       uint64_t minTimestamp = std::numeric_limits<uint64_t>::max();
+      uint64_t minRank = 0;
       TSMIterationState *minState = nullptr;
 
-      // Get the block with the lowest timestamp
-      for (int i = 0; i < tsmResultSize; i++) {
+      // Get the block with the lowest timestamp, preferring higher rank
+      // (more recent TSM file) when timestamps are equal
+      for (size_t i = 0; i < iterStateSize; i++) {
         TSMIterationState *state = &blockIterState[i];
 
         if (state->block == nullptr)
           continue;
 
-        if (state->currentTimestamp < minTimestamp) {
+        if (state->currentTimestamp < minTimestamp ||
+            (state->currentTimestamp == minTimestamp && state->rank > minRank)) {
           minTimestamp = state->currentTimestamp;
+          minRank = state->rank;
           minState = state;
         }
       }
@@ -93,7 +109,7 @@ public:
       timestamps.push_back(minTimestamp);
       values.push_back(minState->block->valueAt(minState->blockOffset));
 
-      for (int i = 0; i < tsmResultSize; i++) {
+      for (size_t i = 0; i < iterStateSize; i++) {
         TSMIterationState *state = &blockIterState[i];
 
         if (state->block == nullptr)
@@ -105,7 +121,7 @@ public:
           if (state->blockOffset >= state->blockSize) {
             state->blockIdx++;
             state->blockOffset = 0;
-            state->block = tsmResults[i].getBlock(state->blockIdx);
+            state->block = tsmResults[state->tsmResultIndex].getBlock(state->blockIdx);
 
             if (state->block == nullptr)
               break;
