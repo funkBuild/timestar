@@ -15,11 +15,11 @@ private:
   WALFileManager *walFileManager;
 
   template <class T>
-  seastar::future<QueryResult<T>> queryTsm(std::string series, uint64_t startTime, uint64_t endTime);
+  seastar::future<QueryResult<T>> queryTsm(const std::string& series, uint64_t startTime, uint64_t endTime);
 public:
   QueryRunner(TSMFileManager* _fileManager, WALFileManager* _walFileManager) : fileManager(_fileManager), walFileManager(_walFileManager) {};
 
-  seastar::future<VariantQueryResult> runQuery(std::string series, uint64_t startTime, uint64_t endTime);
+  seastar::future<VariantQueryResult> runQuery(const std::string& series, uint64_t startTime, uint64_t endTime);
 };
 
 #endif

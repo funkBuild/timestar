@@ -9,8 +9,23 @@
 #include "float/float_decoder.hpp"  // Contains FloatDecoderBasic
 #include "float/float_decoder_simd.hpp"
 #include "float/float_decoder_avx512.hpp"
+#include "alp/alp_encoder.hpp"
+#include "alp/alp_decoder.hpp"
 #include "../storage/compressed_buffer.hpp"
 #include "../storage/slice_buffer.hpp"
+
+/**
+ * Compile-time selection of float compression algorithm.
+ * Change this constexpr to switch the entire storage layer between algorithms.
+ *   GORILLA - Gorilla XOR-delta encoding (original, with AVX-512/AVX2 acceleration)
+ *   ALP     - Adaptive Lossless floating-Point compression (SIGMOD 2024)
+ */
+enum class FloatCompression {
+    GORILLA,
+    ALP
+};
+
+static constexpr FloatCompression FLOAT_COMPRESSION = FloatCompression::ALP;
 
 /**
  * Main FloatEncoder class that automatically selects the best implementation

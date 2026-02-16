@@ -496,7 +496,7 @@ WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
 
 
 std::optional<TSMValueType>
-WALFileManager::getSeriesType(std::string &seriesKey) {
+WALFileManager::getSeriesType(const std::string &seriesKey) {
   std::optional<TSMValueType> seriesType;
   SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 

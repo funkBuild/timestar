@@ -4,26 +4,31 @@
 FloatEncoder::Implementation FloatEncoder::s_forced_impl = FloatEncoder::AUTO;
 
 CompressedBuffer FloatEncoder::encode(const std::vector<double>& values) {
-    Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
-    
-    switch (impl) {
-        case AVX512:
-            if (FloatEncoderAVX512::isAvailable()) {
-                return FloatEncoderAVX512::encode(values);
-            }
-            // Fall through if not available
-            
-        case SIMD:
-            if (FloatEncoderSIMD::isAvailable()) {
-                return FloatEncoderSIMD::encode(values);
-            }
-            // Fall through if not available
-            
-        case BASIC:
-        case AUTO:
-        default:
-            // Use the basic implementation from float/ subfolder
-            return FloatEncoderBasic::encode(values);
+    if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
+        return ALPEncoder::encode(values);
+    } else {
+        Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
+
+        switch (impl) {
+            case AVX512:
+                if (FloatEncoderAVX512::isAvailable()) {
+                    return FloatEncoderAVX512::encode(values);
+                }
+                // Fall through if not available
+                [[fallthrough]];
+
+            case SIMD:
+                if (FloatEncoderSIMD::isAvailable()) {
+                    return FloatEncoderSIMD::encode(values);
+                }
+                // Fall through if not available
+                [[fallthrough]];
+
+            case BASIC:
+            case AUTO:
+            default:
+                return FloatEncoderBasic::encode(values);
+        }
     }
 }
 
@@ -31,28 +36,33 @@ CompressedBuffer FloatEncoder::encode(const std::vector<double>& values) {
 FloatDecoder::Implementation FloatDecoder::s_forced_impl = FloatDecoder::AUTO;
 
 void FloatDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
-    // Use the best available decoder based on CPU capabilities
-    Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
+    if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
+        ALPDecoder::decode(encoded, nToSkip, length, out);
+    } else {
+        Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
-    switch (impl) {
-        case AVX512:
-            if (FloatDecoderAVX512::isAvailable()) {
-                FloatDecoderAVX512::decode(encoded, nToSkip, length, out);
-                return;
-            }
-            // Fall through if not available
+        switch (impl) {
+            case AVX512:
+                if (FloatDecoderAVX512::isAvailable()) {
+                    FloatDecoderAVX512::decode(encoded, nToSkip, length, out);
+                    return;
+                }
+                // Fall through if not available
+                [[fallthrough]];
 
-        case SIMD:
-            if (FloatDecoderSIMD::isAvailable()) {
-                FloatDecoderSIMD::decode(encoded, nToSkip, length, out);
-                return;
-            }
-            // Fall through if not available
+            case SIMD:
+                if (FloatDecoderSIMD::isAvailable()) {
+                    FloatDecoderSIMD::decode(encoded, nToSkip, length, out);
+                    return;
+                }
+                // Fall through if not available
+                [[fallthrough]];
 
-        case BASIC:
-        case AUTO:
-        default:
-            FloatDecoderBasic::decode(encoded, nToSkip, length, out);
+            case BASIC:
+            case AUTO:
+            default:
+                FloatDecoderBasic::decode(encoded, nToSkip, length, out);
+        }
     }
 }
 
@@ -67,25 +77,29 @@ FloatDecoder::Implementation FloatDecoder::selectBestImplementation() {
 }
 
 std::string FloatDecoder::getImplementationName() {
-    Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
+    if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
+        return "ALP (Adaptive Lossless floating-Point)";
+    } else {
+        Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
-    switch (impl) {
-        case AVX512:
-            if (FloatDecoderAVX512::isAvailable()) {
-                return "AVX-512 Decoder";
-            }
-            // Fall through
+        switch (impl) {
+            case AVX512:
+                if (FloatDecoderAVX512::isAvailable()) {
+                    return "AVX-512 Decoder";
+                }
+                [[fallthrough]];
 
-        case SIMD:
-            if (FloatDecoderSIMD::isAvailable()) {
-                return "AVX2 SIMD Decoder";
-            }
-            // Fall through
+            case SIMD:
+                if (FloatDecoderSIMD::isAvailable()) {
+                    return "AVX2 SIMD Decoder";
+                }
+                [[fallthrough]];
 
-        case BASIC:
-        case AUTO:
-        default:
-            return "Basic Optimized Decoder";
+            case BASIC:
+            case AUTO:
+            default:
+                return "Basic Optimized Decoder";
+        }
     }
 }
 
@@ -102,25 +116,29 @@ void FloatDecoder::setImplementation(Implementation impl) {
 }
 
 std::string FloatEncoder::getImplementationName() {
-    Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
-    
-    switch (impl) {
-        case AVX512:
-            if (FloatEncoderAVX512::isAvailable()) {
-                return "AVX-512 (8x parallel)";
-            }
-            // Fall through
-            
-        case SIMD:
-            if (FloatEncoderSIMD::isAvailable()) {
-                return "AVX2 SIMD (4x parallel)";
-            }
-            // Fall through
-            
-        case BASIC:
-        case AUTO:
-        default:
-            return "Basic Optimized";
+    if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
+        return "ALP (Adaptive Lossless floating-Point)";
+    } else {
+        Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
+
+        switch (impl) {
+            case AVX512:
+                if (FloatEncoderAVX512::isAvailable()) {
+                    return "AVX-512 (8x parallel)";
+                }
+                [[fallthrough]];
+
+            case SIMD:
+                if (FloatEncoderSIMD::isAvailable()) {
+                    return "AVX2 SIMD (4x parallel)";
+                }
+                [[fallthrough]];
+
+            case BASIC:
+            case AUTO:
+            default:
+                return "Basic Optimized";
+        }
     }
 }
 
@@ -137,7 +155,6 @@ void FloatEncoder::setImplementation(Implementation impl) {
 }
 
 FloatEncoder::Implementation FloatEncoder::selectBestImplementation() {
-    // Based on benchmarks: AVX-512 > AVX2 > Original
     if (FloatEncoderAVX512::isAvailable()) {
         return AVX512;
     }

@@ -61,7 +61,7 @@ public:
     }
     tsdb::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
   }
-  std::optional<TSMValueType> getSeriesType(std::string &seriesKey);
+  std::optional<TSMValueType> getSeriesType(const std::string &seriesKey);
   
   // Query memory stores for data (deletion filtering removed - WAL replay handles current state)
   // Returns a const pointer to the in-memory series, or nullptr if not found.

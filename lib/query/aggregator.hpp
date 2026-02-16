@@ -9,8 +9,36 @@
 #include <algorithm>
 #include <numeric>
 #include <unordered_map>
+#include <string_view>
 
 namespace tsdb {
+
+// Pre-computed hash wrapper: stores a string alongside its hash so that
+// unordered_map lookups never re-hash.  Used as key in the aggregation maps.
+struct PrehashedString {
+    std::string value;
+    size_t hash = 0;
+
+    PrehashedString() = default;
+    explicit PrehashedString(std::string s)
+        : value(std::move(s)), hash(std::hash<std::string>{}(value)) {}
+    // Construct with externally-provided hash (avoids double hashing)
+    PrehashedString(std::string s, size_t h) : value(std::move(s)), hash(h) {}
+
+    bool operator==(const PrehashedString& other) const { return value == other.value; }
+};
+
+struct PrehashedStringHash {
+    using is_transparent = void;
+    size_t operator()(const PrehashedString& k) const noexcept { return k.hash; }
+};
+
+struct PrehashedStringEqual {
+    using is_transparent = void;
+    bool operator()(const PrehashedString& a, const PrehashedString& b) const {
+        return a.value == b.value;
+    }
+};
 
 // Forward declarations
 struct SeriesResult;

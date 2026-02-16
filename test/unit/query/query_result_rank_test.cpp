@@ -153,7 +153,7 @@ TEST_F(QueryResultRankTest, SameRankFirstWins) {
     EXPECT_DOUBLE_EQ(qr.values[3], 40.0);
 }
 
-// Test 5: Source-code inspection -- verify TSMIterationState struct contains a rank field.
+// Test 5: Source-code inspection -- verify rank-based priority is implemented.
 TEST_F(QueryResultRankTest, RankFieldInIterationState) {
 #ifdef QUERY_RESULT_SOURCE_PATH
     std::ifstream file(QUERY_RESULT_SOURCE_PATH);
@@ -167,13 +167,14 @@ TEST_F(QueryResultRankTest, RankFieldInIterationState) {
     EXPECT_NE(content.find("uint64_t rank"), std::string::npos)
         << "TSMIterationState should contain a 'uint64_t rank' field";
 
-    // Verify the merge loop uses rank in its comparison
-    EXPECT_NE(content.find("state->rank > minRank"), std::string::npos)
-        << "Merge loop should compare state->rank > minRank for rank-based priority";
+    // Verify rank-based priority is used in the heap comparator.
+    // The heap entry compares by rank for tie-breaking on equal timestamps.
+    EXPECT_NE(content.find("rank < other.rank"), std::string::npos)
+        << "HeapEntry comparator should use rank for tie-breaking (higher rank wins)";
 
-    // Verify minRank is tracked
-    EXPECT_NE(content.find("uint64_t minRank"), std::string::npos)
-        << "Merge loop should track minRank for rank-based priority";
+    // Verify a priority_queue (min-heap) is used for the merge
+    EXPECT_NE(content.find("priority_queue"), std::string::npos)
+        << "Merge should use a priority_queue (min-heap) for O(M log N) merging";
 #else
     GTEST_SKIP() << "QUERY_RESULT_SOURCE_PATH not defined";
 #endif

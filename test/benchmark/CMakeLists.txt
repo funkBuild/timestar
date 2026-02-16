@@ -291,3 +291,36 @@ add_custom_target(run-batch-read-bench
     COMMENT "Running TSM batch read performance benchmark"
 )
 
+# ALP vs Gorilla Comparison Benchmark
+add_executable(alp_gorilla_comparison_benchmark alp_gorilla_comparison_benchmark.cpp)
+
+target_link_libraries(alp_gorilla_comparison_benchmark PRIVATE
+    libtsdb
+    pthread
+)
+
+target_include_directories(alp_gorilla_comparison_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/encoding
+    ${CMAKE_SOURCE_DIR}/lib/encoding/float
+    ${CMAKE_SOURCE_DIR}/lib/storage
+    ${CMAKE_SOURCE_DIR}/lib/core
+)
+
+# Set optimization flags for benchmark
+target_compile_options(alp_gorilla_comparison_benchmark PRIVATE
+    -O3
+    -march=native
+    -mtune=native
+)
+
+# Add as a test so it can be run with ctest
+add_test(NAME alp_gorilla_comparison_benchmark COMMAND alp_gorilla_comparison_benchmark)
+
+# Add custom target for easy running
+add_custom_target(run-alp-bench
+    COMMAND alp_gorilla_comparison_benchmark
+    DEPENDS alp_gorilla_comparison_benchmark
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running ALP vs Gorilla comparison benchmark"
+)
+

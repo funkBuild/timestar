@@ -99,7 +99,7 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
   co_return;
 }
 
-std::optional<TSMValueType> TSMFileManager::getSeriesType(std::string &seriesKey){
+std::optional<TSMValueType> TSMFileManager::getSeriesType(const std::string &seriesKey){
   std::optional<TSMValueType> seriesType;
 
   // Convert series key to SeriesId128 for TSM operations

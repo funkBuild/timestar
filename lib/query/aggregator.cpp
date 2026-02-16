@@ -72,8 +72,9 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    // Use composite string key to avoid hash collisions
-    std::unordered_map<std::string, PartialAggregationResult> partialResults;
+    // Use PrehashedString key to compute hash once and avoid redundant hashing
+    std::unordered_map<PrehashedString, PartialAggregationResult,
+                       PrehashedStringHash, PrehashedStringEqual> partialResults;
 
     for (const auto& series : seriesResults) {
         for (const auto& [fieldName, fieldData] : series.fields) {
@@ -111,14 +112,17 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             compositeKey += '\0';
             compositeKey += fieldName;
 
-            // Get or create partial result for this group
-            auto& partial = partialResults[compositeKey];
-            if (partial.measurement.empty()) {
+            // Hash once via PrehashedString; try_emplace avoids rehashing on lookup
+            PrehashedString pkey(std::move(compositeKey));
+            const size_t keyHash = pkey.hash;
+            auto [it, inserted] = partialResults.try_emplace(std::move(pkey), PartialAggregationResult{});
+            auto& partial = it->second;
+            if (inserted) {
                 partial.measurement = series.measurement;
                 partial.tags = relevantTags;
                 partial.fieldName = fieldName;
-                partial.groupKey = compositeKey;
-                partial.groupKeyHash = std::hash<std::string>{}(compositeKey);
+                partial.groupKey = it->first.value;  // Read from the emplaced key
+                partial.groupKeyHash = keyHash;       // Reuse pre-computed hash
             }
 
             // PHASE 1 OPTIMIZATION: Two-phase aggregation - aggregate to states immediately
@@ -164,11 +168,15 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
 
     std::vector<GroupedAggregationResult> result;
 
-    // Group partial results by composite key string (collision-free)
-    std::unordered_map<std::string, std::vector<const PartialAggregationResult*>> groups;
+    // Group partial results by pre-hashed composite key (no re-hashing of groupKey strings)
+    std::unordered_map<PrehashedString, std::vector<const PartialAggregationResult*>,
+                       PrehashedStringHash, PrehashedStringEqual> groups;
 
     for (const auto& partial : partialResults) {
-        groups[partial.groupKey].push_back(&partial);
+        // Reuse the pre-computed groupKeyHash — no re-hashing of the string
+        PrehashedString pkey(partial.groupKey, partial.groupKeyHash);
+        auto [it, inserted] = groups.try_emplace(std::move(pkey));
+        it->second.push_back(&partial);
     }
 
     // Pre-allocate result
@@ -193,10 +201,14 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
             // PHASE 1 OPTIMIZATION: Merge pre-aggregated states (O(1) per bucket)
             std::unordered_map<uint64_t, AggregationState> mergedStates;
 
-            // Merge all partial states for each bucket
+            // Merge all partial states for each bucket; try_emplace avoids
+            // default-constructing a state when the bucket already exists
             for (const auto* partial : groupPartials) {
                 for (const auto& [bucketTime, state] : partial->bucketStates) {
-                    mergedStates[bucketTime].merge(state);
+                    auto [it, inserted] = mergedStates.try_emplace(bucketTime, state);
+                    if (!inserted) {
+                        it->second.merge(state);
+                    }
                 }
             }
 
@@ -222,10 +234,14 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
             // PHASE 1 OPTIMIZATION: Merge time-aligned states (interval == 0)
             std::map<uint64_t, AggregationState> mergedStates;
 
-            // Merge all partial states for each timestamp
+            // Merge all partial states for each timestamp; try_emplace avoids
+            // default-constructing a state when the timestamp already exists
             for (const auto* partial : groupPartials) {
                 for (const auto& [timestamp, state] : partial->timestampStates) {
-                    mergedStates[timestamp].merge(state);
+                    auto [it, inserted] = mergedStates.try_emplace(timestamp, state);
+                    if (!inserted) {
+                        it->second.merge(state);
+                    }
                 }
             }
 

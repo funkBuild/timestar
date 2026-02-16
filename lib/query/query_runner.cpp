@@ -17,7 +17,7 @@
 typedef std::chrono::high_resolution_clock Clock;
 
 template <class T>
-seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64_t startTime, uint64_t endTime){
+seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series, uint64_t startTime, uint64_t endTime){
   LOG_QUERY_PATH(tsdb::query_log, debug, "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime, endTime);
 
   // Pre-allocate indexed slots to avoid concurrent push_back on a shared vector.
@@ -69,16 +69,27 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
   QueryResult<T> result = QueryResult<T>::fromTsmResults(tsmResults);
 
   auto memoryMatches = walFileManager->queryAllMemoryStores<T>(series);
-  for (const auto* memoryData : memoryMatches) {
-    const auto& storeData = *memoryData;
 
-    result.timestamps.reserve(result.timestamps.size() + storeData.timestamps.size());
-    result.values.reserve(result.values.size() + storeData.values.size());
+  // Pre-calculate total size across all memory stores and reserve once,
+  // avoiding repeated reserve() calls inside the loop that can cause
+  // multiple reallocations when there are 3+ active memory stores.
+  if (!memoryMatches.empty()) {
+    size_t totalTimestamps = 0;
+    size_t totalValues = 0;
+    for (const auto* memoryData : memoryMatches) {
+      totalTimestamps += memoryData->timestamps.size();
+      totalValues += memoryData->values.size();
+    }
+    result.timestamps.reserve(result.timestamps.size() + totalTimestamps);
+    result.values.reserve(result.values.size() + totalValues);
 
-    for (size_t i = 0; i < storeData.timestamps.size(); ++i) {
-      if (storeData.timestamps[i] >= startTime && storeData.timestamps[i] <= endTime) {
-        result.timestamps.push_back(storeData.timestamps[i]);
-        result.values.push_back(storeData.values[i]);
+    for (const auto* memoryData : memoryMatches) {
+      const auto& storeData = *memoryData;
+      for (size_t i = 0; i < storeData.timestamps.size(); ++i) {
+        if (storeData.timestamps[i] >= startTime && storeData.timestamps[i] <= endTime) {
+          result.timestamps.push_back(storeData.timestamps[i]);
+          result.values.push_back(storeData.values[i]);
+        }
       }
     }
   }
@@ -121,7 +132,7 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, uint64
 
 
 
-seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey, uint64_t startTime, uint64_t endTime){
+seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& seriesKey, uint64_t startTime, uint64_t endTime){
   LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Running query for series='{}', startTime={}, endTime={}", seriesKey, startTime, endTime);
   
   // Get the type of the series
@@ -174,6 +185,6 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey,
 };
 
 // Template instantiations
-template seastar::future<QueryResult<bool>> QueryRunner::queryTsm<bool>(std::string series, uint64_t startTime, uint64_t endTime);
-template seastar::future<QueryResult<double>> QueryRunner::queryTsm<double>(std::string series, uint64_t startTime, uint64_t endTime);
-template seastar::future<QueryResult<std::string>> QueryRunner::queryTsm<std::string>(std::string series, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<bool>> QueryRunner::queryTsm<bool>(const std::string& series, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<double>> QueryRunner::queryTsm<double>(const std::string& series, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<std::string>> QueryRunner::queryTsm<std::string>(const std::string& series, uint64_t startTime, uint64_t endTime);

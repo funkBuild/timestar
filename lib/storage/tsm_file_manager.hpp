@@ -45,7 +45,7 @@ public:
 
   seastar::future<> init();
   seastar::future<> writeMemstore(seastar::shared_ptr<MemoryStore> memStore, uint64_t tier = 0);
-  std::optional<TSMValueType> getSeriesType(std::string &seriesKey);
+  std::optional<TSMValueType> getSeriesType(const std::string &seriesKey);
   
   // Compaction support
   std::vector<seastar::shared_ptr<TSM>> getFilesInTier(uint64_t tier) const;
