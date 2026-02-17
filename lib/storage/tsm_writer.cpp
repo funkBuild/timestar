@@ -12,9 +12,18 @@
 #include <algorithm>
 #include <limits>
 #include <variant>
+#include <stdexcept>
+#include <system_error>
+#include <cstring>
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
+
+#include <seastar/core/seastar.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/coroutine.hh>
 
 TSMWriter::TSMWriter(std::string _filename){
   filename = _filename;
@@ -245,19 +254,130 @@ void TSMWriter::close(){
   LOG_INSERT_PATH(tsdb::tsm_log, debug, "Writing file: {}, buffer size: {} ({:#x}), capacity: {}",
                   filename, buffer.size(), buffer.size(), buffer.capacity());
 
-  std::ofstream file(filename, std::ios::binary);
-  file << buffer;
-  file.flush();
-  file.close();
-
-  // Ensure data is durable on disk
-  int fd = ::open(filename.c_str(), O_RDONLY);
-  if (fd >= 0) {
-    ::fsync(fd);
-    ::close(fd);
+  // Use raw POSIX I/O instead of std::ofstream to avoid the C++ stdio
+  // buffering layer (which chunks large writes into 8KB pieces internally).
+  // We write the entire buffer in one shot from a contiguous allocation,
+  // so a single write() syscall is all that's needed.
+  //
+  // O_WRONLY | O_CREAT | O_TRUNC: create or truncate, write-only.
+  // Mode 0644: owner rw, group/other r.
+  int fd = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "TSMWriter::close: failed to open " + filename);
   }
 
+  // Hint to the kernel that we will write this file sequentially.
+  // This allows read-ahead to be disabled and improves write coalescing.
+  // POSIX_FADV_SEQUENTIAL is a no-op on failure, so ignore errors.
+  ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+  // Write the entire buffer contents in a single large write().
+  // For files > 2GB we loop to handle partial writes, but in practice
+  // TSM files are well under this limit.
+  const char* ptr = reinterpret_cast<const char*>(buffer.data.data());
+  size_t remaining = buffer.size();
+  while (remaining > 0) {
+    ssize_t written = ::write(fd, ptr, remaining);
+    if (written < 0) {
+      int err = errno;
+      ::close(fd);
+      throw std::system_error(err, std::system_category(),
+                              "TSMWriter::close: write failed for " + filename);
+    }
+    ptr += written;
+    remaining -= static_cast<size_t>(written);
+  }
+
+  // fsync on the same fd to ensure durability before returning.
+  // Reusing the write fd avoids an extra open() syscall.
+  if (::fsync(fd) < 0) {
+    int err = errno;
+    ::close(fd);
+    throw std::system_error(err, std::system_category(),
+                            "TSMWriter::close: fsync failed for " + filename);
+  }
+
+  ::close(fd);
+
   LOG_INSERT_PATH(tsdb::tsm_log, debug, "File written successfully: {}", filename);
+}
+
+seastar::future<> TSMWriter::closeDMA(){
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "DMA writing file: {}, buffer size: {} ({:#x}), capacity: {}",
+                  filename, buffer.size(), buffer.size(), buffer.capacity());
+
+  const size_t dataSize = buffer.size();
+
+  // Open the file for DMA writes (create or truncate, write-only)
+  std::string_view filenameView{filename};
+  auto file = co_await seastar::open_file_dma(
+      filenameView,
+      seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+
+  // Ensure we close the file on any exit path (success or exception).
+  // GCC 14 does not support co_await in catch blocks, so we use a
+  // scope guard pattern: capture any exception, close outside the
+  // handler, then rethrow.
+  std::exception_ptr writeError;
+  try {
+    const size_t dmaAlign = file.disk_write_dma_alignment();
+    const size_t memAlign = file.memory_dma_alignment();
+
+    // Pad the data size up to DMA alignment boundary.
+    // The file will contain extra zero bytes at the end, but TSM readers
+    // use the index offset (last 8 bytes of the *logical* data) to find
+    // the index, so they never read past the logical end.  After the
+    // write we truncate the file to the exact logical size.
+    const size_t paddedSize = (dataSize + dmaAlign - 1) & ~(dmaAlign - 1);
+
+    // Allocate a DMA-aligned buffer and copy the data into it.
+    // Using temporary_buffer::aligned guarantees the address satisfies
+    // memory_dma_alignment requirements.
+    auto dmaBuf = seastar::temporary_buffer<char>::aligned(memAlign, paddedSize);
+
+    // Copy the actual data
+    std::memcpy(dmaBuf.get_write(), buffer.data.data(), dataSize);
+
+    // Zero-fill the padding bytes so we write deterministic content
+    if (paddedSize > dataSize) {
+      std::memset(dmaBuf.get_write() + dataSize, 0, paddedSize - dataSize);
+    }
+
+    // Write the entire buffer in a single DMA write.  Seastar's
+    // dma_write may return a short write count, so loop until all
+    // bytes are written.  In practice, for aligned writes up to
+    // disk_write_max_length (~1GB), this completes in one call.
+    size_t written = 0;
+    while (written < paddedSize) {
+      size_t n = co_await file.dma_write(written, dmaBuf.get() + written, paddedSize - written);
+      if (n == 0) {
+        throw std::runtime_error("TSMWriter::closeDMA: dma_write returned 0 for " + filename);
+      }
+      written += n;
+    }
+
+    // Truncate to exact logical size to remove DMA padding bytes.
+    // This ensures the on-disk file is byte-identical to what close() produces.
+    if (paddedSize != dataSize) {
+      co_await file.truncate(dataSize);
+    }
+
+    // Flush for durability (equivalent to fsync)
+    co_await file.flush();
+
+  } catch (...) {
+    writeError = std::current_exception();
+  }
+
+  // Always close the file handle
+  co_await file.close();
+
+  if (writeError) {
+    std::rethrow_exception(writeError);
+  }
+
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "DMA file written successfully: {}", filename);
 }
 
 void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename){
@@ -324,6 +444,72 @@ void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename
   LOG_INSERT_PATH(tsdb::tsm_log, debug, "Closing file...");
   writer.close();
   LOG_INSERT_PATH(tsdb::tsm_log, info, "TSM write complete. Processed {} series with {} total points",
+                  seriesProcessed, totalPoints);
+}
+
+seastar::future<> TSMWriter::runAsync(seastar::shared_ptr<MemoryStore> store, std::string filename){
+  LOG_INSERT_PATH(tsdb::tsm_log, info, "Starting async TSM write to file: {}, memory store has {} series",
+                  filename, store.get()->series.size());
+
+  TSMWriter writer(filename);
+  size_t seriesProcessed = 0;
+  size_t totalPoints = 0;
+
+  for (auto it = store.get()->series.begin(); it != store.get()->series.end(); ++it){
+    const auto& seriesKey = it->first;
+    auto& memStore = it.value();
+    TSMValueType seriesType = (TSMValueType) memStore.index();
+
+    size_t seriesPoints = std::visit([](const auto& s) { return s.timestamps.size(); }, memStore);
+    LOG_INSERT_PATH(tsdb::tsm_log, debug, "Processing series '{}' with {} points, type={}",
+                    seriesKey.toHex(), seriesPoints, static_cast<int>(seriesType));
+
+    SeriesId128 seriesId = seriesKey;
+
+    try {
+      switch(seriesType){
+        case TSMValueType::Float: {
+          auto& series = std::get<InMemorySeries<double>>(memStore);
+          series.sort();
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing float series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
+        case TSMValueType::Boolean: {
+          auto& series = std::get<InMemorySeries<bool>>(memStore);
+          series.sort();
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing bool series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
+        case TSMValueType::String: {
+          auto& series = std::get<InMemorySeries<std::string>>(memStore);
+          series.sort();
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing string series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
+      }
+    } catch (const std::bad_alloc& e) {
+      tsdb::tsm_log.error("BAD_ALLOC when processing series '{}' with {} points", seriesKey.toHex(), seriesPoints);
+      throw;
+    } catch (const std::exception& e) {
+      tsdb::tsm_log.error("ERROR processing series '{}': {}", seriesKey.toHex(), e.what());
+      throw;
+    }
+
+    seriesProcessed++;
+    totalPoints += seriesPoints;
+  }
+
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Writing index...");
+  writer.writeIndex();
+  LOG_INSERT_PATH(tsdb::tsm_log, debug, "Closing file via DMA...");
+  co_await writer.closeDMA();
+  LOG_INSERT_PATH(tsdb::tsm_log, info, "Async TSM write complete. Processed {} series with {} total points",
                   seriesProcessed, totalPoints);
 }
 

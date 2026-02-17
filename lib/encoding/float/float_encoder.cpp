@@ -6,7 +6,7 @@
 #include <cassert>
 #include <cmath>
 
-CompressedBuffer FloatEncoderBasic::encode(const std::vector<double> &values){
+CompressedBuffer FloatEncoderBasic::encode(std::span<const double> values){
     CompressedBuffer buffer;
 
     if (values.empty()) {

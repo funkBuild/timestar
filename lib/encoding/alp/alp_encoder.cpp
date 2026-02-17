@@ -116,7 +116,7 @@ uint8_t requiredBitWidth(int64_t min_val, int64_t max_val) {
 } // anonymous namespace
 
 
-CompressedBuffer ALPEncoder::encode(const std::vector<double>& values) {
+CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     CompressedBuffer buffer;
 
     if (values.empty()) {

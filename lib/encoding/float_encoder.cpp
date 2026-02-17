@@ -3,7 +3,7 @@
 // Static member initialization
 FloatEncoder::Implementation FloatEncoder::s_forced_impl = FloatEncoder::AUTO;
 
-CompressedBuffer FloatEncoder::encode(const std::vector<double>& values) {
+CompressedBuffer FloatEncoder::encode(std::span<const double> values) {
     if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
         return ALPEncoder::encode(values);
     } else {

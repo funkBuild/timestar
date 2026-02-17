@@ -49,7 +49,7 @@ TEST_F(MemoryStoreSortedTest, InOrderInsertsRemainSorted) {
     insert.addValue(4000, 4000.0);
     insert.addValue(5000, 5000.0);
 
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     verifySorted(series);
     verifyPairing(series);
@@ -67,7 +67,7 @@ TEST_F(MemoryStoreSortedTest, OutOfOrderSingleBatchGetsSorted) {
     insert.addValue(2000, 2000.0);
     insert.addValue(4000, 4000.0);
 
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     verifySorted(series);
     verifyPairing(series);
@@ -83,14 +83,14 @@ TEST_F(MemoryStoreSortedTest, MultipleInOrderBatches) {
     insert1.addValue(1000, 1000.0);
     insert1.addValue(2000, 2000.0);
     insert1.addValue(3000, 3000.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Second batch: 4000-6000 (after first batch)
     TSDBInsert<double> insert2("test", "field");
     insert2.addValue(4000, 4000.0);
     insert2.addValue(5000, 5000.0);
     insert2.addValue(6000, 6000.0);
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     verifySorted(series);
     verifyPairing(series);
@@ -106,14 +106,14 @@ TEST_F(MemoryStoreSortedTest, LateArrivingBatch) {
     insert1.addValue(4000, 4000.0);
     insert1.addValue(5000, 5000.0);
     insert1.addValue(6000, 6000.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Second batch: late-arriving data 1000-3000
     TSDBInsert<double> insert2("test", "field");
     insert2.addValue(1000, 1000.0);
     insert2.addValue(2000, 2000.0);
     insert2.addValue(3000, 3000.0);
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     verifySorted(series);
     verifyPairing(series);
@@ -135,14 +135,14 @@ TEST_F(MemoryStoreSortedTest, InterleavedBatches) {
     insert1.addValue(1000, 1000.0);
     insert1.addValue(3000, 3000.0);
     insert1.addValue(5000, 5000.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Second batch: even timestamps (interleaves with first)
     TSDBInsert<double> insert2("test", "field");
     insert2.addValue(2000, 2000.0);
     insert2.addValue(4000, 4000.0);
     insert2.addValue(6000, 6000.0);
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     verifySorted(series);
     verifyPairing(series);
@@ -162,11 +162,11 @@ TEST_F(MemoryStoreSortedTest, EmptyInsertNoOp) {
     TSDBInsert<double> insert1("test", "field");
     insert1.addValue(1000, 1000.0);
     insert1.addValue(2000, 2000.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Empty insert
     TSDBInsert<double> emptyInsert("test", "field");
-    series.insert(emptyInsert);
+    series.insert(std::move(emptyInsert));
 
     verifySorted(series);
     verifyPairing(series);
@@ -178,7 +178,7 @@ TEST_F(MemoryStoreSortedTest, EmptyInsertIntoEmptySeries) {
     InMemorySeries<double> series;
 
     TSDBInsert<double> emptyInsert("test", "field");
-    series.insert(emptyInsert);
+    series.insert(std::move(emptyInsert));
 
     EXPECT_EQ(series.timestamps.size(), 0);
     EXPECT_EQ(series.values.size(), 0);
@@ -190,7 +190,7 @@ TEST_F(MemoryStoreSortedTest, SingleElementInsert) {
 
     TSDBInsert<double> insert("test", "field");
     insert.addValue(42000, 42000.0);
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     EXPECT_EQ(series.timestamps.size(), 1);
     EXPECT_EQ(series.timestamps[0], 42000);
@@ -204,12 +204,12 @@ TEST_F(MemoryStoreSortedTest, SingleElementBeforeExisting) {
     // Insert data at 5000
     TSDBInsert<double> insert1("test", "field");
     insert1.addValue(5000, 5000.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Insert single element before it
     TSDBInsert<double> insert2("test", "field");
     insert2.addValue(1000, 1000.0);
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     verifySorted(series);
     verifyPairing(series);
@@ -226,14 +226,14 @@ TEST_F(MemoryStoreSortedTest, DuplicateTimestamps) {
     insert1.addValue(1000, 1.0);
     insert1.addValue(2000, 2.0);
     insert1.addValue(3000, 3.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Insert with duplicate timestamps
     TSDBInsert<double> insert2("test", "field");
     insert2.addValue(2000, 20.0);
     insert2.addValue(3000, 30.0);
     insert2.addValue(4000, 40.0);
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     verifySorted(series);
     EXPECT_EQ(series.timestamps.size(), 6);
@@ -259,7 +259,7 @@ TEST_F(MemoryStoreSortedTest, LargeRandomBatch) {
     for (auto ts : timestamps) {
         insert.addValue(ts, static_cast<double>(ts));
     }
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     verifySorted(series);
     verifyPairing(series);
@@ -283,7 +283,7 @@ TEST_F(MemoryStoreSortedTest, MultipleRandomBatches) {
         for (auto ts : timestamps) {
             insert.addValue(ts, static_cast<double>(ts));
         }
-        series.insert(insert);
+        series.insert(std::move(insert));
     }
 
     verifySorted(series);
@@ -301,7 +301,7 @@ TEST_F(MemoryStoreSortedTest, BoolValuesStayPaired) {
     insert.addValue(2000, false);
     insert.addValue(4000, true);
 
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     verifySorted(series);
     EXPECT_EQ(series.timestamps.size(), 5);
@@ -330,7 +330,7 @@ TEST_F(MemoryStoreSortedTest, StringValuesStayPaired) {
     insert.addValue(4000, "fourth");
     insert.addValue(2000, "second");
 
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     verifySorted(series);
     EXPECT_EQ(series.timestamps.size(), 4);
@@ -353,19 +353,19 @@ TEST_F(MemoryStoreSortedTest, MultipleStringBatchesOutOfOrder) {
     TSDBInsert<std::string> insert1("logs", "message");
     insert1.addValue(5000, "five");
     insert1.addValue(6000, "six");
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Second batch: earlier timestamps
     TSDBInsert<std::string> insert2("logs", "message");
     insert2.addValue(1000, "one");
     insert2.addValue(2000, "two");
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     // Third batch: middle timestamps
     TSDBInsert<std::string> insert3("logs", "message");
     insert3.addValue(3000, "three");
     insert3.addValue(4000, "four");
-    series.insert(insert3);
+    series.insert(std::move(insert3));
 
     verifySorted(series);
     EXPECT_EQ(series.timestamps.size(), 6);
@@ -388,7 +388,7 @@ TEST_F(MemoryStoreSortedTest, InsertMemoryMaintainsOrder) {
     insert1.addValue(5000, 5000.0);
     insert1.addValue(3000, 3000.0);
     insert1.addValue(1000, 1000.0);
-    store.insertMemory(insert1);
+    store.insertMemory(std::move(insert1));
 
     // Insert more out-of-order data
     TSDBInsert<double> insert2("temp", "value");
@@ -396,7 +396,7 @@ TEST_F(MemoryStoreSortedTest, InsertMemoryMaintainsOrder) {
     insert2.addValue(4000, 4000.0);
     insert2.addValue(2000, 2000.0);
     insert2.addValue(6000, 6000.0);
-    store.insertMemory(insert2);
+    store.insertMemory(std::move(insert2));
 
     // Verify via querySeries
     SeriesId128 seriesId = insert1.seriesId128();
@@ -423,14 +423,14 @@ TEST_F(MemoryStoreSortedTest, NewBatchStartsAtExactBoundary) {
     insert1.addValue(1000, 1000.0);
     insert1.addValue(2000, 2000.0);
     insert1.addValue(3000, 3000.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // New batch starts at exactly the last timestamp
     TSDBInsert<double> insert2("test", "field");
     insert2.addValue(3000, 30000.0);  // Duplicate timestamp, different value
     insert2.addValue(4000, 4000.0);
     insert2.addValue(5000, 5000.0);
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     verifySorted(series);
     EXPECT_EQ(series.timestamps.size(), 6);
@@ -444,20 +444,20 @@ TEST_F(MemoryStoreSortedTest, MiddleBatchInternallyUnsorted) {
     TSDBInsert<double> insert1("test", "field");
     insert1.addValue(1000, 1000.0);
     insert1.addValue(2000, 2000.0);
-    series.insert(insert1);
+    series.insert(std::move(insert1));
 
     // Second batch: internally unsorted, timestamps between first and third
     TSDBInsert<double> insert2("test", "field");
     insert2.addValue(5000, 5000.0);
     insert2.addValue(3000, 3000.0);
     insert2.addValue(4000, 4000.0);
-    series.insert(insert2);
+    series.insert(std::move(insert2));
 
     // Third batch: sorted, after all
     TSDBInsert<double> insert3("test", "field");
     insert3.addValue(6000, 6000.0);
     insert3.addValue(7000, 7000.0);
-    series.insert(insert3);
+    series.insert(std::move(insert3));
 
     verifySorted(series);
     verifyPairing(series);
@@ -472,7 +472,7 @@ TEST_F(MemoryStoreSortedTest, AllSameTimestamps) {
     insert.addValue(1000, 1.0);
     insert.addValue(1000, 2.0);
     insert.addValue(1000, 3.0);
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     verifySorted(series);
     EXPECT_EQ(series.timestamps.size(), 3);
@@ -493,7 +493,7 @@ TEST_F(MemoryStoreSortedTest, ReverseOrderData) {
     insert.addValue(2000, 2000.0);
     insert.addValue(1000, 1000.0);
 
-    series.insert(insert);
+    series.insert(std::move(insert));
 
     verifySorted(series);
     verifyPairing(series);

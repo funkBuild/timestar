@@ -161,7 +161,7 @@ seastar::future<> TSM::readSparseIndex(){
 
   // Add all series to the properly-sized bloom filter
   for(const auto& seriesId : seriesIds) {
-    seriesBloomFilter.insert(seriesId.toBytes());
+    seriesBloomFilter.insert(seriesId.getRawData());
   }
 
   tsdb::tsm_log.info("Loaded sparse index for {} (tier {}): {} series, bloom filter: {} bytes",
@@ -171,15 +171,17 @@ seastar::future<> TSM::readSparseIndex(){
 // Lazy load full index entry for a series (single DMA read)
 seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& seriesId) {
   // Step 1: Bloom filter check (fast, in-memory)
-  if (!seriesBloomFilter.contains(seriesId.toBytes())) {
+  if (!seriesBloomFilter.contains(seriesId.getRawData())) {
     // Definitely not in this file
     co_return nullptr;
   }
 
-  // Step 2: Check cache
+  // Step 2: Check cache (promote to front on hit)
   auto cacheIt = fullIndexCache.find(seriesId);
   if (cacheIt != fullIndexCache.end()) {
-    co_return &cacheIt->second;
+    // Move to front of LRU list (most recently used)
+    lruList.splice(lruList.begin(), lruList, cacheIt->second);
+    co_return &cacheIt->second->second;
   }
 
   // Step 3: Sparse index lookup
@@ -221,17 +223,42 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     fullEntry.indexBlocks.push_back(block);
   }
 
-  // Step 6: Cache it (simple FIFO eviction if needed)
+  // Step 6: Cache it with LRU eviction
   if (fullIndexCache.size() >= MAX_CACHE_ENTRIES) {
-    // Evict first entry (can upgrade to LRU later)
-    fullIndexCache.erase(fullIndexCache.begin());
+    // Evict least recently used entry (back of list)
+    auto& lruEntry = lruList.back();
+    fullIndexCache.erase(lruEntry.first);
+    lruList.pop_back();
   }
-  fullIndexCache[seriesId] = std::move(fullEntry);
+  // Insert at front of LRU list (most recently used)
+  lruList.emplace_front(seriesId, std::move(fullEntry));
+  fullIndexCache[seriesId] = lruList.begin();
 
   tsdb::tsm_log.trace("Loaded full index entry for series {} ({} blocks)",
                       seriesId.toHex(), blockCount);
 
-  co_return &fullIndexCache[seriesId];
+  co_return &lruList.front().second;
+}
+
+// Bulk prefetch: identify cache misses and issue all DMA reads in parallel.
+// Warms the full index cache so subsequent getFullIndexEntry() calls are cache hits.
+seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& seriesIds) {
+  // Filter to only series that (a) pass bloom filter, (b) exist in sparse index,
+  // and (c) are not already cached. This avoids unnecessary I/O.
+  std::vector<SeriesId128> toFetch;
+  for (const auto& seriesId : seriesIds) {
+    if (fullIndexCache.find(seriesId) != fullIndexCache.end()) continue;
+    if (!seriesBloomFilter.contains(seriesId.getRawData())) continue;
+    if (sparseIndex.find(seriesId) == sparseIndex.end()) continue;
+    toFetch.push_back(seriesId);
+  }
+
+  if (toFetch.empty()) co_return;
+
+  // Issue all DMA reads in parallel via getFullIndexEntry (handles parse + caching)
+  co_await seastar::parallel_for_each(toFetch, [this](const SeriesId128& seriesId) {
+    return getFullIndexEntry(seriesId).discard_result();
+  });
 }
 
 template <class T>
@@ -296,14 +323,7 @@ seastar::future<> TSM::readBlock(TSMIndexBlock indexBlock, uint64_t startTime, u
 
   } else if constexpr (std::is_same<T, std::string>::value) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
-    std::vector<std::string> allStrings;
-    StringEncoder::decode(valuesSlice, timestampSize, allStrings);
-
-    // Skip and take the appropriate strings based on nSkipped and nTimestamps
-    blockResults->values->reserve(nTimestamps);
-    for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
-      blockResults->values->push_back(std::move(allStrings[i]));
-    }
+    StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
   }
 
   results.appendBlock(blockResults);
@@ -311,14 +331,16 @@ seastar::future<> TSM::readBlock(TSMIndexBlock indexBlock, uint64_t startTime, u
 
 std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId){
   // Check bloom filter first
-  if (!seriesBloomFilter.contains(seriesId.toBytes())) {
+  if (!seriesBloomFilter.contains(seriesId.getRawData())) {
     return {};
   }
 
   // Check full index cache (populated after getFullIndexEntry is called)
   auto it = fullIndexCache.find(seriesId);
   if(it != fullIndexCache.end()) {
-    return it->second.seriesType;
+    // Promote to front of LRU list on access
+    lruList.splice(lruList.begin(), lruList, it->second);
+    return it->second->second.seriesType;
   }
 
   // Fall back to sparse index which stores the type from the initial index parse
@@ -334,10 +356,11 @@ std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId){
 // Note: This returns blocks only if already loaded in cache
 // For guaranteed results, caller should await getFullIndexEntry() first
 std::vector<TSMIndexBlock> TSM::getSeriesBlocks(const SeriesId128& seriesId) const {
-  // Check cache
+  // Check cache (promote to front on hit)
   auto it = fullIndexCache.find(seriesId);
   if (it != fullIndexCache.end()) {
-    return it->second.indexBlocks;
+    lruList.splice(lruList.begin(), lruList, it->second);
+    return it->second->second.indexBlocks;
   }
 
   // Not in cache - return empty
@@ -380,13 +403,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
 
   } else if constexpr (std::is_same<T, std::string>::value) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
-    std::vector<std::string> allStrings;
-    StringEncoder::decode(valuesSlice, timestampSize, allStrings);
-
-    blockResults->values->reserve(nTimestamps);
-    for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
-      blockResults->values->push_back(std::move(allStrings[i]));
-    }
+    StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
   }
 
   co_return blockResults;
@@ -526,13 +543,7 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
         BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
     } else if constexpr (std::is_same<T, std::string>::value) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        std::vector<std::string> allStrings;
-        StringEncoder::decode(valuesSlice, timestampSize, allStrings);
-
-        blockResults->values->reserve(nTimestamps);
-        for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
-            blockResults->values->push_back(std::move(allStrings[i]));
-        }
+        StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
     }
 
     return blockResults;
@@ -637,6 +648,99 @@ seastar::future<> TSM::readSeriesBatched(
     results.sort();
 
     co_return;
+}
+
+// Pushdown aggregation: decode float blocks and fold directly into a
+// BlockAggregator, bypassing TSMResult/QueryResult materialisation.
+// Handles tombstone filtering inline.  Returns the number of points folded.
+seastar::future<size_t> TSM::aggregateSeries(
+    const SeriesId128& seriesId,
+    uint64_t startTime,
+    uint64_t endTime,
+    tsdb::BlockAggregator& aggregator
+) {
+    // Get full index entry (uses bloom filter + sparse index + lazy load)
+    auto* indexEntry = co_await getFullIndexEntry(seriesId);
+    if (!indexEntry) {
+        co_return 0;
+    }
+
+    // Only float series can be pushdown-aggregated
+    if (indexEntry->seriesType != TSMValueType::Float) {
+        co_return 0;
+    }
+
+    // Filter blocks by time range
+    std::vector<TSMIndexBlock> blocksToScan;
+    for (const auto& block : indexEntry->indexBlocks) {
+        if (block.minTime <= endTime && startTime <= block.maxTime) {
+            blocksToScan.push_back(block);
+        }
+    }
+    if (blocksToScan.empty()) {
+        co_return 0;
+    }
+
+    // Group into contiguous batches for efficient I/O
+    auto batches = groupContiguousBlocks(blocksToScan);
+
+    // Pre-fetch tombstone ranges once (empty vector if no tombstones)
+    std::vector<std::pair<uint64_t, uint64_t>> tombstoneRanges;
+    if (hasTombstones()) {
+        tombstoneRanges = tombstones->getTombstoneRanges(seriesId);
+    }
+    const bool hasTombstoneRanges = !tombstoneRanges.empty();
+
+    size_t totalPoints = 0;
+
+    // Process batches.  parallel_for_each is safe here because
+    // addPoint/addPoints on BlockAggregator is synchronous (no yields)
+    // between co_await suspension points in cooperative scheduling.
+    co_await seastar::parallel_for_each(batches, [&](const BlockBatch& batch) -> seastar::future<> {
+        // Single DMA read for the entire batch
+        auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(
+            batch.startOffset, batch.totalSize);
+
+        uint32_t bufferOffset = 0;
+        for (const auto& block : batch.blocks) {
+            Slice blockSlice(batchBuf.get() + bufferOffset, block.size);
+            auto blockResult = decodeBlock<double>(blockSlice, block.size, startTime, endTime);
+
+            if (blockResult && !blockResult->timestamps->empty()) {
+                const auto& ts = *blockResult->timestamps;
+                const auto& vals = *blockResult->values;
+
+                if (!hasTombstoneRanges) {
+                    // Fast path: no tombstones — fold entire block at once
+                    aggregator.addPoints(ts, vals);
+                    totalPoints += ts.size();
+                } else {
+                    // Filter tombstoned points while folding
+                    for (size_t i = 0; i < ts.size(); ++i) {
+                        uint64_t t = ts[i];
+                        auto rangeIt = std::upper_bound(
+                            tombstoneRanges.begin(), tombstoneRanges.end(),
+                            std::make_pair(t, std::numeric_limits<uint64_t>::max()));
+                        bool isTombstoned = false;
+                        if (rangeIt != tombstoneRanges.begin()) {
+                            --rangeIt;
+                            if (t >= rangeIt->first && t <= rangeIt->second) {
+                                isTombstoned = true;
+                            }
+                        }
+                        if (!isTombstoned) {
+                            aggregator.addPoint(t, vals[i]);
+                            totalPoints++;
+                        }
+                    }
+                }
+            }
+
+            bufferOffset += block.size;
+        }
+    });
+
+    co_return totalPoints;
 }
 
 // Template instantiations for batched reads

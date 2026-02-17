@@ -117,17 +117,22 @@ struct GroupedAggregationResult {
 
 // Structure to hold partial aggregation results from a shard
 // OPTIMIZED: Uses AggregationState for two-phase aggregation (8x less data transfer)
+// Tags are NOT stored here — they're encoded inside groupKey as
+// "measurement\0key1=val1\0key2=val2\0fieldName" and reconstructed lazily
+// in the reduce phase, avoiding std::map tree-node allocations per partial.
 struct PartialAggregationResult {
     std::string measurement;
-    std::map<std::string, std::string> tags;  // Group-by tags only (already sorted)
     std::string fieldName;
 
     // TWO-PHASE AGGREGATION: Store pre-aggregated states instead of raw values
     // Key: bucket timestamp, Value: aggregation state for that bucket
     std::unordered_map<uint64_t, AggregationState> bucketStates;
 
-    // For non-bucketed aggregation (interval == 0) - still use states per timestamp
-    std::map<uint64_t, AggregationState> timestampStates;
+    // For non-bucketed aggregation (interval == 0) - sorted parallel vectors
+    // Replaces std::map<uint64_t, AggregationState> to eliminate per-entry tree
+    // node allocations (525K+ allocs per series in the benchmark).
+    std::vector<uint64_t> sortedTimestamps;
+    std::vector<AggregationState> sortedStates;
 
     // Statistics
     size_t totalPoints = 0;
@@ -137,32 +142,31 @@ struct PartialAggregationResult {
     size_t groupKeyHash = 0;
 
     // Composite group key string (guaranteed unique, used as map key)
+    // Format: "measurement\0tag1=val1\0tag2=val2\0fieldName"
     std::string groupKey;
 
-    // Compute composite group key and its hash
-    void computeGroupKey() {
-        // Build a unique composite key: measurement + sorted tag k=v pairs + fieldName
-        // separated by '\0' delimiter to guarantee uniqueness
-        groupKey.clear();
-        groupKey += measurement;
-        // Tags are already sorted in std::map, iterate in order
-        for (const auto& [k, v] : tags) {
-            groupKey += '\0';
-            groupKey += k;
-            groupKey += '=';
-            groupKey += v;
+    // Parse group-by tags from groupKey (called once per group in reduce phase)
+    static std::map<std::string, std::string> parseTagsFromGroupKey(const std::string& gk) {
+        std::map<std::string, std::string> tags;
+        // Format: measurement\0tag1=val1\0...\0fieldName
+        size_t firstNull = gk.find('\0');
+        if (firstNull == std::string::npos) return tags;
+        size_t lastNull = gk.rfind('\0');
+        if (firstNull == lastNull) return tags;  // No tags segment
+        // Parse tag entries between first and last \0
+        size_t pos = firstNull + 1;
+        while (pos < lastNull) {
+            size_t nextNull = gk.find('\0', pos);
+            if (nextNull == std::string::npos || nextNull > lastNull) {
+                nextNull = lastNull;
+            }
+            size_t eqPos = gk.find('=', pos);
+            if (eqPos != std::string::npos && eqPos < nextNull) {
+                tags[gk.substr(pos, eqPos - pos)] = gk.substr(eqPos + 1, nextNull - eqPos - 1);
+            }
+            pos = nextNull + 1;
         }
-        groupKey += '\0';
-        groupKey += fieldName;
-
-        // Also compute hash for any other uses
-        std::hash<std::string> hasher;
-        groupKeyHash = hasher(groupKey);
-    }
-
-    // Legacy: compute hash only (deprecated, prefer computeGroupKey)
-    void computeGroupKeyHash() {
-        computeGroupKey();
+        return tags;
     }
 };
 
@@ -183,7 +187,7 @@ public:
 
     // Merge partial aggregations with metadata preserved (reduce phase)
     static std::vector<GroupedAggregationResult> mergePartialAggregationsGrouped(
-        const std::vector<PartialAggregationResult>& partialResults,
+        std::vector<PartialAggregationResult>& partialResults,
         AggregationMethod method);
 
     // ========================================================================

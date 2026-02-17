@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <span>
 
 #include "../../storage/compressed_buffer.hpp"
 #include "../../storage/slice_buffer.hpp"
@@ -14,7 +15,7 @@ private:
 public:
   FloatEncoderBasic(){};
 
-  static CompressedBuffer encode(const std::vector<double> &values);
+  static CompressedBuffer encode(std::span<const double> values);
   static void decode(CompressedSlice &encoded, size_t nToSkip, size_t length, std::vector<double> &out);
 };
 

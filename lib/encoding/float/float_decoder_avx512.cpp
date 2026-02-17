@@ -4,26 +4,33 @@
 #include <cpuid.h>
 #include <cstring>
 
-bool FloatDecoderAVX512::isAvailable() {
-    return hasAVX512F() && hasAVX512DQ();
-}
-
 bool FloatDecoderAVX512::hasAVX512F() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_max(0, nullptr) >= 7) {
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        return (ebx & (1 << 16)) != 0; // AVX512F bit
-    }
-    return false;
+    static const bool available = []() {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_max(0, nullptr) >= 7) {
+            __cpuid_count(7, 0, eax, ebx, ecx, edx);
+            return (ebx & (1 << 16)) != 0; // AVX512F bit
+        }
+        return false;
+    }();
+    return available;
 }
 
 bool FloatDecoderAVX512::hasAVX512DQ() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_max(0, nullptr) >= 7) {
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        return (ebx & (1 << 17)) != 0; // AVX512DQ bit
-    }
-    return false;
+    static const bool available = []() {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_max(0, nullptr) >= 7) {
+            __cpuid_count(7, 0, eax, ebx, ecx, edx);
+            return (ebx & (1 << 17)) != 0; // AVX512DQ bit
+        }
+        return false;
+    }();
+    return available;
+}
+
+bool FloatDecoderAVX512::isAvailable() {
+    static const bool available = hasAVX512F() && hasAVX512DQ();
+    return available;
 }
 
 void FloatDecoderAVX512::decodeSafe(CompressedSlice &encoded, size_t nToSkip, size_t length, std::vector<double> &out) {

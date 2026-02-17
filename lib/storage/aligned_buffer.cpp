@@ -78,9 +78,8 @@ void AlignedBuffer::ensure_capacity(size_t required) {
       data.reserve(new_capacity);
     }
     // Grow the vector's logical size so the storage is accessible.
-    // resize() value-initializes new bytes; callers overwrite them via
-    // memcpy immediately after, so the zeroing is redundant work.
-    // Eliminating it would require a default-init allocator.
+    // With default_init_allocator, resize() default-initializes new bytes
+    // (no-op for uint8_t), avoiding redundant zeroing before memcpy.
     data.resize(required);
   }
 }

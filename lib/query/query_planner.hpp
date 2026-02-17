@@ -60,17 +60,17 @@ public:
     
 private:
     // Find all series IDs matching the query filters
-    seastar::future<std::map<unsigned, std::vector<SeriesId128>>> findMatchingSeriesIds(
+    seastar::future<std::vector<std::vector<SeriesId128>>> findMatchingSeriesIds(
         const QueryRequest& request,
         seastar::sharded<LevelDBIndex>* indexSharded);
-    
+
     // Synchronous version for testing
-    std::map<unsigned, std::vector<SeriesId128>> findMatchingSeriesIdsSync(
+    std::vector<std::vector<SeriesId128>> findMatchingSeriesIdsSync(
         const QueryRequest& request,
         LevelDBIndex* index);
-    
+
     // Map series IDs to their respective shards
-    std::map<unsigned, std::vector<SeriesId128>> mapSeriesToShards(
+    std::vector<std::vector<SeriesId128>> mapSeriesToShards(
         const std::vector<SeriesId128>& seriesIds,
         const std::string& measurement,
         const std::map<std::string, std::string>& tags,

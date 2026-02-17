@@ -5,13 +5,16 @@
 #include <cpuid.h>
 #include <cstring>
 
-// Check for AVX2 support
+// Check for AVX2 support (cached - CPUID only called once)
 bool IntegerEncoderSIMD::isAvailable() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-        return (ebx & (1 << 5)) != 0; // AVX2 is bit 5 of EBX
-    }
-    return false;
+    static const bool available = []() {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+            return (ebx & (1 << 5)) != 0; // AVX2 is bit 5 of EBX
+        }
+        return false;
+    }();
+    return available;
 }
 
 // SIMD zigzag encode for 4 values at once using AVX2
@@ -54,7 +57,7 @@ static inline __m256i zigzagDecode4_avx2(const uint64_t* values) {
     return result;
 }
 
-AlignedBuffer IntegerEncoderSIMD::encode(const std::vector<uint64_t> &values) {
+AlignedBuffer IntegerEncoderSIMD::encode(std::span<const uint64_t> values) {
     if (values.empty()) {
         return AlignedBuffer();
     }

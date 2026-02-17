@@ -96,7 +96,7 @@ HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::http::request> 
         if (!prefix.empty()) {
             auto it = std::remove_if(measurements.begin(), measurements.end(), 
                 [&prefix](const std::string& m) {
-                    return m.substr(0, prefix.length()) != prefix;
+                    return !m.starts_with(prefix);
                 });
             measurements.erase(it, measurements.end());
         }

@@ -121,7 +121,7 @@ seastar::future<> testFMSequenceNumberTracking(TSMFileManagerSeastarTest* self) 
     auto store = seastar::make_shared<MemoryStore>(0);
     TSDBInsert<double> insert("test", "metric");
     insert.addValue(1000, 42.0);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     co_await mgr.writeMemstore(store, 0);
 
@@ -325,7 +325,7 @@ seastar::future<> testFMWriteMemstore() {
     insert.addValue(1000, 20.5);
     insert.addValue(2000, 21.0);
     insert.addValue(3000, 21.5);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     co_await mgr.writeMemstore(store, 0);
 
@@ -355,7 +355,7 @@ seastar::future<> testFMWriteMemstoreWithTier() {
     auto store = seastar::make_shared<MemoryStore>(0);
     TSDBInsert<double> insert("cpu", "load");
     insert.addValue(1000, 0.75);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     // Write to tier 2
     co_await mgr.writeMemstore(store, 2);
@@ -384,7 +384,7 @@ seastar::future<> testFMMultipleWriteMemstoreSequence() {
         auto store = seastar::make_shared<MemoryStore>(0);
         TSDBInsert<double> insert("metric", "value");
         insert.addValue(static_cast<uint64_t>(i * 1000 + 1000), static_cast<double>(i));
-        store->insertMemory(insert);
+        store->insertMemory(std::move(insert));
         co_await mgr.writeMemstore(store, 0);
     }
 
@@ -528,7 +528,7 @@ seastar::future<> testFMAddTSMFileUpdatesSequenceNumber(TSMFileManagerSeastarTes
     auto store = seastar::make_shared<MemoryStore>(0);
     TSDBInsert<double> insert("test", "val");
     insert.addValue(1000, 1.0);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
     co_await mgr.writeMemstore(store, 0);
 
     // The new file should have seqNum >= 51
@@ -583,17 +583,17 @@ seastar::future<> testFMWriteMemstoreMixedTypes() {
     TSDBInsert<double> floatInsert("weather", "temperature");
     floatInsert.addValue(1000, 72.5);
     floatInsert.addValue(2000, 73.1);
-    store->insertMemory(floatInsert);
+    store->insertMemory(std::move(floatInsert));
 
     TSDBInsert<bool> boolInsert("system", "healthy");
     boolInsert.addValue(1000, true);
     boolInsert.addValue(2000, false);
-    store->insertMemory(boolInsert);
+    store->insertMemory(std::move(boolInsert));
 
     TSDBInsert<std::string> strInsert("app", "status");
     strInsert.addValue(1000, std::string("running"));
     strInsert.addValue(2000, std::string("stopped"));
-    store->insertMemory(strInsert);
+    store->insertMemory(std::move(strInsert));
 
     co_await mgr.writeMemstore(store, 0);
 
@@ -624,7 +624,7 @@ seastar::future<> testFMAddAndRemoveInterleaved() {
         auto store = seastar::make_shared<MemoryStore>(0);
         TSDBInsert<double> insert("series", std::to_string(i));
         insert.addValue(1000, static_cast<double>(i));
-        store->insertMemory(insert);
+        store->insertMemory(std::move(insert));
         co_await mgr.writeMemstore(store, 0);
     }
 
@@ -640,7 +640,7 @@ seastar::future<> testFMAddAndRemoveInterleaved() {
     auto store = seastar::make_shared<MemoryStore>(0);
     TSDBInsert<double> insert("series", "new");
     insert.addValue(1000, 99.0);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
     co_await mgr.writeMemstore(store, 0);
 
     EXPECT_EQ(mgr.getFileCountInTier(0), 3);
@@ -693,7 +693,7 @@ seastar::future<> testFMPersistenceAcrossManagerLifecycle() {
         TSDBInsert<double> insert("persistent", "data");
         insert.addValue(1000, 42.0);
         insert.addValue(2000, 43.0);
-        store->insertMemory(insert);
+        store->insertMemory(std::move(insert));
 
         co_await mgr1.writeMemstore(store, 0);
 

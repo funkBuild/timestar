@@ -177,21 +177,33 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
 
 HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point) {
     MultiWritePoint mwp;
-    
-    // Parse using Glaze structure
-    GlazeMultiWritePoint glazePoint;
-    std::string json_str;
-    auto write_error = glz::write_json(point, json_str);
-    if (write_error) {
-        throw std::runtime_error("Failed to serialize point for parsing: " + std::string(glz::format_error(write_error)));
+
+    // Extract fields directly from the json_value_t object, avoiding a
+    // serialize-then-reparse round-trip that was previously done via
+    // glz::write_json + glz::read_json(GlazeMultiWritePoint, ...).
+
+    if (!point.is_object()) {
+        throw std::runtime_error("Write point must be a JSON object");
     }
-    auto error = glz::read_json(glazePoint, json_str);
-    if (error) {
-        throw std::runtime_error("Failed to parse write point: " + std::string(glz::format_error(error)));
+    auto& obj = point.get<json_value_t::object_t>();
+
+    // Extract measurement
+    auto measurementIt = obj.find("measurement");
+    if (measurementIt == obj.end() || !measurementIt->second.is_string()) {
+        throw std::runtime_error("Missing or invalid 'measurement' field");
     }
-    
-    mwp.measurement = glazePoint.measurement;
-    mwp.tags = glazePoint.tags;
+    mwp.measurement = measurementIt->second.get<std::string>();
+
+    // Extract tags
+    auto tagsIt = obj.find("tags");
+    if (tagsIt != obj.end() && tagsIt->second.is_object()) {
+        auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
+        for (const auto& [tagKey, tagValue] : tagsObj) {
+            if (tagValue.is_string()) {
+                mwp.tags[tagKey] = tagValue.get<std::string>();
+            }
+        }
+    }
 
     // Validate measurement and tag names before any processing
     {
@@ -206,90 +218,101 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     }
 
     // Parse fields - handle both scalars and arrays
-    if (glazePoint.fields.is_object()) {
-        auto& fields_obj = glazePoint.fields.get<glz::json_t::object_t>();
-        
-        for (auto& [fieldName, fieldValue] : fields_obj) {
-            // Validate field name before processing
-            {
-                auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-                if (!err.empty()) throw std::runtime_error(err);
-            }
-
-            FieldArrays fa;
-
-            if (fieldValue.is_array()) {
-                auto& arr = fieldValue.get<glz::json_t::array_t>();
-                if (arr.empty()) {
-                    throw std::runtime_error("Field array cannot be empty: " + fieldName);
-                }
-                
-                // Determine type from first element
-                if (arr[0].is_number()) {
-                    fa.type = FieldArrays::DOUBLE;
-                    for (auto& elem : arr) {
-                        if (elem.is_number()) {
-                            fa.doubles.push_back(elem.get<double>());
-                        } else {
-                            throw std::runtime_error("Mixed types in field array: " + fieldName);
-                        }
-                    }
-                } else if (arr[0].is_boolean()) {
-                    fa.type = FieldArrays::BOOL;
-                    for (auto& elem : arr) {
-                        if (elem.is_boolean()) {
-                            fa.bools.push_back(elem.get<bool>() ? 1 : 0);
-                        } else {
-                            throw std::runtime_error("Mixed types in field array: " + fieldName);
-                        }
-                    }
-                } else if (arr[0].is_string()) {
-                    fa.type = FieldArrays::STRING;
-                    LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Detected string array field '{}' with {} elements", fieldName, arr.size());
-                    for (auto& elem : arr) {
-                        if (elem.is_string()) {
-                            fa.strings.push_back(elem.get<std::string>());
-                        } else {
-                            throw std::runtime_error("Mixed types in field array: " + fieldName);
-                        }
-                    }
-                    LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Added {} string values to field '{}'", fa.strings.size(), fieldName);
-                } else {
-                    throw std::runtime_error("Unsupported field array type: " + fieldName);
-                }
-            } else {
-                // Single value - convert to array of size 1
-                if (fieldValue.is_number()) {
-                    fa.type = FieldArrays::DOUBLE;
-                    fa.doubles.push_back(fieldValue.get<double>());
-                } else if (fieldValue.is_boolean()) {
-                    fa.type = FieldArrays::BOOL;
-                    fa.bools.push_back(fieldValue.get<bool>() ? 1 : 0);
-                } else if (fieldValue.is_string()) {
-                    fa.type = FieldArrays::STRING;
-                    auto str_value = fieldValue.get<std::string>();
-                    fa.strings.push_back(str_value);
-                    LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Detected single string field '{}' with value: '{}'", fieldName, str_value);
-                } else {
-                    throw std::runtime_error("Unsupported field type: " + fieldName);
-                }
-            }
-            
-            mwp.fields[fieldName] = std::move(fa);
-        }
-    } else {
+    auto fieldsIt = obj.find("fields");
+    if (fieldsIt == obj.end() || !fieldsIt->second.is_object()) {
         throw std::runtime_error("Fields must be an object");
     }
-    
-    // Parse timestamps
-    if (glazePoint.timestamps) {
-        if (std::holds_alternative<uint64_t>(*glazePoint.timestamps)) {
-            mwp.timestamps.push_back(std::get<uint64_t>(*glazePoint.timestamps));
-        } else {
-            mwp.timestamps = std::get<std::vector<uint64_t>>(*glazePoint.timestamps);
+    auto& fields_obj = fieldsIt->second.get<json_value_t::object_t>();
+
+    for (auto& [fieldName, fieldValue] : fields_obj) {
+        // Validate field name before processing
+        {
+            auto err = validateName(fieldName, "Field name '" + fieldName + "'");
+            if (!err.empty()) throw std::runtime_error(err);
         }
-    } else if (glazePoint.timestamp) {
+
+        FieldArrays fa;
+
+        if (fieldValue.is_array()) {
+            auto& arr = fieldValue.get<json_value_t::array_t>();
+            if (arr.empty()) {
+                throw std::runtime_error("Field array cannot be empty: " + fieldName);
+            }
+
+            // Determine type from first element
+            if (arr[0].is_number()) {
+                fa.type = FieldArrays::DOUBLE;
+                for (auto& elem : arr) {
+                    if (elem.is_number()) {
+                        fa.doubles.push_back(elem.as<double>());
+                    } else {
+                        throw std::runtime_error("Mixed types in field array: " + fieldName);
+                    }
+                }
+            } else if (arr[0].is_boolean()) {
+                fa.type = FieldArrays::BOOL;
+                for (auto& elem : arr) {
+                    if (elem.is_boolean()) {
+                        fa.bools.push_back(elem.get<bool>() ? 1 : 0);
+                    } else {
+                        throw std::runtime_error("Mixed types in field array: " + fieldName);
+                    }
+                }
+            } else if (arr[0].is_string()) {
+                fa.type = FieldArrays::STRING;
+                LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Detected string array field '{}' with {} elements", fieldName, arr.size());
+                for (auto& elem : arr) {
+                    if (elem.is_string()) {
+                        fa.strings.push_back(elem.get<std::string>());
+                    } else {
+                        throw std::runtime_error("Mixed types in field array: " + fieldName);
+                    }
+                }
+                LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Added {} string values to field '{}'", fa.strings.size(), fieldName);
+            } else {
+                throw std::runtime_error("Unsupported field array type: " + fieldName);
+            }
+        } else {
+            // Single value - convert to array of size 1
+            if (fieldValue.is_number()) {
+                fa.type = FieldArrays::DOUBLE;
+                fa.doubles.push_back(fieldValue.as<double>());
+            } else if (fieldValue.is_boolean()) {
+                fa.type = FieldArrays::BOOL;
+                fa.bools.push_back(fieldValue.get<bool>() ? 1 : 0);
+            } else if (fieldValue.is_string()) {
+                fa.type = FieldArrays::STRING;
+                auto str_value = fieldValue.get<std::string>();
+                fa.strings.push_back(str_value);
+                LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Detected single string field '{}' with value: '{}'", fieldName, str_value);
+            } else {
+                throw std::runtime_error("Unsupported field type: " + fieldName);
+            }
+        }
+
+        mwp.fields[fieldName] = std::move(fa);
+    }
+
+    // Parse timestamps - extract directly from json_value_t
+    auto timestampsArrIt = obj.find("timestamps");
+    auto singleTimestampIt = obj.find("timestamp");
+
+    if (timestampsArrIt != obj.end()) {
+        // "timestamps" can be a single number or an array of numbers
+        if (timestampsArrIt->second.is_number()) {
+            mwp.timestamps.push_back(timestampsArrIt->second.as<uint64_t>());
+        } else if (timestampsArrIt->second.is_array()) {
+            auto& tsArr = timestampsArrIt->second.get<json_value_t::array_t>();
+            mwp.timestamps.reserve(tsArr.size());
+            for (auto& elem : tsArr) {
+                if (elem.is_number()) {
+                    mwp.timestamps.push_back(elem.as<uint64_t>());
+                }
+            }
+        }
+    } else if (singleTimestampIt != obj.end() && singleTimestampIt->second.is_number()) {
         // Single timestamp - determine how many we need from fields
+        uint64_t ts = singleTimestampIt->second.as<uint64_t>();
         size_t numPoints = 1;
         for (const auto& [fieldName, fieldArray] : mwp.fields) {
             size_t fieldSize = 0;
@@ -301,14 +324,14 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             }
             numPoints = std::max(numPoints, fieldSize);
         }
-        mwp.timestamps.resize(numPoints, *glazePoint.timestamp);
+        mwp.timestamps.resize(numPoints, ts);
     } else {
         // No timestamp - use current time
         auto now = std::chrono::system_clock::now();
         auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count();
         uint64_t currentTime = static_cast<uint64_t>(nanos);
-        
+
         size_t numPoints = 1;
         for (const auto& [fieldName, fieldArray] : mwp.fields) {
             size_t fieldSize = 0;
@@ -320,13 +343,13 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             }
             numPoints = std::max(numPoints, fieldSize);
         }
-        
+
         // Generate timestamps 1ms apart
         for (size_t i = 0; i < numPoints; i++) {
             mwp.timestamps.push_back(currentTime + i * 1000000);
         }
     }
-    
+
     return mwp;
 }
 
@@ -334,21 +357,82 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // Configuration constants
     static const size_t MAX_COALESCE_SIZE = 10000;  // Max values per field array
     static const size_t MIN_COALESCE_COUNT = 2;     // Min writes needed to coalesce
-    
+
+#if TSDB_LOG_INSERT_PATH
     auto start_coalesce = std::chrono::high_resolution_clock::now();
-    
-    // Fast direct parsing approach - avoid JSON string serialization
+#endif
+
+    // Fast direct parsing approach - avoid JSON string serialization.
+    // Handles both scalar and array fields in a single pass, eliminating
+    // the need for callers to pre-scan fields for array detection.
     std::unordered_map<std::string, CoalesceCandidate> candidates;
-    size_t totalWritesProcessed = 0;
-    
+    [[maybe_unused]] size_t totalWritesProcessed = 0;
+
     LOG_INSERT_PATH(tsdb::http_log, debug, "[COALESCE] Processing {} writes for coalescing", writes_array.size());
+
+    // Helper lambda: add a single scalar value to a CoalesceCandidate.
+    // Returns false if the value type is unsupported, true otherwise.
+    auto addScalarToCandidate = [](CoalesceCandidate& candidate, TSMValueType valueType,
+                                   uint64_t ts, const json_value_t& val) -> bool {
+        candidate.timestamps.push_back(ts);
+        if (valueType == TSMValueType::Float) {
+            candidate.doubleValues.push_back(val.as<double>());
+        } else if (valueType == TSMValueType::Boolean) {
+            candidate.boolValues.push_back(val.get<bool>() ? 1 : 0);
+        } else if (valueType == TSMValueType::String) {
+            std::string strValue = val.get<std::string>();
+            candidate.stringValues.push_back(std::move(strValue));
+        } else {
+            return false;
+        }
+        return true;
+    };
+
+    // Helper lambda: initialize a new CoalesceCandidate with metadata.
+    auto initCandidate = [](CoalesceCandidate& candidate, const std::string& seriesKey,
+                            const std::string& measurement, const std::map<std::string, std::string>& tags,
+                            const std::string& fieldName, TSMValueType valueType) {
+        candidate.seriesKey = seriesKey;
+        candidate.measurement = measurement;
+        candidate.tags = tags;
+        candidate.fieldName = fieldName;
+        candidate.valueType = valueType;
+    };
+
+    // Helper lambda: find or create a candidate, handling type mismatch and overflow
+    // by creating disambiguated keys. Returns a reference to the target candidate.
+    auto findOrCreateCandidate = [&](const std::string& seriesKey, const std::string& measurement,
+                                     const std::map<std::string, std::string>& tags,
+                                     const std::string& fieldName, TSMValueType valueType,
+                                     size_t numValuesToAdd) -> CoalesceCandidate& {
+        auto it = candidates.find(seriesKey);
+        if (it == candidates.end()) {
+            CoalesceCandidate& c = candidates[seriesKey];
+            initCandidate(c, seriesKey, measurement, tags, fieldName, valueType);
+            return c;
+        }
+        CoalesceCandidate& existing = it->second;
+        if (existing.valueType == valueType &&
+            existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
+            return existing;
+        }
+        // Type mismatch or size overflow: create a disambiguated candidate
+        size_t suffix = 1;
+        std::string altKey;
+        do {
+            altKey = seriesKey + "#" + std::to_string(suffix++);
+        } while (candidates.count(altKey) > 0);
+        CoalesceCandidate& c = candidates[altKey];
+        initCandidate(c, altKey, measurement, tags, fieldName, valueType);
+        return c;
+    };
 
     // Parse writes directly from JSON objects for better performance
     for (const auto& write : writes_array) {
         totalWritesProcessed++;
-        
+
         if (!write.is_object()) continue;
-        
+
         try {
             auto& writeObj = write.get<json_value_t::object_t>();
 
@@ -363,20 +447,35 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 if (!err.empty()) throw std::runtime_error(err);
             }
 
-            // Extract timestamp - use as<uint64_t>() to preserve precision.
-            // With json_value_t (generic_u64), integer timestamps are stored natively
-            // as uint64_t, avoiding the ~512ns precision loss from double conversion.
-            uint64_t timestamp = 0;
-            auto timestampIt = writeObj.find("timestamp");
-            if (timestampIt != writeObj.end() && timestampIt->second.is_number()) {
-                timestamp = timestampIt->second.as<uint64_t>();
+            // Extract timestamps - handle both "timestamp" (single) and "timestamps" (array).
+            // For scalar fields, we use timestamps[0]. For array fields, timestamps must
+            // match the array length. This unified extraction handles all write formats
+            // in a single pass without requiring callers to pre-detect array vs scalar.
+            std::vector<uint64_t> timestamps;
+            auto timestampsArrIt = writeObj.find("timestamps");
+            auto singleTimestampIt = writeObj.find("timestamp");
+
+            if (timestampsArrIt != writeObj.end()) {
+                if (timestampsArrIt->second.is_array()) {
+                    auto& tsArr = timestampsArrIt->second.get<json_value_t::array_t>();
+                    timestamps.reserve(tsArr.size());
+                    for (auto& elem : tsArr) {
+                        if (elem.is_number()) {
+                            timestamps.push_back(elem.as<uint64_t>());
+                        }
+                    }
+                } else if (timestampsArrIt->second.is_number()) {
+                    timestamps.push_back(timestampsArrIt->second.as<uint64_t>());
+                }
+            } else if (singleTimestampIt != writeObj.end() && singleTimestampIt->second.is_number()) {
+                timestamps.push_back(singleTimestampIt->second.as<uint64_t>());
             } else {
                 // Generate timestamp
                 auto now = std::chrono::system_clock::now();
                 auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-                timestamp = static_cast<uint64_t>(nanos);
+                timestamps.push_back(static_cast<uint64_t>(nanos));
             }
-            
+
             // Extract tags
             std::map<std::string, std::string> tags;
             auto tagsIt = writeObj.find("tags");
@@ -397,10 +496,21 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 if (!err.empty()) throw std::runtime_error(err);
             }
 
-            // Extract fields and process each field
+            // Pre-build measurement+tags prefix for series key construction (once per write point)
+            std::string seriesKeyPrefix;
+            seriesKeyPrefix.reserve(measurement.length() + 64);
+            seriesKeyPrefix = measurement;
+            for (const auto& [tagKey, tagValue] : tags) {
+                seriesKeyPrefix += ",";
+                seriesKeyPrefix += tagKey;
+                seriesKeyPrefix += "=";
+                seriesKeyPrefix += tagValue;
+            }
+
+            // Extract fields and process each field - handles both scalar and array values
             auto fieldsIt = writeObj.find("fields");
             if (fieldsIt == writeObj.end() || !fieldsIt->second.is_object()) continue;
-            
+
             auto& fieldsObj = fieldsIt->second.get<json_value_t::object_t>();
             for (const auto& [fieldName, fieldValue] : fieldsObj) {
                 // Validate field name
@@ -409,94 +519,88 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     if (!err.empty()) throw std::runtime_error(err);
                 }
 
-                // Build series key efficiently
+                // Build series key
                 std::string seriesKey;
-                seriesKey.reserve(measurement.length() + fieldName.length() + 64); // Reserve space
-                seriesKey = measurement;
-                for (const auto& [tagKey, tagValue] : tags) {
-                    seriesKey += ",";
-                    seriesKey += tagKey;
-                    seriesKey += "=";
-                    seriesKey += tagValue;
-                }
+                seriesKey.reserve(seriesKeyPrefix.length() + fieldName.length() + 1);
+                seriesKey = seriesKeyPrefix;
                 seriesKey += " ";
                 seriesKey += fieldName;
-                
-                // Determine value type quickly
-                TSMValueType valueType;
-                if (fieldValue.is_number()) {
-                    valueType = TSMValueType::Float;
-                } else if (fieldValue.is_boolean()) {
-                    valueType = TSMValueType::Boolean;
-                } else if (fieldValue.is_string()) {
-                    valueType = TSMValueType::String;
-                } else {
-                    continue; // Skip unsupported types
-                }
-                
-                // Find or create candidate
-                auto it = candidates.find(seriesKey);
-                if (it == candidates.end()) {
-                    // Create new candidate in-place to avoid moves
-                    CoalesceCandidate& candidate = candidates[seriesKey];
-                    candidate.seriesKey = seriesKey;  // Copy, don't move
-                    candidate.measurement = measurement;
-                    candidate.tags = tags;
-                    candidate.fieldName = fieldName;
-                    candidate.valueType = valueType;
 
-                    // Add the first value - explicitly copy strings from JSON
-                    candidate.timestamps.push_back(timestamp);
-                    if (valueType == TSMValueType::Float) {
-                        candidate.doubleValues.push_back(fieldValue.as<double>());
-                    } else if (valueType == TSMValueType::Boolean) {
-                        candidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
-                    } else if (valueType == TSMValueType::String) {
-                        // Explicitly copy string to avoid potential dangling reference
-                        std::string strValue = fieldValue.get<std::string>();
-                        candidate.stringValues.push_back(std::move(strValue));
+                if (fieldValue.is_array()) {
+                    // Array field - expand all elements into the candidate
+                    auto& arr = fieldValue.get<json_value_t::array_t>();
+                    if (arr.empty()) {
+                        throw std::runtime_error("Field array cannot be empty: " + fieldName);
                     }
-                } else {
-                    // Add to existing candidate
-                    CoalesceCandidate& candidate = it->second;
 
-                    if (candidate.valueType != valueType || candidate.timestamps.size() >= MAX_COALESCE_SIZE) {
-                        // Type mismatch or size overflow: create a new candidate with a
-                        // disambiguated key so the data is not silently dropped.
-                        size_t suffix = 1;
-                        std::string altKey;
-                        do {
-                            altKey = seriesKey + "#" + std::to_string(suffix++);
-                        } while (candidates.count(altKey) > 0);
-
-                        CoalesceCandidate& altCandidate = candidates[altKey];
-                        altCandidate.seriesKey = altKey;
-                        altCandidate.measurement = measurement;
-                        altCandidate.tags = tags;
-                        altCandidate.fieldName = fieldName;
-                        altCandidate.valueType = valueType;
-                        altCandidate.timestamps.push_back(timestamp);
-                        if (valueType == TSMValueType::Float) {
-                            altCandidate.doubleValues.push_back(fieldValue.as<double>());
-                        } else if (valueType == TSMValueType::Boolean) {
-                            altCandidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
-                        } else if (valueType == TSMValueType::String) {
-                            std::string strValue = fieldValue.get<std::string>();
-                            altCandidate.stringValues.push_back(std::move(strValue));
-                        }
+                    // Determine type from first element
+                    TSMValueType valueType;
+                    if (arr[0].is_number()) {
+                        valueType = TSMValueType::Float;
+                    } else if (arr[0].is_boolean()) {
+                        valueType = TSMValueType::Boolean;
+                    } else if (arr[0].is_string()) {
+                        valueType = TSMValueType::String;
                     } else {
-                        // Add value - explicitly copy strings from JSON
-                        candidate.timestamps.push_back(timestamp);
+                        throw std::runtime_error("Unsupported field array type: " + fieldName);
+                    }
+
+                    // Resolve timestamps for this array: use the timestamps array if it
+                    // matches, or replicate a single timestamp, or generate sequential ones
+                    std::vector<uint64_t> fieldTimestamps;
+                    if (timestamps.size() == arr.size()) {
+                        fieldTimestamps = timestamps;
+                    } else if (timestamps.size() == 1) {
+                        // Single timestamp with array fields - replicate for each element
+                        fieldTimestamps.resize(arr.size(), timestamps[0]);
+                    } else {
+                        // Generate timestamps 1ms apart from the first available
+                        uint64_t baseTs = timestamps.empty() ? static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count())
+                            : timestamps[0];
+                        fieldTimestamps.reserve(arr.size());
+                        for (size_t i = 0; i < arr.size(); i++) {
+                            fieldTimestamps.push_back(baseTs + i * 1000000);
+                        }
+                    }
+
+                    CoalesceCandidate& candidate = findOrCreateCandidate(
+                        seriesKey, measurement, tags, fieldName, valueType, arr.size());
+
+                    // Add all array elements to candidate
+                    candidate.timestamps.reserve(candidate.timestamps.size() + arr.size());
+                    for (size_t i = 0; i < arr.size(); i++) {
+                        auto& elem = arr[i];
+                        candidate.timestamps.push_back(fieldTimestamps[i]);
                         if (valueType == TSMValueType::Float) {
-                            candidate.doubleValues.push_back(fieldValue.as<double>());
+                            if (!elem.is_number()) throw std::runtime_error("Mixed types in field array: " + fieldName);
+                            candidate.doubleValues.push_back(elem.as<double>());
                         } else if (valueType == TSMValueType::Boolean) {
-                            candidate.boolValues.push_back(fieldValue.get<bool>() ? 1 : 0);
+                            if (!elem.is_boolean()) throw std::runtime_error("Mixed types in field array: " + fieldName);
+                            candidate.boolValues.push_back(elem.get<bool>() ? 1 : 0);
                         } else if (valueType == TSMValueType::String) {
-                            // Explicitly copy string to avoid potential dangling reference
-                            std::string strValue = fieldValue.get<std::string>();
+                            if (!elem.is_string()) throw std::runtime_error("Mixed types in field array: " + fieldName);
+                            std::string strValue = elem.get<std::string>();
                             candidate.stringValues.push_back(std::move(strValue));
                         }
                     }
+                } else {
+                    // Scalar field - determine type and add single value
+                    TSMValueType valueType;
+                    if (fieldValue.is_number()) {
+                        valueType = TSMValueType::Float;
+                    } else if (fieldValue.is_boolean()) {
+                        valueType = TSMValueType::Boolean;
+                    } else if (fieldValue.is_string()) {
+                        valueType = TSMValueType::String;
+                    } else {
+                        continue; // Skip unsupported types
+                    }
+
+                    CoalesceCandidate& candidate = findOrCreateCandidate(
+                        seriesKey, measurement, tags, fieldName, valueType, 1);
+                    addScalarToCandidate(candidate, valueType, timestamps[0], fieldValue);
                 }
             }
         } catch (const std::exception& e) {
@@ -511,7 +615,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // Group by measurement+tags efficiently (only for coalescing)
     std::unordered_map<std::string, std::vector<std::string>> grouped; // groupKey -> seriesKeys
     std::unordered_set<std::string> processedSeriesKeys; // Track which candidates were coalesced
-    size_t individualCount = 0;
+    [[maybe_unused]] size_t individualCount = 0;
 
     for (const auto& [seriesKey, candidate] : candidates) {
         if (candidate.timestamps.size() < MIN_COALESCE_COUNT) {
@@ -655,13 +759,14 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         result.push_back(std::move(mwp));
     }
 
+#if TSDB_LOG_INSERT_PATH
+    size_t coalescedCount = result.size() - individualCount;
     auto end_coalesce = std::chrono::high_resolution_clock::now();
     auto coalesce_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_coalesce - start_coalesce);
-
-    size_t coalescedCount = result.size() - individualCount;
     LOG_INSERT_PATH(tsdb::http_log, info,
         "[COALESCE] Processed {} writes -> {} coalesced arrays + {} individual writes = {} total ({}μs)",
         totalWritesProcessed, coalescedCount, individualCount, result.size(), coalesce_duration.count());
+#endif
 
     return result;
 }
@@ -689,10 +794,12 @@ bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::str
 }
 
 seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::processMultiWritePoint(
-    const MultiWritePoint& point,
-    std::unordered_set<std::string>& seenMF,
+    MultiWritePoint& point,
+    std::unordered_set<SeriesId128, SeriesId128::Hash>& seenMF,
     std::vector<MetaOp>& metaOps) {
+#if TSDB_LOG_INSERT_PATH
     auto start_total = std::chrono::high_resolution_clock::now();
+#endif
 
     // No artificial batch splitting -- the WAL enforces its own 16 MiB per-segment
     // limit (MAX_WAL_SIZE) and will signal rollover if a single insert exceeds it.
@@ -703,26 +810,39 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
         "[WRITE] Processing MultiWritePoint: {} timestamps × {} fields",
         point.timestamps.size(), point.fields.size());
 
+#if TSDB_LOG_INSERT_PATH
     auto start_grouping = std::chrono::high_resolution_clock::now();
+#endif
 
     // NEW APPROACH: Keep arrays intact - create ONE TSDBInsert per field with ALL timestamps/values
     // Group by (shard, type) to batch properly
-    std::map<size_t, std::vector<TSDBInsert<double>>> shardDoubleInserts;
-    std::map<size_t, std::vector<TSDBInsert<bool>>> shardBoolInserts;
-    std::map<size_t, std::vector<TSDBInsert<std::string>>> shardStringInserts;
+    // Use pre-sized vectors instead of std::map since shard IDs are small integers [0, smp::count)
+    const size_t shardCount = seastar::smp::count;
+    std::vector<std::vector<TSDBInsert<double>>> shardDoubleInserts(shardCount);
+    std::vector<std::vector<TSDBInsert<bool>>> shardBoolInserts(shardCount);
+    std::vector<std::vector<TSDBInsert<std::string>>> shardStringInserts(shardCount);
 
     // Note: seenMF and metaOps are now passed by reference from caller for cross-batch deduplication
 
-    // Process each field - create ONE insert with ALL timestamps and values
+    // Process each field - create ONE insert with ALL timestamps and values.
+    // Use shared_ptr for tags and timestamps so that all field inserts from
+    // the same multi-field point share a single allocation instead of making
+    // N-1 copies (for N fields). This is safe across Seastar shard boundaries
+    // because shared_ptr uses atomic refcounting.
+    auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(point.tags));
+    auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
+
+    // Pre-build the measurement+tags prefix once for series key construction
+    std::string seriesKeyPrefix = point.measurement;
+    for (const auto& [tagKey, tagValue] : *sharedTags) {
+        seriesKeyPrefix += "," + tagKey + "=" + tagValue;
+    }
+
     for (const auto& [fieldName, fieldArray] : point.fields) {
         // Build the complete series key for sharding
-        std::string seriesKey = point.measurement;
-        for (const auto& [tagKey, tagValue] : point.tags) {
-            seriesKey += "," + tagKey + "=" + tagValue;
-        }
-        seriesKey += " " + fieldName;
+        std::string seriesKey = seriesKeyPrefix + " " + fieldName;
 
-        // Determine target shard
+        // Compute SeriesId128 ONCE per field for shard routing.
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
         size_t shard = SeriesId128::Hash{}(seriesId) % seastar::smp::count;
 
@@ -731,27 +851,36 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
             case FieldArrays::DOUBLE: {
                 if (fieldArray.doubles.empty()) continue;
 
+                // Track metadata before potential move - deduplicate by SeriesId128 (16-byte key,
+                // fast hash via first 8 bytes) instead of the raw 60-100 byte series key string.
+                {
+                    if (seenMF.insert(seriesId).second) {
+                        metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+                    }
+                }
+
                 TSDBInsert<double> insert(point.measurement, fieldName);
-                insert.tags = point.tags;
-                insert.timestamps = point.timestamps;
+                insert.setSharedTags(sharedTags);
+                insert.setSharedTimestamps(sharedTimestamps);
                 insert.values = fieldArray.doubles;
 
                 shardDoubleInserts[shard].push_back(std::move(insert));
-
-                // Track metadata - deduplicate by full series key (measurement+tags+field)
-                std::string seriesKey = buildSeriesKey(point.measurement, point.tags, fieldName);
-                if (seenMF.insert(seriesKey).second) {
-                    metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, point.tags});
-                }
                 break;
             }
 
             case FieldArrays::BOOL: {
                 if (fieldArray.bools.empty()) continue;
 
+                // Track metadata before potential move - deduplicate by SeriesId128.
+                {
+                    if (seenMF.insert(seriesId).second) {
+                        metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
+                    }
+                }
+
                 TSDBInsert<bool> insert(point.measurement, fieldName);
-                insert.tags = point.tags;
-                insert.timestamps = point.timestamps;
+                insert.setSharedTags(sharedTags);
+                insert.setSharedTimestamps(sharedTimestamps);
                 // Convert uint8_t to bool
                 insert.values.reserve(fieldArray.bools.size());
                 for (uint8_t val : fieldArray.bools) {
@@ -759,39 +888,41 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
                 }
 
                 shardBoolInserts[shard].push_back(std::move(insert));
-
-                // Track metadata - deduplicate by full series key (measurement+tags+field)
-                std::string seriesKey = buildSeriesKey(point.measurement, point.tags, fieldName);
-                if (seenMF.insert(seriesKey).second) {
-                    metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, point.tags});
-                }
                 break;
             }
 
             case FieldArrays::STRING: {
                 if (fieldArray.strings.empty()) continue;
 
+                // Track metadata before potential move - deduplicate by SeriesId128.
+                {
+                    if (seenMF.insert(seriesId).second) {
+                        metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
+                    }
+                }
+
                 TSDBInsert<std::string> insert(point.measurement, fieldName);
-                insert.tags = point.tags;
-                insert.timestamps = point.timestamps;
+                insert.setSharedTags(sharedTags);
+                insert.setSharedTimestamps(sharedTimestamps);
                 insert.values = fieldArray.strings;
 
                 shardStringInserts[shard].push_back(std::move(insert));
-
-                // Track metadata - deduplicate by full series key (measurement+tags+field)
-                std::string seriesKey = buildSeriesKey(point.measurement, point.tags, fieldName);
-                if (seenMF.insert(seriesKey).second) {
-                    metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, point.tags});
-                }
                 break;
             }
 
             case FieldArrays::INTEGER: {
                 if (fieldArray.integers.empty()) continue;
 
+                // Track metadata before potential move - deduplicate by SeriesId128.
+                {
+                    if (seenMF.insert(seriesId).second) {
+                        metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+                    }
+                }
+
                 TSDBInsert<double> insert(point.measurement, fieldName);
-                insert.tags = point.tags;
-                insert.timestamps = point.timestamps;
+                insert.setSharedTags(sharedTags);
+                insert.setSharedTimestamps(sharedTimestamps);
                 // Convert integers to doubles
                 insert.values.reserve(fieldArray.integers.size());
                 bool warnedPrecision = false;
@@ -806,56 +937,39 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
                 }
 
                 shardDoubleInserts[shard].push_back(std::move(insert));
-
-                // Track metadata - deduplicate by full series key (measurement+tags+field)
-                std::string seriesKey = buildSeriesKey(point.measurement, point.tags, fieldName);
-                if (seenMF.insert(seriesKey).second) {
-                    metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, point.tags});
-                }
                 break;
             }
         }
     }
     
+#if TSDB_LOG_INSERT_PATH
     auto end_grouping = std::chrono::high_resolution_clock::now();
     auto grouping_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_grouping - start_grouping);
+#endif
 
     // Note: Metadata indexing now happens at batch level (after all points processed)
     // to ensure proper deduplication across the entire HTTP request
 
+#if TSDB_LOG_INSERT_PATH
     auto start_batch_ops = std::chrono::high_resolution_clock::now();
+#endif
 
     // Dispatch to all shards in parallel - inserts are already batched per field with all timestamps
     std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
+    shardFutures.reserve(shardCount);
 
-    // Collect all unique shards that have work
-    std::set<size_t> activeShards;
-    for (const auto& [shard, _] : shardDoubleInserts) activeShards.insert(shard);
-    for (const auto& [shard, _] : shardBoolInserts) activeShards.insert(shard);
-    for (const auto& [shard, _] : shardStringInserts) activeShards.insert(shard);
-
-    shardFutures.reserve(activeShards.size());
-
-    for (size_t shard : activeShards) {
-        // Extract this shard's inserts (using moves to avoid copying)
-        std::vector<TSDBInsert<double>> doubles;
-        std::vector<TSDBInsert<bool>> bools;
-        std::vector<TSDBInsert<std::string>> strings;
-
-        auto doubleIt = shardDoubleInserts.find(shard);
-        if (doubleIt != shardDoubleInserts.end()) {
-            doubles = std::move(doubleIt->second);
+    for (size_t shard = 0; shard < shardCount; ++shard) {
+        // Skip shards with no work
+        if (shardDoubleInserts[shard].empty() &&
+            shardBoolInserts[shard].empty() &&
+            shardStringInserts[shard].empty()) {
+            continue;
         }
 
-        auto boolIt = shardBoolInserts.find(shard);
-        if (boolIt != shardBoolInserts.end()) {
-            bools = std::move(boolIt->second);
-        }
-
-        auto stringIt = shardStringInserts.find(shard);
-        if (stringIt != shardStringInserts.end()) {
-            strings = std::move(stringIt->second);
-        }
+        // Move this shard's inserts directly from the pre-sized vectors
+        auto doubles = std::move(shardDoubleInserts[shard]);
+        auto bools = std::move(shardBoolInserts[shard]);
+        auto strings = std::move(shardStringInserts[shard]);
 
         // Launch shard operation
         shardFutures.push_back(
@@ -865,17 +979,17 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
                     AggregatedTimingInfo batchTiming;
 
                     if (!doubles.empty()) {
-                        auto walTiming = co_await engine.insertBatch(doubles);
+                        auto walTiming = co_await engine.insertBatch(std::move(doubles));
                         batchTiming.aggregate(walTiming);
                     }
 
                     if (!bools.empty()) {
-                        auto walTiming = co_await engine.insertBatch(bools);
+                        auto walTiming = co_await engine.insertBatch(std::move(bools));
                         batchTiming.aggregate(walTiming);
                     }
 
                     if (!strings.empty()) {
-                        auto walTiming = co_await engine.insertBatch(strings);
+                        auto walTiming = co_await engine.insertBatch(std::move(strings));
                         batchTiming.aggregate(walTiming);
                     }
 
@@ -893,6 +1007,7 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
         aggregatedTiming.aggregate(timing);
     }
     
+#if TSDB_LOG_INSERT_PATH
     auto end_batch_ops = std::chrono::high_resolution_clock::now();
     auto batch_ops_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_batch_ops - start_batch_ops);
     auto end_total = std::chrono::high_resolution_clock::now();
@@ -901,6 +1016,7 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
     LOG_INSERT_PATH(tsdb::http_log, info,
         "[PERF] [HTTP] processMultiWritePoint breakdown - Total: {}μs, Grouping: {}μs, BatchOps: {}μs",
         total_duration.count(), grouping_duration.count(), batch_ops_duration.count());
+#endif
 
     co_return aggregatedTiming;
 }
@@ -972,100 +1088,159 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
     return wp;
 }
 
+HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_t& doc) {
+    WritePoint wp;
+
+    // Extract fields directly from the already-parsed json_value_t, avoiding
+    // a redundant re-parse of the raw JSON string.
+
+    if (!doc.is_object()) {
+        throw std::runtime_error("Write point must be a JSON object");
+    }
+    auto& obj = doc.get<json_value_t::object_t>();
+
+    // Extract measurement
+    auto measurementIt = obj.find("measurement");
+    if (measurementIt == obj.end() || !measurementIt->second.is_string()) {
+        throw std::runtime_error("Missing or invalid 'measurement' field");
+    }
+    wp.measurement = measurementIt->second.get<std::string>();
+
+    // Extract tags
+    auto tagsIt = obj.find("tags");
+    if (tagsIt != obj.end() && tagsIt->second.is_object()) {
+        auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
+        for (const auto& [tagKey, tagValue] : tagsObj) {
+            if (tagValue.is_string()) {
+                wp.tags[tagKey] = tagValue.get<std::string>();
+            }
+        }
+    }
+
+    // Validate measurement and tag names before any processing
+    {
+        auto err = validateName(wp.measurement, "Measurement name");
+        if (!err.empty()) throw std::runtime_error(err);
+        for (const auto& [key, value] : wp.tags) {
+            err = validateName(key, "Tag key '" + key + "'");
+            if (!err.empty()) throw std::runtime_error(err);
+            err = validateTagValue(value, "Tag value for '" + key + "'");
+            if (!err.empty()) throw std::runtime_error(err);
+        }
+    }
+
+    // Parse fields
+    auto fieldsIt = obj.find("fields");
+    if (fieldsIt == obj.end() || !fieldsIt->second.is_object()) {
+        throw std::runtime_error("'fields' must be an object");
+    }
+
+    auto& fields_obj = fieldsIt->second.get<json_value_t::object_t>();
+    if (fields_obj.empty()) {
+        throw std::runtime_error("'fields' object cannot be empty");
+    }
+
+    for (auto& [fieldName, fieldValue] : fields_obj) {
+        // Validate field name before processing
+        {
+            auto err = validateName(fieldName, "Field name '" + fieldName + "'");
+            if (!err.empty()) throw std::runtime_error(err);
+        }
+
+        if (fieldValue.is_number()) {
+            wp.fields[fieldName] = fieldValue.as<double>();
+        } else if (fieldValue.is_boolean()) {
+            wp.fields[fieldName] = fieldValue.get<bool>();
+        } else if (fieldValue.is_string()) {
+            auto str_value = fieldValue.get<std::string>();
+            wp.fields[fieldName] = str_value;
+            LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Single write: detected string field '{}' with value: '{}'", fieldName, str_value);
+        } else {
+            throw std::runtime_error("Unsupported field type for field: " + fieldName);
+        }
+    }
+
+    // Parse timestamp
+    auto timestampIt = obj.find("timestamp");
+    if (timestampIt != obj.end() && timestampIt->second.is_number()) {
+        wp.timestamp = timestampIt->second.as<uint64_t>();
+    } else {
+        auto now = std::chrono::system_clock::now();
+        auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+        wp.timestamp = static_cast<uint64_t>(nanos);
+    }
+
+    return wp;
+}
+
 seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
+#if TSDB_LOG_INSERT_PATH
     auto start_total = std::chrono::high_resolution_clock::now();
+#endif
 
     // Insert data before metadata for crash safety: if data insert succeeds but
     // metadata indexing fails, the data is still durable and discoverable on retry.
     // The reverse order (metadata first) would create phantom metadata entries
     // pointing to nonexistent data if the data insert fails.
-    //
-    // TODO: Each field does a sequential cross-shard call to insert followed by
-    // indexMetadata. This could be batched like the multi-write path (collect all
-    // MetaOps and dispatch once), but single-point writes are rare in practice.
-    // Process each field in the point sequentially using a simple loop
-    for (const auto& field_pair : point.fields) {
-        auto start_field = std::chrono::high_resolution_clock::now();
-        const auto& fieldName = field_pair.first;
-        const auto& fieldValue = field_pair.second;
-        
+
+    // Group inserts by shard to dispatch all fields in parallel rather than
+    // sequentially. For a point with N fields, this reduces up to 2*N sequential
+    // cross-shard round trips down to one parallel fan-out + one metadata dispatch.
+    std::map<size_t, std::vector<TSDBInsert<double>>> shardDoubleInserts;
+    std::map<size_t, std::vector<TSDBInsert<bool>>> shardBoolInserts;
+    std::map<size_t, std::vector<TSDBInsert<std::string>>> shardStringInserts;
+    std::vector<MetaOp> metaOps;
+
+    // Share tags across all field inserts to avoid N copies for N fields.
+    // For single-point writes this is a minor win, but for multi-field points
+    // it eliminates all tag copies (only shared_ptr refcount increments).
+    auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(point.tags);
+
+    // Pre-build the measurement+tags prefix once for series key construction
+    std::string seriesKeyPrefix = point.measurement;
+    for (const auto& [tagKey, tagValue] : *sharedTags) {
+        seriesKeyPrefix += "," + tagKey + "=" + tagValue;
+    }
+
+    for (const auto& [fieldName, fieldValue] : point.fields) {
         // Build the complete series key for sharding
-        std::string seriesKey = point.measurement;
-        
-        // Sort tags for consistent hashing (tags are already sorted in std::map)
-        for (const auto& [tagKey, tagValue] : point.tags) {
-            seriesKey += "," + tagKey + "=" + tagValue;
-        }
-        seriesKey += " " + fieldName;  // Space separator before field, not comma!
-        
-        // Use SeriesId128 for consistent sharding across the system
+        std::string seriesKey = seriesKeyPrefix + " " + fieldName;
+
+        // Compute SeriesId128 ONCE per field for shard routing.
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
         size_t shard = SeriesId128::Hash{}(seriesId) % seastar::smp::count;
-        
-        // Handle each variant type explicitly
+
+        // Handle each variant type explicitly, accumulating into per-shard vectors
         if (std::holds_alternative<double>(fieldValue)) {
             double value = std::get<double>(fieldValue);
             TSDBInsert<double> insert(point.measurement, fieldName);
-            insert.tags = point.tags;
+            insert.setSharedTags(sharedTags);
             insert.addValue(point.timestamp, value);
+            shardDoubleInserts[shard].push_back(std::move(insert));
+            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
 
-            // Insert data first for crash safety (data before metadata)
-            auto start_insert = std::chrono::high_resolution_clock::now();
-            co_await engineSharded->invoke_on(shard, [insert](Engine& engine) mutable {
-                return engine.insert(std::move(insert));
-            });
-            auto end_insert = std::chrono::high_resolution_clock::now();
-            auto insert_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_insert - start_insert);
-
-            // Then index metadata on shard 0
-            auto start_metadata = std::chrono::high_resolution_clock::now();
-            co_await engineSharded->invoke_on(0, [insert](Engine& engine) -> seastar::future<> {
-                co_await engine.indexMetadata(insert);
-            });
-            auto end_metadata = std::chrono::high_resolution_clock::now();
-            auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_metadata - start_metadata);
-
-            auto end_field = std::chrono::high_resolution_clock::now();
-            auto field_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_field - start_field);
-            LOG_INSERT_PATH(tsdb::http_log, info, "[INDIVIDUAL_WRITE_TIMING] Field: {}μs (insert: {}μs, metadata: {}μs)",
-                field_duration.count(), insert_duration.count(), metadata_duration.count());
-            
         } else if (std::holds_alternative<bool>(fieldValue)) {
             bool value = std::get<bool>(fieldValue);
             TSDBInsert<bool> insert(point.measurement, fieldName);
-            insert.tags = point.tags;
+            insert.setSharedTags(sharedTags);
             insert.addValue(point.timestamp, value);
+            shardBoolInserts[shard].push_back(std::move(insert));
+            metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
 
-            // Insert data first for crash safety (data before metadata)
-            co_await engineSharded->invoke_on(shard, [insert](Engine& engine) mutable {
-                return engine.insert(std::move(insert));
-            });
-
-            // Then index metadata on shard 0
-            co_await engineSharded->invoke_on(0, [insert](Engine& engine) -> seastar::future<> {
-                co_await engine.indexMetadata(insert);
-            });
-            
         } else if (std::holds_alternative<std::string>(fieldValue)) {
             const std::string& value = std::get<std::string>(fieldValue);
             TSDBInsert<std::string> insert(point.measurement, fieldName);
-            insert.tags = point.tags;
+            insert.setSharedTags(sharedTags);
             insert.addValue(point.timestamp, value);
 
             LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Processing single string insert - field: '{}', value: '{}', timestamp: {}, shard: {}",
                            fieldName, value, point.timestamp, shard);
             LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] String series key: '{}'", insert.seriesKey());
 
-            // Insert data first for crash safety (data before metadata)
-            co_await engineSharded->invoke_on(shard, [insert](Engine& engine) mutable {
-                return engine.insert(std::move(insert));
-            });
+            shardStringInserts[shard].push_back(std::move(insert));
+            metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
 
-            // Then index metadata on shard 0
-            co_await engineSharded->invoke_on(0, [insert](Engine& engine) -> seastar::future<> {
-                co_await engine.indexMetadata(insert);
-            });
-            
         } else if (std::holds_alternative<int64_t>(fieldValue)) {
             int64_t value = std::get<int64_t>(fieldValue);
             if (wouldLosePrecision(value)) {
@@ -1075,20 +1250,87 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             }
             // Convert integers to doubles for now
             TSDBInsert<double> insert(point.measurement, fieldName);
-            insert.tags = point.tags;
+            insert.setSharedTags(sharedTags);
             insert.addValue(point.timestamp, static_cast<double>(value));
-
-            // Insert data first for crash safety (data before metadata)
-            co_await engineSharded->invoke_on(shard, [insert](Engine& engine) mutable {
-                return engine.insert(std::move(insert));
-            });
-
-            // Then index metadata on shard 0
-            co_await engineSharded->invoke_on(0, [insert](Engine& engine) -> seastar::future<> {
-                co_await engine.indexMetadata(insert);
-            });
+            shardDoubleInserts[shard].push_back(std::move(insert));
+            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
         }
     }
+
+    // Dispatch all shards in parallel using insertBatch for efficiency
+    std::set<size_t> activeShards;
+    for (const auto& [shard, _] : shardDoubleInserts) activeShards.insert(shard);
+    for (const auto& [shard, _] : shardBoolInserts) activeShards.insert(shard);
+    for (const auto& [shard, _] : shardStringInserts) activeShards.insert(shard);
+
+    std::vector<seastar::future<>> shardFutures;
+    shardFutures.reserve(activeShards.size());
+
+    for (size_t shard : activeShards) {
+        std::vector<TSDBInsert<double>> doubles;
+        std::vector<TSDBInsert<bool>> bools;
+        std::vector<TSDBInsert<std::string>> strings;
+
+        if (auto it = shardDoubleInserts.find(shard); it != shardDoubleInserts.end()) {
+            doubles = std::move(it->second);
+        }
+        if (auto it = shardBoolInserts.find(shard); it != shardBoolInserts.end()) {
+            bools = std::move(it->second);
+        }
+        if (auto it = shardStringInserts.find(shard); it != shardStringInserts.end()) {
+            strings = std::move(it->second);
+        }
+
+        shardFutures.push_back(
+            engineSharded->invoke_on(shard,
+                [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings)]
+                (Engine& engine) mutable -> seastar::future<> {
+                    // Use insertBatch when multiple inserts target the same shard,
+                    // otherwise fall back to single insert for less overhead.
+                    // skipMetadataIndexing=true because we index metadata separately below.
+                    if (!doubles.empty()) {
+                        if (doubles.size() == 1) {
+                            co_await engine.insert(std::move(doubles[0]), true);
+                        } else {
+                            co_await engine.insertBatch(std::move(doubles));
+                        }
+                    }
+                    if (!bools.empty()) {
+                        if (bools.size() == 1) {
+                            co_await engine.insert(std::move(bools[0]), true);
+                        } else {
+                            co_await engine.insertBatch(std::move(bools));
+                        }
+                    }
+                    if (!strings.empty()) {
+                        if (strings.size() == 1) {
+                            co_await engine.insert(std::move(strings[0]), true);
+                        } else {
+                            co_await engine.insertBatch(std::move(strings));
+                        }
+                    }
+                })
+        );
+    }
+
+    // Wait for all shard inserts to complete in parallel
+    co_await seastar::when_all_succeed(std::move(shardFutures));
+
+    // Dispatch metadata indexing to shard 0 once for all fields
+    if (!metaOps.empty()) {
+        co_await engineSharded->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) -> seastar::future<> {
+            co_await engine.indexMetadataBatch(metaOps);
+        });
+    }
+
+#if TSDB_LOG_INSERT_PATH
+    auto end_total = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
+    LOG_INSERT_PATH(tsdb::http_log, info,
+        "[PERF] [HTTP] processWritePoint: {}us ({} fields, {} shards)",
+        total_duration.count(), point.fields.size(), activeShards.size());
+#endif
+
     co_return;
 }
 
@@ -1164,210 +1406,140 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         }
         
         int pointsWritten = 0;
+#if TSDB_LOG_INSERT_PATH
         auto batchStartTime = std::chrono::steady_clock::now();
+#endif
         
         // Check if it's a batch write or single write
         if (doc.is_object()) {
             auto& obj = doc.get<json_value_t::object_t>();
             
             if (obj.contains("writes")) {
-                // Batch write - coalesce individual writes into efficient array writes
+                // Batch write - coalesce ALL writes (both scalar and array) in a
+                // single pass through coalesceWrites. No array-detection pre-scan
+                // is needed because coalesceWrites now handles both scalar and array
+                // field values, eliminating the redundant field iteration that
+                // previously occurred when array writes were detected and then
+                // re-parsed by parseMultiWritePoint.
                 auto& writes = obj["writes"];
                 if (writes.is_array()) {
                     auto& writes_array = writes.get<json_value_t::array_t>();
-                    
+
                     LOG_INSERT_PATH(tsdb::http_log, info, "[BATCH] Processing batch with {} writes", writes_array.size());
-                    
-                    // First, separate already-array writes from individual writes
-                    std::vector<MultiWritePoint> arrayWrites;
-                    std::vector<json_value_t> individualWrites;
-                    
-                    for (auto& point : writes_array) {
-                        try {
-                            // Check if this point has arrays
-                            bool hasArrays = false;
-                            if (point.is_object()) {
-                                auto& point_obj = point.get<json_value_t::object_t>();
-                                if (point_obj.contains("timestamps")) {
-                                    hasArrays = true;
-                                } else if (point_obj.contains("fields")) {
-                                    auto& fields = point_obj["fields"];
-                                    if (fields.is_object()) {
-                                        auto& fields_obj = fields.get<json_value_t::object_t>();
-                                        for (auto& [name, value] : fields_obj) {
-                                            if (value.is_array()) {
-                                                hasArrays = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            if (hasArrays) {
-                                // Already an array write - process directly
-                                MultiWritePoint mwp = parseMultiWritePoint(point);
-                                std::string error;
-                                if (!validateArraySizes(mwp, error)) {
-                                    throw std::runtime_error(error);
-                                }
-                                arrayWrites.push_back(std::move(mwp));
-                            } else {
-                                // Individual write - collect for coalescing.
-                                // Move from writes_array since elements are not needed after this loop.
-                                individualWrites.push_back(std::move(point));
-                            }
-                        } catch (const std::exception& e) {
-                            tsdb::http_log.error("Error processing point: {}", e.what());
-                            // Continue processing other points
-                        }
-                    }
-                    
-                    // Coalesce individual writes into array writes
+
+                    // Coalesce all writes (scalar and array) in a single pass
+#if TSDB_LOG_INSERT_PATH
                     auto coalesceStartTime = std::chrono::steady_clock::now();
-                    std::vector<MultiWritePoint> coalescedWrites;
-                    if (!individualWrites.empty()) {
-                        json_value_t::array_t individualArray(
-                            std::make_move_iterator(individualWrites.begin()),
-                            std::make_move_iterator(individualWrites.end()));
-                        coalescedWrites = coalesceWrites(individualArray);
-                    }
+#endif
+                    auto coalescedWrites = coalesceWrites(writes_array);
+#if TSDB_LOG_INSERT_PATH
                     auto coalesceEndTime = std::chrono::steady_clock::now();
                     auto coalesceDuration = std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
-                    
-                    LOG_INSERT_PATH(tsdb::http_log, info, "[BATCH] Coalesced {} individual writes into {} array writes, plus {} existing array writes", 
-                                   individualWrites.size(), coalescedWrites.size(), arrayWrites.size());
-                    
-                    // Process all array writes (both existing and coalesced)
-                    auto walStartTime = std::chrono::steady_clock::now();
-                    int walWriteCount = 0;
-                    AggregatedTimingInfo batchTiming;
+
+                    LOG_INSERT_PATH(tsdb::http_log, info, "[BATCH] Coalesced {} writes into {} MultiWritePoints ({}μs)",
+                                   writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
+#endif
+
+                    // Process all coalesced writes in parallel
+                    [[maybe_unused]] AggregatedTimingInfo batchTiming;
 
                     // Create shared metadata tracking for entire batch (cross-request deduplication)
-                    std::unordered_set<std::string> seenMF;
+                    // Safe to share across concurrent coroutines: seenMF/metaOps are only written
+                    // during the synchronous grouping phase of processMultiWritePoint (before any co_await),
+                    // and Seastar coroutines are cooperatively scheduled on a single thread.
+                    // Use SeriesId128 (16-byte key, O(1) hash via first 8 bytes) instead of
+                    // string keys (60-100 bytes with expensive hashing).
+                    std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
                     std::vector<MetaOp> metaOps;
 
-                    for (auto& mwp : arrayWrites) {
-                        try {
-                            auto timing = co_await processMultiWritePoint(mwp, seenMF, metaOps);
-                            batchTiming.aggregate(timing);
-                            pointsWritten += mwp.timestamps.size() * mwp.fields.size();
-                            walWriteCount += mwp.fields.size(); // One WAL write per field type
-                        } catch (const std::exception& e) {
-                            tsdb::http_log.error("Error processing array write: {}", e.what());
+                    // Compute point/field counts upfront since processMultiWritePoint may move from the MWPs
+                    for (const auto& mwp : coalescedWrites) {
+                        pointsWritten += mwp.timestamps.size() * mwp.fields.size();
+                    }
+
+                    // Validate array sizes before processing
+                    for (const auto& mwp : coalescedWrites) {
+                        std::string error;
+                        if (!validateArraySizes(mwp, error)) {
+                            throw std::runtime_error(error);
                         }
                     }
 
+                    // Launch all MWP processing concurrently and await them together
+                    std::vector<seastar::future<AggregatedTimingInfo>> mwpFutures;
+                    mwpFutures.reserve(coalescedWrites.size());
+
                     for (auto& mwp : coalescedWrites) {
+                        mwpFutures.push_back(processMultiWritePoint(mwp, seenMF, metaOps));
+                    }
+
+                    // Await all MWP futures in parallel
+                    auto mwpResults = co_await seastar::when_all(mwpFutures.begin(), mwpFutures.end());
+                    for (auto& result : mwpResults) {
                         try {
-                            auto timing = co_await processMultiWritePoint(mwp, seenMF, metaOps);
-                            batchTiming.aggregate(timing);
-                            pointsWritten += mwp.timestamps.size() * mwp.fields.size();
-                            walWriteCount += mwp.fields.size(); // One WAL write per field type
+                            batchTiming.aggregate(result.get());
                         } catch (const std::exception& e) {
-                            tsdb::http_log.error("Error processing coalesced write: {}", e.what());
+                            tsdb::http_log.error("Error processing write: {}", e.what());
                         }
                     }
 
                     // Process metadata once for entire batch using batched LevelDB write
+#if TSDB_LOG_INSERT_PATH
                     auto start_metadata = std::chrono::high_resolution_clock::now();
                     size_t metaOpsCount = metaOps.size(); // Save count before move
+#endif
                     if (!metaOps.empty()) {
                         co_await engineSharded->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) -> seastar::future<> {
                             co_await engine.indexMetadataBatch(metaOps);
                         });
                     }
+#if TSDB_LOG_INSERT_PATH
                     auto end_metadata = std::chrono::high_resolution_clock::now();
                     auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_metadata - start_metadata);
 
                     LOG_INSERT_PATH(tsdb::http_log, info,
                         "[METADATA] Batch indexing: {} unique series indexed in {}μs",
                         metaOpsCount, metadata_duration.count());
-
-                    // Note: All individual writes are now included in coalescedWrites as single-point arrays
-                    // No fallback processing needed
-
-                    // auto walEndTime = std::chrono::steady_clock::now();
-                    // auto walDuration = std::chrono::duration_cast<std::chrono::microseconds>(walEndTime - walStartTime);
-                    // auto batchEndTime = std::chrono::steady_clock::now();
-                    // auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(batchEndTime - batchStartTime);
-                    //
-                    // // Calculate actual WAL time excluding compression
-                    // auto actualWalTime = batchTiming.totalWalWriteTime;
-                    // auto compressionTime = batchTiming.totalCompressionTime;
-                    //
-                    // // Log detailed timing breakdown with compression time
-                    // tsdb::http_log.info("[WRITE_TIMING] Total: {}μs, Coalesce: {}μs, Compression: {}μs, WAL: {}μs, WAL_writes: {}, Points: {} (batch write)",
-                    //                    totalDuration.count(), coalesceDuration.count(), compressionTime.count(), actualWalTime.count(), batchTiming.totalWalWriteCount, pointsWritten);
+#endif
                 }
             } else {
-                // Single write - check for arrays
-                bool hasArrays = false;
-                if (obj.contains("timestamps")) {
-                    hasArrays = true;
-                } else if (obj.contains("fields")) {
-                    auto& fields = obj["fields"];
-                    if (fields.is_object()) {
-                        auto& fields_obj = fields.get<json_value_t::object_t>();
-                        for (auto& [name, value] : fields_obj) {
-                            if (value.is_array()) {
-                                hasArrays = true;
-                                break;
-                            }
-                        }
-                    }
+                // Single write - parseMultiWritePoint handles both scalar and
+                // array fields in a single pass (scalars are wrapped as size-1
+                // arrays), so no detection pre-pass is needed.
+                MultiWritePoint mwp = parseMultiWritePoint(doc);
+                std::string error;
+                if (!validateArraySizes(mwp, error)) {
+                    throw std::runtime_error(error);
                 }
-                
-                if (hasArrays) {
-                    auto walStartTime = std::chrono::steady_clock::now();
-                    MultiWritePoint mwp = parseMultiWritePoint(doc);
-                    std::string error;
-                    if (!validateArraySizes(mwp, error)) {
-                        throw std::runtime_error(error);
-                    }
 
-                    // Create metadata tracking for this single write
-                    std::unordered_set<std::string> seenMF;
-                    std::vector<MetaOp> metaOps;
+                // Compute points count before processMultiWritePoint, which may move from mwp
+                pointsWritten = mwp.timestamps.size() * mwp.fields.size();
 
-                    auto timing = co_await processMultiWritePoint(mwp, seenMF, metaOps);
+                // Create metadata tracking for this single write.
+                // Use SeriesId128 (16-byte key) instead of string keys for faster dedup.
+                std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
+                std::vector<MetaOp> metaOps;
 
-                    // Process metadata for this write using batched LevelDB write
-                    auto start_metadata = std::chrono::high_resolution_clock::now();
-                    size_t metaOpsCount = metaOps.size(); // Save count before move
-                    if (!metaOps.empty()) {
-                        co_await engineSharded->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) -> seastar::future<> {
-                            co_await engine.indexMetadataBatch(metaOps);
-                        });
-                    }
-                    auto end_metadata = std::chrono::high_resolution_clock::now();
-                    auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_metadata - start_metadata);
+                [[maybe_unused]] auto timing = co_await processMultiWritePoint(mwp, seenMF, metaOps);
 
-                    LOG_INSERT_PATH(tsdb::http_log, info,
-                        "[METADATA] Single write indexing: {} unique series indexed in {}μs",
-                        metaOpsCount, metadata_duration.count());
-
-                    // auto walEndTime = std::chrono::steady_clock::now();
-                    // auto walDuration = std::chrono::duration_cast<std::chrono::microseconds>(walEndTime - walStartTime);
-                    pointsWritten = mwp.timestamps.size() * mwp.fields.size();  // Count each timestamp * each field
-
-                    // // Log timing for single array write with compression details
-                    // auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(walEndTime - batchStartTime);
-                    // tsdb::http_log.info("[WRITE_TIMING] Total: {}μs, Compression: {}μs, WAL: {}μs, WAL_writes: {}, Points: {} (single array write)",
-                    //                    totalDuration.count(), timing.totalCompressionTime.count(), timing.totalWalWriteTime.count(), timing.totalWalWriteCount, pointsWritten);
-                } else {
-                    // auto walStartTime = std::chrono::steady_clock::now();
-                    WritePoint wp = parseWritePoint(body);
-                    co_await processWritePoint(wp);
-                    // auto walEndTime = std::chrono::steady_clock::now();
-                    // auto walDuration = std::chrono::duration_cast<std::chrono::microseconds>(walEndTime - walStartTime);
-                    pointsWritten = wp.fields.size();  // Count each field as a point
-
-                    // // Log timing for single individual write
-                    // auto totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(walEndTime - batchStartTime);
-                    // tsdb::http_log.info("[WRITE_TIMING] Total: {}μs, WAL: {}μs, WAL_writes: {}, Points: {} (single individual write)",
-                    //                    totalDuration.count(), walDuration.count(), wp.fields.size(), pointsWritten);
+                // Process metadata for this write using batched LevelDB write
+#if TSDB_LOG_INSERT_PATH
+                auto start_metadata = std::chrono::high_resolution_clock::now();
+                size_t metaOpsCount = metaOps.size(); // Save count before move
+#endif
+                if (!metaOps.empty()) {
+                    co_await engineSharded->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) -> seastar::future<> {
+                        co_await engine.indexMetadataBatch(metaOps);
+                    });
                 }
+#if TSDB_LOG_INSERT_PATH
+                auto end_metadata = std::chrono::high_resolution_clock::now();
+                auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_metadata - start_metadata);
+
+                LOG_INSERT_PATH(tsdb::http_log, info,
+                    "[METADATA] Single write indexing: {} unique series indexed in {}μs",
+                    metaOpsCount, metadata_duration.count());
+#endif
             }
         }
         

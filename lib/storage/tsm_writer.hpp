@@ -11,6 +11,8 @@
 #include <string>
 #include <map>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/coroutine.hh>
 
 // Optimized via benchmark: 3000 provides 25% faster queries with equal insert performance
 // 3000 points × 16 bytes = 48KB fits perfectly in L2 cache (256-512KB)
@@ -49,9 +51,20 @@ public:
   void writeIndexParallel();
 
   void writeIndexBlock(const std::vector<uint64_t> &timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset);
+
+  // Blocking close using POSIX I/O (for use in tests or seastar::async contexts)
   void close();
 
+  // Async close using Seastar DMA I/O (non-blocking, for use on reactor thread)
+  // Writes buffer to disk using open_file_dma + dma_write + flush + close.
+  // Produces byte-identical output to close().
+  seastar::future<> closeDMA();
+
+  // Blocking run: builds TSM file in memory, writes via POSIX I/O (for tests)
   static void run(seastar::shared_ptr<MemoryStore> store, std::string filename);
+
+  // Async run: builds TSM file in memory, writes via Seastar DMA I/O (for production)
+  static seastar::future<> runAsync(seastar::shared_ptr<MemoryStore> store, std::string filename);
 };
 
 #endif

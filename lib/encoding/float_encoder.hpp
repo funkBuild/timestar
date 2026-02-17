@@ -2,6 +2,7 @@
 #define FLOAT_ENCODER_MAIN_H_INCLUDED
 
 #include <vector>
+#include <span>
 #include <string>
 #include "float/float_encoder.hpp"  // Contains FloatEncoderBasic
 #include "float/float_encoder_simd.hpp"
@@ -34,9 +35,11 @@ static constexpr FloatCompression FLOAT_COMPRESSION = FloatCompression::ALP;
 class FloatEncoder {
 public:
     /**
-     * Encode a vector of doubles using the best available implementation
+     * Encode doubles using the best available implementation.
+     * Accepts std::span for zero-copy sub-range encoding; std::vector
+     * converts implicitly.
      */
-    static CompressedBuffer encode(const std::vector<double>& values);
+    static CompressedBuffer encode(std::span<const double> values);
 
     /**
      * Get the name of the encoder implementation being used

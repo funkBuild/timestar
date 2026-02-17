@@ -42,7 +42,7 @@ TEST_F(WALRecoveryDurabilityTest, InsertMemoryWorksWithoutWAL) {
     insert.addValue(3000, 70.0);
 
     // insertMemory does not require a WAL
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     EXPECT_FALSE(store->isEmpty());
     EXPECT_EQ(store->getWAL(), nullptr);  // WAL still not initialized
@@ -63,15 +63,15 @@ TEST_F(WALRecoveryDurabilityTest, RecoveredStoreHasCorrectSeriesType) {
 
     TSDBInsert<double> floatInsert("temperature", "value");
     floatInsert.addValue(1000, 23.5);
-    store->insertMemory(floatInsert);
+    store->insertMemory(std::move(floatInsert));
 
     TSDBInsert<bool> boolInsert("door", "open");
     boolInsert.addValue(1000, true);
-    store->insertMemory(boolInsert);
+    store->insertMemory(std::move(boolInsert));
 
     TSDBInsert<std::string> stringInsert("logs", "message");
     stringInsert.addValue(1000, "hello world");
-    store->insertMemory(stringInsert);
+    store->insertMemory(std::move(stringInsert));
 
     // All three series should exist with correct types, despite no WAL
     EXPECT_EQ(store->getSeriesType(floatInsert.seriesId128()).value(), TSMValueType::Float);
@@ -91,7 +91,7 @@ TEST_F(WALRecoveryDurabilityTest, EmptyStoreIsDetectedBeforeConversion) {
     // After inserting data (simulating WAL replay), isEmpty is false
     TSDBInsert<double> insert("metric", "value");
     insert.addValue(1000, 1.0);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     EXPECT_FALSE(store->isEmpty());
 }
@@ -105,7 +105,7 @@ TEST_F(WALRecoveryDurabilityTest, MultipleInsertsAccumulateWithoutWAL) {
     for (int i = 0; i < 100; i++) {
         TSDBInsert<double> insert("sensor", "reading");
         insert.addValue(static_cast<uint64_t>(i) * 1000, static_cast<double>(i));
-        store->insertMemory(insert);
+        store->insertMemory(std::move(insert));
     }
 
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sensor reading");

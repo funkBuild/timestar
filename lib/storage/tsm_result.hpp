@@ -7,12 +7,16 @@
 #include <memory>
 #include <algorithm>
 #include <iostream>
+#include <type_traits>
 
 #include "util.hpp"
 
 template <class T>
 class TSMBlock {
 private:
+  // std::vector<bool> is a bitset whose at() returns a proxy, not a real bool&.
+  // Return by value for bool to avoid a dangling reference; by const ref otherwise.
+  using value_return_type = std::conditional_t<std::is_same_v<T, bool>, T, const T&>;
 
 public:
   std::unique_ptr<std::vector<uint64_t>> timestamps;
@@ -39,11 +43,11 @@ public:
   }
 
   uint64_t timestampAt(unsigned int idx){
-    return timestamps->at(idx);
+    return (*timestamps)[idx];
   }
 
-  T valueAt(unsigned int idx){
-    return values->at(idx);
+  value_return_type valueAt(unsigned int idx) const {
+    return (*values)[idx];
   }
 };
 
@@ -55,9 +59,7 @@ public:
   uint64_t rank;
   std::vector<std::unique_ptr<TSMBlock<T>>> blocks;
 
-  TSMResult(uint64_t _rank) : rank(_rank) {
-    blocks.reserve(100);
-  };
+  TSMResult(uint64_t _rank) : rank(_rank) {};
 
   TSMBlock<T>* getBlock(int idx){
     if(idx >= blocks.size())

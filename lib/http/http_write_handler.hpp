@@ -164,7 +164,10 @@ private:
 
     // Parse a single write point from JSON string
     WritePoint parseWritePoint(const std::string& json);
-    
+
+    // Parse a single write point from an already-parsed JSON object
+    WritePoint parseWritePoint(const json_value_t& doc);
+
     // Parse a write point that may contain arrays
     MultiWritePoint parseMultiWritePoint(const json_value_t& point);
     
@@ -173,9 +176,10 @@ private:
 
     // Process a multi-point write with arrays
     // Accepts seenMF and metaOps for cross-batch deduplication
+    // Takes point by non-const ref so the last field's tags/timestamps can be moved
     seastar::future<AggregatedTimingInfo> processMultiWritePoint(
-        const MultiWritePoint& point,
-        std::unordered_set<std::string>& seenMF,
+        MultiWritePoint& point,
+        std::unordered_set<SeriesId128, SeriesId128::Hash>& seenMF,
         std::vector<MetaOp>& metaOps);
 
     // Validate that all field arrays have the same length as timestamps

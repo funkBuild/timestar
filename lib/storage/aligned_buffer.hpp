@@ -8,8 +8,49 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <memory>
 
 #include "compressed_buffer.hpp"
+
+// Allocator that default-initializes (i.e. leaves memory uninitialized) on
+// resize, instead of value-initializing (zeroing).  Every AlignedBuffer caller
+// immediately overwrites newly-allocated bytes via memcpy, so the implicit
+// memset from std::vector<uint8_t>::resize() is pure waste.  This allocator
+// eliminates that overhead while keeping the rest of std::vector's semantics
+// (capacity tracking, contiguous storage, iterator invalidation rules, etc.)
+// unchanged.
+template <typename T>
+struct default_init_allocator {
+  using value_type = T;
+
+  default_init_allocator() noexcept = default;
+
+  template <typename U>
+  default_init_allocator(const default_init_allocator<U>&) noexcept {}
+
+  T* allocate(std::size_t n) {
+    return std::allocator<T>{}.allocate(n);
+  }
+
+  void deallocate(T* p, std::size_t n) noexcept {
+    std::allocator<T>{}.deallocate(p, n);
+  }
+
+  // Default construction: leave memory uninitialized (default-init for
+  // trivial types like uint8_t is a no-op).
+  void construct(T* p) noexcept(std::is_nothrow_default_constructible_v<T>) {
+    ::new (static_cast<void*>(p)) T;   // default-init, NOT value-init
+  }
+
+  // Non-default construction: forward arguments as usual.
+  template <typename... Args>
+  void construct(T* p, Args&&... args) {
+    ::new (static_cast<void*>(p)) T(std::forward<Args>(args)...);
+  }
+
+  template <typename U>
+  bool operator==(const default_init_allocator<U>&) const noexcept { return true; }
+};
 
 class AlignedBuffer {
 private:
@@ -22,7 +63,7 @@ private:
   void ensure_capacity(size_t required);
 
 public:
-  std::vector<uint8_t> data;
+  std::vector<uint8_t, default_init_allocator<uint8_t>> data;
 
   AlignedBuffer(size_t initialSize = 0) {
     if (initialSize > 0) {

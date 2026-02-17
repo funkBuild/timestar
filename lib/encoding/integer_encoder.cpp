@@ -6,7 +6,7 @@
 // Static member initialization
 IntegerEncoder::Implementation IntegerEncoder::s_forced_impl = IntegerEncoder::AUTO;
 
-AlignedBuffer IntegerEncoder::encode(const std::vector<uint64_t> &values) {
+AlignedBuffer IntegerEncoder::encode(std::span<const uint64_t> values) {
     Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
     switch (impl) {

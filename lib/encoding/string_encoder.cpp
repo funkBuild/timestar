@@ -38,7 +38,7 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
     return value;
 }
 
-AlignedBuffer StringEncoder::encode(const std::vector<std::string>& values) {
+AlignedBuffer StringEncoder::encode(std::span<const std::string> values) {
     AlignedBuffer result;
 
     // Validate count fits in uint32_t header field
@@ -230,5 +230,136 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
         
         out.emplace_back(reinterpret_cast<const char*>(uncompSlice.data + uncompSlice.offset), strLen);
         uncompSlice.offset += strLen;
+    }
+}
+
+void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                           std::vector<std::string>& out) {
+    if (encoded.size() < 16) {
+        throw std::runtime_error("Invalid encoded string buffer: too small for header");
+    }
+
+    // Read header
+    uint32_t magic;
+    std::memcpy(&magic, encoded.data.data(), 4);
+    if (magic != 0x53545247) {
+        throw std::runtime_error("Invalid magic number in string encoding");
+    }
+
+    uint32_t uncompressedSize;
+    std::memcpy(&uncompressedSize, encoded.data.data() + 4, 4);
+
+    uint32_t compressedSize;
+    std::memcpy(&compressedSize, encoded.data.data() + 8, 4);
+
+    uint32_t storedCount;
+    std::memcpy(&storedCount, encoded.data.data() + 12, 4);
+
+    if (encoded.size() < 16 + compressedSize) {
+        throw std::runtime_error("Invalid encoded buffer: size mismatch");
+    }
+
+    // Decompress (Snappy doesn't support random access, so we must decompress the full block)
+    std::vector<uint8_t> uncompressed(uncompressedSize);
+
+    if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data.data() + 16),
+                                compressedSize,
+                                reinterpret_cast<char*>(uncompressed.data()))) {
+        throw std::runtime_error("Failed to decompress string data");
+    }
+
+    // Decode strings with skip/limit: skip the first skipCount strings without allocating,
+    // then collect the next limitCount strings.
+    Slice slice(uncompressed.data(), uncompressedSize);
+    out.clear();
+    out.reserve(limitCount);
+
+    size_t produced = 0;
+    for (size_t i = 0; i < totalCount && slice.offset < slice.length_; i++) {
+        uint32_t strLen = readVarInt(slice);
+
+        if (slice.offset + strLen > slice.length_) {
+            throw std::runtime_error("Invalid string length in encoded data");
+        }
+
+        if (i < skipCount) {
+            // Skip: advance pointer without allocating the string
+            slice.offset += strLen;
+        } else if (produced < limitCount) {
+            out.emplace_back(reinterpret_cast<const char*>(slice.data + slice.offset), strLen);
+            slice.offset += strLen;
+            produced++;
+        } else {
+            // We have enough strings, stop early
+            break;
+        }
+    }
+}
+
+void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                           std::vector<std::string>& out) {
+    if (encoded.length_ - encoded.offset < 16) {
+        throw std::runtime_error("Invalid encoded string buffer: too small for header");
+    }
+
+    // Read header
+    uint32_t magic;
+    std::memcpy(&magic, encoded.data + encoded.offset, 4);
+    if (magic != 0x53545247) {
+        throw std::runtime_error("Invalid magic number in string encoding");
+    }
+    encoded.offset += 4;
+
+    uint32_t uncompressedSize;
+    std::memcpy(&uncompressedSize, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    uint32_t compressedSize;
+    std::memcpy(&compressedSize, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    uint32_t storedCount;
+    std::memcpy(&storedCount, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    if (encoded.length_ - encoded.offset < compressedSize) {
+        throw std::runtime_error("Invalid encoded buffer: size mismatch");
+    }
+
+    // Decompress (Snappy doesn't support random access, so we must decompress the full block)
+    std::vector<uint8_t> uncompressed(uncompressedSize);
+
+    if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data + encoded.offset),
+                                compressedSize,
+                                reinterpret_cast<char*>(uncompressed.data()))) {
+        throw std::runtime_error("Failed to decompress string data");
+    }
+    encoded.offset += compressedSize;
+
+    // Decode strings with skip/limit: skip the first skipCount strings without allocating,
+    // then collect the next limitCount strings.
+    Slice uncompSlice(uncompressed.data(), uncompressedSize);
+    out.clear();
+    out.reserve(limitCount);
+
+    size_t produced = 0;
+    for (size_t i = 0; i < totalCount && uncompSlice.offset < uncompSlice.length_; i++) {
+        uint32_t strLen = readVarInt(uncompSlice);
+
+        if (uncompSlice.offset + strLen > uncompSlice.length_) {
+            throw std::runtime_error("Invalid string length in encoded data");
+        }
+
+        if (i < skipCount) {
+            // Skip: advance pointer without allocating the string
+            uncompSlice.offset += strLen;
+        } else if (produced < limitCount) {
+            out.emplace_back(reinterpret_cast<const char*>(uncompSlice.data + uncompSlice.offset), strLen);
+            uncompSlice.offset += strLen;
+            produced++;
+        } else {
+            // We have enough strings, stop early
+            break;
+        }
     }
 }

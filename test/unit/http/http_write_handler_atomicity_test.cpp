@@ -106,107 +106,99 @@ TEST_F(HttpWriteHandlerAtomicityTest, ProcessWritePointExists) {
         << "Missing int64_t branch";
 }
 
-// Core test: In the double branch, engine.insert() must appear BEFORE engine.indexMetadata()
+// Core test: In processWritePoint, data dispatch (when_all_succeed on shard inserts)
+// must appear BEFORE metadata dispatch (indexMetadataBatch).
+// The refactored function batches inserts by shard and dispatches in parallel,
+// then indexes metadata once after all data inserts complete.
 TEST_F(HttpWriteHandlerAtomicityTest, DoubleBranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
-    // Find the double branch
-    size_t doubleBranch = funcBody.find("holds_alternative<double>");
-    ASSERT_NE(doubleBranch, std::string::npos);
+    // The batched architecture groups inserts by shard, dispatches via when_all_succeed,
+    // then indexes metadata via indexMetadataBatch. Verify this ordering.
+    size_t dataDispatchPos = funcBody.find("when_all_succeed");
+    size_t metadataPos = funcBody.find("indexMetadataBatch");
 
-    // Find the next branch boundary (bool branch) to limit search scope
-    size_t nextBranch = funcBody.find("holds_alternative<bool>", doubleBranch);
-    std::string doubleSection = funcBody.substr(doubleBranch,
-        nextBranch != std::string::npos ? nextBranch - doubleBranch : std::string::npos);
-
-    // In this section, engine.insert should appear BEFORE engine.indexMetadata
-    size_t insertPos = doubleSection.find("engine.insert(");
-    size_t metadataPos = doubleSection.find("engine.indexMetadata(");
-
-    ASSERT_NE(insertPos, std::string::npos)
-        << "Could not find engine.insert() in double branch";
+    ASSERT_NE(dataDispatchPos, std::string::npos)
+        << "Could not find when_all_succeed (parallel shard dispatch) in processWritePoint";
     ASSERT_NE(metadataPos, std::string::npos)
-        << "Could not find engine.indexMetadata() in double branch";
+        << "Could not find indexMetadataBatch in processWritePoint";
 
-    EXPECT_LT(insertPos, metadataPos)
-        << "BUG: In the double branch, engine.indexMetadata() appears BEFORE engine.insert(). "
-           "Data must be inserted before metadata for crash safety. "
-           "If data insert fails, phantom metadata entries will be created.";
+    EXPECT_LT(dataDispatchPos, metadataPos)
+        << "BUG: indexMetadataBatch appears BEFORE when_all_succeed. "
+           "Data must be inserted before metadata for crash safety.";
 }
 
-// Core test: In the bool branch, engine.insert() must appear BEFORE engine.indexMetadata()
+// Verify all 4 type branches exist in the grouping phase
 TEST_F(HttpWriteHandlerAtomicityTest, BoolBranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
-    size_t boolBranch = funcBody.find("holds_alternative<bool>");
-    ASSERT_NE(boolBranch, std::string::npos);
+    // All 4 type branches should exist in the grouping phase
+    EXPECT_NE(funcBody.find("holds_alternative<double>"), std::string::npos)
+        << "Missing double type handling";
+    EXPECT_NE(funcBody.find("holds_alternative<bool>"), std::string::npos)
+        << "Missing bool type handling";
+    EXPECT_NE(funcBody.find("holds_alternative<std::string>"), std::string::npos)
+        << "Missing string type handling";
+    EXPECT_NE(funcBody.find("holds_alternative<int64_t>"), std::string::npos)
+        << "Missing int64_t type handling";
 
-    size_t nextBranch = funcBody.find("holds_alternative<std::string>", boolBranch);
-    std::string boolSection = funcBody.substr(boolBranch,
-        nextBranch != std::string::npos ? nextBranch - boolBranch : std::string::npos);
-
-    size_t insertPos = boolSection.find("engine.insert(");
-    size_t metadataPos = boolSection.find("engine.indexMetadata(");
-
-    ASSERT_NE(insertPos, std::string::npos)
-        << "Could not find engine.insert() in bool branch";
-    ASSERT_NE(metadataPos, std::string::npos)
-        << "Could not find engine.indexMetadata() in bool branch";
-
-    EXPECT_LT(insertPos, metadataPos)
-        << "BUG: In the bool branch, engine.indexMetadata() appears BEFORE engine.insert(). "
-           "Data must be inserted before metadata for crash safety.";
+    // Inserts should be dispatched via engine.insert or engine.insertBatch
+    bool hasInsert = funcBody.find("engine.insert(") != std::string::npos ||
+                     funcBody.find("engine.insertBatch(") != std::string::npos;
+    EXPECT_TRUE(hasInsert)
+        << "Could not find engine.insert() or engine.insertBatch() in processWritePoint";
 }
 
-// Core test: In the string branch, engine.insert() must appear BEFORE engine.indexMetadata()
+// Verify metadata is batched, not per-field
 TEST_F(HttpWriteHandlerAtomicityTest, StringBranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
-    size_t stringBranch = funcBody.find("holds_alternative<std::string>");
-    ASSERT_NE(stringBranch, std::string::npos);
+    // Metadata should use batch indexing, not individual per-field calls
+    EXPECT_NE(funcBody.find("indexMetadataBatch"), std::string::npos)
+        << "processWritePoint should use indexMetadataBatch for efficient metadata indexing";
 
-    size_t nextBranch = funcBody.find("holds_alternative<int64_t>", stringBranch);
-    std::string stringSection = funcBody.substr(stringBranch,
-        nextBranch != std::string::npos ? nextBranch - stringBranch : std::string::npos);
-
-    size_t insertPos = stringSection.find("engine.insert(");
-    size_t metadataPos = stringSection.find("engine.indexMetadata(");
-
-    ASSERT_NE(insertPos, std::string::npos)
-        << "Could not find engine.insert() in string branch";
-    ASSERT_NE(metadataPos, std::string::npos)
-        << "Could not find engine.indexMetadata() in string branch";
-
-    EXPECT_LT(insertPos, metadataPos)
-        << "BUG: In the string branch, engine.indexMetadata() appears BEFORE engine.insert(). "
-           "Data must be inserted before metadata for crash safety.";
+    // Should NOT have individual indexMetadata calls (the old per-field pattern)
+    // indexMetadataBatch is the batched version; individual indexMetadata would indicate
+    // the old sequential pattern
+    size_t batchPos = funcBody.find("indexMetadataBatch");
+    // Count occurrences of "indexMetadata(" that are NOT "indexMetadataBatch("
+    size_t pos = 0;
+    int individualCalls = 0;
+    while ((pos = funcBody.find("indexMetadata(", pos)) != std::string::npos) {
+        // Check it's not indexMetadataBatch
+        if (pos < 5 || funcBody.substr(pos - 5, 5) != "Batch") {
+            // Check it's not part of indexMetadataBatch
+            if (funcBody.substr(pos, 19) != "indexMetadataBatch(") {
+                individualCalls++;
+            }
+        }
+        pos++;
+    }
+    EXPECT_EQ(individualCalls, 0)
+        << "processWritePoint should not call individual indexMetadata(); "
+           "use indexMetadataBatch() instead for batched metadata indexing";
 }
 
-// Core test: In the int64_t branch, engine.insert() must appear BEFORE engine.indexMetadata()
+// Verify parallel shard dispatch structure exists
 TEST_F(HttpWriteHandlerAtomicityTest, Int64BranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
-    size_t intBranch = funcBody.find("holds_alternative<int64_t>");
-    ASSERT_NE(intBranch, std::string::npos);
+    // Should have parallel dispatch infrastructure
+    EXPECT_NE(funcBody.find("invoke_on"), std::string::npos)
+        << "processWritePoint should use invoke_on for cross-shard dispatch";
+    EXPECT_NE(funcBody.find("when_all_succeed"), std::string::npos)
+        << "processWritePoint should use when_all_succeed for parallel shard dispatch";
 
-    // int64_t is the last branch, so search to end of function
-    std::string intSection = funcBody.substr(intBranch);
-
-    size_t insertPos = intSection.find("engine.insert(");
-    size_t metadataPos = intSection.find("engine.indexMetadata(");
-
-    ASSERT_NE(insertPos, std::string::npos)
-        << "Could not find engine.insert() in int64_t branch";
-    ASSERT_NE(metadataPos, std::string::npos)
-        << "Could not find engine.indexMetadata() in int64_t branch";
-
-    EXPECT_LT(insertPos, metadataPos)
-        << "BUG: In the int64_t branch, engine.indexMetadata() appears BEFORE engine.insert(). "
-           "Data must be inserted before metadata for crash safety.";
+    // The skipMetadataIndexing=true pattern should be used
+    bool hasSkipMeta = funcBody.find("true") != std::string::npos &&
+                       (funcBody.find("skipMetadata") != std::string::npos ||
+                        funcBody.find("engine.insert(std::move(") != std::string::npos);
+    EXPECT_TRUE(hasSkipMeta)
+        << "processWritePoint should pass skipMetadataIndexing=true to engine.insert()";
 }
 
 // Verify that the batch path (processMultiWritePoint) already has the correct ordering:

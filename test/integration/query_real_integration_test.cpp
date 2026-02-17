@@ -87,10 +87,10 @@ TEST_F(QueryRealIntegrationTest, MemoryStoreRealData) {
     insert.timestamps = timestamps;
     insert.values = values;
     
-    memoryStore->insertMemory(insert);
-    
-    // Query the data back
     std::string seriesKey = insert.seriesKey();
+    memoryStore->insertMemory(std::move(insert));
+
+    // Query the data back
     auto results = queryMemoryStore(seriesKey);
     
     ASSERT_EQ(results.timestamps.size(), 60);
@@ -136,12 +136,13 @@ TEST_F(QueryRealIntegrationTest, RealDataAggregation) {
         insert.timestamps = timestamps;
         insert.values = values;
         
-        memoryStore->insertMemory(insert);
-        
+        std::string insertKey = insert.seriesKey();
+        memoryStore->insertMemory(std::move(insert));
+
         QueryResult<double> qr;
         qr.timestamps = timestamps;
         qr.values = values;
-        allData[insert.seriesKey()] = qr;
+        allData[insertKey] = qr;
     }
     
     // Test aggregation with real data
@@ -263,10 +264,10 @@ TEST_F(QueryRealIntegrationTest, CompleteQueryPipeline) {
             insert.timestamps = timestamps;
             insert.values = values;
             
-            memoryStore->insertMemory(insert);
+            memoryStore->insertMemory(std::move(insert));
         }
     }
-    
+
     // Step 2: Verify data was inserted
     EXPECT_EQ(memoryStore->series.size(), 6); // 2 hosts × 3 interfaces
     
@@ -309,9 +310,10 @@ TEST_F(QueryRealIntegrationTest, RealDataEdgeCases) {
     TSDBInsert<double> sparseInsert("sparse_metric", "value");
     sparseInsert.timestamps = sparseTimestamps;
     sparseInsert.values = sparseValues;
-    memoryStore->insertMemory(sparseInsert);
-    
-    auto sparseResult = queryMemoryStore(sparseInsert.seriesKey());
+    std::string sparseKey = sparseInsert.seriesKey();
+    memoryStore->insertMemory(std::move(sparseInsert));
+
+    auto sparseResult = queryMemoryStore(sparseKey);
     EXPECT_EQ(sparseResult.timestamps.size(), 3);
     
     // Aggregate sparse data with 15-minute intervals
@@ -336,9 +338,10 @@ TEST_F(QueryRealIntegrationTest, RealDataEdgeCases) {
     TSDBInsert<double> denseInsert("dense_metric", "value");
     denseInsert.timestamps = denseTimestamps;
     denseInsert.values = denseValues;
-    memoryStore->insertMemory(denseInsert);
-    
-    auto denseResult = queryMemoryStore(denseInsert.seriesKey());
+    std::string denseKey = denseInsert.seriesKey();
+    memoryStore->insertMemory(std::move(denseInsert));
+
+    auto denseResult = queryMemoryStore(denseKey);
     EXPECT_EQ(denseResult.timestamps.size(), 600);
     
     // Aggregate dense data to 1-second intervals
@@ -359,9 +362,10 @@ TEST_F(QueryRealIntegrationTest, RealDataEdgeCases) {
     TSDBInsert<double> dupInsert("duplicate", "value");
     dupInsert.timestamps = dupTimestamps;
     dupInsert.values = dupValues;
-    memoryStore->insertMemory(dupInsert);
-    
-    auto dupResult = queryMemoryStore(dupInsert.seriesKey());
+    std::string dupKey = dupInsert.seriesKey();
+    memoryStore->insertMemory(std::move(dupInsert));
+
+    auto dupResult = queryMemoryStore(dupKey);
     EXPECT_EQ(dupResult.timestamps.size(), 3);
 }
 
@@ -384,9 +388,9 @@ TEST_F(QueryRealIntegrationTest, PerformanceWithRealisticData) {
         insert.timestamps = timestamps;
         insert.values = values;
         
-        memoryStore->insertMemory(insert);
+        memoryStore->insertMemory(std::move(insert));
     }
-    
+
     auto endInsert = std::chrono::high_resolution_clock::now();
     auto insertDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
         endInsert - startInsert);

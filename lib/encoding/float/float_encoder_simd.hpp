@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <span>
 #include <immintrin.h>
 #include "../../storage/compressed_buffer.hpp"
 #include "float_encoder.hpp"
@@ -17,10 +18,10 @@ public:
     static bool isAvailable();
     
     // SIMD-optimized encoding
-    static CompressedBuffer encode(const std::vector<double>& values);
-    
+    static CompressedBuffer encode(std::span<const double> values);
+
     // Fallback to regular encoder if SIMD not available
-    static CompressedBuffer encodeSafe(const std::vector<double>& values);
+    static CompressedBuffer encodeSafe(std::span<const double> values);
     
 private:
     // Process 4 values at once using AVX2

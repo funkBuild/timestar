@@ -1,8 +1,10 @@
 #include "tsm.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <limits>
 
 namespace fs = std::filesystem;
 
@@ -50,20 +52,23 @@ bool TSM::hasSeriesInTimeRange(
     uint64_t endTime) const {
 
     // Check bloom filter first
-    if (!seriesBloomFilter.contains(seriesId.toBytes())) {
+    if (!seriesBloomFilter.contains(seriesId.getRawData())) {
         return false;
     }
 
-    // Check if series exists in cache
+    // Check if series exists in cache (promote to front on hit)
     auto it = fullIndexCache.find(seriesId);
     if (it == fullIndexCache.end()) {
         // Not in cache - could exist but not loaded yet
         // For tombstone operations, be conservative and assume it might exist
-        return seriesBloomFilter.contains(seriesId.toBytes());
+        return seriesBloomFilter.contains(seriesId.getRawData());
     }
 
+    // Promote to front of LRU list on access
+    lruList.splice(lruList.begin(), lruList, it->second);
+
     // Check if any index blocks overlap with the time range
-    const auto& indexEntry = it->second;
+    const auto& indexEntry = it->second->second;
     for (const auto& block : indexEntry.indexBlocks) {
         if (block.minTime <= endTime && block.maxTime >= startTime) {
             return true;
@@ -151,45 +156,85 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime) {
-    
+
     // First, perform the regular query using optimized batched reads
     TSMResult<T> result(rankAsInteger());
     co_await readSeriesBatched<T>(seriesId, startTime, endTime, result);
-    
-    if (!tombstones) {
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "No tombstones loaded for TSM file {}, returning unfiltered data", filePath);
+
+    // hasTombstones() is O(1): checks both null and entry count == 0.
+    // Skips the per-series map lookup and result.empty() check when no
+    // tombstones exist for this TSM file (the common case).
+    if (!hasTombstones()) {
+        co_return result;
     }
-    
-    // Apply tombstone filtering if tombstones exist
-    if (tombstones && !result.empty()) {
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "TSM {} has tombstones, filtering series: {}",
-                        filePath, seriesId.toHex());
 
-        // Get all data from blocks
-        auto [allTimestamps, allValues] = result.getAllData();
+    // Apply tombstone filtering if tombstones exist and there's data
+    if (result.empty()) {
+        co_return result;
+    }
 
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Data before filtering: {} points", allTimestamps.size());
+    // Get merged tombstone ranges for this series
+    auto ranges = tombstones->getTombstoneRanges(seriesId);
+    if (ranges.empty()) {
+        // No tombstones for this series — return data as-is, no copy needed
+        LOG_INSERT_PATH(tsdb::tsm_log, trace, "No tombstones for series {} in TSM {}, returning unfiltered data",
+                        seriesId.toHex(), filePath);
+        co_return result;
+    }
 
-        if (!allTimestamps.empty()) {
-            // Filter out tombstoned data using full SeriesId128 (no hash truncation)
-            auto [filteredTimestamps, filteredValues] =
-                tombstones->filterTombstoned(seriesId, allTimestamps, allValues);
-            
-            LOG_INSERT_PATH(tsdb::tsm_log, trace, "Data after filtering: {} points", filteredTimestamps.size());
-            
-            // Always clear original blocks when tombstone filtering is applied
-            result.blocks.clear();
+    LOG_INSERT_PATH(tsdb::tsm_log, trace, "TSM {} has {} tombstone ranges for series {}, filtering in single pass",
+                    filePath, ranges.size(), seriesId.toHex());
 
-            // Rebuild result with filtered data if any remains
-            if (!filteredTimestamps.empty()) {
-                auto block = std::make_unique<TSMBlock<T>>(filteredTimestamps.size());
-                block->timestamps = std::make_unique<std::vector<uint64_t>>(std::move(filteredTimestamps));
-                block->values = std::make_unique<std::vector<T>>(std::move(filteredValues));
-                result.appendBlock(block);
+    // Single-pass filter: iterate blocks directly and copy only non-tombstoned points
+    // into one output block, avoiding the intermediate getAllData() copy.
+    size_t totalPoints = 0;
+    for (const auto& block : result.blocks) {
+        totalPoints += block->size();
+    }
+
+    auto filteredBlock = std::make_unique<TSMBlock<T>>(totalPoints);
+    auto& outTimestamps = *filteredBlock->timestamps;
+    auto& outValues = *filteredBlock->values;
+
+    size_t tombstonedCount = 0;
+    for (auto& block : result.blocks) {
+        const auto& ts = *block->timestamps;
+        auto& vals = *block->values;
+        for (size_t i = 0; i < ts.size(); ++i) {
+            uint64_t t = ts[i];
+            // Binary search for applicable tombstone range
+            // ranges is sorted by startTime; find the last range whose startTime <= t
+            auto rangeIt = std::upper_bound(ranges.begin(), ranges.end(),
+                std::make_pair(t, std::numeric_limits<uint64_t>::max()));
+            bool isTombstoned = false;
+            if (rangeIt != ranges.begin()) {
+                --rangeIt;
+                if (t >= rangeIt->first && t <= rangeIt->second) {
+                    isTombstoned = true;
+                }
+            }
+            if (!isTombstoned) {
+                outTimestamps.push_back(t);
+                if constexpr (std::is_same_v<T, bool>) {
+                    outValues.push_back(vals[i]);
+                } else {
+                    outValues.push_back(std::move(vals[i]));
+                }
+            } else {
+                ++tombstonedCount;
             }
         }
     }
-    
+
+    LOG_INSERT_PATH(tsdb::tsm_log, trace, "Tombstone filtering: {} points -> {} points ({} removed)",
+                    totalPoints, outTimestamps.size(), tombstonedCount);
+
+    // Replace blocks with filtered result
+    result.blocks.clear();
+    if (!outTimestamps.empty()) {
+        result.appendBlock(filteredBlock);
+    }
+
     co_return result;
 }
 

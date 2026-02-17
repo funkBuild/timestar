@@ -33,11 +33,11 @@ private:
             if (exhausted || !currentBlock || pointIndex >= currentBlock->timestamps->size()) {
                 return UINT64_MAX;
             }
-            return currentBlock->timestamps->at(pointIndex);
+            return (*currentBlock->timestamps)[pointIndex];
         }
 
         T currentValue() const {
-            return currentBlock->values->at(pointIndex);
+            return (*currentBlock->values)[pointIndex];
         }
 
         seastar::future<> advance() {
@@ -164,11 +164,11 @@ private:
             if (exhausted || !currentBlock || pointIndex >= currentBlock->timestamps->size()) {
                 return UINT64_MAX;
             }
-            return currentBlock->timestamps->at(pointIndex);
+            return (*currentBlock->timestamps)[pointIndex];
         }
 
         T currentValue() const {
-            return currentBlock->values->at(pointIndex);
+            return (*currentBlock->values)[pointIndex];
         }
 
         seastar::future<> advance() {

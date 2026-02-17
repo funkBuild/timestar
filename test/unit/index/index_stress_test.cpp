@@ -596,7 +596,7 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, MultipleMeasurementsIsolation) {
     for (int m = 0; m < NUM_MEASUREMENTS; m++) {
         std::string measurement = "isolation_metric_" + std::to_string(m);
 
-        auto allSeries = co_await index.getAllSeriesForMeasurement(measurement);
+        auto allSeries = (co_await index.getAllSeriesForMeasurement(measurement)).value();
         EXPECT_EQ(allSeries.size(), static_cast<size_t>(SERIES_PER_MEASUREMENT))
             << "Measurement " << measurement << " has wrong series count";
 

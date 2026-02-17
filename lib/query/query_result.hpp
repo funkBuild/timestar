@@ -98,6 +98,118 @@ public:
     return state.block != nullptr;
   }
 
+  // Single-source fast path: no merge or dedup needed.
+  // Just concatenate all blocks' data directly into the output.
+  void mergeSingleSource(TSMIterationState &state,
+                         std::vector<TSMResult<T>> &tsmResults) {
+    auto &result = tsmResults[state.tsmResultIndex];
+    for (size_t b = 0; ; ++b) {
+      TSMBlock<T> *block = result.getBlock(b);
+      if (block == nullptr)
+        break;
+      timestamps.insert(timestamps.end(),
+                        block->timestamps->begin(),
+                        block->timestamps->end());
+      values.insert(values.end(),
+                    block->values->begin(),
+                    block->values->end());
+    }
+  }
+
+  // Two-way merge: direct comparison between two iterators, no heap overhead.
+  // For each step, compare the two current timestamps and emit the smaller.
+  // On equal timestamps, the higher-rank source wins (dedup).
+  void mergeTwoWay(std::vector<TSMIterationState> &iters,
+                   std::vector<TSMResult<T>> &tsmResults) {
+    auto &s0 = iters[0];
+    auto &s1 = iters[1];
+
+    while (s0.block != nullptr && s1.block != nullptr) {
+      const uint64_t ts0 = s0.currentTimestamp;
+      const uint64_t ts1 = s1.currentTimestamp;
+
+      if (ts0 < ts1) {
+        // Source 0 has the smaller timestamp -- emit it and advance
+        timestamps.push_back(ts0);
+        values.push_back(s0.block->valueAt(s0.blockOffset));
+        advanceIteratorPast(s0, ts0, tsmResults);
+      } else if (ts1 < ts0) {
+        // Source 1 has the smaller timestamp -- emit it and advance
+        timestamps.push_back(ts1);
+        values.push_back(s1.block->valueAt(s1.blockOffset));
+        advanceIteratorPast(s1, ts1, tsmResults);
+      } else {
+        // Equal timestamps -- higher rank wins, advance both (dedup)
+        if (s0.rank >= s1.rank) {
+          timestamps.push_back(ts0);
+          values.push_back(s0.block->valueAt(s0.blockOffset));
+        } else {
+          timestamps.push_back(ts1);
+          values.push_back(s1.block->valueAt(s1.blockOffset));
+        }
+        advanceIteratorPast(s0, ts0, tsmResults);
+        advanceIteratorPast(s1, ts1, tsmResults);
+      }
+    }
+
+    // Drain whichever source still has data
+    auto drainRemaining = [&](TSMIterationState &s) {
+      while (s.block != nullptr) {
+        timestamps.push_back(s.currentTimestamp);
+        values.push_back(s.block->valueAt(s.blockOffset));
+        const uint64_t ts = s.currentTimestamp;
+        advanceIteratorPast(s, ts, tsmResults);
+      }
+    };
+
+    drainRemaining(s0);
+    drainRemaining(s1);
+  }
+
+  // N-way merge for small N (3-4 sources): linear scan to find minimum.
+  // For N <= 4, a linear scan with branch-free comparison is faster than
+  // any heap or tournament tree due to cache locality and low overhead.
+  void mergeSmallN(std::vector<TSMIterationState> &iters,
+                   const size_t numIters,
+                   std::vector<TSMResult<T>> &tsmResults) {
+    size_t activeCount = numIters;
+
+    while (activeCount > 0) {
+      // Find the source with minimum timestamp (highest rank breaks ties).
+      // Linear scan over at most 4 elements.
+      size_t bestIdx = SIZE_MAX;
+      uint64_t bestTs = UINT64_MAX;
+      uint64_t bestRank = 0;
+
+      for (size_t i = 0; i < numIters; ++i) {
+        if (iters[i].block == nullptr)
+          continue;
+
+        const uint64_t ts = iters[i].currentTimestamp;
+        const uint64_t rk = iters[i].rank;
+
+        if (ts < bestTs || (ts == bestTs && rk > bestRank)) {
+          bestTs = ts;
+          bestRank = rk;
+          bestIdx = i;
+        }
+      }
+
+      // Emit the winning point
+      timestamps.push_back(bestTs);
+      values.push_back(iters[bestIdx].block->valueAt(iters[bestIdx].blockOffset));
+
+      // Advance ALL sources that share the same timestamp (dedup).
+      for (size_t i = 0; i < numIters; ++i) {
+        if (iters[i].block != nullptr && iters[i].currentTimestamp == bestTs) {
+          if (!advanceIteratorPast(iters[i], bestTs, tsmResults)) {
+            --activeCount;
+          }
+        }
+      }
+    }
+  }
+
   void mergeTsmResults(std::vector<TSMResult<T>> &tsmResults) {
     const unsigned int tsmResultSize = tsmResults.size();
 
@@ -130,6 +242,30 @@ public:
     if (blockIterState.empty())
       return;
 
+    const size_t numSources = blockIterState.size();
+
+    // Dispatch to specialized merge based on source count.
+    // The common case is 1-4 TSM files per series; specialized paths
+    // eliminate heap overhead for these cases.
+    if (numSources == 1) {
+      // Single source: direct copy, no merge or dedup needed.
+      mergeSingleSource(blockIterState[0], tsmResults);
+      return;
+    }
+
+    if (numSources == 2) {
+      // Two-way merge: direct comparison, no heap.
+      mergeTwoWay(blockIterState, tsmResults);
+      return;
+    }
+
+    if (numSources <= 4) {
+      // 3-4 way merge: linear scan for minimum, no heap.
+      mergeSmallN(blockIterState, numSources, tsmResults);
+      return;
+    }
+
+    // 5+ sources: heap-based k-way merge (general case).
     // Build min-heap: ordered by (timestamp ASC, rank DESC).
     // Using std::greater<> with our operator> gives min-heap behavior.
     std::priority_queue<HeapEntry, std::vector<HeapEntry>,

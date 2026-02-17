@@ -6,11 +6,13 @@
 #include "tsm_tombstone.hpp"
 #include "series_id.hpp"
 #include "bloom_filter.hpp"
+#include "block_aggregator.hpp"
 
 #include <string>
 #include <memory>
 #include <fstream>
 #include <vector>
+#include <list>
 #include <tuple>
 #include <optional>
 #include <unordered_map>
@@ -64,12 +66,15 @@ private:
   tsl::robin_map<SeriesId128, SparseIndexEntry, SeriesId128::Hash> sparseIndex;
   bloom_filter seriesBloomFilter;
 
-  // Full index cache for hot series (LRU-like behavior)
-  mutable std::unordered_map<SeriesId128, TSMIndexEntry> fullIndexCache;
+  // Full index cache with LRU eviction for hot series
+  // LRU list: front = most recently used, back = least recently used
+  using LRUList = std::list<std::pair<SeriesId128, TSMIndexEntry>>;
+  mutable LRUList lruList;
+  mutable std::unordered_map<SeriesId128, LRUList::iterator, SeriesId128::Hash> fullIndexCache;
 
   // Configuration for bloom filter and cache
   static constexpr double BLOOM_FPR = 0.001;  // 0.1% false positive rate
-  static constexpr size_t MAX_CACHE_ENTRIES = 100;
+  static constexpr size_t MAX_CACHE_ENTRIES = 4096;
 
   // Tombstone support
   std::unique_ptr<tsdb::TSMTombstone> tombstones;
@@ -92,6 +97,8 @@ public:
   // Lazy loading index methods
   seastar::future<> readSparseIndex();
   seastar::future<TSMIndexEntry*> getFullIndexEntry(const SeriesId128& seriesId);
+  // Bulk prefetch: warm the full index cache for multiple series in parallel
+  seastar::future<> prefetchFullIndexEntries(const std::vector<SeriesId128>& seriesIds);
 
   template <class T>
   seastar::future<> readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
@@ -180,6 +187,16 @@ public:
   tsdb::TSMTombstone* getTombstones() { return tombstones.get(); }
   bool hasTombstones() const { return tombstones && tombstones->getEntryCount() > 0; }
   
+  // Pushdown aggregation: decode blocks and fold directly into BlockAggregator
+  // instead of materialising TSMResult. Returns the number of points aggregated.
+  // Only works for Float series; returns 0 for other types.
+  seastar::future<size_t> aggregateSeries(
+    const SeriesId128& seriesId,
+    uint64_t startTime,
+    uint64_t endTime,
+    tsdb::BlockAggregator& aggregator
+  );
+
   // Delete tombstone file after compaction
   seastar::future<> deleteTombstoneFile();
 };

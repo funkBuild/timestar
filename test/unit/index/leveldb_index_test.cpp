@@ -221,25 +221,25 @@ seastar::future<> testFindSeries() {
         {{"host", "server-01"}, {"datacenter", "dc1"}}, "usage");
 
     // Test 1: Find all series for a measurement (no filters)
-    auto allCpuSeries = co_await index.findSeries("cpu");
+    auto allCpuSeries = (co_await index.findSeries("cpu")).value();
     EXPECT_EQ(allCpuSeries.size(), 3);
 
     // Test 2: Find series with single tag filter
-    auto dc1Series = co_await index.findSeries("cpu", {{"datacenter", "dc1"}});
+    auto dc1Series = (co_await index.findSeries("cpu", {{"datacenter", "dc1"}})).value();
     EXPECT_EQ(dc1Series.size(), 2);
 
     // Test 3: Find series with multiple tag filters
-    auto server01Dc1 = co_await index.findSeries("cpu",
-        {{"host", "server-01"}, {"datacenter", "dc1"}});
+    auto server01Dc1 = (co_await index.findSeries("cpu",
+        {{"host", "server-01"}, {"datacenter", "dc1"}})).value();
     EXPECT_EQ(server01Dc1.size(), 1);
     EXPECT_EQ(server01Dc1[0], id1);
 
     // Test 4: Find series with no matches
-    auto noMatches = co_await index.findSeries("cpu", {{"host", "server-99"}});
+    auto noMatches = (co_await index.findSeries("cpu", {{"host", "server-99"}})).value();
     EXPECT_EQ(noMatches.size(), 0);
 
     // Test 5: Find series for different measurement
-    auto memSeries = co_await index.findSeries("memory");
+    auto memSeries = (co_await index.findSeries("memory")).value();
     EXPECT_EQ(memSeries.size(), 1);
     EXPECT_EQ(memSeries[0], id4);
 

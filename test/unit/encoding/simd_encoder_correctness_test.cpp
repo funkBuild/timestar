@@ -10,6 +10,7 @@
 #include "../../../lib/encoding/integer/integer_encoder_avx512.hpp"
 #include "../../../lib/encoding/zigzag.hpp"
 #include <vector>
+#include <span>
 #include <cmath>
 #include <random>
 #include <limits>
@@ -407,7 +408,7 @@ protected:
 
     // Encode with a given encoder, decode, and return decoded values
     static std::vector<uint64_t> roundtrip(
-        AlignedBuffer (*encodeFn)(const std::vector<uint64_t>&),
+        AlignedBuffer (*encodeFn)(std::span<const uint64_t>),
         std::pair<size_t, size_t> (*decodeFn)(Slice&, unsigned int, std::vector<uint64_t>&, uint64_t, uint64_t),
         const std::vector<uint64_t>& values)
     {

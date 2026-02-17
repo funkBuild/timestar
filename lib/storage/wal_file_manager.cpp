@@ -227,7 +227,9 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     co_return; // No work to do
   }
 
+#if TSDB_LOG_INSERT_PATH
   auto start_wal_batch = std::chrono::high_resolution_clock::now();
+#endif
   LOG_INSERT_PATH(tsdb::wal_log, info,
                   "[PERF] [WAL] Batch insert started for {} requests",
                   insertRequests.size());
@@ -238,9 +240,10 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
   }
 
   // First, estimate the total size of this batch to check if it exceeds
-  // threshold
+  // threshold. We compute this once and pass it through to MemoryStore::insertBatch
+  // so it can skip its own re-estimation.
+  size_t totalEstimatedSize = 0;
   if (memoryStores[0] && memoryStores[0]->getWAL()) {
-    size_t totalEstimatedSize = 0;
     for (auto &insertRequest : insertRequests) {
       totalEstimatedSize +=
           memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
@@ -262,10 +265,15 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
                   "[WAL] Inserting batch into memory store for {} requests",
                   insertRequests.size());
 
+#if TSDB_LOG_INSERT_PATH
   auto start_memory_batch = std::chrono::high_resolution_clock::now();
-  // Try to insert batch - returns true if rollover is needed
-  bool needsRollover = co_await memoryStores[0]->insertBatch(insertRequests);
+#endif
+  // Try to insert batch - returns true if rollover is needed.
+  // Pass the pre-computed size so MemoryStore skips redundant estimation.
+  bool needsRollover = co_await memoryStores[0]->insertBatch(insertRequests, totalEstimatedSize);
+#if TSDB_LOG_INSERT_PATH
   auto end_memory_batch = std::chrono::high_resolution_clock::now();
+#endif
 
   if (needsRollover) {
     LOG_INSERT_PATH(
@@ -275,16 +283,13 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     // Rollover the WAL
     co_await rolloverMemoryStore();
 
-    // Now retry the batch insert with the new memory store
-    bool retryResult = co_await memoryStores[0]->insertBatch(insertRequests);
+    // Now retry the batch insert with the new memory store.
+    // Pass the same pre-computed size; it's still valid for the fresh WAL.
+    bool retryResult = co_await memoryStores[0]->insertBatch(insertRequests, totalEstimatedSize);
     if (retryResult) {
-      // The batch still doesn't fit in a fresh WAL - it's too large
-      size_t totalEstimatedSize = 0;
-      for (auto &insertRequest : insertRequests) {
-        totalEstimatedSize +=
-            memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
-      }
-
+      // The batch still doesn't fit in a fresh WAL - it's too large.
+      // Re-use the already-computed totalEstimatedSize (each per-insert size
+      // is cached in the TSDBInsert, so no re-iteration is needed).
       tsdb::wal_log.error("Batch insert of {} bytes too large for fresh WAL",
                           totalEstimatedSize);
       throw std::runtime_error(
@@ -294,6 +299,7 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     }
   }
 
+#if TSDB_LOG_INSERT_PATH
   auto end_wal_batch = std::chrono::high_resolution_clock::now();
   auto memory_batch_duration =
       std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch -
@@ -306,6 +312,7 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
                   memory_batch_duration.count());
   LOG_INSERT_PATH(tsdb::wal_log, info, "[PERF] [WAL] Total batch insert: {}μs",
                   wal_batch_duration.count());
+#endif
 }
 
 seastar::future<> WALFileManager::rolloverMemoryStore() {
@@ -497,8 +504,13 @@ WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
 
 std::optional<TSMValueType>
 WALFileManager::getSeriesType(const std::string &seriesKey) {
-  std::optional<TSMValueType> seriesType;
   SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+  return getSeriesType(seriesId);
+}
+
+std::optional<TSMValueType>
+WALFileManager::getSeriesType(const SeriesId128 &seriesId) {
+  std::optional<TSMValueType> seriesType;
 
   for (auto const &memoryStore : memoryStores) {
     seriesType = memoryStore.get()->getSeriesType(seriesId);

@@ -5,15 +5,18 @@
 #include <cpuid.h>
 #include <cstring>
 
-// Check for AVX-512F and AVX-512DQ support
+// Check for AVX-512F and AVX-512DQ support (cached - CPUID only called once)
 bool IntegerEncoderAVX512::isAvailable() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-        bool has_avx512f = (ebx & (1 << 16)) != 0;  // AVX512F is bit 16 of EBX
-        bool has_avx512dq = (ebx & (1 << 17)) != 0; // AVX512DQ is bit 17 of EBX
-        return has_avx512f && has_avx512dq;
-    }
-    return false;
+    static const bool available = []() {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+            bool has_avx512f = (ebx & (1 << 16)) != 0;  // AVX512F is bit 16 of EBX
+            bool has_avx512dq = (ebx & (1 << 17)) != 0; // AVX512DQ is bit 17 of EBX
+            return has_avx512f && has_avx512dq;
+        }
+        return false;
+    }();
+    return available;
 }
 
 // SIMD zigzag encode for 8 values at once using AVX-512
@@ -55,7 +58,7 @@ static inline __m512i zigzagDecode8_avx512(const uint64_t* values) {
     return result;
 }
 
-AlignedBuffer IntegerEncoderAVX512::encode(const std::vector<uint64_t> &values) {
+AlignedBuffer IntegerEncoderAVX512::encode(std::span<const uint64_t> values) {
     if (values.empty()) {
         return AlignedBuffer();
     }

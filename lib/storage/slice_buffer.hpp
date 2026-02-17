@@ -10,8 +10,12 @@
 
 class CompressedSlice {
 private:
+  // Owning storage used only when the data must be copied (non-aligned or
+  // caller-owned temporary buffer).  When null, data_ points directly into
+  // an externally-owned buffer (zero-copy mode).
   std::unique_ptr<uint64_t[]> alignedStorage_;
-  size_t length_;
+  const uint8_t *data_;   // raw byte pointer to the data (owned or borrowed)
+  size_t length_;          // number of logical uint64_t words
   size_t offset = 0;
   int bitOffset = 0;
 
@@ -21,11 +25,24 @@ private:
     }
   }
 
+  // Load a uint64_t from the word at `wordIndex` using memcpy.
+  // This is safe for any alignment and compiles to a single mov on x86-64.
+  inline uint64_t loadWord(size_t wordIndex) const {
+    uint64_t word;
+    std::memcpy(&word, data_ + wordIndex * 8, sizeof(uint64_t));
+    return word;
+  }
+
 public:
+  // Legacy public member kept for ABI compatibility; points to data_ reinterpreted.
+  // DEPRECATED: external code should not access this directly.
   const uint64_t *data;
 
+  // Copying constructor: allocates aligned storage and copies the input data.
+  // Handles non-multiple-of-8 lengths by zero-padding the last word.
   CompressedSlice(const uint8_t *_data, size_t _length)
     : alignedStorage_(std::make_unique<uint64_t[]>((_length + 7) / 8)),
+      data_(reinterpret_cast<const uint8_t*>(alignedStorage_.get())),
       length_((_length + 7) / 8),
       data(alignedStorage_.get())
   {
@@ -35,6 +52,26 @@ public:
     if (remainder != 0) {
       auto* bytePtr = reinterpret_cast<uint8_t*>(alignedStorage_.get()) + _length;
       std::memset(bytePtr, 0, 8 - remainder);
+    }
+  }
+
+  // Zero-copy constructor: borrows the given pointer without allocating or
+  // copying.  The caller MUST ensure the pointed-to buffer outlives this
+  // CompressedSlice.  `byteLength` must be a multiple of 8; this is
+  // always the case for float-encoded value data in TSM blocks.
+  struct ZeroCopy {};
+  CompressedSlice(ZeroCopy, const uint8_t *_data, size_t _byteLength)
+    : alignedStorage_(nullptr),
+      data_(_data),
+      length_(_byteLength / 8),
+      data(reinterpret_cast<const uint64_t*>(_data))  // may be unaligned, kept for compat
+  {
+    // Zero-copy mode requires the byte length to be a multiple of 8 so that
+    // we don't need to worry about padding the last word.
+    if (_byteLength % 8 != 0) {
+      throw std::runtime_error(
+        "CompressedSlice zero-copy requires byteLength to be a multiple of 8, got " +
+        std::to_string(_byteLength));
     }
   }
 
@@ -51,7 +88,7 @@ public:
     const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
     const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
 
-    uint64_t value = data[offset] >> bitOffset;
+    uint64_t value = loadWord(offset) >> bitOffset;
     value &= mask;
 
     if(leftover_bits > 0) {
@@ -61,7 +98,7 @@ public:
       boundsCheck(offset);
 
       const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-      value |= (data[offset] & mask) << bits_read;
+      value |= (loadWord(offset) & mask) << bits_read;
     } else {
       bitOffset += bits;
     }
@@ -82,7 +119,7 @@ public:
     const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
     const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
 
-    uint64_t value = data[offset] >> bitOffset;
+    uint64_t value = loadWord(offset) >> bitOffset;
     value &= mask;
 
     if(leftover_bits > 0) {
@@ -92,7 +129,7 @@ public:
       boundsCheck(offset);
 
       const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-      value |= (data[offset] & mask) << bits_read;
+      value |= (loadWord(offset) & mask) << bits_read;
     } else {
       bitOffset += bits;
     }
@@ -107,12 +144,12 @@ public:
 
       boundsCheck(offset);
 
-      return (data[offset] & 1) == 1;
+      return (loadWord(offset) & 1) == 1;
     }
 
     boundsCheck(offset);
 
-    bool value = ((data[offset] >> bitOffset) & 1) == 1;
+    bool value = ((loadWord(offset) >> bitOffset) & 1) == 1;
     bitOffset++;
 
     return value;
@@ -184,11 +221,20 @@ public:
     }
 
     const uint8_t* ref = data + offset;
-    CompressedSlice slice(ref, byteLength);
-
     offset += byteLength;
 
-    return slice;
+    // Zero-copy path: when the byte length is a multiple of 8, we can
+    // borrow the pointer directly into the underlying buffer, avoiding
+    // an allocation and memcpy.  This is the common case for float-encoded
+    // value data in TSM blocks (CompressedBuffer always produces a
+    // multiple-of-8 byte stream).
+    if (byteLength % 8 == 0) {
+      return CompressedSlice(CompressedSlice::ZeroCopy{}, ref, byteLength);
+    }
+
+    // Fallback: copy into aligned storage (handles non-multiple-of-8 lengths
+    // by zero-padding the last word).
+    return CompressedSlice(ref, byteLength);
   }
 
   template <class T>

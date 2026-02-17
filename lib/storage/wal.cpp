@@ -13,6 +13,7 @@
 #include "string_encoder.hpp"
 #include "tsm.hpp"
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <optional>
@@ -204,43 +205,52 @@ seastar::future<> WAL::remove() {
 //   [uint32_t  skipBytes]  <-- number of additional zero bytes following
 //   [skipBytes zero bytes]
 //
-// Total padding is always >= 8 bytes.  If the natural padding would be less
-// than 8, we bump up by one full alignment block so the header always fits.
+// Total padding is always >= 8 bytes and a multiple of _dma_alignment above
+// the current position.  If the natural gap to the next alignment boundary is
+// less than 8 bytes, we target the boundary *after* that so the 8-byte header
+// always fits.  The entire payload (header + zero body) is assembled into a
+// static buffer (zero-initialised once) and issued as a single write.
 seastar::future<> WAL::padToAlignment() {
   if (!out || _dma_alignment <= 1)
     co_return;
 
-  size_t remainder = _unflushed_bytes % _dma_alignment;
+  const size_t remainder = _unflushed_bytes % _dma_alignment;
   if (remainder == 0)
     co_return; // already aligned
 
   size_t padding = _dma_alignment - remainder;
 
-  // Ensure at least 8 bytes so the structured header (marker + skipBytes)
-  // always fits.
+  // The structured header needs 8 bytes (4-byte zero marker + 4-byte skip
+  // count).  If the gap to the nearest alignment boundary is < 8 bytes, step
+  // to the *next* boundary so the header fits while keeping
+  // (_unflushed_bytes + padding) aligned.
   if (padding < 8) {
     padding += _dma_alignment;
   }
 
-  // Write the 8-byte header: [paddingMarker=0][skipBytes]
-  const uint32_t paddingMarker = 0;
-  const uint32_t skipBytes = static_cast<uint32_t>(padding - 8);
-  co_await out->write(reinterpret_cast<const char *>(&paddingMarker),
-                      sizeof(paddingMarker));
-  co_await out->write(reinterpret_cast<const char *>(&skipBytes),
-                      sizeof(skipBytes));
+  // Static buffer, zero-initialised once.  Seastar's shard-per-core model
+  // guarantees single-threaded access, so no synchronisation is needed.
+  // Maximum padding is (_dma_alignment * 2 - 1) bytes; 8192 covers the
+  // common 4096-byte DMA alignment with headroom.
+  static constexpr size_t PAD_BUF_SIZE = 8192;
+  static char buf[PAD_BUF_SIZE] = {};  // zero-initialised once at startup
 
-  // Write the remaining zero bytes.
-  if (skipBytes > 0) {
-    char zeros[4096] = {};
-    size_t written = 0;
-    while (written < skipBytes) {
-      size_t chunk =
-          std::min(static_cast<size_t>(skipBytes) - written, sizeof(zeros));
-      co_await out->write(zeros, chunk);
-      written += chunk;
-    }
+  // Safety: if an exotic filesystem reports a very large DMA alignment,
+  // fall back to a heap buffer rather than overflowing.
+  char *pad_ptr = buf;
+  std::vector<char> heap_buf;
+  if (padding > PAD_BUF_SIZE) [[unlikely]] {
+    heap_buf.resize(padding, '\0');
+    pad_ptr = heap_buf.data();
   }
+
+  // Write the structured header into the (reusable) buffer.
+  // Bytes 0-3: zero marker (always 0, so no need to re-zero).
+  // Bytes 4-7: skipBytes count.
+  const uint32_t skipBytes = static_cast<uint32_t>(padding - 8);
+  std::memcpy(pad_ptr + 4, &skipBytes, sizeof(skipBytes));
+
+  co_await out->write(pad_ptr, padding);
 
   _unflushed_bytes += padding;
   filePos += padding;
@@ -252,13 +262,16 @@ seastar::future<> WAL::flushBlock() {
   if (!out)
     co_return;
   try {
+#if TSDB_LOG_INSERT_PATH
     auto startTime = std::chrono::steady_clock::now();
+#endif
 
     // Pad to DMA alignment before flushing to keep file sink position aligned
     co_await padToAlignment();
     co_await out->flush();
     _unflushed_bytes = 0; // reset after successful flush
 
+#if TSDB_LOG_INSERT_PATH
     auto endTime = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime -
                                                                     startTime)
@@ -268,6 +281,7 @@ seastar::future<> WAL::flushBlock() {
     if (ms > 100) {
       tsdb::wal_log.warn("WAL flush took {}ms - potential I/O bottleneck", ms);
     }
+#endif
   } catch (const std::exception &e) {
     tsdb::wal_log.error("WAL flush error: {}", e.what());
   }
@@ -275,6 +289,14 @@ seastar::future<> WAL::flushBlock() {
 
 template <class T>
 size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
+  // Return cached result if available. The estimate depends on seriesKey,
+  // timestamps count, and values — all immutable once the insert is
+  // constructed and entering the pipeline. The cache is invalidated by
+  // setSharedTags() and setSharedTimestamps() if those are called.
+  if (insertRequest._cachedEstimatedSize.has_value()) {
+    return *insertRequest._cachedEstimatedSize;
+  }
+
   // Lightweight upper-bound estimation without performing full encoding.
   // This avoids the cost of encoding timestamps and values just to measure
   // their sizes. The actual encoded data is always <= the worst-case sizes
@@ -287,7 +309,7 @@ size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
   estimatedSize += 16; // SeriesId128 (fixed 16 bytes)
 
   // Series key string (length-prefixed)
-  std::string seriesKey = insertRequest.seriesKey();
+  const std::string& seriesKey = insertRequest.seriesKey();
   estimatedSize += 4 + seriesKey.size();
 
   estimatedSize += 1;  // value type
@@ -295,7 +317,7 @@ size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
 
   // Timestamps: worst case is uncompressed (count * sizeof(uint64_t)),
   // plus the 4-byte encoded-size prefix
-  const size_t count = insertRequest.timestamps.size();
+  const size_t count = insertRequest.getTimestamps().size();
   estimatedSize += 4 + count * sizeof(uint64_t);
 
   // Values: worst case depends on type, plus the 4-byte encoded-size prefix
@@ -314,67 +336,96 @@ size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
     }
   }
 
+  // Cache the result for subsequent calls on this insert
+  insertRequest._cachedEstimatedSize = estimatedSize;
+
   return estimatedSize;
 }
 
-template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
-  // --- Encoding phase (no lock needed) ---
-  // Build the payload (everything after the length prefix and CRC)
-  AlignedBuffer payload;
+// Encode a single WAL insert entry (header + payload + CRC) into the provided
+// buffer.  Shared by insert() and insertBatch() to avoid duplicating the
+// encoding logic.  All allocations go into the caller's buffer; the only
+// temporaries are the encoder outputs (which are memcpy'd in and destroyed).
+//
+// On-disk format per entry (unchanged, recovery-compatible):
+//   [uint32_t entryLength]  -- CRC + payload size
+//   [uint32_t CRC32]        -- over the payload bytes
+//   [payload bytes ...]
+template <class T>
+void WAL::encodeInsertEntry(AlignedBuffer &buffer, TSDBInsert<T> &insertRequest) {
+  // Record where this entry starts so we can backpatch the header
+  const size_t entryStart = buffer.size();
 
-  payload.write((uint8_t)WALType::Write);
+  // Write header placeholders (will be patched after encoding)
+  buffer.write(static_cast<uint32_t>(0)); // placeholder: entryLength
+  buffer.write(static_cast<uint32_t>(0)); // placeholder: CRC32
 
-  // Store SeriesId128 (fixed 16 bytes)
-  SeriesId128 seriesId = insertRequest.seriesId128();
-  std::string seriesIdBytes = seriesId.toBytes();
-  payload.write(seriesIdBytes);
+  const size_t payloadStart = buffer.size();
 
-  // Store series key string for recovery (length-prefixed)
-  std::string seriesKey = insertRequest.seriesKey();
-  payload.write((uint32_t)seriesKey.size());
-  payload.write(seriesKey);
+  // --- Payload directly into buffer ---
+  buffer.write(static_cast<uint8_t>(WALType::Write));
+
+  // Store SeriesId128 (fixed 16 bytes) — write raw bytes directly from the
+  // std::array, avoiding the toBytes() std::string allocation.
+  const auto &rawId = insertRequest.seriesId128().getRawData();
+  buffer.write_array(rawId.data(), rawId.size());
+
+  // Store series key string for recovery (length-prefixed).
+  // Use const reference to avoid copying the cached string.
+  const std::string &seriesKey = insertRequest.seriesKey();
+  buffer.write(static_cast<uint32_t>(seriesKey.size()));
+  buffer.write(seriesKey);
 
   // Value type
-  payload.write((uint8_t)TSM::getValueType<T>());
+  buffer.write(static_cast<uint8_t>(TSM::getValueType<T>()));
 
-  // Num of timestamps
-  payload.write((uint32_t)insertRequest.timestamps.size());
+  // Number of timestamps
+  const auto &tsVec = insertRequest.getTimestamps();
+  buffer.write(static_cast<uint32_t>(tsVec.size()));
 
   // Encoded timestamps
   {
-    AlignedBuffer encodedTimestamps =
-        IntegerEncoder::encode(insertRequest.timestamps);
-    payload.write((uint32_t)encodedTimestamps.size());
-    payload.write(encodedTimestamps);
+    AlignedBuffer encodedTimestamps = IntegerEncoder::encode(tsVec);
+    buffer.write(static_cast<uint32_t>(encodedTimestamps.size()));
+    buffer.write(encodedTimestamps);
   }
 
   // Encoded values
-  if constexpr (std::is_same<T, double>::value) {
+  if constexpr (std::is_same_v<T, double>) {
     CompressedBuffer encodedFloats = FloatEncoder::encode(insertRequest.values);
-    payload.write((uint32_t)encodedFloats.size());
-    payload.write(encodedFloats);
-  } else if constexpr (std::is_same<T, bool>::value) {
+    buffer.write(static_cast<uint32_t>(encodedFloats.size()));
+    buffer.write(encodedFloats);
+  } else if constexpr (std::is_same_v<T, bool>) {
     AlignedBuffer encodedBools = BoolEncoder::encode(insertRequest.values);
-    payload.write((uint32_t)encodedBools.size());
-    payload.write(encodedBools);
-  } else if constexpr (std::is_same<T, std::string>::value) {
+    buffer.write(static_cast<uint32_t>(encodedBools.size()));
+    buffer.write(encodedBools);
+  } else if constexpr (std::is_same_v<T, std::string>) {
     AlignedBuffer encodedStrings = StringEncoder::encode(insertRequest.values);
-    payload.write((uint32_t)encodedStrings.size());
-    payload.write(encodedStrings);
+    buffer.write(static_cast<uint32_t>(encodedStrings.size()));
+    buffer.write(encodedStrings);
   } else {
     throw std::runtime_error("Unsupported data type");
   }
 
-  // Compute CRC32 over the payload
-  uint32_t crc = CRC32::compute(payload.data.data(), payload.size());
+  // --- Backpatch header fields in-place ---
+  const size_t payloadSize = buffer.size() - payloadStart;
+  const uint32_t entryLength =
+      static_cast<uint32_t>(sizeof(uint32_t) + payloadSize); // CRC + payload
+  std::memcpy(buffer.data.data() + entryStart, &entryLength, sizeof(uint32_t));
 
-  // Assemble final buffer: [entryLength][crc32][payload]
-  // entryLength = 4 (CRC) + payload size
+  uint32_t crc =
+      CRC32::compute(buffer.data.data() + payloadStart, payloadSize);
+  std::memcpy(buffer.data.data() + entryStart + sizeof(uint32_t), &crc,
+              sizeof(uint32_t));
+}
+
+template <class T> seastar::future<WALInsertResult> WAL::insert(TSDBInsert<T> &insertRequest) {
+  // --- Encoding phase (no lock needed) ---
+  // Pre-allocate the buffer using the size estimate to avoid reallocations.
   AlignedBuffer buffer;
-  const uint32_t entryLength = static_cast<uint32_t>(4 + payload.size());
-  buffer.write(entryLength);
-  buffer.write(crc);
-  buffer.write(payload);
+  buffer.reserve(estimateInsertSize(insertRequest));
+
+  encodeInsertEntry(buffer, insertRequest);
 
   const size_t dataSize = buffer.size();
 
@@ -386,8 +437,8 @@ template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
   auto units = co_await seastar::get_units(_io_sem, 1);
 
   LOG_INSERT_PATH(tsdb::wal_log, debug,
-                  "WAL::insert - dataSize={}, entryLength={}, currentSize={}",
-                  dataSize, entryLength, currentSize);
+                  "WAL::insert - dataSize={}, currentSize={}",
+                  dataSize, currentSize);
 
   // Respect the 16MiB WAL limit BEFORE writing
   const size_t projectedSize = currentSize + dataSize;
@@ -395,7 +446,7 @@ template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
     tsdb::wal_log.debug("WAL::insert - Would exceed 16MB limit (current={}, "
                         "dataSize={}, projected={}), signaling rollover needed",
                         currentSize, dataSize, projectedSize);
-    throw std::runtime_error("WAL rollover needed");
+    co_return WALInsertResult::RolloverNeeded;
   }
 
   // Stream write
@@ -421,80 +472,39 @@ template <class T> seastar::future<> WAL::insert(TSDBInsert<T> &insertRequest) {
     tsdb::wal_log.error("WAL::insert write failed: {}", e.what());
     throw;
   }
+
+  co_return WALInsertResult::Success;
 }
 
 template <class T>
-seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
+seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
   if (insertRequests.empty()) {
-    co_return;
+    co_return WALInsertResult::Success;
   }
   if (insertRequests.size() == 1) {
-    co_await insert(insertRequests[0]);
-    co_return;
+    co_return co_await insert(insertRequests[0]);
   }
 
   // --- Encoding phase (no lock needed) ---
-  // Prepare all buffers first — encoding, compression, and CRC are CPU-bound
-  // and can run concurrently with other WAL operations.
-  std::vector<AlignedBuffer> buffers;
-  buffers.reserve(insertRequests.size());
-  size_t totalSize = 0;
+  // Single pre-allocated buffer: compute estimated total size, allocate once,
+  // encode all entries sequentially into the shared buffer, then write once.
+  // This eliminates N separate allocations, N moves, and N stream writes.
 
-  for (auto &insertRequest : insertRequests) {
-    // Build the payload first (everything after length prefix and CRC)
-    AlignedBuffer payload;
-
-    payload.write((uint8_t)WALType::Write);
-
-    // Store SeriesId128 (fixed 16 bytes)
-    SeriesId128 seriesId = insertRequest.seriesId128();
-    std::string seriesIdBytes = seriesId.toBytes();
-    payload.write(seriesIdBytes);
-
-    // Store series key string for recovery (length-prefixed)
-    std::string seriesKey = insertRequest.seriesKey();
-    payload.write((uint32_t)seriesKey.size());
-    payload.write(seriesKey);
-
-    payload.write((uint8_t)TSM::getValueType<T>());
-    payload.write((uint32_t)insertRequest.timestamps.size());
-
-    {
-      AlignedBuffer encodedTimestamps =
-          IntegerEncoder::encode(insertRequest.timestamps);
-      payload.write((uint32_t)encodedTimestamps.size());
-      payload.write(encodedTimestamps);
-    }
-
-    if constexpr (std::is_same<T, double>::value) {
-      CompressedBuffer encodedFloats =
-          FloatEncoder::encode(insertRequest.values);
-      payload.write((uint32_t)encodedFloats.size());
-      payload.write(encodedFloats);
-    } else if constexpr (std::is_same<T, bool>::value) {
-      AlignedBuffer encodedBools = BoolEncoder::encode(insertRequest.values);
-      payload.write((uint32_t)encodedBools.size());
-      payload.write(encodedBools);
-    } else if constexpr (std::is_same<T, std::string>::value) {
-      AlignedBuffer encodedStrings =
-          StringEncoder::encode(insertRequest.values);
-      payload.write((uint32_t)encodedStrings.size());
-      payload.write(encodedStrings);
-    }
-
-    // Compute CRC32 over the payload
-    uint32_t crc = CRC32::compute(payload.data.data(), payload.size());
-
-    // Assemble final buffer: [entryLength][crc32][payload]
-    AlignedBuffer buf;
-    uint32_t entryLength = static_cast<uint32_t>(4 + payload.size());
-    buf.write(entryLength);
-    buf.write(crc);
-    buf.write(payload);
-
-    totalSize += buf.size();
-    buffers.push_back(std::move(buf));
+  // First pass: compute total estimated size for pre-allocation
+  size_t estimatedTotal = 0;
+  for (auto &req : insertRequests) {
+    estimatedTotal += estimateInsertSize(req);
   }
+
+  AlignedBuffer buffer;
+  buffer.reserve(estimatedTotal);
+
+  // Second pass: encode each insert directly into the shared buffer
+  for (auto &insertRequest : insertRequests) {
+    encodeInsertEntry(buffer, insertRequest);
+  }
+
+  const size_t totalSize = buffer.size();
 
   // --- I/O phase (under lock) ---
   // Hold the gate BEFORE the semaphore (see insert() for rationale).
@@ -504,7 +514,7 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
   LOG_INSERT_PATH(
       tsdb::wal_log, debug,
       "WAL::insertBatch - {} entries, total size={}, currentSize={}",
-      buffers.size(), totalSize, currentSize);
+      insertRequests.size(), totalSize, currentSize);
 
   // WAL limit check (under lock so currentSize is authoritative)
   const size_t projected = currentSize + totalSize;
@@ -513,20 +523,16 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
         "WAL::insertBatch - Would exceed 16MB limit (current={}, total={}, "
         "projected={}), signaling rollover",
         currentSize, totalSize, projected);
-    throw std::runtime_error("WAL rollover needed");
+    co_return WALInsertResult::RolloverNeeded;
   }
 
   try {
     if (out) {
-      // Write all encoded buffers; output_stream will coalesce internally.
-      // We write all entries before updating filePos/currentSize so that
-      // if an exception is thrown mid-batch, accounting stays consistent.
-      for (auto &b : buffers) {
-        co_await out->write(reinterpret_cast<const char *>(b.data.data()),
-                            b.size());
-      }
+      // Single write for the entire batch
+      co_await out->write(reinterpret_cast<const char *>(buffer.data.data()),
+                          totalSize);
     }
-    // Only update positions atomically after ALL writes succeed
+    // Only update positions atomically after the write succeeds
     filePos += totalSize;
     currentSize += totalSize;
     _unflushed_bytes += totalSize;
@@ -541,34 +547,43 @@ seastar::future<> WAL::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     tsdb::wal_log.error("WAL::insertBatch write failed: {}", e.what());
     throw;
   }
+
+  co_return WALInsertResult::Success;
 }
 
 seastar::future<> WAL::deleteRange(const SeriesId128 &seriesId,
                                    uint64_t startTime, uint64_t endTime) {
   // --- Encoding phase (no lock needed) ---
-  // Build the payload (everything after the length prefix and CRC)
-  AlignedBuffer payload;
+  // Single-buffer encoding: write header placeholders, then payload, then
+  // patch the length and CRC in-place to avoid a second buffer + copy.
+  AlignedBuffer buffer;
 
+  constexpr size_t LENGTH_OFFSET = 0;
+  constexpr size_t CRC_OFFSET = sizeof(uint32_t);
+  constexpr size_t PAYLOAD_OFFSET = 2 * sizeof(uint32_t);
+  buffer.write((uint32_t)0); // placeholder: entryLength
+  buffer.write((uint32_t)0); // placeholder: CRC32
+
+  // --- Payload directly into buffer ---
   // Type
-  payload.write((uint8_t)WALType::DeleteRange);
+  buffer.write(static_cast<uint8_t>(WALType::DeleteRange));
 
-  // Series ID (fixed 16 bytes)
-  std::string seriesIdBytes = seriesId.toBytes();
-  payload.write(seriesIdBytes);
+  // Series ID (fixed 16 bytes) — write raw bytes directly, avoiding
+  // the toBytes() std::string allocation.
+  const auto &rawId = seriesId.getRawData();
+  buffer.write_array(rawId.data(), rawId.size());
 
   // Time range
-  payload.write(startTime);
-  payload.write(endTime);
+  buffer.write(startTime);
+  buffer.write(endTime);
 
-  // Compute CRC32 over the payload
-  uint32_t crc = CRC32::compute(payload.data.data(), payload.size());
+  // --- Patch header fields in-place ---
+  const size_t payloadSize = buffer.size() - PAYLOAD_OFFSET;
+  const uint32_t entryLength = static_cast<uint32_t>(sizeof(uint32_t) + payloadSize);
+  std::memcpy(buffer.data.data() + LENGTH_OFFSET, &entryLength, sizeof(uint32_t));
 
-  // Assemble final buffer: [entryLength][crc32][payload]
-  AlignedBuffer buffer;
-  uint32_t entryLength = static_cast<uint32_t>(4 + payload.size());
-  buffer.write(entryLength);
-  buffer.write(crc);
-  buffer.write(payload);
+  uint32_t crc = CRC32::compute(buffer.data.data() + PAYLOAD_OFFSET, payloadSize);
+  std::memcpy(buffer.data.data() + CRC_OFFSET, &crc, sizeof(uint32_t));
 
   const size_t n = buffer.size();
 
@@ -928,13 +943,7 @@ TSDBInsert<T> WALReader::readSeries(Slice &walSlice,
     FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, insertReq.values);
   } else if constexpr (std::is_same<T, std::string>::value) {
     auto valuesSlice = walSlice.getSlice(valueByteSize);
-    std::vector<std::string> allStrings;
-    StringEncoder::decode(valuesSlice, timestampsCount, allStrings);
-    insertReq.values.reserve(nTimestamps);
-    for (size_t i = nSkipped;
-         i < nSkipped + nTimestamps && i < allStrings.size(); i++) {
-      insertReq.values.push_back(std::move(allStrings[i]));
-    }
+    StringEncoder::decode(valuesSlice, timestampsCount, nSkipped, nTimestamps, insertReq.values);
   } else {
     throw std::runtime_error("Unsupported data type");
   }
@@ -943,19 +952,19 @@ TSDBInsert<T> WALReader::readSeries(Slice &walSlice,
 }
 
 // Explicit instantiations
-template seastar::future<>
+template seastar::future<WALInsertResult>
 WAL::insert<double>(TSDBInsert<double> &insertRequest);
-template seastar::future<> WAL::insert<bool>(TSDBInsert<bool> &insertRequest);
-template seastar::future<>
+template seastar::future<WALInsertResult> WAL::insert<bool>(TSDBInsert<bool> &insertRequest);
+template seastar::future<WALInsertResult>
 WAL::insert<std::string>(TSDBInsert<std::string> &insertRequest);
 template size_t
 WAL::estimateInsertSize<double>(TSDBInsert<double> &insertRequest);
 template size_t WAL::estimateInsertSize<bool>(TSDBInsert<bool> &insertRequest);
 template size_t
 WAL::estimateInsertSize<std::string>(TSDBInsert<std::string> &insertRequest);
-template seastar::future<>
+template seastar::future<WALInsertResult>
 WAL::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests);
-template seastar::future<>
+template seastar::future<WALInsertResult>
 WAL::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
-template seastar::future<> WAL::insertBatch<std::string>(
+template seastar::future<WALInsertResult> WAL::insertBatch<std::string>(
     std::vector<TSDBInsert<std::string>> &insertRequests);

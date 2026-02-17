@@ -4,15 +4,18 @@
 #include <cstring>
 
 bool FloatEncoderSIMD::isAvailable() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_max(0, nullptr) >= 7) {
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        return (ebx & (1 << 5)) != 0; // AVX2 bit
-    }
-    return false;
+    static const bool available = []() {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_max(0, nullptr) >= 7) {
+            __cpuid_count(7, 0, eax, ebx, ecx, edx);
+            return (ebx & (1 << 5)) != 0; // AVX2 bit
+        }
+        return false;
+    }();
+    return available;
 }
 
-CompressedBuffer FloatEncoderSIMD::encodeSafe(const std::vector<double>& values) {
+CompressedBuffer FloatEncoderSIMD::encodeSafe(std::span<const double> values) {
     if (isAvailable()) {
         return encode(values);
     } else {
@@ -20,7 +23,7 @@ CompressedBuffer FloatEncoderSIMD::encodeSafe(const std::vector<double>& values)
     }
 }
 
-CompressedBuffer FloatEncoderSIMD::encode(const std::vector<double>& values) {
+CompressedBuffer FloatEncoderSIMD::encode(std::span<const double> values) {
     if (values.empty()) {
         return CompressedBuffer();
     }

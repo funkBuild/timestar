@@ -5,12 +5,15 @@
 #include <cstring>
 
 bool FloatDecoderSIMD::isAvailable() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_max(0, nullptr) >= 7) {
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        return (ebx & (1 << 5)) != 0; // AVX2 bit
-    }
-    return false;
+    static const bool available = []() {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_max(0, nullptr) >= 7) {
+            __cpuid_count(7, 0, eax, ebx, ecx, edx);
+            return (ebx & (1 << 5)) != 0; // AVX2 bit
+        }
+        return false;
+    }();
+    return available;
 }
 
 void FloatDecoderSIMD::decodeSafe(CompressedSlice &encoded, size_t nToSkip, size_t length, std::vector<double> &out) {

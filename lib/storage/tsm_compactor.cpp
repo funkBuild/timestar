@@ -1083,7 +1083,7 @@ seastar::future<std::string> TSMCompactor::compact(
     
     // Finalize the file
     writer.writeIndex();
-    writer.close();
+    co_await writer.closeDMA();
     
     // Calculate statistics
     auto endTime = std::chrono::steady_clock::now();

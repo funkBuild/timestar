@@ -85,12 +85,10 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
 
   std::string filename = "shard_" + std::to_string(shardId) + "/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
-  // TSMWriter uses blocking POSIX I/O (fopen, fwrite, fsync, fclose, rename).
-  // Wrap in seastar::async() to run on a Seastar worker thread instead of
-  // blocking the reactor thread.
-  co_await seastar::async([memStore, filename] {
-    TSMWriter::run(memStore, filename);
-  });
+  // TSMWriter::runAsync() uses Seastar DMA I/O for non-blocking writes.
+  // All in-memory buffer construction is synchronous (CPU-bound, fast),
+  // and only the final file write is async via open_file_dma + dma_write.
+  co_await TSMWriter::runAsync(memStore, filename);
   co_await openTsmFile(filename);
   
   // Check if this tier needs compaction after adding the new file
@@ -100,11 +98,13 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
 }
 
 std::optional<TSMValueType> TSMFileManager::getSeriesType(const std::string &seriesKey){
+  SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+  return getSeriesType(seriesId);
+}
+
+std::optional<TSMValueType> TSMFileManager::getSeriesType(const SeriesId128 &seriesId){
   std::optional<TSMValueType> seriesType;
 
-  // Convert series key to SeriesId128 for TSM operations
-  SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-  
   for (auto const &[seqNum, tsmFile] : sequencedTsmFiles){
     seriesType = tsmFile.get()->getSeriesType(seriesId);
 

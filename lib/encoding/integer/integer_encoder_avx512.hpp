@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <span>
 #include "../../storage/aligned_buffer.hpp"
 #include "../../storage/slice_buffer.hpp"
 
@@ -14,7 +15,7 @@
  */
 class IntegerEncoderAVX512 {
 public:
-    static AlignedBuffer encode(const std::vector<uint64_t> &values);
+    static AlignedBuffer encode(std::span<const uint64_t> values);
     static std::pair<size_t, size_t> decode(Slice &encoded, unsigned int timestampSize,
                                            std::vector<uint64_t> &values,
                                            uint64_t startTime = 0,

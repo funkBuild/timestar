@@ -99,7 +99,9 @@ public:
     static uint64_t parseInterval(const std::string& interval);
 
     // Format response as JSON (public for testing)
-    std::string formatQueryResponse(const QueryResponse& response, const std::vector<std::string>& requestedFields = {});
+    // Note: field filtering is performed in executeQuery(), so by the time this
+    // function is called, response.series already contains only the requested fields.
+    std::string formatQueryResponse(QueryResponse& response);
 
     // Create error response (public for testing)
     std::string createErrorResponse(const std::string& code, const std::string& message);

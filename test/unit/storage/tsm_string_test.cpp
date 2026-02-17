@@ -391,7 +391,7 @@ TEST_F(TSMStringTest, MemoryStoreWithStrings) {
     insert.addValue(4000, "Task completed");
     insert.addValue(5000, "System shutdown");
 
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     // Verify series exists
     SeriesId128 seriesId = insert.seriesId128();

@@ -64,6 +64,102 @@ double Aggregator::calculateSum(const std::vector<double>& values) {
 // DISTRIBUTED AGGREGATION
 // ============================================================================
 
+// Merge sorted raw (timestamps, values) into an existing sorted (timestamps, states).
+// Both inputs must be sorted by timestamp. Duplicate timestamps are merged via
+// AggregationState::addValue. O(n+m) time, O(n+m) space for the output buffer.
+static void mergeSortedRawInto(
+    std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
+    const std::vector<uint64_t>& newTs, const std::vector<double>& newValues) {
+
+    std::vector<uint64_t> mergedTs;
+    std::vector<AggregationState> mergedStates;
+    mergedTs.reserve(baseTs.size() + newTs.size());
+    mergedStates.reserve(baseTs.size() + newTs.size());
+
+    size_t i = 0, j = 0;
+    while (i < baseTs.size() && j < newTs.size()) {
+        if (baseTs[i] < newTs[j]) {
+            mergedTs.push_back(baseTs[i]);
+            mergedStates.push_back(std::move(baseStates[i]));
+            i++;
+        } else if (baseTs[i] > newTs[j]) {
+            mergedTs.push_back(newTs[j]);
+            AggregationState s;
+            s.addValue(newValues[j], newTs[j]);
+            mergedStates.push_back(s);
+            j++;
+        } else {
+            // Same timestamp: merge into existing state
+            mergedTs.push_back(baseTs[i]);
+            AggregationState s = std::move(baseStates[i]);
+            s.addValue(newValues[j], newTs[j]);
+            mergedStates.push_back(std::move(s));
+            i++;
+            j++;
+        }
+    }
+    while (i < baseTs.size()) {
+        mergedTs.push_back(baseTs[i]);
+        mergedStates.push_back(std::move(baseStates[i]));
+        i++;
+    }
+    while (j < newTs.size()) {
+        mergedTs.push_back(newTs[j]);
+        AggregationState s;
+        s.addValue(newValues[j], newTs[j]);
+        mergedStates.push_back(s);
+        j++;
+    }
+
+    baseTs = std::move(mergedTs);
+    baseStates = std::move(mergedStates);
+}
+
+// Merge two sorted (timestamps, states) vectors. Used in the reduce phase to
+// combine partial results from different shards. O(n+m) time.
+static void mergeSortedStatesInto(
+    std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
+    const std::vector<uint64_t>& newTs, const std::vector<AggregationState>& newStates) {
+
+    std::vector<uint64_t> mergedTs;
+    std::vector<AggregationState> mergedStates;
+    mergedTs.reserve(baseTs.size() + newTs.size());
+    mergedStates.reserve(baseTs.size() + newTs.size());
+
+    size_t i = 0, j = 0;
+    while (i < baseTs.size() && j < newTs.size()) {
+        if (baseTs[i] < newTs[j]) {
+            mergedTs.push_back(baseTs[i]);
+            mergedStates.push_back(std::move(baseStates[i]));
+            i++;
+        } else if (baseTs[i] > newTs[j]) {
+            mergedTs.push_back(newTs[j]);
+            mergedStates.push_back(newStates[j]);
+            j++;
+        } else {
+            mergedTs.push_back(baseTs[i]);
+            AggregationState s = std::move(baseStates[i]);
+            s.merge(newStates[j]);
+            mergedStates.push_back(std::move(s));
+            i++;
+            j++;
+        }
+    }
+    while (i < baseTs.size()) {
+        mergedTs.push_back(baseTs[i]);
+        mergedStates.push_back(std::move(baseStates[i]));
+        i++;
+    }
+    while (j < newTs.size()) {
+        mergedTs.push_back(newTs[j]);
+        mergedStates.push_back(newStates[j]);
+        j++;
+    }
+
+    baseTs = std::move(mergedTs);
+    baseStates = std::move(mergedStates);
+}
+
 std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
     const std::vector<tsdb::SeriesResult>& seriesResults,
     AggregationMethod method,
@@ -119,10 +215,15 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             auto& partial = it->second;
             if (inserted) {
                 partial.measurement = series.measurement;
-                partial.tags = relevantTags;
                 partial.fieldName = fieldName;
                 partial.groupKey = it->first.value;  // Read from the emplaced key
                 partial.groupKeyHash = keyHash;       // Reuse pre-computed hash
+                // Pre-reserve bucket map: at most one bucket per unique timestamp,
+                // so timestamps.size() is a safe upper bound that prevents rehashing
+                // for the typical case where this is the only series in the group.
+                if (interval > 0 && !timestamps.empty()) {
+                    partial.bucketStates.reserve(timestamps.size());
+                }
             }
 
             // PHASE 1 OPTIMIZATION: Two-phase aggregation - aggregate to states immediately
@@ -135,10 +236,24 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                     partial.totalPoints++;
                 }
             } else {
-                // No interval - aggregate by timestamp (per-timestamp aggregation)
-                for (size_t i = 0; i < timestamps.size(); ++i) {
-                    partial.timestampStates[timestamps[i]].addValue(doubleValues[i], timestamps[i]);
-                    partial.totalPoints++;
+                // No interval - sorted vector aggregation by timestamp.
+                // Input timestamps are sorted (from queryTsm). Use sorted merge
+                // to avoid std::map's O(log n) insert + per-node heap allocation.
+                partial.totalPoints += timestamps.size();
+                if (partial.sortedTimestamps.empty()) {
+                    // First series for this group: direct populate (common case)
+                    partial.sortedTimestamps.reserve(timestamps.size());
+                    partial.sortedStates.reserve(timestamps.size());
+                    for (size_t i = 0; i < timestamps.size(); ++i) {
+                        partial.sortedTimestamps.push_back(timestamps[i]);
+                        AggregationState s;
+                        s.addValue(doubleValues[i], timestamps[i]);
+                        partial.sortedStates.push_back(s);
+                    }
+                } else {
+                    // Multiple series in same group: O(n+m) sorted merge
+                    mergeSortedRawInto(partial.sortedTimestamps, partial.sortedStates,
+                                       timestamps, doubleValues);
                 }
             }
         }
@@ -159,7 +274,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 }
 
 std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGrouped(
-    const std::vector<PartialAggregationResult>& partialResults,
+    std::vector<PartialAggregationResult>& partialResults,
     AggregationMethod method) {
 
     if (partialResults.empty()) {
@@ -169,10 +284,10 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
     std::vector<GroupedAggregationResult> result;
 
     // Group partial results by pre-hashed composite key (no re-hashing of groupKey strings)
-    std::unordered_map<PrehashedString, std::vector<const PartialAggregationResult*>,
+    std::unordered_map<PrehashedString, std::vector<PartialAggregationResult*>,
                        PrehashedStringHash, PrehashedStringEqual> groups;
 
-    for (const auto& partial : partialResults) {
+    for (auto& partial : partialResults) {
         // Reuse the pre-computed groupKeyHash — no re-hashing of the string
         PrehashedString pkey(partial.groupKey, partial.groupKeyHash);
         auto [it, inserted] = groups.try_emplace(std::move(pkey));
@@ -183,23 +298,34 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
     result.reserve(groups.size());
 
     // Merge each group and preserve metadata
-    for (const auto& [groupKey, groupPartials] : groups) {
+    for (auto& [groupKey, groupPartials] : groups) {
         if (groupPartials.empty()) {
             continue;
         }
 
         // Create grouped result with metadata from first partial (all in group share same metadata)
         GroupedAggregationResult groupedResult;
-        groupedResult.measurement = groupPartials[0]->measurement;
-        groupedResult.tags = groupPartials[0]->tags;
-        groupedResult.fieldName = groupPartials[0]->fieldName;
+        groupedResult.measurement = std::move(groupPartials[0]->measurement);
+        groupedResult.tags = PartialAggregationResult::parseTagsFromGroupKey(groupPartials[0]->groupKey);
+        groupedResult.fieldName = std::move(groupPartials[0]->fieldName);
 
         // Check if we're using buckets or raw timestamps
         bool hasBuckets = !groupPartials[0]->bucketStates.empty();
 
         if (hasBuckets) {
-            // PHASE 1 OPTIMIZATION: Merge pre-aggregated states (O(1) per bucket)
+            // Merge pre-aggregated states (O(1) per bucket)
             std::unordered_map<uint64_t, AggregationState> mergedStates;
+
+            // Pre-reserve using the sum of all partial bucket counts as an upper bound.
+            // The actual bucket count may be lower if partials share buckets, but this
+            // avoids rehashing during the merge loop.
+            {
+                size_t totalBuckets = 0;
+                for (const auto* partial : groupPartials) {
+                    totalBuckets += partial->bucketStates.size();
+                }
+                mergedStates.reserve(totalBuckets);
+            }
 
             // Merge all partial states for each bucket; try_emplace avoids
             // default-constructing a state when the bucket already exists
@@ -212,7 +338,6 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 }
             }
 
-            // OPTIMIZATION: Pre-allocate points vector
             groupedResult.points.reserve(mergedStates.size());
 
             // Extract final aggregated values from merged states
@@ -220,7 +345,7 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 AggregatedPoint point;
                 point.timestamp = bucketTime;
                 point.count = state.count;
-                point.value = state.getValue(method);  // O(1) extraction
+                point.value = state.getValue(method);
                 groupedResult.points.push_back(point);
             }
 
@@ -231,26 +356,25 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 });
 
         } else {
-            // PHASE 1 OPTIMIZATION: Merge time-aligned states (interval == 0)
-            std::map<uint64_t, AggregationState> mergedStates;
+            // Non-bucketed: merge sorted parallel vectors via O(n+m) merge.
+            // Move from the first partial to avoid a copy, then merge the rest.
+            auto* first = groupPartials[0];
+            std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
+            std::vector<AggregationState> mergedStates = std::move(first->sortedStates);
 
-            // Merge all partial states for each timestamp; try_emplace avoids
-            // default-constructing a state when the timestamp already exists
-            for (const auto* partial : groupPartials) {
-                for (const auto& [timestamp, state] : partial->timestampStates) {
-                    auto [it, inserted] = mergedStates.try_emplace(timestamp, state);
-                    if (!inserted) {
-                        it->second.merge(state);
-                    }
-                }
+            for (size_t i = 1; i < groupPartials.size(); ++i) {
+                mergeSortedStatesInto(mergedTs, mergedStates,
+                                      groupPartials[i]->sortedTimestamps,
+                                      groupPartials[i]->sortedStates);
             }
 
-            // Extract final aggregated values from merged states
-            for (const auto& [timestamp, state] : mergedStates) {
+            // Extract final aggregated values (already sorted)
+            groupedResult.points.reserve(mergedTs.size());
+            for (size_t i = 0; i < mergedTs.size(); ++i) {
                 AggregatedPoint point;
-                point.timestamp = timestamp;
-                point.count = state.count;
-                point.value = state.getValue(method);  // O(1) extraction
+                point.timestamp = mergedTs[i];
+                point.count = mergedStates[i].count;
+                point.value = mergedStates[i].getValue(method);
                 groupedResult.points.push_back(point);
             }
         }

@@ -96,13 +96,18 @@ protected:
 TEST_F(FloatEncoderTest, AutoSelection) {
     std::string impl = FloatEncoder::getImplementationName();
     std::cout << "Selected implementation: " << impl << std::endl;
-    
-    if (FloatEncoder::hasAVX512()) {
-        EXPECT_TRUE(impl.find("AVX-512") != std::string::npos);
-    } else if (FloatEncoder::hasAVX2()) {
-        EXPECT_TRUE(impl.find("AVX2") != std::string::npos);
+
+    if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
+        EXPECT_TRUE(impl.find("ALP") != std::string::npos)
+            << "ALP compression is active, expected 'ALP' in name but got: " << impl;
     } else {
-        EXPECT_TRUE(impl.find("Original") != std::string::npos);
+        if (FloatEncoder::hasAVX512()) {
+            EXPECT_TRUE(impl.find("AVX-512") != std::string::npos);
+        } else if (FloatEncoder::hasAVX2()) {
+            EXPECT_TRUE(impl.find("AVX2") != std::string::npos);
+        } else {
+            EXPECT_TRUE(impl.find("Basic") != std::string::npos);
+        }
     }
 }
 
@@ -246,28 +251,49 @@ TEST_F(FloatEncoderTest, ImplementationConsistency) {
 // Test force implementation selection
 TEST_F(FloatEncoderTest, ForceImplementation) {
     auto data = generateConstantData(100, 42.0);
-    
-    // Force basic implementation
-    FloatEncoder::setImplementation(FloatEncoder::BASIC);
-    EXPECT_TRUE(FloatEncoder::getImplementationName().find("Basic") != std::string::npos);
-    testRoundtrip(data);
-    
-    // Force SIMD if available
-    if (FloatEncoderSIMD::isAvailable()) {
+
+    if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
+        // ALP is selected at compile time, so setImplementation has no effect
+        // on the algorithm used. Verify that the name stays "ALP" regardless
+        // of what implementation is forced, and that roundtrip still works.
+        FloatEncoder::setImplementation(FloatEncoder::BASIC);
+        EXPECT_TRUE(FloatEncoder::getImplementationName().find("ALP") != std::string::npos)
+            << "With ALP active, forcing BASIC should still report ALP";
+        testRoundtrip(data);
+
         FloatEncoder::setImplementation(FloatEncoder::SIMD);
-        EXPECT_TRUE(FloatEncoder::getImplementationName().find("AVX2") != std::string::npos);
+        EXPECT_TRUE(FloatEncoder::getImplementationName().find("ALP") != std::string::npos)
+            << "With ALP active, forcing SIMD should still report ALP";
         testRoundtrip(data);
-    }
-    
-    // Force AVX-512 if available
-    if (FloatEncoderAVX512::isAvailable()) {
+
         FloatEncoder::setImplementation(FloatEncoder::AVX512);
-        EXPECT_TRUE(FloatEncoder::getImplementationName().find("AVX-512") != std::string::npos);
+        EXPECT_TRUE(FloatEncoder::getImplementationName().find("ALP") != std::string::npos)
+            << "With ALP active, forcing AVX512 should still report ALP";
         testRoundtrip(data);
+
+        // Reset to auto
+        FloatEncoder::setImplementation(FloatEncoder::AUTO);
+    } else {
+        // Gorilla XOR mode: setImplementation selects between SIMD variants
+        FloatEncoder::setImplementation(FloatEncoder::BASIC);
+        EXPECT_TRUE(FloatEncoder::getImplementationName().find("Basic") != std::string::npos);
+        testRoundtrip(data);
+
+        if (FloatEncoderSIMD::isAvailable()) {
+            FloatEncoder::setImplementation(FloatEncoder::SIMD);
+            EXPECT_TRUE(FloatEncoder::getImplementationName().find("AVX2") != std::string::npos);
+            testRoundtrip(data);
+        }
+
+        if (FloatEncoderAVX512::isAvailable()) {
+            FloatEncoder::setImplementation(FloatEncoder::AVX512);
+            EXPECT_TRUE(FloatEncoder::getImplementationName().find("AVX-512") != std::string::npos);
+            testRoundtrip(data);
+        }
+
+        // Reset to auto
+        FloatEncoder::setImplementation(FloatEncoder::AUTO);
     }
-    
-    // Reset to auto
-    FloatEncoder::setImplementation(FloatEncoder::AUTO);
 }
 
 // Encoding performance benchmark

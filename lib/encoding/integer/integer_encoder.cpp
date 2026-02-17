@@ -6,7 +6,7 @@
 
 // Basic implementation without SIMD - optimized with loop unrolling
 
-AlignedBuffer IntegerEncoderBasic::encode(const std::vector<uint64_t> &values) {
+AlignedBuffer IntegerEncoderBasic::encode(std::span<const uint64_t> values) {
     if (values.empty()) {
         return AlignedBuffer();
     }

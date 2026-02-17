@@ -6,6 +6,31 @@
 using namespace seastar;
 using namespace httpd;
 
+// Helper to build a canonical series key from measurement + sorted tags + field.
+// Format: "measurement,tag1=val1,tag2=val2 field"
+// Avoids constructing a temporary TSDBInsert<double> object just to build the string.
+static std::string buildSeriesKey(const std::string& measurement,
+                                   const std::map<std::string, std::string>& tags,
+                                   const std::string& field) {
+    size_t totalSize = measurement.size() + 1 + field.size();
+    for (const auto& [k, v] : tags) {
+        totalSize += 1 + k.size() + 1 + v.size();
+    }
+
+    std::string key;
+    key.reserve(totalSize);
+    key.append(measurement);
+    for (const auto& [k, v] : tags) {
+        key += ',';
+        key.append(k);
+        key += '=';
+        key.append(v);
+    }
+    key += ' ';
+    key.append(field);
+    return key;
+}
+
 // Glaze-compatible structures for JSON parsing
 struct GlazeDeleteRequest {
     // For series key format
@@ -207,11 +232,18 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                             std::vector<std::pair<std::string, size_t>> seriesWithShards;
                             
                             // Find all series IDs that match the pattern
+                            // Delete operations don't enforce a series limit (0 = unlimited)
                             std::vector<SeriesId128> seriesIds;
                             if (tags.empty()) {
-                                seriesIds = co_await index.getAllSeriesForMeasurement(measurement);
+                                auto findResult = co_await index.getAllSeriesForMeasurement(measurement);
+                                if (findResult.has_value()) {
+                                    seriesIds = std::move(findResult.value());
+                                }
                             } else {
-                                seriesIds = co_await index.findSeries(measurement, tags);
+                                auto findResult = co_await index.findSeries(measurement, tags);
+                                if (findResult.has_value()) {
+                                    seriesIds = std::move(findResult.value());
+                                }
                             }
                             
                             // Get metadata for each series to check field filters and determine shard
@@ -235,11 +267,10 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                                     }
                                 }
                                 
-                                // Use canonical series key construction
-                                TSDBInsert<double> temp(metadata->measurement, metadata->field);
-                                temp.tags = metadata->tags;
-                                std::string seriesKey = temp.seriesKey();
-                                
+                                // Build series key directly without constructing a temporary
+                                // TSDBInsert<double> object
+                                std::string seriesKey = buildSeriesKey(metadata->measurement, metadata->tags, metadata->field);
+
                                 // Calculate target shard for this series using SeriesId128
                                 SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(seriesKey);
                                 size_t shard = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;

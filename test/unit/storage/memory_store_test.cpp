@@ -35,7 +35,7 @@ TEST_F(MemoryStoreTest, InsertFloatValues) {
     insert.addValue(4000, 22.0);
     insert.addValue(5000, 22.5);
     
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
     
     // Verify series exists
     auto seriesKey = insert.seriesKey();
@@ -63,7 +63,7 @@ TEST_F(MemoryStoreTest, InsertBooleanValues) {
     insert.addValue(2000, false);
     insert.addValue(3000, true);
     
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
     
     // Verify series exists
     auto seriesKey = insert.seriesKey();
@@ -89,17 +89,17 @@ TEST_F(MemoryStoreTest, MultipleSeries) {
     TSDBInsert<double> temp1("temperature", "room1");
     temp1.addValue(1000, 20.0);
     temp1.addValue(2000, 21.0);
-    store->insertMemory(temp1);
+    store->insertMemory(std::move(temp1));
     
     TSDBInsert<double> temp2("temperature", "room2");
     temp2.addValue(1000, 22.0);
     temp2.addValue(2000, 23.0);
-    store->insertMemory(temp2);
+    store->insertMemory(std::move(temp2));
     
     TSDBInsert<bool> door("door", "open");
     door.addValue(1000, true);
     door.addValue(2000, false);
-    store->insertMemory(door);
+    store->insertMemory(std::move(door));
     
     // Verify all series exist
     EXPECT_EQ(store->series.size(), 3);
@@ -128,13 +128,13 @@ TEST_F(MemoryStoreTest, AppendToExistingSeries) {
     TSDBInsert<double> insert1("metrics", "requests");
     insert1.addValue(1000, 100.0);
     insert1.addValue(2000, 200.0);
-    store->insertMemory(insert1);
+    store->insertMemory(std::move(insert1));
     
     // Append more values
     TSDBInsert<double> insert2("metrics", "requests");
     insert2.addValue(3000, 300.0);
     insert2.addValue(4000, 400.0);
-    store->insertMemory(insert2);
+    store->insertMemory(std::move(insert2));
     
     // Verify all values exist
     auto seriesKey = insert1.seriesKey();
@@ -163,7 +163,7 @@ TEST_F(MemoryStoreTest, EmptyStore) {
     // Add data
     TSDBInsert<double> insert("test", "series");
     insert.addValue(1000, 1.0);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
     
     EXPECT_FALSE(store->isEmpty());
 }
@@ -183,7 +183,7 @@ TEST_F(MemoryStoreTest, SeriesKeyFormat) {
     EXPECT_NE(seriesKey.find("location=seattle"), std::string::npos);
     EXPECT_NE(seriesKey.find("sensor=outdoor"), std::string::npos);
     
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
     
     SeriesId128 seriesId = insert.seriesId128();
     auto it = store->series.find(seriesId);
@@ -200,7 +200,7 @@ TEST_F(MemoryStoreTest, SortingTimestamps) {
     insert.addValue(5000, 5.0);
     insert.addValue(4000, 4.0);
     
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
     
     auto seriesKey = insert.seriesKey();
     SeriesId128 seriesId = insert.seriesId128();
@@ -232,7 +232,7 @@ TEST_F(MemoryStoreTest, InsertStringValues) {
     insert.addValue(3000, "Info: Request completed");
     insert.addValue(4000, "Debug: Cache hit");
 
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     // Verify series exists
     auto seriesKey = insert.seriesKey();
@@ -257,15 +257,15 @@ TEST_F(MemoryStoreTest, InsertMixedTypes) {
     // Test that we can have float, bool, and string series in same store
     TSDBInsert<double> floatInsert("metrics", "cpu");
     floatInsert.addValue(1000, 75.5);
-    store->insertMemory(floatInsert);
+    store->insertMemory(std::move(floatInsert));
 
     TSDBInsert<bool> boolInsert("status", "online");
     boolInsert.addValue(1000, true);
-    store->insertMemory(boolInsert);
+    store->insertMemory(std::move(boolInsert));
 
     TSDBInsert<std::string> stringInsert("app", "state");
     stringInsert.addValue(1000, "running");
-    store->insertMemory(stringInsert);
+    store->insertMemory(std::move(stringInsert));
 
     EXPECT_EQ(store->series.size(), 3);
 
@@ -286,7 +286,7 @@ TEST_F(MemoryStoreTest, QuerySeriesFloat) {
     insert.addValue(1000, 20.5);
     insert.addValue(2000, 21.0);
     insert.addValue(3000, 21.5);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     // Query the series
     SeriesId128 seriesId = insert.seriesId128();
@@ -304,7 +304,7 @@ TEST_F(MemoryStoreTest, QuerySeriesString) {
     insert.addValue(1000, "starting");
     insert.addValue(2000, "running");
     insert.addValue(3000, "stopping");
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     // Query the series
     SeriesId128 seriesId = insert.seriesId128();
@@ -330,7 +330,7 @@ TEST_F(MemoryStoreTest, DeleteRangeFloat) {
     insert.addValue(3000, 30.0);
     insert.addValue(4000, 40.0);
     insert.addValue(5000, 50.0);
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     // Delete middle range (2000-3000)
     SeriesId128 seriesId = insert.seriesId128();
@@ -354,7 +354,7 @@ TEST_F(MemoryStoreTest, DeleteRangeString) {
     insert.addValue(2000, "second");
     insert.addValue(3000, "third");
     insert.addValue(4000, "fourth");
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     // Delete range (2000-2000) - just the second value
     SeriesId128 seriesId = insert.seriesId128();
@@ -378,7 +378,7 @@ TEST_F(MemoryStoreTest, EmptyStringValues) {
     insert.addValue(2000, "not empty");
     insert.addValue(3000, "");
 
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     SeriesId128 seriesId = insert.seriesId128();
     auto it = store->series.find(seriesId);
@@ -399,7 +399,7 @@ TEST_F(MemoryStoreTest, LongStringValues) {
     insert.addValue(1000, longString);
     insert.addValue(2000, "short");
 
-    store->insertMemory(insert);
+    store->insertMemory(std::move(insert));
 
     SeriesId128 seriesId = insert.seriesId128();
     auto it = store->series.find(seriesId);

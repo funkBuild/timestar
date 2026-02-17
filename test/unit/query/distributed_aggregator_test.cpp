@@ -144,8 +144,8 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsBasic) {
     EXPECT_EQ(partials[0].fieldName, "usage");
     EXPECT_EQ(partials[0].totalPoints, 3);
 
-    // Should have timestamp states (interval == 0)
-    EXPECT_EQ(partials[0].timestampStates.size(), 3);
+    // Should have sorted timestamp/state vectors (interval == 0)
+    EXPECT_EQ(partials[0].sortedTimestamps.size(), 3);
     EXPECT_TRUE(partials[0].bucketStates.empty());
 }
 
@@ -170,7 +170,7 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithInterval) {
 
     // Should have bucket states (interval > 0)
     EXPECT_EQ(partials[0].bucketStates.size(), 3); // Buckets at 0, 2000000000, 4000000000
-    EXPECT_TRUE(partials[0].timestampStates.empty());
+    EXPECT_TRUE(partials[0].sortedTimestamps.empty());
 }
 
 TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithGroupBy) {
@@ -191,8 +191,10 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithGroupBy) {
         seriesResults, AggregationMethod::AVG, 0, {"region"});
 
     ASSERT_EQ(partials.size(), 1); // Only one group (us-west)
-    EXPECT_EQ(partials[0].tags.size(), 1);
-    EXPECT_EQ(partials[0].tags["region"], "us-west");
+    // Tags are encoded in groupKey, not stored separately
+    auto parsedTags = PartialAggregationResult::parseTagsFromGroupKey(partials[0].groupKey);
+    EXPECT_EQ(parsedTags.size(), 1);
+    EXPECT_EQ(parsedTags["region"], "us-west");
     EXPECT_EQ(partials[0].totalPoints, 6); // 3 points from each series
 }
 

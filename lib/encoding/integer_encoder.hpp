@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <span>
 #include <string>
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -14,9 +15,11 @@
 class IntegerEncoder {
 public:
     /**
-     * Encode a vector of uint64_t values using the best available implementation
+     * Encode uint64_t values using the best available implementation.
+     * Accepts std::span for zero-copy sub-range encoding; std::vector
+     * converts implicitly.
      */
-    static AlignedBuffer encode(const std::vector<uint64_t> &values);
+    static AlignedBuffer encode(std::span<const uint64_t> values);
 
     /**
      * Decode compressed data back to uint64_t values using the best available implementation

@@ -24,10 +24,16 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/with_timeout.hh>
 
+class AlignedBuffer;
 class MemoryStore;
 
 enum class WALType { Write = 0, Delete, DeleteRange, Close };
 enum class WALValueType { Float = 0, Boolean, String };
+
+enum class WALInsertResult {
+    Success,
+    RolloverNeeded
+};
 
 // Structure to track timing information for WAL operations
 struct WALTimingInfo {
@@ -93,7 +99,7 @@ public:
   seastar::future<> init(MemoryStore *store, bool isRecovery = false);
 
   // Insert a single series write
-  template <class T> seastar::future<> insert(TSDBInsert<T> &insertRequest);
+  template <class T> seastar::future<WALInsertResult> insert(TSDBInsert<T> &insertRequest);
 
   // Lightweight upper-bound size estimation for capacity/rollover decisions
   // (does not perform actual encoding)
@@ -101,7 +107,17 @@ public:
 
   // Batch insert for multiple series at once (coalesces I/O)
   template <class T>
-  seastar::future<> insertBatch(std::vector<TSDBInsert<T>> &insertRequests);
+  seastar::future<WALInsertResult> insertBatch(std::vector<TSDBInsert<T>> &insertRequests);
+
+private:
+  // Encode a single insert entry (header + payload + CRC) into the provided
+  // buffer.  Used by both insert() and insertBatch() to avoid duplicating
+  // the encoding logic.  The buffer is appended to; the caller is responsible
+  // for pre-allocating sufficient capacity.
+  template <class T>
+  static void encodeInsertEntry(AlignedBuffer &buffer, TSDBInsert<T> &insertRequest);
+
+public:
 
   // Delete range operation
   seastar::future<> deleteRange(const SeriesId128 &seriesId, uint64_t startTime,
