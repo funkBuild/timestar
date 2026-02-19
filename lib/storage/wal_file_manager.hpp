@@ -47,18 +47,44 @@ public:
       tsdb::wal_log.info("[WAL_CLOSE] Background TSM conversions drained on shard {}", shardId);
     }
 
-    for (auto& store : memoryStores) {
+    // Snapshot remaining stores. convertWalToTsm() erases from memoryStores
+    // and calls removeWAL() internally, so we iterate a copy to avoid
+    // iterator invalidation.
+    auto snapshot = memoryStores;
+
+    for (auto& store : snapshot) {
       if (!store) continue;
-      try {
-        tsdb::wal_log.info("[WAL_CLOSE] Closing memory store {} on shard {}",
-                           store->sequenceNumber, shardId);
-        co_await store->close();
-      } catch (const std::exception& e) {
-        tsdb::wal_log.error("[WAL_CLOSE] Error closing memory store {} on shard {}: {}",
-                           store->sequenceNumber, shardId, e.what());
-        // Continue closing remaining stores
+
+      if (!store->isEmpty()) {
+        // Non-empty store: flush WAL to disk, then convert to TSM.
+        try {
+          tsdb::wal_log.info("[WAL_CLOSE] Flushing memory store {} to TSM on shard {}",
+                             store->sequenceNumber, shardId);
+          co_await store->close();          // flush WAL (idempotent)
+          co_await convertWalToTsm(store);  // write TSM + erase from memoryStores + removeWAL
+          tsdb::wal_log.info("[WAL_CLOSE] Successfully flushed store {} to TSM on shard {}",
+                             store->sequenceNumber, shardId);
+        } catch (const std::exception& e) {
+          tsdb::wal_log.error("[WAL_CLOSE] Failed to flush store {} to TSM on shard {}: {} "
+                              "(WAL preserved for recovery on next startup)",
+                              store->sequenceNumber, shardId, e.what());
+          // WAL file stays on disk — startup recovery will handle it.
+        }
+      } else {
+        // Empty store: just close and remove the WAL file.
+        try {
+          tsdb::wal_log.info("[WAL_CLOSE] Closing empty memory store {} on shard {}",
+                             store->sequenceNumber, shardId);
+          co_await store->close();
+          co_await store->removeWAL();
+        } catch (const std::exception& e) {
+          tsdb::wal_log.error("[WAL_CLOSE] Error closing empty store {} on shard {}: {}",
+                              store->sequenceNumber, shardId, e.what());
+        }
       }
     }
+
+    memoryStores.clear();
     tsdb::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
   }
   std::optional<TSMValueType> getSeriesType(const std::string &seriesKey);

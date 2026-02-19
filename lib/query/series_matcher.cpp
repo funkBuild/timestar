@@ -33,7 +33,13 @@ bool SeriesMatcher::matches(
 bool SeriesMatcher::matchesTag(
     const std::string& tagValue,
     const std::string& scopeValue) {
-    
+
+    // Check for ~regex pattern (starts with ~)
+    if (!scopeValue.empty() && scopeValue[0] == '~') {
+        std::string pattern = scopeValue.substr(1);
+        return matchesRegex(tagValue, pattern);
+    }
+
     // Check for regex pattern (starts with /)
     if (!scopeValue.empty() && scopeValue[0] == '/') {
         size_t endPos = scopeValue.rfind('/');
@@ -42,13 +48,13 @@ bool SeriesMatcher::matchesTag(
             return matchesRegex(tagValue, pattern);
         }
     }
-    
+
     // Check for wildcard pattern (contains * or ?)
-    if (scopeValue.find('*') != std::string::npos || 
+    if (scopeValue.find('*') != std::string::npos ||
         scopeValue.find('?') != std::string::npos) {
         return matchesWildcard(tagValue, scopeValue);
     }
-    
+
     // Exact match
     return tagValue == scopeValue;
 }
@@ -117,6 +123,67 @@ std::string SeriesMatcher::wildcardToRegex(const std::string& pattern) {
     }
     
     return "^" + regex + "$";
+}
+
+ScopeMatchType SeriesMatcher::classifyScope(const std::string& scopeValue) {
+    if (scopeValue.empty()) {
+        return ScopeMatchType::EXACT;
+    }
+    // ~regex or /regex/
+    if (scopeValue[0] == '~') {
+        return ScopeMatchType::REGEX;
+    }
+    if (scopeValue[0] == '/' && scopeValue.size() > 1 && scopeValue.rfind('/') > 0) {
+        return ScopeMatchType::REGEX;
+    }
+    // Wildcard if contains * or ?
+    if (scopeValue.find('*') != std::string::npos ||
+        scopeValue.find('?') != std::string::npos) {
+        return ScopeMatchType::WILDCARD;
+    }
+    return ScopeMatchType::EXACT;
+}
+
+std::string SeriesMatcher::extractLiteralPrefix(const std::string& scopeValue) {
+    if (scopeValue.empty()) {
+        return "";
+    }
+
+    std::string raw;
+    auto type = classifyScope(scopeValue);
+
+    switch (type) {
+    case ScopeMatchType::EXACT:
+        return scopeValue;
+    case ScopeMatchType::WILDCARD:
+        // Return everything before the first * or ?
+        for (char c : scopeValue) {
+            if (c == '*' || c == '?') break;
+            raw += c;
+        }
+        return raw;
+    case ScopeMatchType::REGEX: {
+        // Strip the ~ or / prefix
+        if (scopeValue[0] == '~') {
+            raw = scopeValue.substr(1);
+        } else {
+            // /pattern/ — strip leading / and trailing /
+            size_t endPos = scopeValue.rfind('/');
+            raw = scopeValue.substr(1, endPos - 1);
+        }
+        // Scan for first regex metacharacter
+        std::string prefix;
+        for (char c : raw) {
+            if (c == '[' || c == '(' || c == '.' || c == '*' || c == '+' ||
+                c == '?' || c == '{' || c == '|' || c == '\\' || c == '^' || c == '$') {
+                break;
+            }
+            prefix += c;
+        }
+        return prefix;
+    }
+    }
+    return "";
 }
 
 } // namespace tsdb

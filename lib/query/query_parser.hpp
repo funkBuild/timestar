@@ -36,6 +36,17 @@ struct QueryRequest {
     
     // Helper to check if query has grouping
     bool hasGroupBy() const { return !groupByTags.empty(); }
+
+    // Helper to check if any scope uses wildcard or regex patterns
+    bool hasPatternFilters() const {
+        for (const auto& [key, value] : scopes) {
+            if (value.find('*') != std::string::npos ||
+                value.find('?') != std::string::npos ||
+                (!value.empty() && (value[0] == '~' || value[0] == '/')))
+                return true;
+        }
+        return false;
+    }
 };
 
 class QueryParser {

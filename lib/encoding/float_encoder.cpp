@@ -1,4 +1,5 @@
 #include "float_encoder.hpp"
+#include "../storage/aligned_buffer.hpp"
 
 // Static member initialization
 FloatEncoder::Implementation FloatEncoder::s_forced_impl = FloatEncoder::AUTO;
@@ -29,6 +30,26 @@ CompressedBuffer FloatEncoder::encode(std::span<const double> values) {
             default:
                 return FloatEncoderBasic::encode(values);
         }
+    }
+}
+
+size_t FloatEncoder::encodeInto(std::span<const double> values, AlignedBuffer &target) {
+    if (values.empty()) [[unlikely]] {
+        return 0;
+    }
+
+    if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
+        // ALP encoding writes full 64-bit words, so we can encode directly
+        // into the AlignedBuffer without an intermediate CompressedBuffer.
+        return ALPEncoder::encodeInto(values, target);
+    } else {
+        // Gorilla encoding uses bit-level writes that require CompressedBuffer's
+        // bit-packing machinery. Encode into a CompressedBuffer, then bulk-copy
+        // the resulting uint64_t words into the target.
+        CompressedBuffer compressed = encode(values);
+        const size_t bytesToWrite = compressed.data.size() * sizeof(uint64_t);
+        target.write_array(compressed.data.data(), compressed.data.size());
+        return bytesToWrite;
     }
 }
 

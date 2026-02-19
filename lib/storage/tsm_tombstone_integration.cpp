@@ -238,6 +238,87 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     co_return result;
 }
 
+// Estimate fraction of file data covered by tombstones (metadata-only, no data reads).
+// Uses time-range overlap between tombstone ranges and index block [minTime, maxTime]
+// to estimate dead bytes, weighted by compressed block size.
+//
+// Threading: runs on a single shard's reactor.  The only suspension point is
+// prefetchFullIndexEntries() (DMA I/O).  After that, getSeriesBlocks() and
+// getTombstoneRanges() are pure synchronous cache/map lookups — no other task
+// on this shard can mutate the TSM object while the CPU-bound loop executes.
+seastar::future<double> TSM::estimateTombstoneCoverage() {
+    if (!hasTombstones()) {
+        co_return 0.0;
+    }
+
+    uint64_t fileSize = getFileSize();
+    if (fileSize == 0) {
+        co_return 0.0;
+    }
+
+    // Get all tombstoned series
+    auto tombstonedSeriesSet = tombstones->getTombstonedSeries();
+    if (tombstonedSeriesSet.empty()) {
+        co_return 0.0;
+    }
+
+    std::vector<SeriesId128> tombstonedSeries(tombstonedSeriesSet.begin(), tombstonedSeriesSet.end());
+
+    // Batch-prefetch full index entries into the LRU cache (single DMA I/O
+    // suspension point).  After this returns, getSeriesBlocks() is guaranteed
+    // to find the entries in cache — provided the number of tombstoned series
+    // is ≤ maxCacheEntries(), which is the common case.
+    co_await prefetchFullIndexEntries(tombstonedSeries);
+
+    // Pure CPU work below — no suspension points, no iterator invalidation risk.
+    double estimatedDeadBytes = 0.0;
+
+    for (const auto& seriesId : tombstonedSeries) {
+        auto blocks = getSeriesBlocks(seriesId);
+        if (blocks.empty()) {
+            continue;
+        }
+
+        auto ranges = tombstones->getTombstoneRanges(seriesId);
+        if (ranges.empty()) {
+            continue;
+        }
+
+        for (const auto& block : blocks) {
+            uint64_t blockDuration = block.maxTime - block.minTime;
+
+            if (blockDuration == 0) {
+                // Single-point block: 100% dead if timestamp falls in any range
+                auto rangeIt = std::upper_bound(ranges.begin(), ranges.end(),
+                    std::make_pair(block.minTime, std::numeric_limits<uint64_t>::max()));
+                if (rangeIt != ranges.begin()) {
+                    --rangeIt;
+                    if (block.minTime >= rangeIt->first && block.minTime <= rangeIt->second) {
+                        estimatedDeadBytes += block.size;
+                    }
+                }
+            } else {
+                // Compute total overlap duration between block range and tombstone ranges
+                uint64_t overlapDuration = 0;
+                for (const auto& [rStart, rEnd] : ranges) {
+                    if (rStart > block.maxTime || rEnd < block.minTime) {
+                        continue; // No overlap
+                    }
+                    uint64_t overlapStart = std::max(rStart, block.minTime);
+                    uint64_t overlapEnd = std::min(rEnd, block.maxTime);
+                    overlapDuration += (overlapEnd - overlapStart);
+                }
+                double overlapFraction = static_cast<double>(overlapDuration) / static_cast<double>(blockDuration);
+                // Clamp to [0, 1] in case of overlapping tombstone ranges
+                overlapFraction = std::min(overlapFraction, 1.0);
+                estimatedDeadBytes += overlapFraction * block.size;
+            }
+        }
+    }
+
+    co_return estimatedDeadBytes / static_cast<double>(fileSize);
+}
+
 // Delete tombstone file after successful compaction
 seastar::future<> TSM::deleteTombstoneFile() {
     if (tombstones) {
@@ -253,4 +334,6 @@ template seastar::future<TSMResult<double>> TSM::queryWithTombstones<double>(
 template seastar::future<TSMResult<bool>> TSM::queryWithTombstones<bool>(
     const SeriesId128&, uint64_t, uint64_t);
 template seastar::future<TSMResult<std::string>> TSM::queryWithTombstones<std::string>(
+    const SeriesId128&, uint64_t, uint64_t);
+template seastar::future<TSMResult<int64_t>> TSM::queryWithTombstones<int64_t>(
     const SeriesId128&, uint64_t, uint64_t);

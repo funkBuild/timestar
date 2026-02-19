@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 
 #include <seastar/core/coroutine.hh>
@@ -12,6 +13,7 @@
 #include "aligned_buffer.hpp"
 #include "tsm.hpp"
 #include "memory_store.hpp"
+#include "tsdb_config.hpp"
 
 // Forward declaration
 class TSMCompactor;
@@ -19,7 +21,7 @@ class TSMCompactor;
 class TSMFileManager {
 private:
   static constexpr size_t MAX_TIERS = 5;
-  static constexpr size_t FILES_PER_COMPACTION = 4;
+  static size_t filesPerCompaction() { return tsdb::config().storage.compaction.tier0_min_files; }
   
   int shardId;
   // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
@@ -30,8 +32,8 @@ private:
   // Track files by tier for compaction
   std::vector<seastar::shared_ptr<TSM>> tiers[MAX_TIERS];
   
-  // Compactor (using shared_ptr to work with forward declaration)
-  std::shared_ptr<TSMCompactor> compactor;
+  // Compactor (unique ownership, destructor defined in .cpp where TSMCompactor is complete)
+  std::unique_ptr<TSMCompactor> compactor;
   std::optional<seastar::future<>> compactionTask;
 
   seastar::future<> openTsmFile(std::string path);
@@ -42,6 +44,7 @@ public:
   std::map<unsigned int, seastar::shared_ptr<TSM>> sequencedTsmFiles;
 
   TSMFileManager();
+  ~TSMFileManager();  // Defined in .cpp where TSMCompactor is complete
 
   seastar::future<> init();
   seastar::future<> writeMemstore(seastar::shared_ptr<MemoryStore> memStore, uint64_t tier = 0);
@@ -55,6 +58,12 @@ public:
   seastar::future<> addTSMFile(seastar::shared_ptr<TSM> file);
   seastar::future<> removeTSMFiles(const std::vector<seastar::shared_ptr<TSM>>& files);
   
+  // Allocate a globally unique sequence ID for new TSM files
+  unsigned int allocateSequenceId() { return nextSequenceId++; }
+
+  // Get the compactor (for tombstone rewrites)
+  TSMCompactor* getCompactor() { return compactor.get(); }
+
   // Start background compaction
   seastar::future<> startCompactionLoop();
   seastar::future<> stopCompactionLoop();

@@ -7,95 +7,150 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <ranges>
 
 template <class T>
 void InMemorySeries<T>::insert(TSDBInsert<T>&& insertRequest){
-  if (insertRequest.getTimestamps().empty()) return;
+  const auto& srcTimestamps = insertRequest.getTimestamps();
+  if (srcTimestamps.empty()) [[unlikely]] return;
 
-  size_t oldSize = timestamps.size();
+  const size_t oldSize = timestamps.size();
+  const size_t newSize = srcTimestamps.size();
 
-  if (oldSize == 0) {
+  if (oldSize == 0) [[unlikely]] {
     // Series is empty -- take ownership of the entire vectors via move.
     // takeTimestamps() materializes shared timestamps into owned if needed.
     timestamps = insertRequest.takeTimestamps();
     values = std::move(insertRequest.values);
-  } else {
-    // Append new data. Use getTimestamps() for read access (works with shared).
-    const auto& srcTimestamps = insertRequest.getTimestamps();
-    timestamps.insert(timestamps.end(), srcTimestamps.begin(), srcTimestamps.end());
-    values.insert(values.end(),
-                  std::make_move_iterator(insertRequest.values.begin()),
-                  std::make_move_iterator(insertRequest.values.end()));
-  }
 
-  if (oldSize == 0) {
-    // First insert -- check if already sorted
-    bool sorted = true;
-    for (size_t i = 1; i < timestamps.size(); ++i) {
-      if (timestamps[i] < timestamps[i - 1]) {
-        sorted = false;
-        break;
-      }
-    }
-    if (!sorted) {
-      sort(0);
+    // First insert -- check if already sorted using std::ranges::is_sorted.
+    // In typical time-series workloads, data arrives chronologically, so this
+    // check short-circuits the sort in the common case.
+    if (!std::ranges::is_sorted(timestamps)) [[unlikely]] {
+      sortPaired(0, timestamps.size());
     }
     return;
   }
 
-  // Check if new data starts at or after the last existing timestamp
-  if (timestamps[oldSize] >= timestamps[oldSize - 1]) {
-    // Boundary is fine -- check if new data itself is sorted
-    bool newDataSorted = true;
-    for (size_t i = oldSize + 1; i < timestamps.size(); ++i) {
-      if (timestamps[i] < timestamps[i - 1]) {
-        newDataSorted = false;
-        break;
-      }
+  // Reserve capacity upfront to guarantee a single allocation for both vectors.
+  // Without this, the geometric growth strategy of std::vector may trigger
+  // multiple reallocations when appending large batches to near-capacity vectors.
+  const size_t totalSize = oldSize + newSize;
+  timestamps.reserve(totalSize);
+  values.reserve(totalSize);
+
+  // Append new data. insert() with iterators is optimized by the STL to
+  // perform a single memcpy/memmove for trivially copyable types (uint64_t, double, bool).
+  timestamps.insert(timestamps.end(), srcTimestamps.begin(), srcTimestamps.end());
+  values.insert(values.end(),
+                std::make_move_iterator(insertRequest.values.begin()),
+                std::make_move_iterator(insertRequest.values.end()));
+
+  // Fast path: check if the combined data is already sorted.
+  // In typical time-series workloads, new data arrives in chronological order
+  // and the first new timestamp >= last old timestamp, making this the common case.
+  const bool boundaryOk = timestamps[oldSize] >= timestamps[oldSize - 1];
+  if (boundaryOk) [[likely]] {
+    // Boundary is fine -- check if new data itself is sorted.
+    if (std::ranges::is_sorted(
+            std::ranges::subrange(timestamps.begin() + oldSize, timestamps.end()))) [[likely]] {
+      return;  // Everything already sorted, no work needed
     }
-    if (newDataSorted) return;  // Everything already sorted
+
+    // New suffix is unsorted but boundary was ok. Sort just the suffix, then
+    // re-check the boundary. If the minimum of the suffix (after sorting) is
+    // still >= old tail, we avoid a full merge.
+    sortPaired(oldSize, totalSize);
+
+    if (timestamps[oldSize] >= timestamps[oldSize - 1]) [[likely]] {
+      return;  // Suffix sorted and boundary still clean
+    }
+    // Fall through to merge: suffix is now sorted but boundary is violated
+    // (sorting moved a smaller timestamp to the front of the suffix).
+  } else {
+    // Boundary is violated. Sort the suffix first so we can merge two sorted runs.
+    if (!std::ranges::is_sorted(
+            std::ranges::subrange(timestamps.begin() + oldSize, timestamps.end()))) {
+      sortPaired(oldSize, totalSize);
+    }
   }
 
-  // Data is not sorted -- merge-sort only the new suffix, then merge with existing
-  sort(oldSize);
+  // Both [0, oldSize) and [oldSize, totalSize) are now individually sorted.
+  // Use inplace_merge on paired data to combine them in O(n) time
+  // (vs O(n log n) for a full sort).
+  mergePaired(oldSize);
 }
 
 template <class T>
-void InMemorySeries<T>::sort(size_t sortedPrefix){
-  size_t n = timestamps.size();
-  if (n <= 1) return;
+void InMemorySeries<T>::sortPaired(size_t from, size_t to) {
+  const size_t count = to - from;
+  if (count <= 1) [[unlikely]] return;
 
-  // Build index array
-  std::vector<size_t> indices(n);
-  std::iota(indices.begin(), indices.end(), 0);
+  // Build index array for the range [from, to). Sorting indices lets us apply
+  // the same permutation to both timestamps and values in a single pass.
+  // The index array is only sized for the range being sorted, not the full vector.
+  std::vector<size_t> indices(count);
+  std::iota(indices.begin(), indices.end(), from);
 
-  if (sortedPrefix > 0 && sortedPrefix < n) {
-    // The prefix [0, sortedPrefix) is already sorted.
-    // Sort only the suffix indices [sortedPrefix, n) by timestamp.
-    std::sort(indices.begin() + sortedPrefix, indices.end(),
-              [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
+  std::sort(indices.begin(), indices.end(),
+            [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
 
-    // Merge the two sorted index ranges into one sorted index sequence.
-    std::inplace_merge(indices.begin(), indices.begin() + sortedPrefix, indices.end(),
-                       [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
-  } else {
-    // No sorted prefix -- full sort (first insert with unsorted data)
-    std::sort(indices.begin(), indices.end(),
-              [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
-  }
-
-  // Apply permutation via temporary vectors for sequential access patterns and
-  // better cache locality. The O(N) extra memory is cheap on Seastar's
-  // thread-local allocator (same-shard allocation) and avoids the indirect
-  // index jumps of a cycle-chase approach.
-  std::vector<uint64_t> sortedTs(n);
-  std::vector<T> sortedVals(n);
-  for (size_t i = 0; i < n; i++) {
+  // Apply permutation via temporary vectors for sequential write access and
+  // better cache locality. This is O(count) extra memory, which is cheap for
+  // the suffix-only sort case (small batch) on Seastar's thread-local allocator.
+  std::vector<uint64_t> sortedTs(count);
+  std::vector<T> sortedVals(count);
+  for (size_t i = 0; i < count; ++i) {
     sortedTs[i] = timestamps[indices[i]];
     sortedVals[i] = std::move(values[indices[i]]);
   }
-  timestamps = std::move(sortedTs);
-  values = std::move(sortedVals);
+
+  // Write sorted data back into the range
+  std::copy(sortedTs.begin(), sortedTs.end(), timestamps.begin() + from);
+  std::move(sortedVals.begin(), sortedVals.end(), values.begin() + from);
+}
+
+template <class T>
+void InMemorySeries<T>::mergePaired(size_t midpoint) {
+  const size_t n = timestamps.size();
+  if (midpoint == 0 || midpoint >= n) [[unlikely]] return;
+
+  // Merge two sorted runs: [0, midpoint) and [midpoint, n).
+  // We use a single-pass merge into temporary buffers. This is O(n) time
+  // and O(n) space, but avoids the index indirection overhead of the old
+  // approach and has better cache locality (sequential reads from both runs,
+  // sequential writes to output).
+  std::vector<uint64_t> mergedTs;
+  std::vector<T> mergedVals;
+  mergedTs.reserve(n);
+  mergedVals.reserve(n);
+
+  size_t i = 0, j = midpoint;
+  while (i < midpoint && j < n) {
+    if (timestamps[i] <= timestamps[j]) {
+      mergedTs.push_back(timestamps[i]);
+      mergedVals.push_back(std::move(values[i]));
+      ++i;
+    } else {
+      mergedTs.push_back(timestamps[j]);
+      mergedVals.push_back(std::move(values[j]));
+      ++j;
+    }
+  }
+  // Append remaining elements from whichever run is not exhausted
+  while (i < midpoint) {
+    mergedTs.push_back(timestamps[i]);
+    mergedVals.push_back(std::move(values[i]));
+    ++i;
+  }
+  while (j < n) {
+    mergedTs.push_back(timestamps[j]);
+    mergedVals.push_back(std::move(values[j]));
+    ++j;
+  }
+
+  timestamps = std::move(mergedTs);
+  values = std::move(mergedVals);
 }
 
 seastar::future<> MemoryStore::close(){
@@ -136,7 +191,7 @@ seastar::future<bool> MemoryStore::isFull(){
   // so relying only on actual size may never trigger rollover.
   size_t walSize = wal->getCurrentSize();
   size_t effectiveSize = std::max(walSize, estimatedAccumulatedSize);
-  co_return effectiveSize >= WAL_SIZE_THRESHOLD;
+  co_return effectiveSize >= walSizeThreshold();
 }
 
 template <class T>
@@ -171,17 +226,24 @@ void MemoryStore::insertMemory(TSDBInsert<T>&& insertRequest){
 
 template <class T>
 bool MemoryStore::wouldExceedThreshold(TSDBInsert<T> &insertRequest){
+  size_t unused = 0;
+  return wouldExceedThreshold(insertRequest, unused);
+}
+
+template <class T>
+bool MemoryStore::wouldExceedThreshold(TSDBInsert<T> &insertRequest, size_t &outEstimatedSize){
   if(!wal) {
+    outEstimatedSize = 0;
     return false;
   }
 
-  size_t estimatedSize = wal->estimateInsertSize(insertRequest);
+  outEstimatedSize = wal->estimateInsertSize(insertRequest);
   // Use the larger of actual WAL size and cumulative estimated size for
   // the base, ensuring rollover triggers even when compression is highly
   // effective and actual WAL size grows slowly.
   size_t effectiveSize = std::max(wal->getCurrentSize(), estimatedAccumulatedSize);
 
-  return (effectiveSize + estimatedSize) >= WAL_SIZE_THRESHOLD;
+  return (effectiveSize + outEstimatedSize) >= walSizeThreshold();
 }
 
 template <class T>
@@ -198,7 +260,7 @@ bool MemoryStore::wouldBatchExceedThreshold(std::vector<TSDBInsert<T>> &insertRe
   // Use the larger of actual WAL size and cumulative estimated size
   size_t effectiveSize = std::max(wal->getCurrentSize(), estimatedAccumulatedSize);
 
-  return (effectiveSize + totalEstimatedSize) >= WAL_SIZE_THRESHOLD;
+  return (effectiveSize + totalEstimatedSize) >= walSizeThreshold();
 }
 
 template <class T>
@@ -206,38 +268,29 @@ seastar::future<bool> MemoryStore::insert(TSDBInsert<T> &insertRequest){
   if(closed)
     throw std::runtime_error("MemoryStore is closed");
 
-  // Check if this insert would exceed the 16MB WAL threshold
-  bool needsRollover = wouldExceedThreshold(insertRequest);
+  // Check if this insert would exceed the 16MB WAL threshold.
+  // The estimated size is returned via outEstimatedSize to avoid
+  // recomputing it below (eliminates double-estimation).
+  size_t thisEstimatedSize = 0;
+  bool needsRollover = wouldExceedThreshold(insertRequest, thisEstimatedSize);
   if(needsRollover) {
     // Don't insert - signal that rollover is needed
     tsdb::memory_log.debug("Insert would exceed 16MB WAL limit, signaling rollover needed");
     co_return true;
   }
 
-  // Compute estimated size before the WAL write (used for rollover tracking)
-  size_t thisEstimatedSize = 0;
-  if(wal) {
-    thisEstimatedSize = wal->estimateInsertSize(insertRequest);
-  }
+  estimatedAccumulatedSize += thisEstimatedSize;
 
-  // Try to insert to WAL
   if(wal) {
-    auto result = co_await wal->insert(insertRequest);
-    if (result == WALInsertResult::RolloverNeeded) {
-      tsdb::memory_log.debug("WAL signaled rollover needed during insert");
-      co_return true;  // Signal rollover needed
+    auto walResult = co_await wal->insert(insertRequest);
+    if (walResult == WALInsertResult::RolloverNeeded) [[unlikely]] {
+      co_return true;
     }
     LOG_INSERT_PATH(tsdb::memory_log, trace, "WAL insert completed for series: {}", insertRequest.seriesKey());
   }
-
-  // Track cumulative estimated size for rollover decisions
-  estimatedAccumulatedSize += thisEstimatedSize;
-
-  // Only insert to memory if WAL write succeeded -- move data since WAL
-  // has already persisted it and the caller won't use it again.
   insertMemory(std::move(insertRequest));
 
-  co_return false; // No rollover needed
+  co_return false;
 }
 
 template <class T>
@@ -270,7 +323,7 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &inser
   bool needsRollover = false;
   if(wal) {
     size_t effectiveSize = std::max(wal->getCurrentSize(), estimatedAccumulatedSize);
-    needsRollover = (effectiveSize + batchEstimate) >= WAL_SIZE_THRESHOLD;
+    needsRollover = (effectiveSize + batchEstimate) >= walSizeThreshold();
   }
   if(needsRollover) {
     // Don't insert - signal that rollover is needed
@@ -278,27 +331,18 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &inser
     co_return true;
   }
 
-  // Try to insert batch to WAL using the existing batch functionality
+  estimatedAccumulatedSize += batchEstimate;
+
 #if TSDB_LOG_INSERT_PATH
   auto start_wal_insert = std::chrono::high_resolution_clock::now();
 #endif
   if(wal) {
-    auto result = co_await wal->insertBatch(insertRequests);
-    if (result == WALInsertResult::RolloverNeeded) {
-      LOG_INSERT_PATH(tsdb::memory_log, debug, "WAL signaled rollover needed during batch insert");
-      co_return true;  // Signal rollover needed
+    auto walResult = co_await wal->insertBatch(insertRequests);
+    if (walResult == WALInsertResult::RolloverNeeded) [[unlikely]] {
+      co_return true;
     }
-    LOG_INSERT_PATH(tsdb::memory_log, trace, "WAL batch insert completed for {} requests", insertRequests.size());
   }
-#if TSDB_LOG_INSERT_PATH
-  auto end_wal_insert = std::chrono::high_resolution_clock::now();
-#endif
 
-  // Track cumulative estimated size for rollover decisions
-  estimatedAccumulatedSize += batchEstimate;
-
-  // Only insert to memory if WAL write succeeded - move data since WAL
-  // has already persisted it and individual elements won't be reused.
 #if TSDB_LOG_INSERT_PATH
   auto start_memory_insert = std::chrono::high_resolution_clock::now();
 #endif
@@ -306,21 +350,13 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &inser
     insertMemory(std::move(insertRequest));
   }
 #if TSDB_LOG_INSERT_PATH
-  auto end_memory_insert = std::chrono::high_resolution_clock::now();
-
   auto end_memory_batch = std::chrono::high_resolution_clock::now();
-  auto wal_insert_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_wal_insert - start_wal_insert);
-  auto memory_insert_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_insert - start_memory_insert);
-  auto total_memory_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch - start_memory_batch);
+  auto wal_duration = std::chrono::duration_cast<std::chrono::microseconds>(start_memory_insert - start_wal_insert);
+  auto mem_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch - start_memory_insert);
+  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] WAL batch: {}μs, memory: {}μs", wal_duration.count(), mem_duration.count());
 #endif
 
-#if TSDB_LOG_INSERT_PATH
-  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] WAL batch insert: {}μs", wal_insert_duration.count());
-  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] In-memory batch insert: {}μs", memory_insert_duration.count());
-  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] Total batch insert: {}μs", total_memory_duration.count());
-#endif
-
-  co_return false; // No rollover needed
+  co_return false;
 }
 
 std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128 &seriesId){
@@ -334,27 +370,42 @@ std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128 &series
 
 
 template void InMemorySeries<double>::insert(TSDBInsert<double>&& insertRequest);
-template void InMemorySeries<double>::sort(size_t);
+template void InMemorySeries<double>::sortPaired(size_t, size_t);
+template void InMemorySeries<double>::mergePaired(size_t);
 template void InMemorySeries<bool>::insert(TSDBInsert<bool>&& insertRequest);
-template void InMemorySeries<bool>::sort(size_t);
+template void InMemorySeries<bool>::sortPaired(size_t, size_t);
+template void InMemorySeries<bool>::mergePaired(size_t);
 template void InMemorySeries<std::string>::insert(TSDBInsert<std::string>&& insertRequest);
-template void InMemorySeries<std::string>::sort(size_t);
+template void InMemorySeries<std::string>::sortPaired(size_t, size_t);
+template void InMemorySeries<std::string>::mergePaired(size_t);
+template void InMemorySeries<int64_t>::insert(TSDBInsert<int64_t>&& insertRequest);
+template void InMemorySeries<int64_t>::sortPaired(size_t, size_t);
+template void InMemorySeries<int64_t>::mergePaired(size_t);
 
 template seastar::future<bool> MemoryStore::insert<double>(TSDBInsert<double> &insertRequest);
 template seastar::future<bool> MemoryStore::insert<bool>(TSDBInsert<bool> &insertRequest);
 template seastar::future<bool> MemoryStore::insert<std::string>(TSDBInsert<std::string> &insertRequest);
+template seastar::future<bool> MemoryStore::insert<int64_t>(TSDBInsert<int64_t> &insertRequest);
 template seastar::future<bool> MemoryStore::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests, size_t preComputedBatchSize);
 template seastar::future<bool> MemoryStore::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests, size_t preComputedBatchSize);
 template seastar::future<bool> MemoryStore::insertBatch<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests, size_t preComputedBatchSize);
+template seastar::future<bool> MemoryStore::insertBatch<int64_t>(std::vector<TSDBInsert<int64_t>> &insertRequests, size_t preComputedBatchSize);
 template void MemoryStore::insertMemory<double>(TSDBInsert<double>&& insertRequest);
 template void MemoryStore::insertMemory<bool>(TSDBInsert<bool>&& insertRequest);
 template void MemoryStore::insertMemory<std::string>(TSDBInsert<std::string>&& insertRequest);
+template void MemoryStore::insertMemory<int64_t>(TSDBInsert<int64_t>&& insertRequest);
 template bool MemoryStore::wouldExceedThreshold<double>(TSDBInsert<double> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRequest);
 template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest);
+template bool MemoryStore::wouldExceedThreshold<int64_t>(TSDBInsert<int64_t> &insertRequest);
+template bool MemoryStore::wouldExceedThreshold<double>(TSDBInsert<double> &insertRequest, size_t &outEstimatedSize);
+template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRequest, size_t &outEstimatedSize);
+template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest, size_t &outEstimatedSize);
+template bool MemoryStore::wouldExceedThreshold<int64_t>(TSDBInsert<int64_t> &insertRequest, size_t &outEstimatedSize);
 template bool MemoryStore::wouldBatchExceedThreshold<double>(std::vector<TSDBInsert<double>> &insertRequests);
 template bool MemoryStore::wouldBatchExceedThreshold<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
 template bool MemoryStore::wouldBatchExceedThreshold<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests);
+template bool MemoryStore::wouldBatchExceedThreshold<int64_t>(std::vector<TSDBInsert<int64_t>> &insertRequests);
 
 void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
     tsdb::memory_log.debug("Deleting range for series {} from {} to {}",
@@ -376,19 +427,17 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
         auto& timestamps = inMemorySeries.timestamps;
         auto& values = inMemorySeries.values;
 
+        // Reserve with original size as upper bound to avoid reallocations
         std::vector<uint64_t> newTimestamps;
         std::vector<T> newValues;
+        newTimestamps.reserve(timestamps.size());
+        newValues.reserve(values.size());
 
-        int deletedCount = 0;
         for (size_t i = 0; i < timestamps.size(); ++i) {
-            uint64_t ts = timestamps[i];
-
             // Keep data that's outside the deletion range
-            if (ts < startTime || ts > endTime) {
+            if (timestamps[i] < startTime || timestamps[i] > endTime) [[likely]] {
                 newTimestamps.push_back(timestamps[i]);
                 newValues.push_back(values[i]);
-            } else {
-                deletedCount++;
             }
         }
 

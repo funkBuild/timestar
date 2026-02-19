@@ -178,11 +178,11 @@ seastar::future<> WALFileManager::insert(TSDBInsert<T> &insertRequest) {
   if (memoryStores[0] && memoryStores[0]->getWAL()) {
     size_t estimatedSize =
         memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
-    if (estimatedSize > MemoryStore::WAL_SIZE_THRESHOLD) {
+    if (estimatedSize > MemoryStore::walSizeThreshold()) {
       // This single insert exceeds the entire 16MB WAL limit
       tsdb::wal_log.error(
           "Insert request of {} bytes exceeds maximum WAL size of {} bytes",
-          estimatedSize, MemoryStore::WAL_SIZE_THRESHOLD);
+          estimatedSize, MemoryStore::walSizeThreshold());
       throw std::runtime_error("Insert batch too large - requested " +
                                std::to_string(estimatedSize) +
                                " bytes, exceeds 16MB WAL "
@@ -249,11 +249,11 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
           memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
     }
 
-    if (totalEstimatedSize > MemoryStore::WAL_SIZE_THRESHOLD) {
+    if (totalEstimatedSize > MemoryStore::walSizeThreshold()) {
       // This batch exceeds the entire WAL limit
       tsdb::wal_log.error("Batch insert request of {} bytes exceeds maximum "
                           "WAL size of {} bytes",
-                          totalEstimatedSize, MemoryStore::WAL_SIZE_THRESHOLD);
+                          totalEstimatedSize, MemoryStore::walSizeThreshold());
       throw std::runtime_error(
           "Insert batch too large - requested " +
           std::to_string(totalEstimatedSize) +
@@ -316,14 +316,30 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
 }
 
 seastar::future<> WALFileManager::rolloverMemoryStore() {
-  // Use compaction semaphore to ensure only one compaction at a time
+  // Acquire the rollover semaphore to serialize concurrent rollover attempts.
+  // Multiple insert coroutines may observe needsRollover=true and call this
+  // method simultaneously; the semaphore ensures only one rollover executes.
   auto units = co_await seastar::get_units(compactionSemaphore, 1);
 
-  // Don't check isFull() here - if rolloverMemoryStore() was called,
-  // it means wouldExceedThreshold() returned true, so we need to rollover.
-  // The isFull() check could return false if the WAL is just below the
-  // threshold, causing the rollover to be skipped and the insert to fail.
-  // Removing this check ensures consistency with the threshold logic.
+  // After acquiring the semaphore, check whether the current store still
+  // needs rollover. Another coroutine may have already completed a rollover
+  // while we waited for the semaphore, leaving a fresh empty store at
+  // index 0. Skip the rollover to avoid creating unnecessary empty stores
+  // and WAL files.
+  //
+  // We check isEmpty() rather than isFull() because of the gap between
+  // wouldExceedThreshold() (which projects the NEXT insert) and isFull()
+  // (which checks CURRENT state). A store can be "not full" by isFull()
+  // but still trigger rollover when the next insert is added. Checking
+  // isEmpty() is conservative: it only skips when the store is definitely
+  // fresh (no data at all), which means another coroutine must have just
+  // rolled over.
+  if (!memoryStores.empty() && memoryStores[0]->isEmpty()) {
+    tsdb::wal_log.debug(
+        "Rollover already completed by another coroutine on shard {}, skipping",
+        shardId);
+    co_return;
+  }
 
   auto previousStore = memoryStores[0];
   tsdb::wal_log.info(
@@ -339,6 +355,20 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
 
   tsdb::wal_log.info("New memory store {} created for shard {}",
                      store->sequenceNumber, shardId);
+
+  // -----------------------------------------------------------------------
+  // Release the rollover semaphore early. The critical section is complete:
+  // memoryStores[0] now points to a fresh, empty store that can accept new
+  // inserts. Any other coroutines waiting on the semaphore can proceed
+  // immediately — they will either insert into the new store or (if it fills
+  // up) trigger another rollover.
+  //
+  // The remaining work (background TSM conversion of the old store, or
+  // cleanup of an empty store) does not need to block new inserts.
+  // Background TSM conversions are separately serialized by
+  // _conversionSemaphore and tracked by _backgroundGate.
+  // -----------------------------------------------------------------------
+  units.return_all();
 
   // Do NOT close the old store here — in-flight writes may still be
   // completing on its WAL (holding _io_gate, waiting on _io_sem).
@@ -373,7 +403,9 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
           _backgroundGate.leave();
         });
   } else {
-    // Empty store — close and remove the WAL file
+    // Empty store — close and remove the WAL file.
+    // This path runs after the semaphore is released, so new inserts
+    // are not blocked during the I/O operations.
     co_await previousStore->close();
     co_await previousStore->removeWAL();
     auto it = std::find(memoryStores.begin(), memoryStores.end(), previousStore);
@@ -426,6 +458,8 @@ WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
               stringMem += str.size() + sizeof(std::string);
             }
             mem += stringMem;
+          } else if constexpr (std::is_same_v<T, int64_t>) {
+            mem += seriesPoints * sizeof(int64_t);
           }
           return mem;
         },
@@ -576,6 +610,8 @@ template seastar::future<>
 WALFileManager::insert<double>(TSDBInsert<double> &insertRequest);
 template seastar::future<>
 WALFileManager::insert<std::string>(TSDBInsert<std::string> &insertRequest);
+template seastar::future<>
+WALFileManager::insert<int64_t>(TSDBInsert<int64_t> &insertRequest);
 
 template seastar::future<> WALFileManager::insertBatch<bool>(
     std::vector<TSDBInsert<bool>> &insertRequests);
@@ -583,3 +619,5 @@ template seastar::future<> WALFileManager::insertBatch<double>(
     std::vector<TSDBInsert<double>> &insertRequests);
 template seastar::future<> WALFileManager::insertBatch<std::string>(
     std::vector<TSDBInsert<std::string>> &insertRequests);
+template seastar::future<> WALFileManager::insertBatch<int64_t>(
+    std::vector<TSDBInsert<int64_t>> &insertRequests);

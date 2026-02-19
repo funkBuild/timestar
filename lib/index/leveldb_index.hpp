@@ -11,11 +11,14 @@
 #include "tsdb_value.hpp"
 #include "line_parser.hpp"
 #include "series_id.hpp"
+#include "tsdb_config.hpp"
 
 #include <expected>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+
+#include "retention_policy.hpp"
 
 #include <leveldb/db.h>
 #include <leveldb/options.h>
@@ -43,7 +46,8 @@ enum IndexKeyType : uint8_t {
     GROUP_BY_INDEX = 0x07,      // measurement+tag_key+tag_value -> series_ids (for group-by)
     FIELD_STATS = 0x08,         // series_id+field -> stats
     FIELD_TYPE = 0x09,          // measurement+field -> field type (float, bool, string, integer)
-    MEASUREMENT_SERIES = 0x0A   // measurement+\0+series_id -> (empty) for fast measurement->series lookup
+    MEASUREMENT_SERIES = 0x0A,  // measurement+\0+series_id -> (empty) for fast measurement->series lookup
+    RETENTION_POLICY = 0x0B     // measurement -> JSON retention policy
 };
 
 // Metadata for a time series
@@ -88,9 +92,9 @@ private:
     // retired cache drains at EVICTION_BATCH_SIZE per insert, the retired cache is
     // always fully drained before the next generation swap (the drain takes
     // maxSeriesCacheSize / EVICTION_BATCH_SIZE inserts, which is << maxSeriesCacheSize).
-    static constexpr size_t DEFAULT_MAX_SERIES_CACHE_SIZE = 1'000'000;
+    static size_t defaultMaxSeriesCacheSize() { return tsdb::config().index.series_cache_size; }
     static constexpr size_t EVICTION_BATCH_SIZE = 256;
-    size_t maxSeriesCacheSize = DEFAULT_MAX_SERIES_CACHE_SIZE;
+    size_t maxSeriesCacheSize = defaultMaxSeriesCacheSize();
     std::unordered_set<std::string> indexedSeriesCache_;
     std::unordered_set<std::string> indexedSeriesCacheRetired_;
 
@@ -226,7 +230,7 @@ public:
         const std::unordered_set<std::string>& fieldFilter = {},
         size_t maxSeries = 0);
 
-    // Find series by single tag (optimized).
+    // Find series by single tag (optimized, exact match only).
     // maxSeries: if > 0, stops scanning early when the count exceeds the limit.
     // 0 means unlimited. Note: for multi-tag intersection queries, individual tag
     // scans run without limits since intersection reduces the count. The limit is
@@ -235,6 +239,16 @@ public:
                                                               const std::string& tagKey,
                                                               const std::string& tagValue,
                                                               size_t maxSeries = 0);
+
+    // Find series by tag pattern (wildcard or regex).
+    // Scans TAG_INDEX entries for the given measurement+tagKey, using the literal
+    // prefix of the pattern to narrow the LevelDB seek, then post-filters with
+    // SeriesMatcher::matchesTag(). Supports *, ?, ~regex, and /regex/ patterns.
+    seastar::future<std::vector<SeriesId128>> findSeriesByTagPattern(
+        const std::string& measurement,
+        const std::string& tagKey,
+        const std::string& scopeValue,
+        size_t maxSeries = 0);
 
     // Group series by tag value for aggregations
     seastar::future<std::map<std::string, std::vector<SeriesId128>>>
@@ -270,6 +284,12 @@ public:
     // Rebuild the MEASUREMENT_SERIES index from existing SERIES_METADATA entries.
     // Useful for backward compatibility when upgrading from databases that lack this index.
     seastar::future<> rebuildMeasurementSeriesIndex();
+
+    // Retention policy CRUD (shard 0 only)
+    seastar::future<> setRetentionPolicy(const RetentionPolicy& policy);
+    seastar::future<std::optional<RetentionPolicy>> getRetentionPolicy(const std::string& measurement);
+    seastar::future<std::vector<RetentionPolicy>> getAllRetentionPolicies();
+    seastar::future<bool> deleteRetentionPolicy(const std::string& measurement);
 
     // Debug/maintenance
     seastar::future<size_t> getSeriesCount();

@@ -2,6 +2,7 @@
 #include "alp_constants.hpp"
 #include "alp_ffor.hpp"
 #include "alp_rd.hpp"
+#include "../../storage/aligned_buffer.hpp"
 
 #include <bit>
 #include <cmath>
@@ -331,4 +332,203 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
     buffer.shrink_to_fit();
     return buffer;
+}
+
+size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &target) {
+    if (values.empty()) {
+        return 0;
+    }
+
+    const size_t startPos = target.size();
+
+    const size_t total_values = values.size();
+    const size_t num_blocks = (total_values + alp::ALP_VECTOR_SIZE - 1) / alp::ALP_VECTOR_SIZE;
+    const size_t tail_count = total_values % alp::ALP_VECTOR_SIZE;
+
+    // Determine scheme: try ALP first, fall back to ALP_RD
+    auto best = findBestExpFac(values.data(), total_values);
+    double exception_rate = static_cast<double>(best.exceptions) /
+                            std::min(total_values, alp::ALP_SAMPLE_SIZE);
+
+    uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD)
+                     ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
+
+    // Pre-allocate estimated space in the target buffer (rough upper bound in bytes)
+    const size_t est_bytes = (2 + num_blocks * (2 + alp::ALP_VECTOR_SIZE + 128)) * sizeof(uint64_t);
+    target.reserve(startPos + est_bytes);
+
+    // === Stream Header (2 x uint64_t) ===
+    // Word 0: [0:31] magic, [32:63] total_values
+    uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC)
+                     | (static_cast<uint64_t>(total_values) << 32);
+    target.write(header0);
+
+    // Word 1: [0:15] num_blocks, [16:31] tail_count, [32:39] scheme
+    uint64_t header1 = static_cast<uint64_t>(num_blocks)
+                     | (static_cast<uint64_t>(tail_count) << 16)
+                     | (static_cast<uint64_t>(scheme) << 32);
+    target.write(header1);
+
+    if (scheme == alp::SCHEME_ALP) {
+        // === ALP Encoding ===
+        const uint8_t exp = best.exp;
+        const uint8_t fac = best.fac;
+
+        for (size_t block = 0; block < num_blocks; ++block) {
+            const size_t block_start = block * alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
+                                       ? tail_count : alp::ALP_VECTOR_SIZE;
+
+            // Scale all values in this block
+            std::vector<int64_t> encoded(block_count);
+            std::vector<uint16_t> exc_positions;
+            std::vector<uint64_t> exc_values;
+
+            int64_t min_val = std::numeric_limits<int64_t>::max();
+            int64_t max_val = std::numeric_limits<int64_t>::min();
+
+            for (size_t i = 0; i < block_count; ++i) {
+                double v = values[block_start + i];
+                bool is_special = std::isnan(v) || std::isinf(v)
+                                || (v == 0.0 && std::signbit(v)); // -0.0
+
+                if (!is_special) {
+                    auto result = scaleValue(v, exp, fac);
+                    if (result.exact) {
+                        encoded[i] = result.encoded;
+                        if (result.encoded < min_val) min_val = result.encoded;
+                        if (result.encoded > max_val) max_val = result.encoded;
+                        continue;
+                    }
+                }
+
+                // Exception: store as raw bits
+                exc_positions.push_back(static_cast<uint16_t>(i));
+                exc_values.push_back(std::bit_cast<uint64_t>(v));
+                encoded[i] = 0; // placeholder (will use base after FFOR)
+            }
+
+            // If all values are exceptions, set a safe base
+            if (min_val > max_val) {
+                min_val = 0;
+                max_val = 0;
+            }
+
+            // Set exception placeholders to base so they don't affect bit width
+            for (auto pos : exc_positions) {
+                encoded[pos] = min_val;
+            }
+
+            const uint8_t bw = requiredBitWidth(min_val, max_val);
+            const uint16_t exception_count = static_cast<uint16_t>(exc_positions.size());
+
+            // === Block Header (2 x uint64_t) ===
+            uint64_t bh0 = static_cast<uint64_t>(exp)
+                         | (static_cast<uint64_t>(fac) << 8)
+                         | (static_cast<uint64_t>(bw) << 16)
+                         | (static_cast<uint64_t>(exception_count) << 32)
+                         | (static_cast<uint64_t>(block_count) << 48);
+            target.write(bh0);
+
+            // Word 1: FOR base
+            target.write(std::bit_cast<uint64_t>(min_val));
+
+            // === FFOR Data ===
+            size_t packed_words = alp::ffor_packed_words(block_count, bw);
+            if (packed_words > 0) {
+                std::vector<uint64_t> packed(packed_words, 0);
+                alp::ffor_pack(encoded.data(), block_count, min_val, bw, packed.data());
+                target.write_array(packed.data(), packed_words);
+            }
+
+            // === Exception Positions (packed to word boundary) ===
+            if (exception_count > 0) {
+                // Pack uint16 positions into uint64 words (4 per word)
+                size_t pos_words = (exception_count * 2 + 7) / 8;
+                for (size_t w = 0; w < pos_words; ++w) {
+                    uint64_t word = 0;
+                    for (size_t j = 0; j < 4; ++j) {
+                        size_t idx = w * 4 + j;
+                        if (idx < exception_count) {
+                            word |= static_cast<uint64_t>(exc_positions[idx]) << (j * 16);
+                        }
+                    }
+                    target.write(word);
+                }
+
+                // === Exception Values (one word each) ===
+                target.write_array(exc_values.data(), exception_count);
+            }
+        }
+    } else {
+        // === ALP_RD Encoding ===
+        uint8_t right_bit_count = alp::ALPRD::findBestSplit(values.data(), total_values);
+
+        for (size_t block = 0; block < num_blocks; ++block) {
+            const size_t block_start = block * alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
+                                       ? tail_count : alp::ALP_VECTOR_SIZE;
+
+            auto rd = alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count);
+            const uint16_t exception_count = static_cast<uint16_t>(rd.exception_positions.size());
+
+            // === Block Header (2 x uint64_t) ===
+            uint64_t bh0 = static_cast<uint64_t>(rd.right_bw)
+                         | (static_cast<uint64_t>(rd.left_bw) << 8)
+                         | (static_cast<uint64_t>(rd.dictionary.size()) << 16)
+                         | (static_cast<uint64_t>(right_bit_count) << 24)
+                         | (static_cast<uint64_t>(exception_count) << 32)
+                         | (static_cast<uint64_t>(block_count) << 48);
+            target.write(bh0);
+
+            // Word 1: right FOR base
+            target.write(rd.right_for_base);
+
+            // === Dictionary ===
+            if (!rd.dictionary.empty()) {
+                target.write_array(rd.dictionary.data(), rd.dictionary.size());
+            }
+
+            // === Left Indices (FFOR packed) ===
+            if (rd.left_bw > 0) {
+                std::vector<int64_t> left_as_i64(block_count);
+                for (size_t i = 0; i < block_count; ++i) {
+                    left_as_i64[i] = static_cast<int64_t>(rd.left_indices[i]);
+                }
+                size_t left_packed_words = alp::ffor_packed_words(block_count, rd.left_bw);
+                std::vector<uint64_t> left_packed(left_packed_words, 0);
+                alp::ffor_pack(left_as_i64.data(), block_count, 0, rd.left_bw, left_packed.data());
+                target.write_array(left_packed.data(), left_packed_words);
+            }
+
+            // === Right FFOR Data ===
+            if (rd.right_bw > 0) {
+                size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
+                std::vector<uint64_t> right_packed(right_packed_words, 0);
+                alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base,
+                                   rd.right_bw, right_packed.data());
+                target.write_array(right_packed.data(), right_packed_words);
+            }
+
+            // === Exception Positions ===
+            if (exception_count > 0) {
+                size_t pos_words = (exception_count * 2 + 7) / 8;
+                for (size_t w = 0; w < pos_words; ++w) {
+                    uint64_t word = 0;
+                    for (size_t j = 0; j < 4; ++j) {
+                        size_t idx = w * 4 + j;
+                        if (idx < exception_count) {
+                            word |= static_cast<uint64_t>(rd.exception_positions[idx]) << (j * 16);
+                        }
+                    }
+                    target.write(word);
+                }
+
+                // === Exception Values ===
+                target.write_array(rd.exception_values.data(), exception_count);
+            }
+        }
+    }
+
+    return target.size() - startPos;
 }

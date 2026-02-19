@@ -324,3 +324,62 @@ add_custom_target(run-alp-bench
     COMMENT "Running ALP vs Gorilla comparison benchmark"
 )
 
+# Integer FFOR vs Simple16 Comparison Benchmark
+add_executable(integer_ffor_vs_simple16_benchmark integer_ffor_vs_simple16_benchmark.cpp)
+
+target_link_libraries(integer_ffor_vs_simple16_benchmark PRIVATE
+    libtsdb
+    pthread
+)
+
+target_include_directories(integer_ffor_vs_simple16_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/encoding
+    ${CMAKE_SOURCE_DIR}/lib/encoding/integer
+    ${CMAKE_SOURCE_DIR}/lib/storage
+    ${CMAKE_SOURCE_DIR}/lib/core
+)
+
+target_compile_options(integer_ffor_vs_simple16_benchmark PRIVATE
+    -O3
+    -march=native
+    -mtune=native
+)
+
+add_test(NAME integer_ffor_vs_simple16_benchmark COMMAND integer_ffor_vs_simple16_benchmark)
+
+add_custom_target(run-ffor-bench
+    COMMAND integer_ffor_vs_simple16_benchmark
+    DEPENDS integer_ffor_vs_simple16_benchmark
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running FFOR vs Simple16 integer encoder comparison benchmark"
+)
+
+# Boolean Encoder Benchmark: BitPack vs RLE
+add_executable(bool_encoder_benchmark bool_encoder_benchmark.cpp)
+
+target_link_libraries(bool_encoder_benchmark PRIVATE
+    libtsdb
+    pthread
+)
+
+target_include_directories(bool_encoder_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/encoding
+    ${CMAKE_SOURCE_DIR}/lib/storage
+    ${CMAKE_SOURCE_DIR}/lib/core
+)
+
+target_compile_options(bool_encoder_benchmark PRIVATE
+    -O3
+    -march=native
+    -mtune=native
+)
+
+add_test(NAME bool_encoder_benchmark COMMAND bool_encoder_benchmark)
+
+add_custom_target(run-bool-bench
+    COMMAND bool_encoder_benchmark
+    DEPENDS bool_encoder_benchmark
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running BitPack vs RLE boolean encoder comparison benchmark"
+)
+

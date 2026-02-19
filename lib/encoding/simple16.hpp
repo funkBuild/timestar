@@ -37,6 +37,10 @@ public:
     // Special handling for 64-bit values
     static void packLarge(std::vector<uint64_t> &values, size_t &offset, AlignedBuffer &buffer);
     static void unpackLarge(Slice &encoded, std::vector<uint64_t> &out);
+
+    // Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
+    // Returns the number of bytes written.
+    static size_t encodeInto(std::vector<uint64_t> &values, AlignedBuffer &target);
 };
 
 #endif

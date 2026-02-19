@@ -1,8 +1,9 @@
 #include "tsm.hpp"
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
-#include "bool_encoder.hpp"
+#include "bool_encoder_rle.hpp"
 #include "string_encoder.hpp"
+#include "zigzag.hpp"
 #include "slice_buffer.hpp"
 #include "logger.hpp"
 
@@ -155,7 +156,7 @@ seastar::future<> TSM::readSparseIndex(){
 
   bloom_parameters params;
   params.projected_element_count = actualSeriesCount;
-  params.false_positive_probability = BLOOM_FPR;
+  params.false_positive_probability = bloomFpr();
   params.compute_optimal_parameters();
   seriesBloomFilter = bloom_filter(params);
 
@@ -224,7 +225,7 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
   }
 
   // Step 6: Cache it with LRU eviction
-  if (fullIndexCache.size() >= MAX_CACHE_ENTRIES) {
+  if (fullIndexCache.size() >= maxCacheEntries()) {
     // Evict least recently used entry (back of list)
     auto& lruEntry = lruList.back();
     fullIndexCache.erase(lruEntry.first);
@@ -281,9 +282,28 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
     }
   );
 
-  co_await seastar::parallel_for_each(blocksToScan, [&] (TSMIndexBlock indexBlock) {
-    return readBlock(indexBlock, startTime, endTime, results);
+  // Pre-allocate a slot per block so each coroutine writes to its own index,
+  // avoiding the data race where multiple coroutines push_back concurrently
+  // on the shared results.blocks vector after co_await suspension points.
+  std::vector<std::unique_ptr<TSMBlock<T>>> blockSlots(blocksToScan.size());
+  size_t slotIdx = 0;
+
+  co_await seastar::parallel_for_each(blocksToScan, [&] (TSMIndexBlock indexBlock) -> seastar::future<> {
+    // Capture slot index before any suspension point (safe: lambda invocations
+    // are sequential in cooperative scheduling before the first co_await)
+    size_t mySlot = slotIdx++;
+    auto block = co_await readSingleBlock<T>(indexBlock, startTime, endTime);
+    if (block && !block->timestamps->empty()) {
+      blockSlots[mySlot] = std::move(block);
+    }
   });
+
+  // Collect non-null results into the output TSMResult (single-threaded, safe)
+  for (auto& block : blockSlots) {
+    if (block) {
+      results.appendBlock(block);
+    }
+  }
 
   // parallel_for_each does not guarantee ordering, so sort blocks by start time
   results.sort();
@@ -312,18 +332,23 @@ seastar::future<> TSM::readBlock(TSMIndexBlock indexBlock, uint64_t startTime, u
   auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime);
   size_t valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
 
-  if constexpr (std::is_same<T, double>::value)
-  {
+  if constexpr (std::is_same_v<T, double>) {
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
     FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
-
-  } else if constexpr (std::is_same<T, bool>::value) {
+  } else if constexpr (std::is_same_v<T, bool>) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
-    BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
-
-  } else if constexpr (std::is_same<T, std::string>::value) {
+    BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+  } else if constexpr (std::is_same_v<T, std::string>) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
     StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
+  } else if constexpr (std::is_same_v<T, int64_t>) {
+    auto valuesSlice = blockSlice.getSlice(valueByteSize);
+    std::vector<uint64_t> rawUint;
+    IntegerEncoder::decode(valuesSlice, timestampSize, rawUint);
+    blockResults->values->reserve(nTimestamps);
+    for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < rawUint.size(); ++i) {
+      blockResults->values->push_back(ZigZag::zigzagDecode(rawUint[i]));
+    }
   }
 
   results.appendBlock(blockResults);
@@ -393,17 +418,23 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
   auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime);
   size_t valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
 
-  if constexpr (std::is_same<T, double>::value) {
+  if constexpr (std::is_same_v<T, double>) {
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
     FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
-
-  } else if constexpr (std::is_same<T, bool>::value) {
+  } else if constexpr (std::is_same_v<T, bool>) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
-    BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
-
-  } else if constexpr (std::is_same<T, std::string>::value) {
+    BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+  } else if constexpr (std::is_same_v<T, std::string>) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
     StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
+  } else if constexpr (std::is_same_v<T, int64_t>) {
+    auto valuesSlice = blockSlice.getSlice(valueByteSize);
+    std::vector<uint64_t> rawUint;
+    IntegerEncoder::decode(valuesSlice, timestampSize, rawUint);
+    blockResults->values->reserve(nTimestamps);
+    for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < rawUint.size(); ++i) {
+      blockResults->values->push_back(ZigZag::zigzagDecode(rawUint[i]));
+    }
   }
 
   co_return blockResults;
@@ -412,11 +443,13 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
 template seastar::future<> TSM::readSeries<double>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<double> &results);
 template seastar::future<> TSM::readSeries<bool>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<bool> &results);
 template seastar::future<> TSM::readSeries<std::string>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<std::string> &results);
+template seastar::future<> TSM::readSeries<int64_t>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<int64_t> &results);
 
 // Phase 1.1: Template instantiations for readSingleBlock
 template seastar::future<std::unique_ptr<TSMBlock<double>>> TSM::readSingleBlock<double>(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
 template seastar::future<std::unique_ptr<TSMBlock<bool>>> TSM::readSingleBlock<bool>(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
 template seastar::future<std::unique_ptr<TSMBlock<std::string>>> TSM::readSingleBlock<std::string>(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
+template seastar::future<std::unique_ptr<TSMBlock<int64_t>>> TSM::readSingleBlock<int64_t>(const TSMIndexBlock &indexBlock, uint64_t startTime, uint64_t endTime);
 
 // Phase 2: Read compressed block bytes directly without decompression
 seastar::future<seastar::temporary_buffer<uint8_t>> TSM::readCompressedBlock(const TSMIndexBlock &indexBlock) {
@@ -535,15 +568,23 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
         return nullptr;
     }
 
-    if constexpr (std::is_same<T, double>::value) {
+    if constexpr (std::is_same_v<T, double>) {
         auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
         FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
-    } else if constexpr (std::is_same<T, bool>::value) {
+    } else if constexpr (std::is_same_v<T, bool>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
-    } else if constexpr (std::is_same<T, std::string>::value) {
+        BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+    } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+        auto valuesSlice = blockSlice.getSlice(valueByteSize);
+        std::vector<uint64_t> rawUint;
+        IntegerEncoder::decode(valuesSlice, timestampSize, rawUint);
+        blockResults->values->reserve(nTimestamps);
+        for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < rawUint.size(); ++i) {
+            blockResults->values->push_back(ZigZag::zigzagDecode(rawUint[i]));
+        }
     }
 
     return blockResults;
@@ -639,10 +680,28 @@ seastar::future<> TSM::readSeriesBatched(
                            batchEfficiency, totalBlocks, totalBatches);
     }
 
-    // Step 4: Read each batch (parallel execution for non-contiguous batches)
-    co_await seastar::parallel_for_each(batches, [&](const BlockBatch& batch) {
-        return readBlockBatch(batch, startTime, endTime, results);
+    // Step 4: Read each batch (parallel execution for non-contiguous batches).
+    // Each batch produces its own local TSMResult to avoid the data race where
+    // multiple coroutines call results.appendBlock() concurrently after co_await
+    // suspension points in parallel_for_each.
+    std::vector<TSMResult<T>> batchResults;
+    batchResults.reserve(batches.size());
+    for (size_t i = 0; i < batches.size(); ++i) {
+        batchResults.emplace_back(0);
+    }
+    size_t batchSlotIdx = 0;
+
+    co_await seastar::parallel_for_each(batches, [&](const BlockBatch& batch) -> seastar::future<> {
+        size_t mySlot = batchSlotIdx++;
+        co_await readBlockBatch(batch, startTime, endTime, batchResults[mySlot]);
     });
+
+    // Merge all batch results into the output (single-threaded, safe)
+    for (auto& batchResult : batchResults) {
+        for (auto& block : batchResult.blocks) {
+            results.appendBlock(block);
+        }
+    }
 
     // parallel_for_each does not guarantee ordering, so sort blocks by start time
     results.sort();
@@ -747,12 +806,15 @@ seastar::future<size_t> TSM::aggregateSeries(
 template seastar::future<> TSM::readSeriesBatched<double>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<double>& results);
 template seastar::future<> TSM::readSeriesBatched<bool>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<bool>& results);
 template seastar::future<> TSM::readSeriesBatched<std::string>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<std::string>& results);
+template seastar::future<> TSM::readSeriesBatched<int64_t>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<int64_t>& results);
 
 template seastar::future<> TSM::readBlockBatch<double>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<double>& results);
 template seastar::future<> TSM::readBlockBatch<bool>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<bool>& results);
 template seastar::future<> TSM::readBlockBatch<std::string>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<std::string>& results);
+template seastar::future<> TSM::readBlockBatch<int64_t>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<int64_t>& results);
 
 template std::unique_ptr<TSMBlock<double>> TSM::decodeBlock<double>(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
 template std::unique_ptr<TSMBlock<bool>> TSM::decodeBlock<bool>(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
 template std::unique_ptr<TSMBlock<std::string>> TSM::decodeBlock<std::string>(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
+template std::unique_ptr<TSMBlock<int64_t>> TSM::decodeBlock<int64_t>(Slice& blockSlice, uint32_t blockSize, uint64_t startTime, uint64_t endTime);
 

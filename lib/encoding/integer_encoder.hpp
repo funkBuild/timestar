@@ -22,6 +22,13 @@ public:
     static AlignedBuffer encode(std::span<const uint64_t> values);
 
     /**
+     * Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
+     * Eliminates the intermediate buffer allocation and copy.
+     * Returns the number of bytes written to the target buffer.
+     */
+    static size_t encodeInto(std::span<const uint64_t> values, AlignedBuffer &target);
+
+    /**
      * Decode compressed data back to uint64_t values using the best available implementation
      */
     static std::pair<size_t, size_t> decode(Slice &encoded, unsigned int timestampSize,
@@ -47,7 +54,8 @@ public:
         AUTO,     // Automatically select best
         BASIC,    // Force basic implementation
         SIMD,     // Force SIMD AVX2
-        AVX512    // Force AVX-512
+        AVX512,   // Force AVX-512
+        FFOR      // Force FFOR (Frame-of-Reference) encoding
     };
 
     static void setImplementation(Implementation impl);

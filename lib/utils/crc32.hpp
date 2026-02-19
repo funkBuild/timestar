@@ -12,19 +12,41 @@
 
 class CRC32 {
 public:
-    // Compute CRC32 over a byte buffer.
+    // Initial CRC state for incremental computation.
+    static constexpr uint32_t INIT = 0xFFFFFFFF;
+
+    // Compute CRC32 over a byte buffer (single-shot).
     static uint32_t compute(const uint8_t *data, size_t length) {
-        static const auto tbl = generateTable();
-        uint32_t crc = 0xFFFFFFFF;
-        for (size_t i = 0; i < length; i++) {
-            crc = tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-        }
-        return crc ^ 0xFFFFFFFF;
+        return finalize(update(INIT, data, length));
     }
 
     // Convenience overload for char pointers.
     static uint32_t compute(const char *data, size_t length) {
         return compute(reinterpret_cast<const uint8_t *>(data), length);
+    }
+
+    // Incrementally feed bytes into a running CRC state.
+    // Usage:
+    //   uint32_t crc = CRC32::INIT;
+    //   crc = CRC32::update(crc, buf1, len1);
+    //   crc = CRC32::update(crc, buf2, len2);
+    //   uint32_t result = CRC32::finalize(crc);
+    static uint32_t update(uint32_t crc, const uint8_t *data, size_t length) {
+        static const auto tbl = generateTable();
+        for (size_t i = 0; i < length; i++) {
+            crc = tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+        }
+        return crc;
+    }
+
+    // Convenience overload for char pointers.
+    static uint32_t update(uint32_t crc, const char *data, size_t length) {
+        return update(crc, reinterpret_cast<const uint8_t *>(data), length);
+    }
+
+    // Finalize the running CRC state to produce the final checksum.
+    static constexpr uint32_t finalize(uint32_t crc) {
+        return crc ^ 0xFFFFFFFF;
     }
 
 private:

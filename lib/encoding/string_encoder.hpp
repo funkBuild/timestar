@@ -27,6 +27,12 @@ public:
     // Header: magic_number(4) | uncompressed_size(4) | compressed_size(4) | count(4)
     // Data (before compression): [length_prefix][string_data] for each string
     static AlignedBuffer encode(std::span<const std::string> values);
+
+    // Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
+    // Writes the same format as encode() but directly into the target buffer,
+    // eliminating the final result-buffer allocation and copy.
+    // Returns the number of bytes written to the target buffer.
+    static size_t encodeInto(std::span<const std::string> values, AlignedBuffer &target);
     
     // Decode strings from compressed buffer
     static void decode(AlignedBuffer& encoded, size_t count, std::vector<std::string>& out);

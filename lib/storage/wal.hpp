@@ -6,6 +6,7 @@
 #include "slice_buffer.hpp"
 #include "tsdb_value.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -28,7 +29,7 @@ class AlignedBuffer;
 class MemoryStore;
 
 enum class WALType { Write = 0, Delete, DeleteRange, Close };
-enum class WALValueType { Float = 0, Boolean, String };
+enum class WALValueType { Float = 0, Boolean, String, Integer };
 
 enum class WALInsertResult {
     Success,
@@ -40,6 +41,80 @@ struct WALTimingInfo {
     std::chrono::microseconds compressionTime{0};
     std::chrono::microseconds walWriteTime{0};
     int walWriteCount{0};
+};
+
+// Adaptive compression ratio tracking for WAL size estimation.
+// Updated after each encodeInsertEntry() using exponential moving average (EMA).
+// Per-WAL instance (thread-local in Seastar's shard-per-core model, no atomics needed).
+struct CompressionStats {
+    // Initial ratios are conservative (slightly overestimate) to avoid
+    // underestimation before sufficient samples are collected.
+    double timestampRatio = 0.25;   // Timestamps: typically ~15-20% of raw
+    double floatRatio = 0.30;       // Floats (ALP/Gorilla): typically ~20-25%
+    double boolRatio = 0.05;        // Bools (bit-packing): typically ~1.6%
+    double stringRatio = 0.40;      // Strings (Snappy): typically ~10-30%
+    double integerRatio = 0.25;     // Integers (ZigZag + FFOR): typically ~15-25%
+    size_t sampleCount = 0;         // Number of encodes observed
+
+    // EMA smoothing factor. Higher alpha = faster convergence but more noise.
+    // 0.15 converges in ~10-15 samples while remaining stable.
+    static constexpr double ALPHA = 0.15;
+
+    // Minimum floor ratios to prevent dangerously low estimates.
+    // Even highly compressible data should never estimate below these.
+    static constexpr double MIN_TIMESTAMP_RATIO = 0.03;
+    static constexpr double MIN_FLOAT_RATIO     = 0.05;
+    static constexpr double MIN_BOOL_RATIO      = 0.01;
+    static constexpr double MIN_STRING_RATIO    = 0.05;
+    static constexpr double MIN_INTEGER_RATIO   = 0.03;
+
+    // Safety margin applied to all estimates to avoid underestimation
+    static constexpr double SAFETY_MARGIN = 1.1;
+
+    void updateTimestamp(size_t rawSize, size_t encodedSize) {
+        if (rawSize == 0) [[unlikely]] return;
+        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
+        timestampRatio = std::clamp(
+            timestampRatio * (1.0 - ALPHA) + observed * ALPHA,
+            MIN_TIMESTAMP_RATIO, 1.0);
+        ++sampleCount;
+    }
+
+    void updateFloat(size_t rawSize, size_t encodedSize) {
+        if (rawSize == 0) [[unlikely]] return;
+        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
+        floatRatio = std::clamp(
+            floatRatio * (1.0 - ALPHA) + observed * ALPHA,
+            MIN_FLOAT_RATIO, 1.0);
+        ++sampleCount;
+    }
+
+    void updateBool(size_t rawSize, size_t encodedSize) {
+        if (rawSize == 0) [[unlikely]] return;
+        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
+        boolRatio = std::clamp(
+            boolRatio * (1.0 - ALPHA) + observed * ALPHA,
+            MIN_BOOL_RATIO, 1.0);
+        ++sampleCount;
+    }
+
+    void updateString(size_t rawSize, size_t encodedSize) {
+        if (rawSize == 0) [[unlikely]] return;
+        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
+        stringRatio = std::clamp(
+            stringRatio * (1.0 - ALPHA) + observed * ALPHA,
+            MIN_STRING_RATIO, 1.0);
+        ++sampleCount;
+    }
+
+    void updateInteger(size_t rawSize, size_t encodedSize) {
+        if (rawSize == 0) [[unlikely]] return;
+        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
+        integerRatio = std::clamp(
+            integerRatio * (1.0 - ALPHA) + observed * ALPHA,
+            MIN_INTEGER_RATIO, 1.0);
+        ++sampleCount;
+    }
 };
 
 class WAL {
@@ -84,6 +159,11 @@ private:
   // Close guard to prevent double-close
   bool _closed = false;
 
+  // Adaptive compression ratio tracking. Updated after each encodeInsertEntry()
+  // to converge estimates toward actual encoded sizes. Per-WAL instance,
+  // no synchronization needed (Seastar shard-per-core model).
+  CompressionStats _compressionStats;
+
   // Legacy leftover counter (kept to avoid changing user code paths/logging);
   // not used by the streaming implementation but referenced in wal.cpp
   // destructor.
@@ -113,9 +193,10 @@ private:
   // Encode a single insert entry (header + payload + CRC) into the provided
   // buffer.  Used by both insert() and insertBatch() to avoid duplicating
   // the encoding logic.  The buffer is appended to; the caller is responsible
-  // for pre-allocating sufficient capacity.
+  // for pre-allocating sufficient capacity.  Non-static: updates
+  // _compressionStats with observed compression ratios after encoding.
   template <class T>
-  static void encodeInsertEntry(AlignedBuffer &buffer, TSDBInsert<T> &insertRequest);
+  void encodeInsertEntry(AlignedBuffer &buffer, TSDBInsert<T> &insertRequest);
 
 public:
 

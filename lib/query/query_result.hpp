@@ -322,6 +322,6 @@ public:
   }
 };
 
-using VariantQueryResult = std::variant<QueryResult<double>, QueryResult<bool>, QueryResult<std::string>>;
+using VariantQueryResult = std::variant<QueryResult<double>, QueryResult<bool>, QueryResult<std::string>, QueryResult<int64_t>>;
 
 #endif

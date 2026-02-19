@@ -177,12 +177,26 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             const auto& timestamps = fieldData.first;
             const auto& values = fieldData.second;
 
-            // Only handle numeric values for now
-            if (!std::holds_alternative<std::vector<double>>(values)) {
-                continue;
+            // Extract numeric values as doubles for aggregation.
+            // Handles both native doubles and int64_t (cast to double; precision
+            // loss for values > 2^53 is a known trade-off).
+            std::vector<double> convertedValues;
+            const std::vector<double>* doubleValuesPtr = nullptr;
+
+            if (std::holds_alternative<std::vector<double>>(values)) {
+                doubleValuesPtr = &std::get<std::vector<double>>(values);
+            } else if (std::holds_alternative<std::vector<int64_t>>(values)) {
+                const auto& intValues = std::get<std::vector<int64_t>>(values);
+                convertedValues.reserve(intValues.size());
+                for (int64_t v : intValues) {
+                    convertedValues.push_back(static_cast<double>(v));
+                }
+                doubleValuesPtr = &convertedValues;
+            } else {
+                continue; // Skip non-numeric types (string, bool)
             }
 
-            const auto& doubleValues = std::get<std::vector<double>>(values);
+            const auto& doubleValues = *doubleValuesPtr;
 
             // Extract only the groupByTags (tags map is already sorted)
             std::map<std::string, std::string> relevantTags;

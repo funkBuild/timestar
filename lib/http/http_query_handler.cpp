@@ -142,7 +142,7 @@ struct QueryTimingInfo {
 // Response structures for Glaze serialization - must be at namespace scope
 struct QueryFieldData {
     std::vector<uint64_t> timestamps;
-    std::variant<std::vector<double>, std::vector<bool>, std::vector<std::string>> values;
+    std::variant<std::vector<double>, std::vector<bool>, std::vector<std::string>, std::vector<int64_t>> values;
 };
 
 struct QuerySeriesData {
@@ -179,7 +179,7 @@ struct QueryErrorResponse {
 std::unique_ptr<seastar::http::reply>
 HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
     // Check body size limit
-    if (req.content.size() > MAX_QUERY_BODY_SIZE) {
+    if (req.content.size() > maxQueryBodySize()) {
         auto rep = std::make_unique<seastar::http::reply>();
         rep->set_status(seastar::http::reply::status_type::payload_too_large);
         rep->_content = "{\"status\":\"error\",\"message\":\"Request body too large (max 1MB)\",\"error\":\"Request body too large (max 1MB)\"}";
@@ -390,10 +390,10 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         }
 
         // Struct holding pre-parsed series metadata for per-shard query execution.
-        // Includes pre-computed SeriesId128 to eliminate redundant SHA1 computations.
+        // Includes pre-computed SeriesId128 to eliminate redundant hash computations.
         struct SeriesQueryContext {
             std::string seriesKey;
-            SeriesId128 seriesId;  // Pre-computed from seriesKey — avoids SHA1 in QueryRunner
+            SeriesId128 seriesId;  // Pre-computed from seriesKey — avoids rehashing in QueryRunner
             std::string field;
             std::map<std::string, std::string> tags;
         };
@@ -410,11 +410,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         // Query shard 0 for all series metadata (centralized metadata).
         // Build SeriesQueryContext objects directly, grouped by owning shard,
         // eliminating the intermediate SeriesMetadataWithShard struct + conversion loop.
-        // Pass MAX_SERIES_COUNT into findSeriesWithMetadata to bail out early.
+        // Pass maxSeriesCount() into findSeriesWithMetadata to bail out early.
         auto findSeriesStart = std::chrono::high_resolution_clock::now();
         auto discoveryResult = co_await engineSharded->invoke_on(0,
             [measurement = request.measurement, scopes = request.scopes, fields = request.fields,
-             maxSeries = MAX_SERIES_COUNT](Engine& engine)
+             maxSeries = maxSeriesCount()](Engine& engine)
                 -> seastar::future<SeriesDiscoveryResult> {
                 auto& index = engine.getIndex();
 
@@ -486,12 +486,12 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Total series from centralized metadata: {} across {} shards (took {:.2f} ms)",
                        totalSeriesFound, shardsWithData, timing.findSeriesMs);
 
-        // Safety net: enforce MAX_SERIES_COUNT limit (should rarely trigger now
+        // Safety net: enforce maxSeriesCount() limit (should rarely trigger now
         // that the index layer checks early, but kept for defense-in-depth)
-        if (totalSeriesFound > MAX_SERIES_COUNT) {
+        if (totalSeriesFound > maxSeriesCount()) {
             response.success = false;
             response.errorCode = "TOO_MANY_SERIES";
-            response.errorMessage = "Too many series: " + std::to_string(totalSeriesFound) + " exceeds limit of " + std::to_string(MAX_SERIES_COUNT);
+            response.errorMessage = "Too many series: " + std::to_string(totalSeriesFound) + " exceeds limit of " + std::to_string(maxSeriesCount());
             co_return response;
         }
         
@@ -644,6 +644,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                         seriesResult.fields[ctx.field] = std::make_pair(
                                             std::move(result.timestamps), FieldValues(std::move(result.values)));
                                     }
+                                } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
+                                    if (!result.timestamps.empty()) {
+                                        seriesResult.fields[ctx.field] = std::make_pair(
+                                            std::move(result.timestamps), FieldValues(std::move(result.values)));
+                                    }
                                 }
                             }, variantResult);
 
@@ -697,7 +702,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         }
         
         // Wait for all shards to complete, with timeout to prevent indefinite hangs
-        auto deadline = seastar::lowres_clock::now() + DEFAULT_QUERY_TIMEOUT;
+        auto deadline = seastar::lowres_clock::now() + defaultQueryTimeout();
         std::vector<std::pair<unsigned, ShardQueryResult>> shardResults;
         try {
             shardResults = co_await seastar::with_timeout(deadline,
@@ -707,7 +712,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             timeoutResponse.success = false;
             timeoutResponse.errorCode = "QUERY_TIMEOUT";
             timeoutResponse.errorMessage = "Query timed out after " +
-                std::to_string(DEFAULT_QUERY_TIMEOUT.count()) + " seconds";
+                std::to_string(defaultQueryTimeout().count()) + " seconds";
             co_return timeoutResponse;
         }
         auto shardQueriesEnd = std::chrono::high_resolution_clock::now();
@@ -896,7 +901,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             }
         }
 
-        // Update statistics and enforce MAX_TOTAL_POINTS (covers both numeric and string results)
+        // Update statistics and enforce maxTotalPoints() (covers both numeric and string results)
         response.statistics.pointCount = 0;
         timing.finalPointsReturned = 0;
         for (const auto& series : response.series) {
@@ -907,10 +912,10 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             }
         }
 
-        // Enforce MAX_TOTAL_POINTS limit
-        if (response.statistics.pointCount > MAX_TOTAL_POINTS) {
+        // Enforce maxTotalPoints() limit
+        if (response.statistics.pointCount > maxTotalPoints()) {
             response.statistics.truncated = true;
-            response.statistics.truncationReason = "Total points " + std::to_string(response.statistics.pointCount) + " exceeds limit of " + std::to_string(MAX_TOTAL_POINTS);
+            response.statistics.truncationReason = "Total points " + std::to_string(response.statistics.pointCount) + " exceeds limit of " + std::to_string(maxTotalPoints());
             response.success = false;
             response.errorCode = "TOO_MANY_POINTS";
             response.errorMessage = response.statistics.truncationReason;

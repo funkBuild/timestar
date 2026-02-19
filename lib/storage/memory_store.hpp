@@ -9,6 +9,7 @@
 
 #include "logger.hpp"
 #include "tsdb_value.hpp"
+#include "tsdb_config.hpp"
 #include "tsm.hpp"
 #include "wal.hpp"
 #include "series_id.hpp"
@@ -21,15 +22,26 @@ public:
   std::vector<T> values;
 
   void insert(TSDBInsert<T>&& insertRequest);
-  // Sort timestamps and values together. sortedPrefix indicates how many elements
-  // at the front are already sorted (0 = sort everything, >0 = merge-sort optimization).
-  void sort(size_t sortedPrefix = 0);
+
+  // Sort all timestamps and values together. Convenience wrapper for sortPaired()
+  // over the entire range, used by TSM writer before flushing to disk.
+  void sort() { sortPaired(0, timestamps.size()); }
+
+  // Sort a subrange [from, to) of timestamps and values together using index-based
+  // permutation. Only allocates temporary storage proportional to the subrange size,
+  // not the full vector. Used for sorting unsorted suffixes before merging.
+  void sortPaired(size_t from, size_t to);
+
+  // Merge two individually-sorted runs [0, midpoint) and [midpoint, n) into a
+  // single sorted sequence. Uses a linear-time two-pointer merge into temporary
+  // buffers, which is O(n) vs O(n log n) for a full re-sort.
+  void mergePaired(size_t midpoint);
 };
 
 // Order of variants must match TSMValueType order
 using VariantInMemorySeries =
     std::variant<InMemorySeries<double>, InMemorySeries<bool>,
-                 InMemorySeries<std::string>>;
+                 InMemorySeries<std::string>, InMemorySeries<int64_t>>;
 
 class MemoryStore {
 private:
@@ -44,8 +56,9 @@ private:
   size_t estimatedAccumulatedSize = 0;
 
 public:
-  // 16MB threshold for WAL rollover decisions (based on estimated sizes)
-  static constexpr size_t WAL_SIZE_THRESHOLD = 16 * 1024 * 1024; // 16MB
+  // Threshold for WAL rollover decisions (based on estimated sizes).
+  // Read from tsdb::config().storage.wal_size_threshold at runtime.
+  static size_t walSizeThreshold() { return tsdb::config().storage.wal_size_threshold; }
   const unsigned int sequenceNumber;
   // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
   tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
@@ -71,6 +84,9 @@ public:
   insertBatch(std::vector<TSDBInsert<T>> &insertRequests, size_t preComputedBatchSize = 0); // Batch insert - returns true if WAL needs rollover
   seastar::future<bool> isFull();
   template <class T> bool wouldExceedThreshold(TSDBInsert<T> &insertRequest);
+  // Variant that also returns the computed estimated size to avoid
+  // double-estimation in the single-insert path.
+  template <class T> bool wouldExceedThreshold(TSDBInsert<T> &insertRequest, size_t &outEstimatedSize);
   template <class T> bool wouldBatchExceedThreshold(std::vector<TSDBInsert<T>> &insertRequests);
   bool isClosed() { return closed; }
   bool isEmpty() { return series.size() == 0; }

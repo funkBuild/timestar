@@ -302,7 +302,7 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExceedsLimit) {
 
     seastar::http::request req;
     // Create a body larger than 1MB
-    req.content = std::string(HttpQueryHandler::MAX_QUERY_BODY_SIZE + 1, 'x');
+    req.content = std::string(HttpQueryHandler::maxQueryBodySize() + 1, 'x');
 
     auto result = handler.validateRequest(req);
     ASSERT_NE(result, nullptr) << "Oversized request should fail validation";
@@ -316,7 +316,7 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodyExactlyAtLimit) {
 
     seastar::http::request req;
     // Create a body exactly at the 1MB limit
-    req.content = std::string(HttpQueryHandler::MAX_QUERY_BODY_SIZE, 'x');
+    req.content = std::string(HttpQueryHandler::maxQueryBodySize(), 'x');
 
     auto result = handler.validateRequest(req);
     EXPECT_EQ(result, nullptr) << "Request body exactly at limit should pass validation";
@@ -413,7 +413,7 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodySizeTakesPrecedenceOverContentTy
 
     seastar::http::request req;
     // Both oversized body AND wrong content type
-    req.content = std::string(HttpQueryHandler::MAX_QUERY_BODY_SIZE + 1, 'x');
+    req.content = std::string(HttpQueryHandler::maxQueryBodySize() + 1, 'x');
     req._headers["Content-Type"] = "text/html";
 
     auto result = handler.validateRequest(req);
@@ -427,5 +427,5 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodySizeTakesPrecedenceOverContentTy
 // =============================================================================
 
 TEST_F(HttpQueryHandlerTest, MaxQueryBodySizeIs1MB) {
-    EXPECT_EQ(HttpQueryHandler::MAX_QUERY_BODY_SIZE, 1 * 1024 * 1024);
+    EXPECT_EQ(HttpQueryHandler::maxQueryBodySize(), 1 * 1024 * 1024);
 }

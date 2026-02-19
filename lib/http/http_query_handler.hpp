@@ -5,6 +5,7 @@
 #include "query_planner.hpp"
 #include "leveldb_index.hpp"
 #include "series_id.hpp"
+#include "tsdb_config.hpp"
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
@@ -23,11 +24,12 @@ struct GlazeQueryRequest;
 
 namespace tsdb {
 
-// Variant type for field values - can be double, bool, or string
+// Variant type for field values - can be double, bool, string, or int64
 using FieldValues = std::variant<
     std::vector<double>,
     std::vector<bool>,
-    std::vector<std::string>
+    std::vector<std::string>,
+    std::vector<int64_t>
 >;
 
 struct SeriesResult {
@@ -64,14 +66,14 @@ private:
 
 public:
     // Security limits to prevent DoS attacks
-    static constexpr size_t MAX_QUERY_BODY_SIZE = 1 * 1024 * 1024; // 1MB - queries should be small
+    static size_t maxQueryBodySize() { return tsdb::config().http.max_query_body_size; }
 
     // Query result limits to prevent OOM and excessive response sizes
-    static constexpr size_t MAX_SERIES_COUNT = 10'000;       // Max series in response
-    static constexpr size_t MAX_TOTAL_POINTS = 10'000'000;   // Max total points across all series
+    static size_t maxSeriesCount() { return tsdb::config().http.max_series_count; }
+    static size_t maxTotalPoints() { return tsdb::config().http.max_total_points; }
 
     // Query timeout to prevent indefinite hangs from stuck shards
-    static constexpr std::chrono::seconds DEFAULT_QUERY_TIMEOUT{30};
+    static std::chrono::seconds defaultQueryTimeout() { return std::chrono::seconds(tsdb::config().http.query_timeout_seconds); }
 
     explicit HttpQueryHandler(seastar::sharded<Engine>* engine,
                             seastar::sharded<LevelDBIndex>* index = nullptr)

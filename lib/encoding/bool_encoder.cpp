@@ -29,6 +29,30 @@ AlignedBuffer BoolEncoder::encode(const std::vector<bool> &values){
   return buffer;
 }
 
+size_t BoolEncoder::encodeInto(const std::vector<bool> &values, AlignedBuffer &target) {
+  const size_t startPos = target.size();
+  const size_t valuesLength = values.size();
+  size_t offset = 0;
+
+  while (offset < valuesLength) {
+    unsigned int numValuesLeft = valuesLength - offset;
+
+    if (numValuesLeft >= 64) {
+      encodeBool<uint64_t>(values, offset, target);
+    } else if (numValuesLeft >= 32) {
+      encodeBool<uint32_t>(values, offset, target);
+    } else if (numValuesLeft >= 16) {
+      encodeBool<uint16_t>(values, offset, target);
+    } else if (numValuesLeft >= 8) {
+      encodeBool<uint8_t>(values, offset, target);
+    } else {
+      encodeBool(numValuesLeft, values, offset, target);
+    }
+  }
+
+  return target.size() - startPos;
+}
+
 void BoolEncoder::decode(Slice &encoded, size_t nToSkip, size_t length, std::vector<bool> &out){
   size_t totalBits = nToSkip + length;
   size_t bytesNeeded = (totalBits + 7) / 8;

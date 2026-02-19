@@ -1,0 +1,193 @@
+#ifndef TSDB_CONFIG_H_INCLUDED
+#define TSDB_CONFIG_H_INCLUDED
+
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+#include <glaze/glaze.hpp>
+
+namespace tsdb {
+
+struct ServerConfig {
+    uint16_t port = 8086;
+    std::string log_level = "info";
+    std::string data_dir = ".";
+};
+
+struct CompactionConfig {
+    uint32_t max_concurrent = 2;
+    uint64_t max_memory = 256 * 1024 * 1024;
+    uint32_t batch_size = 10000;
+    uint32_t tier0_min_files = 4;
+    uint32_t tier1_min_files = 4;
+    uint32_t tier2_min_files = 4;
+};
+
+struct StorageConfig {
+    uint64_t wal_size_threshold = 16 * 1024 * 1024;
+    uint32_t max_points_per_block = 3000;
+    double tsm_bloom_fpr = 0.001;
+    uint32_t tsm_cache_entries = 4096;
+    CompactionConfig compaction;
+};
+
+struct HttpConfig {
+    uint64_t max_write_body_size = 64 * 1024 * 1024;
+    uint64_t max_query_body_size = 1 * 1024 * 1024;
+    uint32_t max_series_count = 10000;
+    uint64_t max_total_points = 10000000;
+    uint32_t query_timeout_seconds = 30;
+};
+
+struct IndexConfig {
+    uint32_t bloom_filter_bits = 15;
+    uint32_t block_size = 16384;
+    uint64_t write_buffer_size = 16 * 1024 * 1024;
+    uint32_t max_open_files = 1000;
+    uint64_t max_file_size = 64 * 1024 * 1024;
+    uint64_t series_cache_size = 1000000;
+};
+
+struct EngineConfig {
+    uint32_t metadata_retry_interval_seconds = 5;
+    uint32_t max_metadata_retry_ops = 10000;
+    uint32_t retention_sweep_interval_minutes = 15;
+    double tombstone_dead_fraction_threshold = 0.10;
+    uint32_t max_tombstone_rewrites_per_sweep = 2;
+};
+
+// Seastar settings parsed from [seastar] TOML section.
+// Stored as string key-value pairs; only keys present in the file are set.
+// Keys use underscore naming (matching TOML), and are converted to Seastar's
+// hyphenated CLI names during injection.
+struct SeastarConfig {
+    std::map<std::string, std::string> settings;
+
+    bool has(const std::string& key) const { return settings.count(key) > 0; }
+    const std::string& get(const std::string& key) const { return settings.at(key); }
+};
+
+// Internal struct for Glaze TOML parsing (excludes SeastarConfig)
+struct TsdbConfigParseable {
+    ServerConfig server;
+    StorageConfig storage;
+    HttpConfig http;
+    IndexConfig index;
+    EngineConfig engine;
+};
+
+struct TsdbConfig {
+    ServerConfig server;
+    StorageConfig storage;
+    HttpConfig http;
+    IndexConfig index;
+    EngineConfig engine;
+    SeastarConfig seastar;
+
+    // Validate config values. Returns a list of error strings (empty = valid).
+    std::vector<std::string> validate() const;
+};
+
+// Load config from a TOML file. Throws std::runtime_error on parse/validation failure.
+TsdbConfig loadConfigFile(const std::string& path);
+
+// Return the default config as a TOML string.
+std::string dumpDefaultConfig();
+
+// Set the global config (call once in main before app.run()).
+void setGlobalConfig(const TsdbConfig& cfg);
+
+// Read the global config from any shard (lock-free, set once before reactor starts).
+const TsdbConfig& config();
+
+} // namespace tsdb
+
+// Glaze metadata for TOML serialization
+
+template <>
+struct glz::meta<tsdb::ServerConfig> {
+    using T = tsdb::ServerConfig;
+    static constexpr auto value = object(
+        "port", &T::port,
+        "log_level", &T::log_level,
+        "data_dir", &T::data_dir
+    );
+};
+
+template <>
+struct glz::meta<tsdb::CompactionConfig> {
+    using T = tsdb::CompactionConfig;
+    static constexpr auto value = object(
+        "max_concurrent", &T::max_concurrent,
+        "max_memory", &T::max_memory,
+        "batch_size", &T::batch_size,
+        "tier0_min_files", &T::tier0_min_files,
+        "tier1_min_files", &T::tier1_min_files,
+        "tier2_min_files", &T::tier2_min_files
+    );
+};
+
+template <>
+struct glz::meta<tsdb::StorageConfig> {
+    using T = tsdb::StorageConfig;
+    static constexpr auto value = object(
+        "wal_size_threshold", &T::wal_size_threshold,
+        "max_points_per_block", &T::max_points_per_block,
+        "tsm_bloom_fpr", &T::tsm_bloom_fpr,
+        "tsm_cache_entries", &T::tsm_cache_entries,
+        "compaction", &T::compaction
+    );
+};
+
+template <>
+struct glz::meta<tsdb::HttpConfig> {
+    using T = tsdb::HttpConfig;
+    static constexpr auto value = object(
+        "max_write_body_size", &T::max_write_body_size,
+        "max_query_body_size", &T::max_query_body_size,
+        "max_series_count", &T::max_series_count,
+        "max_total_points", &T::max_total_points,
+        "query_timeout_seconds", &T::query_timeout_seconds
+    );
+};
+
+template <>
+struct glz::meta<tsdb::IndexConfig> {
+    using T = tsdb::IndexConfig;
+    static constexpr auto value = object(
+        "bloom_filter_bits", &T::bloom_filter_bits,
+        "block_size", &T::block_size,
+        "write_buffer_size", &T::write_buffer_size,
+        "max_open_files", &T::max_open_files,
+        "max_file_size", &T::max_file_size,
+        "series_cache_size", &T::series_cache_size
+    );
+};
+
+template <>
+struct glz::meta<tsdb::EngineConfig> {
+    using T = tsdb::EngineConfig;
+    static constexpr auto value = object(
+        "metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds,
+        "max_metadata_retry_ops", &T::max_metadata_retry_ops,
+        "retention_sweep_interval_minutes", &T::retention_sweep_interval_minutes,
+        "tombstone_dead_fraction_threshold", &T::tombstone_dead_fraction_threshold,
+        "max_tombstone_rewrites_per_sweep", &T::max_tombstone_rewrites_per_sweep
+    );
+};
+
+template <>
+struct glz::meta<tsdb::TsdbConfigParseable> {
+    using T = tsdb::TsdbConfigParseable;
+    static constexpr auto value = object(
+        "server", &T::server,
+        "storage", &T::storage,
+        "http", &T::http,
+        "index", &T::index,
+        "engine", &T::engine
+    );
+};
+
+#endif // TSDB_CONFIG_H_INCLUDED

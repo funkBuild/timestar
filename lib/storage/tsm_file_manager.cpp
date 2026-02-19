@@ -17,6 +17,10 @@ TSMFileManager::TSMFileManager(){
   shardId = seastar::this_shard_id();
 }
 
+// Destructor defined here where TSMCompactor is a complete type,
+// so std::unique_ptr<TSMCompactor> can call delete.
+TSMFileManager::~TSMFileManager() = default;
+
 std::string TSMFileManager::basePath(){
   return std::string("shard_" + std::to_string(shardId) + "/tsm/");
 }
@@ -25,7 +29,7 @@ seastar::future<> TSMFileManager::init(){
   tsdb::tsm_log.info("TSMFileManager init. shardId={}", shardId);
   
   // Initialize compactor
-  compactor = std::make_shared<TSMCompactor>(this);
+  compactor = std::make_unique<TSMCompactor>(this);
   
   // Scan the TSM folder for files if it exists.
   // std::filesystem calls are blocking, so run them off the reactor thread.
@@ -90,11 +94,8 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
   // and only the final file write is async via open_file_dma + dma_write.
   co_await TSMWriter::runAsync(memStore, filename);
   co_await openTsmFile(filename);
-  
-  // Check if this tier needs compaction after adding the new file
-  co_await checkAndTriggerCompaction();
 
-  co_return;
+  co_await checkAndTriggerCompaction();
 }
 
 std::optional<TSMValueType> TSMFileManager::getSeriesType(const std::string &seriesKey){
@@ -136,8 +137,8 @@ bool TSMFileManager::shouldCompactTier(uint64_t tier) const {
   
   size_t fileCount = tiers[tier].size();
   
-  // Compact when we have at least FILES_PER_COMPACTION files
-  return fileCount >= FILES_PER_COMPACTION;
+  // Compact when we have at least filesPerCompaction() files
+  return fileCount >= filesPerCompaction();
 }
 
 seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {

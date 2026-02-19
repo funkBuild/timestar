@@ -3,11 +3,11 @@
 #include "logging_config.hpp"
 
 #include <chrono>
-#include <set>
 #include <unordered_set>
-#include <unordered_map>
 #include <numeric>
 #include <algorithm>
+#include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
 #include <boost/iterator/counting_iterator.hpp>
 #include <seastar/core/when_all.hh>
 
@@ -19,30 +19,29 @@ using namespace httpd;
 static std::string buildSeriesKey(const std::string& measurement,
                                    const std::map<std::string, std::string>& tags,
                                    const std::string& field) {
-    std::string key = measurement;
+    size_t totalSize = measurement.size() + 1 + field.size(); // +1 for space
     for (const auto& [tagKey, tagValue] : tags) {
-        key += "," + tagKey + "=" + tagValue;
+        totalSize += 1 + tagKey.size() + 1 + tagValue.size(); // ,key=value
     }
-    key += " " + field;
+    std::string key;
+    key.reserve(totalSize);
+    key = measurement;
+    for (const auto& [tagKey, tagValue] : tags) {
+        key += ',';
+        key += tagKey;
+        key += '=';
+        key += tagValue;
+    }
+    key += ' ';
+    key += field;
     return key;
-}
-
-// IEEE 754 double can represent integers exactly up to 2^53.
-// Beyond that, some integer values will silently lose precision
-// when converted to double (e.g., 9007199254740993 -> 9007199254740992.0).
-namespace {
-    constexpr int64_t MAX_EXACT_DOUBLE_INT = 1LL << 53;  // 9007199254740992
-
-    bool wouldLosePrecision(int64_t value) {
-        return value > MAX_EXACT_DOUBLE_INT || value < -MAX_EXACT_DOUBLE_INT;
-    }
 }
 
 // Glaze-compatible structures for JSON parsing
 struct GlazeWritePoint {
     std::string measurement;
     std::map<std::string, std::string> tags;
-    glz::json_t fields;  // Can hold heterogeneous types
+    json_value_t fields;  // Use u64 mode for integer precision
     std::optional<uint64_t> timestamp;
 };
 
@@ -167,7 +166,7 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
 
     // Validate field names
     if (glazePoint.fields.is_object()) {
-        auto& fields_obj = glazePoint.fields.get<glz::json_t::object_t>();
+        auto& fields_obj = glazePoint.fields.get<json_value_t::object_t>();
         for (const auto& [fieldName, fieldValue] : fields_obj) {
             err = validateName(fieldName, "Field name '" + fieldName + "'");
             if (!err.empty()) throw std::runtime_error(err);
@@ -175,7 +174,7 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
     }
 }
 
-HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point) {
+HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point, uint64_t defaultTimestampNs) {
     MultiWritePoint mwp;
 
     // Extract fields directly from the json_value_t object, avoiding a
@@ -241,12 +240,23 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
 
             // Determine type from first element
             if (arr[0].is_number()) {
-                fa.type = FieldArrays::DOUBLE;
-                for (auto& elem : arr) {
-                    if (elem.is_number()) {
-                        fa.doubles.push_back(elem.as<double>());
-                    } else {
-                        throw std::runtime_error("Mixed types in field array: " + fieldName);
+                if (arr[0].holds<int64_t>() || arr[0].holds<uint64_t>()) {
+                    fa.type = FieldArrays::INTEGER;
+                    for (auto& elem : arr) {
+                        if (elem.is_number()) {
+                            fa.integers.push_back(elem.as<int64_t>());
+                        } else {
+                            throw std::runtime_error("Mixed types in field array: " + fieldName);
+                        }
+                    }
+                } else {
+                    fa.type = FieldArrays::DOUBLE;
+                    for (auto& elem : arr) {
+                        if (elem.is_number()) {
+                            fa.doubles.push_back(elem.as<double>());
+                        } else {
+                            throw std::runtime_error("Mixed types in field array: " + fieldName);
+                        }
                     }
                 }
             } else if (arr[0].is_boolean()) {
@@ -275,8 +285,13 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
         } else {
             // Single value - convert to array of size 1
             if (fieldValue.is_number()) {
-                fa.type = FieldArrays::DOUBLE;
-                fa.doubles.push_back(fieldValue.as<double>());
+                if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
+                    fa.type = FieldArrays::INTEGER;
+                    fa.integers.push_back(fieldValue.as<int64_t>());
+                } else {
+                    fa.type = FieldArrays::DOUBLE;
+                    fa.doubles.push_back(fieldValue.as<double>());
+                }
             } else if (fieldValue.is_boolean()) {
                 fa.type = FieldArrays::BOOL;
                 fa.bools.push_back(fieldValue.get<bool>() ? 1 : 0);
@@ -326,12 +341,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
         }
         mwp.timestamps.resize(numPoints, ts);
     } else {
-        // No timestamp - use current time
-        auto now = std::chrono::system_clock::now();
-        auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()).count();
-        uint64_t currentTime = static_cast<uint64_t>(nanos);
-
+        // No timestamp - use caller-supplied default (captured once per batch)
         size_t numPoints = 1;
         for (const auto& [fieldName, fieldArray] : mwp.fields) {
             size_t fieldSize = 0;
@@ -344,16 +354,16 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             numPoints = std::max(numPoints, fieldSize);
         }
 
-        // Generate timestamps 1ms apart
+        // Generate timestamps 1ms apart from the pre-computed default
         for (size_t i = 0; i < numPoints; i++) {
-            mwp.timestamps.push_back(currentTime + i * 1000000);
+            mwp.timestamps.push_back(defaultTimestampNs + i * 1000000);
         }
     }
 
     return mwp;
 }
 
-std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(const json_value_t::array_t& writes_array) {
+std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs) {
     // Configuration constants
     static const size_t MAX_COALESCE_SIZE = 10000;  // Max values per field array
     static const size_t MIN_COALESCE_COUNT = 2;     // Min writes needed to coalesce
@@ -365,7 +375,13 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // Fast direct parsing approach - avoid JSON string serialization.
     // Handles both scalar and array fields in a single pass, eliminating
     // the need for callers to pre-scan fields for array detection.
-    std::unordered_map<std::string, CoalesceCandidate> candidates;
+    // Use robin_map for better cache locality on the hot lookup path --
+    // open-addressing with Robin Hood probing keeps entries in a flat array,
+    // avoiding per-bucket linked-list pointer chasing of std::unordered_map.
+    tsl::robin_map<std::string, CoalesceCandidate> candidates;
+    // Pre-allocate for the expected number of unique series keys.
+    // A typical write point has 1-3 fields, so estimate writes * 2.
+    candidates.reserve(writes_array.size() * 2);
     [[maybe_unused]] size_t totalWritesProcessed = 0;
 
     LOG_INSERT_PATH(tsdb::http_log, debug, "[COALESCE] Processing {} writes for coalescing", writes_array.size());
@@ -375,6 +391,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     auto addScalarToCandidate = [](CoalesceCandidate& candidate, TSMValueType valueType,
                                    uint64_t ts, const json_value_t& val) -> bool {
         candidate.timestamps.push_back(ts);
+        candidate.timestampHashSum += ts;
+        candidate.timestampHashXor ^= ts;
         if (valueType == TSMValueType::Float) {
             candidate.doubleValues.push_back(val.as<double>());
         } else if (valueType == TSMValueType::Boolean) {
@@ -382,6 +400,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         } else if (valueType == TSMValueType::String) {
             std::string strValue = val.get<std::string>();
             candidate.stringValues.push_back(std::move(strValue));
+        } else if (valueType == TSMValueType::Integer) {
+            candidate.integerValues.push_back(val.as<int64_t>());
         } else {
             return false;
         }
@@ -389,29 +409,34 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     };
 
     // Helper lambda: initialize a new CoalesceCandidate with metadata.
+    // Takes a lw_shared_ptr to the tag map so that all candidates from the
+    // same write point share a single allocation (O(1) pointer copy).
     auto initCandidate = [](CoalesceCandidate& candidate, const std::string& seriesKey,
-                            const std::string& measurement, const std::map<std::string, std::string>& tags,
+                            const std::string& measurement,
+                            seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
                             const std::string& fieldName, TSMValueType valueType) {
         candidate.seriesKey = seriesKey;
         candidate.measurement = measurement;
-        candidate.tags = tags;
+        candidate.sharedTags = std::move(tags);
         candidate.fieldName = fieldName;
         candidate.valueType = valueType;
     };
 
     // Helper lambda: find or create a candidate, handling type mismatch and overflow
     // by creating disambiguated keys. Returns a reference to the target candidate.
+    // Takes lw_shared_ptr<const map> by value so the shared tag map is propagated
+    // without copying the underlying map data.
     auto findOrCreateCandidate = [&](const std::string& seriesKey, const std::string& measurement,
-                                     const std::map<std::string, std::string>& tags,
+                                     seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
                                      const std::string& fieldName, TSMValueType valueType,
                                      size_t numValuesToAdd) -> CoalesceCandidate& {
         auto it = candidates.find(seriesKey);
         if (it == candidates.end()) {
             CoalesceCandidate& c = candidates[seriesKey];
-            initCandidate(c, seriesKey, measurement, tags, fieldName, valueType);
+            initCandidate(c, seriesKey, measurement, std::move(tags), fieldName, valueType);
             return c;
         }
-        CoalesceCandidate& existing = it->second;
+        CoalesceCandidate& existing = it.value();
         if (existing.valueType == valueType &&
             existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
             return existing;
@@ -423,7 +448,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             altKey = seriesKey + "#" + std::to_string(suffix++);
         } while (candidates.count(altKey) > 0);
         CoalesceCandidate& c = candidates[altKey];
-        initCandidate(c, altKey, measurement, tags, fieldName, valueType);
+        initCandidate(c, altKey, measurement, std::move(tags), fieldName, valueType);
         return c;
     };
 
@@ -470,26 +495,26 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             } else if (singleTimestampIt != writeObj.end() && singleTimestampIt->second.is_number()) {
                 timestamps.push_back(singleTimestampIt->second.as<uint64_t>());
             } else {
-                // Generate timestamp
-                auto now = std::chrono::system_clock::now();
-                auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-                timestamps.push_back(static_cast<uint64_t>(nanos));
+                // No timestamp provided - use the batch-level default
+                timestamps.push_back(defaultTimestampNs);
             }
 
-            // Extract tags
-            std::map<std::string, std::string> tags;
+            // Extract tags into a local map, validate, then wrap in a
+            // lw_shared_ptr so all CoalesceCandidates from this write point
+            // share a single allocation (pointer copy instead of map copy).
+            std::map<std::string, std::string> localTags;
             auto tagsIt = writeObj.find("tags");
             if (tagsIt != writeObj.end() && tagsIt->second.is_object()) {
                 auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
                 for (const auto& [tagKey, tagValue] : tagsObj) {
                     if (tagValue.is_string()) {
-                        tags[tagKey] = tagValue.get<std::string>();
+                        localTags[tagKey] = tagValue.get<std::string>();
                     }
                 }
             }
 
             // Validate tag keys and values
-            for (const auto& [tagKey, tagValue] : tags) {
+            for (const auto& [tagKey, tagValue] : localTags) {
                 auto err = validateName(tagKey, "Tag key '" + tagKey + "'");
                 if (!err.empty()) throw std::runtime_error(err);
                 err = validateTagValue(tagValue, "Tag value for '" + tagKey + "'");
@@ -500,12 +525,16 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             std::string seriesKeyPrefix;
             seriesKeyPrefix.reserve(measurement.length() + 64);
             seriesKeyPrefix = measurement;
-            for (const auto& [tagKey, tagValue] : tags) {
+            for (const auto& [tagKey, tagValue] : localTags) {
                 seriesKeyPrefix += ",";
                 seriesKeyPrefix += tagKey;
                 seriesKeyPrefix += "=";
                 seriesKeyPrefix += tagValue;
             }
+
+            // Create the shared tag map once per write point. All fields from
+            // this write point will share this single allocation via lw_shared_ptr.
+            auto sharedTags = seastar::make_lw_shared<const std::map<std::string, std::string>>(std::move(localTags));
 
             // Extract fields and process each field - handles both scalar and array values
             auto fieldsIt = writeObj.find("fields");
@@ -536,7 +565,13 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     // Determine type from first element
                     TSMValueType valueType;
                     if (arr[0].is_number()) {
-                        valueType = TSMValueType::Float;
+                        // With generic_u64 parsing, integer JSON values (no decimal point)
+                        // are stored as int64_t/uint64_t, while floats are stored as double.
+                        if (arr[0].holds<int64_t>() || arr[0].holds<uint64_t>()) {
+                            valueType = TSMValueType::Integer;
+                        } else {
+                            valueType = TSMValueType::Float;
+                        }
                     } else if (arr[0].is_boolean()) {
                         valueType = TSMValueType::Boolean;
                     } else if (arr[0].is_string()) {
@@ -554,10 +589,9 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                         // Single timestamp with array fields - replicate for each element
                         fieldTimestamps.resize(arr.size(), timestamps[0]);
                     } else {
-                        // Generate timestamps 1ms apart from the first available
-                        uint64_t baseTs = timestamps.empty() ? static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count())
+                        // Generate timestamps 1ms apart from the first available,
+                        // falling back to the batch-level default if none exist
+                        uint64_t baseTs = timestamps.empty() ? defaultTimestampNs
                             : timestamps[0];
                         fieldTimestamps.reserve(arr.size());
                         for (size_t i = 0; i < arr.size(); i++) {
@@ -566,13 +600,15 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     }
 
                     CoalesceCandidate& candidate = findOrCreateCandidate(
-                        seriesKey, measurement, tags, fieldName, valueType, arr.size());
+                        seriesKey, measurement, sharedTags, fieldName, valueType, arr.size());
 
                     // Add all array elements to candidate
                     candidate.timestamps.reserve(candidate.timestamps.size() + arr.size());
                     for (size_t i = 0; i < arr.size(); i++) {
                         auto& elem = arr[i];
                         candidate.timestamps.push_back(fieldTimestamps[i]);
+                        candidate.timestampHashSum += fieldTimestamps[i];
+                        candidate.timestampHashXor ^= fieldTimestamps[i];
                         if (valueType == TSMValueType::Float) {
                             if (!elem.is_number()) throw std::runtime_error("Mixed types in field array: " + fieldName);
                             candidate.doubleValues.push_back(elem.as<double>());
@@ -583,13 +619,20 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                             if (!elem.is_string()) throw std::runtime_error("Mixed types in field array: " + fieldName);
                             std::string strValue = elem.get<std::string>();
                             candidate.stringValues.push_back(std::move(strValue));
+                        } else if (valueType == TSMValueType::Integer) {
+                            if (!elem.is_number()) throw std::runtime_error("Mixed types in field array: " + fieldName);
+                            candidate.integerValues.push_back(elem.as<int64_t>());
                         }
                     }
                 } else {
                     // Scalar field - determine type and add single value
                     TSMValueType valueType;
                     if (fieldValue.is_number()) {
-                        valueType = TSMValueType::Float;
+                        if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
+                            valueType = TSMValueType::Integer;
+                        } else {
+                            valueType = TSMValueType::Float;
+                        }
                     } else if (fieldValue.is_boolean()) {
                         valueType = TSMValueType::Boolean;
                     } else if (fieldValue.is_string()) {
@@ -599,7 +642,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     }
 
                     CoalesceCandidate& candidate = findOrCreateCandidate(
-                        seriesKey, measurement, tags, fieldName, valueType, 1);
+                        seriesKey, measurement, sharedTags, fieldName, valueType, 1);
                     addScalarToCandidate(candidate, valueType, timestamps[0], fieldValue);
                 }
             }
@@ -613,8 +656,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     std::vector<MultiWritePoint> result;
 
     // Group by measurement+tags efficiently (only for coalescing)
-    std::unordered_map<std::string, std::vector<std::string>> grouped; // groupKey -> seriesKeys
-    std::unordered_set<std::string> processedSeriesKeys; // Track which candidates were coalesced
+    tsl::robin_map<std::string, std::vector<std::string>> grouped; // groupKey -> seriesKeys
+    tsl::robin_set<std::string> processedSeriesKeys; // Track which candidates were coalesced
     [[maybe_unused]] size_t individualCount = 0;
 
     for (const auto& [seriesKey, candidate] : candidates) {
@@ -626,7 +669,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
         // Build group key (measurement + tags, without field)
         std::string groupKey = candidate.measurement;
-        for (const auto& [tagKey, tagValue] : candidate.tags) {
+        for (const auto& [tagKey, tagValue] : *candidate.sharedTags) {
             groupKey += ",";
             groupKey += tagKey;
             groupKey += "=";
@@ -646,21 +689,14 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         auto& firstCandidate = candidates[firstSeriesKey];
         bool timestampsCompatible = true;
 
-        // Create sorted version of first candidate's timestamps once
-        std::vector<uint64_t> sortedFirst = firstCandidate.timestamps;
-        std::sort(sortedFirst.begin(), sortedFirst.end());
-
+        // Compare timestamps using pre-computed commutative hashes (O(1) per field).
+        // Two multisets with the same count, same sum, and same XOR are identical
+        // for real nanosecond timestamps (collision probability is vanishingly small).
         for (size_t i = 1; i < seriesKeys.size(); i++) {
             auto& candidate = candidates[seriesKeys[i]];
-            if (candidate.timestamps.size() != firstCandidate.timestamps.size()) {
-                timestampsCompatible = false;
-                break;
-            }
-            // Check if timestamps match (allowing for different ordering)
-            std::vector<uint64_t> sortedCurrent = candidate.timestamps;
-            std::sort(sortedCurrent.begin(), sortedCurrent.end());
-
-            if (sortedFirst != sortedCurrent) {
+            if (candidate.timestamps.size() != firstCandidate.timestamps.size() ||
+                candidate.timestampHashSum != firstCandidate.timestampHashSum ||
+                candidate.timestampHashXor != firstCandidate.timestampHashXor) {
                 timestampsCompatible = false;
                 break;
             }
@@ -675,18 +711,21 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
                 MultiWritePoint mwp;
                 mwp.measurement = candidate.measurement;
-                mwp.tags = candidate.tags;
+                mwp.tags = *candidate.sharedTags;
                 mwp.timestamps = std::move(candidate.timestamps);
 
                 FieldArrays fa;
                 fa.type = (candidate.valueType == TSMValueType::Float) ? FieldArrays::DOUBLE :
                          (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL :
+                         (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER :
                          FieldArrays::STRING;
 
                 if (candidate.valueType == TSMValueType::Float) {
                     fa.doubles = std::move(candidate.doubleValues);
                 } else if (candidate.valueType == TSMValueType::Boolean) {
                     fa.bools = std::move(candidate.boolValues);
+                } else if (candidate.valueType == TSMValueType::Integer) {
+                    fa.integers = std::move(candidate.integerValues);
                 } else {
                     fa.strings = std::move(candidate.stringValues);
                 }
@@ -700,7 +739,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
         MultiWritePoint mwp;
         mwp.measurement = firstCandidate.measurement;
-        mwp.tags = firstCandidate.tags;
+        mwp.tags = *firstCandidate.sharedTags;
         mwp.timestamps = std::move(firstCandidate.timestamps);
 
         // NOTE: Don't sort timestamps here because field arrays are in the same original order
@@ -730,8 +769,12 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         result.push_back(std::move(mwp));
     }
 
-    // Finally, process individual writes (< MIN_COALESCE_COUNT) that weren't coalesced
-    for (auto& [seriesKey, candidate] : candidates) {
+    // Finally, process individual writes (< MIN_COALESCE_COUNT) that weren't coalesced.
+    // Use iterator-based loop with .value() to get mutable access for std::move(),
+    // since robin_map's range-for yields const references to the stored pairs.
+    for (auto it = candidates.begin(); it != candidates.end(); ++it) {
+        const auto& seriesKey = it->first;
+        auto& candidate = it.value();
         // Skip if already processed in coalesced groups or if it was a multi-count candidate
         if (processedSeriesKeys.count(seriesKey) > 0 || candidate.timestamps.size() >= MIN_COALESCE_COUNT) {
             continue;
@@ -739,7 +782,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
         MultiWritePoint mwp;
         mwp.measurement = candidate.measurement;
-        mwp.tags = candidate.tags;
+        mwp.tags = *candidate.sharedTags;
         mwp.timestamps = std::move(candidate.timestamps);
 
         FieldArrays fa;
@@ -821,6 +864,7 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
     std::vector<std::vector<TSDBInsert<double>>> shardDoubleInserts(shardCount);
     std::vector<std::vector<TSDBInsert<bool>>> shardBoolInserts(shardCount);
     std::vector<std::vector<TSDBInsert<std::string>>> shardStringInserts(shardCount);
+    std::vector<std::vector<TSDBInsert<int64_t>>> shardIntegerInserts(shardCount);
 
     // Note: seenMF and metaOps are now passed by reference from caller for cross-batch deduplication
 
@@ -833,20 +877,38 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
 
     // Pre-build the measurement+tags prefix once for series key construction
-    std::string seriesKeyPrefix = point.measurement;
-    for (const auto& [tagKey, tagValue] : *sharedTags) {
-        seriesKeyPrefix += "," + tagKey + "=" + tagValue;
+    std::string seriesKeyPrefix;
+    {
+        size_t prefixSize = point.measurement.size();
+        for (const auto& [tagKey, tagValue] : *sharedTags) {
+            prefixSize += 1 + tagKey.size() + 1 + tagValue.size();
+        }
+        seriesKeyPrefix.reserve(prefixSize);
+        seriesKeyPrefix = point.measurement;
+        for (const auto& [tagKey, tagValue] : *sharedTags) {
+            seriesKeyPrefix += ',';
+            seriesKeyPrefix += tagKey;
+            seriesKeyPrefix += '=';
+            seriesKeyPrefix += tagValue;
+        }
     }
 
-    for (const auto& [fieldName, fieldArray] : point.fields) {
-        // Build the complete series key for sharding
-        std::string seriesKey = seriesKeyPrefix + " " + fieldName;
+    for (auto& [fieldName, fieldArray] : point.fields) {
+        // Build the complete series key for sharding (no temporaries)
+        std::string seriesKey;
+        seriesKey.reserve(seriesKeyPrefix.size() + 1 + fieldName.size());
+        seriesKey = seriesKeyPrefix;
+        seriesKey += ' ';
+        seriesKey += fieldName;
 
         // Compute SeriesId128 ONCE per field for shard routing.
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
         size_t shard = SeriesId128::Hash{}(seriesId) % seastar::smp::count;
 
-        // Create ONE TSDBInsert with ALL values for this field
+        // Create ONE TSDBInsert with ALL values for this field.
+        // Move values from the MWP's FieldArrays directly into the TSDBInsert
+        // to avoid copying large value vectors (e.g. 10K doubles = 80KB per field).
+        // Each field is processed exactly once, so the move-from is safe.
         switch (fieldArray.type) {
             case FieldArrays::DOUBLE: {
                 if (fieldArray.doubles.empty()) continue;
@@ -862,7 +924,9 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
                 TSDBInsert<double> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
                 insert.setSharedTimestamps(sharedTimestamps);
-                insert.values = fieldArray.doubles;
+                insert.setCachedSeriesKey(std::move(seriesKey));
+                insert.setCachedSeriesId128(seriesId);
+                insert.values = std::move(fieldArray.doubles);
 
                 shardDoubleInserts[shard].push_back(std::move(insert));
                 break;
@@ -881,6 +945,8 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
                 TSDBInsert<bool> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
                 insert.setSharedTimestamps(sharedTimestamps);
+                insert.setCachedSeriesKey(std::move(seriesKey));
+                insert.setCachedSeriesId128(seriesId);
                 // Convert uint8_t to bool
                 insert.values.reserve(fieldArray.bools.size());
                 for (uint8_t val : fieldArray.bools) {
@@ -904,7 +970,9 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
                 TSDBInsert<std::string> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
                 insert.setSharedTimestamps(sharedTimestamps);
-                insert.values = fieldArray.strings;
+                insert.setCachedSeriesKey(std::move(seriesKey));
+                insert.setCachedSeriesId128(seriesId);
+                insert.values = std::move(fieldArray.strings);
 
                 shardStringInserts[shard].push_back(std::move(insert));
                 break;
@@ -916,27 +984,18 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+                        metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
                     }
                 }
 
-                TSDBInsert<double> insert(point.measurement, fieldName);
+                TSDBInsert<int64_t> insert(point.measurement, fieldName);
                 insert.setSharedTags(sharedTags);
                 insert.setSharedTimestamps(sharedTimestamps);
-                // Convert integers to doubles
-                insert.values.reserve(fieldArray.integers.size());
-                bool warnedPrecision = false;
-                for (int64_t val : fieldArray.integers) {
-                    if (!warnedPrecision && wouldLosePrecision(val)) {
-                        tsdb::http_log.warn(
-                            "Integer field '{}' contains values exceeding 2^53 that will lose precision when stored as double",
-                            fieldName);
-                        warnedPrecision = true;
-                    }
-                    insert.values.push_back(static_cast<double>(val));
-                }
+                insert.setCachedSeriesKey(std::move(seriesKey));
+                insert.setCachedSeriesId128(seriesId);
+                insert.values = std::move(fieldArray.integers);
 
-                shardDoubleInserts[shard].push_back(std::move(insert));
+                shardIntegerInserts[shard].push_back(std::move(insert));
                 break;
             }
         }
@@ -962,7 +1021,8 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
         // Skip shards with no work
         if (shardDoubleInserts[shard].empty() &&
             shardBoolInserts[shard].empty() &&
-            shardStringInserts[shard].empty()) {
+            shardStringInserts[shard].empty() &&
+            shardIntegerInserts[shard].empty()) {
             continue;
         }
 
@@ -970,11 +1030,13 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
         auto doubles = std::move(shardDoubleInserts[shard]);
         auto bools = std::move(shardBoolInserts[shard]);
         auto strings = std::move(shardStringInserts[shard]);
+        auto integers = std::move(shardIntegerInserts[shard]);
 
         // Launch shard operation
         shardFutures.push_back(
             engineSharded->invoke_on(shard,
-                [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings)]
+                [doubles = std::move(doubles), bools = std::move(bools),
+                 strings = std::move(strings), integers = std::move(integers)]
                 (Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
                     AggregatedTimingInfo batchTiming;
 
@@ -990,6 +1052,11 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
 
                     if (!strings.empty()) {
                         auto walTiming = co_await engine.insertBatch(std::move(strings));
+                        batchTiming.aggregate(walTiming);
+                    }
+
+                    if (!integers.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(integers));
                         batchTiming.aggregate(walTiming);
                     }
 
@@ -1021,7 +1088,7 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::proces
     co_return aggregatedTiming;
 }
 
-HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string& json) {
+HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string& json, uint64_t defaultTimestampNs) {
     WritePoint wp;
     
     GlazeWritePoint glazePoint;
@@ -1050,7 +1117,7 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
         throw std::runtime_error("'fields' must be an object");
     }
     
-    auto& fields_obj = glazePoint.fields.get<glz::json_t::object_t>();
+    auto& fields_obj = glazePoint.fields.get<json_value_t::object_t>();
     if (fields_obj.empty()) {
         throw std::runtime_error("'fields' object cannot be empty");
     }
@@ -1063,7 +1130,11 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
         }
 
         if (fieldValue.is_number()) {
-            wp.fields[fieldName] = fieldValue.get<double>();
+            if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
+                wp.fields[fieldName] = fieldValue.as<int64_t>();
+            } else {
+                wp.fields[fieldName] = fieldValue.get<double>();
+            }
         } else if (fieldValue.is_boolean()) {
             wp.fields[fieldName] = fieldValue.get<bool>();
         } else if (fieldValue.is_string()) {
@@ -1074,21 +1145,18 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
             throw std::runtime_error("Unsupported field type for field: " + fieldName);
         }
     }
-    
-    // Parse timestamp
+
+    // Parse timestamp, falling back to the caller-supplied default
     if (glazePoint.timestamp) {
         wp.timestamp = *glazePoint.timestamp;
     } else {
-        auto now = std::chrono::system_clock::now();
-        auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()).count();
-        wp.timestamp = static_cast<uint64_t>(nanos);
+        wp.timestamp = defaultTimestampNs;
     }
-    
+
     return wp;
 }
 
-HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_t& doc) {
+HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_t& doc, uint64_t defaultTimestampNs) {
     WritePoint wp;
 
     // Extract fields directly from the already-parsed json_value_t, avoiding
@@ -1148,7 +1216,11 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_
         }
 
         if (fieldValue.is_number()) {
-            wp.fields[fieldName] = fieldValue.as<double>();
+            if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
+                wp.fields[fieldName] = fieldValue.as<int64_t>();
+            } else {
+                wp.fields[fieldName] = fieldValue.as<double>();
+            }
         } else if (fieldValue.is_boolean()) {
             wp.fields[fieldName] = fieldValue.get<bool>();
         } else if (fieldValue.is_string()) {
@@ -1160,15 +1232,12 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_
         }
     }
 
-    // Parse timestamp
+    // Parse timestamp, falling back to the caller-supplied default
     auto timestampIt = obj.find("timestamp");
     if (timestampIt != obj.end() && timestampIt->second.is_number()) {
         wp.timestamp = timestampIt->second.as<uint64_t>();
     } else {
-        auto now = std::chrono::system_clock::now();
-        auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()).count();
-        wp.timestamp = static_cast<uint64_t>(nanos);
+        wp.timestamp = defaultTimestampNs;
     }
 
     return wp;
@@ -1187,9 +1256,13 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     // Group inserts by shard to dispatch all fields in parallel rather than
     // sequentially. For a point with N fields, this reduces up to 2*N sequential
     // cross-shard round trips down to one parallel fan-out + one metadata dispatch.
-    std::map<size_t, std::vector<TSDBInsert<double>>> shardDoubleInserts;
-    std::map<size_t, std::vector<TSDBInsert<bool>>> shardBoolInserts;
-    std::map<size_t, std::vector<TSDBInsert<std::string>>> shardStringInserts;
+    // Use pre-sized vectors indexed by shard ID for O(1) access and cache locality,
+    // since shard IDs are dense integers in [0, smp::count).
+    const size_t shardCount = seastar::smp::count;
+    std::vector<std::vector<TSDBInsert<double>>> shardDoubleInserts(shardCount);
+    std::vector<std::vector<TSDBInsert<bool>>> shardBoolInserts(shardCount);
+    std::vector<std::vector<TSDBInsert<std::string>>> shardStringInserts(shardCount);
+    std::vector<std::vector<TSDBInsert<int64_t>>> shardIntegerInserts(shardCount);
     std::vector<MetaOp> metaOps;
 
     // Share tags across all field inserts to avoid N copies for N fields.
@@ -1198,14 +1271,29 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(point.tags);
 
     // Pre-build the measurement+tags prefix once for series key construction
-    std::string seriesKeyPrefix = point.measurement;
-    for (const auto& [tagKey, tagValue] : *sharedTags) {
-        seriesKeyPrefix += "," + tagKey + "=" + tagValue;
+    std::string seriesKeyPrefix;
+    {
+        size_t prefixSize = point.measurement.size();
+        for (const auto& [tagKey, tagValue] : *sharedTags) {
+            prefixSize += 1 + tagKey.size() + 1 + tagValue.size();
+        }
+        seriesKeyPrefix.reserve(prefixSize);
+        seriesKeyPrefix = point.measurement;
+        for (const auto& [tagKey, tagValue] : *sharedTags) {
+            seriesKeyPrefix += ',';
+            seriesKeyPrefix += tagKey;
+            seriesKeyPrefix += '=';
+            seriesKeyPrefix += tagValue;
+        }
     }
 
     for (const auto& [fieldName, fieldValue] : point.fields) {
-        // Build the complete series key for sharding
-        std::string seriesKey = seriesKeyPrefix + " " + fieldName;
+        // Build the complete series key for sharding (no temporaries)
+        std::string seriesKey;
+        seriesKey.reserve(seriesKeyPrefix.size() + 1 + fieldName.size());
+        seriesKey = seriesKeyPrefix;
+        seriesKey += ' ';
+        seriesKey += fieldName;
 
         // Compute SeriesId128 ONCE per field for shard routing.
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -1216,6 +1304,8 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             double value = std::get<double>(fieldValue);
             TSDBInsert<double> insert(point.measurement, fieldName);
             insert.setSharedTags(sharedTags);
+            insert.setCachedSeriesKey(std::move(seriesKey));
+            insert.setCachedSeriesId128(seriesId);
             insert.addValue(point.timestamp, value);
             shardDoubleInserts[shard].push_back(std::move(insert));
             metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
@@ -1224,6 +1314,8 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             bool value = std::get<bool>(fieldValue);
             TSDBInsert<bool> insert(point.measurement, fieldName);
             insert.setSharedTags(sharedTags);
+            insert.setCachedSeriesKey(std::move(seriesKey));
+            insert.setCachedSeriesId128(seriesId);
             insert.addValue(point.timestamp, value);
             shardBoolInserts[shard].push_back(std::move(insert));
             metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
@@ -1232,6 +1324,8 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             const std::string& value = std::get<std::string>(fieldValue);
             TSDBInsert<std::string> insert(point.measurement, fieldName);
             insert.setSharedTags(sharedTags);
+            insert.setCachedSeriesKey(std::move(seriesKey));
+            insert.setCachedSeriesId128(seriesId);
             insert.addValue(point.timestamp, value);
 
             LOG_INSERT_PATH(tsdb::http_log, debug, "[WRITE] Processing single string insert - field: '{}', value: '{}', timestamp: {}, shard: {}",
@@ -1243,47 +1337,40 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
 
         } else if (std::holds_alternative<int64_t>(fieldValue)) {
             int64_t value = std::get<int64_t>(fieldValue);
-            if (wouldLosePrecision(value)) {
-                tsdb::http_log.warn(
-                    "Integer field '{}' value {} exceeds 2^53 and will lose precision when stored as double",
-                    fieldName, value);
-            }
-            // Convert integers to doubles for now
-            TSDBInsert<double> insert(point.measurement, fieldName);
+            TSDBInsert<int64_t> insert(point.measurement, fieldName);
             insert.setSharedTags(sharedTags);
-            insert.addValue(point.timestamp, static_cast<double>(value));
-            shardDoubleInserts[shard].push_back(std::move(insert));
-            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+            insert.setCachedSeriesKey(std::move(seriesKey));
+            insert.setCachedSeriesId128(seriesId);
+            insert.addValue(point.timestamp, value);
+            shardIntegerInserts[shard].push_back(std::move(insert));
+            metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
         }
     }
 
-    // Dispatch all shards in parallel using insertBatch for efficiency
-    std::set<size_t> activeShards;
-    for (const auto& [shard, _] : shardDoubleInserts) activeShards.insert(shard);
-    for (const auto& [shard, _] : shardBoolInserts) activeShards.insert(shard);
-    for (const auto& [shard, _] : shardStringInserts) activeShards.insert(shard);
-
+    // Dispatch all shards in parallel using insertBatch for efficiency.
+    // Iterate over the pre-sized vectors directly, skipping empty shards.
     std::vector<seastar::future<>> shardFutures;
-    shardFutures.reserve(activeShards.size());
+    shardFutures.reserve(shardCount);
 
-    for (size_t shard : activeShards) {
-        std::vector<TSDBInsert<double>> doubles;
-        std::vector<TSDBInsert<bool>> bools;
-        std::vector<TSDBInsert<std::string>> strings;
+    for (size_t shard = 0; shard < shardCount; ++shard) {
+        // Skip shards with no work - O(1) emptiness check on each vector
+        if (shardDoubleInserts[shard].empty() &&
+            shardBoolInserts[shard].empty() &&
+            shardStringInserts[shard].empty() &&
+            shardIntegerInserts[shard].empty()) [[likely]] {
+            continue;
+        }
 
-        if (auto it = shardDoubleInserts.find(shard); it != shardDoubleInserts.end()) {
-            doubles = std::move(it->second);
-        }
-        if (auto it = shardBoolInserts.find(shard); it != shardBoolInserts.end()) {
-            bools = std::move(it->second);
-        }
-        if (auto it = shardStringInserts.find(shard); it != shardStringInserts.end()) {
-            strings = std::move(it->second);
-        }
+        // Move this shard's inserts directly from the pre-sized vectors
+        auto doubles = std::move(shardDoubleInserts[shard]);
+        auto bools = std::move(shardBoolInserts[shard]);
+        auto strings = std::move(shardStringInserts[shard]);
+        auto integers = std::move(shardIntegerInserts[shard]);
 
         shardFutures.push_back(
             engineSharded->invoke_on(shard,
-                [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings)]
+                [doubles = std::move(doubles), bools = std::move(bools),
+                 strings = std::move(strings), integers = std::move(integers)]
                 (Engine& engine) mutable -> seastar::future<> {
                     // Use insertBatch when multiple inserts target the same shard,
                     // otherwise fall back to single insert for less overhead.
@@ -1309,6 +1396,13 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
                             co_await engine.insertBatch(std::move(strings));
                         }
                     }
+                    if (!integers.empty()) {
+                        if (integers.size() == 1) {
+                            co_await engine.insert(std::move(integers[0]), true);
+                        } else {
+                            co_await engine.insertBatch(std::move(integers));
+                        }
+                    }
                 })
         );
     }
@@ -1316,11 +1410,11 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     // Wait for all shard inserts to complete in parallel
     co_await seastar::when_all_succeed(std::move(shardFutures));
 
-    // Dispatch metadata indexing to shard 0 once for all fields
+    // Fire-and-forget metadata indexing: dispatch to shard 0 without blocking
+    // the HTTP response. Data is already durable in WAL; metadata is only needed
+    // for query discovery and will be retried on failure.
     if (!metaOps.empty()) {
-        co_await engineSharded->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) -> seastar::future<> {
-            co_await engine.indexMetadataBatch(metaOps);
-        });
+        engineSharded->local().dispatchMetadataAsync(std::move(metaOps));
     }
 
 #if TSDB_LOG_INSERT_PATH
@@ -1328,7 +1422,7 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
     LOG_INSERT_PATH(tsdb::http_log, info,
         "[PERF] [HTTP] processWritePoint: {}us ({} fields, {} shards)",
-        total_duration.count(), point.fields.size(), activeShards.size());
+        total_duration.count(), point.fields.size(), shardFutures.size());
 #endif
 
     co_return;
@@ -1377,9 +1471,9 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
             }
         }
         
-        if (body.size() > MAX_WRITE_BODY_SIZE) {
+        if (body.size() > maxWriteBodySize()) {
             rep->set_status(seastar::http::reply::status_type::payload_too_large);
-            rep->_content = createErrorResponse("Request body too large (max 64MB)");
+            rep->_content = createErrorResponse("Request body too large (max " + std::to_string(maxWriteBodySize() / (1024*1024)) + "MB)");
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
@@ -1409,11 +1503,16 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
 #if TSDB_LOG_INSERT_PATH
         auto batchStartTime = std::chrono::steady_clock::now();
 #endif
-        
+
+        // Capture a single wall-clock timestamp for the entire request.
+        // All write points that lack an explicit timestamp will share this value,
+        // eliminating up to N redundant now() calls in a batch of N points.
+        const uint64_t defaultTimestampNs = currentNanosTimestamp();
+
         // Check if it's a batch write or single write
         if (doc.is_object()) {
             auto& obj = doc.get<json_value_t::object_t>();
-            
+
             if (obj.contains("writes")) {
                 // Batch write - coalesce ALL writes (both scalar and array) in a
                 // single pass through coalesceWrites. No array-detection pre-scan
@@ -1431,7 +1530,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
 #if TSDB_LOG_INSERT_PATH
                     auto coalesceStartTime = std::chrono::steady_clock::now();
 #endif
-                    auto coalescedWrites = coalesceWrites(writes_array);
+                    auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs);
 #if TSDB_LOG_INSERT_PATH
                     auto coalesceEndTime = std::chrono::steady_clock::now();
                     auto coalesceDuration = std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
@@ -1483,30 +1582,26 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                         }
                     }
 
-                    // Process metadata once for entire batch using batched LevelDB write
+                    // Fire-and-forget metadata indexing for entire batch.
+                    // Data is already durable in WAL; metadata is dispatched to shard 0
+                    // as a background task with retry on failure.
 #if TSDB_LOG_INSERT_PATH
-                    auto start_metadata = std::chrono::high_resolution_clock::now();
-                    size_t metaOpsCount = metaOps.size(); // Save count before move
+                    size_t metaOpsCount = metaOps.size();
 #endif
                     if (!metaOps.empty()) {
-                        co_await engineSharded->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) -> seastar::future<> {
-                            co_await engine.indexMetadataBatch(metaOps);
-                        });
+                        engineSharded->local().dispatchMetadataAsync(std::move(metaOps));
                     }
 #if TSDB_LOG_INSERT_PATH
-                    auto end_metadata = std::chrono::high_resolution_clock::now();
-                    auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_metadata - start_metadata);
-
                     LOG_INSERT_PATH(tsdb::http_log, info,
-                        "[METADATA] Batch indexing: {} unique series indexed in {}μs",
-                        metaOpsCount, metadata_duration.count());
+                        "[METADATA] Batch: dispatched {} unique series for async indexing",
+                        metaOpsCount);
 #endif
                 }
             } else {
                 // Single write - parseMultiWritePoint handles both scalar and
                 // array fields in a single pass (scalars are wrapped as size-1
                 // arrays), so no detection pre-pass is needed.
-                MultiWritePoint mwp = parseMultiWritePoint(doc);
+                MultiWritePoint mwp = parseMultiWritePoint(doc, defaultTimestampNs);
                 std::string error;
                 if (!validateArraySizes(mwp, error)) {
                     throw std::runtime_error(error);
@@ -1522,23 +1617,19 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
 
                 [[maybe_unused]] auto timing = co_await processMultiWritePoint(mwp, seenMF, metaOps);
 
-                // Process metadata for this write using batched LevelDB write
+                // Fire-and-forget metadata indexing for this single write.
+                // Data is already durable in WAL; metadata is dispatched to shard 0
+                // as a background task with retry on failure.
 #if TSDB_LOG_INSERT_PATH
-                auto start_metadata = std::chrono::high_resolution_clock::now();
-                size_t metaOpsCount = metaOps.size(); // Save count before move
+                size_t metaOpsCount = metaOps.size();
 #endif
                 if (!metaOps.empty()) {
-                    co_await engineSharded->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) -> seastar::future<> {
-                        co_await engine.indexMetadataBatch(metaOps);
-                    });
+                    engineSharded->local().dispatchMetadataAsync(std::move(metaOps));
                 }
 #if TSDB_LOG_INSERT_PATH
-                auto end_metadata = std::chrono::high_resolution_clock::now();
-                auto metadata_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_metadata - start_metadata);
-
                 LOG_INSERT_PATH(tsdb::http_log, info,
-                    "[METADATA] Single write indexing: {} unique series indexed in {}μs",
-                    metaOpsCount, metadata_duration.count());
+                    "[METADATA] Single write: dispatched {} unique series for async indexing",
+                    metaOpsCount);
 #endif
             }
         }
@@ -1548,6 +1639,12 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         rep->_content = createSuccessResponse(pointsWritten);
         rep->add_header("Content-Type", "application/json");
         
+    } catch (const seastar::gate_closed_exception&) {
+        // Insert gate closed — server is shutting down. Return 503 so clients
+        // know to retry against another node or after restart.
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->_content = createErrorResponse("Server is shutting down");
+        rep->add_header("Content-Type", "application/json");
     } catch (const std::exception& e) {
         tsdb::http_log.error("Error handling write request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);

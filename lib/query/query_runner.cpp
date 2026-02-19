@@ -215,7 +215,7 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
       auto [tsmRank, tsmFile] = tsmTuple;
 
       // Use queryWithTombstones to automatically filter out deleted data
-      // SeriesId128 pre-computed by caller — no redundant SHA1 here
+      // SeriesId128 pre-computed by caller — no redundant hash here
       TSMResult<T> results = co_await tsmFile.get()->queryWithTombstones<T>(seriesId, startTime, endTime);
 
       if(results.empty())
@@ -426,6 +426,10 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& ser
       LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Querying string series: '{}'", seriesKey);
       results = co_await queryTsm<std::string>(seriesKey, seriesId, startTime, endTime);
       break;
+    case TSMValueType::Integer:
+      LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Querying integer series: '{}'", seriesKey);
+      results = co_await queryTsm<int64_t>(seriesKey, seriesId, startTime, endTime);
+      break;
     default:
       LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Unknown series type {} for series: '{}'",
                      static_cast<int>(seriesType.value()), seriesKey);
@@ -562,3 +566,4 @@ seastar::future<std::optional<tsdb::PushdownResult>> QueryRunner::queryTsmAggreg
 template seastar::future<QueryResult<bool>> QueryRunner::queryTsm<bool>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
 template seastar::future<QueryResult<double>> QueryRunner::queryTsm<double>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
 template seastar::future<QueryResult<std::string>> QueryRunner::queryTsm<std::string>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<int64_t>> QueryRunner::queryTsm<int64_t>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);

@@ -221,3 +221,61 @@ void Simple16::unpackLarge(Slice &encoded, std::vector<uint64_t> &out) {
         out.push_back(fullValue);
     }
 }
+
+size_t Simple16::encodeInto(std::vector<uint64_t> &values, AlignedBuffer &target) {
+    const size_t startPos = target.size();
+    size_t offset = 0;
+
+    while (offset < values.size()) {
+        if (canPack<30, 2>(values, offset)) {
+            uint64_t val = pack<13, 30, 2>(values, offset);
+            target.write(val);
+        } else if (canPack<28, 2>(values, offset)) {
+            uint64_t val = pack<0, 28, 2>(values, offset);
+            target.write(val);
+        } else if (canPack<20, 3>(values, offset)) {
+            uint64_t val = pack<1, 20, 3>(values, offset);
+            target.write(val);
+        } else if (canPack<15, 4>(values, offset)) {
+            uint64_t val = pack<2, 15, 4>(values, offset);
+            target.write(val);
+        } else if (canPack<14, 4>(values, offset)) {
+            uint64_t val = pack<14, 14, 4>(values, offset);
+            target.write(val);
+        } else if (canPack<12, 5>(values, offset)) {
+            uint64_t val = pack<3, 12, 5>(values, offset);
+            target.write(val);
+        } else if (canPack<10, 6>(values, offset)) {
+            uint64_t val = pack<4, 10, 6>(values, offset);
+            target.write(val);
+        } else if (canPack<8, 7>(values, offset)) {
+            uint64_t val = pack<5, 8, 7>(values, offset);
+            target.write(val);
+        } else if (canPack<7, 8>(values, offset)) {
+            uint64_t val = pack<6, 7, 8>(values, offset);
+            target.write(val);
+        } else if (canPack<6, 10>(values, offset)) {
+            uint64_t val = pack<7, 6, 10>(values, offset);
+            target.write(val);
+        } else if (canPack<5, 12>(values, offset)) {
+            uint64_t val = pack<8, 5, 12>(values, offset);
+            target.write(val);
+        } else if (canPack<4, 15>(values, offset)) {
+            uint64_t val = pack<9, 4, 15>(values, offset);
+            target.write(val);
+        } else if (canPack<3, 20>(values, offset)) {
+            uint64_t val = pack<10, 3, 20>(values, offset);
+            target.write(val);
+        } else if (canPack<2, 30>(values, offset)) {
+            uint64_t val = pack<11, 2, 30>(values, offset);
+            target.write(val);
+        } else if (canPack<1, 60>(values, offset)) {
+            uint64_t val = pack<12, 1, 60>(values, offset);
+            target.write(val);
+        } else {
+            packLarge(values, offset, target);
+        }
+    }
+
+    return target.size() - startPos;
+}

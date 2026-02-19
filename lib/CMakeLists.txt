@@ -1,5 +1,5 @@
 # Collect source files from all subdirectories
-file(GLOB_RECURSE SRC_FILES 
+file(GLOB_RECURSE SRC_FILES
     core/*.cpp
     storage/*.cpp
     encoding/*.cpp
@@ -7,12 +7,21 @@ file(GLOB_RECURSE SRC_FILES
     index/*.cpp
     http/*.cpp
     utils/*.cpp
+    retention/*.cpp
+    config/*.cpp
 )
 
 find_package (Snappy REQUIRED)
 find_package (Threads REQUIRED)
 find_package (Seastar REQUIRED)
-find_package (OpenSSL REQUIRED)
+# xxHash is used for SeriesId128 generation (XXH3_128bits).
+# It is available system-wide via libxxhash-dev.
+find_path(XXHASH_INCLUDE_DIR NAMES xxhash.h)
+find_library(XXHASH_LIBRARY NAMES xxhash)
+if(NOT XXHASH_INCLUDE_DIR OR NOT XXHASH_LIBRARY)
+    message(FATAL_ERROR "xxHash not found. Please install libxxhash-dev (Ubuntu/Debian) or xxhash-devel (CentOS/RHEL)")
+endif()
+message(STATUS "Found xxHash: ${XXHASH_LIBRARY}")
 
 # Glaze is provided via FetchContent from parent CMakeLists.txt
 
@@ -27,7 +36,7 @@ endif()
 message(STATUS "Found LevelDB: ${LEVELDB_LIBRARY}")
 
 add_library(libtsdb STATIC ${SRC_FILES})
-target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze OpenSSL::Crypto)
+target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze ${XXHASH_LIBRARY})
 
 # Include both the lib directory and all subdirectories for header resolution
 target_include_directories(libtsdb PUBLIC
@@ -39,6 +48,9 @@ target_include_directories(libtsdb PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/index
     ${CMAKE_CURRENT_SOURCE_DIR}/http
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/retention
+    ${CMAKE_CURRENT_SOURCE_DIR}/config
     ${LEVELDB_INCLUDE_DIR}
+    ${XXHASH_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include
 )

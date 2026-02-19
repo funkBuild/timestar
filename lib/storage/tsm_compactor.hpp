@@ -17,7 +17,10 @@
 #include "tsm_writer.hpp"
 #include "tsm_result.hpp"
 #include "series_id.hpp"
+#include "tsdb_config.hpp"
 #include "series_compaction_data.hpp"  // Phase 3: Parallel series processing
+#include "retention_policy.hpp"
+#include "query_parser.hpp"  // AggregationMethod enum
 
 // Forward declarations
 class CompactionStrategy;
@@ -57,7 +60,7 @@ private:
     struct SeriesIterator {
         seastar::shared_ptr<TSM> file;
         SeriesId128 seriesId;
-        std::shared_ptr<TSMBlockIterator<T>> blockIterator;  // Phase 1.3: Use streaming iterator
+        seastar::lw_shared_ptr<TSMBlockIterator<T>> blockIterator;  // Phase 1.3: Use streaming iterator
         TSMBlock<T>* currentBlock = nullptr;  // Phase 1.3: Pointer to current block
         size_t pointIndex = 0;
         bool exhausted = false;
@@ -133,7 +136,7 @@ public:
             auto& iter = iterators[i];
 
             // Create block iterator (lightweight - no I/O yet)
-            iter.blockIterator = std::make_shared<TSMBlockIterator<T>>(
+            iter.blockIterator = seastar::make_lw_shared<TSMBlockIterator<T>>(
                 iter.file, seriesId, 0, UINT64_MAX);
 
             // Initialize block iterator (reads index metadata only)
@@ -214,21 +217,32 @@ public:
 
 class TSMCompactor {
 private:
-    // Limits for compaction
-    static constexpr size_t MAX_CONCURRENT_COMPACTIONS = 2;
-    static constexpr size_t MAX_MEMORY_PER_COMPACTION = 256 * 1024 * 1024; // 256MB
-    static constexpr size_t BATCH_SIZE = 10000; // Points per batch
-    
-    // Compaction thresholds per tier
-    static constexpr size_t TIER0_MIN_FILES = 4;
-    static constexpr size_t TIER1_MIN_FILES = 4;
-    static constexpr size_t TIER2_MIN_FILES = 4;
+    // Compaction limits and thresholds — read from TOML config at runtime.
+    static size_t maxConcurrentCompactions() { return tsdb::config().storage.compaction.max_concurrent; }
+    static size_t maxMemoryPerCompaction() { return tsdb::config().storage.compaction.max_memory; }
+    static size_t batchSize() { return tsdb::config().storage.compaction.batch_size; }
+    static size_t tier0MinFiles() { return tsdb::config().storage.compaction.tier0_min_files; }
+    static size_t tier1MinFiles() { return tsdb::config().storage.compaction.tier1_min_files; }
+    static size_t tier2MinFiles() { return tsdb::config().storage.compaction.tier2_min_files; }
     
     TSMFileManager* fileManager;
     std::unique_ptr<CompactionStrategy> strategy;
     CompactionStats lastCompactStats;  // Stats from the most recent compact() call
-    seastar::semaphore compactionSemaphore{MAX_CONCURRENT_COMPACTIONS};
+    seastar::semaphore compactionSemaphore{2};  // Re-initialized in constructor from config
     std::atomic<bool> compactionEnabled{true};
+
+    // Per-series retention context populated during compact(), consumed by processSeriesForCompaction
+    struct SeriesRetentionContext {
+        uint64_t ttlCutoff = 0;         // Points with ts < ttlCutoff are expired
+        uint64_t downsampleThreshold = 0; // Points with ts < threshold get downsampled
+        uint64_t downsampleInterval = 0;  // Bucket size in nanoseconds
+        tsdb::AggregationMethod downsampleMethod = tsdb::AggregationMethod::AVG;
+    };
+    std::unordered_map<SeriesId128, SeriesRetentionContext, SeriesId128::Hash> _seriesRetention;
+
+    // Pending retention context set by Engine before compaction
+    std::unordered_map<std::string, RetentionPolicy> _pendingRetentionPolicies;
+    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> _pendingSeriesMeasurementMap;
     
     // Track active compactions
     struct ActiveCompaction {
@@ -279,14 +293,29 @@ private:
 public:
     explicit TSMCompactor(TSMFileManager* manager);
     ~TSMCompactor() = default;
+
+    // Set retention policies and series->measurement map for the next compaction.
+    // Called by Engine before triggering compaction so that TTL/downsampling
+    // can be applied during processSeriesForCompaction().
+    void setRetentionContext(
+        const std::unordered_map<std::string, RetentionPolicy>& policies,
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
+        _pendingRetentionPolicies = policies;
+        _pendingSeriesMeasurementMap = seriesMeasurementMap;
+    }
     
     // Set custom compaction strategy
     void setStrategy(std::unique_ptr<CompactionStrategy> newStrategy) {
         strategy = std::move(newStrategy);
     }
     
-    // Main compaction method - merges files and returns path to new file
-    seastar::future<std::string> compact(const std::vector<seastar::shared_ptr<TSM>>& files);
+    // Main compaction method - merges files and returns path to new file.
+    // retentionPolicies: per-measurement policies for TTL/downsampling (empty = no retention).
+    // seriesMetadataMap: SeriesId128 -> measurement name, pre-built by caller for efficiency.
+    seastar::future<std::string> compact(
+        const std::vector<seastar::shared_ptr<TSM>>& files,
+        const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies = {},
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap = {});
     
     // Create a compaction plan for given tier
     CompactionPlan planCompaction(uint64_t tier);
@@ -310,6 +339,22 @@ public:
     
     // Force a full compaction of all tiers
     seastar::future<> forceFullCompaction();
+
+    // Check if a file is currently part of an active compaction.
+    // Single-threaded per shard — no synchronisation needed.
+    bool isFileInActiveCompaction(const seastar::shared_ptr<TSM>& file) const;
+
+    // True when at least one compaction semaphore unit is available.
+    // Single-threaded: safe to call and then co_await executeCompaction()
+    // without a race, because no other task runs between the check and the
+    // first suspension point inside executeCompaction (get_units).
+    bool hasCompactionCapacity() const {
+        return compactionSemaphore.available_units() > 0;
+    }
+
+    // Rewrite a single tombstoned file at the same tier to reclaim space.
+    // Caller must verify hasCompactionCapacity() first (non-blocking design).
+    seastar::future<CompactionStats> executeTombstoneRewrite(seastar::shared_ptr<TSM> file);
 };
 
 // Abstract base class for compaction strategies

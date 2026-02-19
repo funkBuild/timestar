@@ -17,14 +17,24 @@ namespace fs = std::filesystem;
 class WALSeastarTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_wal_seastar_files";
+    fs::path savedCwd;
 
     void SetUp() override {
+        savedCwd = fs::current_path();
+        // If a previous test left us inside the test directory (e.g. due to
+        // a crash or exception that bypassed TearDown), step out first.
+        if (fs::current_path().filename() == "test_wal_seastar_files") {
+            fs::current_path(savedCwd.parent_path());
+            savedCwd = fs::current_path();
+        }
+        // Remove stale test directory from previous runs, then recreate
+        fs::remove_all(testDir);
         fs::create_directories(testDir);
         fs::current_path(testDir);
     }
 
     void TearDown() override {
-        fs::current_path("..");
+        fs::current_path(savedCwd);
         fs::remove_all(testDir);
     }
 };

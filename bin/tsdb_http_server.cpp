@@ -1,11 +1,15 @@
 #include <vector>
 #include <chrono>
+#include <cstring>
+#include <sstream>
 
 #include "core/engine.hpp"
 #include "http/http_write_handler.hpp"
 #include "http/http_query_handler.hpp"
 #include "http/http_delete_handler.hpp"
 #include "http/http_metadata_handler.hpp"
+#include "http/http_retention_handler.hpp"
+#include "config/tsdb_config.hpp"
 #include "utils/stop_signal.hpp"
 #include "utils/logger.hpp"
 
@@ -60,22 +64,92 @@ void set_routes(routes& r) {
     auto* metadataHandler = new HttpMetadataHandler(&g_engine);
     metadataHandler->registerRoutes(r);
 
+    auto* retentionHandler = new HttpRetentionHandler(&g_engine);
+    retentionHandler->registerRoutes(r);
+
     auto* root = new function_handler([](const_req req) {
-        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\"]}";
+        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\",\"/retention\"]}";
     });
     r.add(operation_type::GET, url("/"), root);
 }
 
 int main(int argc, char** argv) {
+    // Pre-scan argv for --dump-config and --config before Seastar touches args.
+    // This avoids Seastar complaining about unknown options.
+    std::string configPath;
+    bool dumpConfig = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--dump-config") == 0) {
+            dumpConfig = true;
+        } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            configPath = argv[i + 1];
+        }
+    }
+
+    if (dumpConfig) {
+        std::cout << tsdb::dumpDefaultConfig();
+        return 0;
+    }
+
+    // Load config file if specified, otherwise use defaults.
+    tsdb::TsdbConfig tsdbConfig{};
+    if (!configPath.empty()) {
+        try {
+            tsdbConfig = tsdb::loadConfigFile(configPath);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+            return 1;
+        }
+    }
+    tsdb::setGlobalConfig(tsdbConfig);
+
     seastar::app_template app;
-    
+
     namespace bpo = boost::program_options;
     app.add_options()
-        ("port", bpo::value<uint16_t>()->default_value(8086), 
-         "HTTP server port (default: 8086)")
+        ("port", bpo::value<uint16_t>()->default_value(tsdbConfig.server.port),
+         "HTTP server port")
         ("log-level", bpo::value<seastar::log_level>()->default_value(seastar::log_level::info),
-         "Log level (error, warn, info, debug, trace)");
-    
+         "Log level (error, warn, info, debug, trace)")
+        ("config", bpo::value<std::string>(),
+         "Path to TOML config file")
+        ("dump-config", "Print default config to stdout and exit");
+
+    // Inject Seastar settings from TOML [seastar] section.
+    // CLI args are already stored first, so bpo::store won't overwrite them.
+    app.set_configuration_reader([&tsdbConfig, &app](bpo::variables_map& vm) {
+        const auto& ss = tsdbConfig.seastar;
+        if (ss.settings.empty()) return;
+
+        // Map TOML underscore keys to Seastar's hyphenated CLI option names.
+        static const std::map<std::string, std::string> keyMap = {
+            {"smp", "smp"}, {"memory", "memory"},
+            {"reserve_memory", "reserve-memory"}, {"poll_mode", "poll-mode"},
+            {"task_quota_ms", "task-quota-ms"}, {"overprovisioned", "overprovisioned"},
+            {"thread_affinity", "thread-affinity"}, {"reactor_backend", "reactor-backend"},
+            {"blocked_reactor_notify_ms", "blocked-reactor-notify-ms"},
+            {"max_networking_io_control_blocks", "max-networking-io-control-blocks"},
+            {"unsafe_bypass_fsync", "unsafe-bypass-fsync"},
+            {"kernel_page_cache", "kernel-page-cache"},
+            {"max_task_backlog", "max-task-backlog"},
+            {"io_properties_file", "io-properties-file"},
+        };
+
+        std::ostringstream ini;
+        for (const auto& [tomlKey, value] : ss.settings) {
+            auto it = keyMap.find(tomlKey);
+            if (it != keyMap.end()) {
+                ini << it->second << "=" << value << "\n";
+            }
+        }
+
+        std::string iniStr = ini.str();
+        if (!iniStr.empty()) {
+            std::istringstream iss(iniStr);
+            bpo::store(bpo::parse_config_file(iss, app.get_conf_file_options_description()), vm);
+        }
+    });
+
     return app.run(argc, argv, [&] {
         return seastar::async([&] {
             auto& config = app.configuration();
@@ -99,6 +173,17 @@ int main(int argc, char** argv) {
                 // forward metadata indexing to shard 0.
                 g_engine.invoke_on_all([](Engine& engine) {
                     engine.setShardedRef(&g_engine);
+                    return seastar::make_ready_future<>();
+                }).get();
+
+                // Load retention policies from LevelDB and broadcast to all shards
+                g_engine.invoke_on(0, [](Engine& engine) {
+                    return engine.loadAndBroadcastRetentionPolicies();
+                }).get();
+
+                // Start the retention sweep timer on shard 0 (15-minute interval)
+                g_engine.invoke_on(0, [](Engine& engine) {
+                    engine.startRetentionSweepTimer();
                     return seastar::make_ready_future<>();
                 }).get();
 
@@ -161,17 +246,17 @@ int main(int argc, char** argv) {
             // Clean shutdown
             tsdb::http_log.info("Shutting down HTTP server...");
             server->stop().get();
-            
-            // Stop background tasks first
-            tsdb::http_log.info("Stopping background tasks...");
+
+            // Flush in-memory data to TSM and stop engine
+            tsdb::http_log.info("Flushing in-memory data to TSM files...");
             g_engine.invoke_on_all([](Engine& engine) {
                 return engine.stop();
             }).get();
-            
+
             // Then stop the engine instances
             tsdb::http_log.info("Stopping Engine instances...");
             g_engine.stop().get();
-            
+
             tsdb::http_log.info("Shutdown complete");
             return 0;
         });

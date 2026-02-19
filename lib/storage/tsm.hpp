@@ -7,6 +7,7 @@
 #include "series_id.hpp"
 #include "bloom_filter.hpp"
 #include "block_aggregator.hpp"
+#include "tsdb_config.hpp"
 
 #include <string>
 #include <memory>
@@ -24,7 +25,7 @@
 // Forward declarations
 class Slice;
 
-enum class TSMValueType { Float = 0, Boolean, String };
+enum class TSMValueType { Float = 0, Boolean, String, Integer };
 
 typedef struct TSMIndexBlock {
   uint64_t minTime;
@@ -72,9 +73,9 @@ private:
   mutable LRUList lruList;
   mutable std::unordered_map<SeriesId128, LRUList::iterator, SeriesId128::Hash> fullIndexCache;
 
-  // Configuration for bloom filter and cache
-  static constexpr double BLOOM_FPR = 0.001;  // 0.1% false positive rate
-  static constexpr size_t MAX_CACHE_ENTRIES = 4096;
+  // Configuration for bloom filter and cache (read from TOML config)
+  static double bloomFpr() { return tsdb::config().storage.tsm_bloom_fpr; }
+  static size_t maxCacheEntries() { return tsdb::config().storage.tsm_cache_entries; }
 
   // Tombstone support
   std::unique_ptr<tsdb::TSMTombstone> tombstones;
@@ -147,6 +148,8 @@ public:
       return TSMValueType::Boolean;
     } else if constexpr (std::is_same_v<T, std::string>) {
       return TSMValueType::String;
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+      return TSMValueType::Integer;
     } else {
       static_assert(sizeof(T) == 0, "Unsupported TSM value type");
     }
@@ -196,6 +199,10 @@ public:
     uint64_t endTime,
     tsdb::BlockAggregator& aggregator
   );
+
+  // Estimate fraction of file data covered by tombstones (metadata-only, no data reads)
+  // Returns value in [0.0, 1.0] representing estimated dead bytes / file size
+  seastar::future<double> estimateTombstoneCoverage();
 
   // Delete tombstone file after compaction
   seastar::future<> deleteTombstoneFile();

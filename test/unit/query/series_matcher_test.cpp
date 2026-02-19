@@ -231,3 +231,86 @@ TEST_F(SeriesMatcherTest, CaseSensitivity) {
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("Server-01", "Server-*"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("Server-01", "server-*"));
 }
+
+// Test ~regex matching via matchesTag
+TEST_F(SeriesMatcherTest, TildeRegexMatching) {
+    // Basic ~regex
+    EXPECT_TRUE(SeriesMatcher::matchesTag("server-01", "~server-[0-9]+"));
+    EXPECT_TRUE(SeriesMatcher::matchesTag("server-123", "~server-[0-9]+"));
+    EXPECT_FALSE(SeriesMatcher::matchesTag("server-abc", "~server-[0-9]+"));
+
+    // ~regex with alternation
+    EXPECT_TRUE(SeriesMatcher::matchesTag("us-west", "~us-(west|east)"));
+    EXPECT_TRUE(SeriesMatcher::matchesTag("us-east", "~us-(west|east)"));
+    EXPECT_FALSE(SeriesMatcher::matchesTag("us-north", "~us-(west|east)"));
+
+    // ~regex with character class range
+    EXPECT_TRUE(SeriesMatcher::matchesTag("server-01", "~server-0[1-3]"));
+    EXPECT_TRUE(SeriesMatcher::matchesTag("server-02", "~server-0[1-3]"));
+    EXPECT_TRUE(SeriesMatcher::matchesTag("server-03", "~server-0[1-3]"));
+    EXPECT_FALSE(SeriesMatcher::matchesTag("server-04", "~server-0[1-3]"));
+
+    // Invalid ~regex
+    EXPECT_FALSE(SeriesMatcher::matchesTag("test", "~[invalid"));
+}
+
+// Test classifyScope
+TEST_F(SeriesMatcherTest, ClassifyScope) {
+    // Exact
+    EXPECT_EQ(SeriesMatcher::classifyScope("server-01"), ScopeMatchType::EXACT);
+    EXPECT_EQ(SeriesMatcher::classifyScope("production"), ScopeMatchType::EXACT);
+    EXPECT_EQ(SeriesMatcher::classifyScope(""), ScopeMatchType::EXACT);
+
+    // Wildcard
+    EXPECT_EQ(SeriesMatcher::classifyScope("server-*"), ScopeMatchType::WILDCARD);
+    EXPECT_EQ(SeriesMatcher::classifyScope("server-0?"), ScopeMatchType::WILDCARD);
+    EXPECT_EQ(SeriesMatcher::classifyScope("*"), ScopeMatchType::WILDCARD);
+
+    // Regex
+    EXPECT_EQ(SeriesMatcher::classifyScope("~server-[0-9]+"), ScopeMatchType::REGEX);
+    EXPECT_EQ(SeriesMatcher::classifyScope("~.*"), ScopeMatchType::REGEX);
+    EXPECT_EQ(SeriesMatcher::classifyScope("/server-[0-9]+/"), ScopeMatchType::REGEX);
+}
+
+// Test extractLiteralPrefix
+TEST_F(SeriesMatcherTest, ExtractLiteralPrefix) {
+    // Exact match returns full value
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("server-01"), "server-01");
+
+    // Wildcard — up to first metachar
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("server-*"), "server-");
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("server-0?"), "server-0");
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("*"), "");
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("?foo"), "");
+
+    // ~regex — strip ~ then scan for metachar
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("~server-[0-9]+"), "server-");
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("~[a-z]+"), "");
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("~prod-us-(west|east)"), "prod-us-");
+
+    // /regex/ — strip slashes then scan
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("/server-[0-9]+/"), "server-");
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix("/[a-z]+/"), "");
+
+    // Empty
+    EXPECT_EQ(SeriesMatcher::extractLiteralPrefix(""), "");
+}
+
+// Test series matching with ~regex in scopes
+TEST_F(SeriesMatcherTest, SeriesMatchingWithTildeRegex) {
+    std::map<std::string, std::string> seriesTags = {
+        {"host", "server-42"},
+        {"datacenter", "dc1"}
+    };
+
+    std::map<std::string, std::string> scopes1 = {
+        {"host", "~server-[0-9]+"},
+        {"datacenter", "dc1"}
+    };
+    EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes1));
+
+    std::map<std::string, std::string> scopes2 = {
+        {"host", "~client-[0-9]+"}
+    };
+    EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes2));
+}

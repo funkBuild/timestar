@@ -15,6 +15,8 @@
 #include "../storage/compressed_buffer.hpp"
 #include "../storage/slice_buffer.hpp"
 
+class AlignedBuffer;
+
 /**
  * Compile-time selection of float compression algorithm.
  * Change this constexpr to switch the entire storage layer between algorithms.
@@ -40,6 +42,14 @@ public:
      * converts implicitly.
      */
     static CompressedBuffer encode(std::span<const double> values);
+
+    /**
+     * Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
+     * The CompressedBuffer is still used internally for bit-packing, but the
+     * result is written directly into the target, eliminating one full copy.
+     * Returns the number of bytes written to the target buffer.
+     */
+    static size_t encodeInto(std::span<const double> values, AlignedBuffer &target);
 
     /**
      * Get the name of the encoder implementation being used

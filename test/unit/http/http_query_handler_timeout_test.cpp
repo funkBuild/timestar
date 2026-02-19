@@ -29,30 +29,30 @@ protected:
 };
 
 // =============================================================================
-// DEFAULT_QUERY_TIMEOUT Constant Tests
-// Verify the timeout constant exists and has a reasonable default value
+// defaultQueryTimeout() Tests
+// Verify the timeout function exists and has a reasonable default value
 // =============================================================================
 
 TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutExists) {
-    // The constant should be accessible and have the correct type
-    auto timeout = HttpQueryHandler::DEFAULT_QUERY_TIMEOUT;
+    // The function should be accessible and have the correct return type
+    auto timeout = HttpQueryHandler::defaultQueryTimeout();
     (void)timeout; // Suppress unused variable warning
-    SUCCEED() << "DEFAULT_QUERY_TIMEOUT constant exists and is accessible";
+    SUCCEED() << "defaultQueryTimeout() exists and is accessible";
 }
 
 TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutIs30Seconds) {
-    EXPECT_EQ(HttpQueryHandler::DEFAULT_QUERY_TIMEOUT.count(), 30)
+    EXPECT_EQ(HttpQueryHandler::defaultQueryTimeout().count(), 30)
         << "Default query timeout should be 30 seconds";
 }
 
 TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutIsPositive) {
-    EXPECT_GT(HttpQueryHandler::DEFAULT_QUERY_TIMEOUT.count(), 0)
+    EXPECT_GT(HttpQueryHandler::defaultQueryTimeout().count(), 0)
         << "Query timeout must be a positive duration";
 }
 
 TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutIsReasonable) {
     // Timeout should be between 5 seconds and 5 minutes for a query
-    auto timeoutSeconds = HttpQueryHandler::DEFAULT_QUERY_TIMEOUT.count();
+    auto timeoutSeconds = HttpQueryHandler::defaultQueryTimeout().count();
     EXPECT_GE(timeoutSeconds, 5)
         << "Query timeout should be at least 5 seconds";
     EXPECT_LE(timeoutSeconds, 300)
@@ -60,11 +60,11 @@ TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutIsReasonable) {
 }
 
 TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutTypeIsChronoSeconds) {
-    // Verify the type is std::chrono::seconds via compile-time check
+    // Verify the return type is std::chrono::seconds
     static_assert(
-        std::is_same_v<decltype(HttpQueryHandler::DEFAULT_QUERY_TIMEOUT),
-                       const std::chrono::seconds>,
-        "DEFAULT_QUERY_TIMEOUT should be of type std::chrono::seconds"
+        std::is_same_v<decltype(HttpQueryHandler::defaultQueryTimeout()),
+                       std::chrono::seconds>,
+        "defaultQueryTimeout() should return std::chrono::seconds"
     );
     SUCCEED();
 }
@@ -97,7 +97,7 @@ TEST_F(HttpQueryHandlerTimeoutTest, TimeoutErrorMessageContainsTimeoutDuration) 
 
     // Simulate the exact error message the timeout handler would generate
     std::string timeoutMsg = "Query timed out after " +
-        std::to_string(HttpQueryHandler::DEFAULT_QUERY_TIMEOUT.count()) + " seconds";
+        std::to_string(HttpQueryHandler::defaultQueryTimeout().count()) + " seconds";
 
     std::string json = handler.createErrorResponse("QUERY_TIMEOUT", timeoutMsg);
 

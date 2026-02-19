@@ -16,6 +16,11 @@
 class IntegerEncoderBasic {
 public:
     static AlignedBuffer encode(std::span<const uint64_t> values);
+
+    // Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
+    // Returns the number of bytes written to the target buffer.
+    static size_t encodeInto(std::span<const uint64_t> values, AlignedBuffer &target);
+
     static std::pair<size_t, size_t> decode(Slice &encoded, unsigned int timestampSize,
                                            std::vector<uint64_t> &values,
                                            uint64_t startTime = 0,

@@ -3,10 +3,11 @@
 #include "wal.hpp"
 
 #include "aligned_buffer.hpp"
-#include "bool_encoder.hpp"
+#include "bool_encoder_rle.hpp"
 #include "crc32.hpp"
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
+#include "zigzag.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "series_id.hpp"
@@ -290,51 +291,80 @@ seastar::future<> WAL::flushBlock() {
 template <class T>
 size_t WAL::estimateInsertSize(TSDBInsert<T> &insertRequest) {
   // Return cached result if available. The estimate depends on seriesKey,
-  // timestamps count, and values — all immutable once the insert is
+  // timestamps count, and values -- all immutable once the insert is
   // constructed and entering the pipeline. The cache is invalidated by
   // setSharedTags() and setSharedTimestamps() if those are called.
   if (insertRequest._cachedEstimatedSize.has_value()) {
     return *insertRequest._cachedEstimatedSize;
   }
 
-  // Lightweight upper-bound estimation without performing full encoding.
-  // This avoids the cost of encoding timestamps and values just to measure
-  // their sizes. The actual encoded data is always <= the worst-case sizes
-  // computed here, so this is safe for rollover/capacity decisions.
-  size_t estimatedSize = 0;
+  const size_t count = insertRequest.getTimestamps().size();
 
-  estimatedSize += 4;  // length prefix
-  estimatedSize += 4;  // CRC32 checksum
-  estimatedSize += 1;  // WAL type
-  estimatedSize += 16; // SeriesId128 (fixed 16 bytes)
+  // Early termination: empty inputs have zero WAL cost.
+  if (count == 0) [[unlikely]] {
+    insertRequest._cachedEstimatedSize = 0;
+    return 0;
+  }
+
+  // Fixed overhead: length prefix (4) + CRC32 (4) + WAL type (1) +
+  // SeriesId128 (16) + value type (1) + timestamp count (4) +
+  // encoded timestamp size prefix (4) + encoded value size prefix (4)
+  constexpr size_t FIXED_OVERHEAD = 4 + 4 + 1 + 16 + 1 + 4 + 4 + 4;
+
+  size_t estimatedSize = FIXED_OVERHEAD;
 
   // Series key string (length-prefixed)
-  const std::string& seriesKey = insertRequest.seriesKey();
+  const std::string &seriesKey = insertRequest.seriesKey();
   estimatedSize += 4 + seriesKey.size();
 
-  estimatedSize += 1;  // value type
-  estimatedSize += 4;  // # of timestamps
+  // Timestamps: apply adaptive compression ratio to raw size.
+  // Raw size = count * 8 bytes (uint64_t). The ratio is learned from
+  // recent encodeInsertEntry() calls via EMA.
+  const size_t rawTsSize = count * sizeof(uint64_t);
+  size_t estimatedTsSize = static_cast<size_t>(
+      static_cast<double>(rawTsSize) * _compressionStats.timestampRatio);
+  // Floor: at least 2 bytes per timestamp (delta-of-delta minimum overhead)
+  estimatedTsSize = std::max(estimatedTsSize, count * 2);
+  estimatedSize += estimatedTsSize;
 
-  // Timestamps: worst case is uncompressed (count * sizeof(uint64_t)),
-  // plus the 4-byte encoded-size prefix
-  const size_t count = insertRequest.getTimestamps().size();
-  estimatedSize += 4 + count * sizeof(uint64_t);
-
-  // Values: worst case depends on type, plus the 4-byte encoded-size prefix
-  estimatedSize += 4;
-  if constexpr (std::is_same<T, double>::value) {
-    // Worst case: uncompressed doubles
-    estimatedSize += count * sizeof(double);
-  } else if constexpr (std::is_same<T, bool>::value) {
-    // Worst case: one byte per bool
-    estimatedSize += count * sizeof(uint8_t);
-  } else if constexpr (std::is_same<T, std::string>::value) {
-    // Worst case: 4-byte varint length prefix + full string data per entry
-    // (Snappy can expand slightly, so account for that too)
+  // Values: apply type-specific adaptive compression ratio.
+  if constexpr (std::is_same_v<T, double>) {
+    const size_t rawFloatSize = count * sizeof(double);
+    size_t estimatedValSize = static_cast<size_t>(
+        static_cast<double>(rawFloatSize) * _compressionStats.floatRatio);
+    // Floor: at least 2 bytes per float (XOR minimum overhead)
+    estimatedValSize = std::max(estimatedValSize, count * 2);
+    estimatedSize += estimatedValSize;
+  } else if constexpr (std::is_same_v<T, bool>) {
+    const size_t rawBoolSize = count * sizeof(uint8_t);
+    size_t estimatedValSize = static_cast<size_t>(
+        static_cast<double>(rawBoolSize) * _compressionStats.boolRatio);
+    // Floor: at least 1 byte per 8 bools (bit-packing minimum)
+    estimatedValSize = std::max(estimatedValSize, (count + 7) / 8);
+    estimatedSize += estimatedValSize;
+  } else if constexpr (std::is_same_v<T, std::string>) {
+    // For strings, compute raw size as sum of string lengths + 4 bytes per prefix
+    size_t rawStringSize = 0;
     for (const auto &s : insertRequest.values) {
-      estimatedSize += 4 + s.size();
+      rawStringSize += 4 + s.size();
     }
+    size_t estimatedValSize = static_cast<size_t>(
+        static_cast<double>(rawStringSize) * _compressionStats.stringRatio);
+    // Floor: at least count bytes (minimum Snappy overhead)
+    estimatedValSize = std::max(estimatedValSize, count);
+    estimatedSize += estimatedValSize;
+  } else if constexpr (std::is_same_v<T, int64_t>) {
+    const size_t rawIntSize = count * sizeof(int64_t);
+    size_t estimatedValSize = static_cast<size_t>(
+        static_cast<double>(rawIntSize) * _compressionStats.integerRatio);
+    // Floor: at least 2 bytes per value (ZigZag + FFOR minimum overhead)
+    estimatedValSize = std::max(estimatedValSize, count * 2);
+    estimatedSize += estimatedValSize;
   }
+
+  // Apply safety margin to avoid underestimation near the 16MB WAL limit.
+  estimatedSize = static_cast<size_t>(
+      static_cast<double>(estimatedSize) * CompressionStats::SAFETY_MARGIN);
 
   // Cache the result for subsequent calls on this insert
   insertRequest._cachedEstimatedSize = estimatedSize;
@@ -365,7 +395,7 @@ void WAL::encodeInsertEntry(AlignedBuffer &buffer, TSDBInsert<T> &insertRequest)
   // --- Payload directly into buffer ---
   buffer.write(static_cast<uint8_t>(WALType::Write));
 
-  // Store SeriesId128 (fixed 16 bytes) — write raw bytes directly from the
+  // Store SeriesId128 (fixed 16 bytes) -- write raw bytes directly from the
   // std::array, avoiding the toBytes() std::string allocation.
   const auto &rawId = insertRequest.seriesId128().getRawData();
   buffer.write_array(rawId.data(), rawId.size());
@@ -381,42 +411,78 @@ void WAL::encodeInsertEntry(AlignedBuffer &buffer, TSDBInsert<T> &insertRequest)
 
   // Number of timestamps
   const auto &tsVec = insertRequest.getTimestamps();
-  buffer.write(static_cast<uint32_t>(tsVec.size()));
+  const size_t count = tsVec.size();
+  buffer.write(static_cast<uint32_t>(count));
 
-  // Encoded timestamps
+  // Compute raw sizes for compression ratio feedback
+  const size_t rawTsSize = count * sizeof(uint64_t);
+
+  // Encoded timestamps -- write directly into buffer (zero intermediate alloc)
+  size_t encodedTsSize;
   {
-    AlignedBuffer encodedTimestamps = IntegerEncoder::encode(tsVec);
-    buffer.write(static_cast<uint32_t>(encodedTimestamps.size()));
-    buffer.write(encodedTimestamps);
+    const size_t sizePos = buffer.size();
+    buffer.write(static_cast<uint32_t>(0)); // placeholder for encoded size
+
+    const size_t startPos = buffer.size();
+    IntegerEncoder::encodeInto(tsVec, buffer);
+    encodedTsSize = buffer.size() - startPos;
+    buffer.writeAt(sizePos, static_cast<uint32_t>(encodedTsSize));
   }
 
-  // Encoded values
-  if constexpr (std::is_same_v<T, double>) {
-    CompressedBuffer encodedFloats = FloatEncoder::encode(insertRequest.values);
-    buffer.write(static_cast<uint32_t>(encodedFloats.size()));
-    buffer.write(encodedFloats);
-  } else if constexpr (std::is_same_v<T, bool>) {
-    AlignedBuffer encodedBools = BoolEncoder::encode(insertRequest.values);
-    buffer.write(static_cast<uint32_t>(encodedBools.size()));
-    buffer.write(encodedBools);
-  } else if constexpr (std::is_same_v<T, std::string>) {
-    AlignedBuffer encodedStrings = StringEncoder::encode(insertRequest.values);
-    buffer.write(static_cast<uint32_t>(encodedStrings.size()));
-    buffer.write(encodedStrings);
-  } else {
-    throw std::runtime_error("Unsupported data type");
+  // Feed back actual timestamp compression ratio
+  _compressionStats.updateTimestamp(rawTsSize, encodedTsSize);
+
+  // Encoded values -- write directly into buffer (zero intermediate alloc)
+  {
+    const size_t sizePos = buffer.size();
+    buffer.write(static_cast<uint32_t>(0)); // placeholder for encoded size
+
+    const size_t startPos = buffer.size();
+
+    if constexpr (std::is_same_v<T, double>) {
+      const size_t rawValSize = count * sizeof(double);
+      FloatEncoder::encodeInto(insertRequest.values, buffer);
+      const size_t encodedValSize = buffer.size() - startPos;
+      buffer.writeAt(sizePos, static_cast<uint32_t>(encodedValSize));
+      _compressionStats.updateFloat(rawValSize, encodedValSize);
+    } else if constexpr (std::is_same_v<T, bool>) {
+      const size_t rawValSize = count * sizeof(uint8_t);
+      BoolEncoderRLE::encodeInto(insertRequest.values, buffer);
+      const size_t encodedValSize = buffer.size() - startPos;
+      buffer.writeAt(sizePos, static_cast<uint32_t>(encodedValSize));
+      _compressionStats.updateBool(rawValSize, encodedValSize);
+    } else if constexpr (std::is_same_v<T, std::string>) {
+      // Raw size for strings: sum of (4-byte prefix + string length) per entry
+      size_t rawValSize = 0;
+      for (const auto &s : insertRequest.values) {
+        rawValSize += 4 + s.size();
+      }
+      StringEncoder::encodeInto(insertRequest.values, buffer);
+      const size_t encodedValSize = buffer.size() - startPos;
+      buffer.writeAt(sizePos, static_cast<uint32_t>(encodedValSize));
+      _compressionStats.updateString(rawValSize, encodedValSize);
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+      const size_t rawValSize = count * sizeof(int64_t);
+      // ZigZag encode int64 → uint64, then FFOR encode
+      auto zigzagged = ZigZag::zigzagEncodeVector(insertRequest.values);
+      IntegerEncoder::encodeInto(zigzagged, buffer);
+      const size_t encodedValSize = buffer.size() - startPos;
+      buffer.writeAt(sizePos, static_cast<uint32_t>(encodedValSize));
+      _compressionStats.updateInteger(rawValSize, encodedValSize);
+    } else {
+      static_assert(sizeof(T) == 0, "Unsupported WAL value type");
+    }
   }
 
   // --- Backpatch header fields in-place ---
   const size_t payloadSize = buffer.size() - payloadStart;
   const uint32_t entryLength =
       static_cast<uint32_t>(sizeof(uint32_t) + payloadSize); // CRC + payload
-  std::memcpy(buffer.data.data() + entryStart, &entryLength, sizeof(uint32_t));
+  buffer.writeAt(entryStart, entryLength);
 
-  uint32_t crc =
-      CRC32::compute(buffer.data.data() + payloadStart, payloadSize);
-  std::memcpy(buffer.data.data() + entryStart + sizeof(uint32_t), &crc,
-              sizeof(uint32_t));
+  // Single-pass bulk CRC over the complete payload (cache-friendly sequential scan)
+  uint32_t crc = CRC32::compute(buffer.data.data() + payloadStart, payloadSize);
+  buffer.writeAt(entryStart + sizeof(uint32_t), crc);
 }
 
 template <class T> seastar::future<WALInsertResult> WAL::insert(TSDBInsert<T> &insertRequest) {
@@ -852,6 +918,19 @@ seastar::future<> WALReader::readAll(MemoryStore *store) {
           continue;
         }
       } break;
+      case WALValueType::Integer: {
+        try {
+          TSDBInsert<int64_t> insertReq =
+              readSeries<int64_t>(entrySlice, seriesKey);
+          store->insertMemory(std::move(insertReq));
+        } catch (const std::exception &e) {
+          tsdb::wal_log.error(
+              "WAL recovery: Failed to read integer series '{}': {}",
+              seriesKey, e.what());
+          partialEntries++;
+          continue;
+        }
+      } break;
       }
       entriesRead++;
     } break;
@@ -935,17 +1014,26 @@ TSDBInsert<T> WALReader::readSeries(Slice &walSlice,
     throw std::runtime_error("Invalid value byte size in WAL entry");
   }
 
-  if constexpr (std::is_same<T, bool>::value) {
+  if constexpr (std::is_same_v<T, bool>) {
     auto valuesSlice = walSlice.getSlice(valueByteSize);
-    BoolEncoder::decode(valuesSlice, nSkipped, nTimestamps, insertReq.values);
-  } else if constexpr (std::is_same<T, double>::value) {
+    BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, insertReq.values);
+  } else if constexpr (std::is_same_v<T, double>) {
     auto valuesSlice = walSlice.getCompressedSlice(valueByteSize);
     FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, insertReq.values);
-  } else if constexpr (std::is_same<T, std::string>::value) {
+  } else if constexpr (std::is_same_v<T, std::string>) {
     auto valuesSlice = walSlice.getSlice(valueByteSize);
     StringEncoder::decode(valuesSlice, timestampsCount, nSkipped, nTimestamps, insertReq.values);
+  } else if constexpr (std::is_same_v<T, int64_t>) {
+    auto valuesSlice = walSlice.getSlice(valueByteSize);
+    std::vector<uint64_t> rawUint;
+    IntegerEncoder::decode(valuesSlice, timestampsCount, rawUint);
+    // ZigZag decode uint64 → int64, skipping values that correspond to filtered timestamps
+    insertReq.values.reserve(nTimestamps);
+    for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < rawUint.size(); ++i) {
+      insertReq.values.push_back(ZigZag::zigzagDecode(rawUint[i]));
+    }
   } else {
-    throw std::runtime_error("Unsupported data type");
+    static_assert(sizeof(T) == 0, "Unsupported WAL value type");
   }
 
   return insertReq;
@@ -957,14 +1045,20 @@ WAL::insert<double>(TSDBInsert<double> &insertRequest);
 template seastar::future<WALInsertResult> WAL::insert<bool>(TSDBInsert<bool> &insertRequest);
 template seastar::future<WALInsertResult>
 WAL::insert<std::string>(TSDBInsert<std::string> &insertRequest);
+template seastar::future<WALInsertResult>
+WAL::insert<int64_t>(TSDBInsert<int64_t> &insertRequest);
 template size_t
 WAL::estimateInsertSize<double>(TSDBInsert<double> &insertRequest);
 template size_t WAL::estimateInsertSize<bool>(TSDBInsert<bool> &insertRequest);
 template size_t
 WAL::estimateInsertSize<std::string>(TSDBInsert<std::string> &insertRequest);
+template size_t
+WAL::estimateInsertSize<int64_t>(TSDBInsert<int64_t> &insertRequest);
 template seastar::future<WALInsertResult>
 WAL::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests);
 template seastar::future<WALInsertResult>
 WAL::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
 template seastar::future<WALInsertResult> WAL::insertBatch<std::string>(
     std::vector<TSDBInsert<std::string>> &insertRequests);
+template seastar::future<WALInsertResult> WAL::insertBatch<int64_t>(
+    std::vector<TSDBInsert<int64_t>> &insertRequests);

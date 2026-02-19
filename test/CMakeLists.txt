@@ -15,6 +15,7 @@ file(GLOB_RECURSE UNIT_QUERY_TESTS unit/query/*.cpp)
 file(GLOB_RECURSE UNIT_INDEX_TESTS unit/index/*.cpp)
 file(GLOB_RECURSE UNIT_HTTP_TESTS unit/http/*.cpp)
 file(GLOB_RECURSE UNIT_CORE_TESTS unit/core/*.cpp)
+file(GLOB_RECURSE UNIT_RETENTION_TESTS unit/retention/*.cpp)
 file(GLOB_RECURSE INTEGRATION_TESTS integration/*.cpp)
 file(GLOB_RECURSE E2E_TESTS e2e/*.cpp)
 file(GLOB_RECURSE PERFORMANCE_TESTS performance/*.cpp)
@@ -43,6 +44,7 @@ set(TEST_SRCS
     ${UNIT_INDEX_TESTS}
     ${UNIT_HTTP_TESTS}
     ${UNIT_CORE_TESTS}
+    ${UNIT_RETENTION_TESTS}
     ${INTEGRATION_TESTS}
     ${E2E_TESTS}
     ${PERFORMANCE_TESTS}
@@ -88,6 +90,7 @@ set(UNIT_TEST_SRCS
     ${UNIT_INDEX_TESTS}
     ${UNIT_HTTP_TESTS}
     ${UNIT_CORE_TESTS}
+    ${UNIT_RETENTION_TESTS}
 )
 add_executable(tsdb_unit_test ${UNIT_TEST_SRCS})
 target_link_libraries(tsdb_unit_test libtsdb gtest_main)

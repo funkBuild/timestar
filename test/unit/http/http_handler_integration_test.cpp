@@ -70,7 +70,21 @@ namespace fs = std::filesystem;
 
 class HttpHandlerIntegrationTest : public ::testing::Test {
 protected:
+    // Store the expected working directory so we can detect and recover from
+    // CWD corruption caused by other test fixtures (e.g. WALSeastarTest).
+    static inline fs::path expectedCwd;
+
+    static void SetUpTestSuite() {
+        expectedCwd = fs::current_path();
+    }
+
     void SetUp() override {
+        // Recover from CWD corruption: if a previous test fixture (e.g.
+        // WALSeastarTest) failed to restore the working directory, we must
+        // restore it before cleaning shard directories.
+        if (fs::current_path() != expectedCwd && !expectedCwd.empty()) {
+            fs::current_path(expectedCwd);
+        }
         robustCleanShardDirectories();
     }
 
@@ -321,8 +335,8 @@ TEST_F(HttpHandlerIntegrationTest, WriteOversizedBodyReturnsError) {
 
         HttpWriteHandler handler(&eng.eng);
 
-        // Create a body larger than MAX_WRITE_BODY_SIZE (64MB)
-        std::string bigBody(HttpWriteHandler::MAX_WRITE_BODY_SIZE + 1, 'x');
+        // Create a body larger than maxWriteBodySize() (default 64MB)
+        std::string bigBody(HttpWriteHandler::maxWriteBodySize() + 1, 'x');
         auto req = makeWriteRequest(bigBody);
 
         auto rep = handler.handleWrite(std::move(req)).get();

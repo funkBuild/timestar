@@ -3,8 +3,9 @@
 #include "series_id.hpp"
 #include "integer_encoder.hpp"
 #include "float_encoder.hpp"
-#include "bool_encoder.hpp"
+#include "bool_encoder_rle.hpp"
 #include "string_encoder.hpp"
+#include "zigzag.hpp"
 
 #include "logger.hpp"
 #include "logging_config.hpp"
@@ -83,20 +84,20 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId,
   buffer.write((uint32_t)encodedTimestamps.size());  // uint32_t timestamp partition length in bytes
   buffer.write(encodedTimestamps);  // uint8_t x N bytes, compressed timestamps
 
-  if constexpr (std::is_same<T, double>::value){
+  if constexpr (std::is_same_v<T, double>) {
     CompressedBuffer encodedFloats = FloatEncoder::encode(values);
-    buffer.write(encodedFloats);  // uint8_t x N bytes, compressed values
-
-  } else if constexpr (std::is_same<T, bool>::value){
-    AlignedBuffer encodedBools = BoolEncoder::encode(values);
-    buffer.write(encodedBools);  // uint8_t x N bytes, compressed values
-
-  } else if constexpr (std::is_same<T, std::string>::value){
+    buffer.write(encodedFloats);
+  } else if constexpr (std::is_same_v<T, bool>) {
+    BoolEncoderRLE::encodeInto(values, buffer);
+  } else if constexpr (std::is_same_v<T, std::string>) {
     AlignedBuffer encodedStrings = StringEncoder::encode(values);
-    buffer.write(encodedStrings);  // uint8_t x N bytes, compressed values
-
+    buffer.write(encodedStrings);
+  } else if constexpr (std::is_same_v<T, int64_t>) {
+    auto zigzagged = ZigZag::zigzagEncodeVector(values);
+    AlignedBuffer encodedIntegers = IntegerEncoder::encode(zigzagged);
+    buffer.write(encodedIntegers);
   } else {
-    throw std::runtime_error("Unsupported data type");
+    static_assert(sizeof(T) == 0, "Unsupported TSM value type");
   }
 
   writeIndexBlock(timestamps, indexEntry, blockStartOffset);
@@ -148,17 +149,20 @@ void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128 &ser
   buffer.write(encodedTimestamps);
 
   // Encode values based on type
-  if constexpr (std::is_same<T, double>::value) {
+  if constexpr (std::is_same_v<T, double>) {
     CompressedBuffer encodedFloats = FloatEncoder::encode(values);
     buffer.write(encodedFloats);
-  } else if constexpr (std::is_same<T, bool>::value) {
-    AlignedBuffer encodedBools = BoolEncoder::encode(values);
-    buffer.write(encodedBools);
-  } else if constexpr (std::is_same<T, std::string>::value) {
+  } else if constexpr (std::is_same_v<T, bool>) {
+    BoolEncoderRLE::encodeInto(values, buffer);
+  } else if constexpr (std::is_same_v<T, std::string>) {
     AlignedBuffer encodedStrings = StringEncoder::encode(values);
     buffer.write(encodedStrings);
+  } else if constexpr (std::is_same_v<T, int64_t>) {
+    auto zigzagged = ZigZag::zigzagEncodeVector(values);
+    AlignedBuffer encodedIntegers = IntegerEncoder::encode(zigzagged);
+    buffer.write(encodedIntegers);
   } else {
-    throw std::runtime_error("Unsupported data type");
+    static_assert(sizeof(T) == 0, "Unsupported TSM value type");
   }
 
   // Write index block (timestamps still valid as lvalue)
@@ -322,7 +326,6 @@ seastar::future<> TSMWriter::closeDMA(){
   std::exception_ptr writeError;
   try {
     const size_t dmaAlign = file.disk_write_dma_alignment();
-    const size_t memAlign = file.memory_dma_alignment();
 
     // Pad the data size up to DMA alignment boundary.
     // The file will contain extra zero bytes at the end, but TSM readers
@@ -331,18 +334,24 @@ seastar::future<> TSMWriter::closeDMA(){
     // write we truncate the file to the exact logical size.
     const size_t paddedSize = (dataSize + dmaAlign - 1) & ~(dmaAlign - 1);
 
-    // Allocate a DMA-aligned buffer and copy the data into it.
-    // Using temporary_buffer::aligned guarantees the address satisfies
-    // memory_dma_alignment requirements.
-    auto dmaBuf = seastar::temporary_buffer<char>::aligned(memAlign, paddedSize);
-
-    // Copy the actual data
-    std::memcpy(dmaBuf.get_write(), buffer.data.data(), dataSize);
-
-    // Zero-fill the padding bytes so we write deterministic content
-    if (paddedSize > dataSize) {
-      std::memset(dmaBuf.get_write() + dataSize, 0, paddedSize - dataSize);
+    // The AlignedBuffer's underlying vector uses dma_default_init_allocator
+    // which guarantees the base address is aligned to DMA_ALIGNMENT (4096).
+    // This satisfies Seastar's memory_dma_alignment requirement, so we can
+    // write directly from buffer.data without an intermediate memcpy.
+    //
+    // We only need to ensure the padding region (beyond dataSize, up to
+    // paddedSize) is accessible and zero-filled.  Resize the vector to
+    // the padded size -- the allocator default-initializes, so we must
+    // explicitly zero the padding bytes for deterministic content.
+    const size_t prevCapacity = buffer.data.size();
+    if (paddedSize > prevCapacity) {
+      buffer.data.resize(paddedSize);
     }
+    if (paddedSize > dataSize) {
+      std::memset(buffer.data.data() + dataSize, 0, paddedSize - dataSize);
+    }
+
+    const char* writePtr = reinterpret_cast<const char*>(buffer.data.data());
 
     // Write the entire buffer in a single DMA write.  Seastar's
     // dma_write may return a short write count, so loop until all
@@ -350,7 +359,7 @@ seastar::future<> TSMWriter::closeDMA(){
     // disk_write_max_length (~1GB), this completes in one call.
     size_t written = 0;
     while (written < paddedSize) {
-      size_t n = co_await file.dma_write(written, dmaBuf.get() + written, paddedSize - written);
+      size_t n = co_await file.dma_write(written, writePtr + written, paddedSize - written);
       if (n == 0) {
         throw std::runtime_error("TSMWriter::closeDMA: dma_write returned 0 for " + filename);
       }
@@ -426,6 +435,14 @@ void TSMWriter::run(seastar::shared_ptr<MemoryStore> store, std::string filename
           writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
         }
         break;
+        case TSMValueType::Integer: {
+          auto& series = std::get<InMemorySeries<int64_t>>(memStore);
+          series.sort();
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing integer series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
       }
     } catch (const std::bad_alloc& e) {
       tsdb::tsm_log.error("BAD_ALLOC when processing series '{}' with {} points", seriesKey.toHex(), seriesPoints);
@@ -492,6 +509,14 @@ seastar::future<> TSMWriter::runAsync(seastar::shared_ptr<MemoryStore> store, st
           writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
         }
         break;
+        case TSMValueType::Integer: {
+          auto& series = std::get<InMemorySeries<int64_t>>(memStore);
+          series.sort();
+          LOG_INSERT_PATH(tsdb::tsm_log, trace, "Writing integer series '{}' with {} points",
+                          seriesKey.toHex(), series.timestamps.size());
+          writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+        }
+        break;
       }
     } catch (const std::bad_alloc& e) {
       tsdb::tsm_log.error("BAD_ALLOC when processing series '{}' with {} points", seriesKey.toHex(), seriesPoints);
@@ -517,12 +542,15 @@ seastar::future<> TSMWriter::runAsync(seastar::shared_ptr<MemoryStore> store, st
 template void TSMWriter::writeSeries<double>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<double> &values);
 template void TSMWriter::writeSeries<bool>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<bool> &values);
 template void TSMWriter::writeSeries<std::string>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<std::string> &values);
+template void TSMWriter::writeSeries<int64_t>(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<int64_t> &values);
 
 // Phase 3.2: Template instantiations for move semantics versions
 template void TSMWriter::writeSeriesDirect<double>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<double> &&values);
 template void TSMWriter::writeSeriesDirect<bool>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<bool> &&values);
 template void TSMWriter::writeSeriesDirect<std::string>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<std::string> &&values);
+template void TSMWriter::writeSeriesDirect<int64_t>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<int64_t> &&values);
 
 template void TSMWriter::writeBlockDirect<double>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<double> &&values, TSMIndexEntry &indexEntry);
 template void TSMWriter::writeBlockDirect<bool>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<bool> &&values, TSMIndexEntry &indexEntry);
 template void TSMWriter::writeBlockDirect<std::string>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<std::string> &&values, TSMIndexEntry &indexEntry);
+template void TSMWriter::writeBlockDirect<int64_t>(TSMValueType seriesType, const SeriesId128 &seriesId, std::vector<uint64_t> &&timestamps, std::vector<int64_t> &&values, TSMIndexEntry &indexEntry);

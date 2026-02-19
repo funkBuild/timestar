@@ -12,16 +12,23 @@ namespace fs = std::filesystem;
 class WALTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_wal_files";
+    fs::path savedCwd;
 
     void SetUp() override {
+        savedCwd = fs::current_path();
+        // If a previous test left us inside the test directory, step out first
+        if (fs::current_path().filename() == "test_wal_files") {
+            fs::current_path(savedCwd.parent_path());
+            savedCwd = fs::current_path();
+        }
+        // Remove stale test directory from previous runs, then recreate
+        fs::remove_all(testDir);
         fs::create_directories(testDir);
-        // Change to test directory for WAL files
         fs::current_path(testDir);
     }
 
     void TearDown() override {
-        // Change back to parent directory
-        fs::current_path("..");
+        fs::current_path(savedCwd);
         fs::remove_all(testDir);
     }
 };

@@ -17,6 +17,11 @@ public:
   BoolEncoder();
 
   static AlignedBuffer encode(const std::vector<bool> &values);
+
+  // Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
+  // Returns the number of bytes written to the target buffer.
+  static size_t encodeInto(const std::vector<bool> &values, AlignedBuffer &target);
+
   static void decode(Slice &encoded, size_t nToSkip, size_t length, std::vector<bool> &out);
 };
 

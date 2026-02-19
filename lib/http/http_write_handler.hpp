@@ -11,10 +11,13 @@
 #include "tsdb_value.hpp"
 #include "series_id.hpp"
 #include "wal_file_manager.hpp"
+#include "tsdb_config.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <tsl/robin_map.h>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/json_path.hh>
@@ -78,7 +81,7 @@ using json_value_t = glz::generic_u64;
 class HttpWriteHandler {
 public:
     // Security limit to prevent DoS attacks via large request bodies
-    static constexpr size_t MAX_WRITE_BODY_SIZE = 64 * 1024 * 1024; // 64MB
+    static size_t maxWriteBodySize() { return tsdb::config().http.max_write_body_size; }
 
     // Field value variant for flexible JSON parsing (public for validation API)
     using FieldValue = std::variant<double, bool, std::string, int64_t>;
@@ -112,30 +115,50 @@ private:
     struct CoalesceCandidate {
         std::string seriesKey;  // measurement + tags + field for grouping
         std::string measurement;
-        std::map<std::string, std::string> tags;
+        // Shared (refcounted) tag map to avoid redundant copies when multiple
+        // fields from the same write point each create a CoalesceCandidate.
+        // Uses lw_shared_ptr (non-atomic refcount) because all candidates
+        // live on the HTTP handler shard -- no cross-shard sharing needed.
+        seastar::lw_shared_ptr<const std::map<std::string, std::string>> sharedTags;
         std::string fieldName;
         TSMValueType valueType;
         std::vector<uint64_t> timestamps;
-        
+        uint64_t timestampHashSum = 0;   // commutative sum of all timestamps
+        uint64_t timestampHashXor = 0;   // commutative XOR of all timestamps
+
         // Value storage by type (only one will be used based on valueType)
         std::vector<double> doubleValues;
         std::vector<uint8_t> boolValues;
         std::vector<std::string> stringValues;
-        
+        std::vector<int64_t> integerValues;
+
         // Helper to add a value with timestamp
         void addValue(uint64_t timestamp, double value) {
             timestamps.push_back(timestamp);
+            timestampHashSum += timestamp;
+            timestampHashXor ^= timestamp;
             doubleValues.push_back(value);
         }
-        
+
         void addValue(uint64_t timestamp, bool value) {
             timestamps.push_back(timestamp);
+            timestampHashSum += timestamp;
+            timestampHashXor ^= timestamp;
             boolValues.push_back(value);
         }
-        
+
         void addValue(uint64_t timestamp, const std::string& value) {
             timestamps.push_back(timestamp);
+            timestampHashSum += timestamp;
+            timestampHashXor ^= timestamp;
             stringValues.push_back(value);
+        }
+
+        void addValue(uint64_t timestamp, int64_t value) {
+            timestamps.push_back(timestamp);
+            timestampHashSum += timestamp;
+            timestampHashXor ^= timestamp;
+            integerValues.push_back(value);
         }
     };
     
@@ -162,14 +185,19 @@ private:
     // Aliases MetadataOp from leveldb_index.hpp for batch indexing compatibility.
     using MetaOp = MetadataOp;
 
-    // Parse a single write point from JSON string
-    WritePoint parseWritePoint(const std::string& json);
+    // Parse a single write point from JSON string.
+    // defaultTimestampNs is used when the point has no explicit timestamp,
+    // avoiding a redundant now() call when the caller already captured one.
+    WritePoint parseWritePoint(const std::string& json, uint64_t defaultTimestampNs);
 
-    // Parse a single write point from an already-parsed JSON object
-    WritePoint parseWritePoint(const json_value_t& doc);
+    // Parse a single write point from an already-parsed JSON object.
+    // defaultTimestampNs is used when the point has no explicit timestamp.
+    WritePoint parseWritePoint(const json_value_t& doc, uint64_t defaultTimestampNs);
 
-    // Parse a write point that may contain arrays
-    MultiWritePoint parseMultiWritePoint(const json_value_t& point);
+    // Parse a write point that may contain arrays.
+    // defaultTimestampNs is used when the point has no explicit timestamp,
+    // so the caller can capture now() once for an entire batch.
+    MultiWritePoint parseMultiWritePoint(const json_value_t& point, uint64_t defaultTimestampNs);
     
     // Process a single write point - determine type and insert
     seastar::future<> processWritePoint(const WritePoint& point);
@@ -185,8 +213,11 @@ private:
     // Validate that all field arrays have the same length as timestamps
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);
     
-    // Coalesce multiple individual writes into efficient array writes
-    std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array);
+    // Coalesce multiple individual writes into efficient array writes.
+    // defaultTimestampNs is the pre-computed current time used for any write
+    // that lacks an explicit timestamp, avoiding per-write now() calls.
+    std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array,
+                                                 uint64_t defaultTimestampNs);
     
     // Create error response JSON
     std::string createErrorResponse(const std::string& error);
@@ -223,6 +254,18 @@ public:
     // Parse and validate a single write point from JSON string (for testing without Seastar).
     // Throws std::runtime_error if JSON is invalid or names contain reserved characters.
     static void parseAndValidateWritePoint(const std::string& json);
+
+    // Return the current wall-clock time as nanoseconds since the Unix epoch.
+    // Encapsulates the std::chrono boilerplate in one place so callers can
+    // capture the value once and reuse it across an entire batch.
+    // We use system_clock (not seastar::lowres_clock) because stored timestamps
+    // need nanosecond-level precision; lowres_clock only updates every ~10 ms.
+    static uint64_t currentNanosTimestamp() {
+        auto now = std::chrono::system_clock::now();
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count());
+    }
 };
 
 #endif // HTTP_WRITE_HANDLER_H_INCLUDED

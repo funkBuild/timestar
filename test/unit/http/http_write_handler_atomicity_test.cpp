@@ -107,25 +107,25 @@ TEST_F(HttpWriteHandlerAtomicityTest, ProcessWritePointExists) {
 }
 
 // Core test: In processWritePoint, data dispatch (when_all_succeed on shard inserts)
-// must appear BEFORE metadata dispatch (indexMetadataBatch).
-// The refactored function batches inserts by shard and dispatches in parallel,
-// then indexes metadata once after all data inserts complete.
+// must appear BEFORE metadata dispatch (dispatchMetadataAsync, fire-and-forget).
+// The refactored function batches inserts by shard, dispatches via when_all_succeed,
+// then fires off metadata indexing asynchronously without blocking the response.
 TEST_F(HttpWriteHandlerAtomicityTest, DoubleBranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
     // The batched architecture groups inserts by shard, dispatches via when_all_succeed,
-    // then indexes metadata via indexMetadataBatch. Verify this ordering.
+    // then dispatches metadata via dispatchMetadataAsync (fire-and-forget). Verify ordering.
     size_t dataDispatchPos = funcBody.find("when_all_succeed");
-    size_t metadataPos = funcBody.find("indexMetadataBatch");
+    size_t metadataPos = funcBody.find("dispatchMetadataAsync");
 
     ASSERT_NE(dataDispatchPos, std::string::npos)
         << "Could not find when_all_succeed (parallel shard dispatch) in processWritePoint";
     ASSERT_NE(metadataPos, std::string::npos)
-        << "Could not find indexMetadataBatch in processWritePoint";
+        << "Could not find dispatchMetadataAsync in processWritePoint";
 
     EXPECT_LT(dataDispatchPos, metadataPos)
-        << "BUG: indexMetadataBatch appears BEFORE when_all_succeed. "
+        << "BUG: dispatchMetadataAsync appears BEFORE when_all_succeed. "
            "Data must be inserted before metadata for crash safety.";
 }
 
@@ -151,35 +151,29 @@ TEST_F(HttpWriteHandlerAtomicityTest, BoolBranchDataBeforeMetadata) {
         << "Could not find engine.insert() or engine.insertBatch() in processWritePoint";
 }
 
-// Verify metadata is batched, not per-field
+// Verify metadata uses fire-and-forget dispatch, not per-field individual calls
 TEST_F(HttpWriteHandlerAtomicityTest, StringBranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
-    // Metadata should use batch indexing, not individual per-field calls
-    EXPECT_NE(funcBody.find("indexMetadataBatch"), std::string::npos)
-        << "processWritePoint should use indexMetadataBatch for efficient metadata indexing";
+    // Metadata should use fire-and-forget async dispatch
+    EXPECT_NE(funcBody.find("dispatchMetadataAsync"), std::string::npos)
+        << "processWritePoint should use dispatchMetadataAsync for fire-and-forget metadata indexing";
 
     // Should NOT have individual indexMetadata calls (the old per-field pattern)
-    // indexMetadataBatch is the batched version; individual indexMetadata would indicate
-    // the old sequential pattern
-    size_t batchPos = funcBody.find("indexMetadataBatch");
-    // Count occurrences of "indexMetadata(" that are NOT "indexMetadataBatch("
+    // Count occurrences of "indexMetadata(" that are NOT "indexMetadataBatch(" or "dispatchMetadataAsync"
     size_t pos = 0;
     int individualCalls = 0;
     while ((pos = funcBody.find("indexMetadata(", pos)) != std::string::npos) {
         // Check it's not indexMetadataBatch
-        if (pos < 5 || funcBody.substr(pos - 5, 5) != "Batch") {
-            // Check it's not part of indexMetadataBatch
-            if (funcBody.substr(pos, 19) != "indexMetadataBatch(") {
-                individualCalls++;
-            }
+        if (funcBody.substr(pos, 19) != "indexMetadataBatch(") {
+            individualCalls++;
         }
         pos++;
     }
     EXPECT_EQ(individualCalls, 0)
         << "processWritePoint should not call individual indexMetadata(); "
-           "use indexMetadataBatch() instead for batched metadata indexing";
+           "use dispatchMetadataAsync() instead for fire-and-forget metadata indexing";
 }
 
 // Verify parallel shard dispatch structure exists

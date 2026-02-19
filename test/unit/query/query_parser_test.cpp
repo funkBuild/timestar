@@ -221,8 +221,53 @@ TEST_F(QueryParserTest, AggregationCaseInsensitive) {
 TEST_F(QueryParserTest, MeasurementCaseSensitive) {
     QueryRequest r1 = QueryParser::parseQueryString("avg:Temperature()");
     QueryRequest r2 = QueryParser::parseQueryString("avg:temperature()");
-    
+
     EXPECT_EQ(r1.measurement, "Temperature");
     EXPECT_EQ(r2.measurement, "temperature");
     EXPECT_NE(r1.measurement, r2.measurement);
+}
+
+// Wildcard scope parsing — parser stores raw strings, wildcards pass through
+TEST_F(QueryParserTest, ParseWildcardScope) {
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:server-*}");
+
+    EXPECT_EQ(request.scopes.size(), 1);
+    EXPECT_EQ(request.scopes.at("host"), "server-*");
+    EXPECT_TRUE(request.hasPatternFilters());
+}
+
+// ~regex scope parsing
+TEST_F(QueryParserTest, ParseTildeRegexScope) {
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:~server-[0-9]+}");
+
+    EXPECT_EQ(request.scopes.size(), 1);
+    EXPECT_EQ(request.scopes.at("host"), "~server-[0-9]+");
+    EXPECT_TRUE(request.hasPatternFilters());
+}
+
+// /regex/ scope parsing
+TEST_F(QueryParserTest, ParseSlashRegexScope) {
+    // Note: /regex/ containing } would break the parser, but simple patterns work
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:/server-[0-9]+/}");
+
+    EXPECT_EQ(request.scopes.size(), 1);
+    EXPECT_EQ(request.scopes.at("host"), "/server-[0-9]+/");
+    EXPECT_TRUE(request.hasPatternFilters());
+}
+
+// Exact scope returns false for hasPatternFilters
+TEST_F(QueryParserTest, ExactScopeNotPattern) {
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:server-01}");
+
+    EXPECT_EQ(request.scopes.at("host"), "server-01");
+    EXPECT_FALSE(request.hasPatternFilters());
+}
+
+// Mixed exact and pattern scopes
+TEST_F(QueryParserTest, MixedExactAndPatternScopes) {
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:server-*,dc:dc1}");
+
+    EXPECT_EQ(request.scopes.at("host"), "server-*");
+    EXPECT_EQ(request.scopes.at("dc"), "dc1");
+    EXPECT_TRUE(request.hasPatternFilters());
 }

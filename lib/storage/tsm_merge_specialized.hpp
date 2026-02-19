@@ -7,7 +7,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <vector>
-#include <memory>
 #include <limits>
 
 // Phase 5.1: Specialized N-way merge iterators for optimal performance
@@ -19,14 +18,14 @@ class TwoWayMergeIterator {
 private:
     struct Source {
         seastar::shared_ptr<TSM> file;
-        std::shared_ptr<TSMBlockIterator<T>> blockIterator;
+        seastar::lw_shared_ptr<TSMBlockIterator<T>> blockIterator;  // shard-local, non-atomic refcount
         TSMBlock<T>* currentBlock = nullptr;
         size_t pointIndex = 0;
         bool exhausted = false;
 
         Source(seastar::shared_ptr<TSM> f, const SeriesId128& seriesId)
             : file(f) {
-            blockIterator = std::make_shared<TSMBlockIterator<T>>(f, seriesId, 0, UINT64_MAX);
+            blockIterator = seastar::make_lw_shared<TSMBlockIterator<T>>(f, seriesId, 0, UINT64_MAX);
         }
 
         uint64_t currentTimestamp() const {
@@ -148,16 +147,16 @@ class FourWayMergeIterator {
 private:
     struct Source {
         seastar::shared_ptr<TSM> file;
-        std::shared_ptr<TSMBlockIterator<T>> blockIterator;
+        seastar::lw_shared_ptr<TSMBlockIterator<T>> blockIterator;  // shard-local, non-atomic refcount
         TSMBlock<T>* currentBlock = nullptr;
         size_t pointIndex = 0;
         bool exhausted = false;
-        uint64_t rank;  // File rank for tie-breaking
+        uint64_t rank = 0;  // File rank for tie-breaking
 
         Source() = default;
         Source(seastar::shared_ptr<TSM> f, const SeriesId128& seriesId)
             : file(f), rank(f->rankAsInteger()) {
-            blockIterator = std::make_shared<TSMBlockIterator<T>>(f, seriesId, 0, UINT64_MAX);
+            blockIterator = seastar::make_lw_shared<TSMBlockIterator<T>>(f, seriesId, 0, UINT64_MAX);
         }
 
         uint64_t currentTimestamp() const {

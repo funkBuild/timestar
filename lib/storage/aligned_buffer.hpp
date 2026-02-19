@@ -9,31 +9,43 @@
 #include <stdexcept>
 #include <string>
 #include <memory>
+#include <cstdlib>
+#include <new>
 
 #include "compressed_buffer.hpp"
 
-// Allocator that default-initializes (i.e. leaves memory uninitialized) on
-// resize, instead of value-initializing (zeroing).  Every AlignedBuffer caller
-// immediately overwrites newly-allocated bytes via memcpy, so the implicit
-// memset from std::vector<uint8_t>::resize() is pure waste.  This allocator
-// eliminates that overhead while keeping the rest of std::vector's semantics
-// (capacity tracking, contiguous storage, iterator invalidation rules, etc.)
-// unchanged.
-template <typename T>
-struct default_init_allocator {
+// Allocator that:
+//  1. Aligns every allocation to DMA_ALIGNMENT (4096) so the buffer can be
+//     passed directly to Seastar's dma_write() without an intermediate copy.
+//  2. Default-initializes (i.e. leaves memory uninitialized) on resize,
+//     avoiding the implicit memset from std::vector<uint8_t>::resize().
+//     Every AlignedBuffer caller immediately overwrites newly-allocated bytes
+//     via memcpy, so value-initialization is pure waste.
+template <typename T, std::size_t Alignment = 4096>
+struct dma_default_init_allocator {
   using value_type = T;
 
-  default_init_allocator() noexcept = default;
-
+  // Required by std::allocator_traits for rebinding (e.g. inside std::vector
+  // internals).  Preserves the Alignment parameter across type rebinds.
   template <typename U>
-  default_init_allocator(const default_init_allocator<U>&) noexcept {}
+  struct rebind { using other = dma_default_init_allocator<U, Alignment>; };
+
+  dma_default_init_allocator() noexcept = default;
+
+  template <typename U, std::size_t A>
+  dma_default_init_allocator(const dma_default_init_allocator<U, A>&) noexcept {}
 
   T* allocate(std::size_t n) {
-    return std::allocator<T>{}.allocate(n);
+    const std::size_t bytes = n * sizeof(T);
+    // std::aligned_alloc requires size to be a multiple of alignment.
+    const std::size_t padded = (bytes + Alignment - 1) & ~(Alignment - 1);
+    void* p = std::aligned_alloc(Alignment, padded);
+    if (!p) throw std::bad_alloc();
+    return static_cast<T*>(p);
   }
 
-  void deallocate(T* p, std::size_t n) noexcept {
-    std::allocator<T>{}.deallocate(p, n);
+  void deallocate(T* p, std::size_t) noexcept {
+    std::free(p);
   }
 
   // Default construction: leave memory uninitialized (default-init for
@@ -48,8 +60,8 @@ struct default_init_allocator {
     ::new (static_cast<void*>(p)) T(std::forward<Args>(args)...);
   }
 
-  template <typename U>
-  bool operator==(const default_init_allocator<U>&) const noexcept { return true; }
+  template <typename U, std::size_t A>
+  bool operator==(const dma_default_init_allocator<U, A>&) const noexcept { return true; }
 };
 
 class AlignedBuffer {
@@ -63,7 +75,13 @@ private:
   void ensure_capacity(size_t required);
 
 public:
-  std::vector<uint8_t, default_init_allocator<uint8_t>> data;
+  // DMA alignment used by the underlying allocator.  Matches Seastar's
+  // default memory_dma_alignment (4096).  The buffer's base address is
+  // always aligned to this value, so closeDMA() can write directly
+  // from data.data() without an intermediate memcpy.
+  static constexpr size_t DMA_ALIGNMENT = 4096;
+
+  std::vector<uint8_t, dma_default_init_allocator<uint8_t, DMA_ALIGNMENT>> data;
 
   AlignedBuffer(size_t initialSize = 0) {
     if (initialSize > 0) {
@@ -117,6 +135,31 @@ public:
                                std::to_string(current_size));
     }
     return data[offset];
+  }
+
+  // Write a value at a specific offset (for backpatching headers).
+  // The target region must already be within the buffer's logical size.
+  template <class T>
+  void writeAt(size_t offset, T value) {
+    if (offset + sizeof(T) > current_size) [[unlikely]] {
+      throw std::runtime_error(
+          "AlignedBuffer::writeAt out of bounds: offset=" +
+          std::to_string(offset) + " sizeof(T)=" +
+          std::to_string(sizeof(T)) + " size=" +
+          std::to_string(current_size));
+    }
+    std::memcpy(data.data() + offset, &value, sizeof(T));
+  }
+
+  // Grow the buffer by `extra_bytes` and return a pointer to the start
+  // of the newly-available region. The new bytes are left uninitialized
+  // (the caller must fill them).
+  uint8_t* grow_uninit(size_t extra_bytes) {
+    const size_t new_size = current_size + extra_bytes;
+    ensure_capacity(new_size);
+    uint8_t* ptr = data.data() + current_size;
+    current_size = new_size;
+    return ptr;
   }
 
   size_t size() const { return current_size; }

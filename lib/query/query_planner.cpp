@@ -273,7 +273,7 @@ bool QueryPlanner::requiresAllShards(const QueryRequest& request) {
     for (const auto& [key, value] : request.scopes) {
         if (value.find('*') != std::string::npos ||
             value.find('?') != std::string::npos ||
-            (!value.empty() && value[0] == '/')) {
+            (!value.empty() && (value[0] == '/' || value[0] == '~'))) {
             return true;
         }
     }
