@@ -10,6 +10,7 @@
 #include "forecast/linear_forecaster.hpp"
 #include "forecast/seasonal_forecaster.hpp"
 #include "forecast/forecast_executor.hpp"
+#include "forecast/periodicity_detector.hpp"
 #include <cmath>
 #include <random>
 #include <numeric>
@@ -1075,16 +1076,14 @@ TEST_F(ForecastNumericalTest, PeriodicityDetectorPeriodogramPureSine) {
     //
     // For a pure sine wave y = sin(2πx/T):
     //   - Period T corresponds to frequency f = 1/T cycles per sample
-    //   - In DFT, frequency index k = n * f = n/T
+    //   - FFT pads to next power of 2, so bin index k = fftSize/T
     //
-    // Example: n=100 samples, period T=10
-    //   - Frequency index k = 100/10 = 10
-    //   - All power should concentrate at index 10
+    // Use power-of-2 size so FFT bins align exactly with the period
 
     PeriodicityDetector detector;
 
-    size_t n = 100;
-    size_t period = 10;
+    size_t n = 128;    // Power of 2: no padding, exact bin alignment
+    size_t period = 16;
     std::vector<double> y(n);
     for (size_t i = 0; i < n; ++i) {
         y[i] = std::sin(2.0 * M_PI * i / period);
@@ -1092,7 +1091,7 @@ TEST_F(ForecastNumericalTest, PeriodicityDetectorPeriodogramPureSine) {
 
     auto periodogram = detector.computePeriodogram(y);
 
-    // Peak should be at frequency index k = n/T = 100/10 = 10
+    // With n=128 (power of 2), peak at k = 128/16 = 8
     size_t expectedPeakIdx = n / period;
 
     // Find the peak (skip DC component at index 0)
@@ -1668,6 +1667,161 @@ TEST_F(ForecastNumericalTest, STLConstantData) {
     EXPECT_NEAR(residualSum, 0.0, 1.0);
 }
 
+TEST_F(ForecastNumericalTest, STLRobustnessWeightsZeroMAD) {
+    // When median(|residuals|) is near zero, the scale h = 6 * median(|residuals|)
+    // also approaches zero.  The fix must clamp and return uniform weights of 1.0
+    // instead of running bisquare with a near-zero denominator, because near-zero
+    // residuals mean there are no outliers and every point is equally "typical".
+
+    STLDecomposer decomposer;
+
+    // Case 1: all residuals exactly zero — median(|r|) = 0, weights must be 1.0
+    {
+        std::vector<double> residuals(20, 0.0);
+        auto weights = decomposer.computeRobustnessWeights(residuals);
+        ASSERT_EQ(weights.size(), 20);
+        for (size_t i = 0; i < weights.size(); ++i) {
+            EXPECT_NEAR(weights[i], 1.0, 1e-9)
+                << "weight[" << i << "] should be 1.0 when all residuals are zero";
+        }
+    }
+
+    // Case 2: all residuals tiny (below epsilon) — median(|r|) << 1e-10, weights must be 1.0
+    {
+        // Residuals at 1e-14 level: median(|r|) = 1e-14, scale = 6e-14 < 1e-10 threshold
+        std::vector<double> residuals(20, 1e-14);
+        auto weights = decomposer.computeRobustnessWeights(residuals);
+        ASSERT_EQ(weights.size(), 20);
+        for (size_t i = 0; i < weights.size(); ++i) {
+            EXPECT_NEAR(weights[i], 1.0, 1e-9)
+                << "weight[" << i << "] should be 1.0 when scale < epsilon (near-zero residuals)";
+        }
+    }
+
+    // Case 3: no NaN/Inf in full decompose with constant input (robust mode, multiple iterations)
+    {
+        std::vector<double> y(48, 42.0);
+        auto result = decomposer.decompose(y, 12, 7, 0, /*robust=*/true, 3, 2);
+        ASSERT_TRUE(result.success);
+        for (size_t i = 0; i < y.size(); ++i) {
+            EXPECT_TRUE(std::isfinite(result.trend[i]))
+                << "trend[" << i << "] is not finite with constant input";
+            EXPECT_TRUE(std::isfinite(result.seasonal[i]))
+                << "seasonal[" << i << "] is not finite with constant input";
+            EXPECT_TRUE(std::isfinite(result.residual[i]))
+                << "residual[" << i << "] is not finite with constant input";
+        }
+        for (size_t i = 0; i < y.size(); ++i) {
+            EXPECT_NEAR(result.trend[i], 42.0, 5.0)
+                << "trend[" << i << "] should be ~42 with constant input";
+        }
+    }
+}
+
+TEST_F(ForecastNumericalTest, STLLoessDuplicateXValues) {
+    // When all x-values in the LOESS neighborhood are identical, maxDist is 0.
+    // The old code clamped maxDist to 1e-10, which causes dist/maxDist to blow
+    // up for any neighbor that is even slightly further away, making tricube
+    // return 0 for nearly every point — a degenerate and numerically unstable
+    // result.  The fix returns uniform weights whenever maxDist <= epsilon.
+    //
+    // A closely related case: near-duplicate x-values (floating-point jitter at
+    // the 1e-15 level) yield maxDist << 1e-10 but nonzero, so the clamping guard
+    // does not fire.  The tricube ratios dist/maxDist still span [0, 1] but the
+    // resulting WLS denominator collapses to ~1e-28, producing a biased result
+    // far from the true mean.  The fix also covers this by using the same
+    // epsilon guard and returning uniform weights.
+
+    STLDecomposer decomposer;
+
+    // Case 1: all x-values exactly identical — pure duplicate x scenario.
+    // Every point is at distance 0 from xeval; uniform weights should apply
+    // and the result should equal the simple mean of y.
+    {
+        std::vector<double> x(10, 5.0);   // all x = 5
+        std::vector<double> y = {1.0, 2.0, 3.0, 4.0, 5.0,
+                                  6.0, 7.0, 8.0, 9.0, 10.0};
+        std::vector<double> xout = {5.0};
+
+        auto result = decomposer.loess(x, y, xout, 1.0);
+        ASSERT_EQ(result.size(), 1u);
+        EXPECT_TRUE(std::isfinite(result[0]))
+            << "LOESS with all-duplicate x should return a finite value, got "
+            << result[0];
+        // With uniform weights and x centered at xeval=5 (all xi=0),
+        // the WLS intercept equals the simple mean: (1+2+...+10)/10 = 5.5
+        EXPECT_NEAR(result[0], 5.5, 1e-6)
+            << "LOESS intercept with uniform weights should be mean of y";
+    }
+
+    // Case 2: near-duplicate x-values (sub-epsilon floating-point jitter).
+    // maxDist ends up ~1e-14, well below 1e-10 epsilon.  Without the fix,
+    // the WLS denominator collapses to ~1e-28, biasing the result away from
+    // the true mean.  With the fix, uniform weights are returned and the result
+    // is the simple mean of y = 5.5.
+    {
+        std::vector<double> x(10, 5.0);
+        // Add sub-epsilon jitter (1e-15 per step, maxDist ends up ~9e-15)
+        for (size_t i = 0; i < 10; ++i) x[i] += static_cast<double>(i) * 1e-15;
+        std::vector<double> y = {1.0, 2.0, 3.0, 4.0, 5.0,
+                                  6.0, 7.0, 8.0, 9.0, 10.0};
+        std::vector<double> xout = {5.0};
+
+        auto result = decomposer.loess(x, y, xout, 1.0);
+        ASSERT_EQ(result.size(), 1u);
+        EXPECT_TRUE(std::isfinite(result[0]))
+            << "LOESS with near-duplicate x should return a finite value, got "
+            << result[0];
+        // With the fix (uniform weights when maxDist <= epsilon), result = mean = 5.5.
+        // Without the fix, the WLS gives ~3.47, which is wrong.
+        EXPECT_NEAR(result[0], 5.5, 0.1)
+            << "LOESS with near-duplicate x should approximate the mean of y";
+    }
+
+    // Case 3: mostly duplicate x with one distant outlier x — the outlier is
+    // excluded from the window (span < 1.0) so the result is dominated by the
+    // duplicates and must still be finite.
+    {
+        std::vector<double> x = {5.0, 5.0, 5.0, 5.0, 5.0,
+                                  5.0, 5.0, 5.0, 5.0, 100.0};
+        std::vector<double> y = {10.0, 10.0, 10.0, 10.0, 10.0,
+                                  10.0, 10.0, 10.0, 10.0, 999.0};
+        std::vector<double> xout = {5.0};
+
+        auto result = decomposer.loess(x, y, xout, 0.9);
+        ASSERT_EQ(result.size(), 1u);
+        EXPECT_TRUE(std::isfinite(result[0]))
+            << "LOESS with mostly-duplicate x must return a finite value, got "
+            << result[0];
+        // The 9 duplicates at x=5 dominate; outlier at x=100 is outside the
+        // 9-point window, so result should be near 10.0.
+        EXPECT_NEAR(result[0], 10.0, 1.0)
+            << "LOESS should be dominated by the 9 duplicate points near xeval";
+    }
+
+    // Case 4: full STL decompose on a dataset with duplicate timestamps.
+    // In practice, repeated timestamps arise when ingesting pre-aggregated data
+    // or when the query engine de-duplicates at nanosecond resolution.  The STL
+    // path uses loessEvenlySpaced (integer indices, never duplicate x), but
+    // verifying the end-to-end pipeline is finite under a constant/flat series
+    // (which causes zero-MAD in robustness weights AND zero-dist in trend LOESS).
+    {
+        // Flat series — all y identical, simulating what duplicate timestamps
+        // would produce after de-duplication / last-value-wins aggregation.
+        std::vector<double> y(36, 7.0);  // 3 full cycles of period 12
+        auto result = decomposer.decompose(y, 12, 7, 0, /*robust=*/true, 2, 2);
+        ASSERT_TRUE(result.success);
+        for (size_t i = 0; i < y.size(); ++i) {
+            EXPECT_TRUE(std::isfinite(result.trend[i]))
+                << "trend[" << i << "] not finite on flat (duplicate-value) series";
+            EXPECT_TRUE(std::isfinite(result.seasonal[i]))
+                << "seasonal[" << i << "] not finite on flat (duplicate-value) series";
+            EXPECT_TRUE(std::isfinite(result.residual[i]))
+                << "residual[" << i << "] not finite on flat (duplicate-value) series";
+        }
+    }
+}
+
 // ==================== Auto/Multi Seasonality Integration Tests ====================
 
 TEST_F(ForecastNumericalTest, ForecastSeasonalityEnumParsing) {
@@ -2224,6 +2378,87 @@ TEST_F(ForecastNumericalTest, DetectPeriodsWithNaNInput) {
     });
 }
 
+TEST_F(ForecastNumericalTest, AutoCorrelationWithInf) {
+    // Test that autoCorrelation filters Inf values the same way it filters NaN.
+    // Before the fix, std::isnan() returned false for Inf, so Inf passed through
+    // the filter, making validCount non-zero but producing an Inf mean and
+    // corrupted ACF result.
+
+    PeriodicityDetector detector;
+
+    // Sinusoidal signal with a single +Inf injected
+    std::vector<double> y(100);
+    for (size_t i = 0; i < 100; ++i) {
+        y[i] = std::sin(2.0 * M_PI * i / 24.0);
+    }
+    y[50] = std::numeric_limits<double>::infinity();
+
+    double acf = detector.autoCorrelation(y, 24);
+
+    // Result must be finite — the Inf must have been filtered out
+    EXPECT_TRUE(std::isfinite(acf))
+        << "autoCorrelation should filter Inf the same way it filters NaN";
+
+    // With only 1 Inf in 100 sinusoidal points the ACF at lag 24 should
+    // still be strongly positive (period alignment)
+    EXPECT_GT(acf, 0.5)
+        << "ACF at the true period should remain strongly positive after Inf is filtered";
+}
+
+TEST_F(ForecastNumericalTest, AutoCorrelationWithNegInf) {
+    // Same as above but with -Inf to ensure both signs are handled.
+
+    PeriodicityDetector detector;
+
+    std::vector<double> y(100);
+    for (size_t i = 0; i < 100; ++i) {
+        y[i] = std::sin(2.0 * M_PI * i / 24.0);
+    }
+    y[25] = -std::numeric_limits<double>::infinity();
+
+    double acf = detector.autoCorrelation(y, 24);
+
+    EXPECT_TRUE(std::isfinite(acf))
+        << "autoCorrelation should filter -Inf the same way it filters NaN";
+    EXPECT_GT(acf, 0.5);
+}
+
+TEST_F(ForecastNumericalTest, DetectPeriodsWithInfInput) {
+    // Test the full detectPeriods pipeline with Inf-contaminated input.
+    // A single Inf used to corrupt the ACF validation step, causing no periods
+    // to be detected even for a strong sinusoidal signal.
+
+    PeriodicityDetector detector;
+
+    // Strong sinusoidal signal: 8 complete cycles of period 24
+    std::vector<double> y(192);
+    for (size_t i = 0; i < 192; ++i) {
+        y[i] = std::sin(2.0 * M_PI * i / 24.0);
+    }
+    // Inject a single Inf at a mid-point
+    y[96] = std::numeric_limits<double>::infinity();
+
+    // Should not crash and should still detect the dominant period
+    std::vector<DetectedPeriod> periods;
+    EXPECT_NO_THROW({
+        periods = detector.detectPeriods(y, 4, 96, 3, 0.1);
+    });
+
+    // The period-24 signal is strong enough that it should still be detected
+    // after the Inf is filtered from the ACF step
+    ASSERT_FALSE(periods.empty())
+        << "Period detection should survive a single Inf value in the input";
+
+    bool found24 = false;
+    for (const auto& p : periods) {
+        if (p.period >= 22 && p.period <= 26) {
+            found24 = true;
+        }
+    }
+    EXPECT_TRUE(found24)
+        << "Period near 24 should be detected even with one Inf in the data";
+}
+
 TEST_F(ForecastNumericalTest, RSquaredClampedToValidRange) {
     // Test that R-squared is always in [0, 1] range even when the model
     // is poor. With weighted regression, the R-squared formula can
@@ -2256,5 +2491,1012 @@ TEST_F(ForecastNumericalTest, RSquaredClampedToValidRange) {
         << "R-squared should not be negative";
     EXPECT_LE(output.rSquared, 1.0)
         << "R-squared should not exceed 1.0";
+}
+
+// ==================== Auto-Windowing Tests ====================
+
+TEST_F(ForecastNumericalTest, WindowingReducesInput) {
+    // 10K points with period 100 → window should be ~400 (4 cycles)
+    // 10000 > 400 * 1.5 = 600, so windowing should apply
+    const size_t N = 10000;
+    const size_t period = 100;
+
+    auto timestamps = generateTimestamps(N, 60000000000ULL);  // 1-min intervals
+    std::vector<double> values(N);
+    for (size_t i = 0; i < N; ++i) {
+        values[i] = std::sin(2.0 * M_PI * static_cast<double>(i) / period);
+    }
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.forecastSeasonality = ForecastSeasonality::AUTO;
+    config.forecastHorizon = 50;
+
+    ForecastExecutor executor;
+    auto output = executor.execute(input, config);
+
+    // The output should succeed (windowed input was used internally)
+    EXPECT_FALSE(output.empty());
+    // Windowed past should be much smaller than 10K
+    EXPECT_LT(output.historicalCount, N);
+    // But should still contain enough data for quality forecast
+    EXPECT_GE(output.historicalCount, period * 2);
+}
+
+TEST_F(ForecastNumericalTest, WindowingPreservesQuality) {
+    // Verify windowed forecast stays within the known signal range
+    // Signal: 10*sin(2π*i/100) + 50, range [40, 60]
+    const size_t N = 5000;
+    const size_t period = 100;
+    const size_t horizon = 50;
+
+    auto timestamps = generateTimestamps(N, 60000000000ULL);
+    std::vector<double> values(N);
+    for (size_t i = 0; i < N; ++i) {
+        values[i] = 10.0 * std::sin(2.0 * M_PI * static_cast<double>(i) / period) + 50.0;
+    }
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.forecastSeasonality = ForecastSeasonality::AUTO;
+    config.forecastHorizon = horizon;
+    // Windowing on by default
+
+    ForecastExecutor executor;
+    auto output = executor.execute(input, config);
+
+    ASSERT_FALSE(output.empty());
+    ASSERT_EQ(output.forecastCount, horizon);
+
+    // Windowed input should be smaller than full
+    EXPECT_LT(output.historicalCount, N);
+
+    // Forecast values should stay within a reasonable range of the signal
+    // Signal range is [40, 60]; allow generous margin for model uncertainty
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_GT(output.forecast[i], 20.0)
+            << "Forecast point " << i << " too low: " << output.forecast[i];
+        EXPECT_LT(output.forecast[i], 80.0)
+            << "Forecast point " << i << " too high: " << output.forecast[i];
+    }
+}
+
+TEST_F(ForecastNumericalTest, WindowingSkipsSmallInput) {
+    // 600 points with period 100 → window = 400, but 600 < 400*1.5 = 600
+    // so windowing should NOT apply (threshold is >)
+    const size_t N = 600;
+    const size_t period = 100;
+
+    auto timestamps = generateTimestamps(N, 60000000000ULL);
+    std::vector<double> values(N);
+    for (size_t i = 0; i < N; ++i) {
+        values[i] = std::sin(2.0 * M_PI * static_cast<double>(i) / period);
+    }
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.forecastSeasonality = ForecastSeasonality::AUTO;
+    config.forecastHorizon = 50;
+
+    ForecastExecutor executor;
+    auto output = executor.execute(input, config);
+
+    EXPECT_FALSE(output.empty());
+    // historicalCount should equal N (no trimming)
+    EXPECT_EQ(output.historicalCount, N);
+}
+
+TEST_F(ForecastNumericalTest, WindowingLinearAlgorithm) {
+    // Linear with no seasonality: window = max(4*horizon, 500)
+    // 10K points, horizon 50 → window = max(200, 500) = 500
+    // 10000 > 500*1.5 = 750, so windowing applies
+    const size_t N = 10000;
+
+    auto timestamps = generateTimestamps(N, 60000000000ULL);
+    std::vector<double> values(N);
+    for (size_t i = 0; i < N; ++i) {
+        values[i] = 2.0 * static_cast<double>(i) + 100.0;  // Linear trend
+    }
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.forecastHorizon = 50;
+
+    ForecastExecutor executor;
+    auto output = executor.execute(input, config);
+
+    EXPECT_FALSE(output.empty());
+    // Should be windowed to ~500 points
+    EXPECT_LT(output.historicalCount, N);
+    EXPECT_GE(output.historicalCount, 500u);
+    EXPECT_LE(output.historicalCount, 600u);
+
+    // Slope should still be ≈ 2.0 (linear data, windowing preserves tail)
+    EXPECT_NEAR(output.slope, 2.0, 1e-6);
+}
+
+TEST_F(ForecastNumericalTest, DisableAutoWindow) {
+    // Verify opt-out flag prevents windowing
+    const size_t N = 10000;
+
+    auto timestamps = generateTimestamps(N, 60000000000ULL);
+    std::vector<double> values(N);
+    for (size_t i = 0; i < N; ++i) {
+        values[i] = 2.0 * static_cast<double>(i) + 100.0;
+    }
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.forecastHorizon = 50;
+    config.disableAutoWindow = true;
+
+    ForecastExecutor executor;
+    auto output = executor.execute(input, config);
+
+    EXPECT_FALSE(output.empty());
+    // Should NOT be windowed
+    EXPECT_EQ(output.historicalCount, N);
+}
+
+TEST_F(ForecastNumericalTest, ExecuteMultiWindowingConsistency) {
+    // Verify result.times.size() matches series values sizes in executeMulti
+    const size_t N = 5000;
+    const size_t period = 100;
+    const size_t horizon = 50;
+
+    auto timestamps = generateTimestamps(N, 60000000000ULL);
+
+    std::vector<std::vector<double>> seriesValues(2);
+    for (size_t s = 0; s < 2; ++s) {
+        seriesValues[s].resize(N);
+        for (size_t i = 0; i < N; ++i) {
+            seriesValues[s][i] = (10.0 + s * 5.0) *
+                std::sin(2.0 * M_PI * static_cast<double>(i) / period) + 50.0;
+        }
+    }
+
+    std::vector<std::vector<std::string>> groupTags = {{"series=A"}, {"series=B"}};
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.forecastSeasonality = ForecastSeasonality::AUTO;
+    config.forecastHorizon = horizon;
+
+    ForecastExecutor executor;
+    auto result = executor.executeMulti(timestamps, seriesValues, groupTags, config);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_GT(result.statistics.originalPoints, 0u);
+    EXPECT_GT(result.statistics.windowedPoints, 0u);
+    EXPECT_LE(result.statistics.windowedPoints, result.statistics.originalPoints);
+
+    // times = windowed historical + forecast
+    EXPECT_EQ(result.times.size(), result.forecastStartIndex + horizon);
+
+    // Each series piece should have values.size() == times.size()
+    for (const auto& piece : result.series) {
+        EXPECT_EQ(piece.values.size(), result.times.size())
+            << "Piece '" << piece.piece << "' size mismatch";
+    }
+
+    // Should have 4 pieces per series (past, forecast, upper, lower) × 2 series
+    EXPECT_EQ(result.series.size(), 8u);
+}
+
+// ==================== Single-Point and Minimal-Input Edge Case Tests ====================
+
+TEST_F(ForecastNumericalTest, GenerateForecastTimestampsSinglePoint) {
+    // generateForecastTimestamps with 1 historical timestamp must not divide by zero
+    // Expected: returns empty (cannot compute interval from a single point)
+    std::vector<uint64_t> singleTs = {1704067200000000000ULL};
+    auto result = ForecastExecutor::generateForecastTimestamps(singleTs, 5);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(ForecastNumericalTest, GenerateForecastTimestampsEmpty) {
+    // generateForecastTimestamps with no historical timestamps
+    std::vector<uint64_t> emptyTs;
+    auto result = ForecastExecutor::generateForecastTimestamps(emptyTs, 5);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(ForecastNumericalTest, GenerateForecastTimestampsTwoPoints) {
+    // generateForecastTimestamps with exactly 2 points: interval = ts[1] - ts[0]
+    uint64_t start = 1704067200000000000ULL;
+    uint64_t interval = 60000000000ULL;  // 1 minute
+    std::vector<uint64_t> twoTs = {start, start + interval};
+    auto result = ForecastExecutor::generateForecastTimestamps(twoTs, 3);
+
+    ASSERT_EQ(result.size(), 3u);
+    EXPECT_EQ(result[0], start + 2 * interval);
+    EXPECT_EQ(result[1], start + 3 * interval);
+    EXPECT_EQ(result[2], start + 4 * interval);
+}
+
+TEST_F(ForecastNumericalTest, ExecuteSinglePointReturnsEmpty) {
+    // execute() with a single-point input must not crash or produce garbage
+    // Expected: returns empty ForecastOutput (insufficient data to compute interval)
+    ForecastInput input;
+    input.timestamps = {1704067200000000000ULL};
+    input.values = {42.0};
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 1;  // Lower threshold so minDataPoints is not the rejection reason
+
+    ForecastExecutor executor;
+    auto output = executor.execute(input, config);
+
+    // With a single point, cannot compute interval, so output must be empty
+    EXPECT_TRUE(output.empty());
+}
+
+TEST_F(ForecastNumericalTest, ExecuteMultiSingleTimestampReportsFailure) {
+    // executeMulti() with only 1 timestamp must report failure, not silent empty success
+    std::vector<uint64_t> timestamps = {1704067200000000000ULL};
+    std::vector<std::vector<double>> seriesValues = {{99.0}};
+    std::vector<std::vector<std::string>> groupTags = {{}};
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 1;  // Lower threshold to isolate the timestamp-count issue
+
+    ForecastExecutor executor;
+    auto result = executor.executeMulti(timestamps, seriesValues, groupTags, config);
+
+    // Must not silently report success with no series
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.errorMessage.empty());
+}
+
+TEST_F(ForecastNumericalTest, ExecuteMultiEmptyTimestampsReportsFailure) {
+    // executeMulti() with no timestamps must report failure
+    std::vector<uint64_t> timestamps;
+    std::vector<std::vector<double>> seriesValues;
+    std::vector<std::vector<std::string>> groupTags;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+
+    ForecastExecutor executor;
+    auto result = executor.executeMulti(timestamps, seriesValues, groupTags, config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.errorMessage.empty());
+}
+
+TEST_F(ForecastNumericalTest, ExecuteMultiTwoPointsSucceeds) {
+    // executeMulti() with 2 points and minDataPoints = 2 must succeed
+    uint64_t start = 1704067200000000000ULL;
+    uint64_t interval = 60000000000ULL;
+    std::vector<uint64_t> timestamps = {start, start + interval};
+    std::vector<std::vector<double>> seriesValues = {{10.0, 20.0}};
+    std::vector<std::vector<std::string>> groupTags = {{}};
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 2;
+    config.forecastHorizon = 3;
+    config.disableAutoWindow = true;
+
+    ForecastExecutor executor;
+    auto result = executor.executeMulti(timestamps, seriesValues, groupTags, config);
+
+    EXPECT_TRUE(result.success);
+    // times = 2 historical + 3 forecast
+    EXPECT_EQ(result.times.size(), 5u);
+    EXPECT_EQ(result.forecastStartIndex, 2u);
+    // 4 pieces (past, forecast, upper, lower)
+    EXPECT_EQ(result.series.size(), 4u);
+}
+
+// ==================== All-NaN Input Safety Tests ====================
+
+TEST_F(ForecastNumericalTest, SeasonalForecastAllNaNInputReturnsEmpty) {
+    // When all input values are NaN the forecaster must not crash or produce
+    // NaN/Inf in the output.  The n >= minDataPoints check passes (100 >= 10)
+    // so the fix must be an explicit all-NaN guard inside forecast().
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const size_t n = 100;
+    std::vector<double> values(n, nan);
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 10);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.arOrder = 2;
+    config.seasonalArOrder = 1;
+
+    SeasonalForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    // Must not crash. The output should be empty or contain no NaN/Inf.
+    if (!output.empty()) {
+        for (size_t i = 0; i < output.forecastCount; ++i) {
+            EXPECT_TRUE(std::isfinite(output.forecast[i]))
+                << "forecast[" << i << "] is not finite";
+            EXPECT_TRUE(std::isfinite(output.upper[i]))
+                << "upper[" << i << "] is not finite";
+            EXPECT_TRUE(std::isfinite(output.lower[i]))
+                << "lower[" << i << "] is not finite";
+        }
+    }
+}
+
+TEST_F(ForecastNumericalTest, SeasonalForecastAllNaNAutoSeasonality) {
+    // Same scenario with AUTO seasonality, which triggers the FFT-based
+    // PeriodicityDetector path.
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const size_t n = 100;
+    std::vector<double> values(n, nan);
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.forecastSeasonality = ForecastSeasonality::AUTO;
+
+    SeasonalForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    if (!output.empty()) {
+        for (size_t i = 0; i < output.forecastCount; ++i) {
+            EXPECT_TRUE(std::isfinite(output.forecast[i]))
+                << "forecast[" << i << "] is not finite (AUTO seasonality)";
+        }
+    }
+}
+
+TEST_F(ForecastNumericalTest, SeasonalForecastAllNaNMixedInput) {
+    // Half NaN, half valid — variance computation must not divide by zero
+    // when the valid portion after differencing is all-NaN.
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const size_t n = 100;
+    std::vector<double> values(n, nan);
+    // Fill second half with real values so at least some data is valid
+    for (size_t i = n / 2; i < n; ++i) {
+        values[i] = static_cast<double>(i);
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::SEASONAL;
+    config.arOrder = 2;
+
+    SeasonalForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    // Must not crash regardless of output content.
+    (void)output;
+}
+
+TEST_F(ForecastNumericalTest, DetectSeasonalPeriodAllNaN) {
+    // detectSeasonalPeriod must return 0 (no period) when given all-NaN input
+    // rather than propagating NaN through variance and returning garbage.
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const size_t n = 100;
+    std::vector<double> values(n, nan);
+
+    SeasonalForecaster forecaster;
+    size_t period = forecaster.detectSeasonalPeriod(values, 60000000000ULL);
+
+    // The only sane result for all-NaN input is 0 (no period detected).
+    EXPECT_EQ(period, size_t(0));
+}
+
+TEST_F(ForecastNumericalTest, FitARCoefficientsAllNaN) {
+    // fitARCoefficients must not produce NaN coefficients (which would silently
+    // corrupt forecasts) when variance is NaN due to all-NaN input.
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const size_t n = 50;
+    std::vector<double> values(n, nan);
+
+    SeasonalForecaster forecaster;
+    auto coeffs = forecaster.fitARCoefficients(values, 2);
+
+    // All coefficients must be finite (zero is the safe fallback).
+    for (size_t i = 0; i < coeffs.size(); ++i) {
+        EXPECT_TRUE(std::isfinite(coeffs[i]))
+            << "AR coefficient[" << i << "] is not finite for all-NaN input";
+    }
+}
+
+// ==================== Additional LinearModelType::SIMPLE and REACTIVE Tests ====================
+
+TEST_F(ForecastNumericalTest, LinearModelSimpleForecastIsFinite) {
+    // Verify that SIMPLE mode always produces finite forecast values and valid
+    // bounds for a well-conditioned linearly increasing input.
+
+    const size_t n = 40;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = 3.0 * static_cast<double>(i) + 10.0;
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 10);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::SIMPLE;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_EQ(output.forecastCount, size_t(10));
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i]))
+            << "forecast[" << i << "] is not finite in SIMPLE mode";
+        EXPECT_TRUE(std::isfinite(output.upper[i]))
+            << "upper[" << i << "] is not finite in SIMPLE mode";
+        EXPECT_TRUE(std::isfinite(output.lower[i]))
+            << "lower[" << i << "] is not finite in SIMPLE mode";
+        EXPECT_GE(output.upper[i], output.forecast[i])
+            << "upper bound must be >= forecast at index " << i;
+        EXPECT_LE(output.lower[i], output.forecast[i])
+            << "lower bound must be <= forecast at index " << i;
+    }
+}
+
+TEST_F(ForecastNumericalTest, LinearModelSimpleMinimumData) {
+    // minDataPoints defaults to 10; supply exactly 10 points and confirm
+    // SIMPLE mode (which internally uses the last 5) still returns a result
+    // with all-finite forecasts.
+
+    const size_t n = 10;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = static_cast<double>(i);
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::SIMPLE;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    EXPECT_EQ(output.forecastCount, size_t(5));
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i]))
+            << "forecast[" << i << "] is not finite with minimum data in SIMPLE mode";
+    }
+}
+
+TEST_F(ForecastNumericalTest, LinearModelSimpleTooFewPoints) {
+    // Fewer points than minDataPoints must produce an empty output rather than
+    // crashing or producing garbage.
+
+    const size_t n = 5;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = static_cast<double>(i);
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 3);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::SIMPLE;
+    // minDataPoints defaults to 10, so 5 points is too few.
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    // Should return empty output, not crash.
+    EXPECT_TRUE(output.empty());
+}
+
+TEST_F(ForecastNumericalTest, LinearModelSimplePerfectRecentLine) {
+    // If the last half is a perfect line y = 5*i + 1 and the first half is
+    // arbitrary noise, SIMPLE mode should recover the exact slope and intercept
+    // of the recent segment with R² = 1.0.
+
+    const size_t n = 60;
+    std::vector<double> values(n);
+    // First 30 points: alternating extreme values (chaotic, should be ignored)
+    for (size_t i = 0; i < 30; ++i) {
+        values[i] = (i % 2 == 0) ? 100.0 : -100.0;
+    }
+    // Last 30 points: perfect line y = 5*i + 1  (i is the global index)
+    for (size_t i = 30; i < n; ++i) {
+        values[i] = 5.0 * static_cast<double>(i) + 1.0;
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::SIMPLE;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    // Slope must be exactly 5.0 (the recent segment's slope)
+    EXPECT_NEAR(output.slope, 5.0, 1e-6)
+        << "SIMPLE mode should fit the last-half slope exactly when it is a perfect line";
+    // Intercept: y = 5*x + 1, so intercept = 1
+    EXPECT_NEAR(output.intercept, 1.0, 1e-6)
+        << "SIMPLE mode should fit the last-half intercept exactly when it is a perfect line";
+    EXPECT_NEAR(output.rSquared, 1.0, 1e-6)
+        << "SIMPLE mode R² should be 1.0 for a perfect line in the last half";
+}
+
+TEST_F(ForecastNumericalTest, LinearModelReactiveForecastIsFinite) {
+    // REACTIVE mode must produce finite forecast, upper, and lower values for
+    // a well-behaved linearly increasing dataset.
+
+    const size_t n = 50;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = 1.5 * static_cast<double>(i) + 7.0;
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 10);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::REACTIVE;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_EQ(output.forecastCount, size_t(10));
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i]))
+            << "forecast[" << i << "] is not finite in REACTIVE mode";
+        EXPECT_TRUE(std::isfinite(output.upper[i]))
+            << "upper[" << i << "] is not finite in REACTIVE mode";
+        EXPECT_TRUE(std::isfinite(output.lower[i]))
+            << "lower[" << i << "] is not finite in REACTIVE mode";
+        EXPECT_GE(output.upper[i], output.forecast[i])
+            << "upper bound must be >= forecast at index " << i;
+        EXPECT_LE(output.lower[i], output.forecast[i])
+            << "lower bound must be <= forecast at index " << i;
+    }
+}
+
+TEST_F(ForecastNumericalTest, LinearModelReactiveMinimumData) {
+    // Supply exactly minDataPoints (10) points; REACTIVE mode must still
+    // produce a non-empty result with all-finite forecasts.
+
+    const size_t n = 10;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = static_cast<double>(i) * 0.5;
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::REACTIVE;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    EXPECT_EQ(output.forecastCount, size_t(5));
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i]))
+            << "forecast[" << i << "] is not finite with minimum data in REACTIVE mode";
+    }
+}
+
+TEST_F(ForecastNumericalTest, LinearModelReactiveTooFewPoints) {
+    // Fewer than minDataPoints must produce empty output, not a crash.
+
+    const size_t n = 5;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = static_cast<double>(i);
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 3);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::REACTIVE;
+    // minDataPoints defaults to 10, so 5 points is too few.
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    EXPECT_TRUE(output.empty());
+}
+
+TEST_F(ForecastNumericalTest, LinearModelReactivePerfectLine) {
+    // For a perfect line y = 3*i + 2, exponential weighting must not distort
+    // the fit: slope and intercept should be exact, R² = 1.0.
+
+    const size_t n = 60;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = 3.0 * static_cast<double>(i) + 2.0;
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.linearModel = LinearModelType::REACTIVE;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    EXPECT_NEAR(output.slope, 3.0, 1e-6)
+        << "REACTIVE mode should recover exact slope on a perfect line";
+    EXPECT_NEAR(output.intercept, 2.0, 1e-6)
+        << "REACTIVE mode should recover exact intercept on a perfect line";
+    EXPECT_NEAR(output.rSquared, 1.0, 1e-6)
+        << "REACTIVE mode R² should be 1.0 for a perfect line";
+    EXPECT_NEAR(output.residualStdDev, 0.0, 1e-6)
+        << "REACTIVE mode residualStdDev should be 0.0 for a perfect line";
+}
+
+TEST_F(ForecastNumericalTest, LinearModelReactiveVsDefaultSlopeOrdering) {
+    // When recent data has a declining trend but earlier data was rising, the
+    // REACTIVE model should produce a lower (more negative) slope than DEFAULT,
+    // and SIMPLE should also lean toward the declining recent data.
+    //
+    // Series: first 50 points rising at +1.0/step, last 50 points falling at
+    // -1.0/step.  DEFAULT averages both halves to a near-zero slope.
+    // REACTIVE and SIMPLE should both show a negative slope.
+
+    const size_t n = 100;
+    std::vector<double> values(n);
+    for (size_t i = 0; i < 50; ++i) {
+        values[i] = static_cast<double>(i);              // 0 .. 49
+    }
+    for (size_t i = 50; i < n; ++i) {
+        // Continue from 49, then decline
+        values[i] = 49.0 - static_cast<double>(i - 50); // 49 .. 0
+    }
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    ForecastConfig cfgDefault;
+    cfgDefault.algorithm = Algorithm::LINEAR;
+    cfgDefault.linearModel = LinearModelType::DEFAULT;
+
+    ForecastConfig cfgReactive;
+    cfgReactive.algorithm = Algorithm::LINEAR;
+    cfgReactive.linearModel = LinearModelType::REACTIVE;
+
+    ForecastConfig cfgSimple;
+    cfgSimple.algorithm = Algorithm::LINEAR;
+    cfgSimple.linearModel = LinearModelType::SIMPLE;
+
+    LinearForecaster forecaster;
+    auto outDefault  = forecaster.forecast(input, cfgDefault,  forecastTs);
+    auto outReactive = forecaster.forecast(input, cfgReactive, forecastTs);
+    auto outSimple   = forecaster.forecast(input, cfgSimple,   forecastTs);
+
+    // DEFAULT slope should be near zero (symmetric rise and fall)
+    EXPECT_NEAR(outDefault.slope, 0.0, 0.5)
+        << "DEFAULT slope should be near 0 for a symmetric rise-then-fall";
+
+    // Both REACTIVE and SIMPLE should produce a negative slope because recent
+    // data is declining.
+    EXPECT_LT(outReactive.slope, 0.0)
+        << "REACTIVE slope should be negative when recent data is declining";
+    EXPECT_LT(outSimple.slope, 0.0)
+        << "SIMPLE slope should be negative when recent data is declining";
+}
+
+TEST_F(ForecastNumericalTest, LinearModelAllModesHorizontalLine) {
+    // For a perfectly flat series all three models must agree: slope 0, same
+    // intercept, R²=1, and identical finite forecasts equal to the constant.
+
+    const size_t n = 80;
+    const double constVal = 7.5;
+    std::vector<double> values(n, constVal);
+
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values = values;
+
+    LinearForecaster forecaster;
+
+    for (auto model : {LinearModelType::DEFAULT,
+                       LinearModelType::SIMPLE,
+                       LinearModelType::REACTIVE}) {
+        ForecastConfig config;
+        config.algorithm  = Algorithm::LINEAR;
+        config.linearModel = model;
+        config.deviations  = 2.0;
+
+        auto output = forecaster.forecast(input, config, forecastTs);
+
+        EXPECT_NEAR(output.slope, 0.0, 1e-9)
+            << "slope should be 0 for flat series, model="
+            << linearModelToString(model);
+        EXPECT_NEAR(output.intercept, constVal, 1e-9)
+            << "intercept should equal the constant value, model="
+            << linearModelToString(model);
+        EXPECT_NEAR(output.rSquared, 1.0, 1e-6)
+            << "R² should be 1.0 for a flat series (zero variance), model="
+            << linearModelToString(model);
+
+        for (size_t i = 0; i < output.forecastCount; ++i) {
+            EXPECT_TRUE(std::isfinite(output.forecast[i]))
+                << "forecast[" << i << "] not finite, model="
+                << linearModelToString(model);
+            EXPECT_DOUBLE_EQ(output.forecast[i], constVal)
+                << "forecast value mismatch, model=" << linearModelToString(model);
+        }
+    }
+}
+
+// ==================== Levinson-Durbin Zero-Variance Guard ====================
+
+TEST_F(ForecastNumericalTest, LevinsonDurbinZeroVarianceReturnsAllZero) {
+    // When r[0] == 0 (constant input, zero variance) the solver must not
+    // produce NaN/Inf.  All-zero AR coefficients are the correct degenerate
+    // result: the AR forecast reduces to the mean.
+
+    SeasonalForecaster forecaster;
+
+    // Order 1: r = {0, 0}
+    {
+        std::vector<double> r = {0.0, 0.0};
+        auto phi = forecaster.levinsonDurbin(r, 1);
+        ASSERT_EQ(phi.size(), 1u);
+        EXPECT_TRUE(std::isfinite(phi[0]))
+            << "levinsonDurbin(r[0]=0, order=1) produced non-finite phi[0]";
+        EXPECT_DOUBLE_EQ(phi[0], 0.0);
+    }
+
+    // Order 2: r = {0, 0, 0}
+    {
+        std::vector<double> r = {0.0, 0.0, 0.0};
+        auto phi = forecaster.levinsonDurbin(r, 2);
+        ASSERT_EQ(phi.size(), 2u);
+        for (size_t i = 0; i < phi.size(); ++i) {
+            EXPECT_TRUE(std::isfinite(phi[i]))
+                << "levinsonDurbin(r[0]=0, order=2) produced non-finite phi[" << i << "]";
+            EXPECT_DOUBLE_EQ(phi[i], 0.0);
+        }
+    }
+
+    // Near-zero but below epsilon: r[0] = 1e-11
+    {
+        std::vector<double> r = {1e-11, 0.0, 0.0};
+        auto phi = forecaster.levinsonDurbin(r, 2);
+        ASSERT_EQ(phi.size(), 2u);
+        for (size_t i = 0; i < phi.size(); ++i) {
+            EXPECT_TRUE(std::isfinite(phi[i]))
+                << "levinsonDurbin(r[0]=1e-11, order=2) produced non-finite phi[" << i << "]";
+        }
+    }
+}
+
+TEST_F(ForecastNumericalTest, SeasonalForecasterConstantInputFiniteForecasts) {
+    // A perfectly constant series (e.g., all 5.0) has zero variance.
+    // The seasonal forecaster must return finite forecasts equal to the constant
+    // and must not propagate NaN/Inf from the Levinson-Durbin solver.
+
+    const double constVal = 5.0;
+    const size_t n = 100;
+
+    std::vector<double> values(n, constVal);
+    auto timestamps = generateTimestamps(n);
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 10);
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values     = values;
+
+    ForecastConfig config;
+    config.algorithm  = Algorithm::SEASONAL;
+    config.arOrder    = 3;
+    config.seasonalArOrder = 1;
+    // Use no explicit seasonality so the differencing path is exercised
+    config.seasonality = Seasonality::NONE;
+
+    SeasonalForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_EQ(output.forecastCount, 10u);
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i]))
+            << "SeasonalForecaster constant input: forecast[" << i << "] is not finite";
+        EXPECT_TRUE(std::isfinite(output.upper[i]))
+            << "SeasonalForecaster constant input: upper[" << i << "] is not finite";
+        EXPECT_TRUE(std::isfinite(output.lower[i]))
+            << "SeasonalForecaster constant input: lower[" << i << "] is not finite";
+        // The forecast should stay near the constant value
+        EXPECT_NEAR(output.forecast[i], constVal, 1.0)
+            << "SeasonalForecaster constant input: forecast[" << i << "] far from constant";
+    }
+}
+
+// ==================== Duplicate / Identical Timestamp Tests ====================
+
+// generateForecastTimestamps must not produce an interval of 0 when all
+// input timestamps are identical (would generate forecast timestamps all equal
+// to lastTime and cause NaN/Inf in downstream forecasters).
+TEST_F(ForecastNumericalTest, GenerateForecastTimestamps_DuplicateTimestamps_ReturnsEmpty) {
+    // All timestamps identical — interval would be 0, so we expect an empty
+    // (or gracefully degraded) forecast timestamp list rather than all-same values.
+    const uint64_t sameTs = 1704067200000000000ULL;
+    std::vector<uint64_t> timestamps(10, sameTs);
+
+    auto forecastTs = ForecastExecutor::generateForecastTimestamps(timestamps, 5);
+
+    // Must not return timestamps that are all identical to the last historical
+    // value (that would yield division-by-zero in xForecast computation).
+    // The safe contract is: return empty when interval == 0.
+    EXPECT_TRUE(forecastTs.empty())
+        << "generateForecastTimestamps should return empty for duplicate timestamps";
+}
+
+// ForecastExecutor::executeMulti must return a failed result (not crash,
+// not produce NaN/Inf) when all input timestamps are identical.
+TEST_F(ForecastNumericalTest, ExecuteMulti_DuplicateTimestamps_ReturnsError) {
+    const uint64_t sameTs = 1704067200000000000ULL;
+    const size_t n = 20;
+    std::vector<uint64_t> timestamps(n, sameTs);
+    std::vector<double> values(n, 3.14);
+
+    ForecastConfig config;
+    config.algorithm = Algorithm::LINEAR;
+    config.minDataPoints = 2;
+
+    ForecastExecutor executor;
+    auto result = executor.executeMulti(
+        timestamps,
+        {{values}},
+        {{}},
+        config
+    );
+
+    // Must not crash and must not produce NaN/Inf values
+    EXPECT_FALSE(result.success)
+        << "executeMulti should report failure for duplicate timestamps";
+    EXPECT_FALSE(result.errorMessage.empty())
+        << "executeMulti should provide an error message for duplicate timestamps";
+
+    // Even if success==false, verify no series contains NaN/Inf (defensive)
+    for (const auto& piece : result.series) {
+        for (const auto& v : piece.values) {
+            if (v.has_value()) {
+                EXPECT_TRUE(std::isfinite(*v))
+                    << "executeMulti: series piece '" << piece.piece
+                    << "' contains non-finite value for duplicate timestamps";
+            }
+        }
+    }
+}
+
+// LinearForecaster must not produce NaN/Inf when all timestamps are identical.
+// Internally interval==0, so the fallback xForecast = n + i path must be taken.
+TEST_F(ForecastNumericalTest, LinearForecaster_DuplicateTimestamps_FiniteOutput) {
+    const uint64_t sameTs = 1704067200000000000ULL;
+    const size_t n = 30;
+    std::vector<uint64_t> timestamps(n, sameTs);
+    std::vector<double> values(n, 7.5);
+
+    // For duplicate timestamps generateForecastTimestamps returns empty, so
+    // build forecast timestamps manually as non-zero future times.
+    // (This tests the LinearForecaster path directly.)
+    std::vector<uint64_t> forecastTs;
+    for (size_t i = 0; i < 5; ++i) {
+        forecastTs.push_back(sameTs + (i + 1) * 60000000000ULL);
+    }
+
+    ForecastInput input;
+    input.timestamps = timestamps;
+    input.values     = values;
+
+    ForecastConfig config;
+    config.algorithm  = Algorithm::LINEAR;
+    config.deviations = 2.0;
+
+    LinearForecaster forecaster;
+    auto output = forecaster.forecast(input, config, forecastTs);
+
+    ASSERT_EQ(output.forecastCount, 5u);
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i]))
+            << "LinearForecaster duplicate timestamps: forecast[" << i << "] is not finite";
+        EXPECT_TRUE(std::isfinite(output.upper[i]))
+            << "LinearForecaster duplicate timestamps: upper[" << i << "] is not finite";
+        EXPECT_TRUE(std::isfinite(output.lower[i]))
+            << "LinearForecaster duplicate timestamps: lower[" << i << "] is not finite";
+    }
 }
 

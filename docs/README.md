@@ -1,69 +1,23 @@
 # TSDB Documentation
 
-This directory contains technical documentation for the TSDB project.
+## API Reference
 
-## Contents
+- [Write API](api-write.md) - Ingest time series data
+- [Query API](api-query.md) - Query with aggregation and filtering
+- [Derived Queries](api-derived.md) - Multi-query expressions, anomaly detection, forecasting
+- [Delete API](api-delete.md) - Delete data by series, pattern, or time range
+- [Metadata API](api-metadata.md) - List measurements, tags, and fields
+- [Streaming API](api-streaming.md) - Real-time SSE subscriptions
+- [Retention API](api-retention.md) - Manage retention and downsampling policies
+- [Health API](api-health.md) - Server health check
 
-### Query System Documentation
+## Query & Functions
 
-- **[QUERY_IMPLEMENTATION_PLAN.md](QUERY_IMPLEMENTATION_PLAN.md)** - Detailed plan for implementing the query system, including parser, planner, and execution components.
+- [Query Language](query-language.md) - Query syntax, aggregation methods, time intervals
+- [Expression Functions](expression-functions.md) - 40+ functions for transforms, rolling windows, cross-series math
+- [Anomaly Detection](anomaly-detection.md) - Basic, agile, and robust anomaly algorithms
+- [Forecasting](forecasting.md) - Linear and seasonal forecasting with STL decomposition
 
-- **[QUERY_EXECUTION_PLAN.md](QUERY_EXECUTION_PLAN.md)** - Architecture and execution flow for query processing across shards.
+## Architecture
 
-### Seastar Framework Integration
-
-- **[SEASTAR_TESTING.md](SEASTAR_TESTING.md)** - Guide for writing and running tests with Seastar's async/coroutine framework.
-
-- **[SEASTAR_GTEST_INTEGRATION.md](SEASTAR_GTEST_INTEGRATION.md)** - Integration strategy for using Google Test with Seastar-based code.
-
-- **[SEASTAR_TEST_INTEGRATION_SUMMARY.md](SEASTAR_TEST_INTEGRATION_SUMMARY.md)** - Summary of test integration approaches and best practices.
-
-### Storage System Documentation
-
-- **[TSM_TOMBSTONE_PLAN.md](TSM_TOMBSTONE_PLAN.md)** - Design and implementation plan for the TSM tombstone system used for logical deletion of time series data.
-
-## Additional Resources
-
-- **Parent [README.md](../README.md)** - Main project documentation
-- **[CLAUDE.md](../CLAUDE.md)** - Development guidance for Claude Code
-- **[Test Documentation](../test/README.md)** - Test suite organization and usage
-- **[HTTP API Tests](../test/http_api_tests/README.md)** - Python-based API test documentation
-
-## Architecture Diagrams
-
-```
-Data Write Path:
-HTTP Request → Engine → WAL → Memory Store → TSM File (on flush)
-                     ↓
-                Index Update (LevelDB)
-
-Query Path:
-HTTP Request → Query Parser → Query Planner → Query Runner
-                                            ↓
-                            Memory Store + TSM Files
-                                            ↓
-                                    Aggregator → Response
-```
-
-## Key Concepts
-
-### TSM (Time-Structured Merge)
-- Immutable file format for time series data
-- Organized by series key with time-ordered blocks
-- Supports multiple compression algorithms
-- Tiered compaction strategy
-
-### WAL (Write-Ahead Log)
-- Ensures durability before acknowledgment
-- Enables recovery of in-memory data
-- Supports write, delete, and delete-range operations
-
-### Sharding
-- Per-core data isolation using Seastar
-- Series keys distributed via consistent hashing
-- Parallel query execution across shards
-
-### Indexing
-- LevelDB for metadata storage
-- Series ID mapping for efficient lookups
-- Tag and field indexing for query optimization
+- [Architecture Overview](architecture.md) - Storage engine, data flow, sharding, compression

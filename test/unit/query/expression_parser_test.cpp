@@ -628,3 +628,116 @@ TEST_F(ExpressionParserTest, ToStringAnomalyFunctionWithSeasonality) {
     std::string str = ast->toString();
     EXPECT_TRUE(str.find("daily") != std::string::npos);
 }
+
+// ==================== time_shift() Parser Tests ====================
+
+TEST_F(ExpressionParserTest, TimeShiftBasicForward) {
+    // time_shift(a, '7d') parses to a TIME_SHIFT_FUNCTION node
+    ExpressionParser parser("time_shift(a, '7d')");
+    auto ast = parser.parse();
+    ASSERT_NE(ast, nullptr);
+    EXPECT_EQ(ast->type, ExprNodeType::TIME_SHIFT_FUNCTION);
+    const auto& ts = ast->asTimeShiftFunction();
+    EXPECT_EQ(ts.queryRef, "a");
+    EXPECT_EQ(ts.offset, "7d");
+}
+
+TEST_F(ExpressionParserTest, TimeShiftNegativeOffset) {
+    // Negative offset is stored as-is with the leading '-' in the string
+    ExpressionParser parser("time_shift(a, '-1h')");
+    auto ast = parser.parse();
+    ASSERT_NE(ast, nullptr);
+    EXPECT_EQ(ast->type, ExprNodeType::TIME_SHIFT_FUNCTION);
+    const auto& ts = ast->asTimeShiftFunction();
+    EXPECT_EQ(ts.queryRef, "a");
+    EXPECT_EQ(ts.offset, "-1h");
+}
+
+TEST_F(ExpressionParserTest, TimeShiftQueryRefRegistered) {
+    // The query reference used in time_shift should be registered
+    ExpressionParser parser("time_shift(my_query, '30m')");
+    auto ast = parser.parse();
+    auto refs = parser.getQueryReferences();
+    EXPECT_TRUE(refs.count("my_query") > 0);
+}
+
+TEST_F(ExpressionParserTest, TimeShiftToString) {
+    ExpressionParser parser("time_shift(a, '7d')");
+    auto ast = parser.parse();
+    std::string str = ast->toString();
+    EXPECT_TRUE(str.find("time_shift(") != std::string::npos);
+    EXPECT_TRUE(str.find("a") != std::string::npos);
+    EXPECT_TRUE(str.find("7d") != std::string::npos);
+}
+
+TEST_F(ExpressionParserTest, TimeShiftInBinaryExpression) {
+    // a - time_shift(a, '7d') should parse as a subtraction
+    ExpressionParser parser("a - time_shift(a, '7d')");
+    auto ast = parser.parse();
+    ASSERT_NE(ast, nullptr);
+    EXPECT_EQ(ast->type, ExprNodeType::BINARY_OP);
+    const auto& op = ast->asBinaryOp();
+    EXPECT_EQ(op.op, BinaryOpType::SUBTRACT);
+    EXPECT_EQ(op.right->type, ExprNodeType::TIME_SHIFT_FUNCTION);
+}
+
+TEST_F(ExpressionParserTest, ErrorTimeShiftMissingSecondArg) {
+    ExpressionParser parser("time_shift(a)");
+    EXPECT_THROW(parser.parse(), ExpressionParseException);
+}
+
+TEST_F(ExpressionParserTest, ErrorTimeShiftSecondArgNotString) {
+    ExpressionParser parser("time_shift(a, 7)");
+    EXPECT_THROW(parser.parse(), ExpressionParseException);
+}
+
+TEST_F(ExpressionParserTest, ErrorTimeShiftMissingQueryRef) {
+    ExpressionParser parser("time_shift('7d')");
+    EXPECT_THROW(parser.parse(), ExpressionParseException);
+}
+
+// ==================== Depth Limit Tests ====================
+
+TEST_F(ExpressionParserTest, ExpressionParser_DeepNesting_ThrowsError) {
+    // Build a deeply nested expression: ((((... (a) ...))))
+    // 600 levels of parentheses wrapping a single query reference.
+    // Without a depth guard this would overflow the call stack and segfault.
+    const int depth = 600;
+    std::string expr(depth, '(');
+    expr += "a";
+    expr += std::string(depth, ')');
+
+    ExpressionParser parser(expr);
+    EXPECT_THROW(parser.parse(), std::exception);
+}
+
+// ==================== Argument Count Limit Tests ====================
+
+TEST_F(ExpressionParserTest, FunctionArgLimit_ExactlyAtLimit_Accepted) {
+    // avg_of_series is variadic and accepts >= 1 argument.
+    // Build a call with exactly MAX_ARGS (1000) arguments — must be accepted.
+    // Each argument is the scalar "1", separated by commas.
+    std::string expr = "avg_of_series(";
+    for (int i = 0; i < 1000; ++i) {
+        if (i > 0) expr += ",";
+        expr += "1";
+    }
+    expr += ")";
+
+    ExpressionParser parser(expr);
+    EXPECT_NO_THROW(parser.parse());
+}
+
+TEST_F(ExpressionParserTest, FunctionArgLimit_OneOverLimit_Throws) {
+    // Build a call with 1001 arguments — one over the MAX_ARGS limit.
+    // The parser must reject this to prevent OOM from unbounded argument lists.
+    std::string expr = "avg_of_series(";
+    for (int i = 0; i < 1001; ++i) {
+        if (i > 0) expr += ",";
+        expr += "1";
+    }
+    expr += ")";
+
+    ExpressionParser parser(expr);
+    EXPECT_THROW(parser.parse(), ExpressionParseException);
+}

@@ -229,3 +229,12 @@ TEST_F(HttpWriteValidationTest, ParseWritePointAcceptsTagValueWithSpace) {
     })";
     EXPECT_NO_THROW(HttpWriteHandler::parseAndValidateWritePoint(json));
 }
+
+// =================== Constructor null-pointer validation ===================
+
+TEST_F(HttpWriteValidationTest, ConstructorThrowsOnNullEngine) {
+    // Passing a null engineSharded pointer must throw std::invalid_argument
+    // before any Seastar calls are made, preventing a segfault at the later
+    // dereference sites (engineSharded->invoke_on, engineSharded->local()).
+    EXPECT_THROW(HttpWriteHandler(nullptr), std::invalid_argument);
+}

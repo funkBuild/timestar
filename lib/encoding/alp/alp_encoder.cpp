@@ -136,6 +136,43 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD)
                      ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
 
+    // Delta-benefit heuristic: sample first block to check if delta reduces bit width
+    if (scheme == alp::SCHEME_ALP) {
+        const size_t sample_count = std::min(total_values, alp::ALP_VECTOR_SIZE);
+        int64_t abs_min = std::numeric_limits<int64_t>::max();
+        int64_t abs_max = std::numeric_limits<int64_t>::min();
+        int64_t zz_min = std::numeric_limits<int64_t>::max();
+        int64_t zz_max = std::numeric_limits<int64_t>::min();
+        int64_t prev = 0;
+        bool first_valid = true;
+
+        for (size_t i = 0; i < sample_count; ++i) {
+            double v = values[i];
+            if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v))) continue;
+            auto result = scaleValue(v, best.exp, best.fac);
+            if (!result.exact) continue;
+
+            if (result.encoded < abs_min) abs_min = result.encoded;
+            if (result.encoded > abs_max) abs_max = result.encoded;
+
+            if (!first_valid) {
+                int64_t delta = result.encoded - prev;
+                uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
+                auto zz_signed = static_cast<int64_t>(zz);
+                if (zz_signed < zz_min) zz_min = zz_signed;
+                if (zz_signed > zz_max) zz_max = zz_signed;
+            }
+            first_valid = false;
+            prev = result.encoded;
+        }
+
+        uint8_t abs_bw = requiredBitWidth(abs_min, abs_max);
+        uint8_t delta_bw = (zz_min <= zz_max) ? requiredBitWidth(zz_min, zz_max) : abs_bw;
+        if (delta_bw < abs_bw) {
+            scheme = alp::SCHEME_ALP_DELTA;
+        }
+    }
+
     // Estimate buffer size (rough upper bound in words)
     size_t est_words = 2 + num_blocks * (2 + alp::ALP_VECTOR_SIZE + 128);
     buffer.reserve(est_words);
@@ -152,8 +189,8 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
                      | (static_cast<uint64_t>(scheme) << 32);
     buffer.write<64>(header1);
 
-    if (scheme == alp::SCHEME_ALP) {
-        // === ALP Encoding ===
+    if (scheme == alp::SCHEME_ALP || scheme == alp::SCHEME_ALP_DELTA) {
+        // === ALP Encoding (with optional delta) ===
         const uint8_t exp = best.exp;
         const uint8_t fac = best.fac;
 
@@ -169,6 +206,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
             int64_t min_val = std::numeric_limits<int64_t>::max();
             int64_t max_val = std::numeric_limits<int64_t>::min();
+            int64_t first_value = 0;  // absolute value of first non-exception (for delta)
 
             for (size_t i = 0; i < block_count; ++i) {
                 double v = values[block_start + i];
@@ -189,6 +227,56 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
                 exc_positions.push_back(static_cast<uint16_t>(i));
                 exc_values.push_back(std::bit_cast<uint64_t>(v));
                 encoded[i] = 0; // placeholder (will use base after FFOR)
+            }
+
+            // === Delta + Zigzag Transform (SCHEME_ALP_DELTA only) ===
+            if (scheme == alp::SCHEME_ALP_DELTA) {
+                // Find first non-exception and save its absolute value
+                size_t exc_scan = 0;
+                size_t first_non_exc = block_count;
+                for (size_t i = 0; i < block_count; ++i) {
+                    if (exc_scan < exc_positions.size() && exc_positions[exc_scan] == i) {
+                        exc_scan++;
+                        continue;
+                    }
+                    first_non_exc = i;
+                    first_value = encoded[i];
+                    break;
+                }
+
+                // Forward scan: compute deltas and zigzag encode
+                if (first_non_exc < block_count) {
+                    int64_t prev_abs = encoded[first_non_exc];
+                    exc_scan = 0;
+                    while (exc_scan < exc_positions.size() && exc_positions[exc_scan] <= first_non_exc) {
+                        exc_scan++;
+                    }
+                    for (size_t i = first_non_exc + 1; i < block_count; ++i) {
+                        if (exc_scan < exc_positions.size() && exc_positions[exc_scan] == i) {
+                            exc_scan++;
+                            continue;
+                        }
+                        int64_t cur = encoded[i];
+                        int64_t delta = cur - prev_abs;
+                        prev_abs = cur;
+                        uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
+                        encoded[i] = static_cast<int64_t>(zz);
+                    }
+                    encoded[first_non_exc] = 0;  // zigzag(0) = 0
+                }
+
+                // Recalculate min/max from zigzag values
+                min_val = std::numeric_limits<int64_t>::max();
+                max_val = std::numeric_limits<int64_t>::min();
+                exc_scan = 0;
+                for (size_t i = 0; i < block_count; ++i) {
+                    if (exc_scan < exc_positions.size() && exc_positions[exc_scan] == i) {
+                        exc_scan++;
+                        continue;
+                    }
+                    if (encoded[i] < min_val) min_val = encoded[i];
+                    if (encoded[i] > max_val) max_val = encoded[i];
+                }
             }
 
             // If all values are exceptions, set a safe base
@@ -218,6 +306,11 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
             // Word 1: FOR base
             uint64_t bh1 = std::bit_cast<uint64_t>(min_val);
             buffer.write<64>(bh1);
+
+            // Word 2: first_value (SCHEME_ALP_DELTA only)
+            if (scheme == alp::SCHEME_ALP_DELTA) {
+                buffer.write<64>(std::bit_cast<uint64_t>(first_value));
+            }
 
             // === FFOR Data ===
             size_t packed_words = alp::ffor_packed_words(block_count, bw);
@@ -353,6 +446,43 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
     uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD)
                      ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
 
+    // Delta-benefit heuristic: sample first block to check if delta reduces bit width
+    if (scheme == alp::SCHEME_ALP) {
+        const size_t sample_count = std::min(total_values, alp::ALP_VECTOR_SIZE);
+        int64_t abs_min = std::numeric_limits<int64_t>::max();
+        int64_t abs_max = std::numeric_limits<int64_t>::min();
+        int64_t zz_min = std::numeric_limits<int64_t>::max();
+        int64_t zz_max = std::numeric_limits<int64_t>::min();
+        int64_t prev = 0;
+        bool first_valid = true;
+
+        for (size_t i = 0; i < sample_count; ++i) {
+            double v = values[i];
+            if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v))) continue;
+            auto result = scaleValue(v, best.exp, best.fac);
+            if (!result.exact) continue;
+
+            if (result.encoded < abs_min) abs_min = result.encoded;
+            if (result.encoded > abs_max) abs_max = result.encoded;
+
+            if (!first_valid) {
+                int64_t delta = result.encoded - prev;
+                uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
+                auto zz_signed = static_cast<int64_t>(zz);
+                if (zz_signed < zz_min) zz_min = zz_signed;
+                if (zz_signed > zz_max) zz_max = zz_signed;
+            }
+            first_valid = false;
+            prev = result.encoded;
+        }
+
+        uint8_t abs_bw = requiredBitWidth(abs_min, abs_max);
+        uint8_t delta_bw = (zz_min <= zz_max) ? requiredBitWidth(zz_min, zz_max) : abs_bw;
+        if (delta_bw < abs_bw) {
+            scheme = alp::SCHEME_ALP_DELTA;
+        }
+    }
+
     // Pre-allocate estimated space in the target buffer (rough upper bound in bytes)
     const size_t est_bytes = (2 + num_blocks * (2 + alp::ALP_VECTOR_SIZE + 128)) * sizeof(uint64_t);
     target.reserve(startPos + est_bytes);
@@ -369,8 +499,8 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
                      | (static_cast<uint64_t>(scheme) << 32);
     target.write(header1);
 
-    if (scheme == alp::SCHEME_ALP) {
-        // === ALP Encoding ===
+    if (scheme == alp::SCHEME_ALP || scheme == alp::SCHEME_ALP_DELTA) {
+        // === ALP Encoding (with optional delta) ===
         const uint8_t exp = best.exp;
         const uint8_t fac = best.fac;
 
@@ -386,6 +516,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
             int64_t min_val = std::numeric_limits<int64_t>::max();
             int64_t max_val = std::numeric_limits<int64_t>::min();
+            int64_t first_value = 0;  // absolute value of first non-exception (for delta)
 
             for (size_t i = 0; i < block_count; ++i) {
                 double v = values[block_start + i];
@@ -406,6 +537,56 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
                 exc_positions.push_back(static_cast<uint16_t>(i));
                 exc_values.push_back(std::bit_cast<uint64_t>(v));
                 encoded[i] = 0; // placeholder (will use base after FFOR)
+            }
+
+            // === Delta + Zigzag Transform (SCHEME_ALP_DELTA only) ===
+            if (scheme == alp::SCHEME_ALP_DELTA) {
+                // Find first non-exception and save its absolute value
+                size_t exc_scan = 0;
+                size_t first_non_exc = block_count;
+                for (size_t i = 0; i < block_count; ++i) {
+                    if (exc_scan < exc_positions.size() && exc_positions[exc_scan] == i) {
+                        exc_scan++;
+                        continue;
+                    }
+                    first_non_exc = i;
+                    first_value = encoded[i];
+                    break;
+                }
+
+                // Forward scan: compute deltas and zigzag encode
+                if (first_non_exc < block_count) {
+                    int64_t prev_abs = encoded[first_non_exc];
+                    exc_scan = 0;
+                    while (exc_scan < exc_positions.size() && exc_positions[exc_scan] <= first_non_exc) {
+                        exc_scan++;
+                    }
+                    for (size_t i = first_non_exc + 1; i < block_count; ++i) {
+                        if (exc_scan < exc_positions.size() && exc_positions[exc_scan] == i) {
+                            exc_scan++;
+                            continue;
+                        }
+                        int64_t cur = encoded[i];
+                        int64_t delta = cur - prev_abs;
+                        prev_abs = cur;
+                        uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
+                        encoded[i] = static_cast<int64_t>(zz);
+                    }
+                    encoded[first_non_exc] = 0;  // zigzag(0) = 0
+                }
+
+                // Recalculate min/max from zigzag values
+                min_val = std::numeric_limits<int64_t>::max();
+                max_val = std::numeric_limits<int64_t>::min();
+                exc_scan = 0;
+                for (size_t i = 0; i < block_count; ++i) {
+                    if (exc_scan < exc_positions.size() && exc_positions[exc_scan] == i) {
+                        exc_scan++;
+                        continue;
+                    }
+                    if (encoded[i] < min_val) min_val = encoded[i];
+                    if (encoded[i] > max_val) max_val = encoded[i];
+                }
             }
 
             // If all values are exceptions, set a safe base
@@ -432,6 +613,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
             // Word 1: FOR base
             target.write(std::bit_cast<uint64_t>(min_val));
+
+            // Word 2: first_value (SCHEME_ALP_DELTA only)
+            if (scheme == alp::SCHEME_ALP_DELTA) {
+                target.write(std::bit_cast<uint64_t>(first_value));
+            }
 
             // === FFOR Data ===
             size_t packed_words = alp::ffor_packed_words(block_count, bw);

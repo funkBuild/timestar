@@ -59,7 +59,7 @@ TEST_F(SeriesAlignerTest, AlignIdenticalTimestamps) {
     ASSERT_EQ(result.size(), 2);
     EXPECT_EQ(result["a"].size(), 3);
     EXPECT_EQ(result["b"].size(), 3);
-    EXPECT_EQ(result["a"].timestamps, result["b"].timestamps);
+    EXPECT_EQ(*result["a"].timestamps, *result["b"].timestamps);
 }
 
 // ==================== Inner Join Tests ====================
@@ -74,8 +74,8 @@ TEST_F(SeriesAlignerTest, InnerJoinPartialOverlap) {
 
     // Only timestamps 2000, 3000, 4000 are common
     ASSERT_EQ(result["a"].size(), 3);
-    EXPECT_EQ(result["a"].timestamps[0], 2000);
-    EXPECT_EQ(result["a"].timestamps[2], 4000);
+    EXPECT_EQ((*result["a"].timestamps)[0], 2000);
+    EXPECT_EQ((*result["a"].timestamps)[2], 4000);
 }
 
 TEST_F(SeriesAlignerTest, InnerJoinNoOverlap) {
@@ -101,8 +101,8 @@ TEST_F(SeriesAlignerTest, InnerJoinThreeSeries) {
 
     // Only timestamps 3000, 4000 are common to all three
     ASSERT_EQ(result["a"].size(), 2);
-    EXPECT_EQ(result["a"].timestamps[0], 3000);
-    EXPECT_EQ(result["a"].timestamps[1], 4000);
+    EXPECT_EQ((*result["a"].timestamps)[0], 3000);
+    EXPECT_EQ((*result["a"].timestamps)[1], 4000);
 }
 
 // ==================== Outer Join / Union Tests ====================
@@ -207,9 +207,9 @@ TEST_F(SeriesAlignerTest, ResampleToInterval) {
 
     // Should resample to 1000, 2000, 3000
     ASSERT_EQ(result["a"].size(), 3);
-    EXPECT_EQ(result["a"].timestamps[0], 1000);
-    EXPECT_EQ(result["a"].timestamps[1], 2000);
-    EXPECT_EQ(result["a"].timestamps[2], 3000);
+    EXPECT_EQ((*result["a"].timestamps)[0], 1000);
+    EXPECT_EQ((*result["a"].timestamps)[1], 2000);
+    EXPECT_EQ((*result["a"].timestamps)[2], 3000);
 }
 
 TEST_F(SeriesAlignerTest, ResampleWithInterpolation) {
@@ -351,8 +351,8 @@ TEST_F(SeriesAlignerTest, IntersectionTwoSeriesPartialOverlap) {
     ASSERT_EQ(result["b"].size(), 5);
 
     std::vector<uint64_t> expected = {500, 600, 700, 800, 900};
-    EXPECT_EQ(result["a"].timestamps, expected);
-    EXPECT_EQ(result["b"].timestamps, expected);
+    EXPECT_EQ(*result["a"].timestamps, expected);
+    EXPECT_EQ(*result["b"].timestamps, expected);
 
     // Verify values are correctly aligned
     EXPECT_DOUBLE_EQ(result["a"].values[0], 500.0);
@@ -392,9 +392,9 @@ TEST_F(SeriesAlignerTest, IntersectionThreeOrMoreSeries) {
     ASSERT_EQ(result.size(), 3);
     std::vector<uint64_t> expected = {3000, 4000, 5000};
 
-    EXPECT_EQ(result["a"].timestamps, expected);
-    EXPECT_EQ(result["b"].timestamps, expected);
-    EXPECT_EQ(result["c"].timestamps, expected);
+    EXPECT_EQ(*result["a"].timestamps, expected);
+    EXPECT_EQ(*result["b"].timestamps, expected);
+    EXPECT_EQ(*result["c"].timestamps, expected);
 
     // Check values are correctly selected
     EXPECT_DOUBLE_EQ(result["a"].values[0], 3.0);
@@ -421,7 +421,7 @@ TEST_F(SeriesAlignerTest, IntersectionThreeOrMoreSeries) {
 
     // Only timestamp 5000 is common to all 5 series
     ASSERT_EQ(result5["s1"].size(), 1);
-    EXPECT_EQ(result5["s1"].timestamps[0], 5000);
+    EXPECT_EQ((*result5["s1"].timestamps)[0], 5000);
 }
 
 TEST_F(SeriesAlignerTest, IntersectionLargeDatasetPerformance) {
@@ -460,12 +460,12 @@ TEST_F(SeriesAlignerTest, IntersectionLargeDatasetPerformance) {
     ASSERT_EQ(result["b"].size(), expectedSize);
 
     // First common timestamp should be 50
-    EXPECT_EQ(result["a"].timestamps[0], 50);
+    EXPECT_EQ((*result["a"].timestamps)[0], 50);
     // Last common timestamp should be (N-1)*10
-    EXPECT_EQ(result["a"].timestamps[expectedSize - 1], (N - 1) * 10);
+    EXPECT_EQ((*result["a"].timestamps)[expectedSize - 1], (N - 1) * 10);
 
     // Verify all timestamps match between the two aligned series
-    EXPECT_EQ(result["a"].timestamps, result["b"].timestamps);
+    EXPECT_EQ(*result["a"].timestamps, *result["b"].timestamps);
 
     // Verify values are correct
     EXPECT_DOUBLE_EQ(result["a"].values[0], 5.0);     // tsA[5] = 50 -> valsA[5] = 5.0
@@ -501,7 +501,7 @@ TEST_F(SeriesAlignerTest, IntersectionLargeDatasetPerformance) {
     // Common range: max(0,50,30)=50 to min(N*10-10, N*10+40, N*10+20)=N*10-10
     // With step 10: 50, 60, ..., N*10-10 => N - 5 points
     ASSERT_EQ(result3["a"].size(), N - 5);
-    EXPECT_EQ(result3["a"].timestamps[0], 50);
+    EXPECT_EQ((*result3["a"].timestamps)[0], 50);
 
     EXPECT_LT(elapsed3.count(), 1000)
         << "Intersection of three 50K-element series took " << elapsed3.count()

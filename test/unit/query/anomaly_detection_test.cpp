@@ -360,6 +360,34 @@ TEST_F(AnomalyDetectionTest, ExecutorMultiSeries) {
     EXPECT_GE(result.series.size(), 8);  // 4 pieces × 2 series
 }
 
+TEST_F(AnomalyDetectionTest, ExecutorMultiSeriesMismatchedSizesThrows) {
+    // seriesValues has 3 entries but seriesGroupTags has only 2.
+    // executeMulti must throw std::invalid_argument rather than silently
+    // using empty tags for the third series, which would lose tag data.
+    AnomalyExecutor executor;
+
+    auto timestamps = generateTimestamps(100);
+    std::vector<std::vector<double>> seriesValues = {
+        generateConstant(100, 50.0),
+        generateConstant(100, 75.0),
+        generateConstant(100, 100.0)
+    };
+    // Intentionally only 2 tag sets for 3 series
+    std::vector<std::vector<std::string>> seriesGroupTags = {
+        {"host=server01"},
+        {"host=server02"}
+    };
+
+    AnomalyConfig config;
+    config.algorithm = Algorithm::BASIC;
+    config.bounds = 2.0;
+
+    EXPECT_THROW(
+        executor.executeMulti(timestamps, seriesValues, seriesGroupTags, config),
+        std::invalid_argument
+    );
+}
+
 // ==================== Algorithm Config Tests ====================
 
 TEST_F(AnomalyDetectionTest, ParseAlgorithmStrings) {

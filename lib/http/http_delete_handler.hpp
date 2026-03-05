@@ -90,7 +90,7 @@ public:
 
     DeleteRequest parseDeleteRequest(const GlazeDeleteRequest& glazeReq);
     std::string createErrorResponse(const std::string& error);
-    std::string createSuccessResponse(int deletedCount, int totalRequests);
+    std::string createSuccessResponse(uint64_t deletedCount, uint64_t totalRequests);
 
     HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded)
         : engineSharded(_engineSharded) {}

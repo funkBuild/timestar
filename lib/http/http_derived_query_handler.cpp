@@ -3,6 +3,7 @@
 #include "anomaly/anomaly_result.hpp"
 #include "forecast/forecast_result.hpp"
 
+#include <stdexcept>
 #include <seastar/core/future.hh>
 #include <seastar/http/reply.hh>
 
@@ -12,7 +13,10 @@ HttpDerivedQueryHandler::HttpDerivedQueryHandler(
     seastar::sharded<Engine>* engine,
     seastar::sharded<LevelDBIndex>* index,
     DerivedQueryConfig config)
-    : engine_(engine), index_(index), config_(config) {}
+    : engine_(engine), index_(index), config_(config) {
+    if (!engine_) throw std::invalid_argument("engine must not be null");
+    if (!index_) throw std::invalid_argument("index must not be null");
+}
 
 void HttpDerivedQueryHandler::registerRoutes(seastar::httpd::routes& r) {
     // POST /derived - Execute derived metric query

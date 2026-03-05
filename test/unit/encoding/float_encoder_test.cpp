@@ -6,10 +6,13 @@
 #include <iomanip>
 #include <chrono>
 #include <sstream>
+#include <stdexcept>
 #include "encoding/float_encoder.hpp"
 #include "encoding/float/float_encoder.hpp"
 #include "encoding/float/float_encoder_simd.hpp"
 #include "encoding/float/float_encoder_avx512.hpp"
+#include "encoding/float/float_decoder.hpp"
+#include "storage/compressed_buffer.hpp"
 #include "storage/slice_buffer.hpp"
 
 class FloatEncoderTest : public ::testing::Test {
@@ -599,4 +602,51 @@ TEST_F(FloatEncoderTest, PerformanceComparison) {
                   << std::fixed << std::setprecision(2) << avx512MBps << " MB/s, "
                   << (double)basicTime / avx512Time << "x speedup)" << std::endl;
     }
+}
+
+// Test that a corrupted float block with lzb + data_bits > 64 is rejected
+// rather than silently underflowing tzb to a huge unsigned value.
+//
+// Bit layout of a valid Gorilla-encoded float stream:
+//   [64 bits: first value as raw uint64_t]
+//   [2 bits: 0b11 = new-bounds prefix]
+//   [5 bits: lzb]
+//   [6 bits: data_bits]
+//   [data_bits bits: XOR mantissa]
+//
+// The decoder stores tzb = 64 - lzb - data_bits (all uint64_t).
+// With corrupted lzb=31, data_bits=63 the subtraction wraps to a huge
+// unsigned value (0xFFFFFFFFFFFFFFE2) and the subsequent left-shift by
+// that huge tzb is undefined behaviour.  The fix must detect this and
+// throw before the shift is reached.
+TEST_F(FloatEncoderTest, CorruptBlockLzbPlusDataBitsOverflow) {
+    // Build the bit-stream manually using CompressedBuffer so the bit-packing
+    // is handled correctly, then read it back via CompressedSlice / FloatDecoderBasic.
+    //
+    // We declare that the block contains 2 values so the decoder enters the
+    // delta-decoding loop at least once.
+
+    CompressedBuffer buf;
+
+    // First value: a harmless 1.0
+    const uint64_t first_raw = std::bit_cast<uint64_t>(1.0);
+    buf.write<64>(first_raw);
+
+    // Second value: 0b11 prefix (new bounds), lzb=31, data_bits=63
+    // 31 + 63 = 94 > 64  =>  tzb would underflow without the guard.
+    buf.writeFixed<0b11, 2>();   // new-bounds prefix
+    buf.write<5>(31u);            // lzb = 31
+    buf.write<6>(63u);            // data_bits = 63
+    // Write 63 bits of payload so the stream is long enough that the bounds
+    // check inside read() does not fire before we reach the tzb guard.
+    buf.write<64>(0xDEADBEEFDEADBEEFull);  // provides more than 63 bits
+
+    // Re-read the buffer through a CompressedSlice (as the real decode path does).
+    buf.rewind();
+    CompressedSlice slice(reinterpret_cast<const uint8_t*>(buf.data.data()),
+                          buf.data.size() * sizeof(uint64_t));
+
+    std::vector<double> out;
+    // The decoder must throw rather than silently corrupt tzb.
+    EXPECT_THROW(FloatDecoderBasic::decode(slice, 0, 2, out), std::runtime_error);
 }

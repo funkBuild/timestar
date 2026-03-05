@@ -1,19 +1,22 @@
 #include "vectorized_series.hpp"
 #include <algorithm>
 #include <numeric>
+#include <stdexcept>
+#include <string>
 
 namespace tsdb::functions {
 
 VectorizedSeries::VectorizedSeries() = default;
 
 std::vector<double> VectorizedSeries::add(const std::vector<double>& a, const std::vector<double>& b) {
-    size_t minSize = std::min(a.size(), b.size());
-    std::vector<double> result(minSize);
-    
-    for (size_t i = 0; i < minSize; ++i) {
+    if (a.size() != b.size()) {
+        throw std::invalid_argument("Vector size mismatch in VectorizedSeries::add: " +
+                                    std::to_string(a.size()) + " vs " + std::to_string(b.size()));
+    }
+    std::vector<double> result(a.size());
+    for (size_t i = 0; i < a.size(); ++i) {
         result[i] = a[i] + b[i];
     }
-    
     return result;
 }
 

@@ -26,6 +26,41 @@
   min-width: 320px;
   border-right: 1px solid var(--border);
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.query-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 10px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+
+.query-tab {
+  padding: 5px 10px;
+  font-size: 11px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  cursor: pointer;
+  color: var(--text-muted);
+  background: transparent;
+}
+
+.query-tab:hover {
+  color: var(--text);
+  background: rgba(108, 126, 224, 0.1);
+  border-color: var(--border);
+}
+
+.query-tab.active {
+  color: var(--accent);
+  background: var(--bg);
+  border-color: var(--border);
+  border-bottom-color: var(--bg);
 }
 
 .pane-right {

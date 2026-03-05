@@ -72,10 +72,26 @@ std::vector<std::string> TsdbConfig::validate() const {
 
     // Validate Seastar-specific settings
     if (seastar.has("task_quota_ms")) {
-        double val = std::stod(seastar.get("task_quota_ms"));
-        if (val <= 0.0) {
-            errors.emplace_back("seastar.task_quota_ms must be > 0");
+        const std::string& raw = seastar.get("task_quota_ms");
+        bool parseOk = false;
+        double val = 0.0;
+        try {
+            std::size_t pos = 0;
+            val = std::stod(raw, &pos);
+            // Reject trailing garbage (e.g. "1.0abc")
+            if (pos != raw.size()) {
+                errors.emplace_back(
+                    "seastar.task_quota_ms must be a number, got: \"" + raw + "\"");
+            } else if (val <= 0.0) {
+                errors.emplace_back("seastar.task_quota_ms must be > 0");
+            } else {
+                parseOk = true;
+            }
+        } catch (const std::exception&) {
+            errors.emplace_back(
+                "seastar.task_quota_ms must be a number, got: \"" + raw + "\"");
         }
+        (void)parseOk;
     }
     if (seastar.has("reactor_backend")) {
         const auto& rb = seastar.get("reactor_backend");
@@ -176,6 +192,7 @@ TsdbConfig loadConfigFile(const std::string& path) {
     cfg.http = parsed.http;
     cfg.index = parsed.index;
     cfg.engine = parsed.engine;
+    cfg.streaming = parsed.streaming;
 
     // Parse [seastar] section manually
     cfg.seastar = parseSeastarSection(content);

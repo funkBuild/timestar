@@ -16,6 +16,15 @@ public:
         const std::map<std::string, std::string>& seriesTags,
         const std::map<std::string, std::string>& queryScopes);
 
+    // Check if series tags match query scopes using pre-compiled regex patterns.
+    // For scope keys present in compiledScopes, the pre-compiled regex is used
+    // directly (avoiding per-call recompilation). For all other scope keys the
+    // existing runtime-compile path in matchesTag() is used.
+    static bool matches(
+        const std::map<std::string, std::string>& seriesTags,
+        const std::map<std::string, std::string>& queryScopes,
+        const std::map<std::string, std::regex>& compiledScopes);
+
     // Check if a single tag matches (supports wildcards, ~regex, /regex/)
     static bool matchesTag(
         const std::string& tagValue,
@@ -33,6 +42,17 @@ public:
 
     // Classify a scope value as EXACT, WILDCARD, or REGEX
     static ScopeMatchType classifyScope(const std::string& scopeValue);
+
+    // Returns true when pattern requires regex/wildcard matching rather than
+    // a simple equality check. Used to decide which scope values need a
+    // pre-compiled std::regex.
+    static bool needsRegexMatch(const std::string& pattern);
+
+    // Convert a wildcard/regex scope pattern to a std::regex-compatible string
+    // suitable for passing to std::regex(). For wildcard patterns (* / ?) the
+    // wildcards are translated to their regex equivalents. For ~regex or
+    // /regex/ patterns the surrounding sigils are stripped.
+    static std::string toRegexPattern(const std::string& pattern);
 
     // Extract the longest literal prefix before the first metacharacter.
     // For wildcards: "server-*" -> "server-", "server-0?" -> "server-0"

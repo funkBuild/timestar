@@ -4,6 +4,7 @@
 #include "forecast_result.hpp"
 #include "linear_forecaster.hpp"
 #include "seasonal_forecaster.hpp"
+#include "periodicity_detector.hpp"
 #include <chrono>
 
 namespace tsdb {
@@ -63,6 +64,25 @@ public:
 private:
     LinearForecaster linearForecaster_;
     SeasonalForecaster seasonalForecaster_;
+
+    // Auto-windowing helpers
+    static size_t detectMaxPeriodForWindowing(
+        const std::vector<double>& values,
+        uint64_t dataIntervalNs,
+        const ForecastConfig& config
+    );
+
+    static size_t computeOptimalWindowSize(
+        size_t inputSize,
+        size_t maxPeriod,
+        size_t horizon,
+        const ForecastConfig& config
+    );
+
+    static size_t windowInput(
+        ForecastInput& input,
+        size_t windowSize
+    );
 
     // Add series pieces to result
     void addSeriesPieces(

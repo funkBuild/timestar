@@ -15,7 +15,13 @@ enum class AggregationMethod {
     MIN,
     MAX,
     SUM,
-    LATEST
+    LATEST,
+    COUNT,   // number of non-NaN data points
+    FIRST,   // earliest value (inverse of LATEST)
+    MEDIAN,  // 50th percentile via sort
+    STDDEV,  // population standard deviation
+    STDVAR,  // population variance
+    SPREAD   // max - min range
 };
 
 struct QueryRequest {

@@ -158,4 +158,38 @@ TEST_F(VectorizedSeriesTest, EdgeCasesSingleElement) {
     EXPECT_NEAR(multiplyResult[0], 84.0, 1e-10);
 }
 
+// Tests for size-mismatch error handling in non-template VectorizedSeries::add
+TEST_F(VectorizedSeriesTest, NonTemplateAddSizeMismatchThrows) {
+    VectorizedSeries series;
+
+    std::vector<double> a = {1.0, 2.0, 3.0};
+    std::vector<double> b = {1.0, 2.0};  // Shorter than a
+
+    EXPECT_THROW(series.add(a, b), std::invalid_argument);
+}
+
+TEST_F(VectorizedSeriesTest, NonTemplateAddSizeMismatchThrowsReversed) {
+    VectorizedSeries series;
+
+    std::vector<double> a = {1.0, 2.0};        // Shorter than b
+    std::vector<double> b = {1.0, 2.0, 3.0};
+
+    EXPECT_THROW(series.add(a, b), std::invalid_argument);
+}
+
+// Tests for size-mismatch error handling in AlignedVectorizedSeries constructor
+TEST_F(VectorizedSeriesTest, AlignedVectorizedSeriesSizeMismatchThrows) {
+    std::vector<uint64_t> timestamps = {100, 200, 300};
+    std::vector<double>   values     = {1.0, 2.0};  // One element short
+
+    EXPECT_THROW((AlignedVectorizedSeries{timestamps, values}), std::invalid_argument);
+}
+
+TEST_F(VectorizedSeriesTest, AlignedVectorizedSeriesSizeMismatchThrowsExtraValues) {
+    std::vector<uint64_t> timestamps = {100, 200};
+    std::vector<double>   values     = {1.0, 2.0, 3.0};  // One element extra
+
+    EXPECT_THROW((AlignedVectorizedSeries{timestamps, values}), std::invalid_argument);
+}
+
 // main() function removed to avoid multiple definitions when linking with other test files

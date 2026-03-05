@@ -73,7 +73,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
     size_t global_pos = 0;
 
     for (uint16_t block = 0; block < num_blocks && output_remaining > 0; ++block) {
-        if (scheme == alp::SCHEME_ALP) {
+        if (scheme == alp::SCHEME_ALP || scheme == alp::SCHEME_ALP_DELTA) {
             // === ALP Block Header ===
             uint64_t bh0 = encoded.readFixed<uint64_t, 64>();
             uint64_t bh1 = encoded.readFixed<uint64_t, 64>();
@@ -84,6 +84,12 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
             uint16_t block_count     = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
             int64_t  for_base        = std::bit_cast<int64_t>(bh1);
+
+            // Read first_value for delta scheme (part of block header)
+            int64_t first_value = 0;
+            if (scheme == alp::SCHEME_ALP_DELTA) {
+                first_value = std::bit_cast<int64_t>(encoded.readFixed<uint64_t, 64>());
+            }
 
             // === Read FFOR Data ===
             size_t packed_words = alp::ffor_packed_words(block_count, bw);
@@ -142,6 +148,30 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 }
             }
 
+            // === Prefix-Sum Reconstruction (SCHEME_ALP_DELTA only) ===
+            if (scheme == alp::SCHEME_ALP_DELTA) {
+                int64_t running = first_value;
+                size_t exc_scan = 0;
+                bool is_first = true;
+
+                for (size_t i = 0; i < block_count; ++i) {
+                    if (exc_scan < exception_count && scratch.exc_positions[exc_scan] == i) {
+                        exc_scan++;
+                        continue;
+                    }
+                    if (is_first) {
+                        scratch.decoded_ints[i] = first_value;
+                        running = first_value;
+                        is_first = false;
+                    } else {
+                        uint64_t zz = static_cast<uint64_t>(scratch.decoded_ints[i]);
+                        int64_t delta = static_cast<int64_t>((zz >> 1) ^ -(zz & 1));
+                        running += delta;
+                        scratch.decoded_ints[i] = running;
+                    }
+                }
+            }
+
             // === Convert to doubles and apply skip/limit ===
             // Build exception map for this block
             size_t exc_idx = 0;
@@ -171,7 +201,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 global_pos++;
             }
 
-        } else {
+        } else if (scheme == alp::SCHEME_ALP_RD) {
             // === ALP_RD Block ===
             uint64_t bh0 = encoded.readFixed<uint64_t, 64>();
             uint64_t bh1 = encoded.readFixed<uint64_t, 64>();
@@ -297,6 +327,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 }
                 global_pos++;
             }
+        } else {
+            throw std::runtime_error("ALPDecoder: unknown ALP scheme");
         }
     }
 

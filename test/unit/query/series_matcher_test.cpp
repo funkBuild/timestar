@@ -94,8 +94,9 @@ TEST_F(SeriesMatcherTest, RegexMatching) {
     EXPECT_TRUE(SeriesMatcher::matchesRegex("test123", "test[0-9]+"));
     EXPECT_FALSE(SeriesMatcher::matchesRegex("mytest123", "^test[0-9]+"));
     
-    // Invalid regex should return false
-    EXPECT_FALSE(SeriesMatcher::matchesRegex("test", "[invalid"));
+    // Invalid regex should throw std::invalid_argument, not silently return false
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "[invalid"),
+                 std::invalid_argument);
 }
 
 // Test tag matching with wildcards
@@ -250,8 +251,9 @@ TEST_F(SeriesMatcherTest, TildeRegexMatching) {
     EXPECT_TRUE(SeriesMatcher::matchesTag("server-03", "~server-0[1-3]"));
     EXPECT_FALSE(SeriesMatcher::matchesTag("server-04", "~server-0[1-3]"));
 
-    // Invalid ~regex
-    EXPECT_FALSE(SeriesMatcher::matchesTag("test", "~[invalid"));
+    // Invalid ~regex should throw std::invalid_argument, not silently return false
+    EXPECT_THROW(SeriesMatcher::matchesTag("test", "~[invalid"),
+                 std::invalid_argument);
 }
 
 // Test classifyScope
@@ -294,6 +296,56 @@ TEST_F(SeriesMatcherTest, ExtractLiteralPrefix) {
 
     // Empty
     EXPECT_EQ(SeriesMatcher::extractLiteralPrefix(""), "");
+}
+
+// Test invalid regex patterns are rejected, not silently treated as exact matches
+TEST_F(SeriesMatcherTest, InvalidRegexThrows) {
+    // matchesRegex must throw std::invalid_argument for malformed patterns
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "[0-9"),
+                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "(unclosed"),
+                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "a{2,1}"),
+                 std::invalid_argument);
+}
+
+// Test valid /regex/ delimited patterns work correctly
+TEST_F(SeriesMatcherTest, ValidSlashRegexMatchesCorrectly) {
+    // Valid /pattern/ — digits
+    EXPECT_TRUE(SeriesMatcher::matchesTag("server-01", "/server-[0-9]+/"));
+    EXPECT_TRUE(SeriesMatcher::matchesTag("server-123", "/server-[0-9]+/"));
+    EXPECT_FALSE(SeriesMatcher::matchesTag("server-abc", "/server-[0-9]+/"));
+
+    // Valid empty regex //
+    // An empty pattern matches only the empty string
+    EXPECT_TRUE(SeriesMatcher::matchesTag("", "//"));
+    EXPECT_FALSE(SeriesMatcher::matchesTag("anything", "//"));
+
+    // Valid /regex/ with alternation
+    EXPECT_TRUE(SeriesMatcher::matchesTag("us-west", "/us-(west|east)/"));
+    EXPECT_FALSE(SeriesMatcher::matchesTag("us-north", "/us-(west|east)/"));
+}
+
+// Test invalid /regex/ patterns throw rather than silently falling through
+TEST_F(SeriesMatcherTest, InvalidSlashRegexThrows) {
+    // /[0-9/ — unclosed bracket; the embedded / makes rfind return a non-zero
+    // position, so the extracted pattern is "[0-9" which is invalid.
+    EXPECT_THROW(SeriesMatcher::matchesTag("42", "/[0-9/"),
+                 std::invalid_argument);
+
+    // /(unclosed — unclosed group
+    EXPECT_THROW(SeriesMatcher::matchesTag("x", "/(unclosed/"),
+                 std::invalid_argument);
+}
+
+// Test that matchesWildcard does NOT silently fall back to exact match
+// when the wildcard-to-regex conversion produces an invalid regex.
+// (wildcardToRegex escapes all regex metacharacters so this path is normally
+// unreachable, but we keep a belt-and-suspenders assertion here.)
+TEST_F(SeriesMatcherTest, InvalidTildeRegexThrows) {
+    // ~[0-9 — unclosed bracket via the ~ path should throw
+    EXPECT_THROW(SeriesMatcher::matchesTag("test", "~[0-9"),
+                 std::invalid_argument);
 }
 
 // Test series matching with ~regex in scopes

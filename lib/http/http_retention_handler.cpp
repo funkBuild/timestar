@@ -244,11 +244,17 @@ HttpRetentionHandler::handleDelete(std::unique_ptr<seastar::http::request> req) 
 }
 
 void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r) {
+    // Capture shared_ptr so the handler object is kept alive as long as the
+    // function_handler lambdas exist (i.e., until routes is destroyed).  This
+    // prevents a use-after-free if the caller does not hold onto the raw pointer
+    // after calling registerRoutes().
+    auto self = shared_from_this();
+
     auto* putHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req,
+        [self](std::unique_ptr<seastar::http::request> req,
                std::unique_ptr<seastar::http::reply> rep)
             -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return handlePut(std::move(req));
+            return self->handlePut(std::move(req));
         },
         "json"
     );
@@ -257,10 +263,10 @@ void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r) {
           putHandler);
 
     auto* getHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req,
+        [self](std::unique_ptr<seastar::http::request> req,
                std::unique_ptr<seastar::http::reply> rep)
             -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return handleGet(std::move(req));
+            return self->handleGet(std::move(req));
         },
         "json"
     );
@@ -269,10 +275,10 @@ void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r) {
           getHandler);
 
     auto* deleteHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req,
+        [self](std::unique_ptr<seastar::http::request> req,
                std::unique_ptr<seastar::http::reply> rep)
             -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return handleDelete(std::move(req));
+            return self->handleDelete(std::move(req));
         },
         "json"
     );

@@ -224,7 +224,30 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     fullEntry.indexBlocks.push_back(block);
   }
 
-  // Step 6: Cache it with LRU eviction
+  // Step 6: Cache it with LRU eviction.
+  //
+  // Concurrency note (Seastar cooperative model):
+  // The co_await at Step 4 above is a suspension point.  While this coroutine
+  // was suspended waiting for DMA I/O, another coroutine running on the same
+  // shard (e.g. a parallel prefetchFullIndexEntries call) could have already
+  // populated the cache for this exact seriesId.  Re-checking here prevents
+  // a double-insert: two LRU list nodes for the same key with only one map
+  // entry, causing the orphaned node to later evict the map entry prematurely.
+  //
+  // There is NO race between the size() check and the mutation below because
+  // there is no co_await between them — the Seastar reactor cannot schedule
+  // another task between these two lines, making the check-then-mutate
+  // sequence effectively atomic within a shard.
+  {
+    auto existingIt = fullIndexCache.find(seriesId);
+    if (existingIt != fullIndexCache.end()) {
+      // Another coroutine beat us to it while we were suspended on DMA I/O.
+      // Promote to front of LRU and return the already-cached entry.
+      lruList.splice(lruList.begin(), lruList, existingIt->second);
+      co_return &existingIt->second->second;
+    }
+  }
+
   if (fullIndexCache.size() >= maxCacheEntries()) {
     // Evict least recently used entry (back of list)
     auto& lruEntry = lruList.back();

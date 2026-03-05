@@ -179,6 +179,11 @@ struct BulkMergeContext {
 
     // Advance to next point (no async!)
     void advance() {
+        if (exhausted || !source) {
+            exhausted = true;
+            return;
+        }
+
         currentPointIdx++;
 
         // Move to next block if current exhausted

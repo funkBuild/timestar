@@ -207,6 +207,10 @@ struct ForecastConfig {
 
     // History duration
     uint64_t historyDurationNs = 0;    // 0 = use entire query range
+
+    // Auto-windowing: trim old data before expensive computation
+    size_t maxHistoryCycles = 4;       // Keep this many cycles of the largest period
+    bool disableAutoWindow = false;    // Set true to skip auto-windowing
 };
 
 // Input for forecasting
@@ -281,6 +285,10 @@ struct ForecastStatistics {
     size_t historicalPoints = 0;
     size_t forecastPoints = 0;
     size_t seriesCount = 0;
+
+    // Windowing
+    size_t originalPoints = 0;
+    size_t windowedPoints = 0;
 
     // Performance
     double executionTimeMs = 0.0;

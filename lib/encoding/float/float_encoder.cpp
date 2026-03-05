@@ -5,6 +5,7 @@
 #include <iostream>
 #include <cassert>
 #include <cmath>
+#include <stdexcept>
 
 CompressedBuffer FloatEncoderBasic::encode(std::span<const double> values){
     CompressedBuffer buffer;
@@ -107,6 +108,9 @@ void FloatEncoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
                     data_bits = 64;
                     tzb = 0;
                 } else {
+                    if (lzb + data_bits > 64) {
+                        throw std::runtime_error("Corrupt float block: lzb + data_bits > 64");
+                    }
                     tzb = 64 - lzb - data_bits;
                 }
 

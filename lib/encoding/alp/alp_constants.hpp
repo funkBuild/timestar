@@ -20,8 +20,9 @@ static constexpr double ALP_RD_EXCEPTION_THRESHOLD = 0.50;
 static constexpr size_t ALP_SAMPLE_SIZE = 256;
 
 // Encoding scheme identifiers
-static constexpr uint8_t SCHEME_ALP    = 0;
-static constexpr uint8_t SCHEME_ALP_RD = 1;
+static constexpr uint8_t SCHEME_ALP       = 0;
+static constexpr uint8_t SCHEME_ALP_RD    = 1;
+static constexpr uint8_t SCHEME_ALP_DELTA = 2;  // ALP with delta encoding
 
 // Maximum bit width for FFOR packing
 static constexpr uint8_t MAX_BIT_WIDTH = 64;

@@ -1,6 +1,7 @@
 #include "anomaly_executor.hpp"
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace tsdb {
 namespace anomaly {
@@ -135,6 +136,12 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
     const std::vector<std::vector<std::string>>& seriesGroupTags,
     const AnomalyConfig& config
 ) {
+    if (seriesValues.size() != seriesGroupTags.size()) {
+        throw std::invalid_argument(
+            "seriesValues and seriesGroupTags must have the same size"
+        );
+    }
+
     auto startTime = std::chrono::high_resolution_clock::now();
 
     AnomalyQueryResult result;
@@ -155,9 +162,7 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
         // Process each series
         for (size_t i = 0; i < seriesValues.size(); ++i) {
             const auto& values = seriesValues[i];
-            const auto& groupTags = (i < seriesGroupTags.size())
-                ? seriesGroupTags[i]
-                : std::vector<std::string>{};
+            const auto& groupTags = seriesGroupTags[i];
 
             if (values.empty()) continue;
 

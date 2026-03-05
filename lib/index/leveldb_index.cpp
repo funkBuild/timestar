@@ -182,21 +182,25 @@ std::string LevelDBIndex::encodeTagValuesKey(const std::string& measurement, con
 }
 
 std::string LevelDBIndex::encodeStringSet(const std::set<std::string>& strings) {
-    // Pre-calculate total size to avoid repeated allocations
+    // Pre-calculate total size to avoid repeated allocations.
+    // Use size_t for the accumulator so the total can exceed UINT32_MAX on
+    // 64-bit platforms without overflow.
     size_t totalSize = 0;
     for (const auto& str : strings) {
-        if (str.length() > UINT16_MAX) {
+        if (str.length() > UINT32_MAX) {
             throw std::runtime_error("String length " + std::to_string(str.length()) +
-                                     " exceeds maximum encodable length of " + std::to_string(UINT16_MAX));
+                                     " exceeds maximum encodable length of " + std::to_string(UINT32_MAX));
         }
-        totalSize += sizeof(uint16_t) + str.length();
+        totalSize += sizeof(uint32_t) + str.length();
     }
 
     std::string result;
     result.reserve(totalSize);
     for (const auto& str : strings) {
-        // Length-prefixed encoding: 2-byte little-endian length + string bytes
-        uint16_t len = static_cast<uint16_t>(str.length());
+        // Length-prefixed encoding: 4-byte little-endian length + string bytes.
+        // Using uint32_t instead of uint16_t avoids overflow for strings longer
+        // than 65535 bytes (UINT16_MAX).
+        uint32_t len = static_cast<uint32_t>(str.length());
         result.append(reinterpret_cast<const char*>(&len), sizeof(len));
         result.append(str.data(), len);
     }
@@ -209,10 +213,10 @@ std::set<std::string> LevelDBIndex::decodeStringSet(const std::string& encoded) 
     size_t size = encoded.size();
     size_t offset = 0;
 
-    while (offset + sizeof(uint16_t) <= size) {
-        uint16_t len;
+    while (offset + sizeof(uint32_t) <= size) {
+        uint32_t len;
         std::memcpy(&len, data + offset, sizeof(len));
-        offset += sizeof(uint16_t);
+        offset += sizeof(uint32_t);
 
         if (offset + len > size) break;  // truncated data
 
@@ -416,11 +420,96 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     // Series doesn't exist - create it
     LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Creating new series index: '{}'", seriesKeyStr);
 
+    // Phase A: Pre-load any field/tag cache misses from LevelDB so that the
+    // batch below can include the complete, merged field/tag sets.
+    // All reads happen BEFORE the batch is built, ensuring we capture any
+    // previously-written values for this measurement.
+    bool fieldsCacheMiss = (fieldsCache.find(measurement) == fieldsCache.end());
+    bool tagsCacheMiss   = (tagsCache.find(measurement)   == tagsCache.end());
+
+    // Collect tag value cache misses (one per unique tag key)
+    std::vector<std::pair<std::string /*tagKey*/, std::string /*tvCacheKey*/>> tvLoadsNeeded;
+    for (const auto& [tagKey, tagValue] : tags) {
+        std::string tvCacheKey = measurement + std::string(1, '\0') + tagKey;
+        if (tagValuesCache.find(tvCacheKey) == tagValuesCache.end()) {
+            tvLoadsNeeded.emplace_back(tagKey, std::move(tvCacheKey));
+        }
+    }
+
+    if (fieldsCacheMiss || tagsCacheMiss || !tvLoadsNeeded.empty()) {
+        // Load all cache misses in one seastar::async block (single co_await)
+        struct CacheMissResults {
+            std::set<std::string> fields;
+            std::set<std::string> tagKeys;
+            std::vector<std::pair<std::string, std::set<std::string>>> tagValues;
+        };
+
+        auto loaded = co_await seastar::async([this, &measurement, fieldsCacheMiss, tagsCacheMiss, &tvLoadsNeeded] {
+            CacheMissResults result;
+            leveldb::ReadOptions readOpts;
+
+            if (fieldsCacheMiss) {
+                std::string key = encodeMeasurementFieldsKey(measurement);
+                std::string val;
+                if (db->Get(readOpts, key, &val).ok()) {
+                    result.fields = decodeStringSet(val);
+                }
+            }
+
+            if (tagsCacheMiss) {
+                std::string key = encodeMeasurementTagsKey(measurement);
+                std::string val;
+                if (db->Get(readOpts, key, &val).ok()) {
+                    result.tagKeys = decodeStringSet(val);
+                }
+            }
+
+            for (const auto& [tagKey, tvCacheKey] : tvLoadsNeeded) {
+                std::string key = encodeTagValuesKey(measurement, tagKey);
+                std::string val;
+                std::set<std::string> values;
+                if (db->Get(readOpts, key, &val).ok()) {
+                    values = decodeStringSet(val);
+                }
+                result.tagValues.emplace_back(tvCacheKey, std::move(values));
+            }
+
+            return result;
+        });
+
+        // Populate caches back on the reactor thread (safe, single-threaded)
+        if (fieldsCacheMiss) {
+            fieldsCache[measurement] = std::move(loaded.fields);
+        }
+        if (tagsCacheMiss) {
+            tagsCache[measurement] = std::move(loaded.tagKeys);
+        }
+        for (auto& [tvCacheKey, values] : loaded.tagValues) {
+            tagValuesCache[tvCacheKey] = std::move(values);
+        }
+    }
+
+    // Phase B: Update in-memory caches and collect which sets need writing.
+    // This mirrors addFieldsAndTags Phase 3 but produces data for our batch
+    // instead of writing to LevelDB independently.
+    bool fieldNeedsWrite = fieldsCache[measurement].insert(field).second;
+
+    bool tagsNeedWrite = false;
+    for (const auto& [tagKey, tagValue] : tags) {
+        if (tagsCache[measurement].insert(tagKey).second) {
+            tagsNeedWrite = true;
+        }
+    }
+
+    // Phase C: Build a single WriteBatch for ALL index writes related to this
+    // new series.  Committing everything in one db->Write() call ensures the
+    // index is never partially written: either all keys are present or none are.
     leveldb::WriteBatch batch;
 
-    // Store series metadata (seriesId -> metadata)
-    // Note: We don't store seriesKey->seriesId mapping because seriesId is deterministically
-    // calculated from seriesKey via XXH3_128bits hash (see SeriesId128::fromSeriesKey)
+    // Series metadata (seriesId -> metadata)
+    // Note: We don't store seriesKey->seriesId mapping because seriesId is
+    // deterministically calculated from seriesKey via XXH3_128bits hash
+    // (see SeriesId128::fromSeriesKey).
     SeriesMetadata metadata;
     metadata.measurement = measurement;
     metadata.tags = tags;
@@ -431,12 +520,11 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     // MEASUREMENT_SERIES index entry for fast measurement -> series lookup
     batch.Put(encodeMeasurementSeriesKey(measurement, seriesId), "");
 
-    // Add TAG_INDEX entries for efficient tag-based queries
+    // TAG_INDEX and GROUP_BY_INDEX entries for efficient tag-based queries
     for (const auto& tag : tags) {
         const std::string& tagKey = tag.first;
         const std::string& tagValue = tag.second;
 
-        // TAG_INDEX key includes series ID to make it unique per series
         std::string tagIndexKey;
         tagIndexKey.push_back(TAG_INDEX);
         tagIndexKey.append(measurement);
@@ -446,10 +534,8 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
         tagIndexKey.append(tagValue);
         tagIndexKey.push_back('\0');
         tagIndexKey.append(encodeSeriesId(seriesId));
-
         batch.Put(tagIndexKey, encodeSeriesId(seriesId));
 
-        // GROUP_BY_INDEX also needs unique keys per series
         std::string groupByKey;
         groupByKey.push_back(GROUP_BY_INDEX);
         groupByKey.append(measurement);
@@ -459,11 +545,31 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
         groupByKey.append(tagValue);
         groupByKey.push_back('\0');
         groupByKey.append(encodeSeriesId(seriesId));
-
         batch.Put(groupByKey, encodeSeriesId(seriesId));
+
+        // TAG_VALUES: merge the new value into the (now-populated) cache and
+        // include the updated set in the batch.
+        std::string tvCacheKey = measurement + std::string(1, '\0') + tagKey;
+        if (tagValuesCache[tvCacheKey].insert(tagValue).second) {
+            batch.Put(encodeTagValuesKey(measurement, tagKey),
+                      encodeStringSet(tagValuesCache[tvCacheKey]));
+        }
     }
 
-    // Write the batch (offload blocking I/O to Seastar thread pool)
+    // MEASUREMENT_FIELDS: write the updated field set if it changed.
+    if (fieldNeedsWrite) {
+        batch.Put(encodeMeasurementFieldsKey(measurement),
+                  encodeStringSet(fieldsCache[measurement]));
+    }
+
+    // MEASUREMENT_TAGS: write the updated tag-keys set if it changed.
+    if (tagsNeedWrite) {
+        batch.Put(encodeMeasurementTagsKey(measurement),
+                  encodeStringSet(tagsCache[measurement]));
+    }
+
+    // Phase D: Atomic commit — all index keys written in a single db->Write().
+    // If this fails, no partial state is left in LevelDB (WriteBatch atomicity).
     auto status = co_await seastar::async([this, &batch] {
         return db->Write(leveldb::WriteOptions(), &batch);
     });
@@ -476,9 +582,6 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     if (msIt != measurementSeriesCache.end()) {
         msIt->second.push_back(seriesId);
     }
-
-    // Update metadata indexes (batched: at most 2 co_awaits instead of N+1)
-    co_await addFieldsAndTags(measurement, field, tags);
 
     tsdb::index_log.debug("Created new series ID {} for key: {}", seriesId.toHex(), seriesKeyStr);
 

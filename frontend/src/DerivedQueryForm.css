@@ -1,0 +1,87 @@
+.sub-queries-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.sub-query-row {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.sub-query-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.sub-query-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--accent);
+}
+
+.sub-query-remove {
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+
+.sub-query-remove:hover {
+  background: rgba(224, 85, 85, 0.15);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.sub-query-body {
+  padding: 8px;
+  background: var(--bg-input);
+}
+
+.sub-form-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.sub-form-section-label {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin: 6px 0 3px;
+}
+
+.sub-checkbox-list {
+  max-height: 100px;
+}
+
+.sub-query-preview {
+  margin-top: 6px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.add-subquery-btn {
+  width: 100%;
+  font-size: 11px;
+  padding: 4px 8px;
+  margin-top: 4px;
+  border-style: dashed;
+}

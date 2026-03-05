@@ -94,8 +94,7 @@ struct glz::meta<TestDerivedResponse> {
 
 class HttpDerivedQueryHandlerTest : public ::testing::Test {
 protected:
-    // Handler with nullptr engine/index for testing synchronous methods
-    HttpDerivedQueryHandler handler{nullptr, nullptr};
+    // Executor with nullptr engine/index for testing synchronous (non-async) methods
     DerivedQueryExecutor executor{nullptr, nullptr};
 };
 
@@ -1096,21 +1095,19 @@ TEST_F(HttpDerivedQueryHandlerTest, DerivedQueryExceptionIsRuntimeError) {
 // Handler Construction Tests
 // =============================================================================
 
-TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullEngine) {
-    // Should not crash when constructed with nullptr
-    EXPECT_NO_THROW(HttpDerivedQueryHandler(nullptr));
+TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullEngineThrows) {
+    // Null engine must throw std::invalid_argument to prevent later segfault
+    EXPECT_THROW(HttpDerivedQueryHandler(nullptr), std::invalid_argument);
 }
 
-TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullEngineAndIndex) {
-    EXPECT_NO_THROW(HttpDerivedQueryHandler(nullptr, nullptr));
-}
-
-TEST_F(HttpDerivedQueryHandlerTest, ConstructWithCustomConfig) {
-    DerivedQueryConfig config;
-    config.maxSubQueries = 5;
-    config.timeoutMs = 10000;
-
-    EXPECT_NO_THROW(HttpDerivedQueryHandler(nullptr, nullptr, config));
+TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullIndexThrows) {
+    // Null index must throw std::invalid_argument to prevent later segfault
+    // (we cannot pass a valid engine without Seastar, so use a non-null sentinel)
+    // We test null index by passing a fake non-null engine pointer alongside null index.
+    // Cast an arbitrary address to the pointer type – we only need the constructor
+    // to reject null index before any member access.
+    auto* fakeEngine = reinterpret_cast<seastar::sharded<Engine>*>(uintptr_t{1});
+    EXPECT_THROW(HttpDerivedQueryHandler(fakeEngine, nullptr), std::invalid_argument);
 }
 
 // =============================================================================

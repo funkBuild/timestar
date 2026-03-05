@@ -75,6 +75,11 @@ std::string ExpressionNode::toString() const {
             result += ")";
             return result;
         }
+
+        case ExprNodeType::TIME_SHIFT_FUNCTION: {
+            const auto& ts = asTimeShiftFunction();
+            return "time_shift(" + ts.queryRef + ", '" + ts.offset + "')";
+        }
     }
     return "?";
 }
@@ -301,12 +306,32 @@ bool ExpressionParser::isFunction(const std::string& name) const {
         "abs", "log", "log10", "sqrt", "ceil", "floor",  // unary math
         "diff", "monotonic_diff", "default_zero",         // unary transform
         "count_nonzero", "count_not_null",               // unary aggregating
+        "rate", "irate", "increase",                     // counter-rate functions
+        "fill_forward", "fill_backward", "fill_linear",  // gap-fill (unary)
+        "cumsum", "integral",                             // accumulation (unary)
+        "normalize",                                      // normalization (unary)
         "min", "max", "pow", "clamp",                     // multi-arg math
         "clamp_min", "clamp_max",                         // clamp with scalar
         "cutoff_min", "cutoff_max",                       // cutoff with scalar
         "per_minute", "per_hour",                         // rate conversion
+        "rolling_avg", "rolling_min",                     // rolling window
+        "rolling_max", "rolling_stddev",                  // rolling window
+        "fill_value",                                     // gap-fill with constant
+        "ema",                                            // exponential moving average
+        "holt_winters",                                   // double exponential smoothing
+        "zscore",                                         // rolling z-score normalization
         "anomalies",                                      // anomaly detection
-        "forecast"                                        // forecasting
+        "forecast",                                       // forecasting
+        "time_shift",                                     // timestamp shifting
+        "topk",                                           // top-N group filter
+        "bottomk",                                        // bottom-N group filter
+        "as_percent",                                     // percent of total (2-arg)
+        // Cross-series aggregation (variadic)
+        "avg_of_series",    // element-wise mean across N series
+        "sum_of_series",    // element-wise sum across N series
+        "min_of_series",    // element-wise min across N series
+        "max_of_series",    // element-wise max across N series
+        "percentile_of_series" // p-th percentile across N series (first arg is p)
     };
     return functions.count(name) > 0;
 }
@@ -317,6 +342,10 @@ bool ExpressionParser::isAnomalyFunction(const std::string& name) const {
 
 bool ExpressionParser::isForecastFunction(const std::string& name) const {
     return name == "forecast";
+}
+
+bool ExpressionParser::isTimeShiftFunction(const std::string& name) const {
+    return name == "time_shift";
 }
 
 std::optional<UnaryOpType> ExpressionParser::getUnaryFunction(const std::string& name) const {
@@ -333,6 +362,19 @@ std::optional<UnaryOpType> ExpressionParser::getUnaryFunction(const std::string&
     if (name == "default_zero") return UnaryOpType::DEFAULT_ZERO;
     if (name == "count_nonzero") return UnaryOpType::COUNT_NONZERO;
     if (name == "count_not_null") return UnaryOpType::COUNT_NOT_NULL;
+    // Counter-rate functions
+    if (name == "rate") return UnaryOpType::RATE;
+    if (name == "irate") return UnaryOpType::IRATE;
+    if (name == "increase") return UnaryOpType::INCREASE;
+    // Gap-fill / interpolation functions
+    if (name == "fill_forward") return UnaryOpType::FILL_FORWARD;
+    if (name == "fill_backward") return UnaryOpType::FILL_BACKWARD;
+    if (name == "fill_linear") return UnaryOpType::FILL_LINEAR;
+    // Accumulation functions
+    if (name == "cumsum") return UnaryOpType::CUMSUM;
+    if (name == "integral") return UnaryOpType::INTEGRAL;
+    // Normalization
+    if (name == "normalize") return UnaryOpType::NORMALIZE;
     return std::nullopt;
 }
 
@@ -349,6 +391,30 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
     if (name == "cutoff_max") return FunctionType::CUTOFF_MAX;
     if (name == "per_minute") return FunctionType::PER_MINUTE;
     if (name == "per_hour") return FunctionType::PER_HOUR;
+    // Rolling window functions
+    if (name == "rolling_avg") return FunctionType::ROLLING_AVG;
+    if (name == "rolling_min") return FunctionType::ROLLING_MIN;
+    if (name == "rolling_max") return FunctionType::ROLLING_MAX;
+    if (name == "rolling_stddev") return FunctionType::ROLLING_STDDEV;
+    // Gap-fill with constant scalar
+    if (name == "fill_value") return FunctionType::FILL_VALUE;
+    // Exponential moving average
+    if (name == "ema") return FunctionType::EMA;
+    // Double exponential smoothing (Holt's linear method)
+    if (name == "holt_winters") return FunctionType::HOLT_WINTERS;
+    // Rolling z-score normalization
+    if (name == "zscore") return FunctionType::ZSCORE;
+    // Cross-series ranking / filtering
+    if (name == "topk") return FunctionType::TOPK;
+    if (name == "bottomk") return FunctionType::BOTTOMK;
+    // Percent of total
+    if (name == "as_percent") return FunctionType::AS_PERCENT;
+    // Cross-series aggregation (variadic; argument count validated in evaluator)
+    if (name == "avg_of_series") return FunctionType::AVG_OF_SERIES;
+    if (name == "sum_of_series") return FunctionType::SUM_OF_SERIES;
+    if (name == "min_of_series") return FunctionType::MIN_OF_SERIES;
+    if (name == "max_of_series") return FunctionType::MAX_OF_SERIES;
+    if (name == "percentile_of_series") return FunctionType::PERCENTILE_OF_SERIES;
     return std::nullopt;
 }
 
@@ -363,6 +429,15 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parse() {
 }
 
 std::unique_ptr<ExpressionNode> ExpressionParser::parseExpression(int precedence) {
+    if (++depth_ > MAX_DEPTH) {
+        throw ExpressionParseException(
+            "Expression nesting too deep (limit " + std::to_string(MAX_DEPTH) + ")");
+    }
+    struct DepthGuard {
+        int& d;
+        ~DepthGuard() { --d; }
+    } guard{depth_};
+
     auto left = parseUnary();
 
     while (getPrecedence() > precedence) {
@@ -601,6 +676,36 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseForecastFunction() {
     return ExpressionNode::makeForecastFunction(queryRef, algorithm, deviations, seasonality, model, history);
 }
 
+std::unique_ptr<ExpressionNode> ExpressionParser::parseTimeShiftFunction() {
+    consume(TokenType::LPAREN, "Expected '(' after 'time_shift'");
+
+    // First argument: query reference (identifier)
+    if (!check(TokenType::IDENTIFIER)) {
+        error("Expected query reference as first argument to time_shift()");
+    }
+    std::string queryRef = currentToken_.value;
+    queryRefs_.insert(queryRef);
+    advance();
+
+    consume(TokenType::COMMA, "Expected ',' after query reference");
+
+    // Second argument: offset string literal (optionally prefixed with '-')
+    // The string may look like '7d', '-1h', '30m', etc.
+    if (!check(TokenType::STRING)) {
+        error("Expected offset string (e.g. '7d', '-1h', '30m') as second argument to time_shift()");
+    }
+    std::string offset = currentToken_.value;
+    if (offset.empty()) {
+        throw ExpressionParseException(
+            "time_shift() offset string must not be empty");
+    }
+    advance();
+
+    consume(TokenType::RPAREN, "Expected ')' after time_shift arguments");
+
+    return ExpressionNode::makeTimeShiftFunction(queryRef, offset);
+}
+
 std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::string& name) {
     // Handle anomaly function specially (requires string literals)
     if (isAnomalyFunction(name)) {
@@ -612,6 +717,11 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
         return parseForecastFunction();
     }
 
+    // Handle time_shift function specially (requires string literal offset)
+    if (isTimeShiftFunction(name)) {
+        return parseTimeShiftFunction();
+    }
+
     consume(TokenType::LPAREN, "Expected '(' after function name");
 
     std::vector<std::unique_ptr<ExpressionNode>> args;
@@ -619,6 +729,11 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
     // Parse arguments
     if (!check(TokenType::RPAREN)) {
         do {
+            if (args.size() >= MAX_ARGS) {
+                throw ExpressionParseException(
+                    "Too many function arguments (limit " +
+                    std::to_string(MAX_ARGS) + ")");
+            }
             args.push_back(parseExpression());
         } while (match(TokenType::COMMA));
     }
@@ -639,15 +754,36 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
     // Check for multi-arg functions
     auto multiFunc = getMultiArgFunction(name);
     if (multiFunc.has_value()) {
-        // Validate argument count
-        size_t expected = 2;
-        if (multiFunc.value() == FunctionType::CLAMP) {
-            expected = 3;
-        }
-        if (args.size() != expected) {
-            throw ExpressionParseException(
-                "Function '" + name + "' expects " + std::to_string(expected) +
-                " arguments, got " + std::to_string(args.size()));
+        // Variadic cross-series aggregation functions: flexible argument counts.
+        // avg/sum/min/max_of_series: require >= 1 series arg.
+        // percentile_of_series: requires >= 2 args (p + at least one series).
+        bool isVariadic =
+            multiFunc.value() == FunctionType::AVG_OF_SERIES ||
+            multiFunc.value() == FunctionType::SUM_OF_SERIES ||
+            multiFunc.value() == FunctionType::MIN_OF_SERIES ||
+            multiFunc.value() == FunctionType::MAX_OF_SERIES ||
+            multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES;
+
+        if (isVariadic) {
+            size_t minArgs = (multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES) ? 2 : 1;
+            if (args.size() < minArgs) {
+                throw ExpressionParseException(
+                    "Function '" + name + "' requires at least " +
+                    std::to_string(minArgs) + " argument(s), got " +
+                    std::to_string(args.size()));
+            }
+        } else {
+            // Fixed argument count
+            size_t expected = 2;
+            if (multiFunc.value() == FunctionType::CLAMP ||
+                multiFunc.value() == FunctionType::HOLT_WINTERS) {
+                expected = 3;
+            }
+            if (args.size() != expected) {
+                throw ExpressionParseException(
+                    "Function '" + name + "' expects " + std::to_string(expected) +
+                    " arguments, got " + std::to_string(args.size()));
+            }
         }
         return ExpressionNode::makeFunctionCall(multiFunc.value(), std::move(args));
     }

@@ -75,6 +75,9 @@ private:
     ExpressionLexer lexer_;
     Token currentToken_;
     std::set<std::string> queryRefs_;
+    int depth_ = 0;
+    static constexpr int MAX_DEPTH = 500;
+    static constexpr size_t MAX_ARGS = 1000;
 
     // Operator precedence levels
     static constexpr int PREC_NONE = 0;
@@ -107,12 +110,14 @@ private:
     bool isFunction(const std::string& name) const;
     bool isAnomalyFunction(const std::string& name) const;
     bool isForecastFunction(const std::string& name) const;
+    bool isTimeShiftFunction(const std::string& name) const;
     std::optional<UnaryOpType> getUnaryFunction(const std::string& name) const;
     std::optional<FunctionType> getMultiArgFunction(const std::string& name) const;
 
     // Special function parsing
     std::unique_ptr<ExpressionNode> parseAnomalyFunction();
     std::unique_ptr<ExpressionNode> parseForecastFunction();
+    std::unique_ptr<ExpressionNode> parseTimeShiftFunction();
 
     void error(const std::string& message) const;
 };

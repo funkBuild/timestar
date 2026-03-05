@@ -1,32 +1,66 @@
 #include "series_matcher.hpp"
 #include <regex>
+#include <stdexcept>
 
 namespace tsdb {
 
 bool SeriesMatcher::matches(
     const std::map<std::string, std::string>& seriesTags,
     const std::map<std::string, std::string>& queryScopes) {
-    
+
     // Empty scopes match everything
     if (queryScopes.empty()) {
         return true;
     }
-    
+
     // Check each scope condition
     for (const auto& [scopeKey, scopeValue] : queryScopes) {
         auto it = seriesTags.find(scopeKey);
-        
+
         // If series doesn't have the tag, it doesn't match
         if (it == seriesTags.end()) {
             return false;
         }
-        
+
         // Check if the tag value matches (supports wildcards and regex)
         if (!matchesTag(it->second, scopeValue)) {
             return false;
         }
     }
-    
+
+    return true;
+}
+
+bool SeriesMatcher::matches(
+    const std::map<std::string, std::string>& seriesTags,
+    const std::map<std::string, std::string>& queryScopes,
+    const std::map<std::string, std::regex>& compiledScopes) {
+
+    // Empty scopes match everything
+    if (queryScopes.empty()) {
+        return true;
+    }
+
+    for (const auto& [scopeKey, scopeValue] : queryScopes) {
+        auto tagIt = seriesTags.find(scopeKey);
+        if (tagIt == seriesTags.end()) {
+            return false;
+        }
+
+        // Use the pre-compiled regex if available for this scope key.
+        auto compiledIt = compiledScopes.find(scopeKey);
+        if (compiledIt != compiledScopes.end()) {
+            if (!std::regex_match(tagIt->second, compiledIt->second)) {
+                return false;
+            }
+        } else {
+            // Fall back to the runtime-compile path.
+            if (!matchesTag(tagIt->second, scopeValue)) {
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -62,29 +96,33 @@ bool SeriesMatcher::matchesTag(
 bool SeriesMatcher::matchesWildcard(
     const std::string& value,
     const std::string& pattern) {
-    
-    // Convert wildcard pattern to regex
+
+    // Convert wildcard pattern to regex — wildcardToRegex escapes all
+    // regex metacharacters so the resulting string should always be valid.
+    // Re-throw as std::invalid_argument on the unlikely event it is not.
     std::string regexPattern = wildcardToRegex(pattern);
-    
+
     try {
         std::regex re(regexPattern);
         return std::regex_match(value, re);
-    } catch (const std::regex_error&) {
-        // If regex is invalid, fall back to exact match
-        return value == pattern;
+    } catch (const std::regex_error& e) {
+        throw std::invalid_argument(
+            std::string("invalid wildcard pattern '") + pattern +
+            "': " + e.what());
     }
 }
 
 bool SeriesMatcher::matchesRegex(
     const std::string& value,
     const std::string& pattern) {
-    
+
     try {
         std::regex re(pattern);
         return std::regex_match(value, re);
-    } catch (const std::regex_error&) {
-        // If regex is invalid, no match
-        return false;
+    } catch (const std::regex_error& e) {
+        throw std::invalid_argument(
+            std::string("invalid regex pattern '") + pattern +
+            "': " + e.what());
     }
 }
 
@@ -142,6 +180,39 @@ ScopeMatchType SeriesMatcher::classifyScope(const std::string& scopeValue) {
         return ScopeMatchType::WILDCARD;
     }
     return ScopeMatchType::EXACT;
+}
+
+bool SeriesMatcher::needsRegexMatch(const std::string& pattern) {
+    return classifyScope(pattern) != ScopeMatchType::EXACT;
+}
+
+std::string SeriesMatcher::toRegexPattern(const std::string& pattern) {
+    auto type = classifyScope(pattern);
+    switch (type) {
+    case ScopeMatchType::WILDCARD:
+        // Convert * / ? wildcards to their regex equivalents.
+        return wildcardToRegex(pattern);
+    case ScopeMatchType::REGEX:
+        if (!pattern.empty() && pattern[0] == '~') {
+            // ~regex — strip the leading ~
+            return pattern.substr(1);
+        }
+        // /regex/ — strip surrounding slashes
+        {
+            size_t endPos = pattern.rfind('/');
+            if (endPos > 0) {
+                return pattern.substr(1, endPos - 1);
+            }
+            // Malformed /regex pattern — treat the whole thing as the pattern
+            return pattern;
+        }
+    case ScopeMatchType::EXACT:
+    default:
+        // Exact patterns don't need regex; caller should have checked
+        // needsRegexMatch() first.  Return an anchored literal anyway so
+        // a caller that ignores this can still get correct behaviour.
+        return "^" + pattern + "$";
+    }
 }
 
 std::string SeriesMatcher::extractLiteralPrefix(const std::string& scopeValue) {

@@ -9,6 +9,7 @@ file(GLOB_RECURSE SRC_FILES
     utils/*.cpp
     retention/*.cpp
     config/*.cpp
+    functions/*.cpp
 )
 
 find_package (Snappy REQUIRED)
@@ -50,6 +51,7 @@ target_include_directories(libtsdb PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/retention
     ${CMAKE_CURRENT_SOURCE_DIR}/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/functions
     ${LEVELDB_INCLUDE_DIR}
     ${XXHASH_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include

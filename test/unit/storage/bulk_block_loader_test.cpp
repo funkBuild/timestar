@@ -466,6 +466,27 @@ TEST(BulkBlockLoaderUnit, BulkMergeContextNullSource) {
 }
 
 // ===========================================================================
+// Task #39: BulkMergeContext null pointer dereference in advance()
+// advance() must not dereference source when source == nullptr (even though
+// exhausted==true was set by the constructor).  Before the fix, the while
+// loop inside advance() reads source->blocks.size() unconditionally, which
+// crashes when source is null.
+// ===========================================================================
+TEST(BulkBlockLoaderUnit, BulkMergeContextAdvanceNullSourceNoCrash) {
+    // Construct with null source -> exhausted is set true
+    BulkMergeContext<double> ctx(nullptr);
+    ASSERT_FALSE(ctx.hasMore());
+
+    // Calling advance() on a null-source context must NOT crash.
+    // Before the fix this dereferences source->blocks.size() and segfaults.
+    EXPECT_NO_FATAL_FAILURE(ctx.advance());
+
+    // State must remain consistent (exhausted, no data)
+    EXPECT_FALSE(ctx.hasMore());
+    EXPECT_EQ(ctx.currentTimestamp(), UINT64_MAX);
+}
+
+// ===========================================================================
 // 11. BulkMerger2Way: basic merge of two non-overlapping sources
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayNonOverlapping) {

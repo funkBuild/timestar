@@ -14,6 +14,7 @@
 #include <seastar/core/with_timeout.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/smp.hh>
+#include <cmath>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -1071,9 +1072,22 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
 
     // Use integer arithmetic when possible to avoid floating-point precision loss
     if (hasDecimal) {
-        double value = std::stod(valueStr);
-        double result = value * multiplier;
-        if (result < 0 || result > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+        double value;
+        try {
+            value = std::stod(valueStr);
+        } catch (const std::invalid_argument&) {
+            throw QueryParseException("Invalid interval format: '" + valueStr + "' is not a valid number");
+        } catch (const std::out_of_range&) {
+            throw QueryParseException("Interval value overflow: " + interval + " exceeds maximum representable nanoseconds");
+        }
+        // Guard against NaN or Inf before any arithmetic: casting a non-finite
+        // double to uint64_t is undefined behavior in C++.
+        if (!std::isfinite(value) || value < 0) {
+            throw QueryParseException("Invalid interval: '" + interval + "' must be a finite positive number");
+        }
+        double result = value * static_cast<double>(multiplier);
+        // Re-check after multiplication: large-but-finite * large multiplier can overflow to Inf.
+        if (!std::isfinite(result) || result > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
             throw QueryParseException("Interval value overflow: " + interval + " exceeds maximum representable nanoseconds");
         }
         return static_cast<uint64_t>(result);

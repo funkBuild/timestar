@@ -293,10 +293,57 @@ TEST_F(InterpolationFunctionTest, EdgeCase_EmptyTimestampList) {
     FunctionContext context;
     context.setParameter("target_timestamps", std::string("")); // Empty list
     context.setParameter("boundary", std::string("clamp"));
-    
+
     auto futureResult = func.execute(getLinearInput(), context);
     auto result = futureResult.get();
-    
+
     EXPECT_EQ(result.timestamps.size(), 0);
     EXPECT_EQ(result.values.size(), 0);
+}
+
+// Invalid timestamp string tests (Task #42: guard std::stoull against bad input)
+TEST_F(InterpolationFunctionTest, InvalidTimestamp_NonNumericString_Linear) {
+    LinearInterpolationFunction func;
+    FunctionContext context;
+    context.setParameter("target_timestamps", std::string("not_a_number"));
+    context.setParameter("boundary", std::string("clamp"));
+
+    EXPECT_THROW(func.execute(getLinearInput(), context).get(), ParameterValidationException);
+}
+
+TEST_F(InterpolationFunctionTest, InvalidTimestamp_OutOfRange_Linear) {
+    LinearInterpolationFunction func;
+    FunctionContext context;
+    // Value exceeds uint64_t max
+    context.setParameter("target_timestamps", std::string("99999999999999999999999999999"));
+    context.setParameter("boundary", std::string("clamp"));
+
+    EXPECT_THROW(func.execute(getLinearInput(), context).get(), ParameterValidationException);
+}
+
+TEST_F(InterpolationFunctionTest, InvalidTimestamp_MixedValidAndInvalid_Linear) {
+    LinearInterpolationFunction func;
+    FunctionContext context;
+    // Second token is non-numeric
+    context.setParameter("target_timestamps", std::string("1500,bad,3500"));
+    context.setParameter("boundary", std::string("clamp"));
+
+    EXPECT_THROW(func.execute(getLinearInput(), context).get(), ParameterValidationException);
+}
+
+TEST_F(InterpolationFunctionTest, InvalidTimestamp_NonNumericString_Spline) {
+    SplineInterpolationFunction func;
+    FunctionContext context;
+    context.setParameter("target_timestamps", std::string("not_a_number"));
+
+    EXPECT_THROW(func.execute(getInput(), context).get(), ParameterValidationException);
+}
+
+TEST_F(InterpolationFunctionTest, InvalidTimestamp_OutOfRange_Spline) {
+    SplineInterpolationFunction func;
+    FunctionContext context;
+    // Value exceeds uint64_t max
+    context.setParameter("target_timestamps", std::string("99999999999999999999999999999"));
+
+    EXPECT_THROW(func.execute(getInput(), context).get(), ParameterValidationException);
 }

@@ -90,6 +90,9 @@ struct glz::meta<GlazeBatchWrite> {
 
 HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded)
     : engineSharded(_engineSharded) {
+    if (!engineSharded) {
+        throw std::invalid_argument("engineSharded must not be null");
+    }
 }
 
 std::string HttpWriteHandler::validateName(const std::string& name, const std::string& context) {

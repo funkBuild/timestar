@@ -121,6 +121,10 @@ static void mergeSmallNSpans(
       }
     }
 
+    // Safety guard: if every span was exhausted but activeCount was stale,
+    // bestIdx remains SIZE_MAX.  Break rather than access spans[SIZE_MAX].
+    if (bestIdx == SIZE_MAX) break;
+
     // Emit the winning point.
     outTs.push_back(bestTs);
     outVal.push_back(spans[bestIdx].val());
@@ -343,15 +347,24 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
     uint64_t memMinTs = spans[1].tsPtr[0];
     if (memMinTs > tsmMaxTs) {
       // Non-overlapping: just append memory data directly.
-      const auto& memSpan = spans[1];
+      // IMPORTANT: Save what we need from spans[1] before clearing spans.
+      // spans[0].tsPtr points into result.timestamps.data(); clearing spans
+      // before calling reserve() prevents a dangling raw pointer surviving a
+      // potential reallocation of result.timestamps below.
+      const uint64_t* memTsPtr = spans[1].tsPtr;
+      size_t memLen            = spans[1].len;
+      const std::vector<T>* memValVec  = spans[1].valVec;
+      size_t memBaseIdx        = spans[1].baseIdx;
+      spans.clear();  // release raw pointers into result before any reallocation
+
       result.timestamps.reserve(totalPoints);
       result.values.reserve(totalPoints);
       result.timestamps.insert(result.timestamps.end(),
-                               memSpan.tsPtr, memSpan.tsPtr + memSpan.len);
+                               memTsPtr, memTsPtr + memLen);
       // Use index-based copy for values (vector<bool> compatibility).
-      const auto& memVals = *memSpan.valVec;
-      for (size_t i = 0; i < memSpan.len; ++i) {
-        result.values.push_back(memVals[memSpan.baseIdx + i]);
+      const auto& memVals = *memValVec;
+      for (size_t i = 0; i < memLen; ++i) {
+        result.values.push_back(memVals[memBaseIdx + i]);
       }
       co_return std::move(result);
     }

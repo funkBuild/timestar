@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <optional>
+#include <stdexcept>
 
 // Response struct definitions for Glaze serialization
 struct ErrorInfo {
@@ -42,6 +43,47 @@ struct FieldsResponse {
     std::unordered_map<std::string, FieldInfo> fields;
     std::optional<std::unordered_map<std::string, std::string>> filtered_by;
 };
+
+// static
+size_t HttpMetadataHandler::parsePaginationParam(const std::string& str,
+                                                  const std::string& paramName,
+                                                  size_t defaultValue) {
+    if (str.empty()) {
+        return defaultValue;
+    }
+    // Reject strings that start with '-' since stoul would throw std::invalid_argument,
+    // but we want a clear bad-request message.
+    if (str[0] == '-') {
+        throw BadRequestException("Invalid " + paramName + " parameter: must be a non-negative integer");
+    }
+    std::size_t pos = 0;
+    unsigned long result = 0;
+    try {
+        result = std::stoul(str, &pos);
+    } catch (const std::invalid_argument&) {
+        throw BadRequestException("Invalid " + paramName + " parameter: not a valid integer");
+    } catch (const std::out_of_range&) {
+        throw BadRequestException("Invalid " + paramName + " parameter: value out of range");
+    }
+    // Reject trailing non-numeric characters (e.g. "3.14", "10abc")
+    if (pos != str.size()) {
+        throw BadRequestException("Invalid " + paramName + " parameter: not a valid integer");
+    }
+    return static_cast<size_t>(result);
+}
+
+// static
+std::string HttpMetadataHandler::validateQueryParam(const std::string& name,
+                                                     const std::string& context) {
+    if (name.empty()) {
+        return context + " must not be empty";
+    }
+    for (char c : name) {
+        if (c == '\0') return context + " must not contain null bytes";
+        if (static_cast<unsigned char>(c) < 32) return context + " must not contain control characters";
+    }
+    return ""; // Valid
+}
 
 HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharded)
     : engineSharded(_engineSharded) {
@@ -101,18 +143,18 @@ HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::http::request> 
             measurements.erase(it, measurements.end());
         }
         
-        // Apply pagination
+        // Apply pagination - validate parameters and return 400 on invalid input
         size_t offset = 0;
         size_t limit = std::numeric_limits<size_t>::max();
-        
-        std::string offsetParam = req->get_query_param("offset");
-        if (!offsetParam.empty()) {
-            offset = std::stoul(offsetParam);
-        }
-        
-        std::string limitParam = req->get_query_param("limit");
-        if (!limitParam.empty()) {
-            limit = std::stoul(limitParam);
+
+        try {
+            offset = parsePaginationParam(req->get_query_param("offset"), "offset", 0);
+            limit  = parsePaginationParam(req->get_query_param("limit"),  "limit",  std::numeric_limits<size_t>::max());
+        } catch (const BadRequestException& e) {
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->_content = createErrorResponse("INVALID_PARAMETER", e.what());
+            rep->add_header("Content-Type", "application/json");
+            co_return rep;
         }
         
         size_t totalCount = measurements.size();
@@ -154,10 +196,29 @@ HttpMetadataHandler::handleTags(std::unique_ptr<seastar::http::request> req) {
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
-        
+
+        {
+            auto err = validateQueryParam(measurement, "Measurement name");
+            if (!err.empty()) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                rep->add_header("Content-Type", "application/json");
+                co_return rep;
+            }
+        }
+
         std::string specificTag = req->get_query_param("tag");
-        
-        tsdb::http_log.debug("Processing /tags request for measurement: {}, tag: {}", 
+        if (!specificTag.empty()) {
+            auto err = validateQueryParam(specificTag, "Tag name");
+            if (!err.empty()) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                rep->add_header("Content-Type", "application/json");
+                co_return rep;
+            }
+        }
+
+        tsdb::http_log.debug("Processing /tags request for measurement: {}, tag: {}",
                            measurement, specificTag.empty() ? "all" : specificTag);
         
         // Metadata is centralized on shard 0, so query only shard 0
@@ -215,7 +276,17 @@ HttpMetadataHandler::handleFields(std::unique_ptr<seastar::http::request> req) {
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
-        
+
+        {
+            auto err = validateQueryParam(measurement, "Measurement name");
+            if (!err.empty()) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                rep->add_header("Content-Type", "application/json");
+                co_return rep;
+            }
+        }
+
         tsdb::http_log.debug("Processing /fields request for measurement: {}", measurement);
         
         // Parse optional tags parameter for filtering

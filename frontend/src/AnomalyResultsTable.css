@@ -1,0 +1,12 @@
+.anomaly-row td {
+  background: rgba(224, 85, 85, 0.08);
+}
+
+.anomaly-row:hover td {
+  background: rgba(224, 85, 85, 0.15);
+}
+
+.anomaly-score {
+  color: var(--danger);
+  font-weight: 600;
+}

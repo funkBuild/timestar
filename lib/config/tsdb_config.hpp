@@ -50,6 +50,12 @@ struct IndexConfig {
     uint64_t series_cache_size = 1000000;
 };
 
+struct StreamingConfig {
+    uint32_t max_subscriptions_per_shard = 100;
+    uint32_t output_queue_size = 1024;
+    uint32_t heartbeat_interval_seconds = 15;
+};
+
 struct EngineConfig {
     uint32_t metadata_retry_interval_seconds = 5;
     uint32_t max_metadata_retry_ops = 10000;
@@ -76,6 +82,7 @@ struct TsdbConfigParseable {
     HttpConfig http;
     IndexConfig index;
     EngineConfig engine;
+    StreamingConfig streaming;
 };
 
 struct TsdbConfig {
@@ -84,6 +91,7 @@ struct TsdbConfig {
     HttpConfig http;
     IndexConfig index;
     EngineConfig engine;
+    StreamingConfig streaming;
     SeastarConfig seastar;
 
     // Validate config values. Returns a list of error strings (empty = valid).
@@ -179,6 +187,16 @@ struct glz::meta<tsdb::EngineConfig> {
 };
 
 template <>
+struct glz::meta<tsdb::StreamingConfig> {
+    using T = tsdb::StreamingConfig;
+    static constexpr auto value = object(
+        "max_subscriptions_per_shard", &T::max_subscriptions_per_shard,
+        "output_queue_size", &T::output_queue_size,
+        "heartbeat_interval_seconds", &T::heartbeat_interval_seconds
+    );
+};
+
+template <>
 struct glz::meta<tsdb::TsdbConfigParseable> {
     using T = tsdb::TsdbConfigParseable;
     static constexpr auto value = object(
@@ -186,7 +204,8 @@ struct glz::meta<tsdb::TsdbConfigParseable> {
         "storage", &T::storage,
         "http", &T::http,
         "index", &T::index,
-        "engine", &T::engine
+        "engine", &T::engine,
+        "streaming", &T::streaming
     );
 };
 

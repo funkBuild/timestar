@@ -210,8 +210,8 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(
         ExpressionEvaluator evaluator;
         auto computed = evaluator.evaluate(*ast, evalInput);
 
-        // Store results
-        result.timestamps = std::move(computed.timestamps);
+        // Store results (copy out of shared_ptr into DerivedQueryResult's own vector)
+        result.timestamps = *computed.timestamps;
         result.values = std::move(computed.values);
         result.stats.pointCount = result.timestamps.size();
 
@@ -572,11 +572,11 @@ std::string DerivedQueryExecutor::formatAnomalyResponse(
         glazePiece.piece = piece.piece;
         glazePiece.group_tags = piece.groupTags;
 
-        // Replace NaN/Inf with 0.0 for JSON serialization (JSON has no NaN/Inf)
+        // Convert values, replacing NaN/Inf with nullopt for proper JSON null
         glazePiece.values.reserve(piece.values.size());
         for (double v : piece.values) {
             if (std::isnan(v) || std::isinf(v)) {
-                glazePiece.values.push_back(0.0);
+                glazePiece.values.push_back(std::nullopt);
             } else {
                 glazePiece.values.push_back(v);
             }

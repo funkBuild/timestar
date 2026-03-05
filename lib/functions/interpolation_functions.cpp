@@ -85,11 +85,16 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
         
         while (std::getline(ss, token, ',')) {
             if (!token.empty()) {
-                targetTimestamps.push_back(std::stoull(token));
+                try {
+                    targetTimestamps.push_back(std::stoull(token));
+                } catch (const std::exception& e) {
+                    throw ParameterValidationException(
+                        "Invalid timestamp value \"" + token + "\": " + e.what());
+                }
             }
         }
     }
-    
+
     if (targetTimestamps.empty()) {
         return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
     }
@@ -238,11 +243,16 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
         
         while (std::getline(ss, token, ',')) {
             if (!token.empty()) {
-                targetTimestamps.push_back(std::stoull(token));
+                try {
+                    targetTimestamps.push_back(std::stoull(token));
+                } catch (const std::exception& e) {
+                    throw ParameterValidationException(
+                        "Invalid timestamp value \"" + token + "\": " + e.what());
+                }
             }
         }
     }
-    
+
     result.timestamps = targetTimestamps;
     result.values.reserve(targetTimestamps.size());
     

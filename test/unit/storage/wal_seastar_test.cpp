@@ -785,3 +785,265 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
 TEST_F(WALSeastarTest, PaddingRecoveryMixedTypes) {
     testPaddingRecoveryMixedTypes().get();
 }
+
+// ---------------------------------------------------------------------------
+// _unflushed_bytes tracking tests
+//
+// These tests verify that _unflushed_bytes is correctly incremented in every
+// write path (insert, insertBatch, deleteRange) so that padToAlignment() in
+// finalFlush() computes the correct amount of padding.  If _unflushed_bytes
+// were never incremented (the bug described in the report), remainder would
+// always be 0, padToAlignment() would no-op, and the DMA write position
+// would be unaligned — causing assertion failures or silent data corruption
+// on the next write after a flush.
+// ---------------------------------------------------------------------------
+
+// Test: finalFlush() after buffered inserts (no immediate flush) recovers data
+// correctly.  This is the primary scenario where _unflushed_bytes must be
+// accurate: data is written to the stream buffer, then finalFlush() calls
+// padToAlignment() which reads _unflushed_bytes to compute the padding needed.
+// If _unflushed_bytes were 0 (never incremented), padToAlignment() would
+// skip padding and leave the file position unaligned.
+seastar::future<> testFinalFlushAfterBufferedInserts() {
+    unsigned int sequenceNumber = 300;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    {
+        WAL wal(sequenceNumber);
+        co_await wal.init(store.get());
+        // Do NOT set immediate flush — writes accumulate in the stream buffer.
+        // _unflushed_bytes must be incremented by each insert() call so that
+        // the finalFlush() → padToAlignment() path produces correct padding.
+
+        TSDBInsert<double> insert("buffered_test", "value");
+        insert.addValue(1000, 1.1);
+        insert.addValue(2000, 2.2);
+        insert.addValue(3000, 3.3);
+        co_await wal.insert(insert);
+
+        // finalFlush() calls padToAlignment() → _unflushed_bytes % _dma_alignment
+        // If _unflushed_bytes were always 0, padding would be skipped and the
+        // file position would be non-aligned after flush.
+        co_await wal.finalFlush();
+        co_await wal.close();
+    }
+
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+        WALReader reader(walFile);
+        co_await reader.readAll(recoveredStore.get());
+    }
+
+    TSDBInsert<double> testInsert("buffered_test", "value");
+    auto it = recoveredStore->series.find(testInsert.seriesId128());
+    EXPECT_NE(it, recoveredStore->series.end())
+        << "Data must be recoverable after finalFlush() without immediate flush";
+
+    if (it != recoveredStore->series.end()) {
+        auto& s = std::get<InMemorySeries<double>>(it->second);
+        EXPECT_EQ(s.values.size(), 3u);
+        EXPECT_DOUBLE_EQ(s.values[0], 1.1);
+        EXPECT_DOUBLE_EQ(s.values[1], 2.2);
+        EXPECT_DOUBLE_EQ(s.values[2], 3.3);
+    }
+
+    co_return;
+}
+
+TEST_F(WALSeastarTest, FinalFlushAfterBufferedInserts) {
+    testFinalFlushAfterBufferedInserts().get();
+}
+
+// Test: multiple single inserts (not batched) accumulate _unflushed_bytes.
+// Each insert() call must add its dataSize to _unflushed_bytes.  After N
+// inserts the counter reflects the total stream position modulo the DMA
+// alignment, so that the final padToAlignment() pads correctly.
+seastar::future<> testUnflushedBytesAccumulatesAcrossMultipleInserts() {
+    unsigned int sequenceNumber = 301;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    const int N = 7; // odd number to ensure non-zero remainder mod DMA alignment
+
+    {
+        WAL wal(sequenceNumber);
+        co_await wal.init(store.get());
+
+        for (int i = 0; i < N; i++) {
+            TSDBInsert<double> insert("multi_insert", "series_" + std::to_string(i));
+            insert.addValue(static_cast<uint64_t>(i + 1) * 1000, static_cast<double>(i) * 10.0);
+            co_await wal.insert(insert);
+        }
+
+        // finalFlush() must not fail or leave data truncated.
+        // If _unflushed_bytes were 0 across all inserts, padding would be
+        // skipped and the file position would differ from what the reader
+        // expects after the padding entries.
+        co_await wal.finalFlush();
+        co_await wal.close();
+    }
+
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+        WALReader reader(walFile);
+        co_await reader.readAll(recoveredStore.get());
+    }
+
+    EXPECT_EQ(recoveredStore->series.size(), static_cast<size_t>(N))
+        << "All " << N << " buffered inserts must be recoverable after finalFlush()";
+
+    co_return;
+}
+
+TEST_F(WALSeastarTest, UnflushedBytesAccumulatesAcrossMultipleInserts) {
+    testUnflushedBytesAccumulatesAcrossMultipleInserts().get();
+}
+
+// Test: insertBatch() increments _unflushed_bytes by the total batch size.
+// The batch write issues a single out->write() call for all encoded entries.
+// _unflushed_bytes must be updated by totalSize after that call so that a
+// subsequent finalFlush() → padToAlignment() produces the correct padding.
+seastar::future<> testUnflushedBytesAfterBatchInsert() {
+    unsigned int sequenceNumber = 302;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    {
+        WAL wal(sequenceNumber);
+        co_await wal.init(store.get());
+
+        std::vector<TSDBInsert<double>> batch;
+        for (int i = 0; i < 5; i++) {
+            TSDBInsert<double> insert("batch_unflushed", "field_" + std::to_string(i));
+            insert.addValue(static_cast<uint64_t>(i + 1) * 1000, static_cast<double>(i) * 3.14);
+            batch.push_back(std::move(insert));
+        }
+
+        co_await wal.insertBatch(batch);
+
+        // After insertBatch, _unflushed_bytes == totalSize of the batch.
+        // finalFlush() must pad correctly.
+        co_await wal.finalFlush();
+        co_await wal.close();
+    }
+
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+        WALReader reader(walFile);
+        co_await reader.readAll(recoveredStore.get());
+    }
+
+    EXPECT_EQ(recoveredStore->series.size(), 5u)
+        << "All 5 batch entries must be recoverable after finalFlush()";
+
+    co_return;
+}
+
+TEST_F(WALSeastarTest, UnflushedBytesAfterBatchInsert) {
+    testUnflushedBytesAfterBatchInsert().get();
+}
+
+// Test: deleteRange() also increments _unflushed_bytes.
+// deleteRange() writes an encoded entry to the stream; the write must be
+// accounted for in _unflushed_bytes so that a subsequent finalFlush() pads
+// to alignment correctly.
+seastar::future<> testUnflushedBytesAfterDeleteRange() {
+    unsigned int sequenceNumber = 303;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    {
+        WAL wal(sequenceNumber);
+        co_await wal.init(store.get());
+
+        TSDBInsert<double> insert("del_range_unflushed", "value");
+        insert.addValue(1000, 10.0);
+        insert.addValue(2000, 20.0);
+        insert.addValue(3000, 30.0);
+
+        SeriesId128 seriesId = insert.seriesId128();
+        co_await wal.insert(insert);
+
+        // deleteRange must also update _unflushed_bytes; otherwise the total
+        // byte count fed into padToAlignment() is wrong.
+        co_await wal.deleteRange(seriesId, 2000, 2000);
+
+        co_await wal.finalFlush();
+        co_await wal.close();
+    }
+
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+        WALReader reader(walFile);
+        co_await reader.readAll(recoveredStore.get());
+    }
+
+    TSDBInsert<double> testInsert("del_range_unflushed", "value");
+    auto it = recoveredStore->series.find(testInsert.seriesId128());
+    EXPECT_NE(it, recoveredStore->series.end())
+        << "Series must be recoverable after insert + deleteRange + finalFlush()";
+
+    if (it != recoveredStore->series.end()) {
+        auto& s = std::get<InMemorySeries<double>>(it->second);
+        // t=2000 was deleted, so only t=1000 and t=3000 remain.
+        EXPECT_EQ(s.values.size(), 2u);
+        EXPECT_DOUBLE_EQ(s.values[0], 10.0);
+        EXPECT_DOUBLE_EQ(s.values[1], 30.0);
+    }
+
+    co_return;
+}
+
+TEST_F(WALSeastarTest, UnflushedBytesAfterDeleteRange) {
+    testUnflushedBytesAfterDeleteRange().get();
+}
+
+// Test: mixing finalFlush() calls with additional writes correctly resets and
+// re-accumulates _unflushed_bytes.  After a finalFlush(), _unflushed_bytes is
+// reset to 0.  Subsequent writes must re-increment it from 0.
+seastar::future<> testUnflushedBytesResetAndReaccumulate() {
+    unsigned int sequenceNumber = 304;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    {
+        WAL wal(sequenceNumber);
+        co_await wal.init(store.get());
+
+        // First group of writes + flush
+        TSDBInsert<double> insert1("reset_test", "first");
+        insert1.addValue(1000, 1.0);
+        co_await wal.insert(insert1);
+        co_await wal.finalFlush();
+        // After flush, _unflushed_bytes == 0
+
+        // Second group of writes — must re-accumulate _unflushed_bytes from 0
+        TSDBInsert<double> insert2("reset_test", "second");
+        insert2.addValue(2000, 2.0);
+        co_await wal.insert(insert2);
+
+        TSDBInsert<double> insert3("reset_test", "third");
+        insert3.addValue(3000, 3.0);
+        co_await wal.insert(insert3);
+
+        // Final flush must pad based on the accumulated bytes from insert2 + insert3
+        co_await wal.finalFlush();
+        co_await wal.close();
+    }
+
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+        WALReader reader(walFile);
+        co_await reader.readAll(recoveredStore.get());
+    }
+
+    EXPECT_EQ(recoveredStore->series.size(), 3u)
+        << "All 3 series (written across two flush cycles) must be recoverable";
+
+    co_return;
+}
+
+TEST_F(WALSeastarTest, UnflushedBytesResetAndReaccumulate) {
+    testUnflushedBytesResetAndReaccumulate().get();
+}

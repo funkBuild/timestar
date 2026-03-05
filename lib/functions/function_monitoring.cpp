@@ -23,31 +23,48 @@ ProductionMonitor& ProductionMonitor::getInstance() {
 }
 
 void ProductionMonitor::start() {
-    if (monitoring_active_.load()) {
-        return; // Already running
+    // Serialize with stop() via lifecycle_mutex_.  This prevents the scenario
+    // where stop() sees monitoring_active_==true and clears the flag while
+    // start() has already passed the CAS but has not yet launched the thread,
+    // which would leave a zombie std::thread object in monitoring_thread_.
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
+    // Use compare_exchange_strong so that only one thread wins when start() is
+    // called concurrently.  If monitoring_active_ is already true the exchange
+    // fails and we return immediately without touching monitoring_thread_.
+    bool expected = false;
+    if (!monitoring_active_.compare_exchange_strong(expected, true)) {
+        return; // Already running (or another thread just won the race)
     }
-    
-    monitoring_active_.store(true);
+
     monitoring_thread_ = std::thread(&ProductionMonitor::monitoringLoop, this);
-    
+
     if (detailed_logging_) {
-        // Log startup
         std::cout << "[ProductionMonitor] Started background monitoring thread\n";
     }
 }
 
 void ProductionMonitor::stop() {
+    // Serialize start()/stop() lifecycle transitions so that only one thread
+    // performs the join.  Without this:
+    //  - Two concurrent stop() calls can both see monitoring_active_==true,
+    //    both set it to false, and then both try to join the same std::thread
+    //    (undefined behaviour, may deadlock).
+    //  - A concurrent start() can create the thread after stop() has already
+    //    cleared monitoring_active_, leaving an unjoinable thread.
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
     if (!monitoring_active_.load()) {
         return; // Not running
     }
-    
+
     monitoring_active_.store(false);
     monitoring_cv_.notify_all();
-    
+
     if (monitoring_thread_.joinable()) {
         monitoring_thread_.join();
     }
-    
+
     if (detailed_logging_) {
         std::cout << "[ProductionMonitor] Stopped background monitoring thread\n";
     }
@@ -124,10 +141,19 @@ void ProductionMonitor::clearAlertsForTesting() {
     std::lock_guard<std::mutex> lock(alerts_mutex_);
     active_alerts_.clear();
     alert_history_.clear();
-    
+
     if (detailed_logging_) {
         std::cout << "[ProductionMonitor] Cleared all alerts and history for testing\n";
     }
+}
+
+void ProductionMonitor::addAlertForTesting(const Alert& alert) {
+    processAlert(alert);
+}
+
+size_t ProductionMonitor::getAlertHistorySize() const {
+    std::lock_guard<std::mutex> lock(alerts_mutex_);
+    return alert_history_.size();
 }
 
 std::map<std::string, FunctionMetricsSnapshot> ProductionMonitor::getAllFunctionMetrics() const {
@@ -462,10 +488,15 @@ void ProductionMonitor::processAlert(const Alert& alert) {
     
     if (!duplicate) {
         active_alerts_.push_back(alert);
+
+        // Enforce bounded alert history: evict the oldest entry when at capacity.
+        if (alert_history_.size() >= MAX_ALERT_HISTORY) {
+            alert_history_.pop_front();
+        }
         alert_history_.push_back(alert);
-        
+
         if (detailed_logging_) {
-            std::cout << "[ProductionMonitor] ALERT: " << alert.message 
+            std::cout << "[ProductionMonitor] ALERT: " << alert.message
                       << " (severity: " << alert.severity << ")\n";
         }
     }

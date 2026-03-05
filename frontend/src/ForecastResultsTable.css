@@ -1,0 +1,12 @@
+.forecast-row td {
+  background: rgba(108, 126, 224, 0.06);
+}
+
+.forecast-row:hover td {
+  background: rgba(108, 126, 224, 0.12);
+}
+
+.forecast-val {
+  color: var(--accent);
+  font-weight: 600;
+}

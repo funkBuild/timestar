@@ -73,6 +73,10 @@ target_compile_definitions(tsdb_test PRIVATE
     BLOOM_FILTER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/bloom_filter.hpp"
     INTEGER_ENCODER_BASIC_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/integer/integer_encoder.cpp"
     HTTP_SERVER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../bin/tsdb_http_server.cpp"
+    HTTP_STREAM_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_stream_handler.cpp"
+    HTTP_METADATA_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_metadata_handler.cpp"
+    DERIVED_QUERY_EXECUTOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/derived_query_executor.cpp"
+    HTTP_DERIVED_QUERY_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_derived_query_handler.cpp"
 )
 
 # Discover tests for CTest
@@ -112,6 +116,10 @@ target_compile_definitions(tsdb_unit_test PRIVATE
     BLOOM_FILTER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/bloom_filter.hpp"
     INTEGER_ENCODER_BASIC_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/integer/integer_encoder.cpp"
     HTTP_SERVER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../bin/tsdb_http_server.cpp"
+    HTTP_STREAM_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_stream_handler.cpp"
+    HTTP_METADATA_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_metadata_handler.cpp"
+    DERIVED_QUERY_EXECUTOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/derived_query_executor.cpp"
+    HTTP_DERIVED_QUERY_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_derived_query_handler.cpp"
 )
 
 # Integration tests only
@@ -182,3 +190,4 @@ target_include_directories(tsdb_http_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Include subdirectories with standalone tests
 add_subdirectory(benchmark)
+add_subdirectory(functions)

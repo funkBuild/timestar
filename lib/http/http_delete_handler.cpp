@@ -76,10 +76,10 @@ struct glz::meta<GlazeBatchDelete> {
 // Response structures for Glaze serialization - must be at namespace scope
 struct DeleteDetailedResponse {
     std::string status = "success";
-    int seriesDeleted;
-    int totalRequests;
+    uint64_t seriesDeleted;
+    uint64_t totalRequests;
     std::optional<std::vector<std::string>> deletedSeries;
-    std::optional<int> deletedSeriesCount;
+    std::optional<uint64_t> deletedSeriesCount;
     std::optional<std::string> note;
 };
 
@@ -148,7 +148,7 @@ std::string HttpDeleteHandler::createErrorResponse(const std::string& error) {
     return buffer;
 }
 
-std::string HttpDeleteHandler::createSuccessResponse(int deletedCount, int totalRequests) {
+std::string HttpDeleteHandler::createSuccessResponse(uint64_t deletedCount, uint64_t totalRequests) {
     // Create JSON object directly
     auto response = glz::obj{"status", "success", "deleted", deletedCount, "total", totalRequests};
     
@@ -208,8 +208,8 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
         }
         
         // Execute deletes
-        int totalSeriesDeleted = 0;
-        int totalPointsDeleted = 0;
+        uint64_t totalSeriesDeleted = 0;
+        uint64_t totalPointsDeleted = 0;
         std::vector<std::string> allDeletedSeries;
         
         tsdb::http_log.info("[DELETE_HANDLER] Processing {} delete requests", deleteRequests.size());
@@ -221,11 +221,11 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                 // Pattern-based deletion
                 std::vector<Engine::DeleteResult> shardResults;
                 
-                // Always query shard 0 first for metadata, regardless of whether we have specific tags/fields
-                // This ensures we use the centralized metadata
-                if (true) {  // Changed from if (!delReq.tags.empty() && !delReq.fields.empty()) to always use this path
-                    // First query shard 0 for metadata to find matching series
-                    auto matchingSeries = co_await engineSharded->invoke_on(0, 
+                // Always query shard 0 first for metadata to find matching series,
+                // regardless of whether we have specific tags/fields.
+                // This ensures we use the centralized metadata.
+                {
+                    auto matchingSeries = co_await engineSharded->invoke_on(0,
                         [measurement = delReq.measurement, tags = delReq.tags, fields = delReq.fields]
                         (Engine& engine) -> seastar::future<std::vector<std::pair<std::string, size_t>>> {
                             auto& index = engine.getIndex();
@@ -378,13 +378,13 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
         // Create detailed response using structured approach
         DeleteDetailedResponse response;
         response.seriesDeleted = totalSeriesDeleted;
-        response.totalRequests = static_cast<int>(deleteRequests.size());
+        response.totalRequests = deleteRequests.size();
         
         // Include deleted series list if not too large
         if (!allDeletedSeries.empty() && allDeletedSeries.size() <= 100) {
             response.deletedSeries = allDeletedSeries;
         } else if (allDeletedSeries.size() > 100) {
-            response.deletedSeriesCount = static_cast<int>(allDeletedSeries.size());
+            response.deletedSeriesCount = allDeletedSeries.size();
             response.note = "Series list omitted due to size";
         }
         

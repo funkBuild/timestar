@@ -104,10 +104,16 @@ public:
 
 private:
     /**
-     * Simple DFT implementation (sufficient for typical TSDB data sizes)
-     * For very large datasets, could be replaced with FFT library
+     * Radix-2 Cooley-Tukey FFT: O(n log n) instead of O(n²) naive DFT.
+     * Input is padded to the next power of 2 internally.
+     * Returns only the first N/2+1 frequency bins (Nyquist limit for real input).
+     * Sets effectiveN_ to the value needed for period = effectiveN_ / freqIdx.
      */
-    std::vector<std::complex<double>> dft(const std::vector<double>& y);
+    std::vector<std::complex<double>> fft(const std::vector<double>& y);
+
+    // Set by fft(): the effective N for mapping bin indices to periods.
+    // period = effectiveN_ / freqIdx. Accounts for both downsampling and padding.
+    size_t effectiveN_ = 0;
 };
 
 } // namespace forecast

@@ -254,11 +254,11 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
     
     for (size_t i = 0; i < count && slice.offset < slice.length_; i++) {
         uint32_t strLen = readVarInt(slice);
-        
-        if (slice.offset + strLen > slice.length_) {
+
+        if (strLen > slice.length_ - slice.offset) {
             throw std::runtime_error("Invalid string length in encoded data");
         }
-        
+
         out.emplace_back(reinterpret_cast<const char*>(slice.data + slice.offset), strLen);
         slice.offset += strLen;
     }
@@ -310,11 +310,11 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
     
     for (size_t i = 0; i < count && uncompSlice.offset < uncompSlice.length_; i++) {
         uint32_t strLen = readVarInt(uncompSlice);
-        
-        if (uncompSlice.offset + strLen > uncompSlice.length_) {
+
+        if (strLen > uncompSlice.length_ - uncompSlice.offset) {
             throw std::runtime_error("Invalid string length in encoded data");
         }
-        
+
         out.emplace_back(reinterpret_cast<const char*>(uncompSlice.data + uncompSlice.offset), strLen);
         uncompSlice.offset += strLen;
     }
@@ -365,7 +365,7 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
     for (size_t i = 0; i < totalCount && slice.offset < slice.length_; i++) {
         uint32_t strLen = readVarInt(slice);
 
-        if (slice.offset + strLen > slice.length_) {
+        if (strLen > slice.length_ - slice.offset) {
             throw std::runtime_error("Invalid string length in encoded data");
         }
 
@@ -433,7 +433,7 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
     for (size_t i = 0; i < totalCount && uncompSlice.offset < uncompSlice.length_; i++) {
         uint32_t strLen = readVarInt(uncompSlice);
 
-        if (uncompSlice.offset + strLen > uncompSlice.length_) {
+        if (strLen > uncompSlice.length_ - uncompSlice.offset) {
             throw std::runtime_error("Invalid string length in encoded data");
         }
 

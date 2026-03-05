@@ -161,7 +161,7 @@ struct GlazeDerivedQueryResponse {
 struct GlazeAnomalySeriesPiece {
     std::string piece;
     std::vector<std::string> group_tags;
-    std::vector<double> values;  // NaN/Inf will be handled during serialization
+    std::vector<std::optional<double>> values;  // NaN/Inf converted to nullopt (JSON null)
     std::optional<double> alert_value;
 };
 

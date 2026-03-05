@@ -119,6 +119,22 @@ public:
         const std::vector<double>& residuals
     );
 
+    /**
+     * Fast LOESS for evenly-spaced integer x-values (0, 1, 2, ..., n-1)
+     * evaluated at the same points. Uses a sliding window instead of
+     * sorting distances, reducing complexity from O(n²) to O(n × window).
+     *
+     * @param y Y values (length n)
+     * @param span Smoothing span (fraction of data)
+     * @param weights Optional robustness weights (length n or empty)
+     * @return Smoothed values (length n)
+     */
+    std::vector<double> loessEvenlySpaced(
+        const std::vector<double>& y,
+        double span,
+        const std::vector<double>& weights = {}
+    );
+
 private:
     /**
      * Tricube weight function for LOESS

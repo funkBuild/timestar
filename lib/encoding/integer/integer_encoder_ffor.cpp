@@ -236,6 +236,21 @@ void encodeBlock(const uint64_t *values, size_t count, AlignedBuffer &buf,
 size_t decodeBlockInto(Slice &s, uint64_t* out) {
     auto hdr = readBlockHeader(s);
 
+    // Validate bit-width: legal values are 0..64.  A corrupt block with bw > 64
+    // implies max_val < min_val (unsigned underflow in the original range
+    // computation), which would cause ffor_packed_words() to return a huge value
+    // and result in a buffer over-read.
+    if (hdr.bw > 64) [[unlikely]] {
+        throw std::runtime_error(
+            "Corrupt FFOR block: bit_width > 64 (implies max_val < min_val)");
+    }
+
+    // Validate exception count: cannot exceed the number of values in the block.
+    if (hdr.exc_count > hdr.block_count) [[unlikely]] {
+        throw std::runtime_error(
+            "Corrupt FFOR block: exception_count exceeds block_count");
+    }
+
     // FFOR unpack
     if (hdr.bw == 0) {
         // All values are base
@@ -244,6 +259,13 @@ size_t decodeBlockInto(Slice &s, uint64_t* out) {
         // Direct pointer access to packed data - skip per-word bounds checks and copy.
         const size_t packed_words = alp::ffor_packed_words(hdr.block_count, hdr.bw);
         const size_t packed_bytes = packed_words * sizeof(uint64_t);
+
+        // Bounds check: ensure the packed data fits within the remaining slice.
+        if (s.offset + packed_bytes > s.length_) [[unlikely]] {
+            throw std::runtime_error(
+                "Corrupt FFOR block: packed data extends beyond end of buffer");
+        }
+
         const uint8_t* packed_ptr = s.data + s.offset;
         s.offset += packed_bytes;
 
@@ -258,11 +280,25 @@ size_t decodeBlockInto(Slice &s, uint64_t* out) {
         // Positions are packed 4 x uint16_t per uint64_t word.
         const size_t pos_words = (hdr.exc_count + 3) / 4;
         const size_t pos_bytes = pos_words * sizeof(uint64_t);
+
+        // Bounds check: exception position words.
+        if (s.offset + pos_bytes > s.length_) [[unlikely]] {
+            throw std::runtime_error(
+                "Corrupt FFOR block: exception positions extend beyond end of buffer");
+        }
+
         const uint8_t* pos_ptr = s.data + s.offset;
         s.offset += pos_bytes;
 
         // Read exception values directly from Slice pointer.
         const size_t val_bytes = hdr.exc_count * sizeof(uint64_t);
+
+        // Bounds check: exception values.
+        if (s.offset + val_bytes > s.length_) [[unlikely]] {
+            throw std::runtime_error(
+                "Corrupt FFOR block: exception values extend beyond end of buffer");
+        }
+
         const uint8_t* val_ptr = s.data + s.offset;
         s.offset += val_bytes;
 

@@ -409,6 +409,97 @@ TEST_F(FunctionFrameworkTest, FunctionRegistrySearch) {
     EXPECT_EQ(results[0], "arithmetic_add");
 }
 
+TEST_F(FunctionFrameworkTest, FunctionRegistryCreateUnknownFunctionReturnsNullptr) {
+    auto& registry = FunctionRegistry::getInstance();
+
+    // Registry is empty at this point (cleared in SetUp)
+    auto result = registry.createFunction("nonexistent_function_xyz");
+    EXPECT_EQ(result, nullptr);
+
+    // Register one function and confirm a different name still returns nullptr
+    FunctionMetadata metadata;
+    metadata.name = "known_function";
+    metadata.description = "A known function";
+    metadata.category = FunctionCategory::ARITHMETIC;
+    registry.registerFunction<MockFunction>(metadata);
+
+    auto unknown = registry.createFunction("definitely_not_registered");
+    EXPECT_EQ(unknown, nullptr);
+
+    // The known function should still be retrievable
+    auto known = registry.createFunction("known_function");
+    EXPECT_NE(known, nullptr);
+}
+
+TEST_F(FunctionFrameworkTest, FunctionRegistryCreateEmptyNameReturnsNullptr) {
+    auto& registry = FunctionRegistry::getInstance();
+
+    // Empty string name is not registered, so createFunction must return nullptr
+    auto result = registry.createFunction("");
+    EXPECT_EQ(result, nullptr);
+
+    // Registering a function and then querying with empty string still returns nullptr
+    FunctionMetadata metadata;
+    metadata.name = "some_function";
+    metadata.category = FunctionCategory::ARITHMETIC;
+    registry.registerFunction<MockFunction>(metadata);
+
+    auto empty = registry.createFunction("");
+    EXPECT_EQ(empty, nullptr);
+}
+
+TEST_F(FunctionFrameworkTest, FunctionRegistrySearchEmptyPatternMatchesAll) {
+    auto& registry = FunctionRegistry::getInstance();
+
+    // With an empty registry, empty pattern returns empty
+    auto emptyResults = registry.searchFunctions("");
+    EXPECT_EQ(emptyResults.size(), 0u);
+
+    // Register two functions with distinct names and descriptions
+    FunctionMetadata md1;
+    md1.name = "alpha_func";
+    md1.description = "Alpha description";
+    md1.category = FunctionCategory::ARITHMETIC;
+    registry.registerFunction<MockFunction>(md1);
+
+    FunctionMetadata md2;
+    md2.name = "beta_func";
+    md2.description = "Beta description";
+    md2.category = FunctionCategory::SMOOTHING;
+    registry.registerFunction<MockFunction>(md2);
+
+    // Empty string is a substring of every string, so all functions match
+    auto allResults = registry.searchFunctions("");
+    EXPECT_EQ(allResults.size(), 2u);
+}
+
+TEST_F(FunctionFrameworkTest, FunctionRegistrySearchWhitespaceOnlyPattern) {
+    auto& registry = FunctionRegistry::getInstance();
+
+    // Register functions whose name and description do not contain spaces
+    FunctionMetadata md1;
+    md1.name = "nospace_name";
+    md1.description = "nodescription";
+    md1.category = FunctionCategory::ARITHMETIC;
+    registry.registerFunction<MockFunction>(md1);
+
+    // A name/description without spaces will not contain the whitespace pattern
+    auto spaceResults = registry.searchFunctions(" ");
+    EXPECT_EQ(spaceResults.size(), 0u);
+
+    // Register a second function whose description contains a space
+    FunctionMetadata md2;
+    md2.name = "another_func";
+    md2.description = "has space here";
+    md2.category = FunctionCategory::SMOOTHING;
+    registry.registerFunction<MockFunction>(md2);
+
+    // Now the space pattern matches the description of md2 (but not md1)
+    auto spaceResults2 = registry.searchFunctions(" ");
+    EXPECT_EQ(spaceResults2.size(), 1u);
+    EXPECT_EQ(spaceResults2[0], "another_func");
+}
+
 TEST_F(FunctionFrameworkTest, FunctionRegistryStats) {
     auto& registry = FunctionRegistry::getInstance();
     

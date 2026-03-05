@@ -14,7 +14,7 @@
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
 
-class HttpRetentionHandler {
+class HttpRetentionHandler : public std::enable_shared_from_this<HttpRetentionHandler> {
 private:
     seastar::sharded<Engine>* engineSharded;
 
@@ -22,14 +22,15 @@ private:
     // Throws std::runtime_error on invalid format.
     static uint64_t parseDuration(const std::string& duration);
 
-    // Validate an aggregation method string.
-    static bool isValidMethod(const std::string& method);
-
-    std::string createErrorResponse(const std::string& error);
-
 public:
     HttpRetentionHandler(seastar::sharded<Engine>* _engineSharded)
         : engineSharded(_engineSharded) {}
+
+    // Validate an aggregation method string.
+    // Exposed publicly to allow direct unit testing.
+    static bool isValidMethod(const std::string& method);
+
+    std::string createErrorResponse(const std::string& error);
 
     seastar::future<std::unique_ptr<seastar::http::reply>>
     handlePut(std::unique_ptr<seastar::http::request> req);

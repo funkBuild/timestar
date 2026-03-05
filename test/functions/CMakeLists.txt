@@ -258,6 +258,21 @@ target_link_libraries(test_function_security_only
 target_compile_features(test_function_security_only PRIVATE cxx_std_23)
 target_compile_options(test_function_security_only PRIVATE -Wall -Wextra -O2 -march=native)
 
+add_executable(test_function_query_parser_only
+    test_function_query_parser.cpp
+)
+
+target_link_libraries(test_function_query_parser_only
+    PRIVATE
+    gtest_main
+    gmock
+    libtsdb
+    pthread
+)
+
+target_compile_features(test_function_query_parser_only PRIVATE cxx_std_23)
+target_compile_options(test_function_query_parser_only PRIVATE -Wall -Wextra -O2 -march=native)
+
 add_executable(test_performance_regression_only
     test_performance_regression.cpp
 )
@@ -305,3 +320,4 @@ gtest_discover_tests(test_edge_cases_only)
 gtest_discover_tests(test_function_security_only)
 gtest_discover_tests(test_performance_regression_only)
 gtest_discover_tests(test_production_monitoring_only)
+gtest_discover_tests(test_function_query_parser_only)

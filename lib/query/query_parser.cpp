@@ -134,8 +134,14 @@ AggregationMethod QueryParser::parseAggregation(const std::string& method) {
     if (lower == "max") return AggregationMethod::MAX;
     if (lower == "sum") return AggregationMethod::SUM;
     if (lower == "latest") return AggregationMethod::LATEST;
-    
-    throw QueryParseException("Must be one of 'avg', 'min', 'max', 'sum', 'latest'");
+    if (lower == "count") return AggregationMethod::COUNT;
+    if (lower == "first") return AggregationMethod::FIRST;
+    if (lower == "median") return AggregationMethod::MEDIAN;
+    if (lower == "stddev") return AggregationMethod::STDDEV;
+    if (lower == "stdvar") return AggregationMethod::STDVAR;
+    if (lower == "spread") return AggregationMethod::SPREAD;
+
+    throw QueryParseException("Must be one of 'avg', 'min', 'max', 'sum', 'latest', 'count', 'first', 'median', 'stddev', 'stdvar', 'spread'");
 }
 
 std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos) {

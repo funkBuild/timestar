@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -204,16 +205,21 @@ private:
     std::unique_ptr<SystemMetrics> system_metrics_;
     AlertThresholds thresholds_;
     
+    static constexpr size_t MAX_ALERT_HISTORY = 1000;
+
     mutable std::mutex metrics_mutex_;
     mutable std::mutex alerts_mutex_;
     std::vector<Alert> active_alerts_;
-    std::vector<Alert> alert_history_;
+    std::deque<Alert> alert_history_;
     
     // Background monitoring thread
     std::thread monitoring_thread_;
     std::atomic<bool> monitoring_active_{false};
     std::condition_variable monitoring_cv_;
     std::mutex monitoring_mutex_;
+    // Serializes start()/stop() lifecycle transitions so that concurrent calls
+    // cannot double-start or double-join the monitoring thread.
+    std::mutex lifecycle_mutex_;
     
     // Metrics collection interval
     std::chrono::seconds collection_interval_{30}; // 30 seconds
@@ -247,6 +253,8 @@ public:
     std::vector<Alert> getAlertHistory(std::chrono::minutes lookback = std::chrono::minutes(60)) const;
     void acknowledgeAlert(size_t alert_id);
     void clearAlertsForTesting(); // Clear all alerts and history for testing
+    void addAlertForTesting(const Alert& alert); // Directly inject an alert for testing
+    size_t getAlertHistorySize() const; // Return raw alert_history_ size for testing
     
     // Metrics reporting
     std::map<std::string, FunctionMetricsSnapshot> getAllFunctionMetrics() const;

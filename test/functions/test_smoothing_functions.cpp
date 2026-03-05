@@ -485,6 +485,70 @@ TEST_F(SmoothingFunctionsTest, PerformanceLargeDataset) {
     }
 }
 
+// Test that pad_zeros mode always divides by the full window size (treating missing
+// boundary values as 0), rather than dividing by the actual number of available values.
+// If the divisor were validCount (actual count) instead of windowSize, edge positions
+// would return the average of available data (same as shrink mode) rather than the
+// zero-padded average.
+TEST_F(SmoothingFunctionsTest, SMAFunctionPadZerosDivisorIsWindowSize) {
+    SMAFunction smaFunc;
+
+    // Use all-10s input so the difference between sum/window and sum/validCount is clear.
+    std::vector<uint64_t> ts = {1000ULL, 2000ULL, 3000ULL, 4000ULL, 5000ULL};
+    std::vector<double>   vs = {10.0,    10.0,    10.0,    10.0,    10.0};
+    DoubleSeriesView series(&ts, &vs);
+
+    FunctionContext context = createContext({
+        {"window", int64_t(4)},
+        {"edge_handling", std::string("pad_zeros")}
+    });
+
+    auto result = smaFunc.execute(series, context).get();
+
+    // pad_zeros always produces the same number of output points as input.
+    ASSERT_EQ(result.size(), vs.size());
+
+    // With window=4 and pad_zeros, missing positions are treated as 0:
+    //   i=0: (10+0+0+0)/4 = 2.5
+    //   i=1: (10+10+0+0)/4 = 5.0
+    //   i=2: (10+10+10+0)/4 = 7.5
+    //   i=3: (10+10+10+10)/4 = 10.0
+    //   i=4: (10+10+10+10)/4 = 10.0
+    //
+    // If the code mistakenly divided by validCount instead of window:
+    //   i=0: 10/1=10.0, i=1: 20/2=10.0, i=2: 30/3=10.0  (all equal to input)
+    // That would be the "shrink" / "truncate" behaviour, NOT pad_zeros.
+    EXPECT_NEAR(result.values[0],  2.5, 1e-10) << "i=0: sum=10, window=4, expect 10/4=2.5";
+    EXPECT_NEAR(result.values[1],  5.0, 1e-10) << "i=1: sum=20, window=4, expect 20/4=5.0";
+    EXPECT_NEAR(result.values[2],  7.5, 1e-10) << "i=2: sum=30, window=4, expect 30/4=7.5";
+    EXPECT_NEAR(result.values[3], 10.0, 1e-10) << "i=3: sum=40, window=4, expect 40/4=10.0";
+    EXPECT_NEAR(result.values[4], 10.0, 1e-10) << "i=4: sum=40, window=4, expect 40/4=10.0";
+}
+
+// Contrast: pad_nearest must give constant output for constant input because the
+// padded boundary values equal the nearest real value, so sum/validCount==sum/window.
+TEST_F(SmoothingFunctionsTest, SMAFunctionPadNearestDivisorEquivalent) {
+    SMAFunction smaFunc;
+
+    std::vector<uint64_t> ts = {1000ULL, 2000ULL, 3000ULL, 4000ULL, 5000ULL};
+    std::vector<double>   vs = {10.0,    10.0,    10.0,    10.0,    10.0};
+    DoubleSeriesView series(&ts, &vs);
+
+    FunctionContext context = createContext({
+        {"window", int64_t(4)},
+        {"edge_handling", std::string("pad_nearest")}
+    });
+
+    auto result = smaFunc.execute(series, context).get();
+    ASSERT_EQ(result.size(), vs.size());
+
+    // pad_nearest pads with the nearest real value (10.0), so every window of 4
+    // contains four 10s regardless of position; the average is always 10.0.
+    for (size_t i = 0; i < result.values.size(); ++i) {
+        EXPECT_NEAR(result.values[i], 10.0, 1e-10) << "at index " << i;
+    }
+}
+
 // Integration test with registry
 TEST_F(SmoothingFunctionsTest, RegistryIntegration) {
     auto& registry = FunctionRegistry::getInstance();

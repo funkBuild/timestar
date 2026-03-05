@@ -8,6 +8,7 @@
 #include <limits>
 #include <algorithm>
 #include <numeric>
+#include <cmath>
 #include <unordered_map>
 #include <string_view>
 
@@ -46,12 +47,34 @@ struct SeriesResult;
 // Two-phase aggregation state - holds pre-aggregated values for efficient merging
 // Instead of transferring all raw values, we transfer compact state and merge O(1)
 struct AggregationState {
+    // Hard limit on the number of raw values retained per AggregationState.
+    //
+    // rawValues is only needed for MEDIAN, STDDEV, and STDVAR — all other methods
+    // compute from running scalar accumulators (sum, min, max, count, etc.).
+    // Without a cap, merging many shards with dense data can allocate hundreds of
+    // megabytes per state: 1M doubles = ~8 MB, and a bucketed query can have many
+    // buckets each holding their own rawValues vector.
+    //
+    // When this limit is exceeded, rawValues stops growing and rawValuesSaturated is
+    // set to true.  getValue() for MEDIAN/STDDEV/STDVAR then returns NaN to signal
+    // that the result would be computed from an incomplete sample rather than silently
+    // returning a statistically wrong answer.
+    static constexpr size_t RAW_VALUES_HARD_LIMIT = 1'000'000;
+
     double sum = 0.0;
     double min = std::numeric_limits<double>::max();
     double max = std::numeric_limits<double>::lowest();
     double latest = 0.0;  // Most recent value
     uint64_t latestTimestamp = 0;  // Timestamp of latest value
+    double first = 0.0;   // Earliest value
+    uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max();  // Timestamp of earliest value
     size_t count = 0;
+    // Raw values for median/stddev/stdvar computation.
+    // Populated by addValue() so that getValue() can compute order-sensitive statistics.
+    // Growth is capped at RAW_VALUES_HARD_LIMIT; if the cap is hit rawValuesSaturated
+    // is set and getValue() returns NaN for the order-sensitive methods.
+    std::vector<double> rawValues;
+    bool rawValuesSaturated = false;
 
     // Add a single value to this state (incremental aggregation)
     void addValue(double value, uint64_t timestamp = 0) {
@@ -61,6 +84,15 @@ struct AggregationState {
         if (timestamp >= latestTimestamp) {
             latest = value;
             latestTimestamp = timestamp;
+        }
+        if (timestamp <= firstTimestamp) {
+            first = value;
+            firstTimestamp = timestamp;
+        }
+        if (rawValues.size() < RAW_VALUES_HARD_LIMIT) {
+            rawValues.push_back(value);
+        } else {
+            rawValuesSaturated = true;
         }
         count++;
     }
@@ -73,6 +105,25 @@ struct AggregationState {
         if (other.latestTimestamp >= latestTimestamp) {
             latest = other.latest;
             latestTimestamp = other.latestTimestamp;
+        }
+        if (other.firstTimestamp <= firstTimestamp) {
+            first = other.first;
+            firstTimestamp = other.firstTimestamp;
+        }
+        // Propagate saturation flag first so getValue() is always consistent.
+        if (other.rawValuesSaturated) {
+            rawValuesSaturated = true;
+        }
+        // Append as many raw values as the cap allows; mark saturated if we hit it.
+        if (!rawValuesSaturated) {
+            size_t available = RAW_VALUES_HARD_LIMIT - rawValues.size();
+            size_t toCopy = std::min(available, other.rawValues.size());
+            rawValues.insert(rawValues.end(),
+                             other.rawValues.begin(),
+                             other.rawValues.begin() + static_cast<std::ptrdiff_t>(toCopy));
+            if (toCopy < other.rawValues.size()) {
+                rawValuesSaturated = true;
+            }
         }
         count += other.count;
     }
@@ -93,6 +144,50 @@ struct AggregationState {
                 return sum;
             case AggregationMethod::LATEST:
                 return latest;
+            case AggregationMethod::COUNT:
+                return static_cast<double>(count);
+            case AggregationMethod::FIRST:
+                return first;
+            case AggregationMethod::SPREAD:
+                return max - min;
+            case AggregationMethod::MEDIAN: {
+                if (rawValues.empty() || rawValuesSaturated) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                std::vector<double> sorted = rawValues;
+                std::sort(sorted.begin(), sorted.end());
+                size_t n = sorted.size();
+                if (n % 2 == 1) {
+                    return sorted[n / 2];
+                } else {
+                    return (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+                }
+            }
+            case AggregationMethod::STDDEV: {
+                if (rawValues.empty() || rawValuesSaturated) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                double mean = sum / count;
+                double variance = 0.0;
+                for (double v : rawValues) {
+                    double diff = v - mean;
+                    variance += diff * diff;
+                }
+                variance /= count;
+                return std::sqrt(variance);
+            }
+            case AggregationMethod::STDVAR: {
+                if (rawValues.empty() || rawValuesSaturated) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                double mean = sum / count;
+                double variance = 0.0;
+                for (double v : rawValues) {
+                    double diff = v - mean;
+                    variance += diff * diff;
+                }
+                return variance / count;
+            }
             default:
                 return std::numeric_limits<double>::quiet_NaN();
         }

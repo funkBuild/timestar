@@ -369,7 +369,13 @@ private:
 public:
     AlignedVectorizedSeries(const std::vector<uint64_t>& timestamps,
                            const std::vector<double>& values)
-        : timestamps_(timestamps), values_(values) {}
+        : timestamps_(timestamps), values_(values) {
+        if (timestamps_.size() != values_.size()) {
+            throw std::invalid_argument(
+                "AlignedVectorizedSeries: timestamps and values must have the same size (" +
+                std::to_string(timestamps_.size()) + " vs " + std::to_string(values_.size()) + ")");
+        }
+    }
 
     size_t size() const { return timestamps_.size(); }
     bool empty() const { return timestamps_.empty(); }

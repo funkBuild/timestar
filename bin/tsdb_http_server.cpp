@@ -9,6 +9,8 @@
 #include "http/http_delete_handler.hpp"
 #include "http/http_metadata_handler.hpp"
 #include "http/http_retention_handler.hpp"
+#include "http/http_stream_handler.hpp"
+#include "http/http_derived_query_handler.hpp"
 #include "config/tsdb_config.hpp"
 #include "utils/stop_signal.hpp"
 #include "utils/logger.hpp"
@@ -64,11 +66,21 @@ void set_routes(routes& r) {
     auto* metadataHandler = new HttpMetadataHandler(&g_engine);
     metadataHandler->registerRoutes(r);
 
-    auto* retentionHandler = new HttpRetentionHandler(&g_engine);
+    // HttpRetentionHandler uses enable_shared_from_this so that its
+    // registerRoutes() can capture shared_from_this() in the route lambdas.
+    // The shared_ptr is kept alive by the function_handler objects owned by
+    // routes; when routes is destroyed the handler is freed cleanly.
+    auto retentionHandler = std::make_shared<HttpRetentionHandler>(&g_engine);
     retentionHandler->registerRoutes(r);
 
+    auto* streamHandler = new tsdb::HttpStreamHandler(&g_engine);
+    streamHandler->registerRoutes(r);
+
+    auto* derivedQueryHandler = new tsdb::HttpDerivedQueryHandler(&g_engine);
+    derivedQueryHandler->registerRoutes(r);
+
     auto* root = new function_handler([](const_req req) {
-        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\",\"/retention\"]}";
+        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\",\"/retention\",\"/subscribe\",\"/subscriptions\"]}";
     });
     r.add(operation_type::GET, url("/"), root);
 }
@@ -239,6 +251,7 @@ int main(int argc, char** argv) {
             tsdb::http_log.info("  POST /write    - Write time series data");
             tsdb::http_log.info("  POST /query    - Query time series data");
             tsdb::http_log.info("  POST /delete   - Delete time series data");
+            tsdb::http_log.info("  POST /subscribe - Subscribe to streaming data (SSE)");
             
             // Wait for stop signal
             stop_signal.wait().get();

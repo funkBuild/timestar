@@ -35,3 +35,18 @@ export async function runQuery({ query, startTime, endTime, aggregationInterval 
   }
   return res.json();
 }
+
+export async function runDerivedQuery({ queries, formula, startTime, endTime, aggregationInterval }) {
+  const body = { queries, formula, startTime, endTime };
+  if (aggregationInterval) body.aggregationInterval = aggregationInterval;
+  const res = await fetch(`${BASE}/derived`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error?.message || err.message || `Query failed: ${res.status}`);
+  }
+  return res.json();
+}

@@ -270,3 +270,65 @@ TEST_F(HttpMetadataHandlerTest, FormatFieldsResponseEmpty) {
     auto& fieldsObj = obj["fields"].get<glz::generic::object_t>();
     EXPECT_TRUE(fieldsObj.empty());
 }
+
+// ---------------------------------------------------------------------------
+// parsePaginationParam tests (validates safe std::stoul wrapping)
+// ---------------------------------------------------------------------------
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamValidNumber) {
+    // Valid numeric string should parse correctly
+    size_t result = HttpMetadataHandler::parsePaginationParam("42", "limit", 100);
+    EXPECT_EQ(result, 42u);
+}
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamZero) {
+    // Zero is a valid value
+    size_t result = HttpMetadataHandler::parsePaginationParam("0", "offset", 0);
+    EXPECT_EQ(result, 0u);
+}
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamDefault) {
+    // Empty string should return the default value
+    size_t result = HttpMetadataHandler::parsePaginationParam("", "limit", 100);
+    EXPECT_EQ(result, 100u);
+}
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamInvalidThrows) {
+    // Non-numeric string must throw HttpBadRequestException, not crash
+    EXPECT_THROW(
+        HttpMetadataHandler::parsePaginationParam("abc", "limit", 100),
+        HttpMetadataHandler::BadRequestException
+    );
+}
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamNegativeThrows) {
+    // Negative numbers must throw (stoul rejects them)
+    EXPECT_THROW(
+        HttpMetadataHandler::parsePaginationParam("-1", "offset", 0),
+        HttpMetadataHandler::BadRequestException
+    );
+}
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamFloatThrows) {
+    // Floating-point strings must throw
+    EXPECT_THROW(
+        HttpMetadataHandler::parsePaginationParam("3.14", "limit", 100),
+        HttpMetadataHandler::BadRequestException
+    );
+}
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamAlphanumericThrows) {
+    // Alphanumeric strings must throw
+    EXPECT_THROW(
+        HttpMetadataHandler::parsePaginationParam("10abc", "limit", 100),
+        HttpMetadataHandler::BadRequestException
+    );
+}
+
+TEST_F(HttpMetadataHandlerTest, ParsePaginationParamOverflowThrows) {
+    // Values that overflow size_t must throw
+    EXPECT_THROW(
+        HttpMetadataHandler::parsePaginationParam("99999999999999999999999999999", "limit", 100),
+        HttpMetadataHandler::BadRequestException
+    );
+}

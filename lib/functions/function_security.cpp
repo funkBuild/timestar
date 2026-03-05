@@ -75,9 +75,14 @@ const std::vector<std::regex> FunctionSecurity::dangerousPatterns_ = {
     std::regex(R"(insert\s+into)", std::regex_constants::icase),
     
     // XSS patterns
+    // NOTE: <script[^>]*> uses [^>]* (negated class) which cannot backtrack catastrophically.
     std::regex(R"(<script[^>]*>)", std::regex_constants::icase),
     std::regex(R"(javascript\s*:)", std::regex_constants::icase),
-    std::regex(R"(on\w+\s*=)", std::regex_constants::icase),
+    // NOTE: on\w+\s*= was vulnerable to ReDoS: with input "onaonaonaona..." (n chars),
+    // the unbounded \w+ caused O(n^2) backtracking per position, totalling O(n^3).
+    // Fix: bound \w to {1,30} — covers all real HTML event attributes (longest is
+    // onsecuritypolicyviolation at 23 chars) while eliminating catastrophic backtracking.
+    std::regex(R"(on\w{1,30}\s*=)", std::regex_constants::icase),
     
     // Format string attacks
     std::regex(R"(%[0-9]*[sdxn])", std::regex_constants::icase),

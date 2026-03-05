@@ -389,4 +389,117 @@ TEST_F(ProductionMonitoringTest, MemoryUsageTracking) {
     EXPECT_GE(metrics->peak_memory_bytes.load(), 0);
 }
 
+// Race condition tests: concurrent start/stop
+TEST_F(ProductionMonitoringTest, ConcurrentStartDoesNotSpawnMultipleThreads) {
+    // Call start() from many threads simultaneously and verify only one thread
+    // is running afterwards (no double-start race).
+    const int kThreads = 16;
+    std::vector<std::thread> threads;
+    std::atomic<int> start_count{0};
+
+    // All threads hammer start() at the same time.
+    std::atomic<bool> go{false};
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&]() {
+            while (!go.load()) { /* spin */ }
+            monitor->start();
+            start_count.fetch_add(1);
+        });
+    }
+
+    go.store(true);
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // The monitor must be running, and exactly one background thread must have
+    // been created (verified indirectly: stop() must not crash/hang).
+    EXPECT_TRUE(monitor->isRunning());
+
+    // stop() must complete cleanly — if two threads were started, the internal
+    // std::thread object would be in a partially-overwritten state and join()
+    // could deadlock or crash.
+    monitor->stop();
+    EXPECT_FALSE(monitor->isRunning());
+}
+
+TEST_F(ProductionMonitoringTest, ConcurrentStopIsSafe) {
+    monitor->start();
+    EXPECT_TRUE(monitor->isRunning());
+
+    // Call stop() from many threads simultaneously.
+    const int kThreads = 16;
+    std::vector<std::thread> threads;
+    std::atomic<bool> go{false};
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&]() {
+            while (!go.load()) { /* spin */ }
+            monitor->stop();
+        });
+    }
+
+    go.store(true);
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Must be cleanly stopped, not crashed.
+    EXPECT_FALSE(monitor->isRunning());
+}
+
+TEST_F(ProductionMonitoringTest, InterleavedStartStopIsSafe) {
+    // Rapidly alternate start/stop from multiple threads.
+    const int kIterations = 50;
+    std::atomic<bool> go{false};
+    std::atomic<bool> failed{false};
+
+    std::thread starter([&]() {
+        while (!go.load()) {}
+        for (int i = 0; i < kIterations && !failed.load(); ++i) {
+            monitor->start();
+            std::this_thread::yield();
+        }
+    });
+
+    std::thread stopper([&]() {
+        while (!go.load()) {}
+        for (int i = 0; i < kIterations && !failed.load(); ++i) {
+            monitor->stop();
+            std::this_thread::yield();
+        }
+    });
+
+    go.store(true);
+    starter.join();
+    stopper.join();
+
+    // Bring to a known-stopped state without crashing.
+    monitor->stop();
+    EXPECT_FALSE(monitor->isRunning());
+}
+
+// Task #55: alert_history_ must be bounded to MAX_ALERT_HISTORY (1000) entries.
+// Without the fix this test fails because alert_history_ grows without limit.
+TEST_F(ProductionMonitoringTest, AlertHistoryIsBounded) {
+    // Inject more alerts than the maximum cap (1001 unique function names,
+    // all with HIGH_FAILURE_RATE so each is a distinct (type,name) pair).
+    const size_t OVER_CAP = 1001;
+    for (size_t i = 0; i < OVER_CAP; ++i) {
+        functions::Alert alert;
+        alert.type = functions::AlertType::HIGH_FAILURE_RATE;
+        alert.function_name = "bounded_test_fn_" + std::to_string(i);
+        alert.message = "Test alert " + std::to_string(i);
+        alert.timestamp = std::chrono::steady_clock::now();
+        alert.severity = 0.5;
+        monitor->addAlertForTesting(alert);
+    }
+
+    // The raw history size must not exceed the cap.
+    size_t history_size = monitor->getAlertHistorySize();
+    EXPECT_LE(history_size, 1000u)
+        << "alert_history_ grew to " << history_size
+        << " which exceeds the MAX_ALERT_HISTORY cap of 1000";
+}
+
 } // namespace tsdb::test

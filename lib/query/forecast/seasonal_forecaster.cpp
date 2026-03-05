@@ -6,6 +6,22 @@
 #include <algorithm>
 #include <numeric>
 
+#if !TSDB_ANOMALY_DISABLE_SIMD
+#include <immintrin.h>
+#endif
+
+// Local hsum helper (same as stl_decomposition.cpp; the one in simd_anomaly.cpp
+// is file-static so we need our own copy).
+#if !TSDB_ANOMALY_DISABLE_SIMD
+static inline double hsum_avx_local(__m256d v) {
+    __m128d vlow  = _mm256_castpd256_pd128(v);
+    __m128d vhigh = _mm256_extractf128_pd(v, 1);
+    vlow = _mm_add_pd(vlow, vhigh);
+    __m128d high64 = _mm_unpackhi_pd(vlow, vlow);
+    return _mm_cvtsd_f64(_mm_add_sd(vlow, high64));
+}
+#endif
+
 namespace tsdb {
 namespace forecast {
 
@@ -17,10 +33,10 @@ std::vector<double> SeasonalForecaster::seasonalDifference(
         return {};
     }
 
-    std::vector<double> result(y.size() - seasonalPeriod);
-    for (size_t i = 0; i < result.size(); ++i) {
-        result[i] = y[i + seasonalPeriod] - y[i];
-    }
+    const size_t n = y.size() - seasonalPeriod;
+    std::vector<double> result(n);
+    // result[i] = y[i + seasonalPeriod] - y[i]  =>  vectorSubtract(a, b, out, count)
+    anomaly::simd::vectorSubtract(&y[seasonalPeriod], &y[0], result.data(), n);
     return result;
 }
 
@@ -29,10 +45,10 @@ std::vector<double> SeasonalForecaster::regularDifference(const std::vector<doub
         return {};
     }
 
-    std::vector<double> result(y.size() - 1);
-    for (size_t i = 0; i < result.size(); ++i) {
-        result[i] = y[i + 1] - y[i];
-    }
+    const size_t n = y.size() - 1;
+    std::vector<double> result(n);
+    // result[i] = y[i + 1] - y[i]  =>  vectorSubtract(a, b, out, count)
+    anomaly::simd::vectorSubtract(&y[1], &y[0], result.data(), n);
     return result;
 }
 
@@ -103,11 +119,62 @@ double SeasonalForecaster::autoCorrelation(
         return 0.0;
     }
 
+    const size_t n = y.size();
+    const size_t count = n - lag;
     double sum = 0.0;
-    size_t n = y.size();
 
-    for (size_t i = 0; i < n - lag; ++i) {
-        sum += (y[i] - mean) * (y[i + lag] - mean);
+#if !TSDB_ANOMALY_DISABLE_SIMD
+    if (anomaly::simd::isAvx2Available() && count >= 16) {
+        // AVX2 path: 4 accumulators to hide FMA latency (4-cycle throughput)
+        const double* py   = y.data();
+        const double* pyL  = y.data() + lag;
+        __m256d vMean = _mm256_set1_pd(mean);
+        __m256d acc0  = _mm256_setzero_pd();
+        __m256d acc1  = _mm256_setzero_pd();
+        __m256d acc2  = _mm256_setzero_pd();
+        __m256d acc3  = _mm256_setzero_pd();
+
+        const size_t simd_end = count & ~size_t(15);  // round down to multiple of 16
+
+        for (size_t i = 0; i < simd_end; i += 16) {
+            // Block 0: i..i+3
+            __m256d a0 = _mm256_sub_pd(_mm256_loadu_pd(py  + i),      vMean);
+            __m256d b0 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i),      vMean);
+            acc0 = _mm256_fmadd_pd(a0, b0, acc0);
+
+            // Block 1: i+4..i+7
+            __m256d a1 = _mm256_sub_pd(_mm256_loadu_pd(py  + i + 4),  vMean);
+            __m256d b1 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 4),  vMean);
+            acc1 = _mm256_fmadd_pd(a1, b1, acc1);
+
+            // Block 2: i+8..i+11
+            __m256d a2 = _mm256_sub_pd(_mm256_loadu_pd(py  + i + 8),  vMean);
+            __m256d b2 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 8),  vMean);
+            acc2 = _mm256_fmadd_pd(a2, b2, acc2);
+
+            // Block 3: i+12..i+15
+            __m256d a3 = _mm256_sub_pd(_mm256_loadu_pd(py  + i + 12), vMean);
+            __m256d b3 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 12), vMean);
+            acc3 = _mm256_fmadd_pd(a3, b3, acc3);
+        }
+
+        // Reduce 4 accumulators -> 1
+        acc0 = _mm256_add_pd(acc0, acc1);
+        acc2 = _mm256_add_pd(acc2, acc3);
+        acc0 = _mm256_add_pd(acc0, acc2);
+        sum = hsum_avx_local(acc0);
+
+        // Scalar remainder
+        for (size_t i = simd_end; i < count; ++i) {
+            sum += (py[i] - mean) * (pyL[i] - mean);
+        }
+    } else
+#endif
+    {
+        // Scalar fallback
+        for (size_t i = 0; i < count; ++i) {
+            sum += (y[i] - mean) * (y[i + lag] - mean);
+        }
     }
 
     return sum / (static_cast<double>(n) * variance);
@@ -122,6 +189,12 @@ std::vector<double> SeasonalForecaster::levinsonDurbin(
 
     if (order == 0 || r.size() <= order) {
         return {};
+    }
+
+    // Guard: zero variance (constant input) — autocorrelations are undefined.
+    // Return all-zero AR coefficients so the AR forecast degenerates to the mean.
+    if (!(std::abs(r[0]) > 1e-10)) {
+        return std::vector<double>(order, 0.0);
     }
 
     std::vector<double> phi(order, 0.0);  // AR coefficients
@@ -144,8 +217,8 @@ std::vector<double> SeasonalForecaster::levinsonDurbin(
 
         double lambda = num / v;
 
-        // Update coefficients
-        phiPrev = phi;
+        // Update coefficients (swap instead of copy)
+        std::swap(phi, phiPrev);
         phi[k] = lambda;
 
         for (size_t j = 0; j < k; ++j) {
@@ -170,7 +243,7 @@ std::vector<double> SeasonalForecaster::fitARCoefficients(
     double mean = anomaly::simd::vectorMean(y.data(), y.size());
     double variance = anomaly::simd::vectorVariance(y.data(), y.size(), mean);
 
-    if (variance < 1e-10) {
+    if (!(variance > 1e-10)) {  // catches NaN and values <= 1e-10
         return std::vector<double>(order, 0.0);
     }
 
@@ -196,7 +269,7 @@ std::vector<double> SeasonalForecaster::fitSeasonalARCoefficients(
     double mean = anomaly::simd::vectorMean(y.data(), y.size());
     double variance = anomaly::simd::vectorVariance(y.data(), y.size(), mean);
 
-    if (variance < 1e-10) {
+    if (!(variance > 1e-10)) {  // catches NaN and values <= 1e-10
         return std::vector<double>(order, 0.0);
     }
 
@@ -315,7 +388,7 @@ size_t SeasonalForecaster::detectSeasonalPeriod(
     double mean = anomaly::simd::vectorMean(y.data(), y.size());
     double variance = anomaly::simd::vectorVariance(y.data(), y.size(), mean);
 
-    if (variance < 1e-10) {
+    if (!(variance > 1e-10)) {  // catches NaN and values <= 1e-10
         return 0;
     }
 
@@ -348,6 +421,21 @@ ForecastOutput SeasonalForecaster::forecast(
 
     if (n < config.minDataPoints) {
         return output;
+    }
+
+    // Guard: if all input values are NaN there is nothing to fit.
+    // Skip the check if n is large by short-circuiting on the first finite value.
+    {
+        bool hasFinite = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::isfinite(input.values[i])) {
+                hasFinite = true;
+                break;
+            }
+        }
+        if (!hasFinite) {
+            return output;
+        }
     }
 
     output.historicalCount = n;
@@ -447,7 +535,9 @@ ForecastOutput SeasonalForecaster::forecast(
 
     // Generate forecasts on differenced scale
     std::vector<double> diffForecasts(nForecast);
-    std::vector<double> yExtended = y;
+    std::vector<double> yExtended;
+    yExtended.reserve(y.size() + nForecast);
+    yExtended = y;
 
     for (size_t i = 0; i < nForecast; ++i) {
         double fc = arForecast(yExtended, arCoeffs, 0.0);  // mean=0 for differenced data
@@ -478,15 +568,17 @@ ForecastOutput SeasonalForecaster::forecast(
     output.upper.resize(nForecast);
     output.lower.resize(nForecast);
 
-    double residualVariance = estimateForecastVariance(y, arCoeffs, 0.0, 1);
-    output.residualStdDev = std::sqrt(residualVariance);
+    // Compute base residual variance once (avoid recomputing SSE per point)
+    double baseVariance = estimateForecastVariance(y, arCoeffs, 0.0, 1);
+    output.residualStdDev = std::sqrt(baseVariance);
 
     for (size_t i = 0; i < nForecast; ++i) {
         output.forecast[i] = finalForecasts[i];
 
-        // Prediction interval width grows with horizon
-        double horizonVariance = estimateForecastVariance(y, arCoeffs, 0.0, i + 1);
-        double width = config.deviations * std::sqrt(horizonVariance);
+        // Scale variance by horizon factor (same formula as estimateForecastVariance
+        // but without recomputing SSE each time)
+        double horizonFactor = 1.0 + 0.5 * std::log(1.0 + (i + 1));
+        double width = config.deviations * std::sqrt(baseVariance * horizonFactor);
 
         output.upper[i] = finalForecasts[i] + width;
         output.lower[i] = finalForecasts[i] - width;
@@ -498,7 +590,7 @@ ForecastOutput SeasonalForecaster::forecast(
         anomaly::simd::vectorMean(input.values.data(), input.values.size())
     );
     if (totalVar > 1e-10) {
-        output.rSquared = 1.0 - residualVariance / totalVar;
+        output.rSquared = 1.0 - baseVariance / totalVar;
         output.rSquared = std::max(0.0, output.rSquared);
     }
 
@@ -516,6 +608,20 @@ ForecastOutput SeasonalForecaster::forecastMSTL(
 
     if (n < config.minDataPoints) {
         return output;
+    }
+
+    // Guard: reject all-NaN input to prevent NaN propagation.
+    {
+        bool hasFinite = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::isfinite(input.values[i])) {
+                hasFinite = true;
+                break;
+            }
+        }
+        if (!hasFinite) {
+            return output;
+        }
     }
 
     output.historicalCount = n;
@@ -580,38 +686,69 @@ ForecastOutput SeasonalForecaster::forecastMSTL(
     std::vector<double> combinedSeasonal(nForecast, 0.0);
     for (size_t i = 0; i < mstl.seasonals.size(); ++i) {
         auto sf = extrapolateSeasonal(mstl.seasonals[i], mstl.periods[i], nForecast);
-        for (size_t j = 0; j < nForecast; ++j) {
-            combinedSeasonal[j] += sf[j];
-        }
+        // SIMD: accumulate seasonal component into combined vector
+        anomaly::simd::vectorAdd(combinedSeasonal.data(), sf.data(),
+                                 combinedSeasonal.data(), nForecast);
     }
 
-    // Combine forecasts
+    // Combine forecasts: forecast = trend + combinedSeasonal (SIMD)
     output.forecast.resize(nForecast);
-    for (size_t i = 0; i < nForecast; ++i) {
-        output.forecast[i] = trendForecast[i] + combinedSeasonal[i];
-    }
+    anomaly::simd::vectorAdd(trendForecast.data(), combinedSeasonal.data(),
+                             output.forecast.data(), nForecast);
 
-    // Compute confidence bounds from residual variance
+    // Compute confidence bounds from residual variance (SIMD)
     double residualStdDev = 0.0;
     if (!mstl.residual.empty()) {
-        double mean = 0.0;
-        for (double r : mstl.residual) mean += r;
-        mean /= mstl.residual.size();
-        for (double r : mstl.residual) {
-            residualStdDev += (r - mean) * (r - mean);
-        }
-        residualStdDev = std::sqrt(residualStdDev / mstl.residual.size());
+        double mean = anomaly::simd::vectorMean(mstl.residual.data(),
+                                                 mstl.residual.size());
+        double sumSqDiff = anomaly::simd::vectorSumSquaredDiff(
+            mstl.residual.data(), mstl.residual.size(), mean);
+        residualStdDev = std::sqrt(sumSqDiff / mstl.residual.size());
     }
 
     output.residualStdDev = residualStdDev;
     output.upper.resize(nForecast);
     output.lower.resize(nForecast);
 
-    for (size_t i = 0; i < nForecast; ++i) {
-        double width = config.deviations * residualStdDev * std::sqrt(1.0 + static_cast<double>(i) / n);
-        output.upper[i] = output.forecast[i] + width;
-        output.lower[i] = output.forecast[i] - width;
+    // Pre-compute per-point scale for computeBounds:
+    //   scale[i] = residualStdDev * sqrt(1 + i/n)
+    // Then computeBounds does: upper[i] = forecast[i] + deviations * scale[i]
+    std::vector<double> boundsScale(nForecast);
+    {
+        const double invN = 1.0 / static_cast<double>(n);
+#if !TSDB_ANOMALY_DISABLE_SIMD
+        if (anomaly::simd::isAvx2Available() && nForecast >= 4) {
+            __m256d vInvN = _mm256_set1_pd(invN);
+            __m256d vStd  = _mm256_set1_pd(residualStdDev);
+            __m256d vOne  = _mm256_set1_pd(1.0);
+            const size_t simd_end = nForecast & ~size_t(3);
+            for (size_t i = 0; i < simd_end; i += 4) {
+                __m256d vIdx = _mm256_set_pd(
+                    static_cast<double>(i + 3),
+                    static_cast<double>(i + 2),
+                    static_cast<double>(i + 1),
+                    static_cast<double>(i));
+                // sqrt(1.0 + i / n)
+                __m256d inner = _mm256_fmadd_pd(vIdx, vInvN, vOne);
+                __m256d sq    = _mm256_sqrt_pd(inner);
+                __m256d sc    = _mm256_mul_pd(vStd, sq);
+                _mm256_storeu_pd(&boundsScale[i], sc);
+            }
+            for (size_t i = simd_end; i < nForecast; ++i) {
+                boundsScale[i] = residualStdDev * std::sqrt(1.0 + static_cast<double>(i) * invN);
+            }
+        } else
+#endif
+        {
+            for (size_t i = 0; i < nForecast; ++i) {
+                boundsScale[i] = residualStdDev * std::sqrt(1.0 + static_cast<double>(i) * invN);
+            }
+        }
     }
+    // SIMD-optimized bounds: upper = forecast + deviations*scale, lower = forecast - deviations*scale
+    anomaly::simd::computeBounds(output.forecast.data(), boundsScale.data(),
+                                  config.deviations, output.upper.data(),
+                                  output.lower.data(), nForecast);
 
     return output;
 }

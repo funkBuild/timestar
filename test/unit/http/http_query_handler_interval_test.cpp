@@ -100,6 +100,50 @@ TEST_F(HttpQueryHandlerIntervalTest, SmallestOverflowingSeconds) {
     EXPECT_THROW(HttpQueryHandler::parseInterval("18446744074s"), QueryParseException);
 }
 
+// ---- NaN / Inf / non-finite inputs ----
+// These must throw QueryParseException, not propagate std::out_of_range or
+// std::invalid_argument from std::stod, and must never invoke
+// static_cast<uint64_t> on a non-finite value (undefined behavior).
+
+// "nan" and "inf" start with a non-digit letter so the numeric parser rejects
+// them immediately; verify they produce a proper QueryParseException.
+TEST_F(HttpQueryHandlerIntervalTest, NanStringThrowsQueryParseException) {
+    EXPECT_THROW(HttpQueryHandler::parseInterval("nan"), QueryParseException);
+}
+
+TEST_F(HttpQueryHandlerIntervalTest, InfStringThrowsQueryParseException) {
+    EXPECT_THROW(HttpQueryHandler::parseInterval("inf"), QueryParseException);
+}
+
+TEST_F(HttpQueryHandlerIntervalTest, NegInfStringThrowsQueryParseException) {
+    EXPECT_THROW(HttpQueryHandler::parseInterval("-inf"), QueryParseException);
+}
+
+// "1.5e999" — the 'e' stops the digit parser so the unit becomes "e999";
+// that is an unknown unit and must throw QueryParseException.
+TEST_F(HttpQueryHandlerIntervalTest, ScientificNotationOverflowThrowsQueryParseException) {
+    EXPECT_THROW(HttpQueryHandler::parseInterval("1.5e999"), QueryParseException);
+}
+
+// A decimal value whose digit string is so long that std::stod throws
+// std::out_of_range.  The parseInterval function must catch that and convert
+// it to QueryParseException instead of letting std::out_of_range escape.
+TEST_F(HttpQueryHandlerIntervalTest, HugeDecimalSecondsThrowsQueryParseException) {
+    // 400 nines followed by ".0s" — the loop accepts all digits and the single
+    // dot, producing valueStr="99...99.0" and unit="s".  std::stod on that
+    // many significant digits overflows and throws std::out_of_range, which
+    // must be converted to QueryParseException by parseInterval.
+    std::string huge = std::string(400, '9') + ".0s";
+    EXPECT_THROW(HttpQueryHandler::parseInterval(huge), QueryParseException);
+}
+
+// A lone decimal point followed by a valid unit: the numeric part is "."
+// which is not a valid number for std::stod (throws std::invalid_argument).
+// parseInterval must convert that to QueryParseException.
+TEST_F(HttpQueryHandlerIntervalTest, DotOnlyDecimalThrowsQueryParseException) {
+    EXPECT_THROW(HttpQueryHandler::parseInterval(".s"), QueryParseException);
+}
+
 // ---- Invalid formats ----
 
 TEST_F(HttpQueryHandlerIntervalTest, EmptyStringThrows) {

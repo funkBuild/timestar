@@ -1,8 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
-import { fetchMeasurements, fetchFields, fetchTags, runQuery } from './api';
+import { fetchMeasurements, fetchFields, fetchTags, runQuery, runDerivedQuery } from './api';
 import QueryForm from './QueryForm';
 import ResultsTable from './ResultsTable';
+import DerivedQueryForm from './DerivedQueryForm';
+import DerivedResultsTable from './DerivedResultsTable';
+import AnomalyQueryForm from './AnomalyQueryForm';
+import AnomalyResultsTable from './AnomalyResultsTable';
+import ForecastQueryForm from './ForecastQueryForm';
+import ForecastResultsTable from './ForecastResultsTable';
 import './App.css';
+
+const QUERY_MODES = ['standard', 'derived', 'anomaly', 'forecast'];
 
 function defaultTimeRange() {
   const now = Date.now() * 1_000_000;
@@ -24,6 +32,7 @@ function buildQueryString(aggregation, measurement, selectedFields, selectedScop
 }
 
 export default function App() {
+  const [queryMode, setQueryMode] = useState('standard');
   const [measurements, setMeasurements] = useState([]);
   const [selectedMeasurement, setSelectedMeasurement] = useState('');
   const [fields, setFields] = useState({});
@@ -41,14 +50,12 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // Fetch measurements on mount
   useEffect(() => {
     fetchMeasurements()
       .then(setMeasurements)
       .catch((e) => setError(e.message));
   }, []);
 
-  // When measurement changes, fetch fields + tags
   useEffect(() => {
     if (!selectedMeasurement) {
       setFields({});
@@ -102,12 +109,7 @@ export default function App() {
       if (intervalValue && Number(intervalValue) > 0) {
         aggregationInterval = `${intervalValue}${intervalUnit}`;
       }
-      const data = await runQuery({
-        query: queryString,
-        startTime,
-        endTime,
-        aggregationInterval,
-      });
+      const data = await runQuery({ query: queryString, startTime, endTime, aggregationInterval });
       setResults(data);
     } catch (e) {
       setError(e.message);
@@ -117,6 +119,26 @@ export default function App() {
     }
   }, [selectedMeasurement, queryString, startTime, endTime, intervalValue, intervalUnit]);
 
+  const handleDerivedSubmit = useCallback(async ({ queries, formula, startTime: st, endTime: et, aggregationInterval }) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await runDerivedQuery({ queries, formula, startTime: st, endTime: et, aggregationInterval });
+      setResults(data);
+    } catch (e) {
+      setError(e.message);
+      setResults(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const handleModeChange = useCallback((mode) => {
+    setQueryMode(mode);
+    setResults(null);
+    setError(null);
+  }, []);
+
   return (
     <>
       <header className="app-header">
@@ -124,37 +146,63 @@ export default function App() {
       </header>
       <div className="app-body">
         <div className="pane-left">
-          <QueryForm
-            measurements={measurements}
-            selectedMeasurement={selectedMeasurement}
-            onMeasurementChange={setSelectedMeasurement}
-            fields={fields}
-            selectedFields={selectedFields}
-            onFieldToggle={toggleField}
-            tags={tags}
-            selectedScopes={selectedScopes}
-            onScopeToggle={toggleScope}
-            tagKeys={tagKeys}
-            selectedGroupBy={selectedGroupBy}
-            onGroupByToggle={toggleGroupBy}
-            aggregation={aggregation}
-            onAggregationChange={setAggregation}
-            startTime={startTime}
-            endTime={endTime}
-            onStartTimeChange={setStartTime}
-            onEndTimeChange={setEndTime}
-            intervalValue={intervalValue}
-            intervalUnit={intervalUnit}
-            onIntervalValueChange={setIntervalValue}
-            onIntervalUnitChange={setIntervalUnit}
-            onSubmit={handleSubmit}
-            loading={loading}
-            queryString={queryString}
-          />
+          <div className="query-tabs">
+            {QUERY_MODES.map((mode) => (
+              <button
+                key={mode}
+                className={`query-tab${queryMode === mode ? ' active' : ''}`}
+                onClick={() => handleModeChange(mode)}
+              >
+                {mode.charAt(0).toUpperCase() + mode.slice(1)}
+              </button>
+            ))}
+          </div>
+
+          {queryMode === 'standard' && (
+            <QueryForm
+              measurements={measurements}
+              selectedMeasurement={selectedMeasurement}
+              onMeasurementChange={setSelectedMeasurement}
+              fields={fields}
+              selectedFields={selectedFields}
+              onFieldToggle={toggleField}
+              tags={tags}
+              selectedScopes={selectedScopes}
+              onScopeToggle={toggleScope}
+              tagKeys={tagKeys}
+              selectedGroupBy={selectedGroupBy}
+              onGroupByToggle={toggleGroupBy}
+              aggregation={aggregation}
+              onAggregationChange={setAggregation}
+              startTime={startTime}
+              endTime={endTime}
+              onStartTimeChange={setStartTime}
+              onEndTimeChange={setEndTime}
+              intervalValue={intervalValue}
+              intervalUnit={intervalUnit}
+              onIntervalValueChange={setIntervalValue}
+              onIntervalUnitChange={setIntervalUnit}
+              onSubmit={handleSubmit}
+              loading={loading}
+              queryString={queryString}
+            />
+          )}
+          {queryMode === 'derived' && (
+            <DerivedQueryForm measurements={measurements} onSubmit={handleDerivedSubmit} loading={loading} />
+          )}
+          {queryMode === 'anomaly' && (
+            <AnomalyQueryForm measurements={measurements} onSubmit={handleDerivedSubmit} loading={loading} />
+          )}
+          {queryMode === 'forecast' && (
+            <ForecastQueryForm measurements={measurements} onSubmit={handleDerivedSubmit} loading={loading} />
+          )}
         </div>
         <div className="pane-right">
           {error && <div className="error-banner">{error}</div>}
-          <ResultsTable results={results} loading={loading} />
+          {queryMode === 'standard' && <ResultsTable results={results} loading={loading} />}
+          {queryMode === 'derived' && <DerivedResultsTable results={results} loading={loading} />}
+          {queryMode === 'anomaly' && <AnomalyResultsTable results={results} loading={loading} />}
+          {queryMode === 'forecast' && <ForecastResultsTable results={results} loading={loading} />}
         </div>
       </div>
     </>
