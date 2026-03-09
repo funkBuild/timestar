@@ -17,7 +17,7 @@
 #include "tsm_writer.hpp"
 #include "tsm_result.hpp"
 #include "series_id.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 #include "series_compaction_data.hpp"  // Phase 3: Parallel series processing
 #include "retention_policy.hpp"
 #include "query_parser.hpp"  // AggregationMethod enum
@@ -34,7 +34,7 @@ struct CompactionStats {
     uint64_t pointsRead = 0;
     uint64_t pointsWritten = 0;
     uint64_t duplicatesRemoved = 0;
-    std::chrono::milliseconds duration;
+    std::chrono::milliseconds duration{0};
 };
 
 // Represents a plan for compacting a set of TSM files
@@ -218,27 +218,27 @@ public:
 class TSMCompactor {
 private:
     // Compaction limits and thresholds — read from TOML config at runtime.
-    static size_t maxConcurrentCompactions() { return tsdb::config().storage.compaction.max_concurrent; }
-    static size_t maxMemoryPerCompaction() { return tsdb::config().storage.compaction.max_memory; }
-    static size_t batchSize() { return tsdb::config().storage.compaction.batch_size; }
-    static size_t tier0MinFiles() { return tsdb::config().storage.compaction.tier0_min_files; }
-    static size_t tier1MinFiles() { return tsdb::config().storage.compaction.tier1_min_files; }
-    static size_t tier2MinFiles() { return tsdb::config().storage.compaction.tier2_min_files; }
+    static size_t maxConcurrentCompactions() { return timestar::config().storage.compaction.max_concurrent; }
+    static size_t maxMemoryPerCompaction() { return timestar::config().storage.compaction.max_memory; }
+    static size_t batchSize() { return timestar::config().storage.compaction.batch_size; }
+    static size_t tier0MinFiles() { return timestar::config().storage.compaction.tier0_min_files; }
+    static size_t tier1MinFiles() { return timestar::config().storage.compaction.tier1_min_files; }
+    static size_t tier2MinFiles() { return timestar::config().storage.compaction.tier2_min_files; }
     
     TSMFileManager* fileManager;
     std::unique_ptr<CompactionStrategy> strategy;
     CompactionStats lastCompactStats;  // Stats from the most recent compact() call
     seastar::semaphore compactionSemaphore{2};  // Re-initialized in constructor from config
-    std::atomic<bool> compactionEnabled{true};
+    bool compactionEnabled{true};
 
-    // Per-series retention context populated during compact(), consumed by processSeriesForCompaction
+    // Per-series retention context built in compact(), passed to processSeriesForCompaction
     struct SeriesRetentionContext {
         uint64_t ttlCutoff = 0;         // Points with ts < ttlCutoff are expired
         uint64_t downsampleThreshold = 0; // Points with ts < threshold get downsampled
         uint64_t downsampleInterval = 0;  // Bucket size in nanoseconds
-        tsdb::AggregationMethod downsampleMethod = tsdb::AggregationMethod::AVG;
+        timestar::AggregationMethod downsampleMethod = timestar::AggregationMethod::AVG;
     };
-    std::unordered_map<SeriesId128, SeriesRetentionContext, SeriesId128::Hash> _seriesRetention;
+    using SeriesRetentionMap = std::unordered_map<SeriesId128, SeriesRetentionContext, SeriesId128::Hash>;
 
     // Pending retention context set by Engine before compaction
     std::unordered_map<std::string, RetentionPolicy> _pendingRetentionPolicies;
@@ -281,7 +281,8 @@ private:
     template<typename T>
     seastar::future<SeriesCompactionData<T>> processSeriesForCompaction(
         const SeriesId128& seriesId,
-        const std::vector<seastar::shared_ptr<TSM>>& sources);
+        const std::vector<seastar::shared_ptr<TSM>>& sources,
+        const SeriesRetentionMap& seriesRetention);
 
     // Phase 3: Write pre-processed series data to TSMWriter
     template<typename T>
@@ -379,9 +380,10 @@ public:
 // Leveled compaction strategy - similar to Cassandra/RocksDB
 class LeveledCompactionStrategy : public CompactionStrategy {
 private:
-    static constexpr size_t MIN_FILES_PER_TIER[4] = {4, 4, 4, 8};
-    static constexpr size_t MAX_FILES_PER_TIER[4] = {8, 8, 8, 16};
-    static constexpr size_t MAX_BYTES_PER_TIER[4] = {
+    static constexpr size_t NUM_TIERS = 4;
+    static constexpr size_t MIN_FILES_PER_TIER[NUM_TIERS] = {4, 4, 4, 8};
+    static constexpr size_t MAX_FILES_PER_TIER[NUM_TIERS] = {8, 8, 8, 16};
+    static constexpr size_t MAX_BYTES_PER_TIER[NUM_TIERS] = {
         100 * 1024 * 1024,   // 100MB for tier 0
         1024 * 1024 * 1024,  // 1GB for tier 1
         10L * 1024 * 1024 * 1024,  // 10GB for tier 2
@@ -390,7 +392,7 @@ private:
     
 public:
     bool shouldCompact(uint64_t tier, size_t fileCount, size_t totalSize) const override {
-        if (tier >= 4) return false;
+        if (tier >= NUM_TIERS) return false;
         
         return fileCount >= MIN_FILES_PER_TIER[tier] ||
                totalSize >= MAX_BYTES_PER_TIER[tier];
@@ -399,22 +401,24 @@ public:
     std::vector<seastar::shared_ptr<TSM>> selectFiles(
         const std::vector<seastar::shared_ptr<TSM>>& availableFiles,
         uint64_t tier) const override {
-        
+
+        if (tier >= NUM_TIERS) return {};
+
         std::vector<seastar::shared_ptr<TSM>> selected;
-        
+
         // Filter files by tier
         for (const auto& file : availableFiles) {
             if (file->tierNum == tier) {
                 selected.push_back(file);
             }
         }
-        
+
         // Sort by sequence number (oldest first)
         std::sort(selected.begin(), selected.end(),
                  [](const auto& a, const auto& b) {
                      return a->seqNum < b->seqNum;
                  });
-        
+
         // Take up to MAX_FILES_PER_TIER files
         if (selected.size() > MAX_FILES_PER_TIER[tier]) {
             selected.resize(MAX_FILES_PER_TIER[tier]);
@@ -424,6 +428,7 @@ public:
     }
     
     uint64_t getTargetTier(uint64_t sourceTier, size_t fileCount) const override {
+        if (sourceTier >= NUM_TIERS) return sourceTier;
         // Promote to next tier if we're compacting enough files
         if (fileCount >= MIN_FILES_PER_TIER[sourceTier] && sourceTier < 3) {
             return sourceTier + 1;

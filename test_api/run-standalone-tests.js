@@ -78,7 +78,7 @@ const options = {
   method: 'GET'
 };
 
-console.log('Checking if TSDB server is running...');
+console.log('Checking if TimeStar server is running...');
 
 const req = http.request(options, (res) => {
   if (res.statusCode === 200) {
@@ -92,8 +92,8 @@ const req = http.request(options, (res) => {
 
 req.on('error', (e) => {
   console.error('✗ Cannot connect to server on port 8086');
-  console.error('Please start the TSDB server first:');
-  console.error('  cd build && ./bin/tsdb_http_server');
+  console.error('Please start the TimeStar server first:');
+  console.error('  cd build && ./bin/timestar_http_server');
   process.exit(1);
 });
 

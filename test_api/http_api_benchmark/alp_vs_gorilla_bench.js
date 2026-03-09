@@ -2,7 +2,7 @@
 /**
  * ALP vs Gorilla Insert & Query Performance Benchmark
  *
- * Run against the TSDB HTTP server to measure end-to-end insert and query
+ * Run against the TimeStar HTTP server to measure end-to-end insert and query
  * performance. Execute once with ALP build and once with Gorilla build,
  * then compare results.
  *
@@ -17,7 +17,7 @@
 const axios = require('axios');
 const { performance } = require('perf_hooks');
 
-const BASE_URL = process.env.TSDB_URL || 'http://localhost:8086';
+const BASE_URL = process.env.TIMESTAR_URL || 'http://localhost:8086';
 const LABEL = process.argv[2] || 'UNKNOWN';
 
 // ── Configuration ──────────────────────────────────────────────────
@@ -220,7 +220,7 @@ async function benchmarkQueries() {
 
 async function main() {
   console.log('='.repeat(70));
-  console.log(` TSDB Insert & Query Benchmark  [${LABEL}]`);
+  console.log(` TimeStar Insert & Query Benchmark  [${LABEL}]`);
   console.log('='.repeat(70));
   console.log(`Server:       ${BASE_URL}`);
   console.log(`Measurement:  ${MEASUREMENT}`);

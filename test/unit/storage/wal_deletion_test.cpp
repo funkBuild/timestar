@@ -10,7 +10,7 @@
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/wal_file_manager.hpp"
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../seastar_gtest.hpp"
 
 namespace fs = std::filesystem;
@@ -59,12 +59,12 @@ seastar::future<> test_partial_field_deletion_does_not_corrupt_other_fields() {
         uint64_t timestamp = 1704067700000000000ULL;
 
         // Insert fieldA
-        TSDBInsert<double> insertA("simple", "fieldA");
+        TimeStarInsert<double> insertA("simple", "fieldA");
         insertA.addTag("id", "test1");
         insertA.addValue(timestamp, 100.0);
 
         // Insert fieldB
-        TSDBInsert<double> insertB("simple", "fieldB");
+        TimeStarInsert<double> insertB("simple", "fieldB");
         insertB.addTag("id", "test1");
         insertB.addValue(timestamp, 200.0);
 
@@ -119,11 +119,11 @@ seastar::future<> test_wal_replay_preserves_partial_field_deletion() {
         try {
             co_await engine.init();
 
-            TSDBInsert<double> insertA("simple", "fieldA");
+            TimeStarInsert<double> insertA("simple", "fieldA");
             insertA.addTag("id", "test1");
             insertA.addValue(timestamp, 100.0);
 
-            TSDBInsert<double> insertB("simple", "fieldB");
+            TimeStarInsert<double> insertB("simple", "fieldB");
             insertB.addTag("id", "test1");
             insertB.addValue(timestamp, 200.0);
 
@@ -151,10 +151,10 @@ seastar::future<> test_wal_replay_preserves_partial_field_deletion() {
         try {
             co_await engine2.init(); // This should replay the WAL
 
-            TSDBInsert<double> insertA("simple", "fieldA");
+            TimeStarInsert<double> insertA("simple", "fieldA");
             insertA.addTag("id", "test1");
 
-            TSDBInsert<double> insertB("simple", "fieldB");
+            TimeStarInsert<double> insertB("simple", "fieldB");
             insertB.addTag("id", "test1");
 
             auto resultA = co_await safeQuery(engine2, insertA.seriesKey(), timestamp, timestamp);

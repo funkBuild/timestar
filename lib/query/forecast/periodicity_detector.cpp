@@ -1,27 +1,18 @@
 #include "periodicity_detector.hpp"
 #include "../anomaly/simd_anomaly.hpp"
+#include "../simd_helpers.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
 #include <limits>
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
-#include <immintrin.h>
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
+using timestar::simd::hsum_avx;
+static inline double hsum_avx_local(__m256d v) { return hsum_avx(v); }
 #endif
 
-// Local hsum helper (mirrors the one in stl_decomposition.cpp / simd_anomaly.cpp).
-#if !TSDB_ANOMALY_DISABLE_SIMD
-static inline double hsum_avx_local(__m256d v) {
-    __m128d vlow  = _mm256_castpd256_pd128(v);
-    __m128d vhigh = _mm256_extractf128_pd(v, 1);
-    vlow = _mm_add_pd(vlow, vhigh);
-    __m128d high64 = _mm_unpackhi_pd(vlow, vlow);
-    return _mm_cvtsd_f64(_mm_add_sd(vlow, high64));
-}
-#endif
-
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 namespace {
@@ -46,7 +37,7 @@ std::vector<double> PeriodicityDetector::detrend(const std::vector<double>& y) {
     double numerator = 0.0;
     double denominator = 0.0;
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
         // AVX2 path: 4 accumulators to hide FMA latency
         __m256d vMeanX = _mm256_set1_pd(meanX);
@@ -138,7 +129,7 @@ std::vector<double> PeriodicityDetector::detrend(const std::vector<double>& y) {
     // Subtract linear trend
     std::vector<double> detrended(n);
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
         // AVX2 path: result[i] = y[i] - intercept - slope * i
         __m256d vSlope     = _mm256_set1_pd(slope);
@@ -302,7 +293,7 @@ std::vector<double> PeriodicityDetector::computePeriodogram(const std::vector<do
     const size_t numBins = X.size();
     std::vector<double> periodogram(numBins);
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && numBins >= 8) {
         // AVX2 path: std::complex<double> is layout-compatible with double[2],
         // so X is stored as {re0, im0, re1, im1, re2, im2, ...} in memory.
@@ -376,6 +367,13 @@ std::vector<size_t> PeriodicityDetector::findPeaks(
             periodogram[i] >= threshold) {
             peaks.push_back(i);
         }
+    }
+
+    // Check the last bin (can be a peak if it exceeds its left neighbor)
+    size_t last = periodogram.size() - 1;
+    if (periodogram[last] > periodogram[last - 1] &&
+        periodogram[last] >= threshold) {
+        peaks.push_back(last);
     }
 
     return peaks;
@@ -459,7 +457,7 @@ double PeriodicityDetector::autoCorrelation(
     const size_t count = n - lag;
     double autocovariance = 0.0;
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && count >= 16) {
         // AVX2 path: 4 accumulators to hide FMA latency
         const double* pyL = py + lag;
@@ -718,4 +716,4 @@ size_t PeriodicityDetector::detectBestPeriod(
 }
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar

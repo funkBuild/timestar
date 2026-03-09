@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -97,7 +98,7 @@ inline BlockHeader readBlockHeader(Slice &s) {
 void encodeBlock(const uint64_t *values, size_t count, AlignedBuffer &buf,
                  uint64_t min_val, uint64_t max_val) {
     // ---- Fast path: all values identical (min == max) ----
-    // This is the most common case for constant-interval TSDB timestamps,
+    // This is the most common case for constant-interval TimeStar timestamps,
     // where delta-of-delta produces all zeros from index 2 onward.
     // Skip histogram, suffix sum, bit-width search, clean array, and FFOR pack.
     // Just emit a 2-word header: bw=0, exc_count=0, base=min_val.
@@ -245,6 +246,13 @@ size_t decodeBlockInto(Slice &s, uint64_t* out) {
             "Corrupt FFOR block: bit_width > 64 (implies max_val < min_val)");
     }
 
+    // Validate block_count: cannot exceed the buffer size (BLOCK_SIZE = 1024).
+    if (hdr.block_count > IntegerEncoderFFOR::BLOCK_SIZE) [[unlikely]] {
+        throw std::runtime_error(
+            "Corrupt FFOR block: block_count (" + std::to_string(hdr.block_count) +
+            ") exceeds BLOCK_SIZE (" + std::to_string(IntegerEncoderFFOR::BLOCK_SIZE) + ")");
+    }
+
     // Validate exception count: cannot exceed the number of values in the block.
     if (hdr.exc_count > hdr.block_count) [[unlikely]] {
         throw std::runtime_error(
@@ -269,7 +277,14 @@ size_t decodeBlockInto(Slice &s, uint64_t* out) {
         const uint8_t* packed_ptr = s.data + s.offset;
         s.offset += packed_bytes;
 
-        alp::ffor_unpack_u64(reinterpret_cast<const uint64_t*>(packed_ptr),
+        // Copy to an aligned stack buffer — the source slice may not be 8-byte
+        // aligned, and reinterpret_cast<const uint64_t*> on unaligned data
+        // is UB (crashes with SIGBUS on ARM / Graviton).
+        // Max packed_words = ceil(BLOCK_SIZE * 64 / 64) = BLOCK_SIZE = 1024 (8KB stack).
+        alignas(8) uint64_t aligned_packed[IntegerEncoderFFOR::BLOCK_SIZE];
+        std::memcpy(aligned_packed, packed_ptr, packed_bytes);
+
+        alp::ffor_unpack_u64(aligned_packed,
                              hdr.block_count, hdr.base,
                              hdr.bw, out);
     }
@@ -311,6 +326,12 @@ size_t decodeBlockInto(Slice &s, uint64_t* out) {
             const size_t count = remaining < 4 ? remaining : 4;
             for (size_t j = 0; j < count; ++j) {
                 uint16_t pos = static_cast<uint16_t>((word >> (j * 16)) & 0xFFFF);
+                if (pos >= hdr.block_count) [[unlikely]] {
+                    throw std::runtime_error(
+                        "Corrupt FFOR block: exception position (" +
+                        std::to_string(pos) + ") >= block_count (" +
+                        std::to_string(hdr.block_count) + ")");
+                }
                 uint64_t val;
                 std::memcpy(&val, val_ptr + (base_idx + j) * sizeof(uint64_t), sizeof(uint64_t));
                 out[pos] = val;
@@ -464,15 +485,17 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer &buf) {
 
         // Scalar tail for remaining values in this block
         for (; zz_idx < block_count && val_idx < sz; ++zz_idx, ++val_idx) {
-            uint64_t zz;
             if (val_idx < 2) {
                 // This handles the edge case where block_count <= 2 and we're
-                // still in the first two values (already handled above, but guard)
+                // still in the first two values (already handled above, but guard).
+                // Decrement zz_idx so the loop increment doesn't skip a buffer slot,
+                // leaving stale/uninitialized data in zigzag[].
+                --zz_idx;
                 continue;
             }
             int64_t D = (static_cast<int64_t>(values[val_idx])     - static_cast<int64_t>(values[val_idx - 1]))
                       - (static_cast<int64_t>(values[val_idx - 1]) - static_cast<int64_t>(values[val_idx - 2]));
-            zz = ZigZag::zigzagEncode(D);
+            uint64_t zz = ZigZag::zigzagEncode(D);
             zigzag[zz_idx] = zz;
             if (zz < block_min) block_min = zz;
             if (zz > block_max) block_max = zz;

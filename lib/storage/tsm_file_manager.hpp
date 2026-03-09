@@ -13,7 +13,7 @@
 #include "aligned_buffer.hpp"
 #include "tsm.hpp"
 #include "memory_store.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 
 // Forward declaration
 class TSMCompactor;
@@ -21,12 +21,12 @@ class TSMCompactor;
 class TSMFileManager {
 private:
   static constexpr size_t MAX_TIERS = 5;
-  static size_t filesPerCompaction() { return tsdb::config().storage.compaction.tier0_min_files; }
+  static size_t filesPerCompaction() { return timestar::config().storage.compaction.tier0_min_files; }
   
   int shardId;
   // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
   // only accessed from a single thread.
-  unsigned int nextSequenceId = 0;
+  uint64_t nextSequenceId = 0;
   std::vector<seastar::shared_ptr<TSM>> tsmFiles;
   
   // Track files by tier for compaction
@@ -40,8 +40,18 @@ private:
   std::string basePath();
   seastar::future<> checkAndTriggerCompaction();
   
+  std::map<uint64_t, seastar::shared_ptr<TSM>> sequencedTsmFiles;
+
 public:
-  std::map<unsigned int, seastar::shared_ptr<TSM>> sequencedTsmFiles;
+  // Read-only access to the sequenced TSM file map.
+  const std::map<uint64_t, seastar::shared_ptr<TSM>>& getSequencedTsmFiles() const {
+    return sequencedTsmFiles;
+  }
+
+  // Direct insertion into the sequenced file map (for testing).
+  void setSequencedTsmFile(uint64_t seq, seastar::shared_ptr<TSM> tsm) {
+    sequencedTsmFiles[seq] = std::move(tsm);
+  }
 
   TSMFileManager();
   ~TSMFileManager();  // Defined in .cpp where TSMCompactor is complete
@@ -59,7 +69,7 @@ public:
   seastar::future<> removeTSMFiles(const std::vector<seastar::shared_ptr<TSM>>& files);
   
   // Allocate a globally unique sequence ID for new TSM files
-  unsigned int allocateSequenceId() { return nextSequenceId++; }
+  uint64_t allocateSequenceId() { return nextSequenceId++; }
 
   // Get the compactor (for tombstone rewrites)
   TSMCompactor* getCompactor() { return compactor.get(); }

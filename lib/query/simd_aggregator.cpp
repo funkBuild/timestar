@@ -1,44 +1,55 @@
 #include "simd_aggregator.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cpuid.h>
 
-namespace tsdb {
+namespace timestar {
 namespace simd {
+
+// Quick scan for any NaN in the input array.
+// Used to guard SIMD min/max paths whose intrinsics have undefined NaN behavior.
+static bool containsNaN(const double* values, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (std::isnan(values[i])) return true;
+    }
+    return false;
+}
 
 // Forward declarations of helper functions
 static double hsum_double_avx(__m256d v);
 static double hmin_double_avx(__m256d v);
 static double hmax_double_avx(__m256d v);
 
-// Check CPU support for AVX2
+// Check CPU support for AVX2 (cached — CPUID is a serializing instruction)
 bool SimdAggregator::isAvx2Available() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-        // Check for AVX support
-        bool avx = (ecx & (1 << 28)) != 0;
-
-        if (avx && __get_cpuid_max(0, nullptr) >= 7) {
-            __cpuid_count(7, 0, eax, ebx, ecx, edx);
-            // Check for AVX2 support
-            bool avx2 = (ebx & (1 << 5)) != 0;
-            return avx2;
+    static const bool cached = [] {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+            bool avx = (ecx & (1 << 28)) != 0;
+            if (avx && __get_cpuid_max(0, nullptr) >= 7) {
+                __cpuid_count(7, 0, eax, ebx, ecx, edx);
+                return (ebx & (1 << 5)) != 0;
+            }
         }
-    }
-    return false;
+        return false;
+    }();
+    return cached;
 }
 
-// Check CPU support for AVX512
+// Check CPU support for AVX512 (cached — CPUID is a serializing instruction)
 bool SimdAggregator::isAvx512Available() {
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_max(0, nullptr) >= 7) {
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        // Check for AVX512F (foundation) and AVX512DQ (additional instructions)
-        bool avx512f = (ebx & (1 << 16)) != 0;
-        bool avx512dq = (ebx & (1 << 17)) != 0;
-        return avx512f && avx512dq;
-    }
-    return false;
+    static const bool cached = [] {
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid_max(0, nullptr) >= 7) {
+            __cpuid_count(7, 0, eax, ebx, ecx, edx);
+            bool avx512f = (ebx & (1 << 16)) != 0;
+            bool avx512dq = (ebx & (1 << 17)) != 0;
+            return avx512f && avx512dq;
+        }
+        return false;
+    }();
+    return cached;
 }
 
 // Horizontal sum of a 256-bit vector containing 4 doubles
@@ -183,6 +194,12 @@ static double calculateMin_AVX2(const double* values, size_t count) {
 double SimdAggregator::calculateMin(const double* values, size_t count) {
     if (count == 0) return std::numeric_limits<double>::quiet_NaN();
 
+    // SIMD _mm256_min_pd / _mm512_min_pd have undefined behavior with NaN inputs.
+    // If any NaN is present, fall through to the scalar path which correctly skips NaN.
+    if (containsNaN(values, count)) {
+        return scalar::calculateMin(values, count);
+    }
+
     // Use AVX512 for best performance (process 8 doubles at once)
     if (isAvx512Available() && count >= 16) {
         return calculateMin_AVX512(values, count);
@@ -242,6 +259,12 @@ static double calculateMax_AVX2(const double* values, size_t count) {
 double SimdAggregator::calculateMax(const double* values, size_t count) {
     if (count == 0) return std::numeric_limits<double>::quiet_NaN();
 
+    // SIMD _mm256_max_pd / _mm512_max_pd have undefined behavior with NaN inputs.
+    // If any NaN is present, fall through to the scalar path which correctly skips NaN.
+    if (containsNaN(values, count)) {
+        return scalar::calculateMax(values, count);
+    }
+
     // Use AVX512 for best performance (process 8 doubles at once)
     if (isAvx512Available() && count >= 16) {
         return calculateMax_AVX512(values, count);
@@ -284,7 +307,7 @@ double SimdAggregator::calculateVariance(const double* values, size_t count, dou
         variance += diff * diff;
     }
     
-    return variance / (count - 1);
+    return variance / count;  // population variance (consistent with AggregationState)
 }
 
 // SIMD-optimized dot product
@@ -442,20 +465,34 @@ double calculateAvg(const double* values, size_t count) {
 
 double calculateMin(const double* values, size_t count) {
     if (count == 0) return std::numeric_limits<double>::quiet_NaN();
-    
-    double min_val = values[0];
-    for (size_t i = 1; i < count; ++i) {
-        min_val = std::min(min_val, values[i]);
+
+    // Skip leading NaN values to find first real value
+    size_t start = 0;
+    while (start < count && std::isnan(values[start])) ++start;
+    if (start == count) return std::numeric_limits<double>::quiet_NaN();
+
+    double min_val = values[start];
+    for (size_t i = start + 1; i < count; ++i) {
+        if (!std::isnan(values[i]) && values[i] < min_val) {
+            min_val = values[i];
+        }
     }
     return min_val;
 }
 
 double calculateMax(const double* values, size_t count) {
     if (count == 0) return std::numeric_limits<double>::quiet_NaN();
-    
-    double max_val = values[0];
-    for (size_t i = 1; i < count; ++i) {
-        max_val = std::max(max_val, values[i]);
+
+    // Skip leading NaN values to find first real value
+    size_t start = 0;
+    while (start < count && std::isnan(values[start])) ++start;
+    if (start == count) return std::numeric_limits<double>::quiet_NaN();
+
+    double max_val = values[start];
+    for (size_t i = start + 1; i < count; ++i) {
+        if (!std::isnan(values[i]) && values[i] > max_val) {
+            max_val = values[i];
+        }
     }
     return max_val;
 }
@@ -468,10 +505,10 @@ double calculateVariance(const double* values, size_t count, double mean) {
         double diff = values[i] - mean;
         sum_sq_diff += diff * diff;
     }
-    return sum_sq_diff / (count - 1);
+    return sum_sq_diff / count;  // population variance (consistent with AggregationState)
 }
 
 } // namespace scalar
 
 } // namespace simd
-} // namespace tsdb
+} // namespace timestar

@@ -1,5 +1,8 @@
 const BASE = '/api';
 
+const TYPE_DISPLAY = { boolean: 'bool', integer: 'int' };
+function normalizeFieldType(t) { return TYPE_DISPLAY[t] || t; }
+
 export async function fetchMeasurements() {
   const res = await fetch(`${BASE}/measurements`);
   if (!res.ok) throw new Error(`Failed to fetch measurements: ${res.status}`);
@@ -11,7 +14,12 @@ export async function fetchFields(measurement) {
   const res = await fetch(`${BASE}/fields?measurement=${encodeURIComponent(measurement)}`);
   if (!res.ok) throw new Error(`Failed to fetch fields: ${res.status}`);
   const data = await res.json();
-  return data.fields || {};
+  const fields = data.fields || {};
+  for (const key of Object.keys(fields)) {
+    const f = fields[key];
+    if (f && f.type) f.type = normalizeFieldType(f.type);
+  }
+  return fields;
 }
 
 export async function fetchTags(measurement) {
@@ -31,7 +39,7 @@ export async function runQuery({ query, startTime, endTime, aggregationInterval 
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.message || err.error || `Query failed: ${res.status}`);
+    throw new Error(err.error?.message || err.message || `Query failed: ${res.status}`);
   }
   return res.json();
 }

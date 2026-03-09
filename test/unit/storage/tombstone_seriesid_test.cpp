@@ -2,7 +2,7 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/tsm_tombstone.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 // Test that TombstoneEntry uses SeriesId128 instead of uint64_t
 TEST(TombstoneSeriesIdTest, EntrySize) {

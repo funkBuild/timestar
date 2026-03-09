@@ -1,4 +1,5 @@
 #include "query_planner.hpp"
+#include "series_key.hpp"
 #include <seastar/core/seastar.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/when_all.hh>
@@ -6,7 +7,7 @@
 #include <functional>
 #include <unordered_set>
 
-namespace tsdb {
+namespace timestar {
 
 seastar::future<QueryPlan> QueryPlanner::createPlan(
     const QueryRequest& request,
@@ -113,11 +114,11 @@ QueryPlanner::findMatchingSeriesIds(
             auto findResult = co_await index.findSeriesWithMetadata(
                 request.measurement, request.scopes, fieldFilter);
 
-            // If limit was exceeded, return empty (the planner doesn't have a
-            // mechanism to propagate the error, but in practice the HTTP handler
-            // calls findSeriesWithMetadata directly, not through the planner)
+            // If limit was exceeded, throw so the caller can report the error
             if (!findResult.has_value()) {
-                co_return std::vector<SeriesId128>{};
+                throw std::runtime_error(
+                    "Query matches too many series for measurement '" +
+                    request.measurement + "'. Narrow your query with more specific tag filters.");
             }
 
             auto& seriesWithMeta = findResult.value();
@@ -155,52 +156,34 @@ QueryPlanner::findMatchingSeriesIdsSync(
 
     std::vector<std::vector<SeriesId128>> shardBuckets(shardCount);
 
-    // If no index provided, use mock implementation for unit tests
-    if (!index) {
-        // Simplified version for testing without actual index operations
-        if (!request.measurement.empty()) {
-            // Simulate finding series based on request
-            std::set<std::string> queryFields;
+    // This synchronous version is only used by unit tests (createPlanSync).
+    // Production code uses the async findMatchingSeriesIds() which queries
+    // the real LevelDB index via invoke_on(0).  The index parameter is
+    // accepted but unused because LevelDB requires async I/O.
+    (void)index;
 
-            if (request.requestsAllFields()) {
-                // Simulate having some default fields
-                queryFields = {"value", "field1", "field2"};
-            } else {
-                queryFields.insert(request.fields.begin(), request.fields.end());
-            }
+    if (!request.measurement.empty()) {
+        std::set<std::string> queryFields;
 
-            // For each field, simulate a series ID
-            for (const auto& field : queryFields) {
-                // Calculate which shard this series belongs to
-                unsigned shardId = calculateShardForSeries(
-                    request.measurement, request.scopes, field);
-
-                // Create a mock SeriesId128 from a proper series key
-                std::string mockSeriesKey = request.measurement;
-                for (const auto& [tagKey, tagValue] : request.scopes) {
-                    mockSeriesKey += "," + tagKey + "=" + tagValue;
-                }
-                mockSeriesKey += " " + field; // Use space separator consistently
-                SeriesId128 mockSeriesId = SeriesId128::fromSeriesKey(mockSeriesKey);
-                shardBuckets[shardId].push_back(mockSeriesId);
-            }
+        if (request.requestsAllFields()) {
+            queryFields = {"value", "field1", "field2"};
+        } else {
+            queryFields.insert(request.fields.begin(), request.fields.end());
         }
-        return shardBuckets;
+
+        for (const auto& field : queryFields) {
+            unsigned shardId = calculateShardForSeries(
+                request.measurement, request.scopes, field);
+
+            std::string mockSeriesKey = request.measurement;
+            for (const auto& [tagKey, tagValue] : request.scopes) {
+                mockSeriesKey += "," + tagKey + "=" + tagValue;
+            }
+            mockSeriesKey += " " + field;
+            SeriesId128 mockSeriesId = SeriesId128::fromSeriesKey(mockSeriesKey);
+            shardBuckets[shardId].push_back(mockSeriesId);
+        }
     }
-
-    // Use actual index to find series
-    // Note: This is a synchronous version, mainly for testing
-    // In production, the async version above should be used
-
-    // For testing, we'll simulate what would happen on each shard
-    // In reality, each shard would only see its own data
-
-    // Simulate querying the index
-    // In a real scenario, we'd need to run this on the actual shard
-    // For now, we'll just demonstrate the logic
-
-    // This would need to be implemented with actual async operations
-    // For testing purposes, we'll keep the mock implementation
 
     return shardBuckets;
 }
@@ -247,18 +230,7 @@ std::string QueryPlanner::buildSeriesKeyForSharding(
     const std::string& measurement,
     const std::map<std::string, std::string>& tags,
     const std::string& field) {
-    
-    std::string seriesKey = measurement;
-    
-    // Add sorted tags for consistent hashing
-    for (const auto& [tagKey, tagValue] : tags) {
-        seriesKey += "," + tagKey + "=" + tagValue;
-    }
-    
-    // Add field name with space separator (consistent with rest of system)
-    seriesKey += " " + field;
-    
-    return seriesKey;
+    return buildSeriesKey(measurement, tags, field);
 }
 
 bool QueryPlanner::requiresAllShards(const QueryRequest& request) {
@@ -281,4 +253,4 @@ bool QueryPlanner::requiresAllShards(const QueryRequest& request) {
     return false;
 }
 
-} // namespace tsdb
+} // namespace timestar

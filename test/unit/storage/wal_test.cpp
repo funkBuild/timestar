@@ -4,7 +4,7 @@
 
 #include "../../../lib/storage/wal.hpp"
 #include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/utils/crc32.hpp"
 
 namespace fs = std::filesystem;

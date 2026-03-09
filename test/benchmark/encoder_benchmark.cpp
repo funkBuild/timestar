@@ -425,7 +425,7 @@ void printSummaryTable(const std::vector<std::pair<std::string, BenchmarkResult>
 }
 
 int main() {
-    std::cout << BOLD << "TSDB Encoder Benchmark Suite" << RESET << std::endl;
+    std::cout << BOLD << "TimeStar Encoder Benchmark Suite" << RESET << std::endl;
     std::cout << "Dataset size: " << DATASET_SIZE << " entries per encoder" << std::endl;
     std::cout << "Iterations: " << BENCHMARK_ITERATIONS << " (after "
               << WARMUP_ITERATIONS << " warmup)" << std::endl;

@@ -4,7 +4,7 @@
 #include "anomaly_detector.hpp"
 #include "stl_decomposition.hpp"
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 // Robust anomaly detection using STL decomposition
@@ -36,6 +36,6 @@ private:
 };
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar
 
 #endif // ROBUST_DETECTOR_H_INCLUDED

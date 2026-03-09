@@ -7,7 +7,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/http/reply.hh>
 
-namespace tsdb {
+namespace timestar {
 
 HttpDerivedQueryHandler::HttpDerivedQueryHandler(
     seastar::sharded<Engine>* engine,
@@ -15,7 +15,6 @@ HttpDerivedQueryHandler::HttpDerivedQueryHandler(
     DerivedQueryConfig config)
     : engine_(engine), index_(index), config_(config) {
     if (!engine_) throw std::invalid_argument("engine must not be null");
-    if (!index_) throw std::invalid_argument("index must not be null");
 }
 
 void HttpDerivedQueryHandler::registerRoutes(seastar::httpd::routes& r) {
@@ -53,7 +52,7 @@ HttpDerivedQueryHandler::handleDerivedQuery(
         // Convert to std::string to avoid sstring::npos vs std::string::npos mismatch
         // (Seastar sstring uses 32-bit npos, std::string uses 64-bit npos)
         std::string contentTypeStr(contentType.data(), contentType.size());
-        if (!contentTypeStr.empty() && contentTypeStr.find("application/json") == std::string::npos) {
+        if (!contentTypeStr.empty() && !contentTypeStr.starts_with("application/json")) {
             rep->set_status(seastar::http::reply::status_type::unsupported_media_type);
             rep->_content = DerivedQueryExecutor::createErrorResponse(
                 "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json");
@@ -112,7 +111,7 @@ HttpDerivedQueryHandler::handleDerivedQuery(
     } catch (const std::exception& e) {
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = DerivedQueryExecutor::createErrorResponse(
-            "INTERNAL_ERROR", e.what());
+            "INTERNAL_ERROR", "Internal server error");
         rep->done("application/json");
 
         http_log.error("Derived query internal error: {}", e.what());
@@ -121,4 +120,4 @@ HttpDerivedQueryHandler::handleDerivedQuery(
     }
 }
 
-} // namespace tsdb
+} // namespace timestar

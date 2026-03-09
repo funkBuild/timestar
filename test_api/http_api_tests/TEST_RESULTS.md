@@ -1,4 +1,4 @@
-# TSDB HTTP API Test Results
+# TimeStar HTTP API Test Results
 
 ## Test Run Summary
 

@@ -1,12 +1,12 @@
 /**
- * tsdb_insert_bench — High-performance HTTP insert benchmark for TSDB.
+ * timestar_insert_bench — High-performance HTTP insert benchmark for TimeStar.
  *
  * Uses Seastar's async HTTP client with connection pooling.  All data is
  * deterministically generated from a fixed seed so results are reproducible
  * across runs.
  *
  * Usage:
- *   ./tsdb_insert_bench --server-host 127.0.0.1 --server-port 8086 \
+ *   ./timestar_insert_bench --server-host 127.0.0.1 --server-port 8086 \
  *       --connections 8 --batch-size 10000 --batches 100 --hosts 10
  */
 
@@ -291,9 +291,9 @@ int main(int argc, char** argv) {
     namespace bpo = boost::program_options;
     app.add_options()
         ("server-host",  bpo::value<std::string>()->default_value("127.0.0.1"),
-         "TSDB server host")
+         "TimeStar server host")
         ("server-port",  bpo::value<uint16_t>()->default_value(8086),
-         "TSDB server port")
+         "TimeStar server port")
         ("connections",  bpo::value<unsigned>()->default_value(8),
          "Max concurrent HTTP connections per shard")
         ("batch-size",   bpo::value<size_t>()->default_value(10000),
@@ -332,7 +332,7 @@ int main(int argc, char** argv) {
 
         // ── Print header ────────────────────────────────────────────
         fmt::print("{:=<70}\n", "");
-        fmt::print(" TSDB C++ Insert Benchmark (Seastar HTTP client)\n");
+        fmt::print(" TimeStar C++ Insert Benchmark (Seastar HTTP client)\n");
         fmt::print("{:=<70}\n", "");
         fmt::print("  Server:         {}:{}\n", host, port);
         fmt::print("  Shards:         {}\n", smp::count);

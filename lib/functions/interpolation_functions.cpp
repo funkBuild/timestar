@@ -3,7 +3,9 @@
 #include <sstream>
 #include <limits>
 
-namespace tsdb::functions {
+namespace timestar::functions {
+
+static constexpr size_t MAX_INTERPOLATION_POINTS = 1'000'000;
 
 // LinearInterpolationFunction implementation
 const FunctionMetadata LinearInterpolationFunction::metadata_ = {
@@ -72,17 +74,28 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
     
     if (context.hasParameter("target_interval")) {
         int64_t interval = context.getParameter<int64_t>("target_interval");
+        if (interval <= 0) {
+            throw ParameterValidationException("target_interval must be positive");
+        }
         uint64_t startTime = input.timestampAt(0);
         uint64_t endTime = input.timestampAt(input.count - 1);
-        
-        for (uint64_t t = startTime; t <= endTime; t += interval) {
+
+        uint64_t uinterval = static_cast<uint64_t>(interval);
+        size_t estimatedPoints = (endTime > startTime) ? ((endTime - startTime) / uinterval + 1) : 1;
+        if (estimatedPoints > MAX_INTERPOLATION_POINTS) {
+            throw ParameterValidationException(
+                "target_interval too small: would generate " + std::to_string(estimatedPoints) +
+                " points (max " + std::to_string(MAX_INTERPOLATION_POINTS) + ")");
+        }
+
+        for (uint64_t t = startTime; t <= endTime; t += uinterval) {
             targetTimestamps.push_back(t);
         }
     } else {
         std::string timestampStr = context.getParameter<std::string>("target_timestamps");
         std::istringstream ss(timestampStr);
         std::string token;
-        
+
         while (std::getline(ss, token, ',')) {
             if (!token.empty()) {
                 try {
@@ -91,6 +104,11 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
                     throw ParameterValidationException(
                         "Invalid timestamp value \"" + token + "\": " + e.what());
                 }
+                if (targetTimestamps.size() > MAX_INTERPOLATION_POINTS) {
+                    throw ParameterValidationException(
+                        "Too many target_timestamps: exceeds limit of " +
+                        std::to_string(MAX_INTERPOLATION_POINTS));
+                }
             }
         }
     }
@@ -98,17 +116,21 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
     if (targetTimestamps.empty()) {
         return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
     }
-    
+
     result.timestamps = targetTimestamps;
     result.values.reserve(targetTimestamps.size());
-    
-    // Perform linear interpolation
+
+    // Perform linear interpolation using two-pointer approach.
+    // Both input timestamps and target timestamps are sorted, so we maintain
+    // the search position across iterations for O(n+m) instead of O(n*m).
+    size_t searchPos = 0;
     for (uint64_t targetTime : targetTimestamps) {
-        // Find the two points to interpolate between
-        size_t i = 0;
-        while (i + 1 < input.count && input.timestampAt(i + 1) < targetTime) {
-            ++i;
+        // Advance searchPos to find the two points to interpolate between.
+        // Since targets are sorted, we never need to go backwards.
+        while (searchPos + 1 < input.count && input.timestampAt(searchPos + 1) < targetTime) {
+            ++searchPos;
         }
+        size_t i = searchPos;
         
         if (targetTime < input.timestampAt(0)) {
             // Before first point
@@ -230,17 +252,28 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
     
     if (context.hasParameter("target_interval")) {
         int64_t interval = context.getParameter<int64_t>("target_interval");
+        if (interval <= 0) {
+            throw ParameterValidationException("target_interval must be positive");
+        }
         uint64_t startTime = input.timestampAt(0);
         uint64_t endTime = input.timestampAt(input.count - 1);
-        
-        for (uint64_t t = startTime; t <= endTime; t += interval) {
+
+        uint64_t uinterval = static_cast<uint64_t>(interval);
+        size_t estimatedPoints = (endTime > startTime) ? ((endTime - startTime) / uinterval + 1) : 1;
+        if (estimatedPoints > MAX_INTERPOLATION_POINTS) {
+            throw ParameterValidationException(
+                "target_interval too small: would generate " + std::to_string(estimatedPoints) +
+                " points (max " + std::to_string(MAX_INTERPOLATION_POINTS) + ")");
+        }
+
+        for (uint64_t t = startTime; t <= endTime; t += uinterval) {
             targetTimestamps.push_back(t);
         }
     } else {
         std::string timestampStr = context.getParameter<std::string>("target_timestamps");
         std::istringstream ss(timestampStr);
         std::string token;
-        
+
         while (std::getline(ss, token, ',')) {
             if (!token.empty()) {
                 try {
@@ -249,6 +282,11 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
                     throw ParameterValidationException(
                         "Invalid timestamp value \"" + token + "\": " + e.what());
                 }
+                if (targetTimestamps.size() > MAX_INTERPOLATION_POINTS) {
+                    throw ParameterValidationException(
+                        "Too many target_timestamps: exceeds limit of " +
+                        std::to_string(MAX_INTERPOLATION_POINTS));
+                }
             }
         }
     }
@@ -256,12 +294,15 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
     result.timestamps = targetTimestamps;
     result.values.reserve(targetTimestamps.size());
     
-    // Simple linear interpolation fallback
+    // Simple linear interpolation fallback using two-pointer approach.
+    // Both input and target timestamps are sorted, so maintain search position
+    // across iterations for O(n+m) instead of O(n*m).
+    size_t searchPos = 0;
     for (uint64_t targetTime : targetTimestamps) {
-        size_t i = 0;
-        while (i + 1 < input.count && input.timestampAt(i + 1) < targetTime) {
-            ++i;
+        while (searchPos + 1 < input.count && input.timestampAt(searchPos + 1) < targetTime) {
+            ++searchPos;
         }
+        size_t i = searchPos;
         
         if (i + 1 < input.count) {
             uint64_t t1 = input.timestampAt(i);
@@ -281,11 +322,4 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
 }
 
 // Legacy function for backward compatibility
-std::vector<double> linearInterpolate(const std::vector<double>& values, 
-                                    const std::vector<uint64_t>& timestamps,
-                                    uint64_t targetInterval) {
-    // Stub implementation for now
-    return values;
-}
-
-} // namespace tsdb::functions
+} // namespace timestar::functions

@@ -24,6 +24,9 @@ void BoolEncoderRLE::writeVarint(AlignedBuffer &buf, uint64_t value) {
 }
 
 uint64_t BoolEncoderRLE::readVarint(Slice &slice) {
+    if (slice.bytesLeft() == 0) [[unlikely]] {
+        return 0;
+    }
     // Fast path: single-byte varint (value < 128) — the common case.
     const uint8_t* ptr = slice.data + slice.offset;
     uint8_t first = *ptr;
@@ -35,11 +38,13 @@ uint64_t BoolEncoderRLE::readVarint(Slice &slice) {
     uint64_t result = first & 0x7F;
     int shift = 7;
     size_t pos = 1;
-    while (true) {
+    const size_t remaining = slice.bytesLeft();
+    while (pos < remaining) {
         uint8_t byte = ptr[pos++];
         result |= static_cast<uint64_t>(byte & 0x7F) << shift;
         if ((byte & 0x80) == 0) break;
         shift += 7;
+        if (shift >= 64) break; // prevent overflow for malformed data
     }
     slice.offset += pos;
     return result;

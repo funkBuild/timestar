@@ -3,7 +3,7 @@
 #include <vector>
 
 #include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 // Tests documenting MemoryStore behavior relevant to WAL recovery durability.
@@ -36,7 +36,7 @@ TEST_F(WALRecoveryDurabilityTest, FreshMemoryStoreIsEmpty) {
 TEST_F(WALRecoveryDurabilityTest, InsertMemoryWorksWithoutWAL) {
     EXPECT_EQ(store->getWAL(), nullptr);
 
-    TSDBInsert<double> insert("cpu", "usage");
+    TimeStarInsert<double> insert("cpu", "usage");
     insert.addValue(1000, 50.0);
     insert.addValue(2000, 60.0);
     insert.addValue(3000, 70.0);
@@ -61,15 +61,15 @@ TEST_F(WALRecoveryDurabilityTest, InsertMemoryWorksWithoutWAL) {
 TEST_F(WALRecoveryDurabilityTest, RecoveredStoreHasCorrectSeriesType) {
     EXPECT_EQ(store->getWAL(), nullptr);
 
-    TSDBInsert<double> floatInsert("temperature", "value");
+    TimeStarInsert<double> floatInsert("temperature", "value");
     floatInsert.addValue(1000, 23.5);
     store->insertMemory(std::move(floatInsert));
 
-    TSDBInsert<bool> boolInsert("door", "open");
+    TimeStarInsert<bool> boolInsert("door", "open");
     boolInsert.addValue(1000, true);
     store->insertMemory(std::move(boolInsert));
 
-    TSDBInsert<std::string> stringInsert("logs", "message");
+    TimeStarInsert<std::string> stringInsert("logs", "message");
     stringInsert.addValue(1000, "hello world");
     store->insertMemory(std::move(stringInsert));
 
@@ -89,7 +89,7 @@ TEST_F(WALRecoveryDurabilityTest, EmptyStoreIsDetectedBeforeConversion) {
     EXPECT_EQ(store->getWAL(), nullptr);
 
     // After inserting data (simulating WAL replay), isEmpty is false
-    TSDBInsert<double> insert("metric", "value");
+    TimeStarInsert<double> insert("metric", "value");
     insert.addValue(1000, 1.0);
     store->insertMemory(std::move(insert));
 
@@ -103,7 +103,7 @@ TEST_F(WALRecoveryDurabilityTest, MultipleInsertsAccumulateWithoutWAL) {
 
     // Simulate replaying multiple WAL entries
     for (int i = 0; i < 100; i++) {
-        TSDBInsert<double> insert("sensor", "reading");
+        TimeStarInsert<double> insert("sensor", "reading");
         insert.addValue(static_cast<uint64_t>(i) * 1000, static_cast<double>(i));
         store->insertMemory(std::move(insert));
     }

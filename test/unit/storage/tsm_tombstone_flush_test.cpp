@@ -48,7 +48,7 @@ protected:
         }
 
         // Fallback to absolute path
-        std::ifstream f("/home/matt/Desktop/source/tsdb/lib/storage/tsm_tombstone.cpp");
+        std::ifstream f("/home/matt/Desktop/source/timestar/lib/storage/tsm_tombstone.cpp");
         if (f.is_open()) {
             std::stringstream ss;
             ss << f.rdbuf();

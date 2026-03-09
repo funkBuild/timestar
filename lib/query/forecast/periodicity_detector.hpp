@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <complex>
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 /**
@@ -117,6 +117,6 @@ private:
 };
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar
 
 #endif

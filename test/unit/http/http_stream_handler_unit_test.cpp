@@ -28,7 +28,7 @@
 #include <map>
 #include <variant>
 
-using namespace tsdb;
+using namespace timestar;
 
 // ---------------------------------------------------------------------------
 // Helpers

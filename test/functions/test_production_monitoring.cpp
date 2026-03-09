@@ -5,7 +5,7 @@
 #include <atomic>
 #include "functions/function_monitoring.hpp"
 
-namespace tsdb::test {
+namespace timestar::test {
 
 class ProductionMonitoringTest : public ::testing::Test {
 protected:
@@ -31,7 +31,7 @@ TEST_F(ProductionMonitoringTest, BasicMetricsCollection) {
     // Register a test function
     monitor->registerFunction("test_function");
     
-    auto* metrics = monitor->getFunctionMetrics("test_function");
+    auto metrics = monitor->getFunctionMetrics("test_function");
     ASSERT_NE(metrics, nullptr);
     
     // Test initial state
@@ -40,7 +40,7 @@ TEST_F(ProductionMonitoringTest, BasicMetricsCollection) {
     EXPECT_EQ(metrics->failed_executions.load(), 0);
     
     // Test auto-registration
-    auto* auto_metrics = monitor->getFunctionMetrics("auto_registered_function");
+    auto auto_metrics = monitor->getFunctionMetrics("auto_registered_function");
     ASSERT_NE(auto_metrics, nullptr);
     EXPECT_EQ(auto_metrics->total_executions.load(), 0);
 }
@@ -56,7 +56,7 @@ TEST_F(ProductionMonitoringTest, FunctionExecutionTracker) {
         tracker.recordCacheHit();
     }
     
-    auto* metrics = monitor->getFunctionMetrics("tracked_function");
+    auto metrics = monitor->getFunctionMetrics("tracked_function");
     EXPECT_EQ(metrics->total_executions.load(), 1);
     EXPECT_EQ(metrics->successful_executions.load(), 1);
     EXPECT_EQ(metrics->failed_executions.load(), 0);
@@ -85,7 +85,7 @@ TEST_F(ProductionMonitoringTest, SystemMetricsCollection) {
 }
 
 TEST_F(ProductionMonitoringTest, MetricsCalculations) {
-    auto* metrics = monitor->getFunctionMetrics("calc_test");
+    auto metrics = monitor->getFunctionMetrics("calc_test");
     
     // Simulate executions
     {
@@ -142,7 +142,7 @@ TEST_F(ProductionMonitoringTest, AlertingSystem) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
     // Trigger failure rate alert
-    auto* metrics = monitor->getFunctionMetrics("alert_test");
+    auto metrics = monitor->getFunctionMetrics("alert_test");
     for (int i = 0; i < 20; ++i) {
         functions::FunctionExecutionTracker tracker("alert_test");
         if (i < 15) {
@@ -169,41 +169,22 @@ TEST_F(ProductionMonitoringTest, AlertingSystem) {
 }
 
 TEST_F(ProductionMonitoringTest, ConcurrentExecutionTracking) {
-    const int num_threads = 10;
-    const int executions_per_thread = 5;
-    
-    std::atomic<int> active_trackers{0};
-    std::atomic<int> max_concurrent{0};
-    std::vector<std::thread> threads;
-    
-    for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&, t]() {
-            for (int i = 0; i < executions_per_thread; ++i) {
-                functions::FunctionExecutionTracker tracker("concurrent_test_" + std::to_string(t));
-                
-                int current_active = active_trackers.fetch_add(1) + 1;
-                int current_max = max_concurrent.load();
-                while (current_active > current_max) {
-                    if (max_concurrent.compare_exchange_weak(current_max, current_active)) {
-                        break;
-                    }
-                }
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                tracker.recordSuccess();
-                
-                active_trackers.fetch_sub(1);
-            }
-        });
+    // ProductionMonitor is thread_local (one per Seastar shard), so test
+    // sequential execution tracking on a single thread — matching the
+    // actual Seastar shard-per-core model.
+    const int num_functions = 10;
+    const int executions_per_function = 5;
+
+    for (int t = 0; t < num_functions; ++t) {
+        for (int i = 0; i < executions_per_function; ++i) {
+            functions::FunctionExecutionTracker tracker("concurrent_test_" + std::to_string(t));
+            tracker.recordSuccess();
+        }
     }
-    
-    for (auto& thread : threads) {
-        thread.join();
-    }
-    
+
     auto* system_metrics = monitor->getSystemMetrics();
     EXPECT_EQ(system_metrics->active_function_calls.load(), 0);
-    
+
     // Check all functions were tracked
     auto all_metrics = monitor->getAllFunctionMetrics();
     int total_executions = 0;
@@ -212,7 +193,7 @@ TEST_F(ProductionMonitoringTest, ConcurrentExecutionTracking) {
             total_executions += metrics.total_executions;
         }
     }
-    EXPECT_EQ(total_executions, num_threads * executions_per_thread);
+    EXPECT_EQ(total_executions, num_functions * executions_per_function);
 }
 
 TEST_F(ProductionMonitoringTest, JsonExport) {
@@ -274,7 +255,7 @@ TEST_F(ProductionMonitoringTest, AlertAcknowledgment) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
     // Trigger alert
-    auto* metrics = monitor->getFunctionMetrics("ack_test");
+    auto metrics = monitor->getFunctionMetrics("ack_test");
     for (int i = 0; i < 20; ++i) {
         functions::FunctionExecutionTracker tracker("ack_test");
         tracker.recordFailure(); // 100% failure rate
@@ -293,7 +274,7 @@ TEST_F(ProductionMonitoringTest, AlertAcknowledgment) {
 }
 
 TEST_F(ProductionMonitoringTest, ErrorTypeTracking) {
-    auto* metrics = monitor->getFunctionMetrics("error_test");
+    auto metrics = monitor->getFunctionMetrics("error_test");
     
     {
         functions::FunctionExecutionTracker tracker("error_test");
@@ -379,12 +360,12 @@ TEST_F(ProductionMonitoringTest, MemoryUsageTracking) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         tracker.recordSuccess();
         
-        auto* metrics = monitor->getFunctionMetrics("memory_test");
+        auto metrics = monitor->getFunctionMetrics("memory_test");
         initial_peak = metrics->peak_memory_bytes.load();
     }
     
     // Memory tracking should have detected some usage
-    auto* metrics = monitor->getFunctionMetrics("memory_test");
+    auto metrics = monitor->getFunctionMetrics("memory_test");
     EXPECT_GE(metrics->total_memory_allocated.load(), 0);
     EXPECT_GE(metrics->peak_memory_bytes.load(), 0);
 }
@@ -502,4 +483,4 @@ TEST_F(ProductionMonitoringTest, AlertHistoryIsBounded) {
         << " which exceeds the MAX_ALERT_HISTORY cap of 1000";
 }
 
-} // namespace tsdb::test
+} // namespace timestar::test

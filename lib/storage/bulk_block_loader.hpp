@@ -220,7 +220,10 @@ private:
 public:
     explicit BulkMerger2Way(std::vector<SeriesBlocks<T>>& sources)
         : ctx0(&sources[0]), ctx1(&sources[1]) {
-        assert(sources.size() == 2);
+        if (sources.size() != 2) {
+            throw std::invalid_argument("BulkMerger2Way requires exactly 2 sources, got " +
+                                        std::to_string(sources.size()));
+        }
     }
 
     [[gnu::always_inline]]
@@ -277,7 +280,10 @@ private:
 public:
     explicit BulkMerger3Way(std::vector<SeriesBlocks<T>>& sources)
         : ctx0(&sources[0]), ctx1(&sources[1]), ctx2(&sources[2]) {
-        assert(sources.size() == 3);
+        if (sources.size() != 3) {
+            throw std::invalid_argument("BulkMerger3Way requires exactly 3 sources, got " +
+                                        std::to_string(sources.size()));
+        }
     }
 
     [[gnu::always_inline]]
@@ -295,8 +301,9 @@ public:
         // Find minimum timestamp
         uint64_t minTs = std::min({ts0, ts1, ts2});
 
-        // Collect value from source with min timestamp (prefer highest rank on tie)
-        T value;
+        // Collect value from source with min timestamp (prefer highest rank on tie).
+        // At least one source must match minTs since it's their minimum.
+        T value{};
         uint64_t maxRank = 0;
         bool found = false;
 

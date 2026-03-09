@@ -9,7 +9,7 @@
 const axios = require('axios');
 const { performance } = require('perf_hooks');
 
-const BASE_URL = process.env.TSDB_URL || 'http://localhost:8086';
+const BASE_URL = process.env.TIMESTAR_URL || 'http://localhost:8086';
 const LABEL = process.argv[2] || 'UNKNOWN';
 
 const MEASUREMENT = 'sizing.sensor';

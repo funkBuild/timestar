@@ -4,7 +4,7 @@
 #include "expression_parser.hpp"
 #include "expression_evaluator.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 static StreamingDataPoint makePoint(
     const std::string& measurement,

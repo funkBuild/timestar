@@ -1,8 +1,8 @@
 const axios = require('axios');
 
 // Test configuration
-const HOST = process.env.TSDB_HOST || 'localhost';
-const PORT = process.env.TSDB_PORT || 8086;
+const HOST = process.env.TIMESTAR_HOST || 'localhost';
+const PORT = process.env.TIMESTAR_PORT || 8086;
 const BASE_URL = `http://${HOST}:${PORT}`;
 
 // Generate random measurement name to avoid conflicts

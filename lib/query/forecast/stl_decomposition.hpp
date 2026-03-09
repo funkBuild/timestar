@@ -4,7 +4,7 @@
 #include <vector>
 #include <cstddef>
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 /**
@@ -36,6 +36,11 @@ struct MSTLResult {
  *
  * Based on Cleveland et al. (1990) "STL: A Seasonal-Trend Decomposition
  * Procedure Based on Loess"
+ *
+ * NOTE: A simpler STL implementation exists at lib/query/anomaly/stl_decomposition.hpp
+ * (timestar::anomaly::STLDecomposition) for anomaly detection. This version is more
+ * sophisticated with AVX2-optimized LOESS, MAD-based robustness weights, and MSTL
+ * (multiple seasonalities) support for forecasting.
  */
 class STLDecomposer {
 public:
@@ -159,6 +164,6 @@ private:
 };
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar
 
 #endif

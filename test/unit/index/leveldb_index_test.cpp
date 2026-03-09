@@ -2,7 +2,7 @@
 #include <filesystem>
 
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 
 #include <seastar/core/coroutine.hh>
 
@@ -25,7 +25,7 @@ seastar::future<> runIndexTest() {
     co_await index.open();
 
     // Test 1: Create a series and get ID
-    TSDBInsert<double> tempInsert("weather", "temperature");
+    TimeStarInsert<double> tempInsert("weather", "temperature");
     tempInsert.addTag("location", "us-midwest");
     tempInsert.addTag("host", "server-01");
 
@@ -36,7 +36,7 @@ seastar::future<> runIndexTest() {
     EXPECT_EQ(seriesId1, seriesId2);
 
     // Test 3: Different field should get different ID
-    TSDBInsert<double> humidityInsert("weather", "humidity");
+    TimeStarInsert<double> humidityInsert("weather", "humidity");
     humidityInsert.addTag("location", "us-midwest");
     humidityInsert.addTag("host", "server-01");
 
@@ -61,7 +61,7 @@ seastar::future<> runIndexTest() {
     EXPECT_TRUE(locationValues.count("us-midwest") > 0);
 
     // Test 7: Add another location
-    TSDBInsert<double> tempInsert2("weather", "temperature");
+    TimeStarInsert<double> tempInsert2("weather", "temperature");
     tempInsert2.addTag("location", "us-west");
     tempInsert2.addTag("host", "server-02");
 
@@ -74,7 +74,6 @@ seastar::future<> runIndexTest() {
 
     co_await index.close();
 
-    std::cout << "All LevelDB index tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, BasicIndexOperations) {
@@ -130,7 +129,6 @@ seastar::future<> testSeriesIdGeneration() {
 
     co_await index2.close();
 
-    std::cout << "Series ID generation tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, SeriesIdGeneration) {
@@ -197,7 +195,6 @@ seastar::future<> testMetadataIndexing() {
 
     co_await index.close();
 
-    std::cout << "Metadata indexing tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, MetadataIndexing) {
@@ -245,7 +242,6 @@ seastar::future<> testFindSeries() {
 
     co_await index.close();
 
-    std::cout << "findSeries tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, FindSeries) {
@@ -285,7 +281,6 @@ seastar::future<> testFindSeriesByTag() {
 
     co_await index.close();
 
-    std::cout << "findSeriesByTag tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, FindSeriesByTag) {
@@ -335,7 +330,6 @@ seastar::future<> testGetSeriesGroupedByTag() {
 
     co_await index.close();
 
-    std::cout << "getSeriesGroupedByTag tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, GetSeriesGroupedByTag) {
@@ -373,7 +367,6 @@ seastar::future<> testFieldTypes() {
 
     co_await index.close();
 
-    std::cout << "Field type tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, FieldTypes) {
@@ -433,7 +426,6 @@ seastar::future<> testFieldStatistics() {
 
     co_await index.close();
 
-    std::cout << "Field statistics tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, FieldStatistics) {
@@ -490,7 +482,6 @@ seastar::future<> testSeriesMetadata() {
 
     co_await index.close();
 
-    std::cout << "Series metadata tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, SeriesMetadata) {
@@ -522,7 +513,6 @@ seastar::future<> testGetAllMeasurements() {
 
     co_await index.close();
 
-    std::cout << "getAllMeasurements tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, GetAllMeasurements) {
@@ -583,7 +573,6 @@ seastar::future<> testOpenCloseLifecycle() {
         co_await index.close();
     }
 
-    std::cout << "Open/close lifecycle tests passed!" << std::endl;
 }
 
 TEST_F(LevelDBIndexTest, OpenCloseLifecycle) {

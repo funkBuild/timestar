@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script to run comprehensive HTTP API tests
-# Starts the TSDB server if not already running, runs tests, then cleans up
+# Starts the TimeStar server if not already running, runs tests, then cleans up
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../../build"
@@ -21,7 +21,7 @@ check_server() {
 
 # Function to start the server
 start_server() {
-    echo -e "${YELLOW}Starting TSDB HTTP server...${NC}"
+    echo -e "${YELLOW}Starting TimeStar HTTP server...${NC}"
     
     # Check if server is already running
     if check_server; then
@@ -30,9 +30,9 @@ start_server() {
     fi
     
     # Build the server if needed
-    if [ ! -f "$BUILD_DIR/bin/tsdb_http_server" ]; then
-        echo -e "${YELLOW}Building TSDB server...${NC}"
-        cd "$BUILD_DIR" && make tsdb_http_server
+    if [ ! -f "$BUILD_DIR/bin/timestar_http_server" ]; then
+        echo -e "${YELLOW}Building TimeStar server...${NC}"
+        cd "$BUILD_DIR" && make timestar_http_server
         if [ $? -ne 0 ]; then
             echo -e "${RED}Failed to build server${NC}"
             exit 1
@@ -40,7 +40,7 @@ start_server() {
     fi
     
     # Start the server in background
-    cd "$BUILD_DIR" && ./bin/tsdb_http_server > /tmp/tsdb_server.log 2>&1 &
+    cd "$BUILD_DIR" && ./bin/timestar_http_server > /tmp/timestar_server.log 2>&1 &
     SERVER_PID=$!
     echo "Server started with PID: $SERVER_PID"
     
@@ -54,14 +54,14 @@ start_server() {
         sleep 1
     done
     
-    echo -e "${RED}Server failed to start. Check /tmp/tsdb_server.log for details${NC}"
+    echo -e "${RED}Server failed to start. Check /tmp/timestar_server.log for details${NC}"
     return 1
 }
 
 # Function to stop the server
 stop_server() {
     if [ -n "$SERVER_PID" ]; then
-        echo -e "${YELLOW}Stopping TSDB server (PID: $SERVER_PID)...${NC}"
+        echo -e "${YELLOW}Stopping TimeStar server (PID: $SERVER_PID)...${NC}"
         kill $SERVER_PID 2>/dev/null
         wait $SERVER_PID 2>/dev/null
     fi
@@ -71,7 +71,7 @@ stop_server() {
 trap stop_server EXIT
 
 # Main execution
-echo -e "${YELLOW}TSDB HTTP API Test Suite${NC}"
+echo -e "${YELLOW}TimeStar HTTP API Test Suite${NC}"
 echo "================================"
 
 # Install dependencies if needed

@@ -4,7 +4,7 @@
 #include <cmath>
 #include <numeric>
 
-namespace tsdb {
+namespace timestar {
 
 // ==================== AlignedSeries Operations ====================
 
@@ -21,7 +21,7 @@ namespace {
 
 AlignedSeries AlignedSeries::operator+(const AlignedSeries& other) const {
     checkSameSize(*this, other, "addition");
-    // TODO: timestamps are copied here; consider sharing via shared_ptr to avoid allocation
+    // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = values[i] + other.values[i];
@@ -31,7 +31,7 @@ AlignedSeries AlignedSeries::operator+(const AlignedSeries& other) const {
 
 AlignedSeries AlignedSeries::operator-(const AlignedSeries& other) const {
     checkSameSize(*this, other, "subtraction");
-    // TODO: timestamps are copied here; consider sharing via shared_ptr to avoid allocation
+    // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = values[i] - other.values[i];
@@ -41,7 +41,7 @@ AlignedSeries AlignedSeries::operator-(const AlignedSeries& other) const {
 
 AlignedSeries AlignedSeries::operator*(const AlignedSeries& other) const {
     checkSameSize(*this, other, "multiplication");
-    // TODO: timestamps are copied here; consider sharing via shared_ptr to avoid allocation
+    // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = values[i] * other.values[i];
@@ -51,7 +51,7 @@ AlignedSeries AlignedSeries::operator*(const AlignedSeries& other) const {
 
 AlignedSeries AlignedSeries::operator/(const AlignedSeries& other) const {
     checkSameSize(*this, other, "division");
-    // TODO: timestamps are copied here; consider sharing via shared_ptr to avoid allocation
+    // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         if (other.values[i] == 0.0) {
@@ -531,7 +531,7 @@ AlignedSeries AlignedSeries::cutoff_max(double threshold) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::per_minute(double seconds_per_point) const {
+AlignedSeries AlignedSeries::rate_per(double seconds_per_point, double scale) const {
     if (values.empty()) {
         return AlignedSeries(timestamps, {});
     }
@@ -544,13 +544,11 @@ AlignedSeries AlignedSeries::per_minute(double seconds_per_point) const {
         double value_diff = values[i] - values[i - 1];
 
         // Compute time delta in seconds from timestamps (nanoseconds)
-        double dt_seconds;
         if (ts[i] <= ts[i - 1]) {
-            // Zero or negative time delta: output 0.0 to avoid division by zero
             result[i] = 0.0;
             continue;
         }
-        dt_seconds = static_cast<double>(ts[i] - ts[i - 1]) / 1e9;
+        double dt_seconds = static_cast<double>(ts[i] - ts[i - 1]) / 1e9;
 
         // Fall back to the provided seconds_per_point if timestamps yield zero
         if (dt_seconds == 0.0) {
@@ -561,46 +559,17 @@ AlignedSeries AlignedSeries::per_minute(double seconds_per_point) const {
             dt_seconds = seconds_per_point;
         }
 
-        // Rate per minute: (value_diff / dt_seconds) * 60
-        result[i] = (value_diff / dt_seconds) * 60.0;
+        result[i] = (value_diff / dt_seconds) * scale;
     }
     return AlignedSeries(timestamps, std::move(result));
 }
 
+AlignedSeries AlignedSeries::per_minute(double seconds_per_point) const {
+    return rate_per(seconds_per_point, 60.0);
+}
+
 AlignedSeries AlignedSeries::per_hour(double seconds_per_point) const {
-    if (values.empty()) {
-        return AlignedSeries(timestamps, {});
-    }
-    const auto& ts = *timestamps;
-
-    std::vector<double> result(values.size());
-    result[0] = std::numeric_limits<double>::quiet_NaN(); // First point has no previous
-
-    for (size_t i = 1; i < values.size(); ++i) {
-        double value_diff = values[i] - values[i - 1];
-
-        // Compute time delta in seconds from timestamps (nanoseconds)
-        double dt_seconds;
-        if (ts[i] <= ts[i - 1]) {
-            // Zero or negative time delta: output 0.0 to avoid division by zero
-            result[i] = 0.0;
-            continue;
-        }
-        dt_seconds = static_cast<double>(ts[i] - ts[i - 1]) / 1e9;
-
-        // Fall back to the provided seconds_per_point if timestamps yield zero
-        if (dt_seconds == 0.0) {
-            if (seconds_per_point == 0.0) {
-                result[i] = 0.0;
-                continue;
-            }
-            dt_seconds = seconds_per_point;
-        }
-
-        // Rate per hour: (value_diff / dt_seconds) * 3600
-        result[i] = (value_diff / dt_seconds) * 3600.0;
-    }
-    return AlignedSeries(timestamps, std::move(result));
+    return rate_per(seconds_per_point, 3600.0);
 }
 
 // ==================== Rolling Window Functions ====================
@@ -616,13 +585,20 @@ AlignedSeries AlignedSeries::rolling_avg(int N) const {
     }
 
     double running_sum = 0.0;
+    int valid_count = 0;  // Track non-NaN values in the window
     for (size_t i = 0; i < values.size(); ++i) {
-        running_sum += values[i];
+        if (!std::isnan(values[i])) {
+            running_sum += values[i];
+            valid_count++;
+        }
         if (i >= static_cast<size_t>(N)) {
-            running_sum -= values[i - N];
+            if (!std::isnan(values[i - N])) {
+                running_sum -= values[i - N];
+                valid_count--;
+            }
         }
         if (i + 1 >= static_cast<size_t>(N)) {
-            result[i] = running_sum / N;
+            result[i] = (valid_count > 0) ? running_sum / valid_count : nan;
         }
         // else remains NaN (window not yet full)
     }
@@ -665,10 +641,27 @@ static AlignedSeries rolling_monotone(const AlignedSeries& s, int N, Cmp cmp) {
         while (!ring_empty() && ring_front() + wsize <= i) {
             ring_pop_front();
         }
+        // Skip NaN values: they poison comparisons (always false), so once a
+        // NaN enters the deque it can never be evicted.  Instead, treat NaN
+        // like a missing value -- emit NaN for this position but leave the
+        // deque untouched so valid entries remain available.
+        if (std::isnan(s.values[i])) {
+            // Also evict any NaN entries stuck in the deque from before the
+            // NaN-skip logic was in place (defensive).
+            while (!ring_empty() && std::isnan(s.values[ring_back()])) {
+                ring_pop_back();
+            }
+            if (i + 1 >= wsize && !ring_empty()) {
+                result[i] = s.values[ring_front()];
+            }
+            // else result[i] is already NaN from initialization
+            continue;
+        }
         // Maintain the monotone invariant: pop back elements that the current
         // value dominates.  cmp(a, b) is true when a is strictly "more extreme"
         // than b (e.g. a < b for min).  We discard back when NOT more extreme.
-        while (!ring_empty() && !cmp(s.values[ring_back()], s.values[i])) {
+        // Also evict NaN entries which can't participate in valid comparisons.
+        while (!ring_empty() && (std::isnan(s.values[ring_back()]) || !cmp(s.values[ring_back()], s.values[i]))) {
             ring_pop_back();
         }
         ring_push_back(i);
@@ -983,9 +976,9 @@ AlignedSeries AlignedSeries::time_shift(int64_t offsetNs) const {
     const auto& ts = *timestamps;
     auto shifted = std::make_shared<std::vector<uint64_t>>(ts.size());
     for (size_t i = 0; i < ts.size(); ++i) {
-        // Cast to int64_t to allow negative offsets, then back to uint64_t.
-        (*shifted)[i] = static_cast<uint64_t>(
-            static_cast<int64_t>(ts[i]) + offsetNs);
+        // Cast to int64_t to allow negative offsets, clamp to 0 to avoid wrap.
+        int64_t result = static_cast<int64_t>(ts[i]) + offsetNs;
+        (*shifted)[i] = (result < 0) ? 0 : static_cast<uint64_t>(result);
     }
     return AlignedSeries(std::move(shifted), values);
 }
@@ -1021,6 +1014,12 @@ AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node,
 
         case ExprNodeType::TIME_SHIFT_FUNCTION:
             return evaluateTimeShiftFunction(node.asTimeShiftFunction(), queryResults);
+
+        case ExprNodeType::ANOMALY_FUNCTION:
+            throw EvaluationException("anomalies() is not yet implemented");
+
+        case ExprNodeType::FORECAST_FUNCTION:
+            throw EvaluationException("forecast() is not yet implemented");
 
         default:
             throw EvaluationException("Unknown expression node type");
@@ -1673,4 +1672,4 @@ AlignedSeries ExpressionEvaluator::evaluateTimeShiftFunction(
     return series.time_shift(offsetNs);
 }
 
-} // namespace tsdb
+} // namespace timestar

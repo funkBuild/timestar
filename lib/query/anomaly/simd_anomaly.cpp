@@ -1,20 +1,21 @@
 #include "simd_anomaly.hpp"
+#include "../simd_helpers.hpp"
 #include <algorithm>
 #include <numeric>
 #include <cstring>
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
 #include <cpuid.h>
 #endif
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 namespace simd {
 
 // ==================== SIMD Detection ====================
 
 bool isAvx2Available() {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     return false;
 #else
     static const bool available = []() {
@@ -33,7 +34,7 @@ bool isAvx2Available() {
 }
 
 bool isAvx512Available() {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     return false;
 #else
     static const bool available = []() {
@@ -52,14 +53,8 @@ bool isAvx512Available() {
 
 // ==================== Helper Functions ====================
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
-static double hsum_avx(__m256d v) {
-    __m128d vlow = _mm256_castpd256_pd128(v);
-    __m128d vhigh = _mm256_extractf128_pd(v, 1);
-    vlow = _mm_add_pd(vlow, vhigh);
-    __m128d high64 = _mm_unpackhi_pd(vlow, vlow);
-    return _mm_cvtsd_f64(_mm_add_sd(vlow, high64));
-}
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
+using ::timestar::simd::hsum_avx;
 #endif
 
 // ==================== Scalar Implementations ====================
@@ -156,7 +151,7 @@ void computeAnomalyScores(
 
 void computeTricubeWeights(const double* distances, double* weights, size_t count) {
     for (size_t i = 0; i < count; ++i) {
-        double u = distances[i];
+        double u = std::abs(distances[i]);
         if (u >= 1.0) {
             weights[i] = 0.0;
         } else {
@@ -179,7 +174,7 @@ void computeMovingAverage(
     double windowSum = 0.0;
     size_t windowCount = 0;
 
-    // Initialize first window
+    // Initialize first window [0, halfWindow] inclusive
     size_t initEnd = std::min(halfWindow + 1, count);
     for (size_t i = 0; i < initEnd; ++i) {
         if (!std::isnan(values[i])) {
@@ -222,7 +217,7 @@ double weightedSum(const double* values, const double* weights, size_t count) {
 // ==================== Vector Operations ====================
 
 void vectorSubtract(const double* a, const double* b, double* result, size_t count) {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::vectorSubtract(a, b, result, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -245,7 +240,7 @@ void vectorSubtract(const double* a, const double* b, double* result, size_t cou
 }
 
 void vectorAdd(const double* a, const double* b, double* result, size_t count) {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::vectorAdd(a, b, result, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -268,7 +263,7 @@ void vectorAdd(const double* a, const double* b, double* result, size_t count) {
 }
 
 void vectorMultiply(const double* a, const double* b, double* result, size_t count) {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::vectorMultiply(a, b, result, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -291,7 +286,7 @@ void vectorMultiply(const double* a, const double* b, double* result, size_t cou
 }
 
 void vectorScalarMultiply(const double* a, double scalar, double* result, size_t count) {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::vectorScalarMultiply(a, scalar, result, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -315,7 +310,7 @@ void vectorScalarMultiply(const double* a, double scalar, double* result, size_t
 }
 
 void vectorFMA(const double* a, const double* b, double scalar, double* result, size_t count) {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::vectorFMA(a, b, scalar, result, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -345,7 +340,7 @@ void vectorFMA(const double* a, const double* b, double scalar, double* result, 
 double vectorSum(const double* values, size_t count) {
     if (count == 0) return 0.0;
 
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     return scalar::vectorSum(values, count);
 #else
     if (isAvx512Available() && count >= 16) {
@@ -394,7 +389,7 @@ double vectorMean(const double* values, size_t count) {
 double vectorSumSquaredDiff(const double* values, size_t count, double mean) {
     if (count == 0) return 0.0;
 
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     return scalar::vectorSumSquaredDiff(values, count, mean);
 #else
     if (isAvx2Available() && count >= 8) {
@@ -534,7 +529,7 @@ void computeMovingAverage(
 double weightedSum(const double* values, const double* weights, size_t count) {
     if (count == 0) return 0.0;
 
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     return scalar::weightedSum(values, weights, count);
 #else
     if (isAvx2Available() && count >= 8) {
@@ -578,7 +573,7 @@ void computeBounds(
     double* lower,
     size_t count) {
 
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::computeBounds(predictions, scale, bounds, upper, lower, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -616,7 +611,7 @@ void computeAnomalyScores(
     double* scores,
     size_t count) {
 
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::computeAnomalyScores(values, upper, lower, scores, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -653,7 +648,7 @@ void computeAnomalyScores(
 // ==================== LOESS Helpers ====================
 
 void computeTricubeWeights(const double* distances, double* weights, size_t count) {
-#if TSDB_ANOMALY_DISABLE_SIMD
+#if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::computeTricubeWeights(distances, weights, count);
 #else
     if (!isAvx2Available() || count < 8) {
@@ -663,10 +658,12 @@ void computeTricubeWeights(const double* distances, double* weights, size_t coun
 
     __m256d one = _mm256_set1_pd(1.0);
     __m256d zero = _mm256_setzero_pd();
+    __m256d sign_mask = _mm256_set1_pd(-0.0); // sign bit mask for abs
     size_t simd_end = count - (count % 4);
 
     for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d u = _mm256_loadu_pd(&distances[i]);
+        // Take absolute value of distances
+        __m256d u = _mm256_andnot_pd(sign_mask, _mm256_loadu_pd(&distances[i]));
 
         // u^3
         __m256d u2 = _mm256_mul_pd(u, u);
@@ -687,7 +684,7 @@ void computeTricubeWeights(const double* distances, double* weights, size_t coun
     }
 
     for (size_t i = simd_end; i < count; ++i) {
-        double u = distances[i];
+        double u = std::abs(distances[i]);
         if (u >= 1.0) {
             weights[i] = 0.0;
         } else {
@@ -718,7 +715,7 @@ LinearFit weightedLinearRegression(
     // Compute weighted products
     std::vector<double> wxx(count), wxy(count);
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (isAvx2Available() && count >= 8) {
         size_t simd_end = count - (count % 4);
 
@@ -768,4 +765,4 @@ LinearFit weightedLinearRegression(
 
 } // namespace simd
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar

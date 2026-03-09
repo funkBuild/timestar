@@ -1,20 +1,20 @@
-# TSDB Examples
+# TimeStar Examples
 
-This directory contains example code demonstrating how to use TSDB.
+This directory contains example code demonstrating how to use TimeStar.
 
 ## Examples
 
 ### Basic Usage
 
-- **write_data.sh** - Example of writing data to TSDB via HTTP API
-- **query_data.sh** - Example of querying data from TSDB
+- **write_data.sh** - Example of writing data to TimeStar via HTTP API
+- **query_data.sh** - Example of querying data from TimeStar
 - **aggregation_query.sh** - Example of aggregation queries
 
 ## Running the Examples
 
-1. Start the TSDB server:
+1. Start the TimeStar server:
    ```bash
-   ./build/bin/tsdb_http_server --port 8086
+   ./build/bin/timestar_http_server --port 8086
    ```
 
 2. Run any example script:

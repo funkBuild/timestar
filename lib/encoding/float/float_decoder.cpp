@@ -13,8 +13,8 @@ void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
     const size_t required_capacity = current_size + length;
 
     if (out.capacity() < required_capacity) {
-        // Reserve with some extra space to avoid frequent reallocations
-        out.reserve(required_capacity + (required_capacity >> 3)); // 12.5% extra
+        // Exact reserve: length is known from the block header
+        out.reserve(required_capacity);
     }
 
     // Resize to exact size needed for direct memory writes
@@ -24,6 +24,7 @@ void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
     uint64_t last_value = values.readFixed<uint64_t, 64>();
     uint64_t tzb = 0;
     uint64_t data_bits = 0;
+    bool bounds_initialized = false;
     size_t count = 0;
 
     // Save original nToSkip for totalLength calculation
@@ -59,10 +60,14 @@ void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t l
                     tzb = 64 - lzb - data_bits;
                 }
 
+                bounds_initialized = true;
                 const uint64_t decoded_value = values.read<uint64_t>(data_bits) << tzb;
                 last_value ^= decoded_value;
             } else {
                 // 0b01 prefix - reusing previous bounds
+                if (!bounds_initialized) [[unlikely]] {
+                    throw std::runtime_error("Corrupt float block: reuse-bounds before any bounds established");
+                }
                 const uint64_t decoded_value = values.read<uint64_t>(data_bits) << tzb;
                 last_value ^= decoded_value;
             }

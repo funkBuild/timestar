@@ -1,8 +1,8 @@
-# TSDB Query API Implementation Summary
+# TimeStar Query API Implementation Summary
 
 ## Executive Summary
 
-The TSDB HTTP API test suite revealed that **84% of tests (21/25) are failing** due to a fundamental difference in how aggregation queries are handled. The core issue is that the server doesn't properly aggregate data across multiple series when no `group by` clause is specified.
+The TimeStar HTTP API test suite revealed that **84% of tests (21/25) are failing** due to a fundamental difference in how aggregation queries are handled. The core issue is that the server doesn't properly aggregate data across multiple series when no `group by` clause is specified.
 
 ## Critical Issue
 

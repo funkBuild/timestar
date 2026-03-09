@@ -9,7 +9,7 @@ This document outlines the implementation plan for three new metadata endpoints:
 ## Architecture Integration
 
 ### 1. Leverage Existing LevelDB Index System
-The TSDB already has a LevelDB-based indexing system (`lib/leveldb_index.hpp/cpp`) that stores:
+The TimeStar already has a LevelDB-based indexing system (`lib/leveldb_index.hpp/cpp`) that stores:
 - Series mappings: `measurement+tags+field → series_id`
 - Measurement fields: `measurement → [field1, field2, ...]`
 - Measurement tags: `measurement → [tag_key1, tag_key2, ...]`
@@ -146,7 +146,7 @@ seastar::future<std::unordered_map<std::string, FieldInfo>>
 
 ## Integration Points
 
-### 1. Modify tsdb_http_server.cpp
+### 1. Modify timestar_http_server.cpp
 ```cpp
 // Add metadata handler
 std::unique_ptr<HttpMetadataHandler> g_metadataHandler;

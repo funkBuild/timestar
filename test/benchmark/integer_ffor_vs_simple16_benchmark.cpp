@@ -38,7 +38,7 @@ std::vector<uint64_t> genConstantInterval(size_t count,
     return v;
 }
 
-// Timestamps with small jitter (common TSDB pattern)
+// Timestamps with small jitter (common TimeStar pattern)
 std::vector<uint64_t> genSmallJitter(size_t count,
                                      uint64_t start = 1'000'000'000'000ULL,
                                      uint64_t interval = 1'000'000'000ULL,

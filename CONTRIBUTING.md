@@ -1,11 +1,11 @@
-# Contributing to TSDB
+# Contributing to TimeStar
 
 ## Getting Started
 
 1. Clone the repository with submodules:
    ```bash
-   git clone --recursive https://github.com/yourusername/tsdb.git
-   cd tsdb
+   git clone --recursive https://github.com/yourusername/timestar.git
+   cd timestar
    ```
 
 2. Install dependencies (Ubuntu/Debian):
@@ -25,7 +25,7 @@
 
 4. Run tests:
    ```bash
-   ./test/tsdb_test
+   ./test/timestar_test
    ```
 
 ## Code Style
@@ -42,7 +42,7 @@ CI will reject PRs with formatting violations.
 
 1. Create a feature branch from `main`
 2. Make your changes with tests
-3. Ensure all tests pass: `./test/tsdb_test`
+3. Ensure all tests pass: `./test/timestar_test`
 4. Ensure formatting passes: `clang-format-17 --dry-run --Werror <files>`
 5. Open a PR against `main` with a clear description
 

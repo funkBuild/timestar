@@ -2,26 +2,26 @@
 
 #include <seastar/util/log.hh>
 
-namespace tsdb {
+namespace timestar {
 
-// TSDB module loggers - each component gets its own logger for filtering
-inline seastar::logger tsdb_log("tsdb");
-inline seastar::logger engine_log("tsdb.engine");
-inline seastar::logger tsm_log("tsdb.tsm");
-inline seastar::logger wal_log("tsdb.wal");
-inline seastar::logger memory_log("tsdb.memory");
-inline seastar::logger index_log("tsdb.index");
-inline seastar::logger metadata_log("tsdb.metadata");
-inline seastar::logger compactor_log("tsdb.compactor");
-inline seastar::logger http_log("tsdb.http");
-inline seastar::logger query_log("tsdb.query");
+// TimeStar module loggers - each component gets its own logger for filtering
+inline seastar::logger timestar_log("timestar");
+inline seastar::logger engine_log("timestar.engine");
+inline seastar::logger tsm_log("timestar.tsm");
+inline seastar::logger wal_log("timestar.wal");
+inline seastar::logger memory_log("timestar.memory");
+inline seastar::logger index_log("timestar.index");
+inline seastar::logger metadata_log("timestar.metadata");
+inline seastar::logger compactor_log("timestar.compactor");
+inline seastar::logger http_log("timestar.http");
+inline seastar::logger query_log("timestar.query");
 
 // Convenience macros for logging
-#define TSDB_LOG_ERROR(logger, ...) logger.error(__VA_ARGS__)
-#define TSDB_LOG_WARN(logger, ...) logger.warn(__VA_ARGS__)
-#define TSDB_LOG_INFO(logger, ...) logger.info(__VA_ARGS__)
-#define TSDB_LOG_DEBUG(logger, ...) logger.debug(__VA_ARGS__)
-#define TSDB_LOG_TRACE(logger, ...) logger.trace(__VA_ARGS__)
+#define TIMESTAR_LOG_ERROR(logger, ...) logger.error(__VA_ARGS__)
+#define TIMESTAR_LOG_WARN(logger, ...) logger.warn(__VA_ARGS__)
+#define TIMESTAR_LOG_INFO(logger, ...) logger.info(__VA_ARGS__)
+#define TIMESTAR_LOG_DEBUG(logger, ...) logger.debug(__VA_ARGS__)
+#define TIMESTAR_LOG_TRACE(logger, ...) logger.trace(__VA_ARGS__)
 
 // Initialize logging with default or custom level
 inline void init_logging(seastar::log_level level = seastar::log_level::info) {
@@ -33,4 +33,4 @@ inline void set_log_level(seastar::logger& logger, seastar::log_level level) {
     logger.set_level(level);
 }
 
-} // namespace tsdb
+} // namespace timestar

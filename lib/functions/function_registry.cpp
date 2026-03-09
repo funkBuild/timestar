@@ -1,10 +1,13 @@
 #include "function_registry.hpp"
 #include <algorithm>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 FunctionRegistry& FunctionRegistry::getInstance() {
-    static FunctionRegistry instance;
+    // Thread-local to ensure each Seastar shard (one OS thread per shard) gets
+    // its own independent registry instance, preventing data races on the
+    // internal std::map members from concurrent cross-shard access.
+    static thread_local FunctionRegistry instance;
     return instance;
 }
 
@@ -103,4 +106,4 @@ void FunctionRegistry::clear() {
     metadata_.clear();
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

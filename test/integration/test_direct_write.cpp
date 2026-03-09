@@ -2,7 +2,7 @@
 #include <iostream>
 #include <seastar/core/sleep.hh>
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include <filesystem>
 
 class DirectWriteTest : public ::testing::Test {
@@ -27,7 +27,7 @@ seastar::future<> testDirectWriteLargeTimestamp() {
     std::cout << "Writing timestamp: " << timestamp
               << " (requires " << (64 - __builtin_clzll(timestamp)) << " bits)" << std::endl;
 
-    TSDBInsert<double> insert("test", "value");
+    TimeStarInsert<double> insert("test", "value");
     insert.addTag("host", "server-01");
     insert.addValue(timestamp, 42.0);
 
@@ -43,7 +43,7 @@ seastar::future<> testDirectWriteLargeTimestamp() {
     std::cout << "\nWriting max timestamp: " << timestamp
               << " (requires " << (64 - __builtin_clzll(timestamp)) << " bits)" << std::endl;
 
-    TSDBInsert<double> insert2("test", "value");
+    TimeStarInsert<double> insert2("test", "value");
     insert2.addTag("host", "server-02");
     insert2.addValue(timestamp, 99.0);
 

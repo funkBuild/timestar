@@ -1,28 +1,30 @@
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 
 #include <glaze/toml.hpp>
 
-namespace tsdb {
+namespace timestar {
 
 // Global config pointer — set once in main() before app.run(), read from any shard.
-static const TsdbConfig* g_config = nullptr;
-static TsdbConfig g_defaultConfig;
+static const TimestarConfig* g_config = nullptr;
+static TimestarConfig g_defaultConfig;
 
-void setGlobalConfig(const TsdbConfig& cfg) {
-    static TsdbConfig stored = cfg;
+void setGlobalConfig(const TimestarConfig& cfg) {
+    static TimestarConfig stored;
+    stored = cfg;
     g_config = &stored;
 }
 
-const TsdbConfig& config() {
+const TimestarConfig& config() {
     return g_config ? *g_config : g_defaultConfig;
 }
 
-std::vector<std::string> TsdbConfig::validate() const {
+std::vector<std::string> TimestarConfig::validate() const {
     std::vector<std::string> errors;
 
     if (server.port == 0) {
@@ -68,6 +70,15 @@ std::vector<std::string> TsdbConfig::validate() const {
 
     if (engine.tombstone_dead_fraction_threshold <= 0.0 || engine.tombstone_dead_fraction_threshold >= 1.0) {
         errors.emplace_back("engine.tombstone_dead_fraction_threshold must be in (0, 1)");
+    }
+    if (engine.retention_sweep_interval_minutes == 0) {
+        errors.emplace_back("engine.retention_sweep_interval_minutes must be > 0");
+    }
+    if (streaming.output_queue_size == 0) {
+        errors.emplace_back("streaming.output_queue_size must be > 0");
+    }
+    if (streaming.heartbeat_interval_seconds == 0) {
+        errors.emplace_back("streaming.heartbeat_interval_seconds must be > 0");
     }
 
     // Validate Seastar-specific settings
@@ -166,7 +177,7 @@ static SeastarConfig parseSeastarSection(const std::string& tomlContent) {
     return cfg;
 }
 
-TsdbConfig loadConfigFile(const std::string& path) {
+TimestarConfig loadConfigFile(const std::string& path) {
     // Read the entire file
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -175,8 +186,8 @@ TsdbConfig loadConfigFile(const std::string& path) {
     std::string content((std::istreambuf_iterator<char>(file)),
                          std::istreambuf_iterator<char>());
 
-    // Parse TSDB sections via Glaze (skip unknown keys like [seastar])
-    TsdbConfigParseable parsed{};
+    // Parse TimeStar sections via Glaze (skip unknown keys like [seastar])
+    TimestarConfigParseable parsed{};
     static constexpr glz::toml::toml_opts tomlOpts{.error_on_unknown_keys = false};
     glz::context ctx{};
     auto ec = glz::read<tomlOpts>(parsed, content, ctx);
@@ -186,7 +197,7 @@ TsdbConfig loadConfigFile(const std::string& path) {
     }
 
     // Build the full config
-    TsdbConfig cfg;
+    TimestarConfig cfg;
     cfg.server = parsed.server;
     cfg.storage = parsed.storage;
     cfg.http = parsed.http;
@@ -210,7 +221,7 @@ TsdbConfig loadConfigFile(const std::string& path) {
 }
 
 std::string dumpDefaultConfig() {
-    TsdbConfigParseable defaults{};
+    TimestarConfigParseable defaults{};
     auto result = glz::write_toml(defaults);
     std::string out;
     if (result.has_value()) {
@@ -240,4 +251,81 @@ std::string dumpDefaultConfig() {
     return out;
 }
 
-} // namespace tsdb
+void applyEnvironmentOverrides(TimestarConfig& cfg) {
+    // Helper lambdas for type-safe env var reading
+    auto envStr = [](const char* name) -> const char* { return std::getenv(name); };
+
+    auto envU16 = [&](const char* name, uint16_t& field) {
+        if (auto v = envStr(name)) field = static_cast<uint16_t>(std::stoul(v));
+    };
+    auto envU32 = [&](const char* name, uint32_t& field) {
+        if (auto v = envStr(name)) field = static_cast<uint32_t>(std::stoul(v));
+    };
+    auto envU64 = [&](const char* name, uint64_t& field) {
+        if (auto v = envStr(name)) field = std::stoull(v);
+    };
+    auto envDbl = [&](const char* name, double& field) {
+        if (auto v = envStr(name)) field = std::stod(v);
+    };
+    auto envString = [&](const char* name, std::string& field) {
+        if (auto v = envStr(name)) field = v;
+    };
+
+    // Server
+    envU16("TIMESTAR_PORT", cfg.server.port);
+    envString("TIMESTAR_LOG_LEVEL", cfg.server.log_level);
+    envString("TIMESTAR_DATA_DIR", cfg.server.data_dir);
+
+    // Storage
+    envU64("TIMESTAR_WAL_SIZE_THRESHOLD", cfg.storage.wal_size_threshold);
+    envU32("TIMESTAR_MAX_POINTS_PER_BLOCK", cfg.storage.max_points_per_block);
+    envDbl("TIMESTAR_TSM_BLOOM_FPR", cfg.storage.tsm_bloom_fpr);
+    envU32("TIMESTAR_TSM_CACHE_ENTRIES", cfg.storage.tsm_cache_entries);
+
+    // Compaction
+    envU32("TIMESTAR_COMPACTION_MAX_CONCURRENT", cfg.storage.compaction.max_concurrent);
+    envU64("TIMESTAR_COMPACTION_MAX_MEMORY", cfg.storage.compaction.max_memory);
+    envU32("TIMESTAR_COMPACTION_BATCH_SIZE", cfg.storage.compaction.batch_size);
+
+    // HTTP
+    envU64("TIMESTAR_HTTP_MAX_WRITE_BODY_SIZE", cfg.http.max_write_body_size);
+    envU64("TIMESTAR_HTTP_MAX_QUERY_BODY_SIZE", cfg.http.max_query_body_size);
+    envU32("TIMESTAR_HTTP_MAX_SERIES_COUNT", cfg.http.max_series_count);
+    envU64("TIMESTAR_HTTP_MAX_TOTAL_POINTS", cfg.http.max_total_points);
+    envU32("TIMESTAR_HTTP_QUERY_TIMEOUT_SECONDS", cfg.http.query_timeout_seconds);
+
+    // Index
+    envU32("TIMESTAR_INDEX_BLOOM_FILTER_BITS", cfg.index.bloom_filter_bits);
+    envU32("TIMESTAR_INDEX_BLOCK_SIZE", cfg.index.block_size);
+    envU64("TIMESTAR_INDEX_WRITE_BUFFER_SIZE", cfg.index.write_buffer_size);
+    envU32("TIMESTAR_INDEX_MAX_OPEN_FILES", cfg.index.max_open_files);
+    envU64("TIMESTAR_INDEX_MAX_FILE_SIZE", cfg.index.max_file_size);
+    envU64("TIMESTAR_INDEX_SERIES_CACHE_SIZE", cfg.index.series_cache_size);
+
+    // Engine
+    envU32("TIMESTAR_RETENTION_SWEEP_INTERVAL_MINUTES", cfg.engine.retention_sweep_interval_minutes);
+    envU32("TIMESTAR_MAX_METADATA_RETRY_OPS", cfg.engine.max_metadata_retry_ops);
+    envDbl("TIMESTAR_TOMBSTONE_DEAD_FRACTION_THRESHOLD", cfg.engine.tombstone_dead_fraction_threshold);
+    envU32("TIMESTAR_MAX_TOMBSTONE_REWRITES_PER_SWEEP", cfg.engine.max_tombstone_rewrites_per_sweep);
+
+    // Streaming
+    envU32("TIMESTAR_STREAMING_MAX_SUBSCRIPTIONS", cfg.streaming.max_subscriptions_per_shard);
+    envU32("TIMESTAR_STREAMING_OUTPUT_QUEUE_SIZE", cfg.streaming.output_queue_size);
+    envU32("TIMESTAR_STREAMING_HEARTBEAT_INTERVAL_SECONDS", cfg.streaming.heartbeat_interval_seconds);
+
+    // Seastar — these go into the string map
+    auto envSeastar = [&](const char* envName, const char* key) {
+        if (auto v = envStr(envName)) cfg.seastar.settings[key] = v;
+    };
+    envSeastar("TIMESTAR_SMP", "smp");
+    envSeastar("TIMESTAR_MEMORY", "memory");
+    envSeastar("TIMESTAR_RESERVE_MEMORY", "reserve_memory");
+    envSeastar("TIMESTAR_OVERPROVISIONED", "overprovisioned");
+    envSeastar("TIMESTAR_THREAD_AFFINITY", "thread_affinity");
+    envSeastar("TIMESTAR_REACTOR_BACKEND", "reactor_backend");
+    envSeastar("TIMESTAR_POLL_MODE", "poll_mode");
+    envSeastar("TIMESTAR_TASK_QUOTA_MS", "task_quota_ms");
+    envSeastar("TIMESTAR_IO_PROPERTIES_FILE", "io_properties_file");
+}
+
+} // namespace timestar

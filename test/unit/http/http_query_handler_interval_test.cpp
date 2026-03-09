@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <limits>
 
-using namespace tsdb;
+using namespace timestar;
 
 class HttpQueryHandlerIntervalTest : public ::testing::Test {};
 
@@ -53,20 +53,25 @@ TEST_F(HttpQueryHandlerIntervalTest, ParseDecimalMinutes) {
     EXPECT_EQ(HttpQueryHandler::parseInterval("0.5m"), 30ULL * 1000000000);
 }
 
-// ---- Bare numbers (nanoseconds) ----
+// ---- Bare numbers require a unit suffix ----
 
-TEST_F(HttpQueryHandlerIntervalTest, BareNumberTreatedAsNanoseconds) {
-    EXPECT_EQ(HttpQueryHandler::parseInterval("300000000000"), 300000000000ULL);
+TEST_F(HttpQueryHandlerIntervalTest, BareNumberThrows) {
+    EXPECT_THROW(HttpQueryHandler::parseInterval("300000000000"), QueryParseException);
 }
 
-TEST_F(HttpQueryHandlerIntervalTest, BareNumberSmall) {
-    EXPECT_EQ(HttpQueryHandler::parseInterval("1"), 1ULL);
+TEST_F(HttpQueryHandlerIntervalTest, BareNumberSmallThrows) {
+    EXPECT_THROW(HttpQueryHandler::parseInterval("1"), QueryParseException);
 }
 
-TEST_F(HttpQueryHandlerIntervalTest, BareNumberUint64Max) {
-    // UINT64_MAX = 18446744073709551615
-    EXPECT_EQ(HttpQueryHandler::parseInterval("18446744073709551615"),
-              std::numeric_limits<uint64_t>::max());
+TEST_F(HttpQueryHandlerIntervalTest, BareNumberErrorMessage) {
+    try {
+        HttpQueryHandler::parseInterval("300");
+        FAIL() << "Expected QueryParseException";
+    } catch (const QueryParseException& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("no unit suffix"), std::string::npos)
+            << "Error message should mention missing unit suffix, got: " << msg;
+    }
 }
 
 // ---- Overflow detection ----

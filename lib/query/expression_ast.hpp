@@ -8,7 +8,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 
 // Forward declarations
 struct ExpressionNode;
@@ -434,6 +434,6 @@ inline const char* functionToString(FunctionType func) {
     }
 }
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // EXPRESSION_AST_H_INCLUDED

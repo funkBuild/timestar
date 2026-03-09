@@ -9,8 +9,9 @@
 #include <set>
 #include <memory>
 #include <optional>
-#include <atomic>
 #include <leveldb/db.h>
+#include <leveldb/cache.h>
+#include <leveldb/filter_policy.h>
 #include <leveldb/write_batch.h>
 
 // Reuse the same data structures
@@ -44,8 +45,10 @@ struct FieldStatsSync {
 class MetadataIndexSync {
 private:
     std::unique_ptr<leveldb::DB> db;
+    const leveldb::FilterPolicy* filterPolicy_{nullptr};
+    leveldb::Cache* blockCache_{nullptr};
     std::string dbPath;
-    std::atomic<uint64_t> nextSeriesId{1};
+    uint64_t nextSeriesId{1};
     
     // Helper methods for key generation
     static std::string seriesKey(uint64_t seriesId);
@@ -61,6 +64,8 @@ private:
                                   const std::string& tagValue);
     static std::string seriesLookupKey(const std::string& seriesKey);
     
+    // Generate tag subsets for composite index (subsets of size 1..3 only,
+    // avoiding the O(2^N) explosion of enumerating all possible subsets).
     std::vector<std::string> generateTagSubsets(const std::map<std::string, std::string>& tags);
     static std::string buildSortedTagString(const std::map<std::string, std::string>& tags);
     

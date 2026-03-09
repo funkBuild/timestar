@@ -27,7 +27,7 @@
 #include "../../../lib/query/derived_query.hpp"
 #include "../../../lib/query/expression_parser.hpp"
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 #include <seastar/core/future.hh>
@@ -37,7 +37,7 @@
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 // ---------------------------------------------------------------------------
 // Source-inspection helpers
@@ -82,7 +82,7 @@ static void insertFloatData(seastar::sharded<Engine>& eng,
                             const std::string& field,
                             const std::map<std::string, std::string>& tags,
                             const std::vector<std::pair<uint64_t, double>>& points) {
-    TSDBInsert<double> ins(measurement, field);
+    TimeStarInsert<double> ins(measurement, field);
     for (const auto& [k, v] : tags) ins.addTag(k, v);
     for (const auto& [ts, val] : points) ins.addValue(ts, val);
     shardedInsert(eng, std::move(ins));

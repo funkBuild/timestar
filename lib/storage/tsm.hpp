@@ -7,7 +7,7 @@
 #include "series_id.hpp"
 #include "bloom_filter.hpp"
 #include "block_aggregator.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 
 #include <string>
 #include <memory>
@@ -74,11 +74,11 @@ private:
   mutable std::unordered_map<SeriesId128, LRUList::iterator, SeriesId128::Hash> fullIndexCache;
 
   // Configuration for bloom filter and cache (read from TOML config)
-  static double bloomFpr() { return tsdb::config().storage.tsm_bloom_fpr; }
-  static size_t maxCacheEntries() { return tsdb::config().storage.tsm_cache_entries; }
+  static double bloomFpr() { return timestar::config().storage.tsm_bloom_fpr; }
+  static size_t maxCacheEntries() { return timestar::config().storage.tsm_cache_entries; }
 
   // Tombstone support
-  std::unique_ptr<tsdb::TSMTombstone> tombstones;
+  std::unique_ptr<timestar::TSMTombstone> tombstones;
 
   // Helper to get tombstone file path
   std::string getTombstonePath() const;
@@ -105,8 +105,6 @@ public:
   seastar::future<> readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   template <class T>
   seastar::future<> readSeriesBatched(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
-  template <class T>
-  seastar::future<> readBlock(TSMIndexBlock indexBlock, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   template <class T>
   seastar::future<> readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime, TSMResult<T> &results);
   std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
@@ -187,7 +185,7 @@ public:
   );
   
   // Get tombstone manager (for compaction)
-  tsdb::TSMTombstone* getTombstones() { return tombstones.get(); }
+  timestar::TSMTombstone* getTombstones() { return tombstones.get(); }
   bool hasTombstones() const { return tombstones && tombstones->getEntryCount() > 0; }
   
   // Pushdown aggregation: decode blocks and fold directly into BlockAggregator
@@ -197,7 +195,7 @@ public:
     const SeriesId128& seriesId,
     uint64_t startTime,
     uint64_t endTime,
-    tsdb::BlockAggregator& aggregator
+    timestar::BlockAggregator& aggregator
   );
 
   // Estimate fraction of file data covered by tombstones (metadata-only, no data reads)

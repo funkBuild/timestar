@@ -6,7 +6,7 @@
 #include <cmath>
 #include <random>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using ::testing::_;
 using ::testing::DoubleNear;
 using ::testing::Each;

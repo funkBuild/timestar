@@ -9,11 +9,11 @@
 #
 set -euo pipefail
 
-TSDB_ROOT="/home/matt/Desktop/source/tsdb"
-BUILD_DIR="$TSDB_ROOT/build"
-SERVER_BIN="$BUILD_DIR/bin/tsdb_http_server"
-BENCH_SCRIPT="$TSDB_ROOT/test_api/http_api_benchmark/filesize_bench_insert.js"
-FLOAT_HEADER="$TSDB_ROOT/lib/encoding/float_encoder.hpp"
+TIMESTAR_ROOT="/home/matt/Desktop/source/timestar"
+BUILD_DIR="$TIMESTAR_ROOT/build"
+SERVER_BIN="$BUILD_DIR/bin/timestar_http_server"
+BENCH_SCRIPT="$TIMESTAR_ROOT/test_api/http_api_benchmark/filesize_bench_insert.js"
+FLOAT_HEADER="$TIMESTAR_ROOT/lib/encoding/float_encoder.hpp"
 PORT=8086
 BASE_URL="http://localhost:$PORT"
 
@@ -24,13 +24,13 @@ GORILLA_LOG="/tmp/filesize_gorilla.log"
 
 kill_server() {
   local pids
-  pids=$(pgrep -f tsdb_http_server 2>/dev/null || true)
+  pids=$(pgrep -f timestar_http_server 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
     echo "  Stopping server (PIDs: $pids)..."
     kill -SIGINT $pids 2>/dev/null || true
     # Wait for graceful shutdown (drains background TSM conversions)
     for i in $(seq 1 30); do
-      if ! pgrep -f tsdb_http_server >/dev/null 2>&1; then
+      if ! pgrep -f timestar_http_server >/dev/null 2>&1; then
         echo "  Server stopped."
         return 0
       fi
@@ -51,7 +51,7 @@ start_server() {
   echo "  Starting server on port $PORT..."
   cd "$BUILD_DIR"
   "$SERVER_BIN" --port "$PORT" >/dev/null 2>&1 &
-  cd "$TSDB_ROOT"
+  cd "$TIMESTAR_ROOT"
 
   # Wait for health
   for i in $(seq 1 60); do
@@ -85,8 +85,8 @@ build() {
   echo "  Building..."
   cd "$BUILD_DIR"
   cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null 2>&1
-  make -j"$(nproc)" tsdb_http_server 2>&1 | tail -5
-  cd "$TSDB_ROOT"
+  make -j"$(nproc)" timestar_http_server 2>&1 | tail -5
+  cd "$TIMESTAR_ROOT"
   echo "  Build complete."
 }
 
@@ -173,9 +173,9 @@ run_benchmark() {
   start_server
   echo ""
   echo "--- Inserting data [$label] ---"
-  cd "$TSDB_ROOT/test_api/http_api_benchmark"
+  cd "$TIMESTAR_ROOT/test_api/http_api_benchmark"
   node filesize_bench_insert.js "$label" 2>&1
-  cd "$TSDB_ROOT"
+  cd "$TIMESTAR_ROOT"
 
   # 4. Stop server gracefully (drains in-flight TSM conversions)
   echo ""

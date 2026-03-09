@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include "../../../lib/query/query_parser.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 class QueryParserTimezoneTest : public ::testing::Test {
 protected:

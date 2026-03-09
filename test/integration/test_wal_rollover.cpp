@@ -7,7 +7,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/core/sleep.hh>
 #include "../../lib/core/engine.hpp"
-#include "../../lib/core/tsdb_value.hpp"
+#include "../../lib/core/timestar_value.hpp"
 
 namespace fs = std::filesystem;
 
@@ -82,7 +82,7 @@ seastar::future<> testWALRolloverAndTSMCreation() {
 
     for (size_t batch = 0; batch < BATCHES; batch++) {
         for (size_t s = 0; s < SERIES_COUNT; s++) {
-            TSDBInsert<double> insert("metric", "field_" + std::to_string(s));
+            TimeStarInsert<double> insert("metric", "field_" + std::to_string(s));
             insert.addTag("host", "h" + std::to_string(s % 5));
 
             uint64_t baseTime = 1000000000 + batch * POINTS_PER_BATCH * 1000;
@@ -130,7 +130,7 @@ seastar::future<> testWALRolloverAndTSMCreation() {
         std::cout << "\nSUCCESS: WAL rollover working!" << std::endl;
 
         // Verify data
-        TSDBInsert<double> q("metric", "field_0");
+        TimeStarInsert<double> q("metric", "field_0");
         q.addTag("host", "h0");
         auto resultOpt = co_await engine.query(q.seriesKey(), 1000000000, 2000000000);
 

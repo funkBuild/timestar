@@ -56,7 +56,7 @@ private:
     std::unique_ptr<const leveldb::FilterPolicy> filterPolicy_;
     std::unique_ptr<leveldb::Cache> blockCache_;
     std::string dbPath;
-    std::atomic<uint64_t> nextSeriesId{1};
+    uint64_t nextSeriesId{1};
     
     // Helper methods for key generation
     static std::string seriesKey(uint64_t seriesId);
@@ -72,7 +72,8 @@ private:
                                   const std::string& tagValue);
     static std::string seriesLookupKey(const std::string& seriesKey);
     
-    // Generate all tag subsets for composite index
+    // Generate tag subsets for composite index (subsets of size 1..3 only,
+    // avoiding the O(2^N) explosion of enumerating all possible subsets).
     std::vector<std::string> generateTagSubsets(const std::map<std::string, std::string>& tags);
     
     // Build sorted tag string for consistent keys

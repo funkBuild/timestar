@@ -5,7 +5,7 @@
 #include "expression_evaluator.hpp"
 #include "engine.hpp"
 #include "logger.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 
 #include <glaze/glaze.hpp>
 
@@ -18,7 +18,7 @@
 #include <chrono>
 #include <cstdio>
 
-namespace tsdb {
+namespace timestar {
 
 // --- JSON parsing for subscribe requests ---
 
@@ -36,11 +36,11 @@ struct GlazeSubscribeRequest {
     std::optional<std::variant<uint64_t, std::string>> aggregationInterval;
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 template <>
-struct glz::meta<tsdb::GlazeQueryEntry> {
-    using T = tsdb::GlazeQueryEntry;
+struct glz::meta<timestar::GlazeQueryEntry> {
+    using T = timestar::GlazeQueryEntry;
     static constexpr auto value = object(
         "query", &T::query,
         "label", &T::label
@@ -48,8 +48,8 @@ struct glz::meta<tsdb::GlazeQueryEntry> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeSubscribeRequest> {
-    using T = tsdb::GlazeSubscribeRequest;
+struct glz::meta<timestar::GlazeSubscribeRequest> {
+    using T = timestar::GlazeSubscribeRequest;
     static constexpr auto value = object(
         "query", &T::query,
         "queries", &T::queries,
@@ -60,7 +60,7 @@ struct glz::meta<tsdb::GlazeSubscribeRequest> {
     );
 };
 
-namespace tsdb {
+namespace timestar {
 
 // --- Parse startTime variant to nanosecond timestamp ---
 
@@ -77,9 +77,10 @@ static uint64_t parseStartTime(const std::optional<std::variant<uint64_t, std::s
             // NOTE: plain integer strings (e.g. "1704067200") are NOT valid here
             // and would be misinterpreted as a nanosecond duration. Pass startTime
             // as a JSON number (not string) to use an absolute nanosecond timestamp.
-            if (!val.empty() && std::all_of(val.begin(), val.end(), ::isdigit)) {
+            if (!val.empty() && std::all_of(val.begin(), val.end(),
+                    [](unsigned char c) { return std::isdigit(c); })) {
                 // Looks like a bare integer — refuse and return 0 (no start time filter)
-                tsdb::http_log.warn("[SUBSCRIBE] startTime string '{}' looks like a bare "
+                timestar::http_log.warn("[SUBSCRIBE] startTime string '{}' looks like a bare "
                     "integer; use a JSON number for absolute timestamps or a duration "
                     "string like '1h' for relative start. Ignoring startTime.", val);
                 return 0;
@@ -422,7 +423,7 @@ void HttpStreamHandler::registerRoutes(seastar::httpd::routes& r) {
     r.add(seastar::httpd::operation_type::GET,
           seastar::httpd::url("/subscriptions"), new subscriptions_handler(this));
 
-    tsdb::http_log.info("Registered HTTP streaming endpoints at /subscribe, /subscriptions");
+    timestar::http_log.info("Registered HTTP streaming endpoints at /subscribe, /subscriptions");
 }
 
 // --- Main subscribe handler ---
@@ -438,6 +439,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>>
 HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
 
+    // Body size limit to prevent DoS via large payloads
+    if (req->content.size() > timestar::config().http.max_query_body_size) {
+        rep->set_status(seastar::http::reply::status_type::payload_too_large);
+        rep->_content = R"({"status":"error","error":"Request body too large"})";
+        rep->add_header("Content-Type", "application/json");
+        co_return rep;
+    }
+
     // Parse JSON body
     GlazeSubscribeRequest glazeReq;
     auto parseErr = glz::read_json(glazeReq, req->content);
@@ -450,6 +459,14 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
 
     // Normalize single-query and multi-query into a unified list of QueryEntry
     std::vector<QueryEntry> queryEntries;
+
+    if (!glazeReq.queries.empty() && !glazeReq.query.empty()) {
+        // Both specified — reject ambiguous request
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->_content = "{\"status\":\"error\",\"error\":{\"code\":\"AMBIGUOUS_REQUEST\",\"message\":\"Specify either 'query' or 'queries', not both\"}}";
+        rep->add_header("Content-Type", "application/json");
+        co_return rep;
+    }
 
     if (!glazeReq.queries.empty()) {
         // Multi-query mode
@@ -575,7 +592,7 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
         }
     }
 
-    const auto& streamCfg = tsdb::config().streaming;
+    const auto& streamCfg = timestar::config().streaming;
 
     // Check subscription limit before accepting (count all queries that will be registered)
     auto& localMgr = _engineSharded->local().getSubscriptionManager();
@@ -611,29 +628,44 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
         // Register on handler shard with queue.
         // addSubscription throws std::invalid_argument if any scope pattern is
         // an invalid regex — return HTTP 400 so the client gets a clear error.
+        std::string subscriptionError;
         try {
             localMgr.addSubscription(sub);
         } catch (const std::invalid_argument& e) {
+            subscriptionError = e.what();
+            // Remove the sub ID we just failed to register (wasn't added)
+            allSubIds.pop_back();
+        }
+        if (!subscriptionError.empty()) {
+            // Clean up all previously registered subscriptions
+            for (auto id : allSubIds) {
+                localMgr.removeSubscription(id);
+            }
+            co_await _engineSharded->invoke_on_all(
+                [allSubIds, thisShard](Engine& engine) {
+                    if (seastar::this_shard_id() == thisShard) return;
+                    for (auto id : allSubIds) {
+                        engine.getSubscriptionManager().removeSubscription(id);
+                    }
+                });
             rep->set_status(seastar::http::reply::status_type{400});
             rep->_content = std::string("{\"status\":\"error\",\"error\":{\"code\":\"INVALID_SCOPE_PATTERN\","
-                            "\"message\":\"") + jsonEscape(e.what()) + "\"}}";
+                            "\"message\":\"") + jsonEscape(subscriptionError) + "\"}}";
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
         localMgr.registerQueue(sub.id, queuePtr);
 
-        // Register filter criteria on all other shards
-        for (unsigned s = 0; s < shardCount; ++s) {
-            if (s == thisShard) continue;
-            co_await _engineSharded->invoke_on(s,
-                [sub](Engine& engine) {
-                    engine.getSubscriptionManager().addSubscription(sub);
-                });
-        }
+        // Register filter criteria on all other shards in parallel
+        co_await _engineSharded->invoke_on_all(
+            [sub, thisShard](Engine& engine) {
+                if (seastar::this_shard_id() == thisShard) return;
+                engine.getSubscriptionManager().addSubscription(sub);
+            });
     }
 
-    tsdb::http_log.info("[SUBSCRIBE] {} subscriptions registered on all {} shards (first id={})",
-        queryEntries.size(), shardCount, allSubIds.front());
+    timestar::http_log.info("[SUBSCRIBE] {} subscriptions registered on all {} shards (first id={})",
+        queryEntries.size(), shardCount, allSubIds.empty() ? 0 : allSubIds.front());
 
     // --- Backfill: execute queries for historical data AFTER subscription registration ---
     std::vector<StreamingBatch> backfillBatches;
@@ -663,17 +695,17 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
                     }
                 }
             } catch (seastar::timed_out_error&) {
-                tsdb::http_log.warn("[SUBSCRIBE] Backfill timed out after {}s for label '{}'; "
+                timestar::http_log.warn("[SUBSCRIBE] Backfill timed out after {}s for label '{}'; "
                     "subscription remains active for live data",
                     backfillTimeoutSeconds.count(), entry.label);
             } catch (const std::exception& e) {
-                tsdb::http_log.warn("[SUBSCRIBE] Backfill failed for label '{}': {}",
+                timestar::http_log.warn("[SUBSCRIBE] Backfill failed for label '{}': {}",
                     entry.label, e.what());
             }
         }
 
         if (!backfillBatches.empty()) {
-            tsdb::http_log.info("[SUBSCRIBE] Backfill: {} batches across {} queries",
+            timestar::http_log.info("[SUBSCRIBE] Backfill: {} batches across {} queries",
                 backfillBatches.size(), queryEntries.size());
         }
     }
@@ -890,7 +922,7 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
             }
         } catch (...) {
             *cancelled = true;
-            tsdb::http_log.info("[SUBSCRIBE] Subscription group disconnected (first id={})",
+            timestar::http_log.info("[SUBSCRIBE] Subscription group disconnected (first id={})",
                 allSubIds.empty() ? 0 : allSubIds.front());
         }
 
@@ -905,11 +937,11 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
                     });
             } catch (...) {
                 // Best-effort: log and continue with remaining subscriptions
-                tsdb::http_log.warn("[SUBSCRIBE] Error during cleanup of subscription {}", subId);
+                timestar::http_log.warn("[SUBSCRIBE] Error during cleanup of subscription {}", subId);
             }
         }
 
-        tsdb::http_log.info("[SUBSCRIBE] {} subscriptions cleaned up from all shards in parallel", allSubIds.size());
+        timestar::http_log.info("[SUBSCRIBE] {} subscriptions cleaned up from all shards in parallel", allSubIds.size());
 
         co_await out.close();
     });
@@ -923,19 +955,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>>
 HttpStreamHandler::handleGetSubscriptions(std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
 
-    // Collect subscription stats from all shards
-    unsigned shardCount = seastar::smp::count;
-    std::vector<SubscriptionStats> allStats;
-
-    for (unsigned s = 0; s < shardCount; ++s) {
-        auto shardStats = co_await _engineSharded->invoke_on(s,
-            [](Engine& engine) {
-                return engine.getSubscriptionManager().getStats();
-            });
-        for (auto& st : shardStats) {
-            allStats.push_back(std::move(st));
-        }
-    }
+    // Collect subscription stats from all shards in parallel
+    auto allStats = co_await _engineSharded->map_reduce0(
+        [](Engine& engine) {
+            return engine.getSubscriptionManager().getStats();
+        },
+        std::vector<SubscriptionStats>{},
+        [](std::vector<SubscriptionStats> acc, std::vector<SubscriptionStats> shardStats) {
+            acc.insert(acc.end(),
+                       std::make_move_iterator(shardStats.begin()),
+                       std::make_move_iterator(shardStats.end()));
+            return acc;
+        });
 
     // Build JSON response manually
     std::string json;
@@ -997,4 +1028,4 @@ HttpStreamHandler::handleGetSubscriptions(std::unique_ptr<seastar::http::request
     co_return rep;
 }
 
-} // namespace tsdb
+} // namespace timestar

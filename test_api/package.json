@@ -1,7 +1,7 @@
 {
-  "name": "tsdb-api-tests",
+  "name": "timestar-api-tests",
   "version": "1.0.0",
-  "description": "API tests for TSDB HTTP server",
+  "description": "API tests for TimeStar HTTP server",
   "main": "index.js",
   "scripts": {
     "test": "jest",
@@ -11,7 +11,7 @@
     "test:all": "npm run test:standalone && npm run test"
   },
   "keywords": [
-    "tsdb",
+    "timestar",
     "timeseries",
     "database",
     "testing"

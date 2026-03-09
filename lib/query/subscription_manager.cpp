@@ -6,7 +6,7 @@
 #include <regex>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 
 // --- Subscription matching ---
 
@@ -47,6 +47,12 @@ void SubscriptionManager::addSubscription(const Subscription& sub) {
     // Idempotent: skip if already registered (prevents phantom duplicates on reconnect)
     if (_subscriptionsById.count(sub.id)) return;
 
+    bool isLocal = (sub.handlerShard == seastar::this_shard_id());
+    if (isLocal && _localSubscriptionCount >= MAX_LOCAL_SUBSCRIPTIONS) {
+        throw std::runtime_error("Maximum local subscription limit reached (" +
+                                 std::to_string(MAX_LOCAL_SUBSCRIPTIONS) + ")");
+    }
+
     // Pre-compile any wildcard/regex scope patterns so that Subscription::matches()
     // can use the cached std::regex objects instead of recompiling on every write.
     // Throws std::invalid_argument if any pattern is syntactically invalid so that
@@ -65,6 +71,7 @@ void SubscriptionManager::addSubscription(const Subscription& sub) {
 
     _subscriptionsById[compiled.id] = std::move(compiled);
     _subscriptionsByMeasurement[sub.measurement].push_back(sub.id);
+    if (isLocal) ++_localSubscriptionCount;
 }
 
 void SubscriptionManager::registerQueue(uint64_t subscriptionId,
@@ -78,6 +85,10 @@ void SubscriptionManager::removeSubscription(uint64_t subscriptionId) {
     auto it = _subscriptionsById.find(subscriptionId);
     if (it == _subscriptionsById.end()) {
         return;
+    }
+
+    if (it->second.handlerShard == seastar::this_shard_id()) {
+        --_localSubscriptionCount;
     }
 
     const auto& measurement = it->second.measurement;
@@ -111,8 +122,9 @@ void SubscriptionManager::deliverBatch(uint64_t subscriptionId,
 
     auto& seqCounter = _sequenceCounters[subscriptionId];
 
-    // Stamp per-subscriber sequence ID via a shallow copy (only the sequenceId
-    // field differs; the points vector is shared with all other subscribers).
+    // Stamp per-subscriber sequence ID. Note: this deep-copies the points
+    // vector for each subscriber. Acceptable for typical workloads but could
+    // be optimized with shared_ptr<const vector<...>> for high fan-out.
     auto tagged = std::make_shared<StreamingBatch>(*batch);
     tagged->sequenceId = seqCounter++;
 
@@ -288,4 +300,4 @@ template std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers<int6
     const std::string&, const std::map<std::string, std::string>&,
     const std::string&, const std::vector<uint64_t>&, const std::vector<int64_t>&);
 
-} // namespace tsdb
+} // namespace timestar

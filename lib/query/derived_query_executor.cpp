@@ -13,8 +13,8 @@
 
 // Glaze reflection for JSON parsing - must be outside namespace
 template <>
-struct glz::meta<tsdb::GlazeDerivedQueryRequest> {
-    using T = tsdb::GlazeDerivedQueryRequest;
+struct glz::meta<timestar::GlazeDerivedQueryRequest> {
+    using T = timestar::GlazeDerivedQueryRequest;
     static constexpr auto value = object(
         "queries", &T::queries,
         "formula", &T::formula,
@@ -25,8 +25,8 @@ struct glz::meta<tsdb::GlazeDerivedQueryRequest> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeDerivedQueryResponse::Statistics> {
-    using T = tsdb::GlazeDerivedQueryResponse::Statistics;
+struct glz::meta<timestar::GlazeDerivedQueryResponse::Statistics> {
+    using T = timestar::GlazeDerivedQueryResponse::Statistics;
     static constexpr auto value = object(
         "point_count", &T::pointCount,
         "execution_time_ms", &T::executionTimeMs,
@@ -36,8 +36,8 @@ struct glz::meta<tsdb::GlazeDerivedQueryResponse::Statistics> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeDerivedQueryResponse::Error> {
-    using T = tsdb::GlazeDerivedQueryResponse::Error;
+struct glz::meta<timestar::GlazeDerivedQueryResponse::Error> {
+    using T = timestar::GlazeDerivedQueryResponse::Error;
     static constexpr auto value = object(
         "code", &T::code,
         "message", &T::message
@@ -45,8 +45,8 @@ struct glz::meta<tsdb::GlazeDerivedQueryResponse::Error> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeDerivedQueryResponse> {
-    using T = tsdb::GlazeDerivedQueryResponse;
+struct glz::meta<timestar::GlazeDerivedQueryResponse> {
+    using T = timestar::GlazeDerivedQueryResponse;
     static constexpr auto value = object(
         "status", &T::status,
         "timestamps", &T::timestamps,
@@ -59,8 +59,8 @@ struct glz::meta<tsdb::GlazeDerivedQueryResponse> {
 
 // Anomaly response Glaze meta templates
 template <>
-struct glz::meta<tsdb::GlazeAnomalySeriesPiece> {
-    using T = tsdb::GlazeAnomalySeriesPiece;
+struct glz::meta<timestar::GlazeAnomalySeriesPiece> {
+    using T = timestar::GlazeAnomalySeriesPiece;
     static constexpr auto value = object(
         "piece", &T::piece,
         "group_tags", &T::group_tags,
@@ -70,8 +70,8 @@ struct glz::meta<tsdb::GlazeAnomalySeriesPiece> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeAnomalyStatistics> {
-    using T = tsdb::GlazeAnomalyStatistics;
+struct glz::meta<timestar::GlazeAnomalyStatistics> {
+    using T = timestar::GlazeAnomalyStatistics;
     static constexpr auto value = object(
         "algorithm", &T::algorithm,
         "bounds", &T::bounds,
@@ -83,16 +83,16 @@ struct glz::meta<tsdb::GlazeAnomalyStatistics> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeAnomalyResponse::Error> {
-    using T = tsdb::GlazeAnomalyResponse::Error;
+struct glz::meta<timestar::GlazeAnomalyResponse::Error> {
+    using T = timestar::GlazeAnomalyResponse::Error;
     static constexpr auto value = object(
         "message", &T::message
     );
 };
 
 template <>
-struct glz::meta<tsdb::GlazeAnomalyResponse> {
-    using T = tsdb::GlazeAnomalyResponse;
+struct glz::meta<timestar::GlazeAnomalyResponse> {
+    using T = timestar::GlazeAnomalyResponse;
     static constexpr auto value = object(
         "status", &T::status,
         "times", &T::times,
@@ -104,8 +104,8 @@ struct glz::meta<tsdb::GlazeAnomalyResponse> {
 
 // Forecast response Glaze meta templates
 template <>
-struct glz::meta<tsdb::GlazeForecastSeriesPiece> {
-    using T = tsdb::GlazeForecastSeriesPiece;
+struct glz::meta<timestar::GlazeForecastSeriesPiece> {
+    using T = timestar::GlazeForecastSeriesPiece;
     static constexpr auto value = object(
         "piece", &T::piece,
         "group_tags", &T::group_tags,
@@ -114,8 +114,8 @@ struct glz::meta<tsdb::GlazeForecastSeriesPiece> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeForecastStatistics> {
-    using T = tsdb::GlazeForecastStatistics;
+struct glz::meta<timestar::GlazeForecastStatistics> {
+    using T = timestar::GlazeForecastStatistics;
     static constexpr auto value = object(
         "algorithm", &T::algorithm,
         "deviations", &T::deviations,
@@ -132,16 +132,16 @@ struct glz::meta<tsdb::GlazeForecastStatistics> {
 };
 
 template <>
-struct glz::meta<tsdb::GlazeForecastResponse::Error> {
-    using T = tsdb::GlazeForecastResponse::Error;
+struct glz::meta<timestar::GlazeForecastResponse::Error> {
+    using T = timestar::GlazeForecastResponse::Error;
     static constexpr auto value = object(
         "message", &T::message
     );
 };
 
 template <>
-struct glz::meta<tsdb::GlazeForecastResponse> {
-    using T = tsdb::GlazeForecastResponse;
+struct glz::meta<timestar::GlazeForecastResponse> {
+    using T = timestar::GlazeForecastResponse;
     static constexpr auto value = object(
         "status", &T::status,
         "times", &T::times,
@@ -152,7 +152,7 @@ struct glz::meta<tsdb::GlazeForecastResponse> {
     );
 };
 
-namespace tsdb {
+namespace timestar {
 
 DerivedQueryExecutor::DerivedQueryExecutor(
     seastar::sharded<Engine>* engine,
@@ -196,9 +196,13 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(
             co_return result;
         }
 
-        // Parse the formula
-        ExpressionParser parser(request.formula);
-        auto ast = parser.parse();
+        // Parse the formula (uses cached AST from executeWithAnomaly if available)
+        std::unique_ptr<ExpressionNode> localAst;
+        if (!cachedAst_) {
+            ExpressionParser parser(request.formula);
+            localAst = parser.parse();
+        }
+        const auto& ast = cachedAst_ ? *cachedAst_ : *localAst;
 
         // Convert to evaluator format
         ExpressionEvaluator::QueryResultMap evalInput;
@@ -208,7 +212,7 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(
 
         // Evaluate the expression
         ExpressionEvaluator evaluator;
-        auto computed = evaluator.evaluate(*ast, evalInput);
+        auto computed = evaluator.evaluate(ast, evalInput);
 
         // Store results (copy out of shared_ptr into DerivedQueryResult's own vector)
         result.timestamps = *computed.timestamps;
@@ -395,9 +399,15 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(
         subResult.field = fname;
         subResult.timestamps = fieldData.first;
 
-        // Extract values (must be doubles for derived metrics)
+        // Extract values (must be numeric for derived metrics)
         if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
             subResult.values = std::get<std::vector<double>>(fieldData.second);
+        } else if (std::holds_alternative<std::vector<int64_t>>(fieldData.second)) {
+            const auto& intVals = std::get<std::vector<int64_t>>(fieldData.second);
+            subResult.values.reserve(intVals.size());
+            for (int64_t v : intVals) {
+                subResult.values.push_back(static_cast<double>(v));
+            }
         } else {
             throw DerivedQueryException(
                 "Sub-query '" + name + "' returned non-numeric values");
@@ -448,8 +458,10 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeWithAnom
             auto forecastResult = co_await executeForecast(request, *ast);
             co_return DerivedQueryResultVariant{std::move(forecastResult)};
         } else {
-            // Execute regular derived query
+            // Execute regular derived query, reusing the already-parsed AST
+            cachedAst_ = ast.get();
             auto result = co_await execute(request);
+            cachedAst_ = nullptr;
             co_return DerivedQueryResultVariant{std::move(result)};
         }
     } catch (const std::exception& e) {
@@ -787,4 +799,4 @@ std::string DerivedQueryExecutor::formatForecastResponse(
     return glz::write_json(response).value_or("{}");
 }
 
-} // namespace tsdb
+} // namespace timestar

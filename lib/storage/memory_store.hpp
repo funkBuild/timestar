@@ -8,8 +8,8 @@
 #include <tsl/robin_map.h>
 
 #include "logger.hpp"
-#include "tsdb_value.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_value.hpp"
+#include "timestar_config.hpp"
 #include "tsm.hpp"
 #include "wal.hpp"
 #include "series_id.hpp"
@@ -21,7 +21,7 @@ public:
   std::vector<uint64_t> timestamps;
   std::vector<T> values;
 
-  void insert(TSDBInsert<T>&& insertRequest);
+  void insert(TimeStarInsert<T>&& insertRequest);
 
   // Sort all timestamps and values together. Convenience wrapper for sortPaired()
   // over the entire range, used by TSM writer before flushing to disk.
@@ -57,37 +57,37 @@ private:
 
 public:
   // Threshold for WAL rollover decisions (based on estimated sizes).
-  // Read from tsdb::config().storage.wal_size_threshold at runtime.
-  static size_t walSizeThreshold() { return tsdb::config().storage.wal_size_threshold; }
+  // Read from timestar::config().storage.wal_size_threshold at runtime.
+  static size_t walSizeThreshold() { return timestar::config().storage.wal_size_threshold; }
   const unsigned int sequenceNumber;
   // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
   tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
 
   MemoryStore(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {
-    tsdb::memory_log.debug("Memory store {} created", sequenceNumber);
+    timestar::memory_log.debug("Memory store {} created", sequenceNumber);
   };
   ~MemoryStore() {
-    tsdb::memory_log.debug("Memory store {} removed", sequenceNumber);
+    timestar::memory_log.debug("Memory store {} removed", sequenceNumber);
   };
 
   seastar::future<> initWAL();
   seastar::future<> removeWAL();
   seastar::future<> initFromWAL(std::string filename);
   seastar::future<> close();
-  template <class T> void insertMemory(TSDBInsert<T>&& insertRequest);
+  template <class T> void insertMemory(TimeStarInsert<T>&& insertRequest);
   template <class T>
   seastar::future<bool>
-  insert(TSDBInsert<T> &insertRequest); // Returns true if WAL needs rollover
+  insert(TimeStarInsert<T> &insertRequest); // Returns true if WAL needs rollover
   
   template <class T>
   seastar::future<bool>
-  insertBatch(std::vector<TSDBInsert<T>> &insertRequests, size_t preComputedBatchSize = 0); // Batch insert - returns true if WAL needs rollover
+  insertBatch(std::vector<TimeStarInsert<T>> &insertRequests, size_t preComputedBatchSize = 0); // Batch insert - returns true if WAL needs rollover
   seastar::future<bool> isFull();
-  template <class T> bool wouldExceedThreshold(TSDBInsert<T> &insertRequest);
+  template <class T> bool wouldExceedThreshold(TimeStarInsert<T> &insertRequest);
   // Variant that also returns the computed estimated size to avoid
   // double-estimation in the single-insert path.
-  template <class T> bool wouldExceedThreshold(TSDBInsert<T> &insertRequest, size_t &outEstimatedSize);
-  template <class T> bool wouldBatchExceedThreshold(std::vector<TSDBInsert<T>> &insertRequests);
+  template <class T> bool wouldExceedThreshold(TimeStarInsert<T> &insertRequest, size_t &outEstimatedSize);
+  template <class T> bool wouldBatchExceedThreshold(std::vector<TimeStarInsert<T>> &insertRequests);
   bool isClosed() { return closed; }
   bool isEmpty() { return series.size() == 0; }
   std::optional<TSMValueType> getSeriesType(const SeriesId128 &seriesId);

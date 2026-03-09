@@ -9,7 +9,7 @@
 #include <filesystem>
 
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexMinimalTest : public ::testing::Test {
@@ -62,10 +62,10 @@ SEASTAR_TEST_F(LevelDBIndexMinimalTest, CreateSeriesWithTags) {
     co_await index.open();
     std::cerr << "Index opened" << std::endl;
 
-    // Create TSDBInsert with tags
-    TSDBInsert<double> insert("test", "value");
+    // Create TimeStarInsert with tags
+    TimeStarInsert<double> insert("test", "value");
     insert.addTag("host", "server1");
-    std::cerr << "Created TSDBInsert with tags" << std::endl;
+    std::cerr << "Created TimeStarInsert with tags" << std::endl;
 
     SeriesId128 seriesId = co_await index.indexInsert(insert);
     std::cerr << "Created series with ID: " << seriesId.toHex() << std::endl;

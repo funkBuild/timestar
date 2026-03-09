@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <string_view>
 
-namespace tsdb {
+namespace timestar {
 
 // Pre-computed hash wrapper: stores a string alongside its hash so that
 // unordered_map lookups never re-hash.  Used as key in the aggregation maps.
@@ -69,15 +69,19 @@ struct AggregationState {
     double first = 0.0;   // Earliest value
     uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max();  // Timestamp of earliest value
     size_t count = 0;
-    // Raw values for median/stddev/stdvar computation.
+    // Welford's online M2 accumulator for STDDEV/STDVAR — O(1) memory, no raw values needed.
+    // M2 = sum of squared differences from the running mean: Σ(x_i - mean)^2
+    double m2 = 0.0;
+    // Raw values for MEDIAN computation only.
     // Populated by addValue() so that getValue() can compute order-sensitive statistics.
     // Growth is capped at RAW_VALUES_HARD_LIMIT; if the cap is hit rawValuesSaturated
-    // is set and getValue() returns NaN for the order-sensitive methods.
+    // is set and getValue() returns NaN for MEDIAN.
     std::vector<double> rawValues;
     bool rawValuesSaturated = false;
 
     // Add a single value to this state (incremental aggregation)
     void addValue(double value, uint64_t timestamp = 0) {
+        if (std::isnan(value)) return;  // Skip NaN to avoid poisoning aggregation
         sum += value;
         min = std::min(min, value);
         max = std::max(max, value);
@@ -89,16 +93,27 @@ struct AggregationState {
             first = value;
             firstTimestamp = timestamp;
         }
+        // Welford's online variance: compute delta from old mean, then update
+        double oldMean = (count > 0) ? (sum - value) / count : 0.0;
+        count++;
+        double newMean = sum / count;
+        m2 += (value - oldMean) * (value - newMean);
         if (rawValues.size() < RAW_VALUES_HARD_LIMIT) {
             rawValues.push_back(value);
         } else {
             rawValuesSaturated = true;
         }
-        count++;
     }
 
     // Merge another state into this one (commutative & associative)
     void merge(const AggregationState& other) {
+        // Parallel Welford merge: combine M2 accumulators from two partitions
+        if (count > 0 && other.count > 0) {
+            double delta = (other.sum / other.count) - (sum / count);
+            m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / (count + other.count);
+        } else if (other.count > 0) {
+            m2 = other.m2;
+        }
         sum += other.sum;
         min = std::min(min, other.min);
         max = std::max(max, other.max);
@@ -154,39 +169,26 @@ struct AggregationState {
                 if (rawValues.empty() || rawValuesSaturated) {
                     return std::numeric_limits<double>::quiet_NaN();
                 }
-                std::vector<double> sorted = rawValues;
-                std::sort(sorted.begin(), sorted.end());
-                size_t n = sorted.size();
+                std::vector<double> tmp = rawValues;
+                size_t n = tmp.size();
+                size_t mid = n / 2;
+                std::nth_element(tmp.begin(), tmp.begin() + mid, tmp.end());
                 if (n % 2 == 1) {
-                    return sorted[n / 2];
+                    return tmp[mid];
                 } else {
-                    return (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+                    // nth_element guarantees elements before mid are <= tmp[mid]
+                    double upper = tmp[mid];
+                    double lower = *std::max_element(tmp.begin(), tmp.begin() + mid);
+                    return (lower + upper) / 2.0;
                 }
             }
             case AggregationMethod::STDDEV: {
-                if (rawValues.empty() || rawValuesSaturated) {
-                    return std::numeric_limits<double>::quiet_NaN();
-                }
-                double mean = sum / count;
-                double variance = 0.0;
-                for (double v : rawValues) {
-                    double diff = v - mean;
-                    variance += diff * diff;
-                }
-                variance /= count;
-                return std::sqrt(variance);
+                // Uses Welford's M2 accumulator — O(1), no rawValues needed
+                return std::sqrt(m2 / count);
             }
             case AggregationMethod::STDVAR: {
-                if (rawValues.empty() || rawValuesSaturated) {
-                    return std::numeric_limits<double>::quiet_NaN();
-                }
-                double mean = sum / count;
-                double variance = 0.0;
-                for (double v : rawValues) {
-                    double diff = v - mean;
-                    variance += diff * diff;
-                }
-                return variance / count;
+                // Uses Welford's M2 accumulator — O(1), no rawValues needed
+                return m2 / count;
             }
             default:
                 return std::numeric_limits<double>::quiet_NaN();
@@ -240,6 +242,10 @@ struct PartialAggregationResult {
     // Format: "measurement\0tag1=val1\0tag2=val2\0fieldName"
     std::string groupKey;
 
+    // Cached parsed tags from groupKey — populated once during createPartialAggregations
+    // so that mergePartialAggregationsGrouped can reuse without re-parsing.
+    std::map<std::string, std::string> cachedTags;
+
     // Parse group-by tags from groupKey (called once per group in reduce phase)
     static std::map<std::string, std::string> parseTagsFromGroupKey(const std::string& gk) {
         std::map<std::string, std::string> tags;
@@ -275,7 +281,7 @@ public:
 
     // Create partial aggregation on shard (map phase)
     static std::vector<PartialAggregationResult> createPartialAggregations(
-        const std::vector<tsdb::SeriesResult>& seriesResults,
+        const std::vector<timestar::SeriesResult>& seriesResults,
         AggregationMethod method,
         uint64_t interval,
         const std::vector<std::string>& groupByTags);
@@ -313,6 +319,6 @@ public:
         uint64_t interval);
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // AGGREGATOR_H_INCLUDED

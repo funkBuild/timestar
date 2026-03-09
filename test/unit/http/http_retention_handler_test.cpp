@@ -53,7 +53,7 @@ static std::string validatePutRequest(const RetentionPolicyRequest& req) {
     uint64_t ttlNanos = 0;
     if (req.ttl.has_value()) {
         try {
-            ttlNanos = tsdb::HttpQueryHandler::parseInterval(*req.ttl);
+            ttlNanos = timestar::HttpQueryHandler::parseInterval(*req.ttl);
         } catch (const std::exception& e) {
             return std::string("Invalid ttl: ") + e.what();
         }
@@ -74,13 +74,13 @@ static std::string validatePutRequest(const RetentionPolicyRequest& req) {
 
         uint64_t afterNanos = 0;
         try {
-            afterNanos = tsdb::HttpQueryHandler::parseInterval(ds.after);
+            afterNanos = timestar::HttpQueryHandler::parseInterval(ds.after);
         } catch (const std::exception& e) {
             return std::string("Invalid downsample.after: ") + e.what();
         }
 
         try {
-            tsdb::HttpQueryHandler::parseInterval(ds.interval);
+            timestar::HttpQueryHandler::parseInterval(ds.interval);
         } catch (const std::exception& e) {
             return std::string("Invalid downsample.interval: ") + e.what();
         }
@@ -214,57 +214,57 @@ TEST_F(HttpRetentionHandlerIsValidMethodTest, LeadingTrailingSpaceIsInvalid) {
 class HttpRetentionHandlerParseDurationTest : public ::testing::Test {};
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseSeconds) {
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("1s"), 1'000'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("1s"), 1'000'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseMinutes) {
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("5m"), 5ULL * 60 * 1'000'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("5m"), 5ULL * 60 * 1'000'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseHours) {
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("1h"), 3600ULL * 1'000'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("1h"), 3600ULL * 1'000'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseDays) {
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("30d"),
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("30d"),
               30ULL * 86400ULL * 1'000'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseMilliseconds) {
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("100ms"), 100'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("100ms"), 100'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseNanoseconds) {
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("500ns"), 500ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("500ns"), 500ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseTypicalRetentionPeriods) {
     // 7d
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("7d"),
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("7d"),
               7ULL * 86400ULL * 1'000'000'000ULL);
     // 90d
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("90d"),
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("90d"),
               90ULL * 86400ULL * 1'000'000'000ULL);
     // 365d
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("365d"),
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("365d"),
               365ULL * 86400ULL * 1'000'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, EmptyStringThrows) {
-    EXPECT_THROW(tsdb::HttpQueryHandler::parseInterval(""), tsdb::QueryParseException);
+    EXPECT_THROW(timestar::HttpQueryHandler::parseInterval(""), timestar::QueryParseException);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, InvalidFormatThrows) {
-    EXPECT_THROW(tsdb::HttpQueryHandler::parseInterval("notaduration"), tsdb::QueryParseException);
+    EXPECT_THROW(timestar::HttpQueryHandler::parseInterval("notaduration"), timestar::QueryParseException);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, UnknownUnitThrows) {
-    EXPECT_THROW(tsdb::HttpQueryHandler::parseInterval("5x"), tsdb::QueryParseException);
+    EXPECT_THROW(timestar::HttpQueryHandler::parseInterval("5x"), timestar::QueryParseException);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, OverflowThrows) {
     // So large it would overflow uint64_t in nanoseconds
-    EXPECT_THROW(tsdb::HttpQueryHandler::parseInterval("99999999999d"), tsdb::QueryParseException);
+    EXPECT_THROW(timestar::HttpQueryHandler::parseInterval("99999999999d"), timestar::QueryParseException);
 }
 
 // =============================================================================

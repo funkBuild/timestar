@@ -1,10 +1,10 @@
 #include "http_query_handler.hpp"
 #include "engine.hpp"
 #include "query_parser.hpp"
-#include "query_planner.hpp"
 #include "aggregator.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "series_key.hpp"
 #include <algorithm>
 #include <numeric>
 #include <unordered_map>
@@ -38,34 +38,7 @@ struct glz::meta<GlazeQueryRequest> {
     );
 };
 
-namespace tsdb {
-
-// Helper to build a canonical series key from measurement + sorted tags + field.
-// Format: "measurement,tag1=val1,tag2=val2 field"
-// This is identical to TSDBInsert::seriesKey() but avoids constructing a
-// temporary TSDBInsert object just to build the string.
-static std::string buildSeriesKey(const std::string& measurement,
-                                   const std::map<std::string, std::string>& tags,
-                                   const std::string& field) {
-    // Pre-calculate total size to avoid repeated reallocations
-    size_t totalSize = measurement.size() + 1 + field.size(); // measurement + ' ' + field
-    for (const auto& [k, v] : tags) {
-        totalSize += 1 + k.size() + 1 + v.size(); // ',' + key + '=' + value
-    }
-
-    std::string key;
-    key.reserve(totalSize);
-    key.append(measurement);
-    for (const auto& [k, v] : tags) {
-        key += ',';
-        key.append(k);
-        key += '=';
-        key.append(v);
-    }
-    key += ' ';
-    key.append(field);
-    return key;
-}
+namespace timestar {
 
 // Helper to build a merge key from measurement + sorted tags with pre-reserved capacity.
 // Avoids repeated reallocations from naive string concatenation in loops.
@@ -183,7 +156,10 @@ HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
     if (req.content.size() > maxQueryBodySize()) {
         auto rep = std::make_unique<seastar::http::reply>();
         rep->set_status(seastar::http::reply::status_type::payload_too_large);
-        rep->_content = "{\"status\":\"error\",\"message\":\"Request body too large (max 1MB)\",\"error\":\"Request body too large (max 1MB)\"}";
+        auto maxBytes = maxQueryBodySize();
+        auto msg = "Request body too large (max " + std::to_string(maxBytes / 1024) + "KB)";
+        auto errObj = glz::obj{"status", "error", "message", msg, "error", msg};
+        rep->_content = glz::write_json(errObj).value_or("{\"status\":\"error\"}");
         rep->add_header("Content-Type", "application/json");
         return rep;
     }
@@ -194,7 +170,7 @@ HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
         // Accept application/json with optional charset/parameters
         // Convert to std::string to avoid sstring::npos vs string::npos mismatch
         std::string contentTypeStr(contentType.data(), contentType.size());
-        if (contentTypeStr.find("application/json") == std::string::npos) {
+        if (!contentTypeStr.starts_with("application/json")) {
             auto rep = std::make_unique<seastar::http::reply>();
             rep->set_status(seastar::http::reply::status_type::unsupported_media_type);
             rep->_content = "{\"status\":\"error\",\"message\":\"Content-Type must be application/json\",\"error\":\"Content-Type must be application/json\"}";
@@ -265,8 +241,8 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
         
         rep->add_header("Content-Type", "application/json");
         
-        // Log query summary after response is ready (controlled by TSDB_LOG_QUERY_PATH)
-        LOG_QUERY_PATH(tsdb::http_log, info, 
+        // Log query summary after response is ready (controlled by TIMESTAR_LOG_QUERY_PATH)
+        LOG_QUERY_PATH(timestar::http_log, info, 
             "[QUERY_SUMMARY] Query: '{}' | StartTime: {} | EndTime: {} | AggregationInterval: {} | ExecutionTime: {:.2f}ms",
             glazeRequest.query,
             queryRequest.startTime,
@@ -275,7 +251,7 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
             response.statistics.executionTimeMs);
         
     } catch (const std::exception& e) {
-        tsdb::http_log.error("[QUERY] Error handling query request: {}", e.what());
+        timestar::http_log.error("[QUERY] Error handling query request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal query error");
         rep->add_header("Content-Type", "application/json");
@@ -295,7 +271,7 @@ void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r) {
     r.add(seastar::httpd::operation_type::POST, 
           seastar::httpd::url("/query"), handler);
     
-    tsdb::http_log.info("Registered HTTP query endpoint at /query");
+    timestar::http_log.info("Registered HTTP query endpoint at /query");
 }
 
 QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeReq) {
@@ -349,7 +325,7 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
         }
     }
     
-    LOG_QUERY_PATH(tsdb::http_log, debug, "[QUERY] Parsed request - Query: '{}', Start: {}, End: {}, Interval: {}",
+    LOG_QUERY_PATH(timestar::http_log, debug, "[QUERY] Parsed request - Query: '{}', Start: {}, End: {}, Interval: {}",
                    queryStr, startTime, endTime, 
                    aggregationInterval ? std::to_string(aggregationInterval) : "none");
     
@@ -363,7 +339,7 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
 }
 
 seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest& request) {
-    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Executing query - Measurement: {}, Fields: {}, Scopes: {}, Start: {}, End: {}",
+    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Executing query - Measurement: {}, Fields: {}, Scopes: {}, Start: {}, End: {}",
                    request.measurement,
                    request.fields.size(),
                    request.scopes.size(),
@@ -379,11 +355,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
     timing.startTime = std::chrono::high_resolution_clock::now();
     
     try {
-        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Checking pointers - engineSharded: {}, indexSharded: {}", 
+        LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Checking pointers - engineSharded: {}, indexSharded: {}", 
                        (void*)engineSharded, (void*)indexSharded);
         
         if (!engineSharded) {
-            LOG_QUERY_PATH(tsdb::http_log, error, "[QUERY] engineSharded is NULL!");
+            LOG_QUERY_PATH(timestar::http_log, error, "[QUERY] engineSharded is NULL!");
             response.success = false;
             response.errorCode = "NULL_ENGINE";
             response.errorMessage = "Engine pointer is null";
@@ -433,7 +409,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
                 auto& seriesWithMeta = findResult.value();
 
-                LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard 0 (metadata) found {} series for measurement '{}' with {} scopes",
+                LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard 0 (metadata) found {} series for measurement '{}' with {} scopes",
                                seriesWithMeta.size(), measurement, scopes.size());
 
                 SeriesDiscoveryResult result;
@@ -484,7 +460,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         timing.seriesFound = totalSeriesFound;
         timing.shardsQueried = shardsWithData;
 
-        LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Total series from centralized metadata: {} across {} shards (took {:.2f} ms)",
+        LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Total series from centralized metadata: {} across {} shards (took {:.2f} ms)",
                        totalSeriesFound, shardsWithData, timing.findSeriesMs);
 
         // Safety net: enforce maxSeriesCount() limit (should rarely trigger now
@@ -517,12 +493,12 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                  aggregationInterval = request.aggregationInterval,
                  groupByTags = request.groupByTags](Engine& engine) mutable -> seastar::future<ShardQueryResult> {
                     auto shardStart = std::chrono::high_resolution_clock::now();
-                    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} querying {} series keys in parallel",
+                    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard {} querying {} series keys in parallel",
                                    shardId, contexts.size());
 
                     // Containers for pushdown results and fallback results
                     std::vector<PartialAggregationResult> pushdownPartials;
-                    std::vector<tsdb::SeriesResult> fallbackResults;
+                    std::vector<timestar::SeriesResult> fallbackResults;
                     fallbackResults.reserve(contexts.size());
 
                     // Prefetch TSM index entries for all series on this shard.
@@ -600,15 +576,15 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                 optResult = co_await engine.query(ctx.seriesKey, ctx.seriesId, startTime, endTime);
                             } catch (const std::runtime_error& e) {
                                 if (std::string(e.what()).find("Series not found") != std::string::npos) {
-                                    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Series '{}' not found on shard {} - skipping",
+                                    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Series '{}' not found on shard {} - skipping",
                                                    ctx.seriesKey, shardId);
                                 } else {
-                                    LOG_QUERY_PATH(tsdb::http_log, warn, "[QUERY] Error querying series '{}' on shard {}: {} - skipping",
+                                    LOG_QUERY_PATH(timestar::http_log, warn, "[QUERY] Error querying series '{}' on shard {}: {} - skipping",
                                                    ctx.seriesKey, shardId, e.what());
                                 }
                                 co_return;
                             } catch (...) {
-                                LOG_QUERY_PATH(tsdb::http_log, warn, "[QUERY] Unknown error querying series '{}' on shard {} - skipping",
+                                LOG_QUERY_PATH(timestar::http_log, warn, "[QUERY] Unknown error querying series '{}' on shard {} - skipping",
                                                ctx.seriesKey, shardId);
                                 co_return;
                             }
@@ -619,7 +595,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
                             auto variantResult = std::move(optResult.value());
 
-                            tsdb::SeriesResult seriesResult;
+                            timestar::SeriesResult seriesResult;
                             seriesResult.measurement = measurement;
                             seriesResult.tags = std::move(ctx.tags);
 
@@ -659,8 +635,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                         });
 
                     // Separate string-typed fallback results from numeric results.
-                    std::vector<tsdb::SeriesResult> stringResults;
-                    std::vector<tsdb::SeriesResult> numericResults;
+                    std::vector<timestar::SeriesResult> stringResults;
+                    std::vector<timestar::SeriesResult> numericResults;
                     for (auto& sr : fallbackResults) {
                         bool hasStringField = false;
                         for (const auto& [fn, fd] : sr.fields) {
@@ -689,7 +665,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
                     auto shardEnd = std::chrono::high_resolution_clock::now();
                     double shardMs = std::chrono::duration<double, std::milli>(shardEnd - shardStart).count();
-                    LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Shard {} completed {} parallel queries + partial aggregation in {:.2f} ms (aggregation: {:.2f} ms)",
+                    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard {} completed {} parallel queries + partial aggregation in {:.2f} ms (aggregation: {:.2f} ms)",
                                    shardId, contexts.size(), shardMs, partialAggMs);
                     ShardQueryResult sqr;
                     sqr.partialResults = std::move(partialResults);
@@ -771,14 +747,14 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         std::unordered_map<std::string, size_t> seriesKeyToIndex;
 
         if (!allPartialResults.empty()) {
-            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merging {} partial aggregations from {} shards",
+            LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merging {} partial aggregations from {} shards",
                            allPartialResults.size(), timing.shardsQueried);
 
             // OPTIMIZATION & FIX: Use grouped merge to preserve metadata associations
             auto groupedResults = Aggregator::mergePartialAggregationsGrouped(
                 allPartialResults, request.aggregation);
 
-            LOG_QUERY_PATH(tsdb::http_log, info, "[QUERY] Merged into {} grouped results",
+            LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results",
                            groupedResults.size());
 
             // Merge GroupedAggregationResult entries that share the same
@@ -933,13 +909,13 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         timing.totalMs = std::chrono::duration<double, std::milli>(timing.endTime - timing.startTime).count();
         
         // Print timing information
-        LOG_QUERY_PATH(tsdb::http_log, info, "{}", timing.toString());
+        LOG_QUERY_PATH(timestar::http_log, info, "{}", timing.toString());
         
     } catch (const std::exception& e) {
         response.success = false;
         response.errorCode = "QUERY_EXECUTION_ERROR";
         response.errorMessage = e.what();
-        LOG_QUERY_PATH(tsdb::http_log, error, "[QUERY] Query execution failed: {}", e.what());
+        LOG_QUERY_PATH(timestar::http_log, error, "[QUERY] Query execution failed: {}", e.what());
     }
     
     co_return response;
@@ -1065,7 +1041,7 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     } else if (unit == "d") {
         multiplier = 86400ULL * 1000000000;
     } else if (unit.empty()) {
-        multiplier = 1;  // Bare numbers are nanoseconds
+        throw QueryParseException("Interval '" + interval + "' has no unit suffix. Please specify a unit (ns, us, ms, s, m, h, d)");
     } else {
         throw QueryParseException("Unknown time unit: '" + unit + "'. Supported units: ns, us, ms, s, m, h, d");
     }
@@ -1100,4 +1076,4 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     }
 }
 
-} // namespace tsdb
+} // namespace timestar

@@ -84,7 +84,7 @@ When `timestamp` or `timestamps` is omitted, the server generates timestamps aut
 
 Field values are auto-detected from JSON:
 
-| JSON Type | TSDB Type |
+| JSON Type | TimeStar Type |
 |-----------|-----------|
 | number (has decimal) | float64 |
 | number (integer) | int64 |

@@ -28,7 +28,7 @@
 #include <filesystem>
 
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexAtomicWriteTest : public ::testing::Test {
@@ -199,7 +199,7 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, IndexInsertConsistency) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    TSDBInsert<double> insert("metrics", "latency");
+    TimeStarInsert<double> insert("metrics", "latency");
     insert.addTag("service", "api");
     insert.addTag("env",     "prod");
 

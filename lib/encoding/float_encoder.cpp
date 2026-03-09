@@ -2,9 +2,12 @@
 #include "../storage/aligned_buffer.hpp"
 
 // Static member initialization
-FloatEncoder::Implementation FloatEncoder::s_forced_impl = FloatEncoder::AUTO;
+thread_local FloatEncoder::Implementation FloatEncoder::s_forced_impl = FloatEncoder::AUTO;
 
 CompressedBuffer FloatEncoder::encode(std::span<const double> values) {
+    if (values.empty()) [[unlikely]] {
+        return {};
+    }
     if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {
         return ALPEncoder::encode(values);
     } else {
@@ -54,7 +57,7 @@ size_t FloatEncoder::encodeInto(std::span<const double> values, AlignedBuffer &t
 }
 
 // FloatDecoder implementation
-FloatDecoder::Implementation FloatDecoder::s_forced_impl = FloatDecoder::AUTO;
+thread_local FloatDecoder::Implementation FloatDecoder::s_forced_impl = FloatDecoder::AUTO;
 
 void FloatDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
     if constexpr (FLOAT_COMPRESSION == FloatCompression::ALP) {

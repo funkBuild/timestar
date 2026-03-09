@@ -5,7 +5,7 @@
 #include <limits>
 #include <numeric>
 
-using namespace tsdb;
+using namespace timestar;
 
 class SeriesAlignerTest : public ::testing::Test {
 protected:

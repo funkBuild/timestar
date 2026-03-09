@@ -6,7 +6,7 @@
 #include "stl_decomposition.hpp"
 #include <vector>
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 /**
@@ -159,6 +159,6 @@ public:
 };
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar
 
 #endif // SEASONAL_FORECASTER_H_INCLUDED

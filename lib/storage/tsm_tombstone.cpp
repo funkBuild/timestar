@@ -9,10 +9,13 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 
 TSMTombstone::TSMTombstone(const std::string& path)
     : tombstonePath(path) {
+    if (path.empty()) {
+        throw std::invalid_argument("TSMTombstone path must not be empty");
+    }
 }
 
 // Simple CRC32 implementation for checksums
@@ -138,29 +141,32 @@ seastar::future<> TSMTombstone::load() {
             // File doesn't exist, nothing to load
             co_return;
         }
-        
+
         tombstoneFile = co_await seastar::open_file_dma(
             tombstonePath,
             seastar::open_flags::ro
         );
-        
+
         isOpen = true;
-        
+
         // Get file size
         auto stat = co_await tombstoneFile.stat();
         auto fileSize = stat.st_size;
-        
+
         if (fileSize < TombstoneHeader::SIZE) {
             // File too small to contain valid header
             co_await close();
             throw std::runtime_error("Tombstone file too small for header");
         }
-        
-        // Read header
-        auto headerBuf = co_await tombstoneFile.dma_read_exactly<char>(0, TombstoneHeader::SIZE);
+
+        // Single DMA read of the entire file -- O(1) I/O instead of O(n)
+        auto fileBuf = co_await tombstoneFile.dma_read_exactly<char>(0, fileSize);
+        const char* data = fileBuf.get();
+
+        // Parse header from the in-memory buffer
         TombstoneHeader header;
-        std::memcpy(&header, headerBuf.get(), TombstoneHeader::SIZE);
-        
+        std::memcpy(&header, data, TombstoneHeader::SIZE);
+
         // Verify magic number and version
         if (header.magic != TOMBSTONE_MAGIC) {
             co_await close();
@@ -189,33 +195,32 @@ seastar::future<> TSMTombstone::load() {
                              (header.entryCount * entrySize) +
                              sizeof(uint64_t);  // Footer checksum
 
-        if (fileSize != expectedSize) {
+        if (static_cast<size_t>(fileSize) != expectedSize) {
             co_await close();
             throw std::runtime_error("Tombstone file corrupt: file size mismatch");
         }
 
-        // Read entries
+        // Parse entries from the in-memory buffer
         entries.clear();
         entries.reserve(header.entryCount);
 
         size_t offset = TombstoneHeader::SIZE;
         for (uint32_t i = 0; i < header.entryCount; ++i) {
-            auto entryBuf = co_await tombstoneFile.dma_read_exactly<char>(
-                offset, entrySize);
+            const char* entryPtr = data + offset;
 
             TombstoneEntry entry;
             if (isV1) {
                 // V1 format: uint64_t seriesId (8 bytes) + startTime (8) + endTime (8) + checksum (4)
                 uint64_t legacySeriesId;
-                std::memcpy(&legacySeriesId, entryBuf.get(), 8);
-                std::memcpy(&entry.startTime, entryBuf.get() + 8, 8);
-                std::memcpy(&entry.endTime, entryBuf.get() + 16, 8);
-                std::memcpy(&entry.checksum, entryBuf.get() + 24, 4);
+                std::memcpy(&legacySeriesId, entryPtr, 8);
+                std::memcpy(&entry.startTime, entryPtr + 8, 8);
+                std::memcpy(&entry.endTime, entryPtr + 16, 8);
+                std::memcpy(&entry.checksum, entryPtr + 24, 4);
 
                 // Convert legacy uint64_t seriesId to SeriesId128 by zero-padding
                 // Place the uint64_t in the first 8 bytes, zero the rest
                 SeriesId128 convertedId;
-                auto& rawData = const_cast<std::array<uint8_t, 16>&>(convertedId.getRawData());
+                auto& rawData = convertedId.getRawData();
                 std::memcpy(rawData.data(), &legacySeriesId, 8);
                 // Remaining 8 bytes are already zero from SeriesId128 default constructor
                 entry.seriesId = convertedId;
@@ -225,11 +230,11 @@ seastar::future<> TSMTombstone::load() {
                 entry.checksum = calculateChecksum(entry);
             } else {
                 // V2 format: SeriesId128 (16 bytes) + startTime (8) + endTime (8) + checksum (4)
-                const auto& rawData = entry.seriesId.getRawData();
-                std::memcpy(const_cast<uint8_t*>(rawData.data()), entryBuf.get(), 16);
-                std::memcpy(&entry.startTime, entryBuf.get() + 16, 8);
-                std::memcpy(&entry.endTime, entryBuf.get() + 24, 8);
-                std::memcpy(&entry.checksum, entryBuf.get() + 32, 4);
+                auto& rawData = entry.seriesId.getRawData();
+                std::memcpy(rawData.data(), entryPtr, 16);
+                std::memcpy(&entry.startTime, entryPtr + 16, 8);
+                std::memcpy(&entry.endTime, entryPtr + 24, 8);
+                std::memcpy(&entry.checksum, entryPtr + 32, 4);
 
                 // Verify entry checksum
                 uint32_t expectedEntryChecksum = entry.checksum;
@@ -247,12 +252,10 @@ seastar::future<> TSMTombstone::load() {
             entries.push_back(entry);
             offset += entrySize;
         }
-        
-        // Read and verify file checksum
-        auto footerBuf = co_await tombstoneFile.dma_read_exactly<char>(
-            offset, sizeof(uint64_t));
+
+        // Parse and verify file checksum from the in-memory buffer
         uint64_t fileChecksum;
-        std::memcpy(&fileChecksum, footerBuf.get(), sizeof(uint64_t));
+        std::memcpy(&fileChecksum, data + offset, sizeof(uint64_t));
 
         // For V1 files, we recomputed entry checksums after conversion to SeriesId128,
         // so the file checksum won't match the original. Only verify for V2 files.
@@ -263,17 +266,17 @@ seastar::future<> TSMTombstone::load() {
                 throw std::runtime_error("Tombstone file checksum mismatch");
             }
         }
-        
+
         // Rebuild index for fast lookups
         rebuildIndex();
-        
+
         co_await close();
         isDirty = false;
-        
+
     } catch (const std::exception& e) {
         // Can't use co_await in catch block - flag for cleanup
         // Will close outside catch block
-        throw std::runtime_error("Failed to load tombstone file: " + 
+        throw std::runtime_error("Failed to load tombstone file: " +
                                 std::string(e.what()));
     }
 }
@@ -309,8 +312,13 @@ seastar::future<> TSMTombstone::flush() {
         header.headerChecksum = 0;
         header.headerChecksum = calculateHeaderChecksum(header);
 
-        // Write header using output stream
-        co_await output_stream.write(reinterpret_cast<const char*>(&header), TombstoneHeader::SIZE);
+        // Write header field by field to avoid struct layout assumptions
+        uint8_t headerBuf[TombstoneHeader::SIZE];
+        std::memcpy(headerBuf, &header.magic, 4);
+        std::memcpy(headerBuf + 4, &header.version, 4);
+        std::memcpy(headerBuf + 8, &header.entryCount, 4);
+        std::memcpy(headerBuf + 12, &header.headerChecksum, 4);
+        co_await output_stream.write(reinterpret_cast<const char*>(headerBuf), TombstoneHeader::SIZE);
 
         // Write entries using output stream - serialize field by field to avoid padding issues
         for (auto& entry : entries) {
@@ -396,20 +404,49 @@ seastar::future<bool> TSMTombstone::addTombstone(
         // For now, we'll trust the caller
     }
     
-    // Create new entry
-    TombstoneEntry entry;
-    entry.seriesId = seriesId;
-    entry.startTime = startTime;
-    entry.endTime = endTime;
-    entry.checksum = calculateChecksum(entry);
-    
-    // Add to entries
-    entries.push_back(entry);
-    
-    // Update index and maintain sorted order
+    // Merge into seriesRanges index, coalescing overlapping/adjacent ranges
     auto& ranges = seriesRanges[seriesId];
-    ranges.push_back({startTime, endTime});
-    std::sort(ranges.begin(), ranges.end());
+    uint64_t mergedStart = startTime;
+    uint64_t mergedEnd = endTime;
+
+    // Find all existing ranges that overlap or are adjacent to the new range.
+    // A range [a,b] overlaps/touches [mergedStart,mergedEnd] when
+    //   a <= mergedEnd + 1  &&  b + 1 >= mergedStart
+    // Because ranges are sorted by start time we can narrow the scan with
+    // lower_bound, but the list is usually short so a linear scan is fine
+    // and keeps the code simple.
+    size_t writeIdx = 0;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        if (ranges[i].first <= mergedEnd + 1 && ranges[i].second + 1 >= mergedStart) {
+            // Overlapping or adjacent — absorb into merged range
+            mergedStart = std::min(mergedStart, ranges[i].first);
+            mergedEnd   = std::max(mergedEnd,   ranges[i].second);
+        } else {
+            // Keep this range
+            ranges[writeIdx++] = ranges[i];
+        }
+    }
+    ranges.resize(writeIdx);
+
+    // Insert the merged range in sorted position
+    auto insertPos = std::lower_bound(ranges.begin(), ranges.end(),
+        std::make_pair(mergedStart, mergedEnd));
+    ranges.insert(insertPos, {mergedStart, mergedEnd});
+
+    // Rebuild entries from the authoritative seriesRanges index so that the
+    // entries vector stays merged too (avoids unbounded growth between flushes).
+    // Remove all existing entries for this series, then re-add from ranges.
+    std::erase_if(entries, [&seriesId](const TombstoneEntry& e) {
+        return e.seriesId == seriesId;
+    });
+    for (const auto& [rStart, rEnd] : ranges) {
+        TombstoneEntry entry;
+        entry.seriesId = seriesId;
+        entry.startTime = rStart;
+        entry.endTime = rEnd;
+        entry.checksum = calculateChecksum(entry);
+        entries.push_back(entry);
+    }
 
     isDirty = true;
     co_return true;
@@ -537,4 +574,4 @@ uint64_t TSMTombstone::getFileSize() const {
            sizeof(uint64_t);  // Footer checksum
 }
 
-} // namespace tsdb
+} // namespace timestar

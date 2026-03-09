@@ -87,7 +87,7 @@ std::string HttpMetadataHandler::validateQueryParam(const std::string& name,
 
 HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharded)
     : engineSharded(_engineSharded) {
-    tsdb::http_log.info("HttpMetadataHandler initialized");
+    timestar::http_log.info("HttpMetadataHandler initialized");
 }
 
 void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
@@ -118,7 +118,7 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
     );
     r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/fields"), fieldsHandler);
     
-    tsdb::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields");
+    timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields");
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> 
@@ -126,7 +126,7 @@ HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::http::request> 
     auto rep = std::make_unique<seastar::http::reply>();
     
     try {
-        tsdb::http_log.debug("Processing /measurements request");
+        timestar::http_log.debug("Processing /measurements request");
         
         // Metadata is centralized on shard 0, so query only shard 0
         auto measurements = co_await engineSharded->invoke_on(0, [](Engine& engine) -> seastar::future<std::vector<std::string>> {
@@ -172,12 +172,12 @@ HttpMetadataHandler::handleMeasurements(std::unique_ptr<seastar::http::request> 
         rep->_content = formatMeasurementsResponse(measurements, totalCount);
         rep->add_header("Content-Type", "application/json");
         
-        tsdb::http_log.debug("Returning {} measurements", measurements.size());
+        timestar::http_log.debug("Returning {} measurements", measurements.size());
         
     } catch (const std::exception& e) {
-        tsdb::http_log.error("Error processing /measurements: {}", e.what());
+        timestar::http_log.error("Error processing /measurements: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
+        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
         rep->add_header("Content-Type", "application/json");
     }
     
@@ -218,7 +218,7 @@ HttpMetadataHandler::handleTags(std::unique_ptr<seastar::http::request> req) {
             }
         }
 
-        tsdb::http_log.debug("Processing /tags request for measurement: {}, tag: {}",
+        timestar::http_log.debug("Processing /tags request for measurement: {}, tag: {}",
                            measurement, specificTag.empty() ? "all" : specificTag);
         
         // Metadata is centralized on shard 0, so query only shard 0
@@ -252,12 +252,12 @@ HttpMetadataHandler::handleTags(std::unique_ptr<seastar::http::request> req) {
         rep->_content = formatTagsResponse(measurement, tagsResult, specificTag);
         rep->add_header("Content-Type", "application/json");
         
-        tsdb::http_log.debug("Returning tags for measurement: {}", measurement);
+        timestar::http_log.debug("Returning tags for measurement: {}", measurement);
         
     } catch (const std::exception& e) {
-        tsdb::http_log.error("Error processing /tags: {}", e.what());
+        timestar::http_log.error("Error processing /tags: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
+        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
         rep->add_header("Content-Type", "application/json");
     }
     
@@ -287,25 +287,32 @@ HttpMetadataHandler::handleFields(std::unique_ptr<seastar::http::request> req) {
             }
         }
 
-        tsdb::http_log.debug("Processing /fields request for measurement: {}", measurement);
+        timestar::http_log.debug("Processing /fields request for measurement: {}", measurement);
         
         // Parse optional tags parameter for filtering
         std::string tagsParam = req->get_query_param("tags");
         std::unordered_map<std::string, std::string> tagFilters;
         if (!tagsParam.empty()) {
             // Parse tags in format "key1:value1,key2:value2"
+            // Use only the first colon as delimiter so values can contain colons
+            // (e.g., "host:port:8080" -> key="host", value="port:8080")
             size_t pos = 0;
             while (pos < tagsParam.length()) {
                 size_t colonPos = tagsParam.find(':', pos);
                 if (colonPos == std::string::npos) break;
-                
-                size_t commaPos = tagsParam.find(',', colonPos);
-                if (commaPos == std::string::npos) commaPos = tagsParam.length();
-                
+
                 std::string key = tagsParam.substr(pos, colonPos - pos);
+
+                // Find the next comma after the key:value pair.
+                // We need to find the next comma that is NOT part of the value.
+                // Since we split on the first colon, the value runs until the next
+                // top-level comma or end of string.
+                size_t commaPos = tagsParam.find(',', colonPos + 1);
+                if (commaPos == std::string::npos) commaPos = tagsParam.length();
+
                 std::string value = tagsParam.substr(colonPos + 1, commaPos - colonPos - 1);
                 tagFilters[key] = value;
-                
+
                 pos = commaPos + 1;
             }
         }
@@ -315,26 +322,28 @@ HttpMetadataHandler::handleFields(std::unique_ptr<seastar::http::request> req) {
             co_return co_await engine.getMeasurementFields(measurement);
         });
         
-        // Look up actual field types from the LevelDB index on shard 0
-        std::unordered_map<std::string, std::string> fieldsWithTypes;
-        for (const auto& field : allFields) {
-            auto fieldType = co_await engineSharded->invoke_on(0, [measurement, field](Engine& engine) -> seastar::future<std::string> {
-                co_return co_await engine.getIndex().getFieldType(measurement, field);
+        // Look up all field types in a single RPC to shard 0
+        auto fieldsWithTypes = co_await engineSharded->invoke_on(0,
+            [measurement, fields = std::vector<std::string>(allFields.begin(), allFields.end())]
+            (Engine& engine) -> seastar::future<std::unordered_map<std::string, std::string>> {
+                std::unordered_map<std::string, std::string> result;
+                for (const auto& field : fields) {
+                    auto fieldType = co_await engine.getIndex().getFieldType(measurement, field);
+                    result[field] = fieldType.empty() ? "float" : fieldType;
+                }
+                co_return result;
             });
-            // Default to "float" if type was never recorded (e.g., legacy data)
-            fieldsWithTypes[field] = fieldType.empty() ? "float" : fieldType;
-        }
         
         rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = formatFieldsResponse(measurement, fieldsWithTypes, tagFilters);
         rep->add_header("Content-Type", "application/json");
         
-        tsdb::http_log.debug("Returning {} fields for measurement: {}", allFields.size(), measurement);
+        timestar::http_log.debug("Returning {} fields for measurement: {}", allFields.size(), measurement);
         
     } catch (const std::exception& e) {
-        tsdb::http_log.error("Error processing /fields: {}", e.what());
+        timestar::http_log.error("Error processing /fields: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", e.what());
+        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
         rep->add_header("Content-Type", "application/json");
     }
     

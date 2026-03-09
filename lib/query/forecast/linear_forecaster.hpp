@@ -3,7 +3,7 @@
 
 #include "forecast_result.hpp"
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 /**
@@ -62,6 +62,6 @@ private:
 };
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar
 
 #endif // LINEAR_FORECASTER_H_INCLUDED

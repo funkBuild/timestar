@@ -1,5 +1,5 @@
-#ifndef TSDB_CONFIG_H_INCLUDED
-#define TSDB_CONFIG_H_INCLUDED
+#ifndef TIMESTAR_CONFIG_H_INCLUDED
+#define TIMESTAR_CONFIG_H_INCLUDED
 
 #include <cstdint>
 #include <map>
@@ -8,7 +8,7 @@
 
 #include <glaze/glaze.hpp>
 
-namespace tsdb {
+namespace timestar {
 
 struct ServerConfig {
     uint16_t port = 8086;
@@ -76,7 +76,7 @@ struct SeastarConfig {
 };
 
 // Internal struct for Glaze TOML parsing (excludes SeastarConfig)
-struct TsdbConfigParseable {
+struct TimestarConfigParseable {
     ServerConfig server;
     StorageConfig storage;
     HttpConfig http;
@@ -85,7 +85,7 @@ struct TsdbConfigParseable {
     StreamingConfig streaming;
 };
 
-struct TsdbConfig {
+struct TimestarConfig {
     ServerConfig server;
     StorageConfig storage;
     HttpConfig http;
@@ -99,24 +99,28 @@ struct TsdbConfig {
 };
 
 // Load config from a TOML file. Throws std::runtime_error on parse/validation failure.
-TsdbConfig loadConfigFile(const std::string& path);
+TimestarConfig loadConfigFile(const std::string& path);
 
 // Return the default config as a TOML string.
 std::string dumpDefaultConfig();
 
+// Apply TIMESTAR_* environment variable overrides onto an existing config.
+// Called after loading config file but before setGlobalConfig().
+void applyEnvironmentOverrides(TimestarConfig& cfg);
+
 // Set the global config (call once in main before app.run()).
-void setGlobalConfig(const TsdbConfig& cfg);
+void setGlobalConfig(const TimestarConfig& cfg);
 
 // Read the global config from any shard (lock-free, set once before reactor starts).
-const TsdbConfig& config();
+const TimestarConfig& config();
 
-} // namespace tsdb
+} // namespace timestar
 
 // Glaze metadata for TOML serialization
 
 template <>
-struct glz::meta<tsdb::ServerConfig> {
-    using T = tsdb::ServerConfig;
+struct glz::meta<timestar::ServerConfig> {
+    using T = timestar::ServerConfig;
     static constexpr auto value = object(
         "port", &T::port,
         "log_level", &T::log_level,
@@ -125,8 +129,8 @@ struct glz::meta<tsdb::ServerConfig> {
 };
 
 template <>
-struct glz::meta<tsdb::CompactionConfig> {
-    using T = tsdb::CompactionConfig;
+struct glz::meta<timestar::CompactionConfig> {
+    using T = timestar::CompactionConfig;
     static constexpr auto value = object(
         "max_concurrent", &T::max_concurrent,
         "max_memory", &T::max_memory,
@@ -138,8 +142,8 @@ struct glz::meta<tsdb::CompactionConfig> {
 };
 
 template <>
-struct glz::meta<tsdb::StorageConfig> {
-    using T = tsdb::StorageConfig;
+struct glz::meta<timestar::StorageConfig> {
+    using T = timestar::StorageConfig;
     static constexpr auto value = object(
         "wal_size_threshold", &T::wal_size_threshold,
         "max_points_per_block", &T::max_points_per_block,
@@ -150,8 +154,8 @@ struct glz::meta<tsdb::StorageConfig> {
 };
 
 template <>
-struct glz::meta<tsdb::HttpConfig> {
-    using T = tsdb::HttpConfig;
+struct glz::meta<timestar::HttpConfig> {
+    using T = timestar::HttpConfig;
     static constexpr auto value = object(
         "max_write_body_size", &T::max_write_body_size,
         "max_query_body_size", &T::max_query_body_size,
@@ -162,8 +166,8 @@ struct glz::meta<tsdb::HttpConfig> {
 };
 
 template <>
-struct glz::meta<tsdb::IndexConfig> {
-    using T = tsdb::IndexConfig;
+struct glz::meta<timestar::IndexConfig> {
+    using T = timestar::IndexConfig;
     static constexpr auto value = object(
         "bloom_filter_bits", &T::bloom_filter_bits,
         "block_size", &T::block_size,
@@ -175,8 +179,8 @@ struct glz::meta<tsdb::IndexConfig> {
 };
 
 template <>
-struct glz::meta<tsdb::EngineConfig> {
-    using T = tsdb::EngineConfig;
+struct glz::meta<timestar::EngineConfig> {
+    using T = timestar::EngineConfig;
     static constexpr auto value = object(
         "metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds,
         "max_metadata_retry_ops", &T::max_metadata_retry_ops,
@@ -187,8 +191,8 @@ struct glz::meta<tsdb::EngineConfig> {
 };
 
 template <>
-struct glz::meta<tsdb::StreamingConfig> {
-    using T = tsdb::StreamingConfig;
+struct glz::meta<timestar::StreamingConfig> {
+    using T = timestar::StreamingConfig;
     static constexpr auto value = object(
         "max_subscriptions_per_shard", &T::max_subscriptions_per_shard,
         "output_queue_size", &T::output_queue_size,
@@ -197,8 +201,8 @@ struct glz::meta<tsdb::StreamingConfig> {
 };
 
 template <>
-struct glz::meta<tsdb::TsdbConfigParseable> {
-    using T = tsdb::TsdbConfigParseable;
+struct glz::meta<timestar::TimestarConfigParseable> {
+    using T = timestar::TimestarConfigParseable;
     static constexpr auto value = object(
         "server", &T::server,
         "storage", &T::storage,
@@ -209,4 +213,4 @@ struct glz::meta<tsdb::TsdbConfigParseable> {
     );
 };
 
-#endif // TSDB_CONFIG_H_INCLUDED
+#endif // TIMESTAR_CONFIG_H_INCLUDED

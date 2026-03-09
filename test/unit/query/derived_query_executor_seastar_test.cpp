@@ -12,7 +12,7 @@
 #include "../../../lib/query/derived_query_executor.hpp"
 #include "../../../lib/query/derived_query.hpp"
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 #include <seastar/core/coroutine.hh>
@@ -26,7 +26,7 @@
 
 namespace fs = std::filesystem;
 
-using namespace tsdb;
+using namespace timestar;
 
 class DerivedQueryExecutorSeastarTest : public ::testing::Test {
 protected:
@@ -47,7 +47,7 @@ static void insertFloatSeries(seastar::sharded<Engine>& eng,
                               const std::string& field,
                               const std::map<std::string, std::string>& tags,
                               const std::vector<std::pair<uint64_t, double>>& points) {
-    TSDBInsert<double> insert(measurement, field);
+    TimeStarInsert<double> insert(measurement, field);
     for (const auto& [k, v] : tags) {
         insert.addTag(k, v);
     }

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  tsdb — top‑level build
+#  timestar — top‑level build
 #  ---------------------------------------------------------------------------
 #  Strategy for “libstdc++ 13 + Seastar” build failures
 #  ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ if(NOT CMAKE_CXX_COMPILER)
   endif()
 endif()
 
-project(tsdb LANGUAGES C CXX ASM)
+project(timestar LANGUAGES C CXX ASM)
 
 # ─────────────────────── sanity check on the chosen compiler ─────────────────
 
@@ -71,6 +71,22 @@ add_compile_options(-march=native)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# ───────────────────────────── Link-Time Optimization ────────────────────────
+# Enable with -DTIMESTAR_ENABLE_LTO=ON.  LTO lets the linker eliminate dead code
+# across translation units, significantly reducing stripped binary size.
+
+option(TIMESTAR_ENABLE_LTO "Enable interprocedural / link-time optimization" OFF)
+if(TIMESTAR_ENABLE_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
+  if(_ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    message(STATUS "LTO enabled")
+  else()
+    message(WARNING "LTO requested but not supported: ${_ipo_error}")
+  endif()
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

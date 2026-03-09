@@ -36,11 +36,11 @@ endif()
 
 message(STATUS "Found LevelDB: ${LEVELDB_LIBRARY}")
 
-add_library(libtsdb STATIC ${SRC_FILES})
-target_link_libraries(libtsdb Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze ${XXHASH_LIBRARY})
+add_library(libtimestar STATIC ${SRC_FILES})
+target_link_libraries(libtimestar Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze ${XXHASH_LIBRARY})
 
 # Include both the lib directory and all subdirectories for header resolution
-target_include_directories(libtsdb PUBLIC
+target_include_directories(libtimestar PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/storage

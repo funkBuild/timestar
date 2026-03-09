@@ -11,14 +11,13 @@
 #include <map>
 #include <algorithm>
 #include <chrono>
-#include <atomic>
 #include <unordered_map>
 #include <mutex>
 
 // Forward declarations
 class Engine;
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Simple request/response structures
 struct FunctionQueryRequest {
@@ -62,39 +61,38 @@ struct QueryParseResponse {
 };
 
 // Performance tracking structures
+// All access is serialized by PerformanceTracker::mutex_, so plain types suffice.
 struct FunctionStats {
-    std::atomic<uint64_t> executions{0};
-    std::atomic<uint64_t> totalTimeNs{0};
-    std::atomic<uint64_t> cacheHits{0};
-    std::atomic<uint64_t> cacheMisses{0};
-    
+    uint64_t executions{0};
+    uint64_t totalTimeNs{0};
+    uint64_t cacheHits{0};
+    uint64_t cacheMisses{0};
+
     double getAverageTime() const {
-        uint64_t execs = executions.load();
-        return execs > 0 ? (totalTimeNs.load() / 1000000.0) / execs : 0.0;
+        return executions > 0 ? (totalTimeNs / 1000000.0) / executions : 0.0;
     }
-    
+
     double getCacheHitRate() const {
-        uint64_t hits = cacheHits.load();
-        uint64_t misses = cacheMisses.load();
-        uint64_t total = hits + misses;
-        return total > 0 ? static_cast<double>(hits) / total : 0.0;
+        uint64_t total = cacheHits + cacheMisses;
+        return total > 0 ? static_cast<double>(cacheHits) / total : 0.0;
     }
 };
 
 class PerformanceTracker {
 private:
-    mutable std::mutex mutex_;
+    // No mutex needed: this is used as a static thread_local (one instance per
+    // Seastar shard), so only a single thread ever accesses it.
     std::unordered_map<std::string, FunctionStats> functionStats_;
     std::chrono::steady_clock::time_point startTime_;
-    
+
 public:
     PerformanceTracker() : startTime_(std::chrono::steady_clock::now()) {}
-    
+
     void recordExecution(const std::string& functionName, std::chrono::nanoseconds duration);
     void recordCacheHit(const std::string& functionName);
     void recordCacheMiss(const std::string& functionName);
     std::string getPerformanceStats() const;
-    
+
     uint64_t getTotalExecutions() const;
     double getAverageExecutionTime() const;
 };
@@ -103,7 +101,7 @@ class FunctionHttpHandler {
 private:
     seastar::sharded<Engine>& engine_;
     // Removed baseQueryHandler_ to fix unique_ptr<void> compilation issue
-    static PerformanceTracker performanceTracker_;
+    static thread_local PerformanceTracker performanceTracker_;
 
 public:
     explicit FunctionHttpHandler(seastar::sharded<Engine>& engine);
@@ -143,6 +141,6 @@ private:
                                                              seastar::http::reply::status_type status = seastar::http::reply::status_type::bad_request) const;
 };
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // FUNCTION_HTTP_HANDLER_H_INCLUDED

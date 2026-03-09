@@ -2,7 +2,7 @@
 #include "derived_query.hpp"
 #include "query_parser.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 class DerivedQueryTest : public ::testing::Test {
 protected:

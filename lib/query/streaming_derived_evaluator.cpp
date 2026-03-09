@@ -6,7 +6,7 @@
 #include <set>
 #include <cmath>
 
-namespace tsdb {
+namespace timestar {
 
 StreamingDerivedEvaluator::StreamingDerivedEvaluator(
     uint64_t intervalNs,
@@ -91,6 +91,9 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
     // For timestamps where a query has no data, use carry-forward.
     std::vector<uint64_t> sortedTimestamps(allTimestamps.begin(), allTimestamps.end());
 
+    // Share a single timestamp vector across all query series (avoids N copies)
+    auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(sortedTimestamps);
+
     ExpressionEvaluator::QueryResultMap queryResults;
     for (const auto& [label, _] : _aggregators) {
         std::vector<double> values;
@@ -144,7 +147,7 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
             // _lastValueTimestamps[label] already updated in the loop above
         }
 
-        queryResults[label] = AlignedSeries(sortedTimestamps, std::move(values));
+        queryResults[label] = AlignedSeries(sharedTimestamps, std::move(values));
     }
 
     // Evaluate formula
@@ -178,4 +181,4 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
     return result;
 }
 
-} // namespace tsdb
+} // namespace timestar

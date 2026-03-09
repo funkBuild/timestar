@@ -9,7 +9,7 @@
 #include "../../../lib/storage/compressed_buffer.hpp"
 #include "../../../lib/encoding/float_encoder.hpp"
 #include "../../../lib/encoding/integer_encoder.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 namespace fs = std::filesystem;
@@ -204,9 +204,9 @@ TEST_F(TSMTest, ReferenceCountingBasic) {
     // TSM no longer has reference counting; the shard-per-core model
     // guarantees single-threaded access, so files are deleted directly
     // in removeTSMFiles() via scheduleDelete().
-    TSM tsm(filename);
-    // Verify TSM can be constructed and scheduleDelete() is available
-    SUCCEED();
+    EXPECT_NO_THROW({
+        TSM tsm(filename);
+    });
 }
 
 // getValueType tests

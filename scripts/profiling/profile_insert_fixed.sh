@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Robust profiling script for TSDB insert path with proper timeout handling
+# Robust profiling script for TimeStar insert path with proper timeout handling
 # Usage: ./profile_insert_fixed.sh [duration_seconds]
 
 DURATION=${1:-30}  # Default 30 seconds
@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 FLAMEGRAPH_DIR="${SCRIPT_DIR}/FlameGraph"
 
-echo "=== TSDB Insert Path Profiling ==="
+echo "=== TimeStar Insert Path Profiling ==="
 echo "Duration: ${DURATION} seconds"
 echo ""
 
@@ -52,16 +52,16 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Check if the server is already running
-if pgrep -f tsdb_http_server > /dev/null; then
-    echo "TSDB server already running. Please stop it first:"
-    echo "  pkill -f tsdb_http_server"
+if pgrep -f timestar_http_server > /dev/null; then
+    echo "TimeStar server already running. Please stop it first:"
+    echo "  pkill -f timestar_http_server"
     exit 1
 fi
 
-# Start the TSDB server
-echo "Starting TSDB server..."
+# Start the TimeStar server
+echo "Starting TimeStar server..."
 cd ${BUILD_DIR}
-./bin/tsdb_http_server --port 8086 &
+./bin/timestar_http_server --port 8086 &
 SERVER_PID=$!
 echo "Server PID: ${SERVER_PID}"
 
@@ -70,7 +70,7 @@ sleep 2
 
 # Verify server is running
 if ! kill -0 ${SERVER_PID} 2>/dev/null; then
-    echo "Failed to start TSDB server"
+    echo "Failed to start TimeStar server"
     exit 1
 fi
 
@@ -165,14 +165,14 @@ else
 
     # Generate detailed flame graph
     ${FLAMEGRAPH_DIR}/flamegraph.pl \
-        --title "TSDB Insert Path CPU Profile (${DURATION}s @ 999Hz)" \
+        --title "TimeStar Insert Path CPU Profile (${DURATION}s @ 999Hz)" \
         --colors hot \
         --width 1800 \
         --height 800 \
         --minwidth 0.5 \
-        out.folded > tsdb_insert_flamegraph.svg
+        out.folded > timestar_insert_flamegraph.svg
 
-    echo "Flame graph generated: tsdb_insert_flamegraph.svg"
+    echo "Flame graph generated: timestar_insert_flamegraph.svg"
 
     # Show summary statistics
     echo ""
@@ -188,8 +188,8 @@ echo ""
 echo "=== Profiling Complete ==="
 echo ""
 echo "To view the flame graph:"
-echo "  firefox ${SCRIPT_DIR}/tsdb_insert_flamegraph.svg"
+echo "  firefox ${SCRIPT_DIR}/timestar_insert_flamegraph.svg"
 echo ""
 echo "Or use Python's HTTP server:"
 echo "  cd ${SCRIPT_DIR} && python3 -m http.server 8000"
-echo "  Then open: http://localhost:8000/tsdb_insert_flamegraph.svg"
+echo "  Then open: http://localhost:8000/timestar_insert_flamegraph.svg"

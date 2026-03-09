@@ -3,7 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 double AnomalyExecutor::computeAlertValue(const std::vector<double>& scores) {
@@ -159,6 +159,12 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
     size_t totalPoints = 0;
 
     try {
+        // Reuse a single AnomalyInput across iterations to avoid copying
+        // sharedTimestamps N times. Timestamps are assigned once; values and
+        // groupTags are swapped in and out each iteration.
+        AnomalyInput input;
+        input.timestamps = sharedTimestamps;
+
         // Process each series
         for (size_t i = 0; i < seriesValues.size(); ++i) {
             const auto& values = seriesValues[i];
@@ -166,9 +172,6 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
 
             if (values.empty()) continue;
 
-            // Prepare input
-            AnomalyInput input;
-            input.timestamps = sharedTimestamps;
             input.values = values;
             input.groupTags = groupTags;
 
@@ -206,4 +209,4 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
 }
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar

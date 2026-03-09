@@ -12,7 +12,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include "series_id.hpp"
 
-namespace tsdb {
+namespace timestar {
 
 // Magic number for tombstone files ('TSMT' in hex)
 constexpr uint32_t TOMBSTONE_MAGIC = 0x54534D54;
@@ -184,6 +184,6 @@ std::pair<std::vector<uint64_t>, std::vector<T>> TSMTombstone::filterTombstoned(
     return {filteredTimestamps, filteredValues};
 }
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // TSM_TOMBSTONE_H_INCLUDED

@@ -9,8 +9,9 @@
 #include <cmath>
 #include <limits>
 #include <chrono>
+#include <random>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using ::testing::_;
 using ::testing::DoubleNear;
 using ::testing::ElementsAre;
@@ -503,10 +504,12 @@ TEST_F(EdgeCasesTest, LargeDatasetSmoothingMemoryUsage) {
     std::vector<double> mediumValues;
     mediumTimestamps.reserve(10000);
     mediumValues.reserve(10000);
-    
+
+    std::mt19937 rng(42); // Fixed seed for reproducible tests
+    std::uniform_real_distribution<double> noiseDist(0.0, 1.0);
     for (size_t i = 0; i < 10000; ++i) {
         mediumTimestamps.push_back(1000ULL + i * 1000ULL);
-        mediumValues.push_back(std::sin(i * 0.1) + static_cast<double>(rand()) / RAND_MAX * 0.1);
+        mediumValues.push_back(std::sin(i * 0.1) + noiseDist(rng) * 0.1);
     }
     
     DoubleSeriesView mediumView(&mediumTimestamps, &mediumValues);

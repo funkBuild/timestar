@@ -4,7 +4,7 @@
 #include <limits>
 #include "../../../lib/query/transform/transform_functions.hpp"
 
-using namespace tsdb::transform;
+using namespace timestar::transform;
 
 class TransformFunctionsTest : public ::testing::Test {
 protected:

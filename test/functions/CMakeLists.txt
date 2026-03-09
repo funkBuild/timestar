@@ -28,7 +28,7 @@ target_link_libraries(function_tests
     PRIVATE
     gtest_main
     gmock
-    libtsdb  # Main TSDB library with function framework
+    libtimestar  # Main TimeStar library with function framework
     pthread
 )
 
@@ -56,7 +56,7 @@ target_link_libraries(test_framework_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -71,7 +71,7 @@ target_link_libraries(test_arithmetic_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -86,7 +86,7 @@ target_link_libraries(test_smoothing_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -101,7 +101,7 @@ target_link_libraries(test_alignment_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -116,7 +116,7 @@ target_link_libraries(test_vectorized_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -131,7 +131,7 @@ target_link_libraries(test_interpolation_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -146,7 +146,7 @@ target_link_libraries(test_thread_safety_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -161,7 +161,7 @@ target_link_libraries(test_real_data_integration_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -176,7 +176,7 @@ target_link_libraries(test_real_data_integration_simplified
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -191,7 +191,7 @@ target_link_libraries(test_resource_management_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -206,7 +206,7 @@ target_link_libraries(test_resource_management_simple
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -221,7 +221,7 @@ target_link_libraries(test_resource_management_basic
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -236,7 +236,7 @@ target_link_libraries(test_edge_cases_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -251,7 +251,7 @@ target_link_libraries(test_function_security_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -266,7 +266,7 @@ target_link_libraries(test_function_query_parser_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -281,7 +281,7 @@ target_link_libraries(test_performance_regression_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 
@@ -296,7 +296,7 @@ target_link_libraries(test_production_monitoring_only
     PRIVATE
     gtest_main
     gmock
-    libtsdb
+    libtimestar
     pthread
 )
 

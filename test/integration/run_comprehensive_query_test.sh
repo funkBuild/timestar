@@ -17,7 +17,7 @@ g++ -std=c++23 \
     -L./lib -L../external/seastar/build/release \
     -o comprehensive_query_test \
     ../test/integration/comprehensive_query_test.cpp \
-    -llibtsdb -lseastar -lgtest -lgtest_main -lpthread \
+    -llibtimestar -lseastar -lgtest -lgtest_main -lpthread \
     -lboost_system -lboost_filesystem -lboost_thread \
     -lsnappy -lleveldb -lfmt -lnuma -lhwloc \
     -Wl,-rpath,./lib -Wl,-rpath,../external/seastar/build/release

@@ -30,7 +30,7 @@ private:
 
     // Memory tracking (Phase 2.3)
     size_t maxMemoryBytes;
-    std::atomic<size_t> currentMemoryUsage{0};
+    size_t currentMemoryUsage{0};
 
 public:
     SeriesPrefetchManager(

@@ -1,14 +1,14 @@
 #!/bin/bash
-# Example: Writing data to TSDB
+# Example: Writing data to TimeStar
 # Usage: ./write_data.sh
 
-TSDB_HOST="${TSDB_HOST:-localhost}"
-TSDB_PORT="${TSDB_PORT:-8086}"
+TIMESTAR_HOST="${TIMESTAR_HOST:-localhost}"
+TIMESTAR_PORT="${TIMESTAR_PORT:-8086}"
 
-echo "Writing sample data to TSDB at ${TSDB_HOST}:${TSDB_PORT}"
+echo "Writing sample data to TimeStar at ${TIMESTAR_HOST}:${TIMESTAR_PORT}"
 
 # Write a single point
-curl -X POST "http://${TSDB_HOST}:${TSDB_PORT}/write" \
+curl -X POST "http://${TIMESTAR_HOST}:${TIMESTAR_PORT}/write" \
   -H "Content-Type: application/json" \
   -d '{
     "measurement": "temperature",
@@ -26,7 +26,7 @@ curl -X POST "http://${TSDB_HOST}:${TSDB_PORT}/write" \
 echo ""
 
 # Write batch data
-curl -X POST "http://${TSDB_HOST}:${TSDB_PORT}/write" \
+curl -X POST "http://${TIMESTAR_HOST}:${TIMESTAR_PORT}/write" \
   -H "Content-Type: application/json" \
   -d '{
     "writes": [

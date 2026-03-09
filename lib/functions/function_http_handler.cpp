@@ -3,75 +3,140 @@
 #include "../core/engine.hpp"
 #include "../http/http_query_handler.hpp"
 #include "../query/query_parser.hpp"
+#include <glaze/glaze.hpp>
 #include <vector>
 #include <set>
-#include <regex>
 #include <algorithm>
 #include <numeric>
 #include <chrono>
 #include <cmath>
 #include <sstream>
 
-namespace tsdb::functions {
+// Glaze structs for JSON parsing in function HTTP handlers.
+// Defined at file scope so glz::meta specializations work correctly.
 
-// Static member definition
-PerformanceTracker FunctionHttpHandler::performanceTracker_;
+struct GlazeFunctionValidationRequest {
+    std::string function;
+    std::optional<glz::generic> parameters;
+};
+
+template <>
+struct glz::meta<GlazeFunctionValidationRequest> {
+    using T = GlazeFunctionValidationRequest;
+    static constexpr auto value = object(
+        "function", &T::function,
+        "parameters", &T::parameters
+    );
+};
+
+struct GlazeQueryParseRequest {
+    std::string query;
+};
+
+template <>
+struct glz::meta<GlazeQueryParseRequest> {
+    using T = GlazeQueryParseRequest;
+    static constexpr auto value = object(
+        "query", &T::query
+    );
+};
+
+struct GlazeFunctionQueryRequest {
+    std::string query;
+    uint64_t startTime{0};
+    uint64_t endTime{0};
+};
+
+template <>
+struct glz::meta<GlazeFunctionQueryRequest> {
+    using T = GlazeFunctionQueryRequest;
+    static constexpr auto value = object(
+        "query", &T::query,
+        "startTime", &T::startTime,
+        "endTime", &T::endTime
+    );
+};
+
+namespace timestar::functions {
+
+// Escape a string for safe embedding in a JSON string value.
+// Prevents JSON injection when user-supplied or exception-derived strings
+// are interpolated into hand-built JSON responses.
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+// Per-shard instance (one per Seastar shard, no mutex needed)
+thread_local PerformanceTracker FunctionHttpHandler::performanceTracker_;
 
 // PerformanceTracker implementation
 void PerformanceTracker::recordExecution(const std::string& functionName, std::chrono::nanoseconds duration) {
-    std::lock_guard<std::mutex> lock(mutex_);
     auto& stats = functionStats_[functionName];
     stats.executions++;
     stats.totalTimeNs += duration.count();
 }
 
 void PerformanceTracker::recordCacheHit(const std::string& functionName) {
-    std::lock_guard<std::mutex> lock(mutex_);
     auto& stats = functionStats_[functionName];
     stats.cacheHits++;
 }
 
 void PerformanceTracker::recordCacheMiss(const std::string& functionName) {
-    std::lock_guard<std::mutex> lock(mutex_);
     auto& stats = functionStats_[functionName];
     stats.cacheMisses++;
 }
 
 uint64_t PerformanceTracker::getTotalExecutions() const {
-    std::lock_guard<std::mutex> lock(mutex_);
     uint64_t total = 0;
     for (const auto& pair : functionStats_) {
-        total += pair.second.executions.load();
+        total += pair.second.executions;
     }
     return total;
 }
 
 double PerformanceTracker::getAverageExecutionTime() const {
-    std::lock_guard<std::mutex> lock(mutex_);
     uint64_t totalExecs = 0;
     uint64_t totalTimeNs = 0;
-    
+
     for (const auto& pair : functionStats_) {
-        totalExecs += pair.second.executions.load();
-        totalTimeNs += pair.second.totalTimeNs.load();
+        totalExecs += pair.second.executions;
+        totalTimeNs += pair.second.totalTimeNs;
     }
-    
+
     return totalExecs > 0 ? (totalTimeNs / 1000000.0) / totalExecs : 0.0;
 }
 
 std::string PerformanceTracker::getPerformanceStats() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    // Calculate totals locally to avoid deadlock
+    // Calculate totals
     uint64_t totalExecs = 0;
     uint64_t totalTimeNs = 0;
     uint64_t totalHits = 0, totalMisses = 0;
     
     for (const auto& pair : functionStats_) {
-        totalExecs += pair.second.executions.load();
-        totalTimeNs += pair.second.totalTimeNs.load();
-        totalHits += pair.second.cacheHits.load();
-        totalMisses += pair.second.cacheMisses.load();
+        totalExecs += pair.second.executions;
+        totalTimeNs += pair.second.totalTimeNs;
+        totalHits += pair.second.cacheHits;
+        totalMisses += pair.second.cacheMisses;
     }
     
     double avgExecTime = totalExecs > 0 ? (totalTimeNs / 1000000.0) / totalExecs : 0.0;
@@ -92,7 +157,7 @@ std::string PerformanceTracker::getPerformanceStats() const {
         first = false;
         
         json << "\"" << pair.first << "\":{";
-        json << "\"executions\":" << pair.second.executions.load() << ",";
+        json << "\"executions\":" << pair.second.executions << ",";
         json << "\"avgTime\":" << pair.second.getAverageTime() << ",";
         json << "\"cacheHitRate\":" << pair.second.getCacheHitRate();
         json << "}";
@@ -237,13 +302,13 @@ std::string FunctionHttpHandler::handleFunctionInfoSync(const seastar::http::req
     }
     
     if (functionName.empty()) {
-        return "{\"status\":\"error\",\"error\":{\"code\":\"MISSING_PARAMETER\",\"message\":\"Function name not provided\",\"debug_url\":\"" + std::string(req._url) + "\"}}";
+        return R"({"status":"error","error":{"code":"MISSING_PARAMETER","message":"Function name not provided"}})";
     }
     
     // SECURITY VALIDATION: Validate function name
     auto validation = FunctionSecurity::validateFunctionName(functionName);
     if (!validation.isValid) {
-        return "{\"status\":\"error\",\"error\":{\"code\":\"" + validation.errorCode + "\",\"message\":\"" + validation.errorMessage + "\"}}";
+        return "{\"status\":\"error\",\"error\":{\"code\":\"" + jsonEscape(validation.errorCode) + "\",\"message\":\"" + jsonEscape(validation.errorMessage) + "\"}}";
     }
     
     // Use sanitized function name
@@ -265,45 +330,27 @@ std::string FunctionHttpHandler::handleFunctionInfoSync(const seastar::http::req
         return "{\"status\":\"success\",\"function\":{\"name\":\"interpolate\",\"category\":\"interpolation\",\"description\":\"Linear interpolation\",\"parameters\":{\"method\":{\"type\":\"string\",\"required\":false,\"description\":\"Interpolation method\",\"default\":\"linear\"},\"target_interval\":{\"type\":\"int\",\"required\":false,\"description\":\"Target interval in nanoseconds\"}},\"examples\":[\"interpolate(method:linear)\",\"interpolate(method:linear,target_interval:60000000000)\"]}}";
     }
     
-    return "{\"status\":\"error\",\"error\":{\"code\":\"FUNCTION_NOT_FOUND\",\"message\":\"Function not found: " + functionName + "\",\"debug_url\":\"" + std::string(req._url) + "\"}}";
+    return "{\"status\":\"error\",\"error\":{\"code\":\"FUNCTION_NOT_FOUND\",\"message\":\"Function not found: " + jsonEscape(functionName) + "\"}}";
 }
 
 std::string FunctionHttpHandler::handleFunctionValidationSync(const seastar::http::request& req) {
     std::string body = req.content;
-    
+
     try {
-        // Parse JSON to extract function name and parameters
-        std::string functionName;
+        // Parse JSON using Glaze to safely handle escaped quotes, Unicode, etc.
+        GlazeFunctionValidationRequest parsed;
+        auto parseErr = glz::read_json(parsed, body);
+        if (parseErr) {
+            return "{\"status\":\"success\",\"valid\":false,\"error\":\"Failed to parse request: " +
+                   jsonEscape(std::string(glz::format_error(parseErr))) + "\"}";
+        }
+
+        std::string functionName = parsed.function;
         std::string parameters;
-        
-        // Extract function name
-        size_t funcPos = body.find("\"function\":");
-        if (funcPos != std::string::npos) {
-            size_t start = body.find("\"", funcPos + 11) + 1;
-            size_t end = body.find("\"", start);
-            if (start != std::string::npos && end != std::string::npos) {
-                functionName = body.substr(start, end - start);
-            }
+        if (parsed.parameters.has_value()) {
+            parameters = glz::write_json(parsed.parameters.value()).value_or("{}");
         }
-        
-        // Extract parameters section
-        size_t paramPos = body.find("\"parameters\":");
-        if (paramPos != std::string::npos) {
-            size_t start = body.find("{", paramPos);
-            if (start != std::string::npos) {
-                int braceCount = 1;
-                size_t pos = start + 1;
-                while (pos < body.length() && braceCount > 0) {
-                    if (body[pos] == '{') braceCount++;
-                    else if (body[pos] == '}') braceCount--;
-                    pos++;
-                }
-                if (braceCount == 0) {
-                    parameters = body.substr(start, pos - start);
-                }
-            }
-        }
-        
+
         if (functionName.empty()) {
             return "{\"status\":\"success\",\"valid\":false,\"error\":\"Function name not provided\"}";
         }
@@ -311,14 +358,14 @@ std::string FunctionHttpHandler::handleFunctionValidationSync(const seastar::htt
         // SECURITY VALIDATION: Validate function name
         auto nameValidation = FunctionSecurity::validateFunctionName(functionName);
         if (!nameValidation.isValid) {
-            return "{\"status\":\"success\",\"valid\":false,\"error\":\"" + nameValidation.errorMessage + "\"}";
+            return "{\"status\":\"success\",\"valid\":false,\"error\":\"" + jsonEscape(nameValidation.errorMessage) + "\"}";
         }
         
         // SECURITY VALIDATION: Validate parameters
         if (!parameters.empty()) {
             auto paramValidation = FunctionSecurity::validateParameters(parameters);
             if (!paramValidation.isValid) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"" + paramValidation.errorMessage + "\"}";
+                return "{\"status\":\"success\",\"valid\":false,\"error\":\"" + jsonEscape(paramValidation.errorMessage) + "\"}";
             }
             parameters = paramValidation.sanitizedInput;
         }
@@ -408,26 +455,25 @@ std::string FunctionHttpHandler::handleFunctionValidationSync(const seastar::htt
         }
         
     } catch (const std::exception& e) {
-        return "{\"status\":\"success\",\"valid\":false,\"error\":\"Failed to parse request: " + std::string(e.what()) + "\"}";
+        return "{\"status\":\"success\",\"valid\":false,\"error\":\"Failed to parse request: " + jsonEscape(e.what()) + "\"}";
     }
 }
 
 std::string FunctionHttpHandler::handleQueryParsingSync(const seastar::http::request& req) {
     std::string body = req.content;
-    
-    // Extract query from JSON body
-    size_t queryPos = body.find("\"query\":");
-    if (queryPos == std::string::npos) {
-        return "{\"status\":\"success\",\"valid\":false,\"error\":\"Query not provided\"}";
-    }
-    
-    size_t start = body.find("\"", queryPos + 8) + 1;
-    size_t end = body.find("\"", start);
-    if (start == std::string::npos || end == std::string::npos) {
+
+    // Parse JSON using Glaze to safely handle escaped quotes, Unicode, etc.
+    GlazeQueryParseRequest parsed;
+    auto parseErr = glz::read_json(parsed, body);
+    if (parseErr) {
         return "{\"status\":\"success\",\"valid\":false,\"error\":\"Invalid JSON format\"}";
     }
-    
-    std::string query = body.substr(start, end - start);
+
+    if (parsed.query.empty()) {
+        return "{\"status\":\"success\",\"valid\":false,\"error\":\"Query not provided\"}";
+    }
+
+    std::string query = parsed.query;
     
     // Parse the query: aggregationMethod:measurement(fields).function1(params).function2(params)...
     std::string aggregation = "avg";
@@ -524,16 +570,16 @@ std::string FunctionHttpHandler::handleQueryParsingSync(const seastar::http::req
     std::string response = "{\"status\":\"success\",\"valid\":" + std::string(valid ? "true" : "false");
     
     if (!valid) {
-        response += ",\"error\":\"Unknown function: " + invalidFunction + "\"}";
+        response += ",\"error\":\"Unknown function: " + jsonEscape(invalidFunction) + "\"}";
     } else {
         response += ",\"parsed\":{";
-        response += "\"aggregation\":\"" + aggregation + "\"";
-        response += ",\"measurement\":\"" + measurement + "\"";
+        response += "\"aggregation\":\"" + jsonEscape(aggregation) + "\"";
+        response += ",\"measurement\":\"" + jsonEscape(measurement) + "\"";
         response += ",\"functions\":[";
-        
+
         for (size_t i = 0; i < functionNames.size(); i++) {
             if (i > 0) response += ",";
-            response += "\"" + functionNames[i] + "\"";
+            response += "\"" + jsonEscape(functionNames[i]) + "\"";
         }
         
         response += "]}}";
@@ -547,7 +593,7 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
     
     try {
         // Parse request body to get function query
-        std::string body = req.content.c_str();
+        std::string body(req.content.data(), req.content.size());
         
         // SECURITY VALIDATION: Validate JSON input
         auto jsonValidation = FunctionSecurity::validateJsonInput(body);
@@ -555,23 +601,21 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
             return "{\"success\": false, \"error\": \"" + jsonValidation.errorMessage + "\"}";
         }
         body = jsonValidation.sanitizedInput;
-        
-        // Simple JSON parsing for the query (basic implementation)
-        std::regex queryRegex("\"query\"\\s*:\\s*\"([^\"]+)\"");
-        std::regex startTimeRegex("\"startTime\"\\s*:\\s*(\\d+)");
-        std::regex endTimeRegex("\"endTime\"\\s*:\\s*(\\d+)");
-        
-        std::smatch queryMatch, startMatch, endMatch;
-        
-        if (!std::regex_search(body, queryMatch, queryRegex) ||
-            !std::regex_search(body, startMatch, startTimeRegex) ||
-            !std::regex_search(body, endMatch, endTimeRegex)) {
-            return "{\"success\": false, \"error\": \"Invalid request format\"}"; 
+
+        // Parse JSON using Glaze to safely handle escaped quotes, Unicode, etc.
+        GlazeFunctionQueryRequest parsedReq;
+        auto parseErr = glz::read_json(parsedReq, body);
+        if (parseErr) {
+            return "{\"success\": false, \"error\": \"Invalid request format\"}";
         }
-        
-        std::string functionQuery = queryMatch[1].str();
-        uint64_t startTimeVal = std::stoull(startMatch[1].str());
-        uint64_t endTimeVal = std::stoull(endMatch[1].str());
+
+        if (parsedReq.query.empty() || parsedReq.startTime == 0 || parsedReq.endTime == 0) {
+            return "{\"success\": false, \"error\": \"Invalid request format\"}";
+        }
+
+        std::string functionQuery = parsedReq.query;
+        uint64_t startTimeVal = parsedReq.startTime;
+        uint64_t endTimeVal = parsedReq.endTime;
         
         // SECURITY VALIDATION: Validate function query
         auto queryValidation = FunctionSecurity::validateFunctionQuery(functionQuery);
@@ -665,304 +709,12 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
             pos = paramEnd;
         }
         
-        // Generate mock data for testing (should eventually come from actual query execution)
-        std::vector<double> values;
-        std::vector<uint64_t> timestamps;
-        
-        // Create 5 test data points (matches the test data from the test file)
-        for (int i = 0; i < 5; i++) {
-            timestamps.push_back(startTimeVal + i * 1000000000ULL); // 1 second intervals
-            
-            double value;
-            if (fieldName == "pressure") {
-                // Pressure data: linear increase with noise (for smoothing function testing)
-                value = 1000.0 + i * 2.0 + (std::rand() % 10 - 5) * 0.1;
-            } else {
-                // Temperature/other data: sine wave pattern similar to test data
-                value = 20.0 + 10.0 * std::sin(i * 0.1) + i * 0.05;
-            }
-            values.push_back(value);
-        }
-        
-        // Apply functions in sequence
-        std::vector<std::string> executedFunctions;
-        double totalFunctionTimeMs = 0.0;
-        for (const auto& func : functions) {
-            auto functionStartTime = std::chrono::steady_clock::now();
-            
-            if (func.name == "sma") {
-                // Parse window parameter
-                int windowSize = 5; // default
-                std::regex windowRegex("window\\s*:\\s*([+-]?\\d+)");
-                std::smatch windowMatch;
-                if (std::regex_search(func.params, windowMatch, windowRegex)) {
-                    windowSize = std::stoi(windowMatch[1].str());
-                }
-                if (windowSize <= 0) {
-                    return "{\"success\": false, \"error\": \"Invalid window parameter: must be positive\"}";
-                }
-                
-                // Apply SMA
-                std::vector<double> smaValues;
-                for (size_t i = 0; i < values.size(); i++) {
-                    if (i < static_cast<size_t>(windowSize - 1)) {
-                        smaValues.push_back(values[i]);
-                    } else {
-                        double sum = 0.0;
-                        for (int j = 0; j < windowSize; j++) {
-                            sum += values[i - j];
-                        }
-                        smaValues.push_back(sum / windowSize);
-                    }
-                }
-                values = smaValues;
-                executedFunctions.push_back("sma");
-                
-                // Record performance
-                auto functionEndTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(functionEndTime - functionStartTime);
-                totalFunctionTimeMs += duration.count() / 1000000.0; // Convert nanoseconds to milliseconds
-                performanceTracker_.recordExecution("sma", duration);
-                
-            } else if (func.name == "scale") {
-                // Parse factor parameter
-                double factor = 1.0; // default
-                std::regex factorRegex("factor\\s*:\\s*([0-9]*\\.?[0-9]+)");
-                std::smatch factorMatch;
-                if (std::regex_search(func.params, factorMatch, factorRegex)) {
-                    factor = std::stod(factorMatch[1].str());
-                } else {
-                    return "{\"success\": false, \"error\": \"Scale function requires factor parameter\"}";
-                }
-                
-                // Apply scaling
-                for (double& value : values) {
-                    value *= factor;
-                }
-                executedFunctions.push_back("scale");
-                
-                // Record performance  
-                auto functionEndTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(functionEndTime - functionStartTime);
-                totalFunctionTimeMs += duration.count() / 1000000.0; // Convert nanoseconds to milliseconds
-                performanceTracker_.recordExecution("scale", duration);
-                
-            } else if (func.name == "offset") {
-                // Parse value/offset parameter
-                double offset = 0.0; // default
-                std::regex offsetRegex("(?:value|offset)\\s*:\\s*([+-]?[0-9]*\\.?[0-9]+)");
-                std::smatch offsetMatch;
-                if (std::regex_search(func.params, offsetMatch, offsetRegex)) {
-                    offset = std::stod(offsetMatch[1].str());
-                } else {
-                    return "{\"success\": false, \"error\": \"Offset function requires value parameter\"}";
-                }
-                
-                // Apply offset
-                for (double& value : values) {
-                    value += offset;
-                }
-                executedFunctions.push_back("offset");
-                
-                // Record performance  
-                auto functionEndTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(functionEndTime - functionStartTime);
-                totalFunctionTimeMs += duration.count() / 1000000.0; // Convert nanoseconds to milliseconds
-                performanceTracker_.recordExecution("offset", duration);
-                
-            } else if (func.name == "add") {
-                // Parse value parameter
-                double addValue = 0.0; // default
-                std::regex addRegex("value\\s*:\\s*([+-]?[0-9]*\\.?[0-9]+)");
-                std::smatch addMatch;
-                if (std::regex_search(func.params, addMatch, addRegex)) {
-                    addValue = std::stod(addMatch[1].str());
-                } else {
-                    return "{\"success\": false, \"error\": \"Add function requires value parameter\"}";
-                }
-                
-                // Apply addition
-                for (double& value : values) {
-                    value += addValue;
-                }
-                executedFunctions.push_back("add");
-                
-                // Record performance  
-                auto functionEndTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(functionEndTime - functionStartTime);
-                totalFunctionTimeMs += duration.count() / 1000000.0; // Convert nanoseconds to milliseconds
-                performanceTracker_.recordExecution("add", duration);
-                
-            } else if (func.name == "multiply") {
-                // Parse value parameter
-                double multiplyValue = 1.0; // default
-                std::regex multiplyRegex("value\\s*:\\s*([+-]?[0-9]*\\.?[0-9]+)");
-                std::smatch multiplyMatch;
-                if (std::regex_search(func.params, multiplyMatch, multiplyRegex)) {
-                    multiplyValue = std::stod(multiplyMatch[1].str());
-                } else {
-                    return "{\"success\": false, \"error\": \"Multiply function requires value parameter\"}";
-                }
-                
-                // Apply multiplication
-                for (double& value : values) {
-                    value *= multiplyValue;
-                }
-                executedFunctions.push_back("multiply");
-                
-                // Record performance  
-                auto functionEndTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(functionEndTime - functionStartTime);
-                totalFunctionTimeMs += duration.count() / 1000000.0; // Convert nanoseconds to milliseconds
-                performanceTracker_.recordExecution("multiply", duration);
-                
-            } else if (func.name == "ema") {
-                // Parse alpha parameter
-                double alpha = 0.3; // default
-                std::regex alphaRegex("alpha\\s*:\\s*([0-9]*\\.?[0-9]+)");
-                std::smatch alphaMatch;
-                if (std::regex_search(func.params, alphaMatch, alphaRegex)) {
-                    alpha = std::stod(alphaMatch[1].str());
-                } else {
-                    return "{\"success\": false, \"error\": \"EMA function requires alpha parameter\"}";
-                }
-                
-                if (alpha <= 0.0 || alpha > 1.0) {
-                    return "{\"success\": false, \"error\": \"EMA alpha parameter must be between 0 and 1\"}";
-                }
-                
-                // Apply EMA
-                std::vector<double> emaValues;
-                if (!values.empty()) {
-                    emaValues.push_back(values[0]); // First value is unchanged
-                    for (size_t i = 1; i < values.size(); i++) {
-                        double emaValue = alpha * values[i] + (1.0 - alpha) * emaValues[i-1];
-                        emaValues.push_back(emaValue);
-                    }
-                }
-                values = emaValues;
-                executedFunctions.push_back("ema");
-                
-                // Record performance  
-                auto functionEndTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(functionEndTime - functionStartTime);
-                totalFunctionTimeMs += duration.count() / 1000000.0; // Convert nanoseconds to milliseconds
-                performanceTracker_.recordExecution("ema", duration);
-                
-            } else if (func.name == "interpolate") {
-                // Parse method and target_interval parameters
-                std::string method = "linear"; // default
-                uint64_t targetInterval = 60000000000ULL; // 60 seconds in nanoseconds, default
-                
-                std::regex methodRegex("method\\s*:\\s*([a-zA-Z_]+)");
-                std::smatch methodMatch;
-                if (std::regex_search(func.params, methodMatch, methodRegex)) {
-                    method = methodMatch[1].str();
-                }
-                
-                std::regex intervalRegex("target_interval\\s*:\\s*(\\d+)");
-                std::smatch intervalMatch;
-                if (std::regex_search(func.params, intervalMatch, intervalRegex)) {
-                    targetInterval = std::stoull(intervalMatch[1].str());
-                }
-                
-                // Apply linear interpolation
-                if (method == "linear" && timestamps.size() >= 2) {
-                    std::vector<double> interpolatedValues;
-                    std::vector<uint64_t> interpolatedTimestamps;
-                    
-                    // Generate new timestamps at target interval
-                    uint64_t startTime = timestamps[0];
-                    uint64_t endTime = timestamps.back();
-                    
-                    for (uint64_t t = startTime; t <= endTime; t += targetInterval) {
-                        interpolatedTimestamps.push_back(t);
-                        
-                        // Find the two closest data points for interpolation
-                        size_t leftIdx = 0;
-                        for (size_t i = 0; i < timestamps.size() - 1; i++) {
-                            if (timestamps[i] <= t && timestamps[i + 1] > t) {
-                                leftIdx = i;
-                                break;
-                            }
-                        }
-                        
-                        size_t rightIdx = leftIdx + 1;
-                        if (rightIdx >= timestamps.size()) {
-                            rightIdx = timestamps.size() - 1;
-                            leftIdx = rightIdx - 1;
-                        }
-                        
-                        // Linear interpolation
-                        if (leftIdx < values.size() && rightIdx < values.size() && leftIdx != rightIdx) {
-                            double ratio = static_cast<double>(t - timestamps[leftIdx]) / 
-                                          static_cast<double>(timestamps[rightIdx] - timestamps[leftIdx]);
-                            double interpolatedValue = values[leftIdx] + ratio * (values[rightIdx] - values[leftIdx]);
-                            interpolatedValues.push_back(interpolatedValue);
-                        } else {
-                            // Fallback to nearest value
-                            interpolatedValues.push_back(values[leftIdx < values.size() ? leftIdx : 0]);
-                        }
-                    }
-                    
-                    // Update values and timestamps with interpolated data
-                    values = interpolatedValues;
-                    timestamps = interpolatedTimestamps;
-                }
-                executedFunctions.push_back("interpolate");
-                
-                // Record performance  
-                auto functionEndTime = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(functionEndTime - functionStartTime);
-                totalFunctionTimeMs += duration.count() / 1000000.0; // Convert nanoseconds to milliseconds
-                performanceTracker_.recordExecution("interpolate", duration);
-                
-            } else {
-                return "{\"success\": false, \"error\": \"Unsupported function: " + func.name + "\"}";
-            }
-        }
-        
-        // The function timing has been accumulated in totalFunctionTimeMs during execution
-        
-        // Build response using stringstream for better control
-        std::ostringstream response;
-        response << "{\"success\": true, \"series\": [{";
-        response << "\"measurement\": \"weather\", ";
-        response << "\"tags\": {\"deviceId\": \"sensor-01\", \"location\": \"datacenter-1\", \"type\": \"environmental\"}, ";
-        response << "\"fields\": {\"" << fieldName << "\": {";
-        
-        // Add timestamps
-        response << "\"timestamps\": [";
-        for (size_t i = 0; i < timestamps.size(); i++) {
-            if (i > 0) response << ", ";
-            response << timestamps[i];
-        }
-        response << "], ";
-        
-        // Add values
-        response << "\"values\": [";
-        for (size_t i = 0; i < values.size(); i++) {
-            if (i > 0) response << ", ";
-            response << values[i];
-        }
-        response << "]";
-        
-        // Close field object, fields object, and series object
-        response << "}}}], ";
-        
-        // Add function metadata
-        response << "\"functionMetadata\": {\"functionsExecuted\": [";
-        for (size_t i = 0; i < executedFunctions.size(); i++) {
-            if (i > 0) response << ", ";
-            response << "\"" << executedFunctions[i] << "\"";
-        }
-        response << "], \"totalFunctionExecutions\": " << executedFunctions.size();
-        response << ", \"totalFunctionTimeMs\": " << totalFunctionTimeMs << "}}";
-        
-        return response.str();
-        
+        // TODO: Query actual data from the engine instead of returning an error.
+        // The function query endpoint does not yet integrate with the storage engine.
+        return R"({"success": false, "error": "Function query endpoint not yet connected to storage engine"})";
+
     } catch (const std::exception& e) {
-        return "{\"success\": false, \"error\": \"Internal server error: " + std::string(e.what()) + "\"}"; 
+        return "{\"success\": false, \"error\": \"" + jsonEscape(e.what()) + "\"}";
     }
 }
 
@@ -1118,69 +870,16 @@ std::string FunctionHttpHandler::handleMultiSeriesOperation(const std::string& f
         return response.str();
         
     } catch (const std::exception& e) {
-        return "{\"success\": false, \"error\": \"Multi-series operation error: " + std::string(e.what()) + "\"}";
+        return "{\"success\": false, \"error\": \"" + jsonEscape(e.what()) + "\"}";
     }
 }
 
 std::string FunctionHttpHandler::handlePerformanceStatsSync() {
-    // Generate realistic statistics that vary slightly each time
-    static uint64_t baseExecutions = 1000;
-    static auto startTime = std::chrono::steady_clock::now();
-    
-    auto now = std::chrono::steady_clock::now();
-    auto uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
-    
-    // Simulate some growth in executions over time
-    uint64_t totalExecutions = baseExecutions + uptimeSeconds * 2;
-    double avgExecutionTime = 1.2 + (std::rand() % 100) / 1000.0; // Random between 1.2-1.3ms
-    double cacheHitRate = 0.75 + (std::rand() % 20) / 100.0; // Random between 0.75-0.95
-    
-    std::ostringstream json;
-    json << "{\"status\":\"success\",\"statistics\":{";
-    json << "\"totalExecutions\":" << totalExecutions << ",";
-    json << "\"averageExecutionTime\":" << avgExecutionTime << ",";
-    json << "\"cacheHitRate\":" << cacheHitRate;
-    json << "},\"functionStats\":{";
-    
-    // Generate function-specific stats
-    json << "\"sma\":{\"executions\":" << (totalExecutions / 3) << ",\"avgTime\":" << (avgExecutionTime * 0.9) << ",\"cacheHitRate\":" << (cacheHitRate * 1.1) << "},";
-    json << "\"scale\":{\"executions\":" << (totalExecutions / 4) << ",\"avgTime\":" << (avgExecutionTime * 0.7) << ",\"cacheHitRate\":" << (cacheHitRate * 0.9) << "},";
-    json << "\"offset\":{\"executions\":" << (totalExecutions / 5) << ",\"avgTime\":" << (avgExecutionTime * 0.6) << ",\"cacheHitRate\":" << (cacheHitRate * 0.8) << "}";
-    
-    json << "}}";
-    return json.str();
+    return R"({"status":"error","error":"Performance statistics endpoint not yet implemented"})";
 }
 
 std::string FunctionHttpHandler::handleCacheStatsSync() {
-    // Generate realistic statistics that vary slightly each time
-    static auto startTime = std::chrono::steady_clock::now();
-    
-    auto now = std::chrono::steady_clock::now();
-    auto uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
-    
-    // Simulate cache growth over time with some randomness
-    uint64_t cacheSize = 500 + (uptimeSeconds * 3) + (std::rand() % 100);
-    double hitRate = 0.75 + (std::rand() % 20) / 100.0; // Random between 0.75-0.95
-    double missRate = 1.0 - hitRate;
-    
-    // Additional cache metrics for more realistic statistics
-    uint64_t totalAccesses = 5000 + uptimeSeconds * 25;
-    uint64_t hits = static_cast<uint64_t>(totalAccesses * hitRate);
-    uint64_t misses = totalAccesses - hits;
-    double avgLookupTime = 0.1 + (std::rand() % 50) / 1000.0; // 0.1-0.15ms
-    
-    std::ostringstream json;
-    json << "{\"status\":\"success\",\"cache\":{";
-    json << "\"size\":" << cacheSize << ",";
-    json << "\"hitRate\":" << hitRate << ",";
-    json << "\"missRate\":" << missRate << ",";
-    json << "\"totalAccesses\":" << totalAccesses << ",";
-    json << "\"hits\":" << hits << ",";
-    json << "\"misses\":" << misses << ",";
-    json << "\"avgLookupTimeMs\":" << avgLookupTime;
-    json << "}}";
-    
-    return json.str();
+    return R"({"status":"error","error":"Cache statistics endpoint not yet implemented"})";
 }
 
 // Stub implementations for compatibility
@@ -1218,4 +917,4 @@ std::unique_ptr<seastar::http::reply> FunctionHttpHandler::createErrorResponse(c
     return nullptr;
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

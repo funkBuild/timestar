@@ -6,7 +6,7 @@
 #include "../../lib/storage/tsm_writer.hpp"
 #include "../../lib/storage/tsm.hpp"
 #include "../../lib/storage/tsm_compactor.hpp"
-#include "../../lib/core/tsdb_value.hpp"
+#include "../../lib/core/timestar_value.hpp"
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
@@ -78,7 +78,7 @@ seastar::future<> generateTSMFile(const std::string& filename, size_t fileIndex,
         std::string location = "datacenter_" + std::to_string(seriesIdx / 100);
         std::string host = "server_" + std::to_string(seriesIdx % 100);
 
-        TSDBInsert<double> insert(measurement, field);
+        TimeStarInsert<double> insert(measurement, field);
         insert.addTag("location", location);
         insert.addTag("host", host);
         SeriesId128 seriesId = insert.seriesId128();

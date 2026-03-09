@@ -2,7 +2,7 @@
 #include <cmath>
 #include <limits>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Alignment utilities implementations
 namespace alignment_utils {
@@ -103,4 +103,4 @@ std::vector<double> SeriesAlignment::alignSeries(const std::vector<double>& valu
     return result;
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

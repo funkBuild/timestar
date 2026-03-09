@@ -9,7 +9,7 @@
 #include <chrono>
 #include <fmt/format.h>
 
-namespace tsdb {
+namespace timestar {
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -119,7 +119,7 @@ static void mergeSortedRawInto(
 // combine partial results from different shards. O(n+m) time.
 static void mergeSortedStatesInto(
     std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
-    const std::vector<uint64_t>& newTs, const std::vector<AggregationState>& newStates) {
+    std::vector<uint64_t>& newTs, std::vector<AggregationState>& newStates) {
 
     std::vector<uint64_t> mergedTs;
     std::vector<AggregationState> mergedStates;
@@ -134,12 +134,12 @@ static void mergeSortedStatesInto(
             i++;
         } else if (baseTs[i] > newTs[j]) {
             mergedTs.push_back(newTs[j]);
-            mergedStates.push_back(newStates[j]);
+            mergedStates.push_back(std::move(newStates[j]));
             j++;
         } else {
             mergedTs.push_back(baseTs[i]);
             AggregationState s = std::move(baseStates[i]);
-            s.merge(newStates[j]);
+            s.merge(std::move(newStates[j]));
             mergedStates.push_back(std::move(s));
             i++;
             j++;
@@ -152,7 +152,7 @@ static void mergeSortedStatesInto(
     }
     while (j < newTs.size()) {
         mergedTs.push_back(newTs[j]);
-        mergedStates.push_back(newStates[j]);
+        mergedStates.push_back(std::move(newStates[j]));
         j++;
     }
 
@@ -161,7 +161,7 @@ static void mergeSortedStatesInto(
 }
 
 std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
-    const std::vector<tsdb::SeriesResult>& seriesResults,
+    const std::vector<timestar::SeriesResult>& seriesResults,
     AggregationMethod method,
     uint64_t interval,
     const std::vector<std::string>& groupByTags) {
@@ -232,11 +232,17 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                 partial.fieldName = fieldName;
                 partial.groupKey = it->first.value;  // Read from the emplaced key
                 partial.groupKeyHash = keyHash;       // Reuse pre-computed hash
+                partial.cachedTags = relevantTags;    // Cache parsed tags once
                 // Pre-reserve bucket map: at most one bucket per unique timestamp,
                 // so timestamps.size() is a safe upper bound that prevents rehashing
                 // for the typical case where this is the only series in the group.
                 if (interval > 0 && !timestamps.empty()) {
-                    partial.bucketStates.reserve(timestamps.size());
+                    // Estimate bucket count from time range / interval rather than
+                    // reserving one entry per timestamp (which over-allocates by 3-4 orders
+                    // of magnitude for dense data with coarse intervals).
+                    uint64_t timeRange = timestamps.back() - timestamps.front();
+                    size_t estimatedBuckets = (interval > 0) ? (timeRange / interval + 1) : timestamps.size();
+                    partial.bucketStates.reserve(std::min(estimatedBuckets, timestamps.size()));
                 }
             }
 
@@ -320,7 +326,7 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
         // Create grouped result with metadata from first partial (all in group share same metadata)
         GroupedAggregationResult groupedResult;
         groupedResult.measurement = std::move(groupPartials[0]->measurement);
-        groupedResult.tags = PartialAggregationResult::parseTagsFromGroupKey(groupPartials[0]->groupKey);
+        groupedResult.tags = std::move(groupPartials[0]->cachedTags);
         groupedResult.fieldName = std::move(groupPartials[0]->fieldName);
 
         // Check if we're using buckets or raw timestamps
@@ -415,7 +421,7 @@ std::vector<AggregatedPoint> Aggregator::aggregate(
 
     if (interval > 0) {
         // Bucketed aggregation
-        std::map<uint64_t, AggregationState> buckets;
+        std::unordered_map<uint64_t, AggregationState> buckets;
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
             uint64_t bucketTime = (timestamps[i] / interval) * interval;
             buckets[bucketTime].addValue(values[i], timestamps[i]);
@@ -426,10 +432,14 @@ std::vector<AggregatedPoint> Aggregator::aggregate(
         for (const auto& [bucketTime, state] : buckets) {
             result.push_back({bucketTime, state.getValue(method), state.count});
         }
+        std::sort(result.begin(), result.end(),
+            [](const AggregatedPoint& a, const AggregatedPoint& b) {
+                return a.timestamp < b.timestamp;
+            });
         return result;
     } else {
         // No bucketing - one point per timestamp
-        std::map<uint64_t, AggregationState> states;
+        std::unordered_map<uint64_t, AggregationState> states;
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
             states[timestamps[i]].addValue(values[i], timestamps[i]);
         }
@@ -439,6 +449,10 @@ std::vector<AggregatedPoint> Aggregator::aggregate(
         for (const auto& [ts, state] : states) {
             result.push_back({ts, state.getValue(method), state.count});
         }
+        std::sort(result.begin(), result.end(),
+            [](const AggregatedPoint& a, const AggregatedPoint& b) {
+                return a.timestamp < b.timestamp;
+            });
         return result;
     }
 }
@@ -453,7 +467,7 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
     }
 
     // Merge all series into one set of timestamp states
-    std::map<uint64_t, AggregationState> mergedStates;
+    std::unordered_map<uint64_t, AggregationState> mergedStates;
 
     for (const auto& [timestamps, values] : groupData) {
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
@@ -467,7 +481,11 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
     for (const auto& [ts, state] : mergedStates) {
         result.push_back({ts, state.getValue(method), state.count});
     }
+    std::sort(result.begin(), result.end(),
+        [](const AggregatedPoint& a, const AggregatedPoint& b) {
+            return a.timestamp < b.timestamp;
+        });
     return result;
 }
 
-} // namespace tsdb
+} // namespace timestar

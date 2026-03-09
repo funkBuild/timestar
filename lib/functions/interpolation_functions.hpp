@@ -5,7 +5,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Linear Interpolation Function
 class LinearInterpolationFunction : public IUnaryFunction {
@@ -35,11 +35,6 @@ public:
     ) const override;
 };
 
-// Legacy function for backward compatibility
-std::vector<double> linearInterpolate(const std::vector<double>& values, 
-                                     const std::vector<uint64_t>& timestamps,
-                                     uint64_t targetInterval);
-
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // INTERPOLATION_FUNCTIONS_H_INCLUDED

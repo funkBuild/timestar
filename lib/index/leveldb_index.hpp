@@ -8,10 +8,10 @@
 #include <unordered_set>
 #include <memory>
 #include <optional>
-#include "tsdb_value.hpp"
+#include "timestar_value.hpp"
 #include "line_parser.hpp"
 #include "series_id.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 
 #include <expected>
 
@@ -92,7 +92,7 @@ private:
     // retired cache drains at EVICTION_BATCH_SIZE per insert, the retired cache is
     // always fully drained before the next generation swap (the drain takes
     // maxSeriesCacheSize / EVICTION_BATCH_SIZE inserts, which is << maxSeriesCacheSize).
-    static size_t defaultMaxSeriesCacheSize() { return tsdb::config().index.series_cache_size; }
+    static size_t defaultMaxSeriesCacheSize() { return timestar::config().index.series_cache_size; }
     static constexpr size_t EVICTION_BATCH_SIZE = 256;
     size_t maxSeriesCacheSize = defaultMaxSeriesCacheSize();
     std::unordered_set<std::string> indexedSeriesCache_;
@@ -200,7 +200,7 @@ public:
 
     // Bulk operations for insert batching
     template<class T>
-    seastar::future<SeriesId128> indexInsert(const TSDBInsert<T>& insert);
+    seastar::future<SeriesId128> indexInsert(const TimeStarInsert<T>& insert);
 
     // Batch metadata indexing: indexes multiple series in a single LevelDB WriteBatch.
     // Much more efficient than calling indexInsert() in a loop for cold starts / burst writes.

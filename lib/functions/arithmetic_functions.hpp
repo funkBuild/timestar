@@ -4,7 +4,7 @@
 #include "function_types.hpp"
 #include <vector>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Add Function
 class AddFunction : public IUnaryFunction {
@@ -96,6 +96,6 @@ std::vector<double> multiply(const std::vector<double>& values, double factor);
 std::vector<double> scale(const std::vector<double>& values, double factor);
 std::vector<double> offset(const std::vector<double>& values, double offset_value);
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // ARITHMETIC_FUNCTIONS_H_INCLUDED

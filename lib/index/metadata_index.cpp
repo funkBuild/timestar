@@ -7,6 +7,7 @@
 #include <seastar/core/smp.hh>
 #include <algorithm>
 #include <cassert>
+#include <memory>
 #include <sstream>
 #include <iomanip>
 
@@ -89,15 +90,13 @@ FieldStats FieldStats::deserialize(const std::string& data) {
 
 // MetadataIndex implementation
 MetadataIndex::MetadataIndex(const std::string& path) : dbPath(path) {
-    tsdb::metadata_log.info("Creating metadata index at: {}", path);
+    timestar::metadata_log.info("Creating metadata index at: {}", path);
 }
 
 MetadataIndex::~MetadataIndex() {
     // DB must be destroyed before filter policy and block cache since LevelDB
     // may reference them during shutdown.
-    if (db) {
-        delete db.release();
-    }
+    db.reset();
     filterPolicy_.reset();
     blockCache_.reset();
 }
@@ -118,7 +117,7 @@ seastar::future<> MetadataIndex::init() {
     leveldb::Status status = leveldb::DB::Open(options, dbPath, &dbPtr);
     
     if (!status.ok()) {
-        tsdb::metadata_log.error("Failed to open metadata index: {}", status.ToString());
+        timestar::metadata_log.error("Failed to open metadata index: {}", status.ToString());
         throw std::runtime_error("Failed to open metadata index: " + status.ToString());
     }
     
@@ -128,23 +127,28 @@ seastar::future<> MetadataIndex::init() {
     std::string value;
     status = db->Get(leveldb::ReadOptions(), "meta:nextSeriesId", &value);
     if (status.ok()) {
-        nextSeriesId = std::stoull(value);
+        try {
+            nextSeriesId = std::stoull(value);
+        } catch (const std::exception& e) {
+            timestar::metadata_log.warn("Corrupt nextSeriesId '{}': {}, resetting to 0", value, e.what());
+            nextSeriesId = 0;
+        }
     }
-    
-    tsdb::metadata_log.info("Metadata index initialized, next series ID: {}", nextSeriesId.load());
+
+    timestar::metadata_log.info("Metadata index initialized, next series ID: {}", nextSeriesId);
     co_return;
 }
 
 seastar::future<> MetadataIndex::close() {
     if (db) {
         // Save next series ID
-        auto putStatus = db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", std::to_string(nextSeriesId.load()));
+        auto putStatus = db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", std::to_string(nextSeriesId));
         if (!putStatus.ok()) {
-            tsdb::metadata_log.warn("Failed to persist nextSeriesId during close: {}", putStatus.ToString());
+            timestar::metadata_log.warn("Failed to persist nextSeriesId during close: {}", putStatus.ToString());
         }
 
         delete db.release();
-        tsdb::metadata_log.info("Metadata index closed");
+        timestar::metadata_log.info("Metadata index closed");
     }
     // Free the bloom filter policy and block cache after the DB is closed
     filterPolicy_.reset();
@@ -211,33 +215,75 @@ std::string MetadataIndex::seriesLookupKey(const std::string& seriesKey) {
 }
 
 std::vector<std::string> MetadataIndex::generateTagSubsets(const std::map<std::string, std::string>& tags) {
-    static constexpr size_t MAX_TAGS_FOR_SUBSETS = 10;
+    // Maximum subset size for composite tag indexes. Only subsets of size 1
+    // through MAX_COMPOSITE_SUBSET_SIZE are generated. This bounds the number
+    // of composite entries per series to O(N^MAX_COMPOSITE_SUBSET_SIZE) instead
+    // of the previous O(2^N) which was exponential.
+    //
+    // For N tags the entry count is:
+    //   C(N,1) + C(N,2) + C(N,3) = N + N*(N-1)/2 + N*(N-1)*(N-2)/6
+    //
+    // Examples:  N=5 -> 25,  N=10 -> 175,  N=20 -> 1350
+    // Compare:   old 2^N approach: N=10 -> 1023,  N=20 -> 1,048,575
+    //
+    // Multi-tag queries with >3 filter tags will fall back to intersecting
+    // results from smaller composite lookups, which is still efficient.
+    static constexpr size_t MAX_COMPOSITE_SUBSET_SIZE = 3;
 
     std::vector<std::string> subsets;
 
-    // Cap the number of tags used for subset generation to avoid O(2^n) explosion.
-    // For 20 tags this would be 1M+ subsets; with the cap at 10 it is at most 1023.
-    size_t n = std::min(tags.size(), MAX_TAGS_FOR_SUBSETS);
+    // Flatten the sorted map into a vector for indexed access.
+    std::vector<std::pair<std::string, std::string>> tagVec(tags.begin(), tags.end());
+    const size_t n = tagVec.size();
 
-    if (tags.size() > MAX_TAGS_FOR_SUBSETS) {
-        tsdb::metadata_log.warn("Tag count {} exceeds MAX_TAGS_FOR_SUBSETS ({}); "
-                                "only first {} tags used for composite index subsets",
-                                tags.size(), MAX_TAGS_FOR_SUBSETS, MAX_TAGS_FOR_SUBSETS);
+    if (n == 0) {
+        return subsets;
     }
 
-    for (size_t mask = 1; mask < (static_cast<size_t>(1) << n); mask++) {
+    // Reserve an upper-bound estimate: C(n,1) + C(n,2) + C(n,3).
+    size_t estimate = n;
+    if (MAX_COMPOSITE_SUBSET_SIZE >= 2 && n >= 2)
+        estimate += n * (n - 1) / 2;
+    if (MAX_COMPOSITE_SUBSET_SIZE >= 3 && n >= 3)
+        estimate += n * (n - 1) * (n - 2) / 6;
+    subsets.reserve(estimate);
+
+    // Generate subsets of size 1 through min(MAX_COMPOSITE_SUBSET_SIZE, n)
+    // using iterative nested loops to avoid recursion overhead.
+    const size_t maxK = std::min(MAX_COMPOSITE_SUBSET_SIZE, n);
+
+    // Size 1 subsets
+    for (size_t i = 0; i < n; ++i) {
         std::map<std::string, std::string> subset;
-        size_t idx = 0;
-
-        for (const auto& [k, v] : tags) {
-            if (idx >= n) break;
-            if (mask & (static_cast<size_t>(1) << idx)) {
-                subset[k] = v;
-            }
-            idx++;
-        }
-
+        subset[tagVec[i].first] = tagVec[i].second;
         subsets.push_back(buildSortedTagString(subset));
+    }
+
+    // Size 2 subsets
+    if (maxK >= 2) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                std::map<std::string, std::string> subset;
+                subset[tagVec[i].first] = tagVec[i].second;
+                subset[tagVec[j].first] = tagVec[j].second;
+                subsets.push_back(buildSortedTagString(subset));
+            }
+        }
+    }
+
+    // Size 3 subsets
+    if (maxK >= 3) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                for (size_t k = j + 1; k < n; ++k) {
+                    std::map<std::string, std::string> subset;
+                    subset[tagVec[i].first] = tagVec[i].second;
+                    subset[tagVec[j].first] = tagVec[j].second;
+                    subset[tagVec[k].first] = tagVec[k].second;
+                    subsets.push_back(buildSortedTagString(subset));
+                }
+            }
+        }
     }
 
     return subsets;
@@ -261,7 +307,7 @@ seastar::future<uint64_t> MetadataIndex::getOrCreateSeriesId(const std::string& 
     }
     
     // Create new series
-    uint64_t seriesId = nextSeriesId.fetch_add(1);
+    uint64_t seriesId = nextSeriesId++;
     
     // Create metadata
     MetadataSeriesInfo metadata;
@@ -295,10 +341,10 @@ seastar::future<uint64_t> MetadataIndex::getOrCreateSeriesId(const std::string& 
     
     // 5. Composite tag indexes (all subsets)
     for (const auto& subset : generateTagSubsets(tags)) {
-        std::map<std::string, std::string> subsetTags;
-        // Parse subset back to map (simplified for now)
-        batch.Put("ct:" + measurement + ":" + subset + ":" + 
-                 std::to_string(seriesId), "");
+        std::stringstream ctss;
+        ctss << "ct:" << measurement << ":" << subset << ":"
+             << std::setfill('0') << std::setw(16) << std::hex << seriesId;
+        batch.Put(ctss.str(), "");
     }
     
     // 6. Field index
@@ -317,33 +363,33 @@ seastar::future<uint64_t> MetadataIndex::getOrCreateSeriesId(const std::string& 
         throw std::runtime_error("Failed to create series: " + status.ToString());
     }
     
-    tsdb::metadata_log.debug("Created new series: {} with ID {}", sKey, seriesId);
+    timestar::metadata_log.debug("Created new series: {} with ID {}", sKey, seriesId);
     co_return seriesId;
 }
 
 seastar::future<std::vector<uint64_t>> MetadataIndex::findSeriesByMeasurement(const std::string& measurement) {
     std::vector<uint64_t> seriesIds;
     std::string prefix = "m:" + measurement + ":";
-    
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
-        // Extract series ID from key
         std::string key = it->key().ToString();
         size_t lastColon = key.rfind(':');
         if (lastColon != std::string::npos) {
             std::string idStr = key.substr(lastColon + 1);
-            uint64_t seriesId = std::stoull(idStr, nullptr, 16);
-            seriesIds.push_back(seriesId);
+            try {
+                uint64_t seriesId = std::stoull(idStr, nullptr, 16);
+                seriesIds.push_back(seriesId);
+            } catch (const std::exception& e) {
+                timestar::metadata_log.warn("Corrupt series ID in key '{}': {}", key, e.what());
+            }
         }
     }
     if (!it->status().ok()) {
-        std::string err = it->status().ToString();
-        delete it;
-        throw std::runtime_error("Iterator error in findSeriesByMeasurement: " + err);
+        throw std::runtime_error("Iterator error in findSeriesByMeasurement: " + it->status().ToString());
     }
-    delete it;
 
-    tsdb::metadata_log.debug("Found {} series for measurement {}", seriesIds.size(), measurement);
+    timestar::metadata_log.debug("Found {} series for measurement {}", seriesIds.size(), measurement);
     co_return seriesIds;
 }
 
@@ -353,22 +399,23 @@ seastar::future<std::vector<uint64_t>> MetadataIndex::findSeriesByTag(const std:
     std::vector<uint64_t> seriesIds;
     std::string prefix = "t:" + measurement + ":" + tagKey + ":" + tagValue + ":";
     
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         size_t lastColon = key.rfind(':');
         if (lastColon != std::string::npos) {
             std::string idStr = key.substr(lastColon + 1);
-            uint64_t seriesId = std::stoull(idStr, nullptr, 16);
-            seriesIds.push_back(seriesId);
+            try {
+                uint64_t seriesId = std::stoull(idStr, nullptr, 16);
+                seriesIds.push_back(seriesId);
+            } catch (const std::exception& e) {
+                timestar::metadata_log.warn("Corrupt series ID in key '{}': {}", key, e.what());
+            }
         }
     }
     if (!it->status().ok()) {
-        std::string err = it->status().ToString();
-        delete it;
-        throw std::runtime_error("Iterator error in findSeriesByTag: " + err);
+        throw std::runtime_error("Iterator error in findSeriesByTag: " + it->status().ToString());
     }
-    delete it;
 
     co_return seriesIds;
 }
@@ -378,23 +425,24 @@ seastar::future<std::vector<uint64_t>> MetadataIndex::findSeriesByTags(const std
     std::vector<uint64_t> seriesIds;
     std::string tagStr = buildSortedTagString(tags);
     std::string prefix = "ct:" + measurement + ":" + tagStr + ":";
-    
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         size_t lastColon = key.rfind(':');
         if (lastColon != std::string::npos) {
             std::string idStr = key.substr(lastColon + 1);
-            uint64_t seriesId = std::stoull(idStr, nullptr, 16);
-            seriesIds.push_back(seriesId);
+            try {
+                uint64_t seriesId = std::stoull(idStr, nullptr, 16);
+                seriesIds.push_back(seriesId);
+            } catch (const std::exception& e) {
+                timestar::metadata_log.warn("Corrupt series ID in key '{}': {}", key, e.what());
+            }
         }
     }
     if (!it->status().ok()) {
-        std::string err = it->status().ToString();
-        delete it;
-        throw std::runtime_error("Iterator error in findSeriesByTags: " + err);
+        throw std::runtime_error("Iterator error in findSeriesByTags: " + it->status().ToString());
     }
-    delete it;
 
     co_return seriesIds;
 }
@@ -430,7 +478,7 @@ seastar::future<std::set<std::string>> MetadataIndex::getMeasurementFields(const
     std::set<std::string> fields;
     std::string prefix = "f:" + measurement + ":";
     
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         // Extract field name from key: f:measurement:field:seriesId
@@ -444,13 +492,10 @@ seastar::future<std::set<std::string>> MetadataIndex::getMeasurementFields(const
         }
     }
     if (!it->status().ok()) {
-        std::string err = it->status().ToString();
-        delete it;
-        throw std::runtime_error("Iterator error in getMeasurementFields: " + err);
+        throw std::runtime_error("Iterator error in getMeasurementFields: " + it->status().ToString());
     }
-    delete it;
 
-    tsdb::metadata_log.debug("Found {} fields for measurement {}", fields.size(), measurement);
+    timestar::metadata_log.debug("Found {} fields for measurement {}", fields.size(), measurement);
     co_return fields;
 }
 
@@ -458,7 +503,7 @@ seastar::future<std::set<std::string>> MetadataIndex::getMeasurementTagKeys(cons
     std::set<std::string> tagKeys;
     std::string prefix = "t:" + measurement + ":";
     
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         // Extract tag key from key: t:measurement:tagKey:tagValue:seriesId
@@ -472,13 +517,10 @@ seastar::future<std::set<std::string>> MetadataIndex::getMeasurementTagKeys(cons
         }
     }
     if (!it->status().ok()) {
-        std::string err = it->status().ToString();
-        delete it;
-        throw std::runtime_error("Iterator error in getMeasurementTagKeys: " + err);
+        throw std::runtime_error("Iterator error in getMeasurementTagKeys: " + it->status().ToString());
     }
-    delete it;
 
-    tsdb::metadata_log.debug("Found {} tag keys for measurement {}", tagKeys.size(), measurement);
+    timestar::metadata_log.debug("Found {} tag keys for measurement {}", tagKeys.size(), measurement);
     co_return tagKeys;
 }
 
@@ -487,7 +529,7 @@ seastar::future<std::set<std::string>> MetadataIndex::getTagValues(const std::st
     std::set<std::string> tagValues;
     std::string prefix = "t:" + measurement + ":" + tagKey + ":";
     
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         // Extract tag value from key: t:measurement:tagKey:tagValue:seriesId
@@ -498,13 +540,10 @@ seastar::future<std::set<std::string>> MetadataIndex::getTagValues(const std::st
         }
     }
     if (!it->status().ok()) {
-        std::string err = it->status().ToString();
-        delete it;
-        throw std::runtime_error("Iterator error in getTagValues: " + err);
+        throw std::runtime_error("Iterator error in getTagValues: " + it->status().ToString());
     }
-    delete it;
 
-    tsdb::metadata_log.debug("Found {} values for tag {}:{}", tagValues.size(), measurement, tagKey);
+    timestar::metadata_log.debug("Found {} values for tag {}:{}", tagValues.size(), measurement, tagKey);
     co_return tagValues;
 }
 
@@ -528,7 +567,7 @@ MetadataIndex::getSeriesGroupedByTag(const std::string& measurement, const std::
     std::map<std::string, std::vector<uint64_t>> grouped;
     std::string prefix = "g:" + measurement + ":" + tagKey + ":";
     
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         // Parse key: g:measurement:tagKey:tagValue:seriesId
@@ -538,19 +577,19 @@ MetadataIndex::getSeriesGroupedByTag(const std::string& measurement, const std::
         if (lastColon != std::string::npos && lastColon > valueStart) {
             std::string tagValue = key.substr(valueStart, lastColon - valueStart);
             std::string idStr = key.substr(lastColon + 1);
-            uint64_t seriesId = std::stoull(idStr);
-
-            grouped[tagValue].push_back(seriesId);
+            try {
+                uint64_t seriesId = std::stoull(idStr);
+                grouped[tagValue].push_back(seriesId);
+            } catch (const std::exception& e) {
+                timestar::metadata_log.warn("Corrupt series ID in key '{}': {}", key, e.what());
+            }
         }
     }
     if (!it->status().ok()) {
-        std::string err = it->status().ToString();
-        delete it;
-        throw std::runtime_error("Iterator error in getSeriesGroupedByTag: " + err);
+        throw std::runtime_error("Iterator error in getSeriesGroupedByTag: " + it->status().ToString());
     }
-    delete it;
 
-    tsdb::metadata_log.debug("Found {} groups for {}:{}", grouped.size(), measurement, tagKey);
+    timestar::metadata_log.debug("Found {} groups for {}:{}", grouped.size(), measurement, tagKey);
     co_return grouped;
 }
 
@@ -586,7 +625,15 @@ seastar::future<> MetadataIndex::deleteSeries(uint64_t seriesId) {
         batch.Delete(tagKey(metadata->measurement, k, v, seriesId));
         batch.Delete(groupByKey(metadata->measurement, k, v) + ":" + std::to_string(seriesId));
     }
-    
+
+    // Delete composite tag indexes (all subsets, mirrors getOrCreateSeriesId step 5)
+    for (const auto& subset : generateTagSubsets(metadata->tags)) {
+        std::stringstream ctss;
+        ctss << "ct:" << metadata->measurement << ":" << subset << ":"
+             << std::setfill('0') << std::setw(16) << std::hex << seriesId;
+        batch.Delete(ctss.str());
+    }
+
     // Delete field indexes
     for (const auto& field : metadata->fields) {
         batch.Delete(fieldKey(metadata->measurement, field, seriesId));
@@ -609,7 +656,7 @@ seastar::future<> MetadataIndex::deleteSeries(uint64_t seriesId) {
         throw std::runtime_error("Failed to delete series: " + status.ToString());
     }
     
-    tsdb::metadata_log.info("Deleted series {}", seriesId);
+    timestar::metadata_log.info("Deleted series {}", seriesId);
     co_return;
 }
 

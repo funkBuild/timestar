@@ -25,7 +25,7 @@
 
 #include "../../../lib/index/leveldb_index.hpp"
 #include "../../../lib/index/metadata_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 // ---------------------------------------------------------------------------
@@ -529,7 +529,7 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, CompactionAfterHeavyWrites) {
     co_return;
 }
 
-// Test indexInsert with TSDBInsert under load (template path)
+// Test indexInsert with TimeStarInsert under load (template path)
 SEASTAR_TEST_F(LevelDBIndexStressTest, IndexInsertTemplateStress) {
     LevelDBIndex index(0);
     co_await index.open();
@@ -539,7 +539,7 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, IndexInsertTemplateStress) {
     futures.reserve(NUM_INSERTS);
 
     for (int i = 0; i < NUM_INSERTS; i++) {
-        TSDBInsert<double> insert("tmpl_metric", "field_" + std::to_string(i % 5));
+        TimeStarInsert<double> insert("tmpl_metric", "field_" + std::to_string(i % 5));
         insert.addTag("host", "host-" + std::to_string(i % 10));
         insert.addTag("region", "region-" + std::to_string(i % 3));
         futures.push_back(index.indexInsert(insert));

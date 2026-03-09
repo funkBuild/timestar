@@ -1,4 +1,4 @@
-# Fix Plan for Remaining TSDB Test Issues
+# Fix Plan for Remaining TimeStar Test Issues
 
 ## Current Status
 - **14/25 tests passing (56%)**
@@ -224,10 +224,10 @@ After all fixes:
 
 After each fix:
 ```bash
-cd /home/matt/Desktop/source/tsdb/build
-make tsdb_http_server
-pkill -f tsdb_http_server; sleep 1
-./bin/tsdb_http_server > /tmp/server.log 2>&1 &
+cd /home/matt/Desktop/source/timestar/build
+make timestar_http_server
+pkill -f timestar_http_server; sleep 1
+./bin/timestar_http_server > /tmp/server.log 2>&1 &
 cd ../test/http_api_tests
 npm test
 ```

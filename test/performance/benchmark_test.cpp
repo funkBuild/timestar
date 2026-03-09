@@ -12,7 +12,7 @@
 #include <sstream>
 
 #include "engine.hpp"
-#include "tsdb_value.hpp"
+#include "timestar_value.hpp"
 #include "query_result.hpp"
 #include "../test_helpers.hpp"
 
@@ -150,11 +150,11 @@ protected:
                      regionDist(0, regions.size() - 1),
                      fieldDist(0, fields.size() - 1) {}
 
-        TSDBInsert<double> generateInsert(uint64_t timestamp, int batchSize = 10) {
+        TimeStarInsert<double> generateInsert(uint64_t timestamp, int batchSize = 10) {
             std::string measurement = measurements[measurementDist(rng)];
             std::string field = fields[fieldDist(rng)];
 
-            TSDBInsert<double> insert(measurement, field);
+            TimeStarInsert<double> insert(measurement, field);
             insert.tags = {
                 {"host", hosts[hostDist(rng)]},
                 {"region", regions[regionDist(rng)]}
@@ -195,7 +195,7 @@ TEST_F(BenchmarkTest, InsertAndQueryPerformance) {
         std::vector<std::string> insertedSeries;
 
         std::cout << "\n========================================" << std::endl;
-        std::cout << "TSDB Performance Benchmark" << std::endl;
+        std::cout << "TimeStar Performance Benchmark" << std::endl;
         std::cout << "========================================" << std::endl;
         std::cout << "Configuration:" << std::endl;
         std::cout << "  Insert operations: " << NUM_INSERTS << std::endl;

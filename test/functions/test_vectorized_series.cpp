@@ -4,7 +4,7 @@
 #include <vector>
 #include <cmath>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using ::testing::_;
 using ::testing::DoubleNear;
 using ::testing::SizeIs;

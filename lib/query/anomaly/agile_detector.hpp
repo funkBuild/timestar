@@ -4,7 +4,7 @@
 #include "anomaly_detector.hpp"
 #include "simd_anomaly.hpp"
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 // Agile anomaly detection using seasonal prediction
@@ -59,6 +59,6 @@ private:
 };
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar
 
 #endif // AGILE_DETECTOR_H_INCLUDED

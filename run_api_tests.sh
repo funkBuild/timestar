@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Kill any existing tsdb_http_server processes
-echo "Killing existing tsdb_http_server processes..."
-pkill -f tsdb_http_server || true
+# Kill any existing timestar_http_server processes
+echo "Killing existing timestar_http_server processes..."
+pkill -f timestar_http_server || true
 sleep 1
 
 # Clean up any leftover files
@@ -10,18 +10,18 @@ echo "Cleaning up old server files..."
 rm -f server.log server.pid
 
 # Build the project if needed
-if [ ! -f "build/bin/tsdb_http_server" ]; then
-    echo "Building tsdb_http_server..."
+if [ ! -f "build/bin/timestar_http_server" ]; then
+    echo "Building timestar_http_server..."
     mkdir -p build
     cd build
     cmake ..
-    make tsdb_http_server
+    make timestar_http_server
     cd ..
 fi
 
 # Start the server in the background
-echo "Starting tsdb_http_server..."
-./build/bin/tsdb_http_server > server.log 2>&1 &
+echo "Starting timestar_http_server..."
+./build/bin/timestar_http_server > server.log 2>&1 &
 SERVER_PID=$!
 echo $SERVER_PID > server.pid
 

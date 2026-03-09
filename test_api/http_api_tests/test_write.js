@@ -1,5 +1,5 @@
 const axios = require('axios');
-const PORT = process.env.TSDB_PORT || 8086;
+const PORT = process.env.TIMESTAR_PORT || 8086;
 const BASE_URL = `http://localhost:${PORT}`;
 
 async function testWrite() {

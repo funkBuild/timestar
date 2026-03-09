@@ -16,7 +16,7 @@
 #include <memory>
 #include <algorithm>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using namespace std::chrono_literals;
 
 class FunctionThreadSafetyTest : public ::testing::Test {
@@ -86,6 +86,21 @@ protected:
     std::condition_variable cv;
     bool ready = false;
     
+    // Initializes the thread_local FunctionRegistry on the calling thread.
+    // Must be called at the start of each worker thread since the registry
+    // is thread_local (one instance per Seastar shard / OS thread).
+    static void initRegistryOnCurrentThread() {
+        try {
+            FunctionRegistry::getInstance().registerFunction<AddFunction>(AddFunction::metadata_);
+        } catch (...) {}
+        try {
+            FunctionRegistry::getInstance().registerFunction<MultiplyFunction>(MultiplyFunction::metadata_);
+        } catch (...) {}
+        try {
+            FunctionRegistry::getInstance().registerFunction<ScaleFunction>(ScaleFunction::metadata_);
+        } catch (...) {}
+    }
+
     // Helper methods
     void waitForAll(int threadCount) {
         std::unique_lock<std::mutex> lock(testMutex);
@@ -127,6 +142,7 @@ TEST_F(FunctionThreadSafetyTest, ConcurrentFunctionExecution) {
     std::vector<int> threadResults(numThreads, 0);
     
     auto worker = [this, executionsPerThread](int threadId, int* result) {
+        initRegistryOnCurrentThread();
         try {
             auto function = FunctionRegistry::getInstance().createFunction("add");
             if (!function) {
@@ -204,6 +220,7 @@ TEST_F(FunctionThreadSafetyTest, ConcurrentRegistryAccess) {
     
     // Thread that continuously looks up functions
     auto lookupWorker = [this, &stopFlag]() {
+        initRegistryOnCurrentThread();
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<> dis(0, 2);
@@ -240,6 +257,7 @@ TEST_F(FunctionThreadSafetyTest, ConcurrentRegistryAccess) {
     
     // Thread that checks registry stats
     auto statsWorker = [this, &stopFlag]() {
+        initRegistryOnCurrentThread();
         while (!stopFlag.load()) {
             try {
                 auto stats = FunctionRegistry::getInstance().getStats();
@@ -261,6 +279,7 @@ TEST_F(FunctionThreadSafetyTest, ConcurrentRegistryAccess) {
     
     // Thread that searches for functions
     auto searchWorker = [this, &stopFlag]() {
+        initRegistryOnCurrentThread();
         std::vector<std::string> patterns = {"add", "mul", "scale", "nonexistent"};
         size_t patternIndex = 0;
         
@@ -311,6 +330,7 @@ TEST_F(FunctionThreadSafetyTest, ConcurrentFunctionCloning) {
     std::atomic<int> cloneCounter{0};
     
     auto cloneWorker = [this, clonesPerThread, &cloneCounter](int threadId) {
+        initRegistryOnCurrentThread();
         std::vector<std::string> functionNames = {"add", "multiply", "scale"};
         std::random_device rd;
         std::mt19937 gen(rd());
@@ -381,6 +401,7 @@ TEST_F(FunctionThreadSafetyTest, SharedContextModifications) {
     std::atomic<int> successfulExecutions{0};
     
     auto worker = [this, executionsPerThread, sharedContext, &contextMutex, &successfulExecutions](int threadId) {
+        initRegistryOnCurrentThread();
         try {
             auto function = FunctionRegistry::getInstance().createFunction("multiply");
             if (!function) {
@@ -449,6 +470,7 @@ TEST_F(FunctionThreadSafetyTest, AtomicOperationsAndMemoryCoherency) {
     std::mutex volatileMutex;
     
     auto worker = [this, operationsPerThread, &atomicSum, &atomicCounter, &volatileSum, &volatileMutex](int threadId) {
+        initRegistryOnCurrentThread();
         try {
             auto function = FunctionRegistry::getInstance().createFunction("add");
             if (!function) {
@@ -553,6 +575,7 @@ TEST_F(FunctionThreadSafetyTest, PerformanceTrackingRaceConditions) {
     PerformanceTracker tracker;
     
     auto worker = [this, executionsPerThread, &tracker](int threadId) {
+        initRegistryOnCurrentThread();
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<> functionDis(0, 2);
@@ -640,6 +663,7 @@ TEST_F(FunctionThreadSafetyTest, ProductionLikeScenario) {
     
     // Worker threads simulating HTTP request handlers
     auto httpWorker = [this, &stopFlag, &stats](int workerId) {
+        initRegistryOnCurrentThread();
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<> functionDis(0, 2);
@@ -706,6 +730,7 @@ TEST_F(FunctionThreadSafetyTest, ProductionLikeScenario) {
     
     // Registry maintenance thread
     auto maintenanceWorker = [this, &stopFlag, &stats]() {
+        initRegistryOnCurrentThread();
         while (!stopFlag.load()) {
             try {
                 // Periodic registry stats collection

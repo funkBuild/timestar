@@ -15,7 +15,7 @@
 #include "query_parser.hpp"
 #include "series_matcher.hpp"
 
-namespace tsdb {
+namespace timestar {
 
 // A single data point notification for streaming to a subscriber.
 struct StreamingDataPoint {
@@ -124,12 +124,7 @@ public:
     // Use this for capacity limit checks — subscriptionCount() overcounts
     // because non-handler shards also store filter entries for remote subscriptions.
     size_t localSubscriptionCount() const {
-        unsigned thisShard = seastar::this_shard_id();
-        size_t count = 0;
-        for (const auto& [id, sub] : _subscriptionsById) {
-            if (sub.handlerShard == thisShard) ++count;
-        }
-        return count;
+        return _localSubscriptionCount;
     }
 
     // Collect stats for all subscriptions on this shard (handler shard only has queue info).
@@ -146,7 +141,9 @@ private:
     tsl::robin_map<uint64_t, uint64_t> _sequenceCounters;
     tsl::robin_map<uint64_t, uint64_t> _droppedCounters;
 
+    static constexpr size_t MAX_LOCAL_SUBSCRIPTIONS = 10'000;
     uint64_t _nextSubscriptionId = 0;
+    size_t _localSubscriptionCount = 0;
 
     template <class T>
     static std::variant<double, bool, std::string, int64_t> toVariant(const T& val);
@@ -161,4 +158,4 @@ private:
         const std::string& label);
 };
 
-} // namespace tsdb
+} // namespace timestar

@@ -12,7 +12,7 @@
 #include <vector>
 #include <numeric>
 
-using namespace tsdb;
+using namespace timestar;
 
 // ============================================================================
 // Parser tests — each new keyword must parse without throwing

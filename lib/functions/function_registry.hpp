@@ -8,7 +8,7 @@
 #include <memory>
 #include <functional>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Registry statistics
 struct RegistryStats {
@@ -47,6 +47,6 @@ public:
     void clear();
 };
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // FUNCTION_REGISTRY_H_INCLUDED

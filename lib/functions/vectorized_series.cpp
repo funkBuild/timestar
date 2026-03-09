@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 VectorizedSeries::VectorizedSeries() = default;
 
@@ -31,4 +31,4 @@ std::vector<double> VectorizedSeries::scale(const std::vector<double>& values, d
     return multiply(values, factor);
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

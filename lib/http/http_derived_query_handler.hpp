@@ -12,7 +12,7 @@
 class Engine;
 class LevelDBIndex;
 
-namespace tsdb {
+namespace timestar {
 
 // HTTP handler for derived metric queries
 // Endpoint: POST /derived
@@ -39,6 +39,6 @@ private:
         std::unique_ptr<seastar::http::reply> rep);
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // HTTP_DERIVED_QUERY_HANDLER_H_INCLUDED

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to profile TSDB insert path and generate flame graph
+# Script to profile TimeStar insert path and generate flame graph
 # Usage: ./profile_insert.sh [duration_seconds] [sample_frequency]
 
 DURATION=${1:-30}  # Default 30 seconds
@@ -9,21 +9,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 FLAMEGRAPH_DIR="${SCRIPT_DIR}/FlameGraph"
 
-echo "=== TSDB Insert Path Profiling ==="
+echo "=== TimeStar Insert Path Profiling ==="
 echo "Duration: ${DURATION} seconds"
 echo "Sample frequency: ${FREQ} Hz"
 echo ""
 
 # Check if the server is already running
-if pgrep -f tsdb_http_server > /dev/null; then
-    echo "TSDB server already running. Please stop it first."
+if pgrep -f timestar_http_server > /dev/null; then
+    echo "TimeStar server already running. Please stop it first."
     exit 1
 fi
 
-# Start the TSDB server in background
-echo "Starting TSDB server..."
+# Start the TimeStar server in background
+echo "Starting TimeStar server..."
 cd ${BUILD_DIR}
-./bin/tsdb_http_server --port 8086 &
+./bin/timestar_http_server --port 8086 &
 SERVER_PID=$!
 echo "Server PID: ${SERVER_PID}"
 
@@ -32,7 +32,7 @@ sleep 2
 
 # Check if server started successfully
 if ! kill -0 ${SERVER_PID} 2>/dev/null; then
-    echo "Failed to start TSDB server"
+    echo "Failed to start TimeStar server"
     exit 1
 fi
 
@@ -157,7 +157,7 @@ sudo kill -INT ${PERF_PID}
 sleep 2
 
 # Stop the server
-echo "Stopping TSDB server..."
+echo "Stopping TimeStar server..."
 kill ${SERVER_PID}
 wait ${SERVER_PID} 2>/dev/null
 
@@ -167,16 +167,16 @@ echo "Generating flame graph..."
 # Generate the flame graph
 sudo perf script -i perf.data > out.perf
 ${FLAMEGRAPH_DIR}/stackcollapse-perf.pl out.perf > out.folded
-${FLAMEGRAPH_DIR}/flamegraph.pl out.folded > tsdb_insert_flamegraph.svg
+${FLAMEGRAPH_DIR}/flamegraph.pl out.folded > timestar_insert_flamegraph.svg
 
 # Also generate a flame graph with better colors and title
 ${FLAMEGRAPH_DIR}/flamegraph.pl \
-    --title "TSDB Insert Path CPU Profile (${DURATION}s @ ${FREQ}Hz)" \
+    --title "TimeStar Insert Path CPU Profile (${DURATION}s @ ${FREQ}Hz)" \
     --colors hot \
     --width 1600 \
     --height 600 \
     --minwidth 0.5 \
-    out.folded > tsdb_insert_flamegraph_detailed.svg
+    out.folded > timestar_insert_flamegraph_detailed.svg
 
 # Clean up temporary files
 rm -f /tmp/insert_load.py
@@ -186,11 +186,11 @@ rm -f out.perf out.folded
 echo ""
 echo "=== Profiling Complete ==="
 echo "Flame graphs generated:"
-echo "  - tsdb_insert_flamegraph.svg (standard)"
-echo "  - tsdb_insert_flamegraph_detailed.svg (detailed with hot colors)"
+echo "  - timestar_insert_flamegraph.svg (standard)"
+echo "  - timestar_insert_flamegraph_detailed.svg (detailed with hot colors)"
 echo ""
 echo "Open in a web browser to explore:"
-echo "  firefox tsdb_insert_flamegraph_detailed.svg"
+echo "  firefox timestar_insert_flamegraph_detailed.svg"
 echo ""
 
 # Show top functions by CPU usage

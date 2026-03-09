@@ -15,6 +15,16 @@
 
 class Engine;
 
+// Pairs a raw pointer to in-memory series data with the shared_ptr that
+// keeps the owning MemoryStore alive.  Callers hold MemoryStoreMatch
+// values to prevent the MemoryStore (and its InMemorySeries) from being
+// destroyed during background TSM conversion.
+template <class T>
+struct MemoryStoreMatch {
+  seastar::shared_ptr<MemoryStore> store;
+  const InMemorySeries<T>* series;
+};
+
 class WALFileManager {
 private:
   int shardId;
@@ -30,26 +40,29 @@ public:
 
   seastar::future<> init(Engine &engine, TSMFileManager &_tsmFileManager);
   template <class T>
-  seastar::future<> insert(TSDBInsert<T> &insertRequest);
+  seastar::future<> insert(TimeStarInsert<T> &insertRequest);
   template <class T>
-  seastar::future<> insertBatch(std::vector<TSDBInsert<T>> &insertRequests);
+  seastar::future<> insertBatch(std::vector<TimeStarInsert<T>> &insertRequests);
   seastar::future<> rolloverMemoryStore();
   seastar::future<> convertWalToTsm(seastar::shared_ptr<MemoryStore> store);
   seastar::future<> close() {
-    tsdb::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
+    timestar::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
 
     // Drain all in-flight background TSM conversions before closing.
     // Guard against double-close (e.g., seastar::sharded<Engine> calling stop() twice).
     if (!_backgroundGate.is_closed()) {
-      tsdb::wal_log.info("[WAL_CLOSE] Draining {} background TSM conversions on shard {}",
+      timestar::wal_log.info("[WAL_CLOSE] Draining {} background TSM conversions on shard {}",
                          _backgroundGate.get_count(), shardId);
       co_await _backgroundGate.close();
-      tsdb::wal_log.info("[WAL_CLOSE] Background TSM conversions drained on shard {}", shardId);
+      timestar::wal_log.info("[WAL_CLOSE] Background TSM conversions drained on shard {}", shardId);
     }
 
-    // Snapshot remaining stores. convertWalToTsm() erases from memoryStores
-    // and calls removeWAL() internally, so we iterate a copy to avoid
-    // iterator invalidation.
+    // Inline conversion of remaining stores.  These run sequentially with
+    // co_await (not via the background gate, which is already closed) so
+    // they are safe: no concurrent background conversions can be in flight.
+    // If a conversion fails, the WAL file is preserved for crash recovery.
+    // convertWalToTsm() erases from memoryStores and calls removeWAL()
+    // internally, so we iterate a copy to avoid iterator invalidation.
     auto snapshot = memoryStores;
 
     for (auto& store : snapshot) {
@@ -58,14 +71,14 @@ public:
       if (!store->isEmpty()) {
         // Non-empty store: flush WAL to disk, then convert to TSM.
         try {
-          tsdb::wal_log.info("[WAL_CLOSE] Flushing memory store {} to TSM on shard {}",
+          timestar::wal_log.info("[WAL_CLOSE] Flushing memory store {} to TSM on shard {}",
                              store->sequenceNumber, shardId);
           co_await store->close();          // flush WAL (idempotent)
           co_await convertWalToTsm(store);  // write TSM + erase from memoryStores + removeWAL
-          tsdb::wal_log.info("[WAL_CLOSE] Successfully flushed store {} to TSM on shard {}",
+          timestar::wal_log.info("[WAL_CLOSE] Successfully flushed store {} to TSM on shard {}",
                              store->sequenceNumber, shardId);
         } catch (const std::exception& e) {
-          tsdb::wal_log.error("[WAL_CLOSE] Failed to flush store {} to TSM on shard {}: {} "
+          timestar::wal_log.error("[WAL_CLOSE] Failed to flush store {} to TSM on shard {}: {} "
                               "(WAL preserved for recovery on next startup)",
                               store->sequenceNumber, shardId, e.what());
           // WAL file stays on disk — startup recovery will handle it.
@@ -73,61 +86,63 @@ public:
       } else {
         // Empty store: just close and remove the WAL file.
         try {
-          tsdb::wal_log.info("[WAL_CLOSE] Closing empty memory store {} on shard {}",
+          timestar::wal_log.info("[WAL_CLOSE] Closing empty memory store {} on shard {}",
                              store->sequenceNumber, shardId);
           co_await store->close();
           co_await store->removeWAL();
         } catch (const std::exception& e) {
-          tsdb::wal_log.error("[WAL_CLOSE] Error closing empty store {} on shard {}: {}",
+          timestar::wal_log.error("[WAL_CLOSE] Error closing empty store {} on shard {}: {}",
                               store->sequenceNumber, shardId, e.what());
         }
       }
     }
 
     memoryStores.clear();
-    tsdb::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
+    timestar::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
   }
   std::optional<TSMValueType> getSeriesType(const std::string &seriesKey);
   std::optional<TSMValueType> getSeriesType(const SeriesId128 &seriesId);
   
   // Query memory stores for data (deletion filtering removed - WAL replay handles current state)
-  // Returns a const pointer to the in-memory series, or nullptr if not found.
+  // Returns the first matching in-memory series together with a shared_ptr
+  // that keeps the owning MemoryStore alive, or std::nullopt if not found.
   // NOTE: With background TSM conversion, multiple memory stores may contain
   // data for the same series. This returns only the first match. Use
   // queryAllMemoryStores() to get data from all stores.
   template <class T>
-  const InMemorySeries<T>* queryMemoryStores(const std::string& seriesKey) {
+  std::optional<MemoryStoreMatch<T>> queryMemoryStores(const std::string& seriesKey) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     return queryMemoryStores<T>(seriesId);
   }
 
   template <class T>
-  const InMemorySeries<T>* queryMemoryStores(const SeriesId128& seriesId) {
+  std::optional<MemoryStoreMatch<T>> queryMemoryStores(const SeriesId128& seriesId) {
     for (auto& memStore : memoryStores) {
       auto result = memStore->querySeries<T>(seriesId);
       if (result != nullptr) {
-        return result;
+        return MemoryStoreMatch<T>{memStore, result};
       }
     }
-    return nullptr;
+    return std::nullopt;
   }
 
-  // Query ALL memory stores and return pointers to every matching series.
-  // Needed because background TSM conversion means multiple stores may
-  // hold data for the same series simultaneously.
+  // Query ALL memory stores and return every matching series together with
+  // a shared_ptr that keeps the owning MemoryStore alive.  The caller holds
+  // the returned MemoryStoreMatch values to prevent use-after-free if a
+  // background TSM conversion removes a store from the memoryStores vector.
   template <class T>
-  std::vector<const InMemorySeries<T>*> queryAllMemoryStores(const std::string& seriesKey) {
+  std::vector<MemoryStoreMatch<T>> queryAllMemoryStores(const std::string& seriesKey) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     return queryAllMemoryStores<T>(seriesId);
   }
 
   template <class T>
-  std::vector<const InMemorySeries<T>*> queryAllMemoryStores(const SeriesId128& seriesId) {
-    std::vector<const InMemorySeries<T>*> results;
+  std::vector<MemoryStoreMatch<T>> queryAllMemoryStores(const SeriesId128& seriesId) {
+    std::vector<MemoryStoreMatch<T>> results;
     for (auto& memStore : memoryStores) {
       auto result = memStore->querySeries<T>(seriesId);
       if (result != nullptr) {
-        results.push_back(result);
+        results.push_back(MemoryStoreMatch<T>{memStore, result});
       }
     }
     return results;

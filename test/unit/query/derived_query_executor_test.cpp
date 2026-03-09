@@ -3,7 +3,7 @@
 #include "derived_query.hpp"
 #include <glaze/glaze.hpp>
 
-using namespace tsdb;
+using namespace timestar;
 
 // Test-local Glaze types for parsing responses (mirrors library types)
 struct TestGlazeDerivedQueryRequest {
@@ -305,12 +305,10 @@ TEST_F(DerivedQueryExecutorTest, CustomConfig) {
     config.maxTotalPoints = 5000000;
     config.timeoutMs = 60000;
 
-    // Create executor with custom config
-    DerivedQueryExecutor executor(nullptr, nullptr, config);
-
-    // Config is stored internally - verify via behavior in other tests
-    // For now, just ensure construction doesn't throw
-    SUCCEED();
+    // Verify construction with custom config does not throw
+    EXPECT_NO_THROW({
+        DerivedQueryExecutor executor(nullptr, nullptr, config);
+    });
 }
 
 // ==================== Request Validation Tests ====================

@@ -10,7 +10,7 @@
 #include <set>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 
 // Exception for derived query errors
 class DerivedQueryException : public std::runtime_error {
@@ -55,41 +55,27 @@ struct DerivedQueryRequest {
                 "Invalid time range: both startTime and endTime must be specified together");
         }
 
-        // Parse formula to validate syntax and get referenced queries
-        ExpressionParser parser(formula);
-        try {
-            parser.parse();
-        } catch (const ExpressionParseException& e) {
-            throw DerivedQueryException("Invalid formula: " + std::string(e.what()));
-        }
+        // Parse formula once — cache references for later use
+        parseFormulaIfNeeded();
 
         // Check that all referenced queries are defined
-        auto referencedQueries = parser.getQueryReferences();
         std::set<std::string> definedQueries;
         for (const auto& [name, _] : queries) {
             definedQueries.insert(name);
         }
 
-        for (const auto& ref : referencedQueries) {
+        for (const auto& ref : cachedQueryRefs_) {
             if (definedQueries.find(ref) == definedQueries.end()) {
                 throw DerivedQueryException(
                     "Formula references undefined query: '" + ref + "'");
-            }
-        }
-
-        // Warn about unused queries (not an error, but might be a mistake)
-        for (const auto& [name, _] : queries) {
-            if (referencedQueries.find(name) == referencedQueries.end()) {
-                // Could log a warning here
             }
         }
     }
 
     // Get all query names referenced in the formula
     std::set<std::string> getReferencedQueries() const {
-        ExpressionParser parser(formula);
-        parser.parse();
-        return parser.getQueryReferences();
+        parseFormulaIfNeeded();
+        return cachedQueryRefs_;
     }
 
     // Apply global time range to queries that don't have their own
@@ -102,6 +88,22 @@ struct DerivedQueryRequest {
                 query.endTime = endTime;
             }
         }
+    }
+
+private:
+    mutable std::set<std::string> cachedQueryRefs_;
+    mutable bool formulaParsed_ = false;
+
+    void parseFormulaIfNeeded() const {
+        if (formulaParsed_) return;
+        ExpressionParser parser(formula);
+        try {
+            parser.parse();
+        } catch (const ExpressionParseException& e) {
+            throw DerivedQueryException("Invalid formula: " + std::string(e.what()));
+        }
+        cachedQueryRefs_ = parser.getQueryReferences();
+        formulaParsed_ = true;
     }
 };
 
@@ -183,6 +185,6 @@ private:
     DerivedQueryRequest request_;
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // DERIVED_QUERY_H_INCLUDED

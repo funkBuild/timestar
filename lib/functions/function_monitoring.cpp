@@ -1,13 +1,14 @@
 #include "function_monitoring.hpp"
-#include <fstream>
-#include <sstream>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <unistd.h>
 #include <sys/resource.h>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 ProductionMonitor::ProductionMonitor() 
     : system_metrics_(std::make_unique<SystemMetrics>()) {
@@ -18,7 +19,9 @@ ProductionMonitor::~ProductionMonitor() {
 }
 
 ProductionMonitor& ProductionMonitor::getInstance() {
-    static ProductionMonitor instance;
+    // Per-shard instance: each Seastar shard gets its own monitor,
+    // eliminating cross-shard mutex contention on the reactor thread.
+    static thread_local ProductionMonitor instance;
     return instance;
 }
 
@@ -73,34 +76,38 @@ void ProductionMonitor::stop() {
 void ProductionMonitor::registerFunction(const std::string& function_name) {
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     if (function_metrics_.find(function_name) == function_metrics_.end()) {
-        function_metrics_[function_name] = std::make_unique<FunctionMetrics>();
-        
+        function_metrics_[function_name] = std::make_shared<FunctionMetrics>();
+
         if (detailed_logging_) {
             std::cout << "[ProductionMonitor] Registered function: " << function_name << "\n";
         }
     }
 }
 
-FunctionMetrics* ProductionMonitor::getFunctionMetrics(const std::string& function_name) {
+std::shared_ptr<FunctionMetrics> ProductionMonitor::getFunctionMetrics(const std::string& function_name) {
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     auto it = function_metrics_.find(function_name);
     if (it != function_metrics_.end()) {
-        return it->second.get();
+        return it->second;
     }
-    
+
     // Auto-register if not found
-    function_metrics_[function_name] = std::make_unique<FunctionMetrics>();
-    
+    auto metrics = std::make_shared<FunctionMetrics>();
+    function_metrics_[function_name] = metrics;
+
     if (detailed_logging_) {
         std::cout << "[ProductionMonitor] Auto-registered function: " << function_name << "\n";
     }
-    
-    return function_metrics_[function_name].get();
+
+    return metrics;
 }
 
 void ProductionMonitor::setAlertThresholds(const AlertThresholds& thresholds) {
+    // thresholds_ is read by checkAlertConditions() (under metrics_mutex_) and
+    // getHealthStatus(), both of which may run concurrently on other threads.
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
     thresholds_ = thresholds;
-    
+
     if (detailed_logging_) {
         std::cout << "[ProductionMonitor] Updated alert thresholds\n";
     }
@@ -129,8 +136,11 @@ std::vector<Alert> ProductionMonitor::getAlertHistory(std::chrono::minutes lookb
 void ProductionMonitor::acknowledgeAlert(size_t alert_id) {
     std::lock_guard<std::mutex> lock(alerts_mutex_);
     if (alert_id < active_alerts_.size()) {
+        // Remove key from the lookup set before erasing from vector
+        const auto& alert = active_alerts_[alert_id];
+        active_alert_keys_.erase(AlertKey{alert.type, alert.function_name});
         active_alerts_.erase(active_alerts_.begin() + alert_id);
-        
+
         if (detailed_logging_) {
             std::cout << "[ProductionMonitor] Acknowledged alert ID: " << alert_id << "\n";
         }
@@ -140,6 +150,7 @@ void ProductionMonitor::acknowledgeAlert(size_t alert_id) {
 void ProductionMonitor::clearAlertsForTesting() {
     std::lock_guard<std::mutex> lock(alerts_mutex_);
     active_alerts_.clear();
+    active_alert_keys_.clear();
     alert_history_.clear();
 
     if (detailed_logging_) {
@@ -306,24 +317,33 @@ ProductionMonitor::HealthStatus ProductionMonitor::getHealthStatus() const {
     status.key_metrics["active_calls"] = system_metrics_->active_function_calls.load();
     status.key_metrics["queued_calls"] = system_metrics_->queued_function_calls.load();
     status.key_metrics["http_success_rate"] = system_metrics_->getHttpSuccessRate();
-    
-    // Check critical thresholds
-    if (system_metrics_->queued_function_calls.load() > thresholds_.max_queue_size) {
-        status.healthy = false;
-        status.status = "CRITICAL";
-    }
-    
-    if (system_metrics_->active_function_calls.load() > thresholds_.max_concurrent_calls) {
-        status.healthy = false;
-        status.status = "OVERLOADED";
+
+    // Check critical thresholds (thresholds_ guarded by metrics_mutex_)
+    {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+        if (system_metrics_->queued_function_calls.load() > thresholds_.max_queue_size) {
+            status.healthy = false;
+            status.status = "CRITICAL";
+        }
+
+        if (system_metrics_->active_function_calls.load() > thresholds_.max_concurrent_calls) {
+            status.healthy = false;
+            status.status = "OVERLOADED";
+        }
     }
     
     return status;
 }
 
 void ProductionMonitor::setCollectionInterval(std::chrono::seconds interval) {
-    collection_interval_ = interval;
-    
+    // collection_interval_ is read by monitoringLoop() under monitoring_mutex_.
+    // Wake the loop so it picks up the new interval immediately.
+    {
+        std::lock_guard<std::mutex> lock(monitoring_mutex_);
+        collection_interval_ = interval;
+    }
+    monitoring_cv_.notify_one();
+
     if (detailed_logging_) {
         std::cout << "[ProductionMonitor] Updated collection interval to " << interval.count() << "s\n";
     }
@@ -380,125 +400,136 @@ void ProductionMonitor::collectSystemMetrics() {
     // Update file descriptors
     system_metrics_->open_file_descriptors.store(getOpenFileDescriptors());
     
-    // Update concurrent execution peak
+    // Update concurrent execution peak (CAS loop to avoid TOCTOU race)
     uint64_t current_active = system_metrics_->active_function_calls.load();
     uint64_t current_peak = system_metrics_->concurrent_execution_peak.load();
-    if (current_active > current_peak) {
-        system_metrics_->concurrent_execution_peak.store(current_active);
+    while (current_active > current_peak) {
+        if (system_metrics_->concurrent_execution_peak.compare_exchange_weak(
+                current_peak, current_active)) {
+            break;
+        }
     }
 }
 
 void ProductionMonitor::checkAlertConditions() {
-    std::lock_guard<std::mutex> lock(metrics_mutex_);
-    
-    for (const auto& [function_name, metrics] : function_metrics_) {
-        if (!metrics) continue;
-        
-        // Check failure rate
-        double failure_rate = metrics->getFailureRate();
-        if (failure_rate > thresholds_.max_failure_rate && metrics->total_executions.load() > 10) {
-            Alert alert;
-            alert.type = AlertType::HIGH_FAILURE_RATE;
-            alert.function_name = function_name;
-            alert.message = "High failure rate: " + std::to_string(failure_rate * 100) + "%";
-            alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, failure_rate / thresholds_.max_failure_rate);
-            alert.metrics["failure_rate"] = failure_rate;
-            processAlert(alert);
+    // Collect alerts while holding metrics_mutex_, then release it before
+    // calling processAlert (which acquires alerts_mutex_). This avoids
+    // nested lock acquisition and eliminates any deadlock risk.
+    std::vector<Alert> pendingAlerts;
+
+    {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+
+        for (const auto& [function_name, metrics] : function_metrics_) {
+            if (!metrics) continue;
+
+            // Check failure rate
+            double failure_rate = metrics->getFailureRate();
+            if (failure_rate > thresholds_.max_failure_rate && metrics->total_executions.load() > 10) {
+                Alert alert;
+                alert.type = AlertType::HIGH_FAILURE_RATE;
+                alert.function_name = function_name;
+                alert.message = "High failure rate: " + std::to_string(failure_rate * 100) + "%";
+                alert.timestamp = std::chrono::steady_clock::now();
+                alert.severity = std::min(1.0, failure_rate / thresholds_.max_failure_rate);
+                alert.metrics["failure_rate"] = failure_rate;
+                pendingAlerts.push_back(std::move(alert));
+            }
+
+            // Check response time
+            double avg_time = metrics->getAverageExecutionTimeMs();
+            if (avg_time > thresholds_.max_response_time_ms && metrics->successful_executions.load() > 5) {
+                Alert alert;
+                alert.type = AlertType::SLOW_RESPONSE_TIME;
+                alert.function_name = function_name;
+                alert.message = "Slow response time: " + std::to_string(avg_time) + "ms";
+                alert.timestamp = std::chrono::steady_clock::now();
+                alert.severity = std::min(1.0, avg_time / thresholds_.max_response_time_ms);
+                alert.metrics["avg_response_time_ms"] = avg_time;
+                pendingAlerts.push_back(std::move(alert));
+            }
+
+            // Check cache hit rate
+            double cache_rate = metrics->getCacheHitRate();
+            uint64_t total_cache_ops = metrics->cache_hits.load() + metrics->cache_misses.load();
+            if (cache_rate < thresholds_.min_cache_hit_rate && total_cache_ops > 20) {
+                Alert alert;
+                alert.type = AlertType::LOW_CACHE_HIT_RATE;
+                alert.function_name = function_name;
+                alert.message = "Low cache hit rate: " + std::to_string(cache_rate * 100) + "%";
+                alert.timestamp = std::chrono::steady_clock::now();
+                alert.severity = std::min(1.0, (thresholds_.min_cache_hit_rate - cache_rate) / thresholds_.min_cache_hit_rate);
+                alert.metrics["cache_hit_rate"] = cache_rate;
+                pendingAlerts.push_back(std::move(alert));
+            }
+
+            // Check memory usage
+            double memory_mb = metrics->getAverageMemoryUsageMB();
+            if (memory_mb > thresholds_.max_memory_usage_mb && metrics->successful_executions.load() > 5) {
+                Alert alert;
+                alert.type = AlertType::HIGH_MEMORY_USAGE;
+                alert.function_name = function_name;
+                alert.message = "High memory usage: " + std::to_string(memory_mb) + "MB";
+                alert.timestamp = std::chrono::steady_clock::now();
+                alert.severity = std::min(1.0, memory_mb / thresholds_.max_memory_usage_mb);
+                alert.metrics["memory_usage_mb"] = memory_mb;
+                pendingAlerts.push_back(std::move(alert));
+            }
         }
-        
-        // Check response time
-        double avg_time = metrics->getAverageExecutionTimeMs();
-        if (avg_time > thresholds_.max_response_time_ms && metrics->successful_executions.load() > 5) {
+
+        // System-level alerts
+        uint64_t active_calls = system_metrics_->active_function_calls.load();
+        if (active_calls > thresholds_.max_concurrent_calls) {
             Alert alert;
-            alert.type = AlertType::SLOW_RESPONSE_TIME;
-            alert.function_name = function_name;
-            alert.message = "Slow response time: " + std::to_string(avg_time) + "ms";
+            alert.type = AlertType::HIGH_CONCURRENCY;
+            alert.function_name = "system";
+            alert.message = "High concurrency: " + std::to_string(active_calls) + " active calls";
             alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, avg_time / thresholds_.max_response_time_ms);
-            alert.metrics["avg_response_time_ms"] = avg_time;
-            processAlert(alert);
+            alert.severity = std::min(1.0, (double)active_calls / thresholds_.max_concurrent_calls);
+            alert.metrics["active_calls"] = active_calls;
+            pendingAlerts.push_back(std::move(alert));
         }
-        
-        // Check cache hit rate
-        double cache_rate = metrics->getCacheHitRate();
-        uint64_t total_cache_ops = metrics->cache_hits.load() + metrics->cache_misses.load();
-        if (cache_rate < thresholds_.min_cache_hit_rate && total_cache_ops > 20) {
+
+        uint64_t queued_calls = system_metrics_->queued_function_calls.load();
+        if (queued_calls > thresholds_.max_queue_size) {
             Alert alert;
-            alert.type = AlertType::LOW_CACHE_HIT_RATE;
-            alert.function_name = function_name;
-            alert.message = "Low cache hit rate: " + std::to_string(cache_rate * 100) + "%";
+            alert.type = AlertType::QUEUE_OVERLOAD;
+            alert.function_name = "system";
+            alert.message = "Queue overload: " + std::to_string(queued_calls) + " queued calls";
             alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, (thresholds_.min_cache_hit_rate - cache_rate) / thresholds_.min_cache_hit_rate);
-            alert.metrics["cache_hit_rate"] = cache_rate;
-            processAlert(alert);
+            alert.severity = std::min(1.0, (double)queued_calls / thresholds_.max_queue_size);
+            alert.metrics["queued_calls"] = queued_calls;
+            pendingAlerts.push_back(std::move(alert));
         }
-        
-        // Check memory usage
-        double memory_mb = metrics->getAverageMemoryUsageMB();
-        if (memory_mb > thresholds_.max_memory_usage_mb && metrics->successful_executions.load() > 5) {
-            Alert alert;
-            alert.type = AlertType::HIGH_MEMORY_USAGE;
-            alert.function_name = function_name;
-            alert.message = "High memory usage: " + std::to_string(memory_mb) + "MB";
-            alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, memory_mb / thresholds_.max_memory_usage_mb);
-            alert.metrics["memory_usage_mb"] = memory_mb;
-            processAlert(alert);
-        }
-    }
-    
-    // System-level alerts
-    uint64_t active_calls = system_metrics_->active_function_calls.load();
-    if (active_calls > thresholds_.max_concurrent_calls) {
-        Alert alert;
-        alert.type = AlertType::HIGH_CONCURRENCY;
-        alert.function_name = "system";
-        alert.message = "High concurrency: " + std::to_string(active_calls) + " active calls";
-        alert.timestamp = std::chrono::steady_clock::now();
-        alert.severity = std::min(1.0, (double)active_calls / thresholds_.max_concurrent_calls);
-        alert.metrics["active_calls"] = active_calls;
-        processAlert(alert);
-    }
-    
-    uint64_t queued_calls = system_metrics_->queued_function_calls.load();
-    if (queued_calls > thresholds_.max_queue_size) {
-        Alert alert;
-        alert.type = AlertType::QUEUE_OVERLOAD;
-        alert.function_name = "system";
-        alert.message = "Queue overload: " + std::to_string(queued_calls) + " queued calls";
-        alert.timestamp = std::chrono::steady_clock::now();
-        alert.severity = std::min(1.0, (double)queued_calls / thresholds_.max_queue_size);
-        alert.metrics["queued_calls"] = queued_calls;
+    } // metrics_mutex_ released
+
+    // Now process alerts with only alerts_mutex_ held
+    for (const auto& alert : pendingAlerts) {
         processAlert(alert);
     }
 }
 
 void ProductionMonitor::processAlert(const Alert& alert) {
     std::lock_guard<std::mutex> lock(alerts_mutex_);
-    
-    // Check if similar alert already exists (avoid spam)
-    bool duplicate = false;
-    for (const auto& existing : active_alerts_) {
-        if (existing.type == alert.type && existing.function_name == alert.function_name) {
-            duplicate = true;
-            break;
-        }
+
+    // O(1) duplicate check using the unordered_set keyed by (type, function_name)
+    AlertKey key{alert.type, alert.function_name};
+    if (active_alert_keys_.contains(key)) {
+        return; // Similar alert already active, avoid spam
     }
-    
-    if (!duplicate) {
-        active_alerts_.push_back(alert);
 
-        // Enforce bounded alert history: evict the oldest entry when at capacity.
-        if (alert_history_.size() >= MAX_ALERT_HISTORY) {
-            alert_history_.pop_front();
-        }
-        alert_history_.push_back(alert);
+    active_alerts_.push_back(alert);
+    active_alert_keys_.insert(std::move(key));
 
-        if (detailed_logging_) {
-            std::cout << "[ProductionMonitor] ALERT: " << alert.message
-                      << " (severity: " << alert.severity << ")\n";
-        }
+    // Enforce bounded alert history: evict the oldest entry when at capacity.
+    if (alert_history_.size() >= MAX_ALERT_HISTORY) {
+        alert_history_.pop_front();
+    }
+    alert_history_.push_back(alert);
+
+    if (detailed_logging_) {
+        std::cout << "[ProductionMonitor] ALERT: " << alert.message
+                  << " (severity: " << alert.severity << ")\n";
     }
 }
 
@@ -518,13 +549,18 @@ void ProductionMonitor::cleanupOldAlerts() {
     
     // Remove old active alerts (auto-acknowledge after 1 hour)
     auto active_cutoff = std::chrono::steady_clock::now() - std::chrono::hours(1);
-    active_alerts_.erase(
-        std::remove_if(active_alerts_.begin(), active_alerts_.end(),
-            [active_cutoff](const Alert& alert) {
-                return alert.timestamp < active_cutoff;
-            }),
-        active_alerts_.end()
-    );
+    auto new_end = std::remove_if(active_alerts_.begin(), active_alerts_.end(),
+        [active_cutoff](const Alert& alert) {
+            return alert.timestamp < active_cutoff;
+        });
+    if (new_end != active_alerts_.end()) {
+        active_alerts_.erase(new_end, active_alerts_.end());
+        // Rebuild the key set to match the remaining active alerts
+        active_alert_keys_.clear();
+        for (const auto& alert : active_alerts_) {
+            active_alert_keys_.insert(AlertKey{alert.type, alert.function_name});
+        }
+    }
 }
 
 uint64_t ProductionMonitor::getCurrentMemoryUsage() {
@@ -542,8 +578,8 @@ uint64_t ProductionMonitor::getCurrentMemoryUsage() {
 }
 
 uint64_t ProductionMonitor::getCpuUsagePercent() {
-    static uint64_t last_cpu_time = 0;
-    static auto last_measurement = std::chrono::steady_clock::now();
+    static thread_local uint64_t last_cpu_time = 0;
+    static thread_local auto last_measurement = std::chrono::steady_clock::now();
     
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage) != 0) {
@@ -570,28 +606,28 @@ uint64_t ProductionMonitor::getCpuUsagePercent() {
 
 uint64_t ProductionMonitor::getOpenFileDescriptors() {
     uint64_t count = 0;
-    std::ifstream fd_dir("/proc/self/fd");
-    if (fd_dir.is_open()) {
-        std::string entry;
-        while (std::getline(fd_dir, entry)) {
-            if (!entry.empty() && entry != "." && entry != "..") {
-                count++;
-            }
+    try {
+        for ([[maybe_unused]] const auto& entry :
+                 std::filesystem::directory_iterator("/proc/self/fd")) {
+            ++count;
         }
+    } catch (const std::filesystem::filesystem_error&) {
+        // /proc/self/fd may not exist on non-Linux platforms
     }
     return count;
 }
 
 // FunctionExecutionTracker implementation
 FunctionExecutionTracker::FunctionExecutionTracker(const std::string& function_name)
-    : function_name_(function_name), start_time_(std::chrono::steady_clock::now()) {
+    : function_name_(function_name), start_time_(std::chrono::steady_clock::now()),
+      initial_memory_(0) {
     monitor_ = &ProductionMonitor::getInstance();
     metrics_ = monitor_->getFunctionMetrics(function_name_);
-    initial_memory_ = monitor_->getCurrentMemoryUsage();
-    
+    // Skip blocking /proc read — memory tracking done only in background collection
+
     // Update active calls
     monitor_->getSystemMetrics()->active_function_calls.fetch_add(1);
-    
+
     // Record execution attempt
     metrics_->total_executions.fetch_add(1);
 }
@@ -599,22 +635,12 @@ FunctionExecutionTracker::FunctionExecutionTracker(const std::string& function_n
 FunctionExecutionTracker::~FunctionExecutionTracker() {
     auto end_time = std::chrono::steady_clock::now();
     auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time_).count();
-    
+
     // Update execution time
     metrics_->total_execution_time_us.fetch_add(duration_us);
-    
-    // Update memory usage
-    uint64_t final_memory = monitor_->getCurrentMemoryUsage();
-    if (final_memory > initial_memory_) {
-        uint64_t memory_used = final_memory - initial_memory_;
-        metrics_->total_memory_allocated.fetch_add(memory_used);
-        
-        uint64_t current_peak = metrics_->peak_memory_bytes.load();
-        if (memory_used > current_peak) {
-            metrics_->peak_memory_bytes.store(memory_used);
-        }
-    }
-    
+
+    // Memory tracking removed from hot path — collected periodically by background monitor
+
     // Update active calls
     monitor_->getSystemMetrics()->active_function_calls.fetch_sub(1);
 }
@@ -647,4 +673,4 @@ void FunctionExecutionTracker::recordInsufficientDataError() {
     metrics_->insufficient_data_errors.fetch_add(1);
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

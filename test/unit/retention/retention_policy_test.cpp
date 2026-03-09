@@ -180,12 +180,12 @@ SEASTAR_TEST_F(RetentionPolicyTest, PolicyWithDownsample) {
 
 // Test the parseInterval function used for duration parsing
 TEST(RetentionDurationParsingTest, ValidDurations) {
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("1s"), 1000000000ULL);
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("5m"), 5ULL * 60 * 1000000000ULL);
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("1h"), 3600ULL * 1000000000ULL);
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("30d"), 30ULL * 86400 * 1000000000ULL);
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("90d"), 90ULL * 86400 * 1000000000ULL);
-    EXPECT_EQ(tsdb::HttpQueryHandler::parseInterval("100ms"), 100000000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("1s"), 1000000000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("5m"), 5ULL * 60 * 1000000000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("1h"), 3600ULL * 1000000000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("30d"), 30ULL * 86400 * 1000000000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("90d"), 90ULL * 86400 * 1000000000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("100ms"), 100000000ULL);
 }
 
 // Test RetentionPolicy Glaze serialization roundtrip
@@ -229,7 +229,7 @@ TEST(RetentionCacheTest, BasicCacheOperations) {
 
     // Lookup
     auto it = cache.find("cpu");
-    EXPECT_NE(it, cache.end());
+    ASSERT_NE(it, cache.end());
     EXPECT_EQ(it->second.ttlNanos, 7776000000000000ULL);
 
     // Update

@@ -7,7 +7,7 @@
 #include <optional>
 #include <set>
 
-namespace tsdb {
+namespace timestar {
 
 // Token types for lexer
 enum class TokenType {
@@ -76,7 +76,7 @@ private:
     Token currentToken_;
     std::set<std::string> queryRefs_;
     int depth_ = 0;
-    static constexpr int MAX_DEPTH = 500;
+    static constexpr int MAX_DEPTH = 100;
     static constexpr size_t MAX_ARGS = 1000;
 
     // Operator precedence levels
@@ -119,9 +119,9 @@ private:
     std::unique_ptr<ExpressionNode> parseForecastFunction();
     std::unique_ptr<ExpressionNode> parseTimeShiftFunction();
 
-    void error(const std::string& message) const;
+    [[noreturn]] void error(const std::string& message) const;
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // EXPRESSION_PARSER_H_INCLUDED

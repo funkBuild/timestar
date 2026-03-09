@@ -4,7 +4,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/sharded.hh>
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/query/query_parser.hpp"
 #include "../test_helpers.hpp"
@@ -13,12 +13,12 @@
 #include <cstdlib>
 
 using namespace seastar;
-using namespace tsdb;
+using namespace timestar;
 
 class ComprehensiveQueryTest : public ::testing::Test {
 protected:
     static seastar::sharded<Engine>* engineSharded;
-    static std::unique_ptr<tsdb::HttpQueryHandler> queryHandler;
+    static std::unique_ptr<timestar::HttpQueryHandler> queryHandler;
     static uint64_t baseTime;
     static std::string testMeasurement;
 
@@ -134,7 +134,7 @@ protected:
         auto timestamps = createTestTimestamps(100);
         auto insertSeries = [&](const std::string& deviceId, const std::string& paddock,
                                 const std::string& fieldName, double multiplier) {
-            TSDBInsert<double> insert(testMeasurement + ".moisture", fieldName);
+            TimeStarInsert<double> insert(testMeasurement + ".moisture", fieldName);
             insert.addTag("deviceId", deviceId);
             insert.addTag("paddock", paddock);
             auto fieldData = createTestFieldData(100, multiplier);
@@ -161,7 +161,7 @@ protected:
     }
 
     static void insertImageDataSync(seastar::sharded<Engine>& eng) {
-        TSDBInsert<std::string> insert(testMeasurement + ".images", "image");
+        TimeStarInsert<std::string> insert(testMeasurement + ".images", "image");
         insert.addTag("deviceId", "camera");
         insert.addValue(baseTime - 2000000000ULL, "ref::image1::s3://bucket/image1.jpeg");
         insert.addValue(baseTime - 1000000000ULL, "ref::image2::s3://bucket/image2.jpeg");
@@ -169,7 +169,7 @@ protected:
     }
 
     static void insertBooleanDataSync(seastar::sharded<Engine>& eng) {
-        TSDBInsert<bool> insert(testMeasurement + ".boolean", "value");
+        TimeStarInsert<bool> insert(testMeasurement + ".boolean", "value");
         insert.addTag("deviceId", "sensor");
         insert.addValue(baseTime - 2000000000ULL, true);
         insert.addValue(baseTime - 1000000000ULL, false);
@@ -178,7 +178,7 @@ protected:
 };
 
 seastar::sharded<Engine>* ComprehensiveQueryTest::engineSharded = nullptr;
-std::unique_ptr<tsdb::HttpQueryHandler> ComprehensiveQueryTest::queryHandler;
+std::unique_ptr<timestar::HttpQueryHandler> ComprehensiveQueryTest::queryHandler;
 uint64_t ComprehensiveQueryTest::baseTime;
 std::string ComprehensiveQueryTest::testMeasurement;
 
@@ -190,7 +190,7 @@ TEST_F(AsyncQueryTest, MinAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -227,7 +227,7 @@ TEST_F(AsyncQueryTest, MaxAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -258,7 +258,7 @@ TEST_F(AsyncQueryTest, AvgAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -288,7 +288,7 @@ TEST_F(AsyncQueryTest, QueryWithSpecificFields) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -316,7 +316,7 @@ TEST_F(AsyncQueryTest, QueryWithScopeFilter) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -345,7 +345,7 @@ TEST_F(AsyncQueryTest, QueryWithGroupBy) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -386,7 +386,7 @@ TEST_F(AsyncQueryTest, BooleanDataQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertBooleanDataSync(eng.eng);
@@ -416,7 +416,7 @@ TEST_F(AsyncQueryTest, ImageDataQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertImageDataSync(eng.eng);
@@ -449,7 +449,7 @@ TEST_F(AsyncQueryTest, TimeRangeFiltering) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -483,7 +483,7 @@ TEST_F(AsyncQueryTest, SumAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -516,7 +516,7 @@ TEST_F(AsyncQueryTest, LatestAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -549,7 +549,7 @@ TEST_F(AsyncQueryTest, InvalidQueryErrors) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         // Missing aggregation method
@@ -598,7 +598,7 @@ TEST_F(AsyncQueryTest, CacheInvalidationAfterInsert) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -609,10 +609,10 @@ TEST_F(AsyncQueryTest, CacheInvalidationAfterInsert) {
 
         ASSERT_EQ(result1.series.size(), 3); // aaaaa, bbbbb, ccccc
 
-        // Insert new device data using TSDBInsert
+        // Insert new device data using TimeStarInsert
         auto timestamps = createTestTimestamps(100);
         auto fieldData = createTestFieldData(100, 1.0);
-        TSDBInsert<double> newDeviceInsert(testMeasurement + ".moisture", "value1");
+        TimeStarInsert<double> newDeviceInsert(testMeasurement + ".moisture", "value1");
         newDeviceInsert.addTag("deviceId", "zzzzzz");
         newDeviceInsert.addTag("paddock", "back-paddock");
         for (int i = 0; i < 100; i++) {
@@ -645,12 +645,12 @@ TEST_F(AsyncQueryTest, FieldsWithSamePrefix) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         // Insert data with field names that share prefixes
         {
-            TSDBInsert<double> insert("lid_data", "pnf");
+            TimeStarInsert<double> insert("lid_data", "pnf");
             insert.addTag("meter_id", "33616");
             for (uint64_t i = 1; i <= 6; i++) {
                 insert.addValue(i, 0.0);
@@ -658,7 +658,7 @@ TEST_F(AsyncQueryTest, FieldsWithSamePrefix) {
             shardedInsert(eng.eng, std::move(insert));
         }
         {
-            TSDBInsert<double> insert("lid_data", "pnf_status");
+            TimeStarInsert<double> insert("lid_data", "pnf_status");
             insert.addTag("meter_id", "33616");
             for (uint64_t i = 1; i <= 6; i++) {
                 insert.addValue(i, 1.0);
@@ -693,7 +693,7 @@ TEST_F(AsyncQueryTest, AggregationWithTimeIntervals) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<tsdb::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -703,7 +703,7 @@ TEST_F(AsyncQueryTest, AggregationWithTimeIntervals) {
         auto request = QueryParser::parseQueryString(queryStr);
         request.startTime = baseTime - 100000000000ULL;
         request.endTime = baseTime;
-        request.aggregationInterval = tsdb::HttpQueryHandler::parseInterval("10s");
+        request.aggregationInterval = timestar::HttpQueryHandler::parseInterval("10s");
 
         auto result = queryHandler->executeQuery(request).get();
 

@@ -10,9 +10,9 @@ const axios = require('axios');
 const { performance } = require('perf_hooks');
 const { execSync } = require('child_process');
 
-const BASE_URL = process.env.TSDB_URL || 'http://localhost:8086';
+const BASE_URL = process.env.TIMESTAR_URL || 'http://localhost:8086';
 const LABEL = process.argv[2] || 'UNKNOWN';
-const BUILD_DIR = process.argv[3] || '/home/matt/Desktop/source/tsdb/build';
+const BUILD_DIR = process.argv[3] || '/home/matt/Desktop/source/timestar/build';
 
 const MEASUREMENT = 'sizing.sensor';
 const NUM_HOSTS = 500;

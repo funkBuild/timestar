@@ -3,11 +3,10 @@
 
 #include <vector>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 double calculateMean(const std::vector<double>& values);
-std::vector<double> simpleMovingAverage(const std::vector<double>& values, int window);
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // FUNCTION_UTILS_H_INCLUDED

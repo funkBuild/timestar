@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Time Series Database (TSDB) implementation built with C++23 and the Seastar framework. The database uses TSM (Time-Structured Merge) files for storage and WAL (Write-Ahead Log) for durability.
+This is a Time Series Database (TimeStar) implementation built with C++23 and the Seastar framework. The database uses TSM (Time-Structured Merge) files for storage and WAL (Write-Ahead Log) for durability.
 
 ## Build Commands
 
@@ -17,10 +17,10 @@ cmake ..
 make -j$(nproc)
 
 # Run tests (from build directory)
-./test/tsdb_test
+./test/timestar_test
 
 # Run a specific test
-./test/tsdb_test --gtest_filter=TestName*
+./test/timestar_test --gtest_filter=TestName*
 
 # Run string tests safely (avoids seastar segfaults)
 ./run_string_tests.sh
@@ -34,18 +34,18 @@ The project includes comprehensive C++ unit tests using Google Test:
 
 ```bash
 # From the build directory, run all tests
-./test/tsdb_test
+./test/timestar_test
 
 # Run specific test suites
-./test/tsdb_test --gtest_filter=MemoryStoreTest*
-./test/tsdb_test --gtest_filter=TSMTest*
-./test/tsdb_test --gtest_filter=QueryParserTest*
+./test/timestar_test --gtest_filter=MemoryStoreTest*
+./test/timestar_test --gtest_filter=TSMTest*
+./test/timestar_test --gtest_filter=QueryParserTest*
 
 # List all available tests
-./test/tsdb_test --gtest_list_tests
+./test/timestar_test --gtest_list_tests
 
 # Run with verbose output
-./test/tsdb_test --gtest_print_time=1
+./test/timestar_test --gtest_print_time=1
 ```
 
 Test coverage includes:
@@ -61,8 +61,8 @@ Test coverage includes:
 The `test_api/` directory contains JavaScript-based API integration tests:
 
 ```bash
-# Start the TSDB server first
-./bin/tsdb_http_server --port 8086
+# Start the TimeStar server first
+./bin/timestar_http_server --port 8086
 
 # In another terminal, navigate to test_api directory
 cd test_api/
@@ -103,10 +103,10 @@ When all tests pass, you should see:
 
 ## Key Executables
 
-- `build/bin/tsdb` - Main TSDB binary
-- `build/bin/tsdb_server` - TSDB server implementation  
-- `build/bin/tsdb_http_server` - HTTP API server with JSON write endpoint
-- `build/test/tsdb_test` - Unit tests using Google Test
+- `build/bin/timestar` - Main TimeStar binary
+- `build/bin/timestar_server` - TimeStar server implementation  
+- `build/bin/timestar_http_server` - HTTP API server with JSON write endpoint
+- `build/test/timestar_test` - Unit tests using Google Test
 
 ## Architecture
 
@@ -185,7 +185,7 @@ The database creates shard directories (`shard_0`, `shard_1`, etc.) in the build
 
 ## String Type Implementation
 
-The TSDB includes full support for string time series data with the following implementation:
+The TimeStar includes full support for string time series data with the following implementation:
 
 ### String Encoder (`lib/string_encoder.hpp/cpp`)
 
@@ -225,7 +225,7 @@ Due to Seastar's architecture limitation (single `app_template` per process), st
 
 ## LevelDB Index System
 
-The TSDB includes a LevelDB-based indexing system for efficient metadata queries and series discovery:
+The TimeStar includes a LevelDB-based indexing system for efficient metadata queries and series discovery:
 
 ### Index Architecture (`lib/leveldb_index.hpp/cpp`)
 
@@ -270,9 +270,9 @@ auto result = co_await engine.queryBySeries("weather",
 
 ## HTTP Write API
 
-The TSDB includes an HTTP server with a JSON-based write API for data ingestion:
+The TimeStar includes an HTTP server with a JSON-based write API for data ingestion:
 
-### Server (`bin/tsdb_http_server.cpp`)
+### Server (`bin/timestar_http_server.cpp`)
 
 - **Port**: Default 8086 (InfluxDB-compatible)
 - **Sharding**: Automatic distribution based on full series key hash (measurement + tags + field)
@@ -337,10 +337,10 @@ The `test/` directory contains all C++ unit and integration tests:
 # Run all tests
 ctest
 # Or run the test binary directly
-./test/tsdb_test
+./test/timestar_test
 
 # Run a specific test
-./test/tsdb_test --gtest_filter=TestName*
+./test/timestar_test --gtest_filter=TestName*
 ```
 
 #### API Tests
@@ -360,15 +360,15 @@ python test_api/test_http_write.py --host localhost --port 8086
 
 ```bash
 # Start with default port (8086)
-./build/bin/tsdb_http_server
+./build/bin/timestar_http_server
 
 # Start with custom port
-./build/bin/tsdb_http_server --port 9000
+./build/bin/timestar_http_server --port 9000
 ```
 
 ## HTTP Query API
 
-The TSDB provides a query endpoint with a simplified string-based query format inspired by time series databases.
+The TimeStar provides a query endpoint with a simplified string-based query format inspired by time series databases.
 
 ### Query Endpoint (`POST /query`)
 
@@ -603,17 +603,17 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
 
 ## Performance Logging Configuration
 
-The TSDB includes compile-time controls for verbose logging in performance-critical paths. This allows developers to enable detailed logging for debugging without impacting production performance.
+The TimeStar includes compile-time controls for verbose logging in performance-critical paths. This allows developers to enable detailed logging for debugging without impacting production performance.
 
 ### Logging Control Defines
 
 Located in `lib/utils/logging_config.hpp`:
 
-- **`TSDB_LOG_INSERT_PATH`** (default: 0): Controls logging in the insert/write path
+- **`TIMESTAR_LOG_INSERT_PATH`** (default: 0): Controls logging in the insert/write path
   - Includes: WAL writes, memory store inserts, TSM writes, HTTP write handler
   - Enable by setting to 1 or defining during compilation
 
-- **`TSDB_LOG_QUERY_PATH`** (default: 0): Controls logging in the query/read path  
+- **`TIMESTAR_LOG_QUERY_PATH`** (default: 0): Controls logging in the query/read path  
   - Includes: Query parsing, planning, execution, result merging
   - Enable by setting to 1 or defining during compilation
 
@@ -622,23 +622,23 @@ Located in `lib/utils/logging_config.hpp`:
 #### Method 1: Compile-time flags
 ```bash
 # Enable insert path logging
-cmake -DCMAKE_CXX_FLAGS="-DTSDB_LOG_INSERT_PATH=1" ..
+cmake -DCMAKE_CXX_FLAGS="-DTIMESTAR_LOG_INSERT_PATH=1" ..
 make
 
 # Enable query path logging
-cmake -DCMAKE_CXX_FLAGS="-DTSDB_LOG_QUERY_PATH=1" ..
+cmake -DCMAKE_CXX_FLAGS="-DTIMESTAR_LOG_QUERY_PATH=1" ..
 make
 
 # Enable both
-cmake -DCMAKE_CXX_FLAGS="-DTSDB_LOG_INSERT_PATH=1 -DTSDB_LOG_QUERY_PATH=1" ..
+cmake -DCMAKE_CXX_FLAGS="-DTIMESTAR_LOG_INSERT_PATH=1 -DTIMESTAR_LOG_QUERY_PATH=1" ..
 make
 ```
 
 #### Method 2: Edit the header file
 Edit `lib/utils/logging_config.hpp` and change the default values:
 ```cpp
-#define TSDB_LOG_INSERT_PATH 1  // Enable insert path logging
-#define TSDB_LOG_QUERY_PATH 1   // Enable query path logging
+#define TIMESTAR_LOG_INSERT_PATH 1  // Enable insert path logging
+#define TIMESTAR_LOG_QUERY_PATH 1   // Enable query path logging
 ```
 
 ### Performance Impact

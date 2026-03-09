@@ -1,6 +1,9 @@
 // Tests for the rawValues capacity cap in AggregationState.
 //
-// AggregationState::rawValues is only required for MEDIAN, STDDEV, and STDVAR.
+// AggregationState::rawValues is only required for MEDIAN.  STDDEV and STDVAR
+// use Welford's online M2 accumulator which is O(1) memory and does not need
+// rawValues at all.
+//
 // Without a cap, merging many shards with large result sets would grow rawValues
 // without bound, exhausting process memory.
 //
@@ -9,8 +12,10 @@
 //    rawValuesSaturated = true.
 //  - merge() propagates the saturation flag and stops appending from the other
 //    state's rawValues once the combined total would exceed the limit.
-//  - getValue() returns NaN for MEDIAN, STDDEV, and STDVAR when rawValuesSaturated
-//    is set, signalling that the result would be statistically unreliable.
+//  - getValue() returns NaN for MEDIAN when rawValuesSaturated is set, signalling
+//    that the result would be statistically unreliable.
+//  - STDDEV and STDVAR always return correct results via Welford's M2 accumulator,
+//    regardless of rawValues saturation.
 //  - All other aggregation methods (AVG, MIN, MAX, SUM, COUNT, LATEST, FIRST,
 //    SPREAD) are unaffected because they compute from running scalar accumulators
 //    that are always updated regardless of saturation.
@@ -20,7 +25,7 @@
 #include <cmath>
 #include <vector>
 
-using namespace tsdb;
+using namespace timestar;
 
 // ---------------------------------------------------------------------------
 // Helper: confirm a double is NaN
@@ -101,7 +106,8 @@ TEST(AggregationStateCapTest, AddValue_NonRawMethodsCorrectAfterCap) {
     EXPECT_DOUBLE_EQ(s.getValue(AggregationMethod::COUNT), static_cast<double>(limit + 1));
 }
 
-// When rawValues is saturated, MEDIAN/STDDEV/STDVAR must return NaN.
+// When rawValues is saturated, MEDIAN must return NaN.
+// STDDEV/STDVAR use Welford's M2 accumulator and remain correct.
 TEST(AggregationStateCapTest, AddValue_OrderSensitiveMethodsReturnNaNAfterCap) {
     AggregationState s;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
@@ -112,8 +118,11 @@ TEST(AggregationStateCapTest, AddValue_OrderSensitiveMethodsReturnNaNAfterCap) {
 
     EXPECT_TRUE(s.rawValuesSaturated);
     EXPECT_TRUE(isNaN(s.getValue(AggregationMethod::MEDIAN)));
-    EXPECT_TRUE(isNaN(s.getValue(AggregationMethod::STDDEV)));
-    EXPECT_TRUE(isNaN(s.getValue(AggregationMethod::STDVAR)));
+    // STDDEV/STDVAR use Welford's online algorithm — always correct
+    EXPECT_FALSE(isNaN(s.getValue(AggregationMethod::STDDEV)));
+    EXPECT_FALSE(isNaN(s.getValue(AggregationMethod::STDVAR)));
+    EXPECT_GT(s.getValue(AggregationMethod::STDDEV), 0.0);
+    EXPECT_GT(s.getValue(AggregationMethod::STDVAR), 0.0);
 }
 
 // Just under the limit: MEDIAN should still compute correctly.
@@ -160,10 +169,11 @@ TEST(AggregationStateCapTest, Merge_CombinedExceedsLimit_SetsFlag) {
     EXPECT_LE(a.rawValues.size(), limit);
     EXPECT_EQ(a.count, (half + 1) * 2);
 
-    // Order-sensitive methods must be NaN
+    // MEDIAN must be NaN (incomplete sample)
     EXPECT_TRUE(isNaN(a.getValue(AggregationMethod::MEDIAN)));
-    EXPECT_TRUE(isNaN(a.getValue(AggregationMethod::STDDEV)));
-    EXPECT_TRUE(isNaN(a.getValue(AggregationMethod::STDVAR)));
+    // STDDEV/STDVAR use Welford's M2 — correct even when rawValues saturated
+    EXPECT_FALSE(isNaN(a.getValue(AggregationMethod::STDDEV)));
+    EXPECT_FALSE(isNaN(a.getValue(AggregationMethod::STDVAR)));
 }
 
 // When the source state already has rawValuesSaturated, the destination also
@@ -252,7 +262,8 @@ TEST(AggregationStateCapTest, Merge_DestinationAlreadySaturated_NoFurtherGrowth)
 //  - rawValues.size() must be exactly RAW_VALUES_HARD_LIMIT
 //  - count must be 1,600,000 (scalar accumulator is not capped)
 //  - SUM/AVG/MIN/MAX/COUNT must be correct
-//  - MEDIAN/STDDEV/STDVAR must be NaN
+//  - MEDIAN must be NaN (incomplete sample)
+//  - STDDEV/STDVAR must be correct (Welford's M2 accumulator)
 TEST(AggregationStateCapTest, LargeMultiShardMerge_CorrectBehavior) {
     const size_t shardsCount = 8;
     const size_t pointsPerShard = 200'000;
@@ -294,10 +305,14 @@ TEST(AggregationStateCapTest, LargeMultiShardMerge_CorrectBehavior) {
     EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::MAX), 1.0);
     EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::SPREAD), 0.0);
 
-    // Order-sensitive methods must return NaN (incomplete sample)
+    // MEDIAN must return NaN (incomplete sample)
     EXPECT_TRUE(isNaN(merged.getValue(AggregationMethod::MEDIAN)));
-    EXPECT_TRUE(isNaN(merged.getValue(AggregationMethod::STDDEV)));
-    EXPECT_TRUE(isNaN(merged.getValue(AggregationMethod::STDVAR)));
+    // STDDEV/STDVAR use Welford's M2 — correct even when saturated
+    // All values are 1.0, so variance = 0
+    EXPECT_FALSE(isNaN(merged.getValue(AggregationMethod::STDDEV)));
+    EXPECT_FALSE(isNaN(merged.getValue(AggregationMethod::STDVAR)));
+    EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::STDDEV), 0.0);
+    EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::STDVAR), 0.0);
 }
 
 // ============================================================================

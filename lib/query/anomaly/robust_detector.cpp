@@ -3,7 +3,7 @@
 #include <cmath>
 #include <numeric>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 void RobustDetector::computeBounds(
@@ -38,9 +38,18 @@ void RobustDetector::computeBounds(
 
     // Use MAD (Median Absolute Deviation) for robust scale estimation
     // nth_element is O(N) vs O(N log N) for full sort
-    size_t medianIdx = absResiduals.size() / 2;
-    std::nth_element(absResiduals.begin(), absResiduals.begin() + medianIdx, absResiduals.end());
-    double mad = absResiduals[medianIdx];
+    size_t sz = absResiduals.size();
+    size_t medianIdx = sz / 2;
+    std::nth_element(absResiduals.begin(), absResiduals.begin() + static_cast<ptrdiff_t>(medianIdx), absResiduals.end());
+    double mad;
+    if (sz % 2 == 0 && sz >= 2) {
+        // For even-length: true median is average of elements at [n/2-1] and [n/2]
+        double upperMedian = absResiduals[medianIdx];
+        auto lowerIt = std::max_element(absResiduals.begin(), absResiduals.begin() + static_cast<ptrdiff_t>(medianIdx));
+        mad = (*lowerIt + upperMedian) / 2.0;
+    } else {
+        mad = absResiduals[medianIdx];
+    }
 
     // Convert MAD to standard deviation equivalent
     // For normal distribution: sigma ≈ 1.4826 * MAD
@@ -108,6 +117,14 @@ AnomalyOutput RobustDetector::detect(
         n
     );
 
+    // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
+    // NaN inputs are missing data, not anomalies -- ensure score is 0.
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isnan(input.values[i])) {
+            output.scores[i] = 0.0;
+        }
+    }
+
     // Count anomalies
     output.anomalyCount = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -120,4 +137,4 @@ AnomalyOutput RobustDetector::detect(
 }
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar

@@ -17,8 +17,8 @@
 #include <cmath>
 #include <random>
 
-using namespace tsdb::forecast;
-using namespace tsdb;
+using namespace timestar::forecast;
+using namespace timestar;
 
 class ForecastTest : public ::testing::Test {
 protected:

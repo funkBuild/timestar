@@ -4,7 +4,7 @@
 #include <cmath>
 #include <limits>
 
-using namespace tsdb;
+using namespace timestar;
 
 class ExpressionEvaluatorTest : public ::testing::Test {
 protected:
@@ -599,7 +599,7 @@ TEST_F(ExpressionEvaluatorTest, MonotonicDiffConsistentWithTransformFunctions) {
     auto series = makeSeries(timestamps, values);
     auto evaluatorResult = series.monotonic_diff();
 
-    // Path 2: tsdb::transform::monotonic_diff (transform functions path)
+    // Path 2: timestar::transform::monotonic_diff (transform functions path)
     // This delegates to simd::monotonic_diff which uses SIMD or scalar
     // We just need to verify both paths agree on counter reset behavior
     EXPECT_TRUE(std::isnan(evaluatorResult.values[0]));

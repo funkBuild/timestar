@@ -8,7 +8,7 @@
 #include <filesystem>
 
 #include "engine.hpp"
-#include "tsdb_value.hpp"
+#include "timestar_value.hpp"
 #include "query_result.hpp"
 #include "../test_helpers.hpp"
 
@@ -27,28 +27,28 @@ protected:
     // Helper to insert test data
     seastar::future<> insertTestData(Engine* engine) {
         // Insert data for series: cpu,host=server01,region=us-east usage
-        TSDBInsert<double> insert1("cpu", "usage");
+        TimeStarInsert<double> insert1("cpu", "usage");
         insert1.tags = {{"host", "server01"}, {"region", "us-east"}};
         insert1.timestamps = {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000};
         insert1.values = {10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5};
         co_await engine->insert(insert1);
 
         // Insert data for series: cpu,host=server01,region=us-east temperature
-        TSDBInsert<double> insert2("cpu", "temperature");
+        TimeStarInsert<double> insert2("cpu", "temperature");
         insert2.tags = {{"host", "server01"}, {"region", "us-east"}};
         insert2.timestamps = {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000};
         insert2.values = {60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 68.0, 69.0};
         co_await engine->insert(insert2);
 
         // Insert data for series: cpu,host=server02,region=us-east usage
-        TSDBInsert<double> insert3("cpu", "usage");
+        TimeStarInsert<double> insert3("cpu", "usage");
         insert3.tags = {{"host", "server02"}, {"region", "us-east"}};
         insert3.timestamps = {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000};
         insert3.values = {15.5, 25.5, 35.5, 45.5, 55.5, 65.5, 75.5, 85.5, 95.5, 105.5};
         co_await engine->insert(insert3);
 
         // Insert data for series: memory,host=server01,region=us-east usage
-        TSDBInsert<double> insert4("memory", "usage");
+        TimeStarInsert<double> insert4("memory", "usage");
         insert4.tags = {{"host", "server01"}, {"region", "us-east"}};
         insert4.timestamps = {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000};
         insert4.values = {1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240};
@@ -309,6 +309,60 @@ TEST_F(DeleteE2ETest, DeleteAllMeasurementDataVerifyEmpty) {
         std::string memorySeries = "memory,host=server01,region=us-east usage";
         auto memoryResult = engine->query(memorySeries, 0, UINT64_MAX).get();
         ASSERT_FALSE(isQueryResultEmpty(memoryResult));
+    }).join().get();
+}
+
+TEST_F(DeleteE2ETest, DeleteNonExistentSeriesIsGracefulNoOp) {
+    seastar::thread([this] {
+        ScopedEngine eng;
+        eng.initWithBackground();
+        auto* engine = eng.get();
+
+        // Do NOT insert any data -- engine is empty.
+
+        // deleteByPattern on a measurement that was never written should
+        // return 0 deleted series without throwing or crashing.
+        Engine::DeleteRequest request;
+        request.measurement = "totally_missing";
+        request.tags = {{"host", "ghost"}};
+        request.startTime = 0;
+        request.endTime = UINT64_MAX;
+
+        auto result = engine->deleteByPattern(request).get();
+        EXPECT_EQ(result.seriesDeleted, 0);
+        EXPECT_TRUE(result.deletedSeries.empty());
+    }).join().get();
+}
+
+TEST_F(DeleteE2ETest, DeleteRangeNonExistentSeriesKeyIsGraceful) {
+    seastar::thread([this] {
+        ScopedEngine eng;
+        eng.initWithBackground();
+        auto* engine = eng.get();
+
+        // Engine is empty -- no data has been inserted.
+        // deleteRange on a series key that was never written should
+        // return false (nothing deleted) without throwing.
+        std::string seriesKey = "nonexistent,host=nowhere usage";
+        bool deleted = engine->deleteRange(seriesKey, 0, UINT64_MAX).get();
+        EXPECT_FALSE(deleted);
+    }).join().get();
+}
+
+TEST_F(DeleteE2ETest, QueryNonExistentSeriesReturnsEmptyAfterInsert) {
+    seastar::thread([this] {
+        ScopedEngine eng;
+        eng.initWithBackground();
+        auto* engine = eng.get();
+
+        // Insert some data so the engine is not completely empty
+        insertTestData(engine).get();
+
+        // Query a series key that was never written -- should return
+        // empty/nullopt, not crash.
+        std::string seriesKey = "disk,host=server99,region=eu-west iops";
+        auto result = engine->query(seriesKey, 0, UINT64_MAX).get();
+        EXPECT_TRUE(isQueryResultEmpty(result));
     }).join().get();
 }
 

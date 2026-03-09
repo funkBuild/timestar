@@ -11,7 +11,7 @@
 #include <cmath>
 #include <limits>
 
-namespace tsdb {
+namespace timestar {
 
 // Strategy for aligning multiple time series
 enum class AlignmentStrategy {
@@ -151,6 +151,6 @@ inline std::vector<uint64_t> generateTimestamps(
     return timestamps;
 }
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // SERIES_ALIGNER_H_INCLUDED

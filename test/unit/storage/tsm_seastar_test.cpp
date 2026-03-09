@@ -5,7 +5,7 @@
 
 #include "../../../lib/storage/tsm_writer.hpp"
 #include "../../../lib/storage/tsm.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 #include <seastar/core/coroutine.hh>

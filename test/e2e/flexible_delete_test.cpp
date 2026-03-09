@@ -6,7 +6,7 @@
 #include <chrono>
 
 #include "engine.hpp"
-#include "tsdb_value.hpp"
+#include "timestar_value.hpp"
 #include "../test_helpers.hpp"
 
 class FlexibleDeleteTest : public ::testing::Test {
@@ -45,7 +45,7 @@ protected:
         // Insert data for multiple series with different tags and fields
 
         // Series 1: cpu,host=server01,region=us-east.usage
-        TSDBInsert<double> insert1("cpu", "usage");
+        TimeStarInsert<double> insert1("cpu", "usage");
         insert1.tags = {{"host", "server01"}, {"region", "us-east"}};
         insert1.timestamps = {1000, 2000, 3000, 4000, 5000};
         insert1.values = {10.5, 20.5, 30.5, 40.5, 50.5};
@@ -53,7 +53,7 @@ protected:
         co_await engine->indexMetadata(insert1);
 
         // Series 2: cpu,host=server01,region=us-east.temperature
-        TSDBInsert<double> insert2("cpu", "temperature");
+        TimeStarInsert<double> insert2("cpu", "temperature");
         insert2.tags = {{"host", "server01"}, {"region", "us-east"}};
         insert2.timestamps = {1000, 2000, 3000, 4000, 5000};
         insert2.values = {60.0, 65.0, 70.0, 75.0, 80.0};
@@ -61,7 +61,7 @@ protected:
         co_await engine->indexMetadata(insert2);
 
         // Series 3: cpu,host=server02,region=us-east.usage
-        TSDBInsert<double> insert3("cpu", "usage");
+        TimeStarInsert<double> insert3("cpu", "usage");
         insert3.tags = {{"host", "server02"}, {"region", "us-east"}};
         insert3.timestamps = {1000, 2000, 3000, 4000, 5000};
         insert3.values = {15.5, 25.5, 35.5, 45.5, 55.5};
@@ -69,7 +69,7 @@ protected:
         co_await engine->indexMetadata(insert3);
 
         // Series 4: cpu,host=server01,region=us-west.usage
-        TSDBInsert<double> insert4("cpu", "usage");
+        TimeStarInsert<double> insert4("cpu", "usage");
         insert4.tags = {{"host", "server01"}, {"region", "us-west"}};
         insert4.timestamps = {1000, 2000, 3000, 4000, 5000};
         insert4.values = {12.5, 22.5, 32.5, 42.5, 52.5};
@@ -77,7 +77,7 @@ protected:
         co_await engine->indexMetadata(insert4);
 
         // Series 5: memory,host=server01,region=us-east.usage
-        TSDBInsert<double> insert5("memory", "usage");
+        TimeStarInsert<double> insert5("memory", "usage");
         insert5.tags = {{"host", "server01"}, {"region", "us-east"}};
         insert5.timestamps = {1000, 2000, 3000, 4000, 5000};
         insert5.values = {1024.0, 2048.0, 3072.0, 4096.0, 5120.0};

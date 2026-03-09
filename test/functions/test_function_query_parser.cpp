@@ -13,7 +13,7 @@
 #include <vector>
 #include <string>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 
 class FunctionQueryParserTest : public ::testing::Test {
 protected:

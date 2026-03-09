@@ -4,13 +4,10 @@ import QueryForm from './QueryForm';
 import ResultsTable from './ResultsTable';
 import DerivedQueryForm from './DerivedQueryForm';
 import DerivedResultsTable from './DerivedResultsTable';
-import AnomalyQueryForm from './AnomalyQueryForm';
-import AnomalyResultsTable from './AnomalyResultsTable';
-import ForecastQueryForm from './ForecastQueryForm';
-import ForecastResultsTable from './ForecastResultsTable';
+import FunctionQueryForm from './FunctionQueryForm';
 import './App.css';
 
-const QUERY_MODES = ['standard', 'derived', 'anomaly', 'forecast'];
+const QUERY_MODES = ['standard', 'derived', 'functions'];
 
 function defaultTimeRange() {
   const now = Date.now() * 1_000_000;
@@ -142,7 +139,7 @@ export default function App() {
   return (
     <>
       <header className="app-header">
-        <h1>TSDB Query</h1>
+        <h1>TimeStar</h1>
       </header>
       <div className="app-body">
         <div className="pane-left">
@@ -190,19 +187,16 @@ export default function App() {
           {queryMode === 'derived' && (
             <DerivedQueryForm measurements={measurements} onSubmit={handleDerivedSubmit} loading={loading} />
           )}
-          {queryMode === 'anomaly' && (
-            <AnomalyQueryForm measurements={measurements} onSubmit={handleDerivedSubmit} loading={loading} />
-          )}
-          {queryMode === 'forecast' && (
-            <ForecastQueryForm measurements={measurements} onSubmit={handleDerivedSubmit} loading={loading} />
+          {queryMode === 'functions' && (
+            <FunctionQueryForm measurements={measurements} onSubmit={handleDerivedSubmit} loading={loading} />
           )}
         </div>
         <div className="pane-right">
           {error && <div className="error-banner">{error}</div>}
           {queryMode === 'standard' && <ResultsTable results={results} loading={loading} />}
-          {queryMode === 'derived' && <DerivedResultsTable results={results} loading={loading} />}
-          {queryMode === 'anomaly' && <AnomalyResultsTable results={results} loading={loading} />}
-          {queryMode === 'forecast' && <ForecastResultsTable results={results} loading={loading} />}
+          {(queryMode === 'derived' || queryMode === 'functions') && (
+            <DerivedResultsTable results={results} loading={loading} />
+          )}
         </div>
       </div>
     </>

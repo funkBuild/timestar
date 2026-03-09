@@ -13,7 +13,7 @@
 #include <cmath>
 #include <random>
 
-using namespace tsdb::anomaly;
+using namespace timestar::anomaly;
 
 class AnomalyDetectionTest : public ::testing::Test {
 protected:

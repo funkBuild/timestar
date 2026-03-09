@@ -1,6 +1,6 @@
-# TSDB Test Suite
+# TimeStar Test Suite
 
-This directory contains the test suite for the TSDB project, organized by areas of concern.
+This directory contains the test suite for the TimeStar project, organized by areas of concern.
 
 ## Test Organization
 
@@ -40,8 +40,8 @@ Benchmarks and performance measurement tests.
 
 ### Run All Tests
 ```bash
-make tsdb_test
-./test/tsdb_test
+make timestar_test
+./test/timestar_test
 ```
 
 ### Run Specific Test Categories
@@ -62,24 +62,24 @@ make test-perf
 ### Run Specific Test Suites
 ```bash
 # Run all storage tests
-./test/tsdb_test --gtest_filter="*Storage*"
+./test/timestar_test --gtest_filter="*Storage*"
 
 # Run all query tests
-./test/tsdb_test --gtest_filter="*Query*"
+./test/timestar_test --gtest_filter="*Query*"
 
 # Run specific test class
-./test/tsdb_test --gtest_filter="MemoryStoreTest.*"
+./test/timestar_test --gtest_filter="MemoryStoreTest.*"
 ```
 
 ## Test Executables
 
 The build system creates multiple test executables:
 
-- `tsdb_test` - All tests combined (default)
-- `tsdb_unit_test` - Unit tests only
-- `tsdb_integration_test` - Integration tests only
-- `tsdb_e2e_test` - End-to-end tests only
-- `tsdb_perf_test` - Performance tests only
+- `timestar_test` - All tests combined (default)
+- `timestar_unit_test` - Unit tests only
+- `timestar_integration_test` - Integration tests only
+- `timestar_e2e_test` - End-to-end tests only
+- `timestar_perf_test` - Performance tests only
 
 ## Seastar-Based Tests
 

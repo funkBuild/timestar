@@ -8,7 +8,7 @@
  * These provide significant speedups for large datasets (typically 4-8x).
  *
  * Compile-time control:
- *   - Define TSDB_DISABLE_SIMD to disable all SIMD and use scalar fallbacks
+ *   - Define TIMESTAR_DISABLE_SIMD to disable all SIMD and use scalar fallbacks
  *
  * Runtime behavior:
  *   - Automatically detects CPU capabilities (AVX2/AVX512)
@@ -21,12 +21,12 @@
 #include <cmath>
 #include <algorithm>
 
-#ifndef TSDB_DISABLE_SIMD
+#ifndef TIMESTAR_DISABLE_SIMD
 #include <immintrin.h>
 #include <cpuid.h>
 #endif
 
-namespace tsdb {
+namespace timestar {
 namespace transform {
 namespace simd {
 
@@ -38,7 +38,7 @@ namespace simd {
  * Check if AVX2 is available at runtime
  */
 inline bool isAvx2Available() {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return false;
 #else
     static int cached = -1;
@@ -63,7 +63,7 @@ inline bool isAvx2Available() {
  * Check if AVX512 is available at runtime
  */
 inline bool isAvx512Available() {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return false;
 #else
     static int cached = -1;
@@ -200,7 +200,7 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
 // ============================================================================
 // AVX2 SIMD Implementations (process 4 doubles at a time)
 // ============================================================================
-#ifndef TSDB_DISABLE_SIMD
+#ifndef TIMESTAR_DISABLE_SIMD
 
 namespace avx2 {
 
@@ -575,20 +575,24 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
 
 } // namespace avx2
 
-#endif // !TSDB_DISABLE_SIMD
+#endif // !TIMESTAR_DISABLE_SIMD
 
 // ============================================================================
 // Dispatch Functions - Select SIMD or scalar based on CPU and array size
 // ============================================================================
 
-// Minimum array size to benefit from SIMD (below this, overhead exceeds benefit)
-constexpr size_t SIMD_MIN_SIZE = 16;
+// Minimum array size to benefit from SIMD (below this, overhead exceeds benefit).
+// Set to 8 (two AVX2 iterations of 4 doubles) consistent with simd_aggregator
+// and simd_anomaly which use the same simple single-accumulator 4-wide loops.
+// Modules with 4-accumulator unrolled loops (forecast/) use >= 16 because they
+// process 16 elements per iteration.
+constexpr size_t SIMD_MIN_SIZE = 8;
 
 /**
  * abs() - Absolute value with SIMD dispatch
  */
 inline std::vector<double> abs(const std::vector<double>& values) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::abs(values);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -602,7 +606,7 @@ inline std::vector<double> abs(const std::vector<double>& values) {
  * default_zero() - Replace NaN with zero, SIMD dispatch
  */
 inline std::vector<double> default_zero(const std::vector<double>& values) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::default_zero(values);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -616,7 +620,7 @@ inline std::vector<double> default_zero(const std::vector<double>& values) {
  * count_nonzero() - Count non-zero values, SIMD dispatch
  */
 inline std::vector<double> count_nonzero(const std::vector<double>& values) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::count_nonzero(values);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -630,7 +634,7 @@ inline std::vector<double> count_nonzero(const std::vector<double>& values) {
  * count_not_null() - Count non-null values, SIMD dispatch
  */
 inline std::vector<double> count_not_null(const std::vector<double>& values) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::count_not_null(values);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -644,7 +648,7 @@ inline std::vector<double> count_not_null(const std::vector<double>& values) {
  * clamp_min() - Clamp to minimum, SIMD dispatch
  */
 inline std::vector<double> clamp_min(const std::vector<double>& values, double minVal) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::clamp_min(values, minVal);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -658,7 +662,7 @@ inline std::vector<double> clamp_min(const std::vector<double>& values, double m
  * clamp_max() - Clamp to maximum, SIMD dispatch
  */
 inline std::vector<double> clamp_max(const std::vector<double>& values, double maxVal) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::clamp_max(values, maxVal);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -672,7 +676,7 @@ inline std::vector<double> clamp_max(const std::vector<double>& values, double m
  * cutoff_min() - Set values below threshold to NaN, SIMD dispatch
  */
 inline std::vector<double> cutoff_min(const std::vector<double>& values, double threshold) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::cutoff_min(values, threshold);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -686,7 +690,7 @@ inline std::vector<double> cutoff_min(const std::vector<double>& values, double 
  * cutoff_max() - Set values above threshold to NaN, SIMD dispatch
  */
 inline std::vector<double> cutoff_max(const std::vector<double>& values, double threshold) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::cutoff_max(values, threshold);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -700,7 +704,7 @@ inline std::vector<double> cutoff_max(const std::vector<double>& values, double 
  * diff() - Difference between consecutive points, SIMD dispatch
  */
 inline std::vector<double> diff(const std::vector<double>& values) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::diff(values);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -714,7 +718,7 @@ inline std::vector<double> diff(const std::vector<double>& values) {
  * monotonic_diff() - Monotonic difference, SIMD dispatch
  */
 inline std::vector<double> monotonic_diff(const std::vector<double>& values) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     return scalar::monotonic_diff(values);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -728,7 +732,7 @@ inline std::vector<double> monotonic_diff(const std::vector<double>& values) {
  * multiply_inplace() - Multiply by constant in place, SIMD dispatch
  */
 inline void multiply_inplace(std::vector<double>& values, double factor) {
-#ifdef TSDB_DISABLE_SIMD
+#ifdef TIMESTAR_DISABLE_SIMD
     scalar::multiply_inplace(values, factor);
 #else
     if (values.size() >= SIMD_MIN_SIZE && isAvx2Available()) {
@@ -741,6 +745,6 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
 
 } // namespace simd
 } // namespace transform
-} // namespace tsdb
+} // namespace timestar
 
 #endif // TRANSFORM_FUNCTIONS_SIMD_H_INCLUDED

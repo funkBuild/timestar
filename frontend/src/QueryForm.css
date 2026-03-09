@@ -61,7 +61,7 @@
 }
 
 .type-badge.float { background: rgba(68, 136, 204, 0.2); color: var(--badge-float); }
-.type-badge.bool { background: rgba(204, 136, 68, 0.2); color: var(--badge-bool); }
+.type-badge.bool, .type-badge.boolean { background: rgba(204, 136, 68, 0.2); color: var(--badge-bool); }
 .type-badge.string { background: rgba(68, 204, 136, 0.2); color: var(--badge-string); }
 .type-badge.int, .type-badge.integer { background: rgba(204, 68, 170, 0.2); color: var(--badge-int); }
 

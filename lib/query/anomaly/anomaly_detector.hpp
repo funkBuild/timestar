@@ -3,12 +3,13 @@
 
 #include "anomaly_result.hpp"
 #include <vector>
+#include <span>
 #include <memory>
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 // Input data for anomaly detection
@@ -52,87 +53,33 @@ public:
     virtual bool supportsSeasonality() const = 0;
 
 protected:
-    // Compute anomaly score based on value and bounds
-    // Returns 0 if within bounds, or a score > 0 indicating deviation
-    static double computeScore(double value, double lower, double upper) {
-        if (value < lower) {
-            // Below lower bound
-            double range = upper - lower;
-            if (range > 0) {
-                return (lower - value) / range;
-            }
-            return 1.0;
-        } else if (value > upper) {
-            // Above upper bound
-            double range = upper - lower;
-            if (range > 0) {
-                return (value - upper) / range;
-            }
-            return 1.0;
-        }
-        return 0.0;  // Within bounds
-    }
-
-    // Compute rolling mean for a window
-    static double rollingMean(
-        const std::vector<double>& values,
-        size_t endIdx,
-        size_t windowSize
-    ) {
-        if (endIdx == 0 || windowSize == 0) return 0.0;
-
-        size_t start = (endIdx > windowSize) ? endIdx - windowSize : 0;
-        double sum = 0.0;
-        size_t count = 0;
-
-        for (size_t i = start; i < endIdx; ++i) {
-            if (!std::isnan(values[i])) {
-                sum += values[i];
-                ++count;
-            }
-        }
-
-        return (count > 0) ? sum / count : 0.0;
-    }
-
-    // Compute rolling standard deviation for a window
-    static double rollingStdDev(
-        const std::vector<double>& values,
-        size_t endIdx,
-        size_t windowSize,
-        double mean
-    ) {
-        if (endIdx == 0 || windowSize == 0) return 0.0;
-
-        size_t start = (endIdx > windowSize) ? endIdx - windowSize : 0;
-        double sumSq = 0.0;
-        size_t count = 0;
-
-        for (size_t i = start; i < endIdx; ++i) {
-            if (!std::isnan(values[i])) {
-                double diff = values[i] - mean;
-                sumSq += diff * diff;
-                ++count;
-            }
-        }
-
-        return (count > 1) ? std::sqrt(sumSq / (count - 1)) : 0.0;
-    }
-
     // Estimate data interval from timestamps (in nanoseconds)
     static uint64_t estimateInterval(const std::vector<uint64_t>& timestamps) {
         if (timestamps.size() < 2) {
             return 60000000000ULL;  // Default 1 minute
         }
 
-        // Use median of first few intervals for robustness
+        // Sample gaps from beginning, middle, and end for robustness
+        // against irregular starts/ends
         std::vector<uint64_t> intervals;
-        size_t sampleSize = std::min(timestamps.size() - 1, size_t(10));
+        size_t n = timestamps.size() - 1;
+        size_t samplesPerRegion = std::min(n, size_t(10));
 
-        for (size_t i = 0; i < sampleSize; ++i) {
-            if (timestamps[i + 1] > timestamps[i]) {
-                intervals.push_back(timestamps[i + 1] - timestamps[i]);
+        auto sampleRegion = [&](size_t start, size_t count) {
+            for (size_t i = start; i < start + count && i < n; ++i) {
+                if (timestamps[i + 1] > timestamps[i]) {
+                    intervals.push_back(timestamps[i + 1] - timestamps[i]);
+                }
             }
+        };
+
+        sampleRegion(0, samplesPerRegion);
+        if (n > samplesPerRegion * 2) {
+            size_t mid = n / 2 - samplesPerRegion / 2;
+            sampleRegion(mid, samplesPerRegion);
+        }
+        if (n > samplesPerRegion) {
+            sampleRegion(n - samplesPerRegion, samplesPerRegion);
         }
 
         if (intervals.empty()) {
@@ -148,6 +95,6 @@ protected:
 std::unique_ptr<AnomalyDetector> createDetector(Algorithm algorithm);
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar
 
 #endif // ANOMALY_DETECTOR_H_INCLUDED

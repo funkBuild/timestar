@@ -2,7 +2,7 @@
 #include "../../../lib/query/query_planner.hpp"
 #include "../../../lib/query/query_parser.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 class QueryPlannerTest : public ::testing::Test {
 protected:

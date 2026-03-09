@@ -12,7 +12,7 @@
 
 // Need to include these after filesystem to avoid conflicts
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexAsyncTest : public ::testing::Test {
@@ -36,7 +36,7 @@ SEASTAR_TEST_F(LevelDBIndexAsyncTest, BasicIndexOperations) {
     co_await index.open();
 
     // Test 1: Create a series and get ID
-    TSDBInsert<double> tempInsert("weather", "temperature");
+    TimeStarInsert<double> tempInsert("weather", "temperature");
     tempInsert.addTag("location", "us-midwest");
     tempInsert.addTag("host", "server-01");
 
@@ -48,7 +48,7 @@ SEASTAR_TEST_F(LevelDBIndexAsyncTest, BasicIndexOperations) {
     EXPECT_EQ(seriesId1, seriesId2);
 
     // Test 3: Different field should get different ID
-    TSDBInsert<double> humidityInsert("weather", "humidity");
+    TimeStarInsert<double> humidityInsert("weather", "humidity");
     humidityInsert.addTag("location", "us-midwest");
     humidityInsert.addTag("host", "server-01");
 

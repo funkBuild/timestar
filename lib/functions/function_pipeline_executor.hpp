@@ -11,7 +11,7 @@
 // Forward declarations
 class Engine;
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 class FunctionPipelineExecutor {
 private:
@@ -26,6 +26,6 @@ public:
         std::vector<double>& data);
 };
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED

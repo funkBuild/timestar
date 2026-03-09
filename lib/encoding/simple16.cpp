@@ -160,6 +160,7 @@ std::vector<uint64_t> Simple16::decode(Slice &encoded, unsigned int size){
 
 template<uint64_t n, uint64_t bits>
 bool Simple16::canPack(std::vector<uint64_t> &values, size_t offset){
+    if(offset > values.size()) return false;
     size_t remaining = values.size() - offset;
     if(remaining < n)
         return false;
@@ -216,10 +217,11 @@ void Simple16::packLarge(std::vector<uint64_t> &values, size_t &offset, AlignedB
 
 void Simple16::unpackLarge(Slice &encoded, std::vector<uint64_t> &out) {
     // When we see selector 15, the next word contains the full 64-bit value
-    if (encoded.length<uint64_t>() > 0) {
-        uint64_t fullValue = encoded.read<uint64_t>();
-        out.push_back(fullValue);
+    if (encoded.length<uint64_t>() == 0) {
+        throw std::runtime_error("Simple16 decode: truncated stream at large value (selector 15)");
     }
+    uint64_t fullValue = encoded.read<uint64_t>();
+    out.push_back(fullValue);
 }
 
 size_t Simple16::encodeInto(std::vector<uint64_t> &values, AlignedBuffer &target) {

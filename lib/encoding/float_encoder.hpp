@@ -76,7 +76,7 @@ public:
 
 private:
     static Implementation selectBestImplementation();
-    static Implementation s_forced_impl;
+    static thread_local Implementation s_forced_impl;
 };
 
 /**
@@ -117,7 +117,7 @@ public:
 
 private:
     static Implementation selectBestImplementation();
-    static Implementation s_forced_impl;
+    static thread_local Implementation s_forced_impl;
 };
 
 #endif // FLOAT_ENCODER_MAIN_H_INCLUDED

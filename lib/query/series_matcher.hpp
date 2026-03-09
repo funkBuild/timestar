@@ -5,7 +5,7 @@
 #include <map>
 #include <regex>
 
-namespace tsdb {
+namespace timestar {
 
 enum class ScopeMatchType { EXACT, WILDCARD, REGEX };
 
@@ -66,6 +66,6 @@ private:
     static std::string wildcardToRegex(const std::string& pattern);
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // SERIES_MATCHER_H_INCLUDED

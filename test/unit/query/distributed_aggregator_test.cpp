@@ -4,7 +4,7 @@
 #include <vector>
 #include <cmath>
 
-using namespace tsdb;
+using namespace timestar;
 
 // Test fixture for distributed aggregation tests
 class DistributedAggregatorTest : public ::testing::Test {

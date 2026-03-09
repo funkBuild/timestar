@@ -6,9 +6,9 @@
 #include <chrono>
 #include <random>
 
-// TSDB Core
+// TimeStar Core
 #include "core/engine.hpp"
-#include "core/tsdb_value.hpp"
+#include "core/timestar_value.hpp"
 #include "query/query_result.hpp"
 #include "storage/memory_store.hpp"
 #include "storage/wal_file_manager.hpp"
@@ -23,7 +23,7 @@
 #include "functions/function_pipeline_executor.hpp"
 #include "functions/function_http_handler.hpp"
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using ::testing::_;
 using ::testing::DoubleNear;
 using ::testing::ElementsAre;
@@ -39,7 +39,7 @@ protected:
         // Create unique test directory for this test run
         auto now = std::chrono::system_clock::now().time_since_epoch();
         auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-        testDataDir = std::string("/tmp/tsdb_test_") + std::to_string(millis);
+        testDataDir = std::string("/tmp/timestar_test_") + std::to_string(millis);
         
         // Clean up any existing directory
         std::filesystem::remove_all(testDataDir);
@@ -107,36 +107,39 @@ protected:
     
     void generateRegularTimeSeries() {
         // Create regular 1-minute interval temperature data
-        TSDBInsert<double> tempData("weather", "temperature");
+        TimeStarInsert<double> tempData("weather", "temperature");
         tempData.addTag("location", "datacenter_1");
         tempData.addTag("host", "server_01");
-        
+
+        std::mt19937 rng(123); // Fixed seed for reproducible tests
+        std::uniform_int_distribution<int> noiseDist(0, 9);
+
         uint64_t baseTime = 1609459200000000000ULL; // Jan 1, 2021 00:00:00 UTC in nanoseconds
         for (int i = 0; i < 1440; i++) { // 24 hours of data
             uint64_t timestamp = baseTime + (i * 60 * 1000000000ULL); // 1-minute intervals
-            double temp = 20.0 + 10.0 * std::sin(i * 3.14159 / 120) + (rand() % 10 - 5) * 0.1; // Sine wave with noise
+            double temp = 20.0 + 10.0 * std::sin(i * 3.14159 / 120) + (noiseDist(rng) - 5) * 0.1; // Sine wave with noise
             tempData.addValue(timestamp, temp);
         }
-        
+
         engine->insert(tempData).get();
-        
+
         // Create humidity data for the same location
-        TSDBInsert<double> humidityData("weather", "humidity");
+        TimeStarInsert<double> humidityData("weather", "humidity");
         humidityData.addTag("location", "datacenter_1");
         humidityData.addTag("host", "server_01");
-        
+
         for (int i = 0; i < 1440; i++) {
             uint64_t timestamp = baseTime + (i * 60 * 1000000000ULL);
-            double humidity = 60.0 + 20.0 * std::cos(i * 3.14159 / 180) + (rand() % 10 - 5) * 0.2;
+            double humidity = 60.0 + 20.0 * std::cos(i * 3.14159 / 180) + (noiseDist(rng) - 5) * 0.2;
             humidityData.addValue(timestamp, humidity);
         }
-        
+
         engine->insert(humidityData).get();
     }
     
     void generateIrregularTimeSeries() {
         // Create irregular interval data (simulating sporadic sensor readings)
-        TSDBInsert<double> powerData("system", "power_usage");
+        TimeStarInsert<double> powerData("system", "power_usage");
         powerData.addTag("location", "datacenter_2");
         powerData.addTag("host", "server_02");
         
@@ -144,9 +147,10 @@ protected:
         std::mt19937 gen(42); // Fixed seed for reproducible tests
         std::uniform_int_distribution<> intervalDist(30, 300); // 30s to 5min intervals
         
+        std::uniform_int_distribution<int> powerNoiseDist(0, 19);
         uint64_t currentTime = baseTime;
         for (int i = 0; i < 200; i++) {
-            double power = 100.0 + 50.0 * std::sin(i * 0.1) + (rand() % 20 - 10);
+            double power = 100.0 + 50.0 * std::sin(i * 0.1) + (powerNoiseDist(gen) - 10);
             powerData.addValue(currentTime, power);
             currentTime += intervalDist(gen) * 1000000000ULL; // Random interval
         }
@@ -156,7 +160,7 @@ protected:
     
     void generateMixedTypeData() {
         // Create boolean status data
-        TSDBInsert<bool> statusData("system", "online");
+        TimeStarInsert<bool> statusData("system", "online");
         statusData.addTag("location", "datacenter_1");
         statusData.addTag("host", "server_01");
         
@@ -170,7 +174,7 @@ protected:
         engine->insert(statusData).get();
         
         // Create string log level data
-        TSDBInsert<std::string> logData("system", "log_level");
+        TimeStarInsert<std::string> logData("system", "log_level");
         logData.addTag("location", "datacenter_1");
         logData.addTag("host", "server_01");
         
@@ -187,25 +191,27 @@ protected:
     void generateCrossShardData() {
         // Generate data that would be distributed across multiple shards
         // (simulating what would happen in a real multi-shard environment)
-        
+
         std::vector<std::string> locations = {"us-west", "us-east", "eu-west", "asia-pacific"};
         std::vector<std::string> hosts = {"web-01", "web-02", "db-01", "db-02", "cache-01"};
-        
+
         uint64_t baseTime = 1609459200000000000ULL;
-        
+        std::mt19937 rng(99); // Fixed seed for reproducible tests
+        std::uniform_int_distribution<int> cpuNoiseDist(0, 19);
+
         for (const auto& location : locations) {
             for (const auto& host : hosts) {
-                TSDBInsert<double> cpuData("system", "cpu_usage");
+                TimeStarInsert<double> cpuData("system", "cpu_usage");
                 cpuData.addTag("location", location);
                 cpuData.addTag("host", host);
-                
+
                 // Generate 2 hours of data at 30-second intervals
                 for (int i = 0; i < 240; i++) {
                     uint64_t timestamp = baseTime + (i * 30 * 1000000000ULL);
-                    double cpu = 10.0 + 60.0 * std::sin(i * 0.05) + (rand() % 20 - 10);
+                    double cpu = 10.0 + 60.0 * std::sin(i * 0.05) + (cpuNoiseDist(rng) - 10);
                     cpuData.addValue(timestamp, cpu);
                 }
-                
+
                 engine->insert(cpuData).get();
             }
         }
@@ -213,7 +219,7 @@ protected:
     
     void generateGapData() {
         // Create data with intentional gaps for testing interpolation
-        TSDBInsert<double> networkData("system", "network_throughput");
+        TimeStarInsert<double> networkData("system", "network_throughput");
         networkData.addTag("location", "datacenter_3");
         networkData.addTag("host", "server_03");
         
@@ -289,7 +295,7 @@ TEST_F(RealDataIntegrationTest, BasicArithmeticWithRealData) {
     uint64_t endTime = startTime + (3600 * 1000000000ULL); // 1 hour of data
     
     auto realData = queryRealData("weather", "temperature", tags, startTime, endTime);
-    ASSERT_GT(realData.size(), 0) << "No real data retrieved from TSDB";
+    ASSERT_GT(realData.size(), 0) << "No real data retrieved from TimeStar";
     
     // Apply arithmetic functions to real data
     DoubleSeriesView dataView = realData.asView();
@@ -520,7 +526,7 @@ TEST_F(RealDataIntegrationTest, PerformanceComparisonRealVsMock) {
 // Test 7: Time Series Integrity After TSM Storage
 TEST_F(RealDataIntegrationTest, DataIntegrityAfterTSMStorage) {
     // Store original data before rollover
-    TSDBInsert<double> originalData("integrity_test", "value");
+    TimeStarInsert<double> originalData("integrity_test", "value");
     originalData.addTag("test", "integrity");
     
     std::vector<uint64_t> originalTimestamps;
@@ -573,16 +579,18 @@ TEST_F(RealDataIntegrationTest, DataIntegrityAfterTSMStorage) {
 // Test 8: Large Dataset Function Operations  
 TEST_F(RealDataIntegrationTest, LargeDatasetFunctionOperations) {
     // Generate large dataset (simulate 1 week of minute-interval data)
-    TSDBInsert<double> largeData("performance", "metric");
+    TimeStarInsert<double> largeData("performance", "metric");
     largeData.addTag("dataset", "large");
     largeData.addTag("test", "performance");
     
     uint64_t baseTime = 1609459200000000000ULL;
     const int dataPoints = 10080; // 1 week of minute data
-    
+
+    std::mt19937 rng(77); // Fixed seed for reproducible tests
+    std::uniform_int_distribution<int> noiseDist(0, 9);
     for (int i = 0; i < dataPoints; i++) {
         uint64_t timestamp = baseTime + (i * 60 * 1000000000ULL);
-        double value = 50.0 + 25.0 * std::sin(i * 0.01) + (rand() % 10 - 5) * 0.1;
+        double value = 50.0 + 25.0 * std::sin(i * 0.01) + (noiseDist(rng) - 5) * 0.1;
         largeData.addValue(timestamp, value);
     }
     

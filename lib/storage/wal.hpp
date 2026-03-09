@@ -4,7 +4,7 @@
 #include "memory_store.hpp"
 #include "series_id.hpp"
 #include "slice_buffer.hpp"
-#include "tsdb_value.hpp"
+#include "timestar_value.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -164,11 +164,6 @@ private:
   // no synchronization needed (Seastar shard-per-core model).
   CompressionStats _compressionStats;
 
-  // Legacy leftover counter (kept to avoid changing user code paths/logging);
-  // not used by the streaming implementation but referenced in wal.cpp
-  // destructor.
-  size_t bufferPos = 0;
-
   // Flush buffered bytes and ensure durability (fdatasync)
   seastar::future<> flushBlock();
 
@@ -179,15 +174,15 @@ public:
   seastar::future<> init(MemoryStore *store, bool isRecovery = false);
 
   // Insert a single series write
-  template <class T> seastar::future<WALInsertResult> insert(TSDBInsert<T> &insertRequest);
+  template <class T> seastar::future<WALInsertResult> insert(TimeStarInsert<T> &insertRequest);
 
   // Lightweight upper-bound size estimation for capacity/rollover decisions
   // (does not perform actual encoding)
-  template <class T> size_t estimateInsertSize(TSDBInsert<T> &insertRequest);
+  template <class T> size_t estimateInsertSize(TimeStarInsert<T> &insertRequest);
 
   // Batch insert for multiple series at once (coalesces I/O)
   template <class T>
-  seastar::future<WALInsertResult> insertBatch(std::vector<TSDBInsert<T>> &insertRequests);
+  seastar::future<WALInsertResult> insertBatch(std::vector<TimeStarInsert<T>> &insertRequests);
 
 private:
   // Encode a single insert entry (header + payload + CRC) into the provided
@@ -196,7 +191,7 @@ private:
   // for pre-allocating sufficient capacity.  Non-static: updates
   // _compressionStats with observed compression ratios after encoding.
   template <class T>
-  void encodeInsertEntry(AlignedBuffer &buffer, TSDBInsert<T> &insertRequest);
+  void encodeInsertEntry(AlignedBuffer &buffer, TimeStarInsert<T> &insertRequest);
 
 public:
 
@@ -226,7 +221,7 @@ private:
   size_t length = 0;
 
   template <class T>
-  TSDBInsert<T> readSeries(Slice &walSlice, const std::string &seriesKey);
+  TimeStarInsert<T> readSeries(Slice &walSlice, const std::string &seriesKey);
 
 public:
   WALReader(std::string filename);

@@ -3,12 +3,14 @@
 
 #include "aggregator.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <numeric>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
-#include <cstdint>
 
-namespace tsdb {
+namespace timestar {
 
 // Stateful sink that folds decoded (timestamp, value) pairs directly into
 // AggregationState(s), avoiding intermediate vector materialisation.
@@ -23,6 +25,10 @@ public:
     // Maximum number of buckets to pre-allocate (guards against pathological inputs
     // such as a tiny interval over a very large time range).
     static constexpr size_t MAX_PREALLOCATED_BUCKETS = 100'000;
+
+    // Maximum number of per-timestamp states in non-bucketed mode.
+    // Each AggregationState is ~96 bytes, so 10M states ≈ ~1GB.
+    static constexpr size_t MAX_UNBUCKETED_STATES = 10'000'000;
 
     BlockAggregator(uint64_t interval) : interval_(interval) {}
 
@@ -48,6 +54,12 @@ public:
     void addPoint(uint64_t timestamp, double value) {
         ++pointCount_;
         if (interval_ == 0) {
+            if (timestamps_.size() >= MAX_UNBUCKETED_STATES) [[unlikely]] {
+                throw std::runtime_error(
+                    "Non-bucketed aggregation exceeded " +
+                    std::to_string(MAX_UNBUCKETED_STATES) +
+                    " states; use an aggregationInterval to reduce cardinality");
+            }
             timestamps_.push_back(timestamp);
             AggregationState s;
             s.addValue(value, timestamp);
@@ -63,6 +75,12 @@ public:
                    const std::vector<double>& values) {
         pointCount_ += timestamps.size();
         if (interval_ == 0) {
+            if (timestamps_.size() + timestamps.size() > MAX_UNBUCKETED_STATES) [[unlikely]] {
+                throw std::runtime_error(
+                    "Non-bucketed aggregation exceeded " +
+                    std::to_string(MAX_UNBUCKETED_STATES) +
+                    " states; use an aggregationInterval to reduce cardinality");
+            }
             timestamps_.reserve(timestamps_.size() + timestamps.size());
             states_.reserve(states_.size() + timestamps.size());
             for (size_t i = 0; i < timestamps.size(); ++i) {
@@ -137,6 +155,6 @@ struct PushdownResult {
     size_t totalPoints = 0;
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // BLOCK_AGGREGATOR_H_INCLUDED

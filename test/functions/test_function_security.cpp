@@ -1,5 +1,5 @@
 /*
- * Security Validation Tests for TSDB Function System
+ * Security Validation Tests for TimeStar Function System
  * 
  * This file contains comprehensive security tests to protect against:
  * - Parameter injection attacks (code execution, command injection)
@@ -32,7 +32,7 @@
 #include "../../lib/functions/function_query_parser.hpp"
 #include "../../lib/core/engine.hpp"
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 
 class FunctionSecurityTest : public ::testing::Test {
 protected:
@@ -768,22 +768,4 @@ TEST_F(FunctionSecurityTest, ErrorMessageInformationDisclosure) {
     }
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    
-    std::cout << "Starting TSDB Function Security Tests..." << std::endl;
-    std::cout << "=========================================" << std::endl;
-    
-    int result = RUN_ALL_TESTS();
-    
-    std::cout << "=========================================" << std::endl;
-    if (result == 0) {
-        std::cout << "All security tests PASSED!" << std::endl;
-        std::cout << "The function system has basic security protection against common attacks." << std::endl;
-    } else {
-        std::cout << "Some security tests FAILED!" << std::endl;
-        std::cout << "Security vulnerabilities may exist in the function system." << std::endl;
-    }
-    
-    return result;
-}
+// main() provided by gtest_main

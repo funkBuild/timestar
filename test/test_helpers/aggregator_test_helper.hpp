@@ -6,7 +6,7 @@
 #include <vector>
 #include <map>
 
-namespace tsdb {
+namespace timestar {
 namespace test {
 
 // Helper class for testing - provides legacy-style interface using distributed aggregation
@@ -104,6 +104,6 @@ public:
 };
 
 } // namespace test
-} // namespace tsdb
+} // namespace timestar
 
 #endif // AGGREGATOR_TEST_HELPER_HPP

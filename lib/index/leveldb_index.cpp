@@ -9,6 +9,8 @@
 #include <cstring>
 #include <filesystem>
 #include <regex>
+#include <set>
+#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 
@@ -33,11 +35,11 @@ seastar::future<> LevelDBIndex::open() {
     // Only shard 0 opens LevelDB for metadata storage
     // Other shards will delegate metadata operations to shard 0
     if (shardId != 0) {
-        tsdb::index_log.info("Shard {} skipping LevelDB index opening - metadata centralized on shard 0", shardId);
+        timestar::index_log.info("Shard {} skipping LevelDB index opening - metadata centralized on shard 0", shardId);
         co_return;
     }
     
-    tsdb::index_log.info("Shard 0 opening centralized metadata LevelDB index");
+    timestar::index_log.info("Shard 0 opening centralized metadata LevelDB index");
     
     // Create index directory if it doesn't exist.
     // Wrap in seastar::async to avoid blocking the reactor thread.
@@ -45,7 +47,7 @@ seastar::future<> LevelDBIndex::open() {
         std::filesystem::create_directories(indexPath);
     });
     
-    const auto& idxCfg = tsdb::config().index;
+    const auto& idxCfg = timestar::config().index;
 
     leveldb::Options options;
     options.create_if_missing = true;
@@ -64,12 +66,12 @@ seastar::future<> LevelDBIndex::open() {
     leveldb::Status status = leveldb::DB::Open(options, indexPath, &dbPtr);
     
     if (!status.ok()) {
-        tsdb::index_log.error("Failed to open LevelDB index: {}", status.ToString());
+        timestar::index_log.error("Failed to open LevelDB index: {}", status.ToString());
         throw std::runtime_error("Failed to open LevelDB index: " + status.ToString());
     }
     
     db.reset(dbPtr);
-    tsdb::index_log.info("LevelDB index opened at: {}", indexPath);
+    timestar::index_log.info("LevelDB index opened at: {}", indexPath);
     
     // SeriesId128 is generated deterministically from SeriesKey - no counter needed
 }
@@ -142,21 +144,49 @@ void LevelDBIndex::seriesCacheEvictIncremental() {
     }
 }
 
+// Escape delimiter characters in index key components to prevent collisions.
+// Delimiters: comma (,), equals (=), space ( ), backslash (\).
+static std::string escapeKeyComponent(const std::string& s) {
+    // Fast path: most strings have no special chars. Check before allocating.
+    bool needsEscape = false;
+    for (char c : s) {
+        if (c == '\\' || c == ',' || c == '=' || c == ' ') {
+            needsEscape = true;
+            break;
+        }
+    }
+    if (!needsEscape) return s;
+
+    std::string out;
+    out.reserve(s.size() + s.size() / 4); // ~25% overhead for escaped chars
+    for (char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case ',':  out += "\\,";  break;
+            case '=':  out += "\\=";  break;
+            case ' ':  out += "\\ ";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
 std::string LevelDBIndex::encodeSeriesKey(const std::string& measurement,
                                          const std::map<std::string, std::string>& tags,
                                          const std::string& field) {
     std::string key;
     key.push_back(static_cast<char>(SERIES_INDEX));
-    
+
     // measurement,tag1=value1,tag2=value2 field
-    key += measurement;
-    
-    // Sort tags for consistent ordering
+    // All components are escaped to prevent delimiter collisions.
+    key += escapeKeyComponent(measurement);
+
+    // Tags are from std::map, already sorted by key
     for (const auto& tag : tags) {
-        key += "," + tag.first + "=" + tag.second;
+        key += "," + escapeKeyComponent(tag.first) + "=" + escapeKeyComponent(tag.second);
     }
-    
-    key += " " + field;
+
+    key += " " + escapeKeyComponent(field);
     return key;
 }
 
@@ -175,6 +205,12 @@ std::string LevelDBIndex::encodeMeasurementTagsKey(const std::string& measuremen
 }
 
 std::string LevelDBIndex::encodeTagValuesKey(const std::string& measurement, const std::string& tagKey) {
+    // Reject embedded null bytes — this key uses \0 as the field separator.
+    if (measurement.find('\0') != std::string::npos ||
+        tagKey.find('\0') != std::string::npos) {
+        throw std::invalid_argument(
+            "Measurement or tag key contains null byte, which is not allowed");
+    }
     std::string key;
     key.push_back(static_cast<char>(TAG_VALUES));
     key += measurement + "\x00" + tagKey; // Use null separator
@@ -182,24 +218,13 @@ std::string LevelDBIndex::encodeTagValuesKey(const std::string& measurement, con
 }
 
 std::string LevelDBIndex::encodeStringSet(const std::set<std::string>& strings) {
-    // Pre-calculate total size to avoid repeated allocations.
-    // Use size_t for the accumulator so the total can exceed UINT32_MAX on
-    // 64-bit platforms without overflow.
-    size_t totalSize = 0;
-    for (const auto& str : strings) {
-        if (str.length() > UINT32_MAX) {
-            throw std::runtime_error("String length " + std::to_string(str.length()) +
-                                     " exceeds maximum encodable length of " + std::to_string(UINT32_MAX));
-        }
-        totalSize += sizeof(uint32_t) + str.length();
-    }
-
+    // Single-pass: estimate total size (assuming typical strings < 256 bytes)
+    // and encode in one iteration. Reserve pessimistically; the result string
+    // will shrink-to-fit on return via move.
     std::string result;
-    result.reserve(totalSize);
+    result.reserve(strings.size() * (sizeof(uint32_t) + 32));
     for (const auto& str : strings) {
         // Length-prefixed encoding: 4-byte little-endian length + string bytes.
-        // Using uint32_t instead of uint16_t avoids overflow for strings longer
-        // than 65535 bytes (UINT16_MAX).
         uint32_t len = static_cast<uint32_t>(str.length());
         result.append(reinterpret_cast<const char*>(&len), sizeof(len));
         result.append(str.data(), len);
@@ -218,7 +243,11 @@ std::set<std::string> LevelDBIndex::decodeStringSet(const std::string& encoded) 
         std::memcpy(&len, data + offset, sizeof(len));
         offset += sizeof(uint32_t);
 
-        if (offset + len > size) break;  // truncated data
+        if (offset + len > size) {
+            timestar::index_log.warn("decodeStringSet: truncated data at offset {} (len={}, remaining={})",
+                                     offset, len, size - offset);
+            break;
+        }
 
         result.emplace(data + offset, len);
         offset += len;
@@ -248,6 +277,7 @@ std::string LevelDBIndex::encodeSeriesMetadataKey(const SeriesId128& seriesId) {
 
 std::string LevelDBIndex::encodeFieldTypeKey(const std::string& measurement, const std::string& field) {
     std::string key;
+    key.reserve(1 + measurement.size() + 1 + field.size());
     key.push_back(static_cast<char>(FIELD_TYPE));
     key += measurement;
     key.push_back('\0');
@@ -318,7 +348,7 @@ std::string LevelDBIndex::encodeSeriesMetadata(const SeriesMetadata& metadata) {
 
         return result;
     } catch (const std::exception& e) {
-        tsdb::index_log.error("encodeSeriesMetadata failed: {}", e.what());
+        timestar::index_log.error("encodeSeriesMetadata failed: {}", e.what());
         throw std::runtime_error(std::string("encodeSeriesMetadata failed: ") + e.what());
     }
 }
@@ -391,7 +421,7 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
 
     // Generate SeriesId128 deterministically from the index-domain series key.
     // Note: encodeSeriesKey() produces a 0x01-prefixed key that differs from
-    // TSDBInsert::seriesKey(), so external IDs cannot be reused here.
+    // TimeStarInsert::seriesKey(), so external IDs cannot be reused here.
     std::string seriesKeyStr = encodeSeriesKey(measurement, tags, field);
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKeyStr);
 
@@ -400,25 +430,25 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     // No mutex needed: Seastar's shard-per-core model guarantees single-threaded access.
     if (seriesCacheContains(seriesKeyStr)) {
         // Already indexed - just return the computed SeriesId
-        LOG_INSERT_PATH(tsdb::index_log, trace, "[INDEX] Cache hit for series: '{}'", seriesKeyStr);
+        LOG_INSERT_PATH(timestar::index_log, trace, "[INDEX] Cache hit for series: '{}'", seriesKeyStr);
         co_return seriesId;
     }
 
     // Cache miss - need to check if it exists in LevelDB (handles restarts).
     // Check metadata directly using the already-computed seriesId instead of
     // calling getSeriesId() which would redundantly recompute encodeSeriesKey + XXH3.
-    LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Cache miss for series: '{}', checking LevelDB", seriesKeyStr);
+    LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] Cache miss for series: '{}', checking LevelDB", seriesKeyStr);
     auto existingMetadata = co_await getSeriesMetadata(seriesId);
     if (existingMetadata.has_value()) {
         // Exists in LevelDB but not in cache (likely after restart) - add to cache.
         // seriesCacheInsert handles incremental eviction of the retired generation.
         seriesCacheInsert(seriesKeyStr);
-        LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Series found in LevelDB, added to cache: '{}'", seriesKeyStr);
+        LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] Series found in LevelDB, added to cache: '{}'", seriesKeyStr);
         co_return seriesId;
     }
 
     // Series doesn't exist - create it
-    LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Creating new series index: '{}'", seriesKeyStr);
+    LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] Creating new series index: '{}'", seriesKeyStr);
 
     // Phase A: Pre-load any field/tag cache misses from LevelDB so that the
     // batch below can include the complete, merged field/tag sets.
@@ -477,15 +507,17 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
             return result;
         });
 
-        // Populate caches back on the reactor thread (safe, single-threaded)
+        // Merge loaded data into caches. We must merge (not overwrite) because
+        // concurrent coroutines may have already populated the cache with new
+        // entries between our cache-miss check and this resume point.
         if (fieldsCacheMiss) {
-            fieldsCache[measurement] = std::move(loaded.fields);
+            fieldsCache[measurement].insert(loaded.fields.begin(), loaded.fields.end());
         }
         if (tagsCacheMiss) {
-            tagsCache[measurement] = std::move(loaded.tagKeys);
+            tagsCache[measurement].insert(loaded.tagKeys.begin(), loaded.tagKeys.end());
         }
         for (auto& [tvCacheKey, values] : loaded.tagValues) {
-            tagValuesCache[tvCacheKey] = std::move(values);
+            tagValuesCache[tvCacheKey].insert(values.begin(), values.end());
         }
     }
 
@@ -583,7 +615,7 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
         msIt->second.push_back(seriesId);
     }
 
-    tsdb::index_log.debug("Created new series ID {} for key: {}", seriesId.toHex(), seriesKeyStr);
+    timestar::index_log.debug("Created new series ID {} for key: {}", seriesId.toHex(), seriesKeyStr);
 
     // Add to cache now that it's written. Move is safe since seriesKeyStr is
     // not used after this point. seriesCacheInsert handles incremental eviction.
@@ -632,10 +664,13 @@ seastar::future<> LevelDBIndex::addField(const std::string& measurement, const s
         }
         cacheIt->second.insert(field);
     } else {
-        // Cache miss: load from LevelDB and populate cache
+        // Cache miss: load from LevelDB and merge into cache.
+        // Must merge (not overwrite) because a concurrent coroutine may have
+        // populated the cache between our find() and this resume point.
         auto fields = co_await getFields(measurement);
-        fields.insert(field);
-        fieldsCache[measurement] = std::move(fields);
+        auto& cached = fieldsCache[measurement];
+        cached.insert(fields.begin(), fields.end());
+        cached.insert(field);
     }
 
     // Write the full set to LevelDB (offload blocking I/O to Seastar thread pool)
@@ -670,11 +705,14 @@ seastar::future<> LevelDBIndex::addTag(const std::string& measurement, const std
             tagsNeedWrite = true;
         }
     } else {
-        // Cache miss: load from LevelDB and populate cache
+        // Cache miss: load from LevelDB and merge into cache.
+        // Must merge (not overwrite) because a concurrent coroutine may have
+        // populated the cache between our find() and this resume point.
         auto tags = co_await getTags(measurement);
-        tagsNeedWrite = (tags.count(tagKey) == 0);
-        tags.insert(tagKey);
-        tagsCache[measurement] = std::move(tags);
+        auto& cached = tagsCache[measurement];
+        cached.insert(tags.begin(), tags.end());
+        tagsNeedWrite = (cached.count(tagKey) == 0);
+        cached.insert(tagKey);
     }
 
     // Check tag values cache
@@ -687,11 +725,14 @@ seastar::future<> LevelDBIndex::addTag(const std::string& measurement, const std
             tagValuesNeedWrite = true;
         }
     } else {
-        // Cache miss: load from LevelDB and populate cache
+        // Cache miss: load from LevelDB and merge into cache.
+        // Must merge (not overwrite) because a concurrent coroutine may have
+        // populated the cache between our find() and this resume point.
         auto tagValues = co_await getTagValues(measurement, tagKey);
-        tagValuesNeedWrite = (tagValues.count(tagValue) == 0);
-        tagValues.insert(tagValue);
-        tagValuesCache[tagValuesCacheKey] = std::move(tagValues);
+        auto& cached = tagValuesCache[tagValuesCacheKey];
+        cached.insert(tagValues.begin(), tagValues.end());
+        tagValuesNeedWrite = (cached.count(tagValue) == 0);
+        cached.insert(tagValue);
     }
 
     // Only write to LevelDB if something changed
@@ -843,15 +884,17 @@ seastar::future<> LevelDBIndex::addFieldsAndTags(const std::string& measurement,
             return result;
         });
 
-        // Populate caches back on the reactor thread (safe, single-threaded)
+        // Merge loaded data into caches. We must merge (not overwrite) because
+        // concurrent coroutines may have already populated the cache with new
+        // entries between our cache-miss check and this resume point.
         if (needFieldsLoad) {
-            fieldsCache[measurement] = std::move(loaded.fields);
+            fieldsCache[measurement].insert(loaded.fields.begin(), loaded.fields.end());
         }
         if (needTagsLoad) {
-            tagsCache[measurement] = std::move(loaded.tagKeys);
+            tagsCache[measurement].insert(loaded.tagKeys.begin(), loaded.tagKeys.end());
         }
         for (auto& [tvCacheKey, values] : loaded.tagValues) {
-            tagValuesCache[tvCacheKey] = std::move(values);
+            tagValuesCache[tvCacheKey].insert(values.begin(), values.end());
         }
     }
 
@@ -952,7 +995,7 @@ seastar::future<std::set<std::string>> LevelDBIndex::getAllMeasurements() {
         return result;
     });
 
-    tsdb::index_log.debug("Found {} measurements in index", measurements.size());
+    timestar::index_log.debug("Found {} measurements in index", measurements.size());
     co_return measurements;
 }
 
@@ -1089,11 +1132,11 @@ seastar::future<std::set<std::string>> LevelDBIndex::getTagValues(const std::str
 }
 
 template<class T>
-seastar::future<SeriesId128> LevelDBIndex::indexInsert(const TSDBInsert<T>& insert) {
+seastar::future<SeriesId128> LevelDBIndex::indexInsert(const TimeStarInsert<T>& insert) {
     // seriesKey() is const (uses mutable cache internally) -- no copy needed
     const std::string& seriesKeyStr = insert.seriesKey();
 
-    LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] indexInsert called for measurement: '{}', field: '{}', series key: '{}'",
+    LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] indexInsert called for measurement: '{}', field: '{}', series key: '{}'",
                     insert.measurement, insert.field, seriesKeyStr);
 
     SeriesId128 seriesId = co_await getOrCreateSeriesId(insert.measurement, insert.getTags(), insert.field);
@@ -1118,7 +1161,7 @@ seastar::future<SeriesId128> LevelDBIndex::indexInsert(const TSDBInsert<T>& inse
         }
     }
 
-    LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] indexInsert completed - series ID: {} for series: '{}'",
+    LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] indexInsert completed - series ID: {} for series: '{}'",
                     seriesId.toHex(), seriesKeyStr);
 
     co_return seriesId;
@@ -1135,7 +1178,7 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
         co_return;
     }
 
-    LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] indexMetadataBatch called with {} ops", ops.size());
+    LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] indexMetadataBatch called with {} ops", ops.size());
 
     // Phase 1: Identify which series are new (not in cache).
     // Collect cache misses that need a LevelDB existence check.
@@ -1154,7 +1197,7 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
 
         if (seriesCacheContains(seriesKeyStr)) {
             // Already in cache - still need to check field type cache below
-            LOG_INSERT_PATH(tsdb::index_log, trace, "[INDEX] Batch cache hit for series: '{}'", seriesKeyStr);
+            LOG_INSERT_PATH(timestar::index_log, trace, "[INDEX] Batch cache hit for series: '{}'", seriesKeyStr);
         } else {
             pending.push_back({i, std::move(seriesKeyStr), seriesId, false});
         }
@@ -1184,7 +1227,7 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
         for (auto& p : pending) {
             if (!p.isNew) {
                 seriesCacheInsert(p.seriesKeyStr);
-                LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] Batch: series found in LevelDB, added to cache: '{}'", p.seriesKeyStr);
+                LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] Batch: series found in LevelDB, added to cache: '{}'", p.seriesKeyStr);
             }
         }
     }
@@ -1258,32 +1301,61 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
 
     // Phase 4: Collect field, tag, and field-type updates for ALL ops (not just new series).
     // Even cached series need field type checks on first batch call after restart.
+
+    // Phase 4a: Pre-load all cache misses BEFORE the mutation loop to avoid
+    // co_await inside the loop (which would allow concurrent coroutines to
+    // interleave and create inconsistent batch state).
+    {
+        std::unordered_set<std::string> measurementsNeedingFieldLoad;
+        std::unordered_set<std::string> measurementsNeedingTagLoad;
+        std::unordered_set<std::string> tvCacheKeysNeedingLoad;
+        for (const auto& op : ops) {
+            if (fieldsCache.find(op.measurement) == fieldsCache.end()) {
+                measurementsNeedingFieldLoad.insert(op.measurement);
+            }
+            if (tagsCache.find(op.measurement) == tagsCache.end()) {
+                measurementsNeedingTagLoad.insert(op.measurement);
+            }
+            for (const auto& [tagKey, tagValue] : op.tags) {
+                std::string tvCacheKey = op.measurement + std::string(1, '\0') + tagKey;
+                if (tagValuesCache.find(tvCacheKey) == tagValuesCache.end()) {
+                    tvCacheKeysNeedingLoad.insert(tvCacheKey);
+                }
+            }
+        }
+        // Load all misses (each co_await happens before the mutation loop)
+        for (const auto& m : measurementsNeedingFieldLoad) {
+            auto fields = co_await getFields(m);
+            fieldsCache[m].insert(fields.begin(), fields.end());
+        }
+        for (const auto& m : measurementsNeedingTagLoad) {
+            auto tags = co_await getTags(m);
+            tagsCache[m].insert(tags.begin(), tags.end());
+        }
+        for (const auto& tvCacheKey : tvCacheKeysNeedingLoad) {
+            auto nullPos = tvCacheKey.find('\0');
+            std::string m = tvCacheKey.substr(0, nullPos);
+            std::string tk = tvCacheKey.substr(nullPos + 1);
+            auto vals = co_await getTagValues(m, tk);
+            tagValuesCache[tvCacheKey].insert(vals.begin(), vals.end());
+        }
+    }
+
+    // Phase 4b: Mutation loop — no co_await, runs atomically.
     for (const auto& op : ops) {
         // Track field additions via in-memory cache
-        auto& fieldSet = fieldsCache[op.measurement];
-        if (fieldSet.empty()) {
-            // Cache miss: need to load from LevelDB
-            auto fields = co_await getFields(op.measurement);
-            fieldSet.insert(fields.begin(), fields.end());
-        }
-        if (fieldSet.insert(op.fieldName).second) {
+        if (fieldsCache[op.measurement].insert(op.fieldName).second) {
             newFields[op.measurement].insert(op.fieldName);
         }
 
         // Track tag additions via in-memory caches
         for (const auto& [tagKey, tagValue] : op.tags) {
-            auto& tagKeySet = tagsCache[op.measurement];
-            if (tagKeySet.empty()) {
-                // Note: empty could mean genuinely empty or cache miss.
-                // Use a sentinel or check LevelDB. For safety, load on first access per measurement.
-            }
-            if (tagKeySet.insert(tagKey).second) {
+            if (tagsCache[op.measurement].insert(tagKey).second) {
                 newTagKeys[op.measurement].insert(tagKey);
             }
 
             std::string tvCacheKey = op.measurement + std::string(1, '\0') + tagKey;
-            auto& tvSet = tagValuesCache[tvCacheKey];
-            if (tvSet.insert(tagValue).second) {
+            if (tagValuesCache[tvCacheKey].insert(tagValue).second) {
                 newTagValues[tvCacheKey].insert(tagValue);
             }
         }
@@ -1308,40 +1380,26 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
     }
 
     // Phase 5: Write accumulated field/tag metadata to the batch.
+    // Caches are already pre-loaded from Phase 4a, so no LevelDB loads needed here.
     for (const auto& [measurement, fields] : newFields) {
         std::string key = encodeMeasurementFieldsKey(measurement);
         batch.Put(key, encodeStringSet(fieldsCache[measurement]));
         batchHasData = true;
     }
 
-    // For tag keys, we need the full set per measurement.
-    // Load from LevelDB on cache miss, merge, and write.
     for (const auto& [measurement, tagKeys] : newTagKeys) {
-        auto& tagKeySet = tagsCache[measurement];
-        // If cache was empty before we inserted, load from LevelDB to ensure correctness
-        if (tagKeySet.size() == tagKeys.size()) {
-            // All entries are new (cache was empty) - might need LevelDB load
-            auto existing = co_await getTags(measurement);
-            tagKeySet.insert(existing.begin(), existing.end());
-        }
         std::string key = encodeMeasurementTagsKey(measurement);
-        batch.Put(key, encodeStringSet(tagKeySet));
+        batch.Put(key, encodeStringSet(tagsCache[measurement]));
         batchHasData = true;
     }
 
     for (const auto& [tvCacheKey, tagValues] : newTagValues) {
-        auto& tvSet = tagValuesCache[tvCacheKey];
-        // Extract measurement and tagKey from cache key (separated by '\0')
+        std::string key;
         auto nullPos = tvCacheKey.find('\0');
         std::string measurement = tvCacheKey.substr(0, nullPos);
         std::string tagKey = tvCacheKey.substr(nullPos + 1);
-        // If cache was populated only by this batch, load existing from LevelDB
-        if (tvSet.size() == tagValues.size()) {
-            auto existing = co_await getTagValues(measurement, tagKey);
-            tvSet.insert(existing.begin(), existing.end());
-        }
-        std::string key = encodeTagValuesKey(measurement, tagKey);
-        batch.Put(key, encodeStringSet(tvSet));
+        key = encodeTagValuesKey(measurement, tagKey);
+        batch.Put(key, encodeStringSet(tagValuesCache[tvCacheKey]));
         batchHasData = true;
     }
 
@@ -1353,7 +1411,7 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
         if (!status.ok()) {
             throw std::runtime_error("Failed to write metadata batch: " + status.ToString());
         }
-        LOG_INSERT_PATH(tsdb::index_log, debug, "[INDEX] indexMetadataBatch wrote batch for {} ops", ops.size());
+        LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] indexMetadataBatch wrote batch for {} ops", ops.size());
     }
 
     co_return;
@@ -1363,12 +1421,12 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>>
 LevelDBIndex::findSeries(const std::string& measurement,
                           const std::map<std::string, std::string>& tagFilters,
                           size_t maxSeries) {
-    tsdb::index_log.debug("findSeries called for measurement: {}, with {} tag filters, maxSeries: {}",
+    timestar::index_log.debug("findSeries called for measurement: {}, with {} tag filters, maxSeries: {}",
                          measurement, tagFilters.size(), maxSeries);
 
     if (tagFilters.empty()) {
         // Return all series for measurement (pass limit through for early bailout)
-        tsdb::index_log.debug("No tag filters, getting all series for measurement");
+        timestar::index_log.debug("No tag filters, getting all series for measurement");
         co_return co_await getAllSeriesForMeasurement(measurement, maxSeries);
     }
 
@@ -1387,17 +1445,17 @@ LevelDBIndex::findSeries(const std::string& measurement,
 
     for (const auto& [tagKey, tagValue] : tagFilters) {
         std::vector<SeriesId128> tagResults;
-        if (tsdb::SeriesMatcher::classifyScope(tagValue) == tsdb::ScopeMatchType::EXACT) {
+        if (timestar::SeriesMatcher::classifyScope(tagValue) == timestar::ScopeMatchType::EXACT) {
             tagResults = co_await findSeriesByTag(measurement, tagKey, tagValue);
         } else {
             tagResults = co_await findSeriesByTagPattern(measurement, tagKey, tagValue);
         }
-        tsdb::index_log.debug("TAG_INDEX filter {}={} returned {} series",
+        timestar::index_log.debug("TAG_INDEX filter {}={} returned {} series",
                              tagKey, tagValue, tagResults.size());
 
         // If any tag filter returns empty, the intersection is empty — short-circuit.
         if (tagResults.empty()) {
-            tsdb::index_log.info("findSeries returning 0 results for measurement {} (empty tag filter {}={})",
+            timestar::index_log.info("findSeries returning 0 results for measurement {} (empty tag filter {}={})",
                                 measurement, tagKey, tagValue);
             co_return std::vector<SeriesId128>{};
         }
@@ -1447,12 +1505,12 @@ LevelDBIndex::findSeries(const std::string& measurement,
 
     // Check limit on the final intersected result
     if (maxSeries > 0 && results.size() > maxSeries) {
-        tsdb::index_log.info("findSeries: {} results exceed limit of {} for measurement {}",
+        timestar::index_log.info("findSeries: {} results exceed limit of {} for measurement {}",
                             results.size(), maxSeries, measurement);
         co_return std::unexpected(SeriesLimitExceeded{results.size(), maxSeries});
     }
 
-    tsdb::index_log.info("findSeries returning {} results for measurement {}",
+    timestar::index_log.info("findSeries returning {} results for measurement {}",
                         results.size(), measurement);
     co_return results;
 }
@@ -1530,7 +1588,7 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
     // Fast path: check in-memory cache
     auto cacheIt = measurementSeriesCache.find(measurement);
     if (cacheIt != measurementSeriesCache.end()) {
-        tsdb::index_log.debug("getAllSeriesForMeasurement cache hit for '{}': {} series",
+        timestar::index_log.debug("getAllSeriesForMeasurement cache hit for '{}': {} series",
                              measurement, cacheIt->second.size());
         // Check limit against cached result before returning
         if (maxSeries > 0 && cacheIt->second.size() > maxSeries) {
@@ -1550,7 +1608,7 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
 
         std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
         if (!it) {
-            tsdb::index_log.error("Failed to create LevelDB iterator");
+            timestar::index_log.error("Failed to create LevelDB iterator");
             return result;
         }
 
@@ -1578,7 +1636,7 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
         }
 
         if (!it->status().ok()) {
-            tsdb::index_log.error("MEASUREMENT_SERIES iterator error: {}", it->status().ToString());
+            timestar::index_log.error("MEASUREMENT_SERIES iterator error: {}", it->status().ToString());
         }
 
         return result;
@@ -1586,22 +1644,29 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
 
     // Check if the limit was exceeded during the MEASUREMENT_SERIES scan
     if (maxSeries > 0 && seriesIds.size() > maxSeries) {
-        tsdb::index_log.info("getAllSeriesForMeasurement: {} series exceed limit of {} for '{}'",
+        timestar::index_log.info("getAllSeriesForMeasurement: {} series exceed limit of {} for '{}'",
                             seriesIds.size(), maxSeries, measurement);
         co_return std::unexpected(SeriesLimitExceeded{seriesIds.size(), maxSeries});
     }
 
     // If the new index returned results, cache and return them
     if (!seriesIds.empty()) {
-        tsdb::index_log.debug("MEASUREMENT_SERIES index found {} series for '{}'",
+        timestar::index_log.debug("MEASUREMENT_SERIES index found {} series for '{}'",
                              seriesIds.size(), measurement);
-        measurementSeriesCache[measurement] = seriesIds;
+        auto& cached = measurementSeriesCache[measurement];
+        // Use a set for O(n log n) dedup instead of O(n²) std::find loop
+        std::set<SeriesId128> existing(cached.begin(), cached.end());
+        for (auto& id : seriesIds) {
+            if (existing.insert(id).second) {
+                cached.push_back(id);
+            }
+        }
         co_return seriesIds;
     }
 
     // Fallback: scan SERIES_METADATA (old full-table-scan approach) for backward compatibility.
     // This handles databases created before the MEASUREMENT_SERIES index was added.
-    tsdb::index_log.debug("MEASUREMENT_SERIES index empty for '{}', falling back to SERIES_METADATA scan",
+    timestar::index_log.debug("MEASUREMENT_SERIES index empty for '{}', falling back to SERIES_METADATA scan",
                          measurement);
 
     seriesIds = co_await seastar::async([this, &measurement, maxSeries]() {
@@ -1612,7 +1677,7 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
 
         std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
         if (!it) {
-            tsdb::index_log.error("Failed to create LevelDB iterator");
+            timestar::index_log.error("Failed to create LevelDB iterator");
             return result;
         }
 
@@ -1643,7 +1708,7 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
                         }
                     }
                 } catch (const std::exception& e) {
-                    tsdb::index_log.error("Failed to decode series metadata: {}", e.what());
+                    timestar::index_log.error("Failed to decode series metadata: {}", e.what());
                 }
             }
 
@@ -1651,7 +1716,7 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
         }
 
         if (!it->status().ok()) {
-            tsdb::index_log.error("SERIES_METADATA fallback iterator error: {}", it->status().ToString());
+            timestar::index_log.error("SERIES_METADATA fallback iterator error: {}", it->status().ToString());
         }
 
         return result;
@@ -1659,13 +1724,13 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
 
     // Check limit on the fallback result
     if (maxSeries > 0 && seriesIds.size() > maxSeries) {
-        tsdb::index_log.info("getAllSeriesForMeasurement fallback: {} series exceed limit of {} for '{}'",
+        timestar::index_log.info("getAllSeriesForMeasurement fallback: {} series exceed limit of {} for '{}'",
                             seriesIds.size(), maxSeries, measurement);
         // Don't cache partial results from limit-exceeded scans
         co_return std::unexpected(SeriesLimitExceeded{seriesIds.size(), maxSeries});
     }
 
-    tsdb::index_log.info("Fallback scan found {} series for measurement '{}'",
+    timestar::index_log.info("Fallback scan found {} series for measurement '{}'",
                         seriesIds.size(), measurement);
 
     // Cache even fallback results
@@ -1678,7 +1743,7 @@ seastar::future<> LevelDBIndex::rebuildMeasurementSeriesIndex() {
         co_return;
     }
 
-    tsdb::index_log.info("Rebuilding MEASUREMENT_SERIES index from SERIES_METADATA entries...");
+    timestar::index_log.info("Rebuilding MEASUREMENT_SERIES index from SERIES_METADATA entries...");
 
     auto count = co_await seastar::async([this]() {
         leveldb::WriteBatch batch;
@@ -1689,7 +1754,7 @@ seastar::future<> LevelDBIndex::rebuildMeasurementSeriesIndex() {
 
         std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
         if (!it) {
-            tsdb::index_log.error("Failed to create LevelDB iterator for rebuild");
+            timestar::index_log.error("Failed to create LevelDB iterator for rebuild");
             return cnt;
         }
 
@@ -1711,7 +1776,7 @@ seastar::future<> LevelDBIndex::rebuildMeasurementSeriesIndex() {
                         batch.Put(encodeMeasurementSeriesKey(metadata.measurement, seriesId), "");
                         ++cnt;
                     } catch (const std::exception& e) {
-                        tsdb::index_log.error("Failed to decode metadata during rebuild: {}", e.what());
+                        timestar::index_log.error("Failed to decode metadata during rebuild: {}", e.what());
                     }
                 }
             }
@@ -1720,7 +1785,7 @@ seastar::future<> LevelDBIndex::rebuildMeasurementSeriesIndex() {
         }
 
         if (!it->status().ok()) {
-            tsdb::index_log.error("Iterator error during rebuild: {}", it->status().ToString());
+            timestar::index_log.error("Iterator error during rebuild: {}", it->status().ToString());
         }
 
         if (cnt > 0) {
@@ -1736,7 +1801,7 @@ seastar::future<> LevelDBIndex::rebuildMeasurementSeriesIndex() {
     // Clear the cache so it will be re-populated from the new index
     measurementSeriesCache.clear();
 
-    tsdb::index_log.info("MEASUREMENT_SERIES index rebuilt: {} entries written", count);
+    timestar::index_log.info("MEASUREMENT_SERIES index rebuilt: {} entries written", count);
     co_return;
 }
 
@@ -1928,7 +1993,7 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTagPattern(
     }
 
     // Extract the literal prefix to narrow the LevelDB seek range
-    std::string literalPrefix = tsdb::SeriesMatcher::extractLiteralPrefix(scopeValue);
+    std::string literalPrefix = timestar::SeriesMatcher::extractLiteralPrefix(scopeValue);
 
     // Build a key prefix: TAG_INDEX + measurement + \0 + tagKey + \0
     // We do NOT include the tagValue — we scan all values for this tag key.
@@ -1947,11 +2012,11 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTagPattern(
             std::vector<SeriesId128> result;
 
             // Pre-compile regex once if this is a regex pattern, to avoid per-entry compilation
-            auto matchType = tsdb::SeriesMatcher::classifyScope(scopeValue);
+            auto matchType = timestar::SeriesMatcher::classifyScope(scopeValue);
             std::optional<std::regex> compiledRegex;
             std::string regexPattern;
 
-            if (matchType == tsdb::ScopeMatchType::REGEX) {
+            if (matchType == timestar::ScopeMatchType::REGEX) {
                 // Extract the raw regex pattern
                 if (scopeValue[0] == '~') {
                     regexPattern = scopeValue.substr(1);
@@ -2005,7 +2070,7 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTagPattern(
                 } else {
                     // Wildcard — delegate to SeriesMatcher
                     std::string tvStr(tagValue);
-                    matched = tsdb::SeriesMatcher::matchesTag(tvStr, scopeValue);
+                    matched = timestar::SeriesMatcher::matchesTag(tvStr, scopeValue);
                 }
 
                 if (matched) {
@@ -2139,23 +2204,35 @@ LevelDBIndex::getFieldStats(const SeriesId128& seriesId, const std::string& fiel
     });
 
     if (status.ok()) {
-        // Decode stats
+        // Decode stats — validate null delimiters to avoid crash on corrupt data
         FieldStats stats;
         size_t pos = 0;
 
-        size_t nextPos = value.find('\0', pos);
-        stats.dataType = value.substr(pos, nextPos - pos);
-        pos = nextPos + 1;
+        auto findDelim = [&](size_t from) -> size_t {
+            size_t p = value.find('\0', from);
+            if (p == std::string::npos) {
+                throw std::runtime_error("Corrupt FieldStats: missing null delimiter");
+            }
+            return p;
+        };
 
-        nextPos = value.find('\0', pos);
-        stats.minTime = std::stoll(value.substr(pos, nextPos - pos));
-        pos = nextPos + 1;
+        try {
+            size_t nextPos = findDelim(pos);
+            stats.dataType = value.substr(pos, nextPos - pos);
+            pos = nextPos + 1;
 
-        nextPos = value.find('\0', pos);
-        stats.maxTime = std::stoll(value.substr(pos, nextPos - pos));
-        pos = nextPos + 1;
+            nextPos = findDelim(pos);
+            stats.minTime = std::stoll(value.substr(pos, nextPos - pos));
+            pos = nextPos + 1;
 
-        stats.pointCount = std::stoull(value.substr(pos));
+            nextPos = findDelim(pos);
+            stats.maxTime = std::stoll(value.substr(pos, nextPos - pos));
+            pos = nextPos + 1;
+
+            stats.pointCount = std::stoull(value.substr(pos));
+        } catch (const std::exception&) {
+            co_return std::nullopt;
+        }
 
         co_return stats;
     } else if (status.IsNotFound()) {
@@ -2165,10 +2242,10 @@ LevelDBIndex::getFieldStats(const SeriesId128& seriesId, const std::string& fiel
     }
 }
 
-template seastar::future<SeriesId128> LevelDBIndex::indexInsert<double>(const TSDBInsert<double>& insert);
-template seastar::future<SeriesId128> LevelDBIndex::indexInsert<bool>(const TSDBInsert<bool>& insert);
-template seastar::future<SeriesId128> LevelDBIndex::indexInsert<std::string>(const TSDBInsert<std::string>& insert);
-template seastar::future<SeriesId128> LevelDBIndex::indexInsert<int64_t>(const TSDBInsert<int64_t>& insert);
+template seastar::future<SeriesId128> LevelDBIndex::indexInsert<double>(const TimeStarInsert<double>& insert);
+template seastar::future<SeriesId128> LevelDBIndex::indexInsert<bool>(const TimeStarInsert<bool>& insert);
+template seastar::future<SeriesId128> LevelDBIndex::indexInsert<std::string>(const TimeStarInsert<std::string>& insert);
+template seastar::future<SeriesId128> LevelDBIndex::indexInsert<int64_t>(const TimeStarInsert<int64_t>& insert);
 
 // --- Retention Policy CRUD ---
 

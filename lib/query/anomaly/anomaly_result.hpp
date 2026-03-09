@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 // Supported anomaly detection algorithms
@@ -40,8 +40,8 @@ inline std::string algorithmToString(Algorithm algo) {
         case Algorithm::BASIC: return "basic";
         case Algorithm::AGILE: return "agile";
         case Algorithm::ROBUST: return "robust";
+        default: return "unknown";
     }
-    return "unknown";
 }
 
 // Convert string to Seasonality enum
@@ -56,6 +56,9 @@ inline Seasonality parseSeasonality(const std::string& str) {
 // Convert Seasonality to period in data points
 // Assumes 1-minute data intervals by default; caller should adjust for actual interval
 inline size_t seasonalityToPeriod(Seasonality seasonality, uint64_t dataIntervalNs = 60000000000ULL) {
+    if (dataIntervalNs == 0) {
+        throw std::invalid_argument("dataIntervalNs must be > 0");
+    }
     uint64_t periodNs = 0;
     switch (seasonality) {
         case Seasonality::NONE:
@@ -70,7 +73,18 @@ inline size_t seasonalityToPeriod(Seasonality seasonality, uint64_t dataInterval
             periodNs = 604800ULL * 1000000000ULL;  // 7 days
             break;
     }
-    return static_cast<size_t>(periodNs / dataIntervalNs);
+    size_t period = static_cast<size_t>(periodNs / dataIntervalNs);
+    // Cap at 10M data points per period to prevent OOM from tiny intervals.
+    // Weekly seasonality at 1-second resolution is 604800 -- well under this cap.
+    // Anything above 10M implies sub-millisecond resolution for weekly seasonality,
+    // which is not a realistic anomaly detection use case.
+    static constexpr size_t MAX_PERIOD = 10'000'000;
+    if (period > MAX_PERIOD) {
+        throw std::invalid_argument(
+            "Seasonal period too large (" + std::to_string(period) +
+            " data points). Increase data interval or use a shorter seasonality.");
+    }
+    return period;
 }
 
 // Configuration for anomaly detection
@@ -172,6 +186,6 @@ struct SARIMAParams {
 };
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar
 
 #endif // ANOMALY_RESULT_H_INCLUDED

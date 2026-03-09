@@ -8,7 +8,7 @@
 #include <chrono>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 
 enum class AggregationMethod {
     AVG,
@@ -30,8 +30,8 @@ struct QueryRequest {
     std::vector<std::string> fields;  // Empty means all fields
     std::map<std::string, std::string> scopes;  // Tag filters (AND condition)
     std::vector<std::string> groupByTags;
-    uint64_t startTime;  // Nanoseconds since epoch
-    uint64_t endTime;    // Nanoseconds since epoch
+    uint64_t startTime = 0;  // Nanoseconds since epoch
+    uint64_t endTime = 0;    // Nanoseconds since epoch
     uint64_t aggregationInterval = 0;  // Nanoseconds, 0 means no time-based aggregation
     
     // Helper to check if query requests all fields
@@ -93,6 +93,6 @@ public:
         : std::runtime_error("Query parse error: " + message) {}
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // QUERY_PARSER_H_INCLUDED

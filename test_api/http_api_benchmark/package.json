@@ -1,7 +1,7 @@
 {
-  "name": "tsdb-http-api-benchmark",
+  "name": "timestar-http-api-benchmark",
   "version": "1.0.0",
-  "description": "HTTP API benchmark tool for TSDB",
+  "description": "HTTP API benchmark tool for TimeStar",
   "main": "benchmark.js",
   "scripts": {
     "benchmark": "node benchmark.js",

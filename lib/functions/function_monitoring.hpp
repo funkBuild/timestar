@@ -8,11 +8,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <condition_variable>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Forward declarations
 class FunctionPerformanceTracker;
@@ -65,6 +66,12 @@ struct FunctionMetrics {
     std::atomic<uint64_t> total_execution_time_us{0};
     
     // Resource metrics
+    // Note (FUNC-H7): peak_memory_bytes was previously updated with a
+    // non-atomic load-compare-store (`if (cur > peak) peak = cur`).  That
+    // pattern was removed when memory tracking was taken out of the hot path.
+    // The field is now only written by background collection.  Additionally,
+    // ProductionMonitor is `static thread_local` (see getInstance()), so all
+    // access is single-threaded per shard, making the atomic sufficient as-is.
     std::atomic<uint64_t> peak_memory_bytes{0};
     std::atomic<uint64_t> total_memory_allocated{0};
     std::atomic<uint64_t> total_cpu_time_us{0};
@@ -80,6 +87,11 @@ struct FunctionMetrics {
     std::atomic<uint64_t> insufficient_data_errors{0};
     
     // Calculate derived metrics
+    // Note (FUNC-H6): These methods load multiple atomics non-atomically, which
+    // would be a TOCTOU race under concurrent access.  This is safe because the
+    // owning ProductionMonitor is `static thread_local` (see getInstance()),
+    // so all reads and writes to these atomics happen on a single Seastar shard
+    // thread -- no cross-thread visibility concern.
     double getSuccessRate() const {
         uint64_t total = total_executions.load();
         return total > 0 ? (double)successful_executions.load() / total : 0.0;
@@ -201,7 +213,7 @@ struct Alert {
 // Production monitoring manager
 class ProductionMonitor {
 private:
-    std::map<std::string, std::unique_ptr<FunctionMetrics>> function_metrics_;
+    std::map<std::string, std::shared_ptr<FunctionMetrics>> function_metrics_;
     std::unique_ptr<SystemMetrics> system_metrics_;
     AlertThresholds thresholds_;
     
@@ -210,6 +222,22 @@ private:
     mutable std::mutex metrics_mutex_;
     mutable std::mutex alerts_mutex_;
     std::vector<Alert> active_alerts_;
+    // O(1) duplicate detection for active alerts keyed by (type, function_name).
+    struct AlertKey {
+        AlertType type;
+        std::string function_name;
+        bool operator==(const AlertKey& o) const {
+            return type == o.type && function_name == o.function_name;
+        }
+    };
+    struct AlertKeyHash {
+        size_t operator()(const AlertKey& k) const {
+            size_t h1 = std::hash<int>{}(static_cast<int>(k.type));
+            size_t h2 = std::hash<std::string>{}(k.function_name);
+            return h1 ^ (h2 << 1);
+        }
+    };
+    std::unordered_set<AlertKey, AlertKeyHash> active_alert_keys_;
     std::deque<Alert> alert_history_;
     
     // Background monitoring thread
@@ -244,7 +272,7 @@ public:
     
     // Metrics registration and access
     void registerFunction(const std::string& function_name);
-    FunctionMetrics* getFunctionMetrics(const std::string& function_name);
+    std::shared_ptr<FunctionMetrics> getFunctionMetrics(const std::string& function_name);
     SystemMetrics* getSystemMetrics() { return system_metrics_.get(); }
     
     // Alert management
@@ -293,7 +321,7 @@ class FunctionExecutionTracker {
 private:
     std::string function_name_;
     std::chrono::steady_clock::time_point start_time_;
-    FunctionMetrics* metrics_;
+    std::shared_ptr<FunctionMetrics> metrics_;
     ProductionMonitor* monitor_;
     uint64_t initial_memory_;
     
@@ -316,20 +344,20 @@ public:
 
 // Utility macros for easy integration
 #define FUNCTION_MONITOR_START(function_name) \
-    tsdb::functions::FunctionExecutionTracker __tracker(function_name)
+    timestar::functions::FunctionExecutionTracker ts_fn_tracker_(function_name)
 
 #define FUNCTION_MONITOR_SUCCESS() \
-    __tracker.recordSuccess()
+    ts_fn_tracker_.recordSuccess()
 
 #define FUNCTION_MONITOR_FAILURE() \
-    __tracker.recordFailure()
+    ts_fn_tracker_.recordFailure()
 
 #define FUNCTION_MONITOR_CACHE_HIT() \
-    __tracker.recordCacheHit()
+    ts_fn_tracker_.recordCacheHit()
 
 #define FUNCTION_MONITOR_CACHE_MISS() \
-    __tracker.recordCacheMiss()
+    ts_fn_tracker_.recordCacheMiss()
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // FUNCTION_MONITORING_H_INCLUDED

@@ -7,7 +7,7 @@
 #include <string>
 #include <chrono>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 // Executes anomaly detection on query results
@@ -47,6 +47,6 @@ private:
 };
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar
 
 #endif // ANOMALY_EXECUTOR_H_INCLUDED

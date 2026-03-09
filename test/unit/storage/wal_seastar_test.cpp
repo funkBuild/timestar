@@ -7,7 +7,7 @@
 
 #include "../../../lib/storage/wal.hpp"
 #include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/utils/crc32.hpp"
 
 #include <seastar/core/coroutine.hh>
@@ -47,7 +47,7 @@ seastar::future<> testWALWriteAndRecoverFloat() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<double> insert("temperature", "sensor1");
+        TimeStarInsert<double> insert("temperature", "sensor1");
         insert.addValue(1000, 20.5);
         insert.addValue(2000, 21.0);
         insert.addValue(3000, 21.5);
@@ -63,18 +63,16 @@ seastar::future<> testWALWriteAndRecoverFloat() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<double> testInsert("temperature", "sensor1");
+    TimeStarInsert<double> testInsert("temperature", "sensor1");
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-
-    if (it != recoveredStore->series.end()) {
-        auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-        EXPECT_EQ(seriesData.values.size(), 3);
-        EXPECT_DOUBLE_EQ(seriesData.values[0], 20.5);
-        EXPECT_DOUBLE_EQ(seriesData.values[1], 21.0);
-        EXPECT_DOUBLE_EQ(seriesData.values[2], 21.5);
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& seriesData = std::get<InMemorySeries<double>>(it->second);
+    EXPECT_EQ(seriesData.values.size(), 3);
+    EXPECT_DOUBLE_EQ(seriesData.values[0], 20.5);
+    EXPECT_DOUBLE_EQ(seriesData.values[1], 21.0);
+    EXPECT_DOUBLE_EQ(seriesData.values[2], 21.5);
 
     co_return;
 }
@@ -91,7 +89,7 @@ seastar::future<> testWALWriteAndRecoverBoolean() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<bool> insert("door", "open");
+        TimeStarInsert<bool> insert("door", "open");
         insert.addValue(1000, true);
         insert.addValue(2000, false);
         insert.addValue(3000, true);
@@ -108,19 +106,17 @@ seastar::future<> testWALWriteAndRecoverBoolean() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<bool> testInsert("door", "open");
+    TimeStarInsert<bool> testInsert("door", "open");
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-
-    if (it != recoveredStore->series.end()) {
-        auto& seriesData = std::get<InMemorySeries<bool>>(it->second);
-        EXPECT_EQ(seriesData.values.size(), 4);
-        EXPECT_EQ(seriesData.values[0], true);
-        EXPECT_EQ(seriesData.values[1], false);
-        EXPECT_EQ(seriesData.values[2], true);
-        EXPECT_EQ(seriesData.values[3], false);
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& seriesData = std::get<InMemorySeries<bool>>(it->second);
+    EXPECT_EQ(seriesData.values.size(), 4);
+    EXPECT_EQ(seriesData.values[0], true);
+    EXPECT_EQ(seriesData.values[1], false);
+    EXPECT_EQ(seriesData.values[2], true);
+    EXPECT_EQ(seriesData.values[3], false);
 
     co_return;
 }
@@ -137,7 +133,7 @@ seastar::future<> testWALWriteAndRecoverString() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<std::string> insert("message", "log");
+        TimeStarInsert<std::string> insert("message", "log");
         insert.addValue(1000, "Error: connection failed");
         insert.addValue(2000, "Warning: high latency");
         insert.addValue(3000, "Info: request completed");
@@ -153,18 +149,16 @@ seastar::future<> testWALWriteAndRecoverString() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<std::string> testInsert("message", "log");
+    TimeStarInsert<std::string> testInsert("message", "log");
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-
-    if (it != recoveredStore->series.end()) {
-        auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
-        EXPECT_EQ(seriesData.values.size(), 3);
-        EXPECT_EQ(seriesData.values[0], "Error: connection failed");
-        EXPECT_EQ(seriesData.values[1], "Warning: high latency");
-        EXPECT_EQ(seriesData.values[2], "Info: request completed");
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
+    EXPECT_EQ(seriesData.values.size(), 3);
+    EXPECT_EQ(seriesData.values[0], "Error: connection failed");
+    EXPECT_EQ(seriesData.values[1], "Warning: high latency");
+    EXPECT_EQ(seriesData.values[2], "Info: request completed");
 
     co_return;
 }
@@ -181,19 +175,19 @@ seastar::future<> testWALBatchInsert() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        std::vector<TSDBInsert<double>> batch;
+        std::vector<TimeStarInsert<double>> batch;
 
-        TSDBInsert<double> insert1("cpu", "usage");
+        TimeStarInsert<double> insert1("cpu", "usage");
         insert1.addValue(1000, 25.5);
         insert1.addValue(2000, 30.2);
         batch.push_back(insert1);
 
-        TSDBInsert<double> insert2("memory", "usage");
+        TimeStarInsert<double> insert2("memory", "usage");
         insert2.addValue(1000, 65.3);
         insert2.addValue(2000, 67.8);
         batch.push_back(insert2);
 
-        TSDBInsert<double> insert3("disk", "usage");
+        TimeStarInsert<double> insert3("disk", "usage");
         insert3.addValue(1000, 80.1);
         insert3.addValue(2000, 82.4);
         batch.push_back(insert3);
@@ -211,15 +205,14 @@ seastar::future<> testWALBatchInsert() {
 
     EXPECT_EQ(recoveredStore->series.size(), 3);
 
-    TSDBInsert<double> cpuInsert("cpu", "usage");
+    TimeStarInsert<double> cpuInsert("cpu", "usage");
     SeriesId128 cpuId = cpuInsert.seriesId128();
     auto cpuIt = recoveredStore->series.find(cpuId);
     EXPECT_NE(cpuIt, recoveredStore->series.end());
-    if (cpuIt != recoveredStore->series.end()) {
-        auto& cpuData = std::get<InMemorySeries<double>>(cpuIt->second);
-        EXPECT_EQ(cpuData.values.size(), 2);
-        EXPECT_DOUBLE_EQ(cpuData.values[0], 25.5);
-    }
+    if (cpuIt == recoveredStore->series.end()) co_return;
+    auto& cpuData = std::get<InMemorySeries<double>>(cpuIt->second);
+    EXPECT_EQ(cpuData.values.size(), 2);
+    EXPECT_DOUBLE_EQ(cpuData.values[0], 25.5);
 
     co_return;
 }
@@ -236,19 +229,19 @@ seastar::future<> testWALMultipleSeries() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<double> temp("weather", "temperature");
+        TimeStarInsert<double> temp("weather", "temperature");
         temp.addTag("location", "us-west");
         temp.addValue(1000, 72.5);
         temp.addValue(2000, 73.1);
         co_await wal.insert(temp);
 
-        TSDBInsert<bool> alarm("system", "alert");
+        TimeStarInsert<bool> alarm("system", "alert");
         alarm.addTag("severity", "high");
         alarm.addValue(1000, false);
         alarm.addValue(2000, true);
         co_await wal.insert(alarm);
 
-        TSDBInsert<std::string> msg("app", "status");
+        TimeStarInsert<std::string> msg("app", "status");
         msg.addTag("component", "api");
         msg.addValue(1000, "running");
         msg.addValue(2000, "degraded");
@@ -281,7 +274,7 @@ seastar::future<> testWALDeleteRange() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<double> insert("metrics", "value");
+        TimeStarInsert<double> insert("metrics", "value");
         insert.addValue(1000, 10.0);
         insert.addValue(2000, 20.0);
         insert.addValue(3000, 30.0);
@@ -302,18 +295,16 @@ seastar::future<> testWALDeleteRange() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<double> testInsert("metrics", "value");
+    TimeStarInsert<double> testInsert("metrics", "value");
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-
-    if (it != recoveredStore->series.end()) {
-        auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-        EXPECT_EQ(seriesData.values.size(), 3);
-        EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);
-        EXPECT_DOUBLE_EQ(seriesData.values[1], 40.0);
-        EXPECT_DOUBLE_EQ(seriesData.values[2], 50.0);
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& seriesData = std::get<InMemorySeries<double>>(it->second);
+    EXPECT_EQ(seriesData.values.size(), 3);
+    EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);
+    EXPECT_DOUBLE_EQ(seriesData.values[1], 40.0);
+    EXPECT_DOUBLE_EQ(seriesData.values[2], 50.0);
 
     co_return;
 }
@@ -334,7 +325,7 @@ seastar::future<> testCRC32RoundtripFloat() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<double> insert("crc_test", "value");
+        TimeStarInsert<double> insert("crc_test", "value");
         insert.addValue(1000, 42.5);
         insert.addValue(2000, 43.0);
         insert.addValue(3000, 43.5);
@@ -351,18 +342,16 @@ seastar::future<> testCRC32RoundtripFloat() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<double> testInsert("crc_test", "value");
+    TimeStarInsert<double> testInsert("crc_test", "value");
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-
-    if (it != recoveredStore->series.end()) {
-        auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-        EXPECT_EQ(seriesData.values.size(), 3);
-        EXPECT_DOUBLE_EQ(seriesData.values[0], 42.5);
-        EXPECT_DOUBLE_EQ(seriesData.values[1], 43.0);
-        EXPECT_DOUBLE_EQ(seriesData.values[2], 43.5);
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& seriesData = std::get<InMemorySeries<double>>(it->second);
+    EXPECT_EQ(seriesData.values.size(), 3);
+    EXPECT_DOUBLE_EQ(seriesData.values[0], 42.5);
+    EXPECT_DOUBLE_EQ(seriesData.values[1], 43.0);
+    EXPECT_DOUBLE_EQ(seriesData.values[2], 43.5);
 
     co_return;
 }
@@ -379,7 +368,7 @@ seastar::future<> testCRC32CorruptionDetection() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<double> insert("corrupt_test", "value");
+        TimeStarInsert<double> insert("corrupt_test", "value");
         insert.addValue(1000, 99.9);
 
         co_await wal.insert(insert);
@@ -433,11 +422,11 @@ seastar::future<> testCRC32PartialCorruption() {
         co_await wal.init(store.get());
 
         // Write two entries
-        TSDBInsert<double> insert1("partial_test", "first");
+        TimeStarInsert<double> insert1("partial_test", "first");
         insert1.addValue(1000, 11.1);
         co_await wal.insert(insert1);
 
-        TSDBInsert<double> insert2("partial_test", "second");
+        TimeStarInsert<double> insert2("partial_test", "second");
         insert2.addValue(2000, 22.2);
         co_await wal.insert(insert2);
 
@@ -480,19 +469,17 @@ seastar::future<> testCRC32PartialCorruption() {
     }
 
     // First entry should be recovered
-    TSDBInsert<double> testInsert1("partial_test", "first");
+    TimeStarInsert<double> testInsert1("partial_test", "first");
     SeriesId128 seriesId1 = testInsert1.seriesId128();
     auto it1 = recoveredStore->series.find(seriesId1);
     EXPECT_NE(it1, recoveredStore->series.end());
-
-    if (it1 != recoveredStore->series.end()) {
-        auto& data = std::get<InMemorySeries<double>>(it1->second);
-        EXPECT_EQ(data.values.size(), 1);
-        EXPECT_DOUBLE_EQ(data.values[0], 11.1);
-    }
+    if (it1 == recoveredStore->series.end()) co_return;
+    auto& data = std::get<InMemorySeries<double>>(it1->second);
+    EXPECT_EQ(data.values.size(), 1);
+    EXPECT_DOUBLE_EQ(data.values[0], 11.1);
 
     // Second entry should NOT be recovered (corrupted)
-    TSDBInsert<double> testInsert2("partial_test", "second");
+    TimeStarInsert<double> testInsert2("partial_test", "second");
     SeriesId128 seriesId2 = testInsert2.seriesId128();
     auto it2 = recoveredStore->series.find(seriesId2);
     EXPECT_EQ(it2, recoveredStore->series.end());
@@ -512,14 +499,14 @@ seastar::future<> testCRC32BatchInsertRoundtrip() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        std::vector<TSDBInsert<double>> batch;
+        std::vector<TimeStarInsert<double>> batch;
 
-        TSDBInsert<double> insert1("batch_crc", "alpha");
+        TimeStarInsert<double> insert1("batch_crc", "alpha");
         insert1.addValue(1000, 10.0);
         insert1.addValue(2000, 20.0);
         batch.push_back(insert1);
 
-        TSDBInsert<double> insert2("batch_crc", "beta");
+        TimeStarInsert<double> insert2("batch_crc", "beta");
         insert2.addValue(1000, 30.0);
         insert2.addValue(2000, 40.0);
         batch.push_back(insert2);
@@ -537,25 +524,23 @@ seastar::future<> testCRC32BatchInsertRoundtrip() {
 
     EXPECT_EQ(recoveredStore->series.size(), 2);
 
-    TSDBInsert<double> alphaInsert("batch_crc", "alpha");
+    TimeStarInsert<double> alphaInsert("batch_crc", "alpha");
     auto alphaIt = recoveredStore->series.find(alphaInsert.seriesId128());
     EXPECT_NE(alphaIt, recoveredStore->series.end());
-    if (alphaIt != recoveredStore->series.end()) {
-        auto& data = std::get<InMemorySeries<double>>(alphaIt->second);
-        EXPECT_EQ(data.values.size(), 2);
-        EXPECT_DOUBLE_EQ(data.values[0], 10.0);
-        EXPECT_DOUBLE_EQ(data.values[1], 20.0);
-    }
+    if (alphaIt == recoveredStore->series.end()) co_return;
+    auto& alphaData = std::get<InMemorySeries<double>>(alphaIt->second);
+    EXPECT_EQ(alphaData.values.size(), 2);
+    EXPECT_DOUBLE_EQ(alphaData.values[0], 10.0);
+    EXPECT_DOUBLE_EQ(alphaData.values[1], 20.0);
 
-    TSDBInsert<double> betaInsert("batch_crc", "beta");
+    TimeStarInsert<double> betaInsert("batch_crc", "beta");
     auto betaIt = recoveredStore->series.find(betaInsert.seriesId128());
     EXPECT_NE(betaIt, recoveredStore->series.end());
-    if (betaIt != recoveredStore->series.end()) {
-        auto& data = std::get<InMemorySeries<double>>(betaIt->second);
-        EXPECT_EQ(data.values.size(), 2);
-        EXPECT_DOUBLE_EQ(data.values[0], 30.0);
-        EXPECT_DOUBLE_EQ(data.values[1], 40.0);
-    }
+    if (betaIt == recoveredStore->series.end()) co_return;
+    auto& betaData = std::get<InMemorySeries<double>>(betaIt->second);
+    EXPECT_EQ(betaData.values.size(), 2);
+    EXPECT_DOUBLE_EQ(betaData.values[0], 30.0);
+    EXPECT_DOUBLE_EQ(betaData.values[1], 40.0);
 
     co_return;
 }
@@ -572,7 +557,7 @@ seastar::future<> testCRC32DeleteRangeRoundtrip() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<double> insert("crc_del", "value");
+        TimeStarInsert<double> insert("crc_del", "value");
         insert.addValue(1000, 10.0);
         insert.addValue(2000, 20.0);
         insert.addValue(3000, 30.0);
@@ -591,18 +576,16 @@ seastar::future<> testCRC32DeleteRangeRoundtrip() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<double> testInsert("crc_del", "value");
+    TimeStarInsert<double> testInsert("crc_del", "value");
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-
-    if (it != recoveredStore->series.end()) {
-        auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-        // After delete range [2000,3000], we should have values at t=1000 and t=4000
-        EXPECT_EQ(seriesData.values.size(), 2);
-        EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);
-        EXPECT_DOUBLE_EQ(seriesData.values[1], 40.0);
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& seriesData = std::get<InMemorySeries<double>>(it->second);
+    // After delete range [2000,3000], we should have values at t=1000 and t=4000
+    EXPECT_EQ(seriesData.values.size(), 2);
+    EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);
+    EXPECT_DOUBLE_EQ(seriesData.values[1], 40.0);
 
     co_return;
 }
@@ -628,7 +611,7 @@ seastar::future<> testPaddingRecoveryWithImmediateFlush() {
         wal.setImmediateFlush(true);
 
         for (int i = 0; i < numEntries; i++) {
-            TSDBInsert<double> insert("flush_test", "value_" + std::to_string(i));
+            TimeStarInsert<double> insert("flush_test", "value_" + std::to_string(i));
             insert.addValue(1000 * (i + 1), static_cast<double>(i) * 1.5);
             co_await wal.insert(insert);
         }
@@ -671,7 +654,7 @@ seastar::future<> testPaddingRecoveryEntryLengthWithZeroLowByte() {
             // Vary measurement name length so that some entries will have
             // entryLength whose lowest byte is 0x00 in little-endian.
             std::string measurement = "meas" + std::string(i, 'x');
-            TSDBInsert<double> insert(measurement, "field");
+            TimeStarInsert<double> insert(measurement, "field");
             insert.addValue(1000 * (i + 1), static_cast<double>(i));
             co_await wal.insert(insert);
         }
@@ -707,19 +690,19 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
         co_await wal.init(store.get());
         wal.setImmediateFlush(true);
 
-        TSDBInsert<double> floatInsert("mixed", "temperature");
+        TimeStarInsert<double> floatInsert("mixed", "temperature");
         floatInsert.addValue(1000, 23.5);
         co_await wal.insert(floatInsert);
 
-        TSDBInsert<bool> boolInsert("mixed", "active");
+        TimeStarInsert<bool> boolInsert("mixed", "active");
         boolInsert.addValue(2000, true);
         co_await wal.insert(boolInsert);
 
-        TSDBInsert<std::string> stringInsert("mixed", "status");
+        TimeStarInsert<std::string> stringInsert("mixed", "status");
         stringInsert.addValue(3000, "running");
         co_await wal.insert(stringInsert);
 
-        TSDBInsert<double> floatInsert2("mixed", "humidity");
+        TimeStarInsert<double> floatInsert2("mixed", "humidity");
         floatInsert2.addValue(4000, 65.0);
         co_await wal.insert(floatInsert2);
 
@@ -739,44 +722,40 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
 
     // Verify each entry
     {
-        TSDBInsert<double> ti("mixed", "temperature");
+        TimeStarInsert<double> ti("mixed", "temperature");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it != recoveredStore->series.end()) {
-            auto& s = std::get<InMemorySeries<double>>(it->second);
-            EXPECT_EQ(s.values.size(), 1u);
-            EXPECT_DOUBLE_EQ(s.values[0], 23.5);
-        }
+        if (it == recoveredStore->series.end()) co_return;
+        auto& s = std::get<InMemorySeries<double>>(it->second);
+        EXPECT_EQ(s.values.size(), 1u);
+        EXPECT_DOUBLE_EQ(s.values[0], 23.5);
     }
     {
-        TSDBInsert<bool> ti("mixed", "active");
+        TimeStarInsert<bool> ti("mixed", "active");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it != recoveredStore->series.end()) {
-            auto& s = std::get<InMemorySeries<bool>>(it->second);
-            EXPECT_EQ(s.values.size(), 1u);
-            EXPECT_EQ(s.values[0], true);
-        }
+        if (it == recoveredStore->series.end()) co_return;
+        auto& s = std::get<InMemorySeries<bool>>(it->second);
+        EXPECT_EQ(s.values.size(), 1u);
+        EXPECT_EQ(s.values[0], true);
     }
     {
-        TSDBInsert<std::string> ti("mixed", "status");
+        TimeStarInsert<std::string> ti("mixed", "status");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it != recoveredStore->series.end()) {
-            auto& s = std::get<InMemorySeries<std::string>>(it->second);
-            EXPECT_EQ(s.values.size(), 1u);
-            EXPECT_EQ(s.values[0], "running");
-        }
+        if (it == recoveredStore->series.end()) co_return;
+        auto& s = std::get<InMemorySeries<std::string>>(it->second);
+        EXPECT_EQ(s.values.size(), 1u);
+        EXPECT_EQ(s.values[0], "running");
     }
     {
-        TSDBInsert<double> ti("mixed", "humidity");
+        TimeStarInsert<double> ti("mixed", "humidity");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it != recoveredStore->series.end()) {
-            auto& s = std::get<InMemorySeries<double>>(it->second);
-            EXPECT_EQ(s.values.size(), 1u);
-            EXPECT_DOUBLE_EQ(s.values[0], 65.0);
-        }
+        if (it == recoveredStore->series.end()) co_return;
+        auto& s = std::get<InMemorySeries<double>>(it->second);
+        EXPECT_EQ(s.values.size(), 1u);
+        EXPECT_DOUBLE_EQ(s.values[0], 65.0);
     }
 
     co_return;
@@ -815,7 +794,7 @@ seastar::future<> testFinalFlushAfterBufferedInserts() {
         // _unflushed_bytes must be incremented by each insert() call so that
         // the finalFlush() → padToAlignment() path produces correct padding.
 
-        TSDBInsert<double> insert("buffered_test", "value");
+        TimeStarInsert<double> insert("buffered_test", "value");
         insert.addValue(1000, 1.1);
         insert.addValue(2000, 2.2);
         insert.addValue(3000, 3.3);
@@ -835,18 +814,16 @@ seastar::future<> testFinalFlushAfterBufferedInserts() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<double> testInsert("buffered_test", "value");
+    TimeStarInsert<double> testInsert("buffered_test", "value");
     auto it = recoveredStore->series.find(testInsert.seriesId128());
     EXPECT_NE(it, recoveredStore->series.end())
         << "Data must be recoverable after finalFlush() without immediate flush";
-
-    if (it != recoveredStore->series.end()) {
-        auto& s = std::get<InMemorySeries<double>>(it->second);
-        EXPECT_EQ(s.values.size(), 3u);
-        EXPECT_DOUBLE_EQ(s.values[0], 1.1);
-        EXPECT_DOUBLE_EQ(s.values[1], 2.2);
-        EXPECT_DOUBLE_EQ(s.values[2], 3.3);
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& s = std::get<InMemorySeries<double>>(it->second);
+    EXPECT_EQ(s.values.size(), 3u);
+    EXPECT_DOUBLE_EQ(s.values[0], 1.1);
+    EXPECT_DOUBLE_EQ(s.values[1], 2.2);
+    EXPECT_DOUBLE_EQ(s.values[2], 3.3);
 
     co_return;
 }
@@ -870,7 +847,7 @@ seastar::future<> testUnflushedBytesAccumulatesAcrossMultipleInserts() {
         co_await wal.init(store.get());
 
         for (int i = 0; i < N; i++) {
-            TSDBInsert<double> insert("multi_insert", "series_" + std::to_string(i));
+            TimeStarInsert<double> insert("multi_insert", "series_" + std::to_string(i));
             insert.addValue(static_cast<uint64_t>(i + 1) * 1000, static_cast<double>(i) * 10.0);
             co_await wal.insert(insert);
         }
@@ -912,9 +889,9 @@ seastar::future<> testUnflushedBytesAfterBatchInsert() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        std::vector<TSDBInsert<double>> batch;
+        std::vector<TimeStarInsert<double>> batch;
         for (int i = 0; i < 5; i++) {
-            TSDBInsert<double> insert("batch_unflushed", "field_" + std::to_string(i));
+            TimeStarInsert<double> insert("batch_unflushed", "field_" + std::to_string(i));
             insert.addValue(static_cast<uint64_t>(i + 1) * 1000, static_cast<double>(i) * 3.14);
             batch.push_back(std::move(insert));
         }
@@ -956,7 +933,7 @@ seastar::future<> testUnflushedBytesAfterDeleteRange() {
         WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
-        TSDBInsert<double> insert("del_range_unflushed", "value");
+        TimeStarInsert<double> insert("del_range_unflushed", "value");
         insert.addValue(1000, 10.0);
         insert.addValue(2000, 20.0);
         insert.addValue(3000, 30.0);
@@ -979,18 +956,16 @@ seastar::future<> testUnflushedBytesAfterDeleteRange() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    TSDBInsert<double> testInsert("del_range_unflushed", "value");
+    TimeStarInsert<double> testInsert("del_range_unflushed", "value");
     auto it = recoveredStore->series.find(testInsert.seriesId128());
     EXPECT_NE(it, recoveredStore->series.end())
         << "Series must be recoverable after insert + deleteRange + finalFlush()";
-
-    if (it != recoveredStore->series.end()) {
-        auto& s = std::get<InMemorySeries<double>>(it->second);
-        // t=2000 was deleted, so only t=1000 and t=3000 remain.
-        EXPECT_EQ(s.values.size(), 2u);
-        EXPECT_DOUBLE_EQ(s.values[0], 10.0);
-        EXPECT_DOUBLE_EQ(s.values[1], 30.0);
-    }
+    if (it == recoveredStore->series.end()) co_return;
+    auto& s = std::get<InMemorySeries<double>>(it->second);
+    // t=2000 was deleted, so only t=1000 and t=3000 remain.
+    EXPECT_EQ(s.values.size(), 2u);
+    EXPECT_DOUBLE_EQ(s.values[0], 10.0);
+    EXPECT_DOUBLE_EQ(s.values[1], 30.0);
 
     co_return;
 }
@@ -1011,18 +986,18 @@ seastar::future<> testUnflushedBytesResetAndReaccumulate() {
         co_await wal.init(store.get());
 
         // First group of writes + flush
-        TSDBInsert<double> insert1("reset_test", "first");
+        TimeStarInsert<double> insert1("reset_test", "first");
         insert1.addValue(1000, 1.0);
         co_await wal.insert(insert1);
         co_await wal.finalFlush();
         // After flush, _unflushed_bytes == 0
 
         // Second group of writes — must re-accumulate _unflushed_bytes from 0
-        TSDBInsert<double> insert2("reset_test", "second");
+        TimeStarInsert<double> insert2("reset_test", "second");
         insert2.addValue(2000, 2.0);
         co_await wal.insert(insert2);
 
-        TSDBInsert<double> insert3("reset_test", "third");
+        TimeStarInsert<double> insert3("reset_test", "third");
         insert3.addValue(3000, 3.0);
         co_await wal.insert(insert3);
 

@@ -7,16 +7,19 @@
 
 // Compile-time flag to disable SIMD optimizations
 // Set to 1 to use scalar fallbacks for all operations
-// Can be defined via CMake: -DTSDB_ANOMALY_DISABLE_SIMD=1
-#ifndef TSDB_ANOMALY_DISABLE_SIMD
-#define TSDB_ANOMALY_DISABLE_SIMD 0
+// Can be defined via CMake: -DTIMESTAR_ANOMALY_DISABLE_SIMD=1
+#ifndef TIMESTAR_ANOMALY_DISABLE_SIMD
+#define TIMESTAR_ANOMALY_DISABLE_SIMD 0
 #endif
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
 #include <immintrin.h>
+#else
+#undef TIMESTAR_ANOMALY_DISABLE_SIMD
+#define TIMESTAR_ANOMALY_DISABLE_SIMD 1
 #endif
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 namespace simd {
 
@@ -51,7 +54,7 @@ double vectorMean(const double* values, size_t count);
 
 // ==================== Variance and StdDev ====================
 
-// SIMD-optimized variance (population)
+// SIMD-optimized variance (sample, using Bessel's correction: N-1 denominator)
 double vectorVariance(const double* values, size_t count, double mean);
 
 // SIMD-optimized sum of squared differences
@@ -157,6 +160,6 @@ LinearFit weightedLinearRegression(
 
 } // namespace simd
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar
 
 #endif // SIMD_ANOMALY_H_INCLUDED

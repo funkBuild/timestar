@@ -3,7 +3,7 @@
  *
  * Measures performance of anomaly detection algorithms with and without SIMD.
  * Run with SIMD: ./anomaly_detection_benchmark
- * Run without SIMD: Rebuild with -DTSDB_ANOMALY_DISABLE_SIMD=1
+ * Run without SIMD: Rebuild with -DTIMESTAR_ANOMALY_DISABLE_SIMD=1
  */
 
 #include <benchmark/benchmark.h>
@@ -19,7 +19,7 @@
 #include <random>
 #include <cmath>
 
-using namespace tsdb::anomaly;
+using namespace timestar::anomaly;
 
 // ==================== Data Generators ====================
 

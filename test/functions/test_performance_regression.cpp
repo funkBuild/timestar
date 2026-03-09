@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <chrono>
+#include <cstdlib>
 #include <vector>
 #include <map>
 #include <fstream>
@@ -9,7 +10,7 @@
 #include <algorithm>
 #include <numeric>
 
-namespace tsdb::test {
+namespace timestar::test {
 
 class PerformanceRegressionTest : public ::testing::Test {
 protected:
@@ -51,8 +52,13 @@ protected:
         }
     }
     
+    static std::string baselineFilePath() {
+        const char* env = std::getenv("TIMESTAR_PERF_BASELINE");
+        return env ? std::string(env) : "timestar_performance_baseline.txt";
+    }
+
     void loadBaselineMetrics() {
-        std::ifstream file("/tmp/tsdb_performance_baseline.txt");
+        std::ifstream file(baselineFilePath());
         if (!file.is_open()) return;
         
         std::string line;
@@ -69,7 +75,7 @@ protected:
     }
     
     void saveBaselineMetrics() {
-        std::ofstream file("/tmp/tsdb_performance_baseline.txt");
+        std::ofstream file(baselineFilePath());
         for (const auto& [test_name, metrics] : current_metrics) {
             file << test_name << " " << metrics.first << " " << metrics.second << "\n";
         }
@@ -404,4 +410,4 @@ TEST_F(PerformanceRegressionTest, PerformanceBenchmarkSummary) {
     EXPECT_GT(offset_result.throughput_points_per_sec, 2000.0) << "Offset should have good throughput";
 }
 
-} // namespace tsdb::test
+} // namespace timestar::test

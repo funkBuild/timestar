@@ -47,7 +47,7 @@ int main() {
     std::cout << std::endl;
     
     // Check AVX2 availability
-    bool avx2_available = tsdb::simd::SimdAggregator::isAvx2Available();
+    bool avx2_available = timestar::simd::SimdAggregator::isAvx2Available();
     std::cout << "AVX2 Support: " << (avx2_available ? "✓ Available" : "✗ Not Available") << std::endl;
     std::cout << std::endl;
     
@@ -74,7 +74,7 @@ int main() {
         double simd_sum_time = 0.0;
         if (avx2_available) {
             simd_sum_time = benchmark("  SIMD Sum (AVX2)", [&]() {
-                return tsdb::simd::SimdAggregator::calculateSum(data.data(), data.size());
+                return timestar::simd::SimdAggregator::calculateSum(data.data(), data.size());
             });
             
             double speedup = scalar_sum_time / simd_sum_time;
@@ -95,7 +95,7 @@ int main() {
         double simd_min_time = 0.0;
         if (avx2_available) {
             simd_min_time = benchmark("  SIMD Min (AVX2)", [&]() {
-                return tsdb::simd::SimdAggregator::calculateMin(data.data(), data.size());
+                return timestar::simd::SimdAggregator::calculateMin(data.data(), data.size());
             });
             
             double speedup = scalar_min_time / simd_min_time;
@@ -116,7 +116,7 @@ int main() {
         double simd_max_time = 0.0;
         if (avx2_available) {
             simd_max_time = benchmark("  SIMD Max (AVX2)", [&]() {
-                return tsdb::simd::SimdAggregator::calculateMax(data.data(), data.size());
+                return timestar::simd::SimdAggregator::calculateMax(data.data(), data.size());
             });
             
             double speedup = scalar_max_time / simd_max_time;
@@ -137,7 +137,7 @@ int main() {
         double simd_avg_time = 0.0;
         if (avx2_available) {
             simd_avg_time = benchmark("  SIMD Avg (AVX2)", [&]() {
-                return tsdb::simd::SimdAggregator::calculateAvg(data.data(), data.size());
+                return timestar::simd::SimdAggregator::calculateAvg(data.data(), data.size());
             });
             
             double speedup = scalar_avg_time / simd_avg_time;
@@ -160,7 +160,7 @@ int main() {
         double simd_dot_time = 0.0;
         if (avx2_available) {
             simd_dot_time = benchmark("  SIMD Dot Product (AVX2)", [&]() {
-                return tsdb::simd::SimdAggregator::dotProduct(data.data(), weights.data(), data.size());
+                return timestar::simd::SimdAggregator::dotProduct(data.data(), weights.data(), data.size());
             });
             
             double speedup = scalar_dot_time / simd_dot_time;

@@ -8,10 +8,10 @@
 #include <glaze/glaze.hpp>
 
 #include "engine.hpp"
-#include "tsdb_value.hpp"
+#include "timestar_value.hpp"
 #include "series_id.hpp"
 #include "wal_file_manager.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -81,7 +81,7 @@ using json_value_t = glz::generic_u64;
 class HttpWriteHandler {
 public:
     // Security limit to prevent DoS attacks via large request bodies
-    static size_t maxWriteBodySize() { return tsdb::config().http.max_write_body_size; }
+    static size_t maxWriteBodySize() { return timestar::config().http.max_write_body_size; }
 
     // Field value variant for flexible JSON parsing (public for validation API)
     using FieldValue = std::variant<double, bool, std::string, int64_t>;
@@ -114,6 +114,7 @@ private:
     // Structure for coalescing multiple individual writes into array writes
     struct CoalesceCandidate {
         std::string seriesKey;  // measurement + tags + field for grouping
+        std::string groupKey;   // measurement + tags (no field) for coalesce grouping
         std::string measurement;
         // Shared (refcounted) tag map to avoid redundant copies when multiple
         // fields from the same write point each create a CoalesceCandidate.
@@ -152,6 +153,13 @@ private:
             timestampHashSum += timestamp;
             timestampHashXor ^= timestamp;
             stringValues.push_back(value);
+        }
+
+        void addValue(uint64_t timestamp, std::string&& value) {
+            timestamps.push_back(timestamp);
+            timestampHashSum += timestamp;
+            timestampHashXor ^= timestamp;
+            stringValues.push_back(std::move(value));
         }
 
         void addValue(uint64_t timestamp, int64_t value) {
@@ -202,13 +210,18 @@ private:
     // Process a single write point - determine type and insert
     seastar::future<> processWritePoint(const WritePoint& point);
 
-    // Process a multi-point write with arrays
-    // Accepts seenMF and metaOps for cross-batch deduplication
-    // Takes point by non-const ref so the last field's tags/timestamps can be moved
-    seastar::future<AggregatedTimingInfo> processMultiWritePoint(
-        MultiWritePoint& point,
-        std::unordered_set<SeriesId128, SeriesId128::Hash>& seenMF,
-        std::vector<MetaOp>& metaOps);
+    // Result of processMultiWritePoint: timing info plus any metadata ops
+    // that were collected locally (no shared mutable state across coroutines).
+    struct WriteResult {
+        AggregatedTimingInfo timing;
+        std::vector<MetaOp> metaOps;
+    };
+
+    // Process a multi-point write with arrays.
+    // Returns timing info and locally-collected metadata ops.
+    // Takes point by non-const ref so the last field's tags/timestamps can be moved.
+    seastar::future<WriteResult> processMultiWritePoint(
+        MultiWritePoint& point);
 
     // Validate that all field arrays have the same length as timestamps
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);

@@ -5,12 +5,12 @@
 #include "series_id.hpp"
 
 #include <seastar/core/reactor.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -21,12 +21,12 @@ WALFileManager::WALFileManager() {
 
 seastar::future<> WALFileManager::init(Engine &engine,
                                        TSMFileManager &_tsmFileManager) {
-  tsdb::wal_log.info("WALFileManager::init starting for shard {}", shardId);
+  timestar::wal_log.info("WALFileManager::init starting for shard {}", shardId);
   tsmFileManager = &_tsmFileManager;
 
   // Search for existing WAL's
   std::string path = engine.basePath() + '/'; // TODO: Get WAL path from config
-  tsdb::wal_log.debug("Scanning for WAL files in {} on shard {}", path,
+  timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path,
                       shardId);
 
   std::vector<std::string> walFiles;
@@ -45,22 +45,11 @@ seastar::future<> WALFileManager::init(Engine &engine,
   });
 
   if (!walFiles.empty()) {
-    tsdb::wal_log.info(
+    timestar::wal_log.info(
         "Found {} existing WAL files on shard {} - converting to TSM",
         walFiles.size(), shardId);
 
-    // Log system memory before recovery
-    std::ifstream meminfo("/proc/meminfo");
-    if (meminfo.is_open()) {
-      std::string line;
-      while (std::getline(meminfo, line)) {
-        if (line.find("MemFree:") != std::string::npos ||
-            line.find("MemAvailable:") != std::string::npos) {
-          tsdb::wal_log.info("Before WAL recovery - {}", line);
-        }
-      }
-      meminfo.close();
-    }
+    timestar::wal_log.info("Starting WAL recovery on shard {}", shardId);
   }
 
   // Convert them to TSM's if they exist and are closed
@@ -74,14 +63,14 @@ seastar::future<> WALFileManager::init(Engine &engine,
     if (seqNum > currentWalSequenceNumber)
       currentWalSequenceNumber = seqNum;
 
-    tsdb::wal_log.debug(
+    timestar::wal_log.debug(
         "Creating recovery store for WAL sequence {} on shard {}", seqNum,
         shardId);
     seastar::shared_ptr store = seastar::make_shared<MemoryStore>(seqNum);
-    tsdb::wal_log.debug("Reading WAL file {} on shard {}", walFilename,
+    timestar::wal_log.debug("Reading WAL file {} on shard {}", walFilename,
                         shardId);
     co_await store->initFromWAL(walFilename);
-    tsdb::wal_log.debug("WAL recovery complete for sequence {} on shard {}",
+    timestar::wal_log.debug("WAL recovery complete for sequence {} on shard {}",
                         seqNum, shardId);
 
     // Write to TSM if there's data
@@ -89,40 +78,31 @@ seastar::future<> WALFileManager::init(Engine &engine,
     // due to make_file_output_stream
     bool conversionSucceeded = false;
     if (!store->isEmpty()) {
-      tsdb::wal_log.info("Writing memory store {} to TSM on shard {}", seqNum,
+      timestar::wal_log.info("Writing memory store {} to TSM on shard {}", seqNum,
                          shardId);
       try {
         co_await convertWalToTsm(store);
-        tsdb::wal_log.info("Successfully converted WAL {} to TSM on shard {}",
+        timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {}",
                            seqNum, shardId);
         conversionSucceeded = true;
       } catch (const std::bad_alloc &e) {
-        tsdb::wal_log.error(
+        timestar::wal_log.error(
             "Failed to convert WAL {} to TSM on shard {} - bad_alloc", seqNum,
             shardId);
-        // Log memory info
-        std::ifstream meminfo("/proc/meminfo");
-        if (meminfo.is_open()) {
-          std::string line;
-          while (std::getline(meminfo, line)) {
-            if (line.find("MemFree:") != std::string::npos ||
-                line.find("MemAvailable:") != std::string::npos) {
-              tsdb::wal_log.error("System memory at failure: {}", line);
-            }
-          }
-          meminfo.close();
-        }
+        timestar::wal_log.error(
+            "System may be low on memory - bad_alloc during WAL {} recovery on shard {}",
+            seqNum, shardId);
         throw;
       } catch (const std::exception &e) {
-        tsdb::wal_log.error("Failed to convert WAL {} to TSM on shard {}: {}",
+        timestar::wal_log.error("Failed to convert WAL {} to TSM on shard {}: {}",
                             seqNum, shardId, e.what());
         // Preserve WAL file so it can be recovered on next restart
-        tsdb::wal_log.warn(
+        timestar::wal_log.warn(
             "Preserving WAL file {} for recovery on next restart",
             walFilename);
       }
     } else {
-      tsdb::wal_log.info(
+      timestar::wal_log.info(
           "WAL {} is empty, removing without creating TSM on shard {}", seqNum,
           shardId);
       conversionSucceeded = true; // Empty WAL, safe to remove
@@ -144,28 +124,17 @@ seastar::future<> WALFileManager::init(Engine &engine,
     memoryStores.push_back(store);
   }
 
-  tsdb::wal_log.info("WAL file manager initialization complete for shard {}",
+  timestar::wal_log.info("WAL file manager initialization complete for shard {}",
                      shardId);
 
-  // Log system memory after recovery
   if (!walFiles.empty()) {
-    std::ifstream meminfo("/proc/meminfo");
-    if (meminfo.is_open()) {
-      std::string line;
-      while (std::getline(meminfo, line)) {
-        if (line.find("MemFree:") != std::string::npos ||
-            line.find("MemAvailable:") != std::string::npos) {
-          tsdb::wal_log.info("After WAL recovery - {}", line);
-        }
-      }
-      meminfo.close();
-    }
+    timestar::wal_log.info("WAL recovery complete on shard {}", shardId);
   }
 }
 
 template <class T>
-seastar::future<> WALFileManager::insert(TSDBInsert<T> &insertRequest) {
-  LOG_INSERT_PATH(tsdb::wal_log, debug,
+seastar::future<> WALFileManager::insert(TimeStarInsert<T> &insertRequest) {
+  LOG_INSERT_PATH(timestar::wal_log, debug,
                   "[WAL] Insert called for series: '{}', {} values",
                   insertRequest.seriesKey(), insertRequest.values.size());
 
@@ -180,7 +149,7 @@ seastar::future<> WALFileManager::insert(TSDBInsert<T> &insertRequest) {
         memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
     if (estimatedSize > MemoryStore::walSizeThreshold()) {
       // This single insert exceeds the entire 16MB WAL limit
-      tsdb::wal_log.error(
+      timestar::wal_log.error(
           "Insert request of {} bytes exceeds maximum WAL size of {} bytes",
           estimatedSize, MemoryStore::walSizeThreshold());
       throw std::runtime_error("Insert batch too large - requested " +
@@ -190,14 +159,14 @@ seastar::future<> WALFileManager::insert(TSDBInsert<T> &insertRequest) {
     }
   }
 
-  LOG_INSERT_PATH(tsdb::wal_log, debug,
+  LOG_INSERT_PATH(timestar::wal_log, debug,
                   "[WAL] Inserting into memory store for series: '{}'",
                   insertRequest.seriesKey());
   // Try to insert - returns true if rollover is needed
   bool needsRollover = co_await memoryStores[0]->insert(insertRequest);
 
   if (needsRollover) {
-    LOG_INSERT_PATH(tsdb::wal_log, debug,
+    LOG_INSERT_PATH(timestar::wal_log, debug,
                     "[WAL] Memory store rollover needed for series: '{}'",
                     insertRequest.seriesKey());
     // Rollover the WAL
@@ -209,7 +178,7 @@ seastar::future<> WALFileManager::insert(TSDBInsert<T> &insertRequest) {
       // The insert still doesn't fit in a fresh WAL - it's too large
       size_t estimatedSize =
           memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
-      tsdb::wal_log.error(
+      timestar::wal_log.error(
           "Insert batch of {} bytes too large for fresh 16MB WAL",
           estimatedSize);
       throw std::runtime_error("Insert batch too large - requested " +
@@ -222,15 +191,15 @@ seastar::future<> WALFileManager::insert(TSDBInsert<T> &insertRequest) {
 
 template <class T>
 seastar::future<>
-WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
+WALFileManager::insertBatch(std::vector<TimeStarInsert<T>> &insertRequests) {
   if (insertRequests.empty()) {
     co_return; // No work to do
   }
 
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto start_wal_batch = std::chrono::high_resolution_clock::now();
 #endif
-  LOG_INSERT_PATH(tsdb::wal_log, info,
+  LOG_INSERT_PATH(timestar::wal_log, info,
                   "[PERF] [WAL] Batch insert started for {} requests",
                   insertRequests.size());
 
@@ -251,7 +220,7 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
 
     if (totalEstimatedSize > MemoryStore::walSizeThreshold()) {
       // This batch exceeds the entire WAL limit
-      tsdb::wal_log.error("Batch insert request of {} bytes exceeds maximum "
+      timestar::wal_log.error("Batch insert request of {} bytes exceeds maximum "
                           "WAL size of {} bytes",
                           totalEstimatedSize, MemoryStore::walSizeThreshold());
       throw std::runtime_error(
@@ -261,23 +230,23 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     }
   }
 
-  LOG_INSERT_PATH(tsdb::wal_log, debug,
+  LOG_INSERT_PATH(timestar::wal_log, debug,
                   "[WAL] Inserting batch into memory store for {} requests",
                   insertRequests.size());
 
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto start_memory_batch = std::chrono::high_resolution_clock::now();
 #endif
   // Try to insert batch - returns true if rollover is needed.
   // Pass the pre-computed size so MemoryStore skips redundant estimation.
   bool needsRollover = co_await memoryStores[0]->insertBatch(insertRequests, totalEstimatedSize);
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto end_memory_batch = std::chrono::high_resolution_clock::now();
 #endif
 
   if (needsRollover) {
     LOG_INSERT_PATH(
-        tsdb::wal_log, debug,
+        timestar::wal_log, debug,
         "[WAL] Memory store rollover needed for batch of {} requests",
         insertRequests.size());
     // Rollover the WAL
@@ -289,8 +258,8 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     if (retryResult) {
       // The batch still doesn't fit in a fresh WAL - it's too large.
       // Re-use the already-computed totalEstimatedSize (each per-insert size
-      // is cached in the TSDBInsert, so no re-iteration is needed).
-      tsdb::wal_log.error("Batch insert of {} bytes too large for fresh WAL",
+      // is cached in the TimeStarInsert, so no re-iteration is needed).
+      timestar::wal_log.error("Batch insert of {} bytes too large for fresh WAL",
                           totalEstimatedSize);
       throw std::runtime_error(
           "Insert batch too large - requested " +
@@ -299,7 +268,7 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
     }
   }
 
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto end_wal_batch = std::chrono::high_resolution_clock::now();
   auto memory_batch_duration =
       std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch -
@@ -308,9 +277,9 @@ WALFileManager::insertBatch(std::vector<TSDBInsert<T>> &insertRequests) {
       std::chrono::duration_cast<std::chrono::microseconds>(end_wal_batch -
                                                             start_wal_batch);
 
-  LOG_INSERT_PATH(tsdb::wal_log, info, "[PERF] [WAL] Memory batch insert: {}μs",
+  LOG_INSERT_PATH(timestar::wal_log, info, "[PERF] [WAL] Memory batch insert: {}μs",
                   memory_batch_duration.count());
-  LOG_INSERT_PATH(tsdb::wal_log, info, "[PERF] [WAL] Total batch insert: {}μs",
+  LOG_INSERT_PATH(timestar::wal_log, info, "[PERF] [WAL] Total batch insert: {}μs",
                   wal_batch_duration.count());
 #endif
 }
@@ -335,14 +304,14 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
   // fresh (no data at all), which means another coroutine must have just
   // rolled over.
   if (!memoryStores.empty() && memoryStores[0]->isEmpty()) {
-    tsdb::wal_log.debug(
+    timestar::wal_log.debug(
         "Rollover already completed by another coroutine on shard {}, skipping",
         shardId);
     co_return;
   }
 
   auto previousStore = memoryStores[0];
-  tsdb::wal_log.info(
+  timestar::wal_log.info(
       "Memory store {} full (16MB threshold reached), rolling over",
       previousStore->sequenceNumber);
 
@@ -353,7 +322,7 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
   co_await store->initWAL();
   memoryStores.insert(memoryStores.begin(), store);
 
-  tsdb::wal_log.info("New memory store {} created for shard {}",
+  timestar::wal_log.info("New memory store {} created for shard {}",
                      store->sequenceNumber, shardId);
 
   // -----------------------------------------------------------------------
@@ -382,25 +351,48 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
   if (!previousStore->isEmpty()) {
     auto sid = shardId;
     auto seqNum = previousStore->sequenceNumber;
-    _backgroundGate.enter();
-    // Acquire the semaphore to serialize with other conversions, then
-    // close the store (drains any in-flight WAL writes) and convert.
-    // The chained .finally() releases the gate when the task completes.
-    (void)seastar::get_units(_conversionSemaphore, 1).then(
-        [this, store = previousStore](auto units) {
-          return store->close().then([this, store, units = std::move(units)]() mutable {
-            return convertWalToTsm(store).finally([units = std::move(units)] {});
+    // Use try_with_gate to safely track the background conversion.
+    // This avoids manual enter/leave which can leak on synchronous exceptions.
+    (void)seastar::try_with_gate(_backgroundGate, [this, store = previousStore] {
+      return seastar::get_units(_conversionSemaphore, 1).then(
+          [this, store](auto units) {
+            return store->close().then([this, store, units = std::move(units)]() mutable {
+              return convertWalToTsm(store).finally([units = std::move(units)] {});
+            });
           });
-        }).handle_exception([sid, seqNum](auto ep) {
+    }).handle_exception([this, store = previousStore, sid, seqNum](auto ep) {
           try {
             std::rethrow_exception(ep);
+          } catch (const seastar::gate_closed_exception&) {
+            // Shutdown in progress, ignore
           } catch (const std::exception& e) {
-            tsdb::wal_log.error(
-                "[BG_CONVERT] Background TSM conversion failed for store {} on shard {}: {}",
+            timestar::wal_log.error(
+                "[BG_CONVERT] Background TSM conversion failed for store {} on shard {}: {}. "
+                "Data remains queryable from memory; will retry in 30s. "
+                "WAL on disk will be replayed on restart if retry also fails.",
                 seqNum, sid, e.what());
+            // Schedule a single retry after a delay to avoid permanent memory bloat.
+            (void)seastar::try_with_gate(_backgroundGate, [this, store, sid, seqNum] {
+              return seastar::sleep(std::chrono::seconds(30)).then([this, store, sid, seqNum] {
+                return seastar::get_units(_conversionSemaphore, 1).then(
+                    [this, store, sid, seqNum](auto units) {
+                      timestar::wal_log.info(
+                          "[BG_CONVERT] Retrying TSM conversion for store {} on shard {}",
+                          seqNum, sid);
+                      return convertWalToTsm(store).finally([units = std::move(units)] {});
+                    });
+              });
+            }).handle_exception([sid, seqNum](auto ep2) {
+              try { std::rethrow_exception(ep2); }
+              catch (const seastar::gate_closed_exception&) {}
+              catch (const std::exception& e2) {
+                timestar::wal_log.error(
+                    "[BG_CONVERT] Retry also failed for store {} on shard {}: {}. "
+                    "WAL preserved on disk for recovery on next startup.",
+                    seqNum, sid, e2.what());
+              }
+            });
           }
-        }).finally([this] {
-          _backgroundGate.leave();
         });
   } else {
     // Empty store — close and remove the WAL file.
@@ -414,14 +406,14 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     }
   }
 
-  tsdb::wal_log.info(
+  timestar::wal_log.info(
       "Rollover complete, new memory store {} created for shard {}",
       store->sequenceNumber, shardId);
 }
 
 seastar::future<>
 WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
-  tsdb::wal_log.info(
+  timestar::wal_log.info(
       "[CONVERT_WAL_TO_TSM] Starting conversion of WAL {} to TSM on shard {}",
       store->sequenceNumber, shardId);
 
@@ -468,55 +460,46 @@ WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
 
     // Warn about large series
     if (seriesPoints > 100000) {
-      tsdb::wal_log.warn("[LARGE_SERIES] Series '{}' with {} points (~{} MB) "
+      timestar::wal_log.warn("[LARGE_SERIES] Series '{}' with {} points (~{} MB) "
                          "in memory store {}",
                          key, seriesPoints, seriesMemory / (1024 * 1024),
                          store->sequenceNumber);
     }
   }
 
-  tsdb::wal_log.info("[MEMORY_STORE_STATS] Store {} on shard {}: {} series, {} "
+  timestar::wal_log.info("[MEMORY_STORE_STATS] Store {} on shard {}: {} series, {} "
                      "total points, ~{} MB estimated memory",
                      store->sequenceNumber, shardId, totalSeries, totalPoints,
                      totalMemoryEstimate / (1024 * 1024));
-  tsdb::wal_log.info("[LARGEST_SERIES] Largest series: '{}' with {} points",
+  timestar::wal_log.info("[LARGEST_SERIES] Largest series: '{}' with {} points",
                      largestSeriesKey, largestSeriesPoints);
 
   try {
-    tsdb::wal_log.debug(
+    timestar::wal_log.debug(
         "[TSM_WRITE_START] Calling tsmFileManager->writeMemstore for store {} "
         "on shard {}",
         store->sequenceNumber, shardId);
     co_await tsmFileManager->writeMemstore(store);
-    tsdb::wal_log.debug(
+    timestar::wal_log.debug(
         "[TSM_WRITE_SUCCESS] Successfully wrote TSM for store {} on shard {}",
         store->sequenceNumber, shardId);
   } catch (const std::bad_alloc &e) {
-    tsdb::wal_log.error("[BAD_ALLOC] Memory allocation failed when writing TSM "
+    timestar::wal_log.error("[BAD_ALLOC] Memory allocation failed when writing TSM "
                         "for store {} on shard {}",
                         store->sequenceNumber, shardId);
-    tsdb::wal_log.error("[BAD_ALLOC] Stats: {} series, {} points, ~{} MB "
+    timestar::wal_log.error("[BAD_ALLOC] Stats: {} series, {} points, ~{} MB "
                         "estimated, largest series: '{}' ({} points)",
                         totalSeries, totalPoints,
                         totalMemoryEstimate / (1024 * 1024), largestSeriesKey,
                         largestSeriesPoints);
 
-    // Log system memory info if available
-    std::ifstream meminfo("/proc/meminfo");
-    if (meminfo.is_open()) {
-      std::string line;
-      while (std::getline(meminfo, line)) {
-        if (line.find("MemFree:") != std::string::npos ||
-            line.find("MemAvailable:") != std::string::npos ||
-            line.find("MemTotal:") != std::string::npos) {
-          tsdb::wal_log.error("[SYSTEM_MEMORY] {}", line);
-        }
-      }
-      meminfo.close();
-    }
+    timestar::wal_log.error(
+        "[SYSTEM_MEMORY] System may be low on memory - bad_alloc during TSM write "
+        "for store {} on shard {}",
+        store->sequenceNumber, shardId);
     throw;
   } catch (const std::exception &e) {
-    tsdb::wal_log.error(
+    timestar::wal_log.error(
         "[TSM_WRITE_ERROR] Failed to write TSM for store {} on shard {}: {}",
         store->sequenceNumber, shardId, e.what());
     throw;
@@ -531,7 +514,7 @@ WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
   }
 
   co_await store->removeWAL();
-  tsdb::wal_log.info("Successfully converted WAL {} to TSM on shard {}",
+  timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {}",
                      store->sequenceNumber, shardId);
 }
 
@@ -560,11 +543,12 @@ WALFileManager::getSeriesType(const SeriesId128 &seriesId) {
 seastar::future<>
 WALFileManager::deleteFromMemoryStores(const std::string &seriesKey,
                                        uint64_t startTime, uint64_t endTime) {
+  SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+
   // Check if the series exists in any memory store before writing to WAL
   bool seriesExists = false;
   for (const auto &memStore : memoryStores) {
-    auto seriesType =
-        memStore->getSeriesType(SeriesId128::fromSeriesKey(seriesKey));
+    auto seriesType = memStore->getSeriesType(seriesId);
     if (seriesType.has_value()) {
       seriesExists = true;
       break;
@@ -574,12 +558,10 @@ WALFileManager::deleteFromMemoryStores(const std::string &seriesKey,
   // Write deletion to WAL and apply to memory stores
   // We always write to WAL to ensure deletions are persisted
   if (!memoryStores.empty() && memoryStores[0]) {
-    // Get the current WAL from the first memory store
     auto wal = memoryStores[0]->getWAL();
     if (wal) {
-      SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
       co_await wal->deleteRange(seriesId, startTime, endTime);
-      tsdb::wal_log.debug(
+      timestar::wal_log.debug(
           "Wrote deleteRange to WAL: series={}, startTime={}, endTime={}",
           seriesKey, startTime, endTime);
     }
@@ -588,36 +570,35 @@ WALFileManager::deleteFromMemoryStores(const std::string &seriesKey,
   // Apply deletion to all memory stores
   // This ensures tombstones are applied even if data arrives later
   for (auto &memStore : memoryStores) {
-    memStore->deleteRange(SeriesId128::fromSeriesKey(seriesKey), startTime,
-                          endTime);
+    memStore->deleteRange(seriesId, startTime, endTime);
   }
 
   if (!seriesExists) {
-    tsdb::wal_log.debug(
+    timestar::wal_log.debug(
         "Series '{}' not found in memory stores but deletion recorded",
         seriesKey);
   }
 
-  tsdb::wal_log.debug("Applied deleteRange to {} memory stores",
+  timestar::wal_log.debug("Applied deleteRange to {} memory stores",
                       memoryStores.size());
 
   co_return;
 }
 
 template seastar::future<>
-WALFileManager::insert<bool>(TSDBInsert<bool> &insertRequest);
+WALFileManager::insert<bool>(TimeStarInsert<bool> &insertRequest);
 template seastar::future<>
-WALFileManager::insert<double>(TSDBInsert<double> &insertRequest);
+WALFileManager::insert<double>(TimeStarInsert<double> &insertRequest);
 template seastar::future<>
-WALFileManager::insert<std::string>(TSDBInsert<std::string> &insertRequest);
+WALFileManager::insert<std::string>(TimeStarInsert<std::string> &insertRequest);
 template seastar::future<>
-WALFileManager::insert<int64_t>(TSDBInsert<int64_t> &insertRequest);
+WALFileManager::insert<int64_t>(TimeStarInsert<int64_t> &insertRequest);
 
 template seastar::future<> WALFileManager::insertBatch<bool>(
-    std::vector<TSDBInsert<bool>> &insertRequests);
+    std::vector<TimeStarInsert<bool>> &insertRequests);
 template seastar::future<> WALFileManager::insertBatch<double>(
-    std::vector<TSDBInsert<double>> &insertRequests);
+    std::vector<TimeStarInsert<double>> &insertRequests);
 template seastar::future<> WALFileManager::insertBatch<std::string>(
-    std::vector<TSDBInsert<std::string>> &insertRequests);
+    std::vector<TimeStarInsert<std::string>> &insertRequests);
 template seastar::future<> WALFileManager::insertBatch<int64_t>(
-    std::vector<TSDBInsert<int64_t>> &insertRequests);
+    std::vector<TimeStarInsert<int64_t>> &insertRequests);

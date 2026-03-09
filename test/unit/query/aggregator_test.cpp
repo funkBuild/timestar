@@ -1,54 +1,10 @@
 #include <gtest/gtest.h>
-#include "../../../lib/query/aggregator.hpp"
-#include "../../../lib/http/http_query_handler.hpp"  // For SeriesResult
+#include "../../test_helpers/aggregator_test_helper.hpp"
 #include <vector>
 #include <cmath>
 
-using namespace tsdb;
-
-// Helper class for testing - converts simple data to distributed format
-class AggregatorTestHelper {
-public:
-    static SeriesResult createSeries(
-        const std::string& measurement,
-        const std::map<std::string, std::string>& tags,
-        const std::string& fieldName,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values) {
-
-        SeriesResult sr;
-        sr.measurement = measurement;
-        sr.tags = tags;
-        sr.fields[fieldName] = std::make_pair(timestamps, FieldValues(values));
-        return sr;
-    }
-
-    static std::vector<AggregatedPoint> aggregateSingleSeries(
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values,
-        AggregationMethod method,
-        uint64_t interval = 0) {
-
-        // Create a simple series
-        auto series = createSeries("test", {}, "value", timestamps, values);
-
-        // Create partial aggregations
-        auto partials = Aggregator::createPartialAggregations({series}, method, interval, {});
-
-        // Merge partials
-        auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, method);
-
-        // Extract results
-        std::vector<AggregatedPoint> result;
-        if (!grouped.empty()) {
-            for (const auto& point : grouped[0].points) {
-                result.push_back(point);
-            }
-        }
-
-        return result;
-    }
-};
+using namespace timestar;
+using timestar::test::AggregatorTestHelper;
 
 class AggregatorTest : public ::testing::Test {
 protected:
@@ -65,56 +21,65 @@ protected:
 };
 
 TEST_F(AggregatorTest, AverageAggregation) {
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::AVG, 0);
+    // Use 5-minute buckets so multiple points aggregate into each bucket
+    uint64_t interval = 5 * 60 * 1000000000ULL;
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, interval);
 
-    // With no interval, aggregates by timestamp - should have 10 points
-    ASSERT_EQ(result.size(), 10);
-    // Each point should have its original value (one value per timestamp)
-    for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result[i].value, values[i]);
-    }
+    ASSERT_EQ(result.size(), 2);
+    // First bucket: avg(10, 12, 14, 16, 18) = 14.0
+    EXPECT_DOUBLE_EQ(result[0].value, 14.0);
+    // Second bucket: avg(20, 22, 24, 26, 28) = 24.0
+    EXPECT_DOUBLE_EQ(result[1].value, 24.0);
 }
 
 TEST_F(AggregatorTest, MinAggregation) {
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::MIN, 0);
+    uint64_t interval = 5 * 60 * 1000000000ULL;
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::MIN, interval);
 
-    ASSERT_EQ(result.size(), 10);
-    for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result[i].value, values[i]);
-    }
+    ASSERT_EQ(result.size(), 2);
+    // First bucket: min(10, 12, 14, 16, 18) = 10.0
+    EXPECT_DOUBLE_EQ(result[0].value, 10.0);
+    // Second bucket: min(20, 22, 24, 26, 28) = 20.0
+    EXPECT_DOUBLE_EQ(result[1].value, 20.0);
 }
 
 TEST_F(AggregatorTest, MaxAggregation) {
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::MAX, 0);
+    uint64_t interval = 5 * 60 * 1000000000ULL;
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::MAX, interval);
 
-    ASSERT_EQ(result.size(), 10);
-    for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result[i].value, values[i]);
-    }
+    ASSERT_EQ(result.size(), 2);
+    // First bucket: max(10, 12, 14, 16, 18) = 18.0
+    EXPECT_DOUBLE_EQ(result[0].value, 18.0);
+    // Second bucket: max(20, 22, 24, 26, 28) = 28.0
+    EXPECT_DOUBLE_EQ(result[1].value, 28.0);
 }
 
 TEST_F(AggregatorTest, SumAggregation) {
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::SUM, 0);
+    uint64_t interval = 5 * 60 * 1000000000ULL;
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::SUM, interval);
 
-    ASSERT_EQ(result.size(), 10);
-    for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result[i].value, values[i]);
-    }
+    ASSERT_EQ(result.size(), 2);
+    // First bucket: sum(10, 12, 14, 16, 18) = 70.0
+    EXPECT_DOUBLE_EQ(result[0].value, 70.0);
+    // Second bucket: sum(20, 22, 24, 26, 28) = 120.0
+    EXPECT_DOUBLE_EQ(result[1].value, 120.0);
 }
 
 TEST_F(AggregatorTest, LatestAggregation) {
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::LATEST, 0);
+    uint64_t interval = 5 * 60 * 1000000000ULL;
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::LATEST, interval);
 
-    ASSERT_EQ(result.size(), 10);
-    for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_DOUBLE_EQ(result[i].value, values[i]);
-    }
+    ASSERT_EQ(result.size(), 2);
+    // First bucket: latest value by timestamp = 18.0 (at i=4)
+    EXPECT_DOUBLE_EQ(result[0].value, 18.0);
+    // Second bucket: latest value by timestamp = 28.0 (at i=9)
+    EXPECT_DOUBLE_EQ(result[1].value, 28.0);
 }
 
 TEST_F(AggregatorTest, TimeBasedBucketing) {
     // Aggregate into 5-minute buckets
     uint64_t interval = 5 * 60 * 1000000000ULL; // 5 minutes in nanoseconds
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::AVG, interval);
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, interval);
 
     ASSERT_EQ(result.size(), 2); // Should have 2 buckets (10 points, 1-min intervals, 5-min buckets)
 
@@ -131,7 +96,7 @@ TEST_F(AggregatorTest, EmptyData) {
     std::vector<uint64_t> emptyTimestamps;
     std::vector<double> emptyValues;
 
-    auto result = AggregatorTestHelper::aggregateSingleSeries(emptyTimestamps, emptyValues, AggregationMethod::AVG, 0);
+    auto result = AggregatorTestHelper::aggregate(emptyTimestamps, emptyValues, AggregationMethod::AVG, 0);
 
     EXPECT_EQ(result.size(), 0);
 }
@@ -140,7 +105,7 @@ TEST_F(AggregatorTest, SinglePoint) {
     std::vector<uint64_t> singleTimestamp = {1000000000};
     std::vector<double> singleValue = {42.0};
 
-    auto result = AggregatorTestHelper::aggregateSingleSeries(singleTimestamp, singleValue, AggregationMethod::AVG, 0);
+    auto result = AggregatorTestHelper::aggregate(singleTimestamp, singleValue, AggregationMethod::AVG, 0);
 
     ASSERT_EQ(result.size(), 1);
     EXPECT_DOUBLE_EQ(result[0].value, 42.0);
@@ -216,7 +181,7 @@ TEST_F(AggregatorTest, GroupByAggregation) {
 TEST_F(AggregatorTest, TimeIntervalWithMax) {
     // Test MAX aggregation with time intervals
     uint64_t interval = 3 * 60 * 1000000000ULL; // 3 minutes in nanoseconds
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::MAX, interval);
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::MAX, interval);
 
     ASSERT_EQ(result.size(), 4);
 
@@ -247,7 +212,7 @@ TEST_F(AggregatorTest, InvalidInput) {
 
 TEST_F(AggregatorTest, TimeIntervalWithSum) {
     uint64_t interval = 5 * 60 * 1000000000ULL; // 5 minutes in nanoseconds
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::SUM, interval);
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::SUM, interval);
 
     ASSERT_EQ(result.size(), 2);
 
@@ -262,7 +227,7 @@ TEST_F(AggregatorTest, TimeIntervalWithSum) {
 
 TEST_F(AggregatorTest, TimeIntervalWithLatest) {
     uint64_t interval = 4 * 60 * 1000000000ULL; // 4 minutes in nanoseconds
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::LATEST, interval);
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::LATEST, interval);
 
     ASSERT_EQ(result.size(), 3);
 
@@ -281,7 +246,7 @@ TEST_F(AggregatorTest, TimeIntervalWithLatest) {
 
 TEST_F(AggregatorTest, VerySmallInterval) {
     uint64_t interval = 30000000000ULL; // 30 seconds (data is at 1-minute intervals)
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::AVG, interval);
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, interval);
 
     // Each point should be in its own bucket since interval < data spacing
     EXPECT_EQ(result.size(), 10);
@@ -294,7 +259,7 @@ TEST_F(AggregatorTest, VerySmallInterval) {
 
 TEST_F(AggregatorTest, VeryLargeInterval) {
     uint64_t interval = 20 * 60 * 1000000000ULL; // 20 minutes (data spans 9 minutes)
-    auto result = AggregatorTestHelper::aggregateSingleSeries(timestamps, values, AggregationMethod::AVG, interval);
+    auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, interval);
 
     // Should have just one bucket containing all points
     ASSERT_EQ(result.size(), 1);
@@ -314,7 +279,7 @@ TEST_F(AggregatorTest, IrregularTimestamps) {
     std::vector<double> irregularValues = {10.0, 15.0, 20.0, 25.0, 30.0, 35.0};
 
     uint64_t interval = 2 * 60 * 1000000000ULL; // 2 minutes in nanoseconds
-    auto result = AggregatorTestHelper::aggregateSingleSeries(irregularTimestamps, irregularValues,
+    auto result = AggregatorTestHelper::aggregate(irregularTimestamps, irregularValues,
                                        AggregationMethod::AVG, interval);
 
     // Just verify all points are accounted for

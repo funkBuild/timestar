@@ -1,0 +1,118 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  TimeStar Alpine Docker build — smaller runtime image
+# ──────────────────────────────────────────────────────────────────────────────
+#  Build:  docker build -f Dockerfile.alpine -t timestar:alpine .
+#  Run:    docker run --rm -p 8086:8086 timestar:alpine
+#
+#  Strategy: build on Ubuntu (Seastar requires glibc), run on Alpine with
+#  gcompat (glibc compatibility shim).  This gives us the ~6 MB Alpine base
+#  instead of ~78 MB Ubuntu base.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+#  Stage 1 — build (Ubuntu — Seastar needs glibc + full build toolchain)
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Seastar + TimeStar build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    g++-14 gcc-14 \
+    cmake \
+    ninja-build \
+    git \
+    pkg-config \
+    python3 python3-pyelftools python3-yaml \
+    ragel \
+    meson \
+    stow \
+    libtool \
+    patchelf \
+    # Seastar deps
+    libboost-all-dev \
+    libc-ares-dev \
+    libcrypto++-dev \
+    libfmt-dev \
+    libgnutls28-dev \
+    libhwloc-dev \
+    liblz4-dev \
+    libnuma-dev \
+    libpciaccess-dev \
+    libprotobuf-dev \
+    libsctp-dev \
+    liburing-dev \
+    libxml2-dev \
+    libyaml-cpp-dev \
+    systemtap-sdt-dev \
+    valgrind \
+    xfslibs-dev \
+    # TimeStar deps
+    libsnappy-dev \
+    libleveldb-dev \
+    libxxhash-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CC=gcc-14 CXX=g++-14
+
+WORKDIR /src
+COPY . .
+
+# NOTE: .dockerignore excludes .git/ for speed. Ensure external/seastar
+# is already populated (e.g. via `git submodule update --init` before build).
+
+RUN mkdir -p build && cd build && \
+    cmake .. \
+      -GNinja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
+      -DCMAKE_C_COMPILER=gcc-14 \
+      -DCMAKE_CXX_COMPILER=g++-14 \
+      -DTIMESTAR_ENABLE_LTO=ON \
+    && ninja timestar_http_server
+
+# Strip debug symbols
+RUN strip --strip-all build/bin/timestar_http_server
+
+# Collect shared library dependencies into /deps for the runtime image
+RUN mkdir -p /deps && \
+    ldd build/bin/timestar_http_server \
+      | grep -oP '/\S+' \
+      | while read lib; do \
+          cp --parents "$lib" /deps/ 2>/dev/null || true; \
+        done && \
+    # Also copy the dynamic linker
+    cp --parents /lib64/ld-linux-x86-64.so.2 /deps/ 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+#  Stage 2 — Alpine runtime
+# ---------------------------------------------------------------------------
+FROM alpine:3.21 AS runtime
+
+# gcompat provides glibc compatibility on musl-based Alpine
+RUN apk add --no-cache gcompat libstdc++ wget
+
+# Copy glibc shared libs from the builder
+COPY --from=builder /deps/ /
+
+# Create non-root user and data directory
+RUN addgroup -S timestar && adduser -S -G timestar -h /var/lib/timestar -s /sbin/nologin timestar \
+    && mkdir -p /var/lib/timestar \
+    && chown timestar:timestar /var/lib/timestar
+
+COPY --from=builder /src/build/bin/timestar_http_server /usr/local/bin/timestar_http_server
+
+VOLUME /var/lib/timestar
+
+EXPOSE 8086
+
+ENV TIMESTAR_DATA_DIR=/var/lib/timestar \
+    TIMESTAR_OVERPROVISIONED=true
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget -q --spider http://localhost:8086/health || exit 1
+
+USER timestar
+
+ENTRYPOINT ["timestar_http_server"]

@@ -3,13 +3,13 @@
 #include <iostream>
 
 SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey){
-  const int length = seriesKey.length();
+  const size_t length = seriesKey.length();
 
-  int startIndex = 0;
+  size_t startIndex = 0;
   State state = State::measurement;
   bool insideQuote = false;
 
-  for(int i=0; i < length; i++){
+  for(size_t i=0; i < length; i++){
     //std::cout << seriesKey[i] << std::endl;
     switch(seriesKey[i]){
       case ',': {
@@ -82,6 +82,7 @@ SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey){
 
 void SeriesKeyParser::parseKeypair(std::string_view keypair, std::map<std::string_view, std::string_view> &map){
   auto delim = keypair.find('=');
+  if (delim == std::string_view::npos) return;  // skip malformed keypairs
   std::string_view key = keypair.substr(0, delim);
   std::string_view value = keypair.substr(delim + 1);
 

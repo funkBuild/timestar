@@ -10,7 +10,7 @@
 #include <ranges>
 
 template <class T>
-void InMemorySeries<T>::insert(TSDBInsert<T>&& insertRequest){
+void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest){
   const auto& srcTimestamps = insertRequest.getTimestamps();
   if (srcTimestamps.empty()) [[unlikely]] return;
 
@@ -88,26 +88,34 @@ void InMemorySeries<T>::sortPaired(size_t from, size_t to) {
 
   // Build index array for the range [from, to). Sorting indices lets us apply
   // the same permutation to both timestamps and values in a single pass.
-  // The index array is only sized for the range being sorted, not the full vector.
   std::vector<size_t> indices(count);
   std::iota(indices.begin(), indices.end(), from);
 
   std::sort(indices.begin(), indices.end(),
             [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
 
-  // Apply permutation via temporary vectors for sequential write access and
-  // better cache locality. This is O(count) extra memory, which is cheap for
-  // the suffix-only sort case (small batch) on Seastar's thread-local allocator.
+  // Apply permutation via temporary timestamp vector. Values are applied
+  // differently based on type: std::vector<bool> uses proxy references
+  // that don't support std::move, so we use copy for that specialization.
   std::vector<uint64_t> sortedTs(count);
-  std::vector<T> sortedVals(count);
   for (size_t i = 0; i < count; ++i) {
     sortedTs[i] = timestamps[indices[i]];
-    sortedVals[i] = std::move(values[indices[i]]);
   }
-
-  // Write sorted data back into the range
   std::copy(sortedTs.begin(), sortedTs.end(), timestamps.begin() + from);
-  std::move(sortedVals.begin(), sortedVals.end(), values.begin() + from);
+
+  if constexpr (std::is_same_v<T, bool>) {
+    std::vector<bool> sortedVals(count);
+    for (size_t i = 0; i < count; ++i) {
+      sortedVals[i] = static_cast<bool>(values[indices[i]]);
+    }
+    std::copy(sortedVals.begin(), sortedVals.end(), values.begin() + from);
+  } else {
+    std::vector<T> sortedVals(count);
+    for (size_t i = 0; i < count; ++i) {
+      sortedVals[i] = std::move(values[indices[i]]);
+    }
+    std::move(sortedVals.begin(), sortedVals.end(), values.begin() + from);
+  }
 }
 
 template <class T>
@@ -157,7 +165,7 @@ seastar::future<> MemoryStore::close(){
   closed = true;
 
   if(wal){
-    tsdb::memory_log.debug("Closing WAL for memory store {}", sequenceNumber);
+    timestar::memory_log.debug("Closing WAL for memory store {}", sequenceNumber);
     co_await wal->close();
   }
 }
@@ -195,7 +203,7 @@ seastar::future<bool> MemoryStore::isFull(){
 }
 
 template <class T>
-void MemoryStore::insertMemory(TSDBInsert<T>&& insertRequest){
+void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest){
   // In-memory insert
   SeriesId128 seriesId = insertRequest.seriesId128();
 
@@ -225,13 +233,13 @@ void MemoryStore::insertMemory(TSDBInsert<T>&& insertRequest){
 }
 
 template <class T>
-bool MemoryStore::wouldExceedThreshold(TSDBInsert<T> &insertRequest){
+bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T> &insertRequest){
   size_t unused = 0;
   return wouldExceedThreshold(insertRequest, unused);
 }
 
 template <class T>
-bool MemoryStore::wouldExceedThreshold(TSDBInsert<T> &insertRequest, size_t &outEstimatedSize){
+bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T> &insertRequest, size_t &outEstimatedSize){
   if(!wal) {
     outEstimatedSize = 0;
     return false;
@@ -247,7 +255,7 @@ bool MemoryStore::wouldExceedThreshold(TSDBInsert<T> &insertRequest, size_t &out
 }
 
 template <class T>
-bool MemoryStore::wouldBatchExceedThreshold(std::vector<TSDBInsert<T>> &insertRequests){
+bool MemoryStore::wouldBatchExceedThreshold(std::vector<TimeStarInsert<T>> &insertRequests){
   if(!wal || insertRequests.empty()) {
     return false;
   }
@@ -264,7 +272,7 @@ bool MemoryStore::wouldBatchExceedThreshold(std::vector<TSDBInsert<T>> &insertRe
 }
 
 template <class T>
-seastar::future<bool> MemoryStore::insert(TSDBInsert<T> &insertRequest){
+seastar::future<bool> MemoryStore::insert(TimeStarInsert<T> &insertRequest){
   if(closed)
     throw std::runtime_error("MemoryStore is closed");
 
@@ -275,26 +283,26 @@ seastar::future<bool> MemoryStore::insert(TSDBInsert<T> &insertRequest){
   bool needsRollover = wouldExceedThreshold(insertRequest, thisEstimatedSize);
   if(needsRollover) {
     // Don't insert - signal that rollover is needed
-    tsdb::memory_log.debug("Insert would exceed 16MB WAL limit, signaling rollover needed");
+    timestar::memory_log.debug("Insert would exceed 16MB WAL limit, signaling rollover needed");
     co_return true;
   }
-
-  estimatedAccumulatedSize += thisEstimatedSize;
 
   if(wal) {
     auto walResult = co_await wal->insert(insertRequest);
     if (walResult == WALInsertResult::RolloverNeeded) [[unlikely]] {
       co_return true;
     }
-    LOG_INSERT_PATH(tsdb::memory_log, trace, "WAL insert completed for series: {}", insertRequest.seriesKey());
+    LOG_INSERT_PATH(timestar::memory_log, trace, "WAL insert completed for series: {}", insertRequest.seriesKey());
   }
+
+  estimatedAccumulatedSize += thisEstimatedSize;
   insertMemory(std::move(insertRequest));
 
   co_return false;
 }
 
 template <class T>
-seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &insertRequests, size_t preComputedBatchSize){
+seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>> &insertRequests, size_t preComputedBatchSize){
   if(closed)
     throw std::runtime_error("MemoryStore is closed");
 
@@ -302,10 +310,10 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &inser
     co_return false; // No work to do
   }
 
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto start_memory_batch = std::chrono::high_resolution_clock::now();
 #endif
-  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] Batch insert started for {} requests", insertRequests.size());
+  LOG_INSERT_PATH(timestar::memory_log, info, "[PERF] [MEMORY] Batch insert started for {} requests", insertRequests.size());
 
   // Compute the estimated batch size if not pre-computed
   size_t batchEstimate = preComputedBatchSize;
@@ -327,98 +335,105 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TSDBInsert<T>> &inser
   }
   if(needsRollover) {
     // Don't insert - signal that rollover is needed
-    LOG_INSERT_PATH(tsdb::memory_log, debug, "Batch insert would exceed WAL limit, signaling rollover needed");
+    LOG_INSERT_PATH(timestar::memory_log, debug, "Batch insert would exceed WAL limit, signaling rollover needed");
     co_return true;
   }
 
   estimatedAccumulatedSize += batchEstimate;
 
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto start_wal_insert = std::chrono::high_resolution_clock::now();
 #endif
   if(wal) {
     auto walResult = co_await wal->insertBatch(insertRequests);
     if (walResult == WALInsertResult::RolloverNeeded) [[unlikely]] {
+      estimatedAccumulatedSize -= batchEstimate;
       co_return true;
     }
   }
 
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto start_memory_insert = std::chrono::high_resolution_clock::now();
 #endif
   for(auto& insertRequest : insertRequests) {
     insertMemory(std::move(insertRequest));
   }
-#if TSDB_LOG_INSERT_PATH
+#if TIMESTAR_LOG_INSERT_PATH
   auto end_memory_batch = std::chrono::high_resolution_clock::now();
   auto wal_duration = std::chrono::duration_cast<std::chrono::microseconds>(start_memory_insert - start_wal_insert);
   auto mem_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_memory_batch - start_memory_insert);
-  LOG_INSERT_PATH(tsdb::memory_log, info, "[PERF] [MEMORY] WAL batch: {}μs, memory: {}μs", wal_duration.count(), mem_duration.count());
+  LOG_INSERT_PATH(timestar::memory_log, info, "[PERF] [MEMORY] WAL batch: {}μs, memory: {}μs", wal_duration.count(), mem_duration.count());
 #endif
 
   co_return false;
 }
 
 std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128 &seriesId){
+  // Compile-time guard: variant order must match TSMValueType enum values.
+  using V = decltype(series)::mapped_type;
+  static_assert(std::is_same_v<std::variant_alternative_t<0, V>, InMemorySeries<double>>);
+  static_assert(std::is_same_v<std::variant_alternative_t<1, V>, InMemorySeries<bool>>);
+  static_assert(std::is_same_v<std::variant_alternative_t<2, V>, InMemorySeries<std::string>>);
+  static_assert(std::is_same_v<std::variant_alternative_t<3, V>, InMemorySeries<int64_t>>);
+
   auto it = series.find(seriesId);
 
   if(it == series.end())
     return {};
-  
+
   return (TSMValueType)it->second.index();
 }
 
 
-template void InMemorySeries<double>::insert(TSDBInsert<double>&& insertRequest);
+template void InMemorySeries<double>::insert(TimeStarInsert<double>&& insertRequest);
 template void InMemorySeries<double>::sortPaired(size_t, size_t);
 template void InMemorySeries<double>::mergePaired(size_t);
-template void InMemorySeries<bool>::insert(TSDBInsert<bool>&& insertRequest);
+template void InMemorySeries<bool>::insert(TimeStarInsert<bool>&& insertRequest);
 template void InMemorySeries<bool>::sortPaired(size_t, size_t);
 template void InMemorySeries<bool>::mergePaired(size_t);
-template void InMemorySeries<std::string>::insert(TSDBInsert<std::string>&& insertRequest);
+template void InMemorySeries<std::string>::insert(TimeStarInsert<std::string>&& insertRequest);
 template void InMemorySeries<std::string>::sortPaired(size_t, size_t);
 template void InMemorySeries<std::string>::mergePaired(size_t);
-template void InMemorySeries<int64_t>::insert(TSDBInsert<int64_t>&& insertRequest);
+template void InMemorySeries<int64_t>::insert(TimeStarInsert<int64_t>&& insertRequest);
 template void InMemorySeries<int64_t>::sortPaired(size_t, size_t);
 template void InMemorySeries<int64_t>::mergePaired(size_t);
 
-template seastar::future<bool> MemoryStore::insert<double>(TSDBInsert<double> &insertRequest);
-template seastar::future<bool> MemoryStore::insert<bool>(TSDBInsert<bool> &insertRequest);
-template seastar::future<bool> MemoryStore::insert<std::string>(TSDBInsert<std::string> &insertRequest);
-template seastar::future<bool> MemoryStore::insert<int64_t>(TSDBInsert<int64_t> &insertRequest);
-template seastar::future<bool> MemoryStore::insertBatch<double>(std::vector<TSDBInsert<double>> &insertRequests, size_t preComputedBatchSize);
-template seastar::future<bool> MemoryStore::insertBatch<bool>(std::vector<TSDBInsert<bool>> &insertRequests, size_t preComputedBatchSize);
-template seastar::future<bool> MemoryStore::insertBatch<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests, size_t preComputedBatchSize);
-template seastar::future<bool> MemoryStore::insertBatch<int64_t>(std::vector<TSDBInsert<int64_t>> &insertRequests, size_t preComputedBatchSize);
-template void MemoryStore::insertMemory<double>(TSDBInsert<double>&& insertRequest);
-template void MemoryStore::insertMemory<bool>(TSDBInsert<bool>&& insertRequest);
-template void MemoryStore::insertMemory<std::string>(TSDBInsert<std::string>&& insertRequest);
-template void MemoryStore::insertMemory<int64_t>(TSDBInsert<int64_t>&& insertRequest);
-template bool MemoryStore::wouldExceedThreshold<double>(TSDBInsert<double> &insertRequest);
-template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRequest);
-template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest);
-template bool MemoryStore::wouldExceedThreshold<int64_t>(TSDBInsert<int64_t> &insertRequest);
-template bool MemoryStore::wouldExceedThreshold<double>(TSDBInsert<double> &insertRequest, size_t &outEstimatedSize);
-template bool MemoryStore::wouldExceedThreshold<bool>(TSDBInsert<bool> &insertRequest, size_t &outEstimatedSize);
-template bool MemoryStore::wouldExceedThreshold<std::string>(TSDBInsert<std::string> &insertRequest, size_t &outEstimatedSize);
-template bool MemoryStore::wouldExceedThreshold<int64_t>(TSDBInsert<int64_t> &insertRequest, size_t &outEstimatedSize);
-template bool MemoryStore::wouldBatchExceedThreshold<double>(std::vector<TSDBInsert<double>> &insertRequests);
-template bool MemoryStore::wouldBatchExceedThreshold<bool>(std::vector<TSDBInsert<bool>> &insertRequests);
-template bool MemoryStore::wouldBatchExceedThreshold<std::string>(std::vector<TSDBInsert<std::string>> &insertRequests);
-template bool MemoryStore::wouldBatchExceedThreshold<int64_t>(std::vector<TSDBInsert<int64_t>> &insertRequests);
+template seastar::future<bool> MemoryStore::insert<double>(TimeStarInsert<double> &insertRequest);
+template seastar::future<bool> MemoryStore::insert<bool>(TimeStarInsert<bool> &insertRequest);
+template seastar::future<bool> MemoryStore::insert<std::string>(TimeStarInsert<std::string> &insertRequest);
+template seastar::future<bool> MemoryStore::insert<int64_t>(TimeStarInsert<int64_t> &insertRequest);
+template seastar::future<bool> MemoryStore::insertBatch<double>(std::vector<TimeStarInsert<double>> &insertRequests, size_t preComputedBatchSize);
+template seastar::future<bool> MemoryStore::insertBatch<bool>(std::vector<TimeStarInsert<bool>> &insertRequests, size_t preComputedBatchSize);
+template seastar::future<bool> MemoryStore::insertBatch<std::string>(std::vector<TimeStarInsert<std::string>> &insertRequests, size_t preComputedBatchSize);
+template seastar::future<bool> MemoryStore::insertBatch<int64_t>(std::vector<TimeStarInsert<int64_t>> &insertRequests, size_t preComputedBatchSize);
+template void MemoryStore::insertMemory<double>(TimeStarInsert<double>&& insertRequest);
+template void MemoryStore::insertMemory<bool>(TimeStarInsert<bool>&& insertRequest);
+template void MemoryStore::insertMemory<std::string>(TimeStarInsert<std::string>&& insertRequest);
+template void MemoryStore::insertMemory<int64_t>(TimeStarInsert<int64_t>&& insertRequest);
+template bool MemoryStore::wouldExceedThreshold<double>(TimeStarInsert<double> &insertRequest);
+template bool MemoryStore::wouldExceedThreshold<bool>(TimeStarInsert<bool> &insertRequest);
+template bool MemoryStore::wouldExceedThreshold<std::string>(TimeStarInsert<std::string> &insertRequest);
+template bool MemoryStore::wouldExceedThreshold<int64_t>(TimeStarInsert<int64_t> &insertRequest);
+template bool MemoryStore::wouldExceedThreshold<double>(TimeStarInsert<double> &insertRequest, size_t &outEstimatedSize);
+template bool MemoryStore::wouldExceedThreshold<bool>(TimeStarInsert<bool> &insertRequest, size_t &outEstimatedSize);
+template bool MemoryStore::wouldExceedThreshold<std::string>(TimeStarInsert<std::string> &insertRequest, size_t &outEstimatedSize);
+template bool MemoryStore::wouldExceedThreshold<int64_t>(TimeStarInsert<int64_t> &insertRequest, size_t &outEstimatedSize);
+template bool MemoryStore::wouldBatchExceedThreshold<double>(std::vector<TimeStarInsert<double>> &insertRequests);
+template bool MemoryStore::wouldBatchExceedThreshold<bool>(std::vector<TimeStarInsert<bool>> &insertRequests);
+template bool MemoryStore::wouldBatchExceedThreshold<std::string>(std::vector<TimeStarInsert<std::string>> &insertRequests);
+template bool MemoryStore::wouldBatchExceedThreshold<int64_t>(std::vector<TimeStarInsert<int64_t>> &insertRequests);
 
 void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
-    tsdb::memory_log.debug("Deleting range for series {} from {} to {}",
+    timestar::memory_log.debug("Deleting range for series {} from {} to {}",
                           seriesId.toHex(), startTime, endTime);
 
-    // Find the series in memory - use const find first to check existence
-    auto cit = series.find(seriesId);
-    if (cit == series.end()) {
+    // Find the series in memory
+    auto it = series.find(seriesId);
+    if (it == series.end()) {
         return; // No data to delete
     }
 
-    // Access mutable reference through the map using at()
-    auto& variantSeries = series.at(seriesId);
+    auto& variantSeries = it.value();
 
     // Actually remove data from memory based on variant type
     std::visit([&](auto& inMemorySeries) {

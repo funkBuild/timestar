@@ -87,7 +87,6 @@ public:
   TsxorEncoder(){};
 
   static CompressedBuffer encode(std::vector<double> &values);
-  // static std::vector<double> decode(CompressedBuffer &encoded, unsigned int length);
 };
 
 #endif

@@ -2,7 +2,7 @@
 // Comprehensive benchmark for all AlignedSeries expression functions.
 //
 // Build: add_executable(expression_benchmark expression_benchmark.cpp)
-//        target_link_libraries(expression_benchmark libtsdb benchmark::benchmark)
+//        target_link_libraries(expression_benchmark libtimestar benchmark::benchmark)
 //
 // Run:   ./bin/expression_benchmark \
 //            --benchmark_repetitions=10 \
@@ -26,10 +26,10 @@ static constexpr size_t NUM_GROUPS = 4;
 
 // ──────────────────────────── global test data ───────────────────────────────
 
-static tsdb::AlignedSeries g_series;   // 1 M points — primary signal
-static tsdb::AlignedSeries g_series2;  // 1 M points — secondary signal (for binary ops)
+static timestar::AlignedSeries g_series;   // 1 M points — primary signal
+static timestar::AlignedSeries g_series2;  // 1 M points — secondary signal (for binary ops)
 
-static std::vector<tsdb::GroupedSeries> g_groups;   // 4 × 250 K for cross-series
+static std::vector<timestar::GroupedSeries> g_groups;   // 4 × 250 K for cross-series
 
 // Build everything once at static-init time.
 struct GlobalSetup {
@@ -48,7 +48,7 @@ struct GlobalSetup {
                 vs[i] = std::numeric_limits<double>::quiet_NaN();
             }
         }
-        g_series = tsdb::AlignedSeries(ts, vs);
+        g_series = timestar::AlignedSeries(ts, vs);
 
         // ── secondary series (slightly different phase) ───────────────────
         std::vector<double> vs2(N);
@@ -62,7 +62,7 @@ struct GlobalSetup {
                 vs2[i] = std::numeric_limits<double>::quiet_NaN();
             }
         }
-        g_series2 = tsdb::AlignedSeries(ts, vs2);
+        g_series2 = timestar::AlignedSeries(ts, vs2);
 
         // ── cross-series groups (4 × 250 K) ──────────────────────────────
         g_groups.resize(NUM_GROUPS);
@@ -81,7 +81,7 @@ struct GlobalSetup {
                 }
             }
             g_groups[g].group_tags["group"] = "g" + std::to_string(g);
-            g_groups[g].series = tsdb::AlignedSeries(std::move(gts), std::move(gvs));
+            g_groups[g].series = timestar::AlignedSeries(std::move(gts), std::move(gvs));
         }
     }
 } g_setup;
@@ -89,7 +89,7 @@ struct GlobalSetup {
 // ─────────────────────────── helper macros ───────────────────────────────────
 
 // Convenience: copy groups before passing to functions that consume by value.
-static std::vector<tsdb::GroupedSeries> copyGroups() {
+static std::vector<timestar::GroupedSeries> copyGroups() {
     return g_groups;   // vector of GroupedSeries with copy-constructible AlignedSeries
 }
 
@@ -188,18 +188,18 @@ static void BM_##name(benchmark::State& state) {                      \
 }                                                                     \
 BENCHMARK(BM_##name)
 
-CROSS_BM(avg_of_series,           tsdb::avg_of_series(std::move(grps)));
-CROSS_BM(sum_of_series,           tsdb::sum_of_series(std::move(grps)));
-CROSS_BM(min_of_series,           tsdb::min_of_series(std::move(grps)));
-CROSS_BM(max_of_series,           tsdb::max_of_series(std::move(grps)));
-CROSS_BM(percentile_of_series_p50, tsdb::percentile_of_series(50.0, std::move(grps)));
-CROSS_BM(percentile_of_series_p95, tsdb::percentile_of_series(95.0, std::move(grps)));
+CROSS_BM(avg_of_series,           timestar::avg_of_series(std::move(grps)));
+CROSS_BM(sum_of_series,           timestar::sum_of_series(std::move(grps)));
+CROSS_BM(min_of_series,           timestar::min_of_series(std::move(grps)));
+CROSS_BM(max_of_series,           timestar::max_of_series(std::move(grps)));
+CROSS_BM(percentile_of_series_p50, timestar::percentile_of_series(50.0, std::move(grps)));
+CROSS_BM(percentile_of_series_p95, timestar::percentile_of_series(95.0, std::move(grps)));
 
 // topk / bottomk — copy groups explicitly (they are consumed by value)
 static void BM_topk(benchmark::State& state) {
     for (auto _ : state) {
         auto grps = copyGroups();
-        auto result = tsdb::topk(2, std::move(grps));
+        auto result = timestar::topk(2, std::move(grps));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(
@@ -211,7 +211,7 @@ BENCHMARK(BM_topk);
 static void BM_bottomk(benchmark::State& state) {
     for (auto _ : state) {
         auto grps = copyGroups();
-        auto result = tsdb::bottomk(2, std::move(grps));
+        auto result = timestar::bottomk(2, std::move(grps));
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(

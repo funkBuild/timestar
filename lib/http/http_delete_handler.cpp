@@ -1,35 +1,12 @@
 #include "http_delete_handler.hpp"
 #include "logger.hpp"
+#include "series_key.hpp"
 #include <chrono>
 #include <seastar/core/smp.hh>
 
 using namespace seastar;
 using namespace httpd;
-
-// Helper to build a canonical series key from measurement + sorted tags + field.
-// Format: "measurement,tag1=val1,tag2=val2 field"
-// Avoids constructing a temporary TSDBInsert<double> object just to build the string.
-static std::string buildSeriesKey(const std::string& measurement,
-                                   const std::map<std::string, std::string>& tags,
-                                   const std::string& field) {
-    size_t totalSize = measurement.size() + 1 + field.size();
-    for (const auto& [k, v] : tags) {
-        totalSize += 1 + k.size() + 1 + v.size();
-    }
-
-    std::string key;
-    key.reserve(totalSize);
-    key.append(measurement);
-    for (const auto& [k, v] : tags) {
-        key += ',';
-        key.append(k);
-        key += '=';
-        key.append(v);
-    }
-    key += ' ';
-    key.append(field);
-    return key;
-}
+using timestar::buildSeriesKey;
 
 // Glaze-compatible structures for JSON parsing
 struct GlazeDeleteRequest {
@@ -124,6 +101,22 @@ HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const Gla
         throw std::runtime_error("Either 'series' or 'measurement' is required");
     }
     
+    // Validate strings for null bytes (would corrupt LevelDB keys)
+    auto hasNullByte = [](const std::string& s) {
+        return s.find('\0') != std::string::npos;
+    };
+    if (hasNullByte(req.measurement) || hasNullByte(req.seriesKey) || hasNullByte(req.field)) {
+        throw std::runtime_error("Measurement, series, and field names must not contain null bytes");
+    }
+    for (const auto& f : req.fields) {
+        if (hasNullByte(f)) throw std::runtime_error("Field names must not contain null bytes");
+    }
+    for (const auto& [k, v] : req.tags) {
+        if (hasNullByte(k) || hasNullByte(v)) {
+            throw std::runtime_error("Tag keys and values must not contain null bytes");
+        }
+    }
+
     // Parse time range with defaults
     req.startTime = glazeReq.startTime.value_or(0);  // Start of time
     req.endTime = glazeReq.endTime.value_or(UINT64_MAX);  // End of time
@@ -164,10 +157,33 @@ seastar::future<std::unique_ptr<seastar::http::reply>>
 HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
-    
-    tsdb::http_log.info("[DELETE_HANDLER] Received delete request");
-    tsdb::http_log.info("[DELETE_HANDLER] Request body: {}", req->content);
-    
+
+    if (!engineSharded) {
+        reply->set_status(seastar::http::reply::status_type::internal_server_error);
+        reply->_content = R"({"status":"error","error":"Delete handler not initialized"})";
+        co_return reply;
+    }
+
+    // Body size limit to prevent DoS via large payloads
+    if (req->content.size() > timestar::config().http.max_query_body_size) {
+        reply->set_status(seastar::http::reply::status_type::payload_too_large);
+        reply->_content = R"({"status":"error","error":"Request body too large"})";
+        co_return reply;
+    }
+
+    // Validate Content-Type if explicitly set
+    {
+        auto ct = req->get_header("Content-Type");
+        std::string ctStr(ct.data(), ct.size());
+        if (!ctStr.empty() && !ctStr.starts_with("application/json")) {
+            reply->set_status(seastar::http::reply::status_type::unsupported_media_type);
+            reply->_content = R"({"status":"error","error":"Content-Type must be application/json"})";
+            co_return reply;
+        }
+    }
+
+    timestar::http_log.debug("[DELETE_HANDLER] Received delete request");
+
     try {
         // Parse JSON body using Glaze
         std::vector<DeleteRequest> deleteRequests;
@@ -176,7 +192,15 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
         GlazeBatchDelete batchDelete;
         auto batch_error = glz::read_json(batchDelete, req->content);
         
+        static constexpr size_t MAX_BATCH_DELETE_SIZE = 10'000;
         if (!batch_error && !batchDelete.deletes.empty()) {
+            if (batchDelete.deletes.size() > MAX_BATCH_DELETE_SIZE) {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = createErrorResponse(
+                    "Batch delete exceeds maximum size of " +
+                    std::to_string(MAX_BATCH_DELETE_SIZE));
+                co_return reply;
+            }
             // Batch delete request
             for (const auto& glazeReq : batchDelete.deletes) {
                 try {
@@ -194,7 +218,7 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
             
             if (single_error) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
-                reply->_content = createErrorResponse("Invalid JSON: " + std::string(glz::format_error(single_error)));
+                reply->_content = createErrorResponse("Invalid JSON in delete request");
                 co_return reply;
             }
             
@@ -212,10 +236,10 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
         uint64_t totalPointsDeleted = 0;
         std::vector<std::string> allDeletedSeries;
         
-        tsdb::http_log.info("[DELETE_HANDLER] Processing {} delete requests", deleteRequests.size());
+        timestar::http_log.info("[DELETE_HANDLER] Processing {} delete requests", deleteRequests.size());
         
         for (const auto& delReq : deleteRequests) {
-            tsdb::http_log.info("[DELETE_HANDLER] Delete request: measurement={}, tags={}, fields={}, startTime={}, endTime={}", 
+            timestar::http_log.info("[DELETE_HANDLER] Delete request: measurement={}, tags={}, fields={}, startTime={}, endTime={}", 
                                delReq.measurement, delReq.tags.size(), delReq.fields.size(), delReq.startTime, delReq.endTime);
             if (delReq.isPattern) {
                 // Pattern-based deletion
@@ -246,6 +270,16 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                                 }
                             }
                             
+                            // Guard against unbounded series expansion
+                            static constexpr size_t MAX_DELETE_SERIES = 100000;
+                            if (seriesIds.size() > MAX_DELETE_SERIES) {
+                                throw std::runtime_error(
+                                    "Delete matches too many series (" +
+                                    std::to_string(seriesIds.size()) +
+                                    "). Narrow with tag filters (limit: " +
+                                    std::to_string(MAX_DELETE_SERIES) + ").");
+                            }
+
                             // Get metadata for each series to check field filters and determine shard
                             for (const SeriesId128& seriesId : seriesIds) {
                                 auto metadata = co_await index.getSeriesMetadata(seriesId);
@@ -268,7 +302,7 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
                                 }
                                 
                                 // Build series key directly without constructing a temporary
-                                // TSDBInsert<double> object
+                                // TimeStarInsert<double> object
                                 std::string seriesKey = buildSeriesKey(metadata->measurement, metadata->tags, metadata->field);
 
                                 // Calculate target shard for this series using SeriesId128
@@ -322,11 +356,7 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
             }
             else if (delReq.isStructured && !delReq.field.empty()) {
                 // Single series structured delete - determine shard based on series
-                std::string fullSeriesKey = delReq.measurement;
-                for (const auto& [tagKey, tagValue] : delReq.tags) {
-                    fullSeriesKey += "," + tagKey + "=" + tagValue;
-                }
-                fullSeriesKey += " " + delReq.field; // Use space separator consistent with write handler
+                std::string fullSeriesKey = buildSeriesKey(delReq.measurement, delReq.tags, delReq.field);
                 
                 // Hash the full series key to determine shard using SeriesId128
                 SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(fullSeriesKey);
@@ -391,9 +421,9 @@ HttpDeleteHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
         reply->_content = glz::write_json(response).value_or("{}");
         
     } catch (const std::exception& e) {
-        tsdb::http_log.error("Delete handler error: {}", e.what());
+        timestar::http_log.error("Delete handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
-        reply->_content = createErrorResponse(std::string("Internal error: ") + e.what());
+        reply->_content = createErrorResponse("Internal server error");
     }
     
     co_return reply;
@@ -412,5 +442,5 @@ void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r) {
           seastar::httpd::url("/delete"), 
           handler);
     
-    tsdb::http_log.info("Registered DELETE endpoint at /delete");
+    timestar::http_log.info("Registered DELETE endpoint at /delete");
 }

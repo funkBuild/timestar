@@ -177,7 +177,7 @@ TEST_F(HttpWriteValidationTest, ParseWritePointRejectsMeasurementWithComma) {
         "fields": {"value": 42.0},
         "timestamp": 1000000000
     })";
-    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::runtime_error);
+    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::invalid_argument);
 }
 
 TEST_F(HttpWriteValidationTest, ParseWritePointRejectsTagKeyWithEquals) {
@@ -187,7 +187,7 @@ TEST_F(HttpWriteValidationTest, ParseWritePointRejectsTagKeyWithEquals) {
         "fields": {"value": 42.0},
         "timestamp": 1000000000
     })";
-    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::runtime_error);
+    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::invalid_argument);
 }
 
 TEST_F(HttpWriteValidationTest, ParseWritePointRejectsTagValueWithComma) {
@@ -197,7 +197,7 @@ TEST_F(HttpWriteValidationTest, ParseWritePointRejectsTagValueWithComma) {
         "fields": {"value": 42.0},
         "timestamp": 1000000000
     })";
-    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::runtime_error);
+    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::invalid_argument);
 }
 
 TEST_F(HttpWriteValidationTest, ParseWritePointRejectsFieldNameWithSpace) {
@@ -207,7 +207,7 @@ TEST_F(HttpWriteValidationTest, ParseWritePointRejectsFieldNameWithSpace) {
         "fields": {"bad field": 42.0},
         "timestamp": 1000000000
     })";
-    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::runtime_error);
+    EXPECT_THROW(HttpWriteHandler::parseAndValidateWritePoint(json), std::invalid_argument);
 }
 
 TEST_F(HttpWriteValidationTest, ParseWritePointAcceptsValidInput) {

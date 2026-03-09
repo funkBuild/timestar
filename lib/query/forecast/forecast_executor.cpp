@@ -2,7 +2,7 @@
 #include <chrono>
 #include <algorithm>
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 std::vector<uint64_t> ForecastExecutor::generateForecastTimestamps(
@@ -47,6 +47,11 @@ size_t ForecastExecutor::detectMaxPeriodForWindowing(
     uint64_t dataIntervalNs,
     const ForecastConfig& config
 ) {
+    // LINEAR with no seasonality needs no periodicity detection
+    if (config.forecastSeasonality == ForecastSeasonality::NONE) {
+        return 0;
+    }
+
     // For known seasonality, use the analytical period
     if (config.forecastSeasonality == ForecastSeasonality::HOURLY ||
         config.forecastSeasonality == ForecastSeasonality::DAILY ||
@@ -140,8 +145,9 @@ ForecastOutput ForecastExecutor::execute(
         horizon = std::min(std::max<size_t>(input.size() / 5, 50), size_t(2000));
     }
 
-    // Auto-windowing: trim old data before expensive computation
-    ForecastInput workingInput = input;  // copy (only trimmed if windowing applies)
+    // Auto-windowing: trim old data before expensive computation.
+    // Only copy the input if we actually need to trim.
+    std::optional<ForecastInput> trimmedInput;
     if (!config.disableAutoWindow && input.size() >= 2) {
         uint64_t dataIntervalNs = (input.timestamps.back() - input.timestamps.front())
                                   / (input.size() - 1);
@@ -150,9 +156,11 @@ ForecastOutput ForecastExecutor::execute(
 
         // Only trim if saving >33% of the data
         if (input.size() > windowSize * 3 / 2) {
-            windowInput(workingInput, windowSize);
+            trimmedInput.emplace(input);
+            windowInput(*trimmedInput, windowSize);
         }
     }
+    const ForecastInput& workingInput = trimmedInput ? *trimmedInput : input;
 
     auto forecastTimestamps = generateForecastTimestamps(workingInput.timestamps, horizon);
 
@@ -213,7 +221,7 @@ void ForecastExecutor::addSeriesPieces(
         forecastPiece.values.resize(totalPoints);
 
         // Include last historical point for continuity
-        for (size_t i = 0; i < nHistorical - 1; ++i) {
+        for (size_t i = 0; i + 1 < nHistorical; ++i) {
             forecastPiece.values[i] = std::nullopt;
         }
         if (nHistorical > 0) {
@@ -422,4 +430,4 @@ ForecastQueryResult ForecastExecutor::executeMulti(
 }
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar

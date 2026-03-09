@@ -202,7 +202,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
-        self->fileManager->sequencedTsmFiles[i] = tsm;
+        self->fileManager->setSequencedTsmFile(i, tsm);
     }
 
     // Phase 2: kick off compaction
@@ -215,7 +215,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
                                           9000000);
     co_await newTsm->open();
     co_await newTsm->readSparseIndex();
-    self->fileManager->sequencedTsmFiles[100] = newTsm;
+    self->fileManager->setSequencedTsmFile(100, newTsm);
 
     // Phase 4: wait for compaction to finish
     auto compactedFile = co_await std::move(compactionFuture);
@@ -224,8 +224,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
     EXPECT_TRUE(fs::exists(compactedFile));
 
     // The new file (seqNum=100) should still be present and readable
-    EXPECT_NE(self->fileManager->sequencedTsmFiles.find(100),
-              self->fileManager->sequencedTsmFiles.end());
+    EXPECT_NE(self->fileManager->getSequencedTsmFiles().find(100),
+              self->fileManager->getSequencedTsmFiles().end());
 
     // Verify the compacted file contains expected data
     auto compactedTSM = seastar::make_shared<TSM>(compactedFile);
@@ -549,10 +549,9 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, DataIntegrityAfterCompaction) {
     for (const auto& [ts, val] : expected) {
         auto it = data.find(ts);
         EXPECT_NE(it, data.end()) << "Missing timestamp " << ts;
-        if (it != data.end()) {
-            EXPECT_DOUBLE_EQ(it->second, val)
-                << "Wrong value at timestamp " << ts;
-        }
+        if (it == data.end()) continue;
+        EXPECT_DOUBLE_EQ(it->second, val)
+            << "Wrong value at timestamp " << ts;
     }
 
     co_return;
@@ -571,17 +570,17 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ForceFullCompactionAcrossTiers) {
                 1000000 + seq * 20000);
             co_await tsm->open();
             co_await tsm->readSparseIndex();
-            self->fileManager->sequencedTsmFiles[seq] = tsm;
+            self->fileManager->setSequencedTsmFile(seq, tsm);
             seq++;
         }
     }
 
-    size_t totalBefore = self->fileManager->sequencedTsmFiles.size();
+    size_t totalBefore = self->fileManager->getSequencedTsmFiles().size();
     EXPECT_EQ(totalBefore, 9);
 
     co_await self->compactor->forceFullCompaction();
 
-    size_t totalAfter = self->fileManager->sequencedTsmFiles.size();
+    size_t totalAfter = self->fileManager->getSequencedTsmFiles().size();
     EXPECT_LT(totalAfter, totalBefore);
 
     co_return;
@@ -816,7 +815,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ConcurrentReadsDuringCompaction) {
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
-        self->fileManager->sequencedTsmFiles[i] = tsm;
+        self->fileManager->setSequencedTsmFile(i, tsm);
     }
 
     std::atomic<bool> compactionDone{false};

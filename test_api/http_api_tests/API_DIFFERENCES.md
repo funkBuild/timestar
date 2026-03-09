@@ -1,4 +1,4 @@
-# TSDB HTTP API Differences and Required Changes
+# TimeStar HTTP API Differences and Required Changes
 
 ## Test Results Summary
 

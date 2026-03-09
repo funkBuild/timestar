@@ -3,6 +3,11 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
+
+// Maximum decompressed size we'll allocate for string decoding (256MB).
+// Prevents OOM from a crafted payload that claims a multi-GB uncompressed size.
+static constexpr uint32_t MAX_UNCOMPRESSED_SIZE = 256 * 1024 * 1024;
 
 void StringEncoder::writeVarInt(AlignedBuffer& buffer, uint32_t value) {
     while (value >= 0x80) {
@@ -25,11 +30,11 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
         value |= (uint32_t(byte & 0x7F) << shift);
         shift += 7;
         if (shift > 28) {
-            // We've read the 5th byte (bits 28-34), but uint32_t only holds 32 bits,
-            // so bits 32-34 are silently truncated. If the continuation bit is still
-            // set, the varint is definitely too large for uint32_t.
-            if (byte & 0x80) {
-                throw std::runtime_error("VarInt too large");
+            // 5th byte: only bits 28-31 fit in uint32_t. Reject if higher bits
+            // are set (byte & 0x70 contributes bits 32-34) or if continuation bit
+            // indicates more bytes.
+            if ((byte & 0x80) || (byte & 0x70)) {
+                throw std::runtime_error("VarInt too large for uint32_t");
             }
             break;
         }
@@ -75,6 +80,10 @@ AlignedBuffer StringEncoder::encode(std::span<const std::string> values) {
     size_t writePos = 0;
 
     for (const auto& str : values) {
+        if (str.size() > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("String encoder: individual string size " +
+                std::to_string(str.size()) + " exceeds uint32_t maximum");
+        }
         // Write varint length prefix
         uint32_t len = static_cast<uint32_t>(str.size());
         while (len >= 0x80) {
@@ -234,11 +243,20 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
     uint32_t storedCount;
     std::memcpy(&storedCount, encoded.data.data() + 12, 4);
 
+    if (storedCount < count) {
+        throw std::runtime_error("String block has fewer entries than requested: header=" +
+            std::to_string(storedCount) + " requested=" + std::to_string(count));
+    }
+
     if (encoded.size() < 16 + compressedSize) {
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
     
-    // Decompress
+    // Decompress (guard against crafted payloads claiming excessive uncompressed size)
+    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
+        throw std::runtime_error("String block uncompressedSize (" +
+            std::to_string(uncompressedSize) + ") exceeds limit");
+    }
     std::vector<uint8_t> uncompressed(uncompressedSize);
     
     if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data.data() + 16),
@@ -288,12 +306,21 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
     uint32_t storedCount;
     std::memcpy(&storedCount, encoded.data + encoded.offset, 4);
     encoded.offset += 4;
-    
+
+    if (storedCount < count) {
+        throw std::runtime_error("String block has fewer entries than requested: header=" +
+            std::to_string(storedCount) + " requested=" + std::to_string(count));
+    }
+
     if (encoded.length_ - encoded.offset < compressedSize) {
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
     
-    // Decompress
+    // Decompress (guard against crafted payloads claiming excessive uncompressed size)
+    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
+        throw std::runtime_error("String block uncompressedSize (" +
+            std::to_string(uncompressedSize) + ") exceeds limit");
+    }
     std::vector<uint8_t> uncompressed(uncompressedSize);
     
     if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data + encoded.offset),
@@ -347,6 +374,10 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
     }
 
     // Decompress (Snappy doesn't support random access, so we must decompress the full block)
+    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
+        throw std::runtime_error("String block uncompressedSize (" +
+            std::to_string(uncompressedSize) + ") exceeds limit");
+    }
     std::vector<uint8_t> uncompressed(uncompressedSize);
 
     if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data.data() + 16),
@@ -414,6 +445,10 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
     }
 
     // Decompress (Snappy doesn't support random access, so we must decompress the full block)
+    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
+        throw std::runtime_error("String block uncompressedSize (" +
+            std::to_string(uncompressedSize) + ") exceeds limit");
+    }
     std::vector<uint8_t> uncompressed(uncompressedSize);
 
     if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data + encoded.offset),

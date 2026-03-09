@@ -7,8 +7,9 @@
 #include "functions/series_alignment.hpp"
 #include <vector>
 #include <cmath>
+#include <random>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using ::testing::_;
 using ::testing::Return;
 using ::testing::HasSubstr;
@@ -35,9 +36,11 @@ protected:
         // Sine wave series
         sineTimestamps.clear();
         sineValues.clear();
+        std::mt19937 rng(42); // Fixed seed for reproducible tests
+        std::uniform_int_distribution<int> noiseDist(0, 99);
         for (int i = 0; i < 100; ++i) {
             sineTimestamps.push_back(i * 1000000ULL);  // 1ms intervals
-            sineValues.push_back(std::sin(i * 0.1) + 0.1 * (rand() % 100 - 50)); // with noise
+            sineValues.push_back(std::sin(i * 0.1) + 0.1 * (noiseDist(rng) - 50)); // with noise
         }
         
         // Series with gaps

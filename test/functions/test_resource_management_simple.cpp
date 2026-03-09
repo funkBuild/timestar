@@ -18,7 +18,7 @@
 #include <fstream>
 #include <sys/resource.h>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using namespace std::chrono_literals;
 
 // Simple resource monitoring utilities

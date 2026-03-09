@@ -211,11 +211,11 @@ public:
   }
 
   void mergeTsmResults(std::vector<TSMResult<T>> &tsmResults) {
-    const unsigned int tsmResultSize = tsmResults.size();
+    const size_t tsmResultSize = tsmResults.size();
 
     // Pre-calculate total points for efficient reservation
     size_t totalPoints = 0;
-    for (unsigned int i = 0; i < tsmResultSize; i++) {
+    for (size_t i = 0; i < tsmResultSize; i++) {
       for (size_t b = 0; tsmResults[i].getBlock(b) != nullptr; ++b) {
         totalPoints += tsmResults[i].getBlock(b)->size();
       }
@@ -226,7 +226,7 @@ public:
     // Initialize iteration state for each non-empty TSMResult
     std::vector<TSMIterationState> blockIterState;
 
-    for (int i = 0; i < static_cast<int>(tsmResultSize); i++) {
+    for (size_t i = 0; i < tsmResultSize; i++) {
       TSMBlock<T> *firstBlock = tsmResults[i].getBlock(0);
       if (firstBlock == nullptr)
         continue;

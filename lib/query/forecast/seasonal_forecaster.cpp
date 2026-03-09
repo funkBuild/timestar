@@ -2,27 +2,17 @@
 #include "periodicity_detector.hpp"
 #include "stl_decomposition.hpp"
 #include "../anomaly/simd_anomaly.hpp"
+#include "../simd_helpers.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
-#include <immintrin.h>
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
+using timestar::simd::hsum_avx;
+static inline double hsum_avx_local(__m256d v) { return hsum_avx(v); }
 #endif
 
-// Local hsum helper (same as stl_decomposition.cpp; the one in simd_anomaly.cpp
-// is file-static so we need our own copy).
-#if !TSDB_ANOMALY_DISABLE_SIMD
-static inline double hsum_avx_local(__m256d v) {
-    __m128d vlow  = _mm256_castpd256_pd128(v);
-    __m128d vhigh = _mm256_extractf128_pd(v, 1);
-    vlow = _mm_add_pd(vlow, vhigh);
-    __m128d high64 = _mm_unpackhi_pd(vlow, vlow);
-    return _mm_cvtsd_f64(_mm_add_sd(vlow, high64));
-}
-#endif
-
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 std::vector<double> SeasonalForecaster::seasonalDifference(
@@ -123,7 +113,7 @@ double SeasonalForecaster::autoCorrelation(
     const size_t count = n - lag;
     double sum = 0.0;
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && count >= 16) {
         // AVX2 path: 4 accumulators to hide FMA latency (4-cycle throughput)
         const double* py   = y.data();
@@ -177,7 +167,9 @@ double SeasonalForecaster::autoCorrelation(
         }
     }
 
-    return sum / (static_cast<double>(n) * variance);
+    // Normalize by sum of squared deviations: (n-1)*variance when using
+    // sample variance, so that ACF(0) = 1.0 (standard textbook definition).
+    return sum / (static_cast<double>(n - 1) * variance);
 }
 
 std::vector<double> SeasonalForecaster::levinsonDurbin(
@@ -202,6 +194,12 @@ std::vector<double> SeasonalForecaster::levinsonDurbin(
 
     // Initialize
     phi[0] = r[1] / r[0];
+
+    // Stability check on the first reflection coefficient.
+    if (std::abs(phi[0]) >= 1.0) {
+        return std::vector<double>(order, 0.0);
+    }
+
     double v = r[0] * (1.0 - phi[0] * phi[0]);
 
     for (size_t k = 1; k < order; ++k) {
@@ -216,6 +214,13 @@ std::vector<double> SeasonalForecaster::levinsonDurbin(
         }
 
         double lambda = num / v;
+
+        // Stability check: |lambda| >= 1 means the AR model has a root
+        // outside the unit circle.  Truncate to the last stable order
+        // rather than clamping, which would corrupt subsequent coefficients.
+        if (std::abs(lambda) >= 1.0) {
+            break;
+        }
 
         // Update coefficients (swap instead of copy)
         std::swap(phi, phiPrev);
@@ -336,7 +341,8 @@ double SeasonalForecaster::estimateForecastVariance(
     // Compute in-sample residual variance
     if (y.size() <= arCoeffs.size()) {
         double variance = anomaly::simd::vectorVariance(y.data(), y.size(), mean);
-        return variance * horizonSteps;  // Variance grows with horizon
+        double horizonFactor = 1.0 + std::sqrt(static_cast<double>(horizonSteps));
+        return variance * horizonFactor;
     }
 
     double sse = 0.0;
@@ -355,10 +361,11 @@ double SeasonalForecaster::estimateForecastVariance(
 
     double sigmaSquared = (count > 0) ? sse / static_cast<double>(count) : 0.0;
 
-    // Variance increases with forecast horizon
-    // For AR(p), this is approximately: sigma^2 * sum_{i=0}^{h-1} psi_i^2
-    // We use a simpler approximation: sigma^2 * (1 + c * log(h))
-    double horizonFactor = 1.0 + 0.5 * std::log(1.0 + horizonSteps);
+    // Variance increases with forecast horizon.
+    // For AR(p), the cumulative impulse-response gives variance ~ sigma^2 * h
+    // for persistent processes. Use sqrt(h) growth as a compromise between
+    // the overly conservative log(h) and the random-walk linear growth.
+    double horizonFactor = 1.0 + std::sqrt(static_cast<double>(horizonSteps));
 
     return sigmaSquared * horizonFactor;
 }
@@ -575,9 +582,8 @@ ForecastOutput SeasonalForecaster::forecast(
     for (size_t i = 0; i < nForecast; ++i) {
         output.forecast[i] = finalForecasts[i];
 
-        // Scale variance by horizon factor (same formula as estimateForecastVariance
-        // but without recomputing SSE each time)
-        double horizonFactor = 1.0 + 0.5 * std::log(1.0 + (i + 1));
+        // Scale variance by horizon factor (same formula as estimateForecastVariance)
+        double horizonFactor = 1.0 + std::sqrt(static_cast<double>(i + 1));
         double width = config.deviations * std::sqrt(baseVariance * horizonFactor);
 
         output.upper[i] = finalForecasts[i] + width;
@@ -716,7 +722,7 @@ ForecastOutput SeasonalForecaster::forecastMSTL(
     std::vector<double> boundsScale(nForecast);
     {
         const double invN = 1.0 / static_cast<double>(n);
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
         if (anomaly::simd::isAvx2Available() && nForecast >= 4) {
             __m256d vInvN = _mm256_set1_pd(invN);
             __m256d vStd  = _mm256_set1_pd(residualStdDev);
@@ -807,12 +813,15 @@ std::vector<double> SeasonalForecaster::extrapolateSeasonal(
         return result;
     }
 
-    // Repeat last complete cycle with slight damping
+    // Repeat last complete cycle with slight damping.
+    // Start index within the seasonal array: use the last `period` values if
+    // available, otherwise wrap from the beginning.
+    size_t startIdx = (n >= period) ? (n - period) : 0;
     for (size_t i = 0; i < horizonSteps; ++i) {
-        size_t idx = (n - period + (i % period)) % n;
+        size_t idx = (startIdx + (i % period)) % n;
         if (idx < n) {
             // Apply slight damping for longer horizons
-            double damping = 1.0 - 0.01 * (i / period);
+            double damping = 1.0 - 0.01 * (static_cast<double>(i) / static_cast<double>(period));
             damping = std::max(0.5, damping);
             result[i] = seasonal[idx] * damping;
         }
@@ -822,4 +831,4 @@ std::vector<double> SeasonalForecaster::extrapolateSeasonal(
 }
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar

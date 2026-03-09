@@ -4,6 +4,7 @@
 #include <leveldb/cache.h>
 #include <glaze/glaze.hpp>
 #include <algorithm>
+#include <memory>
 #include <sstream>
 #include <iomanip>
 #include <iostream>
@@ -85,27 +86,34 @@ FieldStatsSync FieldStatsSync::deserialize(const std::string& data) {
 MetadataIndexSync::MetadataIndexSync(const std::string& path) : dbPath(path) {}
 
 MetadataIndexSync::~MetadataIndexSync() {
-    if (db) {
-        delete db.release();
-    }
+    db.reset();
+    delete filterPolicy_;
+    delete blockCache_;
 }
 
 void MetadataIndexSync::init() {
+    filterPolicy_ = leveldb::NewBloomFilterPolicy(10);
+    blockCache_ = leveldb::NewLRUCache(8 * 1024 * 1024);
+
     leveldb::Options options;
     options.create_if_missing = true;
     options.compression = leveldb::kSnappyCompression;
     options.write_buffer_size = 4 * 1024 * 1024;
     options.max_open_files = 100;
-    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
-    options.block_cache = leveldb::NewLRUCache(8 * 1024 * 1024);
-    
+    options.filter_policy = filterPolicy_;
+    options.block_cache = blockCache_;
+
     leveldb::DB* dbPtr;
     leveldb::Status status = leveldb::DB::Open(options, dbPath, &dbPtr);
-    
+
     if (!status.ok()) {
+        delete filterPolicy_;
+        filterPolicy_ = nullptr;
+        delete blockCache_;
+        blockCache_ = nullptr;
         throw std::runtime_error("Failed to open metadata index: " + status.ToString());
     }
-    
+
     db.reset(dbPtr);
     
     std::string value;
@@ -117,9 +125,13 @@ void MetadataIndexSync::init() {
 
 void MetadataIndexSync::close() {
     if (db) {
-        db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", std::to_string(nextSeriesId.load()));
+        db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", std::to_string(nextSeriesId));
         delete db.release();
     }
+    delete filterPolicy_;
+    filterPolicy_ = nullptr;
+    delete blockCache_;
+    blockCache_ = nullptr;
 }
 
 // Key generation helpers
@@ -181,23 +193,64 @@ std::string MetadataIndexSync::seriesLookupKey(const std::string& seriesKey) {
 }
 
 std::vector<std::string> MetadataIndexSync::generateTagSubsets(const std::map<std::string, std::string>& tags) {
+    // Only generate subsets of size 1 through MAX_COMPOSITE_SUBSET_SIZE to avoid
+    // O(2^N) explosion. See the comment in MetadataIndex::generateTagSubsets for
+    // the full rationale. Queries with more filter tags than this limit will fall
+    // back to intersecting results from smaller composite lookups.
+    static constexpr size_t MAX_COMPOSITE_SUBSET_SIZE = 3;
+
     std::vector<std::string> subsets;
-    
-    size_t n = tags.size();
-    for (size_t mask = 1; mask < (1 << n); mask++) {
+
+    std::vector<std::pair<std::string, std::string>> tagVec(tags.begin(), tags.end());
+    const size_t n = tagVec.size();
+
+    if (n == 0) {
+        return subsets;
+    }
+
+    size_t estimate = n;
+    if (MAX_COMPOSITE_SUBSET_SIZE >= 2 && n >= 2)
+        estimate += n * (n - 1) / 2;
+    if (MAX_COMPOSITE_SUBSET_SIZE >= 3 && n >= 3)
+        estimate += n * (n - 1) * (n - 2) / 6;
+    subsets.reserve(estimate);
+
+    const size_t maxK = std::min(MAX_COMPOSITE_SUBSET_SIZE, n);
+
+    // Size 1 subsets
+    for (size_t i = 0; i < n; ++i) {
         std::map<std::string, std::string> subset;
-        size_t idx = 0;
-        
-        for (const auto& [k, v] : tags) {
-            if (mask & (1 << idx)) {
-                subset[k] = v;
-            }
-            idx++;
-        }
-        
+        subset[tagVec[i].first] = tagVec[i].second;
         subsets.push_back(buildSortedTagString(subset));
     }
-    
+
+    // Size 2 subsets
+    if (maxK >= 2) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                std::map<std::string, std::string> subset;
+                subset[tagVec[i].first] = tagVec[i].second;
+                subset[tagVec[j].first] = tagVec[j].second;
+                subsets.push_back(buildSortedTagString(subset));
+            }
+        }
+    }
+
+    // Size 3 subsets
+    if (maxK >= 3) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                for (size_t k = j + 1; k < n; ++k) {
+                    std::map<std::string, std::string> subset;
+                    subset[tagVec[i].first] = tagVec[i].second;
+                    subset[tagVec[j].first] = tagVec[j].second;
+                    subset[tagVec[k].first] = tagVec[k].second;
+                    subsets.push_back(buildSortedTagString(subset));
+                }
+            }
+        }
+    }
+
     return subsets;
 }
 
@@ -214,7 +267,7 @@ uint64_t MetadataIndexSync::getOrCreateSeriesId(const std::string& measurement,
         return std::stoull(value);
     }
     
-    uint64_t seriesId = nextSeriesId.fetch_add(1);
+    uint64_t seriesId = nextSeriesId++;
     
     SeriesMetadataSync metadata;
     metadata.seriesId = seriesId;
@@ -258,8 +311,8 @@ uint64_t MetadataIndexSync::getOrCreateSeriesId(const std::string& measurement,
 std::vector<uint64_t> MetadataIndexSync::findSeriesByMeasurement(const std::string& measurement) {
     std::vector<uint64_t> seriesIds;
     std::string prefix = "m:" + measurement + ":";
-    
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         size_t lastColon = key.rfind(':');
@@ -269,8 +322,7 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByMeasurement(const std::stri
             seriesIds.push_back(seriesId);
         }
     }
-    delete it;
-    
+
     return seriesIds;
 }
 
@@ -279,8 +331,8 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByTag(const std::string& meas
                                                          const std::string& tagValue) {
     std::vector<uint64_t> seriesIds;
     std::string prefix = "t:" + measurement + ":" + tagKey + ":" + tagValue + ":";
-    
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         size_t lastColon = key.rfind(':');
@@ -290,8 +342,7 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByTag(const std::string& meas
             seriesIds.push_back(seriesId);
         }
     }
-    delete it;
-    
+
     return seriesIds;
 }
 
@@ -301,7 +352,7 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByTags(const std::string& mea
     std::string tagStr = buildSortedTagString(tags);
     std::string prefix = "ct:" + measurement + ":" + tagStr + ":";
     
-    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
         size_t lastColon = key.rfind(':');
@@ -311,8 +362,7 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByTags(const std::string& mea
             seriesIds.push_back(seriesId);
         }
     }
-    delete it;
-    
+
     return seriesIds;
 }
 
@@ -326,6 +376,54 @@ std::optional<SeriesMetadataSync> MetadataIndexSync::getSeriesMetadata(uint64_t 
     }
     
     return std::nullopt;
+}
+
+void MetadataIndexSync::deleteSeries(uint64_t seriesId) {
+    auto metadata = getSeriesMetadata(seriesId);
+    if (!metadata.has_value()) {
+        return;
+    }
+
+    leveldb::WriteBatch batch;
+
+    // Delete series metadata
+    batch.Delete(seriesKey(seriesId));
+
+    // Delete measurement index entry
+    batch.Delete(measurementKey(metadata->measurement, seriesId));
+
+    // Delete tag indexes
+    for (const auto& [k, v] : metadata->tags) {
+        batch.Delete(tagKey(metadata->measurement, k, v, seriesId));
+        batch.Delete(groupByKey(metadata->measurement, k, v) + ":" + std::to_string(seriesId));
+    }
+
+    // Delete composite tag indexes (all subsets, mirrors getOrCreateSeriesId)
+    for (const auto& subset : generateTagSubsets(metadata->tags)) {
+        batch.Delete("ct:" + metadata->measurement + ":" + subset + ":" +
+                     std::to_string(seriesId));
+    }
+
+    // Delete field indexes
+    for (const auto& field : metadata->fields) {
+        batch.Delete(fieldKey(metadata->measurement, field, seriesId));
+        batch.Delete("fstats:" + metadata->measurement + ":" + field + ":" + std::to_string(seriesId));
+    }
+
+    // Delete series lookup keys for ALL fields
+    for (const auto& field : metadata->fields) {
+        std::string sKey = SeriesMetadataSync::generateSeriesKey(metadata->measurement, metadata->tags, field);
+        batch.Delete(seriesLookupKey(sKey));
+    }
+    if (metadata->fields.empty()) {
+        std::string sKey = SeriesMetadataSync::generateSeriesKey(metadata->measurement, metadata->tags, "");
+        batch.Delete(seriesLookupKey(sKey));
+    }
+
+    leveldb::Status status = db->Write(leveldb::WriteOptions(), &batch);
+    if (!status.ok()) {
+        throw std::runtime_error("Failed to delete series: " + status.ToString());
+    }
 }
 
 std::string MetadataIndexSync::getStats() const {

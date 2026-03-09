@@ -10,7 +10,7 @@
 #include <string>
 
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/wal_file_manager.hpp"
 #include "../../../lib/storage/tsm_file_manager.hpp"
@@ -52,7 +52,7 @@ TEST_F(WALFileManagerSeastarTest, InitCreatesMemoryStore) {
 
         // After engine init, the WALFileManager should be operational.
         // Verify by inserting data (which requires an active memory store).
-        TSDBInsert<double> insert("temperature", "value");
+        TimeStarInsert<double> insert("temperature", "value");
         insert.addValue(1000, 20.5);
         eng->insert(std::move(insert)).get();
 
@@ -76,7 +76,7 @@ TEST_F(WALFileManagerSeastarTest, RecoverFromExistingWALFiles) {
             ScopedEngine eng;
             eng.init();
 
-            TSDBInsert<double> insert("cpu", "usage");
+            TimeStarInsert<double> insert("cpu", "usage");
             insert.addValue(1000, 50.0);
             insert.addValue(2000, 60.0);
             insert.addValue(3000, 70.0);
@@ -118,7 +118,7 @@ TEST_F(WALFileManagerSeastarTest, RecoverMultipleWALFiles) {
             eng.init();
 
             // Insert first batch
-            TSDBInsert<double> insert1("sensor", "temp");
+            TimeStarInsert<double> insert1("sensor", "temp");
             insert1.addValue(1000, 25.0);
             insert1.addValue(2000, 26.0);
             eng->insert(std::move(insert1)).get();
@@ -127,7 +127,7 @@ TEST_F(WALFileManagerSeastarTest, RecoverMultipleWALFiles) {
             eng->rolloverMemoryStore().get();
 
             // Insert second batch into new memory store
-            TSDBInsert<double> insert2("sensor", "humidity");
+            TimeStarInsert<double> insert2("sensor", "humidity");
             insert2.addValue(3000, 60.0);
             insert2.addValue(4000, 65.0);
             eng->insert(std::move(insert2)).get();
@@ -167,7 +167,7 @@ TEST_F(WALFileManagerSeastarTest, ConvertWalToTsmViaRollover) {
         eng.init();
 
         // Insert data into the memory store
-        TSDBInsert<double> insert("metric", "value");
+        TimeStarInsert<double> insert("metric", "value");
         for (uint64_t t = 1000; t <= 10000; t += 1000) {
             insert.addValue(t, static_cast<double>(t));
         }
@@ -197,7 +197,7 @@ TEST_F(WALFileManagerSeastarTest, ConvertWalToTsmMixedTypes) {
 
         // Insert float data
         {
-            TSDBInsert<double> insert("weather", "temperature");
+            TimeStarInsert<double> insert("weather", "temperature");
             insert.addValue(1000, 72.5);
             insert.addValue(2000, 73.0);
             eng->insert(std::move(insert)).get();
@@ -205,7 +205,7 @@ TEST_F(WALFileManagerSeastarTest, ConvertWalToTsmMixedTypes) {
 
         // Insert boolean data
         {
-            TSDBInsert<bool> insert("system", "healthy");
+            TimeStarInsert<bool> insert("system", "healthy");
             insert.addValue(1000, true);
             insert.addValue(2000, false);
             eng->insert(std::move(insert)).get();
@@ -213,7 +213,7 @@ TEST_F(WALFileManagerSeastarTest, ConvertWalToTsmMixedTypes) {
 
         // Insert string data
         {
-            TSDBInsert<std::string> insert("app", "status");
+            TimeStarInsert<std::string> insert("app", "status");
             insert.addValue(1000, std::string("running"));
             insert.addValue(2000, std::string("stopped"));
             eng->insert(std::move(insert)).get();
@@ -262,7 +262,7 @@ TEST_F(WALFileManagerSeastarTest, MultipleSequentialRollovers) {
         const int pointsPerBatch = 100;
 
         for (int batch = 0; batch < numRollovers; ++batch) {
-            TSDBInsert<double> insert("load_test", "value");
+            TimeStarInsert<double> insert("load_test", "value");
             for (int i = 0; i < pointsPerBatch; ++i) {
                 uint64_t t = static_cast<uint64_t>(batch * pointsPerBatch + i + 1);
                 insert.addValue(t, static_cast<double>(t));
@@ -293,7 +293,7 @@ TEST_F(WALFileManagerSeastarTest, RolloverPreservesDataIntegrity) {
 
         // Phase 1: Insert and rollover
         {
-            TSDBInsert<double> insert("metric", "cpu");
+            TimeStarInsert<double> insert("metric", "cpu");
             insert.addValue(1000, 10.0);
             insert.addValue(2000, 20.0);
             insert.addValue(3000, 30.0);
@@ -303,7 +303,7 @@ TEST_F(WALFileManagerSeastarTest, RolloverPreservesDataIntegrity) {
 
         // Phase 2: Insert more data (to new memory store)
         {
-            TSDBInsert<double> insert("metric", "cpu");
+            TimeStarInsert<double> insert("metric", "cpu");
             insert.addValue(4000, 40.0);
             insert.addValue(5000, 50.0);
             eng->insert(std::move(insert)).get();
@@ -312,7 +312,7 @@ TEST_F(WALFileManagerSeastarTest, RolloverPreservesDataIntegrity) {
 
         // Phase 3: Insert even more
         {
-            TSDBInsert<double> insert("metric", "cpu");
+            TimeStarInsert<double> insert("metric", "cpu");
             insert.addValue(6000, 60.0);
             eng->insert(std::move(insert)).get();
         }
@@ -337,10 +337,10 @@ TEST_F(WALFileManagerSeastarTest, BatchInsertMultipleSeries) {
         eng.init();
 
         const int batchSize = 20;
-        std::vector<TSDBInsert<double>> batch;
+        std::vector<TimeStarInsert<double>> batch;
 
         for (int i = 0; i < batchSize; ++i) {
-            TSDBInsert<double> insert("batch_test", "field_" + std::to_string(i));
+            TimeStarInsert<double> insert("batch_test", "field_" + std::to_string(i));
             for (uint64_t t = 1; t <= 50; ++t) {
                 insert.addValue(t, static_cast<double>(i * 50 + t));
             }
@@ -376,8 +376,8 @@ TEST_F(WALFileManagerSeastarTest, SequentialBatchInsertsSameSeries) {
         const int pointsPerBatch = 100;
 
         for (int batch = 0; batch < numBatches; ++batch) {
-            std::vector<TSDBInsert<double>> batchInserts;
-            TSDBInsert<double> insert("sequential", "value");
+            std::vector<TimeStarInsert<double>> batchInserts;
+            TimeStarInsert<double> insert("sequential", "value");
             for (int i = 0; i < pointsPerBatch; ++i) {
                 uint64_t t = static_cast<uint64_t>(batch * pointsPerBatch + i + 1);
                 insert.addValue(t, static_cast<double>(t));
@@ -403,7 +403,7 @@ TEST_F(WALFileManagerSeastarTest, EmptyBatchInsertIsNoop) {
         ScopedEngine eng;
         eng.init();
 
-        std::vector<TSDBInsert<double>> empty;
+        std::vector<TimeStarInsert<double>> empty;
         auto timing = eng->insertBatch(std::move(empty)).get();
         EXPECT_EQ(timing.walWriteCount, 0);
     }).join().get();
@@ -420,7 +420,7 @@ TEST_F(WALFileManagerSeastarTest, WALReplayPreservesDeletes) {
             ScopedEngine eng;
             eng.init();
 
-            TSDBInsert<double> insert("metric", "value");
+            TimeStarInsert<double> insert("metric", "value");
             insert.addValue(1000, 10.0);
             insert.addValue(2000, 20.0);
             insert.addValue(3000, 30.0);
@@ -461,7 +461,7 @@ TEST_F(WALFileManagerSeastarTest, GracefulShutdownPreservesData) {
             ScopedEngine eng;
             eng.init();
 
-            TSDBInsert<double> insert("shutdown_test", "value");
+            TimeStarInsert<double> insert("shutdown_test", "value");
             insert.addValue(1000, 100.0);
             insert.addValue(2000, 200.0);
             eng->insert(std::move(insert)).get();
@@ -497,7 +497,7 @@ TEST_F(WALFileManagerSeastarTest, InsertAfterRolloverWorks) {
 
         // Insert and rollover
         {
-            TSDBInsert<double> insert("series", "a");
+            TimeStarInsert<double> insert("series", "a");
             insert.addValue(1000, 1.0);
             insert.addValue(2000, 2.0);
             eng->insert(std::move(insert)).get();
@@ -506,7 +506,7 @@ TEST_F(WALFileManagerSeastarTest, InsertAfterRolloverWorks) {
 
         // Insert into new memory store after rollover
         {
-            TSDBInsert<double> insert("series", "a");
+            TimeStarInsert<double> insert("series", "a");
             insert.addValue(3000, 3.0);
             insert.addValue(4000, 4.0);
             eng->insert(std::move(insert)).get();
@@ -529,7 +529,7 @@ TEST_F(WALFileManagerSeastarTest, GetSeriesTypeFloat) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<double> insert("temperature", "value");
+        TimeStarInsert<double> insert("temperature", "value");
         insert.addValue(1000, 25.5);
         eng->insert(std::move(insert)).get();
 
@@ -545,7 +545,7 @@ TEST_F(WALFileManagerSeastarTest, GetSeriesTypeBool) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<bool> insert("door", "open");
+        TimeStarInsert<bool> insert("door", "open");
         insert.addValue(1000, true);
         eng->insert(std::move(insert)).get();
 
@@ -560,7 +560,7 @@ TEST_F(WALFileManagerSeastarTest, GetSeriesTypeString) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<std::string> insert("app", "log");
+        TimeStarInsert<std::string> insert("app", "log");
         insert.addValue(1000, std::string("hello"));
         eng->insert(std::move(insert)).get();
 
@@ -579,7 +579,7 @@ TEST_F(WALFileManagerSeastarTest, QueryMemoryStoreReturnsData) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<double> insert("cpu", "usage");
+        TimeStarInsert<double> insert("cpu", "usage");
         insert.addValue(1000, 50.0);
         insert.addValue(2000, 60.0);
         insert.addValue(3000, 70.0);
@@ -602,7 +602,7 @@ TEST_F(WALFileManagerSeastarTest, DeleteFromMemoryStores) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<double> insert("metric", "val");
+        TimeStarInsert<double> insert("metric", "val");
         insert.addValue(1000, 10.0);
         insert.addValue(2000, 20.0);
         insert.addValue(3000, 30.0);
@@ -649,9 +649,9 @@ TEST_F(WALFileManagerSeastarTest, LargeBatchInsertAndRollover) {
         const int numSeries = 30;
         const int pointsPerSeries = 50;
 
-        std::vector<TSDBInsert<double>> batch;
+        std::vector<TimeStarInsert<double>> batch;
         for (int i = 0; i < numSeries; ++i) {
-            TSDBInsert<double> insert("large_batch", "field_" + std::to_string(i));
+            TimeStarInsert<double> insert("large_batch", "field_" + std::to_string(i));
             for (int j = 0; j < pointsPerSeries; ++j) {
                 uint64_t t = static_cast<uint64_t>(j + 1);
                 insert.addValue(t, static_cast<double>(i * 100 + j));
@@ -688,19 +688,19 @@ TEST_F(WALFileManagerSeastarTest, MixedTypeRecovery) {
             eng.init();
 
             {
-                TSDBInsert<double> insert("sensor", "temperature");
+                TimeStarInsert<double> insert("sensor", "temperature");
                 insert.addValue(1000, 25.5);
                 insert.addValue(2000, 26.0);
                 eng->insert(std::move(insert)).get();
             }
             {
-                TSDBInsert<bool> insert("sensor", "active");
+                TimeStarInsert<bool> insert("sensor", "active");
                 insert.addValue(1000, true);
                 insert.addValue(2000, false);
                 eng->insert(std::move(insert)).get();
             }
             {
-                TSDBInsert<std::string> insert("sensor", "label");
+                TimeStarInsert<std::string> insert("sensor", "label");
                 insert.addValue(1000, std::string("zone-a"));
                 insert.addValue(2000, std::string("zone-b"));
                 eng->insert(std::move(insert)).get();
@@ -748,7 +748,7 @@ TEST_F(WALFileManagerSeastarTest, InsertWithTagsPreservedThroughRollover) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<double> insert("weather", "temperature");
+        TimeStarInsert<double> insert("weather", "temperature");
         insert.addTag("location", "us-west");
         insert.addTag("host", "server-01");
         insert.addValue(1000, 72.5);
@@ -783,7 +783,7 @@ TEST_F(WALFileManagerSeastarTest, RolloverEmptyMemoryStoreIsSafe) {
         EXPECT_NO_THROW(eng->rolloverMemoryStore().get());
 
         // Engine should still be operational after empty rollover
-        TSDBInsert<double> insert("post_empty_rollover", "value");
+        TimeStarInsert<double> insert("post_empty_rollover", "value");
         insert.addValue(1000, 42.0);
         eng->insert(std::move(insert)).get();
 
@@ -803,16 +803,16 @@ TEST_F(WALFileManagerSeastarTest, BatchInsertBooleanType) {
         ScopedEngine eng;
         eng.init();
 
-        std::vector<TSDBInsert<bool>> batch;
+        std::vector<TimeStarInsert<bool>> batch;
         {
-            TSDBInsert<bool> insert("device", "power_on");
+            TimeStarInsert<bool> insert("device", "power_on");
             insert.addValue(1000, true);
             insert.addValue(2000, false);
             insert.addValue(3000, true);
             batch.push_back(std::move(insert));
         }
         {
-            TSDBInsert<bool> insert("device", "connected");
+            TimeStarInsert<bool> insert("device", "connected");
             insert.addValue(1000, false);
             insert.addValue(2000, true);
             batch.push_back(std::move(insert));
@@ -847,16 +847,16 @@ TEST_F(WALFileManagerSeastarTest, BatchInsertStringType) {
         ScopedEngine eng;
         eng.init();
 
-        std::vector<TSDBInsert<std::string>> batch;
+        std::vector<TimeStarInsert<std::string>> batch;
         {
-            TSDBInsert<std::string> insert("logs", "message");
+            TimeStarInsert<std::string> insert("logs", "message");
             insert.addValue(1000, std::string("startup complete"));
             insert.addValue(2000, std::string("request received"));
             insert.addValue(3000, std::string("processing done"));
             batch.push_back(std::move(insert));
         }
         {
-            TSDBInsert<std::string> insert("logs", "level");
+            TimeStarInsert<std::string> insert("logs", "level");
             insert.addValue(1000, std::string("INFO"));
             insert.addValue(2000, std::string("DEBUG"));
             batch.push_back(std::move(insert));
@@ -894,7 +894,7 @@ TEST_F(WALFileManagerSeastarTest, RecoveryAfterInsertRolloverInsertCycle) {
 
             // First batch goes to WAL, then to TSM via rollover
             {
-                TSDBInsert<double> insert("cycle_test", "series_a");
+                TimeStarInsert<double> insert("cycle_test", "series_a");
                 insert.addValue(1000, 1.0);
                 insert.addValue(2000, 2.0);
                 eng->insert(std::move(insert)).get();
@@ -903,7 +903,7 @@ TEST_F(WALFileManagerSeastarTest, RecoveryAfterInsertRolloverInsertCycle) {
 
             // Second batch stays in WAL (not rolled over before shutdown)
             {
-                TSDBInsert<double> insert("cycle_test", "series_b");
+                TimeStarInsert<double> insert("cycle_test", "series_b");
                 insert.addValue(3000, 3.0);
                 insert.addValue(4000, 4.0);
                 eng->insert(std::move(insert)).get();
@@ -953,7 +953,7 @@ TEST_F(WALFileManagerSeastarTest, ShardedWALFileManagerOperatesIndependently) {
 
         // Insert series that may land on different shards
         for (int i = 0; i < 8; ++i) {
-            TSDBInsert<double> insert("sharded_test", "field_" + std::to_string(i));
+            TimeStarInsert<double> insert("sharded_test", "field_" + std::to_string(i));
             insert.addTag("shard_hint", std::to_string(i));
             insert.addValue(1000, static_cast<double>(i * 10));
             insert.addValue(2000, static_cast<double>(i * 10 + 1));
@@ -963,7 +963,7 @@ TEST_F(WALFileManagerSeastarTest, ShardedWALFileManagerOperatesIndependently) {
         // Verify each series is queryable on its correct shard
         int foundCount = 0;
         for (int i = 0; i < 8; ++i) {
-            TSDBInsert<double> tmp("sharded_test", "field_" + std::to_string(i));
+            TimeStarInsert<double> tmp("sharded_test", "field_" + std::to_string(i));
             tmp.addTag("shard_hint", std::to_string(i));
             std::string seriesKey = tmp.seriesKey();
             SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
@@ -992,7 +992,7 @@ TEST_F(WALFileManagerSeastarTest, DoubleRolloverWithoutInsert) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<double> insert("metric", "value");
+        TimeStarInsert<double> insert("metric", "value");
         insert.addValue(1000, 42.0);
         eng->insert(std::move(insert)).get();
 
@@ -1019,7 +1019,7 @@ TEST_F(WALFileManagerSeastarTest, DeleteThenRolloverPreservesDeletion) {
         ScopedEngine eng;
         eng.init();
 
-        TSDBInsert<double> insert("metric", "value");
+        TimeStarInsert<double> insert("metric", "value");
         insert.addValue(1000, 10.0);
         insert.addValue(2000, 20.0);
         insert.addValue(3000, 30.0);
@@ -1052,7 +1052,7 @@ TEST_F(WALFileManagerSeastarTest, ManySmallInserts) {
 
         const int numInserts = 200;
         for (int i = 0; i < numInserts; ++i) {
-            TSDBInsert<double> insert("stress", "value");
+            TimeStarInsert<double> insert("stress", "value");
             insert.addValue(static_cast<uint64_t>(i + 1), static_cast<double>(i));
             eng->insert(std::move(insert)).get();
         }

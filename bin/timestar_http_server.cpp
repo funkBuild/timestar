@@ -11,7 +11,8 @@
 #include "http/http_retention_handler.hpp"
 #include "http/http_stream_handler.hpp"
 #include "http/http_derived_query_handler.hpp"
-#include "config/tsdb_config.hpp"
+#include "storage/shard_rebalancer.hpp"
+#include "config/timestar_config.hpp"
 #include "utils/stop_signal.hpp"
 #include "utils/logger.hpp"
 
@@ -36,10 +37,18 @@ using namespace httpd;
 // (Defined before set_routes, initialized in main.)
 seastar::sharded<Engine> g_engine;
 
+// Per-shard stream handler pointer, used to call stop() during shutdown.
+static thread_local timestar::HttpStreamHandler* g_streamHandler = nullptr;
+
+// TODO(H-H1): Add authentication/authorization middleware.  Currently all
+// endpoints are unauthenticated.  When deploying to a network accessible to
+// untrusted clients, place a reverse proxy (nginx, envoy) in front or
+// implement bearer-token / mTLS auth here.
+
 void set_routes(routes& r) {
     // Simple test endpoints
     auto* test = new function_handler([](const_req req) {
-        return "Hello from TSDB HTTP Server!";
+        return "Hello from TimeStar HTTP Server!";
     });
     r.add(operation_type::GET, url("/test"), test);
 
@@ -48,40 +57,48 @@ void set_routes(routes& r) {
     });
     r.add(operation_type::GET, url("/health"), health);
 
-    // Create per-shard handler instances on the calling shard's heap.
-    // Each handler's registerRoutes() captures `this` in route lambdas,
-    // so the handler must outlive set_routes(). Heap allocation ensures
-    // each shard owns its handler in shard-local memory (no cross-shard access).
-    // These are intentionally never freed -- they live for the process lifetime,
-    // matching the pattern used by function_handler above.
-    auto* writeHandler = new HttpWriteHandler(&g_engine);
+    // Per-shard handler instances. Each handler's registerRoutes() captures
+    // `this` in route lambdas, so the handler must outlive set_routes().
+    // We store them in a thread_local vector so they are freed on process exit
+    // (avoids ASAN leak reports while keeping shard-local memory ownership).
+    static thread_local std::vector<std::unique_ptr<void, void(*)(void*)>> handlers;
+
+    auto emplaceHandler = [&]<typename T>(T* ptr) {
+        handlers.emplace_back(ptr, [](void* p) { delete static_cast<T*>(p); });
+        return ptr;
+    };
+
+    auto* writeHandler = emplaceHandler(new HttpWriteHandler(&g_engine));
     writeHandler->registerRoutes(r);
 
-    auto* queryHandler = new tsdb::HttpQueryHandler(&g_engine, nullptr);
+    auto* queryHandler = emplaceHandler(new timestar::HttpQueryHandler(&g_engine, nullptr));
     queryHandler->registerRoutes(r);
 
-    auto* deleteHandler = new HttpDeleteHandler(&g_engine);
+    auto* deleteHandler = emplaceHandler(new HttpDeleteHandler(&g_engine));
     deleteHandler->registerRoutes(r);
 
-    auto* metadataHandler = new HttpMetadataHandler(&g_engine);
+    auto* metadataHandler = emplaceHandler(new HttpMetadataHandler(&g_engine));
     metadataHandler->registerRoutes(r);
 
-    // HttpRetentionHandler uses enable_shared_from_this so that its
-    // registerRoutes() can capture shared_from_this() in the route lambdas.
-    // The shared_ptr is kept alive by the function_handler objects owned by
-    // routes; when routes is destroyed the handler is freed cleanly.
-    auto retentionHandler = std::make_shared<HttpRetentionHandler>(&g_engine);
-    retentionHandler->registerRoutes(r);
+    // HttpRetentionHandler uses enable_shared_from_this, so it must be
+    // constructed as a shared_ptr. Store the shared_ptr in the handlers
+    // vector to ensure it outlives the route lambdas.
+    auto retentionHandlerPtr = std::make_shared<HttpRetentionHandler>(&g_engine);
+    retentionHandlerPtr->registerRoutes(r);
+    handlers.emplace_back(
+        new std::shared_ptr<HttpRetentionHandler>(retentionHandlerPtr),
+        [](void* p) { delete static_cast<std::shared_ptr<HttpRetentionHandler>*>(p); });
 
-    auto* streamHandler = new tsdb::HttpStreamHandler(&g_engine);
+    auto* streamHandler = emplaceHandler(new timestar::HttpStreamHandler(&g_engine));
     streamHandler->registerRoutes(r);
+    g_streamHandler = streamHandler;  // Save for shutdown
 
-    auto* derivedQueryHandler = new tsdb::HttpDerivedQueryHandler(&g_engine);
+    auto* derivedQueryHandler = emplaceHandler(new timestar::HttpDerivedQueryHandler(&g_engine));
     derivedQueryHandler->registerRoutes(r);
 
-    auto* root = new function_handler([](const_req req) {
-        return "{\"message\":\"TSDB HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\",\"/retention\",\"/subscribe\",\"/subscriptions\"]}";
-    });
+    auto* root = emplaceHandler(new function_handler([](const_req req) {
+        return "{\"message\":\"TimeStar HTTP Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/tags\",\"/fields\",\"/retention\",\"/subscribe\",\"/subscriptions\"]}";
+    }));
     r.add(operation_type::GET, url("/"), root);
 }
 
@@ -99,27 +116,48 @@ int main(int argc, char** argv) {
     }
 
     if (dumpConfig) {
-        std::cout << tsdb::dumpDefaultConfig();
+        std::cout << timestar::dumpDefaultConfig();
         return 0;
     }
 
+    // Support TIMESTAR_CONFIG_FILE env var as alternative to --config
+    if (configPath.empty()) {
+        if (auto envCfg = std::getenv("TIMESTAR_CONFIG_FILE")) {
+            configPath = envCfg;
+        }
+    }
+
     // Load config file if specified, otherwise use defaults.
-    tsdb::TsdbConfig tsdbConfig{};
+    timestar::TimestarConfig timestarConfig{};
     if (!configPath.empty()) {
         try {
-            tsdbConfig = tsdb::loadConfigFile(configPath);
+            timestarConfig = timestar::loadConfigFile(configPath);
         } catch (const std::exception& e) {
             std::cerr << "Error: " << e.what() << std::endl;
             return 1;
         }
     }
-    tsdb::setGlobalConfig(tsdbConfig);
+
+    // Apply TIMESTAR_* environment variable overrides (env vars > config file > defaults)
+    timestar::applyEnvironmentOverrides(timestarConfig);
+
+    // Re-validate after env overrides (env vars may set invalid values)
+    auto envErrors = timestarConfig.validate();
+    if (!envErrors.empty()) {
+        std::cerr << "Config validation errors after environment overrides:" << std::endl;
+        for (const auto& e : envErrors) {
+            std::cerr << "  - " << e << std::endl;
+        }
+        return 1;
+    }
+
+    timestar::setGlobalConfig(timestarConfig);
 
     seastar::app_template app;
 
     namespace bpo = boost::program_options;
     app.add_options()
-        ("port", bpo::value<uint16_t>()->default_value(tsdbConfig.server.port),
+        ("port", bpo::value<uint16_t>()->default_value(timestarConfig.server.port),
          "HTTP server port")
         ("log-level", bpo::value<seastar::log_level>()->default_value(seastar::log_level::info),
          "Log level (error, warn, info, debug, trace)")
@@ -129,8 +167,8 @@ int main(int argc, char** argv) {
 
     // Inject Seastar settings from TOML [seastar] section.
     // CLI args are already stored first, so bpo::store won't overwrite them.
-    app.set_configuration_reader([&tsdbConfig, &app](bpo::variables_map& vm) {
-        const auto& ss = tsdbConfig.seastar;
+    app.set_configuration_reader([&timestarConfig, &app](bpo::variables_map& vm) {
+        const auto& ss = timestarConfig.seastar;
         if (ss.settings.empty()) return;
 
         // Map TOML underscore keys to Seastar's hyphenated CLI option names.
@@ -169,11 +207,28 @@ int main(int argc, char** argv) {
             auto log_level = config["log-level"].as<seastar::log_level>();
             
             // Initialize logging
-            tsdb::init_logging(log_level);
-            tsdb::http_log.info("Starting TSDB HTTP Server with log level: {}", log_level);
+            timestar::init_logging(log_level);
+            timestar::http_log.info("Starting TimeStar HTTP Server with log level: {}", log_level);
             
+            // STEP 0: Check for shard rebalancing (CPU count change)
+            {
+                timestar::ShardRebalancer rebalancer(".");
+                // Recover from any previously interrupted rebalance first
+                rebalancer.recoverIfNeeded(seastar::smp::count).get();
+
+                if (rebalancer.isRebalanceNeeded(seastar::smp::count)) {
+                    timestar::http_log.info("Shard count changed from {} to {}, starting rebalance...",
+                                            rebalancer.previousShardCount(), seastar::smp::count);
+                    rebalancer.execute(seastar::smp::count).get();
+                    timestar::http_log.info("Shard rebalance complete");
+                } else {
+                    // Persist current shard count for next startup
+                    timestar::ShardRebalancer::writeShardCountMeta(".", seastar::smp::count);
+                }
+            }
+
             // STEP 1: Initialize the Engine on all shards
-            tsdb::http_log.info("Initializing Engine on all shards...");
+            timestar::http_log.info("Initializing Engine on all shards...");
             g_engine.start().get();
             
             try {
@@ -199,26 +254,28 @@ int main(int argc, char** argv) {
                     return seastar::make_ready_future<>();
                 }).get();
 
-                tsdb::http_log.info("Engine init completed on all shards");
+                // Persist shard count after successful init
+                timestar::ShardRebalancer::writeShardCountMeta(".", seastar::smp::count);
+                timestar::http_log.info("Engine init completed on all shards");
             } catch (const std::bad_alloc& e) {
-                tsdb::http_log.error("bad_alloc during Engine init: {}", e.what());
+                timestar::http_log.error("bad_alloc during Engine init: {}", e.what());
                 // Print backtrace for debugging according to Seastar docs
-                tsdb::http_log.error("Backtrace:\n{}", current_backtrace());
+                timestar::http_log.error("Backtrace:\n{}", current_backtrace());
                 throw;
             } catch (const std::exception& e) {
-                tsdb::http_log.error("Exception during Engine init: {}", e.what());
+                timestar::http_log.error("Exception during Engine init: {}", e.what());
                 // Print backtrace for debugging
-                tsdb::http_log.error("Backtrace:\n{}", current_backtrace());
+                timestar::http_log.error("Backtrace:\n{}", current_backtrace());
                 throw;
             }
             
             // Start background tasks on all shards for WAL->TSM conversion
-            tsdb::http_log.info("Starting background tasks on all shards...");
+            timestar::http_log.info("Starting background tasks on all shards...");
             g_engine.invoke_on_all([](Engine& engine) {
                 return engine.startBackgroundTasks();
             }).get();
             
-            tsdb::http_log.info("Engine initialized successfully with background tasks");
+            timestar::http_log.info("Engine initialized successfully with background tasks");
 
             // STEP 2: Create stop signal handler
             // Note: HTTP handlers are created per-shard inside set_routes() to avoid
@@ -234,7 +291,7 @@ int main(int argc, char** argv) {
                 server->set_routes(set_routes).get();
                 server->listen(port).get();
             } catch (const std::exception& e) {
-                tsdb::http_log.error("Failed to start HTTP server: {}", e.what());
+                timestar::http_log.error("Failed to start HTTP server: {}", e.what());
                 // Clean up engine before exiting
                 g_engine.invoke_on_all([](Engine& engine) {
                     return engine.stop();
@@ -243,34 +300,45 @@ int main(int argc, char** argv) {
                 throw;
             }
             
-            tsdb::http_log.info("TSDB HTTP Server listening on port {} ...", port);
-            tsdb::http_log.info("Available endpoints:");
-            tsdb::http_log.info("  GET  /         - Root endpoint");
-            tsdb::http_log.info("  GET  /test     - Test message");
-            tsdb::http_log.info("  GET  /health   - Health check");
-            tsdb::http_log.info("  POST /write    - Write time series data");
-            tsdb::http_log.info("  POST /query    - Query time series data");
-            tsdb::http_log.info("  POST /delete   - Delete time series data");
-            tsdb::http_log.info("  POST /subscribe - Subscribe to streaming data (SSE)");
+            timestar::http_log.info("TimeStar HTTP Server listening on port {} ...", port);
+            timestar::http_log.info("Available endpoints:");
+            timestar::http_log.info("  GET  /         - Root endpoint");
+            timestar::http_log.info("  GET  /test     - Test message");
+            timestar::http_log.info("  GET  /health   - Health check");
+            timestar::http_log.info("  POST /write    - Write time series data");
+            timestar::http_log.info("  POST /query    - Query time series data");
+            timestar::http_log.info("  POST /delete   - Delete time series data");
+            timestar::http_log.info("  POST /subscribe - Subscribe to streaming data (SSE)");
             
             // Wait for stop signal
             stop_signal.wait().get();
             
             // Clean shutdown
-            tsdb::http_log.info("Shutting down HTTP server...");
+            timestar::http_log.info("Shutting down HTTP server...");
             server->stop().get();
 
+            // Stop stream handlers to close SSE connection gates before
+            // destroying the engine (prevents use-after-free on active SSE
+            // connections that reference sharded<Engine>).
+            timestar::http_log.info("Stopping stream handlers...");
+            seastar::smp::invoke_on_all([] {
+                if (g_streamHandler) {
+                    return g_streamHandler->stop();
+                }
+                return seastar::make_ready_future<>();
+            }).get();
+
             // Flush in-memory data to TSM and stop engine
-            tsdb::http_log.info("Flushing in-memory data to TSM files...");
+            timestar::http_log.info("Flushing in-memory data to TSM files...");
             g_engine.invoke_on_all([](Engine& engine) {
                 return engine.stop();
             }).get();
 
             // Then stop the engine instances
-            tsdb::http_log.info("Stopping Engine instances...");
+            timestar::http_log.info("Stopping Engine instances...");
             g_engine.stop().get();
 
-            tsdb::http_log.info("Shutdown complete");
+            timestar::http_log.info("Shutdown complete");
             return 0;
         });
     });

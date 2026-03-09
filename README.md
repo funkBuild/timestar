@@ -1,4 +1,4 @@
-# TSDB
+# TimeStar
 
 A high-performance time series database built with C++23 and the Seastar framework.
 
@@ -56,8 +56,8 @@ sudo apt install cmake g++-14 libleveldb-dev libsnappy-dev libssl-dev \
   systemtap-sdt-dev libyaml-cpp-dev libxxhash-dev ragel
 
 # Clone and build
-git clone --recursive https://github.com/yourusername/tsdb.git
-cd tsdb
+git clone --recursive https://github.com/yourusername/timestar.git
+cd timestar
 mkdir -p build && cd build
 cmake ..
 make -j$(nproc)
@@ -66,7 +66,7 @@ make -j$(nproc)
 ### Run
 
 ```bash
-./bin/tsdb_http_server --port 8086
+./bin/timestar_http_server --port 8086
 ```
 
 ### Write Data
@@ -114,8 +114,8 @@ curl -X POST http://localhost:8086/derived \
 Generate a default TOML config and customize it:
 
 ```bash
-./bin/tsdb_http_server --dump-config > tsdb.toml
-./bin/tsdb_http_server --config tsdb.toml
+./bin/timestar_http_server --dump-config > timestar.toml
+./bin/timestar_http_server --config timestar.toml
 ```
 
 Key config sections: `[server]`, `[storage]`, `[http]`, `[index]`, `[engine]`, `[streaming]`, `[seastar]`. See [docs/architecture.md](docs/architecture.md) for details.
@@ -153,7 +153,7 @@ See [docs/query-language.md](docs/query-language.md) and [docs/expression-functi
 ## Project Structure
 
 ```
-tsdb/
+timestar/
 ├── lib/                    Core library
 │   ├── core/              Engine orchestration
 │   ├── storage/           TSM, WAL, MemoryStore
@@ -183,20 +183,20 @@ tsdb/
 cd build
 
 # All tests (~2200 tests across 150+ suites)
-./test/tsdb_test
+./test/timestar_test
 
 # Specific suite
-./test/tsdb_test --gtest_filter="QueryParserTest.*"
+./test/timestar_test --gtest_filter="QueryParserTest.*"
 
 # List all tests
-./test/tsdb_test --gtest_list_tests
+./test/timestar_test --gtest_list_tests
 ```
 
 ### API Integration Tests
 
 ```bash
 # Start the server first
-./bin/tsdb_http_server --port 8086
+./bin/timestar_http_server --port 8086
 
 # In another terminal
 cd test_api && npm install && npm test

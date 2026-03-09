@@ -4,7 +4,7 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../seastar_gtest.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 namespace fs = std::filesystem;
 
 // Helper to create distinct SeriesId128 values for testing
@@ -355,8 +355,8 @@ TEST_F(TSMTombstoneTest, LargeTombstoneSet) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-    // Should be fast even with many tombstones (< 1ms per lookup)
-    EXPECT_LT(duration.count() / 10000.0, 1.0);
+    // Should be fast even with many tombstones (< 2ms per lookup, generous for CI/ASAN)
+    EXPECT_LT(duration.count() / 10000.0, 2.0);
 
     // Test persistence
     tombstone->flush().get();

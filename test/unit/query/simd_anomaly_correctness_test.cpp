@@ -7,7 +7,7 @@
 #include <numeric>
 #include <algorithm>
 
-namespace simd_ns = tsdb::anomaly::simd;
+namespace simd_ns = timestar::anomaly::simd;
 
 // ============================================================================
 // Local scalar reference implementations for comparison.

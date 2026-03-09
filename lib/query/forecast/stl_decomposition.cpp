@@ -1,31 +1,19 @@
 #include "stl_decomposition.hpp"
 #include "../anomaly/simd_anomaly.hpp"
+#include "../simd_helpers.hpp"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
 #include <limits>
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
-#include <immintrin.h>
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
+using timestar::simd::hsum_avx;
+static inline double hsum_avx_local(__m256d v) { return hsum_avx(v); }
 #endif
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
-
-// ============================================================================
-// Local SIMD helpers (mirrors hsum_avx from simd_anomaly.cpp which is static)
-// ============================================================================
-
-#if !TSDB_ANOMALY_DISABLE_SIMD
-static inline double hsum_avx_local(__m256d v) {
-    __m128d vlow  = _mm256_castpd256_pd128(v);
-    __m128d vhigh = _mm256_extractf128_pd(v, 1);
-    vlow = _mm_add_pd(vlow, vhigh);
-    __m128d high64 = _mm_unpackhi_pd(vlow, vlow);
-    return _mm_cvtsd_f64(_mm_add_sd(vlow, high64));
-}
-#endif
 
 // ============================================================================
 // Weight Functions
@@ -192,7 +180,7 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
     const bool hasWeights = !weights.empty();
     std::vector<double> result(n);
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && window >= 8) {
         // ================================================================
         // AVX2 SIMD path
@@ -352,7 +340,7 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
 
         return result;
     }
-#endif // !TSDB_ANOMALY_DISABLE_SIMD
+#endif // !TIMESTAR_ANOMALY_DISABLE_SIMD
 
     // ================================================================
     // Scalar fallback (original implementation)
@@ -533,7 +521,7 @@ std::vector<double> STLDecomposer::computeRobustnessWeights(
     // Use a copy for median-finding (nth_element rearranges), keep original for weights
     std::vector<double> absResiduals(n);
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 8) {
         // ================================================================
         // AVX2 SIMD path
@@ -624,7 +612,7 @@ std::vector<double> STLDecomposer::computeRobustnessWeights(
 
         return weights;
     }
-#endif // !TSDB_ANOMALY_DISABLE_SIMD
+#endif // !TIMESTAR_ANOMALY_DISABLE_SIMD
 
     // ================================================================
     // Scalar fallback
@@ -833,4 +821,4 @@ MSTLResult STLDecomposer::decomposeMultiple(
 }
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar

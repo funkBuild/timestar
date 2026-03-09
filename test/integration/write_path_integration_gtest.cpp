@@ -11,7 +11,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/sleep.hh>
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/query/query_result.hpp"
 #include <filesystem>
 #include <functional>
@@ -35,7 +35,7 @@ SEASTAR_TEST_F(WritePathIntegrationTest, BasicWriteAndQuery) {
     co_await engine.startBackgroundTasks();
 
     // Insert float data
-    TSDBInsert<double> tempInsert("weather", "temperature");
+    TimeStarInsert<double> tempInsert("weather", "temperature");
     tempInsert.addTag("location", "us-midwest");
     tempInsert.addTag("host", "server-01");
 
@@ -45,14 +45,14 @@ SEASTAR_TEST_F(WritePathIntegrationTest, BasicWriteAndQuery) {
     co_await engine.insert(tempInsert);
 
     // Insert boolean data
-    TSDBInsert<bool> statusInsert("system", "status");
+    TimeStarInsert<bool> statusInsert("system", "status");
     statusInsert.addTag("host", "server-01");
     statusInsert.addValue(baseTime + 1000000000, true);
 
     co_await engine.insert(statusInsert);
 
     // Insert string data
-    TSDBInsert<std::string> messageInsert("logs", "message");
+    TimeStarInsert<std::string> messageInsert("logs", "message");
     messageInsert.addTag("host", "server-01");
     messageInsert.addValue(baseTime + 2000000000, "System started successfully");
 
@@ -113,20 +113,20 @@ SEASTAR_TEST_F(WritePathIntegrationTest, MetadataIndexing) {
     co_await engine.init();
 
     // Insert data with different measurements and tags
-    TSDBInsert<double> tempInsert("temperature", "value");
+    TimeStarInsert<double> tempInsert("temperature", "value");
     tempInsert.addTag("location", "room1");
     tempInsert.addValue(1638360000000000000LL, 22.5);
     co_await engine.insert(tempInsert);
     co_await engine.indexMetadata(tempInsert);
 
     // Create a new insert for room2 (don't reuse - seriesKey cache issue)
-    TSDBInsert<double> tempInsert2("temperature", "value");
+    TimeStarInsert<double> tempInsert2("temperature", "value");
     tempInsert2.addTag("location", "room2");
     tempInsert2.addValue(1638360000000000000LL, 23.0);
     co_await engine.insert(tempInsert2);
     co_await engine.indexMetadata(tempInsert2);
 
-    TSDBInsert<double> pressureInsert("pressure", "value");
+    TimeStarInsert<double> pressureInsert("pressure", "value");
     pressureInsert.addTag("location", "room1");
     pressureInsert.addValue(1638360000000000000LL, 1013.25);
     co_await engine.insert(pressureInsert);
@@ -165,7 +165,7 @@ SEASTAR_TEST_F(WritePathIntegrationTest, MultipleSeriesQuery) {
 
     // Insert data for multiple series
     for (int i = 0; i < 5; i++) {
-        TSDBInsert<double> insert("metrics", "cpu");
+        TimeStarInsert<double> insert("metrics", "cpu");
         insert.addTag("host", "server-" + std::to_string(i));
         insert.addValue(baseTime + i * 1000000000LL, 50.0 + i * 10);
         co_await engine.insert(insert);
@@ -177,7 +177,7 @@ SEASTAR_TEST_F(WritePathIntegrationTest, MultipleSeriesQuery) {
 
     // Query each series
     for (int i = 0; i < 5; i++) {
-        TSDBInsert<double> queryKey("metrics", "cpu");
+        TimeStarInsert<double> queryKey("metrics", "cpu");
         queryKey.addTag("host", "server-" + std::to_string(i));
         std::string seriesKey = queryKey.seriesKey();
         auto result = co_await engine.query(seriesKey, baseTime, baseTime + 10000000000LL);

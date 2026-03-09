@@ -151,6 +151,12 @@ std::vector<uint64_t> Simple8B::decode(Slice &encoded, unsigned int size){
     }
   }
 
+  // The last packed word may contain padding values beyond the expected count.
+  // Trim to the exact expected size.
+  if (values.size() > size) {
+    values.resize(size);
+  }
+
   return values;
 }
 

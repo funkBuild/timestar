@@ -2,7 +2,7 @@
 #include <sstream>
 #include <iomanip>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Static member definitions
 const std::unordered_set<std::string> FunctionSecurity::dangerousFunctionNames_ = {
@@ -38,61 +38,75 @@ const std::unordered_set<std::string> FunctionSecurity::dangerousFunctionNames_ 
     "fork", "spawn", "thread", "process", "exit", "abort"
 };
 
-const std::vector<std::regex> FunctionSecurity::dangerousPatterns_ = {
-    // Code injection patterns
-    std::regex(R"(__import__\s*\()", std::regex_constants::icase),
-    std::regex(R"(exec\s*\()", std::regex_constants::icase),
-    std::regex(R"(eval\s*\()", std::regex_constants::icase),
-    std::regex(R"(system\s*\()", std::regex_constants::icase),
-    std::regex(R"(shell_exec\s*\()", std::regex_constants::icase),
-    
-    // Command injection patterns
-    std::regex(R"([;&|`$(){}[\]])", std::regex_constants::icase),
-    std::regex(R"(\\x[0-9a-f]{2})", std::regex_constants::icase),
-    
-    // Command-like patterns (spaces between command arguments)
-    std::regex(R"(rm\s+)", std::regex_constants::icase),
-    std::regex(R"(sudo\s+)", std::regex_constants::icase),
-    std::regex(R"(chmod\s+)", std::regex_constants::icase),
-    std::regex(R"(kill\s+)", std::regex_constants::icase),
-    std::regex(R"(ps\s+)", std::regex_constants::icase),
-    std::regex(R"(ls\s+)", std::regex_constants::icase),
-    std::regex(R"(cat\s+)", std::regex_constants::icase),
-    std::regex(R"(curl\s+)", std::regex_constants::icase),
-    std::regex(R"(wget\s+)", std::regex_constants::icase),
-    std::regex(R"(nc\s+)", std::regex_constants::icase),
-    
-    // Path traversal patterns
-    std::regex(R"(\.\./|\.\.\\)", std::regex_constants::icase),
-    std::regex(R"(%2e%2e%2f|%2e%2e%5c)", std::regex_constants::icase),
-    std::regex(R"(\\\.\\\.\\|\\\.\\\.\/)", std::regex_constants::icase),
-    
-    // SQL injection patterns
-    std::regex(R"('\s*or\s*')", std::regex_constants::icase),
-    std::regex(R"('\s*union\s*select)", std::regex_constants::icase),
-    std::regex(R"(drop\s+table)", std::regex_constants::icase),
-    std::regex(R"(delete\s+from)", std::regex_constants::icase),
-    std::regex(R"(insert\s+into)", std::regex_constants::icase),
-    
-    // XSS patterns
-    // NOTE: <script[^>]*> uses [^>]* (negated class) which cannot backtrack catastrophically.
-    std::regex(R"(<script[^>]*>)", std::regex_constants::icase),
-    std::regex(R"(javascript\s*:)", std::regex_constants::icase),
-    // NOTE: on\w+\s*= was vulnerable to ReDoS: with input "onaonaonaona..." (n chars),
-    // the unbounded \w+ caused O(n^2) backtracking per position, totalling O(n^3).
-    // Fix: bound \w to {1,30} — covers all real HTML event attributes (longest is
-    // onsecuritypolicyviolation at 23 chars) while eliminating catastrophic backtracking.
-    std::regex(R"(on\w{1,30}\s*=)", std::regex_constants::icase),
-    
-    // Format string attacks
-    std::regex(R"(%[0-9]*[sdxn])", std::regex_constants::icase),
-    
-    // LDAP injection
-    std::regex(R"(\*\)\([\w=*]+\)\(\|)", std::regex_constants::icase),
-    
-    // Protocol injection
-    std::regex(R"(file:\/\/|ftp:\/\/|ldap:\/\/)", std::regex_constants::icase),
-};
+// Lazily initialized on first call. Function-local static avoids global
+// constructor ordering issues and safely contains any regex_error.
+const std::vector<std::regex>& FunctionSecurity::getDangerousPatterns() {
+    static const std::vector<std::regex> patterns = [] {
+        std::vector<std::regex> p;
+        // Pre-allocate to avoid repeated reallocation
+        p.reserve(30);
+        auto add = [&](const char* pattern) {
+            p.emplace_back(pattern, std::regex_constants::icase);
+        };
+
+        // Code injection patterns
+        add(R"(__import__\s*\()");
+        add(R"(exec\s*\()");
+        add(R"(eval\s*\()");
+        add(R"(system\s*\()");
+        add(R"(shell_exec\s*\()");
+
+        // Command injection patterns — only match shell metacharacters.
+        // Parentheses (), braces {}, and brackets [] are legitimate query
+        // language syntax and must NOT be blocked here.
+        add(R"([;&|`$])");
+        add(R"(\\x[0-9a-f]{2})");
+
+        // Command-like patterns (spaces between command arguments)
+        add(R"(rm\s+)");
+        add(R"(sudo\s+)");
+        add(R"(chmod\s+)");
+        add(R"(kill\s+)");
+        add(R"(ps\s+)");
+        add(R"(ls\s+)");
+        add(R"(cat\s+)");
+        add(R"(curl\s+)");
+        add(R"(wget\s+)");
+        add(R"(nc\s+)");
+
+        // Path traversal patterns
+        add(R"(\.\./|\.\.\\)");
+        add(R"(%2e%2e%2f|%2e%2e%5c)");
+        add(R"(\\\.\\\.\\|\\\.\\\./)");
+
+        // SQL injection patterns
+        add(R"('\s*or\s*')");
+        add(R"('\s*union\s*select)");
+        add(R"(drop\s+table)");
+        add(R"(delete\s+from)");
+        add(R"(insert\s+into)");
+
+        // XSS patterns
+        add(R"(<script[^>]*>)");
+        add(R"(javascript\s*:)");
+        // Bound \w to {1,30} to prevent ReDoS (longest HTML event attr is 23 chars)
+        add(R"(on\w{1,30}\s*=)");
+
+        // Format string attacks — match %n (dangerous write primitive) and multi-digit
+        // width specifiers like %10s, %08x, but NOT bare %Xd or %Xs which collide with
+        // URL-encoded values (%2d = '-', %3d = '=', etc.)
+        add(R"(%[0-9]{2,}[sdxn]|%n)");
+
+        // LDAP injection
+        add(R"(\*\)\([\w=*]+\)\(\|)");
+
+        // Protocol injection
+        add(R"(file:\/\/|ftp:\/\/|ldap:\/\/)");
+
+        return p;
+    }();
+    return patterns;
+}
 
 FunctionSecurity::ValidationResult FunctionSecurity::validateFunctionName(const std::string& functionName) {
     ValidationResult result;
@@ -316,7 +330,7 @@ std::string FunctionSecurity::sanitizeInput(const std::string& input) {
 }
 
 bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
-    for (const auto& pattern : dangerousPatterns_) {
+    for (const auto& pattern : getDangerousPatterns()) {
         if (std::regex_search(input, pattern)) {
             return true;
         }
@@ -331,10 +345,16 @@ bool FunctionSecurity::isValidFunctionNameChar(char c) {
 }
 
 bool FunctionSecurity::containsPathTraversal(const std::string& input) {
-    return input.find("../") != std::string::npos ||
-           input.find("..\\") != std::string::npos ||
-           input.find("%2e%2e%2f") != std::string::npos ||
-           input.find("%2e%2e%5c") != std::string::npos;
+    if (input.find("../") != std::string::npos ||
+        input.find("..\\") != std::string::npos) {
+        return true;
+    }
+    // URL-encoded checks must be case-insensitive since hex digits
+    // can be upper or lowercase (e.g., %2e vs %2E).
+    std::string lower = input;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower.find("%2e%2e%2f") != std::string::npos ||
+           lower.find("%2e%2e%5c") != std::string::npos;
 }
 
 bool FunctionSecurity::containsNullBytes(const std::string& input) {
@@ -369,4 +389,4 @@ bool FunctionSecurity::exceedsMaxLength(const std::string& input, size_t maxLeng
     return input.length() > maxLength;
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

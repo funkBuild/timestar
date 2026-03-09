@@ -5,7 +5,7 @@
 #include <iomanip>
 #include <ctime>
 
-namespace tsdb {
+namespace timestar {
 
 QueryRequest QueryParser::parse(
     const std::string& queryString,
@@ -67,8 +67,13 @@ QueryRequest QueryParser::parseQueryString(const std::string& queryString) {
     // Parse optional group by
     skipWhitespace(queryString, pos);
     if (pos < queryString.length()) {
-        // Check for "by" keyword
-        if (queryString.substr(pos, 2) == "by") {
+        // Check for "by" keyword (with word boundary — must be followed by
+        // whitespace or '{' to avoid matching "bytes", "bypass", etc.)
+        if (pos + 1 < queryString.length() &&
+            queryString[pos] == 'b' && queryString[pos + 1] == 'y' &&
+            (pos + 2 >= queryString.length() ||
+             queryString[pos + 2] == ' ' || queryString[pos + 2] == '\t' ||
+             queryString[pos + 2] == '{')) {
             pos += 2;
             skipWhitespace(queryString, pos);
             if (pos >= queryString.length() || queryString[pos] != '{') {
@@ -91,12 +96,12 @@ uint64_t QueryParser::parseTime(const std::string& timeStr) {
     
     // Parse components
     int day, month, year, hour, minute, second;
-    char dash1, dash2, space, colon1, colon2;
-    
-    ss >> day >> dash1 >> month >> dash2 >> year 
-       >> space >> hour >> colon1 >> minute >> colon2 >> second;
-    
-    if (ss.fail() || dash1 != '-' || dash2 != '-' || 
+    char dash1, dash2, colon1, colon2;
+
+    ss >> day >> dash1 >> month >> dash2 >> year
+       >> hour >> colon1 >> minute >> colon2 >> second;
+
+    if (ss.fail() || dash1 != '-' || dash2 != '-' ||
         colon1 != ':' || colon2 != ':') {
         throw QueryParseException("Invalid time format. Expected: dd-mm-yyyy hh:mm:ss");
     }
@@ -158,8 +163,9 @@ std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos)
             // Check if followed by 'by' keyword
             size_t tempPos = pos;
             skipWhitespace(query, tempPos);
-            if (tempPos + 2 <= query.length() && 
-                query.substr(tempPos, 2) == "by") {
+            if (tempPos + 1 < query.length() &&
+                query[tempPos] == 'b' && query[tempPos + 1] == 'y' &&
+                (tempPos + 2 == query.length() || std::isspace(query[tempPos + 2]) || query[tempPos + 2] == '{')) {
                 break;
             }
         }
@@ -289,13 +295,14 @@ std::string QueryParser::trim(const std::string& str) {
 
 std::vector<std::string> QueryParser::split(const std::string& str, char delimiter) {
     std::vector<std::string> result;
-    std::stringstream ss(str);
-    std::string item;
-    
-    while (std::getline(ss, item, delimiter)) {
-        result.push_back(item);
+    size_t start = 0;
+    size_t end = str.find(delimiter);
+    while (end != std::string::npos) {
+        result.push_back(str.substr(start, end - start));
+        start = end + 1;
+        end = str.find(delimiter, start);
     }
-    
+    result.push_back(str.substr(start));
     return result;
 }
 
@@ -305,4 +312,4 @@ void QueryParser::skipWhitespace(const std::string& str, size_t& pos) {
     }
 }
 
-} // namespace tsdb
+} // namespace timestar

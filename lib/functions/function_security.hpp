@@ -8,10 +8,10 @@
 #include <cctype>
 #include <regex>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 /**
- * Security validation utility for TSDB function system.
+ * Security validation utility for TimeStar function system.
  * Provides comprehensive input validation and sanitization to protect against:
  * - Parameter injection attacks
  * - Path traversal attempts
@@ -64,8 +64,8 @@ private:
     // Known dangerous function names
     static const std::unordered_set<std::string> dangerousFunctionNames_;
     
-    // Dangerous patterns to detect
-    static const std::vector<std::regex> dangerousPatterns_;
+    // Dangerous patterns to detect (lazily initialized via getDangerousPatterns())
+    static const std::vector<std::regex>& getDangerousPatterns();
     
     // Maximum allowed input sizes
     static const size_t MAX_FUNCTION_NAME_LENGTH = 64;
@@ -82,6 +82,6 @@ private:
     static bool exceedsMaxLength(const std::string& input, size_t maxLength);
 };
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // FUNCTION_SECURITY_H_INCLUDED

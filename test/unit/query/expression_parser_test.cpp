@@ -2,7 +2,7 @@
 #include "expression_ast.hpp"
 #include "expression_parser.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 class ExpressionParserTest : public ::testing::Test {
 protected:
@@ -700,9 +700,9 @@ TEST_F(ExpressionParserTest, ErrorTimeShiftMissingQueryRef) {
 
 TEST_F(ExpressionParserTest, ExpressionParser_DeepNesting_ThrowsError) {
     // Build a deeply nested expression: ((((... (a) ...))))
-    // 600 levels of parentheses wrapping a single query reference.
+    // 200 levels of parentheses wrapping a single query reference.
     // Without a depth guard this would overflow the call stack and segfault.
-    const int depth = 600;
+    const int depth = 200;
     std::string expr(depth, '(');
     expr += "a";
     expr += std::string(depth, ')');

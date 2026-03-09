@@ -1,12 +1,12 @@
 {
-  "name": "tsdb-http-api-tests",
+  "name": "timestar-http-api-tests",
   "version": "1.0.0",
-  "description": "HTTP API tests for TSDB",
+  "description": "HTTP API tests for TimeStar",
   "scripts": {
     "test": "jest comprehensive_query.test.js",
     "test:verbose": "jest comprehensive_query.test.js --verbose",
     "test:watch": "jest comprehensive_query.test.js --watch",
-    "start-server": "../../build/bin/tsdb_http_server",
+    "start-server": "../../build/bin/timestar_http_server",
     "test:with-server": "npm run start-server & SERVER_PID=$! && sleep 2 && npm test; kill $SERVER_PID"
   },
   "dependencies": {

@@ -1,7 +1,7 @@
 const axios = require('axios');
 
-const HOST = process.env.TSDB_HOST || 'localhost';
-const PORT = process.env.TSDB_PORT || 8086;
+const HOST = process.env.TIMESTAR_HOST || 'localhost';
+const PORT = process.env.TIMESTAR_PORT || 8086;
 const BASE_URL = `http://${HOST}:${PORT}`;
 
 const testMeasurement = `test_scope_${Math.floor(Math.random() * 10000)}`;

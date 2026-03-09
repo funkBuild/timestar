@@ -24,7 +24,7 @@ A clear and concise description of what actually happened.
 ## Environment
 - **OS**: [e.g., Ubuntu 24.04]
 - **Compiler**: [e.g., GCC 14.1]
-- **TSDB Version**: [e.g., 0.1.0]
+- **TimeStar Version**: [e.g., 0.1.0]
 - **Build Type**: [e.g., Release, Debug]
 
 ## Logs/Error Messages

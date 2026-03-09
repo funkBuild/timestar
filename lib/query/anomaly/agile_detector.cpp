@@ -3,7 +3,7 @@
 #include <cmath>
 #include <numeric>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 AgileDetector::HoltWintersState AgileDetector::initializeState(
@@ -92,17 +92,29 @@ double AgileDetector::computeErrorStdDev(
     if (errors.empty()) return 1.0;
 
     size_t start = (errors.size() > windowSize) ? errors.size() - windowSize : 0;
-    size_t count = errors.size() - start;
+    size_t end = errors.size();
 
+    // Collect finite values from the window (skip NaN entries from missing data)
+    double sum = 0.0;
+    size_t count = 0;
+    for (size_t i = start; i < end; ++i) {
+        if (std::isfinite(errors[i])) {
+            sum += errors[i];
+            ++count;
+        }
+    }
     if (count < 2) return 1.0;
 
-    // Use SIMD for sum and variance computation
-    const double* windowStart = errors.data() + start;
-
-    double sum = simd::vectorSum(windowStart, count);
     double mean = sum / static_cast<double>(count);
 
-    double variance = simd::vectorVariance(windowStart, count, mean);
+    double sumSqDiff = 0.0;
+    for (size_t i = start; i < end; ++i) {
+        if (std::isfinite(errors[i])) {
+            double d = errors[i] - mean;
+            sumSqDiff += d * d;
+        }
+    }
+    double variance = sumSqDiff / static_cast<double>(count - 1);
 
     return (variance > 0) ? std::sqrt(variance) : 1.0;
 }
@@ -149,8 +161,12 @@ AnomalyOutput AgileDetector::detect(
     // Pre-allocate scale vector for SIMD bounds computation
     std::vector<double> scale(n, 1.0);
 
-    // Minimum data points before reliable bounds
-    size_t minDataPoints = std::max(config.minDataPoints, seasonalPeriod);
+    // Minimum data points before reliable bounds.
+    // Use at most 1/4 of the seasonal period to avoid suppressing anomaly
+    // detection for the majority of the first season (e.g. 72 vs 288 for
+    // daily seasonality with 5-minute intervals).
+    size_t seasonalMin = seasonalPeriod > 0 ? std::max<size_t>(seasonalPeriod / 4, 2) : 2;
+    size_t minDataPoints = std::max(config.minDataPoints, seasonalMin);
 
     // First pass: compute predictions and scales
     for (size_t i = 0; i < n; ++i) {
@@ -161,10 +177,9 @@ AnomalyOutput AgileDetector::detect(
         double prediction = predictAndUpdate(state, value, seasonalIdx, seasonalPeriod);
         output.predictions[i] = prediction;
 
-        // Track error
-        if (!std::isnan(value)) {
-            errors.push_back(value - prediction);
-        }
+        // Track error (always push to maintain 1:1 alignment with data points;
+        // NaN values produce NaN errors, skipped by computeErrorStdDev)
+        errors.push_back(value - prediction);
 
         // Compute adaptive bounds based on recent error distribution
         if (i < minDataPoints) {
@@ -206,6 +221,14 @@ AnomalyOutput AgileDetector::detect(
         );
     }
 
+    // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
+    // NaN inputs are missing data, not anomalies -- ensure score is 0.
+    for (size_t i = minDataPoints; i < n; ++i) {
+        if (std::isnan(input.values[i])) {
+            output.scores[i] = 0.0;
+        }
+    }
+
     // Count anomalies
     for (size_t i = minDataPoints; i < n; ++i) {
         if (output.scores[i] > 0) {
@@ -217,4 +240,4 @@ AnomalyOutput AgileDetector::detect(
 }
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar

@@ -23,7 +23,7 @@ protected:
     void SetUp() override {
         std::ifstream file(HTTP_SERVER_SOURCE_PATH);
         ASSERT_TRUE(file.is_open())
-            << "Could not open tsdb_http_server.cpp at: " << HTTP_SERVER_SOURCE_PATH;
+            << "Could not open timestar_http_server.cpp at: " << HTTP_SERVER_SOURCE_PATH;
         sourceCode.assign(
             std::istreambuf_iterator<char>(file),
             std::istreambuf_iterator<char>());
@@ -77,8 +77,8 @@ TEST_F(HttpServerShardSafetyTest, NoGlobalHandlerUniquePointers) {
         << "Handlers must not be stored in global unique_ptrs that are allocated "
         << "on shard 0 but accessed from all shards.";
 
-    EXPECT_EQ(sourceCode.find("std::unique_ptr<tsdb::HttpQueryHandler>"), std::string::npos)
-        << "Found global std::unique_ptr<tsdb::HttpQueryHandler>. "
+    EXPECT_EQ(sourceCode.find("std::unique_ptr<timestar::HttpQueryHandler>"), std::string::npos)
+        << "Found global std::unique_ptr<timestar::HttpQueryHandler>. "
         << "Handlers must not be stored in global unique_ptrs.";
 
     // Also check for HttpQueryHandler without namespace
@@ -158,8 +158,8 @@ TEST_F(HttpServerShardSafetyTest, HandlersAreHeapAllocated) {
         << "HttpWriteHandler must be heap-allocated with new inside set_routes "
         << "because registerRoutes() captures `this` in route lambdas.";
 
-    // HttpQueryHandler might be in tsdb:: namespace
-    bool hasQueryHandler = setRoutesBody.find("new tsdb::HttpQueryHandler") != std::string::npos
+    // HttpQueryHandler might be in timestar:: namespace
+    bool hasQueryHandler = setRoutesBody.find("new timestar::HttpQueryHandler") != std::string::npos
                         || setRoutesBody.find("new HttpQueryHandler") != std::string::npos;
     EXPECT_TRUE(hasQueryHandler)
         << "HttpQueryHandler must be heap-allocated with new inside set_routes.";
@@ -205,8 +205,8 @@ TEST_F(HttpServerShardSafetyTest, NoHandlerCreationInMain) {
         << "Found make_unique<HttpWriteHandler> in main(). "
         << "Handlers must be created per-shard in set_routes(), not in main().";
 
-    EXPECT_EQ(mainBody.find("make_unique<tsdb::HttpQueryHandler>"), std::string::npos)
-        << "Found make_unique<tsdb::HttpQueryHandler> in main(). "
+    EXPECT_EQ(mainBody.find("make_unique<timestar::HttpQueryHandler>"), std::string::npos)
+        << "Found make_unique<timestar::HttpQueryHandler> in main(). "
         << "Handlers must be created per-shard in set_routes(), not in main().";
 
     EXPECT_EQ(mainBody.find("make_unique<HttpDeleteHandler>"), std::string::npos)

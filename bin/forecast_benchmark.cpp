@@ -2,7 +2,7 @@
 // Micro-benchmark for all forecast code paths using Google Benchmark.
 //
 // Build: add_executable(forecast_benchmark forecast_benchmark.cpp)
-//        target_link_libraries(forecast_benchmark libtsdb benchmark::benchmark)
+//        target_link_libraries(forecast_benchmark libtimestar benchmark::benchmark)
 //
 // Run:   ./bin/forecast_benchmark \
 //            --benchmark_repetitions=5 \
@@ -23,7 +23,7 @@
 #include <numeric>
 #include <vector>
 
-using namespace tsdb::forecast;
+using namespace timestar::forecast;
 
 // ─────────────────────────────── constants ───────────────────────────────────
 

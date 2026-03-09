@@ -1,8 +1,9 @@
 #include "series_matcher.hpp"
 #include <regex>
 #include <stdexcept>
+#include <unordered_map>
 
-namespace tsdb {
+namespace timestar {
 
 bool SeriesMatcher::matches(
     const std::map<std::string, std::string>& seriesTags,
@@ -97,33 +98,100 @@ bool SeriesMatcher::matchesWildcard(
     const std::string& value,
     const std::string& pattern) {
 
-    // Convert wildcard pattern to regex — wildcardToRegex escapes all
-    // regex metacharacters so the resulting string should always be valid.
-    // Re-throw as std::invalid_argument on the unlikely event it is not.
-    std::string regexPattern = wildcardToRegex(pattern);
+    // Cache compiled regex per pattern to avoid ~10-100us recompilation per call.
+    // Thread-local is safe under Seastar's one-thread-per-shard model.
+    static thread_local std::unordered_map<std::string, std::regex> cache;
 
-    try {
-        std::regex re(regexPattern);
-        return std::regex_match(value, re);
-    } catch (const std::regex_error& e) {
-        throw std::invalid_argument(
-            std::string("invalid wildcard pattern '") + pattern +
-            "': " + e.what());
+    auto it = cache.find(pattern);
+    if (it == cache.end()) {
+        std::string regexPattern = wildcardToRegex(pattern);
+        try {
+            auto [ins, _] = cache.emplace(pattern, std::regex(regexPattern));
+            it = ins;
+        } catch (const std::regex_error& e) {
+            throw std::invalid_argument(
+                std::string("invalid wildcard pattern '") + pattern +
+                "': " + e.what());
+        }
     }
+
+    return std::regex_match(value, it->second);
 }
 
 bool SeriesMatcher::matchesRegex(
     const std::string& value,
     const std::string& pattern) {
 
-    try {
-        std::regex re(pattern);
-        return std::regex_match(value, re);
-    } catch (const std::regex_error& e) {
+    // Guard against ReDoS: limit pattern length and reject patterns with
+    // nested quantifiers that cause catastrophic backtracking in std::regex
+    // (which has no timeout mechanism). Since Seastar is single-threaded
+    // per shard, a stuck regex freezes the entire shard.
+    static constexpr size_t MAX_REGEX_LEN = 512;
+    if (pattern.size() > MAX_REGEX_LEN) {
         throw std::invalid_argument(
-            std::string("invalid regex pattern '") + pattern +
-            "': " + e.what());
+            "regex pattern exceeds maximum length of " +
+            std::to_string(MAX_REGEX_LEN) + " characters");
     }
+
+    // Detect patterns that cause exponential backtracking:
+    // 1. Nested quantifiers: (a+)+, (a*)+, (a+)*, etc.
+    // 2. Quantified alternation: (a|aa)+, (x|xy)*, etc. — overlapping
+    //    alternatives with a quantifier cause the same combinatorial explosion.
+    size_t depth = 0;
+    bool hasQuantifierInGroup = false;
+    bool hasAlternationInGroup = false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        char c = pattern[i];
+        if (c == '\\' && i + 1 < pattern.size()) {
+            ++i; // skip escaped character
+            continue;
+        }
+        if (c == '(') {
+            depth++;
+            hasQuantifierInGroup = false;
+            hasAlternationInGroup = false;
+        } else if (c == '+' || c == '*') {
+            if (depth > 0) {
+                hasQuantifierInGroup = true;
+            }
+        } else if (c == '|') {
+            if (depth > 0) {
+                hasAlternationInGroup = true;
+            }
+        } else if (c == ')') {
+            if (depth > 0) depth--;
+            // Check if a quantifier follows the closing paren of a group
+            // that itself contains a quantifier or alternation
+            if ((hasQuantifierInGroup || hasAlternationInGroup) && i + 1 < pattern.size()) {
+                char next = pattern[i + 1];
+                if (next == '+' || next == '*' || next == '{') {
+                    throw std::invalid_argument(
+                        "regex pattern rejected: quantified group with "
+                        "nested quantifiers or alternation can cause "
+                        "catastrophic backtracking");
+                }
+            }
+            hasQuantifierInGroup = false;
+            hasAlternationInGroup = false;
+        }
+    }
+
+    // Cache compiled regex per pattern to avoid recompilation on each call.
+    static thread_local std::unordered_map<std::string, std::regex> cache;
+
+    auto it = cache.find(pattern);
+    if (it == cache.end()) {
+        try {
+            auto [ins, _] = cache.emplace(pattern, std::regex(pattern, std::regex::optimize));
+            it = ins;
+        } catch (const std::regex_error& e) {
+            throw std::invalid_argument(
+                std::string("invalid regex pattern '") + pattern +
+                "': " + e.what());
+        }
+    }
+
+    return std::regex_match(value, it->second);
 }
 
 std::string SeriesMatcher::wildcardToRegex(const std::string& pattern) {
@@ -207,11 +275,24 @@ std::string SeriesMatcher::toRegexPattern(const std::string& pattern) {
             return pattern;
         }
     case ScopeMatchType::EXACT:
-    default:
+    default: {
         // Exact patterns don't need regex; caller should have checked
         // needsRegexMatch() first.  Return an anchored literal anyway so
         // a caller that ignores this can still get correct behaviour.
-        return "^" + pattern + "$";
+        // Escape regex metacharacters so "foo.bar" matches literally.
+        static const std::string metacharacters = R"(\.^$|()[]{}*+?)";
+        std::string escaped;
+        escaped.reserve(pattern.size() + 4);
+        escaped += '^';
+        for (char c : pattern) {
+            if (metacharacters.find(c) != std::string::npos) {
+                escaped += '\\';
+            }
+            escaped += c;
+        }
+        escaped += '$';
+        return escaped;
+    }
     }
 }
 
@@ -257,4 +338,4 @@ std::string SeriesMatcher::extractLiteralPrefix(const std::string& scopeValue) {
     return "";
 }
 
-} // namespace tsdb
+} // namespace timestar

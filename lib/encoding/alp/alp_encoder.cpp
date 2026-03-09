@@ -178,7 +178,11 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     buffer.reserve(est_words);
 
     // === Stream Header (2 x uint64_t) ===
-    // Word 0: [0:31] magic, [32:63] total_values
+    // Word 0: [0:31] magic, [32:63] total_values (max 2^32-1)
+    if (total_values > UINT32_MAX) {
+        throw std::overflow_error("ALP encoder: total_values " + std::to_string(total_values) +
+                                  " exceeds 32-bit header capacity");
+    }
     uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC)
                      | (static_cast<uint64_t>(total_values) << 32);
     buffer.write<64>(header0);
@@ -488,7 +492,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
     target.reserve(startPos + est_bytes);
 
     // === Stream Header (2 x uint64_t) ===
-    // Word 0: [0:31] magic, [32:63] total_values
+    // Word 0: [0:31] magic, [32:63] total_values (max 2^32-1)
+    if (total_values > UINT32_MAX) {
+        throw std::overflow_error("ALP encoder: total_values " + std::to_string(total_values) +
+                                  " exceeds 32-bit header capacity");
+    }
     uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC)
                      | (static_cast<uint64_t>(total_values) << 32);
     target.write(header0);

@@ -113,12 +113,12 @@ jobs:
           path: build/
 
       - name: Make test binaries executable
-        run: chmod +x build/test/tsdb_test
+        run: chmod +x build/test/timestar_test
 
       - name: Run unit tests
         run: |
           cd build
-          ./test/tsdb_test --gtest_output=xml:test-results.xml
+          ./test/timestar_test --gtest_output=xml:test-results.xml
 
       - name: Upload test results
         uses: actions/upload-artifact@v4

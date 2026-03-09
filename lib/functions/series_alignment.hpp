@@ -5,7 +5,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Alignment utilities namespace
 namespace alignment_utils {
@@ -36,6 +36,6 @@ public:
                                    uint64_t targetInterval);
 };
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // SERIES_ALIGNMENT_H_INCLUDED

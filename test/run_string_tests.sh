@@ -2,13 +2,13 @@
 
 # Script to run string tests safely, avoiding seastar multi-instance issues
 
-echo "🔧 TSDB String Type Test Suite"
+echo "🔧 TimeStar String Type Test Suite"
 echo "==============================="
 echo
 
 # Run non-seastar tests (these can be run together)
 echo "📊 Running StringEncoder tests (non-seastar)..."
-./build/test/tsdb_test --gtest_filter="StringEncoderTest.*" 
+./build/test/timestar_test --gtest_filter="StringEncoderTest.*" 
 if [ $? -eq 0 ]; then
     echo "✅ StringEncoder tests: ALL PASSED"
 else
@@ -34,7 +34,7 @@ FAILED_TESTS=()
 
 for test in "${TSM_TESTS[@]}"; do
     echo -n "  🧪 Testing $test... "
-    ./build/test/tsdb_test --gtest_filter="TSMStringTest.$test" >/dev/null 2>&1
+    ./build/test/timestar_test --gtest_filter="TSMStringTest.$test" >/dev/null 2>&1
     if [ $? -eq 0 ]; then
         echo "✅ PASSED"
         ((PASSED_COUNT++))

@@ -1,4 +1,4 @@
-# TSDB Documentation
+# TimeStar Documentation
 
 ## API Reference
 

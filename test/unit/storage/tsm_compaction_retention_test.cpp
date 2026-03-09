@@ -340,7 +340,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, CompactedOutputHasFewerFiles) {
         co_await f->open();
         co_await f->readSparseIndex();
         files.push_back(f);
-        self->fileManager->sequencedTsmFiles[i] = f;
+        self->fileManager->setSequencedTsmFile(i, f);
     }
 
     EXPECT_EQ(files.size(), 4u);

@@ -10,7 +10,7 @@
 #include <filesystem>
 
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexEnhancedTest : public ::testing::Test {

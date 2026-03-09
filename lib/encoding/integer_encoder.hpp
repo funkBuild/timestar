@@ -62,7 +62,7 @@ public:
 
 private:
     static Implementation selectBestImplementation();
-    static Implementation s_forced_impl;
+    static thread_local Implementation s_forced_impl;
 };
 
 #endif // INTEGER_ENCODER_H_INCLUDED

@@ -4,7 +4,7 @@
 #include "function_types.hpp"
 #include <vector>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Base smoothing function with edge handling
 class SmoothingFunction {
@@ -72,6 +72,6 @@ public:
 std::vector<double> simpleMovingAverage(const std::vector<double>& values, int window);
 std::vector<double> exponentialMovingAverage(const std::vector<double>& values, double alpha);
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // SMOOTHING_FUNCTIONS_H_INCLUDED

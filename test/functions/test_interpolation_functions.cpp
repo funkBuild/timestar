@@ -5,7 +5,7 @@
 #include <cmath>
 #include <limits>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using namespace testing;
 
 class InterpolationFunctionTest : public ::testing::Test {

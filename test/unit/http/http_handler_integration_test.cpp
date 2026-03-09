@@ -25,7 +25,7 @@
 
 // Engine and helpers
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../test_helpers.hpp"
 
@@ -61,7 +61,7 @@ struct glz::meta<GlazeDeleteRequest> {
 
 #include "../../../lib/http/http_delete_handler.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 namespace fs = std::filesystem;
 
 // ============================================================================

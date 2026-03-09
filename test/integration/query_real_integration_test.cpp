@@ -13,7 +13,7 @@
 #include <memory>
 #include <random>
 
-using namespace tsdb;
+using namespace timestar;
 namespace fs = std::filesystem;
 
 class QueryRealIntegrationTest : public ::testing::Test {
@@ -82,7 +82,7 @@ TEST_F(QueryRealIntegrationTest, MemoryStoreRealData) {
         values.push_back(20.0 + sin(i * 0.1) * 5.0); // Temperature oscillating 15-25°C
     }
     
-    TSDBInsert<double> insert("temperature", "value");
+    TimeStarInsert<double> insert("temperature", "value");
     insert.tags = {{"location", "room1"}, {"sensor", "temp01"}};
     insert.timestamps = timestamps;
     insert.values = values;
@@ -131,7 +131,7 @@ TEST_F(QueryRealIntegrationTest, RealDataAggregation) {
             values.push_back(value);
         }
         
-        TSDBInsert<double> insert(measurement, field);
+        TimeStarInsert<double> insert(measurement, field);
         insert.tags = tags;
         insert.timestamps = timestamps;
         insert.values = values;
@@ -259,7 +259,7 @@ TEST_F(QueryRealIntegrationTest, CompleteQueryPipeline) {
                 values.push_back(dis(gen));
             }
             
-            TSDBInsert<double> insert("network", "bytes_sent");
+            TimeStarInsert<double> insert("network", "bytes_sent");
             insert.tags = {{"host", host}, {"interface", iface}};
             insert.timestamps = timestamps;
             insert.values = values;
@@ -307,7 +307,7 @@ TEST_F(QueryRealIntegrationTest, RealDataEdgeCases) {
     };
     std::vector<double> sparseValues = {100.0, 200.0, 150.0};
     
-    TSDBInsert<double> sparseInsert("sparse_metric", "value");
+    TimeStarInsert<double> sparseInsert("sparse_metric", "value");
     sparseInsert.timestamps = sparseTimestamps;
     sparseInsert.values = sparseValues;
     std::string sparseKey = sparseInsert.seriesKey();
@@ -335,7 +335,7 @@ TEST_F(QueryRealIntegrationTest, RealDataEdgeCases) {
         denseValues.push_back(sin(i * 0.1) * 50.0 + 50.0);
     }
     
-    TSDBInsert<double> denseInsert("dense_metric", "value");
+    TimeStarInsert<double> denseInsert("dense_metric", "value");
     denseInsert.timestamps = denseTimestamps;
     denseInsert.values = denseValues;
     std::string denseKey = denseInsert.seriesKey();
@@ -359,7 +359,7 @@ TEST_F(QueryRealIntegrationTest, RealDataEdgeCases) {
     };
     std::vector<double> dupValues = {10.0, 20.0, 30.0};
     
-    TSDBInsert<double> dupInsert("duplicate", "value");
+    TimeStarInsert<double> dupInsert("duplicate", "value");
     dupInsert.timestamps = dupTimestamps;
     dupInsert.values = dupValues;
     std::string dupKey = dupInsert.seriesKey();
@@ -383,7 +383,7 @@ TEST_F(QueryRealIntegrationTest, PerformanceWithRealisticData) {
             values.push_back(50.0 + (s % 10) * 5.0 + (i % 100) * 0.1);
         }
         
-        TSDBInsert<double> insert("metric", "value");
+        TimeStarInsert<double> insert("metric", "value");
         insert.tags = {{"host", "host" + std::to_string(s)}};
         insert.timestamps = timestamps;
         insert.values = values;

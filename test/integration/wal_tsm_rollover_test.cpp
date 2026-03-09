@@ -79,7 +79,7 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestWALToTSMRollover) {
         bool rolloverDetected = false;
 
         for (size_t s = 0; s < MAX_SERIES; s++) {
-            TSDBInsert<double> insert("test_metric", "field_" + std::to_string(s));
+            TimeStarInsert<double> insert("test_metric", "field_" + std::to_string(s));
             insert.tags = {
                 {"host", "server_" + std::to_string(s % 10)},
                 {"region", "region_" + std::to_string(s % 5)}
@@ -120,7 +120,7 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestWALToTSMRollover) {
         std::cout << "\nVerifying data integrity..." << std::endl;
 
         for (size_t s = 0; s < std::min(size_t(3), MAX_SERIES); s++) {
-            TSDBInsert<double> queryKey("test_metric", "field_" + std::to_string(s));
+            TimeStarInsert<double> queryKey("test_metric", "field_" + std::to_string(s));
             queryKey.tags = {
                 {"host", "server_" + std::to_string(s % 10)},
                 {"region", "region_" + std::to_string(s % 5)}
@@ -170,7 +170,7 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestMultipleRollovers) {
             std::cout << "\nRound " << (round + 1) << ":" << std::endl;
 
             for (size_t s = 0; s < SERIES_PER_ROUND; s++) {
-                TSDBInsert<double> insert("metric_round_" + std::to_string(round),
+                TimeStarInsert<double> insert("metric_round_" + std::to_string(round),
                                         "field_" + std::to_string(s));
                 insert.tags = {{"round", std::to_string(round)}};
 
@@ -228,7 +228,7 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestBatchedWritesWithRollover) {
 
         bool rolloverDetected = false;
         for (size_t s = 0; s < NUM_SERIES; s++) {
-            TSDBInsert<double> insert("batch_metric", "series_" + std::to_string(s));
+            TimeStarInsert<double> insert("batch_metric", "series_" + std::to_string(s));
             insert.tags = {
                 {"batch_test", "true"},
                 {"host", "server_" + std::to_string(s % 10)},
@@ -266,7 +266,7 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestBatchedWritesWithRollover) {
         EXPECT_GE(finalTsmCount, 1) << "Should have created TSM files with batched writes";
 
         // Verify a sample of data
-        TSDBInsert<double> queryKey("batch_metric", "series_0");
+        TimeStarInsert<double> queryKey("batch_metric", "series_0");
         queryKey.tags = {
             {"batch_test", "true"},
             {"host", "server_0"},

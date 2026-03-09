@@ -5,7 +5,7 @@
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/query/query_runner.hpp"
 #include "../test_helpers.hpp"
 
@@ -33,7 +33,7 @@ seastar::future<> testWriteAndRead() {
     std::exception_ptr eptr;
     try {
         // Test 1: Write float data
-        TSDBInsert<double> tempInsert("temperature", "value");
+        TimeStarInsert<double> tempInsert("temperature", "value");
         tempInsert.addTag("location", "us-west");
         tempInsert.addTag("sensor", "temp-01");
 
@@ -46,7 +46,7 @@ seastar::future<> testWriteAndRead() {
         co_await engine.indexMetadata(tempInsert);
 
         // Test 2: Write boolean data
-        TSDBInsert<bool> statusInsert("temperature", "is_active");
+        TimeStarInsert<bool> statusInsert("temperature", "is_active");
         statusInsert.addTag("location", "us-west");
         statusInsert.addTag("sensor", "temp-01");
 
@@ -58,7 +58,7 @@ seastar::future<> testWriteAndRead() {
         co_await engine.indexMetadata(statusInsert);
 
         // Test 3: Write string data
-        TSDBInsert<std::string> messageInsert("temperature", "status");
+        TimeStarInsert<std::string> messageInsert("temperature", "status");
         messageInsert.addTag("location", "us-west");
         messageInsert.addTag("sensor", "temp-01");
 
@@ -131,7 +131,7 @@ seastar::future<> testWriteAndRead() {
             ADD_FAILURE() << "Expected string result";
         }
 
-        std::cout << "End-to-end write and read test passed!" << std::endl;
+        // Test assertions above verify correctness via EXPECT_EQ/EXPECT_TRUE
     } catch (...) {
         eptr = std::current_exception();
     }
@@ -152,21 +152,21 @@ seastar::future<> testMetadataQueries() {
     std::exception_ptr eptr;
     try {
         // Insert data for multiple measurements
-        TSDBInsert<double> tempInsert("temperature", "value");
+        TimeStarInsert<double> tempInsert("temperature", "value");
         tempInsert.addTag("location", "us-west");
         tempInsert.addTag("sensor", "temp-01");
         tempInsert.addValue(1638202821000000000, 25.5);
         co_await engine.insert(tempInsert);
         co_await engine.indexMetadata(tempInsert);
 
-        TSDBInsert<double> tempInsert2("temperature", "humidity");
+        TimeStarInsert<double> tempInsert2("temperature", "humidity");
         tempInsert2.addTag("location", "us-west");
         tempInsert2.addTag("sensor", "temp-01");
         tempInsert2.addValue(1638202821000000000, 65.0);
         co_await engine.insert(tempInsert2);
         co_await engine.indexMetadata(tempInsert2);
 
-        TSDBInsert<double> pressureInsert("pressure", "value");
+        TimeStarInsert<double> pressureInsert("pressure", "value");
         pressureInsert.addTag("location", "us-east");
         pressureInsert.addTag("sensor", "press-01");
         pressureInsert.addValue(1638202821000000000, 1013.25);
@@ -194,7 +194,7 @@ seastar::future<> testMetadataQueries() {
         EXPECT_EQ(locations.size(), 1);
         EXPECT_TRUE(locations.count("us-west") > 0);
 
-        std::cout << "Metadata queries test passed!" << std::endl;
+        // Test assertions above verify correctness via EXPECT_EQ/EXPECT_TRUE
     } catch (...) {
         eptr = std::current_exception();
     }
@@ -216,7 +216,7 @@ seastar::future<> testPersistence() {
 
         std::exception_ptr eptr;
         try {
-            TSDBInsert<double> insert("cpu", "usage");
+            TimeStarInsert<double> insert("cpu", "usage");
             insert.addTag("host", "server-01");
             insert.addTag("cpu", "cpu0");
 
@@ -263,7 +263,7 @@ seastar::future<> testPersistence() {
                 ADD_FAILURE() << "Expected float result after restart";
             }
 
-            std::cout << "Persistence test passed!" << std::endl;
+            // Test assertions above verify correctness via EXPECT_EQ/EXPECT_DOUBLE_EQ
         } catch (...) {
             eptr = std::current_exception();
         }

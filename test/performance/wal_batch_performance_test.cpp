@@ -4,7 +4,7 @@
 #include <vector>
 #include "../../lib/storage/wal.hpp"
 #include "../../lib/storage/memory_store.hpp"
-#include "../../lib/core/tsdb_value.hpp"
+#include "../../lib/core/timestar_value.hpp"
 #include "../test_helpers.hpp"
 #include <seastar/core/seastar.hh>
 #include <seastar/core/thread.hh>
@@ -41,7 +41,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
             auto start = std::chrono::high_resolution_clock::now();
 
             for (int s = 0; s < NUM_SERIES; s++) {
-                TSDBInsert<double> insert("metric", "value" + std::to_string(s));
+                TimeStarInsert<double> insert("metric", "value" + std::to_string(s));
                 insert.tags = {{"host", "server" + std::to_string(s % 10)}};
 
                 for (int i = 0; i < POINTS_PER_SERIES; i++) {
@@ -75,7 +75,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
             auto start = std::chrono::high_resolution_clock::now();
 
             for (int s = 0; s < NUM_SERIES; s++) {
-                TSDBInsert<double> insert("metric", "value" + std::to_string(s));
+                TimeStarInsert<double> insert("metric", "value" + std::to_string(s));
                 insert.tags = {{"host", "server" + std::to_string(s % 10)}};
 
                 for (int i = 0; i < POINTS_PER_SERIES; i++) {
@@ -114,11 +114,11 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
 
             // Batch 10 series at a time
             for (int batch = 0; batch < NUM_SERIES / 10; batch++) {
-                std::vector<TSDBInsert<double>> batchInserts;
+                std::vector<TimeStarInsert<double>> batchInserts;
 
                 for (int s = 0; s < 10; s++) {
                     int seriesIdx = batch * 10 + s;
-                    TSDBInsert<double> insert("metric", "value" + std::to_string(seriesIdx));
+                    TimeStarInsert<double> insert("metric", "value" + std::to_string(seriesIdx));
                     insert.tags = {{"host", "server" + std::to_string(seriesIdx % 10)}};
 
                     for (int i = 0; i < POINTS_PER_SERIES; i++) {
@@ -167,10 +167,10 @@ TEST_F(WALBatchPerformanceTest, VerifyDataIntegrity) {
             MemoryStore store(1003);
             wal.init(&store).get();
 
-            std::vector<TSDBInsert<double>> batchInserts;
+            std::vector<TimeStarInsert<double>> batchInserts;
 
             for (int s = 0; s < 5; s++) {
-                TSDBInsert<double> insert("test_metric", "field" + std::to_string(s));
+                TimeStarInsert<double> insert("test_metric", "field" + std::to_string(s));
                 insert.tags = {{"tag1", "value" + std::to_string(s)}};
 
                 for (int i = 0; i < 10; i++) {
@@ -193,7 +193,7 @@ TEST_F(WALBatchPerformanceTest, VerifyDataIntegrity) {
 
             // Verify all series were recovered
             for (int s = 0; s < 5; s++) {
-                TSDBInsert<double> expected("test_metric", "field" + std::to_string(s));
+                TimeStarInsert<double> expected("test_metric", "field" + std::to_string(s));
                 expected.tags = {{"tag1", "value" + std::to_string(s)}};
                 std::string seriesKey = expected.seriesKey();
 

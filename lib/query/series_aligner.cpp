@@ -3,7 +3,7 @@
 #include <cmath>
 #include <limits>
 
-namespace tsdb {
+namespace timestar {
 
 std::map<std::string, AlignedSeries> SeriesAligner::align(
     const std::map<std::string, SubQueryResult>& series) {
@@ -115,13 +115,25 @@ std::vector<uint64_t> SeriesAligner::computeIntersection(
 std::vector<uint64_t> SeriesAligner::computeUnion(
     const std::map<std::string, SubQueryResult>& series) {
 
-    std::set<uint64_t> allTimestamps;
+    if (series.empty()) return {};
 
-    for (const auto& [name, result] : series) {
-        allTimestamps.insert(result.timestamps.begin(), result.timestamps.end());
+    // Start with the first series' timestamps (already sorted)
+    auto it = series.begin();
+    std::vector<uint64_t> merged = it->second.timestamps;
+
+    // Iteratively merge each subsequent sorted series using set_union
+    for (++it; it != series.end(); ++it) {
+        if (it->second.timestamps.empty()) continue;
+        std::vector<uint64_t> temp;
+        temp.reserve(merged.size() + it->second.timestamps.size());
+        std::set_union(
+            merged.begin(), merged.end(),
+            it->second.timestamps.begin(), it->second.timestamps.end(),
+            std::back_inserter(temp));
+        merged = std::move(temp);
     }
 
-    return std::vector<uint64_t>(allTimestamps.begin(), allTimestamps.end());
+    return merged;
 }
 
 std::vector<uint64_t> SeriesAligner::resampleTimestamps(
@@ -294,4 +306,4 @@ size_t SeriesAligner::findLowerBound(const std::vector<uint64_t>& timestamps,
     return std::distance(timestamps.begin(), it) - 1;
 }
 
-} // namespace tsdb
+} // namespace timestar

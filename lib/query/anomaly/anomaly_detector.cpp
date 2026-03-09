@@ -3,7 +3,7 @@
 #include "robust_detector.hpp"
 #include "agile_detector.hpp"
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 std::unique_ptr<AnomalyDetector> createDetector(Algorithm algorithm) {
@@ -20,4 +20,4 @@ std::unique_ptr<AnomalyDetector> createDetector(Algorithm algorithm) {
 }
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar

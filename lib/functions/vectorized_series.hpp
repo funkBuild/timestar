@@ -4,7 +4,7 @@
 #include "function_types.hpp"
 #include <vector>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Non-template class for backward compatibility and the actual implementation
 class VectorizedSeries {
@@ -58,6 +58,6 @@ public:
     }
 };
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // VECTORIZED_SERIES_H_INCLUDED

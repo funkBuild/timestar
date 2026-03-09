@@ -1,6 +1,8 @@
 #pragma once
 
+#include <exception>
 #include <filesystem>
+#include <iostream>
 #include <string>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
@@ -16,7 +18,7 @@ namespace fs = std::filesystem;
  * metadata on shard 0. This ensures data is queryable through the standard query path.
  */
 template <class T>
-inline void shardedInsert(seastar::sharded<Engine>& eng, TSDBInsert<T> insert) {
+inline void shardedInsert(seastar::sharded<Engine>& eng, TimeStarInsert<T> insert) {
     // Calculate target shard from series key hash (same as HTTP write handler)
     std::string seriesKey = insert.seriesKey();
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -36,6 +38,12 @@ inline void shardedInsert(seastar::sharded<Engine>& eng, TSDBInsert<T> insert) {
 /**
  * Clean up all shard directories created by tests.
  * Call from SetUp/TearDown to ensure test isolation.
+ *
+ * WARNING: Uses relative paths (shard_0 .. shard_63) in the CWD.
+ * Tests that use this must either:
+ *   (a) cd into a unique temp directory first (preferred), or
+ *   (b) ensure no other test runs concurrently in the same CWD.
+ * GTest runs tests sequentially by default, so (b) holds for now.
  */
 inline void cleanTestShardDirectories(int maxShards = 64) {
     for (int i = 0; i < maxShards; ++i) {
@@ -80,8 +88,10 @@ public:
         if (engine) {
             try {
                 engine->stop().get();
+            } catch (const std::exception& e) {
+                std::cerr << "ScopedEngine::~ScopedEngine: exception during engine stop: " << e.what() << std::endl;
             } catch (...) {
-                // Swallow errors during cleanup
+                std::cerr << "ScopedEngine::~ScopedEngine: unknown exception during engine stop" << std::endl;
             }
         }
     }

@@ -11,7 +11,7 @@
 // Include SIMD-optimized implementations
 #include "transform_functions_simd.hpp"
 
-namespace tsdb {
+namespace timestar {
 namespace transform {
 
 /**
@@ -1633,6 +1633,6 @@ inline std::vector<std::vector<bool>> outliers_mask(
 }
 
 } // namespace transform
-} // namespace tsdb
+} // namespace timestar
 
 #endif // TRANSFORM_FUNCTIONS_H_INCLUDED

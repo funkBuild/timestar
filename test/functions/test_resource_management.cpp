@@ -21,7 +21,7 @@
 #include <signal.h>
 #include <cstring>
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using namespace std::chrono_literals;
 
 // Resource monitoring utilities

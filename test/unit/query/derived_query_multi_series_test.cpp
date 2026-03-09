@@ -3,7 +3,7 @@
 #include "derived_query.hpp"
 #include "http_query_handler.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 class DerivedQueryMultiSeriesTest : public ::testing::Test {
 protected:

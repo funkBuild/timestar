@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 
 // Exception for evaluation errors
 class EvaluationException : public std::runtime_error {
@@ -118,6 +118,7 @@ struct AlignedSeries {
     AlignedSeries clamp_max(double maxVal) const;   // Clamp values to maximum
     AlignedSeries cutoff_min(double threshold) const; // Set values below threshold to NaN
     AlignedSeries cutoff_max(double threshold) const; // Set values above threshold to NaN
+    AlignedSeries rate_per(double seconds_per_point, double scale) const;
     AlignedSeries per_minute(double seconds_per_point) const; // Rate * 60
     AlignedSeries per_hour(double seconds_per_point) const;   // Rate * 3600
 
@@ -191,6 +192,6 @@ private:
         const QueryResultMap& queryResults) const;
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // EXPRESSION_EVALUATOR_H_INCLUDED

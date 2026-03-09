@@ -2,10 +2,9 @@
 #define HTTP_QUERY_HANDLER_H_INCLUDED
 
 #include "query_parser.hpp"
-#include "query_planner.hpp"
 #include "leveldb_index.hpp"
 #include "series_id.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
@@ -22,7 +21,7 @@ class Engine;
 // Glaze struct forward declaration
 struct GlazeQueryRequest;
 
-namespace tsdb {
+namespace timestar {
 
 // Variant type for field values - can be double, bool, string, or int64
 using FieldValues = std::variant<
@@ -62,22 +61,21 @@ class HttpQueryHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
     seastar::sharded<LevelDBIndex>* indexSharded;
-    std::unique_ptr<QueryPlanner> planner;
 
 public:
     // Security limits to prevent DoS attacks
-    static size_t maxQueryBodySize() { return tsdb::config().http.max_query_body_size; }
+    static size_t maxQueryBodySize() { return timestar::config().http.max_query_body_size; }
 
     // Query result limits to prevent OOM and excessive response sizes
-    static size_t maxSeriesCount() { return tsdb::config().http.max_series_count; }
-    static size_t maxTotalPoints() { return tsdb::config().http.max_total_points; }
+    static size_t maxSeriesCount() { return timestar::config().http.max_series_count; }
+    static size_t maxTotalPoints() { return timestar::config().http.max_total_points; }
 
     // Query timeout to prevent indefinite hangs from stuck shards
-    static std::chrono::seconds defaultQueryTimeout() { return std::chrono::seconds(tsdb::config().http.query_timeout_seconds); }
+    static std::chrono::seconds defaultQueryTimeout() { return std::chrono::seconds(timestar::config().http.query_timeout_seconds); }
 
     explicit HttpQueryHandler(seastar::sharded<Engine>* engine,
                             seastar::sharded<LevelDBIndex>* index = nullptr)
-        : engineSharded(engine), indexSharded(index), planner(std::make_unique<QueryPlanner>()) {}
+        : engineSharded(engine), indexSharded(index) {}
 
     // Validate request body size and content type (public for testing).
     // Returns a reply with an error if validation fails, or nullptr if valid.
@@ -120,6 +118,6 @@ private:
     seastar::future<std::vector<SeriesResult>> queryAllShards(const QueryRequest& request);
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // HTTP_QUERY_HANDLER_H_INCLUDED

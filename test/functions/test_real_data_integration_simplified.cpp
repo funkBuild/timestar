@@ -6,9 +6,9 @@
 #include <chrono>
 #include <random>
 
-// TSDB Core
+// TimeStar Core
 #include "core/engine.hpp"
-#include "core/tsdb_value.hpp"
+#include "core/timestar_value.hpp"
 #include "query/query_result.hpp"
 
 // Function system
@@ -18,7 +18,7 @@
 #include "functions/smoothing_functions.hpp"
 #include "functions/interpolation_functions.hpp"
 
-using namespace tsdb::functions;
+using namespace timestar::functions;
 using ::testing::_;
 using ::testing::DoubleNear;
 using ::testing::ElementsAre;
@@ -33,7 +33,7 @@ protected:
         // Create unique test directory for this test run
         auto now = std::chrono::system_clock::now().time_since_epoch();
         auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-        testDataDir = std::string("/tmp/tsdb_test_simple_") + std::to_string(millis);
+        testDataDir = std::string("/tmp/timestar_test_simple_") + std::to_string(millis);
         
         // Clean up any existing directory
         std::filesystem::remove_all(testDataDir);
@@ -81,7 +81,7 @@ protected:
     
     void generateSimpleTestData() {
         // Create simple temperature data for testing
-        TSDBInsert<double> tempData("weather", "temperature");
+        TimeStarInsert<double> tempData("weather", "temperature");
         tempData.addTag("location", "test_datacenter");
         tempData.addTag("host", "test_server");
         
@@ -97,7 +97,7 @@ protected:
         engine->insert(tempData).get();
         
         // Create CPU usage data
-        TSDBInsert<double> cpuData("system", "cpu_usage");
+        TimeStarInsert<double> cpuData("system", "cpu_usage");
         cpuData.addTag("location", "test_datacenter");
         cpuData.addTag("host", "test_server");
         
@@ -155,7 +155,7 @@ TEST_F(SimplifiedRealDataIntegrationTest, BasicArithmeticWithRealData) {
     uint64_t endTime = startTime + (6000 * 1000000000ULL); // 100 minutes
     
     auto realData = queryRealData("weather", "temperature", tags, startTime, endTime);
-    ASSERT_GT(realData.size(), 0) << "No real data retrieved from TSDB";
+    ASSERT_GT(realData.size(), 0) << "No real data retrieved from TimeStar";
     
     // Apply Add function to real data
     AddFunction addFunc;

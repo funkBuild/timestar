@@ -3,7 +3,7 @@
 #include <cmath>
 #include <numeric>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 AnomalyOutput BasicDetector::detect(
@@ -43,6 +43,17 @@ AnomalyOutput BasicDetector::detectOptimized(
     // First pass: compute rolling stats incrementally
     for (size_t i = 0; i < n; ++i) {
         double value = input.values[i];
+
+        if (std::isnan(value)) {
+            // NaN input: not an anomaly, just missing data
+            output.upper[i] = std::numeric_limits<double>::quiet_NaN();
+            output.lower[i] = std::numeric_limits<double>::quiet_NaN();
+            output.scores[i] = 0.0;
+            output.predictions[i] = stats.count() > 0 ? stats.mean() : 0.0;
+            // Don't update stats with NaN (IncrementalRollingStats already skips NaN,
+            // but we skip the rest of the loop body too)
+            continue;
+        }
 
         if (i < minDataPoints) {
             // Not enough data yet - use wide bounds
@@ -93,6 +104,14 @@ AnomalyOutput BasicDetector::detectOptimized(
             output.scores.data() + minDataPoints,
             n - minDataPoints
         );
+    }
+
+    // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
+    // NaN inputs are missing data, not anomalies -- ensure score is 0.
+    for (size_t i = minDataPoints; i < n; ++i) {
+        if (std::isnan(input.values[i])) {
+            output.scores[i] = 0.0;
+        }
     }
 
     // Count anomalies
@@ -163,4 +182,4 @@ BasicDetector::RollingStats BasicDetector::computeRollingStats(
 }
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar

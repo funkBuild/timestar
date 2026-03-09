@@ -9,7 +9,7 @@
 #include <string>
 
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/query/query_runner.hpp"
 #include "../../../lib/query/query_result.hpp"
 #include "../../../lib/core/series_id.hpp"
@@ -53,7 +53,7 @@ protected:
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryFloatFromMemoryStore() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("temperature", "value");
+        TimeStarInsert<double> insert("temperature", "value");
         insert.addTag("location", "us-west");
         insert.addValue(1000, 20.5);
         insert.addValue(2000, 21.0);
@@ -88,7 +88,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryFloatFromMemoryStore) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryBooleanData() {
     WITH_ENGINE(engine, {
-        TSDBInsert<bool> insert("door", "open");
+        TimeStarInsert<bool> insert("door", "open");
         insert.addTag("building", "hq");
         insert.addValue(1000, true);
         insert.addValue(2000, false);
@@ -121,7 +121,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryBooleanData) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryStringData() {
     WITH_ENGINE(engine, {
-        TSDBInsert<std::string> insert("logs", "message");
+        TimeStarInsert<std::string> insert("logs", "message");
         insert.addTag("level", "info");
         insert.addValue(1000, "server started");
         insert.addValue(2000, "connection established");
@@ -167,7 +167,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryNonExistentSeries) {
 // ---------------------------------------------------------------------------
 seastar::future<> testTimeRangeFiltering() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("cpu", "usage");
+        TimeStarInsert<double> insert("cpu", "usage");
         for (uint64_t ts = 1000; ts <= 10000; ts += 1000) {
             insert.addValue(ts, static_cast<double>(ts) / 100.0);
         }
@@ -199,7 +199,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, TimeRangeFiltering) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryFromTSMFiles() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("disk", "usage");
+        TimeStarInsert<double> insert("disk", "usage");
         insert.addValue(1000, 50.0);
         insert.addValue(2000, 55.0);
         insert.addValue(3000, 60.0);
@@ -234,7 +234,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryFromTSMFiles) {
 seastar::future<> testResultMergingTSMAndMemory() {
     WITH_ENGINE(engine, {
         // Insert first batch of data
-        TSDBInsert<double> insert1("network", "throughput");
+        TimeStarInsert<double> insert1("network", "throughput");
         insert1.addValue(1000, 100.0);
         insert1.addValue(2000, 200.0);
         insert1.addValue(3000, 300.0);
@@ -245,7 +245,7 @@ seastar::future<> testResultMergingTSMAndMemory() {
         co_await engine.rolloverMemoryStore();
 
         // Insert second batch (stays in memory store)
-        TSDBInsert<double> insert2("network", "throughput");
+        TimeStarInsert<double> insert2("network", "throughput");
         insert2.addValue(4000, 400.0);
         insert2.addValue(5000, 500.0);
         insert2.addValue(6000, 600.0);
@@ -283,7 +283,7 @@ seastar::future<> testMultipleTSMFileMerging() {
     WITH_ENGINE(engine, {
         // Create 3 TSM files via rollovers
         for (int batch = 0; batch < 3; batch++) {
-            TSDBInsert<double> insert("metrics", "latency");
+            TimeStarInsert<double> insert("metrics", "latency");
             for (int i = 0; i < 5; i++) {
                 uint64_t ts = (batch * 5 + i + 1) * 1000;
                 double val = static_cast<double>(batch * 5 + i + 1);
@@ -324,7 +324,7 @@ seastar::future<> testLargeResultSet() {
     WITH_ENGINE(engine, {
         const int numPoints = 10000;
 
-        TSDBInsert<double> insert("sensor", "reading");
+        TimeStarInsert<double> insert("sensor", "reading");
         for (int i = 0; i < numPoints; i++) {
             insert.addValue(static_cast<uint64_t>(i + 1) * 1000, static_cast<double>(i) * 0.1);
         }
@@ -361,7 +361,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, LargeResultSet) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryEmptyTimeRange() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("temperature", "celsius");
+        TimeStarInsert<double> insert("temperature", "celsius");
         insert.addValue(5000, 25.0);
         insert.addValue(6000, 26.0);
         insert.addValue(7000, 27.0);
@@ -391,19 +391,19 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryEmptyTimeRange) {
 seastar::future<> testTypeBasedRouting() {
     WITH_ENGINE(engine, {
         // Insert float series
-        TSDBInsert<double> floatInsert("metrics", "cpu_usage");
+        TimeStarInsert<double> floatInsert("metrics", "cpu_usage");
         floatInsert.addValue(1000, 75.5);
         floatInsert.addValue(2000, 80.2);
         co_await engine.insert(std::move(floatInsert));
 
         // Insert boolean series
-        TSDBInsert<bool> boolInsert("alerts", "active");
+        TimeStarInsert<bool> boolInsert("alerts", "active");
         boolInsert.addValue(1000, true);
         boolInsert.addValue(2000, false);
         co_await engine.insert(std::move(boolInsert));
 
         // Insert string series
-        TSDBInsert<std::string> stringInsert("events", "description");
+        TimeStarInsert<std::string> stringInsert("events", "description");
         stringInsert.addValue(1000, "deploy started");
         stringInsert.addValue(2000, "deploy completed");
         co_await engine.insert(std::move(stringInsert));
@@ -442,13 +442,13 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, TypeBasedRouting) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryWithTags() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert1("weather", "temperature");
+        TimeStarInsert<double> insert1("weather", "temperature");
         insert1.addTag("city", "nyc");
         insert1.addValue(1000, 32.0);
         insert1.addValue(2000, 33.0);
         co_await engine.insert(std::move(insert1));
 
-        TSDBInsert<double> insert2("weather", "temperature");
+        TimeStarInsert<double> insert2("weather", "temperature");
         insert2.addTag("city", "sf");
         insert2.addValue(1000, 65.0);
         insert2.addValue(2000, 66.0);
@@ -486,7 +486,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryWithTags) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryAfterDeletion() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("metrics", "value");
+        TimeStarInsert<double> insert("metrics", "value");
         insert.addValue(1000, 10.0);
         insert.addValue(2000, 20.0);
         insert.addValue(3000, 30.0);
@@ -525,7 +525,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryAfterDeletion) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryTSMWithTimeRange() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("io", "bytes");
+        TimeStarInsert<double> insert("io", "bytes");
         for (uint64_t ts = 1000; ts <= 20000; ts += 1000) {
             insert.addValue(ts, static_cast<double>(ts));
         }
@@ -558,7 +558,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryTSMWithTimeRange) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryBoolFromTSM() {
     WITH_ENGINE(engine, {
-        TSDBInsert<bool> insert("status", "healthy");
+        TimeStarInsert<bool> insert("status", "healthy");
         insert.addValue(1000, true);
         insert.addValue(2000, true);
         insert.addValue(3000, false);
@@ -591,7 +591,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryBoolFromTSM) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryStringFromTSM() {
     WITH_ENGINE(engine, {
-        TSDBInsert<std::string> insert("audit", "action");
+        TimeStarInsert<std::string> insert("audit", "action");
         insert.addValue(1000, "login");
         insert.addValue(2000, "view_dashboard");
         insert.addValue(3000, "logout");
@@ -627,7 +627,7 @@ seastar::future<> testLargeResultSetAcrossTSMAndMemory() {
 
         // Insert data in batches, rolling over between each
         for (int batch = 0; batch < numBatches; batch++) {
-            TSDBInsert<double> insert("large_series", "data");
+            TimeStarInsert<double> insert("large_series", "data");
             for (int i = 0; i < pointsPerBatch; i++) {
                 uint64_t ts = static_cast<uint64_t>(batch * pointsPerBatch + i + 1) * 1000;
                 double val = static_cast<double>(batch * pointsPerBatch + i);
@@ -672,7 +672,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, LargeResultSetAcrossTSMAndMemory) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQuerySinglePoint() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("test", "one_point");
+        TimeStarInsert<double> insert("test", "one_point");
         insert.addValue(42000, 99.9);
 
         co_await engine.insert(std::move(insert));
@@ -699,7 +699,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QuerySinglePoint) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryBoundaryTimestamps() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("boundary", "test");
+        TimeStarInsert<double> insert("boundary", "test");
         insert.addValue(1000, 1.0);
         insert.addValue(2000, 2.0);
         insert.addValue(3000, 3.0);
@@ -733,7 +733,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryBoundaryTimestamps) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryTSMAfterDeletion() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("tsm_delete", "val");
+        TimeStarInsert<double> insert("tsm_delete", "val");
         insert.addValue(1000, 10.0);
         insert.addValue(2000, 20.0);
         insert.addValue(3000, 30.0);
@@ -770,17 +770,17 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryTSMAfterDeletion) {
 // ---------------------------------------------------------------------------
 seastar::future<> testMultipleIndependentSeries() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert1("sys", "cpu");
+        TimeStarInsert<double> insert1("sys", "cpu");
         insert1.addValue(1000, 10.0);
         insert1.addValue(2000, 20.0);
         co_await engine.insert(std::move(insert1));
 
-        TSDBInsert<double> insert2("sys", "mem");
+        TimeStarInsert<double> insert2("sys", "mem");
         insert2.addValue(1000, 512.0);
         insert2.addValue(2000, 1024.0);
         co_await engine.insert(std::move(insert2));
 
-        TSDBInsert<double> insert3("sys", "disk");
+        TimeStarInsert<double> insert3("sys", "disk");
         insert3.addValue(1000, 80.0);
         insert3.addValue(2000, 85.0);
         co_await engine.insert(std::move(insert3));
@@ -816,7 +816,7 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, MultipleIndependentSeries) {
 // ---------------------------------------------------------------------------
 seastar::future<> testQueryAfterFullDeletion() {
     WITH_ENGINE(engine, {
-        TSDBInsert<double> insert("ephemeral", "data");
+        TimeStarInsert<double> insert("ephemeral", "data");
         insert.addValue(1000, 1.0);
         insert.addValue(2000, 2.0);
         insert.addValue(3000, 3.0);

@@ -3,7 +3,7 @@
 #include <glaze/glaze.hpp>
 #include <chrono>
 
-using namespace tsdb;
+using namespace timestar;
 
 // Glaze structures for parsing error responses
 struct TimeoutTestErrorResponse {
@@ -34,10 +34,8 @@ protected:
 // =============================================================================
 
 TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutExists) {
-    // The function should be accessible and have the correct return type
     auto timeout = HttpQueryHandler::defaultQueryTimeout();
-    (void)timeout; // Suppress unused variable warning
-    SUCCEED() << "defaultQueryTimeout() exists and is accessible";
+    EXPECT_GT(timeout.count(), 0) << "defaultQueryTimeout() should return a positive duration";
 }
 
 TEST_F(HttpQueryHandlerTimeoutTest, DefaultQueryTimeoutIs30Seconds) {

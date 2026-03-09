@@ -8,7 +8,7 @@ using namespace httpd;
 
 uint64_t HttpRetentionHandler::parseDuration(const std::string& duration) {
     // Reuse the existing parseInterval logic from HttpQueryHandler
-    return tsdb::HttpQueryHandler::parseInterval(duration);
+    return timestar::HttpQueryHandler::parseInterval(duration);
 }
 
 bool HttpRetentionHandler::isValidMethod(const std::string& method) {
@@ -31,6 +31,24 @@ HttpRetentionHandler::handlePut(std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
 
+    // Body size limit to prevent DoS via large payloads
+    if (req->content.size() > timestar::config().http.max_query_body_size) {
+        reply->set_status(seastar::http::reply::status_type::payload_too_large);
+        reply->_content = R"({"status":"error","error":"Request body too large"})";
+        co_return reply;
+    }
+
+    // Validate Content-Type if explicitly set
+    {
+        auto ct = req->get_header("Content-Type");
+        std::string ctStr(ct.data(), ct.size());
+        if (!ctStr.empty() && !ctStr.starts_with("application/json")) {
+            reply->set_status(seastar::http::reply::status_type::unsupported_media_type);
+            reply->_content = R"({"status":"error","error":"Content-Type must be application/json"})";
+            co_return reply;
+        }
+    }
+
     try {
         RetentionPolicyRequest policyReq;
         auto err = glz::read_json(policyReq, req->content);
@@ -44,6 +62,15 @@ HttpRetentionHandler::handlePut(std::unique_ptr<seastar::http::request> req) {
             reply->set_status(seastar::http::reply::status_type::bad_request);
             reply->_content = createErrorResponse("'measurement' is required");
             co_return reply;
+        }
+
+        // Validate measurement name (no control characters or LevelDB key separators)
+        for (char c : policyReq.measurement) {
+            if (c < 0x20 || c == '\x7f') {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = createErrorResponse("Measurement name contains control characters");
+                co_return reply;
+            }
         }
 
         if (!policyReq.ttl.has_value() && !policyReq.downsample.has_value()) {
@@ -137,9 +164,9 @@ HttpRetentionHandler::handlePut(std::unique_ptr<seastar::http::request> req) {
         reply->_content = glz::write_json(responseObj).value_or("{}");
 
     } catch (const std::exception& e) {
-        tsdb::http_log.error("Retention PUT handler error: {}", e.what());
+        timestar::http_log.error("Retention PUT handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
-        reply->_content = createErrorResponse(std::string("Internal error: ") + e.what());
+        reply->_content = createErrorResponse("Internal server error");
     }
 
     co_return reply;
@@ -156,6 +183,15 @@ HttpRetentionHandler::handleGet(std::unique_ptr<seastar::http::request> req) {
         auto it = req->query_parameters.find("measurement");
         if (it != req->query_parameters.end()) {
             measurement = it->second;
+        }
+
+        // Validate measurement name if provided
+        for (char c : measurement) {
+            if (c < 0x20 || c == '\x7f') {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = createErrorResponse("Measurement name contains control characters");
+                co_return reply;
+            }
         }
 
         if (!measurement.empty()) {
@@ -186,9 +222,9 @@ HttpRetentionHandler::handleGet(std::unique_ptr<seastar::http::request> req) {
         }
 
     } catch (const std::exception& e) {
-        tsdb::http_log.error("Retention GET handler error: {}", e.what());
+        timestar::http_log.error("Retention GET handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
-        reply->_content = createErrorResponse(std::string("Internal error: ") + e.what());
+        reply->_content = createErrorResponse("Internal server error");
     }
 
     co_return reply;
@@ -210,6 +246,15 @@ HttpRetentionHandler::handleDelete(std::unique_ptr<seastar::http::request> req) 
             reply->set_status(seastar::http::reply::status_type::bad_request);
             reply->_content = createErrorResponse("'measurement' query parameter is required");
             co_return reply;
+        }
+
+        // Validate measurement name
+        for (char c : measurement) {
+            if (c < 0x20 || c == '\x7f') {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = createErrorResponse("Measurement name contains control characters");
+                co_return reply;
+            }
         }
 
         bool deleted = co_await engineSharded->invoke_on(0,
@@ -235,9 +280,9 @@ HttpRetentionHandler::handleDelete(std::unique_ptr<seastar::http::request> req) 
         }
 
     } catch (const std::exception& e) {
-        tsdb::http_log.error("Retention DELETE handler error: {}", e.what());
+        timestar::http_log.error("Retention DELETE handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
-        reply->_content = createErrorResponse(std::string("Internal error: ") + e.what());
+        reply->_content = createErrorResponse("Internal server error");
     }
 
     co_return reply;
@@ -286,5 +331,5 @@ void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r) {
           seastar::httpd::url("/retention"),
           deleteHandler);
 
-    tsdb::http_log.info("Registered retention endpoints at /retention (PUT/GET/DELETE)");
+    timestar::http_log.info("Registered retention endpoints at /retention (PUT/GET/DELETE)");
 }

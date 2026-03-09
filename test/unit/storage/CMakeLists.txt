@@ -1,1 +1,1 @@
-# All storage tests are now compiled into the main tsdb_test binary via gtest
+# All storage tests are now compiled into the main timestar_test binary via gtest

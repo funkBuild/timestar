@@ -46,7 +46,7 @@ protected:
         }
 
         // If none of the relative paths worked, try absolute
-        std::ifstream file("/home/matt/Desktop/source/tsdb/lib/http/http_write_handler.cpp");
+        std::ifstream file("/home/matt/Desktop/source/timestar/lib/http/http_write_handler.cpp");
         if (file.is_open()) {
             std::stringstream ss;
             ss << file.rdbuf();
@@ -107,25 +107,25 @@ TEST_F(HttpWriteHandlerAtomicityTest, ProcessWritePointExists) {
 }
 
 // Core test: In processWritePoint, data dispatch (when_all_succeed on shard inserts)
-// must appear BEFORE metadata dispatch (dispatchMetadataAsync, fire-and-forget).
+// must appear BEFORE metadata indexing (indexMetadataSync).
 // The refactored function batches inserts by shard, dispatches via when_all_succeed,
-// then fires off metadata indexing asynchronously without blocking the response.
+// then awaits synchronous metadata indexing before returning the response.
 TEST_F(HttpWriteHandlerAtomicityTest, DoubleBranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
     // The batched architecture groups inserts by shard, dispatches via when_all_succeed,
-    // then dispatches metadata via dispatchMetadataAsync (fire-and-forget). Verify ordering.
+    // then awaits indexMetadataSync. Verify ordering.
     size_t dataDispatchPos = funcBody.find("when_all_succeed");
-    size_t metadataPos = funcBody.find("dispatchMetadataAsync");
+    size_t metadataPos = funcBody.find("indexMetadataSync");
 
     ASSERT_NE(dataDispatchPos, std::string::npos)
         << "Could not find when_all_succeed (parallel shard dispatch) in processWritePoint";
     ASSERT_NE(metadataPos, std::string::npos)
-        << "Could not find dispatchMetadataAsync in processWritePoint";
+        << "Could not find indexMetadataSync in processWritePoint";
 
     EXPECT_LT(dataDispatchPos, metadataPos)
-        << "BUG: dispatchMetadataAsync appears BEFORE when_all_succeed. "
+        << "BUG: indexMetadataSync appears BEFORE when_all_succeed. "
            "Data must be inserted before metadata for crash safety.";
 }
 
@@ -151,29 +151,30 @@ TEST_F(HttpWriteHandlerAtomicityTest, BoolBranchDataBeforeMetadata) {
         << "Could not find engine.insert() or engine.insertBatch() in processWritePoint";
 }
 
-// Verify metadata uses fire-and-forget dispatch, not per-field individual calls
+// Verify metadata uses synchronous indexMetadataSync, not per-field individual calls
 TEST_F(HttpWriteHandlerAtomicityTest, StringBranchDataBeforeMetadata) {
     std::string funcBody = extractProcessWritePoint();
     ASSERT_FALSE(funcBody.empty());
 
-    // Metadata should use fire-and-forget async dispatch
-    EXPECT_NE(funcBody.find("dispatchMetadataAsync"), std::string::npos)
-        << "processWritePoint should use dispatchMetadataAsync for fire-and-forget metadata indexing";
+    // Metadata should use synchronous dispatch
+    EXPECT_NE(funcBody.find("indexMetadataSync"), std::string::npos)
+        << "processWritePoint should use indexMetadataSync for synchronous metadata indexing";
 
     // Should NOT have individual indexMetadata calls (the old per-field pattern)
-    // Count occurrences of "indexMetadata(" that are NOT "indexMetadataBatch(" or "dispatchMetadataAsync"
+    // Count occurrences of "indexMetadata(" that are NOT "indexMetadataBatch(" or "indexMetadataSync"
     size_t pos = 0;
     int individualCalls = 0;
     while ((pos = funcBody.find("indexMetadata(", pos)) != std::string::npos) {
-        // Check it's not indexMetadataBatch
-        if (funcBody.substr(pos, 19) != "indexMetadataBatch(") {
+        // Check it's not indexMetadataBatch or indexMetadataSync
+        if (funcBody.substr(pos, 19) != "indexMetadataBatch(" &&
+            funcBody.substr(pos, 18) != "indexMetadataSync(") {
             individualCalls++;
         }
         pos++;
     }
     EXPECT_EQ(individualCalls, 0)
         << "processWritePoint should not call individual indexMetadata(); "
-           "use dispatchMetadataAsync() instead for fire-and-forget metadata indexing";
+           "use indexMetadataSync() instead for synchronous metadata indexing";
 }
 
 // Verify parallel shard dispatch structure exists

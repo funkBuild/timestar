@@ -23,7 +23,7 @@
 // path is covered by code review and the compile-time checks here.
 // =============================================================================
 
-using namespace tsdb;
+using namespace timestar;
 
 class BackfillTimeoutConfigTest : public ::testing::Test {
 protected:

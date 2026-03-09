@@ -11,7 +11,7 @@
 #include <chrono>
 #include <thread>
 
-using namespace tsdb;
+using namespace timestar;
 
 class QueryIntegrationTest : public ::testing::Test {
 protected:

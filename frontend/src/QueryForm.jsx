@@ -1,6 +1,6 @@
 import './QueryForm.css';
 
-const AGGREGATIONS = ['avg', 'min', 'max', 'sum', 'latest'];
+const AGGREGATIONS = ['avg', 'min', 'max', 'sum', 'latest', 'count', 'first', 'median', 'stddev', 'stdvar', 'spread'];
 const INTERVAL_UNITS = [
   { value: 'ns', label: 'ns' },
   { value: 'us', label: 'us' },

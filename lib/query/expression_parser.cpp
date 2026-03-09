@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace tsdb {
+namespace timestar {
 
 // ==================== ExpressionNode::toString ====================
 
@@ -807,4 +807,4 @@ void ExpressionParser::validateQueryReferences(const std::set<std::string>& defi
     }
 }
 
-} // namespace tsdb
+} // namespace timestar

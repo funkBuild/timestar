@@ -32,7 +32,7 @@ protected:
         }
 
         // Fallback to absolute path
-        std::ifstream file("/home/matt/Desktop/source/tsdb/lib/storage/wal.cpp");
+        std::ifstream file("/home/matt/Desktop/source/timestar/lib/storage/wal.cpp");
         if (file.is_open()) {
             std::stringstream ss;
             ss << file.rdbuf();

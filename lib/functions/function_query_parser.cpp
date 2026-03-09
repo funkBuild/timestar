@@ -1,9 +1,13 @@
 #include "function_query_parser.hpp"
+#include "function_registry.hpp"
 #include <cctype>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 FunctionQueryParser::FunctionQueryParser() = default;
+
+FunctionQueryParser::FunctionQueryParser(const FunctionRegistry& registry)
+    : registry_(&registry) {}
 
 // Returns true when the substring query[pos .. pos+len-1] forms a whole word,
 // i.e. the character immediately before (if any) and immediately after (if any)
@@ -42,20 +46,23 @@ static bool containsWholeWord(const std::string& query, const std::string& name)
 std::vector<std::string> FunctionQueryParser::parse(const std::string& query) {
     std::vector<std::string> functions;
 
-    if (containsWholeWord(query, "sma")) {
-        functions.push_back("sma");
-    }
-    if (containsWholeWord(query, "ema")) {
-        functions.push_back("ema");
-    }
-    if (containsWholeWord(query, "add")) {
-        functions.push_back("add");
-    }
-    if (containsWholeWord(query, "multiply")) {
-        functions.push_back("multiply");
+    // Use registry function names when available; fall back to hardcoded set
+    if (registry_) {
+        for (const auto& name : registry_->getAllFunctionNames()) {
+            if (containsWholeWord(query, name)) {
+                functions.push_back(name);
+            }
+        }
+    } else {
+        static const std::vector<std::string> builtins = {"sma", "ema", "add", "multiply"};
+        for (const auto& name : builtins) {
+            if (containsWholeWord(query, name)) {
+                functions.push_back(name);
+            }
+        }
     }
 
     return functions;
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

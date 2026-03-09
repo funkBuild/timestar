@@ -1,4 +1,4 @@
-# TSDB Query Implementation Fix Plan
+# TimeStar Query Implementation Fix Plan
 
 ## Problem Analysis
 
@@ -187,7 +187,7 @@ After implementing these changes:
 1. Rebuild the server:
 ```bash
 cd build
-make tsdb_http_server
+make timestar_http_server
 ```
 
 2. Run the test suite:

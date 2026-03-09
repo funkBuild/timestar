@@ -1,8 +1,8 @@
 # CompilerWarnings.cmake
-# Centralized compiler warning configuration for TSDB
+# Centralized compiler warning configuration for TimeStar
 
-function(tsdb_set_project_warnings target)
-    option(TSDB_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+function(timestar_set_project_warnings target)
+    option(TIMESTAR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
     set(CLANG_WARNINGS
         -Wall
@@ -31,7 +31,7 @@ function(tsdb_set_project_warnings target)
         -Wuseless-cast
     )
 
-    if(TSDB_WARNINGS_AS_ERRORS)
+    if(TIMESTAR_WARNINGS_AS_ERRORS)
         set(CLANG_WARNINGS ${CLANG_WARNINGS} -Werror)
         set(GCC_WARNINGS ${GCC_WARNINGS} -Werror)
     endif()

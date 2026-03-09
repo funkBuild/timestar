@@ -123,7 +123,7 @@ SEASTAR_TEST_F(TSMCompactorTest, BasicCompaction) {
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
-        self->fileManager->sequencedTsmFiles[i] = tsm;
+        self->fileManager->setSequencedTsmFile(i, tsm);
     }
 
     // Compact the files
@@ -601,7 +601,7 @@ SEASTAR_TEST_F(TSMCompactorTest, ConcurrentReadsDuringCompaction) {
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
-        self->fileManager->sequencedTsmFiles[i] = tsm;
+        self->fileManager->setSequencedTsmFile(i, tsm);
     }
 
     std::atomic<bool> compactionDone{false};
@@ -675,7 +675,7 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionStatistics) {
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
-        self->fileManager->sequencedTsmFiles[i] = tsm;
+        self->fileManager->setSequencedTsmFile(i, tsm);
     }
 
     // Execute compaction with plan
@@ -709,20 +709,20 @@ SEASTAR_TEST_F(TSMCompactorTest, FullCompaction) {
             auto tsm = self->createTestTSMFile(tier, totalFiles, "full.", 2, 10);
             co_await tsm->open();
             co_await tsm->readSparseIndex();
-            self->fileManager->sequencedTsmFiles[totalFiles] = tsm;
+            self->fileManager->setSequencedTsmFile(totalFiles, tsm);
             totalFiles++;
         }
     }
 
     // Verify initial file count
-    EXPECT_EQ(self->fileManager->sequencedTsmFiles.size(), 9);
+    EXPECT_EQ(self->fileManager->getSequencedTsmFiles().size(), 9);
 
     // Run full compaction
     co_await self->compactor->forceFullCompaction();
 
     // Should have fewer files after compaction
     // Each tier should be compacted
-    EXPECT_LT(self->fileManager->sequencedTsmFiles.size(), 9);
+    EXPECT_LT(self->fileManager->getSequencedTsmFiles().size(), 9);
 
     co_return;
 }

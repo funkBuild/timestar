@@ -2,8 +2,8 @@ const axios = require("axios");
 const { performance } = require("perf_hooks");
 
 // Configuration
-const HOST = process.env.TSDB_HOST || "localhost";
-const PORT = process.env.TSDB_PORT || 8086;
+const HOST = process.env.TIMESTAR_HOST || "localhost";
+const PORT = process.env.TIMESTAR_PORT || 8086;
 const BASE_URL = `http://${HOST}:${PORT}`;
 
 // Benchmark configuration
@@ -417,7 +417,7 @@ async function benchmarkQueries() {
 // Main benchmark runner
 async function runBenchmarks() {
   console.log("=".repeat(60));
-  console.log(" TSDB HTTP API BENCHMARK TOOL");
+  console.log(" TimeStar HTTP API BENCHMARK TOOL");
   console.log("=".repeat(60));
   console.log(`Server: ${BASE_URL}`);
   console.log(`Measurement: ${MEASUREMENT}`);

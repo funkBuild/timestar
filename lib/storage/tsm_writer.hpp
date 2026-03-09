@@ -5,7 +5,7 @@
 #include "aligned_buffer.hpp"
 #include "tsm.hpp"
 #include "series_id.hpp"
-#include "tsdb_config.hpp"
+#include "timestar_config.hpp"
 
 #include <iostream>
 #include <vector>
@@ -18,7 +18,7 @@
 // Optimized via benchmark: 3000 provides 25% faster queries with equal insert performance
 // 3000 points × 16 bytes = 48KB fits perfectly in L2 cache (256-512KB)
 // Configurable via [storage] max_points_per_block in TOML config.
-#define MaxPointsPerBlock (tsdb::config().storage.max_points_per_block)
+inline size_t MaxPointsPerBlock() { return timestar::config().storage.max_points_per_block; }
 
 class TSMWriter {
 private:
@@ -28,6 +28,9 @@ private:
   std::string filename;
 
   void writeHeader();
+
+  // Shared series-processing loop used by both run() and runAsync().
+  static void writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStore> store);
 public:
   TSMWriter(std::string _filename);
 

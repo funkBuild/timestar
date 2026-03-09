@@ -2,7 +2,7 @@
 #include "streaming_derived_evaluator.hpp"
 #include "expression_parser.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 static StreamingDataPoint makePoint(
     const std::string& measurement,

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# End-to-End Test Runner for TSDB HTTP Server
+# End-to-End Test Runner for TimeStar HTTP Server
 # Runs both quick tests and comprehensive test suite
 
 set -e
@@ -8,7 +8,7 @@ set -e
 cd "$(dirname "$0")"
 
 echo "=============================================="
-echo "TSDB HTTP Server - End-to-End Test Runner"
+echo "TimeStar HTTP Server - End-to-End Test Runner"
 echo "=============================================="
 
 # Check if Python and requests are available
@@ -54,7 +54,7 @@ echo "Comprehensive:      $([ "$COMPREHENSIVE_PASSED" = "true" ] && echo "✓ PA
 
 if [ "$QUICK_PASSED" = "true" ] && [ "$COMPREHENSIVE_PASSED" = "true" ]; then
     echo
-    echo "🎉 ALL TESTS PASSED! The TSDB HTTP server is working correctly."
+    echo "🎉 ALL TESTS PASSED! The TimeStar HTTP server is working correctly."
     exit 0
 else
     echo

@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 FLAMEGRAPH_DIR="${SCRIPT_DIR}/FlameGraph"
 
-echo "=== Advanced TSDB Insert Path Profiling ==="
+echo "=== Advanced TimeStar Insert Path Profiling ==="
 echo "Mode: ${MODE}"
 echo "Duration: ${DURATION} seconds"
 echo ""
@@ -27,9 +27,9 @@ run_server_with_load() {
     local load_pid
 
     # Start server
-    echo "Starting TSDB server..."
+    echo "Starting TimeStar server..."
     cd ${BUILD_DIR}
-    ./bin/tsdb_http_server --port 8086 &
+    ./bin/timestar_http_server --port 8086 &
     server_pid=$!
     sleep 2
 
@@ -98,11 +98,11 @@ case ${MODE} in
         # Generate flame graph
         sudo perf script -i perf_cpu.data > out_cpu.perf
         ${FLAMEGRAPH_DIR}/stackcollapse-perf.pl out_cpu.perf > out_cpu.folded
-        ${FLAMEGRAPH_DIR}/flamegraph.pl --title "TSDB Insert CPU Profile" \
+        ${FLAMEGRAPH_DIR}/flamegraph.pl --title "TimeStar Insert CPU Profile" \
             --colors hot --width 1800 \
-            out_cpu.folded > tsdb_cpu_flamegraph.svg
+            out_cpu.folded > timestar_cpu_flamegraph.svg
 
-        echo "Generated: tsdb_cpu_flamegraph.svg"
+        echo "Generated: timestar_cpu_flamegraph.svg"
         ;;
 
     offcpu)
@@ -122,11 +122,11 @@ case ${MODE} in
         sudo /usr/share/bcc/tools/offcputime -df -p ${server_pid} ${DURATION} > offcpu.stacks
 
         # Generate flame graph
-        ${FLAMEGRAPH_DIR}/flamegraph.pl --title "TSDB Insert Off-CPU Profile" \
+        ${FLAMEGRAPH_DIR}/flamegraph.pl --title "TimeStar Insert Off-CPU Profile" \
             --colors blue --countname "us" --width 1800 \
-            offcpu.stacks > tsdb_offcpu_flamegraph.svg
+            offcpu.stacks > timestar_offcpu_flamegraph.svg
 
-        echo "Generated: tsdb_offcpu_flamegraph.svg"
+        echo "Generated: timestar_offcpu_flamegraph.svg"
         ;;
 
     cache)
@@ -149,11 +149,11 @@ case ${MODE} in
         # Also create a flame graph for cache misses
         sudo perf script -i perf_cache.data > out_cache.perf
         ${FLAMEGRAPH_DIR}/stackcollapse-perf.pl out_cache.perf > out_cache.folded
-        ${FLAMEGRAPH_DIR}/flamegraph.pl --title "TSDB Insert Cache Misses" \
+        ${FLAMEGRAPH_DIR}/flamegraph.pl --title "TimeStar Insert Cache Misses" \
             --colors mem --width 1800 \
-            out_cache.folded > tsdb_cache_flamegraph.svg
+            out_cache.folded > timestar_cache_flamegraph.svg
 
-        echo "Generated: tsdb_cache_flamegraph.svg"
+        echo "Generated: timestar_cache_flamegraph.svg"
         ;;
 
     branch)
@@ -211,5 +211,5 @@ rm -f /tmp/simple_load.sh out_*.perf out_*.folded perf_*.data perf.data.old
 
 echo ""
 echo "=== Profiling Complete ==="
-echo "View flame graphs with: firefox tsdb_*_flamegraph.svg"
+echo "View flame graphs with: firefox timestar_*_flamegraph.svg"
 echo "View reports with: less *_report.txt"

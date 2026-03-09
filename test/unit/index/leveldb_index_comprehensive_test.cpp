@@ -18,7 +18,7 @@
  *  14. Non-zero shard throws on write methods - error handling
  *  15. findSeries() short-circuit on empty tag result
  *  16. indexMetadataBatch() empty ops         - no-op path
- *  17. TSDBInsert<int64_t> indexInsert        - integer field type
+ *  17. TimeStarInsert<int64_t> indexInsert        - integer field type
  *  18. getSeriesId() on non-zero shard throws
  *  19. addField()/addTag() on non-zero shard throw
  */
@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/tsm.hpp"  // for TSMValueType
 
@@ -964,14 +964,14 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, NonZeroShardGetSeriesIdThrows) {
 }
 
 // ---------------------------------------------------------------------------
-// 17. TSDBInsert<int64_t> indexInsert stores "integer" field type
+// 17. TimeStarInsert<int64_t> indexInsert stores "integer" field type
 // ---------------------------------------------------------------------------
 
 SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, IndexInsertInt64StoresIntegerType) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    TSDBInsert<int64_t> insert("counters", "events");
+    TimeStarInsert<int64_t> insert("counters", "events");
     insert.addTag("service", "auth");
     insert.addValue(1000000000LL, int64_t(42));
 

@@ -6,7 +6,7 @@
 #include "../../../lib/query/derived_query_executor.hpp"
 #include "../../../lib/query/expression_parser.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 // =============================================================================
 // Glaze structures for parsing test responses
@@ -1100,14 +1100,11 @@ TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullEngineThrows) {
     EXPECT_THROW(HttpDerivedQueryHandler(nullptr), std::invalid_argument);
 }
 
-TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullIndexThrows) {
-    // Null index must throw std::invalid_argument to prevent later segfault
-    // (we cannot pass a valid engine without Seastar, so use a non-null sentinel)
-    // We test null index by passing a fake non-null engine pointer alongside null index.
-    // Cast an arbitrary address to the pointer type – we only need the constructor
-    // to reject null index before any member access.
+TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullIndexAccepted) {
+    // Null index is valid — the server always passes null since metadata
+    // lookups go through the engine. Verify construction does not throw.
     auto* fakeEngine = reinterpret_cast<seastar::sharded<Engine>*>(uintptr_t{1});
-    EXPECT_THROW(HttpDerivedQueryHandler(fakeEngine, nullptr), std::invalid_argument);
+    EXPECT_NO_THROW(HttpDerivedQueryHandler(fakeEngine, nullptr));
 }
 
 // =============================================================================

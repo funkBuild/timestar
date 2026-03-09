@@ -3,7 +3,7 @@
 #include "../../../lib/query/query_parser.hpp"
 #include <glaze/glaze.hpp>
 
-using namespace tsdb;
+using namespace timestar;
 
 // Glaze-compatible structure for JSON parsing (from http_query_handler.cpp)
 struct GlazeQueryRequest {

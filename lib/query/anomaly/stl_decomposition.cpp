@@ -4,10 +4,11 @@
 #include <numeric>
 #include <limits>
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 double STLDecomposition::tricubeWeight(double u) {
+    if (u < 0.0) u = -u;
     if (u >= 1.0) return 0.0;
     double t = 1.0 - u * u * u;
     return t * t * t;
@@ -45,12 +46,18 @@ double STLDecomposition::iqr(const std::vector<double>& values) {
 
     if (v.size() < 4) return 1.0;  // Fallback
 
-    std::sort(v.begin(), v.end());
+    // Use nth_element for O(N) quartile extraction instead of O(N log N) sort.
+    // Two partial sorts: first find Q3, then find Q1 in the lower partition.
     size_t n = v.size();
     size_t q1Idx = n / 4;
     size_t q3Idx = (3 * n) / 4;
 
-    return v[q3Idx] - v[q1Idx];
+    std::nth_element(v.begin(), v.begin() + q3Idx, v.end());
+    double q3 = v[q3Idx];
+    std::nth_element(v.begin(), v.begin() + q1Idx, v.begin() + q3Idx);
+    double q1 = v[q1Idx];
+
+    return q3 - q1;
 }
 
 std::vector<double> STLDecomposition::computeRobustnessWeights(
@@ -114,7 +121,9 @@ std::vector<double> STLDecomposition::loess(
     size_t halfWindow = windowSize / 2;
     bool hasWeights = !weights.empty();
 
-    // Pre-allocate work arrays
+    // Pre-allocate work arrays.  Max window span is halfWindow left + 1 center
+    // + halfWindow right = windowSize + 1 elements (for odd windowSize, or
+    // windowSize for even).  +2 provides a safety margin.
     std::vector<double> localWeights(windowSize + 2);
     std::vector<double> localX(windowSize + 2);
     std::vector<double> localY(windowSize + 2);
@@ -188,18 +197,27 @@ std::vector<double> STLDecomposition::computeSeasonalMeans(
 
     // Use SIMD for subseries mean computation
     std::vector<double> seasonalMeans(period);
+    size_t nonEmptyCount = 0;
+    double sumOfMeans = 0.0;
     for (size_t p = 0; p < period; ++p) {
         if (!subseries[p].empty()) {
             seasonalMeans[p] = simd::vectorMean(subseries[p].data(), subseries[p].size());
+            sumOfMeans += seasonalMeans[p];
+            ++nonEmptyCount;
         } else {
             seasonalMeans[p] = 0.0;
         }
     }
 
-    // Center the seasonal means (should sum to zero)
-    double meanOfMeans = simd::vectorMean(seasonalMeans.data(), period);
-    for (double& m : seasonalMeans) {
-        m -= meanOfMeans;
+    // Center the seasonal means (should sum to zero).
+    // Only average over non-empty subseries to avoid bias from all-NaN phases.
+    if (nonEmptyCount > 0) {
+        double meanOfMeans = sumOfMeans / static_cast<double>(nonEmptyCount);
+        for (size_t p = 0; p < period; ++p) {
+            if (!subseries[p].empty()) {
+                seasonalMeans[p] -= meanOfMeans;
+            }
+        }
     }
 
     // Assign seasonal values
@@ -303,4 +321,4 @@ STLComponents STLDecomposition::decompose(
 }
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar

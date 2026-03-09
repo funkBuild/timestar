@@ -199,19 +199,20 @@ static void mergeHeapSpans(
 }
 
 template <class T>
-seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime){
-  LOG_QUERY_PATH(tsdb::query_log, debug, "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime, endTime);
+seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime){
+  LOG_QUERY_PATH(timestar::query_log, debug, "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime, endTime);
 
   // Pre-allocate indexed slots to avoid concurrent push_back on a shared vector.
   // Each coroutine writes to its own slot, eliminating the race condition where
   // parallel_for_each coroutines could push_back concurrently after co_await points.
-  std::vector<std::optional<TSMResult<T>>> tsmSlots(fileManager->sequencedTsmFiles.size());
+  const auto& seqFiles = fileManager->getSequencedTsmFiles();
+  std::vector<std::optional<TSMResult<T>>> tsmSlots(seqFiles.size());
 
   // First query TSM files
   size_t slotIdx = 0;
   co_await seastar::parallel_for_each(
-    fileManager->sequencedTsmFiles.begin(),
-    fileManager->sequencedTsmFiles.end(),
+    seqFiles.begin(),
+    seqFiles.end(),
     [&tsmSlots, &seriesId, startTime, endTime, &slotIdx] (std::pair<unsigned int, seastar::shared_ptr<TSM>> tsmTuple) -> seastar::future<> {
       // Assign index before any suspension point - safe in cooperative scheduling
       // because parallel_for_each invokes the lambda sequentially before yielding
@@ -269,10 +270,17 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
   // -----------------------------------------------------------------------
 
   // Build sorted spans: TSM first (index 0), then each memory store.
+  // SAFETY: SortedSpan holds raw pointers into memory store data.  The
+  // MemoryStoreMatch values in memoryMatches keep each MemoryStore alive
+  // via shared_ptr, so the underlying InMemorySeries data remains valid
+  // for the lifetime of memoryMatches — even if a background TSM
+  // conversion removes the store from the WALFileManager's vector.
   std::vector<SortedSpan<T>> spans;
   spans.reserve(1 + memoryMatches.size());
 
   // Span 0: TSM data (already sorted + deduped).
+  // INVARIANT: result.timestamps must not be modified (no push_back/resize)
+  // after this point — tsmSpan.tsPtr is a raw pointer into its storage.
   if (!result.timestamps.empty()) {
     SortedSpan<T> tsmSpan;
     tsmSpan.tsPtr = result.timestamps.data();
@@ -286,8 +294,8 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
   // Pre-filter each memory store to [startTime, endTime] and create spans.
   // Binary search is O(log n) per store; the filtered range is a read-only
   // view with no copying.
-  for (const auto* memoryData : memoryMatches) {
-    const auto& storeData = *memoryData;
+  for (const auto& match : memoryMatches) {
+    const auto& storeData = *match.series;
     if (storeData.timestamps.empty()) continue;
 
     auto beginIt = std::lower_bound(storeData.timestamps.begin(),
@@ -395,56 +403,56 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
 
 
 // Convenience overload: computes SeriesId128 internally from the series key string.
-seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& seriesKey, uint64_t startTime, uint64_t endTime){
+seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey, uint64_t startTime, uint64_t endTime){
   SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
   co_return co_await runQuery(seriesKey, seriesId, startTime, endTime);
 }
 
-seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime){
-  LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Running query for series='{}', startTime={}, endTime={}", seriesKey, startTime, endTime);
+seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime){
+  LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Running query for series='{}', startTime={}, endTime={}", seriesKey, startTime, endTime);
 
   // Check TSM files first: established series (the common query case) are already
   // flushed to TSM. Each TSM file uses a bloom filter for O(1) negative rejection,
   // so absent series are ruled out quickly. WAL memory stores are the fallback for
   // recently written data that hasn't been flushed yet.
-  LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Getting series type from TSM for series: '{}'", seriesKey);
+  LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Getting series type from TSM for series: '{}'", seriesKey);
   std::optional<TSMValueType> seriesType = fileManager->getSeriesType(seriesId);
 
   if(!seriesType.has_value()) {
-    LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Series type not found in TSM, trying WAL for series: '{}'", seriesKey);
+    LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Series type not found in TSM, trying WAL for series: '{}'", seriesKey);
     seriesType = walFileManager->getSeriesType(seriesId);
   }
 
   // If there's no type, the series doesn't exist
   if(!seriesType.has_value()) {
-    LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Series type not found anywhere for series: '{}' - series doesn't exist", seriesKey);
+    LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Series type not found anywhere for series: '{}' - series doesn't exist", seriesKey);
     throw std::runtime_error("Series not found");
   }
 
-  LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Found series type: {} for series: '{}'",
+  LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Found series type: {} for series: '{}'",
                  static_cast<int>(seriesType.value()), seriesKey);
 
   VariantQueryResult results;
 
   switch(seriesType.value()){
     case TSMValueType::Boolean:
-      LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Querying boolean series: '{}'", seriesKey);
+      LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying boolean series: '{}'", seriesKey);
       results = co_await queryTsm<bool>(seriesKey, seriesId, startTime, endTime);
       break;
     case TSMValueType::Float:
-      LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Querying float series: '{}'", seriesKey);
+      LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying float series: '{}'", seriesKey);
       results = co_await queryTsm<double>(seriesKey, seriesId, startTime, endTime);
       break;
     case TSMValueType::String:
-      LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Querying string series: '{}'", seriesKey);
+      LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying string series: '{}'", seriesKey);
       results = co_await queryTsm<std::string>(seriesKey, seriesId, startTime, endTime);
       break;
     case TSMValueType::Integer:
-      LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Querying integer series: '{}'", seriesKey);
+      LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying integer series: '{}'", seriesKey);
       results = co_await queryTsm<int64_t>(seriesKey, seriesId, startTime, endTime);
       break;
     default:
-      LOG_QUERY_PATH(tsdb::query_log, debug, "[QUERYRUNNER] Unknown series type {} for series: '{}'",
+      LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Unknown series type {} for series: '{}'",
                      static_cast<int>(seriesType.value()), seriesKey);
       throw std::runtime_error("Unknown series type");
   }
@@ -456,16 +464,16 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& ser
 // Pushdown aggregation
 // ---------------------------------------------------------------------------
 
-seastar::future<std::optional<tsdb::PushdownResult>> QueryRunner::queryTsmAggregated(
-    const std::string& seriesKey,
-    const SeriesId128& seriesId,
+seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
+    std::string seriesKey,
+    SeriesId128 seriesId,
     uint64_t startTime,
     uint64_t endTime,
     uint64_t aggregationInterval)
 {
     // Gate 0: Skip pushdown entirely if there are no TSM files — all data
     // is in memory stores and the full materialisation path is appropriate.
-    if (fileManager->sequencedTsmFiles.empty()) {
+    if (fileManager->getSequencedTsmFiles().empty()) {
         co_return std::nullopt;
     }
 
@@ -484,9 +492,9 @@ seastar::future<std::optional<tsdb::PushdownResult>> QueryRunner::queryTsmAggreg
 
     if (memMinTimeOpt.has_value()) {
         uint64_t memMinTime = *memMinTimeOpt;
-        if (memMinTime <= startTime) {
-            // Entire requested range overlaps with memory — cannot split,
-            // fall back entirely.
+        if (memMinTime <= startTime || memMinTime == 0) {
+            // Entire requested range overlaps with memory (or edge case
+            // where memMinTime==0 would underflow) — cannot split, fall back.
             co_return std::nullopt;
         }
         // Split: pushdown [startTime, memMinTime-1], fallback [memMinTime, endTime]
@@ -505,7 +513,7 @@ seastar::future<std::optional<tsdb::PushdownResult>> QueryRunner::queryTsmAggreg
     std::vector<FileRef> filesWithData;
     std::vector<std::pair<uint64_t, uint64_t>> allBlockRanges;
 
-    for (auto& [rank, tsmFile] : fileManager->sequencedTsmFiles) {
+    for (const auto& [rank, tsmFile] : fileManager->getSequencedTsmFiles()) {
         auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);
         if (!indexEntry) continue;
 
@@ -543,7 +551,7 @@ seastar::future<std::optional<tsdb::PushdownResult>> QueryRunner::queryTsmAggreg
 
     // Gate checks passed — perform pushdown aggregation on TSM-only range.
     // Pass startTime/tsmEndTime so the constructor can pre-reserve the bucket map.
-    tsdb::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime);
+    timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime);
 
     for (auto& ref : filesWithData) {
         co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator);
@@ -560,7 +568,7 @@ seastar::future<std::optional<tsdb::PushdownResult>> QueryRunner::queryTsmAggreg
         }
     }
 
-    tsdb::PushdownResult result;
+    timestar::PushdownResult result;
     result.totalPoints = aggregator.pointCount();
     if (aggregationInterval > 0) {
         result.bucketStates = aggregator.takeBucketStates();
@@ -576,7 +584,7 @@ seastar::future<std::optional<tsdb::PushdownResult>> QueryRunner::queryTsmAggreg
 }
 
 // Template instantiations
-template seastar::future<QueryResult<bool>> QueryRunner::queryTsm<bool>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
-template seastar::future<QueryResult<double>> QueryRunner::queryTsm<double>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
-template seastar::future<QueryResult<std::string>> QueryRunner::queryTsm<std::string>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
-template seastar::future<QueryResult<int64_t>> QueryRunner::queryTsm<int64_t>(const std::string& series, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<bool>> QueryRunner::queryTsm<bool>(std::string series, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<double>> QueryRunner::queryTsm<double>(std::string series, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<std::string>> QueryRunner::queryTsm<std::string>(std::string series, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<int64_t>> QueryRunner::queryTsm<int64_t>(std::string series, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime);

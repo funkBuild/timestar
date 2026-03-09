@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace tsdb {
+namespace timestar {
 namespace simd {
 
 // SIMD-optimized aggregation functions using AVX2 (256-bit vectors)
@@ -75,6 +75,6 @@ namespace scalar {
 }
 
 } // namespace simd
-} // namespace tsdb
+} // namespace timestar
 
 #endif // SIMD_AGGREGATOR_H_INCLUDED

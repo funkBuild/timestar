@@ -9,7 +9,7 @@
 #include <map>
 #include <string>
 
-using namespace tsdb;
+using namespace timestar;
 
 // ==================== Helper Utilities ====================
 

@@ -1,6 +1,6 @@
 # HTTP API Test Suite
 
-This directory contains Python-based integration tests for the TSDB HTTP API. These tests verify the server's HTTP endpoints are working correctly.
+This directory contains Python-based integration tests for the TimeStar HTTP API. These tests verify the server's HTTP endpoints are working correctly.
 
 ## Prerequisites
 
@@ -9,15 +9,15 @@ This directory contains Python-based integration tests for the TSDB HTTP API. Th
 pip install requests
 ```
 
-## Starting the TSDB Server
+## Starting the TimeStar Server
 
-Before running tests, ensure the TSDB HTTP server is running:
+Before running tests, ensure the TimeStar HTTP server is running:
 
 ```bash
 # From the build directory
-./bin/tsdb_http_server
+./bin/timestar_http_server
 # Or with custom port
-./bin/tsdb_http_server --port 8086
+./bin/timestar_http_server --port 8086
 ```
 
 ## Test Files
@@ -58,7 +58,7 @@ Before running tests, ensure the TSDB HTTP server is running:
 
 ### Utility Scripts
 
-- **`test_tsdb_client.py`** - Interactive test client
+- **`test_timestar_client.py`** - Interactive test client
   - Random data generation
   - Continuous testing
   - Manual exploration
@@ -178,7 +178,7 @@ When adding new Python test scripts:
 
 ## Notes
 
-- These tests assume the TSDB server is already running
+- These tests assume the TimeStar server is already running
 - Tests use the HTTP API on port 8086 by default
 - Some tests generate significant data - ensure adequate disk space
 - Performance tests may take several minutes to complete

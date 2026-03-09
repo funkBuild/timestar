@@ -9,7 +9,7 @@
 #include <vector>
 #include <map>
 
-using namespace tsdb;
+using namespace timestar;
 
 // Mock Engine for testing without Seastar
 class MockEngine {
@@ -119,7 +119,7 @@ protected:
                     if (std::holds_alternative<std::vector<double>>(values)) {
                         auto& doubleValues = std::get<std::vector<double>>(values);
                         
-                        auto aggregated = tsdb::test::AggregatorTestHelper::aggregate(
+                        auto aggregated = timestar::test::AggregatorTestHelper::aggregate(
                             timestamps, doubleValues, request.aggregation, request.aggregationInterval);
                         
                         timestamps.clear();
@@ -191,7 +191,7 @@ protected:
             }
             
             for (const auto& [fieldName, fieldSeries] : fieldGroups) {
-                auto aggregated = tsdb::test::AggregatorTestHelper::aggregateMultiple(
+                auto aggregated = timestar::test::AggregatorTestHelper::aggregateMultiple(
                     fieldSeries, request.aggregation, request.aggregationInterval);
                 
                 std::vector<uint64_t> timestamps;
@@ -693,6 +693,43 @@ TEST_F(QueryE2ETest, WildcardMatching) {
 }
 
 // Performance test with many series
+TEST_F(QueryE2ETest, QueryNonExistentMeasurementReturnsEmpty) {
+    // Simulate querying a measurement with no matching series IDs.
+    // The mock engine should return an empty result set without crashing.
+    ShardQuery emptyQuery;
+    emptyQuery.shardId = 0;
+    emptyQuery.seriesIds = {}; // No series match the non-existent measurement
+    emptyQuery.fields = {"value"};
+    emptyQuery.startTime = startTime;
+    emptyQuery.endTime = endTime;
+
+    auto results = mockEngine->executeLocalQuery(emptyQuery);
+    EXPECT_EQ(results.size(), 0);
+
+    // Also verify the query parser accepts the query string itself --
+    // a non-existent measurement is syntactically valid.
+    auto request = QueryParser::parse(
+        "avg:nonexistent_measurement(value)", startTimeStr, endTimeStr);
+    EXPECT_EQ(request.measurement, "nonexistent_measurement");
+}
+
+TEST_F(QueryE2ETest, InvalidTimeRangeThrows) {
+    // startTime > endTime should be rejected at parse time
+    EXPECT_THROW(
+        QueryParser::parse("avg:temperature(value)",
+                           "01-01-2024 02:00:00",  // start after end
+                           "01-01-2024 01:00:00"),
+        QueryParseException);
+
+    // startTime == endTime should also be rejected (zero-length range)
+    EXPECT_THROW(
+        QueryParser::parse("avg:temperature(value)",
+                           "01-01-2024 01:00:00",
+                           "01-01-2024 01:00:00"),
+        QueryParseException);
+}
+
+// Performance test with many series
 TEST_F(QueryE2ETest, LargeScaleAggregation) {
     // Create a large query
     ShardQuery largeQuery;
@@ -727,7 +764,7 @@ TEST_F(QueryE2ETest, LargeScaleAggregation) {
     }
     
     // Test that aggregation handles many series efficiently
-    auto aggregated = tsdb::test::AggregatorTestHelper::aggregateMultiple(
+    auto aggregated = timestar::test::AggregatorTestHelper::aggregateMultiple(
         allSeries, AggregationMethod::AVG, 10 * 60 * 1000000000ULL);
     
     EXPECT_GE(aggregated.size(), 1);

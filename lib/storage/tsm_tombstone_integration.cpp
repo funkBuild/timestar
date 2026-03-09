@@ -22,24 +22,24 @@ std::string TSM::getTombstonePath() const {
 seastar::future<> TSM::loadTombstones() {
     try {
         std::string tombstonePath = getTombstonePath();
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Loading tombstones from: {} for TSM: {}",
+        LOG_INSERT_PATH(timestar::tsm_log, trace, "Loading tombstones from: {} for TSM: {}",
                         tombstonePath, filePath);
         
-        tombstones = std::make_unique<tsdb::TSMTombstone>(tombstonePath);
+        tombstones = std::make_unique<timestar::TSMTombstone>(tombstonePath);
         
         // Check if tombstone file exists
         bool exists = co_await tombstones->exists();
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Tombstone file exists: {}", exists);
+        LOG_INSERT_PATH(timestar::tsm_log, trace, "Tombstone file exists: {}", exists);
         
         if (exists) {
             co_await tombstones->load();
-            LOG_INSERT_PATH(tsdb::tsm_log, debug, "Successfully loaded tombstones from: {}", tombstonePath);
+            LOG_INSERT_PATH(timestar::tsm_log, debug, "Successfully loaded tombstones from: {}", tombstonePath);
         } else {
-            LOG_INSERT_PATH(tsdb::tsm_log, trace, "No tombstone file found for: {}", filePath);
+            LOG_INSERT_PATH(timestar::tsm_log, trace, "No tombstone file found for: {}", filePath);
         }
     } catch (const std::exception& e) {
         // Log warning but don't fail - TSM can work without tombstones
-        tsdb::tsm_log.warn("Failed to load tombstones for {}: {}", filePath, e.what());
+        timestar::tsm_log.warn("Failed to load tombstones for {}: {}", filePath, e.what());
         tombstones.reset();  // Clear tombstone manager on error
     }
     co_return;
@@ -107,7 +107,7 @@ seastar::future<bool> TSM::deleteRange(
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry) {
         // Series doesn't exist in this TSM file - no tombstone needed
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Series '{}' not found in TSM {} - skipping tombstone",
+        LOG_INSERT_PATH(timestar::tsm_log, trace, "Series '{}' not found in TSM {} - skipping tombstone",
                         seriesId.toHex(), filePath);
         co_return false;
     }
@@ -123,18 +123,18 @@ seastar::future<bool> TSM::deleteRange(
 
     if (!hasOverlap) {
         // No data in the requested time range - no tombstone needed
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "Series '{}' has no data in range [{}, {}] in TSM {} - skipping tombstone",
+        LOG_INSERT_PATH(timestar::tsm_log, trace, "Series '{}' has no data in range [{}, {}] in TSM {} - skipping tombstone",
                         seriesId.toHex(), startTime, endTime, filePath);
         co_return false;
     }
     
     // Series exists and has data in the time range - add tombstone
-    LOG_INSERT_PATH(tsdb::tsm_log, debug, "Adding tombstone for series '{}' in TSM {}",
+    LOG_INSERT_PATH(timestar::tsm_log, debug, "Adding tombstone for series '{}' in TSM {}",
                     seriesId.toHex(), filePath);
     
     // Initialize tombstones if not already done
     if (!tombstones) {
-        tombstones = std::make_unique<tsdb::TSMTombstone>(getTombstonePath());
+        tombstones = std::make_unique<timestar::TSMTombstone>(getTombstonePath());
     }
     
     // Add tombstone using the full SeriesId128 (no hash truncation)
@@ -143,7 +143,7 @@ seastar::future<bool> TSM::deleteRange(
     if (added) {
         // Persist tombstone immediately for durability
         co_await tombstones->flush();
-        LOG_INSERT_PATH(tsdb::tsm_log, debug, "Tombstone persisted for series '{}' in TSM {}",
+        LOG_INSERT_PATH(timestar::tsm_log, debug, "Tombstone persisted for series '{}' in TSM {}",
                         seriesId.toHex(), filePath);
     }
     
@@ -177,12 +177,12 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     auto ranges = tombstones->getTombstoneRanges(seriesId);
     if (ranges.empty()) {
         // No tombstones for this series — return data as-is, no copy needed
-        LOG_INSERT_PATH(tsdb::tsm_log, trace, "No tombstones for series {} in TSM {}, returning unfiltered data",
+        LOG_INSERT_PATH(timestar::tsm_log, trace, "No tombstones for series {} in TSM {}, returning unfiltered data",
                         seriesId.toHex(), filePath);
         co_return result;
     }
 
-    LOG_INSERT_PATH(tsdb::tsm_log, trace, "TSM {} has {} tombstone ranges for series {}, filtering in single pass",
+    LOG_INSERT_PATH(timestar::tsm_log, trace, "TSM {} has {} tombstone ranges for series {}, filtering in single pass",
                     filePath, ranges.size(), seriesId.toHex());
 
     // Single-pass filter: iterate blocks directly and copy only non-tombstoned points
@@ -226,7 +226,7 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
         }
     }
 
-    LOG_INSERT_PATH(tsdb::tsm_log, trace, "Tombstone filtering: {} points -> {} points ({} removed)",
+    LOG_INSERT_PATH(timestar::tsm_log, trace, "Tombstone filtering: {} points -> {} points ({} removed)",
                     totalPoints, outTimestamps.size(), tombstonedCount);
 
     // Replace blocks with filtered result

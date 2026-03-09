@@ -15,7 +15,7 @@
 #include <random>
 
 // The variant used by the HTTP write handler and internally for field values.
-using TSDBValue = std::variant<double, bool, std::string, int64_t>;
+using TimeStarValue = std::variant<double, bool, std::string, int64_t>;
 
 class IntegerTypeTest : public ::testing::Test {
 protected:
@@ -328,56 +328,56 @@ TEST_F(IntegerTypeTest, TSMValueType_GetValueType_AllTypes) {
 TEST_F(IntegerTypeTest, Variant_Int64AtIndex3) {
     // The variant std::variant<double, bool, std::string, int64_t>
     // should have int64_t at index 3, matching TSMValueType::Integer.
-    TSDBValue val = static_cast<int64_t>(42);
+    TimeStarValue val = static_cast<int64_t>(42);
     EXPECT_EQ(val.index(), 3u);
     EXPECT_EQ(val.index(), static_cast<size_t>(TSMValueType::Integer));
 }
 
 TEST_F(IntegerTypeTest, Variant_DoubleAtIndex0) {
-    TSDBValue val = 3.14;
+    TimeStarValue val = 3.14;
     EXPECT_EQ(val.index(), 0u);
     EXPECT_EQ(val.index(), static_cast<size_t>(TSMValueType::Float));
 }
 
 TEST_F(IntegerTypeTest, Variant_BoolAtIndex1) {
-    TSDBValue val = true;
+    TimeStarValue val = true;
     EXPECT_EQ(val.index(), 1u);
     EXPECT_EQ(val.index(), static_cast<size_t>(TSMValueType::Boolean));
 }
 
 TEST_F(IntegerTypeTest, Variant_StringAtIndex2) {
-    TSDBValue val = std::string("hello");
+    TimeStarValue val = std::string("hello");
     EXPECT_EQ(val.index(), 2u);
     EXPECT_EQ(val.index(), static_cast<size_t>(TSMValueType::String));
 }
 
 TEST_F(IntegerTypeTest, Variant_Int64GetWorks) {
-    TSDBValue val = static_cast<int64_t>(-12345);
+    TimeStarValue val = static_cast<int64_t>(-12345);
     ASSERT_TRUE(std::holds_alternative<int64_t>(val));
     EXPECT_EQ(std::get<int64_t>(val), -12345);
 }
 
 TEST_F(IntegerTypeTest, Variant_Int64NegativeExtremes) {
-    TSDBValue val = INT64_MIN;
+    TimeStarValue val = INT64_MIN;
     ASSERT_TRUE(std::holds_alternative<int64_t>(val));
     EXPECT_EQ(std::get<int64_t>(val), INT64_MIN);
 }
 
 TEST_F(IntegerTypeTest, Variant_Int64PositiveExtremes) {
-    TSDBValue val = INT64_MAX;
+    TimeStarValue val = INT64_MAX;
     ASSERT_TRUE(std::holds_alternative<int64_t>(val));
     EXPECT_EQ(std::get<int64_t>(val), INT64_MAX);
 }
 
 TEST_F(IntegerTypeTest, Variant_AllIndicesMatchTSMValueType) {
     // Verify the compile-time guarantee that variant indices line up with the enum
-    static_assert(std::is_same_v<std::variant_alternative_t<0, TSDBValue>, double>,
+    static_assert(std::is_same_v<std::variant_alternative_t<0, TimeStarValue>, double>,
                   "Index 0 must be double (Float)");
-    static_assert(std::is_same_v<std::variant_alternative_t<1, TSDBValue>, bool>,
+    static_assert(std::is_same_v<std::variant_alternative_t<1, TimeStarValue>, bool>,
                   "Index 1 must be bool (Boolean)");
-    static_assert(std::is_same_v<std::variant_alternative_t<2, TSDBValue>, std::string>,
+    static_assert(std::is_same_v<std::variant_alternative_t<2, TimeStarValue>, std::string>,
                   "Index 2 must be std::string (String)");
-    static_assert(std::is_same_v<std::variant_alternative_t<3, TSDBValue>, int64_t>,
+    static_assert(std::is_same_v<std::variant_alternative_t<3, TimeStarValue>, int64_t>,
                   "Index 3 must be int64_t (Integer)");
 
     // Runtime check that the enum values match the indices
@@ -385,6 +385,35 @@ TEST_F(IntegerTypeTest, Variant_AllIndicesMatchTSMValueType) {
     EXPECT_EQ(static_cast<size_t>(TSMValueType::Boolean), 1u);
     EXPECT_EQ(static_cast<size_t>(TSMValueType::String), 2u);
     EXPECT_EQ(static_cast<size_t>(TSMValueType::Integer), 3u);
+}
+
+// ============================================================================
+// 4b. Varint boundary values through IntegerEncoder and FFOR
+// ============================================================================
+
+TEST_F(IntegerTypeTest, IntegerEncoder_VarintBoundaryValues) {
+    // Varint encoding boundaries: 7-bit, 14-bit, 21-bit, 28-bit thresholds
+    std::vector<int64_t> values = {
+        0, 1, -1,
+        127, 128, -128, -129,              // 7-bit boundary
+        16383, 16384, -16383, -16384,      // 14-bit boundary
+        2097151, 2097152,                   // 21-bit boundary
+        268435455, 268435456,              // 28-bit boundary
+        INT64_MIN, INT64_MAX,
+    };
+    verifyIntegerEncoderRoundTrip(values);
+}
+
+TEST_F(IntegerTypeTest, FFOR_VarintBoundaryValues) {
+    std::vector<int64_t> values = {
+        0, 1, -1,
+        127, 128, -128, -129,
+        16383, 16384, -16383, -16384,
+        2097151, 2097152,
+        268435455, 268435456,
+        INT64_MIN, INT64_MAX,
+    };
+    verifyFFORRoundTrip(values);
 }
 
 // ============================================================================

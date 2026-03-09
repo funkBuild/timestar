@@ -7,8 +7,8 @@
 #include <numeric>
 #include <algorithm>
 
-using tsdb::simd::SimdAggregator;
-namespace scalar = tsdb::simd::scalar;
+using timestar::simd::SimdAggregator;
+namespace scalar = timestar::simd::scalar;
 
 // ============================================================================
 // SimdAggregator Correctness Tests
@@ -299,8 +299,8 @@ TEST_F(SimdAggregatorCorrectnessTest, Variance_TwoValues) {
     double simd = SimdAggregator::calculateVariance(values.data(), values.size(), mean);
     double scl = scalar::calculateVariance(values.data(), values.size(), mean);
     EXPECT_DOUBLE_EQ(simd, scl);
-    // Variance of {1,3} with mean 2: ((1-2)^2 + (3-2)^2) / (2-1) = 2.0
-    EXPECT_DOUBLE_EQ(simd, 2.0);
+    // Population variance of {1,3} with mean 2: ((1-2)^2 + (3-2)^2) / 2 = 1.0
+    EXPECT_DOUBLE_EQ(simd, 1.0);
 }
 
 TEST_F(SimdAggregatorCorrectnessTest, Variance_AllSame) {

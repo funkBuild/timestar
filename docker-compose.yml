@@ -1,0 +1,24 @@
+services:
+  timestar:
+    build: .
+    image: timestar:latest
+    ports:
+      - "8086:8086"
+    environment:
+      TIMESTAR_PORT: "8086"
+      TIMESTAR_LOG_LEVEL: "info"
+      TIMESTAR_DATA_DIR: "/var/lib/timestar"
+      # Seastar settings
+      TIMESTAR_SMP: "4"
+      TIMESTAR_MEMORY: "8G"
+      TIMESTAR_OVERPROVISIONED: "true"
+      # Uncomment to use a TOML config file instead of / in addition to env vars
+      # TIMESTAR_CONFIG_FILE: /etc/timestar/config.toml
+    volumes:
+      - timestar-data:/var/lib/timestar
+      # Uncomment to mount a custom config file
+      # - ./config.toml:/etc/timestar/config.toml:ro
+    restart: unless-stopped
+
+volumes:
+  timestar-data:

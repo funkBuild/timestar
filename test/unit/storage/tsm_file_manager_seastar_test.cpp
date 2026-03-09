@@ -10,7 +10,7 @@
 #include "../../../lib/storage/tsm_writer.hpp"
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 #include <seastar/core/coroutine.hh>
@@ -70,7 +70,7 @@ seastar::future<> testFMInitEmpty() {
     co_await mgr.init();
 
     // No files should have been loaded
-    EXPECT_TRUE(mgr.sequencedTsmFiles.empty());
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty());
     EXPECT_EQ(mgr.getFileCountInTier(0), 0);
     EXPECT_EQ(mgr.getFileCountInTier(1), 0);
 }
@@ -93,7 +93,7 @@ seastar::future<> testFMInitDiscoversExistingFiles(TSMFileManagerSeastarTest* se
     co_await mgr.init();
 
     // Both files should be discovered
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 2);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 2);
     EXPECT_EQ(mgr.getFileCountInTier(0), 2);
 }
 
@@ -114,23 +114,23 @@ seastar::future<> testFMSequenceNumberTracking(TSMFileManagerSeastarTest* self) 
     TSMFileManager mgr;
     co_await mgr.init();
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 2);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 2);
 
     // After init, the next sequence ID should be max(3,7)+1 = 8.
     // We verify indirectly: writeMemstore should produce a file with seq >= 8
     auto store = seastar::make_shared<MemoryStore>(0);
-    TSDBInsert<double> insert("test", "metric");
+    TimeStarInsert<double> insert("test", "metric");
     insert.addValue(1000, 42.0);
     store->insertMemory(std::move(insert));
 
     co_await mgr.writeMemstore(store, 0);
 
     // Now there should be 3 files
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 3);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 3);
 
     // The new file should have been created with the next available sequence number
     bool foundHighSeq = false;
-    for (const auto& [seqRank, tsmFile] : mgr.sequencedTsmFiles) {
+    for (const auto& [seqRank, tsmFile] : mgr.getSequencedTsmFiles()) {
         if (tsmFile->seqNum >= 8) {
             foundHighSeq = true;
         }
@@ -230,7 +230,7 @@ seastar::future<> testFMAddTSMFile(TSMFileManagerSeastarTest* self) {
     TSMFileManager mgr;
     co_await mgr.init();
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 0);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
 
     // Create a TSM file and add it via addTSMFile
     self->createTestTSMFile("1_10.tsm", "added.series",
@@ -243,7 +243,7 @@ seastar::future<> testFMAddTSMFile(TSMFileManagerSeastarTest* self) {
     co_await mgr.addTSMFile(tsmFile);
 
     // Verify file is tracked
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 1);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
     EXPECT_EQ(mgr.getFileCountInTier(1), 1);
 
     auto tier1Files = mgr.getFilesInTier(1);
@@ -269,7 +269,7 @@ seastar::future<> testFMRemoveTSMFiles(TSMFileManagerSeastarTest* self) {
     TSMFileManager mgr;
     co_await mgr.init();
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 3);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 3);
     EXPECT_EQ(mgr.getFileCountInTier(0), 3);
 
     // Remove one file
@@ -277,7 +277,7 @@ seastar::future<> testFMRemoveTSMFiles(TSMFileManagerSeastarTest* self) {
     std::vector<seastar::shared_ptr<TSM>> toRemove = { tier0Files[0] };
     co_await mgr.removeTSMFiles(toRemove);
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 2);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 2);
     EXPECT_EQ(mgr.getFileCountInTier(0), 2);
 }
 
@@ -317,11 +317,11 @@ seastar::future<> testFMWriteMemstore() {
     TSMFileManager mgr;
     co_await mgr.init();
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 0);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
 
     // Create a memory store with some data
     auto store = seastar::make_shared<MemoryStore>(0);
-    TSDBInsert<double> insert("temperature", "value");
+    TimeStarInsert<double> insert("temperature", "value");
     insert.addValue(1000, 20.5);
     insert.addValue(2000, 21.0);
     insert.addValue(3000, 21.5);
@@ -330,7 +330,7 @@ seastar::future<> testFMWriteMemstore() {
     co_await mgr.writeMemstore(store, 0);
 
     // A new TSM file should have been created and tracked
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 1);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
     EXPECT_EQ(mgr.getFileCountInTier(0), 1);
 
     // Verify the file is readable by checking series type
@@ -353,7 +353,7 @@ seastar::future<> testFMWriteMemstoreWithTier() {
     co_await mgr.init();
 
     auto store = seastar::make_shared<MemoryStore>(0);
-    TSDBInsert<double> insert("cpu", "load");
+    TimeStarInsert<double> insert("cpu", "load");
     insert.addValue(1000, 0.75);
     store->insertMemory(std::move(insert));
 
@@ -382,18 +382,18 @@ seastar::future<> testFMMultipleWriteMemstoreSequence() {
 
     for (int i = 0; i < 3; ++i) {
         auto store = seastar::make_shared<MemoryStore>(0);
-        TSDBInsert<double> insert("metric", "value");
+        TimeStarInsert<double> insert("metric", "value");
         insert.addValue(static_cast<uint64_t>(i * 1000 + 1000), static_cast<double>(i));
         store->insertMemory(std::move(insert));
         co_await mgr.writeMemstore(store, 0);
     }
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 3);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 3);
     EXPECT_EQ(mgr.getFileCountInTier(0), 3);
 
     // Verify all sequence numbers are distinct
     std::vector<uint64_t> seqNums;
-    for (const auto& [rank, file] : mgr.sequencedTsmFiles) {
+    for (const auto& [rank, file] : mgr.getSequencedTsmFiles()) {
         seqNums.push_back(file->seqNum);
     }
     std::sort(seqNums.begin(), seqNums.end());
@@ -475,7 +475,7 @@ seastar::future<> testFMInitIgnoresNonTSMFiles(TSMFileManagerSeastarTest* self) 
     co_await mgr.init();
 
     // Only the .tsm file should be loaded
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 1);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
 }
 
 TEST_F(TSMFileManagerSeastarTest, InitIgnoresNonTSMFiles) {
@@ -501,7 +501,7 @@ seastar::future<> testFMInitHandlesCorruptedFile(TSMFileManagerSeastarTest* self
 
     // The valid file should still be loaded; the corrupted one should be skipped
     // (openTsmFile catches runtime_error and logs it)
-    EXPECT_GE(mgr.sequencedTsmFiles.size(), 1);
+    EXPECT_GE(mgr.getSequencedTsmFiles().size(), 1);
 }
 
 TEST_F(TSMFileManagerSeastarTest, InitHandlesCorruptedFile) {
@@ -526,14 +526,14 @@ seastar::future<> testFMAddTSMFileUpdatesSequenceNumber(TSMFileManagerSeastarTes
 
     // Now writeMemstore should use seqNum >= 51
     auto store = seastar::make_shared<MemoryStore>(0);
-    TSDBInsert<double> insert("test", "val");
+    TimeStarInsert<double> insert("test", "val");
     insert.addValue(1000, 1.0);
     store->insertMemory(std::move(insert));
     co_await mgr.writeMemstore(store, 0);
 
     // The new file should have seqNum >= 51
     bool foundHighSeq = false;
-    for (const auto& [rank, file] : mgr.sequencedTsmFiles) {
+    for (const auto& [rank, file] : mgr.getSequencedTsmFiles()) {
         if (file->seqNum >= 51) {
             foundHighSeq = true;
         }
@@ -557,12 +557,12 @@ seastar::future<> testFMRemoveAllFiles(TSMFileManagerSeastarTest* self) {
     TSMFileManager mgr;
     co_await mgr.init();
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 2);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 2);
 
     auto allFiles = mgr.getFilesInTier(0);
     co_await mgr.removeTSMFiles(allFiles);
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 0);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
     EXPECT_EQ(mgr.getFileCountInTier(0), 0);
     EXPECT_TRUE(mgr.getFilesInTier(0).empty());
 }
@@ -580,24 +580,24 @@ seastar::future<> testFMWriteMemstoreMixedTypes() {
 
     auto store = seastar::make_shared<MemoryStore>(0);
 
-    TSDBInsert<double> floatInsert("weather", "temperature");
+    TimeStarInsert<double> floatInsert("weather", "temperature");
     floatInsert.addValue(1000, 72.5);
     floatInsert.addValue(2000, 73.1);
     store->insertMemory(std::move(floatInsert));
 
-    TSDBInsert<bool> boolInsert("system", "healthy");
+    TimeStarInsert<bool> boolInsert("system", "healthy");
     boolInsert.addValue(1000, true);
     boolInsert.addValue(2000, false);
     store->insertMemory(std::move(boolInsert));
 
-    TSDBInsert<std::string> strInsert("app", "status");
+    TimeStarInsert<std::string> strInsert("app", "status");
     strInsert.addValue(1000, std::string("running"));
     strInsert.addValue(2000, std::string("stopped"));
     store->insertMemory(std::move(strInsert));
 
     co_await mgr.writeMemstore(store, 0);
 
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 1);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
     EXPECT_EQ(mgr.getFileCountInTier(0), 1);
 
     // Verify that we can look up the float series type
@@ -622,7 +622,7 @@ seastar::future<> testFMAddAndRemoveInterleaved() {
     // Add three files via writeMemstore
     for (int i = 0; i < 3; ++i) {
         auto store = seastar::make_shared<MemoryStore>(0);
-        TSDBInsert<double> insert("series", std::to_string(i));
+        TimeStarInsert<double> insert("series", std::to_string(i));
         insert.addValue(1000, static_cast<double>(i));
         store->insertMemory(std::move(insert));
         co_await mgr.writeMemstore(store, 0);
@@ -638,13 +638,13 @@ seastar::future<> testFMAddAndRemoveInterleaved() {
 
     // Add another file
     auto store = seastar::make_shared<MemoryStore>(0);
-    TSDBInsert<double> insert("series", "new");
+    TimeStarInsert<double> insert("series", "new");
     insert.addValue(1000, 99.0);
     store->insertMemory(std::move(insert));
     co_await mgr.writeMemstore(store, 0);
 
     EXPECT_EQ(mgr.getFileCountInTier(0), 3);
-    EXPECT_EQ(mgr.sequencedTsmFiles.size(), 3);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 3);
 }
 
 TEST_F(TSMFileManagerSeastarTest, AddAndRemoveInterleaved) {
@@ -690,14 +690,14 @@ seastar::future<> testFMPersistenceAcrossManagerLifecycle() {
         co_await mgr1.init();
 
         auto store = seastar::make_shared<MemoryStore>(0);
-        TSDBInsert<double> insert("persistent", "data");
+        TimeStarInsert<double> insert("persistent", "data");
         insert.addValue(1000, 42.0);
         insert.addValue(2000, 43.0);
         store->insertMemory(std::move(insert));
 
         co_await mgr1.writeMemstore(store, 0);
 
-        EXPECT_EQ(mgr1.sequencedTsmFiles.size(), 1);
+        EXPECT_EQ(mgr1.getSequencedTsmFiles().size(), 1);
     }
 
     // Second manager should discover the file on init
@@ -705,7 +705,7 @@ seastar::future<> testFMPersistenceAcrossManagerLifecycle() {
         TSMFileManager mgr2;
         co_await mgr2.init();
 
-        EXPECT_EQ(mgr2.sequencedTsmFiles.size(), 1);
+        EXPECT_EQ(mgr2.getSequencedTsmFiles().size(), 1);
         EXPECT_EQ(mgr2.getFileCountInTier(0), 1);
 
         // Verify the data is accessible

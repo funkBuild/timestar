@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TSDB Consolidated Test Runner
+# TimeStar Consolidated Test Runner
 # Usage: ./scripts/run_tests.sh [unit|e2e|all|simd|no-simd|simd-both]
 #
 # Options:
@@ -52,22 +52,22 @@ check_server() {
 
 # Function to start the server
 start_server() {
-    echo -e "${YELLOW}Starting TSDB HTTP server...${NC}"
+    echo -e "${YELLOW}Starting TimeStar HTTP server...${NC}"
 
     if check_server; then
         echo -e "${GREEN}Server is already running${NC}"
         return 0
     fi
 
-    if [ ! -f "$BUILD_DIR/bin/tsdb_http_server" ]; then
-        echo -e "${RED}Error: tsdb_http_server not found. Run 'make' in build directory first.${NC}"
+    if [ ! -f "$BUILD_DIR/bin/timestar_http_server" ]; then
+        echo -e "${RED}Error: timestar_http_server not found. Run 'make' in build directory first.${NC}"
         return 1
     fi
 
     # Clean up old shard directories for fresh test state
     rm -rf "$BUILD_DIR/shard_"* 2>/dev/null || true
 
-    cd "$BUILD_DIR" && ./bin/tsdb_http_server > /tmp/tsdb_test_server.log 2>&1 &
+    cd "$BUILD_DIR" && ./bin/timestar_http_server > /tmp/timestar_test_server.log 2>&1 &
     SERVER_PID=$!
     echo "Server started with PID: $SERVER_PID"
 
@@ -81,15 +81,15 @@ start_server() {
         sleep 1
     done
 
-    echo -e "${RED}Server failed to start. Check /tmp/tsdb_test_server.log${NC}"
-    cat /tmp/tsdb_test_server.log
+    echo -e "${RED}Server failed to start. Check /tmp/timestar_test_server.log${NC}"
+    cat /tmp/timestar_test_server.log
     return 1
 }
 
 # Function to stop the server
 stop_server() {
     if [ -n "$SERVER_PID" ]; then
-        echo -e "${YELLOW}Stopping TSDB server (PID: $SERVER_PID)...${NC}"
+        echo -e "${YELLOW}Stopping TimeStar server (PID: $SERVER_PID)...${NC}"
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
         SERVER_PID=""
@@ -108,10 +108,10 @@ run_unit_tests() {
 
     cd "$BUILD_DIR"
 
-    # Prefer tsdb_unit_test if available (excludes Seastar tests properly)
-    local TEST_BIN="./test/tsdb_unit_test"
+    # Prefer timestar_unit_test if available (excludes Seastar tests properly)
+    local TEST_BIN="./test/timestar_unit_test"
     if [ ! -f "$TEST_BIN" ]; then
-        TEST_BIN="./test/tsdb_test"
+        TEST_BIN="./test/timestar_test"
     fi
 
     if [ ! -f "$TEST_BIN" ]; then
@@ -224,9 +224,9 @@ run_simd_tests() {
 
     cd "$BUILD_DIR"
 
-    local TEST_BIN="./test/tsdb_unit_test"
+    local TEST_BIN="./test/timestar_unit_test"
     if [ ! -f "$TEST_BIN" ]; then
-        TEST_BIN="./test/tsdb_test"
+        TEST_BIN="./test/timestar_test"
     fi
 
     if [ ! -f "$TEST_BIN" ]; then
@@ -257,10 +257,10 @@ run_no_simd_tests() {
 
     cd "$BUILD_DIR"
 
-    local TEST_BIN="./test/tsdb_test_no_simd"
+    local TEST_BIN="./test/timestar_test_no_simd"
 
     if [ ! -f "$TEST_BIN" ]; then
-        echo -e "${RED}Error: tsdb_test_no_simd not found. Run 'make' in build directory first.${NC}"
+        echo -e "${RED}Error: timestar_test_no_simd not found. Run 'make' in build directory first.${NC}"
         echo -e "${YELLOW}Tip: The no-SIMD test binary is built automatically with 'make'${NC}"
         SIMD_FAILED=1
         return 1

@@ -1,6 +1,6 @@
 # Query Language
 
-TSDB uses a concise query string format for time series retrieval with aggregation, filtering, and grouping.
+TimeStar uses a concise query string format for time series retrieval with aggregation, filtering, and grouping.
 
 ## Syntax
 

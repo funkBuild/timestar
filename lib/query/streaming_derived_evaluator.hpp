@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace tsdb {
+namespace timestar {
 
 // StreamingDerivedEvaluator handles cross-query formula evaluation on live
 // streams. It holds one StreamingAggregator per named query label and, on
@@ -46,4 +46,4 @@ private:
     static constexpr uint64_t kCarryForwardMaxIntervals = 10;
 };
 
-} // namespace tsdb
+} // namespace timestar

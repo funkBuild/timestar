@@ -4,11 +4,12 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include "../anomaly/anomaly_result.hpp"  // Reuse Seasonality enum
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 // Reuse Seasonality from anomaly namespace
@@ -174,7 +175,11 @@ inline uint64_t parseDurationToNs(const std::string& duration) {
         throw std::invalid_argument("Unknown duration unit '" + unit + "'. Use: ns, us, ms, s, m, h, d, w");
     }
 
-    return static_cast<uint64_t>(value * multiplier);
+    double result = value * static_cast<double>(multiplier);
+    if (result < 1.0) {
+        throw std::invalid_argument("Duration resolves to less than 1 nanosecond: " + duration);
+    }
+    return static_cast<uint64_t>(std::llround(result));
 }
 
 // Configuration for forecasting
@@ -349,6 +354,6 @@ struct SARIMAState {
 };
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar
 
 #endif // FORECAST_RESULT_H_INCLUDED

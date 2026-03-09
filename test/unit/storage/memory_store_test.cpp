@@ -5,7 +5,7 @@
 
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/wal.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 namespace fs = std::filesystem;
@@ -28,27 +28,27 @@ protected:
 
 TEST_F(MemoryStoreTest, InsertFloatValues) {
     // Insert float values
-    TSDBInsert<double> insert("temperature", "sensor1");
+    TimeStarInsert<double> insert("temperature", "sensor1");
     insert.addValue(1000, 20.5);
     insert.addValue(2000, 21.0);
     insert.addValue(3000, 21.5);
     insert.addValue(4000, 22.0);
     insert.addValue(5000, 22.5);
     
-    store->insertMemory(std::move(insert));
-    
-    // Verify series exists
     auto seriesKey = insert.seriesKey();
     SeriesId128 seriesId = insert.seriesId128();
+    store->insertMemory(std::move(insert));
+
+    // Verify series exists
     auto seriesType = store->getSeriesType(seriesId);
-    
+
     ASSERT_TRUE(seriesType.has_value());
     EXPECT_EQ(seriesType.value(), TSMValueType::Float);
-    
+
     // Verify data was inserted
     auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
-    
+
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
     EXPECT_EQ(seriesData.timestamps.size(), 5);
     EXPECT_EQ(seriesData.values.size(), 5);
@@ -58,25 +58,25 @@ TEST_F(MemoryStoreTest, InsertFloatValues) {
 
 TEST_F(MemoryStoreTest, InsertBooleanValues) {
     // Insert boolean values
-    TSDBInsert<bool> insert("status", "online");
+    TimeStarInsert<bool> insert("status", "online");
     insert.addValue(1000, true);
     insert.addValue(2000, false);
     insert.addValue(3000, true);
     
-    store->insertMemory(std::move(insert));
-    
-    // Verify series exists
     auto seriesKey = insert.seriesKey();
     SeriesId128 seriesId = insert.seriesId128();
+    store->insertMemory(std::move(insert));
+
+    // Verify series exists
     auto seriesType = store->getSeriesType(seriesId);
-    
+
     ASSERT_TRUE(seriesType.has_value());
     EXPECT_EQ(seriesType.value(), TSMValueType::Boolean);
-    
+
     // Verify data was inserted
     auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
-    
+
     auto& seriesData = std::get<InMemorySeries<bool>>(it->second);
     EXPECT_EQ(seriesData.values.size(), 3);
     EXPECT_EQ(seriesData.values[0], true);
@@ -86,38 +86,38 @@ TEST_F(MemoryStoreTest, InsertBooleanValues) {
 
 TEST_F(MemoryStoreTest, MultipleSeries) {
     // Insert into multiple series
-    TSDBInsert<double> temp1("temperature", "room1");
+    TimeStarInsert<double> temp1("temperature", "room1");
     temp1.addValue(1000, 20.0);
     temp1.addValue(2000, 21.0);
-    store->insertMemory(std::move(temp1));
-    
-    TSDBInsert<double> temp2("temperature", "room2");
-    temp2.addValue(1000, 22.0);
-    temp2.addValue(2000, 23.0);
-    store->insertMemory(std::move(temp2));
-    
-    TSDBInsert<bool> door("door", "open");
-    door.addValue(1000, true);
-    door.addValue(2000, false);
-    store->insertMemory(std::move(door));
-    
-    // Verify all series exist
-    EXPECT_EQ(store->series.size(), 3);
-    
     std::string temp1Key = temp1.seriesKey();
     SeriesId128 temp1Id = temp1.seriesId128();
+    store->insertMemory(std::move(temp1));
+
+    TimeStarInsert<double> temp2("temperature", "room2");
+    temp2.addValue(1000, 22.0);
+    temp2.addValue(2000, 23.0);
+    std::string temp2Key = temp2.seriesKey();
+    SeriesId128 temp2Id = temp2.seriesId128();
+    store->insertMemory(std::move(temp2));
+
+    TimeStarInsert<bool> door("door", "open");
+    door.addValue(1000, true);
+    door.addValue(2000, false);
+    std::string doorKey = door.seriesKey();
+    SeriesId128 doorId = door.seriesId128();
+    store->insertMemory(std::move(door));
+
+    // Verify all series exist
+    EXPECT_EQ(store->series.size(), 3);
+
     auto temp1Type = store->getSeriesType(temp1Id);
     ASSERT_TRUE(temp1Type.has_value());
     EXPECT_EQ(temp1Type.value(), TSMValueType::Float);
-    
-    std::string temp2Key = temp2.seriesKey();
-    SeriesId128 temp2Id = temp2.seriesId128();
+
     auto temp2Type = store->getSeriesType(temp2Id);
     ASSERT_TRUE(temp2Type.has_value());
     EXPECT_EQ(temp2Type.value(), TSMValueType::Float);
-    
-    std::string doorKey = door.seriesKey();
-    SeriesId128 doorId = door.seriesId128();
+
     auto doorType = store->getSeriesType(doorId);
     ASSERT_TRUE(doorType.has_value());
     EXPECT_EQ(doorType.value(), TSMValueType::Boolean);
@@ -125,20 +125,20 @@ TEST_F(MemoryStoreTest, MultipleSeries) {
 
 TEST_F(MemoryStoreTest, AppendToExistingSeries) {
     // Initial insert
-    TSDBInsert<double> insert1("metrics", "requests");
+    TimeStarInsert<double> insert1("metrics", "requests");
     insert1.addValue(1000, 100.0);
     insert1.addValue(2000, 200.0);
+    auto seriesKey = insert1.seriesKey();
+    SeriesId128 seriesId = insert1.seriesId128();
     store->insertMemory(std::move(insert1));
-    
+
     // Append more values
-    TSDBInsert<double> insert2("metrics", "requests");
+    TimeStarInsert<double> insert2("metrics", "requests");
     insert2.addValue(3000, 300.0);
     insert2.addValue(4000, 400.0);
     store->insertMemory(std::move(insert2));
-    
+
     // Verify all values exist
-    auto seriesKey = insert1.seriesKey();
-    SeriesId128 seriesId = insert1.seriesId128();
     auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
     
@@ -161,7 +161,7 @@ TEST_F(MemoryStoreTest, EmptyStore) {
     // isFull() is now async, skip in sync test
     
     // Add data
-    TSDBInsert<double> insert("test", "series");
+    TimeStarInsert<double> insert("test", "series");
     insert.addValue(1000, 1.0);
     store->insertMemory(std::move(insert));
     
@@ -170,7 +170,7 @@ TEST_F(MemoryStoreTest, EmptyStore) {
 
 TEST_F(MemoryStoreTest, SeriesKeyFormat) {
     // Test with tags
-    TSDBInsert<double> insert("weather", "temperature");
+    TimeStarInsert<double> insert("weather", "temperature");
     insert.addTag("location", "seattle");
     insert.addTag("sensor", "outdoor");
     insert.addValue(1000, 15.5);
@@ -183,15 +183,15 @@ TEST_F(MemoryStoreTest, SeriesKeyFormat) {
     EXPECT_NE(seriesKey.find("location=seattle"), std::string::npos);
     EXPECT_NE(seriesKey.find("sensor=outdoor"), std::string::npos);
     
-    store->insertMemory(std::move(insert));
-    
     SeriesId128 seriesId = insert.seriesId128();
+    store->insertMemory(std::move(insert));
+
     auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
 }
 
 TEST_F(MemoryStoreTest, SortingTimestamps) {
-    TSDBInsert<double> insert("test", "ordering");
+    TimeStarInsert<double> insert("test", "ordering");
     
     // Insert out of order
     insert.addValue(3000, 3.0);
@@ -200,10 +200,10 @@ TEST_F(MemoryStoreTest, SortingTimestamps) {
     insert.addValue(5000, 5.0);
     insert.addValue(4000, 4.0);
     
-    store->insertMemory(std::move(insert));
-    
     auto seriesKey = insert.seriesKey();
     SeriesId128 seriesId = insert.seriesId128();
+    store->insertMemory(std::move(insert));
+
     // Check that series exists
     ASSERT_NE(store->series.find(seriesId), store->series.end());
 
@@ -226,17 +226,17 @@ TEST_F(MemoryStoreTest, SortingTimestamps) {
 
 TEST_F(MemoryStoreTest, InsertStringValues) {
     // Insert string values
-    TSDBInsert<std::string> insert("logs", "message");
+    TimeStarInsert<std::string> insert("logs", "message");
     insert.addValue(1000, "Error: Connection timeout");
     insert.addValue(2000, "Warning: High CPU usage");
     insert.addValue(3000, "Info: Request completed");
     insert.addValue(4000, "Debug: Cache hit");
 
+    auto seriesKey = insert.seriesKey();
+    SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
     // Verify series exists
-    auto seriesKey = insert.seriesKey();
-    SeriesId128 seriesId = insert.seriesId128();
     auto seriesType = store->getSeriesType(seriesId);
 
     ASSERT_TRUE(seriesType.has_value());
@@ -255,41 +255,39 @@ TEST_F(MemoryStoreTest, InsertStringValues) {
 
 TEST_F(MemoryStoreTest, InsertMixedTypes) {
     // Test that we can have float, bool, and string series in same store
-    TSDBInsert<double> floatInsert("metrics", "cpu");
+    TimeStarInsert<double> floatInsert("metrics", "cpu");
     floatInsert.addValue(1000, 75.5);
+    SeriesId128 floatId = floatInsert.seriesId128();
     store->insertMemory(std::move(floatInsert));
 
-    TSDBInsert<bool> boolInsert("status", "online");
+    TimeStarInsert<bool> boolInsert("status", "online");
     boolInsert.addValue(1000, true);
+    SeriesId128 boolId = boolInsert.seriesId128();
     store->insertMemory(std::move(boolInsert));
 
-    TSDBInsert<std::string> stringInsert("app", "state");
+    TimeStarInsert<std::string> stringInsert("app", "state");
     stringInsert.addValue(1000, "running");
+    SeriesId128 stringId = stringInsert.seriesId128();
     store->insertMemory(std::move(stringInsert));
 
     EXPECT_EQ(store->series.size(), 3);
 
     // Verify each series has correct type
-    SeriesId128 floatId = floatInsert.seriesId128();
     EXPECT_EQ(store->getSeriesType(floatId).value(), TSMValueType::Float);
-
-    SeriesId128 boolId = boolInsert.seriesId128();
     EXPECT_EQ(store->getSeriesType(boolId).value(), TSMValueType::Boolean);
-
-    SeriesId128 stringId = stringInsert.seriesId128();
     EXPECT_EQ(store->getSeriesType(stringId).value(), TSMValueType::String);
 }
 
 TEST_F(MemoryStoreTest, QuerySeriesFloat) {
     // Insert data
-    TSDBInsert<double> insert("temperature", "sensor1");
+    TimeStarInsert<double> insert("temperature", "sensor1");
     insert.addValue(1000, 20.5);
     insert.addValue(2000, 21.0);
     insert.addValue(3000, 21.5);
+    SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
     // Query the series
-    SeriesId128 seriesId = insert.seriesId128();
     auto result = store->querySeries<double>(seriesId);
 
     ASSERT_NE(result, nullptr);
@@ -300,14 +298,14 @@ TEST_F(MemoryStoreTest, QuerySeriesFloat) {
 
 TEST_F(MemoryStoreTest, QuerySeriesString) {
     // Insert data
-    TSDBInsert<std::string> insert("app", "status");
+    TimeStarInsert<std::string> insert("app", "status");
     insert.addValue(1000, "starting");
     insert.addValue(2000, "running");
     insert.addValue(3000, "stopping");
+    SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
     // Query the series
-    SeriesId128 seriesId = insert.seriesId128();
     auto result = store->querySeries<std::string>(seriesId);
 
     ASSERT_NE(result, nullptr);
@@ -324,16 +322,16 @@ TEST_F(MemoryStoreTest, QueryNonExistentSeries) {
 
 TEST_F(MemoryStoreTest, DeleteRangeFloat) {
     // Insert data
-    TSDBInsert<double> insert("metrics", "value");
+    TimeStarInsert<double> insert("metrics", "value");
     insert.addValue(1000, 10.0);
     insert.addValue(2000, 20.0);
     insert.addValue(3000, 30.0);
     insert.addValue(4000, 40.0);
     insert.addValue(5000, 50.0);
+    SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
     // Delete middle range (2000-3000)
-    SeriesId128 seriesId = insert.seriesId128();
     store->deleteRange(seriesId, 2000, 3000);
 
     // Verify deletion
@@ -349,15 +347,15 @@ TEST_F(MemoryStoreTest, DeleteRangeFloat) {
 
 TEST_F(MemoryStoreTest, DeleteRangeString) {
     // Insert data
-    TSDBInsert<std::string> insert("logs", "message");
+    TimeStarInsert<std::string> insert("logs", "message");
     insert.addValue(1000, "first");
     insert.addValue(2000, "second");
     insert.addValue(3000, "third");
     insert.addValue(4000, "fourth");
+    SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
     // Delete range (2000-2000) - just the second value
-    SeriesId128 seriesId = insert.seriesId128();
     store->deleteRange(seriesId, 2000, 2000);
 
     // Verify deletion
@@ -373,14 +371,14 @@ TEST_F(MemoryStoreTest, DeleteRangeString) {
 
 TEST_F(MemoryStoreTest, EmptyStringValues) {
     // Test handling of empty strings
-    TSDBInsert<std::string> insert("test", "empty");
+    TimeStarInsert<std::string> insert("test", "empty");
     insert.addValue(1000, "");
     insert.addValue(2000, "not empty");
     insert.addValue(3000, "");
 
+    SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
-    SeriesId128 seriesId = insert.seriesId128();
     auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
 
@@ -395,13 +393,13 @@ TEST_F(MemoryStoreTest, LongStringValues) {
     // Test handling of long strings
     std::string longString(10000, 'x');  // 10KB string
 
-    TSDBInsert<std::string> insert("test", "long");
+    TimeStarInsert<std::string> insert("test", "long");
     insert.addValue(1000, longString);
     insert.addValue(2000, "short");
 
+    SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
-    SeriesId128 seriesId = insert.seriesId128();
     auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
 

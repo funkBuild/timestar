@@ -3,7 +3,7 @@
 #include <numeric>
 #include <cmath>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // SMAFunction implementation
 const FunctionMetadata SMAFunction::metadata_ = {
@@ -56,7 +56,11 @@ seastar::future<FunctionResult<double>> SMAFunction::execute(
     
     int64_t window = context.getParameter<int64_t>("window", 5);
     std::string edgeHandling = context.getParameter<std::string>("edge_handling", "truncate");
-    
+
+    if (input.empty()) {
+        return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
+    }
+
     if (window <= 0) {
         throw InsufficientDataException("SMA window size must be positive");
     }
@@ -71,69 +75,71 @@ seastar::future<FunctionResult<double>> SMAFunction::execute(
     }
     
     if (edgeHandling == "truncate") {
-        // Original truncate behavior - only return complete windows
-        for (size_t i = window - 1; i < input.count; ++i) {
-            double sum = 0.0;
-            for (int64_t j = 0; j < window; ++j) {
-                sum += input.valueAt(i - j);
-            }
-            result.values.push_back(sum / window);
-            result.timestamps.push_back(input.timestampAt(i));
+        // O(n) sliding window - compute initial sum, then slide
+        size_t outputCount = input.count - (window - 1);
+        result.values.resize(outputCount);
+        result.timestamps.resize(outputCount);
+
+        double sum = 0.0;
+        for (int64_t j = 0; j < window; ++j) {
+            sum += input.valueAt(j);
+        }
+        result.values[0] = sum / window;
+        result.timestamps[0] = input.timestampAt(window - 1);
+
+        for (size_t i = 1; i < outputCount; ++i) {
+            sum -= input.valueAt(i - 1);
+            sum += input.valueAt(i + window - 1);
+            result.values[i] = sum / window;
+            result.timestamps[i] = input.timestampAt(i + window - 1);
         }
     } else if (edgeHandling == "pad_nearest") {
         // Pad with nearest values - return same size as input
         result.timestamps.assign(input.timestamps->begin() + input.startIndex,
                                 input.timestamps->begin() + input.startIndex + input.count);
-        result.values.reserve(input.count);
-        
+        result.values.resize(input.count);
+
         for (size_t i = 0; i < input.count; ++i) {
             double sum = 0.0;
             int64_t validCount = 0;
-            
-            // For each position in the window
+
             for (int64_t j = 0; j < window; ++j) {
                 int64_t dataIdx = static_cast<int64_t>(i) - j;
-                
+
                 if (dataIdx >= 0 && dataIdx < static_cast<int64_t>(input.count)) {
-                    // Valid data point within bounds
                     sum += input.valueAt(dataIdx);
                     validCount++;
                 } else if (dataIdx < 0) {
-                    // Pad with first value (nearest)
                     sum += input.valueAt(0);
                     validCount++;
                 } else {
-                    // dataIdx >= input.count, pad with last value (nearest)
                     sum += input.valueAt(input.count - 1);
                     validCount++;
                 }
             }
-            
-            result.values.push_back(validCount > 0 ? sum / validCount : input.valueAt(i));
+
+            result.values[i] = validCount > 0 ? sum / validCount : input.valueAt(i);
         }
     } else if (edgeHandling == "pad_zeros") {
         // Pad with zeros - return same size as input
         result.timestamps.assign(input.timestamps->begin() + input.startIndex,
                                 input.timestamps->begin() + input.startIndex + input.count);
-        result.values.reserve(input.count);
-        
+        result.values.resize(input.count);
+
         for (size_t i = 0; i < input.count; ++i) {
             double sum = 0.0;
             int64_t validCount = 0;
-            
-            // For each position in the window
+
             for (int64_t j = 0; j < window; ++j) {
                 int64_t dataIdx = static_cast<int64_t>(i) - j;
-                
+
                 if (dataIdx >= 0 && dataIdx < static_cast<int64_t>(input.count)) {
-                    // Valid data point within bounds
                     sum += input.valueAt(dataIdx);
                     validCount++;
                 }
-                // Outside bounds: add 0 (implicit), don't increment validCount
             }
-            
-            result.values.push_back(validCount > 0 ? sum / window : 0.0);  // Divide by full window for pad_zeros
+
+            result.values[i] = validCount > 0 ? sum / window : 0.0;
         }
     }
     
@@ -201,11 +207,11 @@ seastar::future<FunctionResult<double>> EMAFunction::execute(
     const FunctionContext& context
 ) const {
     FunctionResult<double> result;
-    
-    if (input.count == 0) {
+
+    if (input.empty()) {
         return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
     }
-    
+
     // Calculate alpha based on the provided parameter
     double alpha = 0.1; // default
     
@@ -290,11 +296,15 @@ seastar::future<FunctionResult<double>> GaussianSmoothFunction::execute(
     const FunctionContext& context
 ) const {
     FunctionResult<double> result;
-    
+
+    if (input.empty()) {
+        return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
+    }
+
     if (input.count < 3) {
         throw InsufficientDataException("Gaussian smoothing requires at least 3 data points");
     }
-    
+
     // Calculate sigma based on the provided parameter
     double sigma = 1.0; // default
     
@@ -307,8 +317,8 @@ seastar::future<FunctionResult<double>> GaussianSmoothFunction::execute(
     
     result.timestamps.assign(input.timestamps->begin() + input.startIndex,
                             input.timestamps->begin() + input.startIndex + input.count);
-    result.values.reserve(input.count);
-    
+    result.values.resize(input.count);
+
     // Calculate kernel size - ensure it's odd and reasonable
     int kernelSize;
     if (context.hasParameter("window")) {
@@ -337,17 +347,25 @@ seastar::future<FunctionResult<double>> GaussianSmoothFunction::execute(
     }
     
     // Apply convolution with proper boundary handling
-    for (size_t i = 0; i < input.count; ++i) {
+    // Use int for loop variable to avoid repeated size_t-to-int casts
+    int inputCountInt = static_cast<int>(input.count);
+    int halfKernel = kernelSize / 2;
+    for (int i = 0; i < inputCountInt; ++i) {
         double smoothed = 0.0;
-        
+        double weightSum = 0.0;
+
         for (int j = 0; j < kernelSize; ++j) {
-            int idx = static_cast<int>(i) + j - kernelSize / 2;
-            if (idx >= 0 && idx < static_cast<int>(input.count)) {
+            int idx = i + j - halfKernel;
+            if (idx >= 0 && idx < inputCountInt) {
                 smoothed += input.valueAt(idx) * kernel[j];
+                weightSum += kernel[j];
             }
         }
-        
-        result.values.push_back(smoothed);
+
+        if (weightSum > 0.0) {
+            smoothed /= weightSum;
+        }
+        result.values[i] = smoothed;
     }
     
     return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
@@ -390,12 +408,19 @@ std::vector<double> simpleMovingAverage(const std::vector<double>& values, int w
         return result;
     }
     
-    for (size_t i = window - 1; i < values.size(); ++i) {
-        double sum = 0.0;
-        for (int j = 0; j < window; ++j) {
-            sum += values[i - j];
-        }
-        result.push_back(sum / window);
+    size_t outputCount = values.size() - (window - 1);
+    result.resize(outputCount);
+
+    double sum = 0.0;
+    for (int j = 0; j < window; ++j) {
+        sum += values[j];
+    }
+    result[0] = sum / window;
+
+    for (size_t i = 1; i < outputCount; ++i) {
+        sum -= values[i - 1];
+        sum += values[i + window - 1];
+        result[i] = sum / window;
     }
     
     return result;
@@ -416,4 +441,4 @@ std::vector<double> exponentialMovingAverage(const std::vector<double>& values, 
     return result;
 }
 
-} // namespace tsdb::functions
+} // namespace timestar::functions

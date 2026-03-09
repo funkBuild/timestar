@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include "subscription_manager.hpp"
 
-using namespace tsdb;
+using namespace timestar;
 
 class SubscriptionManagerTest : public ::testing::Test {
 protected:

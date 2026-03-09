@@ -14,7 +14,7 @@ protected:
         std::vector<std::string> strings;
         strings.reserve(count);
         
-        std::default_random_engine generator;
+        std::default_random_engine generator(42);
         std::uniform_int_distribution<int> lengthDist(5, avgLength * 2);
         std::uniform_int_distribution<char> charDist('a', 'z');
         
@@ -165,7 +165,7 @@ TEST_F(StringEncoderTest, SpecialCharactersTest) {
     std::vector<std::string> testStrings = {
         "Hello\nWorld",
         "Tab\tSeparated",
-        "Null\0Character",
+        std::string("Null\0Character", 14),
         "UTF-8: ñ, é, ü, 中文",
         "Symbols: !@#$%^&*()",
         "Quotes: \"single' and double\"",
@@ -247,6 +247,93 @@ TEST_F(StringEncoderTest, MaxLengthPrefixTest) {
     EXPECT_EQ(decoded.size(), testStrings.size());
     for (size_t i = 0; i < testStrings.size(); i++) {
         EXPECT_EQ(decoded[i].size(), testStrings[i].size());
+        EXPECT_EQ(decoded[i], testStrings[i]);
+    }
+}
+
+// ==========================================================================
+// Edge case coverage: empty strings, null bytes, very long strings
+// ==========================================================================
+
+TEST_F(StringEncoderTest, SingleEmptyString) {
+    std::vector<std::string> testStrings = {""};
+    auto encoded = StringEncoder::encode(testStrings);
+    std::vector<std::string> decoded;
+    StringEncoder::decode(encoded, testStrings.size(), decoded);
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded[0], "");
+}
+
+TEST_F(StringEncoderTest, AllEmptyStrings) {
+    std::vector<std::string> testStrings(100, "");
+    auto encoded = StringEncoder::encode(testStrings);
+    std::vector<std::string> decoded;
+    StringEncoder::decode(encoded, testStrings.size(), decoded);
+    ASSERT_EQ(decoded.size(), testStrings.size());
+    for (size_t i = 0; i < testStrings.size(); i++) {
+        EXPECT_EQ(decoded[i], "");
+    }
+}
+
+TEST_F(StringEncoderTest, StringWithNullBytes) {
+    // std::string can hold embedded null bytes
+    std::string withNull("before\0after", 12);
+    ASSERT_EQ(withNull.size(), 12u);  // confirm null is embedded, not terminating
+
+    std::vector<std::string> testStrings = {
+        withNull,
+        std::string("\0", 1),           // single null byte
+        std::string("\0\0\0", 3),       // multiple null bytes
+        std::string("a\0b\0c", 5),      // alternating
+    };
+
+    auto encoded = StringEncoder::encode(testStrings);
+    std::vector<std::string> decoded;
+    StringEncoder::decode(encoded, testStrings.size(), decoded);
+    ASSERT_EQ(decoded.size(), testStrings.size());
+    for (size_t i = 0; i < testStrings.size(); i++) {
+        EXPECT_EQ(decoded[i].size(), testStrings[i].size())
+            << "Size mismatch at index " << i;
+        EXPECT_EQ(decoded[i], testStrings[i]);
+    }
+}
+
+TEST_F(StringEncoderTest, VeryLongString100KB) {
+    // A single string exceeding 64KB to stress varint length encoding
+    std::string longStr(100 * 1024, 'x');
+    // Make it non-uniform so Snappy has realistic data
+    for (size_t i = 0; i < longStr.size(); i++) {
+        longStr[i] = static_cast<char>('A' + (i % 26));
+    }
+
+    std::vector<std::string> testStrings = {longStr};
+    auto encoded = StringEncoder::encode(testStrings);
+    std::vector<std::string> decoded;
+    StringEncoder::decode(encoded, testStrings.size(), decoded);
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded[0].size(), longStr.size());
+    EXPECT_EQ(decoded[0], longStr);
+}
+
+TEST_F(StringEncoderTest, MixedLengthsIncludingVeryLong) {
+    std::string longStr(100 * 1024, 'z');
+    std::vector<std::string> testStrings = {
+        "",
+        "short",
+        longStr,
+        "",
+        std::string(65535, 'a'),  // exactly 2-byte varint max
+        std::string(65536, 'b'),  // just over 2-byte varint max
+        "end",
+    };
+
+    auto encoded = StringEncoder::encode(testStrings);
+    std::vector<std::string> decoded;
+    StringEncoder::decode(encoded, testStrings.size(), decoded);
+    ASSERT_EQ(decoded.size(), testStrings.size());
+    for (size_t i = 0; i < testStrings.size(); i++) {
+        EXPECT_EQ(decoded[i].size(), testStrings[i].size())
+            << "Size mismatch at index " << i;
         EXPECT_EQ(decoded[i], testStrings[i]);
     }
 }

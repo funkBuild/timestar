@@ -15,7 +15,7 @@
 
 class Engine;
 
-namespace tsdb {
+namespace timestar {
 
 class HttpStreamHandler {
 public:
@@ -56,4 +56,4 @@ private:
     seastar::gate _connectionGate;
 };
 
-} // namespace tsdb
+} // namespace timestar

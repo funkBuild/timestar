@@ -2,7 +2,7 @@
 #include <filesystem>
 
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 
 // =============================================================================
 // LevelDB Index Field Type Integration Tests
@@ -27,7 +27,7 @@ seastar::future<> testIndexInsertStoresFloatType() {
     LevelDBIndex index(0);
     co_await index.open();
 
-    TSDBInsert<double> insert("temperature", "value");
+    TimeStarInsert<double> insert("temperature", "value");
     insert.addTag("location", "us-west");
     insert.addValue(1000000000, 23.5);
 
@@ -48,7 +48,7 @@ seastar::future<> testIndexInsertStoresBooleanType() {
     LevelDBIndex index(0);
     co_await index.open();
 
-    TSDBInsert<bool> insert("sensor", "is_active");
+    TimeStarInsert<bool> insert("sensor", "is_active");
     insert.addTag("location", "us-east");
     insert.addValue(1000000000, true);
 
@@ -69,7 +69,7 @@ seastar::future<> testIndexInsertStoresStringType() {
     LevelDBIndex index(0);
     co_await index.open();
 
-    TSDBInsert<std::string> insert("logs", "message");
+    TimeStarInsert<std::string> insert("logs", "message");
     insert.addTag("host", "server-01");
     insert.addValue(1000000000, std::string("hello world"));
 
@@ -91,19 +91,19 @@ seastar::future<> testMultipleFieldTypesSameMeasurement() {
     co_await index.open();
 
     // Insert a float field
-    TSDBInsert<double> floatInsert("metrics", "cpu_usage");
+    TimeStarInsert<double> floatInsert("metrics", "cpu_usage");
     floatInsert.addTag("host", "server-01");
     floatInsert.addValue(1000000000, 75.5);
     co_await index.indexInsert(floatInsert);
 
     // Insert a boolean field on the same measurement
-    TSDBInsert<bool> boolInsert("metrics", "is_healthy");
+    TimeStarInsert<bool> boolInsert("metrics", "is_healthy");
     boolInsert.addTag("host", "server-01");
     boolInsert.addValue(1000000000, true);
     co_await index.indexInsert(boolInsert);
 
     // Insert a string field on the same measurement
-    TSDBInsert<std::string> stringInsert("metrics", "status_message");
+    TimeStarInsert<std::string> stringInsert("metrics", "status_message");
     stringInsert.addTag("host", "server-01");
     stringInsert.addValue(1000000000, std::string("all systems go"));
     co_await index.indexInsert(stringInsert);
@@ -132,7 +132,7 @@ seastar::future<> testIdempotentFieldType() {
 
     // Insert same field multiple times
     for (int i = 0; i < 5; i++) {
-        TSDBInsert<double> insert("weather", "temperature");
+        TimeStarInsert<double> insert("weather", "temperature");
         insert.addTag("location", "us-west");
         insert.addValue(1000000000 + i, 20.0 + i);
         co_await index.indexInsert(insert);
@@ -155,12 +155,12 @@ seastar::future<> testFieldTypePersistence() {
         LevelDBIndex index(0);
         co_await index.open();
 
-        TSDBInsert<double> floatInsert("persistent_test", "value");
+        TimeStarInsert<double> floatInsert("persistent_test", "value");
         floatInsert.addTag("tag", "v1");
         floatInsert.addValue(1000000000, 42.0);
         co_await index.indexInsert(floatInsert);
 
-        TSDBInsert<bool> boolInsert("persistent_test", "enabled");
+        TimeStarInsert<bool> boolInsert("persistent_test", "enabled");
         boolInsert.addTag("tag", "v1");
         boolInsert.addValue(1000000000, false);
         co_await index.indexInsert(boolInsert);

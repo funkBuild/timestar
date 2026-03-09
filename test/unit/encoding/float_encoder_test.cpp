@@ -604,6 +604,85 @@ TEST_F(FloatEncoderTest, PerformanceComparison) {
     }
 }
 
+// ==========================================================================
+// Edge case coverage: subnormals, negative zero, infinity, extreme values
+// ==========================================================================
+
+TEST_F(FloatEncoderTest, NegativeZeroRoundtrip) {
+    std::vector<double> data = {-0.0};
+    CompressedBuffer encoded = FloatEncoder::encode(data);
+    encoded.rewind();
+    CompressedSlice slice((const uint8_t*)encoded.data.data(),
+                          encoded.data.size() * sizeof(uint64_t));
+    std::vector<double> decoded;
+    FloatDecoder::decode(slice, 0, data.size(), decoded);
+    ASSERT_EQ(decoded.size(), 1u);
+    // -0.0 == 0.0 by IEEE 754, so check the sign bit directly
+    EXPECT_TRUE(std::signbit(decoded[0])) << "Expected negative zero";
+    EXPECT_EQ(decoded[0], -0.0);
+}
+
+TEST_F(FloatEncoderTest, SubnormalValues) {
+    std::vector<double> data = {
+        std::numeric_limits<double>::denorm_min(),
+        -std::numeric_limits<double>::denorm_min(),
+        std::numeric_limits<double>::denorm_min() * 2,
+        std::numeric_limits<double>::denorm_min() * 1000,
+    };
+    testRoundtrip(data);
+}
+
+TEST_F(FloatEncoderTest, InfinityRoundtrip) {
+    std::vector<double> data = {
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    testRoundtrip(data);
+}
+
+TEST_F(FloatEncoderTest, NaNRoundtrip) {
+    std::vector<double> data = {
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::signaling_NaN(),
+    };
+    CompressedBuffer encoded = FloatEncoder::encode(data);
+    encoded.rewind();
+    CompressedSlice slice((const uint8_t*)encoded.data.data(),
+                          encoded.data.size() * sizeof(uint64_t));
+    std::vector<double> decoded;
+    FloatDecoder::decode(slice, 0, data.size(), decoded);
+    ASSERT_EQ(decoded.size(), 2u);
+    EXPECT_TRUE(std::isnan(decoded[0]));
+    EXPECT_TRUE(std::isnan(decoded[1]));
+}
+
+TEST_F(FloatEncoderTest, ExtremeValues) {
+    std::vector<double> data = {
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<double>::lowest(),  // -DBL_MAX
+        std::numeric_limits<double>::min(),      // smallest positive normal
+        -std::numeric_limits<double>::min(),
+        std::numeric_limits<double>::epsilon(),
+    };
+    testRoundtrip(data);
+}
+
+TEST_F(FloatEncoderTest, MixedSpecialAndNormal) {
+    // Interleave special values with normal values to stress XOR delta encoding
+    std::vector<double> data = {
+        1.0,
+        std::numeric_limits<double>::infinity(),
+        -1.0,
+        -0.0,
+        std::numeric_limits<double>::denorm_min(),
+        42.5,
+        std::numeric_limits<double>::max(),
+        0.0,
+        std::numeric_limits<double>::lowest(),
+    };
+    testRoundtrip(data);
+}
+
 // Test that a corrupted float block with lzb + data_bits > 64 is rejected
 // rather than silently underflowing tzb to a huge unsigned value.
 //

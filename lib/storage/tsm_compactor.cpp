@@ -6,10 +6,12 @@
 #include "tsm_merge_specialized.hpp"  // Phase 5.1: Specialized N-way merges
 #include "bulk_block_loader.hpp"  // Phase A: Bulk loading optimization
 #include "aggregator.hpp"  // AggregationState for downsampling
+#include <chrono>
+#include <cinttypes>
 #include <filesystem>
+#include <limits>
 #include <set>
 #include <unordered_map>
-#include <chrono>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/reactor.hh>
@@ -19,13 +21,13 @@ namespace fs = std::filesystem;
 TSMCompactor::TSMCompactor(TSMFileManager* manager)
     : fileManager(manager),
       strategy(std::make_unique<LeveledCompactionStrategy>()),
-      compactionSemaphore(tsdb::config().storage.compaction.max_concurrent) {
+      compactionSemaphore(timestar::config().storage.compaction.max_concurrent) {
 }
 
 std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqNum) {
     int shardId = seastar::this_shard_id();
     char buffer[256];
-    snprintf(buffer, sizeof(buffer), "shard_%d/tsm/%lu_%lu.tsm", shardId, tier, seqNum);
+    snprintf(buffer, sizeof(buffer), "shard_%d/tsm/%" PRIu64 "_%" PRIu64 ".tsm", shardId, tier, seqNum);
     return std::string(buffer);
 }
 
@@ -98,7 +100,7 @@ seastar::future<> TSMCompactor::mergeSeries(
     timestamps.reserve(batchSize());
     values.reserve(batchSize());
     
-    uint64_t lastTimestamp = 0;
+    uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
     size_t tombstonesFiltered = 0;
     
     // Phase 1.3: Process in batches with streaming
@@ -152,7 +154,7 @@ seastar::future<> TSMCompactor::mergeSeries(
 
     // Log tombstone filtering stats if any points were filtered
     if (tombstonesFiltered > 0) {
-        tsdb::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
+        timestar::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
                                  tombstonesFiltered, seriesId.toHex());
     }
 
@@ -212,7 +214,7 @@ seastar::future<> TSMCompactor::mergeSeriesWithIterator(
     timestamps.reserve(batchSize());
     values.reserve(batchSize());
 
-    uint64_t lastTimestamp = 0;
+    uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
     size_t tombstonesFiltered = 0;
 
     // Process in batches with streaming
@@ -278,7 +280,7 @@ seastar::future<> TSMCompactor::mergeSeriesWithIterator(
 
     // Log tombstone filtering stats if any points were filtered
     if (tombstonesFiltered > 0) {
-        tsdb::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
+        timestar::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
                                  tombstonesFiltered, seriesId.toHex());
     }
 
@@ -399,7 +401,7 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
     currentTimestamps.reserve(batchSize());
     currentValues.reserve(batchSize());
 
-    uint64_t lastTimestamp = 0;
+    uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
     size_t tombstonesFiltered = 0;
 
     // Phase B: Helper lambda to process batches (same logic for all merger types)
@@ -458,6 +460,10 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
 
     // Phase 1: Helper lambda for direct block copy (fast path - no overlap)
     auto copyBlockDirect = [&](const TSMBlock<T>* block) {
+        if (!block) {
+            timestar::compactor_log.warn("Skipping null block pointer for series {}", seriesId.toHex());
+            return;
+        }
         // ULTRA FAST PATH: No tombstones - copy entire block at once
         if (tombstoneRanges.empty()) {
             const auto& timestamps = *block->timestamps;
@@ -557,7 +563,7 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
             }
         }
 
-        tsdb::compactor_log.info(
+        timestar::compactor_log.info(
             "Series {}: {} blocks, {} segments ({} fast path [{} blocks], {} slow path [{} blocks])",
             seriesId.toHex(),
             blockMeta.size(),
@@ -639,7 +645,7 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
 
     // Log tombstone filtering
     if (tombstonesFiltered > 0) {
-        tsdb::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
+        timestar::compactor_log.info("Compaction: Filtered {} tombstoned points for series {}",
                                  tombstonesFiltered, seriesId.toHex());
     }
 
@@ -650,7 +656,8 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
 template<typename T>
 seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompaction(
     const SeriesId128& seriesId,
-    const std::vector<seastar::shared_ptr<TSM>>& sources) {
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    const SeriesRetentionMap& seriesRetention) {
 
     SeriesCompactionData<T> result(seriesId, TSM::getValueType<T>());
 
@@ -747,12 +754,12 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     }
 
     // Look up retention context for this series (populated in compact())
-    auto retIt = _seriesRetention.find(seriesId);
-    bool hasRetention = (retIt != _seriesRetention.end());
+    auto retIt = seriesRetention.find(seriesId);
+    bool hasRetention = (retIt != seriesRetention.end());
     uint64_t ttlCutoff = hasRetention ? retIt->second.ttlCutoff : 0;
     uint64_t downsampleThreshold = hasRetention ? retIt->second.downsampleThreshold : 0;
     uint64_t downsampleInterval = hasRetention ? retIt->second.downsampleInterval : 0;
-    auto downsampleMethod = hasRetention ? retIt->second.downsampleMethod : tsdb::AggregationMethod::AVG;
+    auto downsampleMethod = hasRetention ? retIt->second.downsampleMethod : timestar::AggregationMethod::AVG;
 
     // Check if we can use zero-copy fast path
     // Retention (TTL or downsampling) disables zero-copy since we need to filter/transform points
@@ -768,7 +775,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         });
         size_t eliminated = beforeCount - blockMeta.size();
         if (eliminated > 0) {
-            tsdb::compactor_log.info("TTL: Eliminated {} whole blocks for series {}",
+            timestar::compactor_log.info("TTL: Eliminated {} whole blocks for series {}",
                                      eliminated, seriesId.toHex());
         }
 
@@ -810,7 +817,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     result.timestamps.reserve(batchSize() * 10);  // Pre-allocate
     result.values.reserve(batchSize() * 10);
 
-    uint64_t lastTimestamp = 0;
+    uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
     size_t tombstonesFiltered = 0;
     size_t ttlFiltered = 0;
 
@@ -859,6 +866,10 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
 
     // Helper to process blocks
     auto processBlock = [&](const TSMBlock<T>* block) {
+        if (!block) {
+            timestar::compactor_log.warn("Skipping null block pointer for series {}", seriesId.toHex());
+            return;
+        }
         for (size_t i = 0; i < block->timestamps->size(); i++) {
             processPoint(block->timestamps->at(i), block->values->at(i));
         }
@@ -894,7 +905,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     }
 
     if (ttlFiltered > 0) {
-        tsdb::compactor_log.info("TTL: Filtered {} expired points for series {}",
+        timestar::compactor_log.info("TTL: Filtered {} expired points for series {}",
                                  ttlFiltered, seriesId.toHex());
     }
 
@@ -911,7 +922,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 std::vector<T> dsValues;
 
                 // Bucket and aggregate
-                std::map<uint64_t, tsdb::AggregationState> buckets;
+                std::map<uint64_t, timestar::AggregationState> buckets;
                 for (size_t i = 0; i < partIdx; ++i) {
                     uint64_t bucket = (result.timestamps[i] / downsampleInterval) * downsampleInterval;
                     double val;
@@ -949,7 +960,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 result.values = std::move(dsValues);
                 result.pointsWritten = result.timestamps.size();
 
-                tsdb::compactor_log.info("Downsample: {} -> {} points for series {} ({} old -> {} buckets, {} recent kept)",
+                timestar::compactor_log.info("Downsample: {} -> {} points for series {} ({} old -> {} buckets, {} recent kept)",
                                          originalCount, result.timestamps.size(), seriesId.toHex(),
                                          partIdx, buckets.size(), recentCount);
             }
@@ -1013,7 +1024,7 @@ seastar::future<std::string> TSMCompactor::compact(
     }
 
     uint64_t targetTier = strategy->getTargetTier(maxTier, files.size());
-    uint64_t targetSeq = maxSeq + 1;
+    uint64_t targetSeq = fileManager->allocateSequenceId();
     std::string outputPath = generateCompactedFilename(targetTier, targetSeq);
 
     // Create temporary file for writing
@@ -1027,8 +1038,8 @@ seastar::future<std::string> TSMCompactor::compact(
     // Get all unique series across files
     auto allSeries = getAllSeriesIds(files);
 
-    // Build per-series retention context from policies + metadata map
-    _seriesRetention.clear();
+    // Build per-series retention context from policies + metadata map (local to this compaction)
+    SeriesRetentionMap seriesRetention;
     if (!retentionPolicies.empty() && !seriesMeasurementMap.empty()) {
         uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1052,21 +1063,21 @@ seastar::future<std::string> TSMCompactor::compact(
                 ctx.downsampleInterval = policy.downsample->intervalNanos;
 
                 const auto& method = policy.downsample->method;
-                if (method == "min") ctx.downsampleMethod = tsdb::AggregationMethod::MIN;
-                else if (method == "max") ctx.downsampleMethod = tsdb::AggregationMethod::MAX;
-                else if (method == "sum") ctx.downsampleMethod = tsdb::AggregationMethod::SUM;
-                else if (method == "latest") ctx.downsampleMethod = tsdb::AggregationMethod::LATEST;
-                else ctx.downsampleMethod = tsdb::AggregationMethod::AVG;
+                if (method == "min") ctx.downsampleMethod = timestar::AggregationMethod::MIN;
+                else if (method == "max") ctx.downsampleMethod = timestar::AggregationMethod::MAX;
+                else if (method == "sum") ctx.downsampleMethod = timestar::AggregationMethod::SUM;
+                else if (method == "latest") ctx.downsampleMethod = timestar::AggregationMethod::LATEST;
+                else ctx.downsampleMethod = timestar::AggregationMethod::AVG;
             }
 
             if (ctx.ttlCutoff > 0 || ctx.downsampleThreshold > 0) {
-                _seriesRetention[sid] = ctx;
+                seriesRetention[sid] = ctx;
             }
         }
 
-        if (!_seriesRetention.empty()) {
-            tsdb::compactor_log.info("Compaction: {} series have retention policies applied",
-                                     _seriesRetention.size());
+        if (!seriesRetention.empty()) {
+            timestar::compactor_log.info("Compaction: {} series have retention policies applied",
+                                     seriesRetention.size());
         }
     }
 
@@ -1125,7 +1136,7 @@ seastar::future<std::string> TSMCompactor::compact(
                 const auto& seriesId = seriesVec[j];
 
                 // Process series and write with serialization
-                auto future = processSeriesForCompaction<ValueType>(seriesId, files)
+                auto future = processSeriesForCompaction<ValueType>(seriesId, files, seriesRetention)
                     .then([this, &writer, &writeSemaphore, &stats](SeriesCompactionData<ValueType> data) {
                         // Serialize writes with semaphore
                         return seastar::with_semaphore(writeSemaphore, 1,
@@ -1142,22 +1153,18 @@ seastar::future<std::string> TSMCompactor::compact(
         }
     };
 
-    // Process all series types in parallel batches
-    if (!floatSeries.empty()) {
-        co_await processBatch(floatSeries, (double*)nullptr);
-    }
-
-    if (!boolSeries.empty()) {
-        co_await processBatch(boolSeries, (bool*)nullptr);
-    }
-
-    if (!stringSeries.empty()) {
-        co_await processBatch(stringSeries, (std::string*)nullptr);
-    }
-
-    if (!integerSeries.empty()) {
-        co_await processBatch(integerSeries, (int64_t*)nullptr);
-    }
+    // Process all series types concurrently (writes serialized by writeSemaphore)
+    std::vector<seastar::future<>> typeFutures;
+    typeFutures.reserve(4);
+    if (!floatSeries.empty())
+        typeFutures.push_back(processBatch(floatSeries, (double*)nullptr));
+    if (!boolSeries.empty())
+        typeFutures.push_back(processBatch(boolSeries, (bool*)nullptr));
+    if (!stringSeries.empty())
+        typeFutures.push_back(processBatch(stringSeries, (std::string*)nullptr));
+    if (!integerSeries.empty())
+        typeFutures.push_back(processBatch(integerSeries, (int64_t*)nullptr));
+    co_await seastar::when_all_succeed(typeFutures.begin(), typeFutures.end());
 
     // Finalize the file
     writer.writeIndex();
@@ -1175,6 +1182,20 @@ seastar::future<std::string> TSMCompactor::compact(
     // Atomic rename from temp to final (async to avoid blocking the reactor)
     co_await seastar::rename_file(tempPath, outputPath);
 
+    // Fsync the parent directory to ensure the rename (directory entry update)
+    // is durable.  Without this, a crash could lose the rename even though
+    // the file data is already on disk.
+    auto slash = outputPath.rfind('/');
+    std::string dir = (slash != std::string::npos) ? outputPath.substr(0, slash) : ".";
+    try {
+        auto dirFile = co_await seastar::open_directory(dir);
+        co_await dirFile.flush();
+        co_await dirFile.close();
+    } catch (...) {
+        // Best-effort: log but don't fail the compaction
+        timestar::compactor_log.warn("Failed to fsync parent directory after compaction rename: {}", dir);
+    }
+
     co_return outputPath;
 }
 
@@ -1182,21 +1203,20 @@ CompactionPlan TSMCompactor::planCompaction(uint64_t tier) {
     CompactionPlan plan;
     plan.targetTier = tier;
     
-    // Get files from file manager using new tier tracking
+    // Get files from file manager using new tier tracking, excluding any
+    // that are already part of an in-flight compaction to prevent double-
+    // compaction races (which can crash or corrupt output).
     std::vector<seastar::shared_ptr<TSM>> tierFiles = fileManager->getFilesInTier(tier);
-    
+    std::erase_if(tierFiles, [this](const seastar::shared_ptr<TSM>& f) {
+        return isFileInActiveCompaction(f);
+    });
+
     // Use strategy to select files
     plan.sourceFiles = strategy->selectFiles(tierFiles, tier);
     
     if (!plan.sourceFiles.empty()) {
-        // Calculate target tier and sequence
-        uint64_t maxSeq = 0;
-        for (const auto& file : plan.sourceFiles) {
-            maxSeq = std::max(maxSeq, file->seqNum);
-        }
-        
         plan.targetTier = strategy->getTargetTier(tier, plan.sourceFiles.size());
-        plan.targetSeqNum = maxSeq + 1;
+        plan.targetSeqNum = fileManager->allocateSequenceId();
         plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
         
         // Estimate output size (rough estimate - 70% of input due to compression)
@@ -1238,14 +1258,8 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
         co_await fileManager->addTSMFile(newTSM);
         
         // Remove old files from manager and mark for deletion
+        // (removeTSMFiles also deletes associated tombstone files)
         co_await fileManager->removeTSMFiles(plan.sourceFiles);
-        
-        // Delete tombstone files for the compacted TSM files
-        for (const auto& file : plan.sourceFiles) {
-            if (file->hasTombstones()) {
-                co_await file->deleteTombstoneFile();
-            }
-        }
     }
     
     // Propagate stats from the compact() call and add timing
@@ -1283,11 +1297,11 @@ seastar::future<> TSMCompactor::runCompactionLoop() {
                         auto stats = co_await executeCompaction(plan);
                         didCompaction = true;
 
-                        tsdb::compactor_log.info("Compacted {} files in tier {}, removed {} duplicates in {}ms",
+                        timestar::compactor_log.info("Compacted {} files in tier {}, removed {} duplicates in {}ms",
                                                 stats.filesCompacted, tier, stats.duplicatesRemoved,
                                                 stats.duration.count());
                     } catch (const std::exception& e) {
-                        tsdb::compactor_log.error(
+                        timestar::compactor_log.error(
                             "Compaction failed for tier {}: {}. Will retry on next cycle.",
                             tier, e.what());
                     }
@@ -1306,25 +1320,25 @@ seastar::future<> TSMCompactor::runCompactionLoop() {
 }
 
 seastar::future<> TSMCompactor::forceFullCompaction() {
-    tsdb::compactor_log.info("Starting forced full compaction...");
+    timestar::compactor_log.info("Starting forced full compaction...");
     
     // Compact each tier from bottom up
     for (uint64_t tier = 0; tier < 3; tier++) {
         // Get all files in this tier
         std::vector<seastar::shared_ptr<TSM>> tierFiles;
-        for (const auto& [seq, file] : fileManager->sequencedTsmFiles) {
+        for (const auto& [seq, file] : fileManager->getSequencedTsmFiles()) {
             if (file->tierNum == tier) {
                 tierFiles.push_back(file);
             }
         }
         
         if (tierFiles.size() > 1) {
-            tsdb::compactor_log.info("Compacting {} files in tier {}", tierFiles.size(), tier);
+            timestar::compactor_log.info("Compacting {} files in tier {}", tierFiles.size(), tier);
             
             CompactionPlan plan;
             plan.sourceFiles = tierFiles;
             plan.targetTier = tier + 1;
-            plan.targetSeqNum = 0; // Will be set properly
+            plan.targetSeqNum = fileManager->allocateSequenceId();
             plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
             
             auto stats = co_await executeCompaction(plan);
@@ -1360,7 +1374,7 @@ seastar::future<CompactionStats> TSMCompactor::executeTombstoneRewrite(seastar::
     plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
     plan.estimatedSize = file->getFileSize();
 
-    tsdb::compactor_log.info("[TOMBSTONE-REWRITE] Rewriting {} at tier {} seq {} -> seq {}",
+    timestar::compactor_log.info("[TOMBSTONE-REWRITE] Rewriting {} at tier {} seq {} -> seq {}",
                               file->getFileSize(), plan.targetTier, file->seqNum, plan.targetSeqNum);
 
     co_return co_await executeCompaction(plan);
@@ -1461,15 +1475,18 @@ template seastar::future<> TSMCompactor::mergeSeriesBulk<int64_t>(
 // Phase 3: Parallel processing template instantiations
 template seastar::future<SeriesCompactionData<double>> TSMCompactor::processSeriesForCompaction<double>(
     const SeriesId128& seriesId,
-    const std::vector<seastar::shared_ptr<TSM>>& sources);
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    const SeriesRetentionMap& seriesRetention);
 
 template seastar::future<SeriesCompactionData<bool>> TSMCompactor::processSeriesForCompaction<bool>(
     const SeriesId128& seriesId,
-    const std::vector<seastar::shared_ptr<TSM>>& sources);
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    const SeriesRetentionMap& seriesRetention);
 
 template seastar::future<SeriesCompactionData<std::string>> TSMCompactor::processSeriesForCompaction<std::string>(
     const SeriesId128& seriesId,
-    const std::vector<seastar::shared_ptr<TSM>>& sources);
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    const SeriesRetentionMap& seriesRetention);
 
 template void TSMCompactor::writeSeriesCompactionData<double>(
     TSMWriter& writer,
@@ -1488,7 +1505,8 @@ template void TSMCompactor::writeSeriesCompactionData<std::string>(
 
 template seastar::future<SeriesCompactionData<int64_t>> TSMCompactor::processSeriesForCompaction<int64_t>(
     const SeriesId128& seriesId,
-    const std::vector<seastar::shared_ptr<TSM>>& sources);
+    const std::vector<seastar::shared_ptr<TSM>>& sources,
+    const SeriesRetentionMap& seriesRetention);
 
 template void TSMCompactor::writeSeriesCompactionData<int64_t>(
     TSMWriter& writer,

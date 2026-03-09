@@ -12,7 +12,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 
-namespace tsdb {
+namespace timestar {
 
 // Represents a query to be executed on a specific shard
 struct ShardQuery {
@@ -83,6 +83,6 @@ private:
         const std::string& field);
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // QUERY_PLANNER_H_INCLUDED

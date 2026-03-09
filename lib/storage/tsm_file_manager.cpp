@@ -26,7 +26,7 @@ std::string TSMFileManager::basePath(){
 }
 
 seastar::future<> TSMFileManager::init(){
-  tsdb::tsm_log.info("TSMFileManager init. shardId={}", shardId);
+  timestar::tsm_log.info("TSMFileManager init. shardId={}", shardId);
   
   // Initialize compactor
   compactor = std::make_unique<TSMCompactor>(this);
@@ -40,6 +40,18 @@ seastar::future<> TSMFileManager::init(){
       for (const auto &entry : fs::directory_iterator(base)) {
         if (endsWith(entry.path(), ".tsm")) {
           paths.push_back(fs::canonical(fs::absolute(entry.path())).string());
+        } else if (endsWith(entry.path(), ".tmp")) {
+          // Orphaned .tmp files from a previous crash (compaction wrote the
+          // file but died before rename to .tsm). Safe to remove.
+          std::error_code ec;
+          fs::remove(entry.path(), ec);
+          if (ec) {
+            timestar::tsm_log.warn("Failed to remove orphaned tmp file {}: {}",
+                                   entry.path().string(), ec.message());
+          } else {
+            timestar::tsm_log.info("Cleaned up orphaned tmp file: {}",
+                                   entry.path().string());
+          }
         }
       }
     }
@@ -53,7 +65,7 @@ seastar::future<> TSMFileManager::init(){
 }
 
 seastar::future<> TSMFileManager::openTsmFile(std::string path){
-  tsdb::tsm_log.debug("Opening TSM file: {}", path);
+  timestar::tsm_log.debug("Opening TSM file: {}", path);
 
   try {
     seastar::shared_ptr<TSM> tsmFile = seastar::make_shared<TSM>(path);
@@ -71,7 +83,7 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path){
 
     auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, tsmFile});
     if (!inserted) {
-      tsdb::tsm_log.warn("Duplicate sequence number {} for TSM file: {}, existing file takes precedence",
+      timestar::tsm_log.warn("Duplicate sequence number {} for TSM file: {}, existing file takes precedence",
                           tsmSeqNum, path);
     }
 
@@ -79,7 +91,7 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path){
       nextSequenceId = tsmFile->seqNum + 1;
     }
   } catch(const std::runtime_error& e) {
-    tsdb::tsm_log.error("Failed to open TSM file {}: {}", path, e.what());
+    timestar::tsm_log.error("Failed to open TSM file {}: {}", path, e.what());
     co_return;
   }
 }
@@ -152,7 +164,7 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
   uint64_t tsmSeqNum = file->rankAsInteger();
   auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, file});
   if (!inserted) {
-    tsdb::tsm_log.warn("Duplicate sequence number {} when adding TSM file, existing file takes precedence",
+    timestar::tsm_log.warn("Duplicate sequence number {} when adding TSM file, existing file takes precedence",
                         tsmSeqNum);
   }
 
@@ -191,7 +203,7 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
   // Check each tier for compaction needs
   for(uint64_t tier = 0; tier < MAX_TIERS - 1; tier++) {
     if(shouldCompactTier(tier)) {
-      tsdb::compactor_log.info("Tier {} needs compaction ({} files)", 
+      timestar::compactor_log.info("Tier {} needs compaction ({} files)", 
                                 tier, getFileCountInTier(tier));
       
       // Plan and execute compaction
@@ -199,11 +211,11 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
       if(plan.isValid()) {
         try {
           auto stats = co_await compactor->executeCompaction(plan);
-          tsdb::compactor_log.info("Compacted {} files from tier {} to tier {} in {}ms",
+          timestar::compactor_log.info("Compacted {} files from tier {} to tier {} in {}ms",
                                     stats.filesCompacted, tier, plan.targetTier,
                                     stats.duration.count());
         } catch (const std::exception& e) {
-          tsdb::compactor_log.error(
+          timestar::compactor_log.error(
               "Compaction failed for tier {}: {}. Will retry later.",
               tier, e.what());
         }

@@ -4,7 +4,7 @@
 #include "anomaly_detector.hpp"
 #include "simd_anomaly.hpp"
 
-namespace tsdb {
+namespace timestar {
 namespace anomaly {
 
 // Basic anomaly detection using rolling window statistics
@@ -50,6 +50,6 @@ private:
 };
 
 } // namespace anomaly
-} // namespace tsdb
+} // namespace timestar
 
 #endif // BASIC_DETECTOR_H_INCLUDED

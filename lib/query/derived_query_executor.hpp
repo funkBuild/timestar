@@ -25,7 +25,7 @@ class Engine;
 class LevelDBIndex;
 class DerivedQueryMultiSeriesTest;
 
-namespace tsdb {
+namespace timestar {
 
 // Configuration for derived query execution
 struct DerivedQueryConfig {
@@ -99,6 +99,7 @@ private:
     seastar::sharded<Engine>* engine_;
     seastar::sharded<LevelDBIndex>* index_;
     DerivedQueryConfig config_;
+    const ExpressionNode* cachedAst_ = nullptr; // Avoids re-parsing in executeWithAnomaly→execute
 
     // Execute a single sub-query
     seastar::future<SubQueryResult> executeSubQuery(
@@ -216,6 +217,6 @@ struct GlazeForecastResponse {
     } error;
 };
 
-} // namespace tsdb
+} // namespace timestar
 
 #endif // DERIVED_QUERY_EXECUTOR_H_INCLUDED

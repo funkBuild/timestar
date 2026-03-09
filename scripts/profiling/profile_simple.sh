@@ -7,18 +7,18 @@ DURATION=${1:-30}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 
-echo "=== Simple TSDB CPU Profiling ==="
+echo "=== Simple TimeStar CPU Profiling ==="
 echo "Duration: ${DURATION} seconds"
 echo ""
 
 # Check for existing server
-pkill -f tsdb_http_server 2>/dev/null
+pkill -f timestar_http_server 2>/dev/null
 sleep 1
 
 # Start server
-echo "Starting TSDB server..."
+echo "Starting TimeStar server..."
 cd ${BUILD_DIR}
-./bin/tsdb_http_server --port 8086 &
+./bin/timestar_http_server --port 8086 &
 SERVER_PID=$!
 sleep 2
 
@@ -92,10 +92,10 @@ echo "Generating flame graph..."
 sudo perf script > out.perf
 ${SCRIPT_DIR}/FlameGraph/stackcollapse-perf.pl out.perf > out.folded
 ${SCRIPT_DIR}/FlameGraph/flamegraph.pl \
-    --title "TSDB Insert CPU Profile (${DURATION}s)" \
+    --title "TimeStar Insert CPU Profile (${DURATION}s)" \
     --colors hot \
     --width 1800 \
-    out.folded > tsdb_cpu_profile.svg
+    out.folded > timestar_cpu_profile.svg
 
 # Cleanup
 sudo rm -f perf.data perf.data.old
@@ -103,9 +103,9 @@ rm -f out.perf out.folded
 
 echo ""
 echo "=== Complete ==="
-echo "Flame graph saved as: tsdb_cpu_profile.svg"
+echo "Flame graph saved as: timestar_cpu_profile.svg"
 echo ""
-echo "View with: firefox tsdb_cpu_profile.svg"
+echo "View with: firefox timestar_cpu_profile.svg"
 echo ""
 
 # Show quick summary

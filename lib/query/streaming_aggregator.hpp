@@ -9,13 +9,15 @@
 #include <vector>
 #include <cmath>
 
-namespace tsdb {
+namespace timestar {
 
 // Running aggregation state for a single time bucket of a single series+field.
 struct BucketState {
     double sum = 0.0;
     double min = std::numeric_limits<double>::max();
     double max = std::numeric_limits<double>::lowest();
+    double first = 0.0;
+    uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max();
     double latest = 0.0;
     uint64_t latestTimestamp = 0;
     uint64_t count = 0;
@@ -26,6 +28,10 @@ struct BucketState {
         sum += val;
         if (val < min) min = val;
         if (val > max) max = val;
+        if (ts < firstTimestamp) {
+            first = val;
+            firstTimestamp = ts;
+        }
         if (ts >= latestTimestamp) {
             latest = val;
             latestTimestamp = ts;
@@ -46,7 +52,16 @@ struct BucketState {
             case AggregationMethod::MIN: return min;
             case AggregationMethod::MAX: return max;
             case AggregationMethod::LATEST: return latest;
-            default: return sum / static_cast<double>(count);
+            case AggregationMethod::FIRST: return first;
+            case AggregationMethod::COUNT: return static_cast<double>(count);
+            case AggregationMethod::SPREAD: return max - min;
+            case AggregationMethod::MEDIAN:
+            case AggregationMethod::STDDEV:
+            case AggregationMethod::STDVAR:
+                // MEDIAN/STDDEV/STDVAR require rawValues which BucketState doesn't track.
+                // Return NaN to signal unsupported rather than silently returning AVG.
+                return std::numeric_limits<double>::quiet_NaN();
+            default: return sum / static_cast<double>(count); // fallback to AVG
         }
     }
 };
@@ -74,7 +89,7 @@ struct SeriesFieldKey {
 class StreamingAggregator {
 public:
     StreamingAggregator(uint64_t intervalNs, AggregationMethod method)
-        : _intervalNs(intervalNs), _method(method) {}
+        : _intervalNs(intervalNs == 0 ? 1 : intervalNs), _method(method) {}
 
     // Add a data point to the appropriate time bucket.
     void addPoint(const StreamingDataPoint& pt);
@@ -101,4 +116,4 @@ private:
     }
 };
 
-} // namespace tsdb
+} // namespace timestar

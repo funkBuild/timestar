@@ -3,7 +3,7 @@
 #include <map>
 #include <string>
 
-using namespace tsdb;
+using namespace timestar;
 
 class SeriesMatcherTest : public ::testing::Test {
 protected:
@@ -365,4 +365,38 @@ TEST_F(SeriesMatcherTest, SeriesMatchingWithTildeRegex) {
         {"host", "~client-[0-9]+"}
     };
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes2));
+}
+
+// Test ReDoS protection: nested quantifiers are rejected
+TEST_F(SeriesMatcherTest, ReDoSNestedQuantifiersRejected) {
+    // (a+)+ -- classic ReDoS pattern
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a+)+"),
+                 std::invalid_argument);
+    // (a+)* -- variant
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a+)*"),
+                 std::invalid_argument);
+    // (a*)+
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a*)+"),
+                 std::invalid_argument);
+    // Nested group with quantifier followed by quantifier
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "((a+)b+)+"),
+                 std::invalid_argument);
+}
+
+// Test ReDoS protection: overly long patterns are rejected
+TEST_F(SeriesMatcherTest, ReDoSLongPatternRejected) {
+    std::string longPattern(600, 'a');
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", longPattern),
+                 std::invalid_argument);
+}
+
+// Test that legitimate patterns still work
+TEST_F(SeriesMatcherTest, LegitimateRegexStillWorks) {
+    // Simple quantifiers (not nested) should work fine
+    EXPECT_TRUE(SeriesMatcher::matchesRegex("server-01", "server-[0-9]+"));
+    EXPECT_TRUE(SeriesMatcher::matchesRegex("aaa", "a+"));
+    EXPECT_TRUE(SeriesMatcher::matchesRegex("abc", "(abc)"));
+    EXPECT_FALSE(SeriesMatcher::matchesRegex("def", "(abc)"));
+    // Non-capturing groups with quantifier (no inner quantifier)
+    EXPECT_TRUE(SeriesMatcher::matchesRegex("abcabc", "(abc)+"));
 }

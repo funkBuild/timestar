@@ -8,10 +8,11 @@
 #include <map>
 #include <variant>
 #include <stdexcept>
+#include <cassert>
 #include <cstdint>
 #include <seastar/core/future.hh>
 
-namespace tsdb::functions {
+namespace timestar::functions {
 
 // Parameter value types for function context
 using ParameterValue = std::variant<int64_t, double, std::string, bool>;
@@ -44,20 +45,24 @@ public:
 
     // Default constructor for member variable initialization
     TimeSeriesView() : timestamps(nullptr), values(nullptr), startIndex(0), count(0) {}
-    
-    TimeSeriesView(const std::vector<uint64_t>* ts, const std::vector<T>* vals, 
+
+    TimeSeriesView(const std::vector<uint64_t>* ts, const std::vector<T>* vals,
                    size_t start = 0, size_t cnt = 0)
-        : timestamps(ts), values(vals), startIndex(start), 
-          count(cnt == 0 ? (vals ? vals->size() - start : 0) : cnt) {}
+        : timestamps(ts), values(vals), startIndex(start),
+          count((!ts || !vals) ? 0
+                : (cnt == 0 ? (start <= vals->size() ? vals->size() - start : 0)
+                             : std::min(cnt, start <= vals->size() ? vals->size() - start : 0))) {}
 
     size_t size() const { return count; }
-    bool empty() const { return count == 0; }
-    
+    bool empty() const { return count == 0 || !timestamps || !values; }
+
     uint64_t timestampAt(size_t index) const {
+        assert(timestamps && index < count);
         return (*timestamps)[startIndex + index];
     }
-    
+
     T valueAt(size_t index) const {
+        assert(values && index < count);
         return (*values)[startIndex + index];
     }
 
@@ -274,7 +279,10 @@ public:
 
     size_t size() const { return data_.size(); }
     bool empty() const { return data_.empty(); }
-    bool isSimdAligned() const { return true; } // Simplified for now
+    bool isSimdAligned() const {
+        return !data_.empty() &&
+               (reinterpret_cast<uintptr_t>(data_.data()) % 32) == 0;
+    }
 
     double& operator[](size_t index) { return data_[index]; }
     const double& operator[](size_t index) const { return data_[index]; }
@@ -325,24 +333,34 @@ public:
             throw std::invalid_argument("Series size mismatch");
         }
         for (size_t i = 0; i < data_.size(); ++i) {
-            data_[i] /= other.data_[i];
+            if (other.data_[i] == 0.0) {
+                data_[i] = std::numeric_limits<double>::quiet_NaN();
+            } else {
+                data_[i] /= other.data_[i];
+            }
         }
         return *this;
     }
 
-    // Aggregation operations
+    // Aggregation operations (Kahan compensated summation for precision)
     double sum() const {
         double result = 0.0;
-        for (const auto& val : data_) result += val;
+        double compensation = 0.0;
+        for (const auto& val : data_) {
+            double y = val - compensation;
+            double t = result + y;
+            compensation = (t - result) - y;
+            result = t;
+        }
         return result;
     }
 
     double average() const {
-        return empty() ? 0.0 : sum() / data_.size();
+        return empty() ? std::numeric_limits<double>::quiet_NaN() : sum() / data_.size();
     }
 
     double minimum() const {
-        if (empty()) return 0.0;
+        if (empty()) return std::numeric_limits<double>::quiet_NaN();
         double result = data_[0];
         for (const auto& val : data_) {
             if (val < result) result = val;
@@ -351,7 +369,7 @@ public:
     }
 
     double maximum() const {
-        if (empty()) return 0.0;
+        if (empty()) return std::numeric_limits<double>::quiet_NaN();
         double result = data_[0];
         for (const auto& val : data_) {
             if (val > result) result = val;
@@ -482,7 +500,8 @@ public:
                 if (t1 == t2) {
                     result.values.push_back(v1);
                 } else {
-                    double ratio = static_cast<double>(targetTime - t1) / static_cast<double>(t2 - t1);
+                    double ratio = (static_cast<double>(targetTime) - static_cast<double>(t1))
+                                 / (static_cast<double>(t2) - static_cast<double>(t1));
                     double interpolated = v1 + ratio * (v2 - v1);
                     result.values.push_back(interpolated);
                 }
@@ -493,6 +512,6 @@ public:
     }
 };
 
-} // namespace tsdb::functions
+} // namespace timestar::functions
 
 #endif // FUNCTION_TYPES_H_INCLUDED

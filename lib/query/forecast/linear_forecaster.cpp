@@ -1,26 +1,17 @@
 #include "linear_forecaster.hpp"
 #include "../anomaly/simd_anomaly.hpp"
-#include <cmath>
+#include "../simd_helpers.hpp"
 #include <algorithm>
+#include <cmath>
 #include <numeric>
+#include <stdexcept>
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
-#include <immintrin.h>
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
+using timestar::simd::hsum_avx;
+static inline double hsum_avx_local(__m256d v) { return hsum_avx(v); }
 #endif
 
-// Local hsum helper (same as stl_decomposition.cpp and seasonal_forecaster.cpp;
-// the one in simd_anomaly.cpp is file-static so we need our own copy).
-#if !TSDB_ANOMALY_DISABLE_SIMD
-static inline double hsum_avx_local(__m256d v) {
-    __m128d vlow  = _mm256_castpd256_pd128(v);
-    __m128d vhigh = _mm256_extractf128_pd(v, 1);
-    vlow = _mm_add_pd(vlow, vhigh);
-    __m128d high64 = _mm_unpackhi_pd(vlow, vlow);
-    return _mm_cvtsd_f64(_mm_add_sd(vlow, high64));
-}
-#endif
-
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
@@ -30,6 +21,13 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
 ) {
     LinearFit fit{};
     size_t n = x.size();
+
+    if (y.size() != n || weights.size() != n) {
+        throw std::invalid_argument(
+            "fitLinearRegression: x, y, and weights must have the same size (got " +
+            std::to_string(n) + ", " + std::to_string(y.size()) + ", " +
+            std::to_string(weights.size()) + ")");
+    }
 
     if (n < 2) {
         fit.slope = 0.0;
@@ -55,7 +53,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
     double weightedSumX = 0.0;
     double weightedSumY = 0.0;
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
         // AVX2 path: 4 accumulators per reduction to hide FMA latency
         __m256d accW0  = _mm256_setzero_pd();
@@ -107,9 +105,9 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
         weightedSumX = hsum_avx_local(accWX0);
         weightedSumY = hsum_avx_local(accWY0);
 
-        // Scalar remainder
+        // Scalar remainder (skip NaN values)
         for (size_t i = simd_end; i < n; ++i) {
-            double w = pw[i];
+            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
             sumWeights   += w;
             weightedSumX += w * px[i];
             weightedSumY += w * py[i];
@@ -117,13 +115,24 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
     } else
 #endif
     {
-        // Scalar fallback
+        // Scalar fallback (skip NaN values by zeroing their weight)
         for (size_t i = 0; i < n; ++i) {
-            double w = pw[i];
+            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
             sumWeights   += w;
             weightedSumX += w * px[i];
             weightedSumY += w * py[i];
         }
+    }
+
+    if (sumWeights <= 0.0) {
+        // All data points are NaN or zero-weighted — no valid regression
+        fit.slope = 0.0;
+        fit.intercept = 0.0;
+        fit.rSquared = 0.0;
+        fit.residualStdDev = 0.0;
+        fit.sumSquaredX = 0.0;
+        fit.meanX = 0.0;
+        return fit;
     }
 
     fit.meanX = weightedSumX / sumWeights;
@@ -139,7 +148,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
     double sumXX = 0.0;
     double sumYY = 0.0;
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
         __m256d vMeanX = _mm256_set1_pd(fit.meanX);
         __m256d vMeanY = _mm256_set1_pd(meanY);
@@ -205,9 +214,9 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
         sumXY = hsum_avx_local(accXY0);
         sumYY = hsum_avx_local(accYY0);
 
-        // Scalar remainder
+        // Scalar remainder (skip NaN values)
         for (size_t i = simd_end; i < n; ++i) {
-            double w  = pw[i];
+            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
             double dx = px[i] - fit.meanX;
             double dy = py[i] - meanY;
             sumXX += w * dx * dx;
@@ -217,9 +226,9 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
     } else
 #endif
     {
-        // Scalar fallback
+        // Scalar fallback (skip NaN values)
         for (size_t i = 0; i < n; ++i) {
-            double w  = pw[i];
+            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
             double dx = px[i] - fit.meanX;
             double dy = py[i] - meanY;
             sumXY += w * dx * dy;
@@ -255,7 +264,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
     // ======================================================================
     double sse = 0.0;
 
-#if !TSDB_ANOMALY_DISABLE_SIMD
+#if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
         __m256d vSlope     = _mm256_set1_pd(fit.slope);
         __m256d vIntercept = _mm256_set1_pd(fit.intercept);
@@ -370,6 +379,7 @@ ForecastOutput LinearForecaster::forecast(
     std::vector<double> weights(n, 1.0);  // Default: uniform weights
 
     // Apply model-specific weighting and data selection
+    const size_t originalN = n;  // Save original input size before SIMPLE model halves n
     size_t startIdx = 0;
     switch (config.linearModel) {
         case LinearModelType::DEFAULT:
@@ -421,10 +431,10 @@ ForecastOutput LinearForecaster::forecast(
     output.upper.resize(nForecast);
     output.lower.resize(nForecast);
 
-    // Calculate time interval from historical data
+    // Calculate time interval from historical data (use full input range)
     uint64_t interval = 0;
-    if (n >= 2) {
-        interval = (input.timestamps[n - 1] - input.timestamps[0]) / (n - 1);
+    if (originalN >= 2) {
+        interval = (input.timestamps[originalN - 1] - input.timestamps[0]) / (originalN - 1);
     }
 
     for (size_t i = 0; i < nForecast; ++i) {
@@ -453,4 +463,4 @@ ForecastOutput LinearForecaster::forecast(
 }
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar

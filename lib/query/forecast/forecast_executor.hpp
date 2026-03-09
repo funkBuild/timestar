@@ -7,7 +7,7 @@
 #include "periodicity_detector.hpp"
 #include <chrono>
 
-namespace tsdb {
+namespace timestar {
 namespace forecast {
 
 /**
@@ -94,6 +94,6 @@ private:
 };
 
 } // namespace forecast
-} // namespace tsdb
+} // namespace timestar
 
 #endif // FORECAST_EXECUTOR_H_INCLUDED

@@ -8,7 +8,7 @@
 #include <cmath>
 #include <algorithm>
 
-namespace tsdb {
+namespace timestar {
 
 // A named group from a multi-group query result (e.g. avg:cpu{} by {host}).
 // Each group has a set of tags that identify it and the aligned series data.
@@ -371,4 +371,4 @@ inline GroupedSeries percentile_of_series(double p,
     return result;
 }
 
-} // namespace tsdb
+} // namespace timestar

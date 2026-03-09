@@ -7,7 +7,7 @@
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/tsm_result.hpp"
 #include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/tsdb_value.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
 
 #include "../../seastar_gtest.hpp"
@@ -384,7 +384,7 @@ TEST_F(TSMStringTest, MemoryStoreWithStrings) {
     // Test that memory store can handle string inserts
     auto store = std::make_shared<MemoryStore>(1);
 
-    TSDBInsert<std::string> insert("events", "description");
+    TimeStarInsert<std::string> insert("events", "description");
     insert.addValue(1000, "System started");
     insert.addValue(2000, "User logged in");
     insert.addValue(3000, "File uploaded");

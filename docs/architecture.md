@@ -2,7 +2,7 @@
 
 ## Overview
 
-TSDB is a time series database built on C++23 and the Seastar framework. It uses a shard-per-core architecture where each CPU core independently manages its own storage, providing lock-free operation and linear scalability.
+TimeStar is a time series database built on C++23 and the Seastar framework. It uses a shard-per-core architecture where each CPU core independently manages its own storage, providing lock-free operation and linear scalability.
 
 ## Data Flow
 
@@ -141,6 +141,6 @@ TOML-based configuration file with sections:
 | `[streaming]` | Subscription limits, queue size, heartbeat interval |
 | `[seastar]` | SMP count, memory, reactor backend, poll mode |
 
-Generate a default config: `./tsdb_http_server --dump-config`
+Generate a default config: `./timestar_http_server --dump-config`
 
-Load a config: `./tsdb_http_server --config /path/to/config.toml`
+Load a config: `./timestar_http_server --config /path/to/config.toml`

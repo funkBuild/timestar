@@ -5,7 +5,7 @@
 #include <random>
 #include <iomanip>
 
-using namespace tsdb;
+using namespace timestar;
 using namespace std::chrono;
 
 // Configuration matching the benchmark.js scenario
@@ -78,7 +78,7 @@ BenchmarkResult benchmarkNoGroupNoInterval() {
 
     // Benchmark aggregation
     auto start = high_resolution_clock::now();
-    auto result = tsdb::test::AggregatorTestHelper::aggregateMultiple(series, AggregationMethod::AVG, 0);
+    auto result = timestar::test::AggregatorTestHelper::aggregateMultiple(series, AggregationMethod::AVG, 0);
     auto end = high_resolution_clock::now();
 
     double durationMs = duration<double, std::milli>(end - start).count();
@@ -116,7 +116,7 @@ BenchmarkResult benchmarkWithTimeInterval() {
 
     // Benchmark aggregation with 1-hour intervals
     auto start = high_resolution_clock::now();
-    auto result = tsdb::test::AggregatorTestHelper::aggregateMultiple(series, AggregationMethod::AVG, HOUR_IN_NS);
+    auto result = timestar::test::AggregatorTestHelper::aggregateMultiple(series, AggregationMethod::AVG, HOUR_IN_NS);
     auto end = high_resolution_clock::now();
 
     double durationMs = duration<double, std::milli>(end - start).count();
@@ -146,7 +146,7 @@ BenchmarkResult benchmarkSingleSeries() {
 
     // Benchmark single series aggregation
     auto start = high_resolution_clock::now();
-    auto result = tsdb::test::AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, HOUR_IN_NS);
+    auto result = timestar::test::AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, HOUR_IN_NS);
     auto end = high_resolution_clock::now();
 
     double durationMs = duration<double, std::milli>(end - start).count();
@@ -188,7 +188,7 @@ BenchmarkResult benchmarkWorstCase() {
 
     // Benchmark aggregation
     auto start = high_resolution_clock::now();
-    auto result = tsdb::test::AggregatorTestHelper::aggregateMultiple(series, AggregationMethod::AVG, HOUR_IN_NS);
+    auto result = timestar::test::AggregatorTestHelper::aggregateMultiple(series, AggregationMethod::AVG, HOUR_IN_NS);
     auto end = high_resolution_clock::now();
 
     double durationMs = duration<double, std::milli>(end - start).count();
@@ -207,7 +207,7 @@ BenchmarkResult benchmarkWorstCase() {
 
 int main() {
     std::cout << "\n" << std::string(70, '=') << "\n";
-    std::cout << "TSDB Aggregator Performance Benchmark\n";
+    std::cout << "TimeStar Aggregator Performance Benchmark\n";
     std::cout << std::string(70, '=') << "\n";
     std::cout << "\nConfiguration:\n";
     std::cout << "  - Data points per series: " << MINUTES_PER_YEAR << " (1 year at 1-minute intervals)\n";

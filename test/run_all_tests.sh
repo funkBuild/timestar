@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Comprehensive test runner for TSDB project
+# Comprehensive test runner for TimeStar project
 # Runs all tests including Seastar-based tests (individually to avoid segfaults)
 
-echo "🔧 TSDB Complete Test Suite"
+echo "🔧 TimeStar Complete Test Suite"
 echo "============================"
 echo
 
@@ -17,7 +17,7 @@ cd "$SCRIPT_DIR/build"
 
 # Run all non-Seastar tests together
 echo "📊 Running non-Seastar tests..."
-./test/tsdb_test --gtest_filter="-TSMCompactorTest.*:TSMStringTest.*" 2>&1 | tee /tmp/test_output.txt | grep -E "^\[==========\]|^\[  PASSED  \]|^\[  FAILED  \]"
+./test/timestar_test --gtest_filter="-TSMCompactorTest.*:TSMStringTest.*" 2>&1 | tee /tmp/test_output.txt | grep -E "^\[==========\]|^\[  PASSED  \]|^\[  FAILED  \]"
 
 if grep -q "\[  PASSED  \]" /tmp/test_output.txt; then
     PASSED=$(grep "\[  PASSED  \]" /tmp/test_output.txt | grep -oE "[0-9]+" | head -1)
@@ -50,7 +50,7 @@ declare -a COMPACTOR_TESTS=(
 COMPACTOR_PASSED=0
 for test in "${COMPACTOR_TESTS[@]}"; do
     echo -n "  🧪 Testing $test... "
-    timeout 5 ./test/tsdb_test --gtest_filter="TSMCompactorTest.$test" >/dev/null 2>&1
+    timeout 5 ./test/timestar_test --gtest_filter="TSMCompactorTest.$test" >/dev/null 2>&1
     if [ $? -eq 0 ]; then
         echo "✅ PASSED"
         ((COMPACTOR_PASSED++))
@@ -79,7 +79,7 @@ declare -a STRING_TESTS=(
 STRING_PASSED=0
 for test in "${STRING_TESTS[@]}"; do
     echo -n "  🧪 Testing $test... "
-    timeout 5 ./test/tsdb_test --gtest_filter="TSMStringTest.$test" >/dev/null 2>&1
+    timeout 5 ./test/timestar_test --gtest_filter="TSMStringTest.$test" >/dev/null 2>&1
     if [ $? -eq 0 ]; then
         echo "✅ PASSED"
         ((STRING_PASSED++))

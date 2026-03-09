@@ -63,6 +63,7 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
     uint64_t last_value = encoded.readFixed<uint64_t, 64>();
     uint64_t tzb = 0;
     uint64_t data_bits = 0;
+    bool bounds_initialized = false;
     size_t count = 0;
 
     // Save original nToSkip for totalLength calculation
@@ -102,10 +103,14 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
                     tzb = 64 - lzb - data_bits;
                 }
 
+                bounds_initialized = true;
                 const uint64_t decoded_value = encoded.read<uint64_t>(data_bits) << tzb;
                 last_value ^= decoded_value;
             } else {
                 // 0b01 prefix - reuse bounds
+                if (!bounds_initialized) [[unlikely]] {
+                    throw std::runtime_error("Corrupt float block: reuse-bounds before any bounds established");
+                }
                 const uint64_t decoded_value = encoded.read<uint64_t>(data_bits) << tzb;
                 last_value ^= decoded_value;
             }
@@ -139,9 +144,13 @@ void FloatDecoderAVX512::decode(CompressedSlice &encoded, size_t nToSkip, size_t
                     tzb = 64 - lzb - data_bits;
                 }
 
+                bounds_initialized = true;
                 const uint64_t decoded_value = encoded.read<uint64_t>(data_bits) << tzb;
                 last_value ^= decoded_value;
             } else {
+                if (!bounds_initialized) [[unlikely]] {
+                    throw std::runtime_error("Corrupt float block: reuse-bounds before any bounds established");
+                }
                 const uint64_t decoded_value = encoded.read<uint64_t>(data_bits) << tzb;
                 last_value ^= decoded_value;
             }
