@@ -17,13 +17,13 @@ cmake ..
 make -j$(nproc)
 
 # Run tests (from build directory)
-./test/timestar_test
+./test/timestar_unit_test
 
 # Run a specific test
-./test/timestar_test --gtest_filter=TestName*
+./test/timestar_unit_test --gtest_filter=TestName*
 
 # Run string tests safely (avoids seastar segfaults)
-./run_string_tests.sh
+../test/run_string_tests.sh
 ```
 
 ## Running Tests
@@ -34,18 +34,18 @@ The project includes comprehensive C++ unit tests using Google Test:
 
 ```bash
 # From the build directory, run all tests
-./test/timestar_test
+./test/timestar_unit_test
 
 # Run specific test suites
-./test/timestar_test --gtest_filter=MemoryStoreTest*
-./test/timestar_test --gtest_filter=TSMTest*
-./test/timestar_test --gtest_filter=QueryParserTest*
+./test/timestar_unit_test --gtest_filter=MemoryStoreTest*
+./test/timestar_unit_test --gtest_filter=TSMTest*
+./test/timestar_unit_test --gtest_filter=QueryParserTest*
 
 # List all available tests
-./test/timestar_test --gtest_list_tests
+./test/timestar_unit_test --gtest_list_tests
 
 # Run with verbose output
-./test/timestar_test --gtest_print_time=1
+./test/timestar_unit_test --gtest_print_time=1
 ```
 
 Test coverage includes:
@@ -61,8 +61,8 @@ Test coverage includes:
 The `test_api/` directory contains JavaScript-based API integration tests:
 
 ```bash
-# Start the TimeStar server first
-./bin/timestar_http_server --port 8086
+# Start the TimeStar server first (from build directory)
+./build/bin/timestar_http_server --port 8086
 
 # In another terminal, navigate to test_api directory
 cd test_api/
@@ -95,18 +95,20 @@ Test files include:
 ### Expected Test Results
 
 When all tests pass, you should see:
-- **C++ Tests**: 207 tests from 21 test suites, all passing
+- **C++ Tests**: ~2740 tests across 150+ test suites, all passing
 - **Jest Tests**: 46 tests from 3 test suites, all passing
 - **Standalone Tests**: 8 tests, all passing
 
-```
-
 ## Key Executables
 
-- `build/bin/timestar` - Main TimeStar binary
-- `build/bin/timestar_server` - TimeStar server implementation  
 - `build/bin/timestar_http_server` - HTTP API server with JSON write endpoint
-- `build/test/timestar_test` - Unit tests using Google Test
+- `build/bin/timestar_benchmark` - General benchmark tool
+- `build/bin/timestar_insert_bench` - Insert throughput benchmark
+- `build/bin/timestar_query_bench` - Query throughput benchmark
+- `build/bin/expression_benchmark` - Expression evaluation benchmark
+- `build/bin/forecast_benchmark` - Forecasting benchmark
+- `build/test/timestar_unit_test` - Unit tests using Google Test
+- `build/test/timestar_test` - Full test suite (unit + integration)
 
 ## Architecture
 
@@ -114,36 +116,36 @@ When all tests pass, you should see:
 
 The codebase is organized around these key abstractions:
 
-1. **Engine** (`lib/engine.hpp/cpp`) - Main orchestrator that coordinates TSM files and WAL operations across shards
+1. **Engine** (`lib/core/engine.hpp/cpp`) - Main orchestrator that coordinates TSM files and WAL operations across shards
    - Manages TSMFileManager and WALFileManager
    - Handles inserts, queries, and memory store rollovers
    - Implements sharding with per-shard data directories
 
-2. **TSM Files** (`lib/tsm.hpp/cpp`) - Time-Structured Merge tree storage format
+2. **TSM Files** (`lib/storage/tsm.hpp/cpp`) - Time-Structured Merge tree storage format
    - Immutable files containing compressed time series data
    - Indexed by series ID with min/max time bounds
    - Supports Float, Boolean, and String value types
    - Files ranked by tier number and sequence number for compaction
    - String values compressed using Snappy compression with variable-length prefixes
 
-3. **WAL** (`lib/wal.hpp/cpp`) - Write-Ahead Log for durability
+3. **WAL** (`lib/storage/wal.hpp/cpp`) - Write-Ahead Log for durability
    - Ensures data persistence before acknowledgment
    - Used to recover in-memory stores on restart
    - Supports write, delete, and delete-range operations
 
-4. **Memory Store** (`lib/memory_store.hpp/cpp`) - In-memory buffer for recent writes
+4. **Memory Store** (`lib/storage/memory_store.hpp/cpp`) - In-memory buffer for recent writes
    - Holds data before flushing to TSM files
    - Provides fast reads for recent data
    - Rolled over periodically to create new TSM files
 
 5. **Encoders** - Compression algorithms for efficient storage:
    - `integer_encoder` - Integer compression using Simple8b
-   - `float_encoder` - Float compression using XOR encoding
+   - `float_encoder` - Float compression using ALP (Adaptive Lossless floating-Point)
    - `bool_encoder` - Boolean value compression
    - `string_encoder` - String compression using Snappy with variable-length prefixes
    - `tsxor_encoder` - Timestamp compression using XOR
 
-6. **Query Runner** (`lib/query_runner.hpp/cpp`) - Executes queries across TSM files and memory stores
+6. **Query Runner** (`lib/query/query_runner.hpp/cpp`) - Executes queries across TSM files and memory stores
    - Merges results from multiple sources
    - Handles time range filtering
 
@@ -172,6 +174,7 @@ The build system automatically selects the appropriate compiler:
 
 - Seastar (included as submodule in `external/seastar`)
 - Google Test (fetched automatically for tests)
+- Glaze (fetched automatically for JSON parsing)
 - Snappy compression library
 - LevelDB (install with `sudo apt install libleveldb-dev` on Ubuntu/Debian)
 - Threads library
@@ -187,7 +190,7 @@ The database creates shard directories (`shard_0`, `shard_1`, etc.) in the build
 
 The TimeStar includes full support for string time series data with the following implementation:
 
-### String Encoder (`lib/string_encoder.hpp/cpp`)
+### String Encoder (`lib/encoding/string_encoder.hpp/cpp`)
 
 - **Compression**: Uses Snappy compression for efficient string storage
 - **Encoding Format**: Variable-length prefixes followed by compressed string data
@@ -209,8 +212,7 @@ Due to Seastar's architecture limitation (single `app_template` per process), st
 
 - **StringEncoder Tests**: Unit tests for encode/decode operations (10 tests)
 - **TSM String Tests**: Integration tests with actual file I/O (7 tests)  
-- **Test Runner**: `run_string_tests.sh` script runs tests safely to avoid segfaults
-- **Documentation**: `SEASTAR_TESTING.md` explains testing constraints and solutions
+- **Test Runner**: `test/run_string_tests.sh` script runs tests safely to avoid segfaults
 
 ### Features Verified
 
@@ -227,7 +229,7 @@ Due to Seastar's architecture limitation (single `app_template` per process), st
 
 The TimeStar includes a LevelDB-based indexing system for efficient metadata queries and series discovery:
 
-### Index Architecture (`lib/leveldb_index.hpp/cpp`)
+### Index Architecture (`lib/index/leveldb_index.hpp/cpp`)
 
 - **Per-Shard Storage**: Each shard maintains its own LevelDB index in `shard_N/index/`
 - **Key Encoding**: Different index types use prefixed keys for separation:
@@ -235,6 +237,13 @@ The TimeStar includes a LevelDB-based indexing system for efficient metadata que
   - `0x02`: Measurement fields (`measurement → [field1, field2, ...]`)
   - `0x03`: Measurement tags (`measurement → [tag_key1, tag_key2, ...]`)
   - `0x04`: Tag values (`measurement+tag_key → [value1, value2, ...]`)
+  - `0x05`: Series metadata (`series_id → metadata`)
+  - `0x06`: Tag index (`measurement+tag_key+tag_value → series_ids`)
+  - `0x07`: Group-by index (`measurement+tag_key+tag_value → series_ids`)
+  - `0x08`: Field stats (`series_id+field → stats`)
+  - `0x09`: Field type (`measurement+field → field type`)
+  - `0x0A`: Measurement series (`measurement+\0+series_id → empty, for fast lookup`)
+  - `0x0B`: Retention policy (`measurement → JSON retention policy`)
 
 ### Features
 
@@ -281,7 +290,7 @@ The TimeStar includes an HTTP server with a JSON-based write API for data ingest
   - Different fields from the same measurement can be on different shards
 - **Concurrency**: Full Seastar async/await with coroutines
 
-### Write Endpoint (`lib/http_write_handler.hpp/cpp`)
+### Write Endpoint (`lib/http/http_write_handler.hpp/cpp`)
 
 **Endpoint**: `POST /write`
 
@@ -327,7 +336,14 @@ The TimeStar includes an HTTP server with a JSON-based write API for data ingest
 
 - `GET /health` - Health check endpoint
 - `POST /query` - Query endpoint for time series data retrieval
-- `GET /measurements` - List measurements (placeholder)
+- `GET /measurements` - List measurements
+- `GET /tags` - Get tag keys and values
+- `GET /fields` - Get field names and types
+- `POST /delete` - Delete data by series, pattern, or time range
+- `POST /subscribe` - SSE streaming subscriptions
+- `GET /subscriptions` - List active subscriptions
+- `PUT/GET/DELETE /retention` - Retention and downsampling policies
+- `POST /derived` - Derived queries, anomaly detection, forecasting
 
 ### Testing
 
@@ -337,10 +353,10 @@ The `test/` directory contains all C++ unit and integration tests:
 # Run all tests
 ctest
 # Or run the test binary directly
-./test/timestar_test
+./test/timestar_unit_test
 
 # Run a specific test
-./test/timestar_test --gtest_filter=TestName*
+./test/timestar_unit_test --gtest_filter=TestName*
 ```
 
 #### API Tests
@@ -394,9 +410,15 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
 1. **Aggregation Methods** (required):
    - `avg` - Average of values (default)
    - `min` - Minimum value
-   - `max` - Maximum value  
+   - `max` - Maximum value
    - `sum` - Sum of values
+   - `count` - Count of values
    - `latest` - Most recent value
+   - `first` - First value
+   - `median` - Median value
+   - `stddev` - Standard deviation
+   - `stdvar` - Standard variance
+   - `spread` - Difference between max and min
 
 2. **Measurement** (required):
    - The measurement name to query
@@ -411,9 +433,9 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
 4. **Scopes** (optional):
    - Filter conditions in `key:value` format within braces
    - Multiple scopes separated by commas (AND condition)
-   - Must use exact values (no wildcards currently)
+   - Supports exact match, wildcards (`*`, `?`), and regex (`~pattern` or `/pattern/`)
    - Empty braces `{}` for no filtering
-   - Example: `{location:us-west,sensor:temp-01}`
+   - Example: `{location:us-west,sensor:temp-01}` or `{host:server-*}` or `{host:~server-[0-9]+}`
 
 5. **Group By** (optional):
    - Tag keys for grouping results after `by` keyword
@@ -595,8 +617,6 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
 
 ### Future Query Enhancements
 
-- Wildcard and regex support in scopes
-- Time-based aggregation intervals (e.g., 5m, 1h intervals)
 - Join operations between multiple measurements
 - Continuous queries and materialized views
 - InfluxQL compatibility layer

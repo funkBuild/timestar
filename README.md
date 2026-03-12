@@ -2,7 +2,7 @@
 
 A high-performance time series database built with C++23 and the Seastar framework.
 
-[![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
+[![CI](https://github.com/funkBuild/timestar/actions/workflows/ci.yml/badge.svg)](https://github.com/funkBuild/timestar/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 ## Features
@@ -25,7 +25,7 @@ A high-performance time series database built with C++23 and the Seastar framewo
 - Time-bucketed aggregation with flexible interval syntax
 - Tag filtering with exact match, wildcards, and regex
 - Group-by on arbitrary tag keys
-- 50+ expression functions (math, transforms, rolling windows, cross-series, gap-fill, smoothing)
+- 40+ expression functions (math, transforms, rolling windows, cross-series, gap-fill, smoothing)
 - Derived queries combining multiple sub-queries with formulas
 
 **Analytics**
@@ -56,7 +56,7 @@ sudo apt install cmake g++-14 libleveldb-dev libsnappy-dev libssl-dev \
   systemtap-sdt-dev libyaml-cpp-dev libxxhash-dev ragel
 
 # Clone and build
-git clone --recursive https://github.com/yourusername/timestar.git
+git clone --recursive https://github.com/funkBuild/timestar.git
 cd timestar
 mkdir -p build && cd build
 cmake ..
@@ -164,6 +164,7 @@ timestar/
 │   │   └── transform/     SIMD-optimized transform functions
 │   ├── http/              HTTP API handlers
 │   ├── index/             LevelDB metadata index
+│   ├── functions/         Arithmetic, interpolation, smoothing functions
 │   ├── config/            TOML configuration
 │   ├── retention/         Retention policy enforcement
 │   └── utils/             Logging, signals
@@ -182,14 +183,14 @@ timestar/
 ```bash
 cd build
 
-# All tests (~2200 tests across 150+ suites)
-./test/timestar_test
+# All tests (~2740 tests across 150+ suites)
+./test/timestar_unit_test
 
 # Specific suite
-./test/timestar_test --gtest_filter="QueryParserTest.*"
+./test/timestar_unit_test --gtest_filter="QueryParserTest.*"
 
 # List all tests
-./test/timestar_test --gtest_list_tests
+./test/timestar_unit_test --gtest_list_tests
 ```
 
 ### API Integration Tests
