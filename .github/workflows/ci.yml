@@ -28,8 +28,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Initialize submodules
+        run: git submodule update --init
 
       - name: Install dependencies
         run: |
@@ -93,8 +94,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install runtime dependencies
         run: |
