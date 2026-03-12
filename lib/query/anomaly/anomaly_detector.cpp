@@ -1,7 +1,8 @@
 #include "anomaly_detector.hpp"
+
+#include "agile_detector.hpp"
 #include "basic_detector.hpp"
 #include "robust_detector.hpp"
-#include "agile_detector.hpp"
 
 namespace timestar {
 namespace anomaly {
@@ -19,5 +20,5 @@ std::unique_ptr<AnomalyDetector> createDetector(Algorithm algorithm) {
     }
 }
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar

@@ -1,6 +1,8 @@
 #include "float_encoder_simd.hpp"
-#include <bit>
+
 #include <cpuid.h>
+
+#include <bit>
 #include <cstring>
 
 bool FloatEncoderSIMD::isAvailable() {
@@ -8,7 +10,7 @@ bool FloatEncoderSIMD::isAvailable() {
         unsigned int eax, ebx, ecx, edx;
         if (__get_cpuid_max(0, nullptr) >= 7) {
             __cpuid_count(7, 0, eax, ebx, ecx, edx);
-            return (ebx & (1 << 5)) != 0; // AVX2 bit
+            return (ebx & (1 << 5)) != 0;  // AVX2 bit
         }
         return false;
     }();
@@ -19,7 +21,7 @@ CompressedBuffer FloatEncoderSIMD::encodeSafe(std::span<const double> values) {
     if (isAvailable()) {
         return encode(values);
     } else {
-        return FloatEncoderBasic::encode(values); // Fallback to regular encoder
+        return FloatEncoderBasic::encode(values);  // Fallback to regular encoder
     }
 }
 
@@ -44,7 +46,7 @@ CompressedBuffer FloatEncoderSIMD::encode(std::span<const double> values) {
     size_t i = 1;
 
     // Process in blocks of 4 for SIMD optimization
-    if (values.size() >= 5) { // Need at least 4 values after the first
+    if (values.size() >= 5) {  // Need at least 4 values after the first
         alignas(32) uint64_t xor_results[4];
         alignas(32) uint64_t current_values[4];
         alignas(32) uint64_t prev_values[4];
@@ -105,22 +107,21 @@ CompressedBuffer FloatEncoderSIMD::encode(std::span<const double> values) {
                         }
                     } else {
                         // New bounds needed
-                        if (lzb > 31) lzb = 31;
+                        if (lzb > 31)
+                            lzb = 31;
                         data_bits = 64 - lzb - tzb;
 
                         // Try to combine control block and data if they fit
                         if (data_bits + 13 <= 64) {
                             // Combine control block (13 bits) and data into single write
-                            uint64_t control_block = (0b11ULL) |
-                                                    (uint64_t(lzb) << 2) |
-                                                    (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                            uint64_t control_block =
+                                (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                             uint64_t combined = control_block | ((xor_val >> tzb) << 13);
                             buffer.write(combined, data_bits + 13);
                         } else {
                             // Write control block and data separately
-                            uint64_t control_block = (0b11ULL) |
-                                                    (uint64_t(lzb) << 2) |
-                                                    (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                            uint64_t control_block =
+                                (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                             buffer.write(control_block, 13);
                             buffer.write(xor_val >> tzb, data_bits);
                         }
@@ -157,20 +158,19 @@ CompressedBuffer FloatEncoderSIMD::encode(std::span<const double> values) {
                     buffer.write(xor_value >> prev_tzb, data_bits);
                 }
             } else {
-                if (lzb > 31) lzb = 31;
+                if (lzb > 31)
+                    lzb = 31;
                 data_bits = 64 - lzb - tzb;
 
                 // Try to combine control and data
                 if (data_bits + 13 <= 64) {
-                    uint64_t control_block = (0b11ULL) |
-                                            (uint64_t(lzb) << 2) |
-                                            (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                    uint64_t control_block =
+                        (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                     uint64_t combined = control_block | ((xor_value >> tzb) << 13);
                     buffer.write(combined, data_bits + 13);
                 } else {
-                    uint64_t control_block = (0b11ULL) |
-                                            (uint64_t(lzb) << 2) |
-                                            (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                    uint64_t control_block =
+                        (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                     buffer.write(control_block, 13);
                     buffer.write(xor_value >> tzb, data_bits);
                 }

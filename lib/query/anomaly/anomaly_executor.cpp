@@ -1,4 +1,5 @@
 #include "anomaly_executor.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -16,13 +17,9 @@ double AnomalyExecutor::computeAlertValue(const std::vector<double>& scores) {
     return maxScore;
 }
 
-void AnomalyExecutor::addSeriesPieces(
-    AnomalyQueryResult& result,
-    const std::vector<double>& rawValues,
-    const AnomalyOutput& output,
-    const std::vector<std::string>& groupTags,
-    size_t queryIndex
-) {
+void AnomalyExecutor::addSeriesPieces(AnomalyQueryResult& result, const std::vector<double>& rawValues,
+                                      const AnomalyOutput& output, const std::vector<std::string>& groupTags,
+                                      size_t queryIndex) {
     // Raw values piece
     {
         AnomalySeriesPiece piece;
@@ -75,12 +72,8 @@ void AnomalyExecutor::addSeriesPieces(
     }
 }
 
-AnomalyQueryResult AnomalyExecutor::execute(
-    const std::vector<uint64_t>& timestamps,
-    const std::vector<double>& values,
-    const std::vector<std::string>& groupTags,
-    const AnomalyConfig& config
-) {
+AnomalyQueryResult AnomalyExecutor::execute(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
+                                            const std::vector<std::string>& groupTags, const AnomalyConfig& config) {
     auto startTime = std::chrono::high_resolution_clock::now();
 
     AnomalyQueryResult result;
@@ -110,9 +103,10 @@ AnomalyQueryResult AnomalyExecutor::execute(
         // Fill statistics
         result.statistics.algorithm = algorithmToString(config.algorithm);
         result.statistics.bounds = config.bounds;
-        result.statistics.seasonality = (config.seasonality == Seasonality::NONE) ? "none" :
-            (config.seasonality == Seasonality::HOURLY) ? "hourly" :
-            (config.seasonality == Seasonality::DAILY) ? "daily" : "weekly";
+        result.statistics.seasonality = (config.seasonality == Seasonality::NONE)     ? "none"
+                                        : (config.seasonality == Seasonality::HOURLY) ? "hourly"
+                                        : (config.seasonality == Seasonality::DAILY)  ? "daily"
+                                                                                      : "weekly";
         result.statistics.anomalyCount = output.anomalyCount;
         result.statistics.totalPoints = values.size();
 
@@ -124,22 +118,17 @@ AnomalyQueryResult AnomalyExecutor::execute(
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();
-    result.statistics.executionTimeMs =
-        std::chrono::duration<double, std::milli>(endTime - startTime).count();
+    result.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
     return result;
 }
 
-AnomalyQueryResult AnomalyExecutor::executeMulti(
-    const std::vector<uint64_t>& sharedTimestamps,
-    const std::vector<std::vector<double>>& seriesValues,
-    const std::vector<std::vector<std::string>>& seriesGroupTags,
-    const AnomalyConfig& config
-) {
+AnomalyQueryResult AnomalyExecutor::executeMulti(const std::vector<uint64_t>& sharedTimestamps,
+                                                 const std::vector<std::vector<double>>& seriesValues,
+                                                 const std::vector<std::vector<std::string>>& seriesGroupTags,
+                                                 const AnomalyConfig& config) {
     if (seriesValues.size() != seriesGroupTags.size()) {
-        throw std::invalid_argument(
-            "seriesValues and seriesGroupTags must have the same size"
-        );
+        throw std::invalid_argument("seriesValues and seriesGroupTags must have the same size");
     }
 
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -170,7 +159,8 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
             const auto& values = seriesValues[i];
             const auto& groupTags = seriesGroupTags[i];
 
-            if (values.empty()) continue;
+            if (values.empty())
+                continue;
 
             input.values = values;
             input.groupTags = groupTags;
@@ -188,9 +178,10 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
         // Fill statistics
         result.statistics.algorithm = algorithmToString(config.algorithm);
         result.statistics.bounds = config.bounds;
-        result.statistics.seasonality = (config.seasonality == Seasonality::NONE) ? "none" :
-            (config.seasonality == Seasonality::HOURLY) ? "hourly" :
-            (config.seasonality == Seasonality::DAILY) ? "daily" : "weekly";
+        result.statistics.seasonality = (config.seasonality == Seasonality::NONE)     ? "none"
+                                        : (config.seasonality == Seasonality::HOURLY) ? "hourly"
+                                        : (config.seasonality == Seasonality::DAILY)  ? "daily"
+                                                                                      : "weekly";
         result.statistics.anomalyCount = totalAnomalies;
         result.statistics.totalPoints = totalPoints;
 
@@ -202,11 +193,10 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();
-    result.statistics.executionTimeMs =
-        std::chrono::duration<double, std::milli>(endTime - startTime).count();
+    result.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
     return result;
 }
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar

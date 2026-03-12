@@ -1,30 +1,31 @@
 #ifndef HTTP_WRITE_HANDLER_H_INCLUDED
 #define HTTP_WRITE_HANDLER_H_INCLUDED
 
-#include <string>
-#include <memory>
-#include <variant>
-#include <chrono>
+#include "engine.hpp"
+#include "series_id.hpp"
+#include "timestar_config.hpp"
+#include "timestar_value.hpp"
+#include "wal_file_manager.hpp"
+
 #include <glaze/glaze.hpp>
 
-#include "engine.hpp"
-#include "timestar_value.hpp"
-#include "series_id.hpp"
-#include "wal_file_manager.hpp"
-#include "timestar_config.hpp"
+#include <tsl/robin_map.h>
 
+#include <chrono>
+#include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <tsl/robin_map.h>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/json_path.hh>
+#include <string>
+#include <variant>
 
 /*
  * JSON Schema for Write Requests:
- * 
+ *
  * Single point:
  * {
  *   "measurement": "temperature",
@@ -38,7 +39,7 @@
  *   },
  *   "timestamp": 1465839830100400200  // nanoseconds since epoch
  * }
- * 
+ *
  * Multiple points (array format):
  * {
  *   "measurement": "temperature",
@@ -52,7 +53,7 @@
  *   },
  *   "timestamps": [1000000000, 1000001000, 1000002000, 1000003000]  // Array of timestamps
  * }
- * 
+ *
  * Or batch writes:
  * {
  *   "writes": [
@@ -88,14 +89,14 @@ public:
 
 private:
     seastar::sharded<Engine>* engineSharded;
-    
+
     struct WritePoint {
         std::string measurement;
         std::map<std::string, std::string> tags;
         std::map<std::string, FieldValue> fields;
         uint64_t timestamp;
     };
-    
+
     struct FieldArrays {
         std::vector<double> doubles;
         std::vector<uint8_t> bools;
@@ -103,14 +104,14 @@ private:
         std::vector<int64_t> integers;
         enum Type { DOUBLE, BOOL, STRING, INTEGER } type;
     };
-    
+
     struct MultiWritePoint {
         std::string measurement;
         std::map<std::string, std::string> tags;
         std::map<std::string, FieldArrays> fields;  // Field name -> array of values
-        std::vector<uint64_t> timestamps;  // Array of timestamps
+        std::vector<uint64_t> timestamps;           // Array of timestamps
     };
-    
+
     // Structure for coalescing multiple individual writes into array writes
     struct CoalesceCandidate {
         std::string seriesKey;  // measurement + tags + field for grouping
@@ -124,8 +125,8 @@ private:
         std::string fieldName;
         TSMValueType valueType;
         std::vector<uint64_t> timestamps;
-        uint64_t timestampHashSum = 0;   // commutative sum of all timestamps
-        uint64_t timestampHashXor = 0;   // commutative XOR of all timestamps
+        uint64_t timestampHashSum = 0;  // commutative sum of all timestamps
+        uint64_t timestampHashXor = 0;  // commutative XOR of all timestamps
 
         // Value storage by type (only one will be used based on valueType)
         std::vector<double> doubleValues;
@@ -169,7 +170,7 @@ private:
             integerValues.push_back(value);
         }
     };
-    
+
     // Structure to collect timing information across all operations
     struct AggregatedTimingInfo {
         std::chrono::microseconds totalCompressionTime = std::chrono::microseconds(0);
@@ -206,7 +207,7 @@ private:
     // defaultTimestampNs is used when the point has no explicit timestamp,
     // so the caller can capture now() once for an entire batch.
     MultiWritePoint parseMultiWritePoint(const json_value_t& point, uint64_t defaultTimestampNs);
-    
+
     // Process a single write point - determine type and insert
     seastar::future<> processWritePoint(const WritePoint& point);
 
@@ -220,26 +221,24 @@ private:
     // Process a multi-point write with arrays.
     // Returns timing info and locally-collected metadata ops.
     // Takes point by non-const ref so the last field's tags/timestamps can be moved.
-    seastar::future<WriteResult> processMultiWritePoint(
-        MultiWritePoint& point);
+    seastar::future<WriteResult> processMultiWritePoint(MultiWritePoint& point);
 
     // Build a MultiWritePoint from a FastDoubleWritePoint (fast-path, all fields are doubles).
     // Returns true on success, false on validation failure.
     static bool buildMWPFromFastPath(struct FastDoubleWritePoint& fwp, uint64_t defaultTimestampNs,
-                                      MultiWritePoint& mwp);
+                                     MultiWritePoint& mwp);
 
     // Validate that all field arrays have the same length as timestamps
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);
-    
+
     // Coalesce multiple individual writes into efficient array writes.
     // defaultTimestampNs is the pre-computed current time used for any write
     // that lacks an explicit timestamp, avoiding per-write now() calls.
-    std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array,
-                                                 uint64_t defaultTimestampNs);
-    
+    std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs);
+
     // Create error response JSON
     std::string createErrorResponse(const std::string& error);
-    
+
     // Create success response JSON
     std::string createSuccessResponse(int pointsWritten);
 
@@ -247,8 +246,7 @@ public:
     HttpWriteHandler(seastar::sharded<Engine>* _engineSharded);
 
     // Main handler for write requests
-    seastar::future<std::unique_ptr<seastar::http::reply>> handleWrite(
-        std::unique_ptr<seastar::http::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleWrite(std::unique_ptr<seastar::http::request> req);
 
     // Register routes with HTTP server
     void registerRoutes(seastar::httpd::routes& r);
@@ -265,8 +263,7 @@ public:
 
     // Validate all names in a write point (measurement, tags, fields).
     // Throws std::runtime_error if any name is invalid.
-    static void validateWritePointNames(const std::string& measurement,
-                                        const std::map<std::string, std::string>& tags,
+    static void validateWritePointNames(const std::string& measurement, const std::map<std::string, std::string>& tags,
                                         const std::map<std::string, FieldValue>& fields);
 
     // Parse and validate a single write point from JSON string (for testing without Seastar).
@@ -281,9 +278,8 @@ public:
     static uint64_t currentNanosTimestamp() {
         auto now = std::chrono::system_clock::now();
         return static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                now.time_since_epoch()).count());
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
     }
 };
 
-#endif // HTTP_WRITE_HANDLER_H_INCLUDED
+#endif  // HTTP_WRITE_HANDLER_H_INCLUDED

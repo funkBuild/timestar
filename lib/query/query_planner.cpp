@@ -1,23 +1,23 @@
 #include "query_planner.hpp"
+
 #include "series_key.hpp"
-#include <seastar/core/seastar.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/when_all.hh>
+
 #include <algorithm>
 #include <functional>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/when_all.hh>
 #include <unordered_set>
 
 namespace timestar {
 
-seastar::future<QueryPlan> QueryPlanner::createPlan(
-    const QueryRequest& request,
-    seastar::sharded<LevelDBIndex>* indexSharded) {
-    
+seastar::future<QueryPlan> QueryPlanner::createPlan(const QueryRequest& request,
+                                                    seastar::sharded<LevelDBIndex>* indexSharded) {
     QueryPlan plan;
     plan.aggregation = request.aggregation;
     plan.aggregationInterval = request.aggregationInterval;
     plan.groupByTags = request.groupByTags;
-    
+
     // Find all matching series IDs across all shards
     auto shardBuckets = co_await findMatchingSeriesIds(request, indexSharded);
 
@@ -44,21 +44,18 @@ seastar::future<QueryPlan> QueryPlanner::createPlan(
             plan.estimatedSeriesCount += seriesIds.size();
         }
     }
-    
+
     plan.requiresMerging = plan.shardQueries.size() > 1;
-    
+
     co_return plan;
 }
 
-QueryPlan QueryPlanner::createPlanSync(
-    const QueryRequest& request,
-    LevelDBIndex* index) {
-    
+QueryPlan QueryPlanner::createPlanSync(const QueryRequest& request, LevelDBIndex* index) {
     QueryPlan plan;
     plan.aggregation = request.aggregation;
     plan.aggregationInterval = request.aggregationInterval;
     plan.groupByTags = request.groupByTags;
-    
+
     // Find matching series IDs (synchronous version for testing)
     std::vector<std::vector<SeriesId128>> shardBuckets;
 
@@ -91,34 +88,29 @@ QueryPlan QueryPlanner::createPlanSync(
             plan.estimatedSeriesCount += seriesIds.size();
         }
     }
-    
+
     plan.requiresMerging = plan.shardQueries.size() > 1;
-    
+
     return plan;
 }
 
-seastar::future<std::vector<std::vector<SeriesId128>>>
-QueryPlanner::findMatchingSeriesIds(
-    const QueryRequest& request,
-    seastar::sharded<LevelDBIndex>* indexSharded) {
-
+seastar::future<std::vector<std::vector<SeriesId128>>> QueryPlanner::findMatchingSeriesIds(
+    const QueryRequest& request, seastar::sharded<LevelDBIndex>* indexSharded) {
     // Metadata is centralized on shard 0; query only shard 0 for series discovery,
     // then distribute results to the appropriate data shards by SeriesId128 hash.
-    auto allSeriesIds = co_await indexSharded->invoke_on(0,
-        [request](LevelDBIndex& index) -> seastar::future<std::vector<SeriesId128>> {
+    auto allSeriesIds = co_await indexSharded->invoke_on(
+        0, [request](LevelDBIndex& index) -> seastar::future<std::vector<SeriesId128>> {
             std::unordered_set<std::string> fieldFilter;
             if (!request.requestsAllFields()) {
                 fieldFilter.insert(request.fields.begin(), request.fields.end());
             }
 
-            auto findResult = co_await index.findSeriesWithMetadata(
-                request.measurement, request.scopes, fieldFilter);
+            auto findResult = co_await index.findSeriesWithMetadata(request.measurement, request.scopes, fieldFilter);
 
             // If limit was exceeded, throw so the caller can report the error
             if (!findResult.has_value()) {
-                throw std::runtime_error(
-                    "Query matches too many series for measurement '" +
-                    request.measurement + "'. Narrow your query with more specific tag filters.");
+                throw std::runtime_error("Query matches too many series for measurement '" + request.measurement +
+                                         "'. Narrow your query with more specific tag filters.");
             }
 
             auto& seriesWithMeta = findResult.value();
@@ -133,7 +125,8 @@ QueryPlanner::findMatchingSeriesIds(
 
     // Distribute series to their data shards by SeriesId128 hash
     unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0) shardCount = 1;  // Handle test environment
+    if (shardCount == 0)
+        shardCount = 1;  // Handle test environment
 
     std::vector<std::vector<SeriesId128>> shardBuckets(shardCount);
 
@@ -146,13 +139,11 @@ QueryPlanner::findMatchingSeriesIds(
     co_return shardBuckets;
 }
 
-std::vector<std::vector<SeriesId128>>
-QueryPlanner::findMatchingSeriesIdsSync(
-    const QueryRequest& request,
-    LevelDBIndex* index) {
-
+std::vector<std::vector<SeriesId128>> QueryPlanner::findMatchingSeriesIdsSync(const QueryRequest& request,
+                                                                              LevelDBIndex* index) {
     unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0) shardCount = 1;  // Handle test environment
+    if (shardCount == 0)
+        shardCount = 1;  // Handle test environment
 
     std::vector<std::vector<SeriesId128>> shardBuckets(shardCount);
 
@@ -172,8 +163,7 @@ QueryPlanner::findMatchingSeriesIdsSync(
         }
 
         for (const auto& field : queryFields) {
-            unsigned shardId = calculateShardForSeries(
-                request.measurement, request.scopes, field);
+            unsigned shardId = calculateShardForSeries(request.measurement, request.scopes, field);
 
             std::string mockSeriesKey = request.measurement;
             for (const auto& [tagKey, tagValue] : request.scopes) {
@@ -188,14 +178,13 @@ QueryPlanner::findMatchingSeriesIdsSync(
     return shardBuckets;
 }
 
-std::vector<std::vector<SeriesId128>> QueryPlanner::mapSeriesToShards(
-    const std::vector<SeriesId128>& seriesIds,
-    const std::string& measurement,
-    const std::map<std::string, std::string>& tags,
-    const std::vector<std::string>& fields) {
-
+std::vector<std::vector<SeriesId128>> QueryPlanner::mapSeriesToShards(const std::vector<SeriesId128>& seriesIds,
+                                                                      const std::string& measurement,
+                                                                      const std::map<std::string, std::string>& tags,
+                                                                      const std::vector<std::string>& fields) {
     unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0) shardCount = 1;  // Handle test environment
+    if (shardCount == 0)
+        shardCount = 1;  // Handle test environment
 
     std::vector<std::vector<SeriesId128>> shardBuckets(shardCount);
 
@@ -210,47 +199,44 @@ std::vector<std::vector<SeriesId128>> QueryPlanner::mapSeriesToShards(
     return shardBuckets;
 }
 
-unsigned QueryPlanner::calculateShardForSeries(
-    const std::string& measurement,
-    const std::map<std::string, std::string>& tags,
-    const std::string& field) {
-    
+unsigned QueryPlanner::calculateShardForSeries(const std::string& measurement,
+                                               const std::map<std::string, std::string>& tags,
+                                               const std::string& field) {
     // Build the series key and hash it to determine shard using SeriesId128
     std::string seriesKey = buildSeriesKeyForSharding(measurement, tags, field);
-    
+
     unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0) shardCount = 1;  // Handle test environment
-    
+    if (shardCount == 0)
+        shardCount = 1;  // Handle test environment
+
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     size_t hash = SeriesId128::Hash{}(seriesId);
     return hash % shardCount;
 }
 
-std::string QueryPlanner::buildSeriesKeyForSharding(
-    const std::string& measurement,
-    const std::map<std::string, std::string>& tags,
-    const std::string& field) {
+std::string QueryPlanner::buildSeriesKeyForSharding(const std::string& measurement,
+                                                    const std::map<std::string, std::string>& tags,
+                                                    const std::string& field) {
     return buildSeriesKey(measurement, tags, field);
 }
 
 bool QueryPlanner::requiresAllShards(const QueryRequest& request) {
     // If no specific tags are provided, we need to query all shards
     // Also if using wildcards or regex, we may need all shards
-    
+
     if (request.scopes.empty()) {
         return true;
     }
-    
+
     // Check for wildcards or regex in scopes
     for (const auto& [key, value] : request.scopes) {
-        if (value.find('*') != std::string::npos ||
-            value.find('?') != std::string::npos ||
+        if (value.find('*') != std::string::npos || value.find('?') != std::string::npos ||
             (!value.empty() && (value[0] == '/' || value[0] == '~'))) {
             return true;
         }
     }
-    
+
     return false;
 }
 
-} // namespace timestar
+}  // namespace timestar

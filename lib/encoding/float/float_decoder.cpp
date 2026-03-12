@@ -1,9 +1,10 @@
 #include "float_decoder.hpp"
+
 #include <bit>
 #include <cstring>
 #include <stdexcept>
 
-void FloatDecoderBasic::decode(CompressedSlice &values, size_t nToSkip, size_t length, std::vector<double> &out) {
+void FloatDecoderBasic::decode(CompressedSlice& values, size_t nToSkip, size_t length, std::vector<double>& out) {
     if (length == 0) [[unlikely]] {
         return;
     }

@@ -14,10 +14,7 @@ class AgileDetector : public AnomalyDetector {
 public:
     AgileDetector() = default;
 
-    AnomalyOutput detect(
-        const AnomalyInput& input,
-        const AnomalyConfig& config
-    ) override;
+    AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) override;
 
     std::string algorithmName() const override { return "agile"; }
 
@@ -25,9 +22,9 @@ public:
 
 private:
     // Prediction parameters
-    static constexpr double ALPHA = 0.3;       // Smoothing for level
-    static constexpr double BETA = 0.1;        // Smoothing for trend
-    static constexpr double GAMMA = 0.3;       // Smoothing for seasonality
+    static constexpr double ALPHA = 0.3;           // Smoothing for level
+    static constexpr double BETA = 0.1;            // Smoothing for trend
+    static constexpr double GAMMA = 0.3;           // Smoothing for seasonality
     static constexpr double RECENCY_WEIGHT = 0.6;  // Weight for recent vs historical
 
     // Holt-Winters triple exponential smoothing with seasonality
@@ -38,27 +35,16 @@ private:
     };
 
     // Initialize Holt-Winters state
-    HoltWintersState initializeState(
-        const std::vector<double>& values,
-        size_t seasonalPeriod
-    );
+    HoltWintersState initializeState(const std::vector<double>& values, size_t seasonalPeriod);
 
     // Update state and predict next value
-    double predictAndUpdate(
-        HoltWintersState& state,
-        double actualValue,
-        size_t seasonalIndex,
-        size_t seasonalPeriod
-    );
+    double predictAndUpdate(HoltWintersState& state, double actualValue, size_t seasonalIndex, size_t seasonalPeriod);
 
     // Compute prediction error statistics
-    double computeErrorStdDev(
-        const std::vector<double>& errors,
-        size_t windowSize
-    );
+    double computeErrorStdDev(const std::vector<double>& errors, size_t windowSize);
 };
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar
 
-#endif // AGILE_DETECTOR_H_INCLUDED
+#endif  // AGILE_DETECTOR_H_INCLUDED

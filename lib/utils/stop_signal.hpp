@@ -22,16 +22,15 @@
 
 #pragma once
 
-#include <seastar/core/sharded.hh>
-#include <seastar/core/reactor.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/signal.hh>
 #include <seastar/util/log.hh>
 
 /// Seastar apps lib namespace
 
 namespace seastar_apps_lib {
-
 
 /// \brief Futurized SIGINT/SIGTERM signals handler class
 ///
@@ -54,6 +53,7 @@ class stop_signal {
     bool _caught = false;
     seastar::condition_variable _cond;
     static seastar::logger log;
+
 private:
     void signaled() {
         log.debug("Signal received (SIGINT or SIGTERM)");
@@ -63,6 +63,7 @@ private:
         _caught = true;
         _cond.broadcast();
     }
+
 public:
     stop_signal() {
         seastar::handle_signal(SIGINT, [this] { signaled(); });
@@ -76,10 +77,8 @@ public:
     seastar::future<> wait() {
         return _cond.wait([this] { return _caught; });
     }
-    bool stopping() const {
-        return _caught;
-    }
+    bool stopping() const { return _caught; }
 };
 
 inline seastar::logger stop_signal::log("signal");
-}
+}  // namespace seastar_apps_lib

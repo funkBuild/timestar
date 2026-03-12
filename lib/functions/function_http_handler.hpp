@@ -1,18 +1,18 @@
 #ifndef FUNCTION_HTTP_HANDLER_H_INCLUDED
 #define FUNCTION_HTTP_HANDLER_H_INCLUDED
 
-#include <seastar/http/httpd.hh>
-#include <seastar/http/handlers.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/sharded.hh>
-#include <string>
-#include <memory>
-#include <vector>
-#include <map>
 #include <algorithm>
 #include <chrono>
-#include <unordered_map>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/http/handlers.hh>
+#include <seastar/http/httpd.hh>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 // Forward declarations
 class Engine;
@@ -37,7 +37,7 @@ struct FunctionQueryResponse {
     std::string errorCode;
     std::string originalQuery;
     std::string parsedQuery;
-    
+
     struct FunctionMetadata {
         std::vector<std::string> functionsExecuted;
         size_t totalFunctionExecutions = 0;
@@ -68,9 +68,7 @@ struct FunctionStats {
     uint64_t cacheHits{0};
     uint64_t cacheMisses{0};
 
-    double getAverageTime() const {
-        return executions > 0 ? (totalTimeNs / 1000000.0) / executions : 0.0;
-    }
+    double getAverageTime() const { return executions > 0 ? (totalTimeNs / 1000000.0) / executions : 0.0; }
 
     double getCacheHitRate() const {
         uint64_t total = cacheHits + cacheMisses;
@@ -105,10 +103,10 @@ private:
 
 public:
     explicit FunctionHttpHandler(seastar::sharded<Engine>& engine);
-    
+
     // Register routes with HTTP server
     void registerRoutes(seastar::httpd::routes& routes);
-    
+
     // Synchronous function endpoints
     std::string handleFunctionListSync();
     std::string handleFunctionInfoSync(const seastar::http::request& req);
@@ -117,19 +115,18 @@ public:
     std::string handleFunctionQuerySync(const seastar::http::request& req);
     std::string handlePerformanceStatsSync();
     std::string handleCacheStatsSync();
-    
+
     // Multi-series operation handler
-    std::string handleMultiSeriesOperation(const std::string& functionQuery, 
-                                          uint64_t startTimeVal, uint64_t endTimeVal, 
-                                          const std::chrono::high_resolution_clock::time_point& startTime);
+    std::string handleMultiSeriesOperation(const std::string& functionQuery, uint64_t startTimeVal, uint64_t endTimeVal,
+                                           const std::chrono::high_resolution_clock::time_point& startTime);
 
 private:
     // Helper methods
-    seastar::future<std::unique_ptr<seastar::http::reply>>
-    createJsonReply(const std::string& json);
-    
-    seastar::future<std::unique_ptr<seastar::http::reply>>
-    createErrorReply(const std::string& error, seastar::http::reply::status_type status = seastar::http::reply::status_type::bad_request);
+    seastar::future<std::unique_ptr<seastar::http::reply>> createJsonReply(const std::string& json);
+
+    seastar::future<std::unique_ptr<seastar::http::reply>> createErrorReply(
+        const std::string& error,
+        seastar::http::reply::status_type status = seastar::http::reply::status_type::bad_request);
 
     // Stub methods for header compatibility
     seastar::future<FunctionQueryResponse> executeFunctionQuery(const FunctionQueryRequest& request);
@@ -137,10 +134,11 @@ private:
     FunctionPerformanceResponse buildPerformanceResponse() const;
     QueryParseResponse parseAndValidateQuery(const std::string& query) const;
     void updatePerformanceMetrics(const std::string& functionName, double executionTimeMs) const;
-    std::unique_ptr<seastar::http::reply> createErrorResponse(const std::string& error, 
-                                                             seastar::http::reply::status_type status = seastar::http::reply::status_type::bad_request) const;
+    std::unique_ptr<seastar::http::reply> createErrorResponse(
+        const std::string& error,
+        seastar::http::reply::status_type status = seastar::http::reply::status_type::bad_request) const;
 };
 
-} // namespace timestar::functions
+}  // namespace timestar::functions
 
-#endif // FUNCTION_HTTP_HANDLER_H_INCLUDED
+#endif  // FUNCTION_HTTP_HANDLER_H_INCLUDED

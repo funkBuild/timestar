@@ -29,11 +29,8 @@ public:
      * @param forecastTimestamps Timestamps to forecast
      * @return ForecastOutput with past, forecast, upper, lower values
      */
-    ForecastOutput forecast(
-        const ForecastInput& input,
-        const ForecastConfig& config,
-        const std::vector<uint64_t>& forecastTimestamps
-    );
+    ForecastOutput forecast(const ForecastInput& input, const ForecastConfig& config,
+                            const std::vector<uint64_t>& forecastTimestamps);
 
 private:
     // Fit linear regression and get coefficients
@@ -46,22 +43,14 @@ private:
         double meanX;
     };
 
-    LinearFit fitLinearRegression(
-        const std::vector<double>& x,
-        const std::vector<double>& y,
-        const std::vector<double>& weights
-    );
+    LinearFit fitLinearRegression(const std::vector<double>& x, const std::vector<double>& y,
+                                  const std::vector<double>& weights);
 
     // Compute prediction interval width at a given x value
-    double predictionIntervalWidth(
-        const LinearFit& fit,
-        double x,
-        size_t n,
-        double deviations
-    );
+    double predictionIntervalWidth(const LinearFit& fit, double x, size_t n, double deviations);
 };
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar
 
-#endif // LINEAR_FORECASTER_H_INCLUDED
+#endif  // LINEAR_FORECASTER_H_INCLUDED

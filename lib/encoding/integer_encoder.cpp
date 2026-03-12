@@ -1,8 +1,9 @@
 #include "integer_encoder.hpp"
-#include "integer/integer_encoder.hpp"       // IntegerEncoderBasic
-#include "integer/integer_encoder_simd.hpp"  // IntegerEncoderSIMD
-#include "integer/integer_encoder_avx512.hpp" // IntegerEncoderAVX512
-#include "integer/integer_encoder_ffor.hpp"  // IntegerEncoderFFOR
+
+#include "integer/integer_encoder.hpp"         // IntegerEncoderBasic
+#include "integer/integer_encoder_avx512.hpp"  // IntegerEncoderAVX512
+#include "integer/integer_encoder_ffor.hpp"    // IntegerEncoderFFOR
+#include "integer/integer_encoder_simd.hpp"    // IntegerEncoderSIMD
 
 // Static member initialization
 thread_local IntegerEncoder::Implementation IntegerEncoder::s_forced_impl = IntegerEncoder::AUTO;
@@ -35,7 +36,7 @@ AlignedBuffer IntegerEncoder::encode(std::span<const uint64_t> values) {
     }
 }
 
-size_t IntegerEncoder::encodeInto(std::span<const uint64_t> values, AlignedBuffer &target) {
+size_t IntegerEncoder::encodeInto(std::span<const uint64_t> values, AlignedBuffer& target) {
     Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
     switch (impl) {
@@ -53,9 +54,8 @@ size_t IntegerEncoder::encodeInto(std::span<const uint64_t> values, AlignedBuffe
     }
 }
 
-std::pair<size_t, size_t> IntegerEncoder::decode(Slice &encoded, unsigned int timestampSize,
-                                                std::vector<uint64_t> &values,
-                                                uint64_t minTime, uint64_t maxTime) {
+std::pair<size_t, size_t> IntegerEncoder::decode(Slice& encoded, unsigned int timestampSize,
+                                                 std::vector<uint64_t>& values, uint64_t minTime, uint64_t maxTime) {
     Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
     switch (impl) {

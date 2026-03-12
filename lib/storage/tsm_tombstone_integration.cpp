@@ -1,6 +1,7 @@
-#include "tsm.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "tsm.hpp"
+
 #include <algorithm>
 #include <filesystem>
 #include <functional>
@@ -22,15 +23,14 @@ std::string TSM::getTombstonePath() const {
 seastar::future<> TSM::loadTombstones() {
     try {
         std::string tombstonePath = getTombstonePath();
-        LOG_INSERT_PATH(timestar::tsm_log, trace, "Loading tombstones from: {} for TSM: {}",
-                        tombstonePath, filePath);
-        
+        LOG_INSERT_PATH(timestar::tsm_log, trace, "Loading tombstones from: {} for TSM: {}", tombstonePath, filePath);
+
         tombstones = std::make_unique<timestar::TSMTombstone>(tombstonePath);
-        
+
         // Check if tombstone file exists
         bool exists = co_await tombstones->exists();
         LOG_INSERT_PATH(timestar::tsm_log, trace, "Tombstone file exists: {}", exists);
-        
+
         if (exists) {
             co_await tombstones->load();
             LOG_INSERT_PATH(timestar::tsm_log, debug, "Successfully loaded tombstones from: {}", tombstonePath);
@@ -46,11 +46,7 @@ seastar::future<> TSM::loadTombstones() {
 }
 
 // Check if series exists in the given time range
-bool TSM::hasSeriesInTimeRange(
-    const SeriesId128& seriesId,
-    uint64_t startTime,
-    uint64_t endTime) const {
-
+bool TSM::hasSeriesInTimeRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) const {
     // Check bloom filter first
     if (!seriesBloomFilter.contains(seriesId.getRawData())) {
         return false;
@@ -85,21 +81,17 @@ bool TSM::couldContainTimeRange(uint64_t startTime, uint64_t endTime) const {
     // In a more sophisticated implementation, we could check file-level time bounds
     // But for delete operations, it's better to be safe and create tombstones
     // even if no current data exists (to handle future writes)
-    
+
     // Only reject if the time range is clearly invalid
     if (startTime > endTime) {
         return false;
     }
-    
+
     return true;  // Accept all valid time ranges for delete operations
 }
 
 // Delete range with verification
-seastar::future<bool> TSM::deleteRange(
-    const SeriesId128& seriesId,
-    uint64_t startTime,
-    uint64_t endTime) {
-
+seastar::future<bool> TSM::deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
     // IMPORTANT: Only add tombstones if the series actually exists in this TSM file
     // This prevents unnecessary tombstone creation for non-existent series
 
@@ -123,40 +115,37 @@ seastar::future<bool> TSM::deleteRange(
 
     if (!hasOverlap) {
         // No data in the requested time range - no tombstone needed
-        LOG_INSERT_PATH(timestar::tsm_log, trace, "Series '{}' has no data in range [{}, {}] in TSM {} - skipping tombstone",
-                        seriesId.toHex(), startTime, endTime, filePath);
+        LOG_INSERT_PATH(timestar::tsm_log, trace,
+                        "Series '{}' has no data in range [{}, {}] in TSM {} - skipping tombstone", seriesId.toHex(),
+                        startTime, endTime, filePath);
         co_return false;
     }
-    
+
     // Series exists and has data in the time range - add tombstone
-    LOG_INSERT_PATH(timestar::tsm_log, debug, "Adding tombstone for series '{}' in TSM {}",
-                    seriesId.toHex(), filePath);
-    
+    LOG_INSERT_PATH(timestar::tsm_log, debug, "Adding tombstone for series '{}' in TSM {}", seriesId.toHex(), filePath);
+
     // Initialize tombstones if not already done
     if (!tombstones) {
         tombstones = std::make_unique<timestar::TSMTombstone>(getTombstonePath());
     }
-    
+
     // Add tombstone using the full SeriesId128 (no hash truncation)
     bool added = co_await tombstones->addTombstone(seriesId, startTime, endTime, nullptr);
-    
+
     if (added) {
         // Persist tombstone immediately for durability
         co_await tombstones->flush();
-        LOG_INSERT_PATH(timestar::tsm_log, debug, "Tombstone persisted for series '{}' in TSM {}",
-                        seriesId.toHex(), filePath);
+        LOG_INSERT_PATH(timestar::tsm_log, debug, "Tombstone persisted for series '{}' in TSM {}", seriesId.toHex(),
+                        filePath);
     }
-    
+
     co_return added;
 }
 
 // Query with tombstone filtering
 template <class T>
-seastar::future<TSMResult<T>> TSM::queryWithTombstones(
-    const SeriesId128& seriesId,
-    uint64_t startTime,
-    uint64_t endTime) {
-
+seastar::future<TSMResult<T>> TSM::queryWithTombstones(const SeriesId128& seriesId, uint64_t startTime,
+                                                       uint64_t endTime) {
     // First, perform the regular query using optimized batched reads
     TSMResult<T> result(rankAsInteger());
     co_await readSeriesBatched<T>(seriesId, startTime, endTime, result);
@@ -225,8 +214,8 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
         }
     }
 
-    LOG_INSERT_PATH(timestar::tsm_log, trace, "Tombstone filtering: {} points -> {} points ({} removed)",
-                    totalPoints, outTimestamps.size(), tombstonedCount);
+    LOG_INSERT_PATH(timestar::tsm_log, trace, "Tombstone filtering: {} points -> {} points ({} removed)", totalPoints,
+                    outTimestamps.size(), tombstonedCount);
 
     // Replace blocks with filtered result
     result.blocks.clear();
@@ -289,7 +278,7 @@ seastar::future<double> TSM::estimateTombstoneCoverage() {
             if (blockDuration == 0) {
                 // Single-point block: 100% dead if timestamp falls in any range
                 auto rangeIt = std::upper_bound(ranges.begin(), ranges.end(),
-                    std::make_pair(block.minTime, std::numeric_limits<uint64_t>::max()));
+                                                std::make_pair(block.minTime, std::numeric_limits<uint64_t>::max()));
                 if (rangeIt != ranges.begin()) {
                     --rangeIt;
                     if (block.minTime >= rangeIt->first && block.minTime <= rangeIt->second) {
@@ -301,7 +290,7 @@ seastar::future<double> TSM::estimateTombstoneCoverage() {
                 uint64_t overlapDuration = 0;
                 for (const auto& [rStart, rEnd] : ranges) {
                     if (rStart > block.maxTime || rEnd < block.minTime) {
-                        continue; // No overlap
+                        continue;  // No overlap
                     }
                     uint64_t overlapStart = std::max(rStart, block.minTime);
                     uint64_t overlapEnd = std::min(rEnd, block.maxTime);
@@ -328,11 +317,8 @@ seastar::future<> TSM::deleteTombstoneFile() {
 }
 
 // Explicit template instantiations for supported types
-template seastar::future<TSMResult<double>> TSM::queryWithTombstones<double>(
-    const SeriesId128&, uint64_t, uint64_t);
-template seastar::future<TSMResult<bool>> TSM::queryWithTombstones<bool>(
-    const SeriesId128&, uint64_t, uint64_t);
-template seastar::future<TSMResult<std::string>> TSM::queryWithTombstones<std::string>(
-    const SeriesId128&, uint64_t, uint64_t);
-template seastar::future<TSMResult<int64_t>> TSM::queryWithTombstones<int64_t>(
-    const SeriesId128&, uint64_t, uint64_t);
+template seastar::future<TSMResult<double>> TSM::queryWithTombstones<double>(const SeriesId128&, uint64_t, uint64_t);
+template seastar::future<TSMResult<bool>> TSM::queryWithTombstones<bool>(const SeriesId128&, uint64_t, uint64_t);
+template seastar::future<TSMResult<std::string>> TSM::queryWithTombstones<std::string>(const SeriesId128&, uint64_t,
+                                                                                       uint64_t);
+template seastar::future<TSMResult<int64_t>> TSM::queryWithTombstones<int64_t>(const SeriesId128&, uint64_t, uint64_t);

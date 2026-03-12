@@ -142,18 +142,3 @@ jobs:
         run: |
           find lib bin -name '*.cpp' -o -name '*.hpp' | \
             xargs clang-format-17 --dry-run --Werror
-
-  docs:
-    name: Documentation Check
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Check documentation files exist
-        run: |
-          test -f README.md
-          test -f LICENSE
-          test -f CONTRIBUTING.md
-          test -d docs/

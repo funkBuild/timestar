@@ -1,168 +1,114 @@
 #include "derived_query_executor.hpp"
-#include "http_query_handler.hpp"
+
+#include "anomaly/anomaly_executor.hpp"
+#include "anomaly/anomaly_result.hpp"
 #include "engine.hpp"
+#include "http_query_handler.hpp"
 #include "leveldb_index.hpp"
 #include "logger.hpp"
-#include "anomaly/anomaly_result.hpp"
-#include "anomaly/anomaly_executor.hpp"
 
 #include <glaze/glaze.hpp>
-#include <seastar/core/when_all.hh>
+
 #include <chrono>
 #include <regex>
+#include <seastar/core/when_all.hh>
 
 // Glaze reflection for JSON parsing - must be outside namespace
 template <>
 struct glz::meta<timestar::GlazeDerivedQueryRequest> {
     using T = timestar::GlazeDerivedQueryRequest;
-    static constexpr auto value = object(
-        "queries", &T::queries,
-        "formula", &T::formula,
-        "startTime", &T::startTime,
-        "endTime", &T::endTime,
-        "aggregationInterval", &T::aggregationInterval
-    );
+    static constexpr auto value = object("queries", &T::queries, "formula", &T::formula, "startTime", &T::startTime,
+                                         "endTime", &T::endTime, "aggregationInterval", &T::aggregationInterval);
 };
 
 template <>
 struct glz::meta<timestar::GlazeDerivedQueryResponse::Statistics> {
     using T = timestar::GlazeDerivedQueryResponse::Statistics;
-    static constexpr auto value = object(
-        "point_count", &T::pointCount,
-        "execution_time_ms", &T::executionTimeMs,
-        "sub_queries_executed", &T::subQueriesExecuted,
-        "points_dropped_due_to_alignment", &T::pointsDroppedDueToAlignment
-    );
+    static constexpr auto value =
+        object("point_count", &T::pointCount, "execution_time_ms", &T::executionTimeMs, "sub_queries_executed",
+               &T::subQueriesExecuted, "points_dropped_due_to_alignment", &T::pointsDroppedDueToAlignment);
 };
 
 template <>
 struct glz::meta<timestar::GlazeDerivedQueryResponse::Error> {
     using T = timestar::GlazeDerivedQueryResponse::Error;
-    static constexpr auto value = object(
-        "code", &T::code,
-        "message", &T::message
-    );
+    static constexpr auto value = object("code", &T::code, "message", &T::message);
 };
 
 template <>
 struct glz::meta<timestar::GlazeDerivedQueryResponse> {
     using T = timestar::GlazeDerivedQueryResponse;
-    static constexpr auto value = object(
-        "status", &T::status,
-        "timestamps", &T::timestamps,
-        "values", &T::values,
-        "formula", &T::formula,
-        "statistics", &T::statistics,
-        "error", &T::error
-    );
+    static constexpr auto value = object("status", &T::status, "timestamps", &T::timestamps, "values", &T::values,
+                                         "formula", &T::formula, "statistics", &T::statistics, "error", &T::error);
 };
 
 // Anomaly response Glaze meta templates
 template <>
 struct glz::meta<timestar::GlazeAnomalySeriesPiece> {
     using T = timestar::GlazeAnomalySeriesPiece;
-    static constexpr auto value = object(
-        "piece", &T::piece,
-        "group_tags", &T::group_tags,
-        "values", &T::values,
-        "alert_value", &T::alert_value
-    );
+    static constexpr auto value =
+        object("piece", &T::piece, "group_tags", &T::group_tags, "values", &T::values, "alert_value", &T::alert_value);
 };
 
 template <>
 struct glz::meta<timestar::GlazeAnomalyStatistics> {
     using T = timestar::GlazeAnomalyStatistics;
-    static constexpr auto value = object(
-        "algorithm", &T::algorithm,
-        "bounds", &T::bounds,
-        "seasonality", &T::seasonality,
-        "anomaly_count", &T::anomaly_count,
-        "total_points", &T::total_points,
-        "execution_time_ms", &T::execution_time_ms
-    );
+    static constexpr auto value =
+        object("algorithm", &T::algorithm, "bounds", &T::bounds, "seasonality", &T::seasonality, "anomaly_count",
+               &T::anomaly_count, "total_points", &T::total_points, "execution_time_ms", &T::execution_time_ms);
 };
 
 template <>
 struct glz::meta<timestar::GlazeAnomalyResponse::Error> {
     using T = timestar::GlazeAnomalyResponse::Error;
-    static constexpr auto value = object(
-        "message", &T::message
-    );
+    static constexpr auto value = object("message", &T::message);
 };
 
 template <>
 struct glz::meta<timestar::GlazeAnomalyResponse> {
     using T = timestar::GlazeAnomalyResponse;
-    static constexpr auto value = object(
-        "status", &T::status,
-        "times", &T::times,
-        "series", &T::series,
-        "statistics", &T::statistics,
-        "error", &T::error
-    );
+    static constexpr auto value = object("status", &T::status, "times", &T::times, "series", &T::series, "statistics",
+                                         &T::statistics, "error", &T::error);
 };
 
 // Forecast response Glaze meta templates
 template <>
 struct glz::meta<timestar::GlazeForecastSeriesPiece> {
     using T = timestar::GlazeForecastSeriesPiece;
-    static constexpr auto value = object(
-        "piece", &T::piece,
-        "group_tags", &T::group_tags,
-        "values", &T::values
-    );
+    static constexpr auto value = object("piece", &T::piece, "group_tags", &T::group_tags, "values", &T::values);
 };
 
 template <>
 struct glz::meta<timestar::GlazeForecastStatistics> {
     using T = timestar::GlazeForecastStatistics;
-    static constexpr auto value = object(
-        "algorithm", &T::algorithm,
-        "deviations", &T::deviations,
-        "seasonality", &T::seasonality,
-        "slope", &T::slope,
-        "intercept", &T::intercept,
-        "r_squared", &T::r_squared,
-        "residual_std_dev", &T::residual_std_dev,
-        "historical_points", &T::historical_points,
-        "forecast_points", &T::forecast_points,
-        "series_count", &T::series_count,
-        "execution_time_ms", &T::execution_time_ms
-    );
+    static constexpr auto value =
+        object("algorithm", &T::algorithm, "deviations", &T::deviations, "seasonality", &T::seasonality, "slope",
+               &T::slope, "intercept", &T::intercept, "r_squared", &T::r_squared, "residual_std_dev",
+               &T::residual_std_dev, "historical_points", &T::historical_points, "forecast_points", &T::forecast_points,
+               "series_count", &T::series_count, "execution_time_ms", &T::execution_time_ms);
 };
 
 template <>
 struct glz::meta<timestar::GlazeForecastResponse::Error> {
     using T = timestar::GlazeForecastResponse::Error;
-    static constexpr auto value = object(
-        "message", &T::message
-    );
+    static constexpr auto value = object("message", &T::message);
 };
 
 template <>
 struct glz::meta<timestar::GlazeForecastResponse> {
     using T = timestar::GlazeForecastResponse;
-    static constexpr auto value = object(
-        "status", &T::status,
-        "times", &T::times,
-        "forecast_start_index", &T::forecast_start_index,
-        "series", &T::series,
-        "statistics", &T::statistics,
-        "error", &T::error
-    );
+    static constexpr auto value =
+        object("status", &T::status, "times", &T::times, "forecast_start_index", &T::forecast_start_index, "series",
+               &T::series, "statistics", &T::statistics, "error", &T::error);
 };
 
 namespace timestar {
 
-DerivedQueryExecutor::DerivedQueryExecutor(
-    seastar::sharded<Engine>* engine,
-    seastar::sharded<LevelDBIndex>* index,
-    DerivedQueryConfig config)
+DerivedQueryExecutor::DerivedQueryExecutor(seastar::sharded<Engine>* engine, seastar::sharded<LevelDBIndex>* index,
+                                           DerivedQueryConfig config)
     : engine_(engine), index_(index), config_(config) {}
 
-seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(
-    const DerivedQueryRequest& request) {
-
+seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(const DerivedQueryRequest& request) {
     auto startTime = std::chrono::high_resolution_clock::now();
     DerivedQueryResult result;
     result.formula = request.formula;
@@ -221,8 +167,7 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(
 
         // Record execution time
         auto endTime = std::chrono::high_resolution_clock::now();
-        result.stats.executionTimeMs = std::chrono::duration<double, std::milli>(
-            endTime - startTime).count();
+        result.stats.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
         co_return result;
 
@@ -237,9 +182,7 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(
     }
 }
 
-seastar::future<DerivedQueryResult> DerivedQueryExecutor::executeFromJson(
-    const std::string& jsonBody) {
-
+seastar::future<DerivedQueryResult> DerivedQueryExecutor::executeFromJson(const std::string& jsonBody) {
     // Parse JSON request
     GlazeDerivedQueryRequest glazeReq;
     auto parseResult = glz::read_json(glazeReq, jsonBody);
@@ -255,8 +198,7 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::executeFromJson(
 
     // Parse aggregation interval if provided
     if (!glazeReq.aggregationInterval.empty()) {
-        request.aggregationInterval = HttpQueryHandler::parseInterval(
-            glazeReq.aggregationInterval);
+        request.aggregationInterval = HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
     }
 
     // Parse each query string
@@ -268,8 +210,7 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::executeFromJson(
             queryReq.endTime = request.endTime;
             request.queries[name] = queryReq;
         } catch (const QueryParseException& e) {
-            throw DerivedQueryException(
-                "Error parsing query '" + name + "': " + e.what());
+            throw DerivedQueryException("Error parsing query '" + name + "': " + e.what());
         }
     }
 
@@ -291,9 +232,7 @@ std::string DerivedQueryExecutor::formatResponse(const DerivedQueryResult& resul
     return glz::write_json(response).value_or("{}");
 }
 
-std::string DerivedQueryExecutor::createErrorResponse(
-    const std::string& code, const std::string& message) {
-
+std::string DerivedQueryExecutor::createErrorResponse(const std::string& code, const std::string& message) {
     GlazeDerivedQueryResponse response;
     response.status = "error";
     response.error.code = code;
@@ -304,18 +243,16 @@ std::string DerivedQueryExecutor::createErrorResponse(
 
 void DerivedQueryExecutor::validateRequest(const DerivedQueryRequest& request) {
     if (request.queries.size() > config_.maxSubQueries) {
-        throw DerivedQueryException(
-            "Too many sub-queries: " + std::to_string(request.queries.size()) +
-            " (max: " + std::to_string(config_.maxSubQueries) + ")");
+        throw DerivedQueryException("Too many sub-queries: " + std::to_string(request.queries.size()) +
+                                    " (max: " + std::to_string(config_.maxSubQueries) + ")");
     }
 
     // Additional validation handled by DerivedQueryRequest::validate()
     request.validate();
 }
 
-seastar::future<std::map<std::string, SubQueryResult>>
-DerivedQueryExecutor::executeAllSubQueries(const DerivedQueryRequest& request) {
-
+seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::executeAllSubQueries(
+    const DerivedQueryRequest& request) {
     // Get the set of queries actually referenced in the formula
     auto referencedQueries = request.getReferencedQueries();
 
@@ -328,11 +265,9 @@ DerivedQueryExecutor::executeAllSubQueries(const DerivedQueryRequest& request) {
             continue;
         }
 
-        futures.push_back(
-            executeSubQuery(name, query).then([name](SubQueryResult result) {
-                return std::make_pair(name, std::move(result));
-            })
-        );
+        futures.push_back(executeSubQuery(name, query).then([name](SubQueryResult result) {
+            return std::make_pair(name, std::move(result));
+        }));
     }
 
     // Execute all in parallel
@@ -347,28 +282,22 @@ DerivedQueryExecutor::executeAllSubQueries(const DerivedQueryRequest& request) {
     co_return resultMap;
 }
 
-seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(
-    const std::string& name,
-    const QueryRequest& query) {
-
+seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std::string& name,
+                                                                      const QueryRequest& query) {
     // Create a query handler to execute the sub-query
     HttpQueryHandler handler(engine_, index_);
 
     auto response = co_await handler.executeQuery(query);
 
     if (!response.success) {
-        throw DerivedQueryException(
-            "Sub-query '" + name + "' failed: " + response.errorMessage);
+        throw DerivedQueryException("Sub-query '" + name + "' failed: " + response.errorMessage);
     }
 
     co_return convertQueryResponse(name, query, response.series);
 }
 
-SubQueryResult DerivedQueryExecutor::convertQueryResponse(
-    const std::string& name,
-    const QueryRequest& query,
-    const std::vector<SeriesResult>& results) {
-
+SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& name, const QueryRequest& query,
+                                                          const std::vector<SeriesResult>& results) {
     SubQueryResult subResult;
     subResult.queryName = name;
     subResult.measurement = query.measurement;
@@ -378,11 +307,9 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(
     }
 
     if (results.size() > 1) {
-        throw DerivedQueryException(
-            "Sub-query '" + name + "' returned " +
-            std::to_string(results.size()) +
-            " series but derived queries require exactly one series. "
-            "Add more specific scope filters to narrow the result.");
+        throw DerivedQueryException("Sub-query '" + name + "' returned " + std::to_string(results.size()) +
+                                    " series but derived queries require exactly one series. "
+                                    "Add more specific scope filters to narrow the result.");
     }
 
     const auto& series = results[0];
@@ -409,8 +336,7 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(
                 subResult.values.push_back(static_cast<double>(v));
             }
         } else {
-            throw DerivedQueryException(
-                "Sub-query '" + name + "' returned non-numeric values");
+            throw DerivedQueryException("Sub-query '" + name + "' returned non-numeric values");
         }
 
         break;  // Take first matching field
@@ -443,7 +369,6 @@ bool DerivedQueryExecutor::isForecastFormula(const std::string& formula) {
 
 seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeWithAnomaly(
     const DerivedQueryRequest& request) {
-
     try {
         // Parse the formula to check if it's an anomaly or forecast function
         ExpressionParser parser(request.formula);
@@ -471,7 +396,6 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeWithAnom
 
 seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeFromJsonWithAnomaly(
     const std::string& jsonBody) {
-
     // Parse JSON request
     GlazeDerivedQueryRequest glazeReq;
     auto parseResult = glz::read_json(glazeReq, jsonBody);
@@ -487,8 +411,7 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeFromJson
 
     // Parse aggregation interval if provided
     if (!glazeReq.aggregationInterval.empty()) {
-        request.aggregationInterval = HttpQueryHandler::parseInterval(
-            glazeReq.aggregationInterval);
+        request.aggregationInterval = HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
     }
 
     // Parse each query string
@@ -500,8 +423,7 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeFromJson
             queryReq.endTime = request.endTime;
             request.queries[name] = queryReq;
         } catch (const QueryParseException& e) {
-            throw DerivedQueryException(
-                "Error parsing query '" + name + "': " + e.what());
+            throw DerivedQueryException("Error parsing query '" + name + "': " + e.what());
         }
     }
 
@@ -510,9 +432,7 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeFromJson
 }
 
 seastar::future<anomaly::AnomalyQueryResult> DerivedQueryExecutor::executeAnomalyDetection(
-    const DerivedQueryRequest& request,
-    const ExpressionNode& anomalyNode) {
-
+    const DerivedQueryRequest& request, const ExpressionNode& anomalyNode) {
     auto startTime = std::chrono::high_resolution_clock::now();
 
     const auto& anomalyFunc = anomalyNode.asAnomalyFunction();
@@ -521,8 +441,7 @@ seastar::future<anomaly::AnomalyQueryResult> DerivedQueryExecutor::executeAnomal
     // Find the referenced query
     auto it = request.queries.find(queryRef);
     if (it == request.queries.end()) {
-        throw DerivedQueryException(
-            "Query '" + queryRef + "' not found in queries map");
+        throw DerivedQueryException("Query '" + queryRef + "' not found in queries map");
     }
 
     // Execute the sub-query
@@ -550,24 +469,16 @@ seastar::future<anomaly::AnomalyQueryResult> DerivedQueryExecutor::executeAnomal
 
     // Execute anomaly detection
     anomaly::AnomalyExecutor executor;
-    auto result = executor.execute(
-        subResult.timestamps,
-        subResult.values,
-        groupTags,
-        config
-    );
+    auto result = executor.execute(subResult.timestamps, subResult.values, groupTags, config);
 
     // Record total execution time
     auto endTime = std::chrono::high_resolution_clock::now();
-    result.statistics.executionTimeMs =
-        std::chrono::duration<double, std::milli>(endTime - startTime).count();
+    result.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
     co_return result;
 }
 
-std::string DerivedQueryExecutor::formatAnomalyResponse(
-    const anomaly::AnomalyQueryResult& result) {
-
+std::string DerivedQueryExecutor::formatAnomalyResponse(const anomaly::AnomalyQueryResult& result) {
     GlazeAnomalyResponse response;
     response.status = result.success ? "success" : "error";
 
@@ -609,9 +520,7 @@ std::string DerivedQueryExecutor::formatAnomalyResponse(
     return glz::write_json(response).value_or("{}");
 }
 
-std::string DerivedQueryExecutor::formatResponseVariant(
-    const DerivedQueryResultVariant& result) {
-
+std::string DerivedQueryExecutor::formatResponseVariant(const DerivedQueryResultVariant& result) {
     if (std::holds_alternative<DerivedQueryResult>(result)) {
         return formatResponse(std::get<DerivedQueryResult>(result));
     } else if (std::holds_alternative<anomaly::AnomalyQueryResult>(result)) {
@@ -622,9 +531,7 @@ std::string DerivedQueryExecutor::formatResponseVariant(
 }
 
 seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeForecast(
-    const DerivedQueryRequest& request,
-    const ExpressionNode& forecastNode) {
-
+    const DerivedQueryRequest& request, const ExpressionNode& forecastNode) {
     auto startTime = std::chrono::high_resolution_clock::now();
 
     const auto& forecastFunc = forecastNode.asForecastFunction();
@@ -633,8 +540,7 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
     // Find the referenced query
     auto it = request.queries.find(queryRef);
     if (it == request.queries.end()) {
-        throw DerivedQueryException(
-            "Query '" + queryRef + "' not found in queries map");
+        throw DerivedQueryException("Query '" + queryRef + "' not found in queries map");
     }
 
     // Execute the sub-query
@@ -661,8 +567,7 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
         try {
             config.linearModel = forecast::parseLinearModel(forecastFunc.model.value());
         } catch (const std::exception& e) {
-            throw DerivedQueryException(
-                "Invalid model parameter: " + std::string(e.what()));
+            throw DerivedQueryException("Invalid model parameter: " + std::string(e.what()));
         }
     }
 
@@ -671,8 +576,7 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
         try {
             config.historyDurationNs = forecast::parseDurationToNs(forecastFunc.history.value());
         } catch (const std::exception& e) {
-            throw DerivedQueryException(
-                "Invalid history parameter: " + std::string(e.what()));
+            throw DerivedQueryException("Invalid history parameter: " + std::string(e.what()));
         }
     }
 
@@ -683,9 +587,7 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
     if (config.historyDurationNs > 0 && !subResult.timestamps.empty()) {
         // Find the cutoff time (last timestamp - history duration)
         uint64_t lastTimestamp = subResult.timestamps.back();
-        uint64_t cutoffTime = lastTimestamp > config.historyDurationNs
-            ? lastTimestamp - config.historyDurationNs
-            : 0;
+        uint64_t cutoffTime = lastTimestamp > config.historyDurationNs ? lastTimestamp - config.historyDurationNs : 0;
 
         // Find the first index where timestamp >= cutoffTime
         size_t startIdx = 0;
@@ -698,24 +600,19 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
 
         // Filter the data
         if (startIdx > 0 && startIdx < subResult.timestamps.size()) {
-            filteredTimestamps = std::vector<uint64_t>(
-                subResult.timestamps.begin() + startIdx,
-                subResult.timestamps.end()
-            );
-            filteredValues = std::vector<double>(
-                subResult.values.begin() + startIdx,
-                subResult.values.end()
-            );
+            filteredTimestamps =
+                std::vector<uint64_t>(subResult.timestamps.begin() + startIdx, subResult.timestamps.end());
+            filteredValues = std::vector<double>(subResult.values.begin() + startIdx, subResult.values.end());
         }
     }
 
     // Determine forecast horizon based on query time range
     // Guard against unsigned underflow if endTime <= startTime
-    uint64_t duration = (request.endTime > request.startTime)
-        ? request.endTime - request.startTime : 0;
+    uint64_t duration = (request.endTime > request.startTime) ? request.endTime - request.startTime : 0;
     if (duration > 0 && filteredTimestamps.size() >= 2) {
         uint64_t timeSpan = (filteredTimestamps.back() > filteredTimestamps.front())
-            ? filteredTimestamps.back() - filteredTimestamps.front() : 0;
+                                ? filteredTimestamps.back() - filteredTimestamps.front()
+                                : 0;
         uint64_t interval = timeSpan / (filteredTimestamps.size() - 1);
         if (interval > 0) {
             config.forecastHorizon = duration / interval;
@@ -733,24 +630,16 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
     std::vector<std::vector<double>> seriesValues = {filteredValues};
     std::vector<std::vector<std::string>> seriesGroupTags = {groupTags};
 
-    auto result = executor.executeMulti(
-        filteredTimestamps,
-        seriesValues,
-        seriesGroupTags,
-        config
-    );
+    auto result = executor.executeMulti(filteredTimestamps, seriesValues, seriesGroupTags, config);
 
     // Record total execution time
     auto endTime = std::chrono::high_resolution_clock::now();
-    result.statistics.executionTimeMs =
-        std::chrono::duration<double, std::milli>(endTime - startTime).count();
+    result.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
     co_return result;
 }
 
-std::string DerivedQueryExecutor::formatForecastResponse(
-    const forecast::ForecastQueryResult& result) {
-
+std::string DerivedQueryExecutor::formatForecastResponse(const forecast::ForecastQueryResult& result) {
     GlazeForecastResponse response;
     response.status = result.success ? "success" : "error";
 
@@ -799,4 +688,4 @@ std::string DerivedQueryExecutor::formatForecastResponse(
     return glz::write_json(response).value_or("{}");
 }
 
-} // namespace timestar
+}  // namespace timestar

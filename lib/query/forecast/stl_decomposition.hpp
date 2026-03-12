@@ -1,8 +1,8 @@
 #ifndef STL_DECOMPOSITION_H_INCLUDED
 #define STL_DECOMPOSITION_H_INCLUDED
 
-#include <vector>
 #include <cstddef>
+#include <vector>
 
 namespace timestar {
 namespace forecast {
@@ -11,11 +11,11 @@ namespace forecast {
  * Result of STL decomposition
  */
 struct STLResult {
-    std::vector<double> trend;      // Trend component
-    std::vector<double> seasonal;   // Seasonal component
-    std::vector<double> residual;   // Residual (remainder)
-    size_t period;                  // Seasonal period used
-    bool success;                   // Whether decomposition succeeded
+    std::vector<double> trend;     // Trend component
+    std::vector<double> seasonal;  // Seasonal component
+    std::vector<double> residual;  // Residual (remainder)
+    size_t period;                 // Seasonal period used
+    bool success;                  // Whether decomposition succeeded
 };
 
 /**
@@ -24,7 +24,7 @@ struct STLResult {
 struct MSTLResult {
     std::vector<double> trend;
     std::vector<std::vector<double>> seasonals;  // One per period
-    std::vector<size_t> periods;                  // Periods used
+    std::vector<size_t> periods;                 // Periods used
     std::vector<double> residual;
     bool success;
 };
@@ -56,15 +56,8 @@ public:
      * @param innerIterations Number of inner loop iterations
      * @return STLResult with trend, seasonal, residual
      */
-    STLResult decompose(
-        const std::vector<double>& y,
-        size_t period,
-        size_t seasonalWindow = 7,
-        size_t trendWindow = 0,
-        bool robust = true,
-        size_t outerIterations = 2,
-        size_t innerIterations = 2
-    );
+    STLResult decompose(const std::vector<double>& y, size_t period, size_t seasonalWindow = 7, size_t trendWindow = 0,
+                        bool robust = true, size_t outerIterations = 2, size_t innerIterations = 2);
 
     /**
      * Perform MSTL decomposition (multiple seasonalities)
@@ -73,10 +66,7 @@ public:
      * @param periods Seasonal periods (should be sorted ascending)
      * @return MSTLResult with trend, multiple seasonals, residual
      */
-    MSTLResult decomposeMultiple(
-        const std::vector<double>& y,
-        std::vector<size_t> periods
-    );
+    MSTLResult decomposeMultiple(const std::vector<double>& y, std::vector<size_t> periods);
 
     // Public for testing
 
@@ -90,39 +80,25 @@ public:
      * @param weights Optional weights
      * @return Smoothed values at xout
      */
-    std::vector<double> loess(
-        const std::vector<double>& x,
-        const std::vector<double>& y,
-        const std::vector<double>& xout,
-        double span,
-        const std::vector<double>& weights = {}
-    );
+    std::vector<double> loess(const std::vector<double>& x, const std::vector<double>& y,
+                              const std::vector<double>& xout, double span, const std::vector<double>& weights = {});
 
     /**
      * Cycle-subseries smoothing
      * Smooth each position within the seasonal cycle
      */
-    std::vector<double> smoothCycleSubseries(
-        const std::vector<double>& y,
-        size_t period,
-        size_t window
-    );
+    std::vector<double> smoothCycleSubseries(const std::vector<double>& y, size_t period, size_t window);
 
     /**
      * Low-pass filter for seasonal component
      */
-    std::vector<double> lowPassFilter(
-        const std::vector<double>& y,
-        size_t period
-    );
+    std::vector<double> lowPassFilter(const std::vector<double>& y, size_t period);
 
     /**
      * Compute robustness weights from residuals
      * Using bisquare function
      */
-    std::vector<double> computeRobustnessWeights(
-        const std::vector<double>& residuals
-    );
+    std::vector<double> computeRobustnessWeights(const std::vector<double>& residuals);
 
     /**
      * Fast LOESS for evenly-spaced integer x-values (0, 1, 2, ..., n-1)
@@ -134,11 +110,8 @@ public:
      * @param weights Optional robustness weights (length n or empty)
      * @return Smoothed values (length n)
      */
-    std::vector<double> loessEvenlySpaced(
-        const std::vector<double>& y,
-        double span,
-        const std::vector<double>& weights = {}
-    );
+    std::vector<double> loessEvenlySpaced(const std::vector<double>& y, double span,
+                                          const std::vector<double>& weights = {});
 
 private:
     /**
@@ -154,16 +127,11 @@ private:
     /**
      * Weighted linear regression at a point
      */
-    double weightedLocalRegression(
-        const std::vector<double>& x,
-        const std::vector<double>& y,
-        double xeval,
-        double span,
-        const std::vector<double>& weights
-    );
+    double weightedLocalRegression(const std::vector<double>& x, const std::vector<double>& y, double xeval,
+                                   double span, const std::vector<double>& weights);
 };
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar
 
 #endif

@@ -1,6 +1,8 @@
 #include "linear_forecaster.hpp"
+
 #include "../anomaly/simd_anomaly.hpp"
 #include "../simd_helpers.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -8,25 +10,24 @@
 
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD
 using timestar::simd::hsum_avx;
-static inline double hsum_avx_local(__m256d v) { return hsum_avx(v); }
+static inline double hsum_avx_local(__m256d v) {
+    return hsum_avx(v);
+}
 #endif
 
 namespace timestar {
 namespace forecast {
 
-LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
-    const std::vector<double>& x,
-    const std::vector<double>& y,
-    const std::vector<double>& weights
-) {
+LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vector<double>& x,
+                                                                  const std::vector<double>& y,
+                                                                  const std::vector<double>& weights) {
     LinearFit fit{};
     size_t n = x.size();
 
     if (y.size() != n || weights.size() != n) {
-        throw std::invalid_argument(
-            "fitLinearRegression: x, y, and weights must have the same size (got " +
-            std::to_string(n) + ", " + std::to_string(y.size()) + ", " +
-            std::to_string(weights.size()) + ")");
+        throw std::invalid_argument("fitLinearRegression: x, y, and weights must have the same size (got " +
+                                    std::to_string(n) + ", " + std::to_string(y.size()) + ", " +
+                                    std::to_string(weights.size()) + ")");
     }
 
     if (n < 2) {
@@ -56,10 +57,10 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
         // AVX2 path: 4 accumulators per reduction to hide FMA latency
-        __m256d accW0  = _mm256_setzero_pd();
-        __m256d accW1  = _mm256_setzero_pd();
-        __m256d accW2  = _mm256_setzero_pd();
-        __m256d accW3  = _mm256_setzero_pd();
+        __m256d accW0 = _mm256_setzero_pd();
+        __m256d accW1 = _mm256_setzero_pd();
+        __m256d accW2 = _mm256_setzero_pd();
+        __m256d accW3 = _mm256_setzero_pd();
         __m256d accWX0 = _mm256_setzero_pd();
         __m256d accWX1 = _mm256_setzero_pd();
         __m256d accWX2 = _mm256_setzero_pd();
@@ -98,17 +99,17 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
         }
 
         // Reduce 4 accumulators -> 1
-        accW0  = _mm256_add_pd(_mm256_add_pd(accW0, accW1), _mm256_add_pd(accW2, accW3));
+        accW0 = _mm256_add_pd(_mm256_add_pd(accW0, accW1), _mm256_add_pd(accW2, accW3));
         accWX0 = _mm256_add_pd(_mm256_add_pd(accWX0, accWX1), _mm256_add_pd(accWX2, accWX3));
         accWY0 = _mm256_add_pd(_mm256_add_pd(accWY0, accWY1), _mm256_add_pd(accWY2, accWY3));
-        sumWeights   = hsum_avx_local(accW0);
+        sumWeights = hsum_avx_local(accW0);
         weightedSumX = hsum_avx_local(accWX0);
         weightedSumY = hsum_avx_local(accWY0);
 
         // Scalar remainder (skip NaN values)
         for (size_t i = simd_end; i < n; ++i) {
             double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
-            sumWeights   += w;
+            sumWeights += w;
             weightedSumX += w * px[i];
             weightedSumY += w * py[i];
         }
@@ -118,7 +119,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
         // Scalar fallback (skip NaN values by zeroing their weight)
         for (size_t i = 0; i < n; ++i) {
             double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
-            sumWeights   += w;
+            sumWeights += w;
             weightedSumX += w * px[i];
             weightedSumY += w * py[i];
         }
@@ -170,7 +171,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
 
         for (size_t i = 0; i < simd_end; i += 16) {
             // Block 0
-            __m256d w0  = _mm256_loadu_pd(pw + i);
+            __m256d w0 = _mm256_loadu_pd(pw + i);
             __m256d dx0 = _mm256_sub_pd(_mm256_loadu_pd(px + i), vMeanX);
             __m256d dy0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), vMeanY);
             __m256d wdx0 = _mm256_mul_pd(w0, dx0);
@@ -179,7 +180,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
             accYY0 = _mm256_fmadd_pd(_mm256_mul_pd(w0, dy0), dy0, accYY0);
 
             // Block 1
-            __m256d w1  = _mm256_loadu_pd(pw + i + 4);
+            __m256d w1 = _mm256_loadu_pd(pw + i + 4);
             __m256d dx1 = _mm256_sub_pd(_mm256_loadu_pd(px + i + 4), vMeanX);
             __m256d dy1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), vMeanY);
             __m256d wdx1 = _mm256_mul_pd(w1, dx1);
@@ -188,7 +189,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
             accYY1 = _mm256_fmadd_pd(_mm256_mul_pd(w1, dy1), dy1, accYY1);
 
             // Block 2
-            __m256d w2  = _mm256_loadu_pd(pw + i + 8);
+            __m256d w2 = _mm256_loadu_pd(pw + i + 8);
             __m256d dx2 = _mm256_sub_pd(_mm256_loadu_pd(px + i + 8), vMeanX);
             __m256d dy2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), vMeanY);
             __m256d wdx2 = _mm256_mul_pd(w2, dx2);
@@ -197,7 +198,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
             accYY2 = _mm256_fmadd_pd(_mm256_mul_pd(w2, dy2), dy2, accYY2);
 
             // Block 3
-            __m256d w3  = _mm256_loadu_pd(pw + i + 12);
+            __m256d w3 = _mm256_loadu_pd(pw + i + 12);
             __m256d dx3 = _mm256_sub_pd(_mm256_loadu_pd(px + i + 12), vMeanX);
             __m256d dy3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), vMeanY);
             __m256d wdx3 = _mm256_mul_pd(w3, dx3);
@@ -266,7 +267,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
 
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
-        __m256d vSlope     = _mm256_set1_pd(fit.slope);
+        __m256d vSlope = _mm256_set1_pd(fit.slope);
         __m256d vIntercept = _mm256_set1_pd(fit.intercept);
 
         __m256d accSSE0 = _mm256_setzero_pd();
@@ -279,25 +280,25 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
         for (size_t i = 0; i < simd_end; i += 16) {
             // Block 0: residual = y[i] - (slope*x[i] + intercept)
             __m256d pred0 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i), vIntercept);
-            __m256d res0  = _mm256_sub_pd(_mm256_loadu_pd(py + i), pred0);
+            __m256d res0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), pred0);
             __m256d wres0 = _mm256_mul_pd(_mm256_loadu_pd(pw + i), res0);
             accSSE0 = _mm256_fmadd_pd(wres0, res0, accSSE0);
 
             // Block 1
             __m256d pred1 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i + 4), vIntercept);
-            __m256d res1  = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), pred1);
+            __m256d res1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), pred1);
             __m256d wres1 = _mm256_mul_pd(_mm256_loadu_pd(pw + i + 4), res1);
             accSSE1 = _mm256_fmadd_pd(wres1, res1, accSSE1);
 
             // Block 2
             __m256d pred2 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i + 8), vIntercept);
-            __m256d res2  = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), pred2);
+            __m256d res2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), pred2);
             __m256d wres2 = _mm256_mul_pd(_mm256_loadu_pd(pw + i + 8), res2);
             accSSE2 = _mm256_fmadd_pd(wres2, res2, accSSE2);
 
             // Block 3
             __m256d pred3 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i + 12), vIntercept);
-            __m256d res3  = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), pred3);
+            __m256d res3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), pred3);
             __m256d wres3 = _mm256_mul_pd(_mm256_loadu_pd(pw + i + 12), res3);
             accSSE3 = _mm256_fmadd_pd(wres3, res3, accSSE3);
         }
@@ -309,7 +310,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
         // Scalar remainder
         for (size_t i = simd_end; i < n; ++i) {
             double predicted = fit.slope * px[i] + fit.intercept;
-            double residual  = py[i] - predicted;
+            double residual = py[i] - predicted;
             sse += pw[i] * residual * residual;
         }
     } else
@@ -318,7 +319,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
         // Scalar fallback
         for (size_t i = 0; i < n; ++i) {
             double predicted = fit.slope * px[i] + fit.intercept;
-            double residual  = py[i] - predicted;
+            double residual = py[i] - predicted;
             sse += pw[i] * residual * residual;
         }
     }
@@ -334,12 +335,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(
     return fit;
 }
 
-double LinearForecaster::predictionIntervalWidth(
-    const LinearFit& fit,
-    double x,
-    size_t n,
-    double deviations
-) {
+double LinearForecaster::predictionIntervalWidth(const LinearFit& fit, double x, size_t n, double deviations) {
     if (n < 3 || fit.sumSquaredX < 1e-10) {
         return deviations * fit.residualStdDev;
     }
@@ -354,11 +350,8 @@ double LinearForecaster::predictionIntervalWidth(
     return deviations * fit.residualStdDev * std::sqrt(term);
 }
 
-ForecastOutput LinearForecaster::forecast(
-    const ForecastInput& input,
-    const ForecastConfig& config,
-    const std::vector<uint64_t>& forecastTimestamps
-) {
+ForecastOutput LinearForecaster::forecast(const ForecastInput& input, const ForecastConfig& config,
+                                          const std::vector<uint64_t>& forecastTimestamps) {
     ForecastOutput output;
 
     size_t n = input.size();
@@ -462,5 +455,5 @@ ForecastOutput LinearForecaster::forecast(
     return output;
 }
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar

@@ -1,12 +1,12 @@
 #ifndef FUNCTION_SECURITY_H_INCLUDED
 #define FUNCTION_SECURITY_H_INCLUDED
 
-#include <string>
-#include <vector>
-#include <unordered_set>
 #include <algorithm>
 #include <cctype>
 #include <regex>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 namespace timestar::functions {
 
@@ -63,16 +63,16 @@ public:
 private:
     // Known dangerous function names
     static const std::unordered_set<std::string> dangerousFunctionNames_;
-    
+
     // Dangerous patterns to detect (lazily initialized via getDangerousPatterns())
     static const std::vector<std::regex>& getDangerousPatterns();
-    
+
     // Maximum allowed input sizes
     static const size_t MAX_FUNCTION_NAME_LENGTH = 64;
     static const size_t MAX_PARAMETER_LENGTH = 1000;
     static const size_t MAX_QUERY_LENGTH = 2000;
     static const size_t MAX_JSON_LENGTH = 5000;
-    
+
     // Helper methods
     static bool isValidFunctionNameChar(char c);
     static bool containsPathTraversal(const std::string& input);
@@ -82,6 +82,6 @@ private:
     static bool exceedsMaxLength(const std::string& input, size_t maxLength);
 };
 
-} // namespace timestar::functions
+}  // namespace timestar::functions
 
-#endif // FUNCTION_SECURITY_H_INCLUDED
+#endif  // FUNCTION_SECURITY_H_INCLUDED

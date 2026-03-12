@@ -2,12 +2,13 @@
 #define ANOMALY_DETECTOR_H_INCLUDED
 
 #include "anomaly_result.hpp"
-#include <vector>
-#include <span>
-#include <memory>
-#include <cstdint>
-#include <cmath>
+
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <vector>
 
 namespace timestar {
 namespace anomaly {
@@ -24,11 +25,11 @@ struct AnomalyInput {
 
 // Output from a single anomaly detection run
 struct AnomalyOutput {
-    std::vector<double> upper;       // Upper bound values
-    std::vector<double> lower;       // Lower bound values
-    std::vector<double> scores;      // Anomaly scores (0 = normal, 1 = anomaly)
-    std::vector<double> predictions; // Predicted values (for Agile/Robust)
-    size_t anomalyCount = 0;         // Count of detected anomalies
+    std::vector<double> upper;        // Upper bound values
+    std::vector<double> lower;        // Lower bound values
+    std::vector<double> scores;       // Anomaly scores (0 = normal, 1 = anomaly)
+    std::vector<double> predictions;  // Predicted values (for Agile/Robust)
+    size_t anomalyCount = 0;          // Count of detected anomalies
 
     bool empty() const { return upper.empty(); }
     size_t size() const { return upper.size(); }
@@ -41,10 +42,7 @@ public:
 
     // Detect anomalies in the input data
     // Returns bounds and scores for each point
-    virtual AnomalyOutput detect(
-        const AnomalyInput& input,
-        const AnomalyConfig& config
-    ) = 0;
+    virtual AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) = 0;
 
     // Get the algorithm name
     virtual std::string algorithmName() const = 0;
@@ -94,7 +92,7 @@ protected:
 // Factory function to create detector by algorithm type
 std::unique_ptr<AnomalyDetector> createDetector(Algorithm algorithm);
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar
 
-#endif // ANOMALY_DETECTOR_H_INCLUDED
+#endif  // ANOMALY_DETECTOR_H_INCLUDED

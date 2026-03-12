@@ -1,12 +1,13 @@
 #include "alp_decoder.hpp"
+
 #include "alp_constants.hpp"
 #include "alp_ffor.hpp"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
-#include <stdexcept>
 #include <cstring>
+#include <stdexcept>
 
 namespace {
 
@@ -37,11 +38,11 @@ static ALPScratchBuffers& getScratch() {
     return scratch;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
-void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
-                        std::vector<double>& out) {
-    if (length == 0) [[unlikely]] return;
+void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
+    if (length == 0) [[unlikely]]
+        return;
 
     // Pre-allocate output -- exact size, no over-reserve since length is known
     const size_t current_size = out.size();
@@ -60,7 +61,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
     }
 
     const uint16_t num_blocks = static_cast<uint16_t>(header1 & 0xFFFF);
-    const uint8_t  scheme     = static_cast<uint8_t>((header1 >> 32) & 0xFF);
+    const uint8_t scheme = static_cast<uint8_t>((header1 >> 32) & 0xFF);
 
     // Get thread-local scratch buffers (reuses capacity across calls)
     auto& scratch = getScratch();
@@ -74,12 +75,12 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             uint64_t bh0 = encoded.readFixed<uint64_t, 64>();
             uint64_t bh1 = encoded.readFixed<uint64_t, 64>();
 
-            const uint8_t  exp             = static_cast<uint8_t>(bh0 & 0xFF);
-            const uint8_t  fac             = static_cast<uint8_t>((bh0 >> 8) & 0xFF);
-            const uint8_t  bw              = static_cast<uint8_t>((bh0 >> 16) & 0x7F);
+            const uint8_t exp = static_cast<uint8_t>(bh0 & 0xFF);
+            const uint8_t fac = static_cast<uint8_t>((bh0 >> 8) & 0xFF);
+            const uint8_t bw = static_cast<uint8_t>((bh0 >> 16) & 0x7F);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
-            const uint16_t block_count     = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
-            const int64_t  for_base        = std::bit_cast<int64_t>(bh1);
+            const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
+            const int64_t for_base = std::bit_cast<int64_t>(bh1);
 
             // Read first_value for delta scheme (part of block header)
             int64_t first_value = 0;
@@ -119,8 +120,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             // Unpack integers
             scratch.decoded_ints.resize(block_count);
-            alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw,
-                             scratch.decoded_ints.data());
+            alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw, scratch.decoded_ints.data());
 
             // === Read Exceptions ===
             if (exception_count > 0) [[unlikely]] {
@@ -184,8 +184,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 }
 
                 // Emit values until block ends or output is full
-                const size_t emit_end = std::min(static_cast<size_t>(block_count),
-                                                 i + output_remaining);
+                const size_t emit_end = std::min(static_cast<size_t>(block_count), i + output_remaining);
                 for (; i < emit_end; ++i) {
                     // Must preserve original evaluation order: (int * frac) / fact
                     // to maintain bit-exact round-trip with the encoder
@@ -224,12 +223,12 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             uint64_t bh0 = encoded.readFixed<uint64_t, 64>();
             uint64_t bh1 = encoded.readFixed<uint64_t, 64>();
 
-            const uint8_t  right_bw        = static_cast<uint8_t>(bh0 & 0xFF);
-            const uint8_t  left_bw         = static_cast<uint8_t>((bh0 >> 8) & 0xFF);
-            const uint8_t  dict_size       = static_cast<uint8_t>((bh0 >> 16) & 0xFF);
+            const uint8_t right_bw = static_cast<uint8_t>(bh0 & 0xFF);
+            const uint8_t left_bw = static_cast<uint8_t>((bh0 >> 8) & 0xFF);
+            const uint8_t dict_size = static_cast<uint8_t>((bh0 >> 16) & 0xFF);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
-            const uint16_t block_count     = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
-            const uint64_t right_for_base  = bh1;
+            const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
+            const uint64_t right_for_base = bh1;
 
             // === Read Dictionary ===
             // (Must always read to advance stream position)
@@ -278,8 +277,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 for (size_t w = 0; w < left_packed_words; ++w) {
                     scratch.left_packed[w] = encoded.readFixed<uint64_t, 64>();
                 }
-                alp::ffor_unpack(scratch.left_packed.data(), block_count, 0, left_bw,
-                                 scratch.left_indices_i64.data());
+                alp::ffor_unpack(scratch.left_packed.data(), block_count, 0, left_bw, scratch.left_indices_i64.data());
             }
 
             // === Read Right FFOR Data ===
@@ -291,8 +289,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 for (size_t w = 0; w < right_packed_words; ++w) {
                     scratch.right_packed[w] = encoded.readFixed<uint64_t, 64>();
                 }
-                alp::ffor_unpack_u64(scratch.right_packed.data(), block_count, right_for_base,
-                                     right_bw, scratch.right_parts.data());
+                alp::ffor_unpack_u64(scratch.right_packed.data(), block_count, right_for_base, right_bw,
+                                     scratch.right_parts.data());
             }
 
             // === Read Exceptions ===
@@ -317,8 +315,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             // === Reconstruct doubles ===
             const uint8_t right_bit_count = static_cast<uint8_t>((bh0 >> 24) & 0xFF);
 
-            const uint64_t right_mask = (right_bit_count == 64) ? ~0ULL
-                                        : ((1ULL << right_bit_count) - 1);
+            const uint64_t right_mask = (right_bit_count == 64) ? ~0ULL : ((1ULL << right_bit_count) - 1);
 
             if (exception_count == 0) [[likely]] {
                 // Fast path: no exceptions -- tight reconstruction loop
@@ -333,8 +330,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 }
 
                 // Emit values until block ends or output is full
-                const size_t emit_end = std::min(static_cast<size_t>(block_count),
-                                                 i + output_remaining);
+                const size_t emit_end = std::min(static_cast<size_t>(block_count), i + output_remaining);
                 for (; i < emit_end; ++i) {
                     uint64_t left = dict[static_cast<uint8_t>(left_idx[i])];
                     uint64_t r = right[i] & right_mask;

@@ -3,10 +3,10 @@
 
 #include "derived_query_executor.hpp"
 
-#include <seastar/http/httpd.hh>
-#include <seastar/http/handlers.hh>
-#include <seastar/http/function_handlers.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/http/function_handlers.hh>
+#include <seastar/http/handlers.hh>
+#include <seastar/http/httpd.hh>
 
 // Forward declarations
 class Engine;
@@ -19,11 +19,10 @@ namespace timestar {
 class HttpDerivedQueryHandler {
 public:
     // Security limits to prevent DoS attacks
-    static constexpr size_t MAX_DERIVED_QUERY_BODY_SIZE = 1 * 1024 * 1024; // 1MB
+    static constexpr size_t MAX_DERIVED_QUERY_BODY_SIZE = 1 * 1024 * 1024;  // 1MB
 
-    HttpDerivedQueryHandler(seastar::sharded<Engine>* engine,
-                           seastar::sharded<LevelDBIndex>* index = nullptr,
-                           DerivedQueryConfig config = {});
+    HttpDerivedQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<LevelDBIndex>* index = nullptr,
+                            DerivedQueryConfig config = {});
 
     // Register routes with the HTTP server
     void registerRoutes(seastar::httpd::routes& r);
@@ -35,10 +34,9 @@ private:
 
     // Handle POST /derived request
     seastar::future<std::unique_ptr<seastar::http::reply>> handleDerivedQuery(
-        std::unique_ptr<seastar::http::request> req,
-        std::unique_ptr<seastar::http::reply> rep);
+        std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // HTTP_DERIVED_QUERY_HANDLER_H_INCLUDED
+#endif  // HTTP_DERIVED_QUERY_HANDLER_H_INCLUDED

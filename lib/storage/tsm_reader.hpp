@@ -2,6 +2,7 @@
 #define TSM_READER_H_INCLUDED
 
 #include "tsm.hpp"
+
 #include <seastar/core/shared_ptr.hh>
 
 // RAII wrapper for TSM file access.
@@ -21,9 +22,7 @@ public:
     TSMReader& operator=(const TSMReader&) = delete;
 
     // Move constructor
-    TSMReader(TSMReader&& other) noexcept : tsm(std::move(other.tsm)) {
-        other.tsm = nullptr;
-    }
+    TSMReader(TSMReader&& other) noexcept : tsm(std::move(other.tsm)) { other.tsm = nullptr; }
 
     // Move assignment
     TSMReader& operator=(TSMReader&& other) noexcept {
@@ -33,22 +32,20 @@ public:
         }
         return *this;
     }
-    
+
     // Access the underlying TSM file
     TSM* operator->() const { return tsm.get(); }
     TSM& operator*() const { return *tsm; }
-    
+
     // Check if valid
     explicit operator bool() const { return tsm != nullptr; }
-    
+
     // Get the underlying pointer
     TSM* get() const { return tsm.get(); }
-    
+
     // Read series with automatic reference management
     template <class T>
-    seastar::future<TSMResult<T>> readSeries(const SeriesId128& seriesId,
-                                             uint64_t startTime,
-                                             uint64_t endTime) {
+    seastar::future<TSMResult<T>> readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
         TSMResult<T> results(tsm->rankAsInteger());
         co_await tsm->readSeries<T>(seriesId, startTime, endTime, results);
         co_return results;
@@ -60,4 +57,4 @@ inline TSMReader makeTSMReader(seastar::shared_ptr<TSM> file) {
     return TSMReader(file);
 }
 
-#endif // TSM_READER_H_INCLUDED
+#endif  // TSM_READER_H_INCLUDED

@@ -52,16 +52,34 @@ inline size_t appendJsonStringEscaped(std::string& buf, size_t pos, std::string_
     *p++ = '"';
     for (char c : sv) {
         switch (c) {
-            case '"':  *p++ = '\\'; *p++ = '"';  break;
-            case '\\': *p++ = '\\'; *p++ = '\\'; break;
-            case '\n': *p++ = '\\'; *p++ = 'n';  break;
-            case '\r': *p++ = '\\'; *p++ = 'r';  break;
-            case '\t': *p++ = '\\'; *p++ = 't';  break;
+            case '"':
+                *p++ = '\\';
+                *p++ = '"';
+                break;
+            case '\\':
+                *p++ = '\\';
+                *p++ = '\\';
+                break;
+            case '\n':
+                *p++ = '\\';
+                *p++ = 'n';
+                break;
+            case '\r':
+                *p++ = '\\';
+                *p++ = 'r';
+                break;
+            case '\t':
+                *p++ = '\\';
+                *p++ = 't';
+                break;
             default:
                 if (static_cast<unsigned char>(c) < 0x20) {
                     // \uXXXX
                     static constexpr char hex[] = "0123456789abcdef";
-                    *p++ = '\\'; *p++ = 'u'; *p++ = '0'; *p++ = '0';
+                    *p++ = '\\';
+                    *p++ = 'u';
+                    *p++ = '0';
+                    *p++ = '0';
                     *p++ = hex[(static_cast<unsigned char>(c) >> 4) & 0xf];
                     *p++ = hex[static_cast<unsigned char>(c) & 0xf];
                 } else {
@@ -77,7 +95,7 @@ inline size_t appendJsonStringEscaped(std::string& buf, size_t pos, std::string_
 // Fast path: if no escaping needed, direct memcpy.
 inline size_t appendJsonString(std::string& buf, size_t pos, std::string_view sv) {
     if (!needsEscaping(sv)) [[likely]] {
-        size_t need = sv.size() + 2; // quotes
+        size_t need = sv.size() + 2;  // quotes
         if (pos + need > buf.size()) {
             buf.resize(std::max(buf.size() * 2, pos + need));
         }
@@ -112,7 +130,7 @@ inline size_t appendChar(std::string& buf, size_t pos, char c) {
 
 inline void ensureArraySpace(std::string& buf, size_t pos, size_t count) {
     // Each element: up to MAX_NUM_LEN digits + 1 comma
-    size_t need = count * (MAX_NUM_LEN + 1) + 2; // + brackets
+    size_t need = count * (MAX_NUM_LEN + 1) + 2;  // + brackets
     if (pos + need > buf.size()) {
         buf.resize(std::max(buf.size() * 2, pos + need));
     }
@@ -126,7 +144,8 @@ inline size_t appendUint64Array(std::string& buf, size_t pos, const std::vector<
     char* p = buf.data() + pos;
     *p++ = '[';
     for (size_t i = 0; i < arr.size(); ++i) {
-        if (i > 0) *p++ = ',';
+        if (i > 0)
+            *p++ = ',';
         p = glz::to_chars(p, arr[i]);
     }
     *p++ = ']';
@@ -140,7 +159,8 @@ inline size_t appendDoubleArray(std::string& buf, size_t pos, const std::vector<
     char* p = buf.data() + pos;
     *p++ = '[';
     for (size_t i = 0; i < arr.size(); ++i) {
-        if (i > 0) *p++ = ',';
+        if (i > 0)
+            *p++ = ',';
         // Dragonbox handles NaN/Inf by writing "null" (4 bytes)
         p = glz::to_chars(p, arr[i]);
     }
@@ -158,11 +178,14 @@ inline size_t appendBoolArray(std::string& buf, size_t pos, const std::vector<bo
     char* p = buf.data() + pos;
     *p++ = '[';
     for (size_t i = 0; i < arr.size(); ++i) {
-        if (i > 0) *p++ = ',';
+        if (i > 0)
+            *p++ = ',';
         if (arr[i]) {
-            std::memcpy(p, "true", 4); p += 4;
+            std::memcpy(p, "true", 4);
+            p += 4;
         } else {
-            std::memcpy(p, "false", 5); p += 5;
+            std::memcpy(p, "false", 5);
+            p += 5;
         }
     }
     *p++ = ']';
@@ -173,7 +196,8 @@ inline size_t appendBoolArray(std::string& buf, size_t pos, const std::vector<bo
 inline size_t appendStringArray(std::string& buf, size_t pos, const std::vector<std::string>& arr) {
     pos = appendChar(buf, pos, '[');
     for (size_t i = 0; i < arr.size(); ++i) {
-        if (i > 0) pos = appendChar(buf, pos, ',');
+        if (i > 0)
+            pos = appendChar(buf, pos, ',');
         pos = appendJsonString(buf, pos, arr[i]);
     }
     pos = appendChar(buf, pos, ']');
@@ -186,7 +210,8 @@ inline size_t appendInt64Array(std::string& buf, size_t pos, const std::vector<i
     char* p = buf.data() + pos;
     *p++ = '[';
     for (size_t i = 0; i < arr.size(); ++i) {
-        if (i > 0) *p++ = ',';
+        if (i > 0)
+            *p++ = ',';
         p = glz::to_chars(p, arr[i]);
     }
     *p++ = ']';
@@ -195,22 +220,24 @@ inline size_t appendInt64Array(std::string& buf, size_t pos, const std::vector<i
 
 // Dispatch FieldValues variant to the correct array writer.
 inline size_t appendFieldValues(std::string& buf, size_t pos, const FieldValues& values) {
-    return std::visit([&](const auto& vec) -> size_t {
-        using T = std::decay_t<decltype(vec)>;
-        if constexpr (std::is_same_v<T, std::vector<double>>)
-            return appendDoubleArray(buf, pos, vec);
-        else if constexpr (std::is_same_v<T, std::vector<bool>>)
-            return appendBoolArray(buf, pos, vec);
-        else if constexpr (std::is_same_v<T, std::vector<std::string>>)
-            return appendStringArray(buf, pos, vec);
-        else if constexpr (std::is_same_v<T, std::vector<int64_t>>)
-            return appendInt64Array(buf, pos, vec);
-        else
-            static_assert(sizeof(T) == 0, "unhandled FieldValues alternative — update appendFieldValues");
-    }, values);
+    return std::visit(
+        [&](const auto& vec) -> size_t {
+            using T = std::decay_t<decltype(vec)>;
+            if constexpr (std::is_same_v<T, std::vector<double>>)
+                return appendDoubleArray(buf, pos, vec);
+            else if constexpr (std::is_same_v<T, std::vector<bool>>)
+                return appendBoolArray(buf, pos, vec);
+            else if constexpr (std::is_same_v<T, std::vector<std::string>>)
+                return appendStringArray(buf, pos, vec);
+            else if constexpr (std::is_same_v<T, std::vector<int64_t>>)
+                return appendInt64Array(buf, pos, vec);
+            else
+                static_assert(sizeof(T) == 0, "unhandled FieldValues alternative — update appendFieldValues");
+        },
+        values);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ──────────────────────────────────────────────────────────────────────
 // Public API
@@ -231,8 +258,10 @@ std::string ResponseFormatter::format(QueryResponse& response) {
 
     bool firstSeries = true;
     for (auto& series : response.series) {
-        if (series.fields.empty()) continue;
-        if (!firstSeries) pos = appendChar(buf, pos, ',');
+        if (series.fields.empty())
+            continue;
+        if (!firstSeries)
+            pos = appendChar(buf, pos, ',');
         firstSeries = false;
 
         // {"measurement":"..."
@@ -243,7 +272,8 @@ std::string ResponseFormatter::format(QueryResponse& response) {
         pos = appendRaw(buf, pos, R"(,"groupTags":[)");
         bool firstTag = true;
         for (const auto& [key, value] : series.tags) {
-            if (!firstTag) pos = appendChar(buf, pos, ',');
+            if (!firstTag)
+                pos = appendChar(buf, pos, ',');
             firstTag = false;
             // Write "key=value" directly — tag keys/values never need escaping
             size_t need = key.size() + value.size() + 4;
@@ -252,9 +282,11 @@ std::string ResponseFormatter::format(QueryResponse& response) {
             }
             char* p = buf.data() + pos;
             *p++ = '"';
-            std::memcpy(p, key.data(), key.size()); p += key.size();
+            std::memcpy(p, key.data(), key.size());
+            p += key.size();
             *p++ = '=';
-            std::memcpy(p, value.data(), value.size()); p += value.size();
+            std::memcpy(p, value.data(), value.size());
+            p += value.size();
             *p++ = '"';
             pos = static_cast<size_t>(p - buf.data());
         }
@@ -264,7 +296,8 @@ std::string ResponseFormatter::format(QueryResponse& response) {
         pos = appendRaw(buf, pos, R"(,"fields":{)");
         bool firstField = true;
         for (auto& [fieldName, fieldData] : series.fields) {
-            if (!firstField) pos = appendChar(buf, pos, ',');
+            if (!firstField)
+                pos = appendChar(buf, pos, ',');
             firstField = false;
 
             pos = appendJsonString(buf, pos, fieldName);
@@ -286,10 +319,12 @@ std::string ResponseFormatter::format(QueryResponse& response) {
     char* p = buf.data() + pos;
     p = glz::to_chars(p, static_cast<int64_t>(response.statistics.seriesCount));
     constexpr std::string_view ptKey = R"(,"point_count":)";
-    std::memcpy(p, ptKey.data(), ptKey.size()); p += ptKey.size();
+    std::memcpy(p, ptKey.data(), ptKey.size());
+    p += ptKey.size();
     p = glz::to_chars(p, static_cast<int64_t>(response.statistics.pointCount));
     constexpr std::string_view execKey = R"(,"execution_time_ms":)";
-    std::memcpy(p, execKey.data(), execKey.size()); p += execKey.size();
+    std::memcpy(p, execKey.data(), execKey.size());
+    p += execKey.size();
     p = glz::to_chars(p, response.statistics.executionTimeMs);
     *p++ = '}';
     *p++ = '}';
@@ -315,4 +350,4 @@ std::string ResponseFormatter::formatError(const std::string& message) {
     return buf;
 }
 
-} // namespace timestar
+}  // namespace timestar

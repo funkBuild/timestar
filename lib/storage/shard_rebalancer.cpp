@@ -1,22 +1,22 @@
 #include "shard_rebalancer.hpp"
-#include "tsm.hpp"
-#include "tsm_writer.hpp"
+
+#include "logger.hpp"
 #include "memory_store.hpp"
 #include "series_id.hpp"
-#include "logger.hpp"
+#include "tsm.hpp"
+#include "tsm_writer.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <regex>
-#include <algorithm>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/thread.hh>
 #include <unordered_map>
 #include <unordered_set>
-#include <limits>
-
-#include <seastar/core/seastar.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/shared_ptr.hh>
 
 namespace fs = std::filesystem;
 
@@ -26,8 +26,7 @@ namespace timestar {
 // Construction & path helpers
 // ---------------------------------------------------------------------------
 
-ShardRebalancer::ShardRebalancer(const std::string& dataDir)
-    : _dataDir(dataDir.empty() ? "." : dataDir) {}
+ShardRebalancer::ShardRebalancer(const std::string& dataDir) : _dataDir(dataDir.empty() ? "." : dataDir) {}
 
 std::string ShardRebalancer::shardDir(unsigned shard) const {
     return _dataDir + "/shard_" + std::to_string(shard);
@@ -53,8 +52,7 @@ std::string ShardRebalancer::stateFilePath() const {
 // shard_count.meta persistence
 // ---------------------------------------------------------------------------
 
-void ShardRebalancer::writeShardCountMeta(const std::string& dataDir,
-                                           unsigned shardCount) {
+void ShardRebalancer::writeShardCountMeta(const std::string& dataDir, unsigned shardCount) {
     std::string path = (dataDir.empty() ? "." : dataDir) + "/shard_count.meta";
     std::ofstream ofs(path, std::ios::trunc);
     if (!ofs) {
@@ -67,7 +65,8 @@ void ShardRebalancer::writeShardCountMeta(const std::string& dataDir,
 unsigned ShardRebalancer::readShardCountMeta(const std::string& dataDir) {
     std::string path = (dataDir.empty() ? "." : dataDir) + "/shard_count.meta";
     std::ifstream ifs(path);
-    if (!ifs) return 0;
+    if (!ifs)
+        return 0;
     unsigned count = 0;
     ifs >> count;
     return count;
@@ -90,11 +89,13 @@ void ShardRebalancer::writeState(const RebalanceState& state) {
 
 RebalanceState ShardRebalancer::readState() {
     std::ifstream ifs(stateFilePath());
-    if (!ifs) return {};
+    if (!ifs)
+        return {};
     RebalanceState state;
     int phaseInt = 0;
     ifs >> phaseInt >> state.oldShardCount >> state.newShardCount;
-    if (ifs.fail()) return {};
+    if (ifs.fail())
+        return {};
     state.phase = static_cast<RebalancePhase>(phaseInt);
     return state;
 }
@@ -113,10 +114,12 @@ unsigned ShardRebalancer::detectShardCountFromDirs() const {
     bool found = false;
     std::regex shardPattern("shard_(\\d+)");
 
-    if (!fs::exists(_dataDir)) return 0;
+    if (!fs::exists(_dataDir))
+        return 0;
 
     for (const auto& entry : fs::directory_iterator(_dataDir)) {
-        if (!entry.is_directory()) continue;
+        if (!entry.is_directory())
+            continue;
         std::string name = entry.path().filename().string();
         std::smatch m;
         if (std::regex_match(name, m, shardPattern)) {
@@ -167,11 +170,11 @@ void ShardRebalancer::createStagingDirs(unsigned newShardCount) {
 // Phase A: WAL file processing
 // ---------------------------------------------------------------------------
 
-seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount,
-                                                    unsigned newShardCount) {
+seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount, unsigned newShardCount) {
     for (unsigned oldShard = 0; oldShard < oldShardCount; ++oldShard) {
         std::string shardPath = shardDir(oldShard);
-        if (!fs::exists(shardPath)) continue;
+        if (!fs::exists(shardPath))
+            continue;
 
         // Collect WAL files
         std::vector<std::string> walFiles;
@@ -181,17 +184,18 @@ seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount,
             }
         }
 
-        if (walFiles.empty()) continue;
+        if (walFiles.empty())
+            continue;
 
-        engine_log.info("[REBALANCE] Processing {} WAL files from shard {}",
-                        walFiles.size(), oldShard);
+        engine_log.info("[REBALANCE] Processing {} WAL files from shard {}", walFiles.size(), oldShard);
 
         for (const auto& walPath : walFiles) {
             // Replay WAL into a temporary MemoryStore (no WAL backing)
             auto tempStore = seastar::make_shared<::MemoryStore>(0);
             co_await tempStore->initFromWAL(walPath);
 
-            if (tempStore->isEmpty()) continue;
+            if (tempStore->isEmpty())
+                continue;
 
             // Group series by new target shard
             std::unordered_map<unsigned, seastar::shared_ptr<::MemoryStore>> perShardStores;
@@ -210,12 +214,13 @@ seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount,
 
             // Write each per-shard store as a new TSM file in the staging dir
             for (auto& [targetShard, store] : perShardStores) {
-                if (store->isEmpty()) continue;
+                if (store->isEmpty())
+                    continue;
 
                 // Generate a unique filename based on source WAL
                 std::string basename = fs::path(walPath).stem().string();
-                std::string tsmPath = shardDirNew(targetShard) + "/tsm/0_wal_" +
-                                      std::to_string(oldShard) + "_" + basename + ".tsm";
+                std::string tsmPath =
+                    shardDirNew(targetShard) + "/tsm/0_wal_" + std::to_string(oldShard) + "_" + basename + ".tsm";
 
                 co_await ::TSMWriter::runAsync(store, tsmPath);
                 engine_log.debug("[REBALANCE] Wrote WAL data to {}", tsmPath);
@@ -228,14 +233,14 @@ seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount,
 // Phase B+C: TSM file analysis and move/split
 // ---------------------------------------------------------------------------
 
-seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount,
-                                                    unsigned newShardCount) {
+seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsigned newShardCount) {
     // Track next sequence ID per new shard to avoid collisions
     std::unordered_map<unsigned, uint64_t> nextSeqPerShard;
 
     for (unsigned oldShard = 0; oldShard < oldShardCount; ++oldShard) {
         std::string tsmDir = shardDir(oldShard) + "/tsm";
-        if (!fs::exists(tsmDir)) continue;
+        if (!fs::exists(tsmDir))
+            continue;
 
         // Collect TSM files
         std::vector<std::string> tsmFiles;
@@ -245,8 +250,7 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount,
             }
         }
 
-        engine_log.info("[REBALANCE] Analyzing {} TSM files from shard {}",
-                        tsmFiles.size(), oldShard);
+        engine_log.info("[REBALANCE] Analyzing {} TSM files from shard {}", tsmFiles.size(), oldShard);
 
         for (const auto& tsmPath : tsmFiles) {
             // Open the TSM file and read its sparse index
@@ -291,9 +295,8 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount,
                         // Fallback to copy if hard link fails (cross-device)
                         fs::copy_file(tsmPath, destPath, ec);
                         if (ec) {
-                            throw std::runtime_error("Failed to copy TSM file " +
-                                                     tsmPath + " to " + destPath +
-                                                     ": " + ec.message());
+                            throw std::runtime_error("Failed to copy TSM file " + tsmPath + " to " + destPath + ": " +
+                                                     ec.message());
                         }
                     }
 
@@ -305,12 +308,10 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount,
                     }
                 });
 
-                engine_log.debug("[REBALANCE] Moved TSM {} -> {} (shard {})",
-                                 tsmPath, destPath, targetShard);
+                engine_log.debug("[REBALANCE] Moved TSM {} -> {} (shard {})", tsmPath, destPath, targetShard);
             } else {
                 // File has series spanning multiple new shards — must split
-                engine_log.debug("[REBALANCE] Splitting TSM {} across {} shards",
-                                 tsmPath, shardGroups.size());
+                engine_log.debug("[REBALANCE] Splitting TSM {} across {} shards", tsmPath, shardGroups.size());
 
                 // Load tombstones for filtering during read
                 co_await tsm->loadTombstones();
@@ -320,13 +321,16 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount,
 
                     for (const auto& seriesId : ids) {
                         auto typeOpt = tsm->getSeriesType(seriesId);
-                        if (!typeOpt) continue;
+                        if (!typeOpt)
+                            continue;
 
                         // Helper: extract all data from a TSMResult into an InMemorySeries
                         auto extractData = [&]<typename T>(::TSMResult<T>& result) {
-                            if (result.empty()) return;
+                            if (result.empty())
+                                return;
                             auto [ts, vals] = result.getAllData();
-                            if (ts.empty()) return;
+                            if (ts.empty())
+                                return;
                             ::InMemorySeries<T> series;
                             series.timestamps = std::move(ts);
                             series.values = std::move(vals);
@@ -334,40 +338,39 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount,
                         };
 
                         switch (*typeOpt) {
-                        case ::TSMValueType::Float: {
-                            auto result = co_await tsm->queryWithTombstones<double>(
-                                seriesId, 0, std::numeric_limits<uint64_t>::max());
-                            extractData(result);
-                            break;
-                        }
-                        case ::TSMValueType::Boolean: {
-                            auto result = co_await tsm->queryWithTombstones<bool>(
-                                seriesId, 0, std::numeric_limits<uint64_t>::max());
-                            extractData(result);
-                            break;
-                        }
-                        case ::TSMValueType::String: {
-                            auto result = co_await tsm->queryWithTombstones<std::string>(
-                                seriesId, 0, std::numeric_limits<uint64_t>::max());
-                            extractData(result);
-                            break;
-                        }
-                        case ::TSMValueType::Integer: {
-                            auto result = co_await tsm->queryWithTombstones<int64_t>(
-                                seriesId, 0, std::numeric_limits<uint64_t>::max());
-                            extractData(result);
-                            break;
-                        }
+                            case ::TSMValueType::Float: {
+                                auto result = co_await tsm->queryWithTombstones<double>(
+                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
+                                extractData(result);
+                                break;
+                            }
+                            case ::TSMValueType::Boolean: {
+                                auto result = co_await tsm->queryWithTombstones<bool>(
+                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
+                                extractData(result);
+                                break;
+                            }
+                            case ::TSMValueType::String: {
+                                auto result = co_await tsm->queryWithTombstones<std::string>(
+                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
+                                extractData(result);
+                                break;
+                            }
+                            case ::TSMValueType::Integer: {
+                                auto result = co_await tsm->queryWithTombstones<int64_t>(
+                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
+                                extractData(result);
+                                break;
+                            }
                         }
                     }
 
                     if (!splitStore->isEmpty()) {
                         auto& seq = nextSeqPerShard[targetShard];
-                        std::string destPath = shardDirNew(targetShard) + "/tsm/0_split_" +
-                                               std::to_string(seq++) + ".tsm";
+                        std::string destPath =
+                            shardDirNew(targetShard) + "/tsm/0_split_" + std::to_string(seq++) + ".tsm";
                         co_await ::TSMWriter::runAsync(splitStore, destPath);
-                        engine_log.debug("[REBALANCE] Wrote split TSM {} ({} series)",
-                                         destPath, ids.size());
+                        engine_log.debug("[REBALANCE] Wrote split TSM {} ({} series)", destPath, ids.size());
                     }
                 }
 
@@ -386,7 +389,8 @@ void ShardRebalancer::moveLevelDBIndex() {
     std::string srcIndex = shardDir(0) + "/index";
     std::string dstIndex = shardDirNew(0) + "/index";
 
-    if (!fs::exists(srcIndex)) return;
+    if (!fs::exists(srcIndex))
+        return;
 
     // Remove the empty index dir we created in staging
     std::error_code ec;
@@ -465,8 +469,7 @@ void ShardRebalancer::cleanup(unsigned oldShardCount) {
             std::error_code ec;
             fs::remove_all(oldDir, ec);
             if (ec) {
-                engine_log.warn("[REBALANCE] Failed to remove {}: {}",
-                                oldDir, ec.message());
+                engine_log.warn("[REBALANCE] Failed to remove {}: {}", oldDir, ec.message());
             }
         }
     }
@@ -475,8 +478,7 @@ void ShardRebalancer::cleanup(unsigned oldShardCount) {
     std::regex newPattern("shard_\\d+_new");
     if (fs::exists(_dataDir)) {
         for (const auto& entry : fs::directory_iterator(_dataDir)) {
-            if (entry.is_directory() &&
-                std::regex_match(entry.path().filename().string(), newPattern)) {
+            if (entry.is_directory() && std::regex_match(entry.path().filename().string(), newPattern)) {
                 std::error_code ec;
                 fs::remove_all(entry.path(), ec);
             }
@@ -492,52 +494,55 @@ seastar::future<> ShardRebalancer::recoverIfNeeded(unsigned newShardCount) {
     auto state = readState();
 
     switch (state.phase) {
-    case RebalancePhase::None:
-        co_return;
+        case RebalancePhase::None:
+            co_return;
 
-    case RebalancePhase::InProgress:
-        // Crash during WAL/TSM processing. Old dirs are intact.
-        // Delete any partial staging dirs and restart from scratch.
-        engine_log.warn("[REBALANCE] Recovering from interrupted rebalance "
-                        "(phase: InProgress, {}->{})",
-                        state.oldShardCount, state.newShardCount);
-        for (unsigned s = 0; s < state.newShardCount; ++s) {
-            std::error_code ec;
-            fs::remove_all(shardDirNew(s), ec);
-        }
-        removeState();
-        // Set _oldShardCount so execute() knows the old count
-        _oldShardCount = state.oldShardCount;
-        // Now execute the full rebalance
-        co_await execute(newShardCount);
-        co_return;
-
-    case RebalancePhase::RenamesStarted:
-        // Crash during directory renames. Complete them.
-        engine_log.warn("[REBALANCE] Recovering from interrupted rename "
-                        "(phase: RenamesStarted, {}->{})",
-                        state.oldShardCount, state.newShardCount);
-        co_await seastar::async([this, &state] {
-            completeCutover(state.oldShardCount, state.newShardCount);
-            cleanup(state.oldShardCount);
-            writeShardCountMeta(_dataDir, state.newShardCount);
+        case RebalancePhase::InProgress:
+            // Crash during WAL/TSM processing. Old dirs are intact.
+            // Delete any partial staging dirs and restart from scratch.
+            engine_log.warn(
+                "[REBALANCE] Recovering from interrupted rebalance "
+                "(phase: InProgress, {}->{})",
+                state.oldShardCount, state.newShardCount);
+            for (unsigned s = 0; s < state.newShardCount; ++s) {
+                std::error_code ec;
+                fs::remove_all(shardDirNew(s), ec);
+            }
             removeState();
-        });
-        engine_log.info("[REBALANCE] Recovery complete (rename phase)");
-        co_return;
+            // Set _oldShardCount so execute() knows the old count
+            _oldShardCount = state.oldShardCount;
+            // Now execute the full rebalance
+            co_await execute(newShardCount);
+            co_return;
 
-    case RebalancePhase::Complete:
-        // Crash after renames but before cleanup. Just clean up.
-        engine_log.warn("[REBALANCE] Recovering from interrupted cleanup "
-                        "(phase: Complete, {}->{})",
-                        state.oldShardCount, state.newShardCount);
-        co_await seastar::async([this, &state] {
-            cleanup(state.oldShardCount);
-            writeShardCountMeta(_dataDir, state.newShardCount);
-            removeState();
-        });
-        engine_log.info("[REBALANCE] Recovery complete (cleanup phase)");
-        co_return;
+        case RebalancePhase::RenamesStarted:
+            // Crash during directory renames. Complete them.
+            engine_log.warn(
+                "[REBALANCE] Recovering from interrupted rename "
+                "(phase: RenamesStarted, {}->{})",
+                state.oldShardCount, state.newShardCount);
+            co_await seastar::async([this, &state] {
+                completeCutover(state.oldShardCount, state.newShardCount);
+                cleanup(state.oldShardCount);
+                writeShardCountMeta(_dataDir, state.newShardCount);
+                removeState();
+            });
+            engine_log.info("[REBALANCE] Recovery complete (rename phase)");
+            co_return;
+
+        case RebalancePhase::Complete:
+            // Crash after renames but before cleanup. Just clean up.
+            engine_log.warn(
+                "[REBALANCE] Recovering from interrupted cleanup "
+                "(phase: Complete, {}->{})",
+                state.oldShardCount, state.newShardCount);
+            co_await seastar::async([this, &state] {
+                cleanup(state.oldShardCount);
+                writeShardCountMeta(_dataDir, state.newShardCount);
+                removeState();
+            });
+            engine_log.info("[REBALANCE] Recovery complete (cleanup phase)");
+            co_return;
     }
 }
 
@@ -554,8 +559,7 @@ seastar::future<> ShardRebalancer::execute(unsigned newShardCount) {
         co_return;
     }
 
-    engine_log.info("[REBALANCE] Starting shard rebalance: {} -> {} shards",
-                    oldShardCount, newShardCount);
+    engine_log.info("[REBALANCE] Starting shard rebalance: {} -> {} shards", oldShardCount, newShardCount);
 
     auto startTime = std::chrono::steady_clock::now();
 
@@ -575,15 +579,11 @@ seastar::future<> ShardRebalancer::execute(unsigned newShardCount) {
 
     // Phase D: Move LevelDB index
     engine_log.info("[REBALANCE] Phase D: Moving LevelDB index...");
-    co_await seastar::async([this] {
-        moveLevelDBIndex();
-    });
+    co_await seastar::async([this] { moveLevelDBIndex(); });
 
     // Phase E: Atomic cutover
     engine_log.info("[REBALANCE] Phase E: Performing directory cutover...");
-    co_await seastar::async([this, oldShardCount, newShardCount] {
-        performCutover(oldShardCount, newShardCount);
-    });
+    co_await seastar::async([this, oldShardCount, newShardCount] { performCutover(oldShardCount, newShardCount); });
 
     // Phase F: Cleanup
     engine_log.info("[REBALANCE] Phase F: Cleaning up old shard directories...");
@@ -593,10 +593,9 @@ seastar::future<> ShardRebalancer::execute(unsigned newShardCount) {
         removeState();
     });
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - startTime);
-    engine_log.info("[REBALANCE] Shard rebalance complete ({} -> {} shards) in {}ms",
-                    oldShardCount, newShardCount, elapsed.count());
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime);
+    engine_log.info("[REBALANCE] Shard rebalance complete ({} -> {} shards) in {}ms", oldShardCount, newShardCount,
+                    elapsed.count());
 }
 
-} // namespace timestar
+}  // namespace timestar

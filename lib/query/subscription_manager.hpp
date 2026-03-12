@@ -1,19 +1,18 @@
 #pragma once
 
-#include <map>
-#include <memory>
-#include <regex>
-#include <string>
-#include <variant>
-#include <vector>
-
-#include <seastar/core/queue.hh>
-#include <seastar/core/sharded.hh>
+#include "query_parser.hpp"
+#include "series_matcher.hpp"
 
 #include <tsl/robin_map.h>
 
-#include "query_parser.hpp"
-#include "series_matcher.hpp"
+#include <map>
+#include <memory>
+#include <regex>
+#include <seastar/core/queue.hh>
+#include <seastar/core/sharded.hh>
+#include <string>
+#include <variant>
+#include <vector>
 
 namespace timestar {
 
@@ -30,9 +29,9 @@ struct StreamingDataPoint {
 struct StreamingBatch {
     std::vector<StreamingDataPoint> points;
     uint64_t sequenceId = 0;
-    std::string label;  // Query label for multi-query subscriptions (empty = single-query)
-    bool isDrop = false;       // true for drop-notification batches (no points)
-    uint64_t droppedCount = 0; // number of points dropped (valid when isDrop=true)
+    std::string label;          // Query label for multi-query subscriptions (empty = single-query)
+    bool isDrop = false;        // true for drop-notification batches (no points)
+    uint64_t droppedCount = 0;  // number of points dropped (valid when isDrop=true)
 };
 
 // Per-subscription filter criteria. Stored on EVERY shard for local matching.
@@ -40,10 +39,10 @@ struct Subscription {
     uint64_t id = 0;
     std::string measurement;
     std::map<std::string, std::string> scopes;  // Tag filters (AND)
-    std::vector<std::string> fields;             // Field filters (empty = all)
+    std::vector<std::string> fields;            // Field filters (empty = all)
     AggregationMethod aggregation = AggregationMethod::AVG;
-    unsigned handlerShard = 0;                   // Shard that owns the output queue
-    std::string label;                           // Query label for multi-query subscriptions
+    unsigned handlerShard = 0;  // Shard that owns the output queue
+    std::string label;          // Query label for multi-query subscriptions
 
     // Pre-compiled regex patterns for scope values that use wildcard/regex syntax.
     // Populated by SubscriptionManager::addSubscription() so that matches() avoids
@@ -53,8 +52,7 @@ struct Subscription {
     mutable std::map<std::string, std::regex> compiledScopes;
 
     // Check if a write matches this subscription's filters.
-    bool matches(const std::string& writeMeasurement,
-                 const std::map<std::string, std::string>& writeTags,
+    bool matches(const std::string& writeMeasurement, const std::map<std::string, std::string>& writeTags,
                  const std::string& writeField) const;
 };
 
@@ -99,12 +97,10 @@ public:
     // handlerShard == this shard, pushes directly to the queue. For remote
     // subscriptions, adds to the returned vector for the caller to dispatch.
     template <class T>
-    std::vector<RemoteDelivery> notifySubscribers(
-        const std::string& measurement,
-        const std::map<std::string, std::string>& tags,
-        const std::string& field,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<T>& values);
+    std::vector<RemoteDelivery> notifySubscribers(const std::string& measurement,
+                                                  const std::map<std::string, std::string>& tags,
+                                                  const std::string& field, const std::vector<uint64_t>& timestamps,
+                                                  const std::vector<T>& values);
 
     // Deliver a batch to a local subscription's queue. Called via invoke_on()
     // from remote shards.
@@ -112,9 +108,7 @@ public:
 
     // Generate a globally unique subscription ID (upper 16 bits = shard ID).
     // Must be called on the handler shard before registering across shards.
-    uint64_t allocateId() {
-        return (uint64_t(seastar::this_shard_id()) << 48) | (++_nextSubscriptionId);
-    }
+    uint64_t allocateId() { return (uint64_t(seastar::this_shard_id()) << 48) | (++_nextSubscriptionId); }
 
     // Total subscription entries on this shard (includes filter copies for remote handler shards).
     // Use localSubscriptionCount() for capacity enforcement.
@@ -123,9 +117,7 @@ public:
     // Count subscriptions managed by this shard (handler-shard role only).
     // Use this for capacity limit checks — subscriptionCount() overcounts
     // because non-handler shards also store filter entries for remote subscriptions.
-    size_t localSubscriptionCount() const {
-        return _localSubscriptionCount;
-    }
+    size_t localSubscriptionCount() const { return _localSubscriptionCount; }
 
     // Collect stats for all subscriptions on this shard (handler shard only has queue info).
     std::vector<SubscriptionStats> getStats() const;
@@ -149,13 +141,11 @@ private:
     static std::variant<double, bool, std::string, int64_t> toVariant(const T& val);
 
     template <class T>
-    static std::shared_ptr<const StreamingBatch> buildBatch(
-        const std::string& measurement,
-        const std::map<std::string, std::string>& tags,
-        const std::string& field,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<T>& values,
-        const std::string& label);
+    static std::shared_ptr<const StreamingBatch> buildBatch(const std::string& measurement,
+                                                            const std::map<std::string, std::string>& tags,
+                                                            const std::string& field,
+                                                            const std::vector<uint64_t>& timestamps,
+                                                            const std::vector<T>& values, const std::string& label);
 };
 
-} // namespace timestar
+}  // namespace timestar

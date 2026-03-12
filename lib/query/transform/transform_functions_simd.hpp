@@ -16,14 +16,14 @@
  *   - Falls back for small arrays where SIMD overhead exceeds benefit
  */
 
-#include <vector>
-#include <cstdint>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
 
 #ifndef TIMESTAR_DISABLE_SIMD
-#include <immintrin.h>
-#include <cpuid.h>
+    #include <cpuid.h>
+    #include <immintrin.h>
 #endif
 
 namespace timestar {
@@ -42,7 +42,8 @@ inline bool isAvx2Available() {
     return false;
 #else
     static int cached = -1;
-    if (cached >= 0) return cached != 0;
+    if (cached >= 0)
+        return cached != 0;
 
     unsigned int eax, ebx, ecx, edx;
     if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
@@ -67,7 +68,8 @@ inline bool isAvx512Available() {
     return false;
 #else
     static int cached = -1;
-    if (cached >= 0) return cached != 0;
+    if (cached >= 0)
+        return cached != 0;
 
     unsigned int eax, ebx, ecx, edx;
     if (__get_cpuid_max(0, nullptr) >= 7) {
@@ -138,8 +140,7 @@ inline std::vector<double> clamp_max(const std::vector<double>& values, double m
 inline std::vector<double> cutoff_min(const std::vector<double>& values, double threshold) {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = (!std::isnan(values[i]) && values[i] < threshold)
-                    ? std::nan("") : values[i];
+        result[i] = (!std::isnan(values[i]) && values[i] < threshold) ? std::nan("") : values[i];
     }
     return result;
 }
@@ -147,8 +148,7 @@ inline std::vector<double> cutoff_min(const std::vector<double>& values, double 
 inline std::vector<double> cutoff_max(const std::vector<double>& values, double threshold) {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = (!std::isnan(values[i]) && values[i] > threshold)
-                    ? std::nan("") : values[i];
+        result[i] = (!std::isnan(values[i]) && values[i] > threshold) ? std::nan("") : values[i];
     }
     return result;
 }
@@ -160,10 +160,10 @@ inline std::vector<double> diff(const std::vector<double>& values) {
     std::vector<double> result(values.size());
     result[0] = std::nan("");
     for (size_t i = 1; i < values.size(); ++i) {
-        if (std::isnan(values[i]) || std::isnan(values[i-1])) {
+        if (std::isnan(values[i]) || std::isnan(values[i - 1])) {
             result[i] = std::nan("");
         } else {
-            result[i] = values[i] - values[i-1];
+            result[i] = values[i] - values[i - 1];
         }
     }
     return result;
@@ -176,10 +176,10 @@ inline std::vector<double> monotonic_diff(const std::vector<double>& values) {
     std::vector<double> result(values.size());
     result[0] = std::nan("");
     for (size_t i = 1; i < values.size(); ++i) {
-        if (std::isnan(values[i]) || std::isnan(values[i-1])) {
+        if (std::isnan(values[i]) || std::isnan(values[i - 1])) {
             result[i] = std::nan("");
         } else {
-            double dv = values[i] - values[i-1];
+            double dv = values[i] - values[i - 1];
             result[i] = (dv >= 0) ? dv : values[i];  // counter reset: use current value
         }
     }
@@ -195,7 +195,7 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
     }
 }
 
-} // namespace scalar
+}  // namespace scalar
 
 // ============================================================================
 // AVX2 SIMD Implementations (process 4 doubles at a time)
@@ -401,8 +401,7 @@ inline std::vector<double> cutoff_min(const std::vector<double>& values, double 
 
     // Handle remaining
     for (size_t i = simd_end; i < values.size(); ++i) {
-        result[i] = (!std::isnan(values[i]) && values[i] < threshold)
-                    ? std::nan("") : values[i];
+        result[i] = (!std::isnan(values[i]) && values[i] < threshold) ? std::nan("") : values[i];
     }
 
     return result;
@@ -434,8 +433,7 @@ inline std::vector<double> cutoff_max(const std::vector<double>& values, double 
 
     // Handle remaining
     for (size_t i = simd_end; i < values.size(); ++i) {
-        result[i] = (!std::isnan(values[i]) && values[i] > threshold)
-                    ? std::nan("") : values[i];
+        result[i] = (!std::isnan(values[i]) && values[i] > threshold) ? std::nan("") : values[i];
     }
 
     return result;
@@ -458,7 +456,8 @@ inline std::vector<double> diff(const std::vector<double>& values) {
     // Process in groups of 4 starting from index 1
     // We need values[i] - values[i-1] for i = 1..n-1
     size_t simd_end = 1 + ((values.size() - 1) / 4) * 4;
-    if (simd_end > values.size()) simd_end = values.size();
+    if (simd_end > values.size())
+        simd_end = values.size();
 
     // For SIMD, we need adjacent pairs: (v1-v0, v2-v1, v3-v2, v4-v3)
     // Process 4 diffs at a time when possible
@@ -466,7 +465,7 @@ inline std::vector<double> diff(const std::vector<double>& values) {
     while (i + 3 < values.size()) {
         // Load current values
         __m256d curr = _mm256_loadu_pd(&values[i]);
-        __m256d prev = _mm256_loadu_pd(&values[i-1]);
+        __m256d prev = _mm256_loadu_pd(&values[i - 1]);
 
         // Compute differences
         __m256d diff = _mm256_sub_pd(curr, prev);
@@ -485,10 +484,10 @@ inline std::vector<double> diff(const std::vector<double>& values) {
 
     // Handle remaining elements
     for (; i < values.size(); ++i) {
-        if (std::isnan(values[i]) || std::isnan(values[i-1])) {
+        if (std::isnan(values[i]) || std::isnan(values[i - 1])) {
             result[i] = std::nan("");
         } else {
-            result[i] = values[i] - values[i-1];
+            result[i] = values[i] - values[i - 1];
         }
     }
 
@@ -512,7 +511,7 @@ inline std::vector<double> monotonic_diff(const std::vector<double>& values) {
     size_t i = 1;
     while (i + 3 < values.size()) {
         __m256d curr = _mm256_loadu_pd(&values[i]);
-        __m256d prev = _mm256_loadu_pd(&values[i-1]);
+        __m256d prev = _mm256_loadu_pd(&values[i - 1]);
 
         // Compute differences
         __m256d diff = _mm256_sub_pd(curr, prev);
@@ -535,10 +534,10 @@ inline std::vector<double> monotonic_diff(const std::vector<double>& values) {
 
     // Handle remaining elements
     for (; i < values.size(); ++i) {
-        if (std::isnan(values[i]) || std::isnan(values[i-1])) {
+        if (std::isnan(values[i]) || std::isnan(values[i - 1])) {
             result[i] = std::nan("");
         } else {
-            double dv = values[i] - values[i-1];
+            double dv = values[i] - values[i - 1];
             result[i] = (dv >= 0) ? dv : values[i];  // counter reset: use current value
         }
     }
@@ -573,9 +572,9 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
     }
 }
 
-} // namespace avx2
+}  // namespace avx2
 
-#endif // !TIMESTAR_DISABLE_SIMD
+#endif  // !TIMESTAR_DISABLE_SIMD
 
 // ============================================================================
 // Dispatch Functions - Select SIMD or scalar based on CPU and array size
@@ -743,8 +742,8 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
 #endif
 }
 
-} // namespace simd
-} // namespace transform
-} // namespace timestar
+}  // namespace simd
+}  // namespace transform
+}  // namespace timestar
 
-#endif // TRANSFORM_FUNCTIONS_SIMD_H_INCLUDED
+#endif  // TRANSFORM_FUNCTIONS_SIMD_H_INCLUDED

@@ -1,13 +1,16 @@
 #include "aggregator.hpp"
-#include "simd_aggregator.hpp"
+
 #include "http_query_handler.hpp"  // For SeriesResult
-#include <stdexcept>
-#include <cmath>
-#include <algorithm>
-#include <limits>
-#include <unordered_map>
-#include <chrono>
+#include "simd_aggregator.hpp"
+
 #include <fmt/format.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <unordered_map>
 
 namespace timestar {
 
@@ -67,10 +70,8 @@ double Aggregator::calculateSum(const std::vector<double>& values) {
 // Merge sorted raw (timestamps, values) into an existing sorted (timestamps, states).
 // Both inputs must be sorted by timestamp. Duplicate timestamps are merged via
 // AggregationState::addValue. O(n+m) time, O(n+m) space for the output buffer.
-static void mergeSortedRawInto(
-    std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
-    const std::vector<uint64_t>& newTs, const std::vector<double>& newValues) {
-
+static void mergeSortedRawInto(std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
+                               const std::vector<uint64_t>& newTs, const std::vector<double>& newValues) {
     // Inherit collectRaw from existing states so new states match
     const bool needsRaw = !baseStates.empty() && baseStates[0].collectRaw;
 
@@ -128,12 +129,9 @@ static void mergeSortedRawInto(
 // from different shards that share timestamps.
 // Returns merged (timestamps, values, counts) suitable for building
 // AggregatedPoints directly.
-static void mergeSortedRawValuesInto(
-    std::vector<uint64_t>& baseTs, std::vector<double>& baseVals,
-    std::vector<size_t>& baseCounts,
-    const std::vector<uint64_t>& newTs, const std::vector<double>& newVals,
-    AggregationMethod method) {
-
+static void mergeSortedRawValuesInto(std::vector<uint64_t>& baseTs, std::vector<double>& baseVals,
+                                     std::vector<size_t>& baseCounts, const std::vector<uint64_t>& newTs,
+                                     const std::vector<double>& newVals, AggregationMethod method) {
     std::vector<uint64_t> mergedTs;
     std::vector<double> mergedVals;
     std::vector<size_t> mergedCounts;
@@ -161,16 +159,21 @@ static void mergeSortedRawValuesInto(
             switch (method) {
                 case AggregationMethod::AVG:
                 case AggregationMethod::SUM:
-                    v = baseVals[i] + newVals[j]; break;
+                    v = baseVals[i] + newVals[j];
+                    break;
                 case AggregationMethod::MIN:
-                    v = std::min(baseVals[i], newVals[j]); break;
+                    v = std::min(baseVals[i], newVals[j]);
+                    break;
                 case AggregationMethod::MAX:
                 case AggregationMethod::LATEST:
-                    v = std::max(baseVals[i], newVals[j]); break;
+                    v = std::max(baseVals[i], newVals[j]);
+                    break;
                 case AggregationMethod::FIRST:
-                    v = baseVals[i]; break;
+                    v = baseVals[i];
+                    break;
                 default:
-                    v = baseVals[i] + newVals[j]; break;  // SUM-like for COUNT etc.
+                    v = baseVals[i] + newVals[j];
+                    break;  // SUM-like for COUNT etc.
             }
             mergedVals.push_back(v);
             mergedCounts.push_back(cnt);
@@ -198,10 +201,8 @@ static void mergeSortedRawValuesInto(
 
 // Merge two sorted (timestamps, states) vectors. Used in the reduce phase to
 // combine partial results from different shards. O(n+m) time.
-static void mergeSortedStatesInto(
-    std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
-    std::vector<uint64_t>& newTs, std::vector<AggregationState>& newStates) {
-
+static void mergeSortedStatesInto(std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
+                                  std::vector<uint64_t>& newTs, std::vector<AggregationState>& newStates) {
     std::vector<uint64_t> mergedTs;
     std::vector<AggregationState> mergedStates;
     mergedTs.reserve(baseTs.size() + newTs.size());
@@ -242,16 +243,13 @@ static void mergeSortedStatesInto(
 }
 
 std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
-    const std::vector<timestar::SeriesResult>& seriesResults,
-    AggregationMethod method,
-    uint64_t interval,
+    const std::vector<timestar::SeriesResult>& seriesResults, AggregationMethod method, uint64_t interval,
     const std::vector<std::string>& groupByTags) {
-
     auto startTime = std::chrono::high_resolution_clock::now();
 
     // Use PrehashedString key to compute hash once and avoid redundant hashing
-    std::unordered_map<PrehashedString, PartialAggregationResult,
-                       PrehashedStringHash, PrehashedStringEqual> partialResults;
+    std::unordered_map<PrehashedString, PartialAggregationResult, PrehashedStringHash, PrehashedStringEqual>
+        partialResults;
 
     for (const auto& series : seriesResults) {
         for (const auto& [fieldName, fieldData] : series.fields) {
@@ -274,7 +272,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                 }
                 doubleValuesPtr = &convertedValues;
             } else {
-                continue; // Skip non-numeric types (string, bool)
+                continue;  // Skip non-numeric types (string, bool)
             }
 
             const auto& doubleValues = *doubleValuesPtr;
@@ -312,8 +310,8 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                 partial.measurement = series.measurement;
                 partial.fieldName = fieldName;
                 partial.groupKey = it->first.value;  // Read from the emplaced key
-                partial.groupKeyHash = keyHash;       // Reuse pre-computed hash
-                partial.cachedTags = relevantTags;    // Cache parsed tags once
+                partial.groupKeyHash = keyHash;      // Reuse pre-computed hash
+                partial.cachedTags = relevantTags;   // Cache parsed tags once
                 // Pre-reserve bucket map: at most one bucket per unique timestamp,
                 // so timestamps.size() is a safe upper bound that prevents rehashing
                 // for the typical case where this is the only series in the group.
@@ -357,8 +355,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                     }
                 } else {
                     // Multiple series in same group: O(n+m) sorted merge
-                    mergeSortedRawInto(partial.sortedTimestamps, partial.sortedStates,
-                                       timestamps, doubleValues);
+                    mergeSortedRawInto(partial.sortedTimestamps, partial.sortedStates, timestamps, doubleValues);
                 }
             }
         }
@@ -379,9 +376,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 }
 
 std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGrouped(
-    std::vector<PartialAggregationResult>& partialResults,
-    AggregationMethod method) {
-
+    std::vector<PartialAggregationResult>& partialResults, AggregationMethod method) {
     if (partialResults.empty()) {
         return {};
     }
@@ -389,8 +384,9 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
     std::vector<GroupedAggregationResult> result;
 
     // Group partial results by pre-hashed composite key (no re-hashing of groupKey strings)
-    std::unordered_map<PrehashedString, std::vector<PartialAggregationResult*>,
-                       PrehashedStringHash, PrehashedStringEqual> groups;
+    std::unordered_map<PrehashedString, std::vector<PartialAggregationResult*>, PrehashedStringHash,
+                       PrehashedStringEqual>
+        groups;
 
     for (auto& partial : partialResults) {
         // Reuse the pre-computed groupKeyHash — no re-hashing of the string
@@ -456,9 +452,7 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
 
             // Sort points by timestamp
             std::sort(groupedResult.points.begin(), groupedResult.points.end(),
-                [](const AggregatedPoint& a, const AggregatedPoint& b) {
-                    return a.timestamp < b.timestamp;
-                });
+                      [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
 
         } else {
             // Non-bucketed merge. Check if all partials carry compact raw
@@ -499,10 +493,8 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     std::vector<size_t> mergedCounts(mergedTs.size(), 1);
 
                     for (size_t i = 1; i < groupPartials.size(); ++i) {
-                        mergeSortedRawValuesInto(mergedTs, mergedVals, mergedCounts,
-                                                 groupPartials[i]->sortedTimestamps,
-                                                 groupPartials[i]->sortedValues,
-                                                 method);
+                        mergeSortedRawValuesInto(mergedTs, mergedVals, mergedCounts, groupPartials[i]->sortedTimestamps,
+                                                 groupPartials[i]->sortedValues, method);
                     }
 
                     groupedResult.points.reserve(mergedTs.size());
@@ -513,8 +505,7 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                         } else if (method == AggregationMethod::COUNT) {
                             finalValue = static_cast<double>(mergedCounts[i]);
                         }
-                        groupedResult.points.push_back(
-                            {mergedTs[i], finalValue, mergedCounts[i]});
+                        groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
                     }
                 }
             } else {
@@ -539,8 +530,7 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 std::vector<AggregationState> mergedStates = std::move(first->sortedStates);
 
                 for (size_t i = 1; i < groupPartials.size(); ++i) {
-                    mergeSortedStatesInto(mergedTs, mergedStates,
-                                          groupPartials[i]->sortedTimestamps,
+                    mergeSortedStatesInto(mergedTs, mergedStates, groupPartials[i]->sortedTimestamps,
                                           groupPartials[i]->sortedStates);
                 }
 
@@ -565,12 +555,9 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
 // LEGACY COMPATIBILITY
 // ============================================================================
 
-std::vector<AggregatedPoint> Aggregator::aggregate(
-    const std::vector<uint64_t>& timestamps,
-    const std::vector<double>& values,
-    AggregationMethod method,
-    uint64_t interval) {
-
+std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& timestamps,
+                                                   const std::vector<double>& values, AggregationMethod method,
+                                                   uint64_t interval) {
     if (timestamps.empty() || values.empty()) {
         return {};
     }
@@ -589,9 +576,7 @@ std::vector<AggregatedPoint> Aggregator::aggregate(
             result.push_back({bucketTime, state.getValue(method), state.count});
         }
         std::sort(result.begin(), result.end(),
-            [](const AggregatedPoint& a, const AggregatedPoint& b) {
-                return a.timestamp < b.timestamp;
-            });
+                  [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
         return result;
     } else {
         // No bucketing - one point per timestamp
@@ -606,18 +591,14 @@ std::vector<AggregatedPoint> Aggregator::aggregate(
             result.push_back({ts, state.getValue(method), state.count});
         }
         std::sort(result.begin(), result.end(),
-            [](const AggregatedPoint& a, const AggregatedPoint& b) {
-                return a.timestamp < b.timestamp;
-            });
+                  [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
         return result;
     }
 }
 
 std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
-    const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& groupData,
-    AggregationMethod method,
+    const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& groupData, AggregationMethod method,
     uint64_t interval) {
-
     if (groupData.empty()) {
         return {};
     }
@@ -638,10 +619,8 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
         result.push_back({ts, state.getValue(method), state.count});
     }
     std::sort(result.begin(), result.end(),
-        [](const AggregatedPoint& a, const AggregatedPoint& b) {
-            return a.timestamp < b.timestamp;
-        });
+              [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
     return result;
 }
 
-} // namespace timestar
+}  // namespace timestar

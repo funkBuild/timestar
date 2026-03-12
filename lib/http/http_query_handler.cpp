@@ -1,26 +1,28 @@
 #include "http_query_handler.hpp"
-#include "response_formatter.hpp"
-#include "engine.hpp"
-#include "query_parser.hpp"
+
 #include "aggregator.hpp"
+#include "engine.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "query_parser.hpp"
+#include "response_formatter.hpp"
 #include "series_key.hpp"
+
 #include <algorithm>
-#include <numeric>
-#include <unordered_map>
-#include <unordered_set>
-#include <seastar/core/when_all.hh>
-#include <seastar/core/loop.hh>
-#include <seastar/core/with_timeout.hh>
-#include <seastar/core/lowres_clock.hh>
-#include <seastar/core/smp.hh>
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <numeric>
+#include <seastar/core/loop.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/when_all.hh>
+#include <seastar/core/with_timeout.hh>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
-// Glaze-compatible structures for JSON parsing  
+// Glaze-compatible structures for JSON parsing
 struct GlazeQueryRequest {
     std::string query;
     std::variant<uint64_t, std::string> startTime;
@@ -31,24 +33,19 @@ struct GlazeQueryRequest {
 template <>
 struct glz::meta<GlazeQueryRequest> {
     using T = GlazeQueryRequest;
-    static constexpr auto value = object(
-        "query", &T::query,
-        "startTime", &T::startTime,
-        "endTime", &T::endTime,
-        "aggregationInterval", &T::aggregationInterval
-    );
+    static constexpr auto value = object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime,
+                                         "aggregationInterval", &T::aggregationInterval);
 };
 
 namespace timestar {
 
 // Helper to build a merge key from measurement + sorted tags with pre-reserved capacity.
 // Avoids repeated reallocations from naive string concatenation in loops.
-static std::string buildMergeKey(const std::string& measurement,
-                                  const std::map<std::string, std::string>& tags) {
+static std::string buildMergeKey(const std::string& measurement, const std::map<std::string, std::string>& tags) {
     // Pre-calculate total size: measurement + (NUL + key + '=' + value) for each tag
     size_t totalSize = measurement.size();
     for (const auto& [k, v] : tags) {
-        totalSize += 1 + k.size() + 1 + v.size(); // '\0' + key + '=' + value
+        totalSize += 1 + k.size() + 1 + v.size();  // '\0' + key + '=' + value
     }
 
     std::string key;
@@ -67,7 +64,7 @@ static std::string buildMergeKey(const std::string& measurement,
 struct QueryTimingInfo {
     std::chrono::high_resolution_clock::time_point startTime;
     std::chrono::high_resolution_clock::time_point endTime;
-    
+
     // Step timings
     double parseRequestMs = 0.0;
     double findSeriesMs = 0.0;
@@ -78,13 +75,13 @@ struct QueryTimingInfo {
     double aggregationMs = 0.0;       // time for merge + reduce + response building
     double responseFormattingMs = 0.0;
     double totalMs = 0.0;
-    
+
     // Statistics
     size_t seriesFound = 0;
     size_t shardsQueried = 0;
     size_t totalPointsRetrieved = 0;
     size_t finalPointsReturned = 0;
-    
+
     std::string toString() const {
         std::stringstream ss;
         ss << std::fixed << std::setprecision(2);
@@ -114,8 +111,7 @@ struct QueryTimingInfo {
     }
 };
 
-std::unique_ptr<seastar::http::reply>
-HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
+std::unique_ptr<seastar::http::reply> HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
     // Check body size limit
     if (req.content.size() > maxQueryBodySize()) {
         auto rep = std::make_unique<seastar::http::reply>();
@@ -137,17 +133,19 @@ HttpQueryHandler::validateRequest(const seastar::http::request& req) const {
         if (!contentTypeStr.starts_with("application/json")) {
             auto rep = std::make_unique<seastar::http::reply>();
             rep->set_status(seastar::http::reply::status_type::unsupported_media_type);
-            rep->_content = "{\"status\":\"error\",\"message\":\"Content-Type must be application/json\",\"error\":\"Content-Type must be application/json\"}";
+            rep->_content =
+                "{\"status\":\"error\",\"message\":\"Content-Type must be application/json\",\"error\":\"Content-Type "
+                "must be application/json\"}";
             rep->add_header("Content-Type", "application/json");
             return rep;
         }
     }
 
-    return nullptr; // Validation passed
+    return nullptr;  // Validation passed
 }
 
-seastar::future<std::unique_ptr<seastar::http::reply>>
-HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
+seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQuery(
+    std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
 
     try {
@@ -160,14 +158,15 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
         // Parse JSON request body using Glaze
         GlazeQueryRequest glazeRequest;
         auto parse_error = glz::read_json(glazeRequest, req->content);
-        
+
         if (parse_error) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("INVALID_JSON", "Failed to parse JSON request: " + std::string(glz::format_error(parse_error)));
+            rep->_content = createErrorResponse(
+                "INVALID_JSON", "Failed to parse JSON request: " + std::string(glz::format_error(parse_error)));
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
-        
+
         // Convert to QueryRequest
         QueryRequest queryRequest;
         auto parseStart = std::chrono::high_resolution_clock::now();
@@ -181,16 +180,15 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
         }
         auto parseEnd = std::chrono::high_resolution_clock::now();
         double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
-        
+
         // Execute query
         auto startTime = std::chrono::high_resolution_clock::now();
         QueryResponse response = co_await executeQuery(queryRequest);
         auto endTime = std::chrono::high_resolution_clock::now();
-        
+
         // Calculate execution time
-        response.statistics.executionTimeMs = 
-            std::chrono::duration<double, std::milli>(endTime - startTime).count();
-        
+        response.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+
         // Format response
         auto formatStart = std::chrono::high_resolution_clock::now();
         if (response.success) {
@@ -202,49 +200,45 @@ HttpQueryHandler::handleQuery(std::unique_ptr<seastar::http::request> req) {
         }
         auto formatEnd = std::chrono::high_resolution_clock::now();
         double formatMs = std::chrono::duration<double, std::milli>(formatEnd - formatStart).count();
-        
+
         rep->add_header("Content-Type", "application/json");
-        
+
         // Log query summary after response is ready (controlled by TIMESTAR_LOG_QUERY_PATH)
-        LOG_QUERY_PATH(timestar::http_log, info, 
-            "[QUERY_SUMMARY] Query: '{}' | StartTime: {} | EndTime: {} | AggregationInterval: {} | ExecutionTime: {:.2f}ms",
-            glazeRequest.query,
-            queryRequest.startTime,
-            queryRequest.endTime,
-            queryRequest.aggregationInterval ? std::to_string(queryRequest.aggregationInterval) : "none",
-            response.statistics.executionTimeMs);
-        
+        LOG_QUERY_PATH(timestar::http_log, info,
+                       "[QUERY_SUMMARY] Query: '{}' | StartTime: {} | EndTime: {} | AggregationInterval: {} | "
+                       "ExecutionTime: {:.2f}ms",
+                       glazeRequest.query, queryRequest.startTime, queryRequest.endTime,
+                       queryRequest.aggregationInterval ? std::to_string(queryRequest.aggregationInterval) : "none",
+                       response.statistics.executionTimeMs);
+
     } catch (const std::exception& e) {
         timestar::http_log.error("[QUERY] Error handling query request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal query error");
         rep->add_header("Content-Type", "application/json");
     }
-    
+
     co_return rep;
 }
 
 void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, 
-               std::unique_ptr<seastar::http::reply> rep) 
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return handleQuery(std::move(req));
-        }, "json");
-    
-    r.add(seastar::httpd::operation_type::POST, 
-          seastar::httpd::url("/query"), handler);
-    
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleQuery(std::move(req)); },
+        "json");
+
+    r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/query"), handler);
+
     timestar::http_log.info("Registered HTTP query endpoint at /query");
 }
 
 QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeReq) {
     // Parse the query string
     std::string queryStr = glazeReq.query;
-    
+
     // Handle both numeric and string timestamps for backward compatibility
     uint64_t startTime, endTime;
-    
+
     // Parse startTime - can be number or string
     if (std::holds_alternative<uint64_t>(glazeReq.startTime)) {
         startTime = std::get<uint64_t>(glazeReq.startTime);
@@ -257,7 +251,7 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
             startTime = QueryParser::parseTime(timeStr);
         }
     }
-    
+
     // Parse endTime - can be number or string
     if (std::holds_alternative<uint64_t>(glazeReq.endTime)) {
         endTime = std::get<uint64_t>(glazeReq.endTime);
@@ -270,7 +264,7 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
             endTime = QueryParser::parseTime(timeStr);
         }
     }
-    
+
     // Validate time range
     if (startTime >= endTime) {
         throw QueryParseException("startTime must be less than endTime");
@@ -288,40 +282,37 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
             aggregationInterval = parseInterval(intervalStr);
         }
     }
-    
+
     LOG_QUERY_PATH(timestar::http_log, debug, "[QUERY] Parsed request - Query: '{}', Start: {}, End: {}, Interval: {}",
-                   queryStr, startTime, endTime, 
-                   aggregationInterval ? std::to_string(aggregationInterval) : "none");
-    
-    // Parse the query string to extract components  
+                   queryStr, startTime, endTime, aggregationInterval ? std::to_string(aggregationInterval) : "none");
+
+    // Parse the query string to extract components
     QueryRequest request = QueryParser::parseQueryString(queryStr);
     request.startTime = startTime;
     request.endTime = endTime;
     request.aggregationInterval = aggregationInterval;
-    
+
     return request;
 }
 
 seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest& request) {
-    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Executing query - Measurement: {}, Fields: {}, Scopes: {}, Start: {}, End: {}",
-                   request.measurement,
-                   request.fields.size(),
-                   request.scopes.size(),
-                   request.startTime,
+    LOG_QUERY_PATH(timestar::http_log, info,
+                   "[QUERY] Executing query - Measurement: {}, Fields: {}, Scopes: {}, Start: {}, End: {}",
+                   request.measurement, request.fields.size(), request.scopes.size(), request.startTime,
                    request.endTime);
-    
+
     QueryResponse response;
     response.success = true;
     response.scopes = request.scopes;
-    
+
     // Initialize timing tracker
     QueryTimingInfo timing;
     timing.startTime = std::chrono::high_resolution_clock::now();
-    
+
     try {
-        LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Checking pointers - engineSharded: {}, indexSharded: {}", 
+        LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Checking pointers - engineSharded: {}, indexSharded: {}",
                        (void*)engineSharded, (void*)indexSharded);
-        
+
         if (!engineSharded) {
             LOG_QUERY_PATH(timestar::http_log, error, "[QUERY] engineSharded is NULL!");
             response.success = false;
@@ -353,10 +344,10 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         // eliminating the intermediate SeriesMetadataWithShard struct + conversion loop.
         // Pass maxSeriesCount() into findSeriesWithMetadata to bail out early.
         auto findSeriesStart = std::chrono::high_resolution_clock::now();
-        auto discoveryResult = co_await engineSharded->invoke_on(0,
+        auto discoveryResult = co_await engineSharded->invoke_on(
+            0,
             [measurement = request.measurement, scopes = request.scopes, fields = request.fields,
-             maxSeries = maxSeriesCount()](Engine& engine)
-                -> seastar::future<SeriesDiscoveryResult> {
+             maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<SeriesDiscoveryResult> {
                 auto& index = engine.getIndex();
 
                 std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
@@ -373,16 +364,19 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
                 auto& seriesWithMeta = findResult.value();
 
-                LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard 0 (metadata) found {} series for measurement '{}' with {} scopes",
+                LOG_QUERY_PATH(timestar::http_log, info,
+                               "[QUERY] Shard 0 (metadata) found {} series for measurement '{}' with {} scopes",
                                seriesWithMeta.size(), measurement, scopes.size());
 
                 SeriesDiscoveryResult result;
                 unsigned shardCount = seastar::smp::count;
-                if (shardCount == 0) shardCount = 1;
+                if (shardCount == 0)
+                    shardCount = 1;
                 result.seriesByShard.resize(shardCount);
 
                 for (auto& swm : seriesWithMeta) {
-                    std::string seriesKey = buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
+                    std::string seriesKey =
+                        buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
 
                     SeriesId128 dataSeriesId = SeriesId128::fromSeriesKey(seriesKey);
                     unsigned shardId = SeriesId128::Hash{}(dataSeriesId) % shardCount;
@@ -406,7 +400,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             response.success = false;
             response.errorCode = "TOO_MANY_SERIES";
             response.errorMessage = "Too many series: " + std::to_string(discoveryResult.discovered) +
-                " exceeds limit of " + std::to_string(discoveryResult.limit);
+                                    " exceeds limit of " + std::to_string(discoveryResult.limit);
             co_return response;
         }
 
@@ -424,7 +418,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         timing.seriesFound = totalSeriesFound;
         timing.shardsQueried = shardsWithData;
 
-        LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Total series from centralized metadata: {} across {} shards (took {:.2f} ms)",
+        LOG_QUERY_PATH(timestar::http_log, info,
+                       "[QUERY] Total series from centralized metadata: {} across {} shards (took {:.2f} ms)",
                        totalSeriesFound, shardsWithData, timing.findSeriesMs);
 
         // Safety net: enforce maxSeriesCount() limit (should rarely trigger now
@@ -432,10 +427,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         if (totalSeriesFound > maxSeriesCount()) {
             response.success = false;
             response.errorCode = "TOO_MANY_SERIES";
-            response.errorMessage = "Too many series: " + std::to_string(totalSeriesFound) + " exceeds limit of " + std::to_string(maxSeriesCount());
+            response.errorMessage = "Too many series: " + std::to_string(totalSeriesFound) + " exceeds limit of " +
+                                    std::to_string(maxSeriesCount());
             co_return response;
         }
-        
+
         // Struct to hold shard query results including both aggregatable and non-aggregatable data
         struct ShardQueryResult {
             std::vector<PartialAggregationResult> partialResults;
@@ -447,218 +443,238 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         auto shardQueriesStart = std::chrono::high_resolution_clock::now();
         std::vector<seastar::future<std::pair<unsigned, ShardQueryResult>>> futures;
         for (unsigned shardId = 0; shardId < seriesByShard.size(); ++shardId) {
-            if (seriesByShard[shardId].empty()) continue;
+            if (seriesByShard[shardId].empty())
+                continue;
             auto& shardContexts = seriesByShard[shardId];
-            auto f = engineSharded->invoke_on(shardId,
-                [shardId, contexts = std::move(shardContexts),
-                 startTime = request.startTime, endTime = request.endTime,
-                 measurement = request.measurement,
-                 aggregation = request.aggregation,
-                 aggregationInterval = request.aggregationInterval,
-                 groupByTags = request.groupByTags](Engine& engine) mutable -> seastar::future<ShardQueryResult> {
-                    auto shardStart = std::chrono::high_resolution_clock::now();
-                    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard {} querying {} series keys in parallel",
-                                   shardId, contexts.size());
+            auto f =
+                engineSharded
+                    ->invoke_on(
+                        shardId,
+                        [shardId, contexts = std::move(shardContexts), startTime = request.startTime,
+                         endTime = request.endTime, measurement = request.measurement,
+                         aggregation = request.aggregation, aggregationInterval = request.aggregationInterval,
+                         groupByTags =
+                             request.groupByTags](Engine& engine) mutable -> seastar::future<ShardQueryResult> {
+                            auto shardStart = std::chrono::high_resolution_clock::now();
+                            LOG_QUERY_PATH(timestar::http_log, info,
+                                           "[QUERY] Shard {} querying {} series keys in parallel", shardId,
+                                           contexts.size());
 
-                    // Containers for pushdown results and fallback results
-                    std::vector<PartialAggregationResult> pushdownPartials;
-                    std::vector<timestar::SeriesResult> fallbackResults;
-                    fallbackResults.reserve(contexts.size());
+                            // Containers for pushdown results and fallback results
+                            std::vector<PartialAggregationResult> pushdownPartials;
+                            std::vector<timestar::SeriesResult> fallbackResults;
+                            fallbackResults.reserve(contexts.size());
 
-                    // Prefetch TSM index entries for all series on this shard.
-                    // Warms the full-index cache in parallel so that per-series
-                    // queries hit cache instead of issuing individual DMA reads.
-                    {
-                        std::vector<SeriesId128> prefetchIds;
-                        prefetchIds.reserve(contexts.size());
-                        for (const auto& ctx : contexts) {
-                            prefetchIds.push_back(ctx.seriesId);
-                        }
-                        co_await engine.prefetchSeriesIndices(prefetchIds);
-                    }
+                            // Prefetch TSM index entries for all series on this shard.
+                            // Warms the full-index cache in parallel so that per-series
+                            // queries hit cache instead of issuing individual DMA reads.
+                            {
+                                std::vector<SeriesId128> prefetchIds;
+                                prefetchIds.reserve(contexts.size());
+                                for (const auto& ctx : contexts) {
+                                    prefetchIds.push_back(ctx.seriesId);
+                                }
+                                co_await engine.prefetchSeriesIndices(prefetchIds);
+                            }
 
-                    // Use max_concurrent_for_each to avoid creating thousands of
-                    // concurrent futures at once. Bounded concurrency reduces memory
-                    // pressure and context thrashing.
-                    static constexpr size_t MAX_CONCURRENT_SERIES_QUERIES = 64;
+                            // Use max_concurrent_for_each to avoid creating thousands of
+                            // concurrent futures at once. Bounded concurrency reduces memory
+                            // pressure and context thrashing.
+                            static constexpr size_t MAX_CONCURRENT_SERIES_QUERIES = 64;
 
-                    co_await seastar::max_concurrent_for_each(contexts, MAX_CONCURRENT_SERIES_QUERIES,
-                        [&engine, &pushdownPartials, &fallbackResults, &measurement, startTime, endTime, shardId,
-                         aggregationInterval, &groupByTags](SeriesQueryContext& ctx) -> seastar::future<> {
-                            // ---- PUSHDOWN PATH ----
-                            // Try aggregating directly from TSM blocks, skipping the
-                            // full TSMResult → QueryResult → SeriesResult pipeline.
-                            auto pushdownResult = co_await engine.queryAggregated(
-                                ctx.seriesKey, ctx.seriesId, startTime, endTime, aggregationInterval);
+                            co_await seastar::max_concurrent_for_each(
+                                contexts, MAX_CONCURRENT_SERIES_QUERIES,
+                                [&engine, &pushdownPartials, &fallbackResults, &measurement, startTime, endTime,
+                                 shardId, aggregationInterval,
+                                 &groupByTags](SeriesQueryContext& ctx) -> seastar::future<> {
+                                    // ---- PUSHDOWN PATH ----
+                                    // Try aggregating directly from TSM blocks, skipping the
+                                    // full TSMResult → QueryResult → SeriesResult pipeline.
+                                    auto pushdownResult = co_await engine.queryAggregated(
+                                        ctx.seriesKey, ctx.seriesId, startTime, endTime, aggregationInterval);
 
-                            if (pushdownResult.has_value()) {
-                                // Build PartialAggregationResult directly from PushdownResult
-                                PartialAggregationResult partial;
-                                partial.measurement = measurement;
-                                partial.fieldName = ctx.field;
-                                partial.totalPoints = pushdownResult->totalPoints;
+                                    if (pushdownResult.has_value()) {
+                                        // Build PartialAggregationResult directly from PushdownResult
+                                        PartialAggregationResult partial;
+                                        partial.measurement = measurement;
+                                        partial.fieldName = ctx.field;
+                                        partial.totalPoints = pushdownResult->totalPoints;
 
-                                // Build composite groupKey (same format as createPartialAggregations)
-                                std::map<std::string, std::string> relevantTags;
-                                if (!groupByTags.empty()) {
-                                    for (const auto& tagName : groupByTags) {
-                                        auto it = ctx.tags.find(tagName);
-                                        if (it != ctx.tags.end()) {
-                                            relevantTags[tagName] = it->second;
+                                        // Build composite groupKey (same format as createPartialAggregations)
+                                        std::map<std::string, std::string> relevantTags;
+                                        if (!groupByTags.empty()) {
+                                            for (const auto& tagName : groupByTags) {
+                                                auto it = ctx.tags.find(tagName);
+                                                if (it != ctx.tags.end()) {
+                                                    relevantTags[tagName] = it->second;
+                                                }
+                                            }
                                         }
-                                    }
-                                }
-                                std::string compositeKey;
-                                compositeKey += measurement;
-                                for (const auto& [k, v] : relevantTags) {
-                                    compositeKey += '\0';
-                                    compositeKey += k;
-                                    compositeKey += '=';
-                                    compositeKey += v;
-                                }
-                                compositeKey += '\0';
-                                compositeKey += ctx.field;
-
-                                partial.groupKeyHash = std::hash<std::string>{}(compositeKey);
-                                partial.groupKey = std::move(compositeKey);
-
-                                if (aggregationInterval > 0) {
-                                    partial.bucketStates = std::move(pushdownResult->bucketStates);
-                                } else {
-                                    partial.sortedTimestamps = std::move(pushdownResult->sortedTimestamps);
-                                    partial.sortedValues = std::move(pushdownResult->sortedValues);
-                                }
-
-                                pushdownPartials.push_back(std::move(partial));
-                                co_return;
-                            }
-
-                            // ---- FALLBACK PATH ----
-                            // Pushdown not applicable (non-float, memory data, overlap).
-                            std::optional<VariantQueryResult> optResult;
-                            try {
-                                optResult = co_await engine.query(ctx.seriesKey, ctx.seriesId, startTime, endTime);
-                            } catch (const std::runtime_error& e) {
-                                if (std::string(e.what()).find("Series not found") != std::string::npos) {
-                                    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Series '{}' not found on shard {} - skipping",
-                                                   ctx.seriesKey, shardId);
-                                } else {
-                                    LOG_QUERY_PATH(timestar::http_log, warn, "[QUERY] Error querying series '{}' on shard {}: {} - skipping",
-                                                   ctx.seriesKey, shardId, e.what());
-                                }
-                                co_return;
-                            } catch (...) {
-                                LOG_QUERY_PATH(timestar::http_log, warn, "[QUERY] Unknown error querying series '{}' on shard {} - skipping",
-                                               ctx.seriesKey, shardId);
-                                co_return;
-                            }
-
-                            if (!optResult.has_value()) {
-                                co_return;
-                            }
-
-                            auto variantResult = std::move(optResult.value());
-
-                            timestar::SeriesResult seriesResult;
-                            seriesResult.measurement = measurement;
-                            seriesResult.tags = std::move(ctx.tags);
-
-                            std::visit([&seriesResult, &ctx](auto&& result) {
-                                using T = std::decay_t<decltype(result)>;
-                                if constexpr (std::is_same_v<T, QueryResult<double>>) {
-                                    if (!result.timestamps.empty()) {
-                                        seriesResult.fields[ctx.field] = std::make_pair(
-                                            std::move(result.timestamps), FieldValues(std::move(result.values)));
-                                    }
-                                } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
-                                    if (!result.timestamps.empty()) {
-                                        std::vector<double> doubleValues;
-                                        doubleValues.reserve(result.values.size());
-                                        for (bool v : result.values) {
-                                            doubleValues.push_back(v ? 1.0 : 0.0);
+                                        std::string compositeKey;
+                                        compositeKey += measurement;
+                                        for (const auto& [k, v] : relevantTags) {
+                                            compositeKey += '\0';
+                                            compositeKey += k;
+                                            compositeKey += '=';
+                                            compositeKey += v;
                                         }
-                                        seriesResult.fields[ctx.field] = std::make_pair(
-                                            std::move(result.timestamps), FieldValues(std::move(doubleValues)));
+                                        compositeKey += '\0';
+                                        compositeKey += ctx.field;
+
+                                        partial.groupKeyHash = std::hash<std::string>{}(compositeKey);
+                                        partial.groupKey = std::move(compositeKey);
+
+                                        if (aggregationInterval > 0) {
+                                            partial.bucketStates = std::move(pushdownResult->bucketStates);
+                                        } else {
+                                            partial.sortedTimestamps = std::move(pushdownResult->sortedTimestamps);
+                                            partial.sortedValues = std::move(pushdownResult->sortedValues);
+                                        }
+
+                                        pushdownPartials.push_back(std::move(partial));
+                                        co_return;
                                     }
-                                } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
-                                    if (!result.timestamps.empty()) {
-                                        seriesResult.fields[ctx.field] = std::make_pair(
-                                            std::move(result.timestamps), FieldValues(std::move(result.values)));
+
+                                    // ---- FALLBACK PATH ----
+                                    // Pushdown not applicable (non-float, memory data, overlap).
+                                    std::optional<VariantQueryResult> optResult;
+                                    try {
+                                        optResult =
+                                            co_await engine.query(ctx.seriesKey, ctx.seriesId, startTime, endTime);
+                                    } catch (const std::runtime_error& e) {
+                                        if (std::string(e.what()).find("Series not found") != std::string::npos) {
+                                            LOG_QUERY_PATH(timestar::http_log, info,
+                                                           "[QUERY] Series '{}' not found on shard {} - skipping",
+                                                           ctx.seriesKey, shardId);
+                                        } else {
+                                            LOG_QUERY_PATH(
+                                                timestar::http_log, warn,
+                                                "[QUERY] Error querying series '{}' on shard {}: {} - skipping",
+                                                ctx.seriesKey, shardId, e.what());
+                                        }
+                                        co_return;
+                                    } catch (...) {
+                                        LOG_QUERY_PATH(
+                                            timestar::http_log, warn,
+                                            "[QUERY] Unknown error querying series '{}' on shard {} - skipping",
+                                            ctx.seriesKey, shardId);
+                                        co_return;
                                     }
-                                } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
-                                    if (!result.timestamps.empty()) {
-                                        seriesResult.fields[ctx.field] = std::make_pair(
-                                            std::move(result.timestamps), FieldValues(std::move(result.values)));
+
+                                    if (!optResult.has_value()) {
+                                        co_return;
+                                    }
+
+                                    auto variantResult = std::move(optResult.value());
+
+                                    timestar::SeriesResult seriesResult;
+                                    seriesResult.measurement = measurement;
+                                    seriesResult.tags = std::move(ctx.tags);
+
+                                    std::visit(
+                                        [&seriesResult, &ctx](auto&& result) {
+                                            using T = std::decay_t<decltype(result)>;
+                                            if constexpr (std::is_same_v<T, QueryResult<double>>) {
+                                                if (!result.timestamps.empty()) {
+                                                    seriesResult.fields[ctx.field] =
+                                                        std::make_pair(std::move(result.timestamps),
+                                                                       FieldValues(std::move(result.values)));
+                                                }
+                                            } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
+                                                if (!result.timestamps.empty()) {
+                                                    std::vector<double> doubleValues;
+                                                    doubleValues.reserve(result.values.size());
+                                                    for (bool v : result.values) {
+                                                        doubleValues.push_back(v ? 1.0 : 0.0);
+                                                    }
+                                                    seriesResult.fields[ctx.field] =
+                                                        std::make_pair(std::move(result.timestamps),
+                                                                       FieldValues(std::move(doubleValues)));
+                                                }
+                                            } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
+                                                if (!result.timestamps.empty()) {
+                                                    seriesResult.fields[ctx.field] =
+                                                        std::make_pair(std::move(result.timestamps),
+                                                                       FieldValues(std::move(result.values)));
+                                                }
+                                            } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
+                                                if (!result.timestamps.empty()) {
+                                                    seriesResult.fields[ctx.field] =
+                                                        std::make_pair(std::move(result.timestamps),
+                                                                       FieldValues(std::move(result.values)));
+                                                }
+                                            }
+                                        },
+                                        variantResult);
+
+                                    if (!seriesResult.fields.empty()) {
+                                        fallbackResults.push_back(std::move(seriesResult));
+                                    }
+                                });
+
+                            // Separate string-typed fallback results from numeric results.
+                            std::vector<timestar::SeriesResult> stringResults;
+                            std::vector<timestar::SeriesResult> numericResults;
+                            for (auto& sr : fallbackResults) {
+                                bool hasStringField = false;
+                                for (const auto& [fn, fd] : sr.fields) {
+                                    if (std::holds_alternative<std::vector<std::string>>(fd.second)) {
+                                        hasStringField = true;
+                                        break;
                                     }
                                 }
-                            }, variantResult);
-
-                            if (!seriesResult.fields.empty()) {
-                                fallbackResults.push_back(std::move(seriesResult));
+                                if (hasStringField) {
+                                    stringResults.push_back(std::move(sr));
+                                } else {
+                                    numericResults.push_back(std::move(sr));
+                                }
                             }
-                        });
 
-                    // Separate string-typed fallback results from numeric results.
-                    std::vector<timestar::SeriesResult> stringResults;
-                    std::vector<timestar::SeriesResult> numericResults;
-                    for (auto& sr : fallbackResults) {
-                        bool hasStringField = false;
-                        for (const auto& [fn, fd] : sr.fields) {
-                            if (std::holds_alternative<std::vector<std::string>>(fd.second)) {
-                                hasStringField = true;
-                                break;
-                            }
-                        }
-                        if (hasStringField) {
-                            stringResults.push_back(std::move(sr));
-                        } else {
-                            numericResults.push_back(std::move(sr));
-                        }
-                    }
+                            // Run partial aggregation only on fallback numeric results
+                            auto partialAggStart = std::chrono::high_resolution_clock::now();
+                            auto partialResults = Aggregator::createPartialAggregations(
+                                numericResults, aggregation, aggregationInterval, groupByTags);
+                            // Combine pushdown partials with fallback partials
+                            partialResults.insert(partialResults.end(),
+                                                  std::make_move_iterator(pushdownPartials.begin()),
+                                                  std::make_move_iterator(pushdownPartials.end()));
+                            auto partialAggEnd = std::chrono::high_resolution_clock::now();
+                            double partialAggMs =
+                                std::chrono::duration<double, std::milli>(partialAggEnd - partialAggStart).count();
 
-                    // Run partial aggregation only on fallback numeric results
-                    auto partialAggStart = std::chrono::high_resolution_clock::now();
-                    auto partialResults = Aggregator::createPartialAggregations(
-                        numericResults, aggregation, aggregationInterval, groupByTags);
-                    // Combine pushdown partials with fallback partials
-                    partialResults.insert(partialResults.end(),
-                        std::make_move_iterator(pushdownPartials.begin()),
-                        std::make_move_iterator(pushdownPartials.end()));
-                    auto partialAggEnd = std::chrono::high_resolution_clock::now();
-                    double partialAggMs = std::chrono::duration<double, std::milli>(partialAggEnd - partialAggStart).count();
-
-                    auto shardEnd = std::chrono::high_resolution_clock::now();
-                    double shardMs = std::chrono::duration<double, std::milli>(shardEnd - shardStart).count();
-                    LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard {} completed {} parallel queries + partial aggregation in {:.2f} ms (aggregation: {:.2f} ms)",
-                                   shardId, contexts.size(), shardMs, partialAggMs);
-                    ShardQueryResult sqr;
-                    sqr.partialResults = std::move(partialResults);
-                    sqr.stringResults = std::move(stringResults);
-                    sqr.shardMs = shardMs;
-                    co_return sqr;
-                }).then([shardId](ShardQueryResult result) {
-                    return std::make_pair(shardId, std::move(result));
-                });
+                            auto shardEnd = std::chrono::high_resolution_clock::now();
+                            double shardMs = std::chrono::duration<double, std::milli>(shardEnd - shardStart).count();
+                            LOG_QUERY_PATH(timestar::http_log, info,
+                                           "[QUERY] Shard {} completed {} parallel queries + partial aggregation in "
+                                           "{:.2f} ms (aggregation: {:.2f} ms)",
+                                           shardId, contexts.size(), shardMs, partialAggMs);
+                            ShardQueryResult sqr;
+                            sqr.partialResults = std::move(partialResults);
+                            sqr.stringResults = std::move(stringResults);
+                            sqr.shardMs = shardMs;
+                            co_return sqr;
+                        })
+                    .then([shardId](ShardQueryResult result) { return std::make_pair(shardId, std::move(result)); });
             futures.push_back(std::move(f));
         }
-        
+
         // Wait for all shards to complete, with timeout to prevent indefinite hangs
         auto deadline = seastar::lowres_clock::now() + defaultQueryTimeout();
         std::vector<std::pair<unsigned, ShardQueryResult>> shardResults;
         try {
-            shardResults = co_await seastar::with_timeout(deadline,
-                seastar::when_all_succeed(futures.begin(), futures.end()));
+            shardResults =
+                co_await seastar::with_timeout(deadline, seastar::when_all_succeed(futures.begin(), futures.end()));
         } catch (seastar::timed_out_error&) {
             QueryResponse timeoutResponse;
             timeoutResponse.success = false;
             timeoutResponse.errorCode = "QUERY_TIMEOUT";
-            timeoutResponse.errorMessage = "Query timed out after " +
-                std::to_string(defaultQueryTimeout().count()) + " seconds";
+            timeoutResponse.errorMessage =
+                "Query timed out after " + std::to_string(defaultQueryTimeout().count()) + " seconds";
             co_return timeoutResponse;
         }
         auto shardQueriesEnd = std::chrono::high_resolution_clock::now();
         timing.shardQueriesMs = std::chrono::duration<double, std::milli>(shardQueriesEnd - shardQueriesStart).count();
-        
+
         // Collect partial aggregations from all shards
         auto mergeStart = std::chrono::high_resolution_clock::now();
 
@@ -681,14 +697,12 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             }
 
             // Collect all partial results
-            allPartialResults.insert(allPartialResults.end(),
-                std::make_move_iterator(sqr.partialResults.begin()),
-                std::make_move_iterator(sqr.partialResults.end()));
+            allPartialResults.insert(allPartialResults.end(), std::make_move_iterator(sqr.partialResults.begin()),
+                                     std::make_move_iterator(sqr.partialResults.end()));
 
             // Collect string results (these bypass aggregation)
-            allStringResults.insert(allStringResults.end(),
-                std::make_move_iterator(sqr.stringResults.begin()),
-                std::make_move_iterator(sqr.stringResults.end()));
+            allStringResults.insert(allStringResults.end(), std::make_move_iterator(sqr.stringResults.begin()),
+                                    std::make_move_iterator(sqr.stringResults.end()));
         }
 
         auto mergeEnd = std::chrono::high_resolution_clock::now();
@@ -701,9 +715,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             QueryResponse limitResponse;
             limitResponse.success = false;
             limitResponse.errorCode = "TOO_MANY_POINTS";
-            limitResponse.errorMessage = "Total points " +
-                std::to_string(timing.totalPointsRetrieved) +
-                " exceeds limit of " + std::to_string(maxTotalPoints());
+            limitResponse.errorMessage = "Total points " + std::to_string(timing.totalPointsRetrieved) +
+                                         " exceeds limit of " + std::to_string(maxTotalPoints());
             limitResponse.statistics.truncated = true;
             limitResponse.statistics.truncationReason = limitResponse.errorMessage;
             co_return limitResponse;
@@ -730,11 +743,9 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                            allPartialResults.size(), timing.shardsQueried);
 
             // OPTIMIZATION & FIX: Use grouped merge to preserve metadata associations
-            auto groupedResults = Aggregator::mergePartialAggregationsGrouped(
-                allPartialResults, request.aggregation);
+            auto groupedResults = Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation);
 
-            LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results",
-                           groupedResults.size());
+            LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results", groupedResults.size());
 
             // Merge GroupedAggregationResult entries that share the same
             // measurement+tags into a single SeriesResult with multiple fields.
@@ -792,9 +803,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             // building a temporary map and copying/moving entries.
             if (!requestedFieldSet.empty()) {
                 for (auto& series : response.series) {
-                    std::erase_if(series.fields, [&](const auto& item) {
-                        return !requestedFieldSet.contains(item.first);
-                    });
+                    std::erase_if(series.fields,
+                                  [&](const auto& item) { return !requestedFieldSet.contains(item.first); });
                 }
                 // Remove series that have no fields after filtering.
                 // Use index-based compaction to keep seriesMergeKeys in sync.
@@ -817,7 +827,6 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     seriesKeyToIndex[seriesMergeKeys[i]] = i;
                 }
             }
-
         }
         // Add string results that bypassed aggregation directly to response
         if (!allStringResults.empty()) {
@@ -827,15 +836,12 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             // building a temporary map and copying/moving entries.
             if (!requestedFieldSet.empty()) {
                 for (auto& sr : allStringResults) {
-                    std::erase_if(sr.fields, [&](const auto& item) {
-                        return !requestedFieldSet.contains(item.first);
-                    });
+                    std::erase_if(sr.fields, [&](const auto& item) { return !requestedFieldSet.contains(item.first); });
                 }
                 // Remove string series with no fields after filtering
-                allStringResults.erase(
-                    std::remove_if(allStringResults.begin(), allStringResults.end(),
-                        [](const SeriesResult& s) { return s.fields.empty(); }),
-                    allStringResults.end());
+                allStringResults.erase(std::remove_if(allStringResults.begin(), allStringResults.end(),
+                                                      [](const SeriesResult& s) { return s.fields.empty(); }),
+                                       allStringResults.end());
             }
 
             // seriesKeyToIndex is already up-to-date from the numeric path above
@@ -877,7 +883,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         // Enforce maxTotalPoints() limit
         if (response.statistics.pointCount > maxTotalPoints()) {
             response.statistics.truncated = true;
-            response.statistics.truncationReason = "Total points " + std::to_string(response.statistics.pointCount) + " exceeds limit of " + std::to_string(maxTotalPoints());
+            response.statistics.truncationReason = "Total points " + std::to_string(response.statistics.pointCount) +
+                                                   " exceeds limit of " + std::to_string(maxTotalPoints());
             response.success = false;
             response.errorCode = "TOO_MANY_POINTS";
             response.errorMessage = response.statistics.truncationReason;
@@ -888,21 +895,21 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         timing.aggregationMs = std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count();
 
         response.statistics.seriesCount = response.series.size();
-        
+
         // Calculate total timing
         timing.endTime = std::chrono::high_resolution_clock::now();
         timing.totalMs = std::chrono::duration<double, std::milli>(timing.endTime - timing.startTime).count();
-        
+
         // Print timing information
         LOG_QUERY_PATH(timestar::http_log, info, "{}", timing.toString());
-        
+
     } catch (const std::exception& e) {
         response.success = false;
         response.errorCode = "QUERY_EXECUTION_ERROR";
         response.errorMessage = e.what();
         LOG_QUERY_PATH(timestar::http_log, error, "[QUERY] Query execution failed: {}", e.what());
     }
-    
+
     co_return response;
 }
 
@@ -917,7 +924,8 @@ std::string HttpQueryHandler::createErrorResponse(const std::string& code, const
 // Test-only utility: production query path iterates shards inline in executeQuery().
 std::vector<unsigned> HttpQueryHandler::determineTargetShards(const QueryRequest& /*request*/) {
     unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0) shardCount = 1; // test environment default
+    if (shardCount == 0)
+        shardCount = 1;  // test environment default
     std::vector<unsigned> shards(shardCount);
     std::iota(shards.begin(), shards.end(), 0u);
     return shards;
@@ -927,9 +935,8 @@ std::vector<unsigned> HttpQueryHandler::determineTargetShards(const QueryRequest
 std::vector<SeriesResult> HttpQueryHandler::mergeResults(std::vector<std::vector<SeriesResult>> shardResults) {
     std::vector<SeriesResult> merged;
     for (auto& shardResult : shardResults) {
-        merged.insert(merged.end(),
-            std::make_move_iterator(shardResult.begin()),
-            std::make_move_iterator(shardResult.end()));
+        merged.insert(merged.end(), std::make_move_iterator(shardResult.begin()),
+                      std::make_move_iterator(shardResult.end()));
     }
     return merged;
 }
@@ -938,19 +945,20 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     if (interval.empty()) {
         throw QueryParseException("Interval string cannot be empty");
     }
-    
+
     // Find where the numeric part ends
     size_t unitPos = 0;
     bool hasDecimal = false;
     for (size_t i = 0; i < interval.length(); ++i) {
         if (std::isdigit(interval[i]) || (interval[i] == '.' && !hasDecimal)) {
-            if (interval[i] == '.') hasDecimal = true;
+            if (interval[i] == '.')
+                hasDecimal = true;
             unitPos = i + 1;
         } else {
             break;
         }
     }
-    
+
     if (unitPos == 0) {
         throw QueryParseException("Invalid interval format: no numeric value");
     }
@@ -975,7 +983,8 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     } else if (unit == "d") {
         multiplier = 86400ULL * 1000000000;
     } else if (unit.empty()) {
-        throw QueryParseException("Interval '" + interval + "' has no unit suffix. Please specify a unit (ns, us, ms, s, m, h, d)");
+        throw QueryParseException("Interval '" + interval +
+                                  "' has no unit suffix. Please specify a unit (ns, us, ms, s, m, h, d)");
     } else {
         throw QueryParseException("Unknown time unit: '" + unit + "'. Supported units: ns, us, ms, s, m, h, d");
     }
@@ -988,7 +997,8 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
         } catch (const std::invalid_argument&) {
             throw QueryParseException("Invalid interval format: '" + valueStr + "' is not a valid number");
         } catch (const std::out_of_range&) {
-            throw QueryParseException("Interval value overflow: " + interval + " exceeds maximum representable nanoseconds");
+            throw QueryParseException("Interval value overflow: " + interval +
+                                      " exceeds maximum representable nanoseconds");
         }
         // Guard against NaN or Inf before any arithmetic: casting a non-finite
         // double to uint64_t is undefined behavior in C++.
@@ -998,16 +1008,18 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
         double result = value * static_cast<double>(multiplier);
         // Re-check after multiplication: large-but-finite * large multiplier can overflow to Inf.
         if (!std::isfinite(result) || result > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
-            throw QueryParseException("Interval value overflow: " + interval + " exceeds maximum representable nanoseconds");
+            throw QueryParseException("Interval value overflow: " + interval +
+                                      " exceeds maximum representable nanoseconds");
         }
         return static_cast<uint64_t>(result);
     } else {
         uint64_t value = std::stoull(valueStr);
         if (multiplier > 1 && value > std::numeric_limits<uint64_t>::max() / multiplier) {
-            throw QueryParseException("Interval value overflow: " + interval + " exceeds maximum representable nanoseconds");
+            throw QueryParseException("Interval value overflow: " + interval +
+                                      " exceeds maximum representable nanoseconds");
         }
         return value * multiplier;
     }
 }
 
-} // namespace timestar
+}  // namespace timestar

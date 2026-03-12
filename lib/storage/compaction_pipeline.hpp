@@ -2,14 +2,15 @@
 #define COMPACTION_PIPELINE_H_INCLUDED
 
 #include "tsm_compactor.hpp"
-#include <seastar/core/future.hh>
-#include <seastar/core/queue.hh>
+
 #include <memory>
 #include <queue>
+#include <seastar/core/future.hh>
+#include <seastar/core/queue.hh>
 
 // Phase 2.1: Series prefetch manager for pipelined compaction
 // Overlaps I/O (reading series N+1) with computation (processing series N)
-template<typename T>
+template <typename T>
 class SeriesPrefetchManager {
 private:
     struct PrefetchedSeries {
@@ -33,15 +34,11 @@ private:
     size_t currentMemoryUsage{0};
 
 public:
-    SeriesPrefetchManager(
-        const std::vector<seastar::shared_ptr<TSM>>& tsmFiles,
-        const std::vector<SeriesId128>& series,
-        size_t depth = 2,
-        size_t maxMemory = 256 * 1024 * 1024  // 256MB default
-    ) : files(tsmFiles),
-        seriesQueue(series),
-        prefetchDepth(depth),
-        maxMemoryBytes(maxMemory) {}
+    SeriesPrefetchManager(const std::vector<seastar::shared_ptr<TSM>>& tsmFiles, const std::vector<SeriesId128>& series,
+                          size_t depth = 2,
+                          size_t maxMemory = 256 * 1024 * 1024  // 256MB default
+                          )
+        : files(tsmFiles), seriesQueue(series), prefetchDepth(depth), maxMemoryBytes(maxMemory) {}
 
     // Phase 2.1: Start prefetching pipeline
     seastar::future<> init() {
@@ -66,8 +63,7 @@ public:
         } else {
             // Fallback: no prefetch available, create synchronously
             prefetched.seriesId = seriesQueue[currentIndex];
-            prefetched.iterator = std::make_unique<TSMMergeIterator<T>>(
-                prefetched.seriesId, files);
+            prefetched.iterator = std::make_unique<TSMMergeIterator<T>>(prefetched.seriesId, files);
             co_await prefetched.iterator->init();
         }
 
@@ -82,14 +78,10 @@ public:
     }
 
     // Check if more series are available
-    bool hasNext() const {
-        return currentIndex < seriesQueue.size();
-    }
+    bool hasNext() const { return currentIndex < seriesQueue.size(); }
 
     // Get current prefetch queue size (for monitoring)
-    size_t getPrefetchQueueSize() const {
-        return prefetchQueue.size();
-    }
+    size_t getPrefetchQueueSize() const { return prefetchQueue.size(); }
 
 private:
     // Phase 2.1: Start async prefetch of a series (non-blocking)
@@ -102,8 +94,7 @@ private:
         auto future = [this, index]() -> seastar::future<PrefetchedSeries> {
             PrefetchedSeries result;
             result.seriesId = seriesQueue[index];
-            result.iterator = std::make_unique<TSMMergeIterator<T>>(
-                result.seriesId, files);
+            result.iterator = std::make_unique<TSMMergeIterator<T>>(result.seriesId, files);
 
             co_await result.iterator->init();
             result.initialized = true;
@@ -115,4 +106,4 @@ private:
     }
 };
 
-#endif // COMPACTION_PIPELINE_H_INCLUDED
+#endif  // COMPACTION_PIPELINE_H_INCLUDED

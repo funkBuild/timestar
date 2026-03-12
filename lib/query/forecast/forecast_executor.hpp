@@ -3,8 +3,9 @@
 
 #include "forecast_result.hpp"
 #include "linear_forecaster.hpp"
-#include "seasonal_forecaster.hpp"
 #include "periodicity_detector.hpp"
+#include "seasonal_forecaster.hpp"
+
 #include <chrono>
 
 namespace timestar {
@@ -28,10 +29,7 @@ public:
      * @param config Forecast configuration
      * @return ForecastOutput with forecast values and bounds
      */
-    ForecastOutput execute(
-        const ForecastInput& input,
-        const ForecastConfig& config
-    );
+    ForecastOutput execute(const ForecastInput& input, const ForecastConfig& config);
 
     /**
      * Execute forecast on multiple series (grouped data)
@@ -42,12 +40,10 @@ public:
      * @param config Forecast configuration
      * @return ForecastQueryResult with all series pieces
      */
-    ForecastQueryResult executeMulti(
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<std::vector<double>>& seriesValues,
-        const std::vector<std::vector<std::string>>& seriesGroupTags,
-        const ForecastConfig& config
-    );
+    ForecastQueryResult executeMulti(const std::vector<uint64_t>& timestamps,
+                                     const std::vector<std::vector<double>>& seriesValues,
+                                     const std::vector<std::vector<std::string>>& seriesGroupTags,
+                                     const ForecastConfig& config);
 
     /**
      * Generate forecast timestamps
@@ -56,44 +52,28 @@ public:
      * @param forecastHorizon Number of forecast points (0 = match historical)
      * @return Vector of forecast timestamps
      */
-    static std::vector<uint64_t> generateForecastTimestamps(
-        const std::vector<uint64_t>& historicalTimestamps,
-        size_t forecastHorizon = 0
-    );
+    static std::vector<uint64_t> generateForecastTimestamps(const std::vector<uint64_t>& historicalTimestamps,
+                                                            size_t forecastHorizon = 0);
 
 private:
     LinearForecaster linearForecaster_;
     SeasonalForecaster seasonalForecaster_;
 
     // Auto-windowing helpers
-    static size_t detectMaxPeriodForWindowing(
-        const std::vector<double>& values,
-        uint64_t dataIntervalNs,
-        const ForecastConfig& config
-    );
+    static size_t detectMaxPeriodForWindowing(const std::vector<double>& values, uint64_t dataIntervalNs,
+                                              const ForecastConfig& config);
 
-    static size_t computeOptimalWindowSize(
-        size_t inputSize,
-        size_t maxPeriod,
-        size_t horizon,
-        const ForecastConfig& config
-    );
+    static size_t computeOptimalWindowSize(size_t inputSize, size_t maxPeriod, size_t horizon,
+                                           const ForecastConfig& config);
 
-    static size_t windowInput(
-        ForecastInput& input,
-        size_t windowSize
-    );
+    static size_t windowInput(ForecastInput& input, size_t windowSize);
 
     // Add series pieces to result
-    void addSeriesPieces(
-        ForecastQueryResult& result,
-        const ForecastOutput& output,
-        const std::vector<std::string>& groupTags,
-        size_t queryIndex = 0
-    );
+    void addSeriesPieces(ForecastQueryResult& result, const ForecastOutput& output,
+                         const std::vector<std::string>& groupTags, size_t queryIndex = 0);
 };
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar
 
-#endif // FORECAST_EXECUTOR_H_INCLUDED
+#endif  // FORECAST_EXECUTOR_H_INCLUDED

@@ -1,7 +1,9 @@
 #include "expression_evaluator.hpp"
+
 #include "forecast/forecast_result.hpp"
-#include <limits>
+
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace timestar {
@@ -9,15 +11,13 @@ namespace timestar {
 // ==================== AlignedSeries Operations ====================
 
 namespace {
-    void checkSameSize(const AlignedSeries& a, const AlignedSeries& b,
-                       const std::string& operation) {
-        if (a.size() != b.size()) {
-            throw EvaluationException(
-                "Series size mismatch in " + operation + ": " +
-                std::to_string(a.size()) + " vs " + std::to_string(b.size()));
-        }
+void checkSameSize(const AlignedSeries& a, const AlignedSeries& b, const std::string& operation) {
+    if (a.size() != b.size()) {
+        throw EvaluationException("Series size mismatch in " + operation + ": " + std::to_string(a.size()) + " vs " +
+                                  std::to_string(b.size()));
     }
 }
+}  // namespace
 
 AlignedSeries AlignedSeries::operator+(const AlignedSeries& other) const {
     checkSameSize(*this, other, "addition");
@@ -59,9 +59,8 @@ AlignedSeries AlignedSeries::operator/(const AlignedSeries& other) const {
             if (values[i] == 0.0) {
                 result[i] = std::numeric_limits<double>::quiet_NaN();
             } else {
-                result[i] = values[i] > 0
-                    ? std::numeric_limits<double>::infinity()
-                    : -std::numeric_limits<double>::infinity();
+                result[i] =
+                    values[i] > 0 ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
             }
         } else {
             result[i] = values[i] / other.values[i];
@@ -188,9 +187,7 @@ AlignedSeries AlignedSeries::pow(const AlignedSeries& base, const AlignedSeries&
     return AlignedSeries(base.timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::clamp(const AlignedSeries& val,
-                                   const AlignedSeries& minVal,
-                                   const AlignedSeries& maxVal) {
+AlignedSeries AlignedSeries::clamp(const AlignedSeries& val, const AlignedSeries& minVal, const AlignedSeries& maxVal) {
     checkSameSize(val, minVal, "clamp");
     checkSameSize(val, maxVal, "clamp");
     std::vector<double> result(val.values.size());
@@ -207,7 +204,7 @@ AlignedSeries AlignedSeries::diff() const {
         return AlignedSeries(timestamps, {});
     }
     std::vector<double> result(values.size());
-    result[0] = std::numeric_limits<double>::quiet_NaN(); // First point has no previous
+    result[0] = std::numeric_limits<double>::quiet_NaN();  // First point has no previous
     for (size_t i = 1; i < values.size(); ++i) {
         result[i] = values[i] - values[i - 1];
     }
@@ -219,7 +216,7 @@ AlignedSeries AlignedSeries::monotonic_diff() const {
         return AlignedSeries(timestamps, {});
     }
     std::vector<double> result(values.size());
-    result[0] = std::numeric_limits<double>::quiet_NaN(); // First point has no previous
+    result[0] = std::numeric_limits<double>::quiet_NaN();  // First point has no previous
     for (size_t i = 1; i < values.size(); ++i) {
         double d = values[i] - values[i - 1];
         // Counter reset handling: if diff is negative, assume counter wrapped/reset
@@ -267,15 +264,14 @@ AlignedSeries AlignedSeries::rate() const {
         return AlignedSeries(timestamps, {});
     }
     std::vector<double> result(values.size());
-    result[0] = nan; // First point has no previous
+    result[0] = nan;  // First point has no previous
     for (size_t i = 1; i < values.size(); ++i) {
         double diff = values[i] - values[i - 1];
-        if (diff < 0.0) diff = 0.0; // Counter reset: treat as zero increase
-        uint64_t delta_ns = (ts[i] > ts[i - 1])
-                            ? (ts[i] - ts[i - 1])
-                            : 0ULL;
+        if (diff < 0.0)
+            diff = 0.0;  // Counter reset: treat as zero increase
+        uint64_t delta_ns = (ts[i] > ts[i - 1]) ? (ts[i] - ts[i - 1]) : 0ULL;
         if (delta_ns == 0ULL) {
-            result[i] = nan; // Zero or negative time delta
+            result[i] = nan;  // Zero or negative time delta
         } else {
             double delta_seconds = static_cast<double>(delta_ns) / 1e9;
             result[i] = diff / delta_seconds;
@@ -299,9 +295,7 @@ AlignedSeries AlignedSeries::irate() const {
         // Counter reset at the last step: rate is 0
         rate_val = 0.0;
     } else {
-        uint64_t delta_ns = (ts[n - 1] > ts[n - 2])
-                            ? (ts[n - 1] - ts[n - 2])
-                            : 0ULL;
+        uint64_t delta_ns = (ts[n - 1] > ts[n - 2]) ? (ts[n - 1] - ts[n - 2]) : 0ULL;
         if (delta_ns == 0ULL) {
             rate_val = nan;
         } else {
@@ -347,7 +341,7 @@ AlignedSeries AlignedSeries::fill_forward() const {
 AlignedSeries AlignedSeries::fill_backward() const {
     std::vector<double> result(values);
     double next = std::numeric_limits<double>::quiet_NaN();
-    for (size_t i = result.size(); i-- > 0; ) {
+    for (size_t i = result.size(); i-- > 0;) {
         if (!std::isnan(result[i])) {
             next = result[i];
         } else if (!std::isnan(next)) {
@@ -415,7 +409,8 @@ AlignedSeries AlignedSeries::cumsum() const {
     std::vector<double> result(values.size());
     double running = 0.0;
     for (size_t i = 0; i < values.size(); ++i) {
-        if (!std::isnan(values[i])) running += values[i];
+        if (!std::isnan(values[i]))
+            running += values[i];
         result[i] = running;
     }
     return AlignedSeries(timestamps, std::move(result));
@@ -455,8 +450,10 @@ AlignedSeries AlignedSeries::normalize() const {
     double mx = -std::numeric_limits<double>::infinity();
     for (size_t i = 0; i < values.size(); ++i) {
         if (!std::isnan(values[i])) {
-            if (values[i] < mn) mn = values[i];
-            if (values[i] > mx) mx = values[i];
+            if (values[i] < mn)
+                mn = values[i];
+            if (values[i] > mx)
+                mx = values[i];
         }
     }
 
@@ -538,7 +535,7 @@ AlignedSeries AlignedSeries::rate_per(double seconds_per_point, double scale) co
     const auto& ts = *timestamps;
 
     std::vector<double> result(values.size());
-    result[0] = std::numeric_limits<double>::quiet_NaN(); // First point has no previous
+    result[0] = std::numeric_limits<double>::quiet_NaN();  // First point has no previous
 
     for (size_t i = 1; i < values.size(); ++i) {
         double value_diff = values[i] - values[i - 1];
@@ -614,7 +611,7 @@ AlignedSeries AlignedSeries::rolling_avg(int N) const {
 //
 // Cmp = std::less<double>{}    -> rolling_min  (ascending invariant, front is min)
 // Cmp = std::greater<double>{} -> rolling_max  (descending invariant, front is max)
-template<typename Cmp>
+template <typename Cmp>
 static AlignedSeries rolling_monotone(const AlignedSeries& s, int N, Cmp cmp) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<double> result(s.values.size(), nan);
@@ -629,12 +626,15 @@ static AlignedSeries rolling_monotone(const AlignedSeries& s, int N, Cmp cmp) {
     size_t head = 0, tail = 0;
 
     // All operations are O(1) with no heap traffic.
-    auto ring_empty     = [&]{ return head == tail; };
-    auto ring_front     = [&]{ return ring[head]; };
-    auto ring_back      = [&]{ return ring[(tail + cap - 1) % cap]; };
-    auto ring_pop_front = [&]{ head = (head + 1) % cap; };
-    auto ring_pop_back  = [&]{ tail = (tail + cap - 1) % cap; };
-    auto ring_push_back = [&](size_t v){ ring[tail] = v; tail = (tail + 1) % cap; };
+    auto ring_empty = [&] { return head == tail; };
+    auto ring_front = [&] { return ring[head]; };
+    auto ring_back = [&] { return ring[(tail + cap - 1) % cap]; };
+    auto ring_pop_front = [&] { head = (head + 1) % cap; };
+    auto ring_pop_back = [&] { tail = (tail + cap - 1) % cap; };
+    auto ring_push_back = [&](size_t v) {
+        ring[tail] = v;
+        tail = (tail + 1) % cap;
+    };
 
     for (size_t i = 0; i < s.values.size(); ++i) {
         // Evict expired indices from the front.
@@ -749,7 +749,7 @@ AlignedSeries AlignedSeries::rolling_stddev(int N) const {
     }
 
     // Phase 2: k == wsize throughout -- precompute loop-invariant reciprocals.
-    const double inv_wsize    = 1.0 / static_cast<double>(wsize);
+    const double inv_wsize = 1.0 / static_cast<double>(wsize);
     const double inv_wsize_m1 = (wsize > 1) ? 1.0 / static_cast<double>(wsize - 1) : 0.0;
 
     for (size_t i = wsize - 1; i < values.size(); ++i) {
@@ -758,7 +758,7 @@ AlignedSeries AlignedSeries::rolling_stddev(int N) const {
         {
             double x = values[i];
             double delta = x - M;
-            M += delta * inv_wsize;     // replaces: M += delta / k  (k == wsize)
+            M += delta * inv_wsize;  // replaces: M += delta / k  (k == wsize)
             Q += delta * (x - M);
         }
 
@@ -770,7 +770,8 @@ AlignedSeries AlignedSeries::rolling_stddev(int N) const {
             double delta = x - M;
             M -= delta * inv_wsize_m1;  // replaces: M -= delta / (k-1)  (k-1 == wsize-1)
             Q -= delta * (x - M);
-            if (Q < 0.0) Q = 0.0;      // clamp rounding noise
+            if (Q < 0.0)
+                Q = 0.0;  // clamp rounding noise
             --k;
         }
     }
@@ -807,9 +808,9 @@ AlignedSeries AlignedSeries::zscore(int N) const {
     // Pattern C optimisation: in Phase 2 both k (== wsize) and k-1 (== wsize-1)
     // are loop-invariant constants.  We precompute their reciprocals.
     const size_t wsize = static_cast<size_t>(N);
-    double M = 0.0;      // running window mean (NaN values treated as 0)
-    double Q = 0.0;      // running sum of squared deviations from M
-    size_t k = 0;        // current window occupancy
+    double M = 0.0;  // running window mean (NaN values treated as 0)
+    double Q = 0.0;  // running sum of squared deviations from M
+    size_t k = 0;    // current window occupancy
     size_t nan_count = 0;
 
     auto safe = [](double v) { return std::isnan(v) ? 0.0 : v; };
@@ -825,11 +826,12 @@ AlignedSeries AlignedSeries::zscore(int N) const {
     // Phase 1: fill the window
     for (size_t i = 0; i < wsize - 1 && i < values.size(); ++i) {
         welford_add_p1(safe(values[i]));
-        if (std::isnan(values[i])) ++nan_count;
+        if (std::isnan(values[i]))
+            ++nan_count;
     }
 
     // Phase 2: k == wsize throughout -- precompute loop-invariant reciprocals.
-    const double inv_wsize    = 1.0 / static_cast<double>(wsize);
+    const double inv_wsize = 1.0 / static_cast<double>(wsize);
     const double inv_wsize_m1 = (wsize > 1) ? 1.0 / static_cast<double>(wsize - 1) : 0.0;
 
     // Phase 2: slide the window across the rest of the series
@@ -839,10 +841,11 @@ AlignedSeries AlignedSeries::zscore(int N) const {
         ++k;
         {
             double delta = v_in - M;
-            M += delta * inv_wsize;     // replaces: M += delta / k  (k == wsize)
+            M += delta * inv_wsize;  // replaces: M += delta / k  (k == wsize)
             Q += delta * (v_in - M);
         }
-        if (std::isnan(values[i])) ++nan_count;
+        if (std::isnan(values[i]))
+            ++nan_count;
 
         if (nan_count > 0) {
             result[i] = nan;
@@ -857,13 +860,15 @@ AlignedSeries AlignedSeries::zscore(int N) const {
 
         if (i + 1 < values.size()) {
             size_t remove_idx = i - wsize + 1;
-            if (std::isnan(values[remove_idx])) --nan_count;
+            if (std::isnan(values[remove_idx]))
+                --nan_count;
             // Remove old left-edge element using Phase-2 reciprocal multiply.
             double x = safe(values[remove_idx]);
             double delta = x - M;
             M -= delta * inv_wsize_m1;  // replaces: M -= delta / (k-1)  (k-1 == wsize-1)
             Q -= delta * (x - M);
-            if (Q < 0.0) Q = 0.0;
+            if (Q < 0.0)
+                Q = 0.0;
             --k;
         }
     }
@@ -878,8 +883,10 @@ AlignedSeries AlignedSeries::ema(double param) const {
     // Determine alpha: if param > 1, treat as span N => alpha = 2 / (N + 1)
     double alpha = (param > 1.0) ? (2.0 / (param + 1.0)) : param;
     // Clamp alpha to (0, 1]
-    if (alpha <= 0.0) alpha = std::numeric_limits<double>::min(); // nearly zero but positive
-    if (alpha > 1.0)  alpha = 1.0;
+    if (alpha <= 0.0)
+        alpha = std::numeric_limits<double>::min();  // nearly zero but positive
+    if (alpha > 1.0)
+        alpha = 1.0;
 
     std::vector<double> result(values.size(), nan);
     if (values.empty()) {
@@ -887,7 +894,7 @@ AlignedSeries AlignedSeries::ema(double param) const {
     }
 
     // Find the first non-NaN value to seed the EMA
-    size_t seed = values.size(); // sentinel: no real value found
+    size_t seed = values.size();  // sentinel: no real value found
     for (size_t i = 0; i < values.size(); ++i) {
         if (!std::isnan(values[i])) {
             seed = i;
@@ -923,10 +930,14 @@ AlignedSeries AlignedSeries::holt_winters(double alpha, double beta) const {
     const double nan = std::numeric_limits<double>::quiet_NaN();
 
     // Clamp alpha and beta to (0, 1]
-    if (alpha <= 0.0) alpha = std::numeric_limits<double>::min();
-    if (alpha > 1.0)  alpha = 1.0;
-    if (beta  <= 0.0) beta  = std::numeric_limits<double>::min();
-    if (beta  > 1.0)  beta  = 1.0;
+    if (alpha <= 0.0)
+        alpha = std::numeric_limits<double>::min();
+    if (alpha > 1.0)
+        alpha = 1.0;
+    if (beta <= 0.0)
+        beta = std::numeric_limits<double>::min();
+    if (beta > 1.0)
+        beta = 1.0;
 
     std::vector<double> result(values.size(), nan);
     if (values.empty()) {
@@ -934,7 +945,7 @@ AlignedSeries AlignedSeries::holt_winters(double alpha, double beta) const {
     }
 
     // Find the first non-NaN value to seed level and trend
-    size_t seed = values.size(); // sentinel: no real value found
+    size_t seed = values.size();  // sentinel: no real value found
     for (size_t i = 0; i < values.size(); ++i) {
         if (!std::isnan(values[i])) {
             seed = i;
@@ -985,8 +996,7 @@ AlignedSeries AlignedSeries::time_shift(int64_t offsetNs) const {
 
 // ==================== ExpressionEvaluator ====================
 
-AlignedSeries ExpressionEvaluator::evaluate(const ExpressionNode& expr,
-                                            const QueryResultMap& queryResults) {
+AlignedSeries ExpressionEvaluator::evaluate(const ExpressionNode& expr, const QueryResultMap& queryResults) {
     if (queryResults.empty()) {
         throw EvaluationException("No query results provided for evaluation");
     }
@@ -994,8 +1004,7 @@ AlignedSeries ExpressionEvaluator::evaluate(const ExpressionNode& expr,
     return evaluateNode(expr, queryResults);
 }
 
-AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node,
-                                                 const QueryResultMap& queryResults) {
+AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults) {
     switch (node.type) {
         case ExprNodeType::QUERY_REF:
             return evaluateQueryRef(node.asQueryRef(), queryResults);
@@ -1026,8 +1035,7 @@ AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node,
     }
 }
 
-const AlignedSeries& ExpressionEvaluator::evaluateQueryRef(const QueryRef& ref,
-                                                           const QueryResultMap& queryResults) {
+const AlignedSeries& ExpressionEvaluator::evaluateQueryRef(const QueryRef& ref, const QueryResultMap& queryResults) {
     auto it = queryResults.find(ref.name);
     if (it == queryResults.end()) {
         throw EvaluationException("Query '" + ref.name + "' not found in results");
@@ -1035,14 +1043,12 @@ const AlignedSeries& ExpressionEvaluator::evaluateQueryRef(const QueryRef& ref,
     return it->second;
 }
 
-AlignedSeries ExpressionEvaluator::evaluateScalar(const ScalarValue& scalar,
-                                                   const QueryResultMap& queryResults) {
+AlignedSeries ExpressionEvaluator::evaluateScalar(const ScalarValue& scalar, const QueryResultMap& queryResults) {
     auto tsPtr = getReferenceTimestamps(queryResults);
     return makeScalarSeries(scalar.value, tsPtr);
 }
 
-AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op,
-                                                     const QueryResultMap& queryResults) {
+AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op, const QueryResultMap& queryResults) {
     auto left = evaluateNode(*op.left, queryResults);
     auto right = evaluateNode(*op.right, queryResults);
 
@@ -1060,8 +1066,7 @@ AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op,
     }
 }
 
-AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op,
-                                                    const QueryResultMap& queryResults) {
+AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op, const QueryResultMap& queryResults) {
     auto operand = evaluateNode(*op.operand, queryResults);
 
     switch (op.op) {
@@ -1117,8 +1122,7 @@ AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op,
     }
 }
 
-AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call,
-                                                         const QueryResultMap& queryResults) {
+AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call, const QueryResultMap& queryResults) {
     switch (call.func) {
         case FunctionType::MIN: {
             if (call.args.size() != 2) {
@@ -1331,7 +1335,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             }
             auto series = evaluateNode(*call.args[0], queryResults);
             auto alphaSeries = evaluateNode(*call.args[1], queryResults);
-            auto betaSeries  = evaluateNode(*call.args[2], queryResults);
+            auto betaSeries = evaluateNode(*call.args[2], queryResults);
             if (alphaSeries.empty()) {
                 throw EvaluationException("holt_winters() alpha (second argument) must be a non-empty scalar");
             }
@@ -1339,7 +1343,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 throw EvaluationException("holt_winters() beta (third argument) must be a non-empty scalar");
             }
             double alpha = alphaSeries.values[0];
-            double beta  = betaSeries.values[0];
+            double beta = betaSeries.values[0];
             if (alpha <= 0.0 || alpha > 1.0) {
                 throw EvaluationException("holt_winters() alpha must be in (0, 1]");
             }
@@ -1370,7 +1374,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 throw EvaluationException("as_percent() requires exactly 2 arguments");
             }
             auto series = evaluateNode(*call.args[0], queryResults);
-            auto total  = evaluateNode(*call.args[1], queryResults);
+            auto total = evaluateNode(*call.args[1], queryResults);
             return AlignedSeries::as_percent(series, total);
         }
 
@@ -1403,14 +1407,14 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             return series;  // N >= 1: single group is always kept
         }
 
-        // ---- Cross-series aggregation (variadic, element-wise) ----
-        //
-        // All input series must already be aligned (same timestamps).
-        // Each function accepts >= 1 series argument (avg/sum/min/max)
-        // or >= 2 arguments where the first is a scalar p (percentile_of_series).
-        //
-        // For each index i, gather the non-NaN values from all series and apply
-        // the aggregation. If no non-NaN value exists at index i, output NaN.
+            // ---- Cross-series aggregation (variadic, element-wise) ----
+            //
+            // All input series must already be aligned (same timestamps).
+            // Each function accepts >= 1 series argument (avg/sum/min/max)
+            // or >= 2 arguments where the first is a scalar p (percentile_of_series).
+            //
+            // For each index i, gather the non-NaN values from all series and apply
+            // the aggregation. If no non-NaN value exists at index i, output NaN.
 
         case FunctionType::AVG_OF_SERIES: {
             if (call.args.empty()) {
@@ -1426,8 +1430,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             size_t n = series[0].size();
             for (size_t i = 1; i < series.size(); ++i) {
                 if (series[i].size() != n) {
-                    throw EvaluationException(
-                        "avg_of_series(): all series must have the same length");
+                    throw EvaluationException("avg_of_series(): all series must have the same length");
                 }
             }
             const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -1441,7 +1444,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                         ++cnt;
                     }
                 }
-                if (cnt > 0) result[i] = sum / static_cast<double>(cnt);
+                if (cnt > 0)
+                    result[i] = sum / static_cast<double>(cnt);
             }
             return AlignedSeries(series[0].timestamps, std::move(result));
         }
@@ -1458,8 +1462,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             size_t n = series[0].size();
             for (size_t i = 1; i < series.size(); ++i) {
                 if (series[i].size() != n) {
-                    throw EvaluationException(
-                        "sum_of_series(): all series must have the same length");
+                    throw EvaluationException("sum_of_series(): all series must have the same length");
                 }
             }
             const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -1473,7 +1476,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                         ++cnt;
                     }
                 }
-                if (cnt > 0) result[i] = sum;
+                if (cnt > 0)
+                    result[i] = sum;
             }
             return AlignedSeries(series[0].timestamps, std::move(result));
         }
@@ -1490,8 +1494,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             size_t n = series[0].size();
             for (size_t i = 1; i < series.size(); ++i) {
                 if (series[i].size() != n) {
-                    throw EvaluationException(
-                        "min_of_series(): all series must have the same length");
+                    throw EvaluationException("min_of_series(): all series must have the same length");
                 }
             }
             const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -1508,7 +1511,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                         }
                     }
                 }
-                if (found) result[i] = minVal;
+                if (found)
+                    result[i] = minVal;
             }
             return AlignedSeries(series[0].timestamps, std::move(result));
         }
@@ -1525,8 +1529,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             size_t n = series[0].size();
             for (size_t i = 1; i < series.size(); ++i) {
                 if (series[i].size() != n) {
-                    throw EvaluationException(
-                        "max_of_series(): all series must have the same length");
+                    throw EvaluationException("max_of_series(): all series must have the same length");
                 }
             }
             const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -1543,7 +1546,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                         }
                     }
                 }
-                if (found) result[i] = maxVal;
+                if (found)
+                    result[i] = maxVal;
             }
             return AlignedSeries(series[0].timestamps, std::move(result));
         }
@@ -1559,14 +1563,11 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             // Evaluate p (first arg, expected to be a scalar or scalar series)
             auto pSeries = evaluateNode(*call.args[0], queryResults);
             if (pSeries.empty()) {
-                throw EvaluationException(
-                    "percentile_of_series() first argument (p) must be a non-empty scalar");
+                throw EvaluationException("percentile_of_series() first argument (p) must be a non-empty scalar");
             }
             double p = pSeries.values[0];
             if (p < 0.0 || p > 100.0) {
-                throw EvaluationException(
-                    "percentile_of_series() p must be in [0, 100], got " +
-                    std::to_string(p));
+                throw EvaluationException("percentile_of_series() p must be in [0, 100], got " + std::to_string(p));
             }
 
             // Evaluate the series arguments
@@ -1578,8 +1579,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             size_t n = series[0].size();
             for (size_t i = 1; i < series.size(); ++i) {
                 if (series[i].size() != n) {
-                    throw EvaluationException(
-                        "percentile_of_series(): all series must have the same length");
+                    throw EvaluationException("percentile_of_series(): all series must have the same length");
                 }
             }
 
@@ -1595,7 +1595,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                         tmp.push_back(s.values[i]);
                     }
                 }
-                if (tmp.empty()) continue;  // result[i] stays NaN
+                if (tmp.empty())
+                    continue;  // result[i] stays NaN
 
                 std::sort(tmp.begin(), tmp.end());
                 // Linear interpolation percentile
@@ -1618,7 +1619,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
 }
 
 AlignedSeries ExpressionEvaluator::makeScalarSeries(double value,
-                                                     const std::shared_ptr<const std::vector<uint64_t>>& tsPtr) const {
+                                                    const std::shared_ptr<const std::vector<uint64_t>>& tsPtr) const {
     std::vector<double> values(tsPtr->size(), value);
     return AlignedSeries(tsPtr, std::move(values));
 }
@@ -1634,15 +1635,12 @@ std::shared_ptr<const std::vector<uint64_t>> ExpressionEvaluator::getReferenceTi
     throw EvaluationException("No non-empty series found in query results");
 }
 
-AlignedSeries ExpressionEvaluator::evaluateTimeShiftFunction(
-    const TimeShiftFunction& ts,
-    const QueryResultMap& queryResults) {
-
+AlignedSeries ExpressionEvaluator::evaluateTimeShiftFunction(const TimeShiftFunction& ts,
+                                                             const QueryResultMap& queryResults) {
     // Retrieve the series for the query reference
     auto it = queryResults.find(ts.queryRef);
     if (it == queryResults.end()) {
-        throw EvaluationException(
-            "time_shift(): query '" + ts.queryRef + "' not found in results");
+        throw EvaluationException("time_shift(): query '" + ts.queryRef + "' not found in results");
     }
     const AlignedSeries& series = it->second;
 
@@ -1653,23 +1651,19 @@ AlignedSeries ExpressionEvaluator::evaluateTimeShiftFunction(
     std::string absStr = negative ? offsetStr.substr(1) : offsetStr;
 
     if (absStr.empty()) {
-        throw EvaluationException(
-            "time_shift(): offset string is empty or just '-'");
+        throw EvaluationException("time_shift(): offset string is empty or just '-'");
     }
 
     uint64_t absNs;
     try {
         absNs = forecast::parseDurationToNs(absStr);
     } catch (const std::exception& e) {
-        throw EvaluationException(
-            std::string("time_shift(): invalid offset '") + offsetStr + "': " + e.what());
+        throw EvaluationException(std::string("time_shift(): invalid offset '") + offsetStr + "': " + e.what());
     }
 
-    int64_t offsetNs = negative
-        ? -static_cast<int64_t>(absNs)
-        : static_cast<int64_t>(absNs);
+    int64_t offsetNs = negative ? -static_cast<int64_t>(absNs) : static_cast<int64_t>(absNs);
 
     return series.time_shift(offsetNs);
 }
 
-} // namespace timestar
+}  // namespace timestar

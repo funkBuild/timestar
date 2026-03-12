@@ -1,12 +1,12 @@
 #include "timestar_config.hpp"
 
+#include <glaze/toml.hpp>
+
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
-
-#include <glaze/toml.hpp>
 
 namespace timestar {
 
@@ -91,16 +91,14 @@ std::vector<std::string> TimestarConfig::validate() const {
             val = std::stod(raw, &pos);
             // Reject trailing garbage (e.g. "1.0abc")
             if (pos != raw.size()) {
-                errors.emplace_back(
-                    "seastar.task_quota_ms must be a number, got: \"" + raw + "\"");
+                errors.emplace_back("seastar.task_quota_ms must be a number, got: \"" + raw + "\"");
             } else if (val <= 0.0) {
                 errors.emplace_back("seastar.task_quota_ms must be > 0");
             } else {
                 parseOk = true;
             }
         } catch (const std::exception&) {
-            errors.emplace_back(
-                "seastar.task_quota_ms must be a number, got: \"" + raw + "\"");
+            errors.emplace_back("seastar.task_quota_ms must be a number, got: \"" + raw + "\"");
         }
         (void)parseOk;
     }
@@ -131,18 +129,22 @@ static SeastarConfig parseSeastarSection(const std::string& tomlContent) {
     while (std::getline(stream, line)) {
         // Trim leading whitespace
         auto start = line.find_first_not_of(" \t");
-        if (start == std::string::npos) continue;
+        if (start == std::string::npos)
+            continue;
         line = line.substr(start);
 
         // Skip comments and empty lines
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty() || line[0] == '#')
+            continue;
 
         // Stop at next section header
-        if (line[0] == '[') break;
+        if (line[0] == '[')
+            break;
 
         // Parse key = value
         auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
+        if (eq == std::string::npos)
+            continue;
 
         std::string key = line.substr(0, eq);
         std::string value = line.substr(eq + 1);
@@ -151,7 +153,10 @@ static SeastarConfig parseSeastarSection(const std::string& tomlContent) {
         auto trimWs = [](std::string& s) {
             auto b = s.find_first_not_of(" \t");
             auto e = s.find_last_not_of(" \t\r\n");
-            if (b == std::string::npos) { s.clear(); return; }
+            if (b == std::string::npos) {
+                s.clear();
+                return;
+            }
             s = s.substr(b, e - b + 1);
         };
         trimWs(key);
@@ -183,8 +188,7 @@ TimestarConfig loadConfigFile(const std::string& path) {
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open config file: " + path);
     }
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     // Parse TimeStar sections via Glaze (skip unknown keys like [seastar])
     TimestarConfigParseable parsed{};
@@ -192,8 +196,7 @@ TimestarConfig loadConfigFile(const std::string& path) {
     glz::context ctx{};
     auto ec = glz::read<tomlOpts>(parsed, content, ctx);
     if (ec) {
-        throw std::runtime_error("Failed to parse config file '" + path + "': " +
-                                 glz::format_error(ec, content));
+        throw std::runtime_error("Failed to parse config file '" + path + "': " + glz::format_error(ec, content));
     }
 
     // Build the full config
@@ -256,19 +259,24 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     auto envStr = [](const char* name) -> const char* { return std::getenv(name); };
 
     auto envU16 = [&](const char* name, uint16_t& field) {
-        if (auto v = envStr(name)) field = static_cast<uint16_t>(std::stoul(v));
+        if (auto v = envStr(name))
+            field = static_cast<uint16_t>(std::stoul(v));
     };
     auto envU32 = [&](const char* name, uint32_t& field) {
-        if (auto v = envStr(name)) field = static_cast<uint32_t>(std::stoul(v));
+        if (auto v = envStr(name))
+            field = static_cast<uint32_t>(std::stoul(v));
     };
     auto envU64 = [&](const char* name, uint64_t& field) {
-        if (auto v = envStr(name)) field = std::stoull(v);
+        if (auto v = envStr(name))
+            field = std::stoull(v);
     };
     auto envDbl = [&](const char* name, double& field) {
-        if (auto v = envStr(name)) field = std::stod(v);
+        if (auto v = envStr(name))
+            field = std::stod(v);
     };
     auto envString = [&](const char* name, std::string& field) {
-        if (auto v = envStr(name)) field = v;
+        if (auto v = envStr(name))
+            field = v;
     };
 
     // Server
@@ -315,7 +323,8 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
 
     // Seastar — these go into the string map
     auto envSeastar = [&](const char* envName, const char* key) {
-        if (auto v = envStr(envName)) cfg.seastar.settings[key] = v;
+        if (auto v = envStr(envName))
+            cfg.seastar.settings[key] = v;
     };
     envSeastar("TIMESTAR_SMP", "smp");
     envSeastar("TIMESTAR_MEMORY", "memory");
@@ -328,4 +337,4 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envSeastar("TIMESTAR_IO_PROPERTIES_FILE", "io_properties_file");
 }
 
-} // namespace timestar
+}  // namespace timestar

@@ -1,18 +1,20 @@
 #ifndef HTTP_QUERY_HANDLER_H_INCLUDED
 #define HTTP_QUERY_HANDLER_H_INCLUDED
 
-#include "query_parser.hpp"
 #include "leveldb_index.hpp"
+#include "query_parser.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
-#include <seastar/http/httpd.hh>
-#include <seastar/http/handlers.hh>
-#include <seastar/http/function_handlers.hh>
+
+#include <glaze/glaze.hpp>
+
+#include <chrono>
+#include <memory>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
-#include <glaze/glaze.hpp>
-#include <memory>
-#include <chrono>
+#include <seastar/http/function_handlers.hh>
+#include <seastar/http/handlers.hh>
+#include <seastar/http/httpd.hh>
 #include <variant>
 
 // Forward declaration
@@ -24,12 +26,8 @@ struct GlazeQueryRequest;
 namespace timestar {
 
 // Variant type for field values - can be double, bool, string, or int64
-using FieldValues = std::variant<
-    std::vector<double>,
-    std::vector<bool>,
-    std::vector<std::string>,
-    std::vector<int64_t>
->;
+using FieldValues =
+    std::variant<std::vector<double>, std::vector<bool>, std::vector<std::string>, std::vector<int64_t>>;
 
 struct SeriesResult {
     std::string measurement;
@@ -40,11 +38,11 @@ struct SeriesResult {
 struct QueryStatistics {
     size_t seriesCount = 0;
     size_t pointCount = 0;
-    size_t failedSeriesCount = 0;    // Number of series that failed to query
+    size_t failedSeriesCount = 0;  // Number of series that failed to query
     double executionTimeMs = 0.0;
     std::vector<int> shardsQueried;
-    bool truncated = false;          // True if results were truncated due to limits
-    std::string truncationReason;    // Reason for truncation if truncated
+    bool truncated = false;        // True if results were truncated due to limits
+    std::string truncationReason;  // Reason for truncation if truncated
 };
 
 struct QueryResponse {
@@ -71,20 +69,19 @@ public:
     static size_t maxTotalPoints() { return timestar::config().http.max_total_points; }
 
     // Query timeout to prevent indefinite hangs from stuck shards
-    static std::chrono::seconds defaultQueryTimeout() { return std::chrono::seconds(timestar::config().http.query_timeout_seconds); }
+    static std::chrono::seconds defaultQueryTimeout() {
+        return std::chrono::seconds(timestar::config().http.query_timeout_seconds);
+    }
 
-    explicit HttpQueryHandler(seastar::sharded<Engine>* engine,
-                            seastar::sharded<LevelDBIndex>* index = nullptr)
+    explicit HttpQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<LevelDBIndex>* index = nullptr)
         : engineSharded(engine), indexSharded(index) {}
 
     // Validate request body size and content type (public for testing).
     // Returns a reply with an error if validation fails, or nullptr if valid.
-    std::unique_ptr<seastar::http::reply> validateRequest(
-        const seastar::http::request& req) const;
+    std::unique_ptr<seastar::http::reply> validateRequest(const seastar::http::request& req) const;
 
     // Main query handler
-    seastar::future<std::unique_ptr<seastar::http::reply>>
-    handleQuery(std::unique_ptr<seastar::http::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleQuery(std::unique_ptr<seastar::http::request> req);
 
     // Register routes with HTTP server
     void registerRoutes(seastar::httpd::routes& r);
@@ -116,11 +113,10 @@ public:
     std::vector<SeriesResult> mergeResults(std::vector<std::vector<SeriesResult>> shardResults);
 
 private:
-
     // Query all relevant shards
     seastar::future<std::vector<SeriesResult>> queryAllShards(const QueryRequest& request);
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // HTTP_QUERY_HANDLER_H_INCLUDED
+#endif  // HTTP_QUERY_HANDLER_H_INCLUDED

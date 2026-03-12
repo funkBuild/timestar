@@ -1,25 +1,25 @@
 #ifndef STRING_ENCODER_H_INCLUDED
 #define STRING_ENCODER_H_INCLUDED
 
-#include <vector>
-#include <string>
-#include <cstdint>
-#include <span>
-
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
+
+#include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
 
 class StringEncoder {
 private:
     // Write variable-length integer for string lengths
     static void writeVarInt(AlignedBuffer& buffer, uint32_t value);
-    
+
     // Read variable-length integer
     static uint32_t readVarInt(Slice& slice);
-    
+
 public:
     StringEncoder() = default;
-    
+
     // Encode strings with Snappy compression.
     // Accepts std::span for zero-copy sub-range encoding; std::vector
     // converts implicitly.
@@ -32,8 +32,8 @@ public:
     // Writes the same format as encode() but directly into the target buffer,
     // eliminating the final result-buffer allocation and copy.
     // Returns the number of bytes written to the target buffer.
-    static size_t encodeInto(std::span<const std::string> values, AlignedBuffer &target);
-    
+    static size_t encodeInto(std::span<const std::string> values, AlignedBuffer& target);
+
     // Decode strings from compressed buffer
     static void decode(AlignedBuffer& encoded, size_t count, std::vector<std::string>& out);
 
@@ -49,4 +49,4 @@ public:
                        std::vector<std::string>& out);
 };
 
-#endif // STRING_ENCODER_H_INCLUDED
+#endif  // STRING_ENCODER_H_INCLUDED

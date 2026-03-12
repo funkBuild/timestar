@@ -1,26 +1,30 @@
 #include "periodicity_detector.hpp"
+
 #include "../anomaly/simd_anomaly.hpp"
 #include "../simd_helpers.hpp"
-#include <cmath>
+
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
-#include <limits>
 
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD
 using timestar::simd::hsum_avx;
-static inline double hsum_avx_local(__m256d v) { return hsum_avx(v); }
+static inline double hsum_avx_local(__m256d v) {
+    return hsum_avx(v);
+}
 #endif
 
 namespace timestar {
 namespace forecast {
 
 namespace {
-    constexpr double PI = 3.14159265358979323846;
-    constexpr double MIN_ACF_VALIDATION = 0.2;  // Minimum ACF for period validation
-    constexpr size_t MIN_DATA_POINTS = 8;       // Minimum required data points
-    constexpr size_t MAX_DFT_SIZE = 4096;       // Cap input size to avoid O(n^2) reactor blocking
-}
+constexpr double PI = 3.14159265358979323846;
+constexpr double MIN_ACF_VALIDATION = 0.2;  // Minimum ACF for period validation
+constexpr size_t MIN_DATA_POINTS = 8;       // Minimum required data points
+constexpr size_t MAX_DFT_SIZE = 4096;       // Cap input size to avoid O(n^2) reactor blocking
+}  // namespace
 
 // Remove linear trend using least squares fit
 std::vector<double> PeriodicityDetector::detrend(const std::vector<double>& y) {
@@ -132,7 +136,7 @@ std::vector<double> PeriodicityDetector::detrend(const std::vector<double>& y) {
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD
     if (anomaly::simd::isAvx2Available() && n >= 16) {
         // AVX2 path: result[i] = y[i] - intercept - slope * i
-        __m256d vSlope     = _mm256_set1_pd(slope);
+        __m256d vSlope = _mm256_set1_pd(slope);
         __m256d vIntercept = _mm256_set1_pd(intercept);
 
         // Index vectors
@@ -232,7 +236,8 @@ std::vector<std::complex<double>> PeriodicityDetector::fft(const std::vector<dou
 
     // Pad to next power of 2
     size_t fftSize = 1;
-    while (fftSize < n) fftSize <<= 1;
+    while (fftSize < n)
+        fftSize <<= 1;
     fftInput.resize(fftSize, 0.0);  // Zero-pad
 
     // Store effective N for period mapping: period = effectiveN_ / freqIdx
@@ -253,7 +258,8 @@ std::vector<std::complex<double>> PeriodicityDetector::fft(const std::vector<dou
             bit >>= 1;
         }
         j ^= bit;
-        if (i < j) std::swap(X[i], X[j]);
+        if (i < j)
+            std::swap(X[i], X[j]);
     }
 
     // Butterfly stages
@@ -349,10 +355,7 @@ std::vector<double> PeriodicityDetector::computePeriodogram(const std::vector<do
 }
 
 // Find peaks in periodogram
-std::vector<size_t> PeriodicityDetector::findPeaks(
-    const std::vector<double>& periodogram,
-    double threshold
-) {
+std::vector<size_t> PeriodicityDetector::findPeaks(const std::vector<double>& periodogram, double threshold) {
     if (periodogram.size() < 3) {
         return {};
     }
@@ -362,17 +365,14 @@ std::vector<size_t> PeriodicityDetector::findPeaks(
     // Skip DC component (index 0)
     for (size_t i = 1; i < periodogram.size() - 1; ++i) {
         // Check if it's a local maximum
-        if (periodogram[i] > periodogram[i - 1] &&
-            periodogram[i] > periodogram[i + 1] &&
-            periodogram[i] >= threshold) {
+        if (periodogram[i] > periodogram[i - 1] && periodogram[i] > periodogram[i + 1] && periodogram[i] >= threshold) {
             peaks.push_back(i);
         }
     }
 
     // Check the last bin (can be a peak if it exceeds its left neighbor)
     size_t last = periodogram.size() - 1;
-    if (periodogram[last] > periodogram[last - 1] &&
-        periodogram[last] >= threshold) {
+    if (periodogram[last] > periodogram[last - 1] && periodogram[last] >= threshold) {
         peaks.push_back(last);
     }
 
@@ -380,10 +380,7 @@ std::vector<size_t> PeriodicityDetector::findPeaks(
 }
 
 // Compute autocorrelation at given lag
-double PeriodicityDetector::autoCorrelation(
-    const std::vector<double>& y,
-    size_t lag
-) {
+double PeriodicityDetector::autoCorrelation(const std::vector<double>& y, size_t lag) {
     const size_t n = y.size();
 
     if (lag >= n || n == 0) {
@@ -462,31 +459,31 @@ double PeriodicityDetector::autoCorrelation(
         // AVX2 path: 4 accumulators to hide FMA latency
         const double* pyL = py + lag;
         __m256d vMean = _mm256_set1_pd(mean);
-        __m256d acc0  = _mm256_setzero_pd();
-        __m256d acc1  = _mm256_setzero_pd();
-        __m256d acc2  = _mm256_setzero_pd();
-        __m256d acc3  = _mm256_setzero_pd();
+        __m256d acc0 = _mm256_setzero_pd();
+        __m256d acc1 = _mm256_setzero_pd();
+        __m256d acc2 = _mm256_setzero_pd();
+        __m256d acc3 = _mm256_setzero_pd();
 
         const size_t simd_end = count & ~size_t(15);  // round down to multiple of 16
 
         for (size_t i = 0; i < simd_end; i += 16) {
             // Block 0: i..i+3
-            __m256d a0 = _mm256_sub_pd(_mm256_loadu_pd(py  + i),      vMean);
-            __m256d b0 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i),      vMean);
+            __m256d a0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), vMean);
+            __m256d b0 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i), vMean);
             acc0 = _mm256_fmadd_pd(a0, b0, acc0);
 
             // Block 1: i+4..i+7
-            __m256d a1 = _mm256_sub_pd(_mm256_loadu_pd(py  + i + 4),  vMean);
-            __m256d b1 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 4),  vMean);
+            __m256d a1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), vMean);
+            __m256d b1 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 4), vMean);
             acc1 = _mm256_fmadd_pd(a1, b1, acc1);
 
             // Block 2: i+8..i+11
-            __m256d a2 = _mm256_sub_pd(_mm256_loadu_pd(py  + i + 8),  vMean);
-            __m256d b2 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 8),  vMean);
+            __m256d a2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), vMean);
+            __m256d b2 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 8), vMean);
             acc2 = _mm256_fmadd_pd(a2, b2, acc2);
 
             // Block 3: i+12..i+15
-            __m256d a3 = _mm256_sub_pd(_mm256_loadu_pd(py  + i + 12), vMean);
+            __m256d a3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), vMean);
             __m256d b3 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 12), vMean);
             acc3 = _mm256_fmadd_pd(a3, b3, acc3);
         }
@@ -515,13 +512,9 @@ double PeriodicityDetector::autoCorrelation(
 }
 
 // Main period detection function
-std::vector<DetectedPeriod> PeriodicityDetector::detectPeriods(
-    const std::vector<double>& y,
-    size_t minPeriod,
-    size_t maxPeriod,
-    size_t maxPeriods,
-    double powerThreshold
-) {
+std::vector<DetectedPeriod> PeriodicityDetector::detectPeriods(const std::vector<double>& y, size_t minPeriod,
+                                                               size_t maxPeriod, size_t maxPeriods,
+                                                               double powerThreshold) {
     const size_t n = y.size();
 
     // Validate input
@@ -621,7 +614,8 @@ std::vector<DetectedPeriod> PeriodicityDetector::detectPeriods(
     std::vector<DetectedPeriod> candidates;
 
     for (size_t freqIdx : peakIndices) {
-        if (freqIdx == 0) continue;  // Skip DC component
+        if (freqIdx == 0)
+            continue;  // Skip DC component
 
         // Convert frequency index to period using effective FFT size (rounded)
         size_t period = (effectiveN_ + freqIdx / 2) / freqIdx;
@@ -645,12 +639,7 @@ std::vector<DetectedPeriod> PeriodicityDetector::detectPeriods(
         // Confidence is geometric mean of normalized power and ACF
         double confidence = std::sqrt(normalizedPower * acf);
 
-        candidates.push_back({
-            period,
-            periodogram[freqIdx],
-            acf,
-            confidence
-        });
+        candidates.push_back({period, periodogram[freqIdx], acf, confidence});
     }
 
     // Step 7: Sort by confidence and return top-N
@@ -664,10 +653,7 @@ std::vector<DetectedPeriod> PeriodicityDetector::detectPeriods(
 }
 
 // Detect single best period (for 'auto' mode)
-size_t PeriodicityDetector::detectBestPeriod(
-    const std::vector<double>& y,
-    uint64_t dataIntervalNs
-) {
+size_t PeriodicityDetector::detectBestPeriod(const std::vector<double>& y, uint64_t dataIntervalNs) {
     // Use heuristics to determine sensible period range
     const size_t n = y.size();
 
@@ -695,11 +681,11 @@ size_t PeriodicityDetector::detectBestPeriod(
             maxPeriod = std::min(n / 2, size_t(24 * 60));  // Up to 24 hours of minutes
         } else if (dataIntervalNs <= NS_PER_HOUR) {
             // Hourly data: look for daily/weekly patterns
-            minPeriod = 6;   // At least 6 hours
+            minPeriod = 6;                                // At least 6 hours
             maxPeriod = std::min(n / 2, size_t(7 * 24));  // Up to weekly
         } else if (dataIntervalNs <= NS_PER_DAY) {
             // Daily data: look for weekly/monthly patterns
-            minPeriod = 4;   // At least 4 days
+            minPeriod = 4;                             // At least 4 days
             maxPeriod = std::min(n / 2, size_t(365));  // Up to yearly
         }
     }
@@ -715,5 +701,5 @@ size_t PeriodicityDetector::detectBestPeriod(
     return periods[0].period;
 }
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar

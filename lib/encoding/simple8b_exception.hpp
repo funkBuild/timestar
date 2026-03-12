@@ -1,14 +1,13 @@
 #ifndef SIMPLE8B_EXCEPTION_H_INCLUDED
 #define SIMPLE8B_EXCEPTION_H_INCLUDED
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <cstdint>
 
 class Simple8BException : public std::runtime_error {
 public:
-    Simple8BException(const std::string& message) 
-        : std::runtime_error(message) {}
+    Simple8BException(const std::string& message) : std::runtime_error(message) {}
 };
 
 class Simple8BValueTooLargeException : public Simple8BException {
@@ -19,9 +18,7 @@ private:
 
 public:
     Simple8BValueTooLargeException(uint64_t value, size_t offset)
-        : Simple8BException(createMessage(value, offset)),
-          value_(value),
-          offset_(offset) {}
+        : Simple8BException(createMessage(value, offset)), value_(value), offset_(offset) {}
 
     uint64_t getValue() const { return value_; }
     size_t getOffset() const { return offset_; }
@@ -29,10 +26,8 @@ public:
 
 private:
     static std::string createMessage(uint64_t value, size_t offset) {
-        return "Simple8B encoding failed: Value " + std::to_string(value) + 
-               " at offset " + std::to_string(offset) + 
-               " exceeds maximum encodable value of " + std::to_string(MAX_ENCODABLE_VALUE) +
-               " (60-bit limit)";
+        return "Simple8B encoding failed: Value " + std::to_string(value) + " at offset " + std::to_string(offset) +
+               " exceeds maximum encodable value of " + std::to_string(MAX_ENCODABLE_VALUE) + " (60-bit limit)";
     }
 };
 

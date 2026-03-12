@@ -1,6 +1,8 @@
 #include "integer_encoder.hpp"
-#include "../zigzag.hpp"
+
 #include "../simple16.hpp"
+#include "../zigzag.hpp"
+
 #include <limits>
 
 // Basic implementation without SIMD - optimized with loop unrolling
@@ -31,10 +33,14 @@ AlignedBuffer IntegerEncoderBasic::encode(std::span<const uint64_t> values) {
 
     // Process 4 values at a time when possible
     for (; i + 3 < size; i += 4) {
-        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
-        int64_t d1 = (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i])) - (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1]));
-        int64_t d2 = (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1])) - (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i]));
-        int64_t d3 = (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2])) - (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1]));
+        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                     (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
+        int64_t d1 = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i])) -
+                     (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]));
+        int64_t d2 = (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1])) -
+                     (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i]));
+        int64_t d3 = (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2])) -
+                     (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1]));
 
         encoded.push_back(ZigZag::zigzagEncode(d0));
         encoded.push_back(ZigZag::zigzagEncode(d1));
@@ -44,7 +50,8 @@ AlignedBuffer IntegerEncoderBasic::encode(std::span<const uint64_t> values) {
 
     // Handle remaining values
     for (; i < size; i++) {
-        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
+        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                    (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
         uint64_t encD = ZigZag::zigzagEncode(D);
         encoded.push_back(encD);
     }
@@ -52,7 +59,7 @@ AlignedBuffer IntegerEncoderBasic::encode(std::span<const uint64_t> values) {
     return Simple16::encode(encoded);
 }
 
-size_t IntegerEncoderBasic::encodeInto(std::span<const uint64_t> values, AlignedBuffer &target) {
+size_t IntegerEncoderBasic::encodeInto(std::span<const uint64_t> values, AlignedBuffer& target) {
     if (values.empty()) [[unlikely]] {
         return 0;
     }
@@ -77,10 +84,14 @@ size_t IntegerEncoderBasic::encodeInto(std::span<const uint64_t> values, Aligned
 
     // Process 4 values at a time when possible
     for (; i + 3 < size; i += 4) {
-        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
-        int64_t d1 = (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i])) - (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1]));
-        int64_t d2 = (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1])) - (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i]));
-        int64_t d3 = (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2])) - (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1]));
+        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                     (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
+        int64_t d1 = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i])) -
+                     (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]));
+        int64_t d2 = (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1])) -
+                     (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i]));
+        int64_t d3 = (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2])) -
+                     (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1]));
 
         encoded.push_back(ZigZag::zigzagEncode(d0));
         encoded.push_back(ZigZag::zigzagEncode(d1));
@@ -90,7 +101,8 @@ size_t IntegerEncoderBasic::encodeInto(std::span<const uint64_t> values, Aligned
 
     // Handle remaining values
     for (; i < size; i++) {
-        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
+        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                    (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
         uint64_t encD = ZigZag::zigzagEncode(D);
         encoded.push_back(encD);
     }
@@ -98,15 +110,15 @@ size_t IntegerEncoderBasic::encodeInto(std::span<const uint64_t> values, Aligned
     return Simple16::encodeInto(encoded, target);
 }
 
-std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned int timestampSize,
-                                                      std::vector<uint64_t> &values,
-                                                      uint64_t minTime, uint64_t maxTime) {
+std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice& encoded, unsigned int timestampSize,
+                                                      std::vector<uint64_t>& values, uint64_t minTime,
+                                                      uint64_t maxTime) {
     // Optimized memory allocation
     const size_t current_size = values.size();
     const size_t estimated_new = timestampSize;
 
     if (values.capacity() < current_size + estimated_new) {
-        values.reserve(current_size + estimated_new + (estimated_new >> 2)); // 25% extra
+        values.reserve(current_size + estimated_new + (estimated_new >> 2));  // 25% extra
     }
 
     std::vector<uint64_t> deltaValues = Simple16::decode(encoded, timestampSize);
@@ -154,9 +166,9 @@ std::pair<size_t, size_t> IntegerEncoderBasic::decode(Slice &encoded, unsigned i
     for (; i + 3 < size; i += 4) {
         // Decode all 4 delta-of-deltas
         int64_t dd0 = ZigZag::zigzagDecode(deltaValues[i]);
-        int64_t dd1 = ZigZag::zigzagDecode(deltaValues[i+1]);
-        int64_t dd2 = ZigZag::zigzagDecode(deltaValues[i+2]);
-        int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i+3]);
+        int64_t dd1 = ZigZag::zigzagDecode(deltaValues[i + 1]);
+        int64_t dd2 = ZigZag::zigzagDecode(deltaValues[i + 2]);
+        int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i + 3]);
 
         // Reconstruct values
         delta += dd0;

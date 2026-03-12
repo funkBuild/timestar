@@ -1,8 +1,11 @@
 #include "metadata_index_sync.hpp"
-#include <leveldb/options.h>
-#include <leveldb/filter_policy.h>
-#include <leveldb/cache.h>
+
 #include <glaze/glaze.hpp>
+
+#include <leveldb/cache.h>
+#include <leveldb/filter_policy.h>
+#include <leveldb/options.h>
+
 #include <algorithm>
 #include <charconv>
 #include <memory>
@@ -11,27 +14,17 @@
 template <>
 struct glz::meta<SeriesMetadataSync> {
     using T = SeriesMetadataSync;
-    static constexpr auto value = object(
-        "seriesId", &T::seriesId,
-        "measurement", &T::measurement,
-        "minTime", &T::minTime,
-        "maxTime", &T::maxTime,
-        "shardId", &T::shardId,
-        "tags", &T::tags,
-        "fields", &T::fields
-    );
+    static constexpr auto value =
+        object("seriesId", &T::seriesId, "measurement", &T::measurement, "minTime", &T::minTime, "maxTime", &T::maxTime,
+               "shardId", &T::shardId, "tags", &T::tags, "fields", &T::fields);
 };
 
 // Glaze template specialization for FieldStatsSync
 template <>
 struct glz::meta<FieldStatsSync> {
     using T = FieldStatsSync;
-    static constexpr auto value = object(
-        "dataType", &T::dataType,
-        "minValue", &T::minValue,
-        "maxValue", &T::maxValue,
-        "pointCount", &T::pointCount
-    );
+    static constexpr auto value = object("dataType", &T::dataType, "minValue", &T::minValue, "maxValue", &T::maxValue,
+                                         "pointCount", &T::pointCount);
 };
 
 // SeriesMetadataSync implementation
@@ -42,11 +35,11 @@ std::string SeriesMetadataSync::serialize() const {
 SeriesMetadataSync SeriesMetadataSync::deserialize(const std::string& data) {
     SeriesMetadataSync metadata;
     auto error = glz::read_json(metadata, data);
-    
+
     if (error) {
         throw std::runtime_error("Failed to parse series metadata: " + std::string(glz::format_error(error)));
     }
-    
+
     return metadata;
 }
 
@@ -55,12 +48,12 @@ std::string SeriesMetadataSync::generateSeriesKey(const std::string& measurement
                                                   const std::string& field) {
     std::stringstream ss;
     ss << measurement;
-    
+
     for (const auto& [k, v] : tags) {
         ss << "," << k << "=" << v;
     }
     ss << "," << field;
-    
+
     return ss.str();
 }
 
@@ -72,11 +65,11 @@ std::string FieldStatsSync::serialize() const {
 FieldStatsSync FieldStatsSync::deserialize(const std::string& data) {
     FieldStatsSync stats;
     auto error = glz::read_json(stats, data);
-    
+
     if (error) {
         throw std::runtime_error("Failed to parse field stats: " + std::string(glz::format_error(error)));
     }
-    
+
     return stats;
 }
 
@@ -113,7 +106,7 @@ void MetadataIndexSync::init() {
     }
 
     db.reset(dbPtr);
-    
+
     std::string value;
     status = db->Get(leveldb::ReadOptions(), "meta:nextSeriesId", &value);
     if (status.ok()) {
@@ -190,7 +183,8 @@ std::string MetadataIndexSync::buildSortedTagString(const std::map<std::string, 
     result.reserve(totalSize);
     bool first = true;
     for (const auto& [k, v] : tags) {
-        if (!first) result.push_back(',');
+        if (!first)
+            result.push_back(',');
         result.append(k);
         result.push_back('=');
         result.append(v);
@@ -200,8 +194,7 @@ std::string MetadataIndexSync::buildSortedTagString(const std::map<std::string, 
 }
 
 std::string MetadataIndexSync::compositeTagKey(const std::string& measurement,
-                                               const std::map<std::string, std::string>& tags,
-                                               uint64_t seriesId) {
+                                               const std::map<std::string, std::string>& tags, uint64_t seriesId) {
     std::string tagStr = buildSortedTagString(tags);
     std::string result;
     result.reserve(3 + measurement.size() + 1 + tagStr.size() + 1 + 16);
@@ -214,8 +207,7 @@ std::string MetadataIndexSync::compositeTagKey(const std::string& measurement,
     return result;
 }
 
-std::string MetadataIndexSync::fieldKey(const std::string& measurement, const std::string& field,
-                                        uint64_t seriesId) {
+std::string MetadataIndexSync::fieldKey(const std::string& measurement, const std::string& field, uint64_t seriesId) {
     std::string result;
     result.reserve(2 + measurement.size() + 1 + field.size() + 1 + 16);
     result.append("f:");
@@ -274,11 +266,15 @@ std::vector<std::string> MetadataIndexSync::generateTagSubsets(const std::map<st
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = i + 1; j < n; ++j) {
                 std::string s;
-                s.reserve(tagVec[i].first.size() + 1 + tagVec[i].second.size() + 1 +
-                           tagVec[j].first.size() + 1 + tagVec[j].second.size());
-                s.append(tagVec[i].first); s.push_back('='); s.append(tagVec[i].second);
+                s.reserve(tagVec[i].first.size() + 1 + tagVec[i].second.size() + 1 + tagVec[j].first.size() + 1 +
+                          tagVec[j].second.size());
+                s.append(tagVec[i].first);
+                s.push_back('=');
+                s.append(tagVec[i].second);
                 s.push_back(',');
-                s.append(tagVec[j].first); s.push_back('='); s.append(tagVec[j].second);
+                s.append(tagVec[j].first);
+                s.push_back('=');
+                s.append(tagVec[j].second);
                 subsets.push_back(std::move(s));
             }
         }
@@ -290,14 +286,19 @@ std::vector<std::string> MetadataIndexSync::generateTagSubsets(const std::map<st
             for (size_t j = i + 1; j < n; ++j) {
                 for (size_t k = j + 1; k < n; ++k) {
                     std::string s;
-                    s.reserve(tagVec[i].first.size() + 1 + tagVec[i].second.size() + 1 +
-                               tagVec[j].first.size() + 1 + tagVec[j].second.size() + 1 +
-                               tagVec[k].first.size() + 1 + tagVec[k].second.size());
-                    s.append(tagVec[i].first); s.push_back('='); s.append(tagVec[i].second);
+                    s.reserve(tagVec[i].first.size() + 1 + tagVec[i].second.size() + 1 + tagVec[j].first.size() + 1 +
+                              tagVec[j].second.size() + 1 + tagVec[k].first.size() + 1 + tagVec[k].second.size());
+                    s.append(tagVec[i].first);
+                    s.push_back('=');
+                    s.append(tagVec[i].second);
                     s.push_back(',');
-                    s.append(tagVec[j].first); s.push_back('='); s.append(tagVec[j].second);
+                    s.append(tagVec[j].first);
+                    s.push_back('=');
+                    s.append(tagVec[j].second);
                     s.push_back(',');
-                    s.append(tagVec[k].first); s.push_back('='); s.append(tagVec[k].second);
+                    s.append(tagVec[k].first);
+                    s.push_back('=');
+                    s.append(tagVec[k].second);
                     subsets.push_back(std::move(s));
                 }
             }
@@ -312,16 +313,16 @@ uint64_t MetadataIndexSync::getOrCreateSeriesId(const std::string& measurement,
                                                 const std::string& field) {
     std::string sKey = SeriesMetadataSync::generateSeriesKey(measurement, tags, field);
     std::string lookupKey = seriesLookupKey(sKey);
-    
+
     std::string value;
     leveldb::Status status = db->Get(leveldb::ReadOptions(), lookupKey, &value);
-    
+
     if (status.ok()) {
         return std::stoull(value);
     }
-    
+
     uint64_t seriesId = nextSeriesId++;
-    
+
     SeriesMetadataSync metadata;
     metadata.seriesId = seriesId;
     metadata.measurement = measurement;
@@ -330,7 +331,7 @@ uint64_t MetadataIndexSync::getOrCreateSeriesId(const std::string& measurement,
     metadata.minTime = std::numeric_limits<int64_t>::max();
     metadata.maxTime = std::numeric_limits<int64_t>::min();
     metadata.shardId = seriesId % 32;  // Default to 32 shards
-    
+
     leveldb::WriteBatch batch;
 
     // Convert seriesId to decimal string once and reuse
@@ -371,12 +372,12 @@ uint64_t MetadataIndexSync::getOrCreateSeriesId(const std::string& measurement,
         gKey.append(idStr);
         batch.Put(gKey, "");
     }
-    
+
     status = db->Write(leveldb::WriteOptions(), &batch);
     if (!status.ok()) {
         throw std::runtime_error("Failed to create series: " + status.ToString());
     }
-    
+
     return seriesId;
 }
 
@@ -398,8 +399,7 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByMeasurement(const std::stri
     return seriesIds;
 }
 
-std::vector<uint64_t> MetadataIndexSync::findSeriesByTag(const std::string& measurement,
-                                                         const std::string& tagKey,
+std::vector<uint64_t> MetadataIndexSync::findSeriesByTag(const std::string& measurement, const std::string& tagKey,
                                                          const std::string& tagValue) {
     std::vector<uint64_t> seriesIds;
     std::string prefix = "t:" + measurement + ":" + tagKey + ":" + tagValue + ":";
@@ -423,7 +423,7 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByTags(const std::string& mea
     std::vector<uint64_t> seriesIds;
     std::string tagStr = buildSortedTagString(tags);
     std::string prefix = "ct:" + measurement + ":" + tagStr + ":";
-    
+
     std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         std::string key = it->key().ToString();
@@ -441,12 +441,12 @@ std::vector<uint64_t> MetadataIndexSync::findSeriesByTags(const std::string& mea
 std::optional<SeriesMetadataSync> MetadataIndexSync::getSeriesMetadata(uint64_t seriesId) {
     std::string key = seriesKey(seriesId);
     std::string value;
-    
+
     leveldb::Status status = db->Get(leveldb::ReadOptions(), key, &value);
     if (status.ok()) {
         return SeriesMetadataSync::deserialize(value);
     }
-    
+
     return std::nullopt;
 }
 

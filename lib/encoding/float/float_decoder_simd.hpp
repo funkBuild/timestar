@@ -1,10 +1,12 @@
 #ifndef FLOAT_DECODER_SIMD_H_INCLUDED
 #define FLOAT_DECODER_SIMD_H_INCLUDED
 
-#include <vector>
-#include <cstdint>
-#include <immintrin.h>
 #include "../../storage/slice_buffer.hpp"
+
+#include <immintrin.h>
+
+#include <cstdint>
+#include <vector>
 
 /**
  * SIMD-optimized float decoder using AVX2 instructions
@@ -21,10 +23,10 @@ public:
     static bool isAvailable();
 
     // SIMD-optimized decoding
-    static void decode(CompressedSlice &encoded, size_t nToSkip, size_t length, std::vector<double> &out);
+    static void decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 
     // Fallback to regular decoder if SIMD not available
-    static void decodeSafe(CompressedSlice &encoded, size_t nToSkip, size_t length, std::vector<double> &out);
+    static void decodeSafe(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 };
 
-#endif // FLOAT_DECODER_SIMD_H_INCLUDED
+#endif  // FLOAT_DECODER_SIMD_H_INCLUDED

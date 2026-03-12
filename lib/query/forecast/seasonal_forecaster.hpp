@@ -4,6 +4,7 @@
 #include "forecast_result.hpp"
 #include "periodicity_detector.hpp"
 #include "stl_decomposition.hpp"
+
 #include <vector>
 
 namespace timestar {
@@ -42,123 +43,72 @@ public:
      * @param forecastTimestamps Timestamps to forecast
      * @return ForecastOutput with past, forecast, upper, lower values
      */
-    ForecastOutput forecast(
-        const ForecastInput& input,
-        const ForecastConfig& config,
-        const std::vector<uint64_t>& forecastTimestamps
-    );
+    ForecastOutput forecast(const ForecastInput& input, const ForecastConfig& config,
+                            const std::vector<uint64_t>& forecastTimestamps);
 
     // Public methods for testing numerical accuracy
     // These are the core mathematical operations that need validation
     // Apply seasonal differencing: y'[t] = y[t] - y[t-s]
-    std::vector<double> seasonalDifference(
-        const std::vector<double>& y,
-        size_t seasonalPeriod
-    );
+    std::vector<double> seasonalDifference(const std::vector<double>& y, size_t seasonalPeriod);
 
     // Apply regular differencing: y'[t] = y[t] - y[t-1]
     std::vector<double> regularDifference(const std::vector<double>& y);
 
     // Reverse seasonal differencing for forecasting
-    std::vector<double> inverseSeasonalDifference(
-        const std::vector<double>& diffed,
-        const std::vector<double>& original,
-        size_t seasonalPeriod,
-        size_t forecastCount
-    );
+    std::vector<double> inverseSeasonalDifference(const std::vector<double>& diffed,
+                                                  const std::vector<double>& original, size_t seasonalPeriod,
+                                                  size_t forecastCount);
 
     // Reverse regular differencing
-    std::vector<double> inverseRegularDifference(
-        const std::vector<double>& diffed,
-        double lastValue,
-        size_t forecastCount
-    );
+    std::vector<double> inverseRegularDifference(const std::vector<double>& diffed, double lastValue,
+                                                 size_t forecastCount);
 
     // Fit AR coefficients using Yule-Walker equations
-    std::vector<double> fitARCoefficients(
-        const std::vector<double>& y,
-        size_t order
-    );
+    std::vector<double> fitARCoefficients(const std::vector<double>& y, size_t order);
 
     // Fit seasonal AR coefficients
-    std::vector<double> fitSeasonalARCoefficients(
-        const std::vector<double>& y,
-        size_t order,
-        size_t seasonalPeriod
-    );
+    std::vector<double> fitSeasonalARCoefficients(const std::vector<double>& y, size_t order, size_t seasonalPeriod);
 
     // Compute autocorrelation at a given lag
-    double autoCorrelation(
-        const std::vector<double>& y,
-        double mean,
-        double variance,
-        size_t lag
-    );
+    double autoCorrelation(const std::vector<double>& y, double mean, double variance, size_t lag);
 
     // Solve Yule-Walker system using Levinson-Durbin recursion
-    std::vector<double> levinsonDurbin(
-        const std::vector<double>& r,  // Autocorrelations r[0] to r[order]
-        size_t order
-    );
+    std::vector<double> levinsonDurbin(const std::vector<double>& r,  // Autocorrelations r[0] to r[order]
+                                       size_t order);
 
     // Compute one-step-ahead AR forecast
-    double arForecast(
-        const std::vector<double>& y,
-        const std::vector<double>& arCoeffs,
-        double mean
-    );
+    double arForecast(const std::vector<double>& y, const std::vector<double>& arCoeffs, double mean);
 
     // Compute one-step-ahead seasonal AR forecast
-    double seasonalArForecast(
-        const std::vector<double>& y,
-        const std::vector<double>& sarCoeffs,
-        size_t seasonalPeriod,
-        double mean
-    );
+    double seasonalArForecast(const std::vector<double>& y, const std::vector<double>& sarCoeffs, size_t seasonalPeriod,
+                              double mean);
 
     // Estimate forecast error variance (for prediction intervals)
-    double estimateForecastVariance(
-        const std::vector<double>& y,
-        const std::vector<double>& arCoeffs,
-        double mean,
-        size_t horizonSteps
-    );
+    double estimateForecastVariance(const std::vector<double>& y, const std::vector<double>& arCoeffs, double mean,
+                                    size_t horizonSteps);
 
     // Detect seasonal period from data if not specified
-    size_t detectSeasonalPeriod(
-        const std::vector<double>& y,
-        uint64_t dataIntervalNs
-    );
+    size_t detectSeasonalPeriod(const std::vector<double>& y, uint64_t dataIntervalNs);
 
     /**
      * Forecast using MSTL decomposition (multiple seasonalities)
      * Used when seasonality='multi'
      */
-    ForecastOutput forecastMSTL(
-        const ForecastInput& input,
-        const ForecastConfig& config,
-        const std::vector<uint64_t>& forecastTimestamps
-    );
+    ForecastOutput forecastMSTL(const ForecastInput& input, const ForecastConfig& config,
+                                const std::vector<uint64_t>& forecastTimestamps);
 
     /**
      * Extrapolate trend component
      */
-    std::vector<double> extrapolateTrend(
-        const std::vector<double>& trend,
-        size_t horizonSteps
-    );
+    std::vector<double> extrapolateTrend(const std::vector<double>& trend, size_t horizonSteps);
 
     /**
      * Extrapolate seasonal component (repeat last cycle)
      */
-    std::vector<double> extrapolateSeasonal(
-        const std::vector<double>& seasonal,
-        size_t period,
-        size_t horizonSteps
-    );
+    std::vector<double> extrapolateSeasonal(const std::vector<double>& seasonal, size_t period, size_t horizonSteps);
 };
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar
 
-#endif // SEASONAL_FORECASTER_H_INCLUDED
+#endif  // SEASONAL_FORECASTER_H_INCLUDED

@@ -2,27 +2,28 @@
 #define EXPRESSION_PARSER_H_INCLUDED
 
 #include "expression_ast.hpp"
-#include <string>
-#include <string_view>
+
 #include <optional>
 #include <set>
+#include <string>
+#include <string_view>
 
 namespace timestar {
 
 // Token types for lexer
 enum class TokenType {
-    END,            // End of input
-    NUMBER,         // 123, 45.67
-    IDENTIFIER,     // a, b, query_name, abs, min, max
-    STRING,         // 'basic', 'robust', etc.
-    PLUS,           // +
-    MINUS,          // -
-    STAR,           // *
-    SLASH,          // /
-    LPAREN,         // (
-    RPAREN,         // )
-    COMMA,          // ,
-    EQUALS          // =
+    END,         // End of input
+    NUMBER,      // 123, 45.67
+    IDENTIFIER,  // a, b, query_name, abs, min, max
+    STRING,      // 'basic', 'robust', etc.
+    PLUS,        // +
+    MINUS,       // -
+    STAR,        // *
+    SLASH,       // /
+    LPAREN,      // (
+    RPAREN,      // )
+    COMMA,       // ,
+    EQUALS       // =
 };
 
 struct Token {
@@ -30,8 +31,7 @@ struct Token {
     std::string value;
     size_t position;
 
-    Token(TokenType t, std::string v, size_t pos)
-        : type(t), value(std::move(v)), position(pos) {}
+    Token(TokenType t, std::string v, size_t pos) : type(t), value(std::move(v)), position(pos) {}
 };
 
 // Lexer for tokenizing expression strings
@@ -81,10 +81,10 @@ private:
 
     // Operator precedence levels
     static constexpr int PREC_NONE = 0;
-    static constexpr int PREC_TERM = 1;      // + -
-    static constexpr int PREC_FACTOR = 2;    // * /
-    static constexpr int PREC_UNARY = 3;     // - (negation)
-    static constexpr int PREC_CALL = 4;      // function calls
+    static constexpr int PREC_TERM = 1;    // + -
+    static constexpr int PREC_FACTOR = 2;  // * /
+    static constexpr int PREC_UNARY = 3;   // - (negation)
+    static constexpr int PREC_CALL = 4;    // function calls
 
     void advance();
     bool check(TokenType type) const;
@@ -122,6 +122,6 @@ private:
     [[noreturn]] void error(const std::string& message) const;
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // EXPRESSION_PARSER_H_INCLUDED
+#endif  // EXPRESSION_PARSER_H_INCLUDED

@@ -19,6 +19,6 @@ private:
     const FunctionRegistry* registry_ = nullptr;
 };
 
-} // namespace timestar::functions
+}  // namespace timestar::functions
 
-#endif // FUNCTION_QUERY_PARSER_H_INCLUDED
+#endif  // FUNCTION_QUERY_PARSER_H_INCLUDED

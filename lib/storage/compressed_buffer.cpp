@@ -1,209 +1,208 @@
 #include "compressed_buffer.hpp"
 
-#include <cstring>
 #include <algorithm>
+#include <cstring>
 
 // Define static constants
 constexpr size_t CompressedBuffer::INITIAL_CAPACITY;
 constexpr size_t CompressedBuffer::GROWTH_FACTOR;
 
-void CompressedBuffer::write(uint64_t value, int bits){
-  if(!initialized || bitOffset > 63) {
-    if(!initialized) {
-      initialized = true;
-      offset = 0;
-      bitOffset = 0;
-      if(data.empty()) {
-        ensure_capacity(1);
-        data.resize(1, 0);
-      }
+void CompressedBuffer::write(uint64_t value, int bits) {
+    if (!initialized || bitOffset > 63) {
+        if (!initialized) {
+            initialized = true;
+            offset = 0;
+            bitOffset = 0;
+            if (data.empty()) {
+                ensure_capacity(1);
+                data.resize(1, 0);
+            }
+        } else {
+            offset++;
+            bitOffset = 0;
+            if (offset >= data.size()) {
+                ensure_capacity(1);
+                data.resize(offset + 1, 0);
+            }
+        }
+    }
+
+    const int leftover_bits = bits - (64 - bitOffset);
+
+    data[offset] |= value << bitOffset;
+
+    if (leftover_bits > 0) {
+        offset++;
+        bitOffset = leftover_bits;
+        if (offset >= data.size()) {
+            ensure_capacity(1);
+            data.resize(offset + 1, 0);
+        }
+        data[offset] = value >> (bits - leftover_bits);
     } else {
-      offset++;
-      bitOffset = 0;
-      if(offset >= data.size()) {
-        ensure_capacity(1);
-        data.resize(offset + 1, 0);
-      }
+        bitOffset += bits;
     }
-  }
-
-  const int leftover_bits = bits - (64 - bitOffset);
-
-  data[offset] |= value << bitOffset;
-
-  if(leftover_bits > 0) {
-    offset++;
-    bitOffset = leftover_bits;
-    if(offset >= data.size()) {
-      ensure_capacity(1);
-      data.resize(offset + 1, 0);
-    }
-    data[offset] = value >> (bits - leftover_bits);
-  } else {
-    bitOffset += bits;
-  }
 }
 
 template <int bits>
-void CompressedBuffer::write(uint64_t value){
-  if(!initialized || bitOffset > 63) {
-    if(!initialized) {
-      initialized = true;
-      offset = 0;
-      bitOffset = 0;
-      if(data.empty()) {
-        ensure_capacity(1);
-        data.resize(1, 0);
-      }
+void CompressedBuffer::write(uint64_t value) {
+    if (!initialized || bitOffset > 63) {
+        if (!initialized) {
+            initialized = true;
+            offset = 0;
+            bitOffset = 0;
+            if (data.empty()) {
+                ensure_capacity(1);
+                data.resize(1, 0);
+            }
+        } else {
+            offset++;
+            bitOffset = 0;
+            if (offset >= data.size()) {
+                ensure_capacity(1);
+                data.resize(offset + 1, 0);
+            }
+        }
+    }
+
+    const int leftover_bits = bits - (64 - bitOffset);
+
+    data[offset] |= value << bitOffset;
+
+    if (leftover_bits > 0) {
+        offset++;
+        bitOffset = leftover_bits;
+        if (offset >= data.size()) {
+            ensure_capacity(1);
+            data.resize(offset + 1, 0);
+        }
+        data[offset] = value >> (bits - leftover_bits);
     } else {
-      offset++;
-      bitOffset = 0;
-      if(offset >= data.size()) {
-        ensure_capacity(1);
-        data.resize(offset + 1, 0);
-      }
+        bitOffset += bits;
     }
-  }
-
-  const int leftover_bits = bits - (64 - bitOffset);
-
-  data[offset] |= value << bitOffset;
-
-  if(leftover_bits > 0) {
-    offset++;
-    bitOffset = leftover_bits;
-    if(offset >= data.size()) {
-      ensure_capacity(1);
-      data.resize(offset + 1, 0);
-    }
-    data[offset] = value >> (bits - leftover_bits);
-  } else {
-    bitOffset += bits;
-  }
 }
 
 template <uint64_t value, int bits>
-void CompressedBuffer::writeFixed(){
-  if(!initialized || bitOffset > 63) {
-    if(!initialized) {
-      initialized = true;
-      offset = 0;
-      bitOffset = 0;
-      if(data.empty()) {
-        ensure_capacity(1);
-        data.resize(1, 0);
-      }
+void CompressedBuffer::writeFixed() {
+    if (!initialized || bitOffset > 63) {
+        if (!initialized) {
+            initialized = true;
+            offset = 0;
+            bitOffset = 0;
+            if (data.empty()) {
+                ensure_capacity(1);
+                data.resize(1, 0);
+            }
+        } else {
+            offset++;
+            bitOffset = 0;
+            if (offset >= data.size()) {
+                ensure_capacity(1);
+                data.resize(offset + 1, 0);
+            }
+        }
+    }
+
+    // Happy path for single bit writes
+    if (bits == 1) {
+        if (value == 1)
+            data[offset] |= value << bitOffset;
+        bitOffset++;
+        return;
+    }
+
+    const int leftover_bits = bits - (64 - bitOffset);
+
+    data[offset] |= value << bitOffset;
+
+    if (leftover_bits > 0) {
+        offset++;
+        bitOffset = leftover_bits;
+        if (offset >= data.size()) {
+            ensure_capacity(1);
+            data.resize(offset + 1, 0);
+        }
+        data[offset] = value >> (bits - leftover_bits);
     } else {
-      offset++;
-      bitOffset = 0;
-      if(offset >= data.size()) {
-        ensure_capacity(1);
-        data.resize(offset + 1, 0);
-      }
+        bitOffset += bits;
     }
-  }
-
-  // Happy path for single bit writes
-  if(bits == 1) {
-    if(value == 1)
-      data[offset] |= value << bitOffset;
-    bitOffset++;
-    return;
-  }
-
-  const int leftover_bits = bits - (64 - bitOffset);
-
-  data[offset] |= value << bitOffset;
-
-  if(leftover_bits > 0) {
-    offset++;
-    bitOffset = leftover_bits;
-    if(offset >= data.size()) {
-      ensure_capacity(1);
-      data.resize(offset + 1, 0);
-    }
-    data[offset] = value >> (bits - leftover_bits);
-  } else {
-    bitOffset += bits;
-  }
 }
 
 template <typename T>
-T CompressedBuffer::read(const int bits){
-  if(bitOffset > 63){
-    offset++;
-    bitOffset = 0;
-  }
-
-  boundsCheck();
-
-  const int leftover_bits = bits - (64 - bitOffset);
-  const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
-  const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
-
-  uint64_t value = data[offset] >> bitOffset;
-  value &= mask;
-
-  if(leftover_bits > 0) {
-    offset++;
-    bitOffset = leftover_bits;
+T CompressedBuffer::read(const int bits) {
+    if (bitOffset > 63) {
+        offset++;
+        bitOffset = 0;
+    }
 
     boundsCheck();
 
-    const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-    value |= (data[offset] & mask) << bits_read;
-  } else {
-    bitOffset += bits;
-  }
+    const int leftover_bits = bits - (64 - bitOffset);
+    const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
+    const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
 
-  return value;
+    uint64_t value = data[offset] >> bitOffset;
+    value &= mask;
+
+    if (leftover_bits > 0) {
+        offset++;
+        bitOffset = leftover_bits;
+
+        boundsCheck();
+
+        const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
+        value |= (data[offset] & mask) << bits_read;
+    } else {
+        bitOffset += bits;
+    }
+
+    return value;
 }
-
 
 template <typename T, int bits>
-T CompressedBuffer::readFixed(){
-  if(bitOffset > 63){
-    offset++;
-    bitOffset = 0;
-  }
-
-  boundsCheck();
-
-  const int leftover_bits = bits - (64 - bitOffset);
-  const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
-  const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
-
-  uint64_t value = data[offset] >> bitOffset;
-  value &= mask;
-
-  if(leftover_bits > 0) {
-    offset++;
-    bitOffset = leftover_bits;
+T CompressedBuffer::readFixed() {
+    if (bitOffset > 63) {
+        offset++;
+        bitOffset = 0;
+    }
 
     boundsCheck();
 
-    const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-    value |= (data[offset] & mask) << bits_read;
-  } else {
-    bitOffset += bits;
-  }
+    const int leftover_bits = bits - (64 - bitOffset);
+    const int bits_read = leftover_bits > 0 ? bits - leftover_bits : bits;
+    const uint64_t mask = bits_read == 64 ? 0xffffffffffffffff : (1ull << bits_read) - 1;
 
-  return value;
+    uint64_t value = data[offset] >> bitOffset;
+    value &= mask;
+
+    if (leftover_bits > 0) {
+        offset++;
+        bitOffset = leftover_bits;
+
+        boundsCheck();
+
+        const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
+        value |= (data[offset] & mask) << bits_read;
+    } else {
+        bitOffset += bits;
+    }
+
+    return value;
 }
 
-bool CompressedBuffer::readBit(){
-  if(bitOffset > 63){
-    offset++;
-    bitOffset = 0;
-  }
+bool CompressedBuffer::readBit() {
+    if (bitOffset > 63) {
+        offset++;
+        bitOffset = 0;
+    }
 
-  boundsCheck();
+    boundsCheck();
 
-  bool value = ((data[offset] >> bitOffset) & 1) == 1;
+    bool value = ((data[offset] >> bitOffset) & 1) == 1;
 
-  bitOffset++;
+    bitOffset++;
 
-  return value;
+    return value;
 }
 
 template void CompressedBuffer::write<6>(uint64_t value);
@@ -211,15 +210,14 @@ template void CompressedBuffer::write<5>(uint64_t value);
 template void CompressedBuffer::write<8>(uint64_t value);
 template void CompressedBuffer::write<64>(uint64_t value);
 
-
 template void CompressedBuffer::writeFixed<0b01, 2>();
 template void CompressedBuffer::writeFixed<0b11, 2>();
 template void CompressedBuffer::writeFixed<0b0, 1>();
 
-template uint8_t  CompressedBuffer::read<uint8_t>(int bits);
+template uint8_t CompressedBuffer::read<uint8_t>(int bits);
 template uint64_t CompressedBuffer::read<uint64_t>(int bits);
-template double   CompressedBuffer::read<double>(int bits);
-template bool     CompressedBuffer::read<bool>(int bits);
+template double CompressedBuffer::read<double>(int bits);
+template bool CompressedBuffer::read<bool>(int bits);
 
 template uint64_t CompressedBuffer::readFixed<uint64_t, 64>();
 template uint64_t CompressedBuffer::readFixed<uint64_t, 5>();

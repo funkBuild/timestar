@@ -8,6 +8,6 @@ namespace timestar::functions {
 // This file exists to provide backward compatibility
 // All function interfaces are now defined in function_types.hpp
 
-} // namespace timestar::functions
+}  // namespace timestar::functions
 
-#endif // FUNCTION_INTERFACE_H_INCLUDED
+#endif  // FUNCTION_INTERFACE_H_INCLUDED

@@ -1,13 +1,14 @@
 #include "function_query_parser.hpp"
+
 #include "function_registry.hpp"
+
 #include <cctype>
 
 namespace timestar::functions {
 
 FunctionQueryParser::FunctionQueryParser() = default;
 
-FunctionQueryParser::FunctionQueryParser(const FunctionRegistry& registry)
-    : registry_(&registry) {}
+FunctionQueryParser::FunctionQueryParser(const FunctionRegistry& registry) : registry_(&registry) {}
 
 // Returns true when the substring query[pos .. pos+len-1] forms a whole word,
 // i.e. the character immediately before (if any) and immediately after (if any)
@@ -65,4 +66,4 @@ std::vector<std::string> FunctionQueryParser::parse(const std::string& query) {
     return functions;
 }
 
-} // namespace timestar::functions
+}  // namespace timestar::functions

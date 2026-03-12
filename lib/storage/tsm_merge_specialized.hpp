@@ -1,19 +1,20 @@
 #ifndef TSM_MERGE_SPECIALIZED_H_INCLUDED
 #define TSM_MERGE_SPECIALIZED_H_INCLUDED
 
-#include "tsm_block_iterator.hpp"
-#include "tsm.hpp"
 #include "series_id.hpp"
+#include "tsm.hpp"
+#include "tsm_block_iterator.hpp"
+
+#include <limits>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <vector>
-#include <limits>
 
 // Phase 5.1: Specialized N-way merge iterators for optimal performance
 // Eliminates priority_queue overhead for common merge cases (2-4 files)
 
 // Phase 5.1: Two-way merge iterator - direct comparison, no heap
-template<typename T>
+template <typename T>
 class TwoWayMergeIterator {
 private:
     struct Source {
@@ -23,8 +24,7 @@ private:
         size_t pointIndex = 0;
         bool exhausted = false;
 
-        Source(seastar::shared_ptr<TSM> f, const SeriesId128& seriesId)
-            : file(f) {
+        Source(seastar::shared_ptr<TSM> f, const SeriesId128& seriesId) : file(f) {
             blockIterator = seastar::make_lw_shared<TSMBlockIterator<T>>(f, seriesId, 0, UINT64_MAX);
         }
 
@@ -35,9 +35,7 @@ private:
             return currentBlock->timestamps[pointIndex];
         }
 
-        T currentValue() const {
-            return currentBlock->values[pointIndex];
-        }
+        T currentValue() const { return currentBlock->values[pointIndex]; }
 
         seastar::future<> advance() {
             pointIndex++;
@@ -58,10 +56,8 @@ private:
     bool initialized = false;
 
 public:
-    TwoWayMergeIterator(const SeriesId128& series,
-                        const std::vector<seastar::shared_ptr<TSM>>& files)
-        : sources{Source(files[0], series), Source(files[1], series)},
-          seriesId(series) {}
+    TwoWayMergeIterator(const SeriesId128& series, const std::vector<seastar::shared_ptr<TSM>>& files)
+        : sources{Source(files[0], series), Source(files[1], series)}, seriesId(series) {}
 
     seastar::future<> init() {
         for (auto& src : sources) {
@@ -75,13 +71,9 @@ public:
         initialized = true;
     }
 
-    bool hasNext() const {
-        return !sources[0].exhausted || !sources[1].exhausted;
-    }
+    bool hasNext() const { return !sources[0].exhausted || !sources[1].exhausted; }
 
-    const SeriesId128& getSeriesId() const {
-        return seriesId;
-    }
+    const SeriesId128& getSeriesId() const { return seriesId; }
 
     // Phase 5.1: Direct comparison between two sources (no heap)
     seastar::future<std::pair<uint64_t, T>> next() {
@@ -117,9 +109,12 @@ public:
             auto [ts, val] = co_await next();
 
             // Skip duplicates from the other source
-            uint64_t otherTs = sources[0].exhausted ? UINT64_MAX :
-                              (sources[1].exhausted ? UINT64_MAX :
-                               (sources[0].currentTimestamp() == ts ? sources[1].currentTimestamp() : sources[0].currentTimestamp()));
+            uint64_t otherTs =
+                sources[0].exhausted
+                    ? UINT64_MAX
+                    : (sources[1].exhausted ? UINT64_MAX
+                                            : (sources[0].currentTimestamp() == ts ? sources[1].currentTimestamp()
+                                                                                   : sources[0].currentTimestamp()));
 
             while (hasNext() && otherTs == ts) {
                 // Advance the source with same timestamp
@@ -129,9 +124,11 @@ public:
                 if (!sources[1].exhausted && sources[1].currentTimestamp() == ts) {
                     co_await sources[1].advance();
                 }
-                otherTs = sources[0].exhausted ? UINT64_MAX :
-                         (sources[1].exhausted ? UINT64_MAX :
-                          std::min(sources[0].currentTimestamp(), sources[1].currentTimestamp()));
+                otherTs = sources[0].exhausted
+                              ? UINT64_MAX
+                              : (sources[1].exhausted
+                                     ? UINT64_MAX
+                                     : std::min(sources[0].currentTimestamp(), sources[1].currentTimestamp()));
             }
 
             batch.push_back({ts, val});
@@ -142,7 +139,7 @@ public:
 };
 
 // Phase 5.1: Four-way merge iterator - tournament-style comparison tree
-template<typename T>
+template <typename T>
 class FourWayMergeIterator {
 private:
     struct Source {
@@ -154,8 +151,7 @@ private:
         uint64_t rank = 0;  // File rank for tie-breaking
 
         Source() = default;
-        Source(seastar::shared_ptr<TSM> f, const SeriesId128& seriesId)
-            : file(f), rank(f->rankAsInteger()) {
+        Source(seastar::shared_ptr<TSM> f, const SeriesId128& seriesId) : file(f), rank(f->rankAsInteger()) {
             blockIterator = seastar::make_lw_shared<TSMBlockIterator<T>>(f, seriesId, 0, UINT64_MAX);
         }
 
@@ -166,9 +162,7 @@ private:
             return currentBlock->timestamps[pointIndex];
         }
 
-        T currentValue() const {
-            return currentBlock->values[pointIndex];
-        }
+        T currentValue() const { return currentBlock->values[pointIndex]; }
 
         seastar::future<> advance() {
             pointIndex++;
@@ -189,8 +183,7 @@ private:
     bool initialized = false;
 
 public:
-    FourWayMergeIterator(const SeriesId128& series,
-                         const std::vector<seastar::shared_ptr<TSM>>& files)
+    FourWayMergeIterator(const SeriesId128& series, const std::vector<seastar::shared_ptr<TSM>>& files)
         : seriesId(series) {
         for (size_t i = 0; i < 4 && i < files.size(); ++i) {
             sources[i] = Source(files[i], series);
@@ -215,14 +208,13 @@ public:
 
     bool hasNext() const {
         for (const auto& src : sources) {
-            if (!src.exhausted) return true;
+            if (!src.exhausted)
+                return true;
         }
         return false;
     }
 
-    const SeriesId128& getSeriesId() const {
-        return seriesId;
-    }
+    const SeriesId128& getSeriesId() const { return seriesId; }
 
     // Phase 5.1: Tournament-style 4-way comparison (3 comparisons)
     seastar::future<std::pair<uint64_t, T>> next() {
@@ -240,9 +232,10 @@ public:
         uint64_t tsWinner01 = sources[winner01].currentTimestamp();
         uint64_t tsWinner23 = sources[winner23].currentTimestamp();
 
-        size_t chosenIdx = (tsWinner01 < tsWinner23) ? winner01 :
-                          (tsWinner23 < tsWinner01) ? winner23 :
-                          (sources[winner23].rank > sources[winner01].rank ? winner23 : winner01);
+        size_t chosenIdx = (tsWinner01 < tsWinner23) ? winner01
+                           : (tsWinner23 < tsWinner01)
+                               ? winner23
+                               : (sources[winner23].rank > sources[winner01].rank ? winner23 : winner01);
 
         auto& chosen = sources[chosenIdx];
         uint64_t timestamp = chosen.currentTimestamp();
@@ -269,7 +262,8 @@ public:
                         foundDup = true;
                     }
                 }
-                if (!foundDup) break;
+                if (!foundDup)
+                    break;
             }
 
             batch.push_back({timestamp, value});
@@ -279,4 +273,4 @@ public:
     }
 };
 
-#endif // TSM_MERGE_SPECIALIZED_H_INCLUDED
+#endif  // TSM_MERGE_SPECIALIZED_H_INCLUDED

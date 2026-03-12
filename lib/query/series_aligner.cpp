@@ -1,13 +1,12 @@
 #include "series_aligner.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
 namespace timestar {
 
-std::map<std::string, AlignedSeries> SeriesAligner::align(
-    const std::map<std::string, SubQueryResult>& series) {
-
+std::map<std::string, AlignedSeries> SeriesAligner::align(const std::map<std::string, SubQueryResult>& series) {
     stats_ = AlignmentStats();
     stats_.inputSeriesCount = series.size();
 
@@ -38,10 +37,7 @@ std::map<std::string, AlignedSeries> SeriesAligner::align(
     std::map<std::string, AlignedSeries> result;
 
     for (const auto& [name, subResult] : series) {
-        std::vector<double> alignedValues = interpolateSeries(
-            subResult.timestamps,
-            subResult.values,
-            outputTimestamps);
+        std::vector<double> alignedValues = interpolateSeries(subResult.timestamps, subResult.values, outputTimestamps);
 
         result[name] = AlignedSeries(outputTimestamps, std::move(alignedValues));
     }
@@ -49,9 +45,7 @@ std::map<std::string, AlignedSeries> SeriesAligner::align(
     return result;
 }
 
-std::vector<uint64_t> SeriesAligner::computeOutputTimestamps(
-    const std::map<std::string, SubQueryResult>& series) {
-
+std::vector<uint64_t> SeriesAligner::computeOutputTimestamps(const std::map<std::string, SubQueryResult>& series) {
     switch (strategy_) {
         case AlignmentStrategy::INNER:
             return computeIntersection(series);
@@ -74,9 +68,7 @@ std::vector<uint64_t> SeriesAligner::computeOutputTimestamps(
     }
 }
 
-std::vector<uint64_t> SeriesAligner::computeIntersection(
-    const std::map<std::string, SubQueryResult>& series) {
-
+std::vector<uint64_t> SeriesAligner::computeIntersection(const std::map<std::string, SubQueryResult>& series) {
     if (series.empty()) {
         return {};
     }
@@ -90,10 +82,8 @@ std::vector<uint64_t> SeriesAligner::computeIntersection(
     for (++it; it != series.end(); ++it) {
         std::vector<uint64_t> temp;
         temp.reserve(std::min(intersection.size(), it->second.timestamps.size()));
-        std::set_intersection(
-            intersection.begin(), intersection.end(),
-            it->second.timestamps.begin(), it->second.timestamps.end(),
-            std::back_inserter(temp));
+        std::set_intersection(intersection.begin(), intersection.end(), it->second.timestamps.begin(),
+                              it->second.timestamps.end(), std::back_inserter(temp));
 
         intersection = std::move(temp);
 
@@ -112,10 +102,9 @@ std::vector<uint64_t> SeriesAligner::computeIntersection(
     return intersection;
 }
 
-std::vector<uint64_t> SeriesAligner::computeUnion(
-    const std::map<std::string, SubQueryResult>& series) {
-
-    if (series.empty()) return {};
+std::vector<uint64_t> SeriesAligner::computeUnion(const std::map<std::string, SubQueryResult>& series) {
+    if (series.empty())
+        return {};
 
     // Start with the first series' timestamps (already sorted)
     auto it = series.begin();
@@ -123,23 +112,19 @@ std::vector<uint64_t> SeriesAligner::computeUnion(
 
     // Iteratively merge each subsequent sorted series using set_union
     for (++it; it != series.end(); ++it) {
-        if (it->second.timestamps.empty()) continue;
+        if (it->second.timestamps.empty())
+            continue;
         std::vector<uint64_t> temp;
         temp.reserve(merged.size() + it->second.timestamps.size());
-        std::set_union(
-            merged.begin(), merged.end(),
-            it->second.timestamps.begin(), it->second.timestamps.end(),
-            std::back_inserter(temp));
+        std::set_union(merged.begin(), merged.end(), it->second.timestamps.begin(), it->second.timestamps.end(),
+                       std::back_inserter(temp));
         merged = std::move(temp);
     }
 
     return merged;
 }
 
-std::vector<uint64_t> SeriesAligner::resampleTimestamps(
-    const std::vector<uint64_t>& timestamps,
-    uint64_t interval) {
-
+std::vector<uint64_t> SeriesAligner::resampleTimestamps(const std::vector<uint64_t>& timestamps, uint64_t interval) {
     if (timestamps.empty() || interval == 0) {
         return timestamps;
     }
@@ -161,7 +146,7 @@ std::vector<uint64_t> SeriesAligner::resampleTimestamps(
     // Guard against extremely small intervals that would create too many points
     uint64_t range = end - start;
     uint64_t expectedCount = range / interval + 1;
-    static constexpr uint64_t MAX_RESAMPLE_POINTS = 10000000; // 10M points max
+    static constexpr uint64_t MAX_RESAMPLE_POINTS = 10000000;  // 10M points max
     if (expectedCount > MAX_RESAMPLE_POINTS) {
         // Interval too small for the range; return original timestamps
         return timestamps;
@@ -179,11 +164,9 @@ std::vector<uint64_t> SeriesAligner::resampleTimestamps(
     return resampled;
 }
 
-std::vector<double> SeriesAligner::interpolateSeries(
-    const std::vector<uint64_t>& srcTimestamps,
-    const std::vector<double>& srcValues,
-    const std::vector<uint64_t>& targetTimestamps) {
-
+std::vector<double> SeriesAligner::interpolateSeries(const std::vector<uint64_t>& srcTimestamps,
+                                                     const std::vector<double>& srcValues,
+                                                     const std::vector<uint64_t>& targetTimestamps) {
     std::vector<double> result;
     result.reserve(targetTimestamps.size());
 
@@ -247,10 +230,8 @@ std::vector<double> SeriesAligner::interpolateSeries(
         if (srcIdx + 1 < srcSize) {
             switch (interpolation_) {
                 case InterpolationMethod::LINEAR: {
-                    double interpolated = linearInterpolate(
-                        targetTs,
-                        srcTimestamps[srcIdx], srcValues[srcIdx],
-                        srcTimestamps[srcIdx + 1], srcValues[srcIdx + 1]);
+                    double interpolated = linearInterpolate(targetTs, srcTimestamps[srcIdx], srcValues[srcIdx],
+                                                            srcTimestamps[srcIdx + 1], srcValues[srcIdx + 1]);
                     result.push_back(interpolated);
                     stats_.pointsInterpolated++;
                     break;
@@ -281,8 +262,7 @@ std::vector<double> SeriesAligner::interpolateSeries(
     return result;
 }
 
-double SeriesAligner::linearInterpolate(uint64_t t, uint64_t t1, double v1,
-                                        uint64_t t2, double v2) {
+double SeriesAligner::linearInterpolate(uint64_t t, uint64_t t1, double v1, uint64_t t2, double v2) {
     if (t1 == t2) {
         return v1;
     }
@@ -291,8 +271,7 @@ double SeriesAligner::linearInterpolate(uint64_t t, uint64_t t1, double v1,
     return v1 + ratio * (v2 - v1);
 }
 
-size_t SeriesAligner::findLowerBound(const std::vector<uint64_t>& timestamps,
-                                     uint64_t target) {
+size_t SeriesAligner::findLowerBound(const std::vector<uint64_t>& timestamps, uint64_t target) {
     auto it = std::lower_bound(timestamps.begin(), timestamps.end(), target);
     if (it == timestamps.end()) {
         return timestamps.size() - 1;
@@ -306,4 +285,4 @@ size_t SeriesAligner::findLowerBound(const std::vector<uint64_t>& timestamps,
     return std::distance(timestamps.begin(), it) - 1;
 }
 
-} // namespace timestar
+}  // namespace timestar

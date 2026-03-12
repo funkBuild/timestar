@@ -2,15 +2,16 @@
 #define AGGREGATOR_H_INCLUDED
 
 #include "query_parser.hpp"
-#include <vector>
-#include <map>
-#include <optional>
-#include <limits>
+
 #include <algorithm>
-#include <numeric>
 #include <cmath>
-#include <unordered_map>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <optional>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace timestar {
 
@@ -21,8 +22,7 @@ struct PrehashedString {
     size_t hash = 0;
 
     PrehashedString() = default;
-    explicit PrehashedString(std::string s)
-        : value(std::move(s)), hash(std::hash<std::string>{}(value)) {}
+    explicit PrehashedString(std::string s) : value(std::move(s)), hash(std::hash<std::string>{}(value)) {}
     // Construct with externally-provided hash (avoids double hashing)
     PrehashedString(std::string s, size_t h) : value(std::move(s)), hash(h) {}
 
@@ -36,9 +36,7 @@ struct PrehashedStringHash {
 
 struct PrehashedStringEqual {
     using is_transparent = void;
-    bool operator()(const PrehashedString& a, const PrehashedString& b) const {
-        return a.value == b.value;
-    }
+    bool operator()(const PrehashedString& a, const PrehashedString& b) const { return a.value == b.value; }
 };
 
 // Forward declarations
@@ -64,9 +62,9 @@ struct AggregationState {
     double sum = 0.0;
     double min = std::numeric_limits<double>::max();
     double max = std::numeric_limits<double>::lowest();
-    double latest = 0.0;  // Most recent value
-    uint64_t latestTimestamp = 0;  // Timestamp of latest value
-    double first = 0.0;   // Earliest value
+    double latest = 0.0;                                             // Most recent value
+    uint64_t latestTimestamp = 0;                                    // Timestamp of latest value
+    double first = 0.0;                                              // Earliest value
     uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max();  // Timestamp of earliest value
     size_t count = 0;
     // Welford's online M2 accumulator for STDDEV/STDVAR — O(1) memory, no raw values needed.
@@ -84,7 +82,8 @@ struct AggregationState {
 
     // Add a single value to this state (incremental aggregation)
     void addValue(double value, uint64_t timestamp = 0) {
-        if (std::isnan(value)) return;  // Skip NaN to avoid poisoning aggregation
+        if (std::isnan(value))
+            return;  // Skip NaN to avoid poisoning aggregation
         sum += value;
         min = std::min(min, value);
         max = std::max(max, value);
@@ -138,8 +137,7 @@ struct AggregationState {
         if (!rawValuesSaturated) {
             size_t available = RAW_VALUES_HARD_LIMIT - rawValues.size();
             size_t toCopy = std::min(available, other.rawValues.size());
-            rawValues.insert(rawValues.end(),
-                             other.rawValues.begin(),
+            rawValues.insert(rawValues.end(), other.rawValues.begin(),
                              other.rawValues.begin() + static_cast<std::ptrdiff_t>(toCopy));
             if (toCopy < other.rawValues.size()) {
                 rawValuesSaturated = true;
@@ -265,9 +263,11 @@ struct PartialAggregationResult {
         std::map<std::string, std::string> tags;
         // Format: measurement\0tag1=val1\0...\0fieldName
         size_t firstNull = gk.find('\0');
-        if (firstNull == std::string::npos) return tags;
+        if (firstNull == std::string::npos)
+            return tags;
         size_t lastNull = gk.rfind('\0');
-        if (firstNull == lastNull) return tags;  // No tags segment
+        if (firstNull == lastNull)
+            return tags;  // No tags segment
         // Parse tag entries between first and last \0
         size_t pos = firstNull + 1;
         while (pos < lastNull) {
@@ -295,15 +295,12 @@ public:
 
     // Create partial aggregation on shard (map phase)
     static std::vector<PartialAggregationResult> createPartialAggregations(
-        const std::vector<timestar::SeriesResult>& seriesResults,
-        AggregationMethod method,
-        uint64_t interval,
+        const std::vector<timestar::SeriesResult>& seriesResults, AggregationMethod method, uint64_t interval,
         const std::vector<std::string>& groupByTags);
 
     // Merge partial aggregations with metadata preserved (reduce phase)
     static std::vector<GroupedAggregationResult> mergePartialAggregationsGrouped(
-        std::vector<PartialAggregationResult>& partialResults,
-        AggregationMethod method);
+        std::vector<PartialAggregationResult>& partialResults, AggregationMethod method);
 
     // ========================================================================
     // UTILITY FUNCTIONS
@@ -320,19 +317,16 @@ public:
     // ========================================================================
     // Simple aggregation over a single series (timestamps + values).
     // Provided for backward compatibility with integration tests.
-    static std::vector<AggregatedPoint> aggregate(
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values,
-        AggregationMethod method,
-        uint64_t interval);
+    static std::vector<AggregatedPoint> aggregate(const std::vector<uint64_t>& timestamps,
+                                                  const std::vector<double>& values, AggregationMethod method,
+                                                  uint64_t interval);
 
     // Aggregate across multiple series (group-by merge).
     static std::vector<AggregatedPoint> aggregateMultiple(
-        const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& groupData,
-        AggregationMethod method,
+        const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& groupData, AggregationMethod method,
         uint64_t interval);
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // AGGREGATOR_H_INCLUDED
+#endif  // AGGREGATOR_H_INCLUDED

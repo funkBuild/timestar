@@ -1,16 +1,17 @@
 #ifndef BULK_BLOCK_LOADER_H_INCLUDED
 #define BULK_BLOCK_LOADER_H_INCLUDED
 
-#include "tsm.hpp"
 #include "series_id.hpp"
+#include "tsm.hpp"
+
+#include <algorithm>
+#include <cassert>
+#include <memory>
+#include <queue>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/when_all.hh>
 #include <vector>
-#include <memory>
-#include <cassert>
-#include <algorithm>
-#include <queue>
 
 // Phase A: Bulk Block Loading - Remove async streaming overhead
 //
@@ -25,7 +26,7 @@
 //   loadAllBlocks() → return vector<TSMBlock>
 //   = 1 async operation for all blocks
 
-template<typename T>
+template <typename T>
 struct SeriesBlocks {
     SeriesId128 seriesId;
     std::vector<std::unique_ptr<TSMBlock<T>>> blocks;  // All blocks loaded in memory
@@ -56,16 +57,12 @@ struct SeriesBlocks {
 };
 
 // Phase A: Bulk loader for reading all blocks of a series from multiple files
-template<typename T>
+template <typename T>
 class BulkBlockLoader {
 public:
     // Load all blocks for a series from a single TSM file
-    static seastar::future<SeriesBlocks<T>> loadFromFile(
-        seastar::shared_ptr<TSM> file,
-        const SeriesId128& seriesId,
-        uint64_t startTime = 0,
-        uint64_t endTime = UINT64_MAX) {
-
+    static seastar::future<SeriesBlocks<T>> loadFromFile(seastar::shared_ptr<TSM> file, const SeriesId128& seriesId,
+                                                         uint64_t startTime = 0, uint64_t endTime = UINT64_MAX) {
         SeriesBlocks<T> result(seriesId);
         result.fileRank = file->rankAsInteger();
 
@@ -124,11 +121,8 @@ public:
 
     // Load all blocks for a series from multiple TSM files
     static seastar::future<std::vector<SeriesBlocks<T>>> loadFromFiles(
-        const std::vector<seastar::shared_ptr<TSM>>& files,
-        const SeriesId128& seriesId,
-        uint64_t startTime = 0,
+        const std::vector<seastar::shared_ptr<TSM>>& files, const SeriesId128& seriesId, uint64_t startTime = 0,
         uint64_t endTime = UINT64_MAX) {
-
         std::vector<SeriesBlocks<T>> allBlocks;
         allBlocks.reserve(files.size());
 
@@ -146,7 +140,7 @@ public:
 
 // Phase A: In-memory merge context for bulk-loaded blocks
 // This replaces the streaming iterator approach with direct array access
-template<typename T>
+template <typename T>
 struct BulkMergeContext {
     SeriesBlocks<T>* source;  // Pointer to source blocks
     size_t currentBlockIdx = 0;
@@ -201,25 +195,20 @@ struct BulkMergeContext {
         exhausted = true;
     }
 
-    bool hasMore() const {
-        return !exhausted;
-    }
+    bool hasMore() const { return !exhausted; }
 
-    uint64_t getFileRank() const {
-        return source->fileRank;
-    }
+    uint64_t getFileRank() const { return source->fileRank; }
 };
 
 // Phase B: Specialized 2-way merge (fastest: just compare two values)
-template<typename T>
+template <typename T>
 class BulkMerger2Way {
 private:
     BulkMergeContext<T> ctx0;
     BulkMergeContext<T> ctx1;
 
 public:
-    explicit BulkMerger2Way(std::vector<SeriesBlocks<T>>& sources)
-        : ctx0(&sources[0]), ctx1(&sources[1]) {
+    explicit BulkMerger2Way(std::vector<SeriesBlocks<T>>& sources) : ctx0(&sources[0]), ctx1(&sources[1]) {
         if (sources.size() != 2) {
             throw std::invalid_argument("BulkMerger2Way requires exactly 2 sources, got " +
                                         std::to_string(sources.size()));
@@ -247,9 +236,7 @@ public:
             return {ts1, value};
         } else {
             // Duplicate: prefer newer file (higher rank)
-            T value = (ctx0.getFileRank() > ctx1.getFileRank())
-                      ? ctx0.currentValue()
-                      : ctx1.currentValue();
+            T value = (ctx0.getFileRank() > ctx1.getFileRank()) ? ctx0.currentValue() : ctx1.currentValue();
             ctx0.advance();
             ctx1.advance();
             return {ts0, value};
@@ -270,7 +257,7 @@ public:
 };
 
 // Phase B: Specialized 3-way merge (fast: min of three values)
-template<typename T>
+template <typename T>
 class BulkMerger3Way {
 private:
     BulkMergeContext<T> ctx0;
@@ -346,7 +333,7 @@ public:
 
 // Phase A: Bulk N-way merge for in-memory blocks (N≥4 files)
 // Merges multiple SeriesBlocks into batches without async overhead
-template<typename T>
+template <typename T>
 class BulkMerger {
 private:
     std::vector<BulkMergeContext<T>> contexts;
@@ -381,9 +368,7 @@ public:
         }
     }
 
-    bool hasNext() const {
-        return !minHeap.empty();
-    }
+    bool hasNext() const { return !minHeap.empty(); }
 
     // Get next point (NO ASYNC!)
     std::pair<uint64_t, T> next() {
@@ -433,14 +418,14 @@ public:
 
 // Phase 1: Block Ordering Optimization - Metadata for overlap detection
 // Represents timestamp range and location of a block for fast overlap checking
-template<typename T>
+template <typename T>
 struct BlockMetadata {
     uint64_t minTime;
     uint64_t maxTime;
-    size_t fileIndex;        // Which SeriesBlocks (file) this came from
-    size_t blockIndex;       // Which block within that file
-    TSMBlock<T>* blockPtr;   // Pointer to actual block data
-    uint64_t fileRank;       // For deduplication (higher = newer)
+    size_t fileIndex;       // Which SeriesBlocks (file) this came from
+    size_t blockIndex;      // Which block within that file
+    TSMBlock<T>* blockPtr;  // Pointer to actual block data
+    uint64_t fileRank;      // For deduplication (higher = newer)
 
     // Phase 2: Zero-copy support
     seastar::shared_ptr<TSM> sourceFile;  // Source TSM file for zero-copy reads
@@ -456,9 +441,11 @@ struct BlockMetadata {
     // Comparison for sorting by timestamp
     bool operator<(const BlockMetadata& other) const {
         // Sort by minTime first (temporal order)
-        if (minTime != other.minTime) return minTime < other.minTime;
+        if (minTime != other.minTime)
+            return minTime < other.minTime;
         // If same start, sort by maxTime (shorter ranges first)
-        if (maxTime != other.maxTime) return maxTime < other.maxTime;
+        if (maxTime != other.maxTime)
+            return maxTime < other.maxTime;
         // If same range, prefer newer files (higher rank)
         return fileRank > other.fileRank;
     }
@@ -466,11 +453,11 @@ struct BlockMetadata {
 
 // Phase 1: Merge segment - represents contiguous blocks that need merging
 struct MergeSegment {
-    size_t startIdx;      // Index in blockMeta vector (inclusive)
-    size_t endIdx;        // Index in blockMeta vector (inclusive)
-    bool needsMerge;      // true if blocks in this range overlap
+    size_t startIdx;  // Index in blockMeta vector (inclusive)
+    size_t endIdx;    // Index in blockMeta vector (inclusive)
+    bool needsMerge;  // true if blocks in this range overlap
 
     size_t blockCount() const { return endIdx - startIdx + 1; }
 };
 
-#endif // BULK_BLOCK_LOADER_H_INCLUDED
+#endif  // BULK_BLOCK_LOADER_H_INCLUDED

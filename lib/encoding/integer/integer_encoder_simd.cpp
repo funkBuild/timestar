@@ -1,8 +1,11 @@
 #include "integer_encoder_simd.hpp"
-#include "../zigzag.hpp"
+
 #include "../simple16.hpp"
-#include <immintrin.h>
+#include "../zigzag.hpp"
+
 #include <cpuid.h>
+#include <immintrin.h>
+
 #include <cstring>
 
 // Check for AVX2 support (cached - CPUID only called once)
@@ -10,7 +13,7 @@ bool IntegerEncoderSIMD::isAvailable() {
     static const bool available = []() {
         unsigned int eax, ebx, ecx, edx;
         if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-            return (ebx & (1 << 5)) != 0; // AVX2 is bit 5 of EBX
+            return (ebx & (1 << 5)) != 0;  // AVX2 is bit 5 of EBX
         }
         return false;
     }();
@@ -27,7 +30,7 @@ static inline __m256i zigzagEncode4_avx2(const int64_t* values) {
 
     // AVX2 alternative: use comparison to emulate arithmetic right shift by 63
     __m256i zero = _mm256_setzero_si256();
-    __m256i sign = _mm256_cmpgt_epi64(zero, v); // All 1s if negative, all 0s if positive
+    __m256i sign = _mm256_cmpgt_epi64(zero, v);  // All 1s if negative, all 0s if positive
 
     // XOR: ((x << 1) ^ -(x >> 63))
     __m256i result = _mm256_xor_si256(shifted, sign);
@@ -87,14 +90,22 @@ AlignedBuffer IntegerEncoderSIMD::encode(std::span<const uint64_t> values) {
         for (; i + 7 < size; i += 8) {
             // Calculate delta-of-deltas for 8 values
             // Unroll for better pipeline utilization
-            deltas[0] = (static_cast<int64_t>(values[i+0]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
-            deltas[1] = (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i+0])) - (static_cast<int64_t>(values[i+0]) - static_cast<int64_t>(values[i-1]));
-            deltas[2] = (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1])) - (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i+0]));
-            deltas[3] = (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2])) - (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1]));
-            deltas[4] = (static_cast<int64_t>(values[i+4]) - static_cast<int64_t>(values[i+3])) - (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2]));
-            deltas[5] = (static_cast<int64_t>(values[i+5]) - static_cast<int64_t>(values[i+4])) - (static_cast<int64_t>(values[i+4]) - static_cast<int64_t>(values[i+3]));
-            deltas[6] = (static_cast<int64_t>(values[i+6]) - static_cast<int64_t>(values[i+5])) - (static_cast<int64_t>(values[i+5]) - static_cast<int64_t>(values[i+4]));
-            deltas[7] = (static_cast<int64_t>(values[i+7]) - static_cast<int64_t>(values[i+6])) - (static_cast<int64_t>(values[i+6]) - static_cast<int64_t>(values[i+5]));
+            deltas[0] = (static_cast<int64_t>(values[i + 0]) - static_cast<int64_t>(values[i - 1])) -
+                        (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
+            deltas[1] = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i + 0])) -
+                        (static_cast<int64_t>(values[i + 0]) - static_cast<int64_t>(values[i - 1]));
+            deltas[2] = (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1])) -
+                        (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i + 0]));
+            deltas[3] = (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2])) -
+                        (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1]));
+            deltas[4] = (static_cast<int64_t>(values[i + 4]) - static_cast<int64_t>(values[i + 3])) -
+                        (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2]));
+            deltas[5] = (static_cast<int64_t>(values[i + 5]) - static_cast<int64_t>(values[i + 4])) -
+                        (static_cast<int64_t>(values[i + 4]) - static_cast<int64_t>(values[i + 3]));
+            deltas[6] = (static_cast<int64_t>(values[i + 6]) - static_cast<int64_t>(values[i + 5])) -
+                        (static_cast<int64_t>(values[i + 5]) - static_cast<int64_t>(values[i + 4]));
+            deltas[7] = (static_cast<int64_t>(values[i + 7]) - static_cast<int64_t>(values[i + 6])) -
+                        (static_cast<int64_t>(values[i + 6]) - static_cast<int64_t>(values[i + 5]));
 
             // SIMD zigzag encode in two batches of 4
             __m256i enc1 = zigzagEncode4_avx2(&deltas[0]);
@@ -113,10 +124,14 @@ AlignedBuffer IntegerEncoderSIMD::encode(std::span<const uint64_t> values) {
 
     // Process remaining values with 4x unrolling
     for (; i + 3 < size; i += 4) {
-        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
-        int64_t d1 = (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i])) - (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1]));
-        int64_t d2 = (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1])) - (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i]));
-        int64_t d3 = (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2])) - (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1]));
+        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                     (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
+        int64_t d1 = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i])) -
+                     (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]));
+        int64_t d2 = (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1])) -
+                     (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i]));
+        int64_t d3 = (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2])) -
+                     (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1]));
 
         // Use SIMD for zigzag if available
         if (isAvailable()) {
@@ -139,22 +154,23 @@ AlignedBuffer IntegerEncoderSIMD::encode(std::span<const uint64_t> values) {
 
     // Handle remaining values
     for (; i < size; i++) {
-        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
+        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                    (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
         encoded.push_back(ZigZag::zigzagEncode(D));
     }
 
     return Simple16::encode(encoded);
 }
 
-std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice &encoded, unsigned int timestampSize,
-                                                     std::vector<uint64_t> &values,
-                                                     uint64_t minTime, uint64_t maxTime) {
+std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice& encoded, unsigned int timestampSize,
+                                                     std::vector<uint64_t>& values, uint64_t minTime,
+                                                     uint64_t maxTime) {
     // Optimized memory allocation
     const size_t current_size = values.size();
     const size_t estimated_new = timestampSize;
 
     if (values.capacity() < current_size + estimated_new) {
-        values.reserve(current_size + estimated_new + (estimated_new >> 2)); // 25% extra
+        values.reserve(current_size + estimated_new + (estimated_new >> 2));  // 25% extra
     }
 
     std::vector<uint64_t> deltaValues = Simple16::decode(encoded, timestampSize);
@@ -210,8 +226,8 @@ std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice &encoded, unsigned in
             _mm256_storeu_si256((__m256i*)&decoded_batch[0], dec1);
             _mm256_storeu_si256((__m256i*)&decoded_batch[4], dec2);
 
-            // Sequential reconstruction with prefetching
-            #pragma unroll 8
+// Sequential reconstruction with prefetching
+#pragma unroll 8
             for (size_t j = 0; j < 8; j++) {
                 delta += decoded_batch[j];
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
@@ -290,9 +306,9 @@ std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice &encoded, unsigned in
         // Fallback to non-SIMD 4x unrolling
         for (; i + 3 < size; i += 4) {
             int64_t dd0 = ZigZag::zigzagDecode(deltaValues[i]);
-            int64_t dd1 = ZigZag::zigzagDecode(deltaValues[i+1]);
-            int64_t dd2 = ZigZag::zigzagDecode(deltaValues[i+2]);
-            int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i+3]);
+            int64_t dd1 = ZigZag::zigzagDecode(deltaValues[i + 1]);
+            int64_t dd2 = ZigZag::zigzagDecode(deltaValues[i + 2]);
+            int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i + 3]);
 
             delta += dd0;
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);

@@ -9,14 +9,14 @@
 //            --benchmark_report_aggregates_only=true \
 //            --benchmark_display_aggregates_only=true
 
-#include <benchmark/benchmark.h>
-
 #include "forecast/forecast_executor.hpp"
 #include "forecast/forecast_result.hpp"
 #include "forecast/linear_forecaster.hpp"
-#include "forecast/seasonal_forecaster.hpp"
 #include "forecast/periodicity_detector.hpp"
+#include "forecast/seasonal_forecaster.hpp"
 #include "forecast/stl_decomposition.hpp"
+
+#include <benchmark/benchmark.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -28,11 +28,11 @@ using namespace timestar::forecast;
 // ─────────────────────────────── constants ───────────────────────────────────
 
 // 1 year of 5-minute data ≈ 105,120 points
-static constexpr size_t N_YEAR     = 105'120;
+static constexpr size_t N_YEAR = 105'120;
 // 1 month of 5-minute data ≈ 8,640 points
-static constexpr size_t N_MONTH    = 8'640;
+static constexpr size_t N_MONTH = 8'640;
 // 1 week of 5-minute data ≈ 2,016 points
-static constexpr size_t N_WEEK     = 2'016;
+static constexpr size_t N_WEEK = 2'016;
 // Interval: 5 minutes in nanoseconds
 static constexpr uint64_t INTERVAL = 300'000'000'000ULL;
 
@@ -40,11 +40,11 @@ static constexpr uint64_t INTERVAL = 300'000'000'000ULL;
 
 // Realistic time series: trend + daily seasonality + weekly seasonality + noise
 static std::vector<uint64_t> g_timestamps_year;
-static std::vector<double>   g_values_year;
+static std::vector<double> g_values_year;
 static std::vector<uint64_t> g_timestamps_month;
-static std::vector<double>   g_values_month;
+static std::vector<double> g_values_month;
 static std::vector<uint64_t> g_timestamps_week;
-static std::vector<double>   g_values_week;
+static std::vector<double> g_values_week;
 
 struct GlobalSetup {
     GlobalSetup() {
@@ -57,27 +57,26 @@ struct GlobalSetup {
             // Points per week = 2016
             for (size_t i = 0; i < n; ++i) {
                 ts[i] = static_cast<uint64_t>(i) * INTERVAL;
-                double trend     = 50.0 + 0.001 * static_cast<double>(i);
-                double daily     = 10.0 * std::sin(PI2 * static_cast<double>(i) / 288.0);
-                double weekly    =  5.0 * std::sin(PI2 * static_cast<double>(i) / 2016.0);
-                double noise     = 0.5 * (static_cast<double>(std::rand() % 1000) / 1000.0 - 0.5);
+                double trend = 50.0 + 0.001 * static_cast<double>(i);
+                double daily = 10.0 * std::sin(PI2 * static_cast<double>(i) / 288.0);
+                double weekly = 5.0 * std::sin(PI2 * static_cast<double>(i) / 2016.0);
+                double noise = 0.5 * (static_cast<double>(std::rand() % 1000) / 1000.0 - 0.5);
                 vs[i] = trend + daily + weekly + noise;
             }
         };
-        generate(N_YEAR,  g_timestamps_year,  g_values_year);
+        generate(N_YEAR, g_timestamps_year, g_values_year);
         generate(N_MONTH, g_timestamps_month, g_values_month);
-        generate(N_WEEK,  g_timestamps_week,  g_values_week);
+        generate(N_WEEK, g_timestamps_week, g_values_week);
     }
 };
 static GlobalSetup g_setup;
 
 // ─────────────────── helpers ──────────────────────────────────────────────
 
-static ForecastInput makeInput(const std::vector<uint64_t>& ts,
-                               const std::vector<double>& vs) {
+static ForecastInput makeInput(const std::vector<uint64_t>& ts, const std::vector<double>& vs) {
     ForecastInput input;
     input.timestamps = ts;
-    input.values     = vs;
+    input.values = vs;
     return input;
 }
 
@@ -368,10 +367,10 @@ BENCHMARK(BM_ForecastExecutor_Seasonal_Year_Windowed);
 
 static void BM_SeasonalAutoCorrelation(benchmark::State& state) {
     SeasonalForecaster forecaster;
-    double mean = std::accumulate(g_values_year.begin(), g_values_year.end(), 0.0)
-                  / static_cast<double>(N_YEAR);
+    double mean = std::accumulate(g_values_year.begin(), g_values_year.end(), 0.0) / static_cast<double>(N_YEAR);
     double variance = 0.0;
-    for (double v : g_values_year) variance += (v - mean) * (v - mean);
+    for (double v : g_values_year)
+        variance += (v - mean) * (v - mean);
     variance /= N_YEAR;
     for (auto _ : state) {
         double r = forecaster.autoCorrelation(g_values_year, mean, variance, 288);

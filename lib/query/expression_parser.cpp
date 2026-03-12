@@ -1,7 +1,8 @@
 #include "expression_parser.hpp"
+
+#include <algorithm>
 #include <cctype>
 #include <sstream>
-#include <algorithm>
 #include <stdexcept>
 
 namespace timestar {
@@ -21,9 +22,7 @@ std::string ExpressionNode::toString() const {
 
         case ExprNodeType::BINARY_OP: {
             const auto& op = asBinaryOp();
-            return "(" + op.left->toString() + " " +
-                   binaryOpToString(op.op) + " " +
-                   op.right->toString() + ")";
+            return "(" + op.left->toString() + " " + binaryOpToString(op.op) + " " + op.right->toString() + ")";
         }
 
         case ExprNodeType::UNARY_OP: {
@@ -31,15 +30,15 @@ std::string ExpressionNode::toString() const {
             if (op.op == UnaryOpType::NEGATE) {
                 return "(-" + op.operand->toString() + ")";
             }
-            return std::string(unaryOpToString(op.op)) + "(" +
-                   op.operand->toString() + ")";
+            return std::string(unaryOpToString(op.op)) + "(" + op.operand->toString() + ")";
         }
 
         case ExprNodeType::FUNCTION_CALL: {
             const auto& call = asFunctionCall();
             std::string result = std::string(functionToString(call.func)) + "(";
             for (size_t i = 0; i < call.args.size(); ++i) {
-                if (i > 0) result += ", ";
+                if (i > 0)
+                    result += ", ";
                 result += call.args[i]->toString();
             }
             result += ")";
@@ -48,9 +47,8 @@ std::string ExpressionNode::toString() const {
 
         case ExprNodeType::ANOMALY_FUNCTION: {
             const auto& anomaly = asAnomalyFunction();
-            std::string result = "anomalies(" + anomaly.queryRef + ", '" +
-                                 anomaly.algorithm + "', " +
-                                 std::to_string(anomaly.bounds);
+            std::string result =
+                "anomalies(" + anomaly.queryRef + ", '" + anomaly.algorithm + "', " + std::to_string(anomaly.bounds);
             if (anomaly.seasonality.has_value()) {
                 result += ", '" + anomaly.seasonality.value() + "'";
             }
@@ -60,8 +58,7 @@ std::string ExpressionNode::toString() const {
 
         case ExprNodeType::FORECAST_FUNCTION: {
             const auto& forecast = asForecastFunction();
-            std::string result = "forecast(" + forecast.queryRef + ", '" +
-                                 forecast.algorithm + "', " +
+            std::string result = "forecast(" + forecast.queryRef + ", '" + forecast.algorithm + "', " +
                                  std::to_string(forecast.deviations);
             if (forecast.seasonality.has_value()) {
                 result += ", seasonality='" + forecast.seasonality.value() + "'";
@@ -86,8 +83,7 @@ std::string ExpressionNode::toString() const {
 
 // ==================== ExpressionLexer ====================
 
-ExpressionLexer::ExpressionLexer(std::string_view input)
-    : input_(input) {}
+ExpressionLexer::ExpressionLexer(std::string_view input) : input_(input) {}
 
 void ExpressionLexer::skipWhitespace() {
     while (!isAtEnd() && std::isspace(peek())) {
@@ -96,7 +92,8 @@ void ExpressionLexer::skipWhitespace() {
 }
 
 char ExpressionLexer::peek() const {
-    if (isAtEnd()) return '\0';
+    if (isAtEnd())
+        return '\0';
     return input_[pos_];
 }
 
@@ -118,9 +115,8 @@ Token ExpressionLexer::readNumber() {
     }
 
     // Decimal part
-    if (!isAtEnd() && peek() == '.' && pos_ + 1 < input_.size() &&
-        std::isdigit(input_[pos_ + 1])) {
-        advance(); // consume '.'
+    if (!isAtEnd() && peek() == '.' && pos_ + 1 < input_.size() && std::isdigit(input_[pos_ + 1])) {
+        advance();  // consume '.'
         while (!isAtEnd() && std::isdigit(peek())) {
             advance();
         }
@@ -143,9 +139,7 @@ Token ExpressionLexer::readNumber() {
         }
     }
 
-    return Token(TokenType::NUMBER,
-                 std::string(input_.substr(start, pos_ - start)),
-                 startPos);
+    return Token(TokenType::NUMBER, std::string(input_.substr(start, pos_ - start)), startPos);
 }
 
 Token ExpressionLexer::readIdentifier() {
@@ -160,14 +154,12 @@ Token ExpressionLexer::readIdentifier() {
         advance();
     }
 
-    return Token(TokenType::IDENTIFIER,
-                 std::string(input_.substr(start, pos_ - start)),
-                 startPos);
+    return Token(TokenType::IDENTIFIER, std::string(input_.substr(start, pos_ - start)), startPos);
 }
 
 Token ExpressionLexer::readString() {
     size_t startPos = pos_;
-    advance(); // consume opening quote
+    advance();  // consume opening quote
 
     size_t start = pos_;
     while (!isAtEnd() && peek() != '\'') {
@@ -175,12 +167,11 @@ Token ExpressionLexer::readString() {
     }
 
     if (isAtEnd()) {
-        throw ExpressionParseException(
-            "Unterminated string literal at position " + std::to_string(startPos));
+        throw ExpressionParseException("Unterminated string literal at position " + std::to_string(startPos));
     }
 
     std::string value(input_.substr(start, pos_ - start));
-    advance(); // consume closing quote
+    advance();  // consume closing quote
 
     return Token(TokenType::STRING, value, startPos);
 }
@@ -211,15 +202,32 @@ Token ExpressionLexer::nextToken() {
 
     // Single character tokens
     switch (c) {
-        case '+': advance(); return Token(TokenType::PLUS, "+", startPos);
-        case '-': advance(); return Token(TokenType::MINUS, "-", startPos);
-        case '*': advance(); return Token(TokenType::STAR, "*", startPos);
-        case '/': advance(); return Token(TokenType::SLASH, "/", startPos);
-        case '(': advance(); return Token(TokenType::LPAREN, "(", startPos);
-        case ')': advance(); return Token(TokenType::RPAREN, ")", startPos);
-        case ',': advance(); return Token(TokenType::COMMA, ",", startPos);
-        case '=': advance(); return Token(TokenType::EQUALS, "=", startPos);
-        default: break;
+        case '+':
+            advance();
+            return Token(TokenType::PLUS, "+", startPos);
+        case '-':
+            advance();
+            return Token(TokenType::MINUS, "-", startPos);
+        case '*':
+            advance();
+            return Token(TokenType::STAR, "*", startPos);
+        case '/':
+            advance();
+            return Token(TokenType::SLASH, "/", startPos);
+        case '(':
+            advance();
+            return Token(TokenType::LPAREN, "(", startPos);
+        case ')':
+            advance();
+            return Token(TokenType::RPAREN, ")", startPos);
+        case ',':
+            advance();
+            return Token(TokenType::COMMA, ",", startPos);
+        case '=':
+            advance();
+            return Token(TokenType::EQUALS, "=", startPos);
+        default:
+            break;
     }
 
     // Numbers
@@ -237,16 +245,14 @@ Token ExpressionLexer::nextToken() {
         return readIdentifier();
     }
 
-    throw ExpressionParseException(
-        "Unexpected character '" + std::string(1, c) +
-        "' at position " + std::to_string(pos_));
+    throw ExpressionParseException("Unexpected character '" + std::string(1, c) + "' at position " +
+                                   std::to_string(pos_));
 }
 
 // ==================== ExpressionParser ====================
 
-ExpressionParser::ExpressionParser(std::string_view input)
-    : lexer_(input), currentToken_(TokenType::END, "", 0) {
-    advance(); // Load first token
+ExpressionParser::ExpressionParser(std::string_view input) : lexer_(input), currentToken_(TokenType::END, "", 0) {
+    advance();  // Load first token
 }
 
 void ExpressionParser::advance() {
@@ -273,9 +279,8 @@ void ExpressionParser::consume(TokenType type, const std::string& message) {
 }
 
 void ExpressionParser::error(const std::string& message) const {
-    throw ExpressionParseException(
-        message + " at position " + std::to_string(currentToken_.position) +
-        " (got '" + currentToken_.value + "')");
+    throw ExpressionParseException(message + " at position " + std::to_string(currentToken_.position) + " (got '" +
+                                   currentToken_.value + "')");
 }
 
 int ExpressionParser::getPrecedence() const {
@@ -293,45 +298,50 @@ int ExpressionParser::getPrecedence() const {
 
 std::optional<BinaryOpType> ExpressionParser::getBinaryOp() const {
     switch (currentToken_.type) {
-        case TokenType::PLUS: return BinaryOpType::ADD;
-        case TokenType::MINUS: return BinaryOpType::SUBTRACT;
-        case TokenType::STAR: return BinaryOpType::MULTIPLY;
-        case TokenType::SLASH: return BinaryOpType::DIVIDE;
-        default: return std::nullopt;
+        case TokenType::PLUS:
+            return BinaryOpType::ADD;
+        case TokenType::MINUS:
+            return BinaryOpType::SUBTRACT;
+        case TokenType::STAR:
+            return BinaryOpType::MULTIPLY;
+        case TokenType::SLASH:
+            return BinaryOpType::DIVIDE;
+        default:
+            return std::nullopt;
     }
 }
 
 bool ExpressionParser::isFunction(const std::string& name) const {
     static const std::set<std::string> functions = {
         "abs", "log", "log10", "sqrt", "ceil", "floor",  // unary math
-        "diff", "monotonic_diff", "default_zero",         // unary transform
+        "diff", "monotonic_diff", "default_zero",        // unary transform
         "count_nonzero", "count_not_null",               // unary aggregating
         "rate", "irate", "increase",                     // counter-rate functions
         "fill_forward", "fill_backward", "fill_linear",  // gap-fill (unary)
-        "cumsum", "integral",                             // accumulation (unary)
-        "normalize",                                      // normalization (unary)
-        "min", "max", "pow", "clamp",                     // multi-arg math
-        "clamp_min", "clamp_max",                         // clamp with scalar
-        "cutoff_min", "cutoff_max",                       // cutoff with scalar
-        "per_minute", "per_hour",                         // rate conversion
-        "rolling_avg", "rolling_min",                     // rolling window
-        "rolling_max", "rolling_stddev",                  // rolling window
-        "fill_value",                                     // gap-fill with constant
-        "ema",                                            // exponential moving average
-        "holt_winters",                                   // double exponential smoothing
-        "zscore",                                         // rolling z-score normalization
-        "anomalies",                                      // anomaly detection
-        "forecast",                                       // forecasting
-        "time_shift",                                     // timestamp shifting
-        "topk",                                           // top-N group filter
-        "bottomk",                                        // bottom-N group filter
-        "as_percent",                                     // percent of total (2-arg)
+        "cumsum", "integral",                            // accumulation (unary)
+        "normalize",                                     // normalization (unary)
+        "min", "max", "pow", "clamp",                    // multi-arg math
+        "clamp_min", "clamp_max",                        // clamp with scalar
+        "cutoff_min", "cutoff_max",                      // cutoff with scalar
+        "per_minute", "per_hour",                        // rate conversion
+        "rolling_avg", "rolling_min",                    // rolling window
+        "rolling_max", "rolling_stddev",                 // rolling window
+        "fill_value",                                    // gap-fill with constant
+        "ema",                                           // exponential moving average
+        "holt_winters",                                  // double exponential smoothing
+        "zscore",                                        // rolling z-score normalization
+        "anomalies",                                     // anomaly detection
+        "forecast",                                      // forecasting
+        "time_shift",                                    // timestamp shifting
+        "topk",                                          // top-N group filter
+        "bottomk",                                       // bottom-N group filter
+        "as_percent",                                    // percent of total (2-arg)
         // Cross-series aggregation (variadic)
-        "avg_of_series",    // element-wise mean across N series
-        "sum_of_series",    // element-wise sum across N series
-        "min_of_series",    // element-wise min across N series
-        "max_of_series",    // element-wise max across N series
-        "percentile_of_series" // p-th percentile across N series (first arg is p)
+        "avg_of_series",        // element-wise mean across N series
+        "sum_of_series",        // element-wise sum across N series
+        "min_of_series",        // element-wise min across N series
+        "max_of_series",        // element-wise max across N series
+        "percentile_of_series"  // p-th percentile across N series (first arg is p)
     };
     return functions.count(name) > 0;
 }
@@ -350,71 +360,117 @@ bool ExpressionParser::isTimeShiftFunction(const std::string& name) const {
 
 std::optional<UnaryOpType> ExpressionParser::getUnaryFunction(const std::string& name) const {
     // Math functions
-    if (name == "abs") return UnaryOpType::ABS;
-    if (name == "log") return UnaryOpType::LOG;
-    if (name == "log10") return UnaryOpType::LOG10;
-    if (name == "sqrt") return UnaryOpType::SQRT;
-    if (name == "ceil") return UnaryOpType::CEIL;
-    if (name == "floor") return UnaryOpType::FLOOR;
+    if (name == "abs")
+        return UnaryOpType::ABS;
+    if (name == "log")
+        return UnaryOpType::LOG;
+    if (name == "log10")
+        return UnaryOpType::LOG10;
+    if (name == "sqrt")
+        return UnaryOpType::SQRT;
+    if (name == "ceil")
+        return UnaryOpType::CEIL;
+    if (name == "floor")
+        return UnaryOpType::FLOOR;
     // Transform functions (SIMD-optimized)
-    if (name == "diff") return UnaryOpType::DIFF;
-    if (name == "monotonic_diff") return UnaryOpType::MONOTONIC_DIFF;
-    if (name == "default_zero") return UnaryOpType::DEFAULT_ZERO;
-    if (name == "count_nonzero") return UnaryOpType::COUNT_NONZERO;
-    if (name == "count_not_null") return UnaryOpType::COUNT_NOT_NULL;
+    if (name == "diff")
+        return UnaryOpType::DIFF;
+    if (name == "monotonic_diff")
+        return UnaryOpType::MONOTONIC_DIFF;
+    if (name == "default_zero")
+        return UnaryOpType::DEFAULT_ZERO;
+    if (name == "count_nonzero")
+        return UnaryOpType::COUNT_NONZERO;
+    if (name == "count_not_null")
+        return UnaryOpType::COUNT_NOT_NULL;
     // Counter-rate functions
-    if (name == "rate") return UnaryOpType::RATE;
-    if (name == "irate") return UnaryOpType::IRATE;
-    if (name == "increase") return UnaryOpType::INCREASE;
+    if (name == "rate")
+        return UnaryOpType::RATE;
+    if (name == "irate")
+        return UnaryOpType::IRATE;
+    if (name == "increase")
+        return UnaryOpType::INCREASE;
     // Gap-fill / interpolation functions
-    if (name == "fill_forward") return UnaryOpType::FILL_FORWARD;
-    if (name == "fill_backward") return UnaryOpType::FILL_BACKWARD;
-    if (name == "fill_linear") return UnaryOpType::FILL_LINEAR;
+    if (name == "fill_forward")
+        return UnaryOpType::FILL_FORWARD;
+    if (name == "fill_backward")
+        return UnaryOpType::FILL_BACKWARD;
+    if (name == "fill_linear")
+        return UnaryOpType::FILL_LINEAR;
     // Accumulation functions
-    if (name == "cumsum") return UnaryOpType::CUMSUM;
-    if (name == "integral") return UnaryOpType::INTEGRAL;
+    if (name == "cumsum")
+        return UnaryOpType::CUMSUM;
+    if (name == "integral")
+        return UnaryOpType::INTEGRAL;
     // Normalization
-    if (name == "normalize") return UnaryOpType::NORMALIZE;
+    if (name == "normalize")
+        return UnaryOpType::NORMALIZE;
     return std::nullopt;
 }
 
 std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::string& name) const {
     // Math functions
-    if (name == "min") return FunctionType::MIN;
-    if (name == "max") return FunctionType::MAX;
-    if (name == "pow") return FunctionType::POW;
-    if (name == "clamp") return FunctionType::CLAMP;
+    if (name == "min")
+        return FunctionType::MIN;
+    if (name == "max")
+        return FunctionType::MAX;
+    if (name == "pow")
+        return FunctionType::POW;
+    if (name == "clamp")
+        return FunctionType::CLAMP;
     // Transform functions with scalar argument (SIMD-optimized)
-    if (name == "clamp_min") return FunctionType::CLAMP_MIN;
-    if (name == "clamp_max") return FunctionType::CLAMP_MAX;
-    if (name == "cutoff_min") return FunctionType::CUTOFF_MIN;
-    if (name == "cutoff_max") return FunctionType::CUTOFF_MAX;
-    if (name == "per_minute") return FunctionType::PER_MINUTE;
-    if (name == "per_hour") return FunctionType::PER_HOUR;
+    if (name == "clamp_min")
+        return FunctionType::CLAMP_MIN;
+    if (name == "clamp_max")
+        return FunctionType::CLAMP_MAX;
+    if (name == "cutoff_min")
+        return FunctionType::CUTOFF_MIN;
+    if (name == "cutoff_max")
+        return FunctionType::CUTOFF_MAX;
+    if (name == "per_minute")
+        return FunctionType::PER_MINUTE;
+    if (name == "per_hour")
+        return FunctionType::PER_HOUR;
     // Rolling window functions
-    if (name == "rolling_avg") return FunctionType::ROLLING_AVG;
-    if (name == "rolling_min") return FunctionType::ROLLING_MIN;
-    if (name == "rolling_max") return FunctionType::ROLLING_MAX;
-    if (name == "rolling_stddev") return FunctionType::ROLLING_STDDEV;
+    if (name == "rolling_avg")
+        return FunctionType::ROLLING_AVG;
+    if (name == "rolling_min")
+        return FunctionType::ROLLING_MIN;
+    if (name == "rolling_max")
+        return FunctionType::ROLLING_MAX;
+    if (name == "rolling_stddev")
+        return FunctionType::ROLLING_STDDEV;
     // Gap-fill with constant scalar
-    if (name == "fill_value") return FunctionType::FILL_VALUE;
+    if (name == "fill_value")
+        return FunctionType::FILL_VALUE;
     // Exponential moving average
-    if (name == "ema") return FunctionType::EMA;
+    if (name == "ema")
+        return FunctionType::EMA;
     // Double exponential smoothing (Holt's linear method)
-    if (name == "holt_winters") return FunctionType::HOLT_WINTERS;
+    if (name == "holt_winters")
+        return FunctionType::HOLT_WINTERS;
     // Rolling z-score normalization
-    if (name == "zscore") return FunctionType::ZSCORE;
+    if (name == "zscore")
+        return FunctionType::ZSCORE;
     // Cross-series ranking / filtering
-    if (name == "topk") return FunctionType::TOPK;
-    if (name == "bottomk") return FunctionType::BOTTOMK;
+    if (name == "topk")
+        return FunctionType::TOPK;
+    if (name == "bottomk")
+        return FunctionType::BOTTOMK;
     // Percent of total
-    if (name == "as_percent") return FunctionType::AS_PERCENT;
+    if (name == "as_percent")
+        return FunctionType::AS_PERCENT;
     // Cross-series aggregation (variadic; argument count validated in evaluator)
-    if (name == "avg_of_series") return FunctionType::AVG_OF_SERIES;
-    if (name == "sum_of_series") return FunctionType::SUM_OF_SERIES;
-    if (name == "min_of_series") return FunctionType::MIN_OF_SERIES;
-    if (name == "max_of_series") return FunctionType::MAX_OF_SERIES;
-    if (name == "percentile_of_series") return FunctionType::PERCENTILE_OF_SERIES;
+    if (name == "avg_of_series")
+        return FunctionType::AVG_OF_SERIES;
+    if (name == "sum_of_series")
+        return FunctionType::SUM_OF_SERIES;
+    if (name == "min_of_series")
+        return FunctionType::MIN_OF_SERIES;
+    if (name == "max_of_series")
+        return FunctionType::MAX_OF_SERIES;
+    if (name == "percentile_of_series")
+        return FunctionType::PERCENTILE_OF_SERIES;
     return std::nullopt;
 }
 
@@ -430,8 +486,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parse() {
 
 std::unique_ptr<ExpressionNode> ExpressionParser::parseExpression(int precedence) {
     if (++depth_ > MAX_DEPTH) {
-        throw ExpressionParseException(
-            "Expression nesting too deep (limit " + std::to_string(MAX_DEPTH) + ")");
+        throw ExpressionParseException("Expression nesting too deep (limit " + std::to_string(MAX_DEPTH) + ")");
     }
     struct DepthGuard {
         int& d;
@@ -448,7 +503,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseExpression(int precedence
 
         BinaryOpType op = opOpt.value();
         int opPrec = getPrecedence();
-        advance(); // consume operator
+        advance();  // consume operator
 
         auto right = parseExpression(opPrec);
         left = ExpressionNode::makeBinaryOp(op, std::move(left), std::move(right));
@@ -486,7 +541,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parsePrimary() {
     }
 
     error("Expected expression");
-    return nullptr; // unreachable
+    return nullptr;  // unreachable
 }
 
 std::unique_ptr<ExpressionNode> ExpressionParser::parseNumber() {
@@ -535,8 +590,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseAnomalyFunction() {
     }
     std::string algorithm = currentToken_.value;
     if (algorithm != "basic" && algorithm != "agile" && algorithm != "robust") {
-        throw ExpressionParseException(
-            "Invalid algorithm '" + algorithm + "'. Use 'basic', 'agile', or 'robust'");
+        throw ExpressionParseException("Invalid algorithm '" + algorithm + "'. Use 'basic', 'agile', or 'robust'");
     }
     advance();
 
@@ -555,8 +609,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseAnomalyFunction() {
         throw ExpressionParseException("Invalid number: " + currentToken_.value);
     }
     if (bounds < 1.0 || bounds > 4.0) {
-        throw ExpressionParseException(
-            "Bounds must be between 1 and 4, got " + std::to_string(bounds));
+        throw ExpressionParseException("Bounds must be between 1 and 4, got " + std::to_string(bounds));
     }
     advance();
 
@@ -568,8 +621,8 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseAnomalyFunction() {
         }
         std::string seasonStr = currentToken_.value;
         if (seasonStr != "hourly" && seasonStr != "daily" && seasonStr != "weekly") {
-            throw ExpressionParseException(
-                "Invalid seasonality '" + seasonStr + "'. Use 'hourly', 'daily', or 'weekly'");
+            throw ExpressionParseException("Invalid seasonality '" + seasonStr +
+                                           "'. Use 'hourly', 'daily', or 'weekly'");
         }
         seasonality = seasonStr;
         advance();
@@ -599,8 +652,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseForecastFunction() {
     }
     std::string algorithm = currentToken_.value;
     if (algorithm != "linear" && algorithm != "seasonal") {
-        throw ExpressionParseException(
-            "Invalid forecast algorithm '" + algorithm + "'. Use 'linear' or 'seasonal'");
+        throw ExpressionParseException("Invalid forecast algorithm '" + algorithm + "'. Use 'linear' or 'seasonal'");
     }
     advance();
 
@@ -619,8 +671,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseForecastFunction() {
         throw ExpressionParseException("Invalid number: " + currentToken_.value);
     }
     if (deviations < 1.0 || deviations > 4.0) {
-        throw ExpressionParseException(
-            "Deviations must be between 1 and 4, got " + std::to_string(deviations));
+        throw ExpressionParseException("Deviations must be between 1 and 4, got " + std::to_string(deviations));
     }
     advance();
 
@@ -649,16 +700,16 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseForecastFunction() {
 
         // Parse based on parameter name
         if (paramName == "seasonality") {
-            if (paramValue != "hourly" && paramValue != "daily" &&
-                paramValue != "weekly" && paramValue != "auto" && paramValue != "multi") {
-                throw ExpressionParseException(
-                    "Invalid seasonality '" + paramValue + "'. Use 'hourly', 'daily', 'weekly', 'auto', or 'multi'");
+            if (paramValue != "hourly" && paramValue != "daily" && paramValue != "weekly" && paramValue != "auto" &&
+                paramValue != "multi") {
+                throw ExpressionParseException("Invalid seasonality '" + paramValue +
+                                               "'. Use 'hourly', 'daily', 'weekly', 'auto', or 'multi'");
             }
             seasonality = paramValue;
         } else if (paramName == "model") {
             if (paramValue != "default" && paramValue != "simple" && paramValue != "reactive") {
-                throw ExpressionParseException(
-                    "Invalid model '" + paramValue + "'. Use 'default', 'simple', or 'reactive'");
+                throw ExpressionParseException("Invalid model '" + paramValue +
+                                               "'. Use 'default', 'simple', or 'reactive'");
             }
             model = paramValue;
         } else if (paramName == "history") {
@@ -666,8 +717,8 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseForecastFunction() {
             // Validation will be done when actually using the value
             history = paramValue;
         } else {
-            throw ExpressionParseException(
-                "Unknown parameter '" + paramName + "'. Expected 'seasonality', 'model', or 'history'");
+            throw ExpressionParseException("Unknown parameter '" + paramName +
+                                           "'. Expected 'seasonality', 'model', or 'history'");
         }
     }
 
@@ -696,8 +747,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseTimeShiftFunction() {
     }
     std::string offset = currentToken_.value;
     if (offset.empty()) {
-        throw ExpressionParseException(
-            "time_shift() offset string must not be empty");
+        throw ExpressionParseException("time_shift() offset string must not be empty");
     }
     advance();
 
@@ -730,9 +780,7 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
     if (!check(TokenType::RPAREN)) {
         do {
             if (args.size() >= MAX_ARGS) {
-                throw ExpressionParseException(
-                    "Too many function arguments (limit " +
-                    std::to_string(MAX_ARGS) + ")");
+                throw ExpressionParseException("Too many function arguments (limit " + std::to_string(MAX_ARGS) + ")");
             }
             args.push_back(parseExpression());
         } while (match(TokenType::COMMA));
@@ -744,9 +792,8 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
     auto unaryOp = getUnaryFunction(name);
     if (unaryOp.has_value()) {
         if (args.size() != 1) {
-            throw ExpressionParseException(
-                "Function '" + name + "' expects 1 argument, got " +
-                std::to_string(args.size()));
+            throw ExpressionParseException("Function '" + name + "' expects 1 argument, got " +
+                                           std::to_string(args.size()));
         }
         return ExpressionNode::makeUnaryOp(unaryOp.value(), std::move(args[0]));
     }
@@ -758,31 +805,25 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
         // avg/sum/min/max_of_series: require >= 1 series arg.
         // percentile_of_series: requires >= 2 args (p + at least one series).
         bool isVariadic =
-            multiFunc.value() == FunctionType::AVG_OF_SERIES ||
-            multiFunc.value() == FunctionType::SUM_OF_SERIES ||
-            multiFunc.value() == FunctionType::MIN_OF_SERIES ||
-            multiFunc.value() == FunctionType::MAX_OF_SERIES ||
+            multiFunc.value() == FunctionType::AVG_OF_SERIES || multiFunc.value() == FunctionType::SUM_OF_SERIES ||
+            multiFunc.value() == FunctionType::MIN_OF_SERIES || multiFunc.value() == FunctionType::MAX_OF_SERIES ||
             multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES;
 
         if (isVariadic) {
             size_t minArgs = (multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES) ? 2 : 1;
             if (args.size() < minArgs) {
-                throw ExpressionParseException(
-                    "Function '" + name + "' requires at least " +
-                    std::to_string(minArgs) + " argument(s), got " +
-                    std::to_string(args.size()));
+                throw ExpressionParseException("Function '" + name + "' requires at least " + std::to_string(minArgs) +
+                                               " argument(s), got " + std::to_string(args.size()));
             }
         } else {
             // Fixed argument count
             size_t expected = 2;
-            if (multiFunc.value() == FunctionType::CLAMP ||
-                multiFunc.value() == FunctionType::HOLT_WINTERS) {
+            if (multiFunc.value() == FunctionType::CLAMP || multiFunc.value() == FunctionType::HOLT_WINTERS) {
                 expected = 3;
             }
             if (args.size() != expected) {
-                throw ExpressionParseException(
-                    "Function '" + name + "' expects " + std::to_string(expected) +
-                    " arguments, got " + std::to_string(args.size()));
+                throw ExpressionParseException("Function '" + name + "' expects " + std::to_string(expected) +
+                                               " arguments, got " + std::to_string(args.size()));
             }
         }
         return ExpressionNode::makeFunctionCall(multiFunc.value(), std::move(args));
@@ -801,10 +842,9 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseGrouping() {
 void ExpressionParser::validateQueryReferences(const std::set<std::string>& definedQueries) const {
     for (const auto& ref : queryRefs_) {
         if (definedQueries.find(ref) == definedQueries.end()) {
-            throw ExpressionParseException(
-                "Undefined query reference: '" + ref + "'");
+            throw ExpressionParseException("Undefined query reference: '" + ref + "'");
         }
     }
 }
 
-} // namespace timestar
+}  // namespace timestar

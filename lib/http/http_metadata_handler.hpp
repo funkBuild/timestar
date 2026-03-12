@@ -1,15 +1,15 @@
 #ifndef HTTP_METADATA_HANDLER_H_INCLUDED
 #define HTTP_METADATA_HANDLER_H_INCLUDED
 
-#include <seastar/http/httpd.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/coroutine.hh>
-#include <memory>
-#include <stdexcept>
-#include <string>
-
 #include "engine.hpp"
 #include "logger.hpp"
+
+#include <memory>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/http/httpd.hh>
+#include <stdexcept>
+#include <string>
 
 class HttpMetadataHandler {
 private:
@@ -26,14 +26,12 @@ public:
 
     void registerRoutes(seastar::httpd::routes& r);
 
-    seastar::future<std::unique_ptr<seastar::http::reply>>
-        handleMeasurements(std::unique_ptr<seastar::http::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleMeasurements(
+        std::unique_ptr<seastar::http::request> req);
 
-    seastar::future<std::unique_ptr<seastar::http::reply>>
-        handleTags(std::unique_ptr<seastar::http::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleTags(std::unique_ptr<seastar::http::request> req);
 
-    seastar::future<std::unique_ptr<seastar::http::reply>>
-        handleFields(std::unique_ptr<seastar::http::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleFields(std::unique_ptr<seastar::http::request> req);
 
     std::string createErrorResponse(const std::string& code, const std::string& message);
     std::string formatMeasurementsResponse(const std::vector<std::string>& measurements, size_t total = 0);
@@ -48,9 +46,7 @@ public:
     // Returns `defaultValue` when `str` is empty.
     // Throws BadRequestException if `str` is non-empty but not a valid non-negative integer,
     // or if `str` contains trailing non-numeric characters (e.g. "3.14", "10abc").
-    static size_t parsePaginationParam(const std::string& str,
-                                       const std::string& paramName,
-                                       size_t defaultValue);
+    static size_t parsePaginationParam(const std::string& str, const std::string& paramName, size_t defaultValue);
 
     // Validate a URL query-parameter value that will be used as a LevelDB key
     // (measurement name, tag key, etc.).  Rejects empty strings and any string
@@ -58,8 +54,7 @@ public:
     //
     // Returns an empty string when the name is valid; otherwise returns a
     // human-readable error description suitable for an HTTP 400 response body.
-    static std::string validateQueryParam(const std::string& name,
-                                          const std::string& context);
+    static std::string validateQueryParam(const std::string& name, const std::string& context);
 };
 
 #endif

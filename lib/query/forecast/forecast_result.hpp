@@ -1,20 +1,21 @@
 #ifndef FORECAST_RESULT_H_INCLUDED
 #define FORECAST_RESULT_H_INCLUDED
 
-#include <string>
-#include <vector>
-#include <optional>
+#include "../anomaly/anomaly_result.hpp"  // Reuse Seasonality enum
+
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
-#include "../anomaly/anomaly_result.hpp"  // Reuse Seasonality enum
+#include <string>
+#include <vector>
 
 namespace timestar {
 namespace forecast {
 
 // Reuse Seasonality from anomaly namespace
-using anomaly::Seasonality;
 using anomaly::parseSeasonality;
+using anomaly::Seasonality;
 using anomaly::seasonalityToPeriod;
 
 // Extended seasonality modes for forecasting
@@ -23,29 +24,41 @@ enum class ForecastSeasonality {
     HOURLY,
     DAILY,
     WEEKLY,
-    AUTO,       // Auto-detect single best period
-    MULTI       // Auto-detect and combine multiple periods
+    AUTO,  // Auto-detect single best period
+    MULTI  // Auto-detect and combine multiple periods
 };
 
 // Convert string to ForecastSeasonality
 inline ForecastSeasonality parseForecastSeasonality(const std::string& str) {
-    if (str == "none") return ForecastSeasonality::NONE;
-    if (str == "hourly") return ForecastSeasonality::HOURLY;
-    if (str == "daily") return ForecastSeasonality::DAILY;
-    if (str == "weekly") return ForecastSeasonality::WEEKLY;
-    if (str == "auto") return ForecastSeasonality::AUTO;
-    if (str == "multi") return ForecastSeasonality::MULTI;
+    if (str == "none")
+        return ForecastSeasonality::NONE;
+    if (str == "hourly")
+        return ForecastSeasonality::HOURLY;
+    if (str == "daily")
+        return ForecastSeasonality::DAILY;
+    if (str == "weekly")
+        return ForecastSeasonality::WEEKLY;
+    if (str == "auto")
+        return ForecastSeasonality::AUTO;
+    if (str == "multi")
+        return ForecastSeasonality::MULTI;
     throw std::invalid_argument("Unknown seasonality: " + str);
 }
 
 inline std::string forecastSeasonalityToString(ForecastSeasonality s) {
     switch (s) {
-        case ForecastSeasonality::NONE: return "none";
-        case ForecastSeasonality::HOURLY: return "hourly";
-        case ForecastSeasonality::DAILY: return "daily";
-        case ForecastSeasonality::WEEKLY: return "weekly";
-        case ForecastSeasonality::AUTO: return "auto";
-        case ForecastSeasonality::MULTI: return "multi";
+        case ForecastSeasonality::NONE:
+            return "none";
+        case ForecastSeasonality::HOURLY:
+            return "hourly";
+        case ForecastSeasonality::DAILY:
+            return "daily";
+        case ForecastSeasonality::WEEKLY:
+            return "weekly";
+        case ForecastSeasonality::AUTO:
+            return "auto";
+        case ForecastSeasonality::MULTI:
+            return "multi";
     }
     return "unknown";
 }
@@ -53,65 +66,81 @@ inline std::string forecastSeasonalityToString(ForecastSeasonality s) {
 // Convert ForecastSeasonality to period in data points
 inline size_t forecastSeasonalityToPeriod(ForecastSeasonality s, uint64_t dataIntervalNs) {
     // For AUTO/MULTI, return 0 (will be detected)
-    if (s == ForecastSeasonality::AUTO || s == ForecastSeasonality::MULTI ||
-        s == ForecastSeasonality::NONE) {
+    if (s == ForecastSeasonality::AUTO || s == ForecastSeasonality::MULTI || s == ForecastSeasonality::NONE) {
         return 0;
     }
 
     // Convert to anomaly::Seasonality for period calculation
     anomaly::Seasonality as;
     switch (s) {
-        case ForecastSeasonality::HOURLY: as = anomaly::Seasonality::HOURLY; break;
-        case ForecastSeasonality::DAILY: as = anomaly::Seasonality::DAILY; break;
-        case ForecastSeasonality::WEEKLY: as = anomaly::Seasonality::WEEKLY; break;
-        default: return 0;
+        case ForecastSeasonality::HOURLY:
+            as = anomaly::Seasonality::HOURLY;
+            break;
+        case ForecastSeasonality::DAILY:
+            as = anomaly::Seasonality::DAILY;
+            break;
+        case ForecastSeasonality::WEEKLY:
+            as = anomaly::Seasonality::WEEKLY;
+            break;
+        default:
+            return 0;
     }
     return anomaly::seasonalityToPeriod(as, dataIntervalNs);
 }
 
 // Supported forecasting algorithms
 enum class Algorithm {
-    LINEAR,    // Simple linear regression extrapolation
-    SEASONAL   // SARIMA-based seasonal forecasting
+    LINEAR,   // Simple linear regression extrapolation
+    SEASONAL  // SARIMA-based seasonal forecasting
 };
 
 // Linear model types (for Algorithm::LINEAR only)
 enum class LinearModelType {
-    DEFAULT,   // Standard least-squares regression
-    SIMPLE,    // Less sensitive to recent changes (uniform weighting on last half)
-    REACTIVE   // More sensitive to recent changes (exponential decay weighting)
+    DEFAULT,  // Standard least-squares regression
+    SIMPLE,   // Less sensitive to recent changes (uniform weighting on last half)
+    REACTIVE  // More sensitive to recent changes (exponential decay weighting)
 };
 
 // Convert string to Algorithm enum
 inline Algorithm parseAlgorithm(const std::string& str) {
-    if (str == "linear") return Algorithm::LINEAR;
-    if (str == "seasonal") return Algorithm::SEASONAL;
+    if (str == "linear")
+        return Algorithm::LINEAR;
+    if (str == "seasonal")
+        return Algorithm::SEASONAL;
     throw std::invalid_argument("Unknown forecast algorithm: " + str + ". Use 'linear' or 'seasonal'");
 }
 
 // Convert Algorithm enum to string
 inline std::string algorithmToString(Algorithm algo) {
     switch (algo) {
-        case Algorithm::LINEAR: return "linear";
-        case Algorithm::SEASONAL: return "seasonal";
+        case Algorithm::LINEAR:
+            return "linear";
+        case Algorithm::SEASONAL:
+            return "seasonal";
     }
     return "unknown";
 }
 
 // Convert string to LinearModelType enum
 inline LinearModelType parseLinearModel(const std::string& str) {
-    if (str == "default") return LinearModelType::DEFAULT;
-    if (str == "simple") return LinearModelType::SIMPLE;
-    if (str == "reactive") return LinearModelType::REACTIVE;
+    if (str == "default")
+        return LinearModelType::DEFAULT;
+    if (str == "simple")
+        return LinearModelType::SIMPLE;
+    if (str == "reactive")
+        return LinearModelType::REACTIVE;
     throw std::invalid_argument("Unknown linear model type: " + str + ". Use 'default', 'simple', or 'reactive'");
 }
 
 // Convert LinearModelType enum to string
 inline std::string linearModelToString(LinearModelType model) {
     switch (model) {
-        case LinearModelType::DEFAULT: return "default";
-        case LinearModelType::SIMPLE: return "simple";
-        case LinearModelType::REACTIVE: return "reactive";
+        case LinearModelType::DEFAULT:
+            return "default";
+        case LinearModelType::SIMPLE:
+            return "simple";
+        case LinearModelType::REACTIVE:
+            return "reactive";
     }
     return "unknown";
 }
@@ -185,24 +214,24 @@ inline uint64_t parseDurationToNs(const std::string& duration) {
 // Configuration for forecasting
 struct ForecastConfig {
     Algorithm algorithm = Algorithm::LINEAR;
-    double deviations = 2.0;           // Confidence interval width (1-4 std devs)
-    size_t forecastHorizon = 0;        // 0 = auto (match historical period)
+    double deviations = 2.0;     // Confidence interval width (1-4 std devs)
+    size_t forecastHorizon = 0;  // 0 = auto (match historical period)
 
     // Seasonality configuration
     ForecastSeasonality forecastSeasonality = ForecastSeasonality::NONE;
     Seasonality seasonality = Seasonality::NONE;  // Keep for backwards compat
 
     // Auto-detection settings (for AUTO/MULTI modes)
-    size_t maxSeasonalComponents = 3;     // Max periods to detect
-    double seasonalThreshold = 0.2;        // Min confidence for period
-    size_t minPeriod = 4;                  // Minimum period to consider
-    size_t maxPeriod = 0;                  // Maximum period (0 = n/2)
+    size_t maxSeasonalComponents = 3;  // Max periods to detect
+    double seasonalThreshold = 0.2;    // Min confidence for period
+    size_t minPeriod = 4;              // Minimum period to consider
+    size_t maxPeriod = 0;              // Maximum period (0 = n/2)
 
     // SARIMA parameters for seasonal forecasting
-    int arOrder = 2;                   // Autoregressive order (p)
-    int maOrder = 2;                   // Moving average order (q)
-    int seasonalArOrder = 1;           // Seasonal AR order (P)
-    int seasonalMaOrder = 1;           // Seasonal MA order (Q)
+    int arOrder = 2;          // Autoregressive order (p)
+    int maOrder = 2;          // Moving average order (q)
+    int seasonalArOrder = 1;  // Seasonal AR order (P)
+    int seasonalMaOrder = 1;  // Seasonal MA order (Q)
 
     // Minimum points required for forecasting
     size_t minDataPoints = 10;
@@ -211,11 +240,11 @@ struct ForecastConfig {
     LinearModelType linearModel = LinearModelType::DEFAULT;  // Model type for linear algorithm
 
     // History duration
-    uint64_t historyDurationNs = 0;    // 0 = use entire query range
+    uint64_t historyDurationNs = 0;  // 0 = use entire query range
 
     // Auto-windowing: trim old data before expensive computation
-    size_t maxHistoryCycles = 4;       // Keep this many cycles of the largest period
-    bool disableAutoWindow = false;    // Set true to skip auto-windowing
+    size_t maxHistoryCycles = 4;     // Keep this many cycles of the largest period
+    bool disableAutoWindow = false;  // Set true to skip auto-windowing
 };
 
 // Input for forecasting
@@ -334,8 +363,8 @@ struct ForecastQueryResult {
 // SARIMA model state for seasonal forecasting
 struct SARIMAState {
     // Model coefficients
-    std::vector<double> arCoeffs;      // AR coefficients
-    std::vector<double> maCoeffs;      // MA coefficients
+    std::vector<double> arCoeffs;  // AR coefficients
+    std::vector<double> maCoeffs;  // MA coefficients
     std::vector<double> seasonalArCoeffs;
     std::vector<double> seasonalMaCoeffs;
 
@@ -353,7 +382,7 @@ struct SARIMAState {
     double sigma = 0.0;  // Residual standard deviation
 };
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar
 
-#endif // FORECAST_RESULT_H_INCLUDED
+#endif  // FORECAST_RESULT_H_INCLUDED

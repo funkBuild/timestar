@@ -2,11 +2,11 @@
 
 #include "expression_evaluator.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <string>
 #include <vector>
-#include <cmath>
-#include <algorithm>
 
 namespace timestar {
 
@@ -59,12 +59,10 @@ inline std::vector<GroupedSeries> topk(int N, std::vector<GroupedSeries> groups)
 
     // Build index array, sort by descending mean
     std::vector<size_t> indices(groups.size());
-    for (size_t i = 0; i < indices.size(); ++i) indices[i] = i;
+    for (size_t i = 0; i < indices.size(); ++i)
+        indices[i] = i;
 
-    std::stable_sort(indices.begin(), indices.end(),
-        [&means](size_t a, size_t b) {
-            return means[a] > means[b];
-        });
+    std::stable_sort(indices.begin(), indices.end(), [&means](size_t a, size_t b) { return means[a] > means[b]; });
 
     // Keep the first k indices (highest means), re-sort by original position
     // to preserve the caller's ordering within the selected subset
@@ -100,12 +98,10 @@ inline std::vector<GroupedSeries> bottomk(int N, std::vector<GroupedSeries> grou
 
     // Build index array, sort by ascending mean (lowest first)
     std::vector<size_t> indices(groups.size());
-    for (size_t i = 0; i < indices.size(); ++i) indices[i] = i;
+    for (size_t i = 0; i < indices.size(); ++i)
+        indices[i] = i;
 
-    std::stable_sort(indices.begin(), indices.end(),
-        [&means](size_t a, size_t b) {
-            return means[a] < means[b];
-        });
+    std::stable_sort(indices.begin(), indices.end(), [&means](size_t a, size_t b) { return means[a] < means[b]; });
 
     // Keep the first k indices (lowest means), re-sort by original position
     indices.resize(k);
@@ -172,24 +168,21 @@ inline double percentileOfSorted(const std::vector<double>& sorted, double p) {
 
 // Calls callback(value) for each non-NaN value at timestamp t,
 // advancing cursors in place. No heap allocation.
-template<typename Callback>
-inline void forEachValueAt(
-    const std::vector<GroupedSeries>& groups,
-    std::vector<size_t>& cursors,
-    uint64_t t,
-    Callback&& cb)
-{
+template <typename Callback>
+inline void forEachValueAt(const std::vector<GroupedSeries>& groups, std::vector<size_t>& cursors, uint64_t t,
+                           Callback&& cb) {
     for (size_t g = 0; g < groups.size(); ++g) {
         const auto& s = groups[g].series;
         const auto& ts = *s.timestamps;
         if (cursors[g] < ts.size() && ts[cursors[g]] == t) {
             double v = s.values[cursors[g]++];
-            if (!std::isnan(v)) cb(v);
+            if (!std::isnan(v))
+                cb(v);
         }
     }
 }
 
-} // namespace detail
+}  // namespace detail
 
 // avg_of_series: at each timestamp, compute the mean of all non-NaN values
 // across all groups. Returns a single GroupedSeries with empty group_tags.
@@ -202,7 +195,7 @@ inline GroupedSeries avg_of_series(std::vector<GroupedSeries> groups) {
     std::vector<size_t> cursors(groups.size(), 0);
 
     std::vector<uint64_t> resultTs;
-    std::vector<double>   resultVals;
+    std::vector<double> resultVals;
     resultTs.reserve(allTs.size());
     resultVals.reserve(allTs.size());
 
@@ -235,7 +228,7 @@ inline GroupedSeries sum_of_series(std::vector<GroupedSeries> groups) {
     std::vector<size_t> cursors(groups.size(), 0);
 
     std::vector<uint64_t> resultTs;
-    std::vector<double>   resultVals;
+    std::vector<double> resultVals;
     resultTs.reserve(allTs.size());
     resultVals.reserve(allTs.size());
 
@@ -268,7 +261,7 @@ inline GroupedSeries min_of_series(std::vector<GroupedSeries> groups) {
     std::vector<size_t> cursors(groups.size(), 0);
 
     std::vector<uint64_t> resultTs;
-    std::vector<double>   resultVals;
+    std::vector<double> resultVals;
     resultTs.reserve(allTs.size());
     resultVals.reserve(allTs.size());
 
@@ -278,7 +271,8 @@ inline GroupedSeries min_of_series(std::vector<GroupedSeries> groups) {
         double m = std::numeric_limits<double>::infinity();
         size_t cnt = 0;
         detail::forEachValueAt(groups, cursors, t, [&](double v) {
-            if (v < m) m = v;
+            if (v < m)
+                m = v;
             ++cnt;
         });
         resultTs.push_back(t);
@@ -301,7 +295,7 @@ inline GroupedSeries max_of_series(std::vector<GroupedSeries> groups) {
     std::vector<size_t> cursors(groups.size(), 0);
 
     std::vector<uint64_t> resultTs;
-    std::vector<double>   resultVals;
+    std::vector<double> resultVals;
     resultTs.reserve(allTs.size());
     resultVals.reserve(allTs.size());
 
@@ -311,7 +305,8 @@ inline GroupedSeries max_of_series(std::vector<GroupedSeries> groups) {
         double m = -std::numeric_limits<double>::infinity();
         size_t cnt = 0;
         detail::forEachValueAt(groups, cursors, t, [&](double v) {
-            if (v > m) m = v;
+            if (v > m)
+                m = v;
             ++cnt;
         });
         resultTs.push_back(t);
@@ -327,12 +322,9 @@ inline GroupedSeries max_of_series(std::vector<GroupedSeries> groups) {
 // non-NaN values across all groups.
 // p must be in [0, 100]. Linear interpolation is used.
 // If no non-NaN values exist at a timestamp, outputs NaN.
-inline GroupedSeries percentile_of_series(double p,
-                                           std::vector<GroupedSeries> groups) {
+inline GroupedSeries percentile_of_series(double p, std::vector<GroupedSeries> groups) {
     if (p < 0.0 || p > 100.0) {
-        throw EvaluationException(
-            "percentile_of_series() p must be in [0, 100], got " +
-            std::to_string(p));
+        throw EvaluationException("percentile_of_series() p must be in [0, 100], got " + std::to_string(p));
     }
     if (groups.empty()) {
         return GroupedSeries{};
@@ -342,7 +334,7 @@ inline GroupedSeries percentile_of_series(double p,
     std::vector<size_t> cursors(groups.size(), 0);
 
     std::vector<uint64_t> resultTs;
-    std::vector<double>   resultVals;
+    std::vector<double> resultVals;
     resultTs.reserve(allTs.size());
     resultVals.reserve(allTs.size());
 
@@ -354,9 +346,7 @@ inline GroupedSeries percentile_of_series(double p,
 
     for (uint64_t t : allTs) {
         tmp.clear();
-        detail::forEachValueAt(groups, cursors, t, [&](double v) {
-            tmp.push_back(v);
-        });
+        detail::forEachValueAt(groups, cursors, t, [&](double v) { tmp.push_back(v); });
         resultTs.push_back(t);
         if (tmp.empty()) {
             resultVals.push_back(nan);
@@ -371,4 +361,4 @@ inline GroupedSeries percentile_of_series(double p,
     return result;
 }
 
-} // namespace timestar
+}  // namespace timestar

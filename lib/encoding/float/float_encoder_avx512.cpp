@@ -1,6 +1,8 @@
 #include "float_encoder_avx512.hpp"
-#include <bit>
+
 #include <cpuid.h>
+
+#include <bit>
 #include <cstring>
 
 bool FloatEncoderAVX512::hasAVX512F() {
@@ -8,7 +10,7 @@ bool FloatEncoderAVX512::hasAVX512F() {
         unsigned int eax, ebx, ecx, edx;
         if (__get_cpuid_max(0, nullptr) >= 7) {
             __cpuid_count(7, 0, eax, ebx, ecx, edx);
-            return (ebx & (1 << 16)) != 0; // AVX512F bit
+            return (ebx & (1 << 16)) != 0;  // AVX512F bit
         }
         return false;
     }();
@@ -20,7 +22,7 @@ bool FloatEncoderAVX512::hasAVX512DQ() {
         unsigned int eax, ebx, ecx, edx;
         if (__get_cpuid_max(0, nullptr) >= 7) {
             __cpuid_count(7, 0, eax, ebx, ecx, edx);
-            return (ebx & (1 << 17)) != 0; // AVX512DQ bit
+            return (ebx & (1 << 17)) != 0;  // AVX512DQ bit
         }
         return false;
     }();
@@ -62,7 +64,7 @@ CompressedBuffer FloatEncoderAVX512::encode(std::span<const double> values) {
     size_t i = 1;
 
     // Process in blocks of 8 for AVX-512
-    if (values.size() >= 9) { // Need at least 8 values after the first
+    if (values.size() >= 9) {  // Need at least 8 values after the first
         alignas(64) uint64_t current_values[8];
         alignas(64) uint64_t prev_values[8];
         alignas(64) uint64_t xor_results[8];
@@ -130,22 +132,21 @@ CompressedBuffer FloatEncoderAVX512::encode(std::span<const double> values) {
                         }
                     } else {
                         // New bounds needed
-                        if (lzb > 31) lzb = 31;
+                        if (lzb > 31)
+                            lzb = 31;
                         data_bits = 64 - lzb - tzb;
 
                         // Try to combine control block and data if they fit
                         if (data_bits + 13 <= 64) {
                             // Combine control block (13 bits) and data into single write
-                            uint64_t control_block = (0b11ULL) |
-                                                    (uint64_t(lzb) << 2) |
-                                                    (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                            uint64_t control_block =
+                                (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                             uint64_t combined = control_block | ((xor_val >> tzb) << 13);
                             buffer.write(combined, data_bits + 13);
                         } else {
                             // Write control block and data separately
-                            uint64_t control_block = (0b11ULL) |
-                                                    (uint64_t(lzb) << 2) |
-                                                    (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                            uint64_t control_block =
+                                (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                             buffer.write(control_block, 13);
                             buffer.write(xor_val >> tzb, data_bits);
                         }
@@ -182,20 +183,19 @@ CompressedBuffer FloatEncoderAVX512::encode(std::span<const double> values) {
                     buffer.write(xor_value >> prev_tzb, data_bits);
                 }
             } else {
-                if (lzb > 31) lzb = 31;
+                if (lzb > 31)
+                    lzb = 31;
                 data_bits = 64 - lzb - tzb;
 
                 // Try to combine control and data
                 if (data_bits + 13 <= 64) {
-                    uint64_t control_block = (0b11ULL) |
-                                            (uint64_t(lzb) << 2) |
-                                            (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                    uint64_t control_block =
+                        (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                     uint64_t combined = control_block | ((xor_value >> tzb) << 13);
                     buffer.write(combined, data_bits + 13);
                 } else {
-                    uint64_t control_block = (0b11ULL) |
-                                            (uint64_t(lzb) << 2) |
-                                            (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
+                    uint64_t control_block =
+                        (0b11ULL) | (uint64_t(lzb) << 2) | (uint64_t(data_bits == 64 ? 0 : data_bits) << 7);
                     buffer.write(control_block, 13);
                     buffer.write(xor_value >> tzb, data_bits);
                 }

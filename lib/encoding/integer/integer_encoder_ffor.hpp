@@ -1,11 +1,12 @@
 #ifndef INTEGER_ENCODER_FFOR_H_INCLUDED
 #define INTEGER_ENCODER_FFOR_H_INCLUDED
 
-#include <vector>
-#include <cstdint>
-#include <span>
 #include "../../storage/aligned_buffer.hpp"
 #include "../../storage/slice_buffer.hpp"
+
+#include <cstdint>
+#include <span>
+#include <vector>
 
 /**
  * IntegerEncoderFFOR - FFOR (Frame-of-Reference) based integer encoder
@@ -32,14 +33,12 @@ public:
 
     static AlignedBuffer encode(std::span<const uint64_t> values);
 
-    static size_t encodeInto(std::span<const uint64_t> values, AlignedBuffer &target);
+    static size_t encodeInto(std::span<const uint64_t> values, AlignedBuffer& target);
 
-    static std::pair<size_t, size_t> decode(Slice &encoded, unsigned int timestampSize,
-                                            std::vector<uint64_t> &values,
-                                            uint64_t startTime = 0,
-                                            uint64_t maxTime = UINT64_MAX);
+    static std::pair<size_t, size_t> decode(Slice& encoded, unsigned int timestampSize, std::vector<uint64_t>& values,
+                                            uint64_t startTime = 0, uint64_t maxTime = UINT64_MAX);
 
     static bool isAvailable() { return true; }
 };
 
-#endif // INTEGER_ENCODER_FFOR_H_INCLUDED
+#endif  // INTEGER_ENCODER_FFOR_H_INCLUDED

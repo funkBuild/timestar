@@ -1,19 +1,20 @@
 #ifndef FLOAT_ENCODER_MAIN_H_INCLUDED
 #define FLOAT_ENCODER_MAIN_H_INCLUDED
 
-#include <vector>
-#include <span>
-#include <string>
-#include "float/float_encoder.hpp"  // Contains FloatEncoderBasic
-#include "float/float_encoder_simd.hpp"
-#include "float/float_encoder_avx512.hpp"
-#include "float/float_decoder.hpp"  // Contains FloatDecoderBasic
-#include "float/float_decoder_simd.hpp"
-#include "float/float_decoder_avx512.hpp"
-#include "alp/alp_encoder.hpp"
-#include "alp/alp_decoder.hpp"
 #include "../storage/compressed_buffer.hpp"
 #include "../storage/slice_buffer.hpp"
+#include "alp/alp_decoder.hpp"
+#include "alp/alp_encoder.hpp"
+#include "float/float_decoder.hpp"  // Contains FloatDecoderBasic
+#include "float/float_decoder_avx512.hpp"
+#include "float/float_decoder_simd.hpp"
+#include "float/float_encoder.hpp"  // Contains FloatEncoderBasic
+#include "float/float_encoder_avx512.hpp"
+#include "float/float_encoder_simd.hpp"
+
+#include <span>
+#include <string>
+#include <vector>
 
 class AlignedBuffer;
 
@@ -23,10 +24,7 @@ class AlignedBuffer;
  *   GORILLA - Gorilla XOR-delta encoding (original, with AVX-512/AVX2 acceleration)
  *   ALP     - Adaptive Lossless floating-Point compression (SIGMOD 2024)
  */
-enum class FloatCompression {
-    GORILLA,
-    ALP
-};
+enum class FloatCompression { GORILLA, ALP };
 
 static constexpr FloatCompression FLOAT_COMPRESSION = FloatCompression::ALP;
 
@@ -49,7 +47,7 @@ public:
      * result is written directly into the target, eliminating one full copy.
      * Returns the number of bytes written to the target buffer.
      */
-    static size_t encodeInto(std::span<const double> values, AlignedBuffer &target);
+    static size_t encodeInto(std::span<const double> values, AlignedBuffer& target);
 
     /**
      * Get the name of the encoder implementation being used
@@ -66,10 +64,10 @@ public:
      * Force a specific implementation (for testing)
      */
     enum Implementation {
-        AUTO,     // Automatically select best
-        BASIC,    // Force basic implementation
-        SIMD,     // Force SIMD AVX2
-        AVX512    // Force AVX-512
+        AUTO,   // Automatically select best
+        BASIC,  // Force basic implementation
+        SIMD,   // Force SIMD AVX2
+        AVX512  // Force AVX-512
     };
 
     static void setImplementation(Implementation impl);
@@ -107,10 +105,10 @@ public:
      * Force a specific implementation (for testing)
      */
     enum Implementation {
-        AUTO,     // Automatically select best
-        BASIC,    // Force basic implementation
-        SIMD,     // Force SIMD AVX2
-        AVX512    // Force AVX-512
+        AUTO,   // Automatically select best
+        BASIC,  // Force basic implementation
+        SIMD,   // Force SIMD AVX2
+        AVX512  // Force AVX-512
     };
 
     static void setImplementation(Implementation impl);
@@ -120,4 +118,4 @@ private:
     static thread_local Implementation s_forced_impl;
 };
 
-#endif // FLOAT_ENCODER_MAIN_H_INCLUDED
+#endif  // FLOAT_ENCODER_MAIN_H_INCLUDED

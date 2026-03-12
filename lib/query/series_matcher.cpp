@@ -1,14 +1,13 @@
 #include "series_matcher.hpp"
+
 #include <regex>
 #include <stdexcept>
 #include <unordered_map>
 
 namespace timestar {
 
-bool SeriesMatcher::matches(
-    const std::map<std::string, std::string>& seriesTags,
-    const std::map<std::string, std::string>& queryScopes) {
-
+bool SeriesMatcher::matches(const std::map<std::string, std::string>& seriesTags,
+                            const std::map<std::string, std::string>& queryScopes) {
     // Empty scopes match everything
     if (queryScopes.empty()) {
         return true;
@@ -32,11 +31,9 @@ bool SeriesMatcher::matches(
     return true;
 }
 
-bool SeriesMatcher::matches(
-    const std::map<std::string, std::string>& seriesTags,
-    const std::map<std::string, std::string>& queryScopes,
-    const std::map<std::string, std::regex>& compiledScopes) {
-
+bool SeriesMatcher::matches(const std::map<std::string, std::string>& seriesTags,
+                            const std::map<std::string, std::string>& queryScopes,
+                            const std::map<std::string, std::regex>& compiledScopes) {
     // Empty scopes match everything
     if (queryScopes.empty()) {
         return true;
@@ -65,10 +62,7 @@ bool SeriesMatcher::matches(
     return true;
 }
 
-bool SeriesMatcher::matchesTag(
-    const std::string& tagValue,
-    const std::string& scopeValue) {
-
+bool SeriesMatcher::matchesTag(const std::string& tagValue, const std::string& scopeValue) {
     // Check for ~regex pattern (starts with ~)
     if (!scopeValue.empty() && scopeValue[0] == '~') {
         std::string pattern = scopeValue.substr(1);
@@ -85,8 +79,7 @@ bool SeriesMatcher::matchesTag(
     }
 
     // Check for wildcard pattern (contains * or ?)
-    if (scopeValue.find('*') != std::string::npos ||
-        scopeValue.find('?') != std::string::npos) {
+    if (scopeValue.find('*') != std::string::npos || scopeValue.find('?') != std::string::npos) {
         return matchesWildcard(tagValue, scopeValue);
     }
 
@@ -94,10 +87,7 @@ bool SeriesMatcher::matchesTag(
     return tagValue == scopeValue;
 }
 
-bool SeriesMatcher::matchesWildcard(
-    const std::string& value,
-    const std::string& pattern) {
-
+bool SeriesMatcher::matchesWildcard(const std::string& value, const std::string& pattern) {
     // Cache compiled regex per pattern to avoid ~10-100us recompilation per call.
     // Thread-local is safe under Seastar's one-thread-per-shard model.
     static thread_local std::unordered_map<std::string, std::regex> cache;
@@ -109,28 +99,22 @@ bool SeriesMatcher::matchesWildcard(
             auto [ins, _] = cache.emplace(pattern, std::regex(regexPattern));
             it = ins;
         } catch (const std::regex_error& e) {
-            throw std::invalid_argument(
-                std::string("invalid wildcard pattern '") + pattern +
-                "': " + e.what());
+            throw std::invalid_argument(std::string("invalid wildcard pattern '") + pattern + "': " + e.what());
         }
     }
 
     return std::regex_match(value, it->second);
 }
 
-bool SeriesMatcher::matchesRegex(
-    const std::string& value,
-    const std::string& pattern) {
-
+bool SeriesMatcher::matchesRegex(const std::string& value, const std::string& pattern) {
     // Guard against ReDoS: limit pattern length and reject patterns with
     // nested quantifiers that cause catastrophic backtracking in std::regex
     // (which has no timeout mechanism). Since Seastar is single-threaded
     // per shard, a stuck regex freezes the entire shard.
     static constexpr size_t MAX_REGEX_LEN = 512;
     if (pattern.size() > MAX_REGEX_LEN) {
-        throw std::invalid_argument(
-            "regex pattern exceeds maximum length of " +
-            std::to_string(MAX_REGEX_LEN) + " characters");
+        throw std::invalid_argument("regex pattern exceeds maximum length of " + std::to_string(MAX_REGEX_LEN) +
+                                    " characters");
     }
 
     // Detect patterns that cause exponential backtracking:
@@ -143,7 +127,7 @@ bool SeriesMatcher::matchesRegex(
     for (size_t i = 0; i < pattern.size(); ++i) {
         char c = pattern[i];
         if (c == '\\' && i + 1 < pattern.size()) {
-            ++i; // skip escaped character
+            ++i;  // skip escaped character
             continue;
         }
         if (c == '(') {
@@ -159,7 +143,8 @@ bool SeriesMatcher::matchesRegex(
                 hasAlternationInGroup = true;
             }
         } else if (c == ')') {
-            if (depth > 0) depth--;
+            if (depth > 0)
+                depth--;
             // Check if a quantifier follows the closing paren of a group
             // that itself contains a quantifier or alternation
             if ((hasQuantifierInGroup || hasAlternationInGroup) && i + 1 < pattern.size()) {
@@ -185,9 +170,7 @@ bool SeriesMatcher::matchesRegex(
             auto [ins, _] = cache.emplace(pattern, std::regex(pattern, std::regex::optimize));
             it = ins;
         } catch (const std::regex_error& e) {
-            throw std::invalid_argument(
-                std::string("invalid regex pattern '") + pattern +
-                "': " + e.what());
+            throw std::invalid_argument(std::string("invalid regex pattern '") + pattern + "': " + e.what());
         }
     }
 
@@ -197,7 +180,7 @@ bool SeriesMatcher::matchesRegex(
 std::string SeriesMatcher::wildcardToRegex(const std::string& pattern) {
     std::string regex;
     regex.reserve(pattern.size() * 2);
-    
+
     for (char c : pattern) {
         switch (c) {
             case '*':
@@ -227,7 +210,7 @@ std::string SeriesMatcher::wildcardToRegex(const std::string& pattern) {
                 break;
         }
     }
-    
+
     return "^" + regex + "$";
 }
 
@@ -243,8 +226,7 @@ ScopeMatchType SeriesMatcher::classifyScope(const std::string& scopeValue) {
         return ScopeMatchType::REGEX;
     }
     // Wildcard if contains * or ?
-    if (scopeValue.find('*') != std::string::npos ||
-        scopeValue.find('?') != std::string::npos) {
+    if (scopeValue.find('*') != std::string::npos || scopeValue.find('?') != std::string::npos) {
         return ScopeMatchType::WILDCARD;
     }
     return ScopeMatchType::EXACT;
@@ -257,42 +239,42 @@ bool SeriesMatcher::needsRegexMatch(const std::string& pattern) {
 std::string SeriesMatcher::toRegexPattern(const std::string& pattern) {
     auto type = classifyScope(pattern);
     switch (type) {
-    case ScopeMatchType::WILDCARD:
-        // Convert * / ? wildcards to their regex equivalents.
-        return wildcardToRegex(pattern);
-    case ScopeMatchType::REGEX:
-        if (!pattern.empty() && pattern[0] == '~') {
-            // ~regex — strip the leading ~
-            return pattern.substr(1);
-        }
-        // /regex/ — strip surrounding slashes
-        {
-            size_t endPos = pattern.rfind('/');
-            if (endPos > 0) {
-                return pattern.substr(1, endPos - 1);
+        case ScopeMatchType::WILDCARD:
+            // Convert * / ? wildcards to their regex equivalents.
+            return wildcardToRegex(pattern);
+        case ScopeMatchType::REGEX:
+            if (!pattern.empty() && pattern[0] == '~') {
+                // ~regex — strip the leading ~
+                return pattern.substr(1);
             }
-            // Malformed /regex pattern — treat the whole thing as the pattern
-            return pattern;
-        }
-    case ScopeMatchType::EXACT:
-    default: {
-        // Exact patterns don't need regex; caller should have checked
-        // needsRegexMatch() first.  Return an anchored literal anyway so
-        // a caller that ignores this can still get correct behaviour.
-        // Escape regex metacharacters so "foo.bar" matches literally.
-        static const std::string metacharacters = R"(\.^$|()[]{}*+?)";
-        std::string escaped;
-        escaped.reserve(pattern.size() + 4);
-        escaped += '^';
-        for (char c : pattern) {
-            if (metacharacters.find(c) != std::string::npos) {
-                escaped += '\\';
+            // /regex/ — strip surrounding slashes
+            {
+                size_t endPos = pattern.rfind('/');
+                if (endPos > 0) {
+                    return pattern.substr(1, endPos - 1);
+                }
+                // Malformed /regex pattern — treat the whole thing as the pattern
+                return pattern;
             }
-            escaped += c;
+        case ScopeMatchType::EXACT:
+        default: {
+            // Exact patterns don't need regex; caller should have checked
+            // needsRegexMatch() first.  Return an anchored literal anyway so
+            // a caller that ignores this can still get correct behaviour.
+            // Escape regex metacharacters so "foo.bar" matches literally.
+            static const std::string metacharacters = R"(\.^$|()[]{}*+?)";
+            std::string escaped;
+            escaped.reserve(pattern.size() + 4);
+            escaped += '^';
+            for (char c : pattern) {
+                if (metacharacters.find(c) != std::string::npos) {
+                    escaped += '\\';
+                }
+                escaped += c;
+            }
+            escaped += '$';
+            return escaped;
         }
-        escaped += '$';
-        return escaped;
-    }
     }
 }
 
@@ -305,37 +287,38 @@ std::string SeriesMatcher::extractLiteralPrefix(const std::string& scopeValue) {
     auto type = classifyScope(scopeValue);
 
     switch (type) {
-    case ScopeMatchType::EXACT:
-        return scopeValue;
-    case ScopeMatchType::WILDCARD:
-        // Return everything before the first * or ?
-        for (char c : scopeValue) {
-            if (c == '*' || c == '?') break;
-            raw += c;
-        }
-        return raw;
-    case ScopeMatchType::REGEX: {
-        // Strip the ~ or / prefix
-        if (scopeValue[0] == '~') {
-            raw = scopeValue.substr(1);
-        } else {
-            // /pattern/ — strip leading / and trailing /
-            size_t endPos = scopeValue.rfind('/');
-            raw = scopeValue.substr(1, endPos - 1);
-        }
-        // Scan for first regex metacharacter
-        std::string prefix;
-        for (char c : raw) {
-            if (c == '[' || c == '(' || c == '.' || c == '*' || c == '+' ||
-                c == '?' || c == '{' || c == '|' || c == '\\' || c == '^' || c == '$') {
-                break;
+        case ScopeMatchType::EXACT:
+            return scopeValue;
+        case ScopeMatchType::WILDCARD:
+            // Return everything before the first * or ?
+            for (char c : scopeValue) {
+                if (c == '*' || c == '?')
+                    break;
+                raw += c;
             }
-            prefix += c;
+            return raw;
+        case ScopeMatchType::REGEX: {
+            // Strip the ~ or / prefix
+            if (scopeValue[0] == '~') {
+                raw = scopeValue.substr(1);
+            } else {
+                // /pattern/ — strip leading / and trailing /
+                size_t endPos = scopeValue.rfind('/');
+                raw = scopeValue.substr(1, endPos - 1);
+            }
+            // Scan for first regex metacharacter
+            std::string prefix;
+            for (char c : raw) {
+                if (c == '[' || c == '(' || c == '.' || c == '*' || c == '+' || c == '?' || c == '{' || c == '|' ||
+                    c == '\\' || c == '^' || c == '$') {
+                    break;
+                }
+                prefix += c;
+            }
+            return prefix;
         }
-        return prefix;
-    }
     }
     return "";
 }
 
-} // namespace timestar
+}  // namespace timestar

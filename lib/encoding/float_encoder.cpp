@@ -1,4 +1,5 @@
 #include "float_encoder.hpp"
+
 #include "../storage/aligned_buffer.hpp"
 
 // Static member initialization
@@ -36,7 +37,7 @@ CompressedBuffer FloatEncoder::encode(std::span<const double> values) {
     }
 }
 
-size_t FloatEncoder::encodeInto(std::span<const double> values, AlignedBuffer &target) {
+size_t FloatEncoder::encodeInto(std::span<const double> values, AlignedBuffer& target) {
     if (values.empty()) [[unlikely]] {
         return 0;
     }

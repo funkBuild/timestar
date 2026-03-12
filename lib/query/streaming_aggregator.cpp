@@ -12,19 +12,21 @@ void StreamingAggregator::addPoint(const StreamingDataPoint& pt) {
 
     auto& state = _buckets[bucket][key];
 
-    std::visit([&](const auto& val) {
-        using VT = std::decay_t<decltype(val)>;
-        if constexpr (std::is_same_v<VT, double>) {
-            state.addDouble(val, pt.timestamp);
-        } else if constexpr (std::is_same_v<VT, int64_t>) {
-            state.addInt64(val, pt.timestamp);
-        } else if constexpr (std::is_same_v<VT, bool>) {
-            state.addDouble(val ? 1.0 : 0.0, pt.timestamp);
-        } else if constexpr (std::is_same_v<VT, std::string>) {
-            // String values can't be aggregated numerically; count only
-            state.count++;
-        }
-    }, pt.value);
+    std::visit(
+        [&](const auto& val) {
+            using VT = std::decay_t<decltype(val)>;
+            if constexpr (std::is_same_v<VT, double>) {
+                state.addDouble(val, pt.timestamp);
+            } else if constexpr (std::is_same_v<VT, int64_t>) {
+                state.addInt64(val, pt.timestamp);
+            } else if constexpr (std::is_same_v<VT, bool>) {
+                state.addDouble(val ? 1.0 : 0.0, pt.timestamp);
+            } else if constexpr (std::is_same_v<VT, std::string>) {
+                // String values can't be aggregated numerically; count only
+                state.count++;
+            }
+        },
+        pt.value);
 }
 
 StreamingBatch StreamingAggregator::closeBuckets(uint64_t nowNs) {
@@ -43,8 +45,10 @@ StreamingBatch StreamingAggregator::closeBuckets(uint64_t nowNs) {
         }
 
         for (auto& [key, state] : it->second) {
-            if (state.count == 0) continue;
-            if (state.isStringOnly) continue;
+            if (state.count == 0)
+                continue;
+            if (state.isStringOnly)
+                continue;
 
             StreamingDataPoint pt;
             pt.measurement = key.measurement;
@@ -62,4 +66,4 @@ StreamingBatch StreamingAggregator::closeBuckets(uint64_t nowNs) {
     return batch;
 }
 
-} // namespace timestar
+}  // namespace timestar

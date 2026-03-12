@@ -1,12 +1,12 @@
 #ifndef TRANSFORM_FUNCTIONS_H_INCLUDED
 #define TRANSFORM_FUNCTIONS_H_INCLUDED
 
-#include <vector>
-#include <cstdint>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
 
 // Include SIMD-optimized implementations
 #include "transform_functions_simd.hpp"
@@ -30,9 +30,7 @@ namespace transform {
  * Returns: diff[i] = value[i] - value[i-1], diff[0] = NaN
  * Uses SIMD optimization when available for large arrays
  */
-inline std::vector<double> diff(
-    const std::vector<double>& values
-) {
+inline std::vector<double> diff(const std::vector<double>& values) {
     return simd::diff(values);
 }
 
@@ -41,9 +39,7 @@ inline std::vector<double> diff(
  * Returns: dt[i] = (time[i] - time[i-1]) / 1e9, dt[0] = NaN
  * Note: Returns NaN for non-monotonic timestamps (where time[i] <= time[i-1])
  */
-inline std::vector<double> dt(
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> dt(const std::vector<uint64_t>& timestamps) {
     if (timestamps.size() < 2) {
         return std::vector<double>(timestamps.size(), std::nan(""));
     }
@@ -53,11 +49,11 @@ inline std::vector<double> dt(
 
     for (size_t i = 1; i < timestamps.size(); ++i) {
         // Check for non-monotonic timestamps to prevent unsigned underflow
-        if (timestamps[i] <= timestamps[i-1]) {
+        if (timestamps[i] <= timestamps[i - 1]) {
             result[i] = std::nan("");
         } else {
             // Convert nanoseconds to seconds
-            result[i] = static_cast<double>(timestamps[i] - timestamps[i-1]) / 1e9;
+            result[i] = static_cast<double>(timestamps[i] - timestamps[i - 1]) / 1e9;
         }
     }
 
@@ -69,10 +65,7 @@ inline std::vector<double> dt(
  * Returns: derivative[i] = diff[i] / dt[i]
  * Note: Returns NaN for non-monotonic timestamps
  */
-inline std::vector<double> derivative(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> derivative(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
     if (values.size() < 2 || values.size() != timestamps.size()) {
         return std::vector<double>(values.size(), std::nan(""));
     }
@@ -81,14 +74,14 @@ inline std::vector<double> derivative(
     result[0] = std::nan("");
 
     for (size_t i = 1; i < values.size(); ++i) {
-        if (std::isnan(values[i]) || std::isnan(values[i-1])) {
+        if (std::isnan(values[i]) || std::isnan(values[i - 1])) {
             result[i] = std::nan("");
-        } else if (timestamps[i] <= timestamps[i-1]) {
+        } else if (timestamps[i] <= timestamps[i - 1]) {
             // Non-monotonic timestamps - prevent unsigned underflow
             result[i] = std::nan("");
         } else {
-            double dv = values[i] - values[i-1];
-            double dtSec = static_cast<double>(timestamps[i] - timestamps[i-1]) / 1e9;
+            double dv = values[i] - values[i - 1];
+            double dtSec = static_cast<double>(timestamps[i] - timestamps[i - 1]) / 1e9;
             result[i] = dv / dtSec;
         }
     }
@@ -102,10 +95,7 @@ inline std::vector<double> derivative(
  * Note: Returns NaN for non-monotonic timestamps
  * Note: Counter resets (negative diffs) are treated as rate = 0
  */
-inline std::vector<double> rate(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> rate(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
     if (values.size() < 2 || values.size() != timestamps.size()) {
         return std::vector<double>(values.size(), std::nan(""));
     }
@@ -114,14 +104,14 @@ inline std::vector<double> rate(
     result[0] = std::nan("");
 
     for (size_t i = 1; i < values.size(); ++i) {
-        if (std::isnan(values[i]) || std::isnan(values[i-1])) {
+        if (std::isnan(values[i]) || std::isnan(values[i - 1])) {
             result[i] = std::nan("");
-        } else if (timestamps[i] <= timestamps[i-1]) {
+        } else if (timestamps[i] <= timestamps[i - 1]) {
             // Non-monotonic timestamps - prevent unsigned underflow
             result[i] = std::nan("");
         } else {
-            double dv = values[i] - values[i-1];
-            double dtSec = static_cast<double>(timestamps[i] - timestamps[i-1]) / 1e9;
+            double dv = values[i] - values[i - 1];
+            double dtSec = static_cast<double>(timestamps[i] - timestamps[i - 1]) / 1e9;
 
             if (dv < 0) {
                 // Counter reset - treat as 0 rate
@@ -138,10 +128,7 @@ inline std::vector<double> rate(
 /**
  * per_second() - Alias for rate()
  */
-inline std::vector<double> per_second(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> per_second(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
     return rate(values, timestamps);
 }
 
@@ -149,10 +136,7 @@ inline std::vector<double> per_second(
  * per_minute() - Rate multiplied by 60
  * Uses SIMD optimization for the multiplication when available
  */
-inline std::vector<double> per_minute(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> per_minute(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
     auto r = rate(values, timestamps);
     simd::multiply_inplace(r, 60.0);
     return r;
@@ -162,10 +146,7 @@ inline std::vector<double> per_minute(
  * per_hour() - Rate multiplied by 3600
  * Uses SIMD optimization for the multiplication when available
  */
-inline std::vector<double> per_hour(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> per_hour(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
     auto r = rate(values, timestamps);
     simd::multiply_inplace(r, 3600.0);
     return r;
@@ -175,9 +156,7 @@ inline std::vector<double> per_hour(
  * monotonic_diff() - Difference that handles counter resets (resets to 0)
  * Uses SIMD optimization when available for large arrays
  */
-inline std::vector<double> monotonic_diff(
-    const std::vector<double>& values
-) {
+inline std::vector<double> monotonic_diff(const std::vector<double>& values) {
     return simd::monotonic_diff(values);
 }
 
@@ -239,10 +218,7 @@ inline std::vector<double> cumsum(const std::vector<double>& values) {
  * Time is in seconds
  * Note: Non-monotonic timestamps are skipped (area not accumulated for those intervals)
  */
-inline std::vector<double> integral(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> integral(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
     if (values.size() != timestamps.size()) {
         return std::vector<double>(values.size(), std::nan(""));
     }
@@ -252,15 +228,15 @@ inline std::vector<double> integral(
     result[0] = 0.0;
 
     for (size_t i = 1; i < values.size(); ++i) {
-        if (std::isnan(values[i]) || std::isnan(values[i-1])) {
+        if (std::isnan(values[i]) || std::isnan(values[i - 1])) {
             result[i] = area;  // Keep previous area
-        } else if (timestamps[i] <= timestamps[i-1]) {
+        } else if (timestamps[i] <= timestamps[i - 1]) {
             // Non-monotonic timestamps - skip this interval
             result[i] = area;
         } else {
-            double dtSec = static_cast<double>(timestamps[i] - timestamps[i-1]) / 1e9;
+            double dtSec = static_cast<double>(timestamps[i] - timestamps[i - 1]) / 1e9;
             // Trapezoidal rule: area += (v1 + v2) / 2 * dt
-            area += (values[i-1] + values[i]) / 2.0 * dtSec;
+            area += (values[i - 1] + values[i]) / 2.0 * dtSec;
             result[i] = area;
         }
     }
@@ -280,10 +256,7 @@ inline std::vector<double> integral(
  *
  * EWMA formula: ewma[i] = alpha * value[i] + (1-alpha) * ewma[i-1]
  */
-inline std::vector<double> ewma(
-    const std::vector<double>& values,
-    int span
-) {
+inline std::vector<double> ewma(const std::vector<double>& values, int span) {
     if (values.empty() || span < 1) {
         return values;
     }
@@ -306,9 +279,9 @@ inline std::vector<double> ewma(
 
     for (size_t i = startIdx + 1; i < values.size(); ++i) {
         if (std::isnan(values[i])) {
-            result[i] = result[i-1];  // Carry forward
+            result[i] = result[i - 1];  // Carry forward
         } else {
-            result[i] = alpha * values[i] + (1 - alpha) * result[i-1];
+            result[i] = alpha * values[i] + (1 - alpha) * result[i - 1];
         }
     }
 
@@ -321,10 +294,7 @@ inline std::vector<double> ewma(
  * @param values Input values
  * @param window Window size (should be odd for symmetry)
  */
-inline std::vector<double> median(
-    const std::vector<double>& values,
-    int window
-) {
+inline std::vector<double> median(const std::vector<double>& values, int window) {
     if (values.empty() || window < 1) {
         return values;
     }
@@ -405,10 +375,7 @@ inline std::vector<double> autosmooth(const std::vector<double>& values) {
  * clamp_min() - Clamp values to minimum (values below become min)
  * Uses SIMD optimization when available for large arrays
  */
-inline std::vector<double> clamp_min(
-    const std::vector<double>& values,
-    double minVal
-) {
+inline std::vector<double> clamp_min(const std::vector<double>& values, double minVal) {
     return simd::clamp_min(values, minVal);
 }
 
@@ -416,10 +383,7 @@ inline std::vector<double> clamp_min(
  * clamp_max() - Clamp values to maximum (values above become max)
  * Uses SIMD optimization when available for large arrays
  */
-inline std::vector<double> clamp_max(
-    const std::vector<double>& values,
-    double maxVal
-) {
+inline std::vector<double> clamp_max(const std::vector<double>& values, double maxVal) {
     return simd::clamp_max(values, maxVal);
 }
 
@@ -427,10 +391,7 @@ inline std::vector<double> clamp_max(
  * cutoff_min() - Remove values below threshold (set to NaN)
  * Uses SIMD optimization when available for large arrays
  */
-inline std::vector<double> cutoff_min(
-    const std::vector<double>& values,
-    double threshold
-) {
+inline std::vector<double> cutoff_min(const std::vector<double>& values, double threshold) {
     return simd::cutoff_min(values, threshold);
 }
 
@@ -438,10 +399,7 @@ inline std::vector<double> cutoff_min(
  * cutoff_max() - Remove values above threshold (set to NaN)
  * Uses SIMD optimization when available for large arrays
  */
-inline std::vector<double> cutoff_max(
-    const std::vector<double>& values,
-    double threshold
-) {
+inline std::vector<double> cutoff_max(const std::vector<double>& values, double threshold) {
     return simd::cutoff_max(values, threshold);
 }
 
@@ -461,10 +419,7 @@ inline std::vector<double> default_zero(const std::vector<double>& values) {
  * fill() - Fill missing values using specified method
  * Methods: "zero", "null", "linear", "last"
  */
-inline std::vector<double> fill(
-    const std::vector<double>& values,
-    const std::string& method
-) {
+inline std::vector<double> fill(const std::vector<double>& values, const std::string& method) {
     if (method == "zero") {
         return default_zero(values);
     }
@@ -500,12 +455,13 @@ inline std::vector<double> fill(
 
                 // Find previous valid
                 if (i > 0) {
-                    for (size_t j = i - 1; ; --j) {
+                    for (size_t j = i - 1;; --j) {
                         if (!std::isnan(result[j])) {
                             prevIdx = j;
                             break;
                         }
-                        if (j == 0) break;
+                        if (j == 0)
+                            break;
                     }
                 }
 
@@ -574,12 +530,8 @@ inline std::vector<double> count_not_null(const std::vector<double>& values) {
  * amortized complexity instead of O(n^2). Since timestamps are sorted, the
  * window start can only move forward as i advances.
  */
-inline std::vector<double> moving_rollup(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps,
-    double windowSeconds,
-    const std::string& method
-) {
+inline std::vector<double> moving_rollup(const std::vector<double>& values, const std::vector<uint64_t>& timestamps,
+                                         double windowSeconds, const std::string& method) {
     if (values.empty() || values.size() != timestamps.size()) {
         return values;
     }
@@ -588,8 +540,7 @@ inline std::vector<double> moving_rollup(
     std::vector<double> result(values.size());
 
     // Validate method upfront to avoid checking per-iteration
-    if (method != "avg" && method != "sum" && method != "min" &&
-        method != "max" && method != "count") {
+    if (method != "avg" && method != "sum" && method != "min" && method != "max" && method != "count") {
         throw std::invalid_argument("Unknown rollup method: " + method);
     }
 
@@ -648,10 +599,7 @@ inline std::vector<double> moving_rollup(
  * @param offsetSeconds Offset in seconds (negative = look back)
  * @return Shifted timestamps
  */
-inline std::vector<uint64_t> timeshift(
-    const std::vector<uint64_t>& timestamps,
-    double offsetSeconds
-) {
+inline std::vector<uint64_t> timeshift(const std::vector<uint64_t>& timestamps, double offsetSeconds) {
     int64_t offsetNs = static_cast<int64_t>(offsetSeconds * 1e9);
     std::vector<uint64_t> result(timestamps.size());
 
@@ -671,19 +619,16 @@ inline std::vector<uint64_t> timeshift(
  * Series data structure for ranking functions
  */
 struct RankedSeries {
-    size_t index;           // Original series index
+    size_t index;  // Original series index
     std::vector<double> values;
     std::vector<std::string> tags;  // Series identifying tags
-    double rankValue;       // Value used for ranking
+    double rankValue;               // Value used for ranking
 };
 
 /**
  * Calculate ranking value for a series using specified method
  */
-inline double calculateRankValue(
-    const std::vector<double>& values,
-    const std::string& method
-) {
+inline double calculateRankValue(const std::vector<double>& values, const std::string& method) {
     // Filter out NaN values
     std::vector<double> validValues;
     validValues.reserve(values.size());
@@ -750,12 +695,8 @@ inline double calculateRankValue(
  * @param order "desc" (default) for highest first, "asc" for lowest first
  * @return Indices of selected series (in ranking order)
  */
-inline std::vector<size_t> top(
-    const std::vector<std::vector<double>>& seriesValues,
-    size_t n,
-    const std::string& method = "mean",
-    const std::string& order = "desc"
-) {
+inline std::vector<size_t> top(const std::vector<std::vector<double>>& seriesValues, size_t n,
+                               const std::string& method = "mean", const std::string& order = "desc") {
     if (seriesValues.empty() || n == 0) {
         return {};
     }
@@ -773,12 +714,10 @@ inline std::vector<size_t> top(
 
     // Sort by rank value
     if (order == "asc") {
-        std::sort(ranked.begin(), ranked.end(),
-            [](const auto& a, const auto& b) { return a.second < b.second; });
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
     } else {
         // Default: descending (top = highest)
-        std::sort(ranked.begin(), ranked.end(),
-            [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     }
 
     // Return top N indices
@@ -803,13 +742,9 @@ inline std::vector<size_t> top(
  * @param offset Number of series to skip
  * @return Indices of selected series
  */
-inline std::vector<size_t> top_offset(
-    const std::vector<std::vector<double>>& seriesValues,
-    size_t n,
-    const std::string& method = "mean",
-    const std::string& order = "desc",
-    size_t offset = 0
-) {
+inline std::vector<size_t> top_offset(const std::vector<std::vector<double>>& seriesValues, size_t n,
+                                      const std::string& method = "mean", const std::string& order = "desc",
+                                      size_t offset = 0) {
     if (seriesValues.empty() || n == 0) {
         return {};
     }
@@ -827,11 +762,9 @@ inline std::vector<size_t> top_offset(
 
     // Sort by rank value
     if (order == "asc") {
-        std::sort(ranked.begin(), ranked.end(),
-            [](const auto& a, const auto& b) { return a.second < b.second; });
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
     } else {
-        std::sort(ranked.begin(), ranked.end(),
-            [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     }
 
     // Return N indices after offset
@@ -854,11 +787,9 @@ inline std::vector<size_t> top_offset(
 /**
  * bottom() - Select bottom N series (same as top with asc order)
  */
-inline std::vector<size_t> bottom(
-    const std::vector<std::vector<double>>& seriesValues,
-    size_t n,
-    const std::string& method = "mean",
-    const std::string& order = "asc"  // Default: ascending for bottom
+inline std::vector<size_t> bottom(const std::vector<std::vector<double>>& seriesValues, size_t n,
+                                  const std::string& method = "mean",
+                                  const std::string& order = "asc"  // Default: ascending for bottom
 ) {
     return top(seriesValues, n, method, order);
 }
@@ -873,7 +804,7 @@ inline std::vector<size_t> bottom(
 struct RegressionResult {
     double slope;
     double intercept;
-    double rSquared;       // Coefficient of determination
+    double rSquared;  // Coefficient of determination
     double residualStdDev;
     std::vector<double> fittedValues;
 };
@@ -884,10 +815,7 @@ struct RegressionResult {
  * Fits y = slope * x + intercept where x is time index
  * Returns fitted values (the trend line)
  */
-inline std::vector<double> trend_line(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline std::vector<double> trend_line(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
     if (values.size() < 2 || values.size() != timestamps.size()) {
         return values;
     }
@@ -937,10 +865,8 @@ inline std::vector<double> trend_line(
 /**
  * trend_line_extended() - Returns regression coefficients and stats
  */
-inline RegressionResult trend_line_extended(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps
-) {
+inline RegressionResult trend_line_extended(const std::vector<double>& values,
+                                            const std::vector<uint64_t>& timestamps) {
     RegressionResult result;
     result.slope = 0.0;
     result.intercept = 0.0;
@@ -993,8 +919,7 @@ inline RegressionResult trend_line_extended(
     }
 
     result.rSquared = (ssTotal != 0) ? 1.0 - ssResidual / ssTotal : 1.0;
-    result.residualStdDev = (x.size() > 2)
-        ? std::sqrt(ssResidual / (x.size() - 2)) : 0.0;
+    result.residualStdDev = (x.size() > 2) ? std::sqrt(ssResidual / (x.size() - 2)) : 0.0;
 
     // Generate fitted values
     result.fittedValues.resize(values.size());
@@ -1013,9 +938,7 @@ inline RegressionResult trend_line_extended(
  * Performs weighted least squares with weights based on residuals.
  */
 inline std::vector<double> robust_trend(
-    const std::vector<double>& values,
-    const std::vector<uint64_t>& timestamps,
-    int maxIterations = 10,
+    const std::vector<double>& values, const std::vector<uint64_t>& timestamps, int maxIterations = 10,
     double huberDelta = 1.345  // Huber's delta (1.345 gives 95% efficiency for normal data)
 ) {
     if (values.size() < 2 || values.size() != timestamps.size()) {
@@ -1065,12 +988,11 @@ inline std::vector<double> robust_trend(
         for (size_t i = 0; i < residuals.size(); ++i) {
             absResiduals[i] = std::abs(residuals[i]);
         }
-        std::nth_element(absResiduals.begin(),
-                        absResiduals.begin() + absResiduals.size()/2,
-                        absResiduals.end());
-        double mad = absResiduals[absResiduals.size()/2] * 1.4826;  // Scale factor for normal
+        std::nth_element(absResiduals.begin(), absResiduals.begin() + absResiduals.size() / 2, absResiduals.end());
+        double mad = absResiduals[absResiduals.size() / 2] * 1.4826;  // Scale factor for normal
 
-        if (mad < 1e-10) mad = 1e-10;  // Prevent division by zero
+        if (mad < 1e-10)
+            mad = 1e-10;  // Prevent division by zero
 
         // Update weights using Huber function
         for (size_t i = 0; i < x.size(); ++i) {
@@ -1090,7 +1012,8 @@ inline std::vector<double> robust_trend(
         }
 
         double denom = sumW * sumWxx - sumWx * sumWx;
-        if (std::abs(denom) < 1e-10) break;
+        if (std::abs(denom) < 1e-10)
+            break;
 
         slope = (sumW * sumWxy - sumWx * sumWy) / denom;
         intercept = (sumWy - slope * sumWx) / sumW;
@@ -1112,10 +1035,8 @@ inline std::vector<double> robust_trend(
  * Uses a simple change-point detection algorithm based on cumulative sum (CUSUM).
  * Returns fitted values as step function.
  */
-inline std::vector<double> piecewise_constant(
-    const std::vector<double>& values,
-    size_t minSegmentSize = 5,
-    double threshold = 2.0  // Threshold in standard deviations
+inline std::vector<double> piecewise_constant(const std::vector<double>& values, size_t minSegmentSize = 5,
+                                              double threshold = 2.0  // Threshold in standard deviations
 ) {
     if (values.empty()) {
         return values;
@@ -1134,20 +1055,19 @@ inline std::vector<double> piecewise_constant(
 
     if (validValues.size() < minSegmentSize * 2) {
         // Not enough data for segmentation - return mean
-        double mean = std::accumulate(validValues.begin(), validValues.end(), 0.0)
-                     / validValues.size();
+        double mean = std::accumulate(validValues.begin(), validValues.end(), 0.0) / validValues.size();
         return std::vector<double>(values.size(), mean);
     }
 
     // Calculate overall statistics
-    double globalMean = std::accumulate(validValues.begin(), validValues.end(), 0.0)
-                       / validValues.size();
+    double globalMean = std::accumulate(validValues.begin(), validValues.end(), 0.0) / validValues.size();
     double sumSq = 0;
     for (double v : validValues) {
         sumSq += (v - globalMean) * (v - globalMean);
     }
     double globalStd = std::sqrt(sumSq / validValues.size());
-    if (globalStd < 1e-10) globalStd = 1e-10;
+    if (globalStd < 1e-10)
+        globalStd = 1e-10;
 
     // Find change points using CUSUM
     std::vector<size_t> changePoints;
@@ -1157,7 +1077,7 @@ inline std::vector<double> piecewise_constant(
     cusum[0] = 0;
 
     for (size_t i = 1; i < validValues.size(); ++i) {
-        cusum[i] = cusum[i-1] + (validValues[i] - globalMean);
+        cusum[i] = cusum[i - 1] + (validValues[i] - globalMean);
     }
 
     // Find significant changes
@@ -1168,7 +1088,8 @@ inline std::vector<double> piecewise_constant(
         size_t rightCount = validValues.size() - i;
 
         // Safety check to avoid division by zero
-        if (leftCount == 0 || rightCount == 0) continue;
+        if (leftCount == 0 || rightCount == 0)
+            continue;
 
         double leftMean = 0, rightMean = 0;
         for (size_t j = segmentStart; j < i; ++j) {
@@ -1194,10 +1115,10 @@ inline std::vector<double> piecewise_constant(
     std::vector<double> segmentMeans;
     for (size_t s = 0; s < changePoints.size() - 1; ++s) {
         double sum = 0;
-        for (size_t i = changePoints[s]; i < changePoints[s+1]; ++i) {
+        for (size_t i = changePoints[s]; i < changePoints[s + 1]; ++i) {
             sum += validValues[i];
         }
-        segmentMeans.push_back(sum / (changePoints[s+1] - changePoints[s]));
+        segmentMeans.push_back(sum / (changePoints[s + 1] - changePoints[s]));
     }
 
     // Generate result
@@ -1207,8 +1128,7 @@ inline std::vector<double> piecewise_constant(
 
     for (size_t i = 0; i < values.size(); ++i) {
         if (validIdx < validIndices.size() && validIndices[validIdx] == i) {
-            while (currentSegment < changePoints.size() - 1 &&
-                   validIdx >= changePoints[currentSegment + 1]) {
+            while (currentSegment < changePoints.size() - 1 && validIdx >= changePoints[currentSegment + 1]) {
                 currentSegment++;
             }
             result[i] = segmentMeans[std::min(currentSegment, segmentMeans.size() - 1)];
@@ -1239,8 +1159,8 @@ enum class OutlierAlgorithm {
  */
 struct OutlierResult {
     size_t seriesIndex;
-    double outlierScore;      // How much of an outlier (0-1)
-    double outlierPercentage; // Percentage of points that are outliers
+    double outlierScore;       // How much of an outlier (0-1)
+    double outlierPercentage;  // Percentage of points that are outliers
     bool isOutlier;
 };
 
@@ -1248,7 +1168,8 @@ struct OutlierResult {
  * Helper: Calculate median of a sorted vector (handles both odd and even sizes)
  */
 inline double calculateMedian(const std::vector<double>& sorted) {
-    if (sorted.empty()) return 0.0;
+    if (sorted.empty())
+        return 0.0;
     size_t n = sorted.size();
     if (n % 2 == 1) {
         return sorted[n / 2];
@@ -1264,7 +1185,8 @@ inline double calculateMedian(const std::vector<double>& sorted) {
  * For non-normal data, the MAD may be less accurate.
  */
 inline double calculateMAD(const std::vector<double>& values) {
-    if (values.empty()) return 0.0;
+    if (values.empty())
+        return 0.0;
 
     // Filter out NaN values
     std::vector<double> validValues;
@@ -1275,7 +1197,8 @@ inline double calculateMAD(const std::vector<double>& values) {
         }
     }
 
-    if (validValues.empty()) return 0.0;
+    if (validValues.empty())
+        return 0.0;
 
     std::vector<double> sorted = validValues;
     std::sort(sorted.begin(), sorted.end());
@@ -1299,19 +1222,14 @@ inline double calculateMAD(const std::vector<double>& values) {
  * Uses sorted order with binary search for O(n log n) neighbor finding
  * instead of brute-force O(n^2) per point.
  */
-inline std::vector<int> dbscan1D(
-    const std::vector<double>& values,
-    double epsilon,
-    size_t minPoints
-) {
+inline std::vector<int> dbscan1D(const std::vector<double>& values, double epsilon, size_t minPoints) {
     std::vector<int> clusters(values.size(), -1);
     int currentCluster = 0;
 
     // Create sorted index for efficient neighbor finding via binary search
     std::vector<size_t> sortedIdx(values.size());
     std::iota(sortedIdx.begin(), sortedIdx.end(), 0);
-    std::sort(sortedIdx.begin(), sortedIdx.end(),
-        [&values](size_t a, size_t b) { return values[a] < values[b]; });
+    std::sort(sortedIdx.begin(), sortedIdx.end(), [&values](size_t a, size_t b) { return values[a] < values[b]; });
 
     // Build sorted values array and reverse map (original index -> sorted position)
     std::vector<double> sortedValues(values.size());
@@ -1346,7 +1264,8 @@ inline std::vector<int> dbscan1D(
     std::vector<bool> visited(values.size(), false);
 
     for (size_t i = 0; i < values.size(); ++i) {
-        if (visited[i]) continue;
+        if (visited[i])
+            continue;
         visited[i] = true;
 
         // Find neighbors within epsilon using binary search
@@ -1394,12 +1313,9 @@ inline std::vector<int> dbscan1D(
  * @param minPercentage Minimum percentage of points that must be outliers (0-100)
  * @return Vector of outlier results for each series
  */
-inline std::vector<OutlierResult> outliers(
-    const std::vector<std::vector<double>>& seriesValues,
-    const std::string& algorithm = "mad",
-    double tolerance = 3.0,
-    double minPercentage = 50.0
-) {
+inline std::vector<OutlierResult> outliers(const std::vector<std::vector<double>>& seriesValues,
+                                           const std::string& algorithm = "mad", double tolerance = 3.0,
+                                           double minPercentage = 50.0) {
     std::vector<OutlierResult> results;
 
     if (seriesValues.empty()) {
@@ -1442,7 +1358,7 @@ inline std::vector<OutlierResult> outliers(
             // DBSCAN-based detection
             // Calculate epsilon based on data spread and tolerance
             double dataRange = *std::max_element(valuesAtT.begin(), valuesAtT.end()) -
-                              *std::min_element(valuesAtT.begin(), valuesAtT.end());
+                               *std::min_element(valuesAtT.begin(), valuesAtT.end());
             double epsilon = dataRange / tolerance;
             size_t minPoints = std::max(2UL, valuesAtT.size() / 4);
 
@@ -1501,12 +1417,8 @@ inline std::vector<OutlierResult> outliers(
     for (size_t s = 0; s < numSeries; ++s) {
         OutlierResult result;
         result.seriesIndex = s;
-        result.outlierPercentage = (numPoints > 0)
-            ? (static_cast<double>(outlierCounts[s]) / numPoints * 100.0)
-            : 0.0;
-        result.outlierScore = (outlierCounts[s] > 0)
-            ? outlierScores[s] / outlierCounts[s]
-            : 0.0;
+        result.outlierPercentage = (numPoints > 0) ? (static_cast<double>(outlierCounts[s]) / numPoints * 100.0) : 0.0;
+        result.outlierScore = (outlierCounts[s] > 0) ? outlierScores[s] / outlierCounts[s] : 0.0;
         result.isOutlier = result.outlierPercentage >= minPercentage;
         results.push_back(result);
     }
@@ -1519,12 +1431,9 @@ inline std::vector<OutlierResult> outliers(
  *
  * Convenience function that returns just the indices of series marked as outliers.
  */
-inline std::vector<size_t> outliers_indices(
-    const std::vector<std::vector<double>>& seriesValues,
-    const std::string& algorithm = "mad",
-    double tolerance = 3.0,
-    double minPercentage = 50.0
-) {
+inline std::vector<size_t> outliers_indices(const std::vector<std::vector<double>>& seriesValues,
+                                            const std::string& algorithm = "mad", double tolerance = 3.0,
+                                            double minPercentage = 50.0) {
     auto results = outliers(seriesValues, algorithm, tolerance, minPercentage);
 
     std::vector<size_t> outlierIndices;
@@ -1543,11 +1452,8 @@ inline std::vector<size_t> outliers_indices(
  * For each series, returns a vector where true indicates the point is an outlier
  * compared to other series at that timestamp.
  */
-inline std::vector<std::vector<bool>> outliers_mask(
-    const std::vector<std::vector<double>>& seriesValues,
-    const std::string& algorithm = "mad",
-    double tolerance = 3.0
-) {
+inline std::vector<std::vector<bool>> outliers_mask(const std::vector<std::vector<double>>& seriesValues,
+                                                    const std::string& algorithm = "mad", double tolerance = 3.0) {
     if (seriesValues.empty()) {
         return {};
     }
@@ -1578,11 +1484,12 @@ inline std::vector<std::vector<bool>> outliers_mask(
             }
         }
 
-        if (valuesAtT.size() < 3) continue;
+        if (valuesAtT.size() < 3)
+            continue;
 
         if (algorithm == "dbscan") {
             double dataRange = *std::max_element(valuesAtT.begin(), valuesAtT.end()) -
-                              *std::min_element(valuesAtT.begin(), valuesAtT.end());
+                               *std::min_element(valuesAtT.begin(), valuesAtT.end());
             double epsilon = dataRange / tolerance;
             size_t minPoints = std::max(2UL, valuesAtT.size() / 4);
 
@@ -1632,7 +1539,7 @@ inline std::vector<std::vector<bool>> outliers_mask(
     return masks;
 }
 
-} // namespace transform
-} // namespace timestar
+}  // namespace transform
+}  // namespace timestar
 
-#endif // TRANSFORM_FUNCTIONS_H_INCLUDED
+#endif  // TRANSFORM_FUNCTIONS_H_INCLUDED

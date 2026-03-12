@@ -1,37 +1,41 @@
 #include "stl_decomposition.hpp"
+
 #include <algorithm>
 #include <cmath>
-#include <numeric>
 #include <limits>
+#include <numeric>
 
 namespace timestar {
 namespace anomaly {
 
 double STLDecomposition::tricubeWeight(double u) {
-    if (u < 0.0) u = -u;
-    if (u >= 1.0) return 0.0;
+    if (u < 0.0)
+        u = -u;
+    if (u >= 1.0)
+        return 0.0;
     double t = 1.0 - u * u * u;
     return t * t * t;
 }
 
 double STLDecomposition::median(std::vector<double> v) {
-    if (v.empty()) return 0.0;
+    if (v.empty())
+        return 0.0;
 
     // Remove NaN values
-    v.erase(std::remove_if(v.begin(), v.end(),
-        [](double x) { return std::isnan(x); }), v.end());
+    v.erase(std::remove_if(v.begin(), v.end(), [](double x) { return std::isnan(x); }), v.end());
 
-    if (v.empty()) return 0.0;
+    if (v.empty())
+        return 0.0;
 
     size_t n = v.size();
-    std::nth_element(v.begin(), v.begin() + n/2, v.end());
+    std::nth_element(v.begin(), v.begin() + n / 2, v.end());
 
     if (n % 2 == 0) {
-        double m1 = v[n/2];
-        std::nth_element(v.begin(), v.begin() + n/2 - 1, v.end());
-        return (v[n/2 - 1] + m1) / 2.0;
+        double m1 = v[n / 2];
+        std::nth_element(v.begin(), v.begin() + n / 2 - 1, v.end());
+        return (v[n / 2 - 1] + m1) / 2.0;
     }
-    return v[n/2];
+    return v[n / 2];
 }
 
 double STLDecomposition::iqr(const std::vector<double>& values) {
@@ -44,7 +48,8 @@ double STLDecomposition::iqr(const std::vector<double>& values) {
         }
     }
 
-    if (v.size() < 4) return 1.0;  // Fallback
+    if (v.size() < 4)
+        return 1.0;  // Fallback
 
     // Use nth_element for O(N) quartile extraction instead of O(N log N) sort.
     // Two partial sorts: first find Q3, then find Q1 in the lower partition.
@@ -60,14 +65,12 @@ double STLDecomposition::iqr(const std::vector<double>& values) {
     return q3 - q1;
 }
 
-std::vector<double> STLDecomposition::computeRobustnessWeights(
-    const std::vector<double>& residuals,
-    double threshold
-) {
+std::vector<double> STLDecomposition::computeRobustnessWeights(const std::vector<double>& residuals, double threshold) {
     std::vector<double> weights(residuals.size(), 1.0);
 
     double h = threshold * iqr(residuals);
-    if (h < 1e-10) h = 1.0;
+    if (h < 1e-10)
+        h = 1.0;
 
     // Compute distances for SIMD tricube computation
     std::vector<double> distances(residuals.size());
@@ -92,10 +95,7 @@ std::vector<double> STLDecomposition::computeRobustnessWeights(
     return weights;
 }
 
-std::vector<double> STLDecomposition::movingAverage(
-    const std::vector<double>& values,
-    size_t windowSize
-) {
+std::vector<double> STLDecomposition::movingAverage(const std::vector<double>& values, size_t windowSize) {
     if (values.empty() || windowSize == 0) {
         return values;
     }
@@ -108,14 +108,11 @@ std::vector<double> STLDecomposition::movingAverage(
     return result;
 }
 
-std::vector<double> STLDecomposition::loess(
-    const std::vector<double>& x,
-    const std::vector<double>& y,
-    size_t windowSize,
-    const std::vector<double>& weights
-) {
+std::vector<double> STLDecomposition::loess(const std::vector<double>& x, const std::vector<double>& y,
+                                            size_t windowSize, const std::vector<double>& weights) {
     size_t n = y.size();
-    if (n == 0) return {};
+    if (n == 0)
+        return {};
 
     std::vector<double> result(n);
     size_t halfWindow = windowSize / 2;
@@ -138,10 +135,11 @@ std::vector<double> STLDecomposition::loess(
         // Compute distances and prepare local arrays
         size_t validCount = 0;
         for (size_t j = start; j < end; ++j) {
-            if (std::isnan(y[j])) continue;
+            if (std::isnan(y[j]))
+                continue;
 
-            double dist = std::abs(static_cast<double>(j) - static_cast<double>(i))
-                         / static_cast<double>(halfWindow + 1);
+            double dist =
+                std::abs(static_cast<double>(j) - static_cast<double>(i)) / static_cast<double>(halfWindow + 1);
             distances[validCount] = dist;
             localX[validCount] = static_cast<double>(j);
             localY[validCount] = y[j];
@@ -160,15 +158,16 @@ std::vector<double> STLDecomposition::loess(
         if (hasWeights) {
             size_t k = 0;
             for (size_t j = start; j < end; ++j) {
-                if (std::isnan(y[j])) continue;
+                if (std::isnan(y[j]))
+                    continue;
                 localWeights[k] *= weights[j];
                 ++k;
             }
         }
 
         // Use SIMD weighted linear regression
-        simd::LinearFit fit = simd::weightedLinearRegression(
-            localX.data(), localY.data(), localWeights.data(), validCount);
+        simd::LinearFit fit =
+            simd::weightedLinearRegression(localX.data(), localY.data(), localWeights.data(), validCount);
 
         result[i] = fit.intercept + fit.slope * static_cast<double>(i);
     }
@@ -176,10 +175,7 @@ std::vector<double> STLDecomposition::loess(
     return result;
 }
 
-std::vector<double> STLDecomposition::computeSeasonalMeans(
-    const std::vector<double>& values,
-    size_t period
-) {
+std::vector<double> STLDecomposition::computeSeasonalMeans(const std::vector<double>& values, size_t period) {
     if (period == 0 || values.empty()) {
         return std::vector<double>(values.size(), 0.0);
     }
@@ -228,10 +224,7 @@ std::vector<double> STLDecomposition::computeSeasonalMeans(
     return result;
 }
 
-STLComponents STLDecomposition::decompose(
-    const std::vector<double>& values,
-    const STLConfig& config
-) {
+STLComponents STLDecomposition::decompose(const std::vector<double>& values, const STLConfig& config) {
     STLComponents components;
     size_t n = values.size();
 
@@ -247,24 +240,25 @@ STLComponents STLDecomposition::decompose(
     size_t period = config.seasonalPeriod;
     if (period == 0 || period > n / 2) {
         // No seasonality - just extract trend using SIMD moving average
-        size_t trendWin = config.trendWindow > 0 ? config.trendWindow : n/10 + 1;
+        size_t trendWin = config.trendWindow > 0 ? config.trendWindow : n / 10 + 1;
         simd::computeMovingAverage(values.data(), n, trendWin, components.trend.data());
 
         // Compute residuals using SIMD
-        simd::vectorSubtract(values.data(), components.trend.data(),
-                            components.residual.data(), n);
+        simd::vectorSubtract(values.data(), components.trend.data(), components.residual.data(), n);
         return components;
     }
 
     // Set window sizes
     size_t seasonalWindow = config.seasonalWindow;
-    if (seasonalWindow % 2 == 0) seasonalWindow++;  // Must be odd
+    if (seasonalWindow % 2 == 0)
+        seasonalWindow++;  // Must be odd
 
     size_t trendWindow = config.trendWindow;
     if (trendWindow == 0) {
         // Default: ceil(1.5 * period / (1 - 1.5/seasonalWindow))
         trendWindow = static_cast<size_t>(1.5 * period / (1.0 - 1.5 / seasonalWindow));
-        if (trendWindow % 2 == 0) trendWindow++;
+        if (trendWindow % 2 == 0)
+            trendWindow++;
     }
 
     // Initialize deseasonalized series
@@ -281,7 +275,8 @@ STLComponents STLDecomposition::decompose(
             simd::computeMovingAverage(deseasonalized.data(), n, trendWindow, trend.data());
         } else {
             std::vector<double> x(n);
-            for (size_t i = 0; i < n; ++i) x[i] = static_cast<double>(i);
+            for (size_t i = 0; i < n; ++i)
+                x[i] = static_cast<double>(i);
             trend = loess(x, deseasonalized, trendWindow, robustnessWeights);
         }
 
@@ -294,7 +289,8 @@ STLComponents STLDecomposition::decompose(
 
         // Step 4: Smooth the seasonal component
         std::vector<double> x(n);
-        for (size_t i = 0; i < n; ++i) x[i] = static_cast<double>(i);
+        for (size_t i = 0; i < n; ++i)
+            x[i] = static_cast<double>(i);
         seasonal = loess(x, seasonal, seasonalWindow, robustnessWeights);
 
         // Step 5: Deseasonalize for next iteration (SIMD)
@@ -307,18 +303,16 @@ STLComponents STLDecomposition::decompose(
         // Compute residuals using SIMD: residual = values - trend - seasonal
         std::vector<double> trendPlusSeasonal(n);
         simd::vectorAdd(trend.data(), seasonal.data(), trendPlusSeasonal.data(), n);
-        simd::vectorSubtract(values.data(), trendPlusSeasonal.data(),
-                            components.residual.data(), n);
+        simd::vectorSubtract(values.data(), trendPlusSeasonal.data(), components.residual.data(), n);
 
         // Update robustness weights for next iteration
         if (config.robust && iter < iterations - 1) {
-            robustnessWeights = computeRobustnessWeights(
-                components.residual, config.robustThreshold);
+            robustnessWeights = computeRobustnessWeights(components.residual, config.robustThreshold);
         }
     }
 
     return components;
 }
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar

@@ -1,33 +1,34 @@
 #ifndef SERIES_ALIGNER_H_INCLUDED
 #define SERIES_ALIGNER_H_INCLUDED
 
-#include "expression_evaluator.hpp"
 #include "derived_query.hpp"
-#include <map>
-#include <vector>
-#include <string>
-#include <set>
+#include "expression_evaluator.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
 namespace timestar {
 
 // Strategy for aligning multiple time series
 enum class AlignmentStrategy {
-    INNER,      // Only keep timestamps present in ALL series (intersection)
-    OUTER,      // Keep all timestamps, interpolate missing values
-    LEFT,       // Keep timestamps from first series only
-    UNION       // Keep all timestamps, use NaN for missing values
+    INNER,  // Only keep timestamps present in ALL series (intersection)
+    OUTER,  // Keep all timestamps, interpolate missing values
+    LEFT,   // Keep timestamps from first series only
+    UNION   // Keep all timestamps, use NaN for missing values
 };
 
 // Strategy for interpolating missing values
 enum class InterpolationMethod {
-    LINEAR,     // Linear interpolation between adjacent points
-    PREVIOUS,   // Use previous known value (step function)
-    NEXT,       // Use next known value
-    ZERO,       // Fill with zero
-    NAN_FILL    // Fill with NaN
+    LINEAR,    // Linear interpolation between adjacent points
+    PREVIOUS,  // Use previous known value (step function)
+    NEXT,      // Use next known value
+    ZERO,      // Fill with zero
+    NAN_FILL   // Fill with NaN
 };
 
 // Statistics about alignment operations
@@ -49,8 +50,7 @@ public:
     // Align multiple series to common timestamps
     // Input: map of query name -> (timestamps, values)
     // Output: map of query name -> AlignedSeries with matching timestamps
-    std::map<std::string, AlignedSeries> align(
-        const std::map<std::string, SubQueryResult>& series);
+    std::map<std::string, AlignedSeries> align(const std::map<std::string, SubQueryResult>& series);
 
     // Get statistics from the last alignment operation
     const AlignmentStats& getStats() const { return stats_; }
@@ -65,31 +65,24 @@ private:
     AlignmentStats stats_;
 
     // Compute the set of output timestamps based on strategy
-    std::vector<uint64_t> computeOutputTimestamps(
-        const std::map<std::string, SubQueryResult>& series);
+    std::vector<uint64_t> computeOutputTimestamps(const std::map<std::string, SubQueryResult>& series);
 
     // Compute intersection of all timestamp sets
-    std::vector<uint64_t> computeIntersection(
-        const std::map<std::string, SubQueryResult>& series);
+    std::vector<uint64_t> computeIntersection(const std::map<std::string, SubQueryResult>& series);
 
     // Compute union of all timestamp sets
-    std::vector<uint64_t> computeUnion(
-        const std::map<std::string, SubQueryResult>& series);
+    std::vector<uint64_t> computeUnion(const std::map<std::string, SubQueryResult>& series);
 
     // Resample timestamps to target interval
-    std::vector<uint64_t> resampleTimestamps(
-        const std::vector<uint64_t>& timestamps,
-        uint64_t interval);
+    std::vector<uint64_t> resampleTimestamps(const std::vector<uint64_t>& timestamps, uint64_t interval);
 
     // Interpolate a single series to target timestamps
-    std::vector<double> interpolateSeries(
-        const std::vector<uint64_t>& srcTimestamps,
-        const std::vector<double>& srcValues,
-        const std::vector<uint64_t>& targetTimestamps);
+    std::vector<double> interpolateSeries(const std::vector<uint64_t>& srcTimestamps,
+                                          const std::vector<double>& srcValues,
+                                          const std::vector<uint64_t>& targetTimestamps);
 
     // Linear interpolation between two points
-    double linearInterpolate(uint64_t t, uint64_t t1, double v1,
-                            uint64_t t2, double v2);
+    double linearInterpolate(uint64_t t, uint64_t t1, double v1, uint64_t t2, double v2);
 
     // Find the index of the largest timestamp <= target
     size_t findLowerBound(const std::vector<uint64_t>& timestamps, uint64_t target);
@@ -104,13 +97,13 @@ struct TimeRange {
     bool valid = false;
 };
 
-inline TimeRange findCommonTimeRange(
-    const std::map<std::string, SubQueryResult>& series) {
+inline TimeRange findCommonTimeRange(const std::map<std::string, SubQueryResult>& series) {
     TimeRange range;
     range.valid = false;
 
     for (const auto& [name, result] : series) {
-        if (result.timestamps.empty()) continue;
+        if (result.timestamps.empty())
+            continue;
 
         uint64_t seriesStart = result.timestamps.front();
         uint64_t seriesEnd = result.timestamps.back();
@@ -134,8 +127,7 @@ inline TimeRange findCommonTimeRange(
 }
 
 // Generate evenly spaced timestamps within a range
-inline std::vector<uint64_t> generateTimestamps(
-    uint64_t start, uint64_t end, uint64_t interval) {
+inline std::vector<uint64_t> generateTimestamps(uint64_t start, uint64_t end, uint64_t interval) {
     std::vector<uint64_t> timestamps;
     if (interval == 0 || start > end) {
         return timestamps;
@@ -151,6 +143,6 @@ inline std::vector<uint64_t> generateTimestamps(
     return timestamps;
 }
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // SERIES_ALIGNER_H_INCLUDED
+#endif  // SERIES_ALIGNER_H_INCLUDED

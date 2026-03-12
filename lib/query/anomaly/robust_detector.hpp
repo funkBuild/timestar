@@ -15,10 +15,7 @@ class RobustDetector : public AnomalyDetector {
 public:
     RobustDetector() = default;
 
-    AnomalyOutput detect(
-        const AnomalyInput& input,
-        const AnomalyConfig& config
-    ) override;
+    AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) override;
 
     std::string algorithmName() const override { return "robust"; }
 
@@ -26,16 +23,11 @@ public:
 
 private:
     // Compute bounds based on residual distribution
-    void computeBounds(
-        const STLComponents& stl,
-        const std::vector<double>& values,
-        double bounds,
-        std::vector<double>& upper,
-        std::vector<double>& lower
-    );
+    void computeBounds(const STLComponents& stl, const std::vector<double>& values, double bounds,
+                       std::vector<double>& upper, std::vector<double>& lower);
 };
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar
 
-#endif // ROBUST_DETECTOR_H_INCLUDED
+#endif  // ROBUST_DETECTOR_H_INCLUDED

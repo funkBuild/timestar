@@ -1,10 +1,11 @@
 #include "alp_rd.hpp"
+
 #include "alp_constants.hpp"
 
-#include <bit>
 #include <algorithm>
-#include <unordered_map>
+#include <bit>
 #include <cmath>
+#include <unordered_map>
 
 namespace alp {
 
@@ -38,9 +39,7 @@ uint8_t ALPRD::findBestSplit(const double* values, size_t count) {
         } else {
             // Pick top-8 by frequency, count exceptions
             std::vector<std::pair<uint64_t, size_t>> freq_vec(left_freq.begin(), left_freq.end());
-            std::partial_sort(freq_vec.begin(),
-                              freq_vec.begin() + ALP_RD_MAX_DICT_SIZE,
-                              freq_vec.end(),
+            std::partial_sort(freq_vec.begin(), freq_vec.begin() + ALP_RD_MAX_DICT_SIZE, freq_vec.end(),
                               [](const auto& a, const auto& b) { return a.second > b.second; });
 
             std::unordered_map<uint64_t, bool> top8;
@@ -85,8 +84,7 @@ ALPRDBlockResult ALPRD::encodeBlock(const double* values, size_t count, uint8_t 
 
     // Build dictionary from top-N most frequent left parts
     std::vector<std::pair<uint64_t, size_t>> freq_vec(left_freq.begin(), left_freq.end());
-    std::sort(freq_vec.begin(), freq_vec.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::sort(freq_vec.begin(), freq_vec.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
 
     const size_t dict_size = std::min(freq_vec.size(), ALP_RD_MAX_DICT_SIZE);
     result.dictionary.resize(dict_size);
@@ -116,8 +114,10 @@ ALPRDBlockResult ALPRD::encodeBlock(const double* values, size_t count, uint8_t 
         uint64_t right = bits & right_mask;
 
         result.right_parts[i] = right;
-        if (right < right_min) right_min = right;
-        if (right > right_max) right_max = right;
+        if (right < right_min)
+            right_min = right;
+        if (right > right_max)
+            right_max = right;
 
         auto it = dict_map.find(left);
         if (it != dict_map.end()) {
@@ -143,8 +143,7 @@ ALPRDBlockResult ALPRD::encodeBlock(const double* values, size_t count, uint8_t 
 }
 
 void ALPRD::decodeBlock(const ALPRDBlockResult& block, size_t count, double* out) {
-    const uint64_t right_mask = (block.right_bit_count == 64) ? ~0ULL
-                                : ((1ULL << block.right_bit_count) - 1);
+    const uint64_t right_mask = (block.right_bit_count == 64) ? ~0ULL : ((1ULL << block.right_bit_count) - 1);
 
     // Build exception lookup
     std::unordered_map<uint16_t, uint64_t> exc_map;
@@ -165,4 +164,4 @@ void ALPRD::decodeBlock(const ALPRDBlockResult& block, size_t count, double* out
     }
 }
 
-} // namespace alp
+}  // namespace alp

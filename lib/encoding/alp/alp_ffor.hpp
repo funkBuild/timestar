@@ -1,8 +1,8 @@
 #ifndef ALP_FFOR_HPP_INCLUDED
 #define ALP_FFOR_HPP_INCLUDED
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 
 namespace alp {
@@ -17,7 +17,8 @@ namespace alp {
 
 // Calculate number of uint64_t words needed to store `count` values at `bw` bits each
 inline size_t ffor_packed_words(size_t count, uint8_t bw) {
-    if (bw == 0) return 0;
+    if (bw == 0)
+        return 0;
     return (static_cast<uint64_t>(count) * bw + 63) / 64;
 }
 
@@ -32,9 +33,8 @@ namespace detail {
 // Pack values into words for a known power-of-2 bit-width.
 // Template parameter BW must be one of {1, 2, 4, 8, 16, 32}.
 // Values per word = 64 / BW.
-template<unsigned BW>
-inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base,
-                          uint64_t* out) {
+template <unsigned BW>
+inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base, uint64_t* out) {
     constexpr unsigned VPW = 64 / BW;  // values per word
     constexpr uint64_t mask = (1ULL << BW) - 1;
     const size_t n_words = ffor_packed_words(count, BW);
@@ -49,9 +49,8 @@ inline void pack_pow2_u64(const uint64_t* values, size_t count, uint64_t base,
     }
 }
 
-template<unsigned BW>
-inline void pack_pow2_i64(const int64_t* values, size_t count, int64_t base,
-                          uint64_t* out) {
+template <unsigned BW>
+inline void pack_pow2_i64(const int64_t* values, size_t count, int64_t base, uint64_t* out) {
     constexpr unsigned VPW = 64 / BW;
     constexpr uint64_t mask = (1ULL << BW) - 1;
     const size_t n_words = ffor_packed_words(count, BW);
@@ -67,9 +66,8 @@ inline void pack_pow2_i64(const int64_t* values, size_t count, int64_t base,
 }
 
 // Unpack values from words for a known power-of-2 bit-width.
-template<unsigned BW>
-inline void unpack_pow2_u64(const uint64_t* in, size_t count, uint64_t base,
-                            uint64_t* out) {
+template <unsigned BW>
+inline void unpack_pow2_u64(const uint64_t* in, size_t count, uint64_t base, uint64_t* out) {
     constexpr unsigned VPW = 64 / BW;
     constexpr uint64_t mask = (1ULL << BW) - 1;
     const size_t n_words = ffor_packed_words(count, BW);
@@ -83,9 +81,8 @@ inline void unpack_pow2_u64(const uint64_t* in, size_t count, uint64_t base,
     }
 }
 
-template<unsigned BW>
-inline void unpack_pow2_i64(const uint64_t* in, size_t count, int64_t base,
-                            int64_t* out) {
+template <unsigned BW>
+inline void unpack_pow2_i64(const uint64_t* in, size_t count, int64_t base, int64_t* out) {
     constexpr unsigned VPW = 64 / BW;
     constexpr uint64_t mask = (1ULL << BW) - 1;
     const size_t n_words = ffor_packed_words(count, BW);
@@ -99,15 +96,15 @@ inline void unpack_pow2_i64(const uint64_t* in, size_t count, int64_t base,
     }
 }
 
-} // namespace detail
+}  // namespace detail
 
 // Pack `count` int64 values into bit-packed uint64 words.
 // Each value is stored as (values[i] - base) using `bw` bits.
 // Caller must ensure (values[i] - base) fits in `bw` bits.
 // `out` must have space for ffor_packed_words(count, bw) words.
-inline void ffor_pack(const int64_t* values, size_t count, int64_t base,
-                      uint8_t bw, uint64_t* out) {
-    if (bw == 0 || count == 0) return;
+inline void ffor_pack(const int64_t* values, size_t count, int64_t base, uint8_t bw, uint64_t* out) {
+    if (bw == 0 || count == 0)
+        return;
 
     if (bw == 64) {
         for (size_t i = 0; i < count; ++i) {
@@ -119,13 +116,26 @@ inline void ffor_pack(const int64_t* values, size_t count, int64_t base,
     // Specialized branchless loops for power-of-2 bit-widths.
     // These write complete words, so no pre-zeroing needed.
     switch (bw) {
-    case 1:  detail::pack_pow2_i64<1>(values, count, base, out);  return;
-    case 2:  detail::pack_pow2_i64<2>(values, count, base, out);  return;
-    case 4:  detail::pack_pow2_i64<4>(values, count, base, out);  return;
-    case 8:  detail::pack_pow2_i64<8>(values, count, base, out);  return;
-    case 16: detail::pack_pow2_i64<16>(values, count, base, out); return;
-    case 32: detail::pack_pow2_i64<32>(values, count, base, out); return;
-    default: break;
+        case 1:
+            detail::pack_pow2_i64<1>(values, count, base, out);
+            return;
+        case 2:
+            detail::pack_pow2_i64<2>(values, count, base, out);
+            return;
+        case 4:
+            detail::pack_pow2_i64<4>(values, count, base, out);
+            return;
+        case 8:
+            detail::pack_pow2_i64<8>(values, count, base, out);
+            return;
+        case 16:
+            detail::pack_pow2_i64<16>(values, count, base, out);
+            return;
+        case 32:
+            detail::pack_pow2_i64<32>(values, count, base, out);
+            return;
+        default:
+            break;
     }
 
     // Generic fallback for non-power-of-2 bit-widths.
@@ -138,8 +148,8 @@ inline void ffor_pack(const int64_t* values, size_t count, int64_t base,
 
     for (size_t i = 0; i < count; ++i) {
         const uint64_t delta = static_cast<uint64_t>(values[i] - base) & mask;
-        const size_t word_idx = bit_pos >> 6;       // bit_pos / 64
-        const unsigned bit_idx = bit_pos & 63;      // bit_pos % 64
+        const size_t word_idx = bit_pos >> 6;   // bit_pos / 64
+        const unsigned bit_idx = bit_pos & 63;  // bit_pos % 64
 
         out[word_idx] |= delta << bit_idx;
 
@@ -153,9 +163,9 @@ inline void ffor_pack(const int64_t* values, size_t count, int64_t base,
 }
 
 // Unsigned variant for ALP_RD right-parts
-inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base,
-                          uint8_t bw, uint64_t* out) {
-    if (bw == 0 || count == 0) return;
+inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
+    if (bw == 0 || count == 0)
+        return;
 
     if (bw == 64) {
         for (size_t i = 0; i < count; ++i) {
@@ -167,13 +177,26 @@ inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base,
     // Specialized branchless loops for power-of-2 bit-widths.
     // These write complete words, so no pre-zeroing needed.
     switch (bw) {
-    case 1:  detail::pack_pow2_u64<1>(values, count, base, out);  return;
-    case 2:  detail::pack_pow2_u64<2>(values, count, base, out);  return;
-    case 4:  detail::pack_pow2_u64<4>(values, count, base, out);  return;
-    case 8:  detail::pack_pow2_u64<8>(values, count, base, out);  return;
-    case 16: detail::pack_pow2_u64<16>(values, count, base, out); return;
-    case 32: detail::pack_pow2_u64<32>(values, count, base, out); return;
-    default: break;
+        case 1:
+            detail::pack_pow2_u64<1>(values, count, base, out);
+            return;
+        case 2:
+            detail::pack_pow2_u64<2>(values, count, base, out);
+            return;
+        case 4:
+            detail::pack_pow2_u64<4>(values, count, base, out);
+            return;
+        case 8:
+            detail::pack_pow2_u64<8>(values, count, base, out);
+            return;
+        case 16:
+            detail::pack_pow2_u64<16>(values, count, base, out);
+            return;
+        case 32:
+            detail::pack_pow2_u64<32>(values, count, base, out);
+            return;
+        default:
+            break;
     }
 
     // Generic fallback for non-power-of-2 bit-widths.
@@ -200,9 +223,9 @@ inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base,
 
 // Unpack `count` int64 values from bit-packed uint64 words.
 // Reconstructs values[i] = unpacked_delta + base.
-inline void ffor_unpack(const uint64_t* in, size_t count, int64_t base,
-                        uint8_t bw, int64_t* out) {
-    if (count == 0) return;
+inline void ffor_unpack(const uint64_t* in, size_t count, int64_t base, uint8_t bw, int64_t* out) {
+    if (count == 0)
+        return;
 
     if (bw == 0) {
         for (size_t i = 0; i < count; ++i) {
@@ -220,13 +243,26 @@ inline void ffor_unpack(const uint64_t* in, size_t count, int64_t base,
 
     // Specialized branchless loops for power-of-2 bit-widths.
     switch (bw) {
-    case 1:  detail::unpack_pow2_i64<1>(in, count, base, out);  return;
-    case 2:  detail::unpack_pow2_i64<2>(in, count, base, out);  return;
-    case 4:  detail::unpack_pow2_i64<4>(in, count, base, out);  return;
-    case 8:  detail::unpack_pow2_i64<8>(in, count, base, out);  return;
-    case 16: detail::unpack_pow2_i64<16>(in, count, base, out); return;
-    case 32: detail::unpack_pow2_i64<32>(in, count, base, out); return;
-    default: break;
+        case 1:
+            detail::unpack_pow2_i64<1>(in, count, base, out);
+            return;
+        case 2:
+            detail::unpack_pow2_i64<2>(in, count, base, out);
+            return;
+        case 4:
+            detail::unpack_pow2_i64<4>(in, count, base, out);
+            return;
+        case 8:
+            detail::unpack_pow2_i64<8>(in, count, base, out);
+            return;
+        case 16:
+            detail::unpack_pow2_i64<16>(in, count, base, out);
+            return;
+        case 32:
+            detail::unpack_pow2_i64<32>(in, count, base, out);
+            return;
+        default:
+            break;
     }
 
     // Generic fallback for non-power-of-2 bit-widths.
@@ -251,9 +287,9 @@ inline void ffor_unpack(const uint64_t* in, size_t count, int64_t base,
 }
 
 // Unsigned unpack variant for ALP_RD right-parts
-inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base,
-                            uint8_t bw, uint64_t* out) {
-    if (count == 0) return;
+inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uint8_t bw, uint64_t* out) {
+    if (count == 0)
+        return;
 
     if (bw == 0) {
         for (size_t i = 0; i < count; ++i) {
@@ -271,13 +307,26 @@ inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base,
 
     // Specialized branchless loops for power-of-2 bit-widths.
     switch (bw) {
-    case 1:  detail::unpack_pow2_u64<1>(in, count, base, out);  return;
-    case 2:  detail::unpack_pow2_u64<2>(in, count, base, out);  return;
-    case 4:  detail::unpack_pow2_u64<4>(in, count, base, out);  return;
-    case 8:  detail::unpack_pow2_u64<8>(in, count, base, out);  return;
-    case 16: detail::unpack_pow2_u64<16>(in, count, base, out); return;
-    case 32: detail::unpack_pow2_u64<32>(in, count, base, out); return;
-    default: break;
+        case 1:
+            detail::unpack_pow2_u64<1>(in, count, base, out);
+            return;
+        case 2:
+            detail::unpack_pow2_u64<2>(in, count, base, out);
+            return;
+        case 4:
+            detail::unpack_pow2_u64<4>(in, count, base, out);
+            return;
+        case 8:
+            detail::unpack_pow2_u64<8>(in, count, base, out);
+            return;
+        case 16:
+            detail::unpack_pow2_u64<16>(in, count, base, out);
+            return;
+        case 32:
+            detail::unpack_pow2_u64<32>(in, count, base, out);
+            return;
+        default:
+            break;
     }
 
     // Generic fallback for non-power-of-2 bit-widths.
@@ -300,6 +349,6 @@ inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base,
     }
 }
 
-} // namespace alp
+}  // namespace alp
 
-#endif // ALP_FFOR_HPP_INCLUDED
+#endif  // ALP_FFOR_HPP_INCLUDED

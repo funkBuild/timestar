@@ -16,10 +16,7 @@ class BasicDetector : public AnomalyDetector {
 public:
     BasicDetector() = default;
 
-    AnomalyOutput detect(
-        const AnomalyInput& input,
-        const AnomalyConfig& config
-    ) override;
+    AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) override;
 
     std::string algorithmName() const override { return "basic"; }
 
@@ -28,10 +25,7 @@ public:
 private:
     // Optimized detection using incremental rolling stats
     // Complexity: O(N) instead of O(N*W)
-    AnomalyOutput detectOptimized(
-        const AnomalyInput& input,
-        const AnomalyConfig& config
-    );
+    AnomalyOutput detectOptimized(const AnomalyInput& input, const AnomalyConfig& config);
 
     // Legacy rolling stats computation (kept for fallback/validation)
     struct RollingStats {
@@ -42,14 +36,10 @@ private:
         double q3;  // 75th percentile
     };
 
-    RollingStats computeRollingStats(
-        const std::vector<double>& values,
-        size_t endIdx,
-        size_t windowSize
-    );
+    RollingStats computeRollingStats(const std::vector<double>& values, size_t endIdx, size_t windowSize);
 };
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar
 
-#endif // BASIC_DETECTOR_H_INCLUDED
+#endif  // BASIC_DETECTOR_H_INCLUDED

@@ -1,14 +1,13 @@
 #include "forecast_executor.hpp"
-#include <chrono>
+
 #include <algorithm>
+#include <chrono>
 
 namespace timestar {
 namespace forecast {
 
-std::vector<uint64_t> ForecastExecutor::generateForecastTimestamps(
-    const std::vector<uint64_t>& historicalTimestamps,
-    size_t forecastHorizon
-) {
+std::vector<uint64_t> ForecastExecutor::generateForecastTimestamps(const std::vector<uint64_t>& historicalTimestamps,
+                                                                   size_t forecastHorizon) {
     if (historicalTimestamps.size() < 2) {
         return {};
     }
@@ -42,11 +41,8 @@ std::vector<uint64_t> ForecastExecutor::generateForecastTimestamps(
 
 // ── Auto-windowing helpers ────────────────────────────────────────────────
 
-size_t ForecastExecutor::detectMaxPeriodForWindowing(
-    const std::vector<double>& values,
-    uint64_t dataIntervalNs,
-    const ForecastConfig& config
-) {
+size_t ForecastExecutor::detectMaxPeriodForWindowing(const std::vector<double>& values, uint64_t dataIntervalNs,
+                                                     const ForecastConfig& config) {
     // LINEAR with no seasonality needs no periodicity detection
     if (config.forecastSeasonality == ForecastSeasonality::NONE) {
         return 0;
@@ -63,13 +59,9 @@ size_t ForecastExecutor::detectMaxPeriodForWindowing(
     if (config.forecastSeasonality == ForecastSeasonality::AUTO ||
         config.forecastSeasonality == ForecastSeasonality::MULTI) {
         PeriodicityDetector detector;
-        auto periods = detector.detectPeriods(
-            values,
-            config.minPeriod,
-            config.maxPeriod > 0 ? config.maxPeriod : values.size() / 2,
-            config.maxSeasonalComponents,
-            config.seasonalThreshold
-        );
+        auto periods = detector.detectPeriods(values, config.minPeriod,
+                                              config.maxPeriod > 0 ? config.maxPeriod : values.size() / 2,
+                                              config.maxSeasonalComponents, config.seasonalThreshold);
         if (!periods.empty()) {
             // Return largest detected period
             size_t maxP = 0;
@@ -84,12 +76,8 @@ size_t ForecastExecutor::detectMaxPeriodForWindowing(
     return 0;
 }
 
-size_t ForecastExecutor::computeOptimalWindowSize(
-    size_t inputSize,
-    size_t maxPeriod,
-    size_t horizon,
-    const ForecastConfig& config
-) {
+size_t ForecastExecutor::computeOptimalWindowSize(size_t inputSize, size_t maxPeriod, size_t horizon,
+                                                  const ForecastConfig& config) {
     size_t windowSize;
 
     if (maxPeriod > 0) {
@@ -110,28 +98,20 @@ size_t ForecastExecutor::computeOptimalWindowSize(
     return windowSize;
 }
 
-size_t ForecastExecutor::windowInput(
-    ForecastInput& input,
-    size_t windowSize
-) {
+size_t ForecastExecutor::windowInput(ForecastInput& input, size_t windowSize) {
     if (windowSize >= input.size()) {
         return 0;  // No trimming needed
     }
 
     size_t trimCount = input.size() - windowSize;
-    input.timestamps.erase(input.timestamps.begin(),
-                           input.timestamps.begin() + static_cast<ptrdiff_t>(trimCount));
-    input.values.erase(input.values.begin(),
-                       input.values.begin() + static_cast<ptrdiff_t>(trimCount));
+    input.timestamps.erase(input.timestamps.begin(), input.timestamps.begin() + static_cast<ptrdiff_t>(trimCount));
+    input.values.erase(input.values.begin(), input.values.begin() + static_cast<ptrdiff_t>(trimCount));
     return trimCount;
 }
 
 // ── execute() ─────────────────────────────────────────────────────────────
 
-ForecastOutput ForecastExecutor::execute(
-    const ForecastInput& input,
-    const ForecastConfig& config
-) {
+ForecastOutput ForecastExecutor::execute(const ForecastInput& input, const ForecastConfig& config) {
     if (input.empty()) {
         return ForecastOutput{};
     }
@@ -149,8 +129,7 @@ ForecastOutput ForecastExecutor::execute(
     // Only copy the input if we actually need to trim.
     std::optional<ForecastInput> trimmedInput;
     if (!config.disableAutoWindow && input.size() >= 2) {
-        uint64_t dataIntervalNs = (input.timestamps.back() - input.timestamps.front())
-                                  / (input.size() - 1);
+        uint64_t dataIntervalNs = (input.timestamps.back() - input.timestamps.front()) / (input.size() - 1);
         size_t maxPeriod = detectMaxPeriodForWindowing(input.values, dataIntervalNs, config);
         size_t windowSize = computeOptimalWindowSize(input.size(), maxPeriod, horizon, config);
 
@@ -184,12 +163,8 @@ ForecastOutput ForecastExecutor::execute(
     return output;
 }
 
-void ForecastExecutor::addSeriesPieces(
-    ForecastQueryResult& result,
-    const ForecastOutput& output,
-    const std::vector<std::string>& groupTags,
-    size_t queryIndex
-) {
+void ForecastExecutor::addSeriesPieces(ForecastQueryResult& result, const ForecastOutput& output,
+                                       const std::vector<std::string>& groupTags, size_t queryIndex) {
     size_t nHistorical = output.historicalCount;
     size_t nForecast = output.forecastCount;
     size_t totalPoints = nHistorical + nForecast;
@@ -271,12 +246,10 @@ void ForecastExecutor::addSeriesPieces(
     }
 }
 
-ForecastQueryResult ForecastExecutor::executeMulti(
-    const std::vector<uint64_t>& timestamps,
-    const std::vector<std::vector<double>>& seriesValues,
-    const std::vector<std::vector<std::string>>& seriesGroupTags,
-    const ForecastConfig& config
-) {
+ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& timestamps,
+                                                   const std::vector<std::vector<double>>& seriesValues,
+                                                   const std::vector<std::vector<std::string>>& seriesGroupTags,
+                                                   const ForecastConfig& config) {
     auto startTime = std::chrono::high_resolution_clock::now();
 
     ForecastQueryResult result;
@@ -290,7 +263,8 @@ ForecastQueryResult ForecastExecutor::executeMulti(
 
     if (timestamps.size() < 2) {
         result.success = false;
-        result.errorMessage = "Insufficient data: at least 2 historical points are required to compute a forecast interval";
+        result.errorMessage =
+            "Insufficient data: at least 2 historical points are required to compute a forecast interval";
         return result;
     }
 
@@ -315,21 +289,17 @@ ForecastQueryResult ForecastExecutor::executeMulti(
     size_t trimCount = 0;
 
     if (!config.disableAutoWindow && timestamps.size() >= 2) {
-        uint64_t dataIntervalNs = (timestamps.back() - timestamps.front())
-                                  / (timestamps.size() - 1);
+        uint64_t dataIntervalNs = (timestamps.back() - timestamps.front()) / (timestamps.size() - 1);
 
         // Use first series for period detection (all series share timestamps)
-        size_t maxPeriod = detectMaxPeriodForWindowing(
-            seriesValues[0], dataIntervalNs, config);
-        size_t windowSize = computeOptimalWindowSize(
-            timestamps.size(), maxPeriod, horizon, config);
+        size_t maxPeriod = detectMaxPeriodForWindowing(seriesValues[0], dataIntervalNs, config);
+        size_t windowSize = computeOptimalWindowSize(timestamps.size(), maxPeriod, horizon, config);
 
         // Only trim if saving >33%
         if (timestamps.size() > windowSize * 3 / 2) {
             trimCount = timestamps.size() - windowSize;
-            windowedTimestamps.erase(
-                windowedTimestamps.begin(),
-                windowedTimestamps.begin() + static_cast<ptrdiff_t>(trimCount));
+            windowedTimestamps.erase(windowedTimestamps.begin(),
+                                     windowedTimestamps.begin() + static_cast<ptrdiff_t>(trimCount));
         }
     }
 
@@ -337,9 +307,7 @@ ForecastQueryResult ForecastExecutor::executeMulti(
 
     // Combine windowed historical + forecast timestamps
     result.times = windowedTimestamps;
-    result.times.insert(result.times.end(),
-                       forecastTimestamps.begin(),
-                       forecastTimestamps.end());
+    result.times.insert(result.times.end(), forecastTimestamps.begin(), forecastTimestamps.end());
     result.forecastStartIndex = windowedTimestamps.size();
 
     // Record windowing statistics
@@ -351,13 +319,9 @@ ForecastQueryResult ForecastExecutor::executeMulti(
          config.forecastSeasonality == ForecastSeasonality::MULTI) &&
         !windowedTimestamps.empty() && !seriesValues.empty()) {
         PeriodicityDetector detector;
-        auto detected = detector.detectPeriods(
-            seriesValues[0],
-            config.minPeriod,
-            config.maxPeriod > 0 ? config.maxPeriod : seriesValues[0].size() / 2,
-            config.maxSeasonalComponents,
-            config.seasonalThreshold
-        );
+        auto detected = detector.detectPeriods(seriesValues[0], config.minPeriod,
+                                               config.maxPeriod > 0 ? config.maxPeriod : seriesValues[0].size() / 2,
+                                               config.maxSeasonalComponents, config.seasonalThreshold);
         for (const auto& d : detected) {
             result.statistics.detectedPeriods.push_back(d.period);
         }
@@ -374,9 +338,7 @@ ForecastQueryResult ForecastExecutor::executeMulti(
 
         // Trim series values by same offset
         if (trimCount > 0 && seriesValues[s].size() > trimCount) {
-            input.values.assign(
-                seriesValues[s].begin() + static_cast<ptrdiff_t>(trimCount),
-                seriesValues[s].end());
+            input.values.assign(seriesValues[s].begin() + static_cast<ptrdiff_t>(trimCount), seriesValues[s].end());
         } else {
             input.values = seriesValues[s];
         }
@@ -411,10 +373,18 @@ ForecastQueryResult ForecastExecutor::executeMulti(
 
     if (config.seasonality != Seasonality::NONE) {
         switch (config.seasonality) {
-            case Seasonality::HOURLY: result.statistics.seasonality = "hourly"; break;
-            case Seasonality::DAILY: result.statistics.seasonality = "daily"; break;
-            case Seasonality::WEEKLY: result.statistics.seasonality = "weekly"; break;
-            default: result.statistics.seasonality = "none"; break;
+            case Seasonality::HOURLY:
+                result.statistics.seasonality = "hourly";
+                break;
+            case Seasonality::DAILY:
+                result.statistics.seasonality = "daily";
+                break;
+            case Seasonality::WEEKLY:
+                result.statistics.seasonality = "weekly";
+                break;
+            default:
+                result.statistics.seasonality = "none";
+                break;
         }
     } else {
         result.statistics.seasonality = "none";
@@ -423,11 +393,10 @@ ForecastQueryResult ForecastExecutor::executeMulti(
     result.statistics.seriesCount = seriesValues.size();
 
     auto endTime = std::chrono::high_resolution_clock::now();
-    result.statistics.executionTimeMs =
-        std::chrono::duration<double, std::milli>(endTime - startTime).count();
+    result.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
     return result;
 }
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar

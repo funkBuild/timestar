@@ -3,12 +3,13 @@
 
 #include "series_id.hpp"
 #include "tsm.hpp"
-#include <vector>
+
 #include <seastar/core/temporary_buffer.hh>
+#include <vector>
 
 // Phase 3: Data structure for parallel series compaction
 // Holds the result of processing a single series, ready to write
-template<typename T>
+template <typename T>
 struct SeriesCompactionData {
     SeriesId128 seriesId;
     TSMValueType seriesType;
@@ -32,8 +33,7 @@ struct SeriesCompactionData {
     uint64_t duplicatesRemoved = 0;
 
     // Constructor
-    SeriesCompactionData(const SeriesId128& id, TSMValueType type)
-        : seriesId(id), seriesType(type) {}
+    SeriesCompactionData(const SeriesId128& id, TSMValueType type) : seriesId(id), seriesType(type) {}
 
     // Move-only (contains temporary_buffer)
     SeriesCompactionData(SeriesCompactionData&&) = default;
@@ -42,4 +42,4 @@ struct SeriesCompactionData {
     SeriesCompactionData& operator=(const SeriesCompactionData&) = delete;
 };
 
-#endif // SERIES_COMPACTION_DATA_H_INCLUDED
+#endif  // SERIES_COMPACTION_DATA_H_INCLUDED

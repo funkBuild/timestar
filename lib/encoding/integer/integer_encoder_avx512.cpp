@@ -1,8 +1,11 @@
 #include "integer_encoder_avx512.hpp"
-#include "../zigzag.hpp"
+
 #include "../simple16.hpp"
-#include <immintrin.h>
+#include "../zigzag.hpp"
+
 #include <cpuid.h>
+#include <immintrin.h>
+
 #include <cstring>
 
 // Check for AVX-512F and AVX-512DQ support (cached - CPUID only called once)
@@ -10,8 +13,8 @@ bool IntegerEncoderAVX512::isAvailable() {
     static const bool available = []() {
         unsigned int eax, ebx, ecx, edx;
         if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-            bool has_avx512f = (ebx & (1 << 16)) != 0;  // AVX512F is bit 16 of EBX
-            bool has_avx512dq = (ebx & (1 << 17)) != 0; // AVX512DQ is bit 17 of EBX
+            bool has_avx512f = (ebx & (1 << 16)) != 0;   // AVX512F is bit 16 of EBX
+            bool has_avx512dq = (ebx & (1 << 17)) != 0;  // AVX512DQ is bit 17 of EBX
             return has_avx512f && has_avx512dq;
         }
         return false;
@@ -86,12 +89,13 @@ AlignedBuffer IntegerEncoderAVX512::encode(std::span<const uint64_t> values) {
         alignas(64) uint64_t encoded_batch[16];
 
         for (; i + 15 < size; i += 16) {
-            // Calculate delta-of-deltas for 16 values
-            // Unroll for better pipeline utilization
-            #pragma unroll 16
+// Calculate delta-of-deltas for 16 values
+// Unroll for better pipeline utilization
+#pragma unroll 16
             for (size_t j = 0; j < 16; j++) {
                 size_t idx = i + j;
-                deltas[j] = (static_cast<int64_t>(values[idx]) - static_cast<int64_t>(values[idx-1])) - (static_cast<int64_t>(values[idx-1]) - static_cast<int64_t>(values[idx-2]));
+                deltas[j] = (static_cast<int64_t>(values[idx]) - static_cast<int64_t>(values[idx - 1])) -
+                            (static_cast<int64_t>(values[idx - 1]) - static_cast<int64_t>(values[idx - 2]));
             }
 
             // SIMD zigzag encode in two batches of 8
@@ -115,11 +119,12 @@ AlignedBuffer IntegerEncoderAVX512::encode(std::span<const uint64_t> values) {
         alignas(64) uint64_t encoded_batch[8];
 
         for (; i + 7 < size; i += 8) {
-            // Calculate delta-of-deltas
-            #pragma unroll 8
+// Calculate delta-of-deltas
+#pragma unroll 8
             for (size_t j = 0; j < 8; j++) {
                 size_t idx = i + j;
-                deltas[j] = (static_cast<int64_t>(values[idx]) - static_cast<int64_t>(values[idx-1])) - (static_cast<int64_t>(values[idx-1]) - static_cast<int64_t>(values[idx-2]));
+                deltas[j] = (static_cast<int64_t>(values[idx]) - static_cast<int64_t>(values[idx - 1])) -
+                            (static_cast<int64_t>(values[idx - 1]) - static_cast<int64_t>(values[idx - 2]));
             }
 
             // SIMD zigzag encode
@@ -135,10 +140,14 @@ AlignedBuffer IntegerEncoderAVX512::encode(std::span<const uint64_t> values) {
 
     // Process remaining values with 4x unrolling
     for (; i + 3 < size; i += 4) {
-        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
-        int64_t d1 = (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i])) - (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1]));
-        int64_t d2 = (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1])) - (static_cast<int64_t>(values[i+1]) - static_cast<int64_t>(values[i]));
-        int64_t d3 = (static_cast<int64_t>(values[i+3]) - static_cast<int64_t>(values[i+2])) - (static_cast<int64_t>(values[i+2]) - static_cast<int64_t>(values[i+1]));
+        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                     (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
+        int64_t d1 = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i])) -
+                     (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]));
+        int64_t d2 = (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1])) -
+                     (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i]));
+        int64_t d3 = (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2])) -
+                     (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1]));
 
         encoded.push_back(ZigZag::zigzagEncode(d0));
         encoded.push_back(ZigZag::zigzagEncode(d1));
@@ -148,22 +157,23 @@ AlignedBuffer IntegerEncoderAVX512::encode(std::span<const uint64_t> values) {
 
     // Handle remaining values
     for (; i < size; i++) {
-        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])) - (static_cast<int64_t>(values[i-1]) - static_cast<int64_t>(values[i-2]));
+        int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                    (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
         encoded.push_back(ZigZag::zigzagEncode(D));
     }
 
     return Simple16::encode(encoded);
 }
 
-std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned int timestampSize,
-                                                       std::vector<uint64_t> &values,
-                                                       uint64_t minTime, uint64_t maxTime) {
+std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice& encoded, unsigned int timestampSize,
+                                                       std::vector<uint64_t>& values, uint64_t minTime,
+                                                       uint64_t maxTime) {
     // Optimized memory allocation with alignment for AVX-512
     const size_t current_size = values.size();
     const size_t estimated_new = timestampSize;
 
     if (values.capacity() < current_size + estimated_new) {
-        values.reserve(current_size + estimated_new + (estimated_new >> 2)); // 25% extra
+        values.reserve(current_size + estimated_new + (estimated_new >> 2));  // 25% extra
     }
 
     std::vector<uint64_t> deltaValues = Simple16::decode(encoded, timestampSize);
@@ -223,7 +233,7 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
             __m512i min_vec = _mm512_set1_epi64(minTime);
             __m512i max_vec = _mm512_set1_epi64(maxTime);
 
-            #pragma unroll 16
+#pragma unroll 16
             for (size_t j = 0; j < 16; j++) {
                 delta += decoded_batch[j];
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
@@ -250,8 +260,8 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
             __m512i dec = zigzagDecode8_avx512(&deltaValues[i]);
             _mm512_storeu_si512((__m512i*)decoded_batch, dec);
 
-            // Unrolled reconstruction
-            #pragma unroll 8
+// Unrolled reconstruction
+#pragma unroll 8
             for (size_t j = 0; j < 8; j++) {
                 delta += decoded_batch[j];
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
@@ -271,9 +281,9 @@ std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice &encoded, unsigned 
     // Process 4 values at a time
     for (; i + 3 < size; i += 4) {
         int64_t dd0 = ZigZag::zigzagDecode(deltaValues[i]);
-        int64_t dd1 = ZigZag::zigzagDecode(deltaValues[i+1]);
-        int64_t dd2 = ZigZag::zigzagDecode(deltaValues[i+2]);
-        int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i+3]);
+        int64_t dd1 = ZigZag::zigzagDecode(deltaValues[i + 1]);
+        int64_t dd2 = ZigZag::zigzagDecode(deltaValues[i + 2]);
+        int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i + 3]);
 
         delta += dd0;
         last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);

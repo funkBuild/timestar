@@ -1,11 +1,11 @@
 #ifndef ALP_ENCODER_HPP_INCLUDED
 #define ALP_ENCODER_HPP_INCLUDED
 
-#include <vector>
+#include "../../storage/compressed_buffer.hpp"
+
 #include <cstdint>
 #include <span>
-
-#include "../../storage/compressed_buffer.hpp"
+#include <vector>
 
 class AlignedBuffer;
 
@@ -19,7 +19,7 @@ public:
     // Writes uint64_t words directly into the target buffer, avoiding the
     // CompressedBuffer allocation and subsequent copy.
     // Returns the number of bytes written.
-    static size_t encodeInto(std::span<const double> values, AlignedBuffer &target);
+    static size_t encodeInto(std::span<const double> values, AlignedBuffer& target);
 };
 
-#endif // ALP_ENCODER_HPP_INCLUDED
+#endif  // ALP_ENCODER_HPP_INCLUDED

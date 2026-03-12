@@ -1,13 +1,14 @@
 #include "alp_encoder.hpp"
+
+#include "../../storage/aligned_buffer.hpp"
 #include "alp_constants.hpp"
 #include "alp_ffor.hpp"
 #include "alp_rd.hpp"
-#include "../../storage/aligned_buffer.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -29,8 +30,7 @@ inline ScaleResult scaleValue(double value, uint8_t exp, uint8_t fac) {
     double rounded = std::round(scaled);
 
     // Check for overflow before casting
-    if (rounded > static_cast<double>(alp::MAX_SAFE_INT) ||
-        rounded < static_cast<double>(alp::MIN_SAFE_INT)) {
+    if (rounded > static_cast<double>(alp::MAX_SAFE_INT) || rounded < static_cast<double>(alp::MIN_SAFE_INT)) {
         return {0, false};
     }
 
@@ -65,7 +65,8 @@ BestPair findBestExpFac(const double* values, size_t count) {
     // Build sample indices (evenly spaced)
     std::vector<size_t> sample_indices(sample_size);
     if (sample_size == count) {
-        for (size_t i = 0; i < count; ++i) sample_indices[i] = i;
+        for (size_t i = 0; i < count; ++i)
+            sample_indices[i] = i;
     } else {
         for (size_t i = 0; i < sample_size; ++i) {
             sample_indices[i] = (i * count) / sample_size;
@@ -80,8 +81,7 @@ BestPair findBestExpFac(const double* values, size_t count) {
             for (size_t idx : sample_indices) {
                 double v = values[idx];
                 // Skip special values - they'll always be exceptions
-                if (std::isnan(v) || std::isinf(v)
-                    || (v == 0.0 && std::signbit(v))) {
+                if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v))) {
                     exceptions++;
                     continue;
                 }
@@ -109,13 +109,13 @@ BestPair findBestExpFac(const double* values, size_t count) {
 
 // Calculate required bit width for a range of int64 values
 uint8_t requiredBitWidth(int64_t min_val, int64_t max_val) {
-    if (min_val == max_val) return 0;
+    if (min_val == max_val)
+        return 0;
     uint64_t range = static_cast<uint64_t>(max_val - min_val);
     return static_cast<uint8_t>(64 - __builtin_clzll(range));
 }
 
-} // anonymous namespace
-
+}  // anonymous namespace
 
 CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     CompressedBuffer buffer;
@@ -130,11 +130,9 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
     // Determine scheme: try ALP first, fall back to ALP_RD
     auto best = findBestExpFac(values.data(), total_values);
-    double exception_rate = static_cast<double>(best.exceptions) /
-                            std::min(total_values, alp::ALP_SAMPLE_SIZE);
+    double exception_rate = static_cast<double>(best.exceptions) / std::min(total_values, alp::ALP_SAMPLE_SIZE);
 
-    uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD)
-                     ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
+    uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD) ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
 
     // Delta-benefit heuristic: sample first block to check if delta reduces bit width
     if (scheme == alp::SCHEME_ALP) {
@@ -148,19 +146,25 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
         for (size_t i = 0; i < sample_count; ++i) {
             double v = values[i];
-            if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v))) continue;
+            if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v)))
+                continue;
             auto result = scaleValue(v, best.exp, best.fac);
-            if (!result.exact) continue;
+            if (!result.exact)
+                continue;
 
-            if (result.encoded < abs_min) abs_min = result.encoded;
-            if (result.encoded > abs_max) abs_max = result.encoded;
+            if (result.encoded < abs_min)
+                abs_min = result.encoded;
+            if (result.encoded > abs_max)
+                abs_max = result.encoded;
 
             if (!first_valid) {
                 int64_t delta = result.encoded - prev;
                 uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
                 auto zz_signed = static_cast<int64_t>(zz);
-                if (zz_signed < zz_min) zz_min = zz_signed;
-                if (zz_signed > zz_max) zz_max = zz_signed;
+                if (zz_signed < zz_min)
+                    zz_min = zz_signed;
+                if (zz_signed > zz_max)
+                    zz_max = zz_signed;
             }
             first_valid = false;
             prev = result.encoded;
@@ -183,14 +187,12 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
         throw std::overflow_error("ALP encoder: total_values " + std::to_string(total_values) +
                                   " exceeds 32-bit header capacity");
     }
-    uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC)
-                     | (static_cast<uint64_t>(total_values) << 32);
+    uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC) | (static_cast<uint64_t>(total_values) << 32);
     buffer.write<64>(header0);
 
     // Word 1: [0:15] num_blocks, [16:31] tail_count, [32:39] scheme
-    uint64_t header1 = static_cast<uint64_t>(num_blocks)
-                     | (static_cast<uint64_t>(tail_count) << 16)
-                     | (static_cast<uint64_t>(scheme) << 32);
+    uint64_t header1 = static_cast<uint64_t>(num_blocks) | (static_cast<uint64_t>(tail_count) << 16) |
+                       (static_cast<uint64_t>(scheme) << 32);
     buffer.write<64>(header1);
 
     if (scheme == alp::SCHEME_ALP || scheme == alp::SCHEME_ALP_DELTA) {
@@ -206,8 +208,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
-                                       ? tail_count : alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
 
             // Reuse scratch buffers (resize is no-op when <= capacity)
             encoded.resize(block_count);
@@ -220,15 +221,16 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
             for (size_t i = 0; i < block_count; ++i) {
                 double v = values[block_start + i];
-                bool is_special = std::isnan(v) || std::isinf(v)
-                                || (v == 0.0 && std::signbit(v)); // -0.0
+                bool is_special = std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v));  // -0.0
 
                 if (!is_special) {
                     auto result = scaleValue(v, exp, fac);
                     if (result.exact) {
                         encoded[i] = result.encoded;
-                        if (result.encoded < min_val) min_val = result.encoded;
-                        if (result.encoded > max_val) max_val = result.encoded;
+                        if (result.encoded < min_val)
+                            min_val = result.encoded;
+                        if (result.encoded > max_val)
+                            max_val = result.encoded;
                         continue;
                     }
                 }
@@ -236,7 +238,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
                 // Exception: store as raw bits
                 exc_positions.push_back(static_cast<uint16_t>(i));
                 exc_values.push_back(std::bit_cast<uint64_t>(v));
-                encoded[i] = 0; // placeholder (will use base after FFOR)
+                encoded[i] = 0;  // placeholder (will use base after FFOR)
             }
 
             // === Delta + Zigzag Transform (SCHEME_ALP_DELTA only) ===
@@ -284,8 +286,10 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
                         exc_scan++;
                         continue;
                     }
-                    if (encoded[i] < min_val) min_val = encoded[i];
-                    if (encoded[i] > max_val) max_val = encoded[i];
+                    if (encoded[i] < min_val)
+                        min_val = encoded[i];
+                    if (encoded[i] > max_val)
+                        max_val = encoded[i];
                 }
             }
 
@@ -306,11 +310,9 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
             // === Block Header (2 x uint64_t) ===
             // Word 0: [0:7] exp, [8:15] fac, [16:22] bit_width, [23:31] reserved,
             //         [32:47] exception_count, [48:63] block_values
-            uint64_t bh0 = static_cast<uint64_t>(exp)
-                         | (static_cast<uint64_t>(fac) << 8)
-                         | (static_cast<uint64_t>(bw) << 16)
-                         | (static_cast<uint64_t>(exception_count) << 32)
-                         | (static_cast<uint64_t>(block_count) << 48);
+            uint64_t bh0 = static_cast<uint64_t>(exp) | (static_cast<uint64_t>(fac) << 8) |
+                           (static_cast<uint64_t>(bw) << 16) | (static_cast<uint64_t>(exception_count) << 32) |
+                           (static_cast<uint64_t>(block_count) << 48);
             buffer.write<64>(bh0);
 
             // Word 1: FOR base
@@ -365,8 +367,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
-                                       ? tail_count : alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
 
             auto rd = alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count);
             const uint16_t exception_count = static_cast<uint16_t>(rd.exception_positions.size());
@@ -374,12 +375,10 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
             // === Block Header (2 x uint64_t) ===
             // Word 0: [0:7] right_bw, [8:15] left_bw, [16:23] dict_size, [24:31] right_bit_count,
             //         [32:47] exception_count, [48:63] block_values
-            uint64_t bh0 = static_cast<uint64_t>(rd.right_bw)
-                         | (static_cast<uint64_t>(rd.left_bw) << 8)
-                         | (static_cast<uint64_t>(rd.dictionary.size()) << 16)
-                         | (static_cast<uint64_t>(right_bit_count) << 24)
-                         | (static_cast<uint64_t>(exception_count) << 32)
-                         | (static_cast<uint64_t>(block_count) << 48);
+            uint64_t bh0 = static_cast<uint64_t>(rd.right_bw) | (static_cast<uint64_t>(rd.left_bw) << 8) |
+                           (static_cast<uint64_t>(rd.dictionary.size()) << 16) |
+                           (static_cast<uint64_t>(right_bit_count) << 24) |
+                           (static_cast<uint64_t>(exception_count) << 32) | (static_cast<uint64_t>(block_count) << 48);
             buffer.write<64>(bh0);
 
             // Word 1: right FOR base
@@ -408,8 +407,8 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
             if (rd.right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
                 right_packed.assign(right_packed_words, 0);
-                alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base,
-                                   rd.right_bw, right_packed.data());
+                alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base, rd.right_bw,
+                                   right_packed.data());
                 for (size_t w = 0; w < right_packed_words; ++w) {
                     buffer.write<64>(right_packed[w]);
                 }
@@ -441,7 +440,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     return buffer;
 }
 
-size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &target) {
+size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& target) {
     if (values.empty()) {
         return 0;
     }
@@ -454,11 +453,9 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
     // Determine scheme: try ALP first, fall back to ALP_RD
     auto best = findBestExpFac(values.data(), total_values);
-    double exception_rate = static_cast<double>(best.exceptions) /
-                            std::min(total_values, alp::ALP_SAMPLE_SIZE);
+    double exception_rate = static_cast<double>(best.exceptions) / std::min(total_values, alp::ALP_SAMPLE_SIZE);
 
-    uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD)
-                     ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
+    uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD) ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
 
     // Delta-benefit heuristic: sample first block to check if delta reduces bit width
     if (scheme == alp::SCHEME_ALP) {
@@ -472,19 +469,25 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
         for (size_t i = 0; i < sample_count; ++i) {
             double v = values[i];
-            if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v))) continue;
+            if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v)))
+                continue;
             auto result = scaleValue(v, best.exp, best.fac);
-            if (!result.exact) continue;
+            if (!result.exact)
+                continue;
 
-            if (result.encoded < abs_min) abs_min = result.encoded;
-            if (result.encoded > abs_max) abs_max = result.encoded;
+            if (result.encoded < abs_min)
+                abs_min = result.encoded;
+            if (result.encoded > abs_max)
+                abs_max = result.encoded;
 
             if (!first_valid) {
                 int64_t delta = result.encoded - prev;
                 uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
                 auto zz_signed = static_cast<int64_t>(zz);
-                if (zz_signed < zz_min) zz_min = zz_signed;
-                if (zz_signed > zz_max) zz_max = zz_signed;
+                if (zz_signed < zz_min)
+                    zz_min = zz_signed;
+                if (zz_signed > zz_max)
+                    zz_max = zz_signed;
             }
             first_valid = false;
             prev = result.encoded;
@@ -507,14 +510,12 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
         throw std::overflow_error("ALP encoder: total_values " + std::to_string(total_values) +
                                   " exceeds 32-bit header capacity");
     }
-    uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC)
-                     | (static_cast<uint64_t>(total_values) << 32);
+    uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC) | (static_cast<uint64_t>(total_values) << 32);
     target.write(header0);
 
     // Word 1: [0:15] num_blocks, [16:31] tail_count, [32:39] scheme
-    uint64_t header1 = static_cast<uint64_t>(num_blocks)
-                     | (static_cast<uint64_t>(tail_count) << 16)
-                     | (static_cast<uint64_t>(scheme) << 32);
+    uint64_t header1 = static_cast<uint64_t>(num_blocks) | (static_cast<uint64_t>(tail_count) << 16) |
+                       (static_cast<uint64_t>(scheme) << 32);
     target.write(header1);
 
     if (scheme == alp::SCHEME_ALP || scheme == alp::SCHEME_ALP_DELTA) {
@@ -530,8 +531,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
-                                       ? tail_count : alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
 
             // Reuse scratch buffers (resize is no-op when <= capacity)
             encoded.resize(block_count);
@@ -544,15 +544,16 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
             for (size_t i = 0; i < block_count; ++i) {
                 double v = values[block_start + i];
-                bool is_special = std::isnan(v) || std::isinf(v)
-                                || (v == 0.0 && std::signbit(v)); // -0.0
+                bool is_special = std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v));  // -0.0
 
                 if (!is_special) {
                     auto result = scaleValue(v, exp, fac);
                     if (result.exact) {
                         encoded[i] = result.encoded;
-                        if (result.encoded < min_val) min_val = result.encoded;
-                        if (result.encoded > max_val) max_val = result.encoded;
+                        if (result.encoded < min_val)
+                            min_val = result.encoded;
+                        if (result.encoded > max_val)
+                            max_val = result.encoded;
                         continue;
                     }
                 }
@@ -560,7 +561,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
                 // Exception: store as raw bits
                 exc_positions.push_back(static_cast<uint16_t>(i));
                 exc_values.push_back(std::bit_cast<uint64_t>(v));
-                encoded[i] = 0; // placeholder (will use base after FFOR)
+                encoded[i] = 0;  // placeholder (will use base after FFOR)
             }
 
             // === Delta + Zigzag Transform (SCHEME_ALP_DELTA only) ===
@@ -608,8 +609,10 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
                         exc_scan++;
                         continue;
                     }
-                    if (encoded[i] < min_val) min_val = encoded[i];
-                    if (encoded[i] > max_val) max_val = encoded[i];
+                    if (encoded[i] < min_val)
+                        min_val = encoded[i];
+                    if (encoded[i] > max_val)
+                        max_val = encoded[i];
                 }
             }
 
@@ -628,11 +631,9 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
             const uint16_t exception_count = static_cast<uint16_t>(exc_positions.size());
 
             // === Block Header (2 x uint64_t) ===
-            uint64_t bh0 = static_cast<uint64_t>(exp)
-                         | (static_cast<uint64_t>(fac) << 8)
-                         | (static_cast<uint64_t>(bw) << 16)
-                         | (static_cast<uint64_t>(exception_count) << 32)
-                         | (static_cast<uint64_t>(block_count) << 48);
+            uint64_t bh0 = static_cast<uint64_t>(exp) | (static_cast<uint64_t>(fac) << 8) |
+                           (static_cast<uint64_t>(bw) << 16) | (static_cast<uint64_t>(exception_count) << 32) |
+                           (static_cast<uint64_t>(block_count) << 48);
             target.write(bh0);
 
             // Word 1: FOR base
@@ -681,19 +682,16 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
-                                       ? tail_count : alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
 
             auto rd = alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count);
             const uint16_t exception_count = static_cast<uint16_t>(rd.exception_positions.size());
 
             // === Block Header (2 x uint64_t) ===
-            uint64_t bh0 = static_cast<uint64_t>(rd.right_bw)
-                         | (static_cast<uint64_t>(rd.left_bw) << 8)
-                         | (static_cast<uint64_t>(rd.dictionary.size()) << 16)
-                         | (static_cast<uint64_t>(right_bit_count) << 24)
-                         | (static_cast<uint64_t>(exception_count) << 32)
-                         | (static_cast<uint64_t>(block_count) << 48);
+            uint64_t bh0 = static_cast<uint64_t>(rd.right_bw) | (static_cast<uint64_t>(rd.left_bw) << 8) |
+                           (static_cast<uint64_t>(rd.dictionary.size()) << 16) |
+                           (static_cast<uint64_t>(right_bit_count) << 24) |
+                           (static_cast<uint64_t>(exception_count) << 32) | (static_cast<uint64_t>(block_count) << 48);
             target.write(bh0);
 
             // Word 1: right FOR base
@@ -720,8 +718,8 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
             if (rd.right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
                 right_packed.assign(right_packed_words, 0);
-                alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base,
-                                   rd.right_bw, right_packed.data());
+                alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base, rd.right_bw,
+                                   right_packed.data());
                 target.write_array(right_packed.data(), right_packed_words);
             }
 

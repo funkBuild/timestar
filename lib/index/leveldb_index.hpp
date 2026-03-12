@@ -1,29 +1,27 @@
 #ifndef LEVELDB_INDEX_H_INCLUDED
 #define LEVELDB_INDEX_H_INCLUDED
 
-#include <string>
-#include <vector>
-#include <set>
-#include <unordered_map>
-#include <unordered_set>
-#include <memory>
-#include <optional>
-#include "timestar_value.hpp"
 #include "line_parser.hpp"
+#include "retention_policy.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
-
-#include <expected>
-
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/future.hh>
-
-#include "retention_policy.hpp"
+#include "timestar_value.hpp"
 
 #include <leveldb/db.h>
+#include <leveldb/filter_policy.h>
 #include <leveldb/options.h>
 #include <leveldb/write_batch.h>
-#include <leveldb/filter_policy.h>
+
+#include <expected>
+#include <memory>
+#include <optional>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 // Forward declaration to avoid circular include with tsm.hpp
 enum class TSMValueType;
@@ -38,8 +36,8 @@ struct MetadataOp {
 
 enum IndexKeyType : uint8_t {
     SERIES_INDEX = 0x01,        // series_key -> series_id
-    MEASUREMENT_FIELDS = 0x02,   // measurement -> fields set
-    MEASUREMENT_TAGS = 0x03,     // measurement -> tag keys set
+    MEASUREMENT_FIELDS = 0x02,  // measurement -> fields set
+    MEASUREMENT_TAGS = 0x03,    // measurement -> tag keys set
     TAG_VALUES = 0x04,          // measurement+tag_key -> values set
     SERIES_METADATA = 0x05,     // series_id -> metadata
     TAG_INDEX = 0x06,           // measurement+tag_key+tag_value -> series_ids
@@ -113,9 +111,9 @@ private:
     // between co_await points eliminates interleaving.
     // These caches are naturally bounded by the number of unique measurements x fields/tags,
     // which is typically small (hundreds to thousands). No eviction needed.
-    std::unordered_map<std::string, std::set<std::string>> fieldsCache;   // measurement -> fields
-    std::unordered_map<std::string, std::set<std::string>> tagsCache;     // measurement -> tag keys
-    std::unordered_map<std::string, std::set<std::string>> tagValuesCache; // measurement+\0+tagKey -> tag values
+    std::unordered_map<std::string, std::set<std::string>> fieldsCache;     // measurement -> fields
+    std::unordered_map<std::string, std::set<std::string>> tagsCache;       // measurement -> tag keys
+    std::unordered_map<std::string, std::set<std::string>> tagValuesCache;  // measurement+\0+tagKey -> tag values
 
     // In-memory cache for field types to avoid redundant LevelDB puts on every insert.
     // Key: measurement + '\0' + field, Value: type string ("float", "boolean", "string")
@@ -128,9 +126,8 @@ private:
     std::unordered_map<std::string, std::vector<SeriesId128>> measurementSeriesCache;
 
     // Helper methods for key encoding
-    std::string encodeSeriesKey(const std::string& measurement,
-                               const std::map<std::string, std::string>& tags,
-                               const std::string& field);
+    std::string encodeSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
+                                const std::string& field);
     std::string encodeMeasurementFieldsKey(const std::string& measurement);
     std::string encodeMeasurementTagsKey(const std::string& measurement);
     std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey);
@@ -161,8 +158,7 @@ public:
     seastar::future<> close();
 
     // Series indexing - core functionality.
-    seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement,
-                                                     std::map<std::string, std::string> tags,
+    seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement, std::map<std::string, std::string> tags,
                                                      std::string field);
 
     seastar::future<std::optional<SeriesId128>> getSeriesId(const std::string& measurement,
@@ -174,8 +170,8 @@ public:
 
     // Batch metadata lookup: performs all LevelDB Gets in a single seastar::async block,
     // reducing N coroutine suspensions + N thread pool dispatches to just 1 of each.
-    seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>>
-    getSeriesMetadataBatch(const std::vector<SeriesId128>& seriesIds);
+    seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>> getSeriesMetadataBatch(
+        const std::vector<SeriesId128>& seriesIds);
 
     // Measurement metadata indexing
     seastar::future<> addField(const std::string& measurement, const std::string& field);
@@ -184,8 +180,7 @@ public:
     // Batched metadata indexing: checks all field/tag caches synchronously,
     // loads any cache misses in a single LevelDB read, then writes all updates
     // in a single WriteBatch. Reduces N+1 co_awaits to at most 2.
-    seastar::future<> addFieldsAndTags(const std::string& measurement,
-                                       const std::string& field,
+    seastar::future<> addFieldsAndTags(const std::string& measurement, const std::string& field,
                                        const std::map<std::string, std::string>& tags);
 
     // Field type management
@@ -199,7 +194,7 @@ public:
     seastar::future<std::set<std::string>> getTagValues(const std::string& measurement, const std::string& tagKey);
 
     // Bulk operations for insert batching
-    template<class T>
+    template <class T>
     seastar::future<SeriesId128> indexInsert(const TimeStarInsert<T>& insert);
 
     // Batch metadata indexing: indexes multiple series in a single LevelDB WriteBatch.
@@ -210,10 +205,9 @@ public:
     // maxSeries: if > 0, returns SeriesLimitExceeded error when the final result
     // exceeds the limit. This prevents wasted metadata Gets for queries that would
     // be rejected anyway. 0 means unlimited.
-    seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>>
-    findSeries(const std::string& measurement,
-               const std::map<std::string, std::string>& tagFilters = {},
-               size_t maxSeries = 0);
+    seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> findSeries(
+        const std::string& measurement, const std::map<std::string, std::string>& tagFilters = {},
+        size_t maxSeries = 0);
 
     struct SeriesWithMetadata {
         SeriesId128 seriesId;
@@ -223,36 +217,30 @@ public:
     // maxSeries: if > 0, returns SeriesLimitExceeded error when the series count
     // exceeds the limit. Checked after findSeries() and before metadata Gets,
     // preventing wasted I/O. 0 means unlimited.
-    seastar::future<std::expected<std::vector<SeriesWithMetadata>, SeriesLimitExceeded>>
-    findSeriesWithMetadata(
-        const std::string& measurement,
-        const std::map<std::string, std::string>& tagFilters = {},
-        const std::unordered_set<std::string>& fieldFilter = {},
-        size_t maxSeries = 0);
+    seastar::future<std::expected<std::vector<SeriesWithMetadata>, SeriesLimitExceeded>> findSeriesWithMetadata(
+        const std::string& measurement, const std::map<std::string, std::string>& tagFilters = {},
+        const std::unordered_set<std::string>& fieldFilter = {}, size_t maxSeries = 0);
 
     // Find series by single tag (optimized, exact match only).
     // maxSeries: if > 0, stops scanning early when the count exceeds the limit.
     // 0 means unlimited. Note: for multi-tag intersection queries, individual tag
     // scans run without limits since intersection reduces the count. The limit is
     // checked on the final result in findSeries().
-    seastar::future<std::vector<SeriesId128>> findSeriesByTag(const std::string& measurement,
-                                                              const std::string& tagKey,
-                                                              const std::string& tagValue,
-                                                              size_t maxSeries = 0);
+    seastar::future<std::vector<SeriesId128>> findSeriesByTag(const std::string& measurement, const std::string& tagKey,
+                                                              const std::string& tagValue, size_t maxSeries = 0);
 
     // Find series by tag pattern (wildcard or regex).
     // Scans TAG_INDEX entries for the given measurement+tagKey, using the literal
     // prefix of the pattern to narrow the LevelDB seek, then post-filters with
     // SeriesMatcher::matchesTag(). Supports *, ?, ~regex, and /regex/ patterns.
-    seastar::future<std::vector<SeriesId128>> findSeriesByTagPattern(
-        const std::string& measurement,
-        const std::string& tagKey,
-        const std::string& scopeValue,
-        size_t maxSeries = 0);
+    seastar::future<std::vector<SeriesId128>> findSeriesByTagPattern(const std::string& measurement,
+                                                                     const std::string& tagKey,
+                                                                     const std::string& scopeValue,
+                                                                     size_t maxSeries = 0);
 
     // Group series by tag value for aggregations
-    seastar::future<std::map<std::string, std::vector<SeriesId128>>>
-        getSeriesGroupedByTag(const std::string& measurement, const std::string& tagKey);
+    seastar::future<std::map<std::string, std::vector<SeriesId128>>> getSeriesGroupedByTag(
+        const std::string& measurement, const std::string& tagKey);
 
     // Field statistics for query optimization
     struct FieldStats {
@@ -262,17 +250,15 @@ public:
         uint64_t pointCount;
     };
 
-    seastar::future<> updateFieldStats(const SeriesId128& seriesId, const std::string& field,
-                                       const FieldStats& stats);
+    seastar::future<> updateFieldStats(const SeriesId128& seriesId, const std::string& field, const FieldStats& stats);
 
-    seastar::future<std::optional<FieldStats>> getFieldStats(const SeriesId128& seriesId,
-                                                              const std::string& field);
+    seastar::future<std::optional<FieldStats>> getFieldStats(const SeriesId128& seriesId, const std::string& field);
 
     // Compaction support - get all series for a measurement.
     // maxSeries: if > 0, stops scanning early and returns SeriesLimitExceeded
     // when the count exceeds the limit. 0 means unlimited.
-    seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>>
-    getAllSeriesForMeasurement(const std::string& measurement, size_t maxSeries = 0);
+    seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> getAllSeriesForMeasurement(
+        const std::string& measurement, size_t maxSeries = 0);
 
     // Series cache size management.
     // getSeriesCacheSize() returns the active cache size only (not retired entries

@@ -2,6 +2,7 @@
 #define BLOCK_AGGREGATOR_H_INCLUDED
 
 #include "aggregator.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <numeric>
@@ -35,9 +36,7 @@ public:
     // parameters are known at construction time.  Bucket count is computed as
     // ceil((endTime - startTime) / interval), capped at MAX_PREALLOCATED_BUCKETS
     // to prevent excessive allocations for pathological inputs.
-    BlockAggregator(uint64_t interval, uint64_t startTime, uint64_t endTime)
-        : interval_(interval)
-    {
+    BlockAggregator(uint64_t interval, uint64_t startTime, uint64_t endTime) : interval_(interval) {
         if (interval_ > 0 && endTime > startTime) {
             uint64_t range = endTime - startTime;
             // Ceiling division: (range + interval - 1) / interval
@@ -54,10 +53,8 @@ public:
         ++pointCount_;
         if (interval_ == 0) {
             if (timestamps_.size() >= MAX_UNBUCKETED_STATES) [[unlikely]] {
-                throw std::runtime_error(
-                    "Non-bucketed aggregation exceeded " +
-                    std::to_string(MAX_UNBUCKETED_STATES) +
-                    " states; use an aggregationInterval to reduce cardinality");
+                throw std::runtime_error("Non-bucketed aggregation exceeded " + std::to_string(MAX_UNBUCKETED_STATES) +
+                                         " states; use an aggregationInterval to reduce cardinality");
             }
             timestamps_.push_back(timestamp);
             rawValues_.push_back(value);
@@ -68,15 +65,12 @@ public:
     }
 
     // Add a batch of decoded points (contiguous arrays).
-    void addPoints(const std::vector<uint64_t>& timestamps,
-                   const std::vector<double>& values) {
+    void addPoints(const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
         pointCount_ += timestamps.size();
         if (interval_ == 0) {
             if (timestamps_.size() + timestamps.size() > MAX_UNBUCKETED_STATES) [[unlikely]] {
-                throw std::runtime_error(
-                    "Non-bucketed aggregation exceeded " +
-                    std::to_string(MAX_UNBUCKETED_STATES) +
-                    " states; use an aggregationInterval to reduce cardinality");
+                throw std::runtime_error("Non-bucketed aggregation exceeded " + std::to_string(MAX_UNBUCKETED_STATES) +
+                                         " states; use an aggregationInterval to reduce cardinality");
             }
             // Store raw (timestamp, value) pairs — 16 bytes/point vs 96 bytes
             // with AggregationState. States are constructed lazily at merge time.
@@ -102,7 +96,8 @@ public:
     // Sort per-timestamp data. Required after parallel_for_each on batches
     // because batch completion order is non-deterministic.
     void sortTimestamps() {
-        if (timestamps_.size() <= 1) return;
+        if (timestamps_.size() <= 1)
+            return;
         // Check if already sorted (common case: single batch or in-order completion)
         bool sorted = true;
         for (size_t i = 1; i < timestamps_.size(); ++i) {
@@ -111,12 +106,13 @@ public:
                 break;
             }
         }
-        if (sorted) return;
+        if (sorted)
+            return;
         // Index permutation sort to keep timestamps and values in sync
         std::vector<size_t> indices(timestamps_.size());
         std::iota(indices.begin(), indices.end(), 0);
         std::sort(indices.begin(), indices.end(),
-            [this](size_t a, size_t b) { return timestamps_[a] < timestamps_[b]; });
+                  [this](size_t a, size_t b) { return timestamps_[a] < timestamps_[b]; });
         std::vector<uint64_t> sortedTs(timestamps_.size());
         std::vector<double> sortedVals(rawValues_.size());
         for (size_t i = 0; i < indices.size(); ++i) {
@@ -148,6 +144,6 @@ struct PushdownResult {
     size_t totalPoints = 0;
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // BLOCK_AGGREGATOR_H_INCLUDED
+#endif  // BLOCK_AGGREGATOR_H_INCLUDED

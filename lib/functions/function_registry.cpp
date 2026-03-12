@@ -1,4 +1,5 @@
 #include "function_registry.hpp"
+
 #include <algorithm>
 
 namespace timestar::functions {
@@ -37,10 +38,10 @@ std::vector<std::string> FunctionRegistry::searchFunctions(const std::string& pa
     std::vector<std::string> results;
     std::string lowerPattern = pattern;
     std::transform(lowerPattern.begin(), lowerPattern.end(), lowerPattern.begin(), ::tolower);
-    
+
     for (const auto& pair : metadata_) {
         const auto& metadata = pair.second;
-        
+
         // Search in name
         std::string lowerName = metadata.name;
         std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
@@ -48,7 +49,7 @@ std::vector<std::string> FunctionRegistry::searchFunctions(const std::string& pa
             results.push_back(pair.first);
             continue;
         }
-        
+
         // Search in description
         std::string lowerDesc = metadata.description;
         std::transform(lowerDesc.begin(), lowerDesc.end(), lowerDesc.begin(), ::tolower);
@@ -56,7 +57,7 @@ std::vector<std::string> FunctionRegistry::searchFunctions(const std::string& pa
             results.push_back(pair.first);
         }
     }
-    
+
     return results;
 }
 
@@ -65,23 +66,21 @@ std::unique_ptr<IFunction> FunctionRegistry::createFunction(const std::string& n
     if (it == prototypes_.end()) {
         return nullptr;
     }
-    
+
     auto metadataIt = metadata_.find(name);
     if (metadataIt == metadata_.end()) {
-        return nullptr; // This shouldn't happen if registry is consistent
+        return nullptr;  // This shouldn't happen if registry is consistent
     }
-    
+
     auto cloned = it->second->clone();
-    
+
     // Check if it's a unary function and wrap appropriately
     auto unaryFunction = dynamic_cast<IUnaryFunction*>(cloned.get());
     if (unaryFunction) {
         // Release the raw pointer from the unique_ptr and wrap it
         cloned.release();
-        return std::make_unique<RegistryUnaryFunctionWrapper>(
-            std::unique_ptr<IUnaryFunction>(unaryFunction), 
-            metadataIt->second
-        );
+        return std::make_unique<RegistryUnaryFunctionWrapper>(std::unique_ptr<IUnaryFunction>(unaryFunction),
+                                                              metadataIt->second);
     } else {
         // For other function types, use the generic wrapper
         return std::make_unique<RegistryFunctionWrapper>(std::move(cloned), metadataIt->second);
@@ -91,13 +90,13 @@ std::unique_ptr<IFunction> FunctionRegistry::createFunction(const std::string& n
 RegistryStats FunctionRegistry::getStats() const {
     RegistryStats stats;
     stats.totalFunctions = prototypes_.size();
-    
+
     for (const auto& pair : metadata_) {
         const auto& metadata = pair.second;
         stats.functionsByCategory[metadata.category]++;
         stats.functionsByOutputType[metadata.outputType]++;
     }
-    
+
     return stats;
 }
 
@@ -106,4 +105,4 @@ void FunctionRegistry::clear() {
     metadata_.clear();
 }
 
-} // namespace timestar::functions
+}  // namespace timestar::functions

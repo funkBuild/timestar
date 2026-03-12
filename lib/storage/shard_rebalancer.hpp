@@ -1,20 +1,19 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <seastar/core/future.hh>
 #include <string>
 #include <vector>
-#include <map>
-
-#include <seastar/core/future.hh>
 
 namespace timestar {
 
 // Persisted state for crash-safe rebalancing.
 enum class RebalancePhase {
-    None,           // No rebalance in progress
-    InProgress,     // New shard dirs being written (old dirs intact)
-    RenamesStarted, // Old dirs being renamed to _old (point of no return)
-    Complete        // New dirs in place, awaiting cleanup of _old dirs
+    None,            // No rebalance in progress
+    InProgress,      // New shard dirs being written (old dirs intact)
+    RenamesStarted,  // Old dirs being renamed to _old (point of no return)
+    Complete         // New dirs in place, awaiting cleanup of _old dirs
 };
 
 struct RebalanceState {
@@ -100,4 +99,4 @@ private:
     void completeCutover(unsigned oldShardCount, unsigned newShardCount);
 };
 
-} // namespace timestar
+}  // namespace timestar

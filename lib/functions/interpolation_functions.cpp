@@ -1,7 +1,8 @@
 #include "interpolation_functions.hpp"
+
 #include <algorithm>
-#include <sstream>
 #include <limits>
+#include <sstream>
 
 namespace timestar::functions {
 
@@ -14,16 +15,23 @@ const FunctionMetadata LinearInterpolationFunction::metadata_ = {
     .category = FunctionCategory::TRANSFORMATION,
     .supportedInputTypes = {"double"},
     .outputType = "double",
-    .parameters = {
-        {.name = "target_interval", .type = "int", .required = false, .description = "Target interval between points in nanoseconds"},
-        {.name = "target_timestamps", .type = "string", .required = false, .description = "Comma-separated list of target timestamps"},
-        {.name = "boundary", .type = "string", .required = false, .description = "Boundary handling: clamp, nan, nan_fill, extrapolate", .defaultValue = "clamp"}
-    },
+    .parameters = {{.name = "target_interval",
+                    .type = "int",
+                    .required = false,
+                    .description = "Target interval between points in nanoseconds"},
+                   {.name = "target_timestamps",
+                    .type = "string",
+                    .required = false,
+                    .description = "Comma-separated list of target timestamps"},
+                   {.name = "boundary",
+                    .type = "string",
+                    .required = false,
+                    .description = "Boundary handling: clamp, nan, nan_fill, extrapolate",
+                    .defaultValue = "clamp"}},
     .supportsVectorization = true,
     .supportsStreaming = false,
     .minDataPoints = 2,
-    .examples = {"linear_interpolate(interval=1000)", "linear_interpolate(timestamps=\"1000,2000,3000\")"}
-};
+    .examples = {"linear_interpolate(interval=1000)", "linear_interpolate(timestamps=\"1000,2000,3000\")"}};
 
 const FunctionMetadata& LinearInterpolationFunction::getMetadata() const {
     return metadata_;
@@ -37,7 +45,7 @@ seastar::future<bool> LinearInterpolationFunction::validateParameters(const Func
     try {
         bool hasInterval = context.hasParameter("target_interval");
         bool hasTimestamps = context.hasParameter("target_timestamps");
-        
+
         // Must have either interval or timestamps, but not both
         if (hasInterval && hasTimestamps) {
             return seastar::make_ready_future<bool>(false);
@@ -45,33 +53,31 @@ seastar::future<bool> LinearInterpolationFunction::validateParameters(const Func
         if (!hasInterval && !hasTimestamps) {
             return seastar::make_ready_future<bool>(false);
         }
-        
+
         if (hasInterval) {
             int64_t interval = context.getParameter<int64_t>("target_interval");
             if (interval <= 0) {
                 return seastar::make_ready_future<bool>(false);
             }
         }
-        
+
         return seastar::make_ready_future<bool>(true);
     } catch (...) {
         return seastar::make_ready_future<bool>(false);
     }
 }
 
-seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(const DoubleSeriesView& input,
+                                                                             const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     if (input.count < 2) {
         throw InsufficientDataException("Linear interpolation requires at least 2 data points");
     }
-    
+
     std::string boundary = context.getParameter<std::string>("boundary", "clamp");
     std::vector<uint64_t> targetTimestamps;
-    
+
     if (context.hasParameter("target_interval")) {
         int64_t interval = context.getParameter<int64_t>("target_interval");
         if (interval <= 0) {
@@ -83,9 +89,9 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
         uint64_t uinterval = static_cast<uint64_t>(interval);
         size_t estimatedPoints = (endTime > startTime) ? ((endTime - startTime) / uinterval + 1) : 1;
         if (estimatedPoints > MAX_INTERPOLATION_POINTS) {
-            throw ParameterValidationException(
-                "target_interval too small: would generate " + std::to_string(estimatedPoints) +
-                " points (max " + std::to_string(MAX_INTERPOLATION_POINTS) + ")");
+            throw ParameterValidationException("target_interval too small: would generate " +
+                                               std::to_string(estimatedPoints) + " points (max " +
+                                               std::to_string(MAX_INTERPOLATION_POINTS) + ")");
         }
 
         for (uint64_t t = startTime; t <= endTime; t += uinterval) {
@@ -101,13 +107,11 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
                 try {
                     targetTimestamps.push_back(std::stoull(token));
                 } catch (const std::exception& e) {
-                    throw ParameterValidationException(
-                        "Invalid timestamp value \"" + token + "\": " + e.what());
+                    throw ParameterValidationException("Invalid timestamp value \"" + token + "\": " + e.what());
                 }
                 if (targetTimestamps.size() > MAX_INTERPOLATION_POINTS) {
-                    throw ParameterValidationException(
-                        "Too many target_timestamps: exceeds limit of " +
-                        std::to_string(MAX_INTERPOLATION_POINTS));
+                    throw ParameterValidationException("Too many target_timestamps: exceeds limit of " +
+                                                       std::to_string(MAX_INTERPOLATION_POINTS));
                 }
             }
         }
@@ -131,19 +135,19 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
             ++searchPos;
         }
         size_t i = searchPos;
-        
+
         if (targetTime < input.timestampAt(0)) {
             // Before first point
             if (boundary == "clamp") {
                 result.values.push_back(input.valueAt(0));
             } else if (boundary == "nan" || boundary == "nan_fill") {
                 result.values.push_back(std::numeric_limits<double>::quiet_NaN());
-            } else { // extrapolate
+            } else {  // extrapolate
                 if (input.count >= 2) {
-                    double slope = (input.valueAt(1) - input.valueAt(0)) / 
-                                  static_cast<double>(input.timestampAt(1) - input.timestampAt(0));
-                    double extrapolated = input.valueAt(0) + slope * 
-                                         static_cast<double>(targetTime - input.timestampAt(0));
+                    double slope = (input.valueAt(1) - input.valueAt(0)) /
+                                   static_cast<double>(input.timestampAt(1) - input.timestampAt(0));
+                    double extrapolated =
+                        input.valueAt(0) + slope * static_cast<double>(targetTime - input.timestampAt(0));
                     result.values.push_back(extrapolated);
                 } else {
                     result.values.push_back(input.valueAt(0));
@@ -155,13 +159,13 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
                 result.values.push_back(input.valueAt(input.count - 1));
             } else if (boundary == "nan" || boundary == "nan_fill") {
                 result.values.push_back(std::numeric_limits<double>::quiet_NaN());
-            } else { // extrapolate
+            } else {  // extrapolate
                 if (input.count >= 2) {
                     size_t lastIdx = input.count - 1;
-                    double slope = (input.valueAt(lastIdx) - input.valueAt(lastIdx - 1)) / 
-                                  static_cast<double>(input.timestampAt(lastIdx) - input.timestampAt(lastIdx - 1));
-                    double extrapolated = input.valueAt(lastIdx) + slope * 
-                                         static_cast<double>(targetTime - input.timestampAt(lastIdx));
+                    double slope = (input.valueAt(lastIdx) - input.valueAt(lastIdx - 1)) /
+                                   static_cast<double>(input.timestampAt(lastIdx) - input.timestampAt(lastIdx - 1));
+                    double extrapolated =
+                        input.valueAt(lastIdx) + slope * static_cast<double>(targetTime - input.timestampAt(lastIdx));
                     result.values.push_back(extrapolated);
                 } else {
                     result.values.push_back(input.valueAt(input.count - 1));
@@ -176,7 +180,7 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
             uint64_t t2 = input.timestampAt(i + 1);
             double v1 = input.valueAt(i);
             double v2 = input.valueAt(i + 1);
-            
+
             double ratio = static_cast<double>(targetTime - t1) / static_cast<double>(t2 - t1);
             double interpolated = v1 + ratio * (v2 - v1);
             result.values.push_back(interpolated);
@@ -185,26 +189,29 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(
             result.values.push_back(input.valueAt(input.count - 1));
         }
     }
-    
+
     return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
 }
 
 // SplineInterpolationFunction implementation
 const FunctionMetadata SplineInterpolationFunction::metadata_ = {
-    .name = "spline_interpolate", 
+    .name = "spline_interpolate",
     .description = "Cubic spline interpolation for smooth curves",
     .category = FunctionCategory::TRANSFORMATION,
     .supportedInputTypes = {"double"},
     .outputType = "double",
-    .parameters = {
-        {.name = "target_interval", .type = "int", .required = false, .description = "Target interval between points in nanoseconds"},
-        {.name = "target_timestamps", .type = "string", .required = false, .description = "Comma-separated list of target timestamps"}
-    },
+    .parameters = {{.name = "target_interval",
+                    .type = "int",
+                    .required = false,
+                    .description = "Target interval between points in nanoseconds"},
+                   {.name = "target_timestamps",
+                    .type = "string",
+                    .required = false,
+                    .description = "Comma-separated list of target timestamps"}},
     .supportsVectorization = true,
     .supportsStreaming = false,
     .minDataPoints = 4,
-    .examples = {"spline_interpolation(interval=1000)"}
-};
+    .examples = {"spline_interpolation(interval=1000)"}};
 
 const FunctionMetadata& SplineInterpolationFunction::getMetadata() const {
     return metadata_;
@@ -218,38 +225,36 @@ seastar::future<bool> SplineInterpolationFunction::validateParameters(const Func
     try {
         bool hasInterval = context.hasParameter("target_interval");
         bool hasTimestamps = context.hasParameter("target_timestamps");
-        
+
         if (!hasInterval && !hasTimestamps) {
             return seastar::make_ready_future<bool>(false);
         }
-        
+
         if (hasInterval) {
             int64_t interval = context.getParameter<int64_t>("target_interval");
             if (interval <= 0) {
                 return seastar::make_ready_future<bool>(false);
             }
         }
-        
+
         return seastar::make_ready_future<bool>(true);
     } catch (...) {
         return seastar::make_ready_future<bool>(false);
     }
 }
 
-seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(const DoubleSeriesView& input,
+                                                                             const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     if (input.count < 4) {
         throw InsufficientDataException("Spline interpolation requires at least 4 data points");
     }
-    
+
     // For now, fall back to linear interpolation
     // A full cubic spline implementation would be more complex
     std::vector<uint64_t> targetTimestamps;
-    
+
     if (context.hasParameter("target_interval")) {
         int64_t interval = context.getParameter<int64_t>("target_interval");
         if (interval <= 0) {
@@ -261,9 +266,9 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
         uint64_t uinterval = static_cast<uint64_t>(interval);
         size_t estimatedPoints = (endTime > startTime) ? ((endTime - startTime) / uinterval + 1) : 1;
         if (estimatedPoints > MAX_INTERPOLATION_POINTS) {
-            throw ParameterValidationException(
-                "target_interval too small: would generate " + std::to_string(estimatedPoints) +
-                " points (max " + std::to_string(MAX_INTERPOLATION_POINTS) + ")");
+            throw ParameterValidationException("target_interval too small: would generate " +
+                                               std::to_string(estimatedPoints) + " points (max " +
+                                               std::to_string(MAX_INTERPOLATION_POINTS) + ")");
         }
 
         for (uint64_t t = startTime; t <= endTime; t += uinterval) {
@@ -279,13 +284,11 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
                 try {
                     targetTimestamps.push_back(std::stoull(token));
                 } catch (const std::exception& e) {
-                    throw ParameterValidationException(
-                        "Invalid timestamp value \"" + token + "\": " + e.what());
+                    throw ParameterValidationException("Invalid timestamp value \"" + token + "\": " + e.what());
                 }
                 if (targetTimestamps.size() > MAX_INTERPOLATION_POINTS) {
-                    throw ParameterValidationException(
-                        "Too many target_timestamps: exceeds limit of " +
-                        std::to_string(MAX_INTERPOLATION_POINTS));
+                    throw ParameterValidationException("Too many target_timestamps: exceeds limit of " +
+                                                       std::to_string(MAX_INTERPOLATION_POINTS));
                 }
             }
         }
@@ -293,7 +296,7 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
 
     result.timestamps = targetTimestamps;
     result.values.reserve(targetTimestamps.size());
-    
+
     // Simple linear interpolation fallback using two-pointer approach.
     // Both input and target timestamps are sorted, so maintain search position
     // across iterations for O(n+m) instead of O(n*m).
@@ -303,13 +306,13 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
             ++searchPos;
         }
         size_t i = searchPos;
-        
+
         if (i + 1 < input.count) {
             uint64_t t1 = input.timestampAt(i);
             uint64_t t2 = input.timestampAt(i + 1);
             double v1 = input.valueAt(i);
             double v2 = input.valueAt(i + 1);
-            
+
             double ratio = static_cast<double>(targetTime - t1) / static_cast<double>(t2 - t1);
             double interpolated = v1 + ratio * (v2 - v1);
             result.values.push_back(interpolated);
@@ -317,9 +320,9 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(
             result.values.push_back(input.valueAt(input.count - 1));
         }
     }
-    
+
     return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
 }
 
 // Legacy function for backward compatibility
-} // namespace timestar::functions
+}  // namespace timestar::functions

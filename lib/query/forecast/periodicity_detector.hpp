@@ -1,11 +1,11 @@
 #ifndef PERIODICITY_DETECTOR_H_INCLUDED
 #define PERIODICITY_DETECTOR_H_INCLUDED
 
-#include <vector>
-#include <cstdint>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 #include <complex>
+#include <cstdint>
+#include <vector>
 
 namespace timestar {
 namespace forecast {
@@ -14,14 +14,12 @@ namespace forecast {
  * Detected period with strength and confidence metrics
  */
 struct DetectedPeriod {
-    size_t period;          // Period in data points
-    double power;           // Spectral power (unnormalized)
-    double acfStrength;     // ACF at this lag (validation)
-    double confidence;      // Combined confidence score [0-1]
+    size_t period;       // Period in data points
+    double power;        // Spectral power (unnormalized)
+    double acfStrength;  // ACF at this lag (validation)
+    double confidence;   // Combined confidence score [0-1]
 
-    bool operator>(const DetectedPeriod& other) const {
-        return confidence > other.confidence;
-    }
+    bool operator>(const DetectedPeriod& other) const { return confidence > other.confidence; }
 };
 
 /**
@@ -47,13 +45,8 @@ public:
      * @param powerThreshold Minimum relative power for a peak (0-1)
      * @return Vector of detected periods sorted by confidence
      */
-    std::vector<DetectedPeriod> detectPeriods(
-        const std::vector<double>& y,
-        size_t minPeriod = 4,
-        size_t maxPeriod = 0,
-        size_t maxPeriods = 3,
-        double powerThreshold = 0.1
-    );
+    std::vector<DetectedPeriod> detectPeriods(const std::vector<double>& y, size_t minPeriod = 4, size_t maxPeriod = 0,
+                                              size_t maxPeriods = 3, double powerThreshold = 0.1);
 
     /**
      * Detect the single best period (for 'auto' mode)
@@ -62,10 +55,7 @@ public:
      * @param dataIntervalNs Data interval in nanoseconds (for heuristics)
      * @return Best period, or 0 if no significant period found
      */
-    size_t detectBestPeriod(
-        const std::vector<double>& y,
-        uint64_t dataIntervalNs = 0
-    );
+    size_t detectBestPeriod(const std::vector<double>& y, uint64_t dataIntervalNs = 0);
 
     // Public for testing
 
@@ -89,18 +79,12 @@ public:
      * Find peaks in periodogram
      * Returns indices of peaks
      */
-    std::vector<size_t> findPeaks(
-        const std::vector<double>& periodogram,
-        double threshold
-    );
+    std::vector<size_t> findPeaks(const std::vector<double>& periodogram, double threshold);
 
     /**
      * Compute autocorrelation at given lag
      */
-    double autoCorrelation(
-        const std::vector<double>& y,
-        size_t lag
-    );
+    double autoCorrelation(const std::vector<double>& y, size_t lag);
 
 private:
     /**
@@ -116,7 +100,7 @@ private:
     size_t effectiveN_ = 0;
 };
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar
 
 #endif

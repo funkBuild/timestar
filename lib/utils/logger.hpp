@@ -33,4 +33,4 @@ inline void set_log_level(seastar::logger& logger, seastar::log_level level) {
     logger.set_level(level);
 }
 
-} // namespace timestar
+}  // namespace timestar

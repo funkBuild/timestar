@@ -1,6 +1,7 @@
 #include "subscription_manager.hpp"
-#include "series_matcher.hpp"
+
 #include "logger.hpp"
+#include "series_matcher.hpp"
 
 #include <algorithm>
 #include <regex>
@@ -10,8 +11,7 @@ namespace timestar {
 
 // --- Subscription matching ---
 
-bool Subscription::matches(const std::string& writeMeasurement,
-                           const std::map<std::string, std::string>& writeTags,
+bool Subscription::matches(const std::string& writeMeasurement, const std::map<std::string, std::string>& writeTags,
                            const std::string& writeField) const {
     if (writeMeasurement != measurement) {
         return false;
@@ -26,7 +26,8 @@ bool Subscription::matches(const std::string& writeMeasurement,
                 break;
             }
         }
-        if (!fieldFound) return false;
+        if (!fieldFound)
+            return false;
     }
 
     // Tag/scope filter: use SeriesMatcher for wildcard/regex support.
@@ -45,7 +46,8 @@ bool Subscription::matches(const std::string& writeMeasurement,
 
 void SubscriptionManager::addSubscription(const Subscription& sub) {
     // Idempotent: skip if already registered (prevents phantom duplicates on reconnect)
-    if (_subscriptionsById.count(sub.id)) return;
+    if (_subscriptionsById.count(sub.id))
+        return;
 
     bool isLocal = (sub.handlerShard == seastar::this_shard_id());
     if (isLocal && _localSubscriptionCount >= MAX_LOCAL_SUBSCRIPTIONS) {
@@ -64,14 +66,14 @@ void SubscriptionManager::addSubscription(const Subscription& sub) {
             // Let std::invalid_argument (from SeriesMatcher) and std::regex_error
             // propagate — the caller must reject the subscription.
             std::string regexStr = SeriesMatcher::toRegexPattern(pattern);
-            compiled.compiledScopes[k] = std::regex(
-                regexStr, std::regex::ECMAScript | std::regex::optimize);
+            compiled.compiledScopes[k] = std::regex(regexStr, std::regex::ECMAScript | std::regex::optimize);
         }
     }
 
     _subscriptionsById[compiled.id] = std::move(compiled);
     _subscriptionsByMeasurement[sub.measurement].push_back(sub.id);
-    if (isLocal) ++_localSubscriptionCount;
+    if (isLocal)
+        ++_localSubscriptionCount;
 }
 
 void SubscriptionManager::registerQueue(uint64_t subscriptionId,
@@ -113,8 +115,7 @@ bool SubscriptionManager::hasSubscribers(const std::string& measurement) const {
     return it != _subscriptionsByMeasurement.end() && !it->second.empty();
 }
 
-void SubscriptionManager::deliverBatch(uint64_t subscriptionId,
-                                       std::shared_ptr<const StreamingBatch> batch) {
+void SubscriptionManager::deliverBatch(uint64_t subscriptionId, std::shared_ptr<const StreamingBatch> batch) {
     auto qIt = _queues.find(subscriptionId);
     if (qIt == _queues.end() || !qIt->second) {
         return;
@@ -157,7 +158,8 @@ std::vector<SubscriptionStats> SubscriptionManager::getStats() const {
     std::vector<SubscriptionStats> stats;
     for (const auto& [id, sub] : _subscriptionsById) {
         // Only report from the handler shard (where the queue lives)
-        if (sub.handlerShard != seastar::this_shard_id()) continue;
+        if (sub.handlerShard != seastar::this_shard_id())
+            continue;
 
         SubscriptionStats s;
         s.id = id;
@@ -190,32 +192,31 @@ std::vector<SubscriptionStats> SubscriptionManager::getStats() const {
 // --- Variant conversion ---
 
 template <>
-std::variant<double, bool, std::string, int64_t>
-SubscriptionManager::toVariant(const double& val) { return val; }
+std::variant<double, bool, std::string, int64_t> SubscriptionManager::toVariant(const double& val) {
+    return val;
+}
 
 template <>
-std::variant<double, bool, std::string, int64_t>
-SubscriptionManager::toVariant(const bool& val) { return val; }
+std::variant<double, bool, std::string, int64_t> SubscriptionManager::toVariant(const bool& val) {
+    return val;
+}
 
 template <>
-std::variant<double, bool, std::string, int64_t>
-SubscriptionManager::toVariant(const std::string& val) { return val; }
+std::variant<double, bool, std::string, int64_t> SubscriptionManager::toVariant(const std::string& val) {
+    return val;
+}
 
 template <>
-std::variant<double, bool, std::string, int64_t>
-SubscriptionManager::toVariant(const int64_t& val) { return val; }
+std::variant<double, bool, std::string, int64_t> SubscriptionManager::toVariant(const int64_t& val) {
+    return val;
+}
 
 // --- buildBatch ---
 
 template <class T>
 std::shared_ptr<const StreamingBatch> SubscriptionManager::buildBatch(
-    const std::string& measurement,
-    const std::map<std::string, std::string>& tags,
-    const std::string& field,
-    const std::vector<uint64_t>& timestamps,
-    const std::vector<T>& values,
-    const std::string& label) {
-
+    const std::string& measurement, const std::map<std::string, std::string>& tags, const std::string& field,
+    const std::vector<uint64_t>& timestamps, const std::vector<T>& values, const std::string& label) {
     auto batch = std::make_shared<StreamingBatch>();
     batch->label = label;
     batch->points.reserve(timestamps.size());
@@ -236,13 +237,11 @@ std::shared_ptr<const StreamingBatch> SubscriptionManager::buildBatch(
 // --- notifySubscribers ---
 
 template <class T>
-std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers(
-    const std::string& measurement,
-    const std::map<std::string, std::string>& tags,
-    const std::string& field,
-    const std::vector<uint64_t>& timestamps,
-    const std::vector<T>& values) {
-
+std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers(const std::string& measurement,
+                                                                   const std::map<std::string, std::string>& tags,
+                                                                   const std::string& field,
+                                                                   const std::vector<uint64_t>& timestamps,
+                                                                   const std::vector<T>& values) {
     std::vector<RemoteDelivery> remotes;
 
     auto it = _subscriptionsByMeasurement.find(measurement);
@@ -258,7 +257,8 @@ std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers(
 
     for (uint64_t subId : it->second) {
         auto subIt = _subscriptionsById.find(subId);
-        if (subIt == _subscriptionsById.end()) continue;
+        if (subIt == _subscriptionsById.end())
+            continue;
         const auto& sub = subIt->second;
 
         if (!sub.matches(measurement, tags, field)) {
@@ -285,19 +285,19 @@ std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers(
 
 // Explicit template instantiations
 template std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers<double>(
-    const std::string&, const std::map<std::string, std::string>&,
-    const std::string&, const std::vector<uint64_t>&, const std::vector<double>&);
+    const std::string&, const std::map<std::string, std::string>&, const std::string&, const std::vector<uint64_t>&,
+    const std::vector<double>&);
 
 template std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers<bool>(
-    const std::string&, const std::map<std::string, std::string>&,
-    const std::string&, const std::vector<uint64_t>&, const std::vector<bool>&);
+    const std::string&, const std::map<std::string, std::string>&, const std::string&, const std::vector<uint64_t>&,
+    const std::vector<bool>&);
 
 template std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers<std::string>(
-    const std::string&, const std::map<std::string, std::string>&,
-    const std::string&, const std::vector<uint64_t>&, const std::vector<std::string>&);
+    const std::string&, const std::map<std::string, std::string>&, const std::string&, const std::vector<uint64_t>&,
+    const std::vector<std::string>&);
 
 template std::vector<RemoteDelivery> SubscriptionManager::notifySubscribers<int64_t>(
-    const std::string&, const std::map<std::string, std::string>&,
-    const std::string&, const std::vector<uint64_t>&, const std::vector<int64_t>&);
+    const std::string&, const std::map<std::string, std::string>&, const std::string&, const std::vector<uint64_t>&,
+    const std::vector<int64_t>&);
 
-} // namespace timestar
+}  // namespace timestar

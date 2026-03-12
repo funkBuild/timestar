@@ -1,22 +1,22 @@
 #ifndef DERIVED_QUERY_H_INCLUDED
 #define DERIVED_QUERY_H_INCLUDED
 
-#include "query_parser.hpp"
 #include "expression_ast.hpp"
 #include "expression_parser.hpp"
+#include "query_parser.hpp"
+
 #include <map>
-#include <string>
 #include <memory>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 namespace timestar {
 
 // Exception for derived query errors
 class DerivedQueryException : public std::runtime_error {
 public:
-    explicit DerivedQueryException(const std::string& message)
-        : std::runtime_error(message) {}
+    explicit DerivedQueryException(const std::string& message) : std::runtime_error(message) {}
 };
 
 // A derived query request containing multiple sub-queries and a formula
@@ -51,8 +51,7 @@ struct DerivedQueryRequest {
 
         // If one of startTime/endTime is set but not the other, reject
         if ((startTime > 0) != (endTime > 0)) {
-            throw DerivedQueryException(
-                "Invalid time range: both startTime and endTime must be specified together");
+            throw DerivedQueryException("Invalid time range: both startTime and endTime must be specified together");
         }
 
         // Parse formula once — cache references for later use
@@ -66,8 +65,7 @@ struct DerivedQueryRequest {
 
         for (const auto& ref : cachedQueryRefs_) {
             if (definedQueries.find(ref) == definedQueries.end()) {
-                throw DerivedQueryException(
-                    "Formula references undefined query: '" + ref + "'");
+                throw DerivedQueryException("Formula references undefined query: '" + ref + "'");
             }
         }
     }
@@ -95,7 +93,8 @@ private:
     mutable bool formulaParsed_ = false;
 
     void parseFormulaIfNeeded() const {
-        if (formulaParsed_) return;
+        if (formulaParsed_)
+            return;
         ExpressionParser parser(formula);
         try {
             parser.parse();
@@ -185,6 +184,6 @@ private:
     DerivedQueryRequest request_;
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // DERIVED_QUERY_H_INCLUDED
+#endif  // DERIVED_QUERY_H_INCLUDED

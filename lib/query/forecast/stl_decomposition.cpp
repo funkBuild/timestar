@@ -1,15 +1,19 @@
 #include "stl_decomposition.hpp"
+
 #include "../anomaly/simd_anomaly.hpp"
 #include "../simd_helpers.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
-#include <limits>
 
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD
 using timestar::simd::hsum_avx;
-static inline double hsum_avx_local(__m256d v) { return hsum_avx(v); }
+static inline double hsum_avx_local(__m256d v) {
+    return hsum_avx(v);
+}
 #endif
 
 namespace timestar {
@@ -20,15 +24,19 @@ namespace forecast {
 // ============================================================================
 
 double STLDecomposer::tricube(double x) {
-    if (x < 0.0) x = -x;
-    if (x >= 1.0) return 0.0;
+    if (x < 0.0)
+        x = -x;
+    if (x >= 1.0)
+        return 0.0;
     double tmp = 1.0 - x * x * x;
     return tmp * tmp * tmp;
 }
 
 double STLDecomposer::bisquare(double x) {
-    if (x < 0.0) x = -x;
-    if (x >= 1.0) return 0.0;
+    if (x < 0.0)
+        x = -x;
+    if (x >= 1.0)
+        return 0.0;
     double tmp = 1.0 - x * x;
     return tmp * tmp;
 }
@@ -37,20 +45,18 @@ double STLDecomposer::bisquare(double x) {
 // LOESS Implementation
 // ============================================================================
 
-double STLDecomposer::weightedLocalRegression(
-    const std::vector<double>& x,
-    const std::vector<double>& y,
-    double xeval,
-    double span,
-    const std::vector<double>& weights
-) {
+double STLDecomposer::weightedLocalRegression(const std::vector<double>& x, const std::vector<double>& y, double xeval,
+                                              double span, const std::vector<double>& weights) {
     size_t n = x.size();
-    if (n == 0) return 0.0;
+    if (n == 0)
+        return 0.0;
 
     // Determine window size
     size_t window = static_cast<size_t>(std::ceil(span * n));
-    if (window < 2) window = 2;
-    if (window > n) window = n;
+    if (window < 2)
+        window = 2;
+    if (window > n)
+        window = n;
 
     // Find distances and sort to get nearest neighbors
     std::vector<std::pair<double, size_t>> distances;
@@ -73,7 +79,8 @@ double STLDecomposer::weightedLocalRegression(
     static constexpr double kDistEpsilon = 1e-10;
     double maxDist = distances[window - 1].first;
     const bool uniformWeights = (maxDist <= kDistEpsilon);
-    if (uniformWeights) maxDist = 1.0;  // avoid division; tricube ratio unused below
+    if (uniformWeights)
+        maxDist = 1.0;  // avoid division; tricube ratio unused below
 
     // Compute weights and weighted sums for linear regression
     double sumW = 0.0;
@@ -126,13 +133,9 @@ double STLDecomposer::weightedLocalRegression(
     return a;
 }
 
-std::vector<double> STLDecomposer::loess(
-    const std::vector<double>& x,
-    const std::vector<double>& y,
-    const std::vector<double>& xout,
-    double span,
-    const std::vector<double>& weights
-) {
+std::vector<double> STLDecomposer::loess(const std::vector<double>& x, const std::vector<double>& y,
+                                         const std::vector<double>& xout, double span,
+                                         const std::vector<double>& weights) {
     if (x.size() != y.size()) {
         throw std::invalid_argument("x and y must have the same length");
     }
@@ -160,21 +163,24 @@ std::vector<double> STLDecomposer::loess(
 // Fast LOESS for Evenly-Spaced Data
 // ============================================================================
 
-std::vector<double> STLDecomposer::loessEvenlySpaced(
-    const std::vector<double>& y,
-    double span,
-    const std::vector<double>& weights
-) {
+std::vector<double> STLDecomposer::loessEvenlySpaced(const std::vector<double>& y, double span,
+                                                     const std::vector<double>& weights) {
     const size_t n = y.size();
-    if (n == 0) return {};
-    if (n == 1) return y;
+    if (n == 0)
+        return {};
+    if (n == 1)
+        return y;
 
-    if (span <= 0.0) span = 0.01;
-    if (span > 1.0) span = 1.0;
+    if (span <= 0.0)
+        span = 0.01;
+    if (span > 1.0)
+        span = 1.0;
 
     size_t window = static_cast<size_t>(std::ceil(span * n));
-    if (window < 2) window = 2;
-    if (window > n) window = n;
+    if (window < 2)
+        window = 2;
+    if (window > n)
+        window = n;
 
     const size_t half = window / 2;
     const bool hasWeights = !weights.empty();
@@ -188,8 +194,8 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
         // Pre-allocate scratch buffers once, reuse across all evaluation points.
         // These hold the per-window tricube weights (optionally multiplied by
         // user weights) and the centered x-coordinates for each window position.
-        std::vector<double> wBuf(window);   // combined weights
-        std::vector<double> xBuf(window);   // centered x-coordinates
+        std::vector<double> wBuf(window);  // combined weights
+        std::vector<double> xBuf(window);  // centered x-coordinates
 
         for (size_t i = 0; i < n; ++i) {
             // ---- sliding window bounds (identical to scalar) ----
@@ -203,14 +209,15 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
             } else {
                 start = i - half;
                 end = start + window;
-                if (end > n) end = n;
+                if (end > n)
+                    end = n;
             }
 
             const size_t wLen = end - start;
 
-            double maxDist = static_cast<double>(
-                std::max(i - start, end - 1 - i));
-            if (maxDist <= 0.0) maxDist = 1.0;
+            double maxDist = static_cast<double>(std::max(i - start, end - 1 - i));
+            if (maxDist <= 0.0)
+                maxDist = 1.0;
             const double invMaxDist = 1.0 / maxDist;
 
             // ---- Step 1: compute tricube weights using AVX2 ----
@@ -218,15 +225,14 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
             // then apply the tricube kernel: (1 - u^3)^3 where u < 1, else 0.
             // This also builds the centered x-coordinates xBuf[k] = j - i.
             {
-                const __m256d vOne        = _mm256_set1_pd(1.0);
-                const __m256d vZero       = _mm256_setzero_pd();
+                const __m256d vOne = _mm256_set1_pd(1.0);
+                const __m256d vZero = _mm256_setzero_pd();
                 const __m256d vInvMaxDist = _mm256_set1_pd(invMaxDist);
-                const __m256d vSignMask   = _mm256_set1_pd(-0.0); // for abs()
+                const __m256d vSignMask = _mm256_set1_pd(-0.0);  // for abs()
 
                 // Base x value for position start relative to center i
                 double baseX = static_cast<double>(start) - static_cast<double>(i);
-                __m256d vBaseX = _mm256_set_pd(baseX + 3.0, baseX + 2.0,
-                                               baseX + 1.0, baseX);
+                __m256d vBaseX = _mm256_set_pd(baseX + 3.0, baseX + 2.0, baseX + 1.0, baseX);
                 const __m256d vFour = _mm256_set1_pd(4.0);
 
                 size_t simdEnd = wLen - (wLen % 4);
@@ -241,11 +247,11 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
                     // Tricube: (1 - u^3)^3, zeroed where u >= 1
                     __m256d u2 = _mm256_mul_pd(u, u);
                     __m256d u3 = _mm256_mul_pd(u2, u);
-                    __m256d t  = _mm256_sub_pd(vOne, u3);
+                    __m256d t = _mm256_sub_pd(vOne, u3);
                     __m256d t2 = _mm256_mul_pd(t, t);
                     __m256d t3 = _mm256_mul_pd(t2, t);
                     __m256d mask = _mm256_cmp_pd(u, vOne, _CMP_LT_OQ);
-                    __m256d w  = _mm256_blendv_pd(vZero, t3, mask);
+                    __m256d w = _mm256_blendv_pd(vZero, t3, mask);
 
                     _mm256_storeu_pd(&wBuf[k], w);
                     vBaseX = _mm256_add_pd(vBaseX, vFour);
@@ -269,7 +275,7 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
                 const double* uw = weights.data() + start;
                 size_t simdEnd = wLen - (wLen % 4);
                 for (size_t k = 0; k < simdEnd; k += 4) {
-                    __m256d vw  = _mm256_loadu_pd(&wBuf[k]);
+                    __m256d vw = _mm256_loadu_pd(&wBuf[k]);
                     __m256d vuw = _mm256_loadu_pd(&uw[k]);
                     _mm256_storeu_pd(&wBuf[k], _mm256_mul_pd(vw, vuw));
                 }
@@ -280,9 +286,9 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
 
             // ---- Step 3: accumulate 5 regression sums using AVX2 FMA ----
             const double* yp = y.data() + start;
-            __m256d vSumW   = _mm256_setzero_pd();
-            __m256d vSumWX  = _mm256_setzero_pd();
-            __m256d vSumWY  = _mm256_setzero_pd();
+            __m256d vSumW = _mm256_setzero_pd();
+            __m256d vSumWX = _mm256_setzero_pd();
+            __m256d vSumWY = _mm256_setzero_pd();
             __m256d vSumWXX = _mm256_setzero_pd();
             __m256d vSumWXY = _mm256_setzero_pd();
 
@@ -306,20 +312,20 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
                 vSumWXY = _mm256_fmadd_pd(vwx, vy, vSumWXY);
             }
 
-            double sumW   = hsum_avx_local(vSumW);
-            double sumWX  = hsum_avx_local(vSumWX);
-            double sumWY  = hsum_avx_local(vSumWY);
+            double sumW = hsum_avx_local(vSumW);
+            double sumWX = hsum_avx_local(vSumWX);
+            double sumWY = hsum_avx_local(vSumWY);
             double sumWXX = hsum_avx_local(vSumWXX);
             double sumWXY = hsum_avx_local(vSumWXY);
 
             // Scalar remainder
             for (size_t k = simdEnd; k < wLen; ++k) {
-                double w  = wBuf[k];
+                double w = wBuf[k];
                 double xj = xBuf[k];
                 double yj = yp[k];
-                sumW   += w;
-                sumWX  += w * xj;
-                sumWY  += w * yj;
+                sumW += w;
+                sumWX += w * xj;
+                sumWY += w * yj;
                 sumWXX += w * xj * xj;
                 sumWXY += w * xj * yj;
             }
@@ -340,7 +346,7 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
 
         return result;
     }
-#endif // !TIMESTAR_ANOMALY_DISABLE_SIMD
+#endif  // !TIMESTAR_ANOMALY_DISABLE_SIMD
 
     // ================================================================
     // Scalar fallback (original implementation)
@@ -357,21 +363,21 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
         } else {
             start = i - half;
             end = start + window;
-            if (end > n) end = n;
+            if (end > n)
+                end = n;
         }
 
         // maxDist is the largest distance from i to any point in [start, end)
-        double maxDist = static_cast<double>(
-            std::max(i - start, end - 1 - i));
-        if (maxDist <= 0.0) maxDist = 1.0;
+        double maxDist = static_cast<double>(std::max(i - start, end - 1 - i));
+        if (maxDist <= 0.0)
+            maxDist = 1.0;
 
         // Weighted linear regression centered at i
         double sumW = 0.0, sumWX = 0.0, sumWY = 0.0;
         double sumWXX = 0.0, sumWXY = 0.0;
 
         for (size_t j = start; j < end; ++j) {
-            double dist = (j >= i) ? static_cast<double>(j - i)
-                                   : static_cast<double>(i - j);
+            double dist = (j >= i) ? static_cast<double>(j - i) : static_cast<double>(i - j);
             double w = tricube(dist / maxDist);
 
             if (hasWeights && weights[j] > 0.0) {
@@ -409,11 +415,7 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(
 // Cycle-Subseries Smoothing
 // ============================================================================
 
-std::vector<double> STLDecomposer::smoothCycleSubseries(
-    const std::vector<double>& y,
-    size_t period,
-    size_t window
-) {
+std::vector<double> STLDecomposer::smoothCycleSubseries(const std::vector<double>& y, size_t period, size_t window) {
     if (y.empty() || period == 0) {
         return std::vector<double>(y.size(), 0.0);
     }
@@ -434,12 +436,15 @@ std::vector<double> STLDecomposer::smoothCycleSubseries(
             subseries.push_back(y[i]);
         }
 
-        if (subseries.empty()) continue;
+        if (subseries.empty())
+            continue;
 
         // Smooth this subseries using fast evenly-spaced LOESS
         double span = static_cast<double>(window) / static_cast<double>(subseries.size());
-        if (span > 1.0) span = 1.0;
-        if (span < 0.1) span = 0.1;
+        if (span > 1.0)
+            span = 1.0;
+        if (span < 0.1)
+            span = 0.1;
 
         auto smoothed = loessEvenlySpaced(subseries, span);
 
@@ -456,17 +461,16 @@ std::vector<double> STLDecomposer::smoothCycleSubseries(
 // Low-Pass Filter
 // ============================================================================
 
-std::vector<double> STLDecomposer::lowPassFilter(
-    const std::vector<double>& y,
-    size_t period
-) {
-    if (y.empty()) return {};
+std::vector<double> STLDecomposer::lowPassFilter(const std::vector<double>& y, size_t period) {
+    if (y.empty())
+        return {};
 
     size_t n = y.size();
 
     // O(n) sliding-window moving average (replaces O(n*window) naive version)
     auto movingAverage = [](const std::vector<double>& data, size_t window) -> std::vector<double> {
-        if (data.empty() || window == 0) return data;
+        if (data.empty() || window == 0)
+            return data;
 
         size_t n = data.size();
         std::vector<double> result(n);
@@ -475,7 +479,8 @@ std::vector<double> STLDecomposer::lowPassFilter(
         // Build initial window for position 0
         size_t end0 = std::min(half + 1, n);
         double sum = 0.0;
-        for (size_t j = 0; j < end0; ++j) sum += data[j];
+        for (size_t j = 0; j < end0; ++j)
+            sum += data[j];
         size_t curStart = 0, curEnd = end0;
         result[0] = sum / static_cast<double>(curEnd - curStart);
 
@@ -510,10 +515,9 @@ std::vector<double> STLDecomposer::lowPassFilter(
 // Robustness Weights
 // ============================================================================
 
-std::vector<double> STLDecomposer::computeRobustnessWeights(
-    const std::vector<double>& residuals
-) {
-    if (residuals.empty()) return {};
+std::vector<double> STLDecomposer::computeRobustnessWeights(const std::vector<double>& residuals) {
+    if (residuals.empty())
+        return {};
 
     size_t n = residuals.size();
 
@@ -529,14 +533,14 @@ std::vector<double> STLDecomposer::computeRobustnessWeights(
 
         // ---- Step 1: compute absolute residuals using branchless SIMD abs ----
         {
-            const __m256d vSignMask = _mm256_set1_pd(-0.0); // sign bit mask
+            const __m256d vSignMask = _mm256_set1_pd(-0.0);  // sign bit mask
             const double* src = residuals.data();
             double* dst = absResiduals.data();
             size_t simdEnd = n - (n % 4);
 
             for (size_t i = 0; i < simdEnd; i += 4) {
                 __m256d v = _mm256_loadu_pd(&src[i]);
-                __m256d vAbs = _mm256_andnot_pd(vSignMask, v); // clear sign bits
+                __m256d vAbs = _mm256_andnot_pd(vSignMask, v);  // clear sign bits
                 _mm256_storeu_pd(&dst[i], vAbs);
             }
             // Scalar remainder
@@ -573,7 +577,7 @@ std::vector<double> STLDecomposer::computeRobustnessWeights(
         // bisquare(u) = (1 - u^2)^2 where u < 1, else 0
         std::vector<double> weights(n);
         {
-            const __m256d vOne  = _mm256_set1_pd(1.0);
+            const __m256d vOne = _mm256_set1_pd(1.0);
             const __m256d vZero = _mm256_setzero_pd();
             const __m256d vInvScale = _mm256_set1_pd(1.0 / scale);
             const double* absPtr = absResiduals.data();
@@ -587,7 +591,7 @@ std::vector<double> STLDecomposer::computeRobustnessWeights(
 
                 // t = 1 - u^2
                 __m256d u2 = _mm256_mul_pd(u, u);
-                __m256d t  = _mm256_sub_pd(vOne, u2);
+                __m256d t = _mm256_sub_pd(vOne, u2);
 
                 // bisquare = t^2
                 __m256d bisq = _mm256_mul_pd(t, t);
@@ -612,7 +616,7 @@ std::vector<double> STLDecomposer::computeRobustnessWeights(
 
         return weights;
     }
-#endif // !TIMESTAR_ANOMALY_DISABLE_SIMD
+#endif  // !TIMESTAR_ANOMALY_DISABLE_SIMD
 
     // ================================================================
     // Scalar fallback
@@ -658,15 +662,8 @@ std::vector<double> STLDecomposer::computeRobustnessWeights(
 // Main STL Decomposition
 // ============================================================================
 
-STLResult STLDecomposer::decompose(
-    const std::vector<double>& y,
-    size_t period,
-    size_t seasonalWindow,
-    size_t trendWindow,
-    bool robust,
-    size_t outerIterations,
-    size_t innerIterations
-) {
+STLResult STLDecomposer::decompose(const std::vector<double>& y, size_t period, size_t seasonalWindow,
+                                   size_t trendWindow, bool robust, size_t outerIterations, size_t innerIterations) {
     STLResult result;
     result.period = period;
     result.success = false;
@@ -691,12 +688,15 @@ STLResult STLDecomposer::decompose(
         double numerator = 1.5 * period;
         double denominator = 1.0 - 1.5 / static_cast<double>(seasonalWindow);
         trendWindow = static_cast<size_t>(std::ceil(numerator / denominator));
-        if (trendWindow % 2 == 0) trendWindow++;  // Ensure odd
-        if (trendWindow < 3) trendWindow = 3;
+        if (trendWindow % 2 == 0)
+            trendWindow++;  // Ensure odd
+        if (trendWindow < 3)
+            trendWindow = 3;
     }
 
     // Ensure trend window is odd
-    if (trendWindow % 2 == 0) trendWindow++;
+    if (trendWindow % 2 == 0)
+        trendWindow++;
 
     // Initialize components
     std::vector<double> trend(n, 0.0);
@@ -730,7 +730,8 @@ STLResult STLDecomposer::decompose(
 
             // Step 6: Trend smoothing via fast evenly-spaced LOESS
             double trendSpan = static_cast<double>(trendWindow) / static_cast<double>(n);
-            if (trendSpan > 1.0) trendSpan = 1.0;
+            if (trendSpan > 1.0)
+                trendSpan = 1.0;
 
             trend = loessEvenlySpaced(deseasonalized, trendSpan, robustnessWeights);
         }
@@ -760,10 +761,7 @@ STLResult STLDecomposer::decompose(
 // MSTL Decomposition (Multiple Seasonalities)
 // ============================================================================
 
-MSTLResult STLDecomposer::decomposeMultiple(
-    const std::vector<double>& y,
-    std::vector<size_t> periods
-) {
+MSTLResult STLDecomposer::decomposeMultiple(const std::vector<double>& y, std::vector<size_t> periods) {
     MSTLResult result;
     result.success = false;
 
@@ -820,5 +818,5 @@ MSTLResult STLDecomposer::decomposeMultiple(
     return result;
 }
 
-} // namespace forecast
-} // namespace timestar
+}  // namespace forecast
+}  // namespace timestar

@@ -1,13 +1,13 @@
 #pragma once
 
-#include "subscription_manager.hpp"
 #include "query_parser.hpp"
+#include "subscription_manager.hpp"
 
+#include <cmath>
 #include <map>
 #include <string>
 #include <variant>
 #include <vector>
-#include <cmath>
 
 namespace timestar {
 
@@ -21,13 +21,15 @@ struct BucketState {
     double latest = 0.0;
     uint64_t latestTimestamp = 0;
     uint64_t count = 0;
-    bool isStringOnly = true;   // true until a numeric value is added
+    bool isStringOnly = true;  // true until a numeric value is added
 
     void addDouble(double val, uint64_t ts) {
-        isStringOnly = false;   // numeric value seen
+        isStringOnly = false;  // numeric value seen
         sum += val;
-        if (val < min) min = val;
-        if (val > max) max = val;
+        if (val < min)
+            min = val;
+        if (val > max)
+            max = val;
         if (ts < firstTimestamp) {
             first = val;
             firstTimestamp = ts;
@@ -45,23 +47,33 @@ struct BucketState {
     }
 
     double computeResult(AggregationMethod method) const {
-        if (count == 0) return std::numeric_limits<double>::quiet_NaN();
+        if (count == 0)
+            return std::numeric_limits<double>::quiet_NaN();
         switch (method) {
-            case AggregationMethod::AVG: return sum / static_cast<double>(count);
-            case AggregationMethod::SUM: return sum;
-            case AggregationMethod::MIN: return min;
-            case AggregationMethod::MAX: return max;
-            case AggregationMethod::LATEST: return latest;
-            case AggregationMethod::FIRST: return first;
-            case AggregationMethod::COUNT: return static_cast<double>(count);
-            case AggregationMethod::SPREAD: return max - min;
+            case AggregationMethod::AVG:
+                return sum / static_cast<double>(count);
+            case AggregationMethod::SUM:
+                return sum;
+            case AggregationMethod::MIN:
+                return min;
+            case AggregationMethod::MAX:
+                return max;
+            case AggregationMethod::LATEST:
+                return latest;
+            case AggregationMethod::FIRST:
+                return first;
+            case AggregationMethod::COUNT:
+                return static_cast<double>(count);
+            case AggregationMethod::SPREAD:
+                return max - min;
             case AggregationMethod::MEDIAN:
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR:
                 // MEDIAN/STDDEV/STDVAR require rawValues which BucketState doesn't track.
                 // Return NaN to signal unsupported rather than silently returning AVG.
                 return std::numeric_limits<double>::quiet_NaN();
-            default: return sum / static_cast<double>(count); // fallback to AVG
+            default:
+                return sum / static_cast<double>(count);  // fallback to AVG
         }
     }
 };
@@ -73,8 +85,10 @@ struct SeriesFieldKey {
     std::string field;
 
     bool operator<(const SeriesFieldKey& other) const {
-        if (measurement != other.measurement) return measurement < other.measurement;
-        if (field != other.field) return field < other.field;
+        if (measurement != other.measurement)
+            return measurement < other.measurement;
+        if (field != other.field)
+            return field < other.field;
         return tags < other.tags;
     }
 };
@@ -111,9 +125,7 @@ private:
     // bucketStart -> (SeriesFieldKey -> BucketState)
     std::map<uint64_t, std::map<SeriesFieldKey, BucketState>> _buckets;
 
-    uint64_t bucketStart(uint64_t timestamp) const {
-        return timestamp - (timestamp % _intervalNs);
-    }
+    uint64_t bucketStart(uint64_t timestamp) const { return timestamp - (timestamp % _intervalNs); }
 };
 
-} // namespace timestar
+}  // namespace timestar

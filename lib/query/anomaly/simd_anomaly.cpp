@@ -1,11 +1,13 @@
 #include "simd_anomaly.hpp"
+
 #include "../simd_helpers.hpp"
+
 #include <algorithm>
-#include <numeric>
 #include <cstring>
+#include <numeric>
 
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD
-#include <cpuid.h>
+    #include <cpuid.h>
 #endif
 
 namespace timestar {
@@ -104,7 +106,8 @@ double vectorSum(const double* values, size_t count) {
 }
 
 double vectorMean(const double* values, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0)
+        return 0.0;
     return vectorSum(values, count) / static_cast<double>(count);
 }
 
@@ -118,17 +121,13 @@ double vectorSumSquaredDiff(const double* values, size_t count, double mean) {
 }
 
 double vectorVariance(const double* values, size_t count, double mean) {
-    if (count <= 1) return 0.0;
+    if (count <= 1)
+        return 0.0;
     return vectorSumSquaredDiff(values, count, mean) / static_cast<double>(count - 1);
 }
 
-void computeBounds(
-    const double* predictions,
-    const double* scale,
-    double bounds,
-    double* upper,
-    double* lower,
-    size_t count) {
+void computeBounds(const double* predictions, const double* scale, double bounds, double* upper, double* lower,
+                   size_t count) {
     for (size_t i = 0; i < count; ++i) {
         double margin = bounds * scale[i];
         upper[i] = predictions[i] + margin;
@@ -136,12 +135,8 @@ void computeBounds(
     }
 }
 
-void computeAnomalyScores(
-    const double* values,
-    const double* upper,
-    const double* lower,
-    double* scores,
-    size_t count) {
+void computeAnomalyScores(const double* values, const double* upper, const double* lower, double* scores,
+                          size_t count) {
     for (size_t i = 0; i < count; ++i) {
         double above = std::max(0.0, values[i] - upper[i]);
         double below = std::max(0.0, lower[i] - values[i]);
@@ -161,12 +156,9 @@ void computeTricubeWeights(const double* distances, double* weights, size_t coun
     }
 }
 
-void computeMovingAverage(
-    const double* values,
-    size_t count,
-    size_t windowSize,
-    double* result) {
-    if (count == 0 || windowSize == 0) return;
+void computeMovingAverage(const double* values, size_t count, size_t windowSize, double* result) {
+    if (count == 0 || windowSize == 0)
+        return;
 
     size_t halfWindow = windowSize / 2;
 
@@ -212,7 +204,7 @@ double weightedSum(const double* values, const double* weights, size_t count) {
     return sum;
 }
 
-} // namespace scalar
+}  // namespace scalar
 
 // ==================== Vector Operations ====================
 
@@ -338,7 +330,8 @@ void vectorFMA(const double* a, const double* b, double scalar, double* result, 
 // ==================== Sum and Mean ====================
 
 double vectorSum(const double* values, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0)
+        return 0.0;
 
 #if TIMESTAR_ANOMALY_DISABLE_SIMD
     return scalar::vectorSum(values, count);
@@ -380,14 +373,16 @@ double vectorSum(const double* values, size_t count) {
 }
 
 double vectorMean(const double* values, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0)
+        return 0.0;
     return vectorSum(values, count) / static_cast<double>(count);
 }
 
 // ==================== Variance ====================
 
 double vectorSumSquaredDiff(const double* values, size_t count, double mean) {
-    if (count == 0) return 0.0;
+    if (count == 0)
+        return 0.0;
 
 #if TIMESTAR_ANOMALY_DISABLE_SIMD
     return scalar::vectorSumSquaredDiff(values, count, mean);
@@ -417,24 +412,26 @@ double vectorSumSquaredDiff(const double* values, size_t count, double mean) {
 }
 
 double vectorVariance(const double* values, size_t count, double mean) {
-    if (count <= 1) return 0.0;
+    if (count <= 1)
+        return 0.0;
     return vectorSumSquaredDiff(values, count, mean) / static_cast<double>(count - 1);
 }
 
 // ==================== Incremental Rolling Stats ====================
 
 IncrementalRollingStats::IncrementalRollingStats(size_t windowSize)
-    : windowSize_(windowSize)
-    , count_(0)
-    , mean_(0.0)
-    , m2_(0.0)
-    , buffer_(windowSize, 0.0)
-    , head_(0)
-    , bufferFull_(false)
-    , updatesSinceRecompute_(0) {}
+    : windowSize_(windowSize),
+      count_(0),
+      mean_(0.0),
+      m2_(0.0),
+      buffer_(windowSize, 0.0),
+      head_(0),
+      bufferFull_(false),
+      updatesSinceRecompute_(0) {}
 
 void IncrementalRollingStats::update(double value) {
-    if (std::isnan(value)) return;
+    if (std::isnan(value))
+        return;
 
     if (bufferFull_) {
         // Remove oldest value from statistics (inverse Welford)
@@ -442,8 +439,7 @@ void IncrementalRollingStats::update(double value) {
         double oldMean = mean_;
         mean_ = mean_ + (value - oldValue) / static_cast<double>(count_);
         // Update M2: add new contribution, remove old contribution
-        m2_ = m2_ + (value - mean_) * (value - oldMean)
-                  - (oldValue - mean_) * (oldValue - oldMean);
+        m2_ = m2_ + (value - mean_) * (value - oldMean) - (oldValue - mean_) * (oldValue - oldMean);
     } else {
         // Welford's online algorithm
         ++count_;
@@ -471,7 +467,8 @@ void IncrementalRollingStats::update(double value) {
 }
 
 double IncrementalRollingStats::variance() const {
-    if (count_ < 2) return 0.0;
+    if (count_ < 2)
+        return 0.0;
     // Clamp M2 to >= 0 to prevent NaN from floating-point rounding errors
     // in the inverse Welford update (removing oldest value from window).
     return std::max(0.0, m2_) / static_cast<double>(count_ - 1);
@@ -482,7 +479,8 @@ double IncrementalRollingStats::stddev() const {
 }
 
 void IncrementalRollingStats::recomputeFromBuffer() {
-    if (count_ == 0) return;
+    if (count_ == 0)
+        return;
 
     // Recompute mean using Kahan summation for precision
     double sum = 0.0, c = 0.0;
@@ -514,11 +512,7 @@ void IncrementalRollingStats::reset() {
 
 // ==================== Moving Average ====================
 
-void computeMovingAverage(
-    const double* values,
-    size_t count,
-    size_t windowSize,
-    double* result) {
+void computeMovingAverage(const double* values, size_t count, size_t windowSize, double* result) {
     // The sliding window algorithm is already O(N), so SIMD doesn't help much here
     // Use the scalar implementation which is already optimized
     scalar::computeMovingAverage(values, count, windowSize, result);
@@ -527,7 +521,8 @@ void computeMovingAverage(
 // ==================== Weighted Operations ====================
 
 double weightedSum(const double* values, const double* weights, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0)
+        return 0.0;
 
 #if TIMESTAR_ANOMALY_DISABLE_SIMD
     return scalar::weightedSum(values, weights, count);
@@ -555,24 +550,20 @@ double weightedSum(const double* values, const double* weights, size_t count) {
 }
 
 double weightedMean(const double* values, const double* weights, size_t count) {
-    if (count == 0) return 0.0;
+    if (count == 0)
+        return 0.0;
 
     double sumW = vectorSum(weights, count);
-    if (sumW < 1e-10) return 0.0;
+    if (sumW < 1e-10)
+        return 0.0;
 
     return weightedSum(values, weights, count) / sumW;
 }
 
 // ==================== Bounds Computation ====================
 
-void computeBounds(
-    const double* predictions,
-    const double* scale,
-    double bounds,
-    double* upper,
-    double* lower,
-    size_t count) {
-
+void computeBounds(const double* predictions, const double* scale, double bounds, double* upper, double* lower,
+                   size_t count) {
 #if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::computeBounds(predictions, scale, bounds, upper, lower, count);
 #else
@@ -604,13 +595,8 @@ void computeBounds(
 #endif
 }
 
-void computeAnomalyScores(
-    const double* values,
-    const double* upper,
-    const double* lower,
-    double* scores,
-    size_t count) {
-
+void computeAnomalyScores(const double* values, const double* upper, const double* lower, double* scores,
+                          size_t count) {
 #if TIMESTAR_ANOMALY_DISABLE_SIMD
     scalar::computeAnomalyScores(values, upper, lower, scores, count);
 #else
@@ -658,7 +644,7 @@ void computeTricubeWeights(const double* distances, double* weights, size_t coun
 
     __m256d one = _mm256_set1_pd(1.0);
     __m256d zero = _mm256_setzero_pd();
-    __m256d sign_mask = _mm256_set1_pd(-0.0); // sign bit mask for abs
+    __m256d sign_mask = _mm256_set1_pd(-0.0);  // sign bit mask for abs
     size_t simd_end = count - (count % 4);
 
     for (size_t i = 0; i < simd_end; i += 4) {
@@ -695,19 +681,16 @@ void computeTricubeWeights(const double* distances, double* weights, size_t coun
 #endif
 }
 
-LinearFit weightedLinearRegression(
-    const double* x,
-    const double* y,
-    const double* weights,
-    size_t count) {
-
+LinearFit weightedLinearRegression(const double* x, const double* y, const double* weights, size_t count) {
     LinearFit fit{0.0, 0.0};
 
-    if (count == 0) return fit;
+    if (count == 0)
+        return fit;
 
     // Compute weighted sums using SIMD where possible
     double sumW = vectorSum(weights, count);
-    if (sumW < 1e-10) return fit;
+    if (sumW < 1e-10)
+        return fit;
 
     double sumWX = weightedSum(x, weights, count);
     double sumWY = weightedSum(y, weights, count);
@@ -763,6 +746,6 @@ LinearFit weightedLinearRegression(
     return fit;
 }
 
-} // namespace simd
-} // namespace anomaly
-} // namespace timestar
+}  // namespace simd
+}  // namespace anomaly
+}  // namespace timestar

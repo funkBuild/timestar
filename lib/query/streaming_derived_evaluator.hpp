@@ -1,8 +1,8 @@
 #pragma once
 
-#include "streaming_aggregator.hpp"
 #include "expression_ast.hpp"
 #include "expression_evaluator.hpp"
+#include "streaming_aggregator.hpp"
 
 #include <map>
 #include <memory>
@@ -17,10 +17,8 @@ namespace timestar {
 // and returns a single StreamingBatch of computed results.
 class StreamingDerivedEvaluator {
 public:
-    StreamingDerivedEvaluator(
-        uint64_t intervalNs,
-        const std::map<std::string, AggregationMethod>& queryMethods,
-        std::shared_ptr<ExpressionNode> formula);
+    StreamingDerivedEvaluator(uint64_t intervalNs, const std::map<std::string, AggregationMethod>& queryMethods,
+                              std::shared_ptr<ExpressionNode> formula);
 
     // Route a data point to the correct query's aggregator.
     void addPoint(const std::string& label, const StreamingDataPoint& pt);
@@ -46,4 +44,4 @@ private:
     static constexpr uint64_t kCarryForwardMaxIntervals = 10;
 };
 
-} // namespace timestar
+}  // namespace timestar

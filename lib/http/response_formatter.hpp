@@ -2,6 +2,7 @@
 #define RESPONSE_FORMATTER_H_INCLUDED
 
 #include "http_query_handler.hpp"
+
 #include <string>
 
 namespace timestar {
@@ -26,6 +27,6 @@ public:
     static std::string formatError(const std::string& message);
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // RESPONSE_FORMATTER_H_INCLUDED
+#endif  // RESPONSE_FORMATTER_H_INCLUDED

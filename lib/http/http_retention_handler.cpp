@@ -1,6 +1,8 @@
 #include "http_retention_handler.hpp"
+
 #include "http_query_handler.hpp"
 #include "logger.hpp"
+
 #include <seastar/core/smp.hh>
 
 using namespace seastar;
@@ -12,8 +14,7 @@ uint64_t HttpRetentionHandler::parseDuration(const std::string& duration) {
 }
 
 bool HttpRetentionHandler::isValidMethod(const std::string& method) {
-    return method == "avg" || method == "min" || method == "max" ||
-           method == "sum" || method == "latest";
+    return method == "avg" || method == "min" || method == "max" || method == "sum" || method == "latest";
 }
 
 std::string HttpRetentionHandler::createErrorResponse(const std::string& error) {
@@ -26,8 +27,8 @@ std::string HttpRetentionHandler::createErrorResponse(const std::string& error) 
     return buffer;
 }
 
-seastar::future<std::unique_ptr<seastar::http::reply>>
-HttpRetentionHandler::handlePut(std::unique_ptr<seastar::http::request> req) {
+seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handlePut(
+    std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
 
@@ -114,7 +115,8 @@ HttpRetentionHandler::handlePut(std::unique_ptr<seastar::http::request> req) {
             }
             if (!isValidMethod(ds.method)) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
-                reply->_content = createErrorResponse("Invalid downsample.method: must be one of avg, min, max, sum, latest");
+                reply->_content =
+                    createErrorResponse("Invalid downsample.method: must be one of avg, min, max, sum, latest");
                 co_return reply;
             }
 
@@ -146,17 +148,15 @@ HttpRetentionHandler::handlePut(std::unique_ptr<seastar::http::request> req) {
         }
 
         // Write to LevelDB on shard 0
-        co_await engineSharded->invoke_on(0,
-            [policy](Engine& engine) -> seastar::future<> {
-                co_await engine.getIndex().setRetentionPolicy(policy);
-            });
+        co_await engineSharded->invoke_on(0, [policy](Engine& engine) -> seastar::future<> {
+            co_await engine.getIndex().setRetentionPolicy(policy);
+        });
 
         // Broadcast to all shards' caches
-        co_await engineSharded->invoke_on_all(
-            [policy](Engine& engine) {
-                engine.updateRetentionPolicyCache(policy);
-                return seastar::make_ready_future<>();
-            });
+        co_await engineSharded->invoke_on_all([policy](Engine& engine) {
+            engine.updateRetentionPolicyCache(policy);
+            return seastar::make_ready_future<>();
+        });
 
         // Build response
         auto responseObj = glz::obj{"status", "success", "policy", policy};
@@ -172,8 +172,8 @@ HttpRetentionHandler::handlePut(std::unique_ptr<seastar::http::request> req) {
     co_return reply;
 }
 
-seastar::future<std::unique_ptr<seastar::http::reply>>
-HttpRetentionHandler::handleGet(std::unique_ptr<seastar::http::request> req) {
+seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleGet(
+    std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
 
@@ -196,10 +196,8 @@ HttpRetentionHandler::handleGet(std::unique_ptr<seastar::http::request> req) {
 
         if (!measurement.empty()) {
             // Get single policy
-            auto policyOpt = co_await engineSharded->invoke_on(0,
-                [measurement](Engine& engine) {
-                    return engine.getIndex().getRetentionPolicy(measurement);
-                });
+            auto policyOpt = co_await engineSharded->invoke_on(
+                0, [measurement](Engine& engine) { return engine.getIndex().getRetentionPolicy(measurement); });
 
             if (policyOpt.has_value()) {
                 auto responseObj = glz::obj{"status", "success", "policy", *policyOpt};
@@ -211,10 +209,8 @@ HttpRetentionHandler::handleGet(std::unique_ptr<seastar::http::request> req) {
             }
         } else {
             // Get all policies
-            auto policies = co_await engineSharded->invoke_on(0,
-                [](Engine& engine) {
-                    return engine.getIndex().getAllRetentionPolicies();
-                });
+            auto policies = co_await engineSharded->invoke_on(
+                0, [](Engine& engine) { return engine.getIndex().getAllRetentionPolicies(); });
 
             auto responseObj = glz::obj{"status", "success", "policies", policies};
             reply->set_status(seastar::http::reply::status_type::ok);
@@ -230,8 +226,8 @@ HttpRetentionHandler::handleGet(std::unique_ptr<seastar::http::request> req) {
     co_return reply;
 }
 
-seastar::future<std::unique_ptr<seastar::http::reply>>
-HttpRetentionHandler::handleDelete(std::unique_ptr<seastar::http::request> req) {
+seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleDelete(
+    std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
 
@@ -257,21 +253,18 @@ HttpRetentionHandler::handleDelete(std::unique_ptr<seastar::http::request> req) 
             }
         }
 
-        bool deleted = co_await engineSharded->invoke_on(0,
-            [measurement](Engine& engine) {
-                return engine.getIndex().deleteRetentionPolicy(measurement);
-            });
+        bool deleted = co_await engineSharded->invoke_on(
+            0, [measurement](Engine& engine) { return engine.getIndex().deleteRetentionPolicy(measurement); });
 
         if (deleted) {
             // Remove from all shards' caches
-            co_await engineSharded->invoke_on_all(
-                [measurement](Engine& engine) {
-                    engine.removeRetentionPolicyCache(measurement);
-                    return seastar::make_ready_future<>();
-                });
+            co_await engineSharded->invoke_on_all([measurement](Engine& engine) {
+                engine.removeRetentionPolicyCache(measurement);
+                return seastar::make_ready_future<>();
+            });
 
-            auto responseObj = glz::obj{"status", "success", "message",
-                "Retention policy deleted for measurement: " + measurement};
+            auto responseObj =
+                glz::obj{"status", "success", "message", "Retention policy deleted for measurement: " + measurement};
             reply->set_status(seastar::http::reply::status_type::ok);
             reply->_content = glz::write_json(responseObj).value_or("{}");
         } else {
@@ -296,40 +289,22 @@ void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r) {
     auto self = shared_from_this();
 
     auto* putHandler = new seastar::httpd::function_handler(
-        [self](std::unique_ptr<seastar::http::request> req,
-               std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return self->handlePut(std::move(req));
-        },
-        "json"
-    );
-    r.add(seastar::httpd::operation_type::PUT,
-          seastar::httpd::url("/retention"),
-          putHandler);
+        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handlePut(std::move(req)); },
+        "json");
+    r.add(seastar::httpd::operation_type::PUT, seastar::httpd::url("/retention"), putHandler);
 
     auto* getHandler = new seastar::httpd::function_handler(
-        [self](std::unique_ptr<seastar::http::request> req,
-               std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return self->handleGet(std::move(req));
-        },
-        "json"
-    );
-    r.add(seastar::httpd::operation_type::GET,
-          seastar::httpd::url("/retention"),
-          getHandler);
+        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handleGet(std::move(req)); },
+        "json");
+    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/retention"), getHandler);
 
     auto* deleteHandler = new seastar::httpd::function_handler(
-        [self](std::unique_ptr<seastar::http::request> req,
-               std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return self->handleDelete(std::move(req));
-        },
-        "json"
-    );
-    r.add(seastar::httpd::operation_type::DELETE,
-          seastar::httpd::url("/retention"),
-          deleteHandler);
+        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handleDelete(std::move(req)); },
+        "json");
+    r.add(seastar::httpd::operation_type::DELETE, seastar::httpd::url("/retention"), deleteHandler);
 
     timestar::http_log.info("Registered retention endpoints at /retention (PUT/GET/DELETE)");
 }

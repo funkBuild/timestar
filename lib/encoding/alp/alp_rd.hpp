@@ -1,8 +1,8 @@
 #ifndef ALP_RD_HPP_INCLUDED
 #define ALP_RD_HPP_INCLUDED
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace alp {
@@ -18,8 +18,8 @@ struct ALPRDBlockResult {
     std::vector<uint64_t> dictionary;  // up to ALP_RD_MAX_DICT_SIZE entries
 
     // Per-value data
-    std::vector<uint8_t>  left_indices;   // index into dictionary per value
-    std::vector<uint64_t> right_parts;    // lower bits per value
+    std::vector<uint8_t> left_indices;  // index into dictionary per value
+    std::vector<uint64_t> right_parts;  // lower bits per value
 
     // Exceptions: values whose left part isn't in dictionary
     std::vector<uint16_t> exception_positions;
@@ -45,6 +45,6 @@ public:
     static void decodeBlock(const ALPRDBlockResult& block, size_t count, double* out);
 };
 
-} // namespace alp
+}  // namespace alp
 
-#endif // ALP_RD_HPP_INCLUDED
+#endif  // ALP_RD_HPP_INCLUDED

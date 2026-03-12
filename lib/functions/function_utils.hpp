@@ -7,6 +7,6 @@ namespace timestar::functions {
 
 double calculateMean(const std::vector<double>& values);
 
-} // namespace timestar::functions
+}  // namespace timestar::functions
 
-#endif // FUNCTION_UTILS_H_INCLUDED
+#endif  // FUNCTION_UTILS_H_INCLUDED

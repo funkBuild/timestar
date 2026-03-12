@@ -1,12 +1,12 @@
 #ifndef TIMESTAR_CONFIG_H_INCLUDED
 #define TIMESTAR_CONFIG_H_INCLUDED
 
+#include <glaze/glaze.hpp>
+
 #include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
-
-#include <glaze/glaze.hpp>
 
 namespace timestar {
 
@@ -114,103 +114,74 @@ void setGlobalConfig(const TimestarConfig& cfg);
 // Read the global config from any shard (lock-free, set once before reactor starts).
 const TimestarConfig& config();
 
-} // namespace timestar
+}  // namespace timestar
 
 // Glaze metadata for TOML serialization
 
 template <>
 struct glz::meta<timestar::ServerConfig> {
     using T = timestar::ServerConfig;
-    static constexpr auto value = object(
-        "port", &T::port,
-        "log_level", &T::log_level,
-        "data_dir", &T::data_dir
-    );
+    static constexpr auto value = object("port", &T::port, "log_level", &T::log_level, "data_dir", &T::data_dir);
 };
 
 template <>
 struct glz::meta<timestar::CompactionConfig> {
     using T = timestar::CompactionConfig;
-    static constexpr auto value = object(
-        "max_concurrent", &T::max_concurrent,
-        "max_memory", &T::max_memory,
-        "batch_size", &T::batch_size,
-        "tier0_min_files", &T::tier0_min_files,
-        "tier1_min_files", &T::tier1_min_files,
-        "tier2_min_files", &T::tier2_min_files
-    );
+    static constexpr auto value =
+        object("max_concurrent", &T::max_concurrent, "max_memory", &T::max_memory, "batch_size", &T::batch_size,
+               "tier0_min_files", &T::tier0_min_files, "tier1_min_files", &T::tier1_min_files, "tier2_min_files",
+               &T::tier2_min_files);
 };
 
 template <>
 struct glz::meta<timestar::StorageConfig> {
     using T = timestar::StorageConfig;
-    static constexpr auto value = object(
-        "wal_size_threshold", &T::wal_size_threshold,
-        "max_points_per_block", &T::max_points_per_block,
-        "tsm_bloom_fpr", &T::tsm_bloom_fpr,
-        "tsm_cache_entries", &T::tsm_cache_entries,
-        "compaction", &T::compaction
-    );
+    static constexpr auto value = object("wal_size_threshold", &T::wal_size_threshold, "max_points_per_block",
+                                         &T::max_points_per_block, "tsm_bloom_fpr", &T::tsm_bloom_fpr,
+                                         "tsm_cache_entries", &T::tsm_cache_entries, "compaction", &T::compaction);
 };
 
 template <>
 struct glz::meta<timestar::HttpConfig> {
     using T = timestar::HttpConfig;
-    static constexpr auto value = object(
-        "max_write_body_size", &T::max_write_body_size,
-        "max_query_body_size", &T::max_query_body_size,
-        "max_series_count", &T::max_series_count,
-        "max_total_points", &T::max_total_points,
-        "query_timeout_seconds", &T::query_timeout_seconds
-    );
+    static constexpr auto value =
+        object("max_write_body_size", &T::max_write_body_size, "max_query_body_size", &T::max_query_body_size,
+               "max_series_count", &T::max_series_count, "max_total_points", &T::max_total_points,
+               "query_timeout_seconds", &T::query_timeout_seconds);
 };
 
 template <>
 struct glz::meta<timestar::IndexConfig> {
     using T = timestar::IndexConfig;
-    static constexpr auto value = object(
-        "bloom_filter_bits", &T::bloom_filter_bits,
-        "block_size", &T::block_size,
-        "write_buffer_size", &T::write_buffer_size,
-        "max_open_files", &T::max_open_files,
-        "max_file_size", &T::max_file_size,
-        "series_cache_size", &T::series_cache_size
-    );
+    static constexpr auto value =
+        object("bloom_filter_bits", &T::bloom_filter_bits, "block_size", &T::block_size, "write_buffer_size",
+               &T::write_buffer_size, "max_open_files", &T::max_open_files, "max_file_size", &T::max_file_size,
+               "series_cache_size", &T::series_cache_size);
 };
 
 template <>
 struct glz::meta<timestar::EngineConfig> {
     using T = timestar::EngineConfig;
-    static constexpr auto value = object(
-        "metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds,
-        "max_metadata_retry_ops", &T::max_metadata_retry_ops,
-        "retention_sweep_interval_minutes", &T::retention_sweep_interval_minutes,
-        "tombstone_dead_fraction_threshold", &T::tombstone_dead_fraction_threshold,
-        "max_tombstone_rewrites_per_sweep", &T::max_tombstone_rewrites_per_sweep
-    );
+    static constexpr auto value =
+        object("metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds, "max_metadata_retry_ops",
+               &T::max_metadata_retry_ops, "retention_sweep_interval_minutes", &T::retention_sweep_interval_minutes,
+               "tombstone_dead_fraction_threshold", &T::tombstone_dead_fraction_threshold,
+               "max_tombstone_rewrites_per_sweep", &T::max_tombstone_rewrites_per_sweep);
 };
 
 template <>
 struct glz::meta<timestar::StreamingConfig> {
     using T = timestar::StreamingConfig;
-    static constexpr auto value = object(
-        "max_subscriptions_per_shard", &T::max_subscriptions_per_shard,
-        "output_queue_size", &T::output_queue_size,
-        "heartbeat_interval_seconds", &T::heartbeat_interval_seconds
-    );
+    static constexpr auto value =
+        object("max_subscriptions_per_shard", &T::max_subscriptions_per_shard, "output_queue_size",
+               &T::output_queue_size, "heartbeat_interval_seconds", &T::heartbeat_interval_seconds);
 };
 
 template <>
 struct glz::meta<timestar::TimestarConfigParseable> {
     using T = timestar::TimestarConfigParseable;
-    static constexpr auto value = object(
-        "server", &T::server,
-        "storage", &T::storage,
-        "http", &T::http,
-        "index", &T::index,
-        "engine", &T::engine,
-        "streaming", &T::streaming
-    );
+    static constexpr auto value = object("server", &T::server, "storage", &T::storage, "http", &T::http, "index",
+                                         &T::index, "engine", &T::engine, "streaming", &T::streaming);
 };
 
-#endif // TIMESTAR_CONFIG_H_INCLUDED
+#endif  // TIMESTAR_CONFIG_H_INCLUDED

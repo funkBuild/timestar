@@ -10,7 +10,7 @@
 // Example: [true x 1000, false x 500, true x 200]
 //   -> initial=1, runs=[1000, 500, 200]
 
-void BoolEncoderRLE::writeVarint(AlignedBuffer &buf, uint64_t value) {
+void BoolEncoderRLE::writeVarint(AlignedBuffer& buf, uint64_t value) {
     if (value < 0x80) [[likely]] {
         buf.write<uint8_t>(static_cast<uint8_t>(value));
         return;
@@ -23,7 +23,7 @@ void BoolEncoderRLE::writeVarint(AlignedBuffer &buf, uint64_t value) {
     buf.write<uint8_t>(static_cast<uint8_t>(value));
 }
 
-uint64_t BoolEncoderRLE::readVarint(Slice &slice) {
+uint64_t BoolEncoderRLE::readVarint(Slice& slice) {
     if (slice.bytesLeft() == 0) [[unlikely]] {
         return 0;
     }
@@ -42,21 +42,23 @@ uint64_t BoolEncoderRLE::readVarint(Slice &slice) {
     while (pos < remaining) {
         uint8_t byte = ptr[pos++];
         result |= static_cast<uint64_t>(byte & 0x7F) << shift;
-        if ((byte & 0x80) == 0) break;
+        if ((byte & 0x80) == 0)
+            break;
         shift += 7;
-        if (shift >= 64) break; // prevent overflow for malformed data
+        if (shift >= 64)
+            break;  // prevent overflow for malformed data
     }
     slice.offset += pos;
     return result;
 }
 
-AlignedBuffer BoolEncoderRLE::encode(const std::vector<bool> &values) {
+AlignedBuffer BoolEncoderRLE::encode(const std::vector<bool>& values) {
     AlignedBuffer buffer;
     encodeInto(values, buffer);
     return buffer;
 }
 
-size_t BoolEncoderRLE::encodeInto(const std::vector<bool> &values, AlignedBuffer &target) {
+size_t BoolEncoderRLE::encodeInto(const std::vector<bool>& values, AlignedBuffer& target) {
     const size_t startPos = target.size();
     const size_t n = values.size();
 
@@ -80,12 +82,11 @@ size_t BoolEncoderRLE::encodeInto(const std::vector<bool> &values, AlignedBuffer
     // run value.  If XOR == 0 the entire word continues the run.  Otherwise
     // __builtin_ctzll finds the bit position of the first transition.
     // -----------------------------------------------------------------------
-    static_assert(sizeof(unsigned long) == 8,
-                  "Word-level RLE encode assumes 64-bit unsigned long");
+    static_assert(sizeof(unsigned long) == 8, "Word-level RLE encode assumes 64-bit unsigned long");
 
     auto it = values.begin();
-    const unsigned long *wordPtr = it._M_p;
-    const unsigned int  bitOff   = it._M_offset; // 0 for a fresh vector
+    const unsigned long* wordPtr = it._M_p;
+    const unsigned int bitOff = it._M_offset;  // 0 for a fresh vector
 
     // Write the initial value byte.
     bool currentValue = values[0];
@@ -94,25 +95,25 @@ size_t BoolEncoderRLE::encodeInto(const std::vector<bool> &values, AlignedBuffer
     uint64_t runLength = 0;
 
     // Number of full 64-bit words that contain our bits (accounting for offset).
-    const size_t totalBits   = n + bitOff;        // bits from wordPtr[0] onward
-    const size_t fullWords   = totalBits / 64;
-    const unsigned int tailBits = totalBits % 64; // leftover bits in last word
+    const size_t totalBits = n + bitOff;  // bits from wordPtr[0] onward
+    const size_t fullWords = totalBits / 64;
+    const unsigned int tailBits = totalBits % 64;  // leftover bits in last word
 
     for (size_t w = 0; w < fullWords; ++w) {
         unsigned long word = wordPtr[w];
 
         // Mask out bits before bitOff in the very first word.
         unsigned long mask = ~0UL;
-        unsigned int  lowBit  = 0;
-        unsigned int  highBit = 64; // one-past-end within this word
+        unsigned int lowBit = 0;
+        unsigned int highBit = 64;  // one-past-end within this word
         if (w == 0 && bitOff != 0) {
             lowBit = bitOff;
-            mask   = ~0UL << bitOff;  // zero out bits [0, bitOff)
+            mask = ~0UL << bitOff;  // zero out bits [0, bitOff)
         }
 
         // Build the expected pattern for the current run value.
         unsigned long expected = currentValue ? mask : 0UL;
-        unsigned long xorWord  = (word ^ (currentValue ? ~0UL : 0UL)) & mask;
+        unsigned long xorWord = (word ^ (currentValue ? ~0UL : 0UL)) & mask;
 
         if (xorWord == 0) {
             // Entire (masked) word matches the current run value.
@@ -125,7 +126,7 @@ size_t BoolEncoderRLE::encodeInto(const std::vector<bool> &values, AlignedBuffer
         unsigned int pos = lowBit;
         while (xorWord != 0) {
             unsigned int tz = __builtin_ctzll(xorWord);
-            unsigned int transitionBit = tz; // absolute bit position in word
+            unsigned int transitionBit = tz;  // absolute bit position in word
 
             // Bits [pos, transitionBit) continue the current run.
             runLength += (transitionBit - pos);
@@ -212,8 +213,9 @@ size_t BoolEncoderRLE::encodeInto(const std::vector<bool> &values, AlignedBuffer
     return target.size() - startPos;
 }
 
-void BoolEncoderRLE::decode(Slice &encoded, size_t nToSkip, size_t length, std::vector<bool> &out) {
-    if (length == 0) [[unlikely]] return;
+void BoolEncoderRLE::decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out) {
+    if (length == 0) [[unlikely]]
+        return;
 
     bool currentValue = encoded.read<uint8_t>() != 0;
 

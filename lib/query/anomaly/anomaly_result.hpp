@@ -1,21 +1,21 @@
 #ifndef ANOMALY_RESULT_H_INCLUDED
 #define ANOMALY_RESULT_H_INCLUDED
 
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
-#include <optional>
-#include <map>
-#include <cstdint>
-#include <stdexcept>
 
 namespace timestar {
 namespace anomaly {
 
 // Supported anomaly detection algorithms
 enum class Algorithm {
-    BASIC,   // Rolling quantile/stddev - no seasonality awareness
-    AGILE,   // SARIMA-based - adapts to level shifts
-    ROBUST   // STL decomposition - stable predictions
+    BASIC,  // Rolling quantile/stddev - no seasonality awareness
+    AGILE,  // SARIMA-based - adapts to level shifts
+    ROBUST  // STL decomposition - stable predictions
 };
 
 // Seasonality options for Agile and Robust algorithms
@@ -28,28 +28,39 @@ enum class Seasonality {
 
 // Convert string to Algorithm enum
 inline Algorithm parseAlgorithm(const std::string& str) {
-    if (str == "basic") return Algorithm::BASIC;
-    if (str == "agile") return Algorithm::AGILE;
-    if (str == "robust") return Algorithm::ROBUST;
+    if (str == "basic")
+        return Algorithm::BASIC;
+    if (str == "agile")
+        return Algorithm::AGILE;
+    if (str == "robust")
+        return Algorithm::ROBUST;
     throw std::invalid_argument("Unknown algorithm: " + str + ". Use 'basic', 'agile', or 'robust'");
 }
 
 // Convert Algorithm enum to string
 inline std::string algorithmToString(Algorithm algo) {
     switch (algo) {
-        case Algorithm::BASIC: return "basic";
-        case Algorithm::AGILE: return "agile";
-        case Algorithm::ROBUST: return "robust";
-        default: return "unknown";
+        case Algorithm::BASIC:
+            return "basic";
+        case Algorithm::AGILE:
+            return "agile";
+        case Algorithm::ROBUST:
+            return "robust";
+        default:
+            return "unknown";
     }
 }
 
 // Convert string to Seasonality enum
 inline Seasonality parseSeasonality(const std::string& str) {
-    if (str.empty() || str == "none") return Seasonality::NONE;
-    if (str == "hourly") return Seasonality::HOURLY;
-    if (str == "daily") return Seasonality::DAILY;
-    if (str == "weekly") return Seasonality::WEEKLY;
+    if (str.empty() || str == "none")
+        return Seasonality::NONE;
+    if (str == "hourly")
+        return Seasonality::HOURLY;
+    if (str == "daily")
+        return Seasonality::DAILY;
+    if (str == "weekly")
+        return Seasonality::WEEKLY;
     throw std::invalid_argument("Unknown seasonality: " + str + ". Use 'hourly', 'daily', or 'weekly'");
 }
 
@@ -80,9 +91,8 @@ inline size_t seasonalityToPeriod(Seasonality seasonality, uint64_t dataInterval
     // which is not a realistic anomaly detection use case.
     static constexpr size_t MAX_PERIOD = 10'000'000;
     if (period > MAX_PERIOD) {
-        throw std::invalid_argument(
-            "Seasonal period too large (" + std::to_string(period) +
-            " data points). Increase data interval or use a shorter seasonality.");
+        throw std::invalid_argument("Seasonal period too large (" + std::to_string(period) +
+                                    " data points). Increase data interval or use a shorter seasonality.");
     }
     return period;
 }
@@ -185,7 +195,7 @@ struct SARIMAParams {
     int s = 0;  // Seasonal period (0 = no seasonality)
 };
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar
 
-#endif // ANOMALY_RESULT_H_INCLUDED
+#endif  // ANOMALY_RESULT_H_INCLUDED

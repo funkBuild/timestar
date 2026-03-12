@@ -1,22 +1,22 @@
 #ifndef SIMD_ANOMALY_H_INCLUDED
 #define SIMD_ANOMALY_H_INCLUDED
 
-#include <vector>
-#include <cstddef>
 #include <cmath>
+#include <cstddef>
+#include <vector>
 
 // Compile-time flag to disable SIMD optimizations
 // Set to 1 to use scalar fallbacks for all operations
 // Can be defined via CMake: -DTIMESTAR_ANOMALY_DISABLE_SIMD=1
 #ifndef TIMESTAR_ANOMALY_DISABLE_SIMD
-#define TIMESTAR_ANOMALY_DISABLE_SIMD 0
+    #define TIMESTAR_ANOMALY_DISABLE_SIMD 0
 #endif
 
 #if !TIMESTAR_ANOMALY_DISABLE_SIMD && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-#include <immintrin.h>
+    #include <immintrin.h>
 #else
-#undef TIMESTAR_ANOMALY_DISABLE_SIMD
-#define TIMESTAR_ANOMALY_DISABLE_SIMD 1
+    #undef TIMESTAR_ANOMALY_DISABLE_SIMD
+    #define TIMESTAR_ANOMALY_DISABLE_SIMD 1
 #endif
 
 namespace timestar {
@@ -104,11 +104,7 @@ private:
 
 // SIMD-optimized moving average computation
 // Returns vector of moving averages for each position
-void computeMovingAverage(
-    const double* values,
-    size_t count,
-    size_t windowSize,
-    double* result);
+void computeMovingAverage(const double* values, size_t count, size_t windowSize, double* result);
 
 // ==================== Weighted Operations ====================
 
@@ -123,22 +119,14 @@ double weightedMean(const double* values, const double* weights, size_t count);
 // Compute upper and lower bounds in one pass using SIMD
 // upper[i] = predictions[i] + bounds * scale[i]
 // lower[i] = predictions[i] - bounds * scale[i]
-void computeBounds(
-    const double* predictions,
-    const double* scale,  // stddev or MAD per point
-    double bounds,        // number of standard deviations
-    double* upper,
-    double* lower,
-    size_t count);
+void computeBounds(const double* predictions,
+                   const double* scale,  // stddev or MAD per point
+                   double bounds,        // number of standard deviations
+                   double* upper, double* lower, size_t count);
 
 // Compute anomaly scores in one pass
 // score[i] = max(0, (value - upper)) + max(0, (lower - value))
-void computeAnomalyScores(
-    const double* values,
-    const double* upper,
-    const double* lower,
-    double* scores,
-    size_t count);
+void computeAnomalyScores(const double* values, const double* upper, const double* lower, double* scores, size_t count);
 
 // ==================== LOESS Helpers ====================
 
@@ -152,14 +140,10 @@ struct LinearFit {
     double slope;
 };
 
-LinearFit weightedLinearRegression(
-    const double* x,
-    const double* y,
-    const double* weights,
-    size_t count);
+LinearFit weightedLinearRegression(const double* x, const double* y, const double* weights, size_t count);
 
-} // namespace simd
-} // namespace anomaly
-} // namespace timestar
+}  // namespace simd
+}  // namespace anomaly
+}  // namespace timestar
 
-#endif // SIMD_ANOMALY_H_INCLUDED
+#endif  // SIMD_ANOMALY_H_INCLUDED

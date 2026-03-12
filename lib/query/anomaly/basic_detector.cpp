@@ -1,4 +1,5 @@
 #include "basic_detector.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -6,18 +7,12 @@
 namespace timestar {
 namespace anomaly {
 
-AnomalyOutput BasicDetector::detect(
-    const AnomalyInput& input,
-    const AnomalyConfig& config
-) {
+AnomalyOutput BasicDetector::detect(const AnomalyInput& input, const AnomalyConfig& config) {
     // Use optimized path for all cases
     return detectOptimized(input, config);
 }
 
-AnomalyOutput BasicDetector::detectOptimized(
-    const AnomalyInput& input,
-    const AnomalyConfig& config
-) {
+AnomalyOutput BasicDetector::detectOptimized(const AnomalyInput& input, const AnomalyConfig& config) {
     AnomalyOutput output;
 
     if (input.empty()) {
@@ -87,23 +82,14 @@ AnomalyOutput BasicDetector::detectOptimized(
 
     // Use SIMD for bounds computation on the portion with valid stats
     if (minDataPoints < n) {
-        simd::computeBounds(
-            output.predictions.data() + minDataPoints,
-            scale.data() + minDataPoints,
-            bounds,
-            output.upper.data() + minDataPoints,
-            output.lower.data() + minDataPoints,
-            n - minDataPoints
-        );
+        simd::computeBounds(output.predictions.data() + minDataPoints, scale.data() + minDataPoints, bounds,
+                            output.upper.data() + minDataPoints, output.lower.data() + minDataPoints,
+                            n - minDataPoints);
 
         // Use SIMD for anomaly score computation
-        simd::computeAnomalyScores(
-            input.values.data() + minDataPoints,
-            output.upper.data() + minDataPoints,
-            output.lower.data() + minDataPoints,
-            output.scores.data() + minDataPoints,
-            n - minDataPoints
-        );
+        simd::computeAnomalyScores(input.values.data() + minDataPoints, output.upper.data() + minDataPoints,
+                                   output.lower.data() + minDataPoints, output.scores.data() + minDataPoints,
+                                   n - minDataPoints);
     }
 
     // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
@@ -125,11 +111,8 @@ AnomalyOutput BasicDetector::detectOptimized(
 }
 
 // Legacy implementation kept for reference/validation
-BasicDetector::RollingStats BasicDetector::computeRollingStats(
-    const std::vector<double>& values,
-    size_t endIdx,
-    size_t windowSize
-) {
+BasicDetector::RollingStats BasicDetector::computeRollingStats(const std::vector<double>& values, size_t endIdx,
+                                                               size_t windowSize) {
     RollingStats stats{0.0, 0.0, 0.0, 0.0, 0.0};
 
     if (endIdx == 0 || windowSize == 0) {
@@ -167,9 +150,9 @@ BasicDetector::RollingStats BasicDetector::computeRollingStats(
 
     // Median
     if (n % 2 == 0) {
-        stats.median = (windowValues[n/2 - 1] + windowValues[n/2]) / 2.0;
+        stats.median = (windowValues[n / 2 - 1] + windowValues[n / 2]) / 2.0;
     } else {
-        stats.median = windowValues[n/2];
+        stats.median = windowValues[n / 2];
     }
 
     // Quartiles
@@ -181,5 +164,5 @@ BasicDetector::RollingStats BasicDetector::computeRollingStats(
     return stats;
 }
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar

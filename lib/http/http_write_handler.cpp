@@ -1,18 +1,21 @@
 #include "http_write_handler.hpp"
+
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "series_key.hpp"
 
-#include <chrono>
-#include <stdexcept>
-#include <unordered_set>
-#include <numeric>
-#include <algorithm>
+#include <boost/iterator/counting_iterator.hpp>
+
 #include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
-#include <boost/iterator/counting_iterator.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <numeric>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <stdexcept>
+#include <unordered_set>
 
 using namespace seastar;
 using namespace httpd;
@@ -29,12 +32,8 @@ struct GlazeWritePoint {
 template <>
 struct glz::meta<GlazeWritePoint> {
     using T = GlazeWritePoint;
-    static constexpr auto value = object(
-        "measurement", &T::measurement,
-        "tags", &T::tags,
-        "fields", &T::fields,
-        "timestamp", &T::timestamp
-    );
+    static constexpr auto value =
+        object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields, "timestamp", &T::timestamp);
 };
 
 struct GlazeMultiWritePoint {
@@ -48,13 +47,8 @@ struct GlazeMultiWritePoint {
 template <>
 struct glz::meta<GlazeMultiWritePoint> {
     using T = GlazeMultiWritePoint;
-    static constexpr auto value = object(
-        "measurement", &T::measurement,
-        "tags", &T::tags,
-        "fields", &T::fields,
-        "timestamps", &T::timestamps,
-        "timestamp", &T::timestamp
-    );
+    static constexpr auto value = object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields,
+                                         "timestamps", &T::timestamps, "timestamp", &T::timestamp);
 };
 
 struct GlazeBatchWrite {
@@ -64,9 +58,7 @@ struct GlazeBatchWrite {
 template <>
 struct glz::meta<GlazeBatchWrite> {
     using T = GlazeBatchWrite;
-    static constexpr auto value = object(
-        "writes", &T::writes
-    );
+    static constexpr auto value = object("writes", &T::writes);
 };
 
 // Fast-path struct for the common case: single write with all double fields.
@@ -84,17 +76,11 @@ struct FastDoubleWritePoint {
 template <>
 struct glz::meta<FastDoubleWritePoint> {
     using T = FastDoubleWritePoint;
-    static constexpr auto value = object(
-        "measurement", &T::measurement,
-        "tags", &T::tags,
-        "timestamps", &T::timestamps,
-        "timestamp", &T::timestamp,
-        "fields", &T::fields
-    );
+    static constexpr auto value = object("measurement", &T::measurement, "tags", &T::tags, "timestamps", &T::timestamps,
+                                         "timestamp", &T::timestamp, "fields", &T::fields);
 };
 
-HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded)
-    : engineSharded(_engineSharded) {
+HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {
     if (!engineSharded) {
         throw std::invalid_argument("engineSharded must not be null");
     }
@@ -103,8 +89,10 @@ HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded)
 // Fast validity check — no allocation on the happy path.
 static bool hasReservedChar(const std::string& s, bool allowSpace) {
     for (char c : s) {
-        if (c == '\0' || c == ',' || c == '=') return true;
-        if (!allowSpace && c == ' ') return true;
+        if (c == '\0' || c == ',' || c == '=')
+            return true;
+        if (!allowSpace && c == ' ')
+            return true;
     }
     return false;
 }
@@ -122,13 +110,19 @@ static inline bool isValidTagValue(const std::string& value) {
 // Shared slow-path validator: hasReservedChar() already ran and returned true,
 // so walk the string to produce a specific error message.
 static std::string validateStringHelper(const std::string& s, const std::string& context, bool allowSpace) {
-    if (s.empty()) return context + " must not be empty";
-    if (!hasReservedChar(s, allowSpace)) return {};
+    if (s.empty())
+        return context + " must not be empty";
+    if (!hasReservedChar(s, allowSpace))
+        return {};
     for (char c : s) {
-        if (c == '\0') return context + " must not contain null bytes";
-        if (c == ',') return context + " must not contain commas";
-        if (c == '=') return context + " must not contain equals signs";
-        if (!allowSpace && c == ' ') return context + " must not contain spaces";
+        if (c == '\0')
+            return context + " must not contain null bytes";
+        if (c == ',')
+            return context + " must not contain commas";
+        if (c == '=')
+            return context + " must not contain equals signs";
+        if (!allowSpace && c == ' ')
+            return context + " must not contain spaces";
     }
     return {};
 }
@@ -141,24 +135,26 @@ std::string HttpWriteHandler::validateTagValue(const std::string& value, const s
     return validateStringHelper(value, context, true);
 }
 
-void HttpWriteHandler::validateWritePointNames(
-    const std::string& measurement,
-    const std::map<std::string, std::string>& tags,
-    const std::map<std::string, FieldValue>& fields) {
-
+void HttpWriteHandler::validateWritePointNames(const std::string& measurement,
+                                               const std::map<std::string, std::string>& tags,
+                                               const std::map<std::string, FieldValue>& fields) {
     auto err = validateName(measurement, "Measurement name");
-    if (!err.empty()) throw std::invalid_argument(err);
+    if (!err.empty())
+        throw std::invalid_argument(err);
 
     for (const auto& [key, value] : tags) {
         err = validateName(key, "Tag key '" + key + "'");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!err.empty())
+            throw std::invalid_argument(err);
         err = validateTagValue(value, "Tag value for '" + key + "'");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!err.empty())
+            throw std::invalid_argument(err);
     }
 
     for (const auto& [fieldName, fieldValue] : fields) {
         err = validateName(fieldName, "Field name '" + fieldName + "'");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!err.empty())
+            throw std::invalid_argument(err);
     }
 }
 
@@ -171,14 +167,17 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
 
     // Validate measurement name
     auto err = validateName(glazePoint.measurement, "Measurement name");
-    if (!err.empty()) throw std::invalid_argument(err);
+    if (!err.empty())
+        throw std::invalid_argument(err);
 
     // Validate tags
     for (const auto& [key, value] : glazePoint.tags) {
         err = validateName(key, "Tag key '" + key + "'");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!err.empty())
+            throw std::invalid_argument(err);
         err = validateTagValue(value, "Tag value for '" + key + "'");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!err.empty())
+            throw std::invalid_argument(err);
     }
 
     // Validate field names
@@ -186,12 +185,14 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
         auto& fields_obj = glazePoint.fields.get<json_value_t::object_t>();
         for (const auto& [fieldName, fieldValue] : fields_obj) {
             err = validateName(fieldName, "Field name '" + fieldName + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
         }
     }
 }
 
-HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point, uint64_t defaultTimestampNs) {
+HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point,
+                                                                         uint64_t defaultTimestampNs) {
     MultiWritePoint mwp;
 
     // Extract fields directly from the json_value_t object, avoiding a
@@ -226,16 +227,19 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     {
         if (!isValidName(mwp.measurement)) {
             auto err = validateName(mwp.measurement, "Measurement name");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
         }
         for (const auto& [key, value] : mwp.tags) {
             if (!isValidName(key)) {
                 auto err = validateName(key, "Tag key '" + key + "'");
-                if (!err.empty()) throw std::invalid_argument(err);
+                if (!err.empty())
+                    throw std::invalid_argument(err);
             }
             if (!isValidTagValue(value)) {
                 auto err = validateTagValue(value, "Tag value for '" + key + "'");
-                if (!err.empty()) throw std::invalid_argument(err);
+                if (!err.empty())
+                    throw std::invalid_argument(err);
             }
         }
     }
@@ -251,7 +255,8 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
         // Validate field name (fast path avoids string allocation for valid names)
         if (!isValidName(fieldName)) {
             auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
         }
 
         FieldArrays fa;
@@ -299,7 +304,8 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             } else if (arr[0].is_string()) {
                 fa.type = FieldArrays::STRING;
                 fa.strings.reserve(arrSize);
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected string array field '{}' with {} elements", fieldName, arr.size());
+                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected string array field '{}' with {} elements",
+                                fieldName, arr.size());
                 for (auto& elem : arr) {
                     if (elem.is_string()) {
                         fa.strings.push_back(elem.get<std::string>());
@@ -307,7 +313,8 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
                         throw std::invalid_argument("Mixed types in field array: " + fieldName);
                     }
                 }
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Added {} string values to field '{}'", fa.strings.size(), fieldName);
+                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Added {} string values to field '{}'",
+                                fa.strings.size(), fieldName);
             } else {
                 throw std::invalid_argument("Unsupported field array type: " + fieldName);
             }
@@ -328,7 +335,8 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
                 fa.type = FieldArrays::STRING;
                 auto str_value = fieldValue.get<std::string>();
                 fa.strings.push_back(str_value);
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected single string field '{}' with value: '{}'", fieldName, str_value);
+                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected single string field '{}' with value: '{}'",
+                                fieldName, str_value);
             } else {
                 throw std::invalid_argument("Unsupported field type: " + fieldName);
             }
@@ -361,10 +369,18 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
         for (const auto& [fieldName, fieldArray] : mwp.fields) {
             size_t fieldSize = 0;
             switch (fieldArray.type) {
-                case FieldArrays::DOUBLE: fieldSize = fieldArray.doubles.size(); break;
-                case FieldArrays::BOOL: fieldSize = fieldArray.bools.size(); break;
-                case FieldArrays::STRING: fieldSize = fieldArray.strings.size(); break;
-                case FieldArrays::INTEGER: fieldSize = fieldArray.integers.size(); break;
+                case FieldArrays::DOUBLE:
+                    fieldSize = fieldArray.doubles.size();
+                    break;
+                case FieldArrays::BOOL:
+                    fieldSize = fieldArray.bools.size();
+                    break;
+                case FieldArrays::STRING:
+                    fieldSize = fieldArray.strings.size();
+                    break;
+                case FieldArrays::INTEGER:
+                    fieldSize = fieldArray.integers.size();
+                    break;
             }
             numPoints = std::max(numPoints, fieldSize);
         }
@@ -375,10 +391,18 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
         for (const auto& [fieldName, fieldArray] : mwp.fields) {
             size_t fieldSize = 0;
             switch (fieldArray.type) {
-                case FieldArrays::DOUBLE: fieldSize = fieldArray.doubles.size(); break;
-                case FieldArrays::BOOL: fieldSize = fieldArray.bools.size(); break;
-                case FieldArrays::STRING: fieldSize = fieldArray.strings.size(); break;
-                case FieldArrays::INTEGER: fieldSize = fieldArray.integers.size(); break;
+                case FieldArrays::DOUBLE:
+                    fieldSize = fieldArray.doubles.size();
+                    break;
+                case FieldArrays::BOOL:
+                    fieldSize = fieldArray.bools.size();
+                    break;
+                case FieldArrays::STRING:
+                    fieldSize = fieldArray.strings.size();
+                    break;
+                case FieldArrays::INTEGER:
+                    fieldSize = fieldArray.integers.size();
+                    break;
             }
             numPoints = std::max(numPoints, fieldSize);
         }
@@ -396,26 +420,31 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
 // Build a MultiWritePoint from a FastDoubleWritePoint (fast path, all fields are doubles).
 // Returns true on success, false if the data is invalid.
 bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t defaultTimestampNs,
-                                             MultiWritePoint& mwp) {
+                                            MultiWritePoint& mwp) {
     mwp.measurement = std::move(fwp.measurement);
     mwp.tags = std::move(fwp.tags);
 
     // Validate names
-    if (!isValidName(mwp.measurement)) return false;
+    if (!isValidName(mwp.measurement))
+        return false;
     for (const auto& [key, value] : mwp.tags) {
-        if (!isValidName(key) || !isValidTagValue(value)) return false;
+        if (!isValidName(key) || !isValidTagValue(value))
+            return false;
     }
 
     // Move fields as DOUBLE type
     for (auto& [fieldName, values] : fwp.fields) {
-        if (!isValidName(fieldName)) return false;
-        if (values.empty()) continue;
+        if (!isValidName(fieldName))
+            return false;
+        if (values.empty())
+            continue;
         FieldArrays fa;
         fa.type = FieldArrays::DOUBLE;
         fa.doubles = std::move(values);
         mwp.fields[fieldName] = std::move(fa);
     }
-    if (mwp.fields.empty()) return false;
+    if (mwp.fields.empty())
+        return false;
 
     // Determine number of points from the largest field array
     size_t numPoints = 1;
@@ -438,7 +467,8 @@ bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t 
     return true;
 }
 
-std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs) {
+std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
+    const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs) {
     // Configuration constants
     static const size_t MAX_COALESCE_SIZE = 10000;  // Max values per field array
     static const size_t MIN_COALESCE_COUNT = 2;     // Min writes needed to coalesce
@@ -463,8 +493,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
     // Helper lambda: add a single scalar value to a CoalesceCandidate.
     // Returns false if the value type is unsupported, true otherwise.
-    auto addScalarToCandidate = [](CoalesceCandidate& candidate, TSMValueType valueType,
-                                   uint64_t ts, const json_value_t& val) -> bool {
+    auto addScalarToCandidate = [](CoalesceCandidate& candidate, TSMValueType valueType, uint64_t ts,
+                                   const json_value_t& val) -> bool {
         candidate.timestamps.push_back(ts);
         candidate.timestampHashSum += ts;
         candidate.timestampHashXor ^= ts;
@@ -486,11 +516,9 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // Helper lambda: initialize a new CoalesceCandidate with metadata.
     // Takes a lw_shared_ptr to the tag map so that all candidates from the
     // same write point share a single allocation (O(1) pointer copy).
-    auto initCandidate = [](CoalesceCandidate& candidate, const std::string& seriesKey,
-                            const std::string& measurement,
+    auto initCandidate = [](CoalesceCandidate& candidate, const std::string& seriesKey, const std::string& measurement,
                             seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
-                            const std::string& fieldName, TSMValueType valueType,
-                            const std::string& groupKey) {
+                            const std::string& fieldName, TSMValueType valueType, const std::string& groupKey) {
         candidate.seriesKey = seriesKey;
         candidate.groupKey = groupKey;
         candidate.measurement = measurement;
@@ -505,8 +533,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // without copying the underlying map data.
     auto findOrCreateCandidate = [&](const std::string& seriesKey, const std::string& measurement,
                                      seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
-                                     const std::string& fieldName, TSMValueType valueType,
-                                     size_t numValuesToAdd,
+                                     const std::string& fieldName, TSMValueType valueType, size_t numValuesToAdd,
                                      const std::string& groupKey) -> CoalesceCandidate& {
         auto it = candidates.find(seriesKey);
         if (it == candidates.end()) {
@@ -515,8 +542,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             return c;
         }
         CoalesceCandidate& existing = it.value();
-        if (existing.valueType == valueType &&
-            existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
+        if (existing.valueType == valueType && existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
             return existing;
         }
         // Type mismatch or size overflow: create a disambiguated candidate
@@ -538,20 +564,23 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     for (const auto& write : writes_array) {
         totalWritesProcessed++;
 
-        if (!write.is_object()) continue;
+        if (!write.is_object())
+            continue;
 
         try {
             auto& writeObj = write.get<json_value_t::object_t>();
 
             // Extract measurement
             auto measurementIt = writeObj.find("measurement");
-            if (measurementIt == writeObj.end() || !measurementIt->second.is_string()) continue;
+            if (measurementIt == writeObj.end() || !measurementIt->second.is_string())
+                continue;
             std::string measurement = measurementIt->second.get<std::string>();
 
             // Validate measurement name
             {
                 auto err = validateName(measurement, "Measurement name");
-                if (!err.empty()) throw std::invalid_argument(err);
+                if (!err.empty())
+                    throw std::invalid_argument(err);
             }
 
             // Extract timestamps - handle both "timestamp" (single) and "timestamps" (array).
@@ -591,10 +620,12 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 for (const auto& [tagKey, tagValue] : tagsObj) {
                     if (tagValue.is_string()) {
                         auto err = validateName(tagKey, "Tag key '" + tagKey + "'");
-                        if (!err.empty()) throw std::invalid_argument(err);
+                        if (!err.empty())
+                            throw std::invalid_argument(err);
                         auto val = tagValue.get<std::string>();
                         err = validateTagValue(val, "Tag value for '" + tagKey + "'");
-                        if (!err.empty()) throw std::invalid_argument(err);
+                        if (!err.empty())
+                            throw std::invalid_argument(err);
                         localTags[tagKey] = std::move(val);
                     }
                 }
@@ -605,7 +636,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             {
                 size_t prefixSize = measurement.length();
                 for (const auto& [tagKey, tagValue] : localTags) {
-                    prefixSize += 1 + tagKey.size() + 1 + tagValue.size(); // ",key=value"
+                    prefixSize += 1 + tagKey.size() + 1 + tagValue.size();  // ",key=value"
                 }
                 seriesKeyPrefix.reserve(prefixSize);
             }
@@ -623,14 +654,16 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
             // Extract fields and process each field - handles both scalar and array values
             auto fieldsIt = writeObj.find("fields");
-            if (fieldsIt == writeObj.end() || !fieldsIt->second.is_object()) continue;
+            if (fieldsIt == writeObj.end() || !fieldsIt->second.is_object())
+                continue;
 
             auto& fieldsObj = fieldsIt->second.get<json_value_t::object_t>();
             for (const auto& [fieldName, fieldValue] : fieldsObj) {
                 // Validate field name
                 {
                     auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-                    if (!err.empty()) throw std::invalid_argument(err);
+                    if (!err.empty())
+                        throw std::invalid_argument(err);
                 }
 
                 // Build series key
@@ -676,16 +709,15 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     } else {
                         // Generate timestamps 1ms apart from the first available,
                         // falling back to the batch-level default if none exist
-                        uint64_t baseTs = timestamps.empty() ? defaultTimestampNs
-                            : timestamps[0];
+                        uint64_t baseTs = timestamps.empty() ? defaultTimestampNs : timestamps[0];
                         fieldTimestamps.reserve(arr.size());
                         for (size_t i = 0; i < arr.size(); i++) {
                             fieldTimestamps.push_back(baseTs + i * 1000000);
                         }
                     }
 
-                    CoalesceCandidate& candidate = findOrCreateCandidate(
-                        seriesKey, measurement, sharedTags, fieldName, valueType, arr.size(), seriesKeyPrefix);
+                    CoalesceCandidate& candidate = findOrCreateCandidate(seriesKey, measurement, sharedTags, fieldName,
+                                                                         valueType, arr.size(), seriesKeyPrefix);
 
                     // Add all array elements to candidate
                     candidate.timestamps.reserve(candidate.timestamps.size() + arr.size());
@@ -703,17 +735,21 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                         candidate.timestampHashSum += fieldTimestamps[i];
                         candidate.timestampHashXor ^= fieldTimestamps[i];
                         if (valueType == TSMValueType::Float) {
-                            if (!elem.is_number()) throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                            if (!elem.is_number())
+                                throw std::invalid_argument("Mixed types in field array: " + fieldName);
                             candidate.doubleValues.push_back(elem.as<double>());
                         } else if (valueType == TSMValueType::Boolean) {
-                            if (!elem.is_boolean()) throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                            if (!elem.is_boolean())
+                                throw std::invalid_argument("Mixed types in field array: " + fieldName);
                             candidate.boolValues.push_back(elem.get<bool>() ? 1 : 0);
                         } else if (valueType == TSMValueType::String) {
-                            if (!elem.is_string()) throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                            if (!elem.is_string())
+                                throw std::invalid_argument("Mixed types in field array: " + fieldName);
                             std::string strValue = elem.get<std::string>();
                             candidate.stringValues.push_back(std::move(strValue));
                         } else if (valueType == TSMValueType::Integer) {
-                            if (!elem.is_number()) throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                            if (!elem.is_number())
+                                throw std::invalid_argument("Mixed types in field array: " + fieldName);
                             candidate.integerValues.push_back(elem.as<int64_t>());
                         }
                     }
@@ -731,11 +767,11 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                     } else if (fieldValue.is_string()) {
                         valueType = TSMValueType::String;
                     } else {
-                        continue; // Skip unsupported types
+                        continue;  // Skip unsupported types
                     }
 
-                    CoalesceCandidate& candidate = findOrCreateCandidate(
-                        seriesKey, measurement, sharedTags, fieldName, valueType, 1, seriesKeyPrefix);
+                    CoalesceCandidate& candidate = findOrCreateCandidate(seriesKey, measurement, sharedTags, fieldName,
+                                                                         valueType, 1, seriesKeyPrefix);
                     addScalarToCandidate(candidate, valueType, timestamps[0], fieldValue);
                 }
             }
@@ -744,13 +780,13 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             continue;
         }
     }
-    
+
     // Second pass: convert candidates to MultiWritePoint objects
     std::vector<MultiWritePoint> result;
 
     // Group by measurement+tags efficiently (only for coalescing)
-    tsl::robin_map<std::string, std::vector<std::string>> grouped; // groupKey -> seriesKeys
-    tsl::robin_set<std::string> processedSeriesKeys; // Track which candidates were coalesced
+    tsl::robin_map<std::string, std::vector<std::string>> grouped;  // groupKey -> seriesKeys
+    tsl::robin_set<std::string> processedSeriesKeys;                // Track which candidates were coalesced
     [[maybe_unused]] size_t individualCount = 0;
 
     for (const auto& [seriesKey, candidate] : candidates) {
@@ -767,7 +803,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // IMPORTANT: Process coalesced groups FIRST before moving data from candidates
     // Build MultiWritePoint objects for coalesced groups
     for (auto& [groupKey, seriesKeys] : grouped) {
-        if (seriesKeys.empty()) continue;
+        if (seriesKeys.empty())
+            continue;
 
         // Get first candidate for validation
         const auto& firstSeriesKey = seriesKeys[0];
@@ -788,7 +825,9 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         }
 
         if (!timestampsCompatible) {
-            LOG_INSERT_PATH(timestar::http_log, debug, "[COALESCE] Group '{}' has incompatible timestamps, emitting individual MultiWritePoints", groupKey);
+            LOG_INSERT_PATH(timestar::http_log, debug,
+                            "[COALESCE] Group '{}' has incompatible timestamps, emitting individual MultiWritePoints",
+                            groupKey);
             // Timestamps are incompatible across fields, so emit each candidate
             // as its own single-field MultiWritePoint to avoid data loss.
             for (const auto& seriesKey : seriesKeys) {
@@ -800,10 +839,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 mwp.timestamps = std::move(candidate.timestamps);
 
                 FieldArrays fa;
-                fa.type = (candidate.valueType == TSMValueType::Float) ? FieldArrays::DOUBLE :
-                         (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL :
-                         (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER :
-                         FieldArrays::STRING;
+                fa.type = (candidate.valueType == TSMValueType::Float)     ? FieldArrays::DOUBLE
+                          : (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL
+                          : (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER
+                                                                           : FieldArrays::STRING;
 
                 if (candidate.valueType == TSMValueType::Float) {
                     fa.doubles = std::move(candidate.doubleValues);
@@ -834,10 +873,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             auto& candidate = candidates[seriesKey];
 
             FieldArrays fa;
-            fa.type = (candidate.valueType == TSMValueType::Float) ? FieldArrays::DOUBLE :
-                     (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL :
-                     (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER :
-                     FieldArrays::STRING;
+            fa.type = (candidate.valueType == TSMValueType::Float)     ? FieldArrays::DOUBLE
+                      : (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL
+                      : (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER
+                                                                       : FieldArrays::STRING;
 
             // Simple assignment without complex sorting
             if (candidate.valueType == TSMValueType::Float) {
@@ -851,7 +890,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             }
 
             mwp.fields[candidate.fieldName] = std::move(fa);
-            processedSeriesKeys.insert(seriesKey); // Mark this series as processed
+            processedSeriesKeys.insert(seriesKey);  // Mark this series as processed
         }
 
         result.push_back(std::move(mwp));
@@ -874,10 +913,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         mwp.timestamps = std::move(candidate.timestamps);
 
         FieldArrays fa;
-        fa.type = (candidate.valueType == TSMValueType::Float) ? FieldArrays::DOUBLE :
-                 (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL :
-                 (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER :
-                 FieldArrays::STRING;
+        fa.type = (candidate.valueType == TSMValueType::Float)     ? FieldArrays::DOUBLE
+                  : (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL
+                  : (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER
+                                                                   : FieldArrays::STRING;
 
         if (candidate.valueType == TSMValueType::Float) {
             fa.doubles = std::move(candidate.doubleValues);
@@ -898,8 +937,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     auto end_coalesce = std::chrono::high_resolution_clock::now();
     auto coalesce_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_coalesce - start_coalesce);
     LOG_INSERT_PATH(timestar::http_log, info,
-        "[COALESCE] Processed {} writes -> {} coalesced arrays + {} individual writes = {} total ({}μs)",
-        totalWritesProcessed, coalescedCount, individualCount, result.size(), coalesce_duration.count());
+                    "[COALESCE] Processed {} writes -> {} coalesced arrays + {} individual writes = {} total ({}μs)",
+                    totalWritesProcessed, coalescedCount, individualCount, result.size(), coalesce_duration.count());
 #endif
 
     return result;
@@ -907,28 +946,35 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
 bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::string& error) {
     size_t expectedSize = point.timestamps.size();
-    
+
     for (const auto& [fieldName, fieldArray] : point.fields) {
         size_t fieldSize = 0;
         switch (fieldArray.type) {
-            case FieldArrays::DOUBLE: fieldSize = fieldArray.doubles.size(); break;
-            case FieldArrays::BOOL: fieldSize = fieldArray.bools.size(); break;
-            case FieldArrays::STRING: fieldSize = fieldArray.strings.size(); break;
-            case FieldArrays::INTEGER: fieldSize = fieldArray.integers.size(); break;
+            case FieldArrays::DOUBLE:
+                fieldSize = fieldArray.doubles.size();
+                break;
+            case FieldArrays::BOOL:
+                fieldSize = fieldArray.bools.size();
+                break;
+            case FieldArrays::STRING:
+                fieldSize = fieldArray.strings.size();
+                break;
+            case FieldArrays::INTEGER:
+                fieldSize = fieldArray.integers.size();
+                break;
         }
-        
+
         if (fieldSize != expectedSize && fieldSize != 1) {
-            error = "Field '" + fieldName + "' has " + std::to_string(fieldSize) + 
-                    " values but expected " + std::to_string(expectedSize) + " (or 1 for scalar)";
+            error = "Field '" + fieldName + "' has " + std::to_string(fieldSize) + " values but expected " +
+                    std::to_string(expectedSize) + " (or 1 for scalar)";
             return false;
         }
     }
-    
+
     return true;
 }
 
-seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(
-    MultiWritePoint& point) {
+seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(MultiWritePoint& point) {
     // Shard-local cache of series IDs that have already been indexed on shard 0.
     // After the first batch, subsequent writes for the same series skip the
     // cross-shard metadata RPC entirely, eliminating the biggest bottleneck
@@ -948,9 +994,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     // Splitting here only adds redundant copies and sequential cross-shard roundtrips.
 
     // Group inserts by shard to reduce cross-shard operations and process them in batches
-    LOG_INSERT_PATH(timestar::http_log, debug,
-        "[WRITE] Processing MultiWritePoint: {} timestamps × {} fields",
-        point.timestamps.size(), point.fields.size());
+    LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Processing MultiWritePoint: {} timestamps × {} fields",
+                    point.timestamps.size(), point.fields.size());
 
 #if TIMESTAR_LOG_INSERT_PATH
     auto start_grouping = std::chrono::high_resolution_clock::now();
@@ -1008,7 +1053,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
         // Each field is processed exactly once, so the move-from is safe.
         switch (fieldArray.type) {
             case FieldArrays::DOUBLE: {
-                if (fieldArray.doubles.empty()) continue;
+                if (fieldArray.doubles.empty())
+                    continue;
 
                 // Track metadata before potential move - deduplicate by SeriesId128 (16-byte key,
                 // fast hash via first 8 bytes) instead of the raw 60-100 byte series key string.
@@ -1035,7 +1081,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
             }
 
             case FieldArrays::BOOL: {
-                if (fieldArray.bools.empty()) continue;
+                if (fieldArray.bools.empty())
+                    continue;
 
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
@@ -1063,7 +1110,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
             }
 
             case FieldArrays::STRING: {
-                if (fieldArray.strings.empty()) continue;
+                if (fieldArray.strings.empty())
+                    continue;
 
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
@@ -1087,7 +1135,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
             }
 
             case FieldArrays::INTEGER: {
-                if (fieldArray.integers.empty()) continue;
+                if (fieldArray.integers.empty())
+                    continue;
 
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
@@ -1111,7 +1160,7 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
             }
         }
     }
-    
+
 #if TIMESTAR_LOG_INSERT_PATH
     auto end_grouping = std::chrono::high_resolution_clock::now();
     auto grouping_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_grouping - start_grouping);
@@ -1129,9 +1178,7 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
     for (size_t shard = 0; shard < shardCount; ++shard) {
         // Skip shards with no work
-        if (shardDoubleInserts[shard].empty() &&
-            shardBoolInserts[shard].empty() &&
-            shardStringInserts[shard].empty() &&
+        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() && shardStringInserts[shard].empty() &&
             shardIntegerInserts[shard].empty()) {
             continue;
         }
@@ -1143,9 +1190,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
         auto integers = std::move(shardIntegerInserts[shard]);
 
         // Lambda that inserts all types into the given engine
-        auto doInserts = [](Engine& engine, auto doubles, auto bools,
-                            auto strings, auto integers) mutable
-                         -> seastar::future<AggregatedTimingInfo> {
+        auto doInserts = [](Engine& engine, auto doubles, auto bools, auto strings,
+                            auto integers) mutable -> seastar::future<AggregatedTimingInfo> {
             AggregatedTimingInfo batchTiming;
 
             if (!doubles.empty()) {
@@ -1173,41 +1219,38 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
         // Local shard: call engine directly, avoiding cross-shard message queue overhead
         if (shard == seastar::this_shard_id()) {
-            shardFutures.push_back(
-                doInserts(engineSharded->local(), std::move(doubles), std::move(bools),
-                          std::move(strings), std::move(integers)));
+            shardFutures.push_back(doInserts(engineSharded->local(), std::move(doubles), std::move(bools),
+                                             std::move(strings), std::move(integers)));
         } else {
             // Remote shard: use invoke_on
-            shardFutures.push_back(
-                engineSharded->invoke_on(shard,
-                    [doubles = std::move(doubles), bools = std::move(bools),
-                     strings = std::move(strings), integers = std::move(integers)]
-                    (Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
-                        AggregatedTimingInfo batchTiming;
+            shardFutures.push_back(engineSharded->invoke_on(
+                shard,
+                [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
+                 integers = std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
+                    AggregatedTimingInfo batchTiming;
 
-                        if (!doubles.empty()) {
-                            auto walTiming = co_await engine.insertBatch(std::move(doubles));
-                            batchTiming.aggregate(walTiming);
-                        }
+                    if (!doubles.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(doubles));
+                        batchTiming.aggregate(walTiming);
+                    }
 
-                        if (!bools.empty()) {
-                            auto walTiming = co_await engine.insertBatch(std::move(bools));
-                            batchTiming.aggregate(walTiming);
-                        }
+                    if (!bools.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(bools));
+                        batchTiming.aggregate(walTiming);
+                    }
 
-                        if (!strings.empty()) {
-                            auto walTiming = co_await engine.insertBatch(std::move(strings));
-                            batchTiming.aggregate(walTiming);
-                        }
+                    if (!strings.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(strings));
+                        batchTiming.aggregate(walTiming);
+                    }
 
-                        if (!integers.empty()) {
-                            auto walTiming = co_await engine.insertBatch(std::move(integers));
-                            batchTiming.aggregate(walTiming);
-                        }
+                    if (!integers.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(integers));
+                        batchTiming.aggregate(walTiming);
+                    }
 
-                        co_return batchTiming;
-                    })
-            );
+                    co_return batchTiming;
+                }));
         }
     }
 
@@ -1219,7 +1262,7 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     for (const auto& timing : shardTimings) {
         aggregatedTiming.aggregate(timing);
     }
-    
+
 #if TIMESTAR_LOG_INSERT_PATH
     auto end_batch_ops = std::chrono::high_resolution_clock::now();
     auto batch_ops_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_batch_ops - start_batch_ops);
@@ -1227,8 +1270,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
 
     LOG_INSERT_PATH(timestar::http_log, info,
-        "[PERF] [HTTP] processMultiWritePoint breakdown - Total: {}μs, Grouping: {}μs, BatchOps: {}μs",
-        total_duration.count(), grouping_duration.count(), batch_ops_duration.count());
+                    "[PERF] [HTTP] processMultiWritePoint breakdown - Total: {}μs, Grouping: {}μs, BatchOps: {}μs",
+                    total_duration.count(), grouping_duration.count(), batch_ops_duration.count());
 #endif
 
     co_return WriteResult{std::move(aggregatedTiming), std::move(metaOps)};
@@ -1236,25 +1279,28 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
 HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string& json, uint64_t defaultTimestampNs) {
     WritePoint wp;
-    
+
     GlazeWritePoint glazePoint;
     auto error = glz::read_json(glazePoint, json);
     if (error) {
         throw std::invalid_argument("Failed to parse write point: " + std::string(glz::format_error(error)));
     }
-    
+
     wp.measurement = glazePoint.measurement;
     wp.tags = glazePoint.tags;
 
     // Validate measurement and tag names before any processing
     {
         auto err = validateName(wp.measurement, "Measurement name");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!err.empty())
+            throw std::invalid_argument(err);
         for (const auto& [key, value] : wp.tags) {
             err = validateName(key, "Tag key '" + key + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
             err = validateTagValue(value, "Tag value for '" + key + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
         }
     }
 
@@ -1262,17 +1308,18 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
     if (!glazePoint.fields.is_object()) {
         throw std::invalid_argument("'fields' must be an object");
     }
-    
+
     auto& fields_obj = glazePoint.fields.get<json_value_t::object_t>();
     if (fields_obj.empty()) {
         throw std::invalid_argument("'fields' object cannot be empty");
     }
-    
+
     for (auto& [fieldName, fieldValue] : fields_obj) {
         // Validate field name (fast path avoids string allocation for valid names)
         if (!isValidName(fieldName)) {
             auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
         }
 
         if (fieldValue.is_number()) {
@@ -1286,7 +1333,8 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
         } else if (fieldValue.is_string()) {
             auto str_value = fieldValue.get<std::string>();
             wp.fields[fieldName] = str_value;
-            LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Single write: detected string field '{}' with value: '{}'", fieldName, str_value);
+            LOG_INSERT_PATH(timestar::http_log, debug,
+                            "[WRITE] Single write: detected string field '{}' with value: '{}'", fieldName, str_value);
         } else {
             throw std::invalid_argument("Unsupported field type for field: " + fieldName);
         }
@@ -1334,12 +1382,15 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_
     // Validate measurement and tag names before any processing
     {
         auto err = validateName(wp.measurement, "Measurement name");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!err.empty())
+            throw std::invalid_argument(err);
         for (const auto& [key, value] : wp.tags) {
             err = validateName(key, "Tag key '" + key + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
             err = validateTagValue(value, "Tag value for '" + key + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
         }
     }
 
@@ -1358,7 +1409,8 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_
         // Validate field name (fast path avoids string allocation for valid names)
         if (!isValidName(fieldName)) {
             auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!err.empty())
+                throw std::invalid_argument(err);
         }
 
         if (fieldValue.is_number()) {
@@ -1372,7 +1424,8 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_
         } else if (fieldValue.is_string()) {
             auto str_value = fieldValue.get<std::string>();
             wp.fields[fieldName] = str_value;
-            LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Single write: detected string field '{}' with value: '{}'", fieldName, str_value);
+            LOG_INSERT_PATH(timestar::http_log, debug,
+                            "[WRITE] Single write: detected string field '{}' with value: '{}'", fieldName, str_value);
         } else {
             throw std::invalid_argument("Unsupported field type for field: " + fieldName);
         }
@@ -1474,8 +1527,10 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
             insert.setCachedSeriesId128(seriesId);
             insert.addValue(point.timestamp, value);
 
-            LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Processing single string insert - field: '{}', value: '{}', timestamp: {}, shard: {}",
-                           fieldName, value, point.timestamp, shard);
+            LOG_INSERT_PATH(
+                timestar::http_log, debug,
+                "[WRITE] Processing single string insert - field: '{}', value: '{}', timestamp: {}, shard: {}",
+                fieldName, value, point.timestamp, shard);
             LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] String series key: '{}'", insert.seriesKey());
 
             shardStringInserts[shard].push_back(std::move(insert));
@@ -1500,9 +1555,7 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
 
     for (size_t shard = 0; shard < shardCount; ++shard) {
         // Skip shards with no work - O(1) emptiness check on each vector
-        if (shardDoubleInserts[shard].empty() &&
-            shardBoolInserts[shard].empty() &&
-            shardStringInserts[shard].empty() &&
+        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() && shardStringInserts[shard].empty() &&
             shardIntegerInserts[shard].empty()) [[likely]] {
             continue;
         }
@@ -1513,44 +1566,42 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
         auto strings = std::move(shardStringInserts[shard]);
         auto integers = std::move(shardIntegerInserts[shard]);
 
-        shardFutures.push_back(
-            engineSharded->invoke_on(shard,
-                [doubles = std::move(doubles), bools = std::move(bools),
-                 strings = std::move(strings), integers = std::move(integers)]
-                (Engine& engine) mutable -> seastar::future<> {
-                    // Use insertBatch when multiple inserts target the same shard,
-                    // otherwise fall back to single insert for less overhead.
-                    // skipMetadataIndexing=true because we index metadata separately below.
-                    if (!doubles.empty()) {
-                        if (doubles.size() == 1) {
-                            co_await engine.insert(std::move(doubles[0]), true);
-                        } else {
-                            co_await engine.insertBatch(std::move(doubles));
-                        }
+        shardFutures.push_back(engineSharded->invoke_on(
+            shard,
+            [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
+             integers = std::move(integers)](Engine& engine) mutable -> seastar::future<> {
+                // Use insertBatch when multiple inserts target the same shard,
+                // otherwise fall back to single insert for less overhead.
+                // skipMetadataIndexing=true because we index metadata separately below.
+                if (!doubles.empty()) {
+                    if (doubles.size() == 1) {
+                        co_await engine.insert(std::move(doubles[0]), true);
+                    } else {
+                        co_await engine.insertBatch(std::move(doubles));
                     }
-                    if (!bools.empty()) {
-                        if (bools.size() == 1) {
-                            co_await engine.insert(std::move(bools[0]), true);
-                        } else {
-                            co_await engine.insertBatch(std::move(bools));
-                        }
+                }
+                if (!bools.empty()) {
+                    if (bools.size() == 1) {
+                        co_await engine.insert(std::move(bools[0]), true);
+                    } else {
+                        co_await engine.insertBatch(std::move(bools));
                     }
-                    if (!strings.empty()) {
-                        if (strings.size() == 1) {
-                            co_await engine.insert(std::move(strings[0]), true);
-                        } else {
-                            co_await engine.insertBatch(std::move(strings));
-                        }
+                }
+                if (!strings.empty()) {
+                    if (strings.size() == 1) {
+                        co_await engine.insert(std::move(strings[0]), true);
+                    } else {
+                        co_await engine.insertBatch(std::move(strings));
                     }
-                    if (!integers.empty()) {
-                        if (integers.size() == 1) {
-                            co_await engine.insert(std::move(integers[0]), true);
-                        } else {
-                            co_await engine.insertBatch(std::move(integers));
-                        }
+                }
+                if (!integers.empty()) {
+                    if (integers.size() == 1) {
+                        co_await engine.insert(std::move(integers[0]), true);
+                    } else {
+                        co_await engine.insertBatch(std::move(integers));
                     }
-                })
-        );
+                }
+            }));
     }
 
     // Wait for all shard inserts to complete in parallel
@@ -1565,9 +1616,8 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
 #if TIMESTAR_LOG_INSERT_PATH
     auto end_total = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
-    LOG_INSERT_PATH(timestar::http_log, info,
-        "[PERF] [HTTP] processWritePoint: {}us ({} fields, {} shards)",
-        total_duration.count(), point.fields.size(), shardFutures.size());
+    LOG_INSERT_PATH(timestar::http_log, info, "[PERF] [HTTP] processWritePoint: {}us ({} fields, {} shards)",
+                    total_duration.count(), point.fields.size(), shardFutures.size());
 #endif
 
     co_return;
@@ -1576,7 +1626,7 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
 std::string HttpWriteHandler::createErrorResponse(const std::string& error) {
     // Create JSON object directly
     auto response = glz::obj{"status", "error", "message", error};
-    
+
     std::string buffer;
     auto ec = glz::write_json(response, buffer);
     if (ec) {
@@ -1588,7 +1638,7 @@ std::string HttpWriteHandler::createErrorResponse(const std::string& error) {
 std::string HttpWriteHandler::createSuccessResponse(int pointsWritten) {
     // Create JSON object directly
     auto response = glz::obj{"status", "success", "points_written", pointsWritten};
-    
+
     std::string buffer;
     auto ec = glz::write_json(response, buffer);
     if (ec) {
@@ -1597,17 +1647,17 @@ std::string HttpWriteHandler::createSuccessResponse(int pointsWritten) {
     return buffer;
 }
 
-seastar::future<std::unique_ptr<seastar::http::reply>> 
-HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
+seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleWrite(
+    std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
-    
+
     try {
         // Read the complete request body — move from request to avoid copying
         std::string body;
         if (!req->content.empty()) {
             body = std::move(req->content);
         }
-        
+
         // Read from stream if available, checking size incrementally
         if (req->content_stream) {
             while (!req->content_stream->eof()) {
@@ -1621,7 +1671,8 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
 
         if (body.size() > maxWriteBodySize()) {
             rep->set_status(seastar::http::reply::status_type::payload_too_large);
-            rep->_content = createErrorResponse("Request body too large (max " + std::to_string(maxWriteBodySize() / (1024*1024)) + "MB)");
+            rep->_content = createErrorResponse("Request body too large (max " +
+                                                std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)");
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
@@ -1644,7 +1695,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
-        
+
         LOG_INSERT_PATH(timestar::http_log, debug, "Received write request: {} bytes", body.size());
 
         int pointsWritten = 0;
@@ -1717,7 +1768,8 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                     if (writes.is_array()) {
                         auto& writes_array = writes.get<json_value_t::array_t>();
 
-                        LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Processing batch with {} writes", writes_array.size());
+                        LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Processing batch with {} writes",
+                                        writes_array.size());
 
 #if TIMESTAR_LOG_INSERT_PATH
                         auto coalesceStartTime = std::chrono::steady_clock::now();
@@ -1725,9 +1777,11 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                         auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs);
 #if TIMESTAR_LOG_INSERT_PATH
                         auto coalesceEndTime = std::chrono::steady_clock::now();
-                        auto coalesceDuration = std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
-                        LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Coalesced {} writes into {} MultiWritePoints ({}μs)",
-                                       writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
+                        auto coalesceDuration =
+                            std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
+                        LOG_INSERT_PATH(timestar::http_log, info,
+                                        "[BATCH] Coalesced {} writes into {} MultiWritePoints ({}μs)",
+                                        writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
 #endif
 
                         for (const auto& mwp : coalescedWrites) {
@@ -1751,9 +1805,8 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                         for (auto& result : mwpResults) {
                             try {
                                 auto writeResult = result.get();
-                                metaOps.insert(metaOps.end(),
-                                    std::make_move_iterator(writeResult.metaOps.begin()),
-                                    std::make_move_iterator(writeResult.metaOps.end()));
+                                metaOps.insert(metaOps.end(), std::make_move_iterator(writeResult.metaOps.begin()),
+                                               std::make_move_iterator(writeResult.metaOps.end()));
                             } catch (const std::exception& e) {
                                 timestar::http_log.error("Error processing write: {}", e.what());
                             }
@@ -1767,8 +1820,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                         }
 #if TIMESTAR_LOG_INSERT_PATH
                         LOG_INSERT_PATH(timestar::http_log, info,
-                            "[METADATA] Batch: indexed {} unique series synchronously",
-                            metaOpsCount);
+                                        "[METADATA] Batch: indexed {} unique series synchronously", metaOpsCount);
 #endif
                     }
                 } else {
@@ -1790,18 +1842,17 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
                     }
 #if TIMESTAR_LOG_INSERT_PATH
                     LOG_INSERT_PATH(timestar::http_log, info,
-                        "[METADATA] Single write: indexed {} unique series synchronously",
-                        metaOpsCount);
+                                    "[METADATA] Single write: indexed {} unique series synchronously", metaOpsCount);
 #endif
                 }
             }
         }
-        
+
         // Success response
         rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = createSuccessResponse(pointsWritten);
         rep->add_header("Content-Type", "application/json");
-        
+
     } catch (const seastar::gate_closed_exception&) {
         // Insert gate closed — server is shutting down. Return 503 so clients
         // know to retry against another node or after restart.
@@ -1820,18 +1871,17 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         rep->_content = createErrorResponse("Internal server error");
         rep->add_header("Content-Type", "application/json");
     }
-    
+
     co_return rep;
 }
 
 void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return handleWrite(std::move(req));
-        }, "json");
-    
-    r.add(seastar::httpd::operation_type::POST, 
-          seastar::httpd::url("/write"), handler);
-    
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleWrite(std::move(req)); },
+        "json");
+
+    r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/write"), handler);
+
     timestar::http_log.info("Registered HTTP write endpoint at /write");
 }

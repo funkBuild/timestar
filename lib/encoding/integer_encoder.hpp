@@ -1,12 +1,13 @@
 #ifndef INTEGER_ENCODER_H_INCLUDED
 #define INTEGER_ENCODER_H_INCLUDED
 
-#include <vector>
+#include "aligned_buffer.hpp"
+#include "slice_buffer.hpp"
+
 #include <cstdint>
 #include <span>
 #include <string>
-#include "aligned_buffer.hpp"
-#include "slice_buffer.hpp"
+#include <vector>
 
 /**
  * Main IntegerEncoder class that automatically selects the best implementation
@@ -26,15 +27,13 @@ public:
      * Eliminates the intermediate buffer allocation and copy.
      * Returns the number of bytes written to the target buffer.
      */
-    static size_t encodeInto(std::span<const uint64_t> values, AlignedBuffer &target);
+    static size_t encodeInto(std::span<const uint64_t> values, AlignedBuffer& target);
 
     /**
      * Decode compressed data back to uint64_t values using the best available implementation
      */
-    static std::pair<size_t, size_t> decode(Slice &encoded, unsigned int timestampSize,
-                                           std::vector<uint64_t> &values,
-                                           uint64_t startTime = 0,
-                                           uint64_t maxTime = UINT64_MAX);
+    static std::pair<size_t, size_t> decode(Slice& encoded, unsigned int timestampSize, std::vector<uint64_t>& values,
+                                            uint64_t startTime = 0, uint64_t maxTime = UINT64_MAX);
 
     /**
      * Get the name of the encoder implementation being used
@@ -51,11 +50,11 @@ public:
      * Force a specific implementation (for testing)
      */
     enum Implementation {
-        AUTO,     // Automatically select best
-        BASIC,    // Force basic implementation
-        SIMD,     // Force SIMD AVX2
-        AVX512,   // Force AVX-512
-        FFOR      // Force FFOR (Frame-of-Reference) encoding
+        AUTO,    // Automatically select best
+        BASIC,   // Force basic implementation
+        SIMD,    // Force SIMD AVX2
+        AVX512,  // Force AVX-512
+        FFOR     // Force FFOR (Frame-of-Reference) encoding
     };
 
     static void setImplementation(Implementation impl);
@@ -65,4 +64,4 @@ private:
     static thread_local Implementation s_forced_impl;
 };
 
-#endif // INTEGER_ENCODER_H_INCLUDED
+#endif  // INTEGER_ENCODER_H_INCLUDED

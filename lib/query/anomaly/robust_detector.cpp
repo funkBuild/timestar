@@ -1,4 +1,5 @@
 #include "robust_detector.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -6,13 +7,8 @@
 namespace timestar {
 namespace anomaly {
 
-void RobustDetector::computeBounds(
-    const STLComponents& stl,
-    const std::vector<double>& values,
-    double bounds,
-    std::vector<double>& upper,
-    std::vector<double>& lower
-) {
+void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<double>& values, double bounds,
+                                   std::vector<double>& upper, std::vector<double>& lower) {
     size_t n = values.size();
     upper.resize(n);
     lower.resize(n);
@@ -40,7 +36,8 @@ void RobustDetector::computeBounds(
     // nth_element is O(N) vs O(N log N) for full sort
     size_t sz = absResiduals.size();
     size_t medianIdx = sz / 2;
-    std::nth_element(absResiduals.begin(), absResiduals.begin() + static_cast<ptrdiff_t>(medianIdx), absResiduals.end());
+    std::nth_element(absResiduals.begin(), absResiduals.begin() + static_cast<ptrdiff_t>(medianIdx),
+                     absResiduals.end());
     double mad;
     if (sz % 2 == 0 && sz >= 2) {
         // For even-length: true median is average of elements at [n/2-1] and [n/2]
@@ -63,7 +60,8 @@ void RobustDetector::computeBounds(
         }
     }
     sigma = std::max(sigma, minSigma);
-    if (sigma < 1e-10) sigma = 1.0;
+    if (sigma < 1e-10)
+        sigma = 1.0;
 
     // Compute expected values (trend + seasonal) using SIMD
     std::vector<double> expected(n);
@@ -76,10 +74,7 @@ void RobustDetector::computeBounds(
     simd::computeBounds(expected.data(), scale.data(), bounds, upper.data(), lower.data(), n);
 }
 
-AnomalyOutput RobustDetector::detect(
-    const AnomalyInput& input,
-    const AnomalyConfig& config
-) {
+AnomalyOutput RobustDetector::detect(const AnomalyInput& input, const AnomalyConfig& config) {
     AnomalyOutput output;
 
     if (input.empty()) {
@@ -90,10 +85,7 @@ AnomalyOutput RobustDetector::detect(
 
     // Configure STL decomposition
     STLConfig stlConfig;
-    stlConfig.seasonalPeriod = seasonalityToPeriod(
-        config.seasonality,
-        estimateInterval(input.timestamps)
-    );
+    stlConfig.seasonalPeriod = seasonalityToPeriod(config.seasonality, estimateInterval(input.timestamps));
     stlConfig.seasonalWindow = config.stlSeasonalWindow;
     stlConfig.robust = config.stlRobust;
 
@@ -109,13 +101,7 @@ AnomalyOutput RobustDetector::detect(
 
     // Compute anomaly scores using SIMD
     output.scores.resize(n);
-    simd::computeAnomalyScores(
-        input.values.data(),
-        output.upper.data(),
-        output.lower.data(),
-        output.scores.data(),
-        n
-    );
+    simd::computeAnomalyScores(input.values.data(), output.upper.data(), output.lower.data(), output.scores.data(), n);
 
     // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
     // NaN inputs are missing data, not anomalies -- ensure score is 0.
@@ -136,5 +122,5 @@ AnomalyOutput RobustDetector::detect(
     return output;
 }
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar

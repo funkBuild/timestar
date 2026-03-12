@@ -1,12 +1,13 @@
 #ifndef HTTP_DELETE_HANDLER_H_INCLUDED
 #define HTTP_DELETE_HANDLER_H_INCLUDED
 
-#include <string>
-#include <memory>
-#include <glaze/glaze.hpp>
-
 #include "engine.hpp"
 #include "series_id.hpp"
+
+#include <glaze/glaze.hpp>
+
+#include <memory>
+#include <string>
 
 // Forward declaration for Glaze structure
 struct GlazeDeleteRequest;
@@ -19,14 +20,14 @@ struct GlazeDeleteRequest;
 
 /*
  * JSON Schema for Delete Requests:
- * 
+ *
  * Delete by series key:
  * {
  *   "series": "temperature,location=us-west.value",
  *   "startTime": 1465839830100400200,  // nanoseconds since epoch
  *   "endTime": 1465839930100400200     // nanoseconds since epoch
  * }
- * 
+ *
  * Delete by structured series (exact match):
  * {
  *   "measurement": "temperature",
@@ -38,7 +39,7 @@ struct GlazeDeleteRequest;
  *   "startTime": 1465839830100400200,
  *   "endTime": 1465839930100400200
  * }
- * 
+ *
  * Flexible delete by pattern:
  * {
  *   "measurement": "temperature",
@@ -49,14 +50,14 @@ struct GlazeDeleteRequest;
  *   "startTime": 1465839830100400200,
  *   "endTime": 1465839930100400200
  * }
- * 
+ *
  * Delete all data for a measurement:
  * {
  *   "measurement": "temperature",
  *   "startTime": 0,
  *   "endTime": 9223372036854775807     // Max int64
  * }
- * 
+ *
  * Batch deletes:
  * {
  *   "deletes": [
@@ -80,8 +81,8 @@ public:
         std::string seriesKey;
         std::string measurement;
         std::map<std::string, std::string> tags;
-        std::string field;                       // For single field deletion
-        std::vector<std::string> fields;         // For multiple field deletion
+        std::string field;                // For single field deletion
+        std::vector<std::string> fields;  // For multiple field deletion
         uint64_t startTime;
         uint64_t endTime;
         bool isStructured;  // true if using measurement/tags/field format
@@ -92,11 +93,9 @@ public:
     std::string createErrorResponse(const std::string& error);
     std::string createSuccessResponse(uint64_t deletedCount, uint64_t totalRequests);
 
-    HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded)
-        : engineSharded(_engineSharded) {}
+    HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {}
 
-    seastar::future<std::unique_ptr<seastar::http::reply>>
-    handleDelete(std::unique_ptr<seastar::http::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleDelete(std::unique_ptr<seastar::http::request> req);
 
     void registerRoutes(seastar::httpd::routes& r);
 };

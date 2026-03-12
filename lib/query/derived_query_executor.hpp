@@ -1,23 +1,23 @@
 #ifndef DERIVED_QUERY_EXECUTOR_H_INCLUDED
 #define DERIVED_QUERY_EXECUTOR_H_INCLUDED
 
-#include "derived_query.hpp"
-#include "expression_parser.hpp"
-#include "expression_evaluator.hpp"
-#include "series_aligner.hpp"
-#include "query_parser.hpp"
-#include "http_query_handler.hpp"
-#include "anomaly/anomaly_result.hpp"
 #include "anomaly/anomaly_executor.hpp"
-#include "forecast/forecast_result.hpp"
+#include "anomaly/anomaly_result.hpp"
+#include "derived_query.hpp"
+#include "expression_evaluator.hpp"
+#include "expression_parser.hpp"
 #include "forecast/forecast_executor.hpp"
+#include "forecast/forecast_result.hpp"
+#include "http_query_handler.hpp"
+#include "query_parser.hpp"
+#include "series_aligner.hpp"
 
+#include <chrono>
+#include <map>
+#include <memory>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
-#include <map>
 #include <string>
-#include <memory>
-#include <chrono>
 #include <variant>
 
 // Forward declarations
@@ -46,19 +46,16 @@ struct DerivedQueryConfig {
 };
 
 // Result type that can be regular, anomaly, or forecast result
-using DerivedQueryResultVariant = std::variant<
-    DerivedQueryResult,
-    anomaly::AnomalyQueryResult,
-    forecast::ForecastQueryResult
->;
+using DerivedQueryResultVariant =
+    std::variant<DerivedQueryResult, anomaly::AnomalyQueryResult, forecast::ForecastQueryResult>;
 
 // Executes derived metric queries
 class DerivedQueryExecutor {
     friend class ::DerivedQueryMultiSeriesTest;
+
 public:
-    DerivedQueryExecutor(seastar::sharded<Engine>* engine,
-                        seastar::sharded<LevelDBIndex>* index = nullptr,
-                        DerivedQueryConfig config = {});
+    DerivedQueryExecutor(seastar::sharded<Engine>* engine, seastar::sharded<LevelDBIndex>* index = nullptr,
+                         DerivedQueryConfig config = {});
 
     // Execute a derived query
     seastar::future<DerivedQueryResult> execute(const DerivedQueryRequest& request);
@@ -67,12 +64,10 @@ public:
     seastar::future<DerivedQueryResult> executeFromJson(const std::string& jsonBody);
 
     // Execute with support for anomaly detection
-    seastar::future<DerivedQueryResultVariant> executeWithAnomaly(
-        const DerivedQueryRequest& request);
+    seastar::future<DerivedQueryResultVariant> executeWithAnomaly(const DerivedQueryRequest& request);
 
     // Execute from JSON with anomaly support
-    seastar::future<DerivedQueryResultVariant> executeFromJsonWithAnomaly(
-        const std::string& jsonBody);
+    seastar::future<DerivedQueryResultVariant> executeFromJsonWithAnomaly(const std::string& jsonBody);
 
     // Format result as JSON response
     std::string formatResponse(const DerivedQueryResult& result);
@@ -99,35 +94,28 @@ private:
     seastar::sharded<Engine>* engine_;
     seastar::sharded<LevelDBIndex>* index_;
     DerivedQueryConfig config_;
-    const ExpressionNode* cachedAst_ = nullptr; // Avoids re-parsing in executeWithAnomaly→execute
+    const ExpressionNode* cachedAst_ = nullptr;  // Avoids re-parsing in executeWithAnomaly→execute
 
     // Execute a single sub-query
-    seastar::future<SubQueryResult> executeSubQuery(
-        const std::string& name,
-        const QueryRequest& query);
+    seastar::future<SubQueryResult> executeSubQuery(const std::string& name, const QueryRequest& query);
 
     // Execute all sub-queries in parallel
-    seastar::future<std::map<std::string, SubQueryResult>> executeAllSubQueries(
-        const DerivedQueryRequest& request);
+    seastar::future<std::map<std::string, SubQueryResult>> executeAllSubQueries(const DerivedQueryRequest& request);
 
     // Convert HTTP query handler results to SubQueryResult
-    SubQueryResult convertQueryResponse(
-        const std::string& name,
-        const QueryRequest& query,
-        const std::vector<SeriesResult>& results);
+    SubQueryResult convertQueryResponse(const std::string& name, const QueryRequest& query,
+                                        const std::vector<SeriesResult>& results);
 
     // Validate request before execution
     void validateRequest(const DerivedQueryRequest& request);
 
     // Execute anomaly detection on query results
-    seastar::future<anomaly::AnomalyQueryResult> executeAnomalyDetection(
-        const DerivedQueryRequest& request,
-        const ExpressionNode& anomalyNode);
+    seastar::future<anomaly::AnomalyQueryResult> executeAnomalyDetection(const DerivedQueryRequest& request,
+                                                                         const ExpressionNode& anomalyNode);
 
     // Execute forecast on query results
-    seastar::future<forecast::ForecastQueryResult> executeForecast(
-        const DerivedQueryRequest& request,
-        const ExpressionNode& forecastNode);
+    seastar::future<forecast::ForecastQueryResult> executeForecast(const DerivedQueryRequest& request,
+                                                                   const ExpressionNode& forecastNode);
 };
 
 // JSON structures for derived query API (using Glaze)
@@ -217,6 +205,6 @@ struct GlazeForecastResponse {
     } error;
 };
 
-} // namespace timestar
+}  // namespace timestar
 
-#endif // DERIVED_QUERY_EXECUTOR_H_INCLUDED
+#endif  // DERIVED_QUERY_EXECUTOR_H_INCLUDED

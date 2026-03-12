@@ -1,4 +1,5 @@
 #include "agile_detector.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -6,15 +7,14 @@
 namespace timestar {
 namespace anomaly {
 
-AgileDetector::HoltWintersState AgileDetector::initializeState(
-    const std::vector<double>& values,
-    size_t seasonalPeriod
-) {
+AgileDetector::HoltWintersState AgileDetector::initializeState(const std::vector<double>& values,
+                                                               size_t seasonalPeriod) {
     HoltWintersState state;
 
     // Initialize level as mean of first period using SIMD
     size_t initSize = std::min(seasonalPeriod, values.size());
-    if (initSize == 0) initSize = std::min(size_t(30), values.size());
+    if (initSize == 0)
+        initSize = std::min(size_t(30), values.size());
 
     // Collect non-NaN values for initial mean
     std::vector<double> validValues;
@@ -25,8 +25,7 @@ AgileDetector::HoltWintersState AgileDetector::initializeState(
         }
     }
 
-    state.level = validValues.empty() ? 0.0 :
-                  simd::vectorMean(validValues.data(), validValues.size());
+    state.level = validValues.empty() ? 0.0 : simd::vectorMean(validValues.data(), validValues.size());
 
     // Initialize trend as zero (no initial trend assumption)
     state.trend = 0.0;
@@ -52,12 +51,8 @@ AgileDetector::HoltWintersState AgileDetector::initializeState(
     return state;
 }
 
-double AgileDetector::predictAndUpdate(
-    HoltWintersState& state,
-    double actualValue,
-    size_t seasonalIndex,
-    size_t seasonalPeriod
-) {
+double AgileDetector::predictAndUpdate(HoltWintersState& state, double actualValue, size_t seasonalIndex,
+                                       size_t seasonalPeriod) {
     // Predict based on current state
     double seasonal = (seasonalPeriod > 0) ? state.seasonal[seasonalIndex] : 0.0;
     double prediction = state.level + state.trend + seasonal;
@@ -67,29 +62,23 @@ double AgileDetector::predictAndUpdate(
         double prevLevel = state.level;
 
         // Update level
-        state.level = ALPHA * (actualValue - seasonal) +
-                      (1 - ALPHA) * (prevLevel + state.trend);
+        state.level = ALPHA * (actualValue - seasonal) + (1 - ALPHA) * (prevLevel + state.trend);
 
         // Update trend
-        state.trend = BETA * (state.level - prevLevel) +
-                      (1 - BETA) * state.trend;
+        state.trend = BETA * (state.level - prevLevel) + (1 - BETA) * state.trend;
 
         // Update seasonal
         if (seasonalPeriod > 0) {
-            state.seasonal[seasonalIndex] =
-                GAMMA * (actualValue - state.level) +
-                (1 - GAMMA) * seasonal;
+            state.seasonal[seasonalIndex] = GAMMA * (actualValue - state.level) + (1 - GAMMA) * seasonal;
         }
     }
 
     return prediction;
 }
 
-double AgileDetector::computeErrorStdDev(
-    const std::vector<double>& errors,
-    size_t windowSize
-) {
-    if (errors.empty()) return 1.0;
+double AgileDetector::computeErrorStdDev(const std::vector<double>& errors, size_t windowSize) {
+    if (errors.empty())
+        return 1.0;
 
     size_t start = (errors.size() > windowSize) ? errors.size() - windowSize : 0;
     size_t end = errors.size();
@@ -103,7 +92,8 @@ double AgileDetector::computeErrorStdDev(
             ++count;
         }
     }
-    if (count < 2) return 1.0;
+    if (count < 2)
+        return 1.0;
 
     double mean = sum / static_cast<double>(count);
 
@@ -119,10 +109,7 @@ double AgileDetector::computeErrorStdDev(
     return (variance > 0) ? std::sqrt(variance) : 1.0;
 }
 
-AnomalyOutput AgileDetector::detect(
-    const AnomalyInput& input,
-    const AnomalyConfig& config
-) {
+AnomalyOutput AgileDetector::detect(const AnomalyInput& input, const AnomalyConfig& config) {
     AnomalyOutput output;
 
     if (input.empty()) {
@@ -132,10 +119,7 @@ AnomalyOutput AgileDetector::detect(
     size_t n = input.size();
 
     // Determine seasonal period
-    size_t seasonalPeriod = seasonalityToPeriod(
-        config.seasonality,
-        estimateInterval(input.timestamps)
-    );
+    size_t seasonalPeriod = seasonalityToPeriod(config.seasonality, estimateInterval(input.timestamps));
 
     // Initialize output vectors
     output.upper.resize(n);
@@ -194,7 +178,8 @@ AnomalyOutput AgileDetector::detect(
             // Ensure minimum bound width
             double minStd = std::abs(prediction) * 0.01;
             errorStd = std::max(errorStd, minStd);
-            if (errorStd < 1e-10) errorStd = 1.0;
+            if (errorStd < 1e-10)
+                errorStd = 1.0;
 
             scale[i] = errorStd;
         }
@@ -202,23 +187,14 @@ AnomalyOutput AgileDetector::detect(
 
     // Use SIMD for bounds computation on the portion with valid stats
     if (minDataPoints < n) {
-        simd::computeBounds(
-            output.predictions.data() + minDataPoints,
-            scale.data() + minDataPoints,
-            config.bounds,
-            output.upper.data() + minDataPoints,
-            output.lower.data() + minDataPoints,
-            n - minDataPoints
-        );
+        simd::computeBounds(output.predictions.data() + minDataPoints, scale.data() + minDataPoints, config.bounds,
+                            output.upper.data() + minDataPoints, output.lower.data() + minDataPoints,
+                            n - minDataPoints);
 
         // Use SIMD for anomaly score computation
-        simd::computeAnomalyScores(
-            input.values.data() + minDataPoints,
-            output.upper.data() + minDataPoints,
-            output.lower.data() + minDataPoints,
-            output.scores.data() + minDataPoints,
-            n - minDataPoints
-        );
+        simd::computeAnomalyScores(input.values.data() + minDataPoints, output.upper.data() + minDataPoints,
+                                   output.lower.data() + minDataPoints, output.scores.data() + minDataPoints,
+                                   n - minDataPoints);
     }
 
     // Fix up NaN inputs: SIMD may have produced NaN scores for NaN input values.
@@ -239,5 +215,5 @@ AnomalyOutput AgileDetector::detect(
     return output;
 }
 
-} // namespace anomaly
-} // namespace timestar
+}  // namespace anomaly
+}  // namespace timestar

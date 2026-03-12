@@ -1,4 +1,5 @@
 #include "arithmetic_functions.hpp"
+
 #include <algorithm>
 #include <numeric>
 
@@ -11,15 +12,16 @@ const FunctionMetadata AddFunction::metadata_ = {
     .category = FunctionCategory::ARITHMETIC,
     .supportedInputTypes = {"double"},
     .outputType = "double",
-    .parameters = {
-        {.name = "operand", .type = "double", .required = true, .description = "Value to add to each point"},
-        {.name = "alignment", .type = "string", .required = false, .description = "Series alignment method", .defaultValue = "inner"}
-    },
+    .parameters = {{.name = "operand", .type = "double", .required = true, .description = "Value to add to each point"},
+                   {.name = "alignment",
+                    .type = "string",
+                    .required = false,
+                    .description = "Series alignment method",
+                    .defaultValue = "inner"}},
     .supportsVectorization = true,
     .supportsStreaming = true,
     .minDataPoints = 1,
-    .examples = {"add(5.0)", "add(-2.5)"}
-};
+    .examples = {"add(5.0)", "add(-2.5)"}};
 
 const FunctionMetadata& AddFunction::getMetadata() const {
     return metadata_;
@@ -38,12 +40,10 @@ seastar::future<bool> AddFunction::validateParameters(const FunctionContext& con
     }
 }
 
-seastar::future<FunctionResult<double>> AddFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> AddFunction::execute(const DoubleSeriesView& input,
+                                                             const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     double operand = context.getParameter<double>("operand");
 
     if (input.empty()) {
@@ -51,7 +51,7 @@ seastar::future<FunctionResult<double>> AddFunction::execute(
     }
 
     result.timestamps.assign(input.timestamps->begin() + input.startIndex,
-                            input.timestamps->begin() + input.startIndex + input.count);
+                             input.timestamps->begin() + input.startIndex + input.count);
     result.values.resize(input.count);
 
     // Tight loop on contiguous memory enables compiler auto-vectorization (AVX2/SSE)
@@ -71,14 +71,12 @@ const FunctionMetadata SubtractFunction::metadata_ = {
     .category = FunctionCategory::ARITHMETIC,
     .supportedInputTypes = {"double"},
     .outputType = "double",
-    .parameters = {
-        {.name = "operand", .type = "double", .required = true, .description = "Value to subtract from each point"}
-    },
+    .parameters =
+        {{.name = "operand", .type = "double", .required = true, .description = "Value to subtract from each point"}},
     .supportsVectorization = true,
     .supportsStreaming = true,
     .minDataPoints = 1,
-    .examples = {"subtract(5.0)", "subtract(-2.5)"}
-};
+    .examples = {"subtract(5.0)", "subtract(-2.5)"}};
 
 const FunctionMetadata& SubtractFunction::getMetadata() const {
     return metadata_;
@@ -97,12 +95,10 @@ seastar::future<bool> SubtractFunction::validateParameters(const FunctionContext
     }
 }
 
-seastar::future<FunctionResult<double>> SubtractFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> SubtractFunction::execute(const DoubleSeriesView& input,
+                                                                  const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     double operand = context.getParameter<double>("operand");
 
     if (input.empty()) {
@@ -110,7 +106,7 @@ seastar::future<FunctionResult<double>> SubtractFunction::execute(
     }
 
     result.timestamps.assign(input.timestamps->begin() + input.startIndex,
-                            input.timestamps->begin() + input.startIndex + input.count);
+                             input.timestamps->begin() + input.startIndex + input.count);
     result.values.resize(input.count);
 
     const double* src = input.values->data() + input.startIndex;
@@ -129,14 +125,12 @@ const FunctionMetadata MultiplyFunction::metadata_ = {
     .category = FunctionCategory::ARITHMETIC,
     .supportedInputTypes = {"double"},
     .outputType = "double",
-    .parameters = {
-        {.name = "factor", .type = "double", .required = true, .description = "Value to multiply each point by"}
-    },
+    .parameters =
+        {{.name = "factor", .type = "double", .required = true, .description = "Value to multiply each point by"}},
     .supportsVectorization = true,
     .supportsStreaming = true,
     .minDataPoints = 1,
-    .examples = {"multiply(2.0)", "multiply(0.5)"}
-};
+    .examples = {"multiply(2.0)", "multiply(0.5)"}};
 
 const FunctionMetadata& MultiplyFunction::getMetadata() const {
     return metadata_;
@@ -155,12 +149,10 @@ seastar::future<bool> MultiplyFunction::validateParameters(const FunctionContext
     }
 }
 
-seastar::future<FunctionResult<double>> MultiplyFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> MultiplyFunction::execute(const DoubleSeriesView& input,
+                                                                  const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     double factor = context.getParameter<double>("factor");
 
     if (input.empty()) {
@@ -168,7 +160,7 @@ seastar::future<FunctionResult<double>> MultiplyFunction::execute(
     }
 
     result.timestamps.assign(input.timestamps->begin() + input.startIndex,
-                            input.timestamps->begin() + input.startIndex + input.count);
+                             input.timestamps->begin() + input.startIndex + input.count);
     result.values.resize(input.count);
 
     // Tight loop on contiguous memory enables compiler auto-vectorization (AVX2/SSE)
@@ -188,14 +180,12 @@ const FunctionMetadata DivideFunction::metadata_ = {
     .category = FunctionCategory::ARITHMETIC,
     .supportedInputTypes = {"double"},
     .outputType = "double",
-    .parameters = {
-        {.name = "divisor", .type = "double", .required = true, .description = "Value to divide each point by"}
-    },
+    .parameters =
+        {{.name = "divisor", .type = "double", .required = true, .description = "Value to divide each point by"}},
     .supportsVectorization = true,
     .supportsStreaming = true,
     .minDataPoints = 1,
-    .examples = {"divide(2.0)", "divide(0.5)"}
-};
+    .examples = {"divide(2.0)", "divide(0.5)"}};
 
 const FunctionMetadata& DivideFunction::getMetadata() const {
     return metadata_;
@@ -214,12 +204,10 @@ seastar::future<bool> DivideFunction::validateParameters(const FunctionContext& 
     }
 }
 
-seastar::future<FunctionResult<double>> DivideFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> DivideFunction::execute(const DoubleSeriesView& input,
+                                                                const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     double divisor = context.getParameter<double>("divisor");
     if (divisor == 0.0) {
         throw ParameterValidationException("Division by zero");
@@ -230,7 +218,7 @@ seastar::future<FunctionResult<double>> DivideFunction::execute(
     }
 
     result.timestamps.assign(input.timestamps->begin() + input.startIndex,
-                            input.timestamps->begin() + input.startIndex + input.count);
+                             input.timestamps->begin() + input.startIndex + input.count);
     result.values.resize(input.count);
 
     // Tight loop on contiguous memory enables compiler auto-vectorization (AVX2/SSE)
@@ -244,21 +232,24 @@ seastar::future<FunctionResult<double>> DivideFunction::execute(
 }
 
 // ScaleFunction implementation (alias for multiply)
-const FunctionMetadata ScaleFunction::metadata_ = {
-    .name = "scale",
-    .description = "Scale each point in the series by a constant factor",
-    .category = FunctionCategory::ARITHMETIC,
-    .supportedInputTypes = {"double"},
-    .outputType = "double",
-    .parameters = {
-        {.name = "factor", .type = "double", .required = true, .description = "Value to scale each point by"},
-        {.name = "alignment", .type = "string", .required = false, .description = "Series alignment method", .defaultValue = "inner"}
-    },
-    .supportsVectorization = true,
-    .supportsStreaming = true,
-    .minDataPoints = 1,
-    .examples = {"scale(2.0)", "scale(0.5)"}
-};
+const FunctionMetadata ScaleFunction::metadata_ = {.name = "scale",
+                                                   .description = "Scale each point in the series by a constant factor",
+                                                   .category = FunctionCategory::ARITHMETIC,
+                                                   .supportedInputTypes = {"double"},
+                                                   .outputType = "double",
+                                                   .parameters = {{.name = "factor",
+                                                                   .type = "double",
+                                                                   .required = true,
+                                                                   .description = "Value to scale each point by"},
+                                                                  {.name = "alignment",
+                                                                   .type = "string",
+                                                                   .required = false,
+                                                                   .description = "Series alignment method",
+                                                                   .defaultValue = "inner"}},
+                                                   .supportsVectorization = true,
+                                                   .supportsStreaming = true,
+                                                   .minDataPoints = 1,
+                                                   .examples = {"scale(2.0)", "scale(0.5)"}};
 
 const FunctionMetadata& ScaleFunction::getMetadata() const {
     return metadata_;
@@ -277,12 +268,10 @@ seastar::future<bool> ScaleFunction::validateParameters(const FunctionContext& c
     }
 }
 
-seastar::future<FunctionResult<double>> ScaleFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> ScaleFunction::execute(const DoubleSeriesView& input,
+                                                               const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     double factor = context.getParameter<double>("factor");
 
     if (input.empty()) {
@@ -290,7 +279,7 @@ seastar::future<FunctionResult<double>> ScaleFunction::execute(
     }
 
     result.timestamps.assign(input.timestamps->begin() + input.startIndex,
-                            input.timestamps->begin() + input.startIndex + input.count);
+                             input.timestamps->begin() + input.startIndex + input.count);
     result.values.resize(input.count);
 
     const double* src = input.values->data() + input.startIndex;
@@ -309,15 +298,16 @@ const FunctionMetadata OffsetFunction::metadata_ = {
     .category = FunctionCategory::ARITHMETIC,
     .supportedInputTypes = {"double"},
     .outputType = "double",
-    .parameters = {
-        {.name = "value", .type = "double", .required = true, .description = "Value to add to each point"},
-        {.name = "alignment", .type = "string", .required = false, .description = "Series alignment method", .defaultValue = "inner"}
-    },
+    .parameters = {{.name = "value", .type = "double", .required = true, .description = "Value to add to each point"},
+                   {.name = "alignment",
+                    .type = "string",
+                    .required = false,
+                    .description = "Series alignment method",
+                    .defaultValue = "inner"}},
     .supportsVectorization = true,
     .supportsStreaming = true,
     .minDataPoints = 1,
-    .examples = {"offset(5.0)", "offset(-2.5)"}
-};
+    .examples = {"offset(5.0)", "offset(-2.5)"}};
 
 const FunctionMetadata& OffsetFunction::getMetadata() const {
     return metadata_;
@@ -336,12 +326,10 @@ seastar::future<bool> OffsetFunction::validateParameters(const FunctionContext& 
     }
 }
 
-seastar::future<FunctionResult<double>> OffsetFunction::execute(
-    const DoubleSeriesView& input,
-    const FunctionContext& context
-) const {
+seastar::future<FunctionResult<double>> OffsetFunction::execute(const DoubleSeriesView& input,
+                                                                const FunctionContext& context) const {
     FunctionResult<double> result;
-    
+
     double value = context.getParameter<double>("value");
 
     if (input.empty()) {
@@ -349,7 +337,7 @@ seastar::future<FunctionResult<double>> OffsetFunction::execute(
     }
 
     result.timestamps.assign(input.timestamps->begin() + input.startIndex,
-                            input.timestamps->begin() + input.startIndex + input.count);
+                             input.timestamps->begin() + input.startIndex + input.count);
     result.values.resize(input.count);
 
     const double* src = input.values->data() + input.startIndex;
@@ -364,15 +352,13 @@ seastar::future<FunctionResult<double>> OffsetFunction::execute(
 // Legacy functions for backward compatibility
 std::vector<double> add(const std::vector<double>& values, double operand) {
     std::vector<double> result(values.size());
-    std::transform(values.begin(), values.end(), result.begin(),
-                   [operand](double val) { return val + operand; });
+    std::transform(values.begin(), values.end(), result.begin(), [operand](double val) { return val + operand; });
     return result;
 }
 
 std::vector<double> multiply(const std::vector<double>& values, double factor) {
     std::vector<double> result(values.size());
-    std::transform(values.begin(), values.end(), result.begin(),
-                   [factor](double val) { return val * factor; });
+    std::transform(values.begin(), values.end(), result.begin(), [factor](double val) { return val * factor; });
     return result;
 }
 
@@ -384,4 +370,4 @@ std::vector<double> offset(const std::vector<double>& values, double offset_valu
     return add(values, offset_value);
 }
 
-} // namespace timestar::functions
+}  // namespace timestar::functions
