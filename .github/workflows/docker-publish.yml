@@ -38,6 +38,8 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            ENABLE_LTO=ON
           tags: |
             funkbuild/timestar:${{ steps.version.outputs.version }}
             funkbuild/timestar:latest

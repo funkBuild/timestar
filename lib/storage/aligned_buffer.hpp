@@ -86,7 +86,7 @@ public:
 
     std::vector<uint8_t, dma_default_init_allocator<uint8_t, DMA_ALIGNMENT>> data;
 
-    AlignedBuffer(size_t initialSize = 0) {
+    explicit AlignedBuffer(size_t initialSize = 0) {
         if (initialSize > 0) {
             data.reserve(std::max(initialSize, INITIAL_CAPACITY));
             data.resize(initialSize);

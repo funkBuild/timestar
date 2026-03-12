@@ -203,8 +203,7 @@ TEST_F(SmoothingFunctionsTest, EMAFunctionFromWindow) {
     EXPECT_EQ(result.size(), linearValues.size());
     
     // Alpha should be 2/(9+1) = 0.2
-    double expectedAlpha = 0.2;
-    
+
     // First value unchanged
     EXPECT_NEAR(result.values[0], 0.0, 1e-10);
     

@@ -149,7 +149,7 @@ struct FunctionMetadata {
     bool supportsVectorization = true;
     bool supportsStreaming = true;
     size_t minDataPoints = 1;
-    std::vector<std::string> examples;
+    std::vector<std::string> examples{};
 };
 
 // Exception hierarchy

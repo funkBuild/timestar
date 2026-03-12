@@ -58,7 +58,7 @@ set_source_files_properties(
     query/forecast/stl_decomposition.cpp
     query/forecast/linear_forecaster.cpp
     query/forecast/periodicity_detector.cpp
-    PROPERTIES COMPILE_FLAGS "-mavx2"
+    PROPERTIES COMPILE_FLAGS "-mavx2 -Wno-stringop-overflow"
 )
 
 add_library(libtimestar STATIC ${SRC_FILES})

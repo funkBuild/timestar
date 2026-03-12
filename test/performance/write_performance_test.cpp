@@ -100,7 +100,7 @@ seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
         // Verify we can read some data back
         auto result = co_await engineSharded.invoke_on(0, [baseTime](Engine& engine) {
             return engine.query("metrics,host=server-0,metric=metric-0 value",
-                              baseTime, baseTime + 10 * 1000000000);
+                              baseTime, baseTime + 10LL * 1000000000LL);
         });
 
         if (result.has_value() && std::holds_alternative<QueryResult<double>>(*result)) {

@@ -1285,7 +1285,10 @@ inline std::vector<int> dbscan1D(const std::vector<double>& values, double epsil
                     std::vector<size_t> jNeighbors = findNeighbors(j);
 
                     if (jNeighbors.size() >= minPoints) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
                         neighbors.insert(neighbors.end(), jNeighbors.begin(), jNeighbors.end());
+#pragma GCC diagnostic pop
                     }
                 }
 

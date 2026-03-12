@@ -103,6 +103,7 @@ protected:
 
     // Helper methods
     void waitForAll(int threadCount) {
+        (void)threadCount;
         std::unique_lock<std::mutex> lock(testMutex);
         cv.wait(lock, [this] { return ready; });
     }
@@ -142,6 +143,7 @@ TEST_F(FunctionThreadSafetyTest, ConcurrentFunctionExecution) {
     std::vector<int> threadResults(numThreads, 0);
     
     auto worker = [this, executionsPerThread](int threadId, int* result) {
+        (void)threadId;
         initRegistryOnCurrentThread();
         try {
             auto function = FunctionRegistry::getInstance().createFunction("add");
@@ -330,6 +332,7 @@ TEST_F(FunctionThreadSafetyTest, ConcurrentFunctionCloning) {
     std::atomic<int> cloneCounter{0};
     
     auto cloneWorker = [this, clonesPerThread, &cloneCounter](int threadId) {
+        (void)threadId;
         initRegistryOnCurrentThread();
         std::vector<std::string> functionNames = {"add", "multiply", "scale"};
         std::random_device rd;
@@ -470,6 +473,7 @@ TEST_F(FunctionThreadSafetyTest, AtomicOperationsAndMemoryCoherency) {
     std::mutex volatileMutex;
     
     auto worker = [this, operationsPerThread, &atomicSum, &atomicCounter, &volatileSum, &volatileMutex](int threadId) {
+        (void)threadId;
         initRegistryOnCurrentThread();
         try {
             auto function = FunctionRegistry::getInstance().createFunction("add");

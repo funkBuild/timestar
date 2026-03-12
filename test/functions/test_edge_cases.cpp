@@ -460,11 +460,11 @@ TEST_F(EdgeCasesTest, MissingRequiredParameters) {
     
     // Test functions that require parameters - they should return false for validation
     SMAFunction smaFunc;
-    bool smaValid = smaFunc.validateParameters(emptyContext).get();
+    smaFunc.validateParameters(emptyContext).get();
     // Some smoothing functions may have default parameters, so we accept both outcomes
-    
-    EMAFunction emaFunc;  
-    bool emaValid = emaFunc.validateParameters(emptyContext).get();
+
+    EMAFunction emaFunc;
+    emaFunc.validateParameters(emptyContext).get();
     
     // Arithmetic functions require parameters and should fail validation
     AddFunction addFunc;

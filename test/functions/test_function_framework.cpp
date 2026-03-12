@@ -159,8 +159,8 @@ TEST_F(FunctionFrameworkTest, ExceptionHierarchy) {
     EXPECT_THAT(dataEx.what(), HasSubstr("Insufficient data"));
     
     // Test inheritance
-    EXPECT_NO_THROW(static_cast<FunctionException&>(paramEx));
-    EXPECT_NO_THROW(static_cast<std::runtime_error&>(baseEx));
+    { [[maybe_unused]] FunctionException& r = paramEx; (void)r; }
+    { [[maybe_unused]] std::runtime_error& r = baseEx; (void)r; }
 }
 
 // Test Vectorized Series
@@ -315,13 +315,15 @@ public:
     }
     
     seastar::future<bool> validateParameters(const FunctionContext& context) const override {
+        (void)context;
         return seastar::make_ready_future<bool>(true);
     }
-    
+
     seastar::future<FunctionResult<double>> execute(
         const DoubleSeriesView& input,
         const FunctionContext& context
     ) const override {
+        (void)context;
         FunctionResult<double> result;
         result.timestamps.assign(input.timestamps->begin() + input.startIndex,
                                 input.timestamps->begin() + input.startIndex + input.count);

@@ -179,11 +179,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
     try {
         // Check for ?measurement= query parameter
-        std::string measurement;
-        auto it = req->query_parameters.find("measurement");
-        if (it != req->query_parameters.end()) {
-            measurement = it->second;
-        }
+        std::string measurement = req->get_query_param("measurement");
 
         // Validate measurement name if provided
         for (char c : measurement) {
@@ -232,11 +228,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     reply->add_header("Content-Type", "application/json");
 
     try {
-        std::string measurement;
-        auto it = req->query_parameters.find("measurement");
-        if (it != req->query_parameters.end()) {
-            measurement = it->second;
-        }
+        std::string measurement = req->get_query_param("measurement");
 
         if (measurement.empty()) {
             reply->set_status(seastar::http::reply::status_type::bad_request);

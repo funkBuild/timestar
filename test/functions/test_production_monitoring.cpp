@@ -349,8 +349,7 @@ TEST_F(ProductionMonitoringTest, AlertHistoryTracking) {
 
 TEST_F(ProductionMonitoringTest, MemoryUsageTracking) {
     // This test verifies that memory usage is being tracked
-    size_t initial_peak = 0;
-    
+    [[maybe_unused]] size_t initial_peak = 0;
     {
         functions::FunctionExecutionTracker tracker("memory_test");
         

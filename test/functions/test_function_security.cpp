@@ -61,6 +61,7 @@ protected:
     struct MockHttpRequest {
         std::string content;
         std::string get_query_param(const std::string& param) const {
+            (void)param;
             // Simple mock implementation
             return "";
         }
@@ -607,7 +608,6 @@ TEST_F(FunctionSecurityTest, InputSanitizationVerification) {
     
     for (const auto& test : sanitizationTests) {
         const std::string& input = test.first;
-        const std::string& expected = test.second;
         
         EXPECT_NO_THROW({
             // Test sanitization functions
@@ -664,7 +664,7 @@ TEST_F(FunctionSecurityTest, ResourceExhaustionProtection) {
             // Test regex operations with timeouts
             std::regex testRegex("window\\s*:\\s*([+-]?\\d+)");
             std::smatch match;
-            bool found = std::regex_search(pattern, match, testRegex);
+            (void)std::regex_search(pattern, match, testRegex);
             
             // Regex should complete quickly
             auto end = std::chrono::high_resolution_clock::now();

@@ -10,6 +10,8 @@
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
+ARG ENABLE_LTO=OFF
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Seastar + TimeStar build dependencies
@@ -68,8 +70,8 @@ RUN mkdir -p build && cd build && \
       -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
       -DCMAKE_C_COMPILER=gcc-14 \
       -DCMAKE_CXX_COMPILER=g++-14 \
-      -DTIMESTAR_ENABLE_LTO=ON \
-    && ninja timestar_http_server
+      -DTIMESTAR_ENABLE_LTO=${ENABLE_LTO} \
+    && ninja timestar_http_server timestar_unit_test timestar_test
 
 # Strip debug symbols — shrinks binary from ~500 MB to ~20 MB
 RUN strip --strip-all build/bin/timestar_http_server

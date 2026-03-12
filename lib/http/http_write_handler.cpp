@@ -39,7 +39,7 @@ struct glz::meta<GlazeWritePoint> {
 struct GlazeMultiWritePoint {
     std::string measurement;
     std::map<std::string, std::string> tags;
-    glz::json_t fields;  // Can hold arrays or scalars
+    glz::generic fields;  // Can hold arrays or scalars
     std::optional<std::variant<uint64_t, std::vector<uint64_t>>> timestamps;
     std::optional<uint64_t> timestamp;  // Single timestamp option
 };
@@ -52,7 +52,7 @@ struct glz::meta<GlazeMultiWritePoint> {
 };
 
 struct GlazeBatchWrite {
-    std::vector<glz::json_t> writes;
+    std::vector<glz::generic> writes;
 };
 
 template <>

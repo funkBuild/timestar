@@ -6,12 +6,9 @@ on:
   pull_request:
     branches: [main, master]
 
-env:
-  BUILD_TYPE: Release
-
 jobs:
-  build:
-    name: Build
+  build-and-test:
+    name: Build & Test
     runs-on: ubuntu-24.04
 
     steps:
@@ -21,103 +18,26 @@ jobs:
       - name: Initialize submodules
         run: git submodule update --init
 
-      - name: Install dependencies
+      - name: Build Docker image (builder stage)
+        run: docker build --target builder -t timestar-builder .
+
+      - name: Run unit tests inside Docker
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            ninja-build \
-            gcc-14 \
-            g++-14 \
-            libc-ares-dev \
-            libfmt-dev \
-            libleveldb-dev \
-            libprotobuf-dev \
-            protobuf-compiler \
-            libsnappy-dev \
-            libssl-dev \
-            liburing-dev \
-            libboost-all-dev \
-            liblz4-dev \
-            libgnutls28-dev \
-            libsctp-dev \
-            libhwloc-dev \
-            libnuma-dev \
-            libpciaccess-dev \
-            libcrypto++-dev \
-            libxml2-dev \
-            xfslibs-dev \
-            systemtap-sdt-dev \
-            valgrind \
-            libyaml-cpp-dev \
-            libxxhash-dev \
-            ragel
+          mkdir -p test-results
+          docker run --rm \
+            -v ${{ github.workspace }}/test-results:/test-results \
+            timestar-builder \
+            bash -c "cd /src/build && ./test/timestar_unit_test --gtest_output=xml:/test-results/test-results.xml"
 
-      - name: Configure CMake
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DCMAKE_C_COMPILER=gcc-14 \
-            -DCMAKE_CXX_COMPILER=g++-14
-
-      - name: Build
-        run: cmake --build build -j$(nproc)
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-gcc-14
-          path: |
-            build/bin/
-            build/test/
-          retention-days: 1
-
-  test:
-    name: Unit Tests
-    needs: build
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libc-ares-dev \
-            libleveldb-dev \
-            libsnappy-dev \
-            libssl-dev \
-            libboost-all-dev \
-            liblz4-dev \
-            libgnutls28-dev \
-            libhwloc-dev \
-            libnuma-dev \
-            libyaml-cpp-dev \
-            libxxhash-dev
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-gcc-14
-          path: build/
-
-      - name: Make test binaries executable
-        run: chmod +x build/test/timestar_test
-
-      - name: Run unit tests
-        run: |
-          cd build
-          ./test/timestar_test --gtest_output=xml:test-results.xml
+      - name: Build production Docker image
+        run: docker build -t timestar .
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-results
-          path: build/test-results.xml
+          path: test-results/test-results.xml
 
   lint:
     name: Code Formatting

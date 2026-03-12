@@ -223,6 +223,7 @@ public:
     }
 
     seastar::future<bool> validateParameters(const FunctionContext& context) const override {
+        (void)context;
         return seastar::make_ready_future<bool>(true);
     }
 
@@ -276,6 +277,7 @@ public:
     }
 
     seastar::future<bool> validateParameters(const FunctionContext& context) const override {
+        (void)context;
         return seastar::make_ready_future<bool>(true);
     }
 
@@ -598,7 +600,7 @@ TEST_F(FunctionResourceManagementTest, MemoryGrowthWithRepeatedCalls) {
     auto function = FunctionRegistry::getInstance().createFunction("memory_intensive");
     ASSERT_NE(function, nullptr);
     
-    size_t initialMemory = resourceMonitor.getCurrentMemoryUsage();
+    (void)resourceMonitor.getCurrentMemoryUsage();
     std::vector<size_t> memorySnapshots;
     
     // Execute function multiple times and monitor memory
@@ -611,7 +613,6 @@ TEST_F(FunctionResourceManagementTest, MemoryGrowthWithRepeatedCalls) {
     }
     
     // Check for continuous memory growth (indicating leaks)
-    bool continuousGrowth = true;
     size_t growthCount = 0;
     
     for (size_t i = 1; i < memorySnapshots.size(); ++i) {
@@ -750,9 +751,9 @@ TEST_F(FunctionResourceManagementTest, StressTestWithLargeDatasets) {
     EXPECT_LT(executionMs, 5000) << "Execution should complete within reasonable time for large dataset";
     
     // Check memory usage
-    size_t peakMemory = resourceMonitor.getPeakMemoryUsage();
+    (void)resourceMonitor.getPeakMemoryUsage();
     size_t finalMemory = resourceMonitor.getCurrentMemoryUsage();
-    
+
     // Memory should return to reasonable levels after processing
     double memoryGrowthPercent = ((double)(finalMemory - initialMemory) / initialMemory) * 100.0;
     EXPECT_LT(memoryGrowthPercent, 20.0) << "Memory growth should be reasonable after large dataset processing";

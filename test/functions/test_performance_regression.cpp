@@ -103,16 +103,16 @@ protected:
         // Perform different operations for performance testing
         if (operation == "sma") {
             // Simple moving average simulation
-            int window = 5;
+            size_t window = 5;
             for (size_t i = 0; i < data.size(); ++i) {
                 if (i < window - 1) {
                     result.push_back(data[i].second);
                 } else {
                     double sum = 0.0;
-                    for (int j = 0; j < window; ++j) {
+                    for (size_t j = 0; j < window; ++j) {
                         sum += data[i - j].second;
                     }
-                    result.push_back(sum / window);
+                    result.push_back(sum / static_cast<double>(window));
                 }
             }
         } else if (operation == "scale") {
@@ -318,8 +318,8 @@ TEST_F(PerformanceRegressionTest, ConcurrentExecution_Performance) {
             auto thread_start = std::chrono::high_resolution_clock::now();
             
             for (int i = 0; i < executions_per_thread; ++i) {
-                auto result = measureDataProcessingPerformance("SMA_Concurrent_" + std::to_string(t), 
-                                                              medium_dataset, "sma");
+                measureDataProcessingPerformance("SMA_Concurrent_" + std::to_string(t),
+                                                medium_dataset, "sma");
             }
             
             auto thread_end = std::chrono::high_resolution_clock::now();
@@ -354,8 +354,8 @@ TEST_F(PerformanceRegressionTest, MemoryLeak_StressTest) {
     
     // Execute many function operations (reduced iterations for stability)
     for (int i = 0; i < 100; ++i) {
-        auto result = measureDataProcessingPerformance("SMA_Stress_" + std::to_string(i), 
-                                                      small_dataset, "sma");
+        measureDataProcessingPerformance("SMA_Stress_" + std::to_string(i),
+                                         small_dataset, "sma");
         
         // Check memory every 25 iterations
         if (i % 25 == 24) {

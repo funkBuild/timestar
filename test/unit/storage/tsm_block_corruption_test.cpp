@@ -388,7 +388,7 @@ seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::strin
         int fd = ::open(filename.c_str(), O_WRONLY);
         EXPECT_GE(fd, 0);
         uint8_t badType = 1; // Boolean
-        ::pwrite(fd, &badType, 1, static_cast<off_t>(blockOffset));
+        [[maybe_unused]] auto pwriteRet1 = ::pwrite(fd, &badType, 1, static_cast<off_t>(blockOffset));
         ::close(fd);
     }
 
@@ -452,7 +452,7 @@ seastar::future<> testReadSingleBlockTypeMismatchBoolCorruptedToFloat(std::strin
         int fd = ::open(filename.c_str(), O_WRONLY);
         EXPECT_GE(fd, 0);
         uint8_t badType = 0;
-        ::pwrite(fd, &badType, 1, static_cast<off_t>(blockOffset));
+        [[maybe_unused]] auto pwriteRet = ::pwrite(fd, &badType, 1, static_cast<off_t>(blockOffset));
         ::close(fd);
     }
 
@@ -515,7 +515,7 @@ seastar::future<> testReadSingleBlockTypeMismatchStringCorruptedToFloat(std::str
         int fd = ::open(filename.c_str(), O_WRONLY);
         EXPECT_GE(fd, 0);
         uint8_t badType = 0;
-        ::pwrite(fd, &badType, 1, static_cast<off_t>(blockOffset));
+        [[maybe_unused]] auto pwriteRet = ::pwrite(fd, &badType, 1, static_cast<off_t>(blockOffset));
         ::close(fd);
     }
 
