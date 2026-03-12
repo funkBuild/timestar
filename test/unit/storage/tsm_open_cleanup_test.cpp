@@ -22,6 +22,16 @@ protected:
     std::string sourceCode;
 
     void SetUp() override {
+#ifdef TSM_CPP_SOURCE_PATH
+        std::ifstream file(TSM_CPP_SOURCE_PATH);
+        if (file.is_open()) {
+            std::stringstream ss;
+            ss << file.rdbuf();
+            sourceCode = ss.str();
+            return;
+        }
+#endif
+
         std::vector<std::string> paths = {
             "../lib/storage/tsm.cpp",
             "../../lib/storage/tsm.cpp",
@@ -35,14 +45,6 @@ protected:
                 sourceCode = ss.str();
                 return;
             }
-        }
-
-        // Fallback to absolute path
-        std::ifstream file("/home/matt/Desktop/source/timestar/lib/storage/tsm.cpp");
-        if (file.is_open()) {
-            std::stringstream ss;
-            ss << file.rdbuf();
-            sourceCode = ss.str();
         }
     }
 

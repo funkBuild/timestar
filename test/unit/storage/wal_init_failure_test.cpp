@@ -16,6 +16,16 @@ protected:
     std::string sourceCode;
 
     void SetUp() override {
+#ifdef WAL_SOURCE_PATH
+        std::ifstream file(WAL_SOURCE_PATH);
+        if (file.is_open()) {
+            std::stringstream ss;
+            ss << file.rdbuf();
+            sourceCode = ss.str();
+            return;
+        }
+#endif
+
         std::vector<std::string> paths = {
             "../lib/storage/wal.cpp",
             "../../lib/storage/wal.cpp",
@@ -29,14 +39,6 @@ protected:
                 sourceCode = ss.str();
                 return;
             }
-        }
-
-        // Fallback to absolute path
-        std::ifstream file("/home/matt/Desktop/source/timestar/lib/storage/wal.cpp");
-        if (file.is_open()) {
-            std::stringstream ss;
-            ss << file.rdbuf();
-            sourceCode = ss.str();
         }
     }
 

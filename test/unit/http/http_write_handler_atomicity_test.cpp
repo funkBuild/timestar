@@ -27,6 +27,16 @@ protected:
     std::string sourceCode;
 
     void SetUp() override {
+#ifdef HTTP_WRITE_HANDLER_SOURCE_PATH
+        std::ifstream file(HTTP_WRITE_HANDLER_SOURCE_PATH);
+        if (file.is_open()) {
+            std::stringstream ss;
+            ss << file.rdbuf();
+            sourceCode = ss.str();
+            return;
+        }
+#endif
+
         // Read the actual source file to verify ordering
         // The path is relative to the build directory, so we use a path
         // that works from the standard build location
@@ -43,14 +53,6 @@ protected:
                 sourceCode = ss.str();
                 return;
             }
-        }
-
-        // If none of the relative paths worked, try absolute
-        std::ifstream file("/home/matt/Desktop/source/timestar/lib/http/http_write_handler.cpp");
-        if (file.is_open()) {
-            std::stringstream ss;
-            ss << file.rdbuf();
-            sourceCode = ss.str();
         }
     }
 

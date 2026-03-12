@@ -46,14 +46,6 @@ protected:
                 return;
             }
         }
-
-        // Fallback to absolute path
-        std::ifstream f("/home/matt/Desktop/source/timestar/lib/storage/tsm_tombstone.cpp");
-        if (f.is_open()) {
-            std::stringstream ss;
-            ss << f.rdbuf();
-            sourceCode = ss.str();
-        }
     }
 
     // Extract the TSMTombstone::flush() function body from source
