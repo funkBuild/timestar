@@ -11,7 +11,7 @@
 class ZigZag {
 private:
 public:
-    ZigZag() {};
+    ZigZag() {}
 
     static std::vector<uint64_t> zigzagEncodeVector(std::span<const int64_t> input) {
         std::vector<uint64_t> output;

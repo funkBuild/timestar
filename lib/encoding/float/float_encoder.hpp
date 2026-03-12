@@ -11,7 +11,7 @@
 class FloatEncoderBasic {
 private:
 public:
-    FloatEncoderBasic() {};
+    FloatEncoderBasic() {}
 
     static CompressedBuffer encode(std::span<const double> values);
     static void decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);

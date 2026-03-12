@@ -159,7 +159,7 @@ public:
     size_t length_;
     size_t offset = 0;
 
-    Slice(const uint8_t* _data, size_t _length) : data(_data), length_(_length) {};
+    Slice(const uint8_t* _data, size_t _length) : data(_data), length_(_length) {}
 
     template <class T>
     T read() {

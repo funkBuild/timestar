@@ -45,7 +45,7 @@ public:
     uint64_t rank;
     std::vector<std::unique_ptr<TSMBlock<T>>> blocks;
 
-    TSMResult(uint64_t _rank) : rank(_rank) {};
+    TSMResult(uint64_t _rank) : rank(_rank) {}
 
     TSMBlock<T>* getBlock(size_t idx) {
         if (idx >= blocks.size())

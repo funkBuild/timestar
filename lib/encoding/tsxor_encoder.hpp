@@ -60,7 +60,7 @@ public:
 class TsxorEncoder {
 private:
 public:
-    TsxorEncoder() {};
+    TsxorEncoder() {}
 
     static CompressedBuffer encode(std::vector<double>& values);
 };

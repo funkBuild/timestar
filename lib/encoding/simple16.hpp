@@ -21,7 +21,7 @@
  */
 class Simple16 {
 public:
-    Simple16() {};
+    Simple16() {}
 
     static AlignedBuffer encode(std::vector<uint64_t>& values);
     static std::vector<uint64_t> decode(Slice& encoded, unsigned int size);

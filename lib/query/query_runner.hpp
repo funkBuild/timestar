@@ -22,7 +22,7 @@ private:
 
 public:
     QueryRunner(TSMFileManager* _fileManager, WALFileManager* _walFileManager)
-        : fileManager(_fileManager), walFileManager(_walFileManager) {};
+        : fileManager(_fileManager), walFileManager(_walFileManager) {}
 
     seastar::future<VariantQueryResult> runQuery(std::string series, SeriesId128 seriesId, uint64_t startTime,
                                                  uint64_t endTime);
