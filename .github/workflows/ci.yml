@@ -27,7 +27,7 @@ jobs:
           docker run --rm \
             -v ${{ github.workspace }}/test-results:/test-results \
             timestar-builder \
-            bash -c "cd /src/build && ./test/timestar_unit_test --gtest_output=xml:/test-results/test-results.xml"
+            bash -c "cd /src/build && stdbuf -o L ./test/timestar_unit_test --gtest_output=xml:/test-results/test-results.xml"
 
       - name: Build production Docker image
         run: docker build -t timestar .

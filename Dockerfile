@@ -73,6 +73,7 @@ RUN mkdir -p build && cd build && \
       -DCMAKE_C_COMPILER=gcc-14 \
       -DCMAKE_CXX_COMPILER=g++-14 \
       -DTIMESTAR_ENABLE_LTO=${ENABLE_LTO} \
+      -DTIMESTAR_NATIVE_ARCH=OFF \
     && ninja timestar_http_server timestar_unit_test timestar_test
 
 # Strip debug symbols — shrinks binary from ~500 MB to ~20 MB

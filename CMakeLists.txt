@@ -67,7 +67,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ───────────────────────────── common compile flags ──────────────────────────
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
-add_compile_options(-march=native)
+option(TIMESTAR_NATIVE_ARCH "Compile for the host CPU (-march=native)" ON)
+if(TIMESTAR_NATIVE_ARCH)
+  add_compile_options(-march=native)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
