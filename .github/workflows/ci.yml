@@ -40,6 +40,7 @@ jobs:
             ninja-build \
             ${{ matrix.cc }} \
             ${{ matrix.cxx }} \
+            libc-ares-dev \
             libleveldb-dev \
             libsnappy-dev \
             libssl-dev \
@@ -95,6 +96,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            libc-ares-dev \
             libleveldb-dev \
             libsnappy-dev \
             libssl-dev \
