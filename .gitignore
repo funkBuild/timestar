@@ -67,9 +67,9 @@ node_modules/
 _deps/
 external/robin-map/
 
-# Core dumps
-core
-core.*
+# Core dumps (only in repo root, not lib/core/ etc.)
+/core
+/core.*
 
 # Executables (but not in bin/)
 /*.out

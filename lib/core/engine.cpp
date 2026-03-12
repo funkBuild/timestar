@@ -1,0 +1,973 @@
+#include "engine.hpp"
+
+#include "aggregator.hpp"
+#include "logger.hpp"
+#include "logging_config.hpp"
+#include "query_runner.hpp"
+#include "tsm_compactor.hpp"
+#include "tsm_writer.hpp"
+#include "util.hpp"
+
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
+#include <unordered_set>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+Engine::Engine() : index(seastar::this_shard_id()) {
+    shardId = seastar::this_shard_id();
+    // Directory creation moved to init() to avoid blocking the reactor thread
+};
+
+seastar::future<> Engine::init() {
+    co_await createDirectoryStructure();
+    co_await index.open();
+    co_await tsmFileManager.init();
+    co_await walFileManager.init(*this, tsmFileManager);
+
+    // Retention policy loading is done post-startup via loadAndBroadcastRetentionPolicies()
+    // after setShardedRef() has been called on all shards.
+
+    // Background compaction loop is optional - inline compaction is triggered automatically
+    // in TSMFileManager::writeMemstore() after each WAL rollover creates a new TSM file.
+    // When a tier reaches 4 files, they are compacted into 1 file at the next tier level.
+    // The background loop provides additional periodic checks but is not required for
+    // normal operation. Uncomment to enable periodic compaction checks:
+    // co_await tsmFileManager.startCompactionLoop();
+};
+
+seastar::future<> Engine::createDirectoryStructure() {
+    std::string shardPath = basePath() + "/tsm";
+    // Wrap blocking std::filesystem call in seastar::async to avoid
+    // blocking the Seastar reactor thread.
+    co_await seastar::async([&shardPath]() { fs::create_directories(shardPath); });
+}
+
+std::string Engine::basePath() {
+    return std::string("shard_" + std::to_string(shardId));
+}
+
+seastar::future<> Engine::stop() {
+    timestar::engine_log.info("[ENGINE_STOP] Starting Engine shutdown on shard {}", shardId);
+
+    // Close the insert gate first: waits for any in-flight inserts to finish,
+    // then rejects all subsequent insert() / insertBatch() calls.
+    if (!_insertGate.is_closed()) {
+        timestar::engine_log.info("[ENGINE_STOP] Closing insert gate ({} in-flight) on shard {}",
+                                  _insertGate.get_count(), shardId);
+        co_await _insertGate.close();
+        timestar::engine_log.info("[ENGINE_STOP] Insert gate closed on shard {}", shardId);
+    }
+
+    // Close the streaming gate: waits for any in-flight cross-shard delivery
+    // futures to complete, then rejects new deliveries.  Must run after the
+    // insert gate so that no new delivery futures can be created, but before
+    // the WAL / index teardown so the Engine is still valid when lambdas run.
+    if (!_streamingGate.is_closed()) {
+        timestar::engine_log.info("[ENGINE_STOP] Closing streaming gate ({} in-flight) on shard {}",
+                                  _streamingGate.get_count(), shardId);
+        co_await _streamingGate.close();
+        timestar::engine_log.info("[ENGINE_STOP] Streaming gate closed on shard {}", shardId);
+    }
+
+    // On shard 0, stop timers and drain in-flight background operations.
+    if (shardId == 0) {
+        _retentionTimer.cancel();
+
+        if (!_retentionGate.is_closed()) {
+            co_await _retentionGate.close();
+            timestar::engine_log.info("[ENGINE_STOP] Retention operations drained on shard 0");
+        }
+    } else {
+        // Non-shard-0: close retention gate if open
+        if (!_retentionGate.is_closed()) {
+            co_await _retentionGate.close();
+        }
+    }
+
+    // Stop compaction first (if it was started)
+    // co_await tsmFileManager.stopCompactionLoop();
+
+    // Close the WAL file manager — this drains any in-flight background
+    // TSM conversions via the gate, then closes all memory stores.
+    timestar::engine_log.info("[ENGINE_STOP] Closing WAL file manager on shard {}", shardId);
+    co_await walFileManager.close();
+    timestar::engine_log.info("[ENGINE_STOP] WAL file manager closed on shard {}", shardId);
+
+    timestar::engine_log.info("[ENGINE_STOP] Closing index on shard {}", shardId);
+    co_await index.close();
+    timestar::engine_log.info("[ENGINE_STOP] Index closed on shard {}", shardId);
+
+    timestar::engine_log.info("[ENGINE_STOP] Engine shutdown complete on shard {}", shardId);
+}
+
+template <class T>
+seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing) {
+    auto holder = _insertGate.hold();
+
+    LOG_INSERT_PATH(timestar::engine_log, debug,
+                    "[ENGINE] Insert called for series: '{}', measurement: '{}', field: '{}', {} values",
+                    insertRequest.seriesKey(), insertRequest.measurement, insertRequest.field,
+                    insertRequest.values.size());
+
+    // Index metadata on shard 0 so that findSeries/queries can discover this series.
+    // When called from the HTTP write handler, skipMetadataIndexing is true because
+    // the handler already indexes metadata separately (avoiding double indexing).
+    // Direct Engine::insert() callers (tests, benchmarks, internal code) leave
+    // skipMetadataIndexing as false so metadata is indexed automatically.
+    if (!skipMetadataIndexing) {
+        if (shardId == 0) {
+            LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata for series: '{}'",
+                            insertRequest.seriesKey());
+            co_await index.indexInsert(insertRequest);
+        } else if (shardedRef) {
+            // Forward metadata indexing to shard 0 where the LevelDB index lives.
+            // Copy the insert request for safe cross-shard transfer.
+            LOG_INSERT_PATH(timestar::engine_log, debug,
+                            "[ENGINE] Forwarding metadata indexing to shard 0 for series: '{}'",
+                            insertRequest.seriesKey());
+            TimeStarInsert<T> metaCopy = insertRequest;
+            co_await shardedRef->invoke_on(
+                0, [metaCopy = std::move(metaCopy)](Engine& engine) mutable -> seastar::future<> {
+                    co_await engine.indexMetadata(metaCopy);
+                });
+        }
+    }
+
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Processing data storage for series: '{}'",
+                    insertRequest.seriesKey());
+
+    // Convert single insert to batch for unified processing
+    std::vector<TimeStarInsert<T>> batch;
+    batch.push_back(std::move(insertRequest));
+
+    // Notify streaming subscribers BEFORE WAL insert, because the WAL+MemoryStore
+    // path moves data out of the batch elements (insertMemory takes by rvalue).
+    for (const auto& req : batch) {
+        if (_subscriptionManager.hasSubscribers(req.measurement)) {
+            auto remotes = _subscriptionManager.notifySubscribers(req.measurement, req.getTags(), req.field,
+                                                                  req.getTimestamps(), req.values);
+            for (auto& rd : remotes) {
+                if (shardedRef) {
+                    (void)seastar::with_gate(_streamingGate, [this, rd = std::move(rd)]() mutable {
+                        return shardedRef
+                            ->invoke_on(rd.targetShard,
+                                        [subId = rd.subscriptionId, b = std::move(rd.batch)](Engine& engine) mutable {
+                                            engine.getSubscriptionManager().deliverBatch(subId, std::move(b));
+                                            return seastar::make_ready_future<>();
+                                        })
+                            .handle_exception([](std::exception_ptr ep) {
+                                try {
+                                    std::rethrow_exception(ep);
+                                } catch (const std::exception& e) {
+                                    timestar::engine_log.warn("[STREAM] Cross-shard delivery failed: {}", e.what());
+                                } catch (...) {
+                                    timestar::engine_log.warn("[STREAM] Cross-shard delivery failed: unknown error");
+                                }
+                            });
+                    }).handle_exception([](std::exception_ptr) {
+                        // Gate is closed (shutting down) — delivery silently dropped, which is correct
+                    });
+                }
+            }
+        }
+    }
+
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Starting unified WAL insert for series via insertBatch");
+    co_await walFileManager.insertBatch(batch);
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Unified WAL insert completed for series");
+}
+
+template <class T>
+seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>> insertRequests) {
+    auto holder = _insertGate.hold();
+
+    if (insertRequests.empty()) {
+        co_return WALTimingInfo{};  // No work to do
+    }
+
+    // Metadata indexing is now handled at the HTTP handler level on shard 0
+    // This Engine method now only handles data storage (WAL + MemoryStore)
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Processing batch data storage for {} requests",
+                    insertRequests.size());
+
+    // Notify streaming subscribers BEFORE WAL insert, because the WAL+MemoryStore
+    // path moves data out of the request elements (insertMemory takes by rvalue).
+    // Fast-path: skip the entire loop when there are no subscribers at all.
+    if (_subscriptionManager.subscriptionCount() > 0) {
+        for (const auto& req : insertRequests) {
+            if (_subscriptionManager.hasSubscribers(req.measurement)) {
+                auto remotes = _subscriptionManager.notifySubscribers(req.measurement, req.getTags(), req.field,
+                                                                      req.getTimestamps(), req.values);
+                for (auto& rd : remotes) {
+                    if (shardedRef) {
+                        (void)seastar::with_gate(_streamingGate, [this, rd = std::move(rd)]() mutable {
+                            return shardedRef
+                                ->invoke_on(
+                                    rd.targetShard,
+                                    [subId = rd.subscriptionId, b = std::move(rd.batch)](Engine& engine) mutable {
+                                        engine.getSubscriptionManager().deliverBatch(subId, std::move(b));
+                                        return seastar::make_ready_future<>();
+                                    })
+                                .handle_exception([](std::exception_ptr ep) {
+                                    try {
+                                        std::rethrow_exception(ep);
+                                    } catch (const std::exception& e) {
+                                        timestar::engine_log.warn("[STREAM] Cross-shard delivery failed: {}", e.what());
+                                    } catch (...) {
+                                        timestar::engine_log.warn(
+                                            "[STREAM] Cross-shard delivery failed: unknown error");
+                                    }
+                                });
+                        }).handle_exception([](std::exception_ptr) {
+                            // Gate is closed (shutting down) — delivery silently dropped, which is correct
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Use WAL file manager batch insert
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Starting unified WAL batch insert for {} requests",
+                    insertRequests.size());
+
+#if TIMESTAR_LOG_INSERT_PATH
+    auto start_wal_batch = std::chrono::high_resolution_clock::now();
+#endif
+    co_await walFileManager.insertBatch(insertRequests);
+
+    // Create timing info
+    WALTimingInfo walTiming;
+#if TIMESTAR_LOG_INSERT_PATH
+    auto end_wal_batch = std::chrono::high_resolution_clock::now();
+    walTiming.walWriteTime = std::chrono::duration_cast<std::chrono::microseconds>(end_wal_batch - start_wal_batch);
+#endif
+    walTiming.walWriteCount = insertRequests.size();
+
+    co_return walTiming;
+}
+
+template <class T>
+seastar::future<SeriesId128> Engine::indexMetadata(TimeStarInsert<T> insertRequest) {
+    if (seastar::this_shard_id() != 0) {
+        throw std::runtime_error("indexMetadata must be called on shard 0");
+    }
+
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata for series: '{}'",
+                    insertRequest.seriesKey());
+    SeriesId128 seriesId = co_await index.indexInsert(insertRequest);
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Metadata indexed, series ID: {}", seriesId.toHex());
+    co_return seriesId;
+}
+
+seastar::future<> Engine::indexMetadataBatch(const std::vector<MetadataOp>& ops) {
+    if (seastar::this_shard_id() != 0) {
+        throw std::runtime_error("indexMetadataBatch must be called on shard 0");
+    }
+
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Batch indexing metadata for {} ops", ops.size());
+    co_await index.indexMetadataBatch(ops);
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Batch metadata indexing complete");
+}
+
+seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
+    if (metaOps.empty()) [[unlikely]] {
+        co_return;
+    }
+
+    if (shardedRef == nullptr) [[unlikely]] {
+        timestar::engine_log.warn("[METADATA] No shardedRef, dropping {} metadata ops", metaOps.size());
+        co_return;
+    }
+
+    co_await shardedRef->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) mutable -> seastar::future<> {
+        co_await engine.index.indexMetadataBatch(metaOps);
+    });
+}
+
+seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string series, uint64_t startTime,
+                                                                 uint64_t endTime) {
+    // Compute SeriesId128 once and pass through to avoid redundant SHA1 hashing
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(series);
+    co_return co_await query(std::move(series), seriesId, startTime, endTime);
+}
+
+seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string series, const SeriesId128& seriesId,
+                                                                 uint64_t startTime, uint64_t endTime) {
+    // seriesId is pre-computed for future optimised lookup; for now delegate to
+    // the string-based runQuery which internally computes SeriesId128 again.
+    (void)seriesId;
+    QueryRunner runner(&tsmFileManager, &walFileManager);
+    try {
+        co_return co_await runner.runQuery(series, startTime, endTime);
+    } catch (const std::runtime_error& e) {
+        // "Series not found" is expected when querying a non-existent or deleted series.
+        // Return nullopt instead of propagating the exception, matching the
+        // std::optional<VariantQueryResult> return type contract.
+        std::string_view msg(e.what());
+        if (msg.find("Series not found") != std::string_view::npos ||
+            msg.find("series not found") != std::string_view::npos) {
+            co_return std::nullopt;
+        }
+        throw;
+    }
+}
+
+seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated(const std::string& seriesKey,
+                                                                                 const SeriesId128& seriesId,
+                                                                                 uint64_t startTime, uint64_t endTime,
+                                                                                 uint64_t aggregationInterval) {
+    // TODO: implement pushdown aggregation via QueryRunner::queryTsmAggregated
+    (void)seriesKey;
+    (void)seriesId;
+    (void)startTime;
+    (void)endTime;
+    (void)aggregationInterval;
+    co_return std::nullopt;
+}
+
+seastar::future<> Engine::prefetchSeriesIndices(const std::vector<SeriesId128>& seriesIds) {
+    // TODO: implement TSM index prefetching via TSM::prefetchFullIndexEntries
+    (void)seriesIds;
+    co_return;
+}
+
+seastar::future<> Engine::startBackgroundTasks() {
+    // Background TSM conversions are launched per-rollover via seastar::try_with_gate
+    // in WALFileManager::rolloverMemoryStore(). No separate startup needed.
+    co_return;
+}
+
+seastar::future<VariantQueryResult> Engine::queryBySeries(std::string measurement,
+                                                          std::map<std::string, std::string> tags, std::string field,
+                                                          uint64_t startTime, uint64_t endTime) {
+    // Get series ID from index
+    auto seriesIdOpt = co_await index.getSeriesId(measurement, tags, field);
+
+    if (!seriesIdOpt.has_value()) {
+        // Series doesn't exist, return empty result
+        co_return VariantQueryResult{QueryResult<double>{}};
+    }
+
+    // Convert back to series key for now (until we fully migrate to numeric IDs)
+    TimeStarInsert<double> temp(measurement, field);
+    temp.tags = tags;
+    std::string seriesKey = temp.seriesKey();
+
+    // Pre-compute SeriesId128 once and pass through to avoid redundant SHA1
+    SeriesId128 dataSeriesId = SeriesId128::fromSeriesKey(seriesKey);
+
+    // Use existing query infrastructure - handle optional return
+    auto resultOpt = co_await query(seriesKey, dataSeriesId, startTime, endTime);
+    if (resultOpt.has_value()) {
+        co_return std::move(resultOpt.value());
+    }
+    // Series data not found, return empty result
+    co_return VariantQueryResult{QueryResult<double>{}};
+}
+
+seastar::future<std::vector<std::string>> Engine::getAllMeasurements() {
+    auto measurements = co_await index.getAllMeasurements();
+    // Convert set to vector (already sorted since std::set maintains order)
+    std::vector<std::string> result(measurements.begin(), measurements.end());
+    co_return result;
+}
+
+seastar::future<std::set<std::string>> Engine::getMeasurementFields(const std::string& measurement) {
+    co_return co_await index.getFields(measurement);
+}
+
+seastar::future<std::set<std::string>> Engine::getMeasurementTags(const std::string& measurement) {
+    co_return co_await index.getTags(measurement);
+}
+
+seastar::future<std::set<std::string>> Engine::getTagValues(const std::string& measurement, const std::string& tagKey) {
+    co_return co_await index.getTagValues(measurement, tagKey);
+}
+
+seastar::future<std::vector<timestar::SeriesResult>> Engine::executeLocalQuery(const timestar::ShardQuery& shardQuery) {
+    std::vector<timestar::SeriesResult> results;
+
+    if (shardQuery.seriesIds.empty()) {
+        co_return results;
+    }
+
+    // Batch-fetch all series metadata in a single cross-shard RPC (P-H3).
+    // This replaces N sequential invoke_on(0, ...) calls with one batched call.
+    std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>> metadataBatch;
+    if (shardId == 0) {
+        metadataBatch = co_await index.getSeriesMetadataBatch(shardQuery.seriesIds);
+    } else if (shardedRef) {
+        metadataBatch = co_await shardedRef->invoke_on(
+            0, [ids = shardQuery.seriesIds](Engine& engine) { return engine.getIndex().getSeriesMetadataBatch(ids); });
+    } else {
+        co_return results;  // Can't look up metadata without shardedRef
+    }
+
+    // Process each series with its pre-fetched metadata
+    for (const auto& [seriesId, seriesMetaOpt] : metadataBatch) {
+        if (!seriesMetaOpt.has_value()) {
+            continue;  // Series no longer exists
+        }
+
+        const auto& meta = seriesMetaOpt.value();
+
+        // Convert to old-style series key for now (until we fully migrate)
+        TimeStarInsert<double> temp(meta.measurement, meta.field);
+        temp.tags = meta.tags;
+        std::string seriesKey = temp.seriesKey();
+
+        // Query data using existing infrastructure
+        QueryRunner runner(&tsmFileManager, &walFileManager);
+        auto variantResult = co_await runner.runQuery(seriesKey, shardQuery.startTime, shardQuery.endTime);
+
+        // Convert to SeriesResult format
+        timestar::SeriesResult seriesResult;
+        seriesResult.measurement = meta.measurement;
+        seriesResult.tags = meta.tags;
+
+        // Handle different value types
+        std::visit(
+            [&](auto&& result) {
+                using T = std::decay_t<decltype(result)>;
+
+                if constexpr (std::is_same_v<T, QueryResult<double>>) {
+                    if (!result.timestamps.empty()) {
+                        // Convert nanosecond timestamps to expected format
+                        std::vector<uint64_t> timestamps;
+                        std::vector<double> values;
+
+                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
+                            timestamps.push_back(result.timestamps[i]);
+                            values.push_back(result.values[i]);
+                        }
+
+                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                    }
+                } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
+                    if (!result.timestamps.empty()) {
+                        std::vector<uint64_t> timestamps;
+                        std::vector<bool> values;
+
+                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
+                            timestamps.push_back(result.timestamps[i]);
+                            values.push_back(result.values[i]);
+                        }
+
+                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                    }
+                } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
+                    if (!result.timestamps.empty()) {
+                        std::vector<uint64_t> timestamps;
+                        std::vector<std::string> values;
+
+                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
+                            timestamps.push_back(result.timestamps[i]);
+                            values.push_back(result.values[i]);
+                        }
+
+                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                    }
+                } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
+                    if (!result.timestamps.empty()) {
+                        std::vector<uint64_t> timestamps;
+                        std::vector<int64_t> values;
+
+                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
+                            timestamps.push_back(result.timestamps[i]);
+                            values.push_back(result.values[i]);
+                        }
+
+                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                    }
+                }
+            },
+            variantResult);
+
+        // Only add if we got data
+        if (!seriesResult.fields.empty()) {
+            results.push_back(seriesResult);
+        }
+    }
+
+    co_return results;
+}
+
+seastar::future<bool> Engine::deleteRange(std::string seriesKey, uint64_t startTime, uint64_t endTime) {
+    auto gate_holder = _insertGate.hold();
+    co_return co_await deleteRangeImpl(std::move(seriesKey), startTime, endTime);
+}
+
+seastar::future<bool> Engine::deleteRangeImpl(std::string seriesKey, uint64_t startTime, uint64_t endTime) {
+    // Delete from all TSM files that contain this series in the time range
+    bool anyDeleted = false;
+
+    // First check if the series exists in memory stores BEFORE deleting
+    bool existsInMemory = false;
+    auto memDataDouble = walFileManager.queryMemoryStores<double>(seriesKey);
+    if (memDataDouble.has_value()) {
+        existsInMemory = true;
+    } else {
+        auto memDataBool = walFileManager.queryMemoryStores<bool>(seriesKey);
+        if (memDataBool.has_value()) {
+            existsInMemory = true;
+        } else {
+            auto memDataString = walFileManager.queryMemoryStores<std::string>(seriesKey);
+            if (memDataString.has_value()) {
+                existsInMemory = true;
+            } else {
+                auto memDataInt = walFileManager.queryMemoryStores<int64_t>(seriesKey);
+                if (memDataInt.has_value()) {
+                    existsInMemory = true;
+                }
+            }
+        }
+    }
+
+    // Delete from memory stores and write to WAL
+    co_await walFileManager.deleteFromMemoryStores(seriesKey, startTime, endTime);
+    if (existsInMemory) {
+        anyDeleted = true;
+    }
+
+    // Iterate through all TSM files and add tombstones where necessary
+    // Convert series key to SeriesId128 for TSM operations
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+    for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+        bool deleted = co_await tsmFile->deleteRange(seriesId, startTime, endTime);
+        if (deleted) {
+            anyDeleted = true;
+        }
+    }
+
+    co_return anyDeleted;
+}
+
+seastar::future<bool> Engine::deleteRangeBySeries(std::string measurement, std::map<std::string, std::string> tags,
+                                                  std::string field, uint64_t startTime, uint64_t endTime) {
+    auto gate_holder = _insertGate.hold();
+    // Look up series ID without creating it — deleting a non-existent series is a no-op.
+    // Metadata lives only on shard 0's LevelDB, so route the lookup there via shardedRef.
+    std::optional<SeriesId128> seriesIdOpt;
+    if (shardId == 0) {
+        seriesIdOpt = co_await index.getSeriesId(measurement, tags, field);
+    } else if (shardedRef) {
+        seriesIdOpt = co_await shardedRef->invoke_on(0, [measurement, tags, field](Engine& engine) {
+            return engine.getIndex().getSeriesId(measurement, tags, field);
+        });
+    } else {
+        // No shardedRef and not on shard 0 — cannot check metadata, treat as not found
+        co_return false;
+    }
+
+    if (!seriesIdOpt.has_value()) {
+        co_return false;  // Series doesn't exist, nothing to delete
+    }
+
+    // Use canonical series key construction
+    TimeStarInsert<double> temp(measurement, field);
+    temp.tags = tags;
+    std::string seriesKey = temp.seriesKey();
+
+    // Call the internal impl directly — we already hold the gate
+    co_return co_await deleteRangeImpl(seriesKey, startTime, endTime);
+}
+
+seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteRequest& request) {
+    auto gate_holder = _insertGate.hold();
+    DeleteResult result;
+
+    // Debug logging disabled - uncomment for troubleshooting
+    // timestar::engine_log.info("deleteByPattern called on shard {} for measurement: {}",
+    //                       shardId, request.measurement);
+
+    // Step 1: Find all series IDs that match the pattern
+    // Delete operations don't enforce a series limit (0 = unlimited)
+    std::vector<SeriesId128> seriesIds;
+
+    // Index metadata lives on shard 0 only — route lookups there
+    if (shardId == 0) {
+        if (request.tags.empty()) {
+            auto result = co_await index.getAllSeriesForMeasurement(request.measurement);
+            if (result.has_value())
+                seriesIds = std::move(result.value());
+        } else {
+            auto result = co_await index.findSeries(request.measurement, request.tags);
+            if (result.has_value())
+                seriesIds = std::move(result.value());
+        }
+    } else if (shardedRef) {
+        if (request.tags.empty()) {
+            seriesIds = co_await shardedRef->invoke_on(
+                0, [measurement = request.measurement](Engine& engine) -> seastar::future<std::vector<SeriesId128>> {
+                    auto result = co_await engine.getIndex().getAllSeriesForMeasurement(measurement);
+                    co_return result.has_value() ? std::move(result.value()) : std::vector<SeriesId128>{};
+                });
+        } else {
+            seriesIds = co_await shardedRef->invoke_on(
+                0,
+                [measurement = request.measurement,
+                 tags = request.tags](Engine& engine) -> seastar::future<std::vector<SeriesId128>> {
+                    auto result = co_await engine.getIndex().findSeries(measurement, tags);
+                    co_return result.has_value() ? std::move(result.value()) : std::vector<SeriesId128>{};
+                });
+        }
+    } else {
+        co_return result;  // Can't look up metadata without shardedRef
+    }
+
+    // Step 2: Get metadata for each series to check field filters
+    // Batch all metadata lookups into a single RPC to shard 0 to avoid N sequential RPCs.
+    std::vector<std::pair<SeriesId128, std::string>> seriesToDelete;  // (seriesId, seriesKey)
+
+    // Convert fields to unordered_set for O(1) lookup (vs O(n) linear search)
+    std::unordered_set<std::string> fieldFilter(request.fields.begin(), request.fields.end());
+
+    auto filterAndBuild = [&fieldFilter](
+                              const std::vector<SeriesId128>& ids,
+                              LevelDBIndex& idx) -> seastar::future<std::vector<std::pair<SeriesId128, std::string>>> {
+        std::vector<std::pair<SeriesId128, std::string>> result;
+        for (const auto& seriesId : ids) {
+            auto metadata = co_await idx.getSeriesMetadata(seriesId);
+            if (!metadata.has_value())
+                continue;
+            if (!fieldFilter.empty() && fieldFilter.count(metadata->field) == 0)
+                continue;
+            TimeStarInsert<double> temp(metadata->measurement, metadata->field);
+            temp.tags = metadata->tags;
+            result.push_back({seriesId, temp.seriesKey()});
+        }
+        co_return result;
+    };
+
+    if (shardId == 0) {
+        seriesToDelete = co_await filterAndBuild(seriesIds, index);
+    } else if (shardedRef) {
+        seriesToDelete = co_await shardedRef->invoke_on(
+            0,
+            [ids = seriesIds,
+             ff = fieldFilter](Engine& engine) -> seastar::future<std::vector<std::pair<SeriesId128, std::string>>> {
+                std::vector<std::pair<SeriesId128, std::string>> result;
+                for (const auto& seriesId : ids) {
+                    auto metadata = co_await engine.getIndex().getSeriesMetadata(seriesId);
+                    if (!metadata.has_value())
+                        continue;
+                    if (!ff.empty() && ff.count(metadata->field) == 0)
+                        continue;
+                    TimeStarInsert<double> temp(metadata->measurement, metadata->field);
+                    temp.tags = metadata->tags;
+                    result.push_back({seriesId, temp.seriesKey()});
+                }
+                co_return result;
+            });
+    }
+
+    // Step 3: Delete each matching series
+    for (const auto& [seriesId, seriesKey] : seriesToDelete) {
+        bool deleted = co_await deleteRangeImpl(seriesKey, request.startTime, request.endTime);
+        if (deleted) {
+            result.seriesDeleted++;
+            result.deletedSeries.push_back(seriesKey);
+
+            // Estimate points deleted (this is rough - actual count would require reading the data)
+            // For now, we'll just track that deletion occurred
+            result.pointsDeleted++;  // This is a placeholder
+        }
+    }
+
+    // timestar::engine_log.info("[DELETE_DEBUG] Shard {} deleted {} series",
+    //                       shardId, result.seriesDeleted);
+
+    co_return result;
+}
+
+seastar::future<> Engine::rolloverMemoryStore() {
+    auto gate_holder = _insertGate.hold();
+    timestar::engine_log.debug("[ENGINE] Rolling over memory store on shard {}", shardId);
+    co_return co_await walFileManager.rolloverMemoryStore();
+}
+
+template seastar::future<> Engine::insert<bool>(TimeStarInsert<bool> insertRequest, bool skipMetadataIndexing);
+template seastar::future<> Engine::insert<double>(TimeStarInsert<double> insertRequest, bool skipMetadataIndexing);
+template seastar::future<> Engine::insert<std::string>(TimeStarInsert<std::string> insertRequest,
+                                                       bool skipMetadataIndexing);
+template seastar::future<> Engine::insert<int64_t>(TimeStarInsert<int64_t> insertRequest, bool skipMetadataIndexing);
+
+template seastar::future<WALTimingInfo> Engine::insertBatch<bool>(std::vector<TimeStarInsert<bool>> insertRequests);
+template seastar::future<WALTimingInfo> Engine::insertBatch<double>(std::vector<TimeStarInsert<double>> insertRequests);
+template seastar::future<WALTimingInfo> Engine::insertBatch<std::string>(
+    std::vector<TimeStarInsert<std::string>> insertRequests);
+template seastar::future<WALTimingInfo> Engine::insertBatch<int64_t>(
+    std::vector<TimeStarInsert<int64_t>> insertRequests);
+
+template seastar::future<SeriesId128> Engine::indexMetadata<bool>(TimeStarInsert<bool> insertRequest);
+template seastar::future<SeriesId128> Engine::indexMetadata<double>(TimeStarInsert<double> insertRequest);
+template seastar::future<SeriesId128> Engine::indexMetadata<std::string>(TimeStarInsert<std::string> insertRequest);
+template seastar::future<SeriesId128> Engine::indexMetadata<int64_t>(TimeStarInsert<int64_t> insertRequest);
+
+// --- Retention policy management ---
+
+void Engine::updateRetentionPolicyCache(const RetentionPolicy& policy) {
+    _retentionPolicies[policy.measurement] = policy;
+}
+
+void Engine::removeRetentionPolicyCache(const std::string& measurement) {
+    _retentionPolicies.erase(measurement);
+}
+
+void Engine::setRetentionPolicies(std::unordered_map<std::string, RetentionPolicy> policies) {
+    _retentionPolicies = std::move(policies);
+}
+
+std::optional<RetentionPolicy> Engine::getRetentionPolicy(const std::string& measurement) const {
+    auto it = _retentionPolicies.find(measurement);
+    if (it != _retentionPolicies.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
+seastar::future<> Engine::loadAndBroadcastRetentionPolicies() {
+    if (shardId != 0) {
+        co_return;
+    }
+
+    auto policies = co_await index.getAllRetentionPolicies();
+    std::unordered_map<std::string, RetentionPolicy> policyMap;
+    for (auto& p : policies) {
+        policyMap[p.measurement] = p;
+    }
+
+    timestar::engine_log.info("[RETENTION] Loaded {} retention policies from LevelDB", policyMap.size());
+
+    // Broadcast to all shards
+    co_await shardedRef->invoke_on_all([policyMap](Engine& engine) {
+        engine.setRetentionPolicies(policyMap);
+        return seastar::make_ready_future<>();
+    });
+}
+
+void Engine::startRetentionSweepTimer() {
+    if (shardId != 0)
+        return;
+
+    _retentionTimer.set_callback([this] {
+        if (!shardedRef)
+            return;
+
+        // Use try_with_gate to safely handle the gate being closed during shutdown.
+        // This avoids the TOCTOU race between is_closed() check and enter().
+        (void)seastar::try_with_gate(_retentionGate, [this] {
+            return shardedRef->invoke_on_all([](Engine& engine) {
+                return engine.sweepExpiredFiles().then([&engine] { return engine.sweepTombstoneRewrites(); });
+            });
+        }).handle_exception([](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const seastar::gate_closed_exception&) {
+                // Shutdown in progress — expected, ignore.
+            } catch (const std::exception& e) {
+                timestar::engine_log.warn("[RETENTION] Sweep failed: {}", e.what());
+            } catch (...) {
+                timestar::engine_log.warn("[RETENTION] Sweep failed with unknown error");
+            }
+        });
+    });
+
+    auto sweepMinutes = timestar::config().engine.retention_sweep_interval_minutes;
+    _retentionTimer.arm_periodic(std::chrono::minutes(sweepMinutes));
+    timestar::engine_log.info("[RETENTION] Started retention sweep timer ({}min interval)", sweepMinutes);
+}
+
+seastar::future<> Engine::sweepExpiredFiles() {
+    if (_retentionPolicies.empty()) {
+        co_return;
+    }
+
+    uint64_t now =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+
+    // Build measurement -> ttlCutoff map from local cache
+    std::unordered_map<std::string, uint64_t> ttlCutoffs;
+    for (const auto& [measurement, policy] : _retentionPolicies) {
+        if (policy.ttlNanos > 0 && now > policy.ttlNanos) {
+            ttlCutoffs[measurement] = now - policy.ttlNanos;
+        }
+    }
+
+    if (ttlCutoffs.empty()) {
+        co_return;
+    }
+
+    // Build seriesId -> measurement map by querying shard 0's index
+    // for each measurement with a TTL policy
+    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMeasurementMap;
+    for (const auto& [measurement, cutoff] : ttlCutoffs) {
+        std::vector<SeriesId128> seriesIds;
+        if (shardId == 0) {
+            auto result = co_await index.getAllSeriesForMeasurement(measurement);
+            if (result.has_value()) {
+                seriesIds = std::move(result.value());
+            }
+        } else if (shardedRef) {
+            seriesIds = co_await shardedRef->invoke_on(
+                0, [measurement](Engine& engine) -> seastar::future<std::vector<SeriesId128>> {
+                    auto result = co_await engine.getIndex().getAllSeriesForMeasurement(measurement);
+                    co_return result.has_value() ? std::move(result.value()) : std::vector<SeriesId128>{};
+                });
+        }
+        for (const auto& sid : seriesIds) {
+            seriesMeasurementMap[sid] = measurement;
+        }
+    }
+
+    if (seriesMeasurementMap.empty()) {
+        co_return;
+    }
+
+    // Iterate TSM files, check block metadata against TTL cutoffs
+    std::vector<seastar::shared_ptr<TSM>> fullyExpiredFiles;
+
+    for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+        bool allExpired = true;
+        bool anyExpired = false;
+
+        auto allSeriesIds = tsmFile->getSeriesIds();
+        for (const auto& seriesId : allSeriesIds) {
+            auto it = seriesMeasurementMap.find(seriesId);
+            if (it == seriesMeasurementMap.end()) {
+                // Series not under TTL policy - file is not fully expired
+                allExpired = false;
+                continue;
+            }
+
+            uint64_t cutoff = ttlCutoffs[it->second];
+            auto blocks = tsmFile->getSeriesBlocks(seriesId);
+            for (const auto& block : blocks) {
+                if (block.maxTime < cutoff) {
+                    anyExpired = true;
+                } else {
+                    allExpired = false;
+                }
+            }
+        }
+
+        if (allExpired && !allSeriesIds.empty()) {
+            fullyExpiredFiles.push_back(tsmFile);
+        }
+        // Partially expired files will be cleaned up during normal compaction
+        // (which now applies TTL filtering)
+    }
+
+    if (!fullyExpiredFiles.empty()) {
+        timestar::engine_log.info("[RETENTION] Shard {}: removing {} fully expired TSM files", shardId,
+                                  fullyExpiredFiles.size());
+        co_await tsmFileManager.removeTSMFiles(fullyExpiredFiles);
+    }
+}
+
+seastar::future<> Engine::sweepTombstoneRewrites() {
+    const double DEAD_FRACTION_THRESHOLD = timestar::config().engine.tombstone_dead_fraction_threshold;
+    const size_t MAX_REWRITES_PER_SWEEP = timestar::config().engine.max_tombstone_rewrites_per_sweep;
+
+    auto* compactor = tsmFileManager.getCompactor();
+    if (!compactor) {
+        co_return;
+    }
+
+    // --- Phase 1: Snapshot ---
+    // Snapshot file pointers before any co_await.  The compaction loop runs
+    // as a separate coroutine on this shard; during any suspension it may
+    // call addTSMFile / removeTSMFiles, which mutate sequencedTsmFiles and
+    // would invalidate a live iterator over the map.
+    std::vector<seastar::shared_ptr<TSM>> tombstonedFiles;
+    for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+        if (tsmFile->hasTombstones()) {
+            tombstonedFiles.push_back(tsmFile);
+        }
+    }
+    // hasTombstones() is O(1), no suspension points — snapshot is consistent.
+
+    if (tombstonedFiles.empty()) {
+        co_return;
+    }
+
+    // --- Phase 2: Estimate coverage (suspension points here) ---
+    struct Candidate {
+        seastar::shared_ptr<TSM> file;
+        double deadFraction;
+    };
+    std::vector<Candidate> candidates;
+
+    for (auto& tsmFile : tombstonedFiles) {
+        // Skip files currently being compacted (saves the DMA prefetch cost).
+        if (compactor->isFileInActiveCompaction(tsmFile)) {
+            continue;
+        }
+
+        double deadFraction = co_await tsmFile->estimateTombstoneCoverage();
+        if (deadFraction > DEAD_FRACTION_THRESHOLD) {
+            candidates.push_back({tsmFile, deadFraction});
+        }
+    }
+
+    if (candidates.empty()) {
+        co_return;
+    }
+
+    // Sort by dead fraction descending (worst offenders first)
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.deadFraction > b.deadFraction; });
+
+    // --- Phase 3: Rewrite (at most MAX_REWRITES_PER_SWEEP) ---
+    size_t rewriteCount = std::min(candidates.size(), MAX_REWRITES_PER_SWEEP);
+
+    for (size_t i = 0; i < rewriteCount; ++i) {
+        auto& candidate = candidates[i];
+
+        // Non-blocking: skip remaining rewrites if both compaction slots are busy.
+        // Single-threaded guarantee: no task can acquire the semaphore between
+        // this check and the get_units() call inside executeCompaction(), because
+        // there are no suspension points in between.
+        if (!compactor->hasCompactionCapacity()) {
+            break;
+        }
+
+        // Staleness guard: the file may have been removed from the file manager
+        // by a compaction that completed during one of our estimation co_awaits.
+        // The shared_ptr keeps the TSM object alive, but executeCompaction would
+        // try to removeTSMFiles + scheduleDelete on an already-deleted file.
+        auto rank = candidate.file->rankAsInteger();
+        auto it = tsmFileManager.getSequencedTsmFiles().find(rank);
+        if (it == tsmFileManager.getSequencedTsmFiles().end() || it->second.get() != candidate.file.get()) {
+            continue;
+        }
+
+        // Also re-check active compaction: the compaction loop may have picked
+        // up this file while we were estimating other files.
+        if (compactor->isFileInActiveCompaction(candidate.file)) {
+            continue;
+        }
+
+        timestar::engine_log.info(
+            "[TOMBSTONE-REWRITE] Shard {}: rewriting file (tier {}, seq {}) "
+            "with {:.1f}% estimated dead data",
+            shardId, candidate.file->tierNum, candidate.file->seqNum, candidate.deadFraction * 100.0);
+        try {
+            auto stats = co_await compactor->executeTombstoneRewrite(candidate.file);
+            timestar::engine_log.info(
+                "[TOMBSTONE-REWRITE] Shard {}: rewrite complete, "
+                "{} points written in {}ms",
+                shardId, stats.pointsWritten, stats.duration.count());
+        } catch (const std::exception& e) {
+            timestar::engine_log.warn("[TOMBSTONE-REWRITE] Shard {}: rewrite failed: {}", shardId, e.what());
+        }
+    }
+}
