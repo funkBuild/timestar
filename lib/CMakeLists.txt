@@ -40,6 +40,27 @@ endif()
 
 message(STATUS "Found LevelDB: ${LEVELDB_LIBRARY}")
 
+# Set per-file SIMD compile flags so intrinsics compile on any host CPU.
+# Runtime detection gates actual use (isAvailable() checks cpuid).
+set_source_files_properties(
+    encoding/float/float_encoder_avx512.cpp
+    encoding/float/float_decoder_avx512.cpp
+    encoding/integer/integer_encoder_avx512.cpp
+    query/simd_aggregator.cpp
+    query/anomaly/simd_anomaly.cpp
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mavx512f -mavx512dq"
+)
+set_source_files_properties(
+    encoding/float/float_encoder_simd.cpp
+    encoding/integer/integer_encoder_simd.cpp
+    encoding/integer/integer_encoder_ffor.cpp
+    query/forecast/seasonal_forecaster.cpp
+    query/forecast/stl_decomposition.cpp
+    query/forecast/linear_forecaster.cpp
+    query/forecast/periodicity_detector.cpp
+    PROPERTIES COMPILE_FLAGS "-mavx2"
+)
+
 add_library(libtimestar STATIC ${SRC_FILES})
 target_link_libraries(libtimestar Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze ${XXHASH_LIBRARY})
 
