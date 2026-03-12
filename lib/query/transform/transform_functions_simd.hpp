@@ -202,6 +202,9 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
 // ============================================================================
 #ifndef TIMESTAR_DISABLE_SIMD
 
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+
 namespace avx2 {
 
 /**
@@ -573,6 +576,8 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
 }
 
 }  // namespace avx2
+
+#pragma GCC pop_options
 
 #endif  // !TIMESTAR_DISABLE_SIMD
 
