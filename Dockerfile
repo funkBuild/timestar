@@ -16,6 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Seastar + TimeStar build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     build-essential \
     g++-14 gcc-14 \
     cmake \
