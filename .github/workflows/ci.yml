@@ -60,6 +60,7 @@ jobs:
             libxml2-dev \
             xfslibs-dev \
             systemtap-sdt-dev \
+            valgrind \
             libyaml-cpp-dev \
             libxxhash-dev \
             ragel
