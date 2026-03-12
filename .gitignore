@@ -65,6 +65,7 @@ __pycache__/
 # Dependencies
 node_modules/
 _deps/
+external/robin-map/
 
 # Core dumps
 core
