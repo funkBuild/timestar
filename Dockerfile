@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnuma-dev \
     libpciaccess-dev \
     libprotobuf-dev \
+    protobuf-compiler \
     libsctp-dev \
     liburing-dev \
     libxml2-dev \
