@@ -14,7 +14,11 @@ file(GLOB_RECURSE SRC_FILES
 
 find_package (Snappy REQUIRED)
 find_package (Threads REQUIRED)
-find_package (Seastar REQUIRED)
+# Seastar is added via add_subdirectory in the top-level CMakeLists.txt,
+# so find_package is only needed when building against a system-installed Seastar.
+if(NOT TARGET Seastar::seastar)
+    find_package(Seastar REQUIRED)
+endif()
 # xxHash is used for SeriesId128 generation (XXH3_128bits).
 # It is available system-wide via libxxhash-dev.
 find_path(XXHASH_INCLUDE_DIR NAMES xxhash.h)

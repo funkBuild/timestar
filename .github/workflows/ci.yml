@@ -41,9 +41,13 @@ jobs:
             ${{ matrix.cc }} \
             ${{ matrix.cxx }} \
             libc-ares-dev \
+            libfmt-dev \
             libleveldb-dev \
+            libprotobuf-dev \
+            protobuf-compiler \
             libsnappy-dev \
             libssl-dev \
+            liburing-dev \
             libboost-all-dev \
             liblz4-dev \
             libgnutls28-dev \

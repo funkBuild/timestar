@@ -1,11 +1,13 @@
-#include <gtest/gtest.h>
 #include "../../../lib/encoding/integer_encoder.hpp"
-#include <vector>
+
+#include <gtest/gtest.h>
+
 #include <cstdint>
-#include <limits>
 #include <fstream>
-#include <string>
+#include <limits>
 #include <sstream>
+#include <string>
+#include <vector>
 
 // Helper to do encode/decode round-trip and verify
 static void verifyRoundTrip(const std::vector<uint64_t>& input) {
@@ -18,8 +20,8 @@ static void verifyRoundTrip(const std::vector<uint64_t>& input) {
     ASSERT_EQ(added, input.size()) << "Number of decoded values should match input size";
     ASSERT_EQ(decoded.size(), input.size()) << "Decoded vector size should match input size";
     for (size_t i = 0; i < input.size(); i++) {
-        EXPECT_EQ(decoded[i], input[i]) << "Mismatch at index " << i
-            << ": expected " << input[i] << " got " << decoded[i];
+        EXPECT_EQ(decoded[i], input[i]) << "Mismatch at index " << i << ": expected " << input[i] << " got "
+                                        << decoded[i];
     }
 }
 
@@ -65,19 +67,17 @@ TEST(IntegerEncoderOverflow, SourceUsesExplicitSignedCast) {
 
     // The encode function should use static_cast<int64_t> for delta calculations
     // Check that the first delta line uses explicit casting
-    EXPECT_NE(source.find("static_cast<int64_t>(values[1]) - static_cast<int64_t>(values[0])"),
-              std::string::npos)
+    EXPECT_NE(source.find("static_cast<int64_t>(values[1]) - static_cast<int64_t>(values[0])"), std::string::npos)
         << "First delta calculation should use static_cast<int64_t> for explicit signed arithmetic";
 
     // Check that the delta-of-delta calculations in the unrolled loop use explicit casting
-    EXPECT_NE(source.find("static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i-1])"),
-              std::string::npos)
+    EXPECT_NE(source.find("static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])"), std::string::npos)
         << "Delta-of-delta calculations should use static_cast<int64_t> for explicit signed arithmetic";
 
     // Check that the decode path uses explicit casting for reconstruction
-    EXPECT_NE(source.find("static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta)"),
-              std::string::npos)
-        << "Decode reconstruction should use explicit cast: static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta)";
+    EXPECT_NE(source.find("static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta)"), std::string::npos)
+        << "Decode reconstruction should use explicit cast: static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + "
+           "delta)";
 
     // Verify the old implicit conversion pattern is NOT present
     // The pattern "int64_t delta = values[1] - values[0]" without casts should be gone
