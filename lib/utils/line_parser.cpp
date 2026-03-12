@@ -1,7 +1,5 @@
 #include "line_parser.hpp"
 
-#include <iostream>
-
 SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey){
   const size_t length = seriesKey.length();
 
@@ -10,7 +8,6 @@ SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey){
   bool insideQuote = false;
 
   for(size_t i=0; i < length; i++){
-    //std::cout << seriesKey[i] << std::endl;
     switch(seriesKey[i]){
       case ',': {
         if(insideQuote)

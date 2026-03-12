@@ -2,7 +2,6 @@
 #include "simple8b_exception.hpp"
 #include "util.hpp"
 
-#include <iostream>
 #include <stdexcept>
 
 AlignedBuffer Simple8B::encode(const std::vector<uint64_t> &values){

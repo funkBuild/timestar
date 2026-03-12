@@ -398,12 +398,6 @@ seastar::future<bool> TSMTombstone::addTombstone(
         co_return false;
     }
     
-    // Optional: Verify the data exists in TSM file
-    if (tsmFile != nullptr) {
-        // TODO: Implement verification once TSM interface is updated
-        // For now, we'll trust the caller
-    }
-    
     // Merge into seriesRanges index, coalescing overlapping/adjacent ranges
     auto& ranges = seriesRanges[seriesId];
     uint64_t mergedStart = startTime;

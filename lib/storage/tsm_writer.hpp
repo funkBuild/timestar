@@ -7,8 +7,8 @@
 #include "series_id.hpp"
 #include "timestar_config.hpp"
 
-#include <iostream>
 #include <vector>
+#include <span>
 #include <string>
 #include <map>
 #include <seastar/core/shared_ptr.hh>
@@ -37,7 +37,7 @@ public:
   template <class T>
   void writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values);
   template <class T>
-  void writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values, TSMIndexEntry &indexEntry);
+  void writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId, std::span<const uint64_t> timestamps, std::span<const T> values, TSMIndexEntry &indexEntry);
 
   // Phase 3.2: Move semantics overloads for zero-copy writes
   template <class T>
@@ -55,7 +55,7 @@ public:
   // Phase 4A: Parallel index building
   void writeIndexParallel();
 
-  void writeIndexBlock(const std::vector<uint64_t> &timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset);
+  void writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset);
 
   // Blocking close using POSIX I/O (for use in tests or seastar::async contexts)
   void close();

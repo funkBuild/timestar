@@ -106,10 +106,13 @@ public:
     // Create error response (public for testing)
     std::string createErrorResponse(const std::string& code, const std::string& message);
 
-    // Determine which shards to query based on request (public for testing)
+    // Test-only utility: returns all shard IDs 0..smp::count.
+    // Production query path iterates shards inline in executeQuery().
     std::vector<unsigned> determineTargetShards(const QueryRequest& request);
 
-    // Merge results from multiple shards (public for testing)
+    // Test-only utility: flat concatenation of shard result vectors.
+    // Production query path uses Aggregator::mergePartialAggregationsGrouped()
+    // which performs full two-phase aggregation, not a simple concat.
     std::vector<SeriesResult> mergeResults(std::vector<std::vector<SeriesResult>> shardResults);
 
 private:

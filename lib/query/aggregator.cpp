@@ -71,6 +71,9 @@ static void mergeSortedRawInto(
     std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
     const std::vector<uint64_t>& newTs, const std::vector<double>& newValues) {
 
+    // Inherit collectRaw from existing states so new states match
+    const bool needsRaw = !baseStates.empty() && baseStates[0].collectRaw;
+
     std::vector<uint64_t> mergedTs;
     std::vector<AggregationState> mergedStates;
     mergedTs.reserve(baseTs.size() + newTs.size());
@@ -85,6 +88,7 @@ static void mergeSortedRawInto(
         } else if (baseTs[i] > newTs[j]) {
             mergedTs.push_back(newTs[j]);
             AggregationState s;
+            s.collectRaw = needsRaw;
             s.addValue(newValues[j], newTs[j]);
             mergedStates.push_back(s);
             j++;
@@ -106,6 +110,7 @@ static void mergeSortedRawInto(
     while (j < newTs.size()) {
         mergedTs.push_back(newTs[j]);
         AggregationState s;
+        s.collectRaw = needsRaw;
         s.addValue(newValues[j], newTs[j]);
         mergedStates.push_back(s);
         j++;
@@ -113,6 +118,82 @@ static void mergeSortedRawInto(
 
     baseTs = std::move(mergedTs);
     baseStates = std::move(mergedStates);
+}
+
+// Merge two sorted (timestamps, values) raw-value vectors. Used in the reduce
+// phase for pushdown results that carry compact raw doubles instead of
+// AggregationState objects. Duplicate timestamps are folded via the provided
+// method: for most methods (single-value-per-timestamp), duplicates won't
+// occur within a single series pushdown, but can appear when merging partials
+// from different shards that share timestamps.
+// Returns merged (timestamps, values, counts) suitable for building
+// AggregatedPoints directly.
+static void mergeSortedRawValuesInto(
+    std::vector<uint64_t>& baseTs, std::vector<double>& baseVals,
+    std::vector<size_t>& baseCounts,
+    const std::vector<uint64_t>& newTs, const std::vector<double>& newVals,
+    AggregationMethod method) {
+
+    std::vector<uint64_t> mergedTs;
+    std::vector<double> mergedVals;
+    std::vector<size_t> mergedCounts;
+    mergedTs.reserve(baseTs.size() + newTs.size());
+    mergedVals.reserve(baseTs.size() + newTs.size());
+    mergedCounts.reserve(baseTs.size() + newTs.size());
+
+    size_t i = 0, j = 0;
+    while (i < baseTs.size() && j < newTs.size()) {
+        if (baseTs[i] < newTs[j]) {
+            mergedTs.push_back(baseTs[i]);
+            mergedVals.push_back(baseVals[i]);
+            mergedCounts.push_back(baseCounts[i]);
+            i++;
+        } else if (baseTs[i] > newTs[j]) {
+            mergedTs.push_back(newTs[j]);
+            mergedVals.push_back(newVals[j]);
+            mergedCounts.push_back(1);
+            j++;
+        } else {
+            // Same timestamp: fold using lightweight merge
+            mergedTs.push_back(baseTs[i]);
+            size_t cnt = baseCounts[i] + 1;
+            double v;
+            switch (method) {
+                case AggregationMethod::AVG:
+                case AggregationMethod::SUM:
+                    v = baseVals[i] + newVals[j]; break;
+                case AggregationMethod::MIN:
+                    v = std::min(baseVals[i], newVals[j]); break;
+                case AggregationMethod::MAX:
+                case AggregationMethod::LATEST:
+                    v = std::max(baseVals[i], newVals[j]); break;
+                case AggregationMethod::FIRST:
+                    v = baseVals[i]; break;
+                default:
+                    v = baseVals[i] + newVals[j]; break;  // SUM-like for COUNT etc.
+            }
+            mergedVals.push_back(v);
+            mergedCounts.push_back(cnt);
+            i++;
+            j++;
+        }
+    }
+    while (i < baseTs.size()) {
+        mergedTs.push_back(baseTs[i]);
+        mergedVals.push_back(baseVals[i]);
+        mergedCounts.push_back(baseCounts[i]);
+        i++;
+    }
+    while (j < newTs.size()) {
+        mergedTs.push_back(newTs[j]);
+        mergedVals.push_back(newVals[j]);
+        mergedCounts.push_back(1);
+        j++;
+    }
+
+    baseTs = std::move(mergedTs);
+    baseVals = std::move(mergedVals);
+    baseCounts = std::move(mergedCounts);
 }
 
 // Merge two sorted (timestamps, states) vectors. Used in the reduce phase to
@@ -248,11 +329,14 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 
             // PHASE 1 OPTIMIZATION: Two-phase aggregation - aggregate to states immediately
             // Single pass, no reallocation, O(1) merge later
+            const bool needsRaw = (method == AggregationMethod::MEDIAN);
             if (interval > 0) {
                 // Bucketed aggregation - accumulate into AggregationState per bucket
                 for (size_t i = 0; i < timestamps.size(); ++i) {
                     uint64_t bucketTime = (timestamps[i] / interval) * interval;
-                    partial.bucketStates[bucketTime].addValue(doubleValues[i], timestamps[i]);
+                    auto& state = partial.bucketStates[bucketTime];
+                    state.collectRaw = needsRaw;
+                    state.addValue(doubleValues[i], timestamps[i]);
                     partial.totalPoints++;
                 }
             } else {
@@ -267,6 +351,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                     for (size_t i = 0; i < timestamps.size(); ++i) {
                         partial.sortedTimestamps.push_back(timestamps[i]);
                         AggregationState s;
+                        s.collectRaw = needsRaw;
                         s.addValue(doubleValues[i], timestamps[i]);
                         partial.sortedStates.push_back(s);
                     }
@@ -376,26 +461,97 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 });
 
         } else {
-            // Non-bucketed: merge sorted parallel vectors via O(n+m) merge.
-            // Move from the first partial to avoid a copy, then merge the rest.
-            auto* first = groupPartials[0];
-            std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
-            std::vector<AggregationState> mergedStates = std::move(first->sortedStates);
-
-            for (size_t i = 1; i < groupPartials.size(); ++i) {
-                mergeSortedStatesInto(mergedTs, mergedStates,
-                                      groupPartials[i]->sortedTimestamps,
-                                      groupPartials[i]->sortedStates);
+            // Non-bucketed merge. Check if all partials carry compact raw
+            // values (from pushdown) — if so, merge without constructing
+            // any AggregationState objects (~6x less memory per point).
+            bool allRaw = true;
+            for (const auto* p : groupPartials) {
+                if (p->sortedValues.empty() && !p->sortedTimestamps.empty()) {
+                    allRaw = false;
+                    break;
+                }
             }
 
-            // Extract final aggregated values (already sorted)
-            groupedResult.points.reserve(mergedTs.size());
-            for (size_t i = 0; i < mergedTs.size(); ++i) {
-                AggregatedPoint point;
-                point.timestamp = mergedTs[i];
-                point.count = mergedStates[i].count;
-                point.value = mergedStates[i].getValue(method);
-                groupedResult.points.push_back(point);
+            if (allRaw && !groupPartials.empty()) {
+                // Fast path: merge raw (timestamp, value) vectors directly.
+                auto* first = groupPartials[0];
+
+                if (groupPartials.size() == 1) {
+                    // Single partial — zero-copy move, no merge needed.
+                    // Move raw vectors directly to avoid creating N
+                    // AggregatedPoint structs that the query handler would
+                    // immediately split back into timestamp/value vectors.
+                    if (method == AggregationMethod::COUNT) {
+                        // COUNT needs to return 1.0 per point; can't use raw values
+                        auto& ts = first->sortedTimestamps;
+                        groupedResult.points.reserve(ts.size());
+                        for (size_t i = 0; i < ts.size(); ++i) {
+                            groupedResult.points.push_back({ts[i], 1.0, 1});
+                        }
+                    } else {
+                        groupedResult.rawTimestamps = std::move(first->sortedTimestamps);
+                        groupedResult.rawValues = std::move(first->sortedValues);
+                    }
+                } else {
+                    // Multiple partials with raw values — sorted merge.
+                    std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
+                    std::vector<double> mergedVals = std::move(first->sortedValues);
+                    std::vector<size_t> mergedCounts(mergedTs.size(), 1);
+
+                    for (size_t i = 1; i < groupPartials.size(); ++i) {
+                        mergeSortedRawValuesInto(mergedTs, mergedVals, mergedCounts,
+                                                 groupPartials[i]->sortedTimestamps,
+                                                 groupPartials[i]->sortedValues,
+                                                 method);
+                    }
+
+                    groupedResult.points.reserve(mergedTs.size());
+                    for (size_t i = 0; i < mergedTs.size(); ++i) {
+                        double finalValue = mergedVals[i];
+                        if (method == AggregationMethod::AVG && mergedCounts[i] > 1) {
+                            finalValue /= mergedCounts[i];
+                        } else if (method == AggregationMethod::COUNT) {
+                            finalValue = static_cast<double>(mergedCounts[i]);
+                        }
+                        groupedResult.points.push_back(
+                            {mergedTs[i], finalValue, mergedCounts[i]});
+                    }
+                }
+            } else {
+                // Fallback: some partials have AggregationStates (from the
+                // createPartialAggregations path). Convert any raw-value
+                // partials to states, then merge normally.
+                for (auto* p : groupPartials) {
+                    if (!p->sortedValues.empty() && p->sortedStates.empty()) {
+                        p->sortedStates.reserve(p->sortedTimestamps.size());
+                        for (size_t i = 0; i < p->sortedTimestamps.size(); ++i) {
+                            AggregationState s;
+                            s.addValue(p->sortedValues[i], p->sortedTimestamps[i]);
+                            p->sortedStates.push_back(s);
+                        }
+                        p->sortedValues.clear();
+                        p->sortedValues.shrink_to_fit();
+                    }
+                }
+
+                auto* first = groupPartials[0];
+                std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
+                std::vector<AggregationState> mergedStates = std::move(first->sortedStates);
+
+                for (size_t i = 1; i < groupPartials.size(); ++i) {
+                    mergeSortedStatesInto(mergedTs, mergedStates,
+                                          groupPartials[i]->sortedTimestamps,
+                                          groupPartials[i]->sortedStates);
+                }
+
+                groupedResult.points.reserve(mergedTs.size());
+                for (size_t i = 0; i < mergedTs.size(); ++i) {
+                    AggregatedPoint point;
+                    point.timestamp = mergedTs[i];
+                    point.count = mergedStates[i].count;
+                    point.value = mergedStates[i].getValue(method);
+                    groupedResult.points.push_back(point);
+                }
             }
         }
 

@@ -34,7 +34,7 @@ TSM::TSM(std::string _absoluteFilePath){
   std::string filename = _absoluteFilePath.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex);
 
   size_t underscoreIndex = filename.find_last_of("_");
-  if(underscoreIndex > filename.length())
+  if(underscoreIndex == std::string::npos)
     throw std::runtime_error("TSM invalid filename:" + filename);
 
   try {
@@ -334,7 +334,7 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
     // are sequential in cooperative scheduling before the first co_await)
     size_t mySlot = slotIdx++;
     auto block = co_await readSingleBlock<T>(indexBlock, startTime, endTime);
-    if (block && !block->timestamps->empty()) {
+    if (block && !block->timestamps.empty()) {
       blockSlots[mySlot] = std::move(block);
     }
   });
@@ -412,25 +412,25 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(
 
   auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
   auto timestampsSlice = blockSlice.getSlice(timestampBytes);
-  auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime);
+  auto [nSkipped, nTimestamps] = IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
   size_t valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
 
   if constexpr (std::is_same_v<T, double>) {
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
-    FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+    FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
   } else if constexpr (std::is_same_v<T, bool>) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
-    BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+    BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
   } else if constexpr (std::is_same_v<T, std::string>) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
-    StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
+    StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
   } else if constexpr (std::is_same_v<T, int64_t>) {
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
     std::vector<uint64_t> rawUint;
     IntegerEncoder::decode(valuesSlice, timestampSize, rawUint);
-    blockResults->values->reserve(nTimestamps);
+    blockResults->values.reserve(nTimestamps);
     for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < rawUint.size(); ++i) {
-      blockResults->values->push_back(ZigZag::zigzagDecode(rawUint[i]));
+      blockResults->values.push_back(ZigZag::zigzagDecode(rawUint[i]));
     }
   }
 
@@ -556,7 +556,7 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
     auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
     auto [nSkipped, nTimestamps] = IntegerEncoder::decode(
-        timestampsSlice, timestampSize, *blockResults->timestamps, startTime, endTime
+        timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime
     );
 
     // Decode values based on type
@@ -570,20 +570,20 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(
 
     if constexpr (std::is_same_v<T, double>) {
         auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
-        FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+        FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
     } else if constexpr (std::is_same_v<T, bool>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, *blockResults->values);
+        BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, *blockResults->values);
+        StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         std::vector<uint64_t> rawUint;
         IntegerEncoder::decode(valuesSlice, timestampSize, rawUint);
-        blockResults->values->reserve(nTimestamps);
+        blockResults->values.reserve(nTimestamps);
         for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < rawUint.size(); ++i) {
-            blockResults->values->push_back(ZigZag::zigzagDecode(rawUint[i]));
+            blockResults->values.push_back(ZigZag::zigzagDecode(rawUint[i]));
         }
     }
 
@@ -621,7 +621,7 @@ seastar::future<> TSM::readBlockBatch(
         auto blockResult = decodeBlock<T>(blockSlice, block.size, startTime, endTime);
 
         // Only append if block has data after time filtering
-        if (blockResult && !blockResult->timestamps->empty()) {
+        if (blockResult && !blockResult->timestamps.empty()) {
             results.appendBlock(blockResult);
             blocksDecoded++;
         }
@@ -766,9 +766,9 @@ seastar::future<size_t> TSM::aggregateSeries(
             Slice blockSlice(batchBuf.get() + bufferOffset, block.size);
             auto blockResult = decodeBlock<double>(blockSlice, block.size, startTime, endTime);
 
-            if (blockResult && !blockResult->timestamps->empty()) {
-                const auto& ts = *blockResult->timestamps;
-                const auto& vals = *blockResult->values;
+            if (blockResult && !blockResult->timestamps.empty()) {
+                const auto& ts = blockResult->timestamps;
+                const auto& vals = blockResult->values;
 
                 if (!hasTombstoneRanges) {
                     // Fast path: no tombstones — fold entire block at once

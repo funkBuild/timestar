@@ -146,7 +146,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileSingleSeries) {
     // Verify all points are present
     size_t totalPts = 0;
     for (const auto& block : result.blocks) {
-        totalPts += block->timestamps->size();
+        totalPts += block->timestamps.size();
     }
     EXPECT_EQ(totalPts, 100);
 
@@ -199,10 +199,10 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileTimeRangeFilter) {
     // but the point-level filtering within readSingleBlock should trim to the range.
     // Verify all returned timestamps are within [1200, 1500].
     for (const auto& block : result.blocks) {
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            EXPECT_GE(block->timestamps->at(i), 1200)
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            EXPECT_GE(block->timestamps.at(i), 1200)
                 << "Timestamp below startTime";
-            EXPECT_LE(block->timestamps->at(i), 1500)
+            EXPECT_LE(block->timestamps.at(i), 1500)
                 << "Timestamp above endTime";
         }
     }
@@ -240,9 +240,9 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileMultipleBlocks) {
     // Verify timestamps are monotonically increasing across blocks
     uint64_t prevTs = 0;
     for (const auto& block : result.blocks) {
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            EXPECT_GT(block->timestamps->at(i), prevTs);
-            prevTs = block->timestamps->at(i);
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            EXPECT_GT(block->timestamps.at(i), prevTs);
+            prevTs = block->timestamps.at(i);
         }
     }
 
@@ -348,9 +348,9 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFilesWithTimeRange) {
     // All returned timestamps should be within [1500, 2500]
     for (const auto& sb : allBlocks) {
         for (const auto& block : sb.blocks) {
-            for (size_t i = 0; i < block->timestamps->size(); i++) {
-                EXPECT_GE(block->timestamps->at(i), 1500);
-                EXPECT_LE(block->timestamps->at(i), 2500);
+            for (size_t i = 0; i < block->timestamps.size(); i++) {
+                EXPECT_GE(block->timestamps.at(i), 1500);
+                EXPECT_LE(block->timestamps.at(i), 2500);
             }
         }
     }
@@ -387,7 +387,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, SeriesBlocksGetPointLocation) {
     EXPECT_EQ(loc0.pointIdx, 0);
 
     // Point at the start of second block
-    size_t firstBlockSize = result.blocks[0]->timestamps->size();
+    size_t firstBlockSize = result.blocks[0]->timestamps.size();
     auto loc1 = result.getPointLocation(firstBlockSize);
     EXPECT_TRUE(loc1.valid);
     EXPECT_EQ(loc1.blockIdx, 1);
@@ -1176,7 +1176,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileMultiSeriesSelectsOne) {
 
     // Verify values match expected pattern: series 2 -> values start at 200.0
     if (!result.blocks.empty()) {
-        EXPECT_DOUBLE_EQ(result.blocks[0]->values->at(0), 200.0);
+        EXPECT_DOUBLE_EQ(result.blocks[0]->values.at(0), 200.0);
     }
 
     co_return;

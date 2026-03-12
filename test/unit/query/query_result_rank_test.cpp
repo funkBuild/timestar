@@ -12,8 +12,8 @@ static std::unique_ptr<TSMBlock<double>> makeRankTestBlock(
     const std::vector<double>& values) {
     auto block = std::make_unique<TSMBlock<double>>(timestamps.size());
     for (size_t i = 0; i < timestamps.size(); i++) {
-        block->timestamps->push_back(timestamps[i]);
-        block->values->push_back(values[i]);
+        block->timestamps.push_back(timestamps[i]);
+        block->values.push_back(values[i]);
     }
     return block;
 }

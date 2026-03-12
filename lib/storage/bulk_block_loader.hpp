@@ -45,7 +45,7 @@ struct SeriesBlocks {
     PointLocation getPointLocation(size_t globalIndex) const {
         size_t accumulated = 0;
         for (size_t blockIdx = 0; blockIdx < blocks.size(); blockIdx++) {
-            size_t blockSize = blocks[blockIdx]->timestamps->size();
+            size_t blockSize = blocks[blockIdx]->timestamps.size();
             if (globalIndex < accumulated + blockSize) {
                 return {blockIdx, globalIndex - accumulated, true};
             }
@@ -113,8 +113,8 @@ public:
         // Process results (when_all returns vector of futures)
         for (auto& future : blockResults) {
             auto block = std::move(future.get());
-            if (block && !block->timestamps->empty()) {
-                result.totalPoints += block->timestamps->size();
+            if (block && !block->timestamps.empty()) {
+                result.totalPoints += block->timestamps.size();
                 result.blocks.push_back(std::move(block));
             }
         }
@@ -165,16 +165,16 @@ struct BulkMergeContext {
             return UINT64_MAX;
         }
         const auto& block = source->blocks[currentBlockIdx];
-        if (currentPointIdx >= block->timestamps->size()) {
+        if (currentPointIdx >= block->timestamps.size()) {
             return UINT64_MAX;
         }
-        return block->timestamps->at(currentPointIdx);
+        return block->timestamps[currentPointIdx];
     }
 
     // Get current value (no async!)
     T currentValue() const {
         const auto& block = source->blocks[currentBlockIdx];
-        return block->values->at(currentPointIdx);
+        return block->values[currentPointIdx];
     }
 
     // Advance to next point (no async!)
@@ -188,7 +188,7 @@ struct BulkMergeContext {
 
         // Move to next block if current exhausted
         while (currentBlockIdx < source->blocks.size()) {
-            if (currentPointIdx < source->blocks[currentBlockIdx]->timestamps->size()) {
+            if (currentPointIdx < source->blocks[currentBlockIdx]->timestamps.size()) {
                 return;  // Still have points in current block
             }
 

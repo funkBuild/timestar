@@ -147,9 +147,9 @@ std::vector<StreamingBatch> HttpStreamHandler::queryResponseToBatches(
 
 // --- JSON string escaping ---
 
-static std::string jsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 4);
+// Append-to-buffer variant: avoids allocation by writing directly into an
+// existing string.  Hot-path callers use this exclusively.
+static void jsonEscapeAppend(const std::string& s, std::string& out) {
     for (unsigned char c : s) {
         switch (c) {
             case '"':  out += "\\\""; break;
@@ -158,8 +158,7 @@ static std::string jsonEscape(const std::string& s) {
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
             default:
-                if (c < 0x20) {
-                    // Control character: emit \uXXXX
+                if (c < 0x20) [[unlikely]] {
                     char buf[8];
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
@@ -169,20 +168,73 @@ static std::string jsonEscape(const std::string& s) {
                 break;
         }
     }
+}
+
+// Convenience wrapper that returns a new string (used only in cold error paths).
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    jsonEscapeAppend(s, out);
     return out;
+}
+
+// Append a uint64_t as decimal text via std::to_chars (stack buffer, no heap).
+static inline void appendUint64(std::string& out, uint64_t v) {
+    char buf[20];
+    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
+    out.append(buf, static_cast<size_t>(ptr - buf));
+}
+
+// Append an int64_t as decimal text via std::to_chars (stack buffer, no heap).
+static inline void appendInt64(std::string& out, int64_t v) {
+    char buf[21];
+    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
+    out.append(buf, static_cast<size_t>(ptr - buf));
+}
+
+// Append a double value as JSON (stack buffer, no heap).
+static inline void appendDouble(std::string& out, double v) {
+    if (!std::isfinite(v)) [[unlikely]] {
+        out += "null";
+    } else {
+        char buf[32];
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v,
+                                        std::chars_format::general);
+        out.append(buf, static_cast<size_t>(ptr - buf));
+    }
+}
+
+// Append the JSON representation of a StreamingDataPoint value variant.
+static inline void appendVariantValue(std::string& out,
+    const std::variant<double, bool, std::string, int64_t>& value) {
+    std::visit([&out](const auto& val) {
+        using VT = std::decay_t<decltype(val)>;
+        if constexpr (std::is_same_v<VT, double>) {
+            appendDouble(out, val);
+        } else if constexpr (std::is_same_v<VT, bool>) {
+            out += val ? "true" : "false";
+        } else if constexpr (std::is_same_v<VT, int64_t>) {
+            appendInt64(out, val);
+        } else if constexpr (std::is_same_v<VT, std::string>) {
+            out += '"';
+            jsonEscapeAppend(val, out);
+            out += '"';
+        }
+    }, value);
 }
 
 // --- Shared SSE JSON payload builder ---
 
 static std::string buildSSEJsonPayload(const StreamingBatch& batch) {
     // Build JSON payload: {"series":[{"measurement":...,"tags":...,"fields":{field:{timestamps:[],values:[]}}}]}
-    // Group points by (measurement, tags) for a cleaner response
+    // Group points by (measurement, tags) for a cleaner response.
+    // Store indices into batch.points rather than pre-formatted value strings
+    // to avoid per-value heap allocations during the grouping phase.
     struct FieldData {
         std::vector<uint64_t> timestamps;
-        std::vector<std::string> valueStrs;
+        std::vector<size_t> pointIndices; // indices into batch.points
     };
 
-    // Use a proper composite key to avoid null-byte collisions from string concatenation.
     struct MeasGroupKey {
         std::string measurement;
         std::map<std::string, std::string> tags;
@@ -198,42 +250,21 @@ static std::string buildSSEJsonPayload(const StreamingBatch& batch) {
 
     std::map<MeasGroupKey, SeriesGroup> groups;
 
-    for (const auto& pt : batch.points) {
+    for (size_t idx = 0; idx < batch.points.size(); ++idx) {
+        const auto& pt = batch.points[idx];
         MeasGroupKey key{pt.measurement, pt.tags};
-        auto& group = groups[key];
-
-        auto& fd = group.fields[pt.field];
+        auto& fd = groups[key].fields[pt.field];
         fd.timestamps.push_back(pt.timestamp);
-
-        // Convert variant value to JSON string representation
-        std::visit([&fd](const auto& val) {
-            using VT = std::decay_t<decltype(val)>;
-            if constexpr (std::is_same_v<VT, double>) {
-                if (!std::isfinite(val)) {
-                    fd.valueStrs.push_back("null");
-                } else {
-                    char buf[32];
-                    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val,
-                                                    std::chars_format::general);
-                    fd.valueStrs.push_back(std::string(buf, ptr));
-                }
-            } else if constexpr (std::is_same_v<VT, bool>) {
-                fd.valueStrs.push_back(val ? "true" : "false");
-            } else if constexpr (std::is_same_v<VT, int64_t>) {
-                fd.valueStrs.push_back(std::to_string(val));
-            } else if constexpr (std::is_same_v<VT, std::string>) {
-                fd.valueStrs.push_back("\"" + jsonEscape(val) + "\"");
-            }
-        }, pt.value);
+        fd.pointIndices.push_back(idx);
     }
 
     std::string payload;
     payload.reserve(256 + batch.points.size() * 32);
 
-    payload += "{";
+    payload += '{';
     if (!batch.label.empty()) {
         payload += "\"label\":\"";
-        payload += jsonEscape(batch.label);
+        jsonEscapeAppend(batch.label, payload);
         payload += "\",";
     }
     payload += "\"series\":[";
@@ -244,18 +275,18 @@ static std::string buildSSEJsonPayload(const StreamingBatch& batch) {
         firstSeries = false;
 
         payload += "{\"measurement\":\"";
-        payload += jsonEscape(key.measurement);
+        jsonEscapeAppend(key.measurement, payload);
         payload += "\",\"tags\":{";
 
         bool firstTag = true;
         for (const auto& [k, v] : key.tags) {
             if (!firstTag) payload += ',';
             firstTag = false;
-            payload += "\"";
-            payload += jsonEscape(k);
+            payload += '"';
+            jsonEscapeAppend(k, payload);
             payload += "\":\"";
-            payload += jsonEscape(v);
-            payload += "\"";
+            jsonEscapeAppend(v, payload);
+            payload += '"';
         }
 
         payload += "},\"fields\":{";
@@ -265,20 +296,20 @@ static std::string buildSSEJsonPayload(const StreamingBatch& batch) {
             if (!firstField) payload += ',';
             firstField = false;
 
-            payload += "\"";
-            payload += jsonEscape(fieldName);
+            payload += '"';
+            jsonEscapeAppend(fieldName, payload);
             payload += "\":{\"timestamps\":[";
 
             for (size_t i = 0; i < fd.timestamps.size(); ++i) {
                 if (i > 0) payload += ',';
-                payload += std::to_string(fd.timestamps[i]);
+                appendUint64(payload, fd.timestamps[i]);
             }
 
             payload += "],\"values\":[";
 
-            for (size_t i = 0; i < fd.valueStrs.size(); ++i) {
+            for (size_t i = 0; i < fd.pointIndices.size(); ++i) {
                 if (i > 0) payload += ',';
-                payload += fd.valueStrs[i];
+                appendVariantValue(payload, batch.points[fd.pointIndices[i]].value);
             }
 
             payload += "]}";
@@ -298,7 +329,7 @@ std::string HttpStreamHandler::formatSSEBackfillEvent(const StreamingBatch& batc
     event.reserve(64 + batch.points.size() * 32);
 
     event += "id: ";
-    event += std::to_string(batch.sequenceId);
+    appendUint64(event, batch.sequenceId);
     event += "\nevent: backfill\ndata: ";
     event += buildSSEJsonPayload(batch);
     event += "\n\n";
@@ -313,7 +344,7 @@ std::string HttpStreamHandler::formatSSEEvent(const StreamingBatch& batch) {
     event.reserve(64 + batch.points.size() * 32);
 
     event += "id: ";
-    event += std::to_string(batch.sequenceId);
+    appendUint64(event, batch.sequenceId);
     event += "\nevent: data\ndata: ";
     event += buildSSEJsonPayload(batch);
     event += "\n\n";
@@ -418,6 +449,8 @@ public:
 };
 
 void HttpStreamHandler::registerRoutes(seastar::httpd::routes& r) {
+    // seastar::httpd::routes takes ownership of raw handler pointers and
+    // deletes them in its destructor — raw new is the required Seastar API.
     r.add(seastar::httpd::operation_type::POST,
           seastar::httpd::url("/subscribe"), new sse_handler(this));
     r.add(seastar::httpd::operation_type::GET,
@@ -723,9 +756,10 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
     rep->add_header("X-Subscription-Ids",
         [&allSubIds]() {
             std::string ids;
+            ids.reserve(allSubIds.size() * 8);
             for (size_t i = 0; i < allSubIds.size(); ++i) {
                 if (i > 0) ids += ',';
-                ids += std::to_string(allSubIds[i]);
+                appendUint64(ids, allSubIds[i]);
             }
             return ids;
         }());
@@ -825,14 +859,16 @@ HttpStreamHandler::handleSubscribe(std::unique_ptr<seastar::http::request> req) 
             auto processBatch = [&](const StreamingBatch& batch) -> seastar::future<> {
                 if (batch.isDrop) {
                     // Emit a drop notification event to the client
-                    std::string event = "id: ";
-                    event += std::to_string(batch.sequenceId);
+                    std::string event;
+                    event.reserve(96);
+                    event += "id: ";
+                    appendUint64(event, batch.sequenceId);
                     event += "\nevent: drop\ndata: {\"droppedPoints\":";
-                    event += std::to_string(batch.droppedCount);
+                    appendUint64(event, batch.droppedCount);
                     if (!batch.label.empty()) {
                         event += ",\"label\":\"";
-                        event += jsonEscape(batch.label);
-                        event += "\"";
+                        jsonEscapeAppend(batch.label, event);
+                        event += '"';
                     }
                     event += "}\n\n";
                     co_await out.write(event);
@@ -978,48 +1014,48 @@ HttpStreamHandler::handleGetSubscriptions(std::unique_ptr<seastar::http::request
         const auto& s = allStats[i];
 
         json += "{\"id\":";
-        json += std::to_string(s.id);
+        appendUint64(json, s.id);
         if (!s.label.empty()) {
             json += ",\"label\":\"";
-            json += jsonEscape(s.label);
-            json += "\"";
+            jsonEscapeAppend(s.label, json);
+            json += '"';
         }
         json += ",\"measurement\":\"";
-        json += jsonEscape(s.measurement);
+        jsonEscapeAppend(s.measurement, json);
         json += "\",\"fields\":[";
         for (size_t f = 0; f < s.fields.size(); ++f) {
             if (f > 0) json += ',';
-            json += "\"";
-            json += jsonEscape(s.fields[f]);
-            json += "\"";
+            json += '"';
+            jsonEscapeAppend(s.fields[f], json);
+            json += '"';
         }
         json += "],\"scopes\":{";
         bool firstScope = true;
         for (const auto& [k, v] : s.scopes) {
             if (!firstScope) json += ',';
             firstScope = false;
-            json += "\"";
-            json += jsonEscape(k);
+            json += '"';
+            jsonEscapeAppend(k, json);
             json += "\":\"";
-            json += jsonEscape(v);
-            json += "\"";
+            jsonEscapeAppend(v, json);
+            json += '"';
         }
         json += "},\"handler_shard\":";
-        json += std::to_string(s.handlerShard);
+        appendUint64(json, s.handlerShard);
         json += ",\"queue_depth\":";
-        json += std::to_string(s.queueDepth);
+        appendUint64(json, s.queueDepth);
         json += ",\"queue_capacity\":";
-        json += std::to_string(s.queueCapacity);
+        appendUint64(json, s.queueCapacity);
         json += ",\"dropped_points\":";
-        json += std::to_string(s.droppedPoints);
+        appendUint64(json, s.droppedPoints);
         json += ",\"events_sent\":";
-        json += std::to_string(s.eventsSent);
-        json += "}";
+        appendUint64(json, s.eventsSent);
+        json += '}';
     }
 
     json += "],\"total_subscriptions\":";
-    json += std::to_string(allStats.size());
-    json += "}";
+    appendUint64(json, allStats.size());
+    json += '}';
 
     rep->set_status(seastar::http::reply::status_type::ok);
     rep->_content = std::move(json);

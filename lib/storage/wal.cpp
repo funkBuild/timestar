@@ -28,6 +28,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
 namespace fs = std::filesystem;
 
@@ -106,7 +107,9 @@ seastar::future<> WAL::init(MemoryStore * /*store*/, bool isRecovery) {
   // aligned positions.  We use file_output_stream_options to set this
   // explicitly (default 65536 is fine, it's a multiple of 4096).
   seastar::file_output_stream_options opts;
-  opts.buffer_size = 65536; // 64 KiB, guaranteed multiple of DMA alignment
+  opts.buffer_size = 262144; // 256 KiB — larger buffer reduces flush frequency under high write load
+  opts.write_behind = 2;     // Allow 2 buffers in-flight concurrently to overlap I/O
+  opts.preallocation_size = 16 * 1024 * 1024; // Pre-allocate 16 MiB (WAL max size) to reduce fragmentation
   auto s = co_await seastar::make_file_output_stream(walFile, opts);
   out.emplace(std::move(s));
 
@@ -467,9 +470,11 @@ void WAL::encodeInsertEntry(AlignedBuffer &buffer, TimeStarInsert<T> &insertRequ
       _compressionStats.updateString(rawValSize, encodedValSize);
     } else if constexpr (std::is_same_v<T, int64_t>) {
       const size_t rawValSize = count * sizeof(int64_t);
-      // ZigZag encode int64 → uint64, then FFOR encode
-      auto zigzagged = ZigZag::zigzagEncodeVector(insertRequest.values);
-      IntegerEncoder::encodeInto(zigzagged, buffer);
+      // ZigZag encode int64 → uint64 using thread-local scratch buffer, then FFOR encode
+      static thread_local std::vector<uint64_t> zigzagScratch;
+      zigzagScratch.resize(count);
+      ZigZag::zigzagEncodeInto(insertRequest.values, zigzagScratch.data());
+      IntegerEncoder::encodeInto(zigzagScratch, buffer);
       const size_t encodedValSize = buffer.size() - startPos;
       buffer.writeAt(sizePos, static_cast<uint32_t>(encodedValSize));
       _compressionStats.updateInteger(rawValSize, encodedValSize);

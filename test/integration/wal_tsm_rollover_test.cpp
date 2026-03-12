@@ -106,6 +106,15 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestWALToTSMRollover) {
             }
         }
 
+        // The background TSM conversion runs asynchronously after rollover.
+        // If we haven't observed a TSM file yet, poll briefly to let the
+        // conversion finish before asserting.
+        if (!rolloverDetected) {
+            for (int wait = 0; wait < 100 && self->countTSMFiles() == 0; ++wait) {
+                seastar::sleep(std::chrono::milliseconds(50)).get();
+            }
+        }
+
         // Now we should have at least 1 TSM file
         size_t finalTsmCount = self->countTSMFiles();
         size_t finalWalCount = self->countWALFiles();
@@ -254,6 +263,13 @@ SEASTAR_TEST_F(WALTSMRolloverTest, TestBatchedWritesWithRollover) {
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+        // Wait for background TSM conversion if it hasn't completed yet
+        if (!rolloverDetected) {
+            for (int wait = 0; wait < 100 && self->countTSMFiles() == 0; ++wait) {
+                seastar::sleep(std::chrono::milliseconds(50)).get();
+            }
+        }
 
         size_t finalTsmCount = self->countTSMFiles();
         size_t finalWalCount = self->countWALFiles();

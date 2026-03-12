@@ -144,6 +144,7 @@ TEST(NewAggregationStateTest, SinglePoint_First) {
 
 TEST(NewAggregationStateTest, SinglePoint_Median) {
     AggregationState s;
+    s.collectRaw = true;
     s.addValue(7.0, 100);
     EXPECT_DOUBLE_EQ(s.getValue(AggregationMethod::MEDIAN), 7.0);
 }
@@ -227,6 +228,7 @@ TEST(NewAggregationStateTest, First_AddedOutOfOrder) {
 
 TEST(NewAggregationStateTest, Median_OddCount) {
     AggregationState s;
+    s.collectRaw = true;
     // Values: 1, 3, 5, 7, 9 — median is 5
     for (int i = 1; i <= 5; ++i) {
         s.addValue(static_cast<double>(2 * i - 1), static_cast<uint64_t>(i * 1000));
@@ -236,6 +238,7 @@ TEST(NewAggregationStateTest, Median_OddCount) {
 
 TEST(NewAggregationStateTest, Median_EvenCount) {
     AggregationState s;
+    s.collectRaw = true;
     // Values: 1, 2, 3, 4 — median is (2+3)/2 = 2.5
     s.addValue(1.0, 1000);
     s.addValue(2.0, 2000);
@@ -246,6 +249,7 @@ TEST(NewAggregationStateTest, Median_EvenCount) {
 
 TEST(NewAggregationStateTest, Median_UnsortedInput) {
     AggregationState s;
+    s.collectRaw = true;
     // Added in jumbled order — sort must happen inside getValue
     s.addValue(5.0, 5000);
     s.addValue(1.0, 1000);
@@ -360,6 +364,8 @@ TEST(NewAggregationStateTest, MergeSpread) {
 
 TEST(NewAggregationStateTest, MergeMedian) {
     AggregationState a, b;
+    a.collectRaw = true;
+    b.collectRaw = true;
     a.addValue(1.0, 100);
     a.addValue(3.0, 200);
     b.addValue(2.0, 300);

@@ -3,7 +3,6 @@
 
 #include <vector>
 #include <cstdint>
-#include <iostream>
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -26,7 +25,7 @@ private:
   }
 
   inline void boundsCheck() const {
-    if (offset >= data.size()) {
+    if (offset >= data.size()) [[unlikely]] {
       throw std::out_of_range("CompressedBuffer: read past end of buffer at offset " +
           std::to_string(offset) + ", size " + std::to_string(data.size()));
     }
@@ -74,15 +73,6 @@ public:
     }
   }
 
-  void printOffsets(){
-    // Debug output - consider using logger if needed
-    // std::cout << "buf offset=" << std::dec << offset << " bitOffset=" << bitOffset << std::endl;
-  }
-
-  void printCurrentValue(){
-    // Debug output - consider using logger if needed
-    // std::cout << "buf value=" << std::hex << data[offset] << std::endl;
-  }
 };
 
 #endif

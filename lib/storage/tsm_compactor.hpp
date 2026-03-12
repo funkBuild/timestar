@@ -72,20 +72,20 @@ private:
             if (exhausted || !currentBlock) {
                 return UINT64_MAX;
             }
-            if (pointIndex >= currentBlock->timestamps->size()) {
+            if (pointIndex >= currentBlock->timestamps.size()) {
                 return UINT64_MAX;
             }
-            return currentBlock->timestamps->at(pointIndex);
+            return currentBlock->timestamps[pointIndex];
         }
 
         T currentValue() const {
-            return currentBlock->values->at(pointIndex);
+            return currentBlock->values[pointIndex];
         }
 
         // Phase 1.3: Async advance that loads blocks on-demand
         seastar::future<> advance() {
             pointIndex++;
-            if (currentBlock && pointIndex >= currentBlock->timestamps->size()) {
+            if (currentBlock && pointIndex >= currentBlock->timestamps.size()) {
                 // Current block exhausted, load next block
                 if (blockIterator->hasNext()) {
                     currentBlock = co_await blockIterator->nextBlock();
@@ -145,7 +145,7 @@ public:
             // Load first block if available
             if (iter.blockIterator->hasNext()) {
                 iter.currentBlock = co_await iter.blockIterator->nextBlock();
-                if (iter.currentBlock && !iter.currentBlock->timestamps->empty()) {
+                if (iter.currentBlock && !iter.currentBlock->timestamps.empty()) {
                     minHeap.push({iter.currentTimestamp(), i, iter.file->rankAsInteger()});
                 } else {
                     iter.exhausted = true;

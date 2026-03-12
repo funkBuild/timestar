@@ -198,15 +198,21 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
         const uint8_t exp = best.exp;
         const uint8_t fac = best.fac;
 
+        // Scratch buffers hoisted out of the block loop to avoid per-block heap allocations.
+        std::vector<int64_t> encoded(alp::ALP_VECTOR_SIZE);
+        std::vector<uint16_t> exc_positions;
+        std::vector<uint64_t> exc_values;
+        std::vector<uint64_t> packed;
+
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
             const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
                                        ? tail_count : alp::ALP_VECTOR_SIZE;
 
-            // Scale all values in this block
-            std::vector<int64_t> encoded(block_count);
-            std::vector<uint16_t> exc_positions;
-            std::vector<uint64_t> exc_values;
+            // Reuse scratch buffers (resize is no-op when <= capacity)
+            encoded.resize(block_count);
+            exc_positions.clear();
+            exc_values.clear();
 
             int64_t min_val = std::numeric_limits<int64_t>::max();
             int64_t max_val = std::numeric_limits<int64_t>::min();
@@ -319,7 +325,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
             // === FFOR Data ===
             size_t packed_words = alp::ffor_packed_words(block_count, bw);
             if (packed_words > 0) {
-                std::vector<uint64_t> packed(packed_words, 0);
+                packed.assign(packed_words, 0);
                 alp::ffor_pack(encoded.data(), block_count, min_val, bw, packed.data());
                 for (size_t w = 0; w < packed_words; ++w) {
                     buffer.write<64>(packed[w]);
@@ -352,6 +358,11 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
         // Find best split for the dataset
         uint8_t right_bit_count = alp::ALPRD::findBestSplit(values.data(), total_values);
 
+        // Scratch buffers hoisted out of the block loop
+        std::vector<int64_t> left_as_i64(alp::ALP_VECTOR_SIZE);
+        std::vector<uint64_t> left_packed;
+        std::vector<uint64_t> right_packed;
+
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
             const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
@@ -381,13 +392,12 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
             // === Left Indices (FFOR packed) ===
             if (rd.left_bw > 0) {
-                // Pack left indices as int64 with base 0
-                std::vector<int64_t> left_as_i64(block_count);
+                left_as_i64.resize(block_count);
                 for (size_t i = 0; i < block_count; ++i) {
                     left_as_i64[i] = static_cast<int64_t>(rd.left_indices[i]);
                 }
                 size_t left_packed_words = alp::ffor_packed_words(block_count, rd.left_bw);
-                std::vector<uint64_t> left_packed(left_packed_words, 0);
+                left_packed.assign(left_packed_words, 0);
                 alp::ffor_pack(left_as_i64.data(), block_count, 0, rd.left_bw, left_packed.data());
                 for (size_t w = 0; w < left_packed_words; ++w) {
                     buffer.write<64>(left_packed[w]);
@@ -397,7 +407,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
             // === Right FFOR Data ===
             if (rd.right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
-                std::vector<uint64_t> right_packed(right_packed_words, 0);
+                right_packed.assign(right_packed_words, 0);
                 alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base,
                                    rd.right_bw, right_packed.data());
                 for (size_t w = 0; w < right_packed_words; ++w) {
@@ -512,15 +522,21 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
         const uint8_t exp = best.exp;
         const uint8_t fac = best.fac;
 
+        // Scratch buffers hoisted out of the block loop to avoid per-block heap allocations.
+        std::vector<int64_t> encoded(alp::ALP_VECTOR_SIZE);
+        std::vector<uint16_t> exc_positions;
+        std::vector<uint64_t> exc_values;
+        std::vector<uint64_t> packed;
+
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
             const size_t block_count = (block == num_blocks - 1 && tail_count > 0)
                                        ? tail_count : alp::ALP_VECTOR_SIZE;
 
-            // Scale all values in this block
-            std::vector<int64_t> encoded(block_count);
-            std::vector<uint16_t> exc_positions;
-            std::vector<uint64_t> exc_values;
+            // Reuse scratch buffers (resize is no-op when <= capacity)
+            encoded.resize(block_count);
+            exc_positions.clear();
+            exc_values.clear();
 
             int64_t min_val = std::numeric_limits<int64_t>::max();
             int64_t max_val = std::numeric_limits<int64_t>::min();
@@ -630,7 +646,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
             // === FFOR Data ===
             size_t packed_words = alp::ffor_packed_words(block_count, bw);
             if (packed_words > 0) {
-                std::vector<uint64_t> packed(packed_words, 0);
+                packed.assign(packed_words, 0);
                 alp::ffor_pack(encoded.data(), block_count, min_val, bw, packed.data());
                 target.write_array(packed.data(), packed_words);
             }
@@ -657,6 +673,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
     } else {
         // === ALP_RD Encoding ===
         uint8_t right_bit_count = alp::ALPRD::findBestSplit(values.data(), total_values);
+
+        // Scratch buffers hoisted out of the block loop
+        std::vector<int64_t> left_as_i64(alp::ALP_VECTOR_SIZE);
+        std::vector<uint64_t> left_packed;
+        std::vector<uint64_t> right_packed;
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
@@ -685,12 +706,12 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
 
             // === Left Indices (FFOR packed) ===
             if (rd.left_bw > 0) {
-                std::vector<int64_t> left_as_i64(block_count);
+                left_as_i64.resize(block_count);
                 for (size_t i = 0; i < block_count; ++i) {
                     left_as_i64[i] = static_cast<int64_t>(rd.left_indices[i]);
                 }
                 size_t left_packed_words = alp::ffor_packed_words(block_count, rd.left_bw);
-                std::vector<uint64_t> left_packed(left_packed_words, 0);
+                left_packed.assign(left_packed_words, 0);
                 alp::ffor_pack(left_as_i64.data(), block_count, 0, rd.left_bw, left_packed.data());
                 target.write_array(left_packed.data(), left_packed_words);
             }
@@ -698,7 +719,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer &tar
             // === Right FFOR Data ===
             if (rd.right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
-                std::vector<uint64_t> right_packed(right_packed_words, 0);
+                right_packed.assign(right_packed_words, 0);
                 alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base,
                                    rd.right_bw, right_packed.data());
                 target.write_array(right_packed.data(), right_packed_words);

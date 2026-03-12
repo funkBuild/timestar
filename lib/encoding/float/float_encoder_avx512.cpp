@@ -2,7 +2,6 @@
 #include <bit>
 #include <cpuid.h>
 #include <cstring>
-#include <iostream>
 
 bool FloatEncoderAVX512::hasAVX512F() {
     static const bool available = []() {

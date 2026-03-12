@@ -234,8 +234,8 @@ void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest){
 
 template <class T>
 bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T> &insertRequest){
-  size_t unused = 0;
-  return wouldExceedThreshold(insertRequest, unused);
+  size_t sz = 0;
+  return wouldExceedThreshold(insertRequest, sz);
 }
 
 template <class T>

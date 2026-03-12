@@ -12,6 +12,7 @@
 #include <tsl/robin_set.h>
 #include <boost/iterator/counting_iterator.hpp>
 #include <seastar/core/when_all.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
 using namespace seastar;
 using namespace httpd;
@@ -68,6 +69,30 @@ struct glz::meta<GlazeBatchWrite> {
     );
 };
 
+// Fast-path struct for the common case: single write with all double fields.
+// Parses timestamps and field arrays directly into typed vectors, bypassing
+// the glz::json_t DOM entirely. This avoids ~110K json_value_t node allocations
+// for a typical 10K-timestamp × 10-field batch.
+struct FastDoubleWritePoint {
+    std::string measurement;
+    std::map<std::string, std::string> tags;
+    std::optional<std::vector<uint64_t>> timestamps;
+    std::optional<uint64_t> timestamp;
+    std::map<std::string, std::vector<double>> fields;
+};
+
+template <>
+struct glz::meta<FastDoubleWritePoint> {
+    using T = FastDoubleWritePoint;
+    static constexpr auto value = object(
+        "measurement", &T::measurement,
+        "tags", &T::tags,
+        "timestamps", &T::timestamps,
+        "timestamp", &T::timestamp,
+        "fields", &T::fields
+    );
+};
+
 HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded)
     : engineSharded(_engineSharded) {
     if (!engineSharded) {
@@ -84,33 +109,36 @@ static bool hasReservedChar(const std::string& s, bool allowSpace) {
     return false;
 }
 
-std::string HttpWriteHandler::validateName(const std::string& name, const std::string& context) {
-    if (name.empty()) {
-        return context + " must not be empty";
-    }
-    if (!hasReservedChar(name, false)) return {};
-    // Slow path: identify which character is invalid
-    for (char c : name) {
+// Fast-path name validation: returns true if name is valid, false otherwise.
+// Avoids constructing context string on the fast path.
+static inline bool isValidName(const std::string& name) {
+    return !name.empty() && !hasReservedChar(name, false);
+}
+
+static inline bool isValidTagValue(const std::string& value) {
+    return !value.empty() && !hasReservedChar(value, true);
+}
+
+// Shared slow-path validator: hasReservedChar() already ran and returned true,
+// so walk the string to produce a specific error message.
+static std::string validateStringHelper(const std::string& s, const std::string& context, bool allowSpace) {
+    if (s.empty()) return context + " must not be empty";
+    if (!hasReservedChar(s, allowSpace)) return {};
+    for (char c : s) {
         if (c == '\0') return context + " must not contain null bytes";
         if (c == ',') return context + " must not contain commas";
         if (c == '=') return context + " must not contain equals signs";
-        if (c == ' ') return context + " must not contain spaces";
+        if (!allowSpace && c == ' ') return context + " must not contain spaces";
     }
     return {};
 }
 
+std::string HttpWriteHandler::validateName(const std::string& name, const std::string& context) {
+    return validateStringHelper(name, context, false);
+}
+
 std::string HttpWriteHandler::validateTagValue(const std::string& value, const std::string& context) {
-    if (value.empty()) {
-        return context + " must not be empty";
-    }
-    if (!hasReservedChar(value, true)) return {};
-    // Slow path: identify which character is invalid
-    for (char c : value) {
-        if (c == '\0') return context + " must not contain null bytes";
-        if (c == ',') return context + " must not contain commas";
-        if (c == '=') return context + " must not contain equals signs";
-    }
-    return {};
+    return validateStringHelper(value, context, true);
 }
 
 void HttpWriteHandler::validateWritePointNames(
@@ -193,15 +221,22 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
         }
     }
 
-    // Validate measurement and tag names before any processing
+    // Validate measurement and tag names before any processing.
+    // Use fast-path checks first to avoid constructing context strings on the common valid path.
     {
-        auto err = validateName(mwp.measurement, "Measurement name");
-        if (!err.empty()) throw std::invalid_argument(err);
+        if (!isValidName(mwp.measurement)) {
+            auto err = validateName(mwp.measurement, "Measurement name");
+            if (!err.empty()) throw std::invalid_argument(err);
+        }
         for (const auto& [key, value] : mwp.tags) {
-            err = validateName(key, "Tag key '" + key + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
-            err = validateTagValue(value, "Tag value for '" + key + "'");
-            if (!err.empty()) throw std::invalid_argument(err);
+            if (!isValidName(key)) {
+                auto err = validateName(key, "Tag key '" + key + "'");
+                if (!err.empty()) throw std::invalid_argument(err);
+            }
+            if (!isValidTagValue(value)) {
+                auto err = validateTagValue(value, "Tag value for '" + key + "'");
+                if (!err.empty()) throw std::invalid_argument(err);
+            }
         }
     }
 
@@ -213,8 +248,8 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     auto& fields_obj = fieldsIt->second.get<json_value_t::object_t>();
 
     for (auto& [fieldName, fieldValue] : fields_obj) {
-        // Validate field name before processing
-        {
+        // Validate field name (fast path avoids string allocation for valid names)
+        if (!isValidName(fieldName)) {
             auto err = validateName(fieldName, "Field name '" + fieldName + "'");
             if (!err.empty()) throw std::invalid_argument(err);
         }
@@ -228,9 +263,11 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             }
 
             // Determine type from first element
+            const size_t arrSize = arr.size();
             if (arr[0].is_number()) {
                 if (arr[0].holds<int64_t>() || arr[0].holds<uint64_t>()) {
                     fa.type = FieldArrays::INTEGER;
+                    fa.integers.reserve(arrSize);
                     for (auto& elem : arr) {
                         if (elem.is_number()) {
                             fa.integers.push_back(elem.as<int64_t>());
@@ -240,6 +277,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
                     }
                 } else {
                     fa.type = FieldArrays::DOUBLE;
+                    fa.doubles.reserve(arrSize);
                     for (auto& elem : arr) {
                         if (elem.is_number()) {
                             fa.doubles.push_back(elem.as<double>());
@@ -250,6 +288,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
                 }
             } else if (arr[0].is_boolean()) {
                 fa.type = FieldArrays::BOOL;
+                fa.bools.reserve(arrSize);
                 for (auto& elem : arr) {
                     if (elem.is_boolean()) {
                         fa.bools.push_back(elem.get<bool>() ? 1 : 0);
@@ -259,6 +298,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
                 }
             } else if (arr[0].is_string()) {
                 fa.type = FieldArrays::STRING;
+                fa.strings.reserve(arrSize);
                 LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected string array field '{}' with {} elements", fieldName, arr.size());
                 for (auto& elem : arr) {
                     if (elem.is_string()) {
@@ -351,6 +391,51 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     }
 
     return mwp;
+}
+
+// Build a MultiWritePoint from a FastDoubleWritePoint (fast path, all fields are doubles).
+// Returns true on success, false if the data is invalid.
+bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t defaultTimestampNs,
+                                             MultiWritePoint& mwp) {
+    mwp.measurement = std::move(fwp.measurement);
+    mwp.tags = std::move(fwp.tags);
+
+    // Validate names
+    if (!isValidName(mwp.measurement)) return false;
+    for (const auto& [key, value] : mwp.tags) {
+        if (!isValidName(key) || !isValidTagValue(value)) return false;
+    }
+
+    // Move fields as DOUBLE type
+    for (auto& [fieldName, values] : fwp.fields) {
+        if (!isValidName(fieldName)) return false;
+        if (values.empty()) continue;
+        FieldArrays fa;
+        fa.type = FieldArrays::DOUBLE;
+        fa.doubles = std::move(values);
+        mwp.fields[fieldName] = std::move(fa);
+    }
+    if (mwp.fields.empty()) return false;
+
+    // Determine number of points from the largest field array
+    size_t numPoints = 1;
+    for (const auto& [_, fa] : mwp.fields) {
+        numPoints = std::max(numPoints, fa.doubles.size());
+    }
+
+    // Handle timestamps (same logic as parseMultiWritePoint)
+    if (fwp.timestamps.has_value() && !fwp.timestamps->empty()) {
+        mwp.timestamps = std::move(*fwp.timestamps);
+    } else if (fwp.timestamp.has_value()) {
+        mwp.timestamps.resize(numPoints, *fwp.timestamp);
+    } else {
+        mwp.timestamps.reserve(numPoints);
+        for (size_t i = 0; i < numPoints; i++) {
+            mwp.timestamps.push_back(defaultTimestampNs + i * 1000000);
+        }
+    }
+
+    return true;
 }
 
 std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs) {
@@ -844,6 +929,12 @@ bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::str
 
 seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(
     MultiWritePoint& point) {
+    // Shard-local cache of series IDs that have already been indexed on shard 0.
+    // After the first batch, subsequent writes for the same series skip the
+    // cross-shard metadata RPC entirely, eliminating the biggest bottleneck
+    // for non-shard-0 shards. The cache persists for the lifetime of the shard.
+    static thread_local tsl::robin_set<SeriesId128, SeriesId128::Hash> knownSeriesCache;
+
     // Local metadata tracking — each coroutine gets its own copies so there
     // is no shared mutable state when multiple coroutines run concurrently.
     std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
@@ -921,9 +1012,14 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
                 // Track metadata before potential move - deduplicate by SeriesId128 (16-byte key,
                 // fast hash via first 8 bytes) instead of the raw 60-100 byte series key string.
+                // knownSeriesCache is a shard-local persistent cache that avoids redundant
+                // cross-shard metadata RPCs for series we've already indexed.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
+                            knownSeriesCache.insert(seriesId);
+                            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+                        }
                     }
                 }
 
@@ -944,7 +1040,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
+                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
+                            knownSeriesCache.insert(seriesId);
+                            metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
+                        }
                     }
                 }
 
@@ -969,7 +1068,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
+                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
+                            knownSeriesCache.insert(seriesId);
+                            metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
+                        }
                     }
                 }
 
@@ -990,7 +1092,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
+                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
+                            knownSeriesCache.insert(seriesId);
+                            metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
+                        }
                     }
                 }
 
@@ -1037,37 +1142,73 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
         auto strings = std::move(shardStringInserts[shard]);
         auto integers = std::move(shardIntegerInserts[shard]);
 
-        // Launch shard operation
-        shardFutures.push_back(
-            engineSharded->invoke_on(shard,
-                [doubles = std::move(doubles), bools = std::move(bools),
-                 strings = std::move(strings), integers = std::move(integers)]
-                (Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
-                    AggregatedTimingInfo batchTiming;
+        // Lambda that inserts all types into the given engine
+        auto doInserts = [](Engine& engine, auto doubles, auto bools,
+                            auto strings, auto integers) mutable
+                         -> seastar::future<AggregatedTimingInfo> {
+            AggregatedTimingInfo batchTiming;
 
-                    if (!doubles.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(doubles));
-                        batchTiming.aggregate(walTiming);
-                    }
+            if (!doubles.empty()) {
+                auto walTiming = co_await engine.insertBatch(std::move(doubles));
+                batchTiming.aggregate(walTiming);
+            }
 
-                    if (!bools.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(bools));
-                        batchTiming.aggregate(walTiming);
-                    }
+            if (!bools.empty()) {
+                auto walTiming = co_await engine.insertBatch(std::move(bools));
+                batchTiming.aggregate(walTiming);
+            }
 
-                    if (!strings.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(strings));
-                        batchTiming.aggregate(walTiming);
-                    }
+            if (!strings.empty()) {
+                auto walTiming = co_await engine.insertBatch(std::move(strings));
+                batchTiming.aggregate(walTiming);
+            }
 
-                    if (!integers.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(integers));
-                        batchTiming.aggregate(walTiming);
-                    }
+            if (!integers.empty()) {
+                auto walTiming = co_await engine.insertBatch(std::move(integers));
+                batchTiming.aggregate(walTiming);
+            }
 
-                    co_return batchTiming;
-                })
-        );
+            co_return batchTiming;
+        };
+
+        // Local shard: call engine directly, avoiding cross-shard message queue overhead
+        if (shard == seastar::this_shard_id()) {
+            shardFutures.push_back(
+                doInserts(engineSharded->local(), std::move(doubles), std::move(bools),
+                          std::move(strings), std::move(integers)));
+        } else {
+            // Remote shard: use invoke_on
+            shardFutures.push_back(
+                engineSharded->invoke_on(shard,
+                    [doubles = std::move(doubles), bools = std::move(bools),
+                     strings = std::move(strings), integers = std::move(integers)]
+                    (Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
+                        AggregatedTimingInfo batchTiming;
+
+                        if (!doubles.empty()) {
+                            auto walTiming = co_await engine.insertBatch(std::move(doubles));
+                            batchTiming.aggregate(walTiming);
+                        }
+
+                        if (!bools.empty()) {
+                            auto walTiming = co_await engine.insertBatch(std::move(bools));
+                            batchTiming.aggregate(walTiming);
+                        }
+
+                        if (!strings.empty()) {
+                            auto walTiming = co_await engine.insertBatch(std::move(strings));
+                            batchTiming.aggregate(walTiming);
+                        }
+
+                        if (!integers.empty()) {
+                            auto walTiming = co_await engine.insertBatch(std::move(integers));
+                            batchTiming.aggregate(walTiming);
+                        }
+
+                        co_return batchTiming;
+                    })
+            );
+        }
     }
 
     // Wait for all shard operations to complete in parallel
@@ -1128,8 +1269,8 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string
     }
     
     for (auto& [fieldName, fieldValue] : fields_obj) {
-        // Validate field name before processing
-        {
+        // Validate field name (fast path avoids string allocation for valid names)
+        if (!isValidName(fieldName)) {
             auto err = validateName(fieldName, "Field name '" + fieldName + "'");
             if (!err.empty()) throw std::invalid_argument(err);
         }
@@ -1214,8 +1355,8 @@ HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_
     }
 
     for (auto& [fieldName, fieldValue] : fields_obj) {
-        // Validate field name before processing
-        {
+        // Validate field name (fast path avoids string allocation for valid names)
+        if (!isValidName(fieldName)) {
             auto err = validateName(fieldName, "Field name '" + fieldName + "'");
             if (!err.empty()) throw std::invalid_argument(err);
         }
@@ -1461,10 +1602,10 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
     
     try {
-        // Read the complete request body
+        // Read the complete request body — move from request to avoid copying
         std::string body;
         if (!req->content.empty()) {
-            body = req->content;
+            body = std::move(req->content);
         }
         
         // Read from stream if available, checking size incrementally
@@ -1505,19 +1646,7 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         }
         
         LOG_INSERT_PATH(timestar::http_log, debug, "Received write request: {} bytes", body.size());
-        
-        // Parse JSON using Glaze with u64 number mode to preserve integer precision.
-        // This prevents nanosecond timestamps from losing precision through double conversion.
-        json_value_t doc{};
-        auto parse_error = glz::read_json(doc, body);
-        
-        if (parse_error) {
-            rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("Invalid JSON: " + std::string(glz::format_error(parse_error)));
-            rep->add_header("Content-Type", "application/json");
-            co_return rep;
-        }
-        
+
         int pointsWritten = 0;
 #if TIMESTAR_LOG_INSERT_PATH
         auto batchStartTime = std::chrono::steady_clock::now();
@@ -1528,121 +1657,143 @@ HttpWriteHandler::handleWrite(std::unique_ptr<seastar::http::request> req) {
         // eliminating up to N redundant now() calls in a batch of N points.
         const uint64_t defaultTimestampNs = currentNanosTimestamp();
 
-        // Check if it's a batch write or single write
-        if (doc.is_object()) {
-            auto& obj = doc.get<json_value_t::object_t>();
+        // ─── Fast path: single write with all-double fields ───
+        // For large payloads (>256 bytes) that aren't batch writes, try parsing
+        // directly into typed vectors, bypassing the json_value_t DOM entirely.
+        // For a 10K-timestamp × 10-field batch, this avoids ~110K DOM node
+        // allocations and roughly halves the JSON parsing cost.
+        bool fastPathHandled = false;
+        if (body.size() > 256) {
+            // Quick check: skip fast path for batch writes (have "writes" key)
+            auto writesPos = body.find("\"writes\"");
+            if (writesPos == std::string::npos || writesPos > 64) {
+                FastDoubleWritePoint fwp;
+                auto fast_err = glz::read_json(fwp, body);
+                if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
+                    // Fast path succeeded - yield after CPU-heavy parse
+                    co_await seastar::coroutine::maybe_yield();
 
-            if (obj.contains("writes")) {
-                // Batch write - coalesce ALL writes (both scalar and array) in a
-                // single pass through coalesceWrites. No array-detection pre-scan
-                // is needed because coalesceWrites now handles both scalar and array
-                // field values, eliminating the redundant field iteration that
-                // previously occurred when array writes were detected and then
-                // re-parsed by parseMultiWritePoint.
-                auto& writes = obj["writes"];
-                if (writes.is_array()) {
-                    auto& writes_array = writes.get<json_value_t::array_t>();
-
-                    LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Processing batch with {} writes", writes_array.size());
-
-                    // Coalesce all writes (scalar and array) in a single pass
-#if TIMESTAR_LOG_INSERT_PATH
-                    auto coalesceStartTime = std::chrono::steady_clock::now();
-#endif
-                    auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs);
-#if TIMESTAR_LOG_INSERT_PATH
-                    auto coalesceEndTime = std::chrono::steady_clock::now();
-                    auto coalesceDuration = std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
-
-                    LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Coalesced {} writes into {} MultiWritePoints ({}μs)",
-                                   writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
-#endif
-
-                    // Process all coalesced writes in parallel
-                    [[maybe_unused]] AggregatedTimingInfo batchTiming;
-
-                    // Compute point/field counts and validate in a single pass
-                    for (const auto& mwp : coalescedWrites) {
-                        pointsWritten += mwp.timestamps.size() * mwp.fields.size();
+                    MultiWritePoint mwp;
+                    if (buildMWPFromFastPath(fwp, defaultTimestampNs, mwp)) {
                         std::string error;
                         if (!validateArraySizes(mwp, error)) {
                             throw std::invalid_argument(error);
                         }
-                    }
 
-                    // Launch all MWP processing concurrently and await them together.
-                    // Each coroutine collects its own metadata ops locally — no shared
-                    // mutable state across concurrent coroutines.
-                    std::vector<seastar::future<WriteResult>> mwpFutures;
-                    mwpFutures.reserve(coalescedWrites.size());
+                        pointsWritten = mwp.timestamps.size() * mwp.fields.size();
 
-                    for (auto& mwp : coalescedWrites) {
-                        mwpFutures.push_back(processMultiWritePoint(mwp));
-                    }
+                        auto writeResult = co_await processMultiWritePoint(mwp);
 
-                    // Await all MWP futures in parallel, then merge timing and metadata ops.
-                    // Each coroutine already deduplicates its own metadata ops internally.
-                    // Cross-coroutine duplicates (rare — same series in multiple MWPs) are
-                    // harmless: indexMetadataBatch uses a series cache and is idempotent.
-                    auto mwpResults = co_await seastar::when_all(mwpFutures.begin(), mwpFutures.end());
-
-                    std::vector<MetaOp> metaOps;
-                    metaOps.reserve(coalescedWrites.size() * 2); // ~2 meta ops per write
-                    for (auto& result : mwpResults) {
-                        try {
-                            auto writeResult = result.get();
-                            batchTiming.aggregate(writeResult.timing);
-                            // Append this coroutine's locally-collected metadata ops
-                            metaOps.insert(metaOps.end(),
-                                std::make_move_iterator(writeResult.metaOps.begin()),
-                                std::make_move_iterator(writeResult.metaOps.end()));
-                        } catch (const std::exception& e) {
-                            timestar::http_log.error("Error processing write: {}", e.what());
+                        if (!writeResult.metaOps.empty()) {
+                            co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
                         }
+                        fastPathHandled = true;
+                    }
+                }
+            }
+        }
+
+        // ─── Standard DOM path (batch writes + mixed-type single writes) ───
+        if (!fastPathHandled) {
+            // Parse JSON using Glaze with u64 number mode to preserve integer precision.
+            json_value_t doc{};
+            auto parse_error = glz::read_json(doc, body);
+
+            if (parse_error) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = createErrorResponse("Invalid JSON: " + std::string(glz::format_error(parse_error)));
+                rep->add_header("Content-Type", "application/json");
+                co_return rep;
+            }
+
+            // Yield after CPU-heavy DOM parse to prevent cascading reactor stalls
+            co_await seastar::coroutine::maybe_yield();
+
+            if (doc.is_object()) {
+                auto& obj = doc.get<json_value_t::object_t>();
+
+                if (obj.contains("writes")) {
+                    auto& writes = obj["writes"];
+                    if (writes.is_array()) {
+                        auto& writes_array = writes.get<json_value_t::array_t>();
+
+                        LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Processing batch with {} writes", writes_array.size());
+
+#if TIMESTAR_LOG_INSERT_PATH
+                        auto coalesceStartTime = std::chrono::steady_clock::now();
+#endif
+                        auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs);
+#if TIMESTAR_LOG_INSERT_PATH
+                        auto coalesceEndTime = std::chrono::steady_clock::now();
+                        auto coalesceDuration = std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
+                        LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Coalesced {} writes into {} MultiWritePoints ({}μs)",
+                                       writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
+#endif
+
+                        for (const auto& mwp : coalescedWrites) {
+                            pointsWritten += mwp.timestamps.size() * mwp.fields.size();
+                            std::string error;
+                            if (!validateArraySizes(mwp, error)) {
+                                throw std::invalid_argument(error);
+                            }
+                        }
+
+                        std::vector<seastar::future<WriteResult>> mwpFutures;
+                        mwpFutures.reserve(coalescedWrites.size());
+                        for (auto& mwp : coalescedWrites) {
+                            mwpFutures.push_back(processMultiWritePoint(mwp));
+                        }
+
+                        auto mwpResults = co_await seastar::when_all(mwpFutures.begin(), mwpFutures.end());
+
+                        std::vector<MetaOp> metaOps;
+                        metaOps.reserve(coalescedWrites.size() * 2);
+                        for (auto& result : mwpResults) {
+                            try {
+                                auto writeResult = result.get();
+                                metaOps.insert(metaOps.end(),
+                                    std::make_move_iterator(writeResult.metaOps.begin()),
+                                    std::make_move_iterator(writeResult.metaOps.end()));
+                            } catch (const std::exception& e) {
+                                timestar::http_log.error("Error processing write: {}", e.what());
+                            }
+                        }
+
+#if TIMESTAR_LOG_INSERT_PATH
+                        size_t metaOpsCount = metaOps.size();
+#endif
+                        if (!metaOps.empty()) {
+                            co_await engineSharded->local().indexMetadataSync(std::move(metaOps));
+                        }
+#if TIMESTAR_LOG_INSERT_PATH
+                        LOG_INSERT_PATH(timestar::http_log, info,
+                            "[METADATA] Batch: indexed {} unique series synchronously",
+                            metaOpsCount);
+#endif
+                    }
+                } else {
+                    MultiWritePoint mwp = parseMultiWritePoint(doc, defaultTimestampNs);
+                    std::string error;
+                    if (!validateArraySizes(mwp, error)) {
+                        throw std::invalid_argument(error);
                     }
 
-                    // Synchronous metadata indexing for entire batch.
-                    // Await completion so metadata is queryable before the write response.
+                    pointsWritten = mwp.timestamps.size() * mwp.fields.size();
+
+                    auto writeResult = co_await processMultiWritePoint(mwp);
+
 #if TIMESTAR_LOG_INSERT_PATH
-                    size_t metaOpsCount = metaOps.size();
+                    size_t metaOpsCount = writeResult.metaOps.size();
 #endif
-                    if (!metaOps.empty()) {
-                        co_await engineSharded->local().indexMetadataSync(std::move(metaOps));
+                    if (!writeResult.metaOps.empty()) {
+                        co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
                     }
 #if TIMESTAR_LOG_INSERT_PATH
                     LOG_INSERT_PATH(timestar::http_log, info,
-                        "[METADATA] Batch: indexed {} unique series synchronously",
+                        "[METADATA] Single write: indexed {} unique series synchronously",
                         metaOpsCount);
 #endif
                 }
-            } else {
-                // Single write - parseMultiWritePoint handles both scalar and
-                // array fields in a single pass (scalars are wrapped as size-1
-                // arrays), so no detection pre-pass is needed.
-                MultiWritePoint mwp = parseMultiWritePoint(doc, defaultTimestampNs);
-                std::string error;
-                if (!validateArraySizes(mwp, error)) {
-                    throw std::invalid_argument(error);
-                }
-
-                // Compute points count before processMultiWritePoint, which may move from mwp
-                pointsWritten = mwp.timestamps.size() * mwp.fields.size();
-
-                auto writeResult = co_await processMultiWritePoint(mwp);
-
-                // Synchronous metadata indexing for this single write.
-                // Await completion so metadata is queryable before the write response.
-#if TIMESTAR_LOG_INSERT_PATH
-                size_t metaOpsCount = writeResult.metaOps.size();
-#endif
-                if (!writeResult.metaOps.empty()) {
-                    co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
-                }
-#if TIMESTAR_LOG_INSERT_PATH
-                LOG_INSERT_PATH(timestar::http_log, info,
-                    "[METADATA] Single write: indexed {} unique series synchronously",
-                    metaOpsCount);
-#endif
             }
         }
         

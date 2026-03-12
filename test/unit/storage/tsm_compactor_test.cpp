@@ -187,7 +187,7 @@ SEASTAR_TEST_F(TSMCompactorTest, DeduplicationDuringCompaction) {
     // Count total points
     size_t totalPoints = 0;
     for (const auto& block : result.blocks) {
-        totalPoints += block->timestamps->size();
+        totalPoints += block->timestamps.size();
     }
 
     EXPECT_EQ(totalPoints, 100); // Should be deduplicated to 100 points
@@ -305,8 +305,8 @@ SEASTAR_TEST_F(TSMCompactorTest, NewerValuesOverwriteOlderDuringCompaction) {
     // Collect all points from result
     std::map<uint64_t, double> compactedData;
     for (const auto& block : result.blocks) {
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            compactedData[block->timestamps->at(i)] = block->values->at(i);
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            compactedData[block->timestamps.at(i)] = block->values.at(i);
         }
     }
 
@@ -444,10 +444,10 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
 
     bool found5000 = false;
     for (const auto& block : result1.blocks) {
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            if (block->timestamps->at(i) == 5000) {
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            if (block->timestamps.at(i) == 5000) {
                 // Should be 300.0 (file 3, index 0 - newest file wins)
-                EXPECT_DOUBLE_EQ(block->values->at(i), 300.0);
+                EXPECT_DOUBLE_EQ(block->values.at(i), 300.0);
                 found5000 = true;
             }
         }
@@ -503,10 +503,10 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
 
     found5000 = false;
     for (const auto& block : result2.blocks) {
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            if (block->timestamps->at(i) == 5000) {
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            if (block->timestamps.at(i) == 5000) {
                 // Should be 403.0 (newest value from last level 1 file)
-                EXPECT_DOUBLE_EQ(block->values->at(i), 403.0);
+                EXPECT_DOUBLE_EQ(block->values.at(i), 403.0);
                 found5000 = true;
             }
         }
@@ -519,8 +519,8 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
 
     std::set<uint64_t> allTimestamps;
     for (const auto& block : allData.blocks) {
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            allTimestamps.insert(block->timestamps->at(i));
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            allTimestamps.insert(block->timestamps.at(i));
         }
     }
 

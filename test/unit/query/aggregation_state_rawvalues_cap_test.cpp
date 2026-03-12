@@ -40,6 +40,7 @@ static bool isNaN(double v) { return std::isnan(v); }
 // are added one at a time, and that the saturation flag is set.
 TEST(AggregationStateCapTest, AddValue_CapEnforced) {
     AggregationState s;
+    s.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
 
     for (size_t i = 0; i <= limit; ++i) {
@@ -59,6 +60,7 @@ TEST(AggregationStateCapTest, AddValue_CapEnforced) {
 // Scalar accumulators must remain correct even when rawValues is saturated.
 TEST(AggregationStateCapTest, AddValue_ScalarAccumulatorsCorrectAfterCap) {
     AggregationState s;
+    s.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
 
     // Fill to cap with value 1.0, then add one extra with value 999.0
@@ -82,6 +84,7 @@ TEST(AggregationStateCapTest, AddValue_ScalarAccumulatorsCorrectAfterCap) {
 // when rawValues is saturated, because they rely on scalar accumulators.
 TEST(AggregationStateCapTest, AddValue_NonRawMethodsCorrectAfterCap) {
     AggregationState s;
+    s.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
 
     // Alternate values: evens = 0.0, odds = 10.0
@@ -110,6 +113,7 @@ TEST(AggregationStateCapTest, AddValue_NonRawMethodsCorrectAfterCap) {
 // STDDEV/STDVAR use Welford's M2 accumulator and remain correct.
 TEST(AggregationStateCapTest, AddValue_OrderSensitiveMethodsReturnNaNAfterCap) {
     AggregationState s;
+    s.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
 
     for (size_t i = 0; i <= limit; ++i) {
@@ -128,6 +132,7 @@ TEST(AggregationStateCapTest, AddValue_OrderSensitiveMethodsReturnNaNAfterCap) {
 // Just under the limit: MEDIAN should still compute correctly.
 TEST(AggregationStateCapTest, AddValue_JustUnderLimit_MedianCorrect) {
     AggregationState s;
+    s.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
 
     // Add exactly limit values: 1.0 through limit.0
@@ -153,6 +158,8 @@ TEST(AggregationStateCapTest, AddValue_JustUnderLimit_MedianCorrect) {
 // rawValues must be capped and rawValuesSaturated set.
 TEST(AggregationStateCapTest, Merge_CombinedExceedsLimit_SetsFlag) {
     AggregationState a, b;
+    a.collectRaw = true;
+    b.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
     const size_t half = limit / 2;
 
@@ -180,6 +187,8 @@ TEST(AggregationStateCapTest, Merge_CombinedExceedsLimit_SetsFlag) {
 // becomes saturated even if its own rawValues vector is small.
 TEST(AggregationStateCapTest, Merge_SourceAlreadySaturated_PropagatesFlag) {
     AggregationState a, b;
+    a.collectRaw = true;
+    b.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
 
     // 'b' is saturated
@@ -204,6 +213,8 @@ TEST(AggregationStateCapTest, Merge_SourceAlreadySaturated_PropagatesFlag) {
 // merge must succeed without saturation.
 TEST(AggregationStateCapTest, Merge_BothSmall_NoSaturation) {
     AggregationState a, b;
+    a.collectRaw = true;
+    b.collectRaw = true;
 
     for (int i = 0; i < 5; ++i) {
         a.addValue(static_cast<double>(i), static_cast<uint64_t>(i));
@@ -226,6 +237,8 @@ TEST(AggregationStateCapTest, Merge_BothSmall_NoSaturation) {
 // further, must keep the flag set, and must still update scalar accumulators.
 TEST(AggregationStateCapTest, Merge_DestinationAlreadySaturated_NoFurtherGrowth) {
     AggregationState a, b;
+    a.collectRaw = true;
+    b.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
 
     // Saturate 'a' via addValue
@@ -272,6 +285,7 @@ TEST(AggregationStateCapTest, LargeMultiShardMerge_CorrectBehavior) {
 
     // Build one partial state per shard, all with value = 1.0
     std::vector<AggregationState> shards(shardsCount);
+    for (auto& sh : shards) sh.collectRaw = true;
     for (size_t s = 0; s < shardsCount; ++s) {
         for (size_t i = 0; i < pointsPerShard; ++i) {
             shards[s].addValue(1.0, static_cast<uint64_t>(s * pointsPerShard + i));
@@ -323,6 +337,8 @@ TEST(AggregationStateCapTest, LargeMultiShardMerge_CorrectBehavior) {
 // the merge fills rawValues to exactly limit with no saturation.
 TEST(AggregationStateCapTest, Merge_ExactlyAtLimit_NoSaturation) {
     AggregationState a, b;
+    a.collectRaw = true;
+    b.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
     const size_t half = limit / 2;
 
@@ -351,6 +367,8 @@ TEST(AggregationStateCapTest, Merge_ExactlyAtLimit_NoSaturation) {
 // One value over the boundary: merge of (limit/2 + 1) + (limit/2) exceeds limit.
 TEST(AggregationStateCapTest, Merge_OnePastLimit_Saturated) {
     AggregationState a, b;
+    a.collectRaw = true;
+    b.collectRaw = true;
     const size_t limit = AggregationState::RAW_VALUES_HARD_LIMIT;
     const size_t half = limit / 2;
 

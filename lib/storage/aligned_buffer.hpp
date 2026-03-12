@@ -3,7 +3,7 @@
 
 #include <vector>
 #include <cstdint>
-#include <iostream>
+#include <iosfwd>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>

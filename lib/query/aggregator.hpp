@@ -72,12 +72,15 @@ struct AggregationState {
     // Welford's online M2 accumulator for STDDEV/STDVAR — O(1) memory, no raw values needed.
     // M2 = sum of squared differences from the running mean: Σ(x_i - mean)^2
     double m2 = 0.0;
-    // Raw values for MEDIAN computation only.
-    // Populated by addValue() so that getValue() can compute order-sensitive statistics.
+    // Raw values for MEDIAN computation only (STDDEV/STDVAR use Welford instead).
+    // Populated by addValue() only when collectRaw is true, avoiding per-value
+    // vector push_back overhead for the ~95% of queries that don't use MEDIAN.
     // Growth is capped at RAW_VALUES_HARD_LIMIT; if the cap is hit rawValuesSaturated
     // is set and getValue() returns NaN for MEDIAN.
-    std::vector<double> rawValues;
+    // Mutable so getValue() can sort in-place via nth_element without copying.
+    mutable std::vector<double> rawValues;
     bool rawValuesSaturated = false;
+    bool collectRaw = false;  // Set to true only for MEDIAN queries
 
     // Add a single value to this state (incremental aggregation)
     void addValue(double value, uint64_t timestamp = 0) {
@@ -98,10 +101,12 @@ struct AggregationState {
         count++;
         double newMean = sum / count;
         m2 += (value - oldMean) * (value - newMean);
-        if (rawValues.size() < RAW_VALUES_HARD_LIMIT) {
-            rawValues.push_back(value);
-        } else {
-            rawValuesSaturated = true;
+        if (collectRaw) {
+            if (rawValues.size() < RAW_VALUES_HARD_LIMIT) {
+                rawValues.push_back(value);
+            } else {
+                rawValuesSaturated = true;
+            }
         }
     }
 
@@ -169,16 +174,17 @@ struct AggregationState {
                 if (rawValues.empty() || rawValuesSaturated) {
                     return std::numeric_limits<double>::quiet_NaN();
                 }
-                std::vector<double> tmp = rawValues;
-                size_t n = tmp.size();
+                // In-place nth_element avoids copying the entire rawValues vector.
+                // rawValues is mutable so this works on const AggregationState.
+                size_t n = rawValues.size();
                 size_t mid = n / 2;
-                std::nth_element(tmp.begin(), tmp.begin() + mid, tmp.end());
+                std::nth_element(rawValues.begin(), rawValues.begin() + mid, rawValues.end());
                 if (n % 2 == 1) {
-                    return tmp[mid];
+                    return rawValues[mid];
                 } else {
-                    // nth_element guarantees elements before mid are <= tmp[mid]
-                    double upper = tmp[mid];
-                    double lower = *std::max_element(tmp.begin(), tmp.begin() + mid);
+                    // nth_element guarantees elements before mid are <= rawValues[mid]
+                    double upper = rawValues[mid];
+                    double lower = *std::max_element(rawValues.begin(), rawValues.begin() + mid);
                     return (lower + upper) / 2.0;
                 }
             }
@@ -210,6 +216,11 @@ struct GroupedAggregationResult {
     std::map<std::string, std::string> tags;
     std::string fieldName;
     std::vector<AggregatedPoint> points;
+    // Optional raw vectors — when populated (from pushdown fast path), points
+    // is empty. Avoids creating N AggregatedPoint structs only to split them
+    // back into separate timestamp/value vectors in the query handler.
+    std::vector<uint64_t> rawTimestamps;
+    std::vector<double> rawValues;
 };
 
 // Structure to hold partial aggregation results from a shard
@@ -225,11 +236,14 @@ struct PartialAggregationResult {
     // Key: bucket timestamp, Value: aggregation state for that bucket
     std::unordered_map<uint64_t, AggregationState> bucketStates;
 
-    // For non-bucketed aggregation (interval == 0) - sorted parallel vectors
-    // Replaces std::map<uint64_t, AggregationState> to eliminate per-entry tree
-    // node allocations (525K+ allocs per series in the benchmark).
+    // For non-bucketed aggregation (interval == 0) - sorted parallel vectors.
+    // When populated from pushdown, sortedValues carries compact raw doubles
+    // (16 bytes/point) and sortedStates is empty. When populated from the
+    // fallback path (createPartialAggregations), sortedStates carries full
+    // AggregationState objects and sortedValues is empty.
     std::vector<uint64_t> sortedTimestamps;
     std::vector<AggregationState> sortedStates;
+    std::vector<double> sortedValues;  // raw values from pushdown (compact path)
 
     // Statistics
     size_t totalPoints = 0;

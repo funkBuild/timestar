@@ -14,8 +14,6 @@ private:
   static void encodeBool(unsigned int length, const std::vector<bool> &values, size_t &offset, AlignedBuffer &buffer);
 
 public:
-  BoolEncoder();
-
   static AlignedBuffer encode(const std::vector<bool> &values);
 
   // Encode directly into an existing AlignedBuffer (zero-copy for WAL path).

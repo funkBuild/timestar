@@ -466,8 +466,8 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
         }
         // ULTRA FAST PATH: No tombstones - copy entire block at once
         if (tombstoneRanges.empty()) {
-            const auto& timestamps = *block->timestamps;
-            const auto& values = *block->values;
+            const auto& timestamps = block->timestamps;
+            const auto& values = block->values;
             size_t blockSize = timestamps.size();
 
             stats.pointsRead += blockSize;
@@ -497,9 +497,9 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(
         }
 
         // SLOW PATH: Have tombstones - check each point
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            uint64_t ts = block->timestamps->at(i);
-            const T& val = block->values->at(i);
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            uint64_t ts = block->timestamps.at(i);
+            const T& val = block->values.at(i);
 
             stats.pointsRead++;
 
@@ -870,8 +870,8 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             timestar::compactor_log.warn("Skipping null block pointer for series {}", seriesId.toHex());
             return;
         }
-        for (size_t i = 0; i < block->timestamps->size(); i++) {
-            processPoint(block->timestamps->at(i), block->values->at(i));
+        for (size_t i = 0; i < block->timestamps.size(); i++) {
+            processPoint(block->timestamps.at(i), block->values.at(i));
         }
     };
 
@@ -1343,15 +1343,12 @@ seastar::future<> TSMCompactor::forceFullCompaction() {
             
             auto stats = co_await executeCompaction(plan);
             
-            std::cout << "Compacted tier " << tier << ": " 
-                     << stats.filesCompacted << " files, "
-                     << stats.pointsWritten << " points written, "
-                     << stats.duplicatesRemoved << " duplicates removed"
-                     << std::endl;
+            timestar::tsm_log.info("Compacted tier {}: {} files, {} points written, {} duplicates removed",
+                     tier, stats.filesCompacted, stats.pointsWritten, stats.duplicatesRemoved);
         }
     }
-    
-    std::cout << "Full compaction complete" << std::endl;
+
+    timestar::tsm_log.info("Full compaction complete");
 }
 
 bool TSMCompactor::isFileInActiveCompaction(const seastar::shared_ptr<TSM>& file) const {

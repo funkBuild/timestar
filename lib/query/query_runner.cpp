@@ -79,13 +79,19 @@ static void mergeTwoSpans(
     }
   }
 
-  // Drain whichever span still has data.
+  // Drain whichever span still has data in bulk.
   for (auto* s : {&a, &b}) {
-    while (!s->exhausted()) {
-      outTs.push_back(s->ts());
-      outVal.push_back(s->val());
-      s->advance();
+    const size_t remaining = s->len - s->pos;
+    if (remaining == 0) continue;
+    // Bulk insert timestamps (contiguous memory).
+    outTs.insert(outTs.end(), s->tsPtr + s->pos, s->tsPtr + s->len);
+    // Index-based copy for values (required for vector<bool> compatibility).
+    const auto& vals = *s->valVec;
+    const size_t base = s->baseIdx + s->pos;
+    for (size_t i = 0; i < remaining; ++i) {
+      outVal.push_back(vals[base + i]);
     }
+    s->pos = s->len;
   }
 }
 
@@ -107,6 +113,24 @@ static void mergeSmallNSpans(
   }
 
   while (activeCount > 0) {
+    // When only one span remains, drain it in bulk and exit.
+    if (activeCount == 1) {
+      for (size_t i = 0; i < K; ++i) {
+        if (spans[i].exhausted()) continue;
+        auto& s = spans[i];
+        const size_t remaining = s.len - s.pos;
+        outTs.insert(outTs.end(), s.tsPtr + s.pos, s.tsPtr + s.len);
+        const auto& vals = *s.valVec;
+        const size_t base = s.baseIdx + s.pos;
+        for (size_t j = 0; j < remaining; ++j) {
+          outVal.push_back(vals[base + j]);
+        }
+        s.pos = s.len;
+        break;
+      }
+      break;
+    }
+
     // Find minimum timestamp across active spans.
     // Lower index (TSM = 0) wins on equal timestamps.
     size_t bestIdx = SIZE_MAX;
@@ -167,6 +191,19 @@ static void mergeHeapSpans(
   sameTs.reserve(spans.size());
 
   while (!heap.empty()) {
+    // When only one span remains in the heap, drain it in bulk.
+    if (heap.size() == 1) {
+      auto& s = spans[heap.top().spanIdx];
+      const size_t remaining = s.len - s.pos;
+      outTs.insert(outTs.end(), s.tsPtr + s.pos, s.tsPtr + s.len);
+      const auto& vals = *s.valVec;
+      const size_t base = s.baseIdx + s.pos;
+      for (size_t i = 0; i < remaining; ++i) {
+        outVal.push_back(vals[base + i]);
+      }
+      break;
+    }
+
     HeapEntry best = heap.top();
     heap.pop();
     const uint64_t currentTs = best.timestamp;
@@ -213,11 +250,11 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
   co_await seastar::parallel_for_each(
     seqFiles.begin(),
     seqFiles.end(),
-    [&tsmSlots, &seriesId, startTime, endTime, &slotIdx] (std::pair<unsigned int, seastar::shared_ptr<TSM>> tsmTuple) -> seastar::future<> {
+    [&tsmSlots, &seriesId, startTime, endTime, &slotIdx] (const std::pair<unsigned int, seastar::shared_ptr<TSM>>& tsmTuple) -> seastar::future<> {
       // Assign index before any suspension point - safe in cooperative scheduling
       // because parallel_for_each invokes the lambda sequentially before yielding
       size_t myIdx = slotIdx++;
-      auto [tsmRank, tsmFile] = tsmTuple;
+      const auto& [tsmRank, tsmFile] = tsmTuple;
 
       // Use queryWithTombstones to automatically filter out deleted data
       // SeriesId128 pre-computed by caller — no redundant hash here
@@ -226,7 +263,8 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
       if(results.empty())
         co_return;
 
-      results.sort();
+      // readSeriesBatched() already sorts blocks by start time after
+      // parallel_for_each (tsm.cpp:707), so no redundant sort needed here.
       tsmSlots[myIdx] = std::move(results);
     }
   );
@@ -577,7 +615,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         // complete in non-deterministic order via parallel_for_each).
         aggregator.sortTimestamps();
         result.sortedTimestamps = aggregator.takeTimestamps();
-        result.sortedStates = aggregator.takeStates();
+        result.sortedValues = aggregator.takeValues();
     }
 
     co_return result;

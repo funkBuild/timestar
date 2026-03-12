@@ -1,7 +1,6 @@
 #include "integer_encoder.hpp"
 #include "../zigzag.hpp"
 #include "../simple16.hpp"
-#include <iostream>
 #include <limits>
 
 // Basic implementation without SIMD - optimized with loop unrolling

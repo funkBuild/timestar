@@ -146,8 +146,8 @@ public:
 
         std::map<uint64_t, double> data;
         for (const auto& block : result.blocks) {
-            for (size_t i = 0; i < block->timestamps->size(); i++) {
-                data[block->timestamps->at(i)] = block->values->at(i);
+            for (size_t i = 0; i < block->timestamps.size(); i++) {
+                data[block->timestamps.at(i)] = block->values.at(i);
             }
         }
         co_return data;

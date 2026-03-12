@@ -1,7 +1,5 @@
 #include "bool_encoder.hpp"
 
-#include <iostream>
-
 // Timestamp encoding - http://www.vldb.org/pvldb/vol8/p1816-teller.pdf
 
 AlignedBuffer BoolEncoder::encode(const std::vector<bool> &values){

@@ -1,4 +1,5 @@
 #include "http_query_handler.hpp"
+#include "response_formatter.hpp"
 #include "engine.hpp"
 #include "query_parser.hpp"
 #include "aggregator.hpp"
@@ -73,8 +74,8 @@ struct QueryTimingInfo {
     double shardDistributionMs = 0.0;
     double shardQueriesMs = 0.0;
     std::vector<std::pair<unsigned, double>> perShardQueryMs;
-    double resultMergingMs = 0.0;
-    double aggregationMs = 0.0;
+    double resultCollectionMs = 0.0;  // time to move shard results into local vectors
+    double aggregationMs = 0.0;       // time for merge + reduce + response building
     double responseFormattingMs = 0.0;
     double totalMs = 0.0;
     
@@ -98,7 +99,7 @@ struct QueryTimingInfo {
                 ss << "    Shard " << shardId << ":         " << std::setw(8) << ms << " ms\n";
             }
         }
-        ss << "Result Merging:       " << std::setw(8) << resultMergingMs << " ms\n";
+        ss << "Result Collection:    " << std::setw(8) << resultCollectionMs << " ms\n";
         ss << "Aggregation:          " << std::setw(8) << aggregationMs << " ms\n";
         ss << "Response Formatting:  " << std::setw(8) << responseFormattingMs << " ms\n";
         ss << "----------------------------------------------------------------\n";
@@ -111,43 +112,6 @@ struct QueryTimingInfo {
         ss << "================================================================\n";
         return ss.str();
     }
-};
-
-// Response structures for Glaze serialization - must be at namespace scope
-struct QueryFieldData {
-    std::vector<uint64_t> timestamps;
-    std::variant<std::vector<double>, std::vector<bool>, std::vector<std::string>, std::vector<int64_t>> values;
-};
-
-struct QuerySeriesData {
-    std::string measurement;
-    std::vector<std::string> groupTags;  // Changed from tags map to groupTags array
-    std::map<std::string, QueryFieldData> fields;
-    // Removed scopes - filter scopes shouldn't be in series
-};
-
-struct QueryStatisticsData {
-    int64_t series_count;
-    int64_t point_count;
-    double execution_time_ms;
-};
-
-struct ScopeData {
-    std::string name;
-    std::string value;
-};
-
-struct QueryFormattedResponse {
-    std::string status = "success";
-    std::vector<QuerySeriesData> series;
-    // Removed top-level scopes as per requirement
-    QueryStatisticsData statistics;
-};
-
-struct QueryErrorResponse {
-    std::string status = "error";
-    std::string message;
-    std::string error;  // Changed to string to match test expectations
 };
 
 std::unique_ptr<seastar::http::reply>
@@ -562,7 +526,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                     partial.bucketStates = std::move(pushdownResult->bucketStates);
                                 } else {
                                     partial.sortedTimestamps = std::move(pushdownResult->sortedTimestamps);
-                                    partial.sortedStates = std::move(pushdownResult->sortedStates);
+                                    partial.sortedValues = std::move(pushdownResult->sortedValues);
                                 }
 
                                 pushdownPartials.push_back(std::move(partial));
@@ -728,7 +692,22 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         }
 
         auto mergeEnd = std::chrono::high_resolution_clock::now();
-        timing.resultMergingMs = std::chrono::duration<double, std::milli>(mergeEnd - mergeStart).count();
+        timing.resultCollectionMs = std::chrono::duration<double, std::milli>(mergeEnd - mergeStart).count();
+
+        // Early point-count check: totalPointsRetrieved is an upper bound on
+        // the final output (merging can only reduce counts via timestamp dedup).
+        // Fail fast before the expensive merge + JSON serialization phase.
+        if (request.aggregationInterval == 0 && timing.totalPointsRetrieved > maxTotalPoints()) {
+            QueryResponse limitResponse;
+            limitResponse.success = false;
+            limitResponse.errorCode = "TOO_MANY_POINTS";
+            limitResponse.errorMessage = "Total points " +
+                std::to_string(timing.totalPointsRetrieved) +
+                " exceeds limit of " + std::to_string(maxTotalPoints());
+            limitResponse.statistics.truncated = true;
+            limitResponse.statistics.truncationReason = limitResponse.errorMessage;
+            co_return limitResponse;
+        }
 
         // Merge partial aggregations from all shards into final aggregated points
         auto aggregationStart = std::chrono::high_resolution_clock::now();
@@ -770,15 +749,21 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 // the index lookup and (if a new series) insertion into seriesKeyToIndex.
                 std::string seriesMergeKey = buildMergeKey(groupedResult.measurement, groupedResult.tags);
 
-                // Build timestamps and values for this field
+                // Build timestamps and values for this field.
+                // Fast path: if the merge returned raw vectors (single-partial
+                // pushdown), move them directly without the AggregatedPoint split.
                 std::vector<uint64_t> timestamps;
                 std::vector<double> values;
-                timestamps.reserve(groupedResult.points.size());
-                values.reserve(groupedResult.points.size());
-
-                for (const auto& point : groupedResult.points) {
-                    timestamps.push_back(point.timestamp);
-                    values.push_back(point.value);
+                if (!groupedResult.rawTimestamps.empty()) {
+                    timestamps = std::move(groupedResult.rawTimestamps);
+                    values = std::move(groupedResult.rawValues);
+                } else {
+                    timestamps.reserve(groupedResult.points.size());
+                    values.reserve(groupedResult.points.size());
+                    for (const auto& point : groupedResult.points) {
+                        timestamps.push_back(point.timestamp);
+                        values.push_back(point.value);
+                    }
                 }
 
                 auto it = seriesKeyToIndex.find(seriesMergeKey);
@@ -922,74 +907,23 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 }
 
 std::string HttpQueryHandler::formatQueryResponse(QueryResponse& response) {
-    // Build response JSON using structured approach
-    QueryFormattedResponse formattedResponse;
-
-    // Note: Field filtering is already performed in executeQuery() — no need to
-    // filter again here. By this point, response.series only contains the fields
-    // that were requested (or all fields if none were specified).
-
-    // Convert series — move timestamps and values to avoid copying large vectors
-    for (auto& series : response.series) {
-        QuerySeriesData sd;
-        sd.measurement = std::move(series.measurement);
-
-        // Convert tags map to groupTags array format.
-        // std::map iterates in sorted key order, so the output is already sorted
-        // — no std::sort needed for deterministic output.
-        sd.groupTags.reserve(series.tags.size());
-        for (const auto& [key, value] : series.tags) {
-            std::string tag;
-            tag.reserve(key.size() + 1 + value.size());
-            tag.append(key);
-            tag += '=';
-            tag.append(value);
-            sd.groupTags.push_back(std::move(tag));
-        }
-
-        // Convert fields to response format
-        for (auto& [fieldName, fieldData] : series.fields) {
-            QueryFieldData fd;
-            fd.timestamps = std::move(fieldData.first);
-            fd.values = std::move(fieldData.second);
-            sd.fields[fieldName] = std::move(fd);
-        }
-
-        if (!sd.fields.empty()) {
-            formattedResponse.series.push_back(std::move(sd));
-        }
-    }
-    // Removed top-level scopes as per requirement
-    
-    // Set statistics
-    formattedResponse.statistics.series_count = response.statistics.seriesCount;
-    formattedResponse.statistics.point_count = response.statistics.pointCount;
-    formattedResponse.statistics.execution_time_ms = response.statistics.executionTimeMs;
-    
-    return glz::write_json(formattedResponse).value_or("{}");
+    return ResponseFormatter::format(response);
 }
 
 std::string HttpQueryHandler::createErrorResponse(const std::string& code, const std::string& message) {
-    QueryErrorResponse response;
-    response.message = message;
-    response.error = message;  // Set error as string to match test expectations
-    
-    return glz::write_json(response).value_or("{}");
+    return ResponseFormatter::formatError(message);
 }
 
-std::vector<unsigned> HttpQueryHandler::determineTargetShards(const QueryRequest& request) {
-    // For now, query all shards
-    std::vector<unsigned> shards;
+// Test-only utility: production query path iterates shards inline in executeQuery().
+std::vector<unsigned> HttpQueryHandler::determineTargetShards(const QueryRequest& /*request*/) {
     unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0) {
-        shardCount = 1; // Default for test environment
-    }
-    for (unsigned i = 0; i < shardCount; ++i) {
-        shards.push_back(i);
-    }
+    if (shardCount == 0) shardCount = 1; // test environment default
+    std::vector<unsigned> shards(shardCount);
+    std::iota(shards.begin(), shards.end(), 0u);
     return shards;
 }
 
+// Test-only utility: flat concat. Production uses Aggregator::mergePartialAggregationsGrouped().
 std::vector<SeriesResult> HttpQueryHandler::mergeResults(std::vector<std::vector<SeriesResult>> shardResults) {
     std::vector<SeriesResult> merged;
     for (auto& shardResult : shardResults) {

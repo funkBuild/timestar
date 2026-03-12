@@ -3,7 +3,6 @@
 
 #include <vector>
 #include <cstdint>
-#include <iostream>
 #include <memory>
 #include <cstring>
 #include <stdexcept>
@@ -20,7 +19,7 @@ private:
   int bitOffset = 0;
 
   void boundsCheck(size_t wordIndex) const {
-    if (wordIndex >= length_) {
+    if (wordIndex >= length_) [[unlikely]] {
       throw std::runtime_error("CompressedSlice - attempted to read beyond buffer bounds");
     }
   }
@@ -77,7 +76,7 @@ public:
 
   template <typename T>
   T read(const int bits){
-    if(bitOffset > 63){
+    if(bitOffset > 63) [[unlikely]] {
       offset++;
       bitOffset = 0;
     }
@@ -91,14 +90,14 @@ public:
     uint64_t value = loadWord(offset) >> bitOffset;
     value &= mask;
 
-    if(leftover_bits > 0) {
+    if(leftover_bits > 0) [[unlikely]] {
       offset++;
       bitOffset = leftover_bits;
 
       boundsCheck(offset);
 
-      const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-      value |= (loadWord(offset) & mask) << bits_read;
+      const uint64_t mask2 = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
+      value |= (loadWord(offset) & mask2) << bits_read;
     } else {
       bitOffset += bits;
     }
@@ -108,7 +107,7 @@ public:
 
   template <typename T, int bits>
   T readFixed(){
-    if(bitOffset > 63){
+    if(bitOffset > 63) [[unlikely]] {
       offset++;
       bitOffset = 0;
     }
@@ -122,14 +121,14 @@ public:
     uint64_t value = loadWord(offset) >> bitOffset;
     value &= mask;
 
-    if(leftover_bits > 0) {
+    if(leftover_bits > 0) [[unlikely]] {
       offset++;
       bitOffset = leftover_bits;
 
       boundsCheck(offset);
 
-      const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-      value |= (loadWord(offset) & mask) << bits_read;
+      const uint64_t mask2 = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
+      value |= (loadWord(offset) & mask2) << bits_read;
     } else {
       bitOffset += bits;
     }
@@ -138,7 +137,7 @@ public:
   };
 
   bool readBit(){
-    if(bitOffset > 63){
+    if(bitOffset > 63) [[unlikely]] {
       offset++;
       bitOffset = 1;
 

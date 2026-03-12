@@ -1,6 +1,5 @@
 #include "simple16.hpp"
 #include "util.hpp"
-#include <iostream>
 #include <stdexcept>
 
 AlignedBuffer Simple16::encode(std::vector<uint64_t> &values){

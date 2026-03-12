@@ -8,6 +8,22 @@ CTestTestfile.cmake
 Makefile
 compile_commands.json
 
+# Compiled binaries (keep source .cpp files)
+bin/CMakeFiles/
+bin/cmake_install.cmake
+bin/CTestTestfile.cmake
+bin/Makefile
+bin/minimal_test
+bin/simple_benchmark
+bin/simple_http_server
+bin/tsdb
+bin/tsdb_benchmark
+bin/tsdb_http_server
+bin/tsdb_server
+test/benchmark/avx512_report
+test/benchmark/float_encoder_ultimate_benchmark
+test/benchmark/simd_encoder_test
+
 # Test outputs
 shard_*/
 test_*.log
@@ -19,7 +35,19 @@ test_*.log
 *.swp
 *.swo
 *~
+*.bak
 .DS_Store
+server.log
+server.pid
+server_output.log
+
+# Profiling artifacts
+perf.data
+perf.data.*
+*.svg
+out.perf
+out.folded
+FlameGraph/
 
 # IDE files
 .vscode/
@@ -35,6 +63,7 @@ __pycache__/
 .pytest_cache/
 
 # Dependencies
+node_modules/
 _deps/
 
 # Core dumps
@@ -53,5 +82,3 @@ core.*
 *.idx
 !/test/data/*.tsm
 !/test/data/*.wal
-
-test/http_api_tests/node_modules/

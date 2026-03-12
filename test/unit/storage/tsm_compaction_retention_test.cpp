@@ -106,8 +106,8 @@ public:
 
         std::map<uint64_t, double> out;
         for (const auto& blk : result.blocks) {
-            for (size_t i = 0; i < blk->timestamps->size(); i++) {
-                out[blk->timestamps->at(i)] = blk->values->at(i);
+            for (size_t i = 0; i < blk->timestamps.size(); i++) {
+                out[blk->timestamps.at(i)] = blk->values.at(i);
             }
         }
         co_return out;
@@ -556,7 +556,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, QueryAfterCompactionReturnsOnlyInRetenti
 
     size_t oldCount = 0;
     for (const auto& blk : oldResult.blocks) {
-        oldCount += blk->timestamps->size();
+        oldCount += blk->timestamps.size();
     }
     EXPECT_EQ(oldCount, 0u)
         << "Query for old data range should return 0 points, got " << oldCount;
@@ -567,7 +567,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, QueryAfterCompactionReturnsOnlyInRetenti
 
     size_t recentCount = 0;
     for (const auto& blk : recentResult.blocks) {
-        recentCount += blk->timestamps->size();
+        recentCount += blk->timestamps.size();
     }
     EXPECT_EQ(recentCount, 2u)
         << "Query for recent data range should return 2 points, got " << recentCount;

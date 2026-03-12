@@ -13,21 +13,20 @@
 namespace timestar {
 
 // Stateful sink that folds decoded (timestamp, value) pairs directly into
-// AggregationState(s), avoiding intermediate vector materialisation.
+// aggregated data, avoiding intermediate vector materialisation.
 //
 // Bucketed mode (interval > 0): values are folded into time-bucket states,
 // reducing N data points to M buckets.
-// Non-bucketed mode (interval == 0): per-timestamp AggregationStates are
-// stored directly, avoiding the TSMResult/QueryResult/SeriesResult pipeline
-// while preserving individual timestamps for downstream merge.
+// Non-bucketed mode (interval == 0): raw (timestamp, value) pairs are stored
+// as compact parallel vectors (16 bytes/point instead of 96 bytes/point with
+// AggregationState), deferring state construction to the merge phase.
 class BlockAggregator {
 public:
     // Maximum number of buckets to pre-allocate (guards against pathological inputs
     // such as a tiny interval over a very large time range).
     static constexpr size_t MAX_PREALLOCATED_BUCKETS = 100'000;
 
-    // Maximum number of per-timestamp states in non-bucketed mode.
-    // Each AggregationState is ~96 bytes, so 10M states ≈ ~1GB.
+    // Maximum number of per-timestamp entries in non-bucketed mode.
     static constexpr size_t MAX_UNBUCKETED_STATES = 10'000'000;
 
     BlockAggregator(uint64_t interval) : interval_(interval) {}
@@ -61,9 +60,7 @@ public:
                     " states; use an aggregationInterval to reduce cardinality");
             }
             timestamps_.push_back(timestamp);
-            AggregationState s;
-            s.addValue(value, timestamp);
-            states_.push_back(s);
+            rawValues_.push_back(value);
         } else {
             uint64_t bucket = (timestamp / interval_) * interval_;
             bucketStates_[bucket].addValue(value, timestamp);
@@ -81,14 +78,10 @@ public:
                     std::to_string(MAX_UNBUCKETED_STATES) +
                     " states; use an aggregationInterval to reduce cardinality");
             }
-            timestamps_.reserve(timestamps_.size() + timestamps.size());
-            states_.reserve(states_.size() + timestamps.size());
-            for (size_t i = 0; i < timestamps.size(); ++i) {
-                timestamps_.push_back(timestamps[i]);
-                AggregationState s;
-                s.addValue(values[i], timestamps[i]);
-                states_.push_back(s);
-            }
+            // Store raw (timestamp, value) pairs — 16 bytes/point vs 96 bytes
+            // with AggregationState. States are constructed lazily at merge time.
+            timestamps_.insert(timestamps_.end(), timestamps.begin(), timestamps.end());
+            rawValues_.insert(rawValues_.end(), values.begin(), values.end());
         } else {
             for (size_t i = 0; i < timestamps.size(); ++i) {
                 uint64_t bucket = (timestamps[i] / interval_) * interval_;
@@ -104,7 +97,7 @@ public:
 
     // Move out per-timestamp data (interval == 0).
     std::vector<uint64_t> takeTimestamps() { return std::move(timestamps_); }
-    std::vector<AggregationState> takeStates() { return std::move(states_); }
+    std::vector<double> takeValues() { return std::move(rawValues_); }
 
     // Sort per-timestamp data. Required after parallel_for_each on batches
     // because batch completion order is non-deterministic.
@@ -119,28 +112,28 @@ public:
             }
         }
         if (sorted) return;
-        // Index permutation sort to keep timestamps and states in sync
+        // Index permutation sort to keep timestamps and values in sync
         std::vector<size_t> indices(timestamps_.size());
         std::iota(indices.begin(), indices.end(), 0);
         std::sort(indices.begin(), indices.end(),
             [this](size_t a, size_t b) { return timestamps_[a] < timestamps_[b]; });
         std::vector<uint64_t> sortedTs(timestamps_.size());
-        std::vector<AggregationState> sortedSt(states_.size());
+        std::vector<double> sortedVals(rawValues_.size());
         for (size_t i = 0; i < indices.size(); ++i) {
             sortedTs[i] = timestamps_[indices[i]];
-            sortedSt[i] = std::move(states_[indices[i]]);
+            sortedVals[i] = rawValues_[indices[i]];
         }
         timestamps_ = std::move(sortedTs);
-        states_ = std::move(sortedSt);
+        rawValues_ = std::move(sortedVals);
     }
 
 private:
     uint64_t interval_;
     // Bucketed mode
     std::unordered_map<uint64_t, AggregationState> bucketStates_;
-    // Non-bucketed mode
+    // Non-bucketed mode: compact raw storage (16 bytes/point)
     std::vector<uint64_t> timestamps_;
-    std::vector<AggregationState> states_;
+    std::vector<double> rawValues_;
     size_t pointCount_ = 0;
 };
 
@@ -149,9 +142,9 @@ private:
 struct PushdownResult {
     // For bucketed (interval > 0):
     std::unordered_map<uint64_t, AggregationState> bucketStates;
-    // For non-bucketed (interval == 0):
+    // For non-bucketed (interval == 0) — raw values (16 bytes/point):
     std::vector<uint64_t> sortedTimestamps;
-    std::vector<AggregationState> sortedStates;
+    std::vector<double> sortedValues;
     size_t totalPoints = 0;
 };
 

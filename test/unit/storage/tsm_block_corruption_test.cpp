@@ -300,10 +300,10 @@ seastar::future<> testReadSingleBlockFloatHappyPath(std::string filename) {
 
     EXPECT_NE(block, nullptr);
     if (block) {
-        EXPECT_EQ(block->timestamps->size(), 3u);
-        EXPECT_EQ(block->values->size(), 3u);
-        EXPECT_DOUBLE_EQ((*block->values)[0], 1.1);
-        EXPECT_DOUBLE_EQ((*block->values)[2], 3.3);
+        EXPECT_EQ(block->timestamps.size(), 3u);
+        EXPECT_EQ(block->values.size(), 3u);
+        EXPECT_DOUBLE_EQ(block->values[0], 1.1);
+        EXPECT_DOUBLE_EQ(block->values[2], 3.3);
     }
 
     co_await tsm.close();
@@ -340,9 +340,9 @@ seastar::future<> testReadSingleBlockStringHappyPath(std::string filename) {
 
     EXPECT_NE(block, nullptr);
     if (block) {
-        EXPECT_EQ(block->timestamps->size(), 3u);
-        EXPECT_EQ((*block->values)[0], "alpha");
-        EXPECT_EQ((*block->values)[2], "gamma");
+        EXPECT_EQ(block->timestamps.size(), 3u);
+        EXPECT_EQ(block->values[0], "alpha");
+        EXPECT_EQ(block->values[2], "gamma");
     }
 
     co_await tsm.close();
@@ -663,7 +663,7 @@ seastar::future<> testReadSingleBlockTimeRangeExcludesAll(std::string filename) 
     // itself returns the (empty) block — callers decide whether to discard it.
     EXPECT_NE(block, nullptr);
     if (block) {
-        EXPECT_EQ(block->timestamps->size(), 0u)
+        EXPECT_EQ(block->timestamps.size(), 0u)
             << "Expected zero timestamps after time-range exclusion";
     }
 
@@ -759,12 +759,12 @@ seastar::future<> testReadSingleBlockBoolHappyPath(std::string filename) {
 
     EXPECT_NE(block, nullptr);
     if (block) {
-        EXPECT_EQ(block->timestamps->size(), 4u);
-        EXPECT_EQ(block->values->size(), 4u);
-        EXPECT_EQ((*block->values)[0], true);
-        EXPECT_EQ((*block->values)[1], false);
-        EXPECT_EQ((*block->values)[2], true);
-        EXPECT_EQ((*block->values)[3], true);
+        EXPECT_EQ(block->timestamps.size(), 4u);
+        EXPECT_EQ(block->values.size(), 4u);
+        EXPECT_EQ(block->values[0], true);
+        EXPECT_EQ(block->values[1], false);
+        EXPECT_EQ(block->values[2], true);
+        EXPECT_EQ(block->values[3], true);
     }
 
     co_await tsm.close();
@@ -801,11 +801,11 @@ seastar::future<> testReadSingleBlockIntegerHappyPath(std::string filename) {
 
     EXPECT_NE(block, nullptr);
     if (block) {
-        EXPECT_EQ(block->timestamps->size(), 3u);
-        EXPECT_EQ(block->values->size(), 3u);
-        EXPECT_EQ((*block->values)[0], -10);
-        EXPECT_EQ((*block->values)[1], 0);
-        EXPECT_EQ((*block->values)[2], 42);
+        EXPECT_EQ(block->timestamps.size(), 3u);
+        EXPECT_EQ(block->values.size(), 3u);
+        EXPECT_EQ(block->values[0], -10);
+        EXPECT_EQ(block->values[1], 0);
+        EXPECT_EQ(block->values[2], 42);
     }
 
     co_await tsm.close();

@@ -25,7 +25,7 @@ seastar::future<> WALFileManager::init(Engine &engine,
   tsmFileManager = &_tsmFileManager;
 
   // Search for existing WAL's
-  std::string path = engine.basePath() + '/'; // TODO: Get WAL path from config
+  std::string path = engine.basePath() + '/';
   timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path,
                       shardId);
 

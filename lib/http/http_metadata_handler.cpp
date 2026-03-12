@@ -1,6 +1,7 @@
 #include "http_metadata_handler.hpp"
 #include <glaze/glaze.hpp>
 #include <seastar/core/smp.hh>
+#include <seastar/core/when_all.hh>
 #include <unordered_map>
 #include <algorithm>
 #include <optional>
@@ -224,20 +225,26 @@ HttpMetadataHandler::handleTags(std::unique_ptr<seastar::http::request> req) {
         // Metadata is centralized on shard 0, so query only shard 0
         std::unordered_map<std::string, std::set<std::string>> allTagsResults = co_await engineSharded->invoke_on(0, [measurement, specificTag](Engine& engine) -> seastar::future<std::unordered_map<std::string, std::set<std::string>>> {
             std::unordered_map<std::string, std::set<std::string>> tagsResults;
-            
+
             if (specificTag.empty()) {
-                // Get all tags for measurement
+                // Get all tags for measurement, then fetch values in parallel
                 auto tagKeys = co_await engine.getMeasurementTags(measurement);
-                for (const auto& tagKey : tagKeys) {
-                    auto tagValues = co_await engine.getTagValues(measurement, tagKey);
-                    tagsResults[tagKey] = tagValues;
+                std::vector<seastar::future<std::set<std::string>>> futures;
+                futures.reserve(tagKeys.size());
+                std::vector<std::string> keyVec(tagKeys.begin(), tagKeys.end());
+                for (const auto& tagKey : keyVec) {
+                    futures.push_back(engine.getTagValues(measurement, tagKey));
+                }
+                auto allValues = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+                for (size_t i = 0; i < keyVec.size(); ++i) {
+                    tagsResults[keyVec[i]] = std::move(allValues[i]);
                 }
             } else {
                 // Get values for specific tag
                 auto tagValues = co_await engine.getTagValues(measurement, specificTag);
                 tagsResults[specificTag] = tagValues;
             }
-            
+
             co_return tagsResults;
         });
         

@@ -223,6 +223,11 @@ private:
     seastar::future<WriteResult> processMultiWritePoint(
         MultiWritePoint& point);
 
+    // Build a MultiWritePoint from a FastDoubleWritePoint (fast-path, all fields are doubles).
+    // Returns true on success, false on validation failure.
+    static bool buildMWPFromFastPath(struct FastDoubleWritePoint& fwp, uint64_t defaultTimestampNs,
+                                      MultiWritePoint& mwp);
+
     // Validate that all field arrays have the same length as timestamps
     bool validateArraySizes(const MultiWritePoint& point, std::string& error);
     

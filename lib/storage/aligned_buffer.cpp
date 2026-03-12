@@ -1,7 +1,6 @@
 #include "aligned_buffer.hpp"
 
 #include <cstring>
-#include <iostream>
 #include <fstream>
 #include <algorithm>
 

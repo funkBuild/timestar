@@ -25,6 +25,7 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/thread.hh>
 
 TSMWriter::TSMWriter(std::string _filename){
   filename = _filename;
@@ -39,8 +40,8 @@ void TSMWriter::writeHeader(){
 
 template <class T>
 void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values){
-  // serializes a single series into one or more blocks. After each block, append an index entry
-  // TODO: What's the optimum block size??
+  // serializes a single series into one or more blocks. After each block, append an index entry.
+  // Block size is config-driven via storage.max_points_per_block (default 1000).
   TSMIndexEntry indexEntry;
   indexEntry.seriesId = seriesId;
   indexEntry.seriesType = seriesType;
@@ -51,20 +52,35 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId
   while(offset < timestamps.size()){
     const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock()));
     size_t blockSize = end - offset;
-    
+
     if (blockCount == 0) {
       LOG_INSERT_PATH(timestar::tsm_log, debug, "Creating blocks for series '{}' ({} total points, up to {} per block)",
                       seriesId.toHex(), timestamps.size(), MaxPointsPerBlock());
     }
 
-    //TODO: Avoid the copy here
-    LOG_INSERT_PATH(timestar::tsm_log, trace, "Allocating vectors for block {} ({} points)", blockCount, blockSize);
-    std::vector<uint64_t> blockTimestamps(timestamps.begin() + offset, timestamps.begin() + end);
-    std::vector<T> blockValues(values.begin() + offset, values.begin() + end);
+    LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing block {} ({} points)", blockCount, blockSize);
     blockCount++;
 
-    // TODO: Implement bool encoded
-    writeBlock(seriesType, seriesId, blockTimestamps, blockValues, indexEntry);
+    // Zero-copy: pass span sub-ranges directly to writeBlock, avoiding
+    // two vector copies per block (timestamps + values).
+    // vector<bool> is a bitset without .data(), so bool inlines its encoding.
+    if constexpr (std::is_same_v<T, bool>) {
+      // Bool path: vector<bool> can't create span, so encode inline
+      std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
+      std::vector<bool> blockValues(values.begin() + offset, values.begin() + end);
+      size_t blockStartOffset = buffer.size();
+      AlignedBuffer encodedTimestamps = IntegerEncoder::encode(tsSpan);
+      buffer.write((uint8_t)seriesType);
+      buffer.write((uint32_t)blockSize);
+      buffer.write((uint32_t)encodedTimestamps.size());
+      buffer.write(encodedTimestamps);
+      BoolEncoderRLE::encodeInto(blockValues, buffer);
+      writeIndexBlock(tsSpan, indexEntry, blockStartOffset);
+    } else {
+      std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
+      std::span<const T> valSpan(values.data() + offset, blockSize);
+      writeBlock(seriesType, seriesId, tsSpan, valSpan, indexEntry);
+    }
 
     offset += MaxPointsPerBlock();
   }
@@ -74,7 +90,7 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128 &seriesId
 }
 
 template <class T>
-void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId, const std::vector<uint64_t> &timestamps, const std::vector<T> &values, TSMIndexEntry &indexEntry){
+void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId, std::span<const uint64_t> timestamps, std::span<const T> values, TSMIndexEntry &indexEntry){
   size_t blockStartOffset = buffer.size();
   AlignedBuffer encodedTimestamps = IntegerEncoder::encode(timestamps);
 
@@ -88,13 +104,19 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128 &seriesId,
     CompressedBuffer encodedFloats = FloatEncoder::encode(values);
     buffer.write(encodedFloats);
   } else if constexpr (std::is_same_v<T, bool>) {
-    BoolEncoderRLE::encodeInto(values, buffer);
+    // vector<bool> path: caller passes spans constructed from a temporary vector<bool>
+    // BoolEncoderRLE needs a vector, so reconstruct one from the span
+    std::vector<bool> boolVec(values.begin(), values.end());
+    BoolEncoderRLE::encodeInto(boolVec, buffer);
   } else if constexpr (std::is_same_v<T, std::string>) {
     AlignedBuffer encodedStrings = StringEncoder::encode(values);
     buffer.write(encodedStrings);
   } else if constexpr (std::is_same_v<T, int64_t>) {
-    auto zigzagged = ZigZag::zigzagEncodeVector(values);
-    AlignedBuffer encodedIntegers = IntegerEncoder::encode(zigzagged);
+    // Use thread-local scratch buffer to avoid per-block heap allocation
+    static thread_local std::vector<uint64_t> zigzagScratch;
+    zigzagScratch.resize(values.size());
+    ZigZag::zigzagEncodeInto(values, zigzagScratch.data());
+    AlignedBuffer encodedIntegers = IntegerEncoder::encode(zigzagScratch);
     buffer.write(encodedIntegers);
   } else {
     static_assert(sizeof(T) == 0, "Unsupported TSM value type");
@@ -158,8 +180,10 @@ void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128 &ser
     AlignedBuffer encodedStrings = StringEncoder::encode(values);
     buffer.write(encodedStrings);
   } else if constexpr (std::is_same_v<T, int64_t>) {
-    auto zigzagged = ZigZag::zigzagEncodeVector(values);
-    AlignedBuffer encodedIntegers = IntegerEncoder::encode(zigzagged);
+    static thread_local std::vector<uint64_t> zigzagScratch;
+    zigzagScratch.resize(values.size());
+    ZigZag::zigzagEncodeInto(values, zigzagScratch.data());
+    AlignedBuffer encodedIntegers = IntegerEncoder::encode(zigzagScratch);
     buffer.write(encodedIntegers);
   } else {
     static_assert(sizeof(T) == 0, "Unsupported TSM value type");
@@ -169,11 +193,11 @@ void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128 &ser
   writeIndexBlock(timestamps, indexEntry, blockStartOffset);
 }
 
-void TSMWriter::writeIndexBlock(const std::vector<uint64_t> &timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset){
+void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEntry &indexEntry, size_t blockStartOffset){
   if (timestamps.empty()) {
     return;  // No data to index
   }
-  const auto [minTime, maxTime] = std::minmax_element(begin(timestamps), end(timestamps));
+  const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
   size_t blockSize = buffer.size() - blockStartOffset;
 
   if (blockSize > std::numeric_limits<uint32_t>::max()) {
@@ -420,7 +444,18 @@ seastar::future<> TSMWriter::closeDMA(){
   }
 
   // Ensure the directory entry for this new file is durable.
-  fsyncParentDir(filename);
+  // Use Seastar's async file API instead of blocking ::open()+::fsync() on the reactor.
+  {
+    auto slash = filename.rfind('/');
+    std::string dir = (slash != std::string::npos) ? filename.substr(0, slash) : ".";
+    try {
+      auto dirFile = co_await seastar::open_directory(dir);
+      co_await dirFile.flush();
+      co_await dirFile.close();
+    } catch (...) {
+      // best-effort directory sync — non-fatal
+    }
+  }
 
   LOG_INSERT_PATH(timestar::tsm_log, debug, "DMA file written successfully: {}", filename);
 }
@@ -483,6 +518,11 @@ void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStor
       timestar::tsm_log.error("ERROR processing series '{}': {}", seriesKey.toHex(), e.what());
       throw;
     }
+
+    // Yield after each series to prevent reactor stalls during background
+    // TSM conversion. sort() + writeSeries() with ALP encoding can take
+    // 50-150ms per series, which exceeds the reactor's stall threshold.
+    seastar::thread::maybe_yield();
   }
 }
 
@@ -504,11 +544,16 @@ seastar::future<> TSMWriter::runAsync(seastar::shared_ptr<MemoryStore> store, st
   LOG_INSERT_PATH(timestar::tsm_log, info, "Starting async TSM write to file: {}, memory store has {} series",
                   filename, store.get()->series.size());
 
+  // Run the CPU-bound sort + encode work in a Seastar thread (off the reactor)
+  // to avoid multi-hundred-ms reactor stalls. seastar::async() uses a Seastar-
+  // managed thread that can block without stalling the reactor. The resulting
+  // TSMWriter buffer is then written to disk via async DMA I/O on the reactor.
   TSMWriter writer(filename);
-  writeAllSeries(writer, store);
+  co_await seastar::async([&writer, &store] {
+    writeAllSeries(writer, store);
+    writer.writeIndex();
+  });
 
-  LOG_INSERT_PATH(timestar::tsm_log, debug, "Writing index...");
-  writer.writeIndex();
   LOG_INSERT_PATH(timestar::tsm_log, debug, "Closing file via DMA...");
   co_await writer.closeDMA();
   LOG_INSERT_PATH(timestar::tsm_log, info, "Async TSM write complete: {}", filename);

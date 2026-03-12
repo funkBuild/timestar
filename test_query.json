@@ -1,5 +1,0 @@
-{
-  "query": "avg:server.metrics(cpu_usage){host:host-01}",
-  "startTime": 0,
-  "endTime": 9999999999999999999
-}

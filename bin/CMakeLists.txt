@@ -10,6 +10,10 @@ target_link_libraries(timestar_benchmark libtimestar)
 add_executable(timestar_insert_bench timestar_insert_bench.cpp)
 target_link_libraries(timestar_insert_bench libtimestar)
 
+# HTTP query benchmark (Seastar HTTP client, comprehensive query profiling)
+add_executable(timestar_query_bench timestar_query_bench.cpp)
+target_link_libraries(timestar_query_bench libtimestar)
+
 # Expression function benchmark (Google Benchmark, no Seastar)
 add_executable(expression_benchmark expression_benchmark.cpp)
 target_link_libraries(expression_benchmark libtimestar benchmark::benchmark)

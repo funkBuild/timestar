@@ -2,6 +2,7 @@
 #define ZIGZAG_H_INCLUDED
 
 #include <vector>
+#include <span>
 #include <cstdint>
 #include <algorithm>
 
@@ -12,7 +13,7 @@ private:
 public:
   ZigZag(){};
 
-  static std::vector<uint64_t> zigzagEncodeVector( const std::vector<int64_t> &input )
+  static std::vector<uint64_t> zigzagEncodeVector( std::span<const int64_t> input )
   {
     std::vector<uint64_t> output;
     output.resize(input.size());
@@ -20,6 +21,11 @@ public:
     std::transform(input.begin(), input.end(), output.begin(), [](int64_t x) { return zigzagEncode(x); });
 
     return output;
+  }
+
+  static std::vector<uint64_t> zigzagEncodeVector( const std::vector<int64_t> &input )
+  {
+    return zigzagEncodeVector(std::span<const int64_t>(input));
   }
 
   static std::vector<int64_t> zigzagDecodeVector( const std::vector<uint64_t> &input )
@@ -40,6 +46,15 @@ public:
   static inline int64_t zigzagDecode( uint64_t y )
   {
     return ( int64_t ) ( ( y >> 1 ) ^ -( y & 0x1 ) );
+  }
+
+  // Encode int64 values as zigzag uint64 in-place into a pre-allocated buffer.
+  // Avoids the heap allocation of zigzagEncodeVector().
+  static void zigzagEncodeInto( std::span<const int64_t> input, uint64_t* output )
+  {
+    for (size_t i = 0; i < input.size(); ++i) {
+      output[i] = zigzagEncode(input[i]);
+    }
   }
 };
 

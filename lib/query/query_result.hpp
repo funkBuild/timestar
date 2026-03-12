@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <iostream>
 #include <memory>
 #include <queue>
 #include <stdint.h>
@@ -12,18 +11,14 @@
 
 #include "tsm_result.hpp"
 #include "util.hpp"
-#include <chrono>
-
-
-typedef std::chrono::high_resolution_clock Clock;
 
 template <class T> class QueryResult {
 private:
   struct TSMIterationState {
-    int tsmResultIndex;
+    size_t tsmResultIndex;
     TSMBlock<T> *block;
-    int blockIdx;
-    int blockOffset;
+    size_t blockIdx;
+    size_t blockOffset;
     size_t blockSize;
     uint64_t currentTimestamp;
     uint64_t rank;
@@ -56,20 +51,7 @@ public:
 
   static QueryResult fromTsmResults(std::vector<TSMResult<T>> &tsmResults) {
     QueryResult<T> results;
-
-    auto start_time = Clock::now();
     results.mergeTsmResults(tsmResults);
-
-    auto end_time = Clock::now();
-
-    uint64_t time_diff = std::chrono::duration_cast<std::chrono::microseconds>(
-                             end_time - start_time)
-                             .count();
-
-    // Debug output - consider using logger if needed
-    // std::cout << "Merge time: " << time_diff / 1000.0 << " milliseconds"
-    //           << std::endl;
-
     return results;
   }
 
@@ -81,7 +63,7 @@ public:
     while (state.block != nullptr && state.currentTimestamp <= targetTimestamp) {
       state.blockOffset++;
 
-      if (static_cast<size_t>(state.blockOffset) >= state.blockSize) {
+      if (state.blockOffset >= state.blockSize) {
         state.blockIdx++;
         state.blockOffset = 0;
         state.block =
@@ -108,11 +90,11 @@ public:
       if (block == nullptr)
         break;
       timestamps.insert(timestamps.end(),
-                        block->timestamps->begin(),
-                        block->timestamps->end());
+                        block->timestamps.begin(),
+                        block->timestamps.end());
       values.insert(values.end(),
-                    block->values->begin(),
-                    block->values->end());
+                    block->values.begin(),
+                    block->values.end());
     }
   }
 

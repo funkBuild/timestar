@@ -193,26 +193,25 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(
     }
 
     auto filteredBlock = std::make_unique<TSMBlock<T>>(totalPoints);
-    auto& outTimestamps = *filteredBlock->timestamps;
-    auto& outValues = *filteredBlock->values;
+    auto& outTimestamps = filteredBlock->timestamps;
+    auto& outValues = filteredBlock->values;
 
     size_t tombstonedCount = 0;
+    // Two-pointer sweep: since both timestamps and tombstone ranges are sorted,
+    // we advance a range index linearly instead of binary searching per point.
+    // This is O(N + T) instead of O(N * log T).
+    size_t ri = 0;
+    const size_t numRanges = ranges.size();
     for (auto& block : result.blocks) {
-        const auto& ts = *block->timestamps;
-        auto& vals = *block->values;
+        const auto& ts = block->timestamps;
+        auto& vals = block->values;
         for (size_t i = 0; i < ts.size(); ++i) {
             uint64_t t = ts[i];
-            // Binary search for applicable tombstone range
-            // ranges is sorted by startTime; find the last range whose startTime <= t
-            auto rangeIt = std::upper_bound(ranges.begin(), ranges.end(),
-                std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-            bool isTombstoned = false;
-            if (rangeIt != ranges.begin()) {
-                --rangeIt;
-                if (t >= rangeIt->first && t <= rangeIt->second) {
-                    isTombstoned = true;
-                }
+            // Advance range pointer past ranges that end before this timestamp
+            while (ri < numRanges && ranges[ri].second < t) {
+                ++ri;
             }
+            bool isTombstoned = (ri < numRanges && t >= ranges[ri].first && t <= ranges[ri].second);
             if (!isTombstoned) {
                 outTimestamps.push_back(t);
                 if constexpr (std::is_same_v<T, bool>) {

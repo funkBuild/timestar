@@ -174,7 +174,14 @@ static std::string escapeKeyComponent(const std::string& s) {
 std::string LevelDBIndex::encodeSeriesKey(const std::string& measurement,
                                          const std::map<std::string, std::string>& tags,
                                          const std::string& field) {
+    // Pre-estimate total size to avoid repeated reallocations.
+    size_t estimatedSize = 1 + measurement.size() + field.size() + 1;
+    for (const auto& [k, v] : tags) {
+        estimatedSize += 1 + k.size() + 1 + v.size();
+    }
+
     std::string key;
+    key.reserve(estimatedSize + estimatedSize / 4);
     key.push_back(static_cast<char>(SERIES_INDEX));
 
     // measurement,tag1=value1,tag2=value2 field
@@ -183,15 +190,20 @@ std::string LevelDBIndex::encodeSeriesKey(const std::string& measurement,
 
     // Tags are from std::map, already sorted by key
     for (const auto& tag : tags) {
-        key += "," + escapeKeyComponent(tag.first) + "=" + escapeKeyComponent(tag.second);
+        key += ',';
+        key += escapeKeyComponent(tag.first);
+        key += '=';
+        key += escapeKeyComponent(tag.second);
     }
 
-    key += " " + escapeKeyComponent(field);
+    key += ' ';
+    key += escapeKeyComponent(field);
     return key;
 }
 
 std::string LevelDBIndex::encodeMeasurementFieldsKey(const std::string& measurement) {
     std::string key;
+    key.reserve(1 + measurement.size());
     key.push_back(static_cast<char>(MEASUREMENT_FIELDS));
     key += measurement;
     return key;
@@ -199,6 +211,7 @@ std::string LevelDBIndex::encodeMeasurementFieldsKey(const std::string& measurem
 
 std::string LevelDBIndex::encodeMeasurementTagsKey(const std::string& measurement) {
     std::string key;
+    key.reserve(1 + measurement.size());
     key.push_back(static_cast<char>(MEASUREMENT_TAGS));
     key += measurement;
     return key;
@@ -212,8 +225,11 @@ std::string LevelDBIndex::encodeTagValuesKey(const std::string& measurement, con
             "Measurement or tag key contains null byte, which is not allowed");
     }
     std::string key;
+    key.reserve(1 + measurement.size() + 1 + tagKey.size());
     key.push_back(static_cast<char>(TAG_VALUES));
-    key += measurement + "\x00" + tagKey; // Use null separator
+    key += measurement;
+    key.push_back('\0');
+    key += tagKey;
     return key;
 }
 
@@ -270,8 +286,9 @@ SeriesId128 LevelDBIndex::decodeSeriesId(const char* data, size_t len) {
 
 std::string LevelDBIndex::encodeSeriesMetadataKey(const SeriesId128& seriesId) {
     std::string key;
+    key.reserve(1 + 16);
     key.push_back(static_cast<char>(SERIES_METADATA));
-    key += encodeSeriesId(seriesId);
+    seriesId.appendTo(key);
     return key;
 }
 
@@ -291,7 +308,7 @@ std::string LevelDBIndex::encodeMeasurementSeriesKey(const std::string& measurem
     key.push_back(static_cast<char>(MEASUREMENT_SERIES));
     key += measurement;
     key.push_back('\0');
-    key += encodeSeriesId(seriesId);
+    seriesId.appendTo(key);
     return key;
 }
 
@@ -552,32 +569,29 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     // MEASUREMENT_SERIES index entry for fast measurement -> series lookup
     batch.Put(encodeMeasurementSeriesKey(measurement, seriesId), "");
 
-    // TAG_INDEX and GROUP_BY_INDEX entries for efficient tag-based queries
+    // TAG_INDEX and GROUP_BY_INDEX entries for efficient tag-based queries.
+    // Build one key and reuse it for GROUP_BY_INDEX by mutating the prefix byte,
+    // avoiding a second near-identical string allocation per tag.
+    std::string encodedSeriesId = encodeSeriesId(seriesId);
     for (const auto& tag : tags) {
         const std::string& tagKey = tag.first;
         const std::string& tagValue = tag.second;
 
-        std::string tagIndexKey;
-        tagIndexKey.push_back(TAG_INDEX);
-        tagIndexKey.append(measurement);
-        tagIndexKey.push_back('\0');
-        tagIndexKey.append(tagKey);
-        tagIndexKey.push_back('\0');
-        tagIndexKey.append(tagValue);
-        tagIndexKey.push_back('\0');
-        tagIndexKey.append(encodeSeriesId(seriesId));
-        batch.Put(tagIndexKey, encodeSeriesId(seriesId));
+        std::string indexKey;
+        indexKey.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size() + 1 + 16);
+        indexKey.push_back(TAG_INDEX);
+        indexKey.append(measurement);
+        indexKey.push_back('\0');
+        indexKey.append(tagKey);
+        indexKey.push_back('\0');
+        indexKey.append(tagValue);
+        indexKey.push_back('\0');
+        indexKey.append(encodedSeriesId);
+        batch.Put(indexKey, encodedSeriesId);
 
-        std::string groupByKey;
-        groupByKey.push_back(GROUP_BY_INDEX);
-        groupByKey.append(measurement);
-        groupByKey.push_back('\0');
-        groupByKey.append(tagKey);
-        groupByKey.push_back('\0');
-        groupByKey.append(tagValue);
-        groupByKey.push_back('\0');
-        groupByKey.append(encodeSeriesId(seriesId));
-        batch.Put(groupByKey, encodeSeriesId(seriesId));
+        // Reuse the same key for GROUP_BY_INDEX: only the prefix byte differs
+        indexKey[0] = GROUP_BY_INDEX;
+        batch.Put(indexKey, encodedSeriesId);
 
         // TAG_VALUES: merge the new value into the (now-populated) cache and
         // include the updated set in the batch.
@@ -966,7 +980,10 @@ seastar::future<std::set<std::string>> LevelDBIndex::getAllMeasurements() {
     auto measurements = co_await seastar::async([this] {
         std::set<std::string> result;
 
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        // Use fill_cache=false for scans to avoid polluting the block cache
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
 
         // Seek to start of MEASUREMENT_FIELDS keys
         std::string startKey;
@@ -1268,29 +1285,25 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
             msIt->second.push_back(p.seriesId);
         }
 
-        // TAG_INDEX and GROUP_BY_INDEX entries
+        // TAG_INDEX and GROUP_BY_INDEX entries.
+        // Encode series ID once; build one key and reuse for GROUP_BY by mutating prefix byte.
+        std::string encodedId = encodeSeriesId(p.seriesId);
         for (const auto& [tagKey, tagValue] : op.tags) {
-            std::string tagIndexKey;
-            tagIndexKey.push_back(TAG_INDEX);
-            tagIndexKey.append(op.measurement);
-            tagIndexKey.push_back('\0');
-            tagIndexKey.append(tagKey);
-            tagIndexKey.push_back('\0');
-            tagIndexKey.append(tagValue);
-            tagIndexKey.push_back('\0');
-            tagIndexKey.append(encodeSeriesId(p.seriesId));
-            batch.Put(tagIndexKey, encodeSeriesId(p.seriesId));
+            std::string indexKey;
+            indexKey.reserve(1 + op.measurement.size() + 1 + tagKey.size() + 1 + tagValue.size() + 1 + 16);
+            indexKey.push_back(TAG_INDEX);
+            indexKey.append(op.measurement);
+            indexKey.push_back('\0');
+            indexKey.append(tagKey);
+            indexKey.push_back('\0');
+            indexKey.append(tagValue);
+            indexKey.push_back('\0');
+            indexKey.append(encodedId);
+            batch.Put(indexKey, encodedId);
 
-            std::string groupByKey;
-            groupByKey.push_back(GROUP_BY_INDEX);
-            groupByKey.append(op.measurement);
-            groupByKey.push_back('\0');
-            groupByKey.append(tagKey);
-            groupByKey.push_back('\0');
-            groupByKey.append(tagValue);
-            groupByKey.push_back('\0');
-            groupByKey.append(encodeSeriesId(p.seriesId));
-            batch.Put(groupByKey, encodeSeriesId(p.seriesId));
+            // Reuse the same key for GROUP_BY_INDEX: only the prefix byte differs
+            indexKey[0] = GROUP_BY_INDEX;
+            batch.Put(indexKey, encodedId);
         }
 
         // Add to series cache with incremental eviction
@@ -1305,39 +1318,100 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
     // Phase 4a: Pre-load all cache misses BEFORE the mutation loop to avoid
     // co_await inside the loop (which would allow concurrent coroutines to
     // interleave and create inconsistent batch state).
+    // All LevelDB reads are batched into a single seastar::async block to reduce
+    // N co_awaits (N = number of unique measurements + tag keys with cache misses)
+    // down to at most 1 co_await.
     {
-        std::unordered_set<std::string> measurementsNeedingFieldLoad;
-        std::unordered_set<std::string> measurementsNeedingTagLoad;
-        std::unordered_set<std::string> tvCacheKeysNeedingLoad;
+        std::vector<std::string> measurementsNeedingFieldLoad;
+        std::vector<std::string> measurementsNeedingTagLoad;
+        // tvCacheKey -> (measurement, tagKey) for tag values that need loading
+        std::vector<std::pair<std::string, std::pair<std::string, std::string>>> tvLoads;
+
+        // Use sets to deduplicate (multiple ops may share the same measurement)
+        std::unordered_set<std::string> fieldLoadSeen, tagLoadSeen, tvLoadSeen;
+
         for (const auto& op : ops) {
-            if (fieldsCache.find(op.measurement) == fieldsCache.end()) {
-                measurementsNeedingFieldLoad.insert(op.measurement);
+            if (fieldsCache.find(op.measurement) == fieldsCache.end() &&
+                fieldLoadSeen.insert(op.measurement).second) {
+                measurementsNeedingFieldLoad.push_back(op.measurement);
             }
-            if (tagsCache.find(op.measurement) == tagsCache.end()) {
-                measurementsNeedingTagLoad.insert(op.measurement);
+            if (tagsCache.find(op.measurement) == tagsCache.end() &&
+                tagLoadSeen.insert(op.measurement).second) {
+                measurementsNeedingTagLoad.push_back(op.measurement);
             }
             for (const auto& [tagKey, tagValue] : op.tags) {
-                std::string tvCacheKey = op.measurement + std::string(1, '\0') + tagKey;
-                if (tagValuesCache.find(tvCacheKey) == tagValuesCache.end()) {
-                    tvCacheKeysNeedingLoad.insert(tvCacheKey);
+                std::string tvCacheKey;
+                tvCacheKey.reserve(op.measurement.size() + 1 + tagKey.size());
+                tvCacheKey.append(op.measurement);
+                tvCacheKey.push_back('\0');
+                tvCacheKey.append(tagKey);
+                if (tagValuesCache.find(tvCacheKey) == tagValuesCache.end() &&
+                    tvLoadSeen.insert(tvCacheKey).second) {
+                    tvLoads.emplace_back(std::move(tvCacheKey),
+                                         std::make_pair(op.measurement, tagKey));
                 }
             }
         }
-        // Load all misses (each co_await happens before the mutation loop)
-        for (const auto& m : measurementsNeedingFieldLoad) {
-            auto fields = co_await getFields(m);
-            fieldsCache[m].insert(fields.begin(), fields.end());
-        }
-        for (const auto& m : measurementsNeedingTagLoad) {
-            auto tags = co_await getTags(m);
-            tagsCache[m].insert(tags.begin(), tags.end());
-        }
-        for (const auto& tvCacheKey : tvCacheKeysNeedingLoad) {
-            auto nullPos = tvCacheKey.find('\0');
-            std::string m = tvCacheKey.substr(0, nullPos);
-            std::string tk = tvCacheKey.substr(nullPos + 1);
-            auto vals = co_await getTagValues(m, tk);
-            tagValuesCache[tvCacheKey].insert(vals.begin(), vals.end());
+
+        if (!measurementsNeedingFieldLoad.empty() ||
+            !measurementsNeedingTagLoad.empty() ||
+            !tvLoads.empty()) {
+            // Single seastar::async block for all LevelDB reads
+            struct BatchLoadResults {
+                std::vector<std::pair<std::string, std::set<std::string>>> fields;
+                std::vector<std::pair<std::string, std::set<std::string>>> tagKeys;
+                std::vector<std::pair<std::string, std::set<std::string>>> tagValues;
+            };
+
+            auto loaded = co_await seastar::async(
+                [this, &measurementsNeedingFieldLoad, &measurementsNeedingTagLoad, &tvLoads] {
+                    BatchLoadResults result;
+                    leveldb::ReadOptions readOpts;
+
+                    for (const auto& m : measurementsNeedingFieldLoad) {
+                        std::string key = encodeMeasurementFieldsKey(m);
+                        std::string val;
+                        std::set<std::string> decoded;
+                        if (db->Get(readOpts, key, &val).ok()) {
+                            decoded = decodeStringSet(val);
+                        }
+                        result.fields.emplace_back(m, std::move(decoded));
+                    }
+
+                    for (const auto& m : measurementsNeedingTagLoad) {
+                        std::string key = encodeMeasurementTagsKey(m);
+                        std::string val;
+                        std::set<std::string> decoded;
+                        if (db->Get(readOpts, key, &val).ok()) {
+                            decoded = decodeStringSet(val);
+                        }
+                        result.tagKeys.emplace_back(m, std::move(decoded));
+                    }
+
+                    for (const auto& [tvCacheKey, measTag] : tvLoads) {
+                        const auto& [m, tk] = measTag;
+                        std::string key = encodeTagValuesKey(m, tk);
+                        std::string val;
+                        std::set<std::string> decoded;
+                        if (db->Get(readOpts, key, &val).ok()) {
+                            decoded = decodeStringSet(val);
+                        }
+                        result.tagValues.emplace_back(tvCacheKey, std::move(decoded));
+                    }
+
+                    return result;
+                });
+
+            // Merge loaded data into caches (back on reactor thread)
+            for (auto& [m, fields] : loaded.fields) {
+                fieldsCache[m].insert(fields.begin(), fields.end());
+            }
+            for (auto& [m, tagKeys] : loaded.tagKeys) {
+                tagsCache[m].insert(tagKeys.begin(), tagKeys.end());
+            }
+            for (auto& [tvCacheKey, values] : loaded.tagValues) {
+                tagValuesCache[tvCacheKey].insert(values.begin(), values.end());
+            }
         }
     }
 
@@ -1354,14 +1428,22 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
                 newTagKeys[op.measurement].insert(tagKey);
             }
 
-            std::string tvCacheKey = op.measurement + std::string(1, '\0') + tagKey;
+            std::string tvCacheKey;
+            tvCacheKey.reserve(op.measurement.size() + 1 + tagKey.size());
+            tvCacheKey.append(op.measurement);
+            tvCacheKey.push_back('\0');
+            tvCacheKey.append(tagKey);
             if (tagValuesCache[tvCacheKey].insert(tagValue).second) {
-                newTagValues[tvCacheKey].insert(tagValue);
+                newTagValues[std::move(tvCacheKey)].insert(tagValue);
             }
         }
 
         // Track field type via in-memory cache
-        std::string fieldTypeCacheKey = op.measurement + std::string(1, '\0') + op.fieldName;
+        std::string fieldTypeCacheKey;
+        fieldTypeCacheKey.reserve(op.measurement.size() + 1 + op.fieldName.size());
+        fieldTypeCacheKey.append(op.measurement);
+        fieldTypeCacheKey.push_back('\0');
+        fieldTypeCacheKey.append(op.fieldName);
         if (knownFieldTypes.find(fieldTypeCacheKey) == knownFieldTypes.end()) {
             std::string typeStr;
             switch (op.valueType) {
@@ -1606,7 +1688,10 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
 
         std::string prefix = encodeMeasurementSeriesPrefix(measurement);
 
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        // Use fill_cache=false to avoid polluting the block cache with scan data
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
         if (!it) {
             timestar::index_log.error("Failed to create LevelDB iterator");
             return result;
@@ -1675,7 +1760,10 @@ LevelDBIndex::getAllSeriesForMeasurement(const std::string& measurement, size_t 
         std::string keyPrefix;
         keyPrefix.push_back(static_cast<char>(SERIES_METADATA));
 
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        // Use fill_cache=false for full-table fallback scan
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
         if (!it) {
             timestar::index_log.error("Failed to create LevelDB iterator");
             return result;
@@ -1752,7 +1840,10 @@ seastar::future<> LevelDBIndex::rebuildMeasurementSeriesIndex() {
         std::string keyPrefix;
         keyPrefix.push_back(static_cast<char>(SERIES_METADATA));
 
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        // Use fill_cache=false for rebuild scan to avoid polluting the block cache
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
         if (!it) {
             timestar::index_log.error("Failed to create LevelDB iterator for rebuild");
             return cnt;
@@ -1814,7 +1905,10 @@ seastar::future<size_t> LevelDBIndex::getSeriesCount() {
     // Offload blocking LevelDB iterator I/O to Seastar thread pool
     auto count = co_await seastar::async([this] {
         size_t cnt = 0;
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        // Use fill_cache=false for count scan to avoid polluting the block cache
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
 
         // Count SERIES_METADATA entries
         std::string startKey;
@@ -1942,6 +2036,7 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTag(const st
 
         // Create key prefix for TAG_INDEX: TAG_INDEX + measurement + tagKey + tagValue
         std::string keyPrefix;
+        keyPrefix.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size() + 1);
         keyPrefix.push_back(TAG_INDEX);
         keyPrefix.append(measurement);
         keyPrefix.push_back('\0');
@@ -1950,9 +2045,11 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTag(const st
         keyPrefix.append(tagValue);
         keyPrefix.push_back('\0');
 
-        // Scan all keys with this prefix
+        // Scan all keys with this prefix; fill_cache=false to avoid polluting block cache
         leveldb::Slice prefixSlice(keyPrefix);
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
         for (it->Seek(prefixSlice); it->Valid(); it->Next()) {
             leveldb::Slice keySlice = it->key();
             // Check if key starts with our prefix
@@ -2033,7 +2130,10 @@ seastar::future<std::vector<SeriesId128>> LevelDBIndex::findSeriesByTagPattern(
                 }
             }
 
-            std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+            // fill_cache=false to avoid polluting the block cache with scan data
+            leveldb::ReadOptions scanOpts;
+            scanOpts.fill_cache = false;
+            std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
             leveldb::Slice prefixSlice(keyPrefix);
 
             for (it->Seek(seekKey); it->Valid(); it->Next()) {
@@ -2107,15 +2207,18 @@ LevelDBIndex::getSeriesGroupedByTag(const std::string& measurement, const std::s
 
         // Create key prefix for GROUP_BY_INDEX: GROUP_BY_INDEX + measurement + tagKey
         std::string keyPrefix;
+        keyPrefix.reserve(1 + measurement.size() + 1 + tagKey.size() + 1);
         keyPrefix.push_back(GROUP_BY_INDEX);
         keyPrefix.append(measurement);
         keyPrefix.push_back('\0');
         keyPrefix.append(tagKey);
         keyPrefix.push_back('\0');
 
-        // Scan all keys with this prefix
+        // Scan all keys with this prefix; fill_cache=false to avoid polluting block cache
         leveldb::Slice prefixSlice(keyPrefix);
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
         for (it->Seek(prefixSlice); it->Valid(); it->Next()) {
             leveldb::Slice keySlice = it->key();
             // Check if key starts with our prefix
@@ -2157,11 +2260,12 @@ seastar::future<> LevelDBIndex::updateFieldStats(const SeriesId128& seriesId, co
 
     // Create key: FIELD_STATS + seriesId + field
     std::string key;
+    key.reserve(1 + 16 + 1 + field.size());
     key.push_back(FIELD_STATS);
-    key.append(encodeSeriesId(seriesId));
+    seriesId.appendTo(key);
     key.push_back('\0');
     key.append(field);
-    
+
     // Encode stats as JSON-like format
     std::string value;
     value.append(stats.dataType);
@@ -2191,11 +2295,12 @@ LevelDBIndex::getFieldStats(const SeriesId128& seriesId, const std::string& fiel
 
     // Create key: FIELD_STATS + seriesId + field
     std::string key;
+    key.reserve(1 + 16 + 1 + field.size());
     key.push_back(FIELD_STATS);
-    key.append(encodeSeriesId(seriesId));
+    seriesId.appendTo(key);
     key.push_back('\0');
     key.append(field);
-    
+
     // Offload blocking LevelDB I/O to Seastar thread pool
     auto [status, value] = co_await seastar::async([this, &key] {
         std::string val;
@@ -2319,7 +2424,10 @@ seastar::future<std::vector<RetentionPolicy>> LevelDBIndex::getAllRetentionPolic
         std::string prefix;
         prefix.push_back(static_cast<char>(RETENTION_POLICY));
 
-        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
+        // Use fill_cache=false for scan to avoid polluting the block cache
+        leveldb::ReadOptions scanOpts;
+        scanOpts.fill_cache = false;
+        std::unique_ptr<leveldb::Iterator> it(db->NewIterator(scanOpts));
         it->Seek(prefix);
 
         while (it->Valid()) {

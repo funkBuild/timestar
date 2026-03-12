@@ -1,6 +1,5 @@
 #include "compressed_buffer.hpp"
 
-#include <iostream>
 #include <cstring>
 #include <algorithm>
 

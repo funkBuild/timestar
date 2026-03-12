@@ -8,9 +8,7 @@
 #include "slice_buffer.hpp"
 
 class Simple8B {
-private:
 public:
-  Simple8B(){};
 
   static AlignedBuffer encode(const std::vector<uint64_t> &values);
   static std::vector<uint64_t> decode(Slice &encoded, unsigned int size);

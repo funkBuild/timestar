@@ -29,19 +29,19 @@ private:
         }
 
         uint64_t currentTimestamp() const {
-            if (exhausted || !currentBlock || pointIndex >= currentBlock->timestamps->size()) {
+            if (exhausted || !currentBlock || pointIndex >= currentBlock->timestamps.size()) {
                 return UINT64_MAX;
             }
-            return (*currentBlock->timestamps)[pointIndex];
+            return currentBlock->timestamps[pointIndex];
         }
 
         T currentValue() const {
-            return (*currentBlock->values)[pointIndex];
+            return currentBlock->values[pointIndex];
         }
 
         seastar::future<> advance() {
             pointIndex++;
-            if (currentBlock && pointIndex >= currentBlock->timestamps->size()) {
+            if (currentBlock && pointIndex >= currentBlock->timestamps.size()) {
                 if (blockIterator->hasNext()) {
                     currentBlock = co_await blockIterator->nextBlock();
                     pointIndex = 0;
@@ -160,19 +160,19 @@ private:
         }
 
         uint64_t currentTimestamp() const {
-            if (exhausted || !currentBlock || pointIndex >= currentBlock->timestamps->size()) {
+            if (exhausted || !currentBlock || pointIndex >= currentBlock->timestamps.size()) {
                 return UINT64_MAX;
             }
-            return (*currentBlock->timestamps)[pointIndex];
+            return currentBlock->timestamps[pointIndex];
         }
 
         T currentValue() const {
-            return (*currentBlock->values)[pointIndex];
+            return currentBlock->values[pointIndex];
         }
 
         seastar::future<> advance() {
             pointIndex++;
-            if (currentBlock && pointIndex >= currentBlock->timestamps->size()) {
+            if (currentBlock && pointIndex >= currentBlock->timestamps.size()) {
                 if (blockIterator->hasNext()) {
                     currentBlock = co_await blockIterator->nextBlock();
                     pointIndex = 0;

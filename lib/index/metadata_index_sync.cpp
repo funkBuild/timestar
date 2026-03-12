@@ -4,10 +4,8 @@
 #include <leveldb/cache.h>
 #include <glaze/glaze.hpp>
 #include <algorithm>
+#include <charconv>
 #include <memory>
-#include <sstream>
-#include <iomanip>
-#include <iostream>
 
 // Glaze template specialization for SeriesMetadataSync
 template <>
@@ -125,7 +123,9 @@ void MetadataIndexSync::init() {
 
 void MetadataIndexSync::close() {
     if (db) {
-        db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", std::to_string(nextSeriesId));
+        char buf[20];
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), nextSeriesId);
+        db->Put(leveldb::WriteOptions(), "meta:nextSeriesId", leveldb::Slice(buf, ptr - buf));
         delete db.release();
     }
     delete filterPolicy_;
@@ -134,53 +134,97 @@ void MetadataIndexSync::close() {
     blockCache_ = nullptr;
 }
 
-// Key generation helpers
+// Fast zero-padded 16-char hex encoding using a lookup table.
+// Replaces std::stringstream + std::hex which allocates and does virtual dispatch.
+static void appendHex16(std::string& out, uint64_t val) {
+    static constexpr char hex[] = "0123456789abcdef";
+    char buf[16];
+    for (int i = 15; i >= 0; --i) {
+        buf[i] = hex[val & 0xF];
+        val >>= 4;
+    }
+    out.append(buf, 16);
+}
+
+// Key generation helpers — allocation-free string building via reserve + append.
 std::string MetadataIndexSync::seriesKey(uint64_t seriesId) {
-    std::stringstream ss;
-    ss << "series:" << std::setfill('0') << std::setw(16) << std::hex << seriesId;
-    return ss.str();
+    std::string result;
+    result.reserve(7 + 16);  // "series:" + 16 hex chars
+    result.append("series:");
+    appendHex16(result, seriesId);
+    return result;
 }
 
 std::string MetadataIndexSync::measurementKey(const std::string& measurement, uint64_t seriesId) {
-    std::stringstream ss;
-    ss << "m:" << measurement << ":" << std::setfill('0') << std::setw(16) << std::hex << seriesId;
-    return ss.str();
+    std::string result;
+    result.reserve(2 + measurement.size() + 1 + 16);
+    result.append("m:");
+    result.append(measurement);
+    result.push_back(':');
+    appendHex16(result, seriesId);
+    return result;
 }
 
 std::string MetadataIndexSync::tagKey(const std::string& measurement, const std::string& tagKey,
                                       const std::string& tagValue, uint64_t seriesId) {
-    std::stringstream ss;
-    ss << "t:" << measurement << ":" << tagKey << ":" << tagValue << ":" 
-       << std::setfill('0') << std::setw(16) << std::hex << seriesId;
-    return ss.str();
+    std::string result;
+    result.reserve(2 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size() + 1 + 16);
+    result.append("t:");
+    result.append(measurement);
+    result.push_back(':');
+    result.append(tagKey);
+    result.push_back(':');
+    result.append(tagValue);
+    result.push_back(':');
+    appendHex16(result, seriesId);
+    return result;
 }
 
 std::string MetadataIndexSync::buildSortedTagString(const std::map<std::string, std::string>& tags) {
-    std::stringstream ss;
+    // Estimate total size: sum of all key + "=" + value + ","
+    size_t totalSize = 0;
+    for (const auto& [k, v] : tags) {
+        totalSize += k.size() + 1 + v.size() + 1;  // key=value,
+    }
+    std::string result;
+    result.reserve(totalSize);
     bool first = true;
     for (const auto& [k, v] : tags) {
-        if (!first) ss << ",";
-        ss << k << "=" << v;
+        if (!first) result.push_back(',');
+        result.append(k);
+        result.push_back('=');
+        result.append(v);
         first = false;
     }
-    return ss.str();
+    return result;
 }
 
 std::string MetadataIndexSync::compositeTagKey(const std::string& measurement,
                                                const std::map<std::string, std::string>& tags,
                                                uint64_t seriesId) {
-    std::stringstream ss;
-    ss << "ct:" << measurement << ":" << buildSortedTagString(tags) << ":"
-       << std::setfill('0') << std::setw(16) << std::hex << seriesId;
-    return ss.str();
+    std::string tagStr = buildSortedTagString(tags);
+    std::string result;
+    result.reserve(3 + measurement.size() + 1 + tagStr.size() + 1 + 16);
+    result.append("ct:");
+    result.append(measurement);
+    result.push_back(':');
+    result.append(tagStr);
+    result.push_back(':');
+    appendHex16(result, seriesId);
+    return result;
 }
 
 std::string MetadataIndexSync::fieldKey(const std::string& measurement, const std::string& field,
                                         uint64_t seriesId) {
-    std::stringstream ss;
-    ss << "f:" << measurement << ":" << field << ":"
-       << std::setfill('0') << std::setw(16) << std::hex << seriesId;
-    return ss.str();
+    std::string result;
+    result.reserve(2 + measurement.size() + 1 + field.size() + 1 + 16);
+    result.append("f:");
+    result.append(measurement);
+    result.push_back(':');
+    result.append(field);
+    result.push_back(':');
+    appendHex16(result, seriesId);
+    return result;
 }
 
 std::string MetadataIndexSync::groupByKey(const std::string& measurement, const std::string& tagKey,
@@ -217,21 +261,25 @@ std::vector<std::string> MetadataIndexSync::generateTagSubsets(const std::map<st
 
     const size_t maxK = std::min(MAX_COMPOSITE_SUBSET_SIZE, n);
 
+    // tagVec is already sorted (came from std::map), so subsets maintain order.
+    // Build strings directly instead of constructing std::map per subset.
+
     // Size 1 subsets
     for (size_t i = 0; i < n; ++i) {
-        std::map<std::string, std::string> subset;
-        subset[tagVec[i].first] = tagVec[i].second;
-        subsets.push_back(buildSortedTagString(subset));
+        subsets.push_back(tagVec[i].first + "=" + tagVec[i].second);
     }
 
     // Size 2 subsets
     if (maxK >= 2) {
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = i + 1; j < n; ++j) {
-                std::map<std::string, std::string> subset;
-                subset[tagVec[i].first] = tagVec[i].second;
-                subset[tagVec[j].first] = tagVec[j].second;
-                subsets.push_back(buildSortedTagString(subset));
+                std::string s;
+                s.reserve(tagVec[i].first.size() + 1 + tagVec[i].second.size() + 1 +
+                           tagVec[j].first.size() + 1 + tagVec[j].second.size());
+                s.append(tagVec[i].first); s.push_back('='); s.append(tagVec[i].second);
+                s.push_back(',');
+                s.append(tagVec[j].first); s.push_back('='); s.append(tagVec[j].second);
+                subsets.push_back(std::move(s));
             }
         }
     }
@@ -241,11 +289,16 @@ std::vector<std::string> MetadataIndexSync::generateTagSubsets(const std::map<st
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = i + 1; j < n; ++j) {
                 for (size_t k = j + 1; k < n; ++k) {
-                    std::map<std::string, std::string> subset;
-                    subset[tagVec[i].first] = tagVec[i].second;
-                    subset[tagVec[j].first] = tagVec[j].second;
-                    subset[tagVec[k].first] = tagVec[k].second;
-                    subsets.push_back(buildSortedTagString(subset));
+                    std::string s;
+                    s.reserve(tagVec[i].first.size() + 1 + tagVec[i].second.size() + 1 +
+                               tagVec[j].first.size() + 1 + tagVec[j].second.size() + 1 +
+                               tagVec[k].first.size() + 1 + tagVec[k].second.size());
+                    s.append(tagVec[i].first); s.push_back('='); s.append(tagVec[i].second);
+                    s.push_back(',');
+                    s.append(tagVec[j].first); s.push_back('='); s.append(tagVec[j].second);
+                    s.push_back(',');
+                    s.append(tagVec[k].first); s.push_back('='); s.append(tagVec[k].second);
+                    subsets.push_back(std::move(s));
                 }
             }
         }
@@ -279,25 +332,44 @@ uint64_t MetadataIndexSync::getOrCreateSeriesId(const std::string& measurement,
     metadata.shardId = seriesId % 32;  // Default to 32 shards
     
     leveldb::WriteBatch batch;
-    
-    batch.Put(lookupKey, std::to_string(seriesId));
+
+    // Convert seriesId to decimal string once and reuse
+    char idBuf[20];
+    auto [idEnd, idEc] = std::to_chars(idBuf, idBuf + sizeof(idBuf), seriesId);
+    std::string_view idStr(idBuf, idEnd - idBuf);
+
+    batch.Put(lookupKey, std::string(idStr));
     batch.Put(seriesKey(seriesId), metadata.serialize());
     batch.Put(measurementKey(measurement, seriesId), "");
-    
+
     for (const auto& [k, v] : tags) {
         batch.Put(tagKey(measurement, k, v, seriesId), "");
     }
-    
+
+    // Convert seriesId to hex string once for composite tag keys
+    std::string hexId;
+    hexId.reserve(16);
+    appendHex16(hexId, seriesId);
+
     for (const auto& subset : generateTagSubsets(tags)) {
-        batch.Put("ct:" + measurement + ":" + subset + ":" + 
-                 std::to_string(seriesId), "");
+        std::string key;
+        key.reserve(3 + measurement.size() + 1 + subset.size() + 1 + 16);
+        key.append("ct:");
+        key.append(measurement);
+        key.push_back(':');
+        key.append(subset);
+        key.push_back(':');
+        key.append(hexId);
+        batch.Put(key, "");
     }
-    
+
     batch.Put(fieldKey(measurement, field, seriesId), "");
-    
+
     for (const auto& [k, v] : tags) {
         std::string gKey = groupByKey(measurement, k, v);
-        batch.Put(gKey + ":" + std::to_string(seriesId), "");
+        gKey.push_back(':');
+        gKey.append(idStr);
+        batch.Put(gKey, "");
     }
     
     status = db->Write(leveldb::WriteOptions(), &batch);
@@ -392,22 +464,48 @@ void MetadataIndexSync::deleteSeries(uint64_t seriesId) {
     // Delete measurement index entry
     batch.Delete(measurementKey(metadata->measurement, seriesId));
 
+    // Convert seriesId once for reuse
+    char idBuf[20];
+    auto [idEnd, idEc] = std::to_chars(idBuf, idBuf + sizeof(idBuf), seriesId);
+    std::string_view idStr(idBuf, idEnd - idBuf);
+    std::string hexId;
+    hexId.reserve(16);
+    appendHex16(hexId, seriesId);
+
     // Delete tag indexes
     for (const auto& [k, v] : metadata->tags) {
         batch.Delete(tagKey(metadata->measurement, k, v, seriesId));
-        batch.Delete(groupByKey(metadata->measurement, k, v) + ":" + std::to_string(seriesId));
+        std::string gKey = groupByKey(metadata->measurement, k, v);
+        gKey.push_back(':');
+        gKey.append(idStr);
+        batch.Delete(gKey);
     }
 
     // Delete composite tag indexes (all subsets, mirrors getOrCreateSeriesId)
     for (const auto& subset : generateTagSubsets(metadata->tags)) {
-        batch.Delete("ct:" + metadata->measurement + ":" + subset + ":" +
-                     std::to_string(seriesId));
+        std::string key;
+        key.reserve(3 + metadata->measurement.size() + 1 + subset.size() + 1 + 16);
+        key.append("ct:");
+        key.append(metadata->measurement);
+        key.push_back(':');
+        key.append(subset);
+        key.push_back(':');
+        key.append(hexId);
+        batch.Delete(key);
     }
 
     // Delete field indexes
     for (const auto& field : metadata->fields) {
         batch.Delete(fieldKey(metadata->measurement, field, seriesId));
-        batch.Delete("fstats:" + metadata->measurement + ":" + field + ":" + std::to_string(seriesId));
+        std::string fKey;
+        fKey.reserve(6 + metadata->measurement.size() + 1 + field.size() + 1 + idStr.size());
+        fKey.append("fstats:");
+        fKey.append(metadata->measurement);
+        fKey.push_back(':');
+        fKey.append(field);
+        fKey.push_back(':');
+        fKey.append(idStr);
+        batch.Delete(fKey);
     }
 
     // Delete series lookup keys for ALL fields

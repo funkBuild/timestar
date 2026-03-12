@@ -6,7 +6,6 @@
 #include <variant>
 #include <memory>
 #include <algorithm>
-#include <iostream>
 #include <type_traits>
 
 #include "util.hpp"
@@ -19,35 +18,32 @@ private:
   using value_return_type = std::conditional_t<std::is_same_v<T, bool>, T, const T&>;
 
 public:
-  std::unique_ptr<std::vector<uint64_t>> timestamps;
-  std::unique_ptr<std::vector<T>> values;
+  std::vector<uint64_t> timestamps;
+  std::vector<T> values;
 
   TSMBlock(size_t initialSize) {
-    timestamps = std::make_unique<std::vector<uint64_t>>();
-    values = std::make_unique<std::vector<T>>();
-
-    timestamps->reserve(initialSize);
-    values->reserve(initialSize);
+    timestamps.reserve(initialSize);
+    values.reserve(initialSize);
   };
 
   uint64_t startTime(){
-    return timestamps->front();
+    return timestamps.front();
   }
 
   uint64_t endTime(){
-    return timestamps->back();
+    return timestamps.back();
   }
 
   size_t size(){
-    return timestamps->size();
+    return timestamps.size();
   }
 
-  uint64_t timestampAt(unsigned int idx){
-    return (*timestamps)[idx];
+  uint64_t timestampAt(size_t idx){
+    return timestamps[idx];
   }
 
-  value_return_type valueAt(unsigned int idx) const {
-    return (*values)[idx];
+  value_return_type valueAt(size_t idx) const {
+    return values[idx];
   }
 };
 
@@ -61,7 +57,7 @@ public:
 
   TSMResult(uint64_t _rank) : rank(_rank) {};
 
-  TSMBlock<T>* getBlock(int idx){
+  TSMBlock<T>* getBlock(size_t idx){
     if(idx >= blocks.size())
       return nullptr;
 
@@ -82,13 +78,6 @@ public:
     });
   }
 
-  void print(){
-    // Debug output - consider using logger if needed
-    // for(auto& block: blocks){
-    //   std::cout << "startTime=" << block->startTime() << " endTime=" << block->endTime() << std::endl;
-    // }
-  }
-  
   // Get all timestamps and values from all blocks
   std::pair<std::vector<uint64_t>, std::vector<T>> getAllData(){
     std::vector<uint64_t> allTimestamps;
@@ -105,8 +94,8 @@ public:
     
     // Collect data from all blocks
     for(auto& block: blocks){
-      allTimestamps.insert(allTimestamps.end(), block->timestamps->begin(), block->timestamps->end());
-      allValues.insert(allValues.end(), block->values->begin(), block->values->end());
+      allTimestamps.insert(allTimestamps.end(), block->timestamps.begin(), block->timestamps.end());
+      allValues.insert(allValues.end(), block->values.begin(), block->values.end());
     }
     
     return {allTimestamps, allValues};
