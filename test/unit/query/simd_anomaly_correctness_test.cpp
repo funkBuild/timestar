@@ -519,9 +519,17 @@ TEST_F(SimdAnomalyCorrectnessTest, ComputeBounds_MatchesRef) {
     ref::computeBounds(predictions.data(), scale.data(), bounds,
                         refUpper.data(), refLower.data(), n);
 
+    // simd_anomaly.cpp is compiled with -mfma, allowing the compiler to contract
+    // mul+add into a single FMA instruction (1 rounding vs 2). This can produce
+    // results that differ by ~1 ULP from non-FMA scalar code. With catastrophic
+    // cancellation the error in the intermediate product (bounds * scale, up to
+    // 12.5) is ~1 ULP ≈ 2.8e-15, not 1 ULP of the near-zero result. Use an
+    // absolute tolerance of 1e-10 which is ~1e5× the worst-case FMA error yet
+    // tight enough to catch any real indexing or logic bugs.
+    constexpr double kAbsTol = 1e-10;
     for (size_t i = 0; i < n; i++) {
-        EXPECT_DOUBLE_EQ(simdUpper[i], refUpper[i]) << "upper mismatch at " << i;
-        EXPECT_DOUBLE_EQ(simdLower[i], refLower[i]) << "lower mismatch at " << i;
+        EXPECT_NEAR(simdUpper[i], refUpper[i], kAbsTol) << "upper mismatch at " << i;
+        EXPECT_NEAR(simdLower[i], refLower[i], kAbsTol) << "lower mismatch at " << i;
     }
 }
 
