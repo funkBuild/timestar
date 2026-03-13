@@ -18,6 +18,8 @@
 #ifndef INCLUDE_BLOOM_FILTER_HPP
     #define INCLUDE_BLOOM_FILTER_HPP
 
+    #include "bloom_filter_simd.hpp"
+
     #include <algorithm>
     #include <cmath>
     #include <cstddef>
@@ -327,8 +329,13 @@ public:
     inline bloom_filter& operator&=(const bloom_filter& f) {
         /* intersection */
         if ((salt_count_ == f.salt_count_) && (table_size_ == f.table_size_) && (random_seed_ == f.random_seed_)) {
-            for (std::size_t i = 0; i < bit_table_.size(); ++i) {
-                bit_table_[i] &= f.bit_table_[i];
+            const auto n = bit_table_.size();
+            if (n >= timestar::bloom::simd::kSimdThreshold) {
+                timestar::bloom::simd::bitwiseAndInplace(bit_table_.data(), f.bit_table_.data(), n);
+            } else {
+                for (std::size_t i = 0; i < n; ++i) {
+                    bit_table_[i] &= f.bit_table_[i];
+                }
             }
         }
 
@@ -338,8 +345,13 @@ public:
     inline bloom_filter& operator|=(const bloom_filter& f) {
         /* union */
         if ((salt_count_ == f.salt_count_) && (table_size_ == f.table_size_) && (random_seed_ == f.random_seed_)) {
-            for (std::size_t i = 0; i < bit_table_.size(); ++i) {
-                bit_table_[i] |= f.bit_table_[i];
+            const auto n = bit_table_.size();
+            if (n >= timestar::bloom::simd::kSimdThreshold) {
+                timestar::bloom::simd::bitwiseOrInplace(bit_table_.data(), f.bit_table_.data(), n);
+            } else {
+                for (std::size_t i = 0; i < n; ++i) {
+                    bit_table_[i] |= f.bit_table_[i];
+                }
             }
         }
 
@@ -349,8 +361,13 @@ public:
     inline bloom_filter& operator^=(const bloom_filter& f) {
         /* difference */
         if ((salt_count_ == f.salt_count_) && (table_size_ == f.table_size_) && (random_seed_ == f.random_seed_)) {
-            for (std::size_t i = 0; i < bit_table_.size(); ++i) {
-                bit_table_[i] ^= f.bit_table_[i];
+            const auto n = bit_table_.size();
+            if (n >= timestar::bloom::simd::kSimdThreshold) {
+                timestar::bloom::simd::bitwiseXorInplace(bit_table_.data(), f.bit_table_.data(), n);
+            } else {
+                for (std::size_t i = 0; i < n; ++i) {
+                    bit_table_[i] ^= f.bit_table_[i];
+                }
             }
         }
 

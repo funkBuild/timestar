@@ -1,6 +1,8 @@
 #include "expression_evaluator.hpp"
 
+#include "anomaly/simd_anomaly.hpp"
 #include "forecast/forecast_result.hpp"
+#include "transform/transform_functions_simd.hpp"
 
 #include <cmath>
 #include <limits>
@@ -9,6 +11,10 @@
 namespace timestar {
 
 // ==================== AlignedSeries Operations ====================
+
+// Minimum array size to benefit from SIMD dispatch overhead.
+// Below this, scalar loops (which the compiler may auto-vectorize) are faster.
+static constexpr size_t kSimdMinSize = 8;
 
 namespace {
 void checkSameSize(const AlignedSeries& a, const AlignedSeries& b, const std::string& operation) {
@@ -23,8 +29,12 @@ AlignedSeries AlignedSeries::operator+(const AlignedSeries& other) const {
     checkSameSize(*this, other, "addition");
     // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
     std::vector<double> result(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = values[i] + other.values[i];
+    if (values.size() >= kSimdMinSize) {
+        anomaly::simd::vectorAdd(values.data(), other.values.data(), result.data(), values.size());
+    } else {
+        for (size_t i = 0; i < values.size(); ++i) {
+            result[i] = values[i] + other.values[i];
+        }
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -33,8 +43,12 @@ AlignedSeries AlignedSeries::operator-(const AlignedSeries& other) const {
     checkSameSize(*this, other, "subtraction");
     // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
     std::vector<double> result(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = values[i] - other.values[i];
+    if (values.size() >= kSimdMinSize) {
+        anomaly::simd::vectorSubtract(values.data(), other.values.data(), result.data(), values.size());
+    } else {
+        for (size_t i = 0; i < values.size(); ++i) {
+            result[i] = values[i] - other.values[i];
+        }
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -43,8 +57,12 @@ AlignedSeries AlignedSeries::operator*(const AlignedSeries& other) const {
     checkSameSize(*this, other, "multiplication");
     // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
     std::vector<double> result(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = values[i] * other.values[i];
+    if (values.size() >= kSimdMinSize) {
+        anomaly::simd::vectorMultiply(values.data(), other.values.data(), result.data(), values.size());
+    } else {
+        for (size_t i = 0; i < values.size(); ++i) {
+            result[i] = values[i] * other.values[i];
+        }
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -52,24 +70,18 @@ AlignedSeries AlignedSeries::operator*(const AlignedSeries& other) const {
 AlignedSeries AlignedSeries::operator/(const AlignedSeries& other) const {
     checkSameSize(*this, other, "division");
     // Timestamps are shared via shared_ptr — O(1) pointer copy, no allocation
+    // IEEE 754 floating-point division naturally produces the correct special values:
+    //   x / 0.0 = +/-Inf (sign matches x),  0.0 / 0.0 = NaN
+    // This allows the compiler to auto-vectorize the loop without branching.
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
-        if (other.values[i] == 0.0) {
-            // Handle division by zero: result is NaN or Inf depending on numerator
-            if (values[i] == 0.0) {
-                result[i] = std::numeric_limits<double>::quiet_NaN();
-            } else {
-                result[i] =
-                    values[i] > 0 ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
-            }
-        } else {
-            result[i] = values[i] / other.values[i];
-        }
+        result[i] = values[i] / other.values[i];
     }
     return AlignedSeries(timestamps, std::move(result));
 }
 
 AlignedSeries AlignedSeries::operator+(double scalar) const {
+    // No vectorScalarAdd in the SIMD library; compiler auto-vectorizes this loop.
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = values[i] + scalar;
@@ -78,6 +90,7 @@ AlignedSeries AlignedSeries::operator+(double scalar) const {
 }
 
 AlignedSeries AlignedSeries::operator-(double scalar) const {
+    // No vectorScalarAdd in the SIMD library; compiler auto-vectorizes this loop.
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = values[i] - scalar;
@@ -87,8 +100,12 @@ AlignedSeries AlignedSeries::operator-(double scalar) const {
 
 AlignedSeries AlignedSeries::operator*(double scalar) const {
     std::vector<double> result(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = values[i] * scalar;
+    if (values.size() >= kSimdMinSize) {
+        anomaly::simd::vectorScalarMultiply(values.data(), scalar, result.data(), values.size());
+    } else {
+        for (size_t i = 0; i < values.size(); ++i) {
+            result[i] = values[i] * scalar;
+        }
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -97,26 +114,34 @@ AlignedSeries AlignedSeries::operator/(double scalar) const {
     if (scalar == 0.0) {
         throw EvaluationException("Division by zero scalar");
     }
+    // Multiply by reciprocal — single SIMD broadcast multiply instead of per-element divide.
     std::vector<double> result(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = values[i] / scalar;
+    const double reciprocal = 1.0 / scalar;
+    if (values.size() >= kSimdMinSize) {
+        anomaly::simd::vectorScalarMultiply(values.data(), reciprocal, result.data(), values.size());
+    } else {
+        for (size_t i = 0; i < values.size(); ++i) {
+            result[i] = values[i] * reciprocal;
+        }
     }
     return AlignedSeries(timestamps, std::move(result));
 }
 
 AlignedSeries AlignedSeries::negate() const {
     std::vector<double> result(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = -values[i];
+    if (values.size() >= kSimdMinSize) {
+        anomaly::simd::vectorScalarMultiply(values.data(), -1.0, result.data(), values.size());
+    } else {
+        for (size_t i = 0; i < values.size(); ++i) {
+            result[i] = -values[i];
+        }
     }
     return AlignedSeries(timestamps, std::move(result));
 }
 
 AlignedSeries AlignedSeries::abs() const {
-    std::vector<double> result(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = std::abs(values[i]);
-    }
+    // transform::simd::abs handles the SIMD threshold internally.
+    auto result = transform::simd::abs(values);
     return AlignedSeries(timestamps, std::move(result));
 }
 
