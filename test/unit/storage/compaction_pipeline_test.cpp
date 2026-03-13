@@ -9,21 +9,22 @@
 //   - Edge cases (empty series list, single series, large series count)
 //   - Iteration through all series via getNext loop
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <set>
-#include <map>
-
 #include "../../../lib/storage/compaction_pipeline.hpp"
-#include "../../../lib/storage/tsm_compactor.hpp"
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm_reader.hpp"
-#include "../../../lib/core/series_id.hpp"
 
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/storage/tsm_compactor.hpp"
+#include "../../../lib/storage/tsm_reader.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <map>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -56,23 +57,15 @@ public:
 
     // Create a TSM file containing `numSeries` float series, each with
     // `pointsPerSeries` data points starting at `startTime` with stride 1000.
-    seastar::shared_ptr<TSM> createTestTSMFile(
-        uint64_t tier,
-        uint64_t seqNum,
-        const std::string& seriesPrefix,
-        int numSeries,
-        int pointsPerSeries,
-        uint64_t startTime = 1000000) {
-
+    seastar::shared_ptr<TSM> createTestTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesPrefix,
+                                               int numSeries, int pointsPerSeries, uint64_t startTime = 1000000) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
 
         TSMWriter writer(filename);
 
         for (int s = 0; s < numSeries; s++) {
-            SeriesId128 seriesId =
-                SeriesId128::fromSeriesKey(seriesPrefix + std::to_string(s));
+            SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesPrefix + std::to_string(s));
             std::vector<uint64_t> timestamps;
             std::vector<double> values;
 
@@ -81,8 +74,7 @@ public:
                 values.push_back(s * 100.0 + p);
             }
 
-            writer.writeSeries(TSMValueType::Float, seriesId,
-                               timestamps, values);
+            writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
         }
 
         writer.writeIndex();
@@ -96,8 +88,7 @@ public:
     }
 
     // Collect all unique series IDs from a set of opened TSM files.
-    std::vector<SeriesId128> getAllSeriesIds(
-        const std::vector<seastar::shared_ptr<TSM>>& files) {
+    std::vector<SeriesId128> getAllSeriesIds(const std::vector<seastar::shared_ptr<TSM>>& files) {
         std::set<SeriesId128> uniqueIds;
         for (const auto& file : files) {
             auto ids = file->getSeriesIds();
@@ -112,9 +103,8 @@ public:
     // all files.  TSMBlockIterator::init() calls getSeriesBlocks() which
     // only returns data already in fullIndexCache; callers must ensure each
     // series has been loaded via getFullIndexEntry() beforehand.
-    static seastar::future<> preloadFullIndex(
-        const std::vector<seastar::shared_ptr<TSM>>& files,
-        const std::vector<SeriesId128>& seriesIds) {
+    static seastar::future<> preloadFullIndex(const std::vector<seastar::shared_ptr<TSM>>& files,
+                                              const std::vector<SeriesId128>& seriesIds) {
         for (const auto& file : files) {
             for (const auto& seriesId : seriesIds) {
                 co_await file->getFullIndexEntry(seriesId);
@@ -157,7 +147,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, SingleSeries) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 1);
-    if (allSeries.empty()) co_return;
+    if (allSeries.empty())
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -199,7 +190,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, MultipleSeriesDefaultDepth) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 5);
-    if (allSeries.size() != 5) co_return;
+    if (allSeries.size() != 5)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -248,7 +240,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, PrefetchDepthOne) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 4);
-    if (allSeries.size() != 4) co_return;
+    if (allSeries.size() != 4)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -280,7 +273,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, PrefetchDepthLargerThanSeriesCount) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 3);
-    if (allSeries.size() != 3) co_return;
+    if (allSeries.size() != 3)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -312,8 +306,7 @@ SEASTAR_TEST_F(CompactionPipelineTest, MultipleFiles) {
     // The merge iterator should merge data from all files for each series.
     std::vector<seastar::shared_ptr<TSM>> files;
     for (int i = 0; i < 3; i++) {
-        auto tsm = self->createTestTSMFile(
-            0, i, "mf.", 2, 10, 1000000 + i * 10000);
+        auto tsm = self->createTestTSMFile(0, i, "mf.", 2, 10, 1000000 + i * 10000);
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
@@ -321,7 +314,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, MultipleFiles) {
 
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 2);
-    if (allSeries.size() != 2) co_return;
+    if (allSeries.size() != 2)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -357,8 +351,7 @@ SEASTAR_TEST_F(CompactionPipelineTest, OverlappingTimestampsDedup) {
     // File with higher seqNum (rank) wins in the merge iterator.
     std::vector<seastar::shared_ptr<TSM>> files;
     for (int i = 0; i < 2; i++) {
-        auto tsm = self->createTestTSMFile(
-            0, i, "overlap.", 1, 10, 1000000);  // Same start time
+        auto tsm = self->createTestTSMFile(0, i, "overlap.", 1, 10, 1000000);  // Same start time
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
@@ -366,7 +359,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, OverlappingTimestampsDedup) {
 
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 1);
-    if (allSeries.size() != 1) co_return;
+    if (allSeries.size() != 1)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -395,7 +389,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, PrefetchQueueDraining) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 6);
-    if (allSeries.size() != 6) co_return;
+    if (allSeries.size() != 6)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -511,7 +506,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, SeriesOrderPreserved) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 4);
-    if (allSeries.size() != 4) co_return;
+    if (allSeries.size() != 4)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -528,8 +524,7 @@ SEASTAR_TEST_F(CompactionPipelineTest, SeriesOrderPreserved) {
 
     EXPECT_EQ(retrievedOrder.size(), allSeries.size());
     for (size_t i = 0; i < std::min(retrievedOrder.size(), allSeries.size()); i++) {
-        EXPECT_EQ(retrievedOrder[i], allSeries[i])
-            << "Series at index " << i << " does not match expected order";
+        EXPECT_EQ(retrievedOrder[i], allSeries[i]) << "Series at index " << i << " does not match expected order";
     }
 
     co_return;
@@ -547,7 +542,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, ManySeriesSmallDepth) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 20);
-    if (allSeries.size() != 20) co_return;
+    if (allSeries.size() != 20)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -582,16 +578,14 @@ SEASTAR_TEST_F(CompactionPipelineTest, BooleanSeriesPrefetch) {
     {
         TSMWriter writer(filename);
         for (int s = 0; s < 3; s++) {
-            SeriesId128 seriesId =
-                SeriesId128::fromSeriesKey("bool." + std::to_string(s));
+            SeriesId128 seriesId = SeriesId128::fromSeriesKey("bool." + std::to_string(s));
             std::vector<uint64_t> timestamps;
             std::vector<bool> values;
             for (int p = 0; p < 8; p++) {
                 timestamps.push_back(1000 + p * 100);
                 values.push_back((s + p) % 2 == 0);
             }
-            writer.writeSeries(TSMValueType::Boolean, seriesId,
-                               timestamps, values);
+            writer.writeSeries(TSMValueType::Boolean, seriesId, timestamps, values);
         }
         writer.writeIndex();
         writer.close();
@@ -606,7 +600,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, BooleanSeriesPrefetch) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 3);
-    if (allSeries.size() != 3) co_return;
+    if (allSeries.size() != 3)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -641,17 +636,14 @@ SEASTAR_TEST_F(CompactionPipelineTest, StringSeriesPrefetch) {
     {
         TSMWriter writer(filename);
         for (int s = 0; s < 2; s++) {
-            SeriesId128 seriesId =
-                SeriesId128::fromSeriesKey("str." + std::to_string(s));
+            SeriesId128 seriesId = SeriesId128::fromSeriesKey("str." + std::to_string(s));
             std::vector<uint64_t> timestamps;
             std::vector<std::string> values;
             for (int p = 0; p < 6; p++) {
                 timestamps.push_back(1000 + p * 100);
-                values.push_back("value_s" + std::to_string(s) +
-                                 "_p" + std::to_string(p));
+                values.push_back("value_s" + std::to_string(s) + "_p" + std::to_string(p));
             }
-            writer.writeSeries(TSMValueType::String, seriesId,
-                               timestamps, values);
+            writer.writeSeries(TSMValueType::String, seriesId, timestamps, values);
         }
         writer.writeIndex();
         writer.close();
@@ -666,7 +658,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, StringSeriesPrefetch) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 2);
-    if (allSeries.size() != 2) co_return;
+    if (allSeries.size() != 2)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -704,7 +697,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, PrefetchDepthZero) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 3);
-    if (allSeries.size() != 3) co_return;
+    if (allSeries.size() != 3)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -754,7 +748,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, DisjointSeriesAcrossFiles) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm0, tsm1};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 4);
-    if (allSeries.size() != 4) co_return;
+    if (allSeries.size() != 4)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -823,17 +818,15 @@ SEASTAR_TEST_F(CompactionPipelineTest, DataIntegrity) {
     EXPECT_EQ(pipelineData.size(), directData.size());
     for (const auto& [seriesId, data] : directData) {
         auto it = pipelineData.find(seriesId);
-        EXPECT_NE(it, pipelineData.end())
-            << "Missing series " << seriesId.toHex() << " in pipeline data";
-        if (it == pipelineData.end()) continue;
+        EXPECT_NE(it, pipelineData.end()) << "Missing series " << seriesId.toHex() << " in pipeline data";
+        if (it == pipelineData.end())
+            continue;
 
-        EXPECT_EQ(it->second.size(), data.size())
-            << "Point count mismatch for series " << seriesId.toHex();
+        EXPECT_EQ(it->second.size(), data.size()) << "Point count mismatch for series " << seriesId.toHex();
 
         for (const auto& [ts, val] : data) {
             auto pIt = it->second.find(ts);
-            EXPECT_NE(pIt, it->second.end())
-                << "Missing timestamp " << ts << " for series " << seriesId.toHex();
+            EXPECT_NE(pIt, it->second.end()) << "Missing timestamp " << ts << " for series " << seriesId.toHex();
             if (pIt != it->second.end()) {
                 EXPECT_DOUBLE_EQ(pIt->second, val);
             }
@@ -854,9 +847,7 @@ SEASTAR_TEST_F(CompactionPipelineTest, SeriesNotInAnyFile) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
 
     // Create a series ID that does not exist in the file
-    std::vector<SeriesId128> fakeSeries = {
-        SeriesId128::fromSeriesKey("nonexistent.series")
-    };
+    std::vector<SeriesId128> fakeSeries = {SeriesId128::fromSeriesKey("nonexistent.series")};
 
     // Preload will attempt to load a non-existent series; getFullIndexEntry
     // returns nullptr for unknown series but populates nothing.
@@ -889,7 +880,8 @@ SEASTAR_TEST_F(CompactionPipelineTest, BatchRetrievalThroughPipeline) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm};
     auto allSeries = self->getAllSeriesIds(files);
     EXPECT_EQ(allSeries.size(), 2);
-    if (allSeries.size() != 2) co_return;
+    if (allSeries.size() != 2)
+        co_return;
 
     co_await CompactionPipelineTest::preloadFullIndex(files, allSeries);
 
@@ -924,8 +916,7 @@ SEASTAR_TEST_F(CompactionPipelineTest, MergeOrderingMultipleFiles) {
 
     for (int f = 0; f < 2; f++) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/00_%010d.tsm", f);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", f);
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts;
@@ -936,9 +927,7 @@ SEASTAR_TEST_F(CompactionPipelineTest, MergeOrderingMultipleFiles) {
             ts.push_back(startTs + p * 1000);
             vals.push_back(baseVal + p * 10.0);
         }
-        writer.writeSeries(TSMValueType::Float,
-                           SeriesId128::fromSeriesKey("merge.order"),
-                           ts, vals);
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("merge.order"), ts, vals);
         writer.writeIndex();
         writer.close();
 
@@ -950,9 +939,7 @@ SEASTAR_TEST_F(CompactionPipelineTest, MergeOrderingMultipleFiles) {
         files.push_back(tsm);
     }
 
-    std::vector<SeriesId128> series = {
-        SeriesId128::fromSeriesKey("merge.order")
-    };
+    std::vector<SeriesId128> series = {SeriesId128::fromSeriesKey("merge.order")};
 
     co_await CompactionPipelineTest::preloadFullIndex(files, series);
 

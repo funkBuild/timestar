@@ -11,20 +11,20 @@
  * - Correctness: cached results match uncached results
  */
 
-#include <gtest/gtest.h>
-
-#include "../../seastar_gtest.hpp"
-
-#include <filesystem>
-#include <memory>
-#include <string>
-#include <vector>
+#include "../../../lib/utils/lru_cache.hpp"
 
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/index/leveldb_index.hpp"
 #include "../../../lib/storage/tsm.hpp"  // for TSMValueType enum definition
-#include "../../../lib/utils/lru_cache.hpp"
+#include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
 
 // ============================================================================
 // Phase 1: Generic LRU cache unit tests (no Seastar needed)

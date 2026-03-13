@@ -35,8 +35,7 @@ public:
     // Returns nullopt when pushdown is not applicable (non-float type, memory
     // store data present, or cross-TSM block time overlap).
     seastar::future<std::optional<timestar::PushdownResult>> queryTsmAggregated(
-        std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime,
-        uint64_t aggregationInterval,
+        std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
         timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 };
 

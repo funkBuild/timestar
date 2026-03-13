@@ -1,7 +1,9 @@
-#include <gtest/gtest.h>
 #include "../../test_helpers/aggregator_test_helper.hpp"
-#include <vector>
+
+#include <gtest/gtest.h>
+
 #include <cmath>
+#include <vector>
 
 using namespace timestar;
 using timestar::test::AggregatorTestHelper;
@@ -11,8 +13,8 @@ protected:
     void SetUp() override {
         // Create sample data
         for (int i = 0; i < 10; ++i) {
-            timestamps.push_back(1000000000 + i * 60000000000ULL); // 1 minute intervals
-            values.push_back(10.0 + i * 2.0); // Values: 10, 12, 14, 16, 18, 20, 22, 24, 26, 28
+            timestamps.push_back(1000000000 + i * 60000000000ULL);  // 1 minute intervals
+            values.push_back(10.0 + i * 2.0);                       // Values: 10, 12, 14, 16, 18, 20, 22, 24, 26, 28
         }
     }
 
@@ -78,17 +80,17 @@ TEST_F(AggregatorTest, LatestAggregation) {
 
 TEST_F(AggregatorTest, TimeBasedBucketing) {
     // Aggregate into 5-minute buckets
-    uint64_t interval = 5 * 60 * 1000000000ULL; // 5 minutes in nanoseconds
+    uint64_t interval = 5 * 60 * 1000000000ULL;  // 5 minutes in nanoseconds
     auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, interval);
 
-    ASSERT_EQ(result.size(), 2); // Should have 2 buckets (10 points, 1-min intervals, 5-min buckets)
+    ASSERT_EQ(result.size(), 2);  // Should have 2 buckets (10 points, 1-min intervals, 5-min buckets)
 
     // First bucket: points 0-4 (values 10, 12, 14, 16, 18)
-    EXPECT_DOUBLE_EQ(result[0].value, 14.0); // Average of first 5 points
+    EXPECT_DOUBLE_EQ(result[0].value, 14.0);  // Average of first 5 points
     EXPECT_EQ(result[0].count, 5);
 
     // Second bucket: points 5-9 (values 20, 22, 24, 26, 28)
-    EXPECT_DOUBLE_EQ(result[1].value, 24.0); // Average of last 5 points
+    EXPECT_DOUBLE_EQ(result[1].value, 24.0);  // Average of last 5 points
     EXPECT_EQ(result[1].count, 5);
 }
 
@@ -115,13 +117,11 @@ TEST_F(AggregatorTest, SinglePoint) {
 
 TEST_F(AggregatorTest, AggregateMultipleSeries) {
     // Create series with overlapping timestamps
-    auto series1 = AggregatorTestHelper::createSeries("test", {}, "value",
-        {1000000000, 2000000000, 3000000000},
-        {10.0, 20.0, 30.0});
+    auto series1 = AggregatorTestHelper::createSeries("test", {}, "value", {1000000000, 2000000000, 3000000000},
+                                                      {10.0, 20.0, 30.0});
 
-    auto series2 = AggregatorTestHelper::createSeries("test", {}, "value",
-        {2000000000, 3000000000, 4000000000},
-        {15.0, 25.0, 35.0});
+    auto series2 = AggregatorTestHelper::createSeries("test", {}, "value", {2000000000, 3000000000, 4000000000},
+                                                      {15.0, 25.0, 35.0});
 
     auto partials = Aggregator::createPartialAggregations({series1, series2}, AggregationMethod::AVG, 0, {});
     auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
@@ -152,15 +152,17 @@ TEST_F(AggregatorTest, GroupByAggregation) {
     std::vector<double> eastValues;
     for (int i = 0; i < 10; ++i) {
         eastTimestamps.push_back(1000000000 + i * 60000000000ULL);
-        eastValues.push_back(20.0 + i * 3.0); // Different values
+        eastValues.push_back(20.0 + i * 3.0);  // Different values
     }
-    auto eastSeries = AggregatorTestHelper::createSeries("test", {{"region", "us-east"}}, "value", eastTimestamps, eastValues);
+    auto eastSeries =
+        AggregatorTestHelper::createSeries("test", {{"region", "us-east"}}, "value", eastTimestamps, eastValues);
 
     // Group by region
-    auto partials = Aggregator::createPartialAggregations({westSeries, eastSeries}, AggregationMethod::AVG, 0, {"region"});
+    auto partials =
+        Aggregator::createPartialAggregations({westSeries, eastSeries}, AggregationMethod::AVG, 0, {"region"});
     auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
 
-    ASSERT_EQ(grouped.size(), 2); // Two groups
+    ASSERT_EQ(grouped.size(), 2);  // Two groups
 
     // Check both groups exist
     bool hasWest = false, hasEast = false;
@@ -180,7 +182,7 @@ TEST_F(AggregatorTest, GroupByAggregation) {
 
 TEST_F(AggregatorTest, TimeIntervalWithMax) {
     // Test MAX aggregation with time intervals
-    uint64_t interval = 3 * 60 * 1000000000ULL; // 3 minutes in nanoseconds
+    uint64_t interval = 3 * 60 * 1000000000ULL;  // 3 minutes in nanoseconds
     auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::MAX, interval);
 
     ASSERT_EQ(result.size(), 4);
@@ -211,7 +213,7 @@ TEST_F(AggregatorTest, InvalidInput) {
 }
 
 TEST_F(AggregatorTest, TimeIntervalWithSum) {
-    uint64_t interval = 5 * 60 * 1000000000ULL; // 5 minutes in nanoseconds
+    uint64_t interval = 5 * 60 * 1000000000ULL;  // 5 minutes in nanoseconds
     auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::SUM, interval);
 
     ASSERT_EQ(result.size(), 2);
@@ -226,7 +228,7 @@ TEST_F(AggregatorTest, TimeIntervalWithSum) {
 }
 
 TEST_F(AggregatorTest, TimeIntervalWithLatest) {
-    uint64_t interval = 4 * 60 * 1000000000ULL; // 4 minutes in nanoseconds
+    uint64_t interval = 4 * 60 * 1000000000ULL;  // 4 minutes in nanoseconds
     auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::LATEST, interval);
 
     ASSERT_EQ(result.size(), 3);
@@ -245,7 +247,7 @@ TEST_F(AggregatorTest, TimeIntervalWithLatest) {
 }
 
 TEST_F(AggregatorTest, VerySmallInterval) {
-    uint64_t interval = 30000000000ULL; // 30 seconds (data is at 1-minute intervals)
+    uint64_t interval = 30000000000ULL;  // 30 seconds (data is at 1-minute intervals)
     auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, interval);
 
     // Each point should be in its own bucket since interval < data spacing
@@ -258,36 +260,36 @@ TEST_F(AggregatorTest, VerySmallInterval) {
 }
 
 TEST_F(AggregatorTest, VeryLargeInterval) {
-    uint64_t interval = 20 * 60 * 1000000000ULL; // 20 minutes (data spans 9 minutes)
+    uint64_t interval = 20 * 60 * 1000000000ULL;  // 20 minutes (data spans 9 minutes)
     auto result = AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, interval);
 
     // Should have just one bucket containing all points
     ASSERT_EQ(result.size(), 1);
-    EXPECT_DOUBLE_EQ(result[0].value, 19.0); // Average of all values
+    EXPECT_DOUBLE_EQ(result[0].value, 19.0);  // Average of all values
     EXPECT_EQ(result[0].count, 10);
 }
 
 TEST_F(AggregatorTest, IrregularTimestamps) {
     std::vector<uint64_t> irregularTimestamps = {
-        1000000000,           // t=0 nanoseconds
-        1030000000000ULL,     // t=30 seconds
-        1045000000000ULL,     // t=45 seconds
-        1120000000000ULL,     // t=2 minutes
-        1180000000000ULL,     // t=3 minutes
-        1300000000000ULL      // t=5 minutes
+        1000000000,        // t=0 nanoseconds
+        1030000000000ULL,  // t=30 seconds
+        1045000000000ULL,  // t=45 seconds
+        1120000000000ULL,  // t=2 minutes
+        1180000000000ULL,  // t=3 minutes
+        1300000000000ULL   // t=5 minutes
     };
     std::vector<double> irregularValues = {10.0, 15.0, 20.0, 25.0, 30.0, 35.0};
 
-    uint64_t interval = 2 * 60 * 1000000000ULL; // 2 minutes in nanoseconds
-    auto result = AggregatorTestHelper::aggregate(irregularTimestamps, irregularValues,
-                                       AggregationMethod::AVG, interval);
+    uint64_t interval = 2 * 60 * 1000000000ULL;  // 2 minutes in nanoseconds
+    auto result =
+        AggregatorTestHelper::aggregate(irregularTimestamps, irregularValues, AggregationMethod::AVG, interval);
 
     // Just verify all points are accounted for
     size_t totalPoints = 0;
     for (const auto& point : result) {
         totalPoints += point.count;
     }
-    EXPECT_EQ(totalPoints, 6); // All 6 points should be accounted for
+    EXPECT_EQ(totalPoints, 6);  // All 6 points should be accounted for
 
     // Verify we have at least 3 buckets (minimum expected)
     EXPECT_GE(result.size(), 3);

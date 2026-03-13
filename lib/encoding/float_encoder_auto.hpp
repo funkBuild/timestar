@@ -48,9 +48,7 @@ public:
     /**
      * Get information about which encoder will be used
      */
-    static std::string getEncoderName() {
-        return "Highway SIMD (auto-dispatch)";
-    }
+    static std::string getEncoderName() { return "Highway SIMD (auto-dispatch)"; }
 
     /**
      * Check feature availability -- always true with Highway

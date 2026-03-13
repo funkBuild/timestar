@@ -97,7 +97,7 @@ HWY_AFTER_NAMESPACE();
 // ── Dispatch table + public API (compiled once) ─────────────────────────────
 #if HWY_ONCE
 
-#include "integer_encoder_avx512.hpp"
+    #include "integer_encoder_avx512.hpp"
 
 namespace timestar {
 namespace encoding {

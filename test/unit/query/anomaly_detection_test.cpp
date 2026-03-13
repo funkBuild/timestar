@@ -1,17 +1,18 @@
-#include <gtest/gtest.h>
-#include "anomaly/anomaly_result.hpp"
+#include "anomaly/agile_detector.hpp"
 #include "anomaly/anomaly_detector.hpp"
 #include "anomaly/anomaly_executor.hpp"
+#include "anomaly/anomaly_result.hpp"
 #include "anomaly/basic_detector.hpp"
 #include "anomaly/robust_detector.hpp"
-#include "anomaly/agile_detector.hpp"
-#include "anomaly/stl_decomposition.hpp"
 #include "anomaly/simd_anomaly.hpp"
+#include "anomaly/stl_decomposition.hpp"
 
-#include <vector>
-#include <set>
+#include <gtest/gtest.h>
+
 #include <cmath>
 #include <random>
+#include <set>
+#include <vector>
 
 using namespace timestar::anomaly;
 
@@ -24,7 +25,7 @@ protected:
     std::vector<uint64_t> generateTimestamps(size_t count, uint64_t startNs = 1704067200000000000ULL) {
         std::vector<uint64_t> timestamps;
         timestamps.reserve(count);
-        uint64_t interval = 60000000000ULL; // 1 minute in nanoseconds
+        uint64_t interval = 60000000000ULL;  // 1 minute in nanoseconds
         for (size_t i = 0; i < count; ++i) {
             timestamps.push_back(startNs + i * interval);
         }
@@ -32,9 +33,7 @@ protected:
     }
 
     // Generate constant values
-    std::vector<double> generateConstant(size_t count, double value) {
-        return std::vector<double>(count, value);
-    }
+    std::vector<double> generateConstant(size_t count, double value) { return std::vector<double>(count, value); }
 
     // Generate linear trend
     std::vector<double> generateLinearTrend(size_t count, double start, double slope) {
@@ -340,14 +339,8 @@ TEST_F(AnomalyDetectionTest, ExecutorMultiSeries) {
     AnomalyExecutor executor;
 
     auto timestamps = generateTimestamps(100);
-    std::vector<std::vector<double>> seriesValues = {
-        generateConstant(100, 50.0),
-        generateConstant(100, 100.0)
-    };
-    std::vector<std::vector<std::string>> seriesGroupTags = {
-        {"host=server01"},
-        {"host=server02"}
-    };
+    std::vector<std::vector<double>> seriesValues = {generateConstant(100, 50.0), generateConstant(100, 100.0)};
+    std::vector<std::vector<std::string>> seriesGroupTags = {{"host=server01"}, {"host=server02"}};
 
     AnomalyConfig config;
     config.algorithm = Algorithm::BASIC;
@@ -367,25 +360,16 @@ TEST_F(AnomalyDetectionTest, ExecutorMultiSeriesMismatchedSizesThrows) {
     AnomalyExecutor executor;
 
     auto timestamps = generateTimestamps(100);
-    std::vector<std::vector<double>> seriesValues = {
-        generateConstant(100, 50.0),
-        generateConstant(100, 75.0),
-        generateConstant(100, 100.0)
-    };
+    std::vector<std::vector<double>> seriesValues = {generateConstant(100, 50.0), generateConstant(100, 75.0),
+                                                     generateConstant(100, 100.0)};
     // Intentionally only 2 tag sets for 3 series
-    std::vector<std::vector<std::string>> seriesGroupTags = {
-        {"host=server01"},
-        {"host=server02"}
-    };
+    std::vector<std::vector<std::string>> seriesGroupTags = {{"host=server01"}, {"host=server02"}};
 
     AnomalyConfig config;
     config.algorithm = Algorithm::BASIC;
     config.bounds = 2.0;
 
-    EXPECT_THROW(
-        executor.executeMulti(timestamps, seriesValues, seriesGroupTags, config),
-        std::invalid_argument
-    );
+    EXPECT_THROW(executor.executeMulti(timestamps, seriesValues, seriesGroupTags, config), std::invalid_argument);
 }
 
 // ==================== Algorithm Config Tests ====================
@@ -413,9 +397,9 @@ TEST_F(AnomalyDetectionTest, SeasonalityToPeriod) {
     uint64_t oneMinuteNs = 60000000000ULL;
 
     EXPECT_EQ(seasonalityToPeriod(Seasonality::NONE, oneMinuteNs), 0);
-    EXPECT_EQ(seasonalityToPeriod(Seasonality::HOURLY, oneMinuteNs), 60);   // 60 mins
-    EXPECT_EQ(seasonalityToPeriod(Seasonality::DAILY, oneMinuteNs), 1440);  // 24 * 60
-    EXPECT_EQ(seasonalityToPeriod(Seasonality::WEEKLY, oneMinuteNs), 10080); // 7 * 24 * 60
+    EXPECT_EQ(seasonalityToPeriod(Seasonality::HOURLY, oneMinuteNs), 60);     // 60 mins
+    EXPECT_EQ(seasonalityToPeriod(Seasonality::DAILY, oneMinuteNs), 1440);    // 24 * 60
+    EXPECT_EQ(seasonalityToPeriod(Seasonality::WEEKLY, oneMinuteNs), 10080);  // 7 * 24 * 60
 }
 
 TEST_F(AnomalyDetectionTest, AlgorithmToString) {
@@ -449,17 +433,14 @@ TEST_F(AnomalyDetectionTest, IncrementalRollingStatsM2ClampingNoNaN) {
 
         // The key assertion: stddev should never be NaN
         double sd = stats.stddev();
-        EXPECT_FALSE(std::isnan(sd))
-            << "stddev() returned NaN after update with value " << v;
+        EXPECT_FALSE(std::isnan(sd)) << "stddev() returned NaN after update with value " << v;
 
         // variance should also never be negative
         double var = stats.variance();
-        EXPECT_GE(var, 0.0)
-            << "variance() returned negative value " << var << " after update with value " << v;
+        EXPECT_GE(var, 0.0) << "variance() returned negative value " << var << " after update with value " << v;
 
         // mean should always be finite
-        EXPECT_TRUE(std::isfinite(stats.mean()))
-            << "mean() is not finite after update with value " << v;
+        EXPECT_TRUE(std::isfinite(stats.mean())) << "mean() is not finite after update with value " << v;
     }
 }
 
@@ -474,10 +455,8 @@ TEST_F(AnomalyDetectionTest, IncrementalRollingStatsM2ClampingConstantValues) {
         stats.update(42.0);
 
         double sd = stats.stddev();
-        EXPECT_FALSE(std::isnan(sd))
-            << "stddev() returned NaN for constant value series at iteration " << i;
-        EXPECT_GE(stats.variance(), 0.0)
-            << "variance() negative for constant value series at iteration " << i;
+        EXPECT_FALSE(std::isnan(sd)) << "stddev() returned NaN for constant value series at iteration " << i;
+        EXPECT_GE(stats.variance(), 0.0) << "variance() negative for constant value series at iteration " << i;
     }
 
     // After enough constant values, variance should be very close to zero
@@ -525,14 +504,10 @@ TEST_F(AnomalyDetectionTest, BasicDetectorProducesNoNaN) {
     auto output = detector.detect(input, config);
 
     for (size_t i = 0; i < output.size(); ++i) {
-        EXPECT_FALSE(std::isnan(output.predictions[i]))
-            << "prediction is NaN at index " << i;
-        EXPECT_FALSE(std::isnan(output.scores[i]))
-            << "score is NaN at index " << i;
-        EXPECT_FALSE(std::isnan(output.upper[i]))
-            << "upper bound is NaN at index " << i;
-        EXPECT_FALSE(std::isnan(output.lower[i]))
-            << "lower bound is NaN at index " << i;
+        EXPECT_FALSE(std::isnan(output.predictions[i])) << "prediction is NaN at index " << i;
+        EXPECT_FALSE(std::isnan(output.scores[i])) << "score is NaN at index " << i;
+        EXPECT_FALSE(std::isnan(output.upper[i])) << "upper bound is NaN at index " << i;
+        EXPECT_FALSE(std::isnan(output.lower[i])) << "lower bound is NaN at index " << i;
     }
 }
 
@@ -577,8 +552,7 @@ TEST_F(AnomalyDetectionTest, AgileDetectorShortDataFallback) {
         << "Agile detector should produce finite bounds for short data by falling back to non-seasonal";
 
     // The anomaly at index 40 should still be detected
-    EXPECT_GT(output.scores[40], 0.0)
-        << "Should detect the outlier even with short data";
+    EXPECT_GT(output.scores[40], 0.0) << "Should detect the outlier even with short data";
 }
 
 // ==================== Welford Drift Accuracy Test ====================
@@ -605,9 +579,7 @@ TEST_F(AnomalyDetectionTest, IncrementalRollingStatsNoDriftOnLongSeries) {
     allValues.reserve(totalPoints);
 
     // Known anomaly positions
-    std::vector<size_t> anomalyPositions = {
-        500, 2000, 5000, 7500, 10000, 12000, 14000
-    };
+    std::vector<size_t> anomalyPositions = {500, 2000, 5000, 7500, 10000, 12000, 14000};
     std::set<size_t> anomalySet(anomalyPositions.begin(), anomalyPositions.end());
 
     for (size_t i = 0; i < totalPoints; ++i) {
@@ -646,15 +618,13 @@ TEST_F(AnomalyDetectionTest, IncrementalRollingStatsNoDriftOnLongSeries) {
 
             // Mean should be accurate to within 1e-9 relative error
             double meanRelErr = (bruteMean != 0.0) ? meanErr / std::abs(bruteMean) : meanErr;
-            EXPECT_LT(meanRelErr, 1e-9)
-                << "Mean drift too large at point " << i
-                << ": incremental=" << stats.mean() << " brute=" << bruteMean;
+            EXPECT_LT(meanRelErr, 1e-9) << "Mean drift too large at point " << i << ": incremental=" << stats.mean()
+                                        << " brute=" << bruteMean;
 
             // Variance should be accurate to within 1e-6 relative error
             double varRelErr = (bruteVariance > 1e-10) ? varErr / bruteVariance : varErr;
-            EXPECT_LT(varRelErr, 1e-6)
-                << "Variance drift too large at point " << i
-                << ": incremental=" << stats.variance() << " brute=" << bruteVariance;
+            EXPECT_LT(varRelErr, 1e-6) << "Variance drift too large at point " << i
+                                       << ": incremental=" << stats.variance() << " brute=" << bruteVariance;
 
             // stddev should never be NaN
             EXPECT_FALSE(std::isnan(stats.stddev()));
@@ -692,9 +662,7 @@ TEST_F(AnomalyDetectionTest, BasicDetectorAccurateOnLongSeriesWithKnownAnomalies
 
     // Insert large anomalies at known positions spread across the series.
     // If drift is occurring, later anomalies would be missed.
-    std::vector<size_t> anomalyPositions = {
-        200, 1000, 3000, 5000, 7000, 9000, 11000
-    };
+    std::vector<size_t> anomalyPositions = {200, 1000, 3000, 5000, 7000, 9000, 11000};
     for (size_t pos : anomalyPositions) {
         input.values[pos] = 200.0;  // ~75 stddevs above mean
     }
@@ -705,17 +673,14 @@ TEST_F(AnomalyDetectionTest, BasicDetectorAccurateOnLongSeriesWithKnownAnomalies
 
     // Every injected anomaly should be detected (positive score)
     for (size_t pos : anomalyPositions) {
-        EXPECT_GT(output.scores[pos], 0.0)
-            << "Failed to detect known anomaly at position " << pos
-            << " (may indicate Welford drift degrading accuracy over time)";
+        EXPECT_GT(output.scores[pos], 0.0) << "Failed to detect known anomaly at position " << pos
+                                           << " (may indicate Welford drift degrading accuracy over time)";
     }
 
     // No NaN values anywhere in the output
     for (size_t i = 0; i < output.size(); ++i) {
-        EXPECT_FALSE(std::isnan(output.predictions[i]))
-            << "NaN prediction at index " << i;
-        EXPECT_FALSE(std::isnan(output.scores[i]))
-            << "NaN score at index " << i;
+        EXPECT_FALSE(std::isnan(output.predictions[i])) << "NaN prediction at index " << i;
+        EXPECT_FALSE(std::isnan(output.scores[i])) << "NaN score at index " << i;
     }
 }
 
@@ -728,13 +693,11 @@ TEST_F(AnomalyDetectionTest, CpuidCachingReturnsConsistentResults) {
 
     bool avx2_first = simd::isAvx2Available();
     bool avx2_second = simd::isAvx2Available();
-    EXPECT_EQ(avx2_first, avx2_second)
-        << "isAvx2Available() returned inconsistent results";
+    EXPECT_EQ(avx2_first, avx2_second) << "isAvx2Available() returned inconsistent results";
 
     bool avx512_first = simd::isAvx512Available();
     bool avx512_second = simd::isAvx512Available();
-    EXPECT_EQ(avx512_first, avx512_second)
-        << "isAvx512Available() returned inconsistent results";
+    EXPECT_EQ(avx512_first, avx512_second) << "isAvx512Available() returned inconsistent results";
 
     // Call many more times to be thorough
     for (int i = 0; i < 100; ++i) {

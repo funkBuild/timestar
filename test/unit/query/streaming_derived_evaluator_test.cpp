@@ -1,15 +1,13 @@
-#include <gtest/gtest.h>
 #include "streaming_derived_evaluator.hpp"
+
 #include "expression_parser.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
-static StreamingDataPoint makePoint(
-    const std::string& measurement,
-    const std::string& field,
-    const std::map<std::string, std::string>& tags,
-    uint64_t timestamp,
-    double value) {
+static StreamingDataPoint makePoint(const std::string& measurement, const std::string& field,
+                                    const std::map<std::string, std::string>& tags, uint64_t timestamp, double value) {
     StreamingDataPoint pt;
     pt.measurement = measurement;
     pt.field = field;
@@ -24,13 +22,9 @@ TEST(StreamingDerivedEvalTest, SimpleSubtraction) {
     ExpressionParser parser("a - b");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     // Add points for query "a" and "b" in the same bucket
     eval.addPoint("a", makePoint("cpu", "usage", {}, 1'000'000'000, 90.0));
@@ -51,13 +45,9 @@ TEST(StreamingDerivedEvalTest, DivisionFormula) {
     ExpressionParser parser("a / b * 100");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::SUM},
-        {"b", AggregationMethod::SUM}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::SUM}, {"b", AggregationMethod::SUM}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     eval.addPoint("a", makePoint("cpu", "usage", {}, 1'000'000'000, 30.0));
     eval.addPoint("a", makePoint("cpu", "usage", {}, 2'000'000'000, 20.0));
@@ -74,13 +64,9 @@ TEST(StreamingDerivedEvalTest, MultipleBuckets) {
     ExpressionParser parser("a + b");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(5'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(5'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     // Bucket [0, 5s)
     eval.addPoint("a", makePoint("cpu", "usage", {}, 1'000'000'000, 10.0));
@@ -95,7 +81,7 @@ TEST(StreamingDerivedEvalTest, MultipleBuckets) {
 
     // Sort by timestamp to verify
     std::sort(batch.points.begin(), batch.points.end(),
-        [](const auto& a, const auto& b) { return a.timestamp < b.timestamp; });
+              [](const auto& a, const auto& b) { return a.timestamp < b.timestamp; });
 
     EXPECT_DOUBLE_EQ(std::get<double>(batch.points[0].value), 30.0);  // 10 + 20
     EXPECT_DOUBLE_EQ(std::get<double>(batch.points[1].value), 70.0);  // 30 + 40
@@ -106,13 +92,9 @@ TEST(StreamingDerivedEvalTest, CarryForwardMissingData) {
     ExpressionParser parser("a - b");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(5'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(5'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     // First emission: both queries have data
     eval.addPoint("a", makePoint("cpu", "usage", {}, 1'000'000'000, 100.0));
@@ -134,13 +116,9 @@ TEST(StreamingDerivedEvalTest, EmptyWhenNoData) {
     ExpressionParser parser("a + b");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     EXPECT_FALSE(eval.hasData());
     auto batch = eval.closeBuckets();
@@ -151,13 +129,9 @@ TEST(StreamingDerivedEvalTest, HasDataFlag) {
     ExpressionParser parser("a + b");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     EXPECT_FALSE(eval.hasData());
 
@@ -174,13 +148,9 @@ TEST(StreamingDerivedEvalTest, ThreeQueryFormula) {
     auto ast = parser.parse();
 
     std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG},
-        {"c", AggregationMethod::AVG}
-    };
+        {"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}, {"c", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     eval.addPoint("a", makePoint("cpu", "user", {}, 1'000'000'000, 30.0));
     eval.addPoint("b", makePoint("cpu", "sys", {}, 1'000'000'000, 20.0));
@@ -196,13 +166,9 @@ TEST(StreamingDerivedEvalTest, UnaryFunctionOnCrossQuery) {
     ExpressionParser parser("abs(a - b)");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     eval.addPoint("a", makePoint("temp", "indoor", {}, 1'000'000'000, 20.0));
     eval.addPoint("b", makePoint("temp", "outdoor", {}, 1'000'000'000, 35.0));
@@ -220,13 +186,9 @@ TEST(StreamingDerivedEvalTest, StringValueProducesNaNNotZero) {
     ExpressionParser parser("a + b");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     eval.addPoint("a", makePoint("cpu", "usage", {}, 1'000'000'000, 42.0));
 
@@ -243,8 +205,7 @@ TEST(StreamingDerivedEvalTest, StringValueProducesNaNNotZero) {
     // Before the fix it was silently 0.0 (42 + 0 = 42), which is wrong.
     ASSERT_EQ(batch.points.size(), 1u);
     double result = std::get<double>(batch.points[0].value);
-    EXPECT_TRUE(std::isnan(result))
-        << "Expected NaN for formula involving string value, got: " << result;
+    EXPECT_TRUE(std::isnan(result)) << "Expected NaN for formula involving string value, got: " << result;
 }
 
 // Test: when EvaluationException is thrown during formula evaluation (e.g. formula
@@ -260,16 +221,12 @@ TEST(StreamingDerivedEvalTest, EvaluationExceptionProducesNaNNotEmptyBatch) {
     ExpressionParser parser("a + c");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     eval.addPoint("a", makePoint("cpu", "usage", {}, 1'000'000'000, 42.0));
-    eval.addPoint("b", makePoint("mem", "used",  {}, 1'000'000'000, 10.0));
+    eval.addPoint("b", makePoint("mem", "used", {}, 1'000'000'000, 10.0));
 
     auto batch = eval.closeBuckets();
 
@@ -278,8 +235,7 @@ TEST(StreamingDerivedEvalTest, EvaluationExceptionProducesNaNNotEmptyBatch) {
     ASSERT_EQ(batch.points.size(), 1u)
         << "EvaluationException silently swallowed: expected 1 NaN point, got empty batch";
     double result = std::get<double>(batch.points[0].value);
-    EXPECT_TRUE(std::isnan(result))
-        << "Expected NaN for unresolvable formula variable, got: " << result;
+    EXPECT_TRUE(std::isnan(result)) << "Expected NaN for unresolvable formula variable, got: " << result;
 }
 
 // Regression test: when _intervalNs is very large (> UINT64_MAX / kCarryForwardMaxIntervals),
@@ -304,18 +260,14 @@ TEST(StreamingDerivedEvalTest, CarryForwardStalenessOverflowSafety) {
     ExpressionParser parser("a - b");
     auto ast = parser.parse();
 
-    std::map<std::string, AggregationMethod> methods = {
-        {"a", AggregationMethod::AVG},
-        {"b", AggregationMethod::AVG}
-    };
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}, {"b", AggregationMethod::AVG}};
 
-    StreamingDerivedEvaluator eval(overflowInterval, methods,
-        std::shared_ptr<ExpressionNode>(std::move(ast)));
+    StreamingDerivedEvaluator eval(overflowInterval, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
 
     // First emission: both "a" and "b" have real data in bucket 0 (timestamp 0).
     // bucketStart(0) = 0 for any intervalNs; lastRealTs for "b" will be recorded as 0.
     eval.addPoint("a", makePoint("cpu", "usage", {}, 0ULL, 100.0));
-    eval.addPoint("b", makePoint("mem", "used",  {}, 0ULL, 40.0));
+    eval.addPoint("b", makePoint("mem", "used", {}, 0ULL, 40.0));
     auto batch1 = eval.closeBuckets();
     ASSERT_EQ(batch1.points.size(), 1u);
     EXPECT_DOUBLE_EQ(std::get<double>(batch1.points[0].value), 60.0);  // 100 - 40
@@ -342,7 +294,7 @@ TEST(StreamingDerivedEvalTest, CarryForwardStalenessOverflowSafety) {
     ASSERT_EQ(batch2.points.size(), 1u);
     double val = std::get<double>(batch2.points[0].value);
     EXPECT_FALSE(std::isnan(val)) << "carry-forward should not expire with huge interval: "
-        "10 * intervalNs overflows uint64_t to 4, making staleCutoff nearly equal to "
-        "latestTs and wrongly expiring a fresh carry-forward value";
+                                     "10 * intervalNs overflows uint64_t to 4, making staleCutoff nearly equal to "
+                                     "latestTs and wrongly expiring a fresh carry-forward value";
     EXPECT_DOUBLE_EQ(val, 40.0);  // 80 - 40 (carry-forward of "b")
 }

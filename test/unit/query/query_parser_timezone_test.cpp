@@ -1,5 +1,6 @@
-#include <gtest/gtest.h>
 #include "../../../lib/query/query_parser.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 

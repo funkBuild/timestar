@@ -1,10 +1,12 @@
-#include <gtest/gtest.h>
 #include "tsxor_encoder.hpp"
-#include <vector>
-#include <cstdint>
-#include <cmath>
-#include <limits>
+
+#include <gtest/gtest.h>
+
 #include <bit>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <vector>
 
 // --- Window tests ---
 
@@ -132,22 +134,19 @@ TEST(TsxorEncoderTest, EncodeProducesCompressedOutput) {
 
     CompressedBuffer result = TsxorEncoder::encode(values);
     size_t rawSize = 1000 * sizeof(double);
-    EXPECT_LT(result.size(), rawSize)
-        << "Compressed size (" << result.size()
-        << ") should be less than raw size (" << rawSize << ")";
+    EXPECT_LT(result.size(), rawSize) << "Compressed size (" << result.size() << ") should be less than raw size ("
+                                      << rawSize << ")";
 }
 
 TEST(TsxorEncoderTest, EncodeHandlesSpecialValues) {
-    std::vector<double> values = {
-        0.0,
-        -0.0,
-        std::numeric_limits<double>::quiet_NaN(),
-        std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::min(),
-        std::numeric_limits<double>::max(),
-        std::numeric_limits<double>::denorm_min()
-    };
+    std::vector<double> values = {0.0,
+                                  -0.0,
+                                  std::numeric_limits<double>::quiet_NaN(),
+                                  std::numeric_limits<double>::infinity(),
+                                  -std::numeric_limits<double>::infinity(),
+                                  std::numeric_limits<double>::min(),
+                                  std::numeric_limits<double>::max(),
+                                  std::numeric_limits<double>::denorm_min()};
 
     // Should not crash
     CompressedBuffer result = TsxorEncoder::encode(values);
@@ -162,8 +161,7 @@ TEST(TsxorEncoderTest, EncodeHandlesSpecialValues) {
 TEST(TsxorEncoderTest, EncodeSingleValue) {
     std::vector<double> values = {1.0};
     CompressedBuffer result = TsxorEncoder::encode(values);
-    EXPECT_GT(result.size(), 0u)
-        << "Encoding a single value must produce a non-empty buffer";
+    EXPECT_GT(result.size(), 0u) << "Encoding a single value must produce a non-empty buffer";
 }
 
 TEST(TsxorEncoderTest, EncodeSingleValueZero) {
@@ -172,29 +170,25 @@ TEST(TsxorEncoderTest, EncodeSingleValueZero) {
     // first value.
     std::vector<double> values = {0.0};
     CompressedBuffer result = TsxorEncoder::encode(values);
-    EXPECT_GT(result.size(), 0u)
-        << "Encoding a single zero value must produce a non-empty buffer";
+    EXPECT_GT(result.size(), 0u) << "Encoding a single zero value must produce a non-empty buffer";
 }
 
 TEST(TsxorEncoderTest, EncodeSingleNaN) {
     std::vector<double> values = {std::numeric_limits<double>::quiet_NaN()};
     CompressedBuffer result = TsxorEncoder::encode(values);
-    EXPECT_GT(result.size(), 0u)
-        << "Encoding a single NaN value must produce a non-empty buffer";
+    EXPECT_GT(result.size(), 0u) << "Encoding a single NaN value must produce a non-empty buffer";
 }
 
 TEST(TsxorEncoderTest, EncodeSingleInfinity) {
     std::vector<double> values = {std::numeric_limits<double>::infinity()};
     CompressedBuffer result = TsxorEncoder::encode(values);
-    EXPECT_GT(result.size(), 0u)
-        << "Encoding a single +Inf value must produce a non-empty buffer";
+    EXPECT_GT(result.size(), 0u) << "Encoding a single +Inf value must produce a non-empty buffer";
 }
 
 TEST(TsxorEncoderTest, EncodeSingleNegativeInfinity) {
     std::vector<double> values = {-std::numeric_limits<double>::infinity()};
     CompressedBuffer result = TsxorEncoder::encode(values);
-    EXPECT_GT(result.size(), 0u)
-        << "Encoding a single -Inf value must produce a non-empty buffer";
+    EXPECT_GT(result.size(), 0u) << "Encoding a single -Inf value must produce a non-empty buffer";
 }
 
 // ---------------------------------------------------------------------------
@@ -228,8 +222,7 @@ TEST(TsxorEncoderTest, EncodeTwoIdenticalCompressesBetterThanTwoDifferent) {
     CompressedBuffer r_different = TsxorEncoder::encode(different);
 
     EXPECT_LE(r_identical.size(), r_different.size())
-        << "Two identical values (" << r_identical.size()
-        << " bytes) should be no larger than two different values ("
+        << "Two identical values (" << r_identical.size() << " bytes) should be no larger than two different values ("
         << r_different.size() << " bytes)";
 }
 
@@ -247,8 +240,7 @@ TEST(TsxorEncoderTest, EncodeAllZeros) {
     EXPECT_GT(result.size(), 0u);
 
     size_t rawSize = values.size() * sizeof(double);
-    EXPECT_LT(result.size(), rawSize)
-        << "All-zero input should compress below raw size";
+    EXPECT_LT(result.size(), rawSize) << "All-zero input should compress below raw size";
 }
 
 // ---------------------------------------------------------------------------
@@ -306,18 +298,16 @@ TEST(TsxorEncoderTest, WindowEvictsFirstAfterWindowSizePlusOneUniqueValues) {
     }
     still_in_window.push_back(v0);  // v0 is still at the tail; this is a hit
 
-    CompressedBuffer r_evicted       = TsxorEncoder::encode(evicted);
-    CompressedBuffer r_still_in_win  = TsxorEncoder::encode(still_in_window);
+    CompressedBuffer r_evicted = TsxorEncoder::encode(evicted);
+    CompressedBuffer r_still_in_win = TsxorEncoder::encode(still_in_window);
 
     // When v0 is evicted the repeat requires a full XOR encoding (more bits).
     // When v0 is still in the window it costs only 1 byte.
     // Both sequences are otherwise the same length with the same unique values,
     // so the evicted case should produce a larger (or equal) compressed output.
     EXPECT_GE(r_evicted.size(), r_still_in_win.size())
-        << "Encoding a value evicted from the window ("
-        << r_evicted.size()
-        << " bytes) should not be smaller than encoding an in-window repeat ("
-        << r_still_in_win.size() << " bytes)";
+        << "Encoding a value evicted from the window (" << r_evicted.size()
+        << " bytes) should not be smaller than encoding an in-window repeat (" << r_still_in_win.size() << " bytes)";
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +321,7 @@ TEST(TsxorEncoderTest, EncodeTimestampLikeMonotonicSequence) {
     // Nanosecond timestamps starting at 2024-01-01 00:00:00 UTC,
     // incrementing by 1 second (1e9 ns). Cast to double via bit_cast.
     const uint64_t base_ts = 1704067200000000000ULL;  // 2024-01-01 in ns
-    const uint64_t step_ns = 1000000000ULL;            // 1 second in ns
+    const uint64_t step_ns = 1000000000ULL;           // 1 second in ns
     const size_t N = 200;
 
     std::vector<double> ts_values;
@@ -346,9 +336,8 @@ TEST(TsxorEncoderTest, EncodeTimestampLikeMonotonicSequence) {
 
     // Monotonic timestamps with small deltas should compress better than raw.
     size_t rawSize = N * sizeof(double);
-    EXPECT_LT(result.size(), rawSize)
-        << "Monotonically increasing timestamp-like values should compress "
-        << "below raw size";
+    EXPECT_LT(result.size(), rawSize) << "Monotonically increasing timestamp-like values should compress "
+                                      << "below raw size";
 }
 
 TEST(TsxorEncoderTest, EncodeTimestampLargeGaps) {
@@ -356,7 +345,7 @@ TEST(TsxorEncoderTest, EncodeTimestampLargeGaps) {
     // Large gaps mean the XOR of consecutive values has fewer leading zeros,
     // but the encoder should still not crash.
     const uint64_t base_ts = 1704067200000000000ULL;
-    const uint64_t day_ns  = 86400ULL * 1000000000ULL;  // 1 day in ns
+    const uint64_t day_ns = 86400ULL * 1000000000ULL;  // 1 day in ns
     const size_t N = 100;
 
     std::vector<double> ts_values;
@@ -385,8 +374,7 @@ TEST(TsxorEncoderTest, EncodeTimestampIdenticalDeltaZero) {
     // After the first value populates the window, every subsequent value is a
     // 1-byte window hit. The compressed size should be well below raw.
     size_t rawSize = N * sizeof(double);
-    EXPECT_LT(result.size(), rawSize / 4)
-        << "Identical timestamp values should compress to under 25% of raw size";
+    EXPECT_LT(result.size(), rawSize / 4) << "Identical timestamp values should compress to under 25% of raw size";
 }
 
 // ---------------------------------------------------------------------------
@@ -396,23 +384,14 @@ TEST(TsxorEncoderTest, EncodeTimestampIdenticalDeltaZero) {
 // specific uint64 bit patterns; they must not cause crashes or silent errors.
 // ---------------------------------------------------------------------------
 TEST(TsxorEncoderTest, NaNInMiddleOfSequence) {
-    std::vector<double> values = {
-        1.0, 2.0, 3.0,
-        std::numeric_limits<double>::quiet_NaN(),
-        4.0, 5.0, 6.0
-    };
+    std::vector<double> values = {1.0, 2.0, 3.0, std::numeric_limits<double>::quiet_NaN(), 4.0, 5.0, 6.0};
     CompressedBuffer result = TsxorEncoder::encode(values);
     EXPECT_GT(result.size(), 0u);
 }
 
 TEST(TsxorEncoderTest, InfinityInMiddleOfSequence) {
     std::vector<double> values = {
-        1.0, 2.0,
-        std::numeric_limits<double>::infinity(),
-        3.0, 4.0,
-        -std::numeric_limits<double>::infinity(),
-        5.0
-    };
+        1.0, 2.0, std::numeric_limits<double>::infinity(), 3.0, 4.0, -std::numeric_limits<double>::infinity(), 5.0};
     CompressedBuffer result = TsxorEncoder::encode(values);
     EXPECT_GT(result.size(), 0u);
 }
@@ -423,8 +402,7 @@ TEST(TsxorEncoderTest, NegativeZeroDistinctFromPositiveZero) {
     // Encoding both in sequence should work correctly.
     uint64_t pos_zero_bits = std::bit_cast<uint64_t>(+0.0);
     uint64_t neg_zero_bits = std::bit_cast<uint64_t>(-0.0);
-    ASSERT_NE(pos_zero_bits, neg_zero_bits)
-        << "Sanity: +0.0 and -0.0 must have different bit patterns";
+    ASSERT_NE(pos_zero_bits, neg_zero_bits) << "Sanity: +0.0 and -0.0 must have different bit patterns";
 
     std::vector<double> values = {0.0, -0.0, 0.0, -0.0};
     CompressedBuffer result = TsxorEncoder::encode(values);
@@ -449,14 +427,12 @@ TEST(WindowTest, ExactWindowSizeCapacity) {
     }
 
     // All initial zeros should be evicted.
-    EXPECT_FALSE(w.contains(0))
-        << "After " << N << " inserts into a window of size " << N
-        << ", the initial zeros must be evicted";
+    EXPECT_FALSE(w.contains(0)) << "After " << N << " inserts into a window of size " << N
+                                << ", the initial zeros must be evicted";
 
     // All inserted values should be present.
     for (int i = 1; i <= N; i++) {
-        EXPECT_TRUE(w.contains(static_cast<uint64_t>(i)))
-            << "Value " << i << " should still be in the window";
+        EXPECT_TRUE(w.contains(static_cast<uint64_t>(i))) << "Value " << i << " should still be in the window";
     }
 }
 
@@ -469,8 +445,7 @@ TEST(WindowTest, WindowSizeIsWindowSizeConstant) {
     for (int i = 0; i < WINDOW_SIZE; i++) {
         w.insert(static_cast<uint64_t>(i + 1));
     }
-    EXPECT_FALSE(w.contains(0))
-        << "After exactly WINDOW_SIZE inserts, the initial zeros must be evicted";
+    EXPECT_FALSE(w.contains(0)) << "After exactly WINDOW_SIZE inserts, the initial zeros must be evicted";
 }
 
 TEST(WindowTest, GetIndexOfAtWindowBoundary) {
@@ -486,8 +461,7 @@ TEST(WindowTest, GetIndexOfAtWindowBoundary) {
     w.insert(50);
     // Deque: [50, 40, 30, 20, 10]
     EXPECT_EQ(w.getIndexOf(50), 0);
-    EXPECT_EQ(w.getIndexOf(10), N - 1)
-        << "Oldest element should be at index N-1=" << (N-1);
+    EXPECT_EQ(w.getIndexOf(10), N - 1) << "Oldest element should be at index N-1=" << (N - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -508,8 +482,7 @@ TEST(TsxorEncoderTest, EncodeMoreThan256Values) {
     EXPECT_GT(result.size(), 0u);
 
     size_t rawSize = 300 * sizeof(double);
-    EXPECT_LT(result.size(), rawSize / 2)
-        << "Alternating 2-value sequence over 300 elements should compress well";
+    EXPECT_LT(result.size(), rawSize / 2) << "Alternating 2-value sequence over 300 elements should compress well";
 }
 
 TEST(TsxorEncoderTest, EncodeExactly256Values) {
@@ -519,8 +492,7 @@ TEST(TsxorEncoderTest, EncodeExactly256Values) {
     EXPECT_GT(result.size(), 0u);
 
     size_t rawSize = 256 * sizeof(double);
-    EXPECT_LT(result.size(), rawSize)
-        << "256 identical values should compress below raw size";
+    EXPECT_LT(result.size(), rawSize) << "256 identical values should compress below raw size";
 }
 
 TEST(TsxorEncoderTest, EncodeExactly257Values) {
@@ -531,8 +503,7 @@ TEST(TsxorEncoderTest, EncodeExactly257Values) {
     EXPECT_GT(result.size(), 0u);
 
     size_t rawSize = 257 * sizeof(double);
-    EXPECT_LT(result.size(), rawSize)
-        << "257 identical values should still compress below raw size";
+    EXPECT_LT(result.size(), rawSize) << "257 identical values should still compress below raw size";
 }
 
 // ---------------------------------------------------------------------------
@@ -540,21 +511,15 @@ TEST(TsxorEncoderTest, EncodeExactly257Values) {
 // (edge-case inputs that might expose non-determinism via NaN bit patterns).
 // ---------------------------------------------------------------------------
 TEST(TsxorEncoderTest, DeterministicWithNaN) {
-    std::vector<double> values = {
-        1.0,
-        std::numeric_limits<double>::quiet_NaN(),
-        2.0,
-        std::numeric_limits<double>::signaling_NaN(),
-        3.0
-    };
+    std::vector<double> values = {1.0, std::numeric_limits<double>::quiet_NaN(), 2.0,
+                                  std::numeric_limits<double>::signaling_NaN(), 3.0};
 
     CompressedBuffer r1 = TsxorEncoder::encode(values);
     CompressedBuffer r2 = TsxorEncoder::encode(values);
 
     ASSERT_EQ(r1.data.size(), r2.data.size());
     for (size_t i = 0; i < r1.data.size(); i++) {
-        EXPECT_EQ(r1.data[i], r2.data[i])
-            << "Encoding with NaN must be deterministic; mismatch at word " << i;
+        EXPECT_EQ(r1.data[i], r2.data[i]) << "Encoding with NaN must be deterministic; mismatch at word " << i;
     }
 }
 
@@ -565,7 +530,6 @@ TEST(TsxorEncoderTest, DeterministicSingleValue) {
 
     ASSERT_EQ(r1.data.size(), r2.data.size());
     for (size_t i = 0; i < r1.data.size(); i++) {
-        EXPECT_EQ(r1.data[i], r2.data[i])
-            << "Single-value encoding must be deterministic; mismatch at word " << i;
+        EXPECT_EQ(r1.data[i], r2.data[i]) << "Single-value encoding must be deterministic; mismatch at word " << i;
     }
 }

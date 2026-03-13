@@ -1,52 +1,46 @@
-#include <gtest/gtest.h>
-#include <cmath>
-#include <random>
-#include <limits>
-#include <bit>
-#include <numeric>
-
 #include "alp/alp_encoder.hpp"
-#include "alp/alp_decoder.hpp"
+
 #include "alp/alp_constants.hpp"
+#include "alp/alp_decoder.hpp"
 #include "alp/alp_ffor.hpp"
+
+#include <gtest/gtest.h>
+
+#include <bit>
+#include <cmath>
+#include <limits>
+#include <numeric>
+#include <random>
 
 class ALPEncoderTest : public ::testing::Test {
 protected:
     void testRoundtrip(const std::vector<double>& original) {
         auto buffer = ALPEncoder::encode(original);
 
-        CompressedSlice slice(
-            reinterpret_cast<const uint8_t*>(buffer.data.data()),
-            buffer.data.size() * sizeof(uint64_t));
+        CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()),
+                              buffer.data.size() * sizeof(uint64_t));
 
         std::vector<double> decoded;
         ALPDecoder::decode(slice, 0, original.size(), decoded);
 
         ASSERT_EQ(decoded.size(), original.size())
-            << "Decoded size mismatch: expected " << original.size()
-            << " got " << decoded.size();
+            << "Decoded size mismatch: expected " << original.size() << " got " << decoded.size();
 
         for (size_t i = 0; i < original.size(); ++i) {
             if (std::isnan(original[i])) {
-                EXPECT_TRUE(std::isnan(decoded[i]))
-                    << "Expected NaN at index " << i;
+                EXPECT_TRUE(std::isnan(decoded[i])) << "Expected NaN at index " << i;
             } else {
-                EXPECT_EQ(std::bit_cast<uint64_t>(original[i]),
-                          std::bit_cast<uint64_t>(decoded[i]))
-                    << "Mismatch at index " << i
-                    << ": original=" << original[i]
-                    << " decoded=" << decoded[i];
+                EXPECT_EQ(std::bit_cast<uint64_t>(original[i]), std::bit_cast<uint64_t>(decoded[i]))
+                    << "Mismatch at index " << i << ": original=" << original[i] << " decoded=" << decoded[i];
             }
         }
     }
 
-    void testSkipDecode(const std::vector<double>& original,
-                        size_t skip, size_t count) {
+    void testSkipDecode(const std::vector<double>& original, size_t skip, size_t count) {
         auto buffer = ALPEncoder::encode(original);
 
-        CompressedSlice slice(
-            reinterpret_cast<const uint8_t*>(buffer.data.data()),
-            buffer.data.size() * sizeof(uint64_t));
+        CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()),
+                              buffer.data.size() * sizeof(uint64_t));
 
         std::vector<double> decoded;
         size_t actual_count = std::min(count, original.size() - skip);
@@ -58,10 +52,8 @@ protected:
             if (std::isnan(original[skip + i])) {
                 EXPECT_TRUE(std::isnan(decoded[i]));
             } else {
-                EXPECT_EQ(std::bit_cast<uint64_t>(original[skip + i]),
-                          std::bit_cast<uint64_t>(decoded[i]))
-                    << "Mismatch at decoded index " << i
-                    << " (original index " << (skip + i) << ")";
+                EXPECT_EQ(std::bit_cast<uint64_t>(original[skip + i]), std::bit_cast<uint64_t>(decoded[i]))
+                    << "Mismatch at decoded index " << i << " (original index " << (skip + i) << ")";
             }
         }
     }
@@ -134,8 +126,7 @@ TEST_F(ALPEncoderTest, NaN) {
 }
 
 TEST_F(ALPEncoderTest, Infinity) {
-    testRoundtrip({std::numeric_limits<double>::infinity(),
-                   -std::numeric_limits<double>::infinity()});
+    testRoundtrip({std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()});
 }
 
 TEST_F(ALPEncoderTest, NegativeZero) {
@@ -143,20 +134,17 @@ TEST_F(ALPEncoderTest, NegativeZero) {
 }
 
 TEST_F(ALPEncoderTest, DBL_MIN_MAX) {
-    testRoundtrip({std::numeric_limits<double>::min(),
-                   std::numeric_limits<double>::max(),
+    testRoundtrip({std::numeric_limits<double>::min(), std::numeric_limits<double>::max(),
                    std::numeric_limits<double>::lowest()});
 }
 
 TEST_F(ALPEncoderTest, Epsilon) {
-    testRoundtrip({std::numeric_limits<double>::epsilon(),
-                   1.0 + std::numeric_limits<double>::epsilon(),
+    testRoundtrip({std::numeric_limits<double>::epsilon(), 1.0 + std::numeric_limits<double>::epsilon(),
                    1.0 - std::numeric_limits<double>::epsilon()});
 }
 
 TEST_F(ALPEncoderTest, Subnormals) {
-    testRoundtrip({std::numeric_limits<double>::denorm_min(),
-                   5e-324, 1e-310});
+    testRoundtrip({std::numeric_limits<double>::denorm_min(), 5e-324, 1e-310});
 }
 
 TEST_F(ALPEncoderTest, MixedSpecialValues) {
@@ -274,7 +262,7 @@ TEST_F(ALPEncoderTest, FinancialTicks) {
     std::vector<double> data(5000);
     data[0] = 150.25;
     for (size_t i = 1; i < data.size(); ++i) {
-        data[i] = std::round((data[i-1] + dist(gen)) * 100.0) / 100.0;
+        data[i] = std::round((data[i - 1] + dist(gen)) * 100.0) / 100.0;
     }
     testRoundtrip(data);
 }
@@ -488,16 +476,13 @@ TEST_F(ALPEncoderTest, DeltaSchemeSelectedForMonotonic) {
     auto buffer = ALPEncoder::encode(data);
 
     // Parse stream header to verify scheme
-    CompressedSlice slice(
-        reinterpret_cast<const uint8_t*>(buffer.data.data()),
-        buffer.data.size() * sizeof(uint64_t));
+    CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()), buffer.data.size() * sizeof(uint64_t));
     uint64_t header0 = slice.readFixed<uint64_t, 64>();
     uint64_t header1 = slice.readFixed<uint64_t, 64>();
     (void)header0;
     uint8_t scheme = static_cast<uint8_t>((header1 >> 32) & 0xFF);
 
-    EXPECT_EQ(scheme, alp::SCHEME_ALP_DELTA)
-        << "Monotonic ramp data should select SCHEME_ALP_DELTA";
+    EXPECT_EQ(scheme, alp::SCHEME_ALP_DELTA) << "Monotonic ramp data should select SCHEME_ALP_DELTA";
 
     testRoundtrip(data);
 }
@@ -532,7 +517,7 @@ TEST_F(ALPEncoderTest, DeltaWithExceptions) {
     data[100] = -std::numeric_limits<double>::infinity();
     data[500] = -0.0;
     data[1023] = std::numeric_limits<double>::quiet_NaN();  // last in first block
-    data[1024] = std::numeric_limits<double>::infinity();    // first in second block
+    data[1024] = std::numeric_limits<double>::infinity();   // first in second block
 
     testRoundtrip(data);
 }
@@ -554,13 +539,13 @@ TEST_F(ALPEncoderTest, DeltaSkipDecode) {
     }
 
     // Skip various offsets
-    testSkipDecode(data, 0, 100);       // no skip
-    testSkipDecode(data, 500, 100);     // mid-block skip
-    testSkipDecode(data, 1024, 100);    // exact block boundary skip
-    testSkipDecode(data, 1500, 100);    // mid second block
-    testSkipDecode(data, 2900, 100);    // near end
-    testSkipDecode(data, 0, 3000);      // full decode
-    testSkipDecode(data, 1024, 1024);   // skip entire first block, decode second
+    testSkipDecode(data, 0, 100);      // no skip
+    testSkipDecode(data, 500, 100);    // mid-block skip
+    testSkipDecode(data, 1024, 100);   // exact block boundary skip
+    testSkipDecode(data, 1500, 100);   // mid second block
+    testSkipDecode(data, 2900, 100);   // near end
+    testSkipDecode(data, 0, 3000);     // full decode
+    testSkipDecode(data, 1024, 1024);  // skip entire first block, decode second
 }
 
 TEST_F(ALPEncoderTest, DeltaCompressionImprovement) {
@@ -611,21 +596,19 @@ TEST_F(ALPEncoderTest, DeltaNotSelectedForRandom) {
     std::mt19937 rng(42);
     std::uniform_real_distribution<double> dist(0.0, 1000.0);
     std::vector<double> data(2048);
-    for (auto& v : data) v = std::round(dist(rng) * 100.0) / 100.0;
+    for (auto& v : data)
+        v = std::round(dist(rng) * 100.0) / 100.0;
 
     auto buffer = ALPEncoder::encode(data);
 
-    CompressedSlice slice(
-        reinterpret_cast<const uint8_t*>(buffer.data.data()),
-        buffer.data.size() * sizeof(uint64_t));
+    CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()), buffer.data.size() * sizeof(uint64_t));
     uint64_t header0 = slice.readFixed<uint64_t, 64>();
     uint64_t header1 = slice.readFixed<uint64_t, 64>();
     (void)header0;
     uint8_t scheme = static_cast<uint8_t>((header1 >> 32) & 0xFF);
 
     // Random data should use SCHEME_ALP (not delta)
-    EXPECT_EQ(scheme, alp::SCHEME_ALP)
-        << "Random data should not select SCHEME_ALP_DELTA";
+    EXPECT_EQ(scheme, alp::SCHEME_ALP) << "Random data should not select SCHEME_ALP_DELTA";
 
     testRoundtrip(data);
 }
@@ -659,7 +642,7 @@ TEST_F(ALPEncoderTest, ExceptionPositionsFourExceptions) {
     for (size_t i = 0; i < data.size(); ++i) {
         data[i] = 50.0 + static_cast<double>(i) * 0.01;
     }
-    data[1]   = std::numeric_limits<double>::quiet_NaN();
+    data[1] = std::numeric_limits<double>::quiet_NaN();
     data[100] = std::numeric_limits<double>::infinity();
     data[500] = -0.0;
     data[999] = -std::numeric_limits<double>::infinity();
@@ -673,11 +656,11 @@ TEST_F(ALPEncoderTest, ExceptionPositionsFiveExceptions) {
     for (size_t i = 0; i < data.size(); ++i) {
         data[i] = 50.0 + static_cast<double>(i) * 0.01;
     }
-    data[0]   = std::numeric_limits<double>::quiet_NaN();
+    data[0] = std::numeric_limits<double>::quiet_NaN();
     data[100] = std::numeric_limits<double>::infinity();
     data[200] = -std::numeric_limits<double>::infinity();
     data[300] = -0.0;
-    data[400] = std::numeric_limits<double>::quiet_NaN();   // 5th: goes into 2nd word
+    data[400] = std::numeric_limits<double>::quiet_NaN();  // 5th: goes into 2nd word
     testRoundtrip(data);
 }
 
@@ -689,8 +672,8 @@ TEST_F(ALPEncoderTest, ExceptionPositionsNineExceptions) {
     }
     const double nan_val = std::numeric_limits<double>::quiet_NaN();
     const double inf_val = std::numeric_limits<double>::infinity();
-    data[10]  = nan_val;
-    data[50]  = inf_val;
+    data[10] = nan_val;
+    data[50] = inf_val;
     data[100] = -inf_val;
     data[200] = -0.0;
     data[300] = nan_val;
@@ -709,8 +692,8 @@ TEST_F(ALPEncoderTest, ExceptionPositionsMultiBlock) {
         data[i] = 20.0 + static_cast<double>(i % 100) * 0.1;
     }
     // Block 0 (indices 0-1023): 3 exceptions
-    data[50]   = std::numeric_limits<double>::quiet_NaN();
-    data[512]  = std::numeric_limits<double>::infinity();
+    data[50] = std::numeric_limits<double>::quiet_NaN();
+    data[512] = std::numeric_limits<double>::infinity();
     data[1000] = -0.0;
     // Block 1 (indices 1024-2047): 5 exceptions (multi-word positions)
     data[1024] = -std::numeric_limits<double>::infinity();
@@ -732,19 +715,17 @@ TEST_F(ALPEncoderTest, ExceptionPositionsVerifyBitPreservation) {
     }
     // 8 exceptions at positions that require 9+ bits (>= 256)
     const size_t exc_positions_arr[] = {256, 300, 400, 500, 600, 700, 900, 1023};
-    data[256]  = std::numeric_limits<double>::quiet_NaN();
-    data[300]  = std::numeric_limits<double>::infinity();
-    data[400]  = -std::numeric_limits<double>::infinity();
-    data[500]  = -0.0;
-    data[600]  = std::numeric_limits<double>::quiet_NaN();
-    data[700]  = std::numeric_limits<double>::infinity();
-    data[900]  = -0.0;
+    data[256] = std::numeric_limits<double>::quiet_NaN();
+    data[300] = std::numeric_limits<double>::infinity();
+    data[400] = -std::numeric_limits<double>::infinity();
+    data[500] = -0.0;
+    data[600] = std::numeric_limits<double>::quiet_NaN();
+    data[700] = std::numeric_limits<double>::infinity();
+    data[900] = -0.0;
     data[1023] = std::numeric_limits<double>::quiet_NaN();
 
     auto buffer = ALPEncoder::encode(data);
-    CompressedSlice slice(
-        reinterpret_cast<const uint8_t*>(buffer.data.data()),
-        buffer.data.size() * sizeof(uint64_t));
+    CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()), buffer.data.size() * sizeof(uint64_t));
     std::vector<double> decoded;
     ALPDecoder::decode(slice, 0, data.size(), decoded);
 
@@ -753,13 +734,11 @@ TEST_F(ALPEncoderTest, ExceptionPositionsVerifyBitPreservation) {
     // Verify exception values are restored at the correct positions
     for (size_t pos : exc_positions_arr) {
         if (std::isnan(data[pos])) {
-            EXPECT_TRUE(std::isnan(decoded[pos]))
-                << "NaN not preserved at position " << pos;
+            EXPECT_TRUE(std::isnan(decoded[pos])) << "NaN not preserved at position " << pos;
         } else {
-            EXPECT_EQ(std::bit_cast<uint64_t>(data[pos]),
-                      std::bit_cast<uint64_t>(decoded[pos]))
-                << "Value mismatch at exception position " << pos
-                << ": original=" << data[pos] << " decoded=" << decoded[pos];
+            EXPECT_EQ(std::bit_cast<uint64_t>(data[pos]), std::bit_cast<uint64_t>(decoded[pos]))
+                << "Value mismatch at exception position " << pos << ": original=" << data[pos]
+                << " decoded=" << decoded[pos];
         }
     }
 
@@ -767,11 +746,13 @@ TEST_F(ALPEncoderTest, ExceptionPositionsVerifyBitPreservation) {
     for (size_t i = 0; i < data.size(); ++i) {
         bool is_exc = false;
         for (size_t pos : exc_positions_arr) {
-            if (pos == i) { is_exc = true; break; }
+            if (pos == i) {
+                is_exc = true;
+                break;
+            }
         }
         if (!is_exc) {
-            EXPECT_EQ(std::bit_cast<uint64_t>(data[i]),
-                      std::bit_cast<uint64_t>(decoded[i]))
+            EXPECT_EQ(std::bit_cast<uint64_t>(data[i]), std::bit_cast<uint64_t>(decoded[i]))
                 << "Non-exception mismatch at position " << i;
         }
     }
@@ -786,9 +767,7 @@ TEST_F(ALPEncoderTest, ExceptionPositionsVerifyBitPreservation) {
 
 // Helper: read scheme byte from an encoded buffer without consuming the whole stream.
 static uint8_t readSchemeFromBuffer(const CompressedBuffer& buffer) {
-    CompressedSlice slice(
-        reinterpret_cast<const uint8_t*>(buffer.data.data()),
-        buffer.data.size() * sizeof(uint64_t));
+    CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()), buffer.data.size() * sizeof(uint64_t));
     uint64_t header0 = slice.readFixed<uint64_t, 64>();
     uint64_t header1 = slice.readFixed<uint64_t, 64>();
     (void)header0;
@@ -805,15 +784,16 @@ TEST_F(ALPEncoderTest, ALPRD_SchemeSelectedForRandomDoubles) {
     for (auto& v : data) {
         // Produce arbitrary bit patterns that are valid (finite) doubles.
         uint64_t bits;
-        do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+        do {
+            bits = dist(gen);
+        } while (!std::isfinite(std::bit_cast<double>(bits)));
         v = std::bit_cast<double>(bits);
     }
 
     auto buffer = ALPEncoder::encode(data);
     uint8_t scheme = readSchemeFromBuffer(buffer);
 
-    EXPECT_EQ(scheme, alp::SCHEME_ALP_RD)
-        << "Random bit-pattern doubles must select SCHEME_ALP_RD";
+    EXPECT_EQ(scheme, alp::SCHEME_ALP_RD) << "Random bit-pattern doubles must select SCHEME_ALP_RD";
 }
 
 TEST_F(ALPEncoderTest, ALPRD_RoundtripSmall) {
@@ -823,7 +803,9 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripSmall) {
     std::vector<double> data(7);
     for (auto& v : data) {
         uint64_t bits;
-        do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+        do {
+            bits = dist(gen);
+        } while (!std::isfinite(std::bit_cast<double>(bits)));
         v = std::bit_cast<double>(bits);
     }
 
@@ -857,7 +839,9 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripExactOneBlock) {
     std::vector<double> data(alp::ALP_VECTOR_SIZE);
     for (auto& v : data) {
         uint64_t bits;
-        do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+        do {
+            bits = dist(gen);
+        } while (!std::isfinite(std::bit_cast<double>(bits)));
         v = std::bit_cast<double>(bits);
     }
 
@@ -873,7 +857,9 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripMultiBlock) {
     std::vector<double> data(3500);
     for (auto& v : data) {
         uint64_t bits;
-        do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+        do {
+            bits = dist(gen);
+        } while (!std::isfinite(std::bit_cast<double>(bits)));
         v = std::bit_cast<double>(bits);
     }
 
@@ -889,7 +875,9 @@ TEST_F(ALPEncoderTest, ALPRD_SkipDecodeWholeBlock) {
     std::vector<double> data(2 * alp::ALP_VECTOR_SIZE);  // 2048 values
     for (auto& v : data) {
         uint64_t bits;
-        do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+        do {
+            bits = dist(gen);
+        } while (!std::isfinite(std::bit_cast<double>(bits)));
         v = std::bit_cast<double>(bits);
     }
 
@@ -907,17 +895,19 @@ TEST_F(ALPEncoderTest, ALPRD_SkipDecodePartial) {
     std::vector<double> data(3000);
     for (auto& v : data) {
         uint64_t bits;
-        do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+        do {
+            bits = dist(gen);
+        } while (!std::isfinite(std::bit_cast<double>(bits)));
         v = std::bit_cast<double>(bits);
     }
 
     auto buffer = ALPEncoder::encode(data);
     EXPECT_EQ(readSchemeFromBuffer(buffer), alp::SCHEME_ALP_RD);
 
-    testSkipDecode(data, 100,  200);   // mid first block
-    testSkipDecode(data, 900,  200);   // crosses block boundary
-    testSkipDecode(data, 1024, 500);   // starts exactly at second block
-    testSkipDecode(data, 2900, 100);   // near end
+    testSkipDecode(data, 100, 200);   // mid first block
+    testSkipDecode(data, 900, 200);   // crosses block boundary
+    testSkipDecode(data, 1024, 500);  // starts exactly at second block
+    testSkipDecode(data, 2900, 100);  // near end
 }
 
 TEST_F(ALPEncoderTest, ALPRD_RoundtripWithExceptions) {
@@ -942,18 +932,18 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripWithExceptions) {
         data.push_back(std::bit_cast<double>(bits));
     }
     // 12 exceptions: completely different upper bits
-    const uint64_t exception_uppers[] = {
-        0x3FF00000ULL, 0x40000000ULL, 0xBFF00000ULL, 0xC0000000ULL,
-        0x7FEFFFFFULL, 0x00100000ULL, 0x40490000ULL, 0x3FC00000ULL,
-        0x40800000ULL, 0x40900000ULL, 0x40A00000ULL, 0x40B00000ULL
-    };
+    const uint64_t exception_uppers[] = {0x3FF00000ULL, 0x40000000ULL, 0xBFF00000ULL, 0xC0000000ULL,
+                                         0x7FEFFFFFULL, 0x00100000ULL, 0x40490000ULL, 0x3FC00000ULL,
+                                         0x40800000ULL, 0x40900000ULL, 0x40A00000ULL, 0x40B00000ULL};
     for (auto upper : exception_uppers) {
         uint64_t bits = (upper << 32) | lower_dist(gen);
         data.push_back(std::bit_cast<double>(bits));
     }
 
     // All values are finite?
-    for (auto v : data) { ASSERT_TRUE(std::isfinite(v)); }
+    for (auto v : data) {
+        ASSERT_TRUE(std::isfinite(v));
+    }
 
     testRoundtrip(data);
 }
@@ -963,8 +953,8 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
     // SCHEME_ALP_RD (1) when the encoder selects the RD path, and that
     // SCHEME_ALP (0) and SCHEME_ALP_DELTA (2) are the only other values
     // produced by the encoder (i.e. the three-way distinction is stable).
-    EXPECT_EQ(alp::SCHEME_ALP,       static_cast<uint8_t>(0));
-    EXPECT_EQ(alp::SCHEME_ALP_RD,    static_cast<uint8_t>(1));
+    EXPECT_EQ(alp::SCHEME_ALP, static_cast<uint8_t>(0));
+    EXPECT_EQ(alp::SCHEME_ALP_RD, static_cast<uint8_t>(1));
     EXPECT_EQ(alp::SCHEME_ALP_DELTA, static_cast<uint8_t>(2));
 
     // ALP_RD data
@@ -974,7 +964,9 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
         std::vector<double> data(512);
         for (auto& v : data) {
             uint64_t bits;
-            do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+            do {
+                bits = dist(gen);
+            } while (!std::isfinite(std::bit_cast<double>(bits)));
             v = std::bit_cast<double>(bits);
         }
         EXPECT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_RD);
@@ -983,7 +975,8 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
     // ALP data (decimal values)
     {
         std::vector<double> data(512);
-        for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<double>(i % 100) * 0.01;
+        for (size_t i = 0; i < data.size(); ++i)
+            data[i] = static_cast<double>(i % 100) * 0.01;
         uint8_t s = readSchemeFromBuffer(ALPEncoder::encode(data));
         EXPECT_TRUE(s == alp::SCHEME_ALP || s == alp::SCHEME_ALP_DELTA)
             << "Decimal data should use ALP or ALP_DELTA, got " << (int)s;
@@ -992,7 +985,8 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
     // ALP_DELTA data (monotonic ramp)
     {
         std::vector<double> data(1024);
-        for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<double>(i);
+        for (size_t i = 0; i < data.size(); ++i)
+            data[i] = static_cast<double>(i);
         EXPECT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_DELTA);
     }
 }
@@ -1006,12 +1000,9 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
 // Helper: encode data, call decode directly (not via testSkipDecode), and
 // return the decoded vector.  This lets us pass skip/length values that are
 // outside the "safe" ranges guarded by testSkipDecode's std::min().
-static std::vector<double> decodeRaw(const std::vector<double>& original,
-                                     size_t skip, size_t length) {
+static std::vector<double> decodeRaw(const std::vector<double>& original, size_t skip, size_t length) {
     auto buffer = ALPEncoder::encode(original);
-    CompressedSlice slice(
-        reinterpret_cast<const uint8_t*>(buffer.data.data()),
-        buffer.data.size() * sizeof(uint64_t));
+    CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()), buffer.data.size() * sizeof(uint64_t));
     std::vector<double> out;
     ALPDecoder::decode(slice, skip, length, out);
     return out;
@@ -1026,9 +1017,7 @@ TEST_F(ALPEncoderTest, SkipEdge_ZeroSkipAllValues_ALP) {
     auto result = decodeRaw(data, 0, data.size());
     ASSERT_EQ(result.size(), data.size());
     for (size_t i = 0; i < data.size(); ++i)
-        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]),
-                  std::bit_cast<uint64_t>(data[i]))
-            << "Mismatch at index " << i;
+        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]), std::bit_cast<uint64_t>(data[i])) << "Mismatch at index " << i;
 }
 
 // 1b. skip=0, limit=all with a multi-block dataset.
@@ -1040,9 +1029,7 @@ TEST_F(ALPEncoderTest, SkipEdge_ZeroSkipAllValues_MultiBlock) {
     auto result = decodeRaw(data, 0, data.size());
     ASSERT_EQ(result.size(), data.size());
     for (size_t i = 0; i < data.size(); ++i)
-        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]),
-                  std::bit_cast<uint64_t>(data[i]))
-            << "Mismatch at index " << i;
+        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]), std::bit_cast<uint64_t>(data[i])) << "Mismatch at index " << i;
 }
 
 // 2. skip=0, limit=0 — must return empty output without touching the stream.
@@ -1052,8 +1039,7 @@ TEST_F(ALPEncoderTest, SkipEdge_ZeroSkipZeroLimit) {
         data[i] = static_cast<double>(i) * 0.5;
 
     auto result = decodeRaw(data, 0, 0);
-    EXPECT_TRUE(result.empty())
-        << "limit=0 should produce an empty output vector";
+    EXPECT_TRUE(result.empty()) << "limit=0 should produce an empty output vector";
 }
 
 // 2b. limit=0 with non-zero skip — must also return empty.
@@ -1063,8 +1049,7 @@ TEST_F(ALPEncoderTest, SkipEdge_NonZeroSkipZeroLimit) {
         data[i] = static_cast<double>(i) * 0.25;
 
     auto result = decodeRaw(data, 100, 0);
-    EXPECT_TRUE(result.empty())
-        << "limit=0 with skip=100 should produce an empty output vector";
+    EXPECT_TRUE(result.empty()) << "limit=0 with skip=100 should produce an empty output vector";
 }
 
 // 3. skip=total_count — skip past all values; output must be empty.
@@ -1075,8 +1060,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipEqualsTotalCount) {
 
     // Requesting 10 values but skip equals total — nothing to return.
     auto result = decodeRaw(data, data.size(), 10);
-    EXPECT_TRUE(result.empty())
-        << "skip==total_count should produce an empty output vector";
+    EXPECT_TRUE(result.empty()) << "skip==total_count should produce an empty output vector";
 }
 
 // 3b. skip larger than total_count — same expectation.
@@ -1086,8 +1070,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipBeyondTotalCount) {
         data[i] = static_cast<double>(i) * 0.3;
 
     auto result = decodeRaw(data, 99999, 50);
-    EXPECT_TRUE(result.empty())
-        << "skip > total_count should produce an empty output vector";
+    EXPECT_TRUE(result.empty()) << "skip > total_count should produce an empty output vector";
 }
 
 // 4. skip=total_count-1, limit=1 — must return exactly the last value.
@@ -1099,8 +1082,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipToLastValue_ALP) {
     const size_t last = data.size() - 1;
     auto result = decodeRaw(data, last, 1);
     ASSERT_EQ(result.size(), 1u);
-    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]),
-              std::bit_cast<uint64_t>(data[last]))
+    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]), std::bit_cast<uint64_t>(data[last]))
         << "Should return only the last value";
 }
 
@@ -1113,8 +1095,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipToLastValue_MultiBlock) {
     const size_t last = data.size() - 1;
     auto result = decodeRaw(data, last, 1);
     ASSERT_EQ(result.size(), 1u);
-    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]),
-              std::bit_cast<uint64_t>(data[last]))
+    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]), std::bit_cast<uint64_t>(data[last]))
         << "Should return only the last value in the tail block";
 }
 
@@ -1161,12 +1142,10 @@ TEST_F(ALPEncoderTest, SkipEdge_LimitBeyondAvailable_ALP) {
     // skip=250, limit=200 — only 50 values remain after skip.
     auto result = decodeRaw(data, 250, 200);
     // Decoder trims output_remaining at the end — should have at most 50.
-    EXPECT_LE(result.size(), 50u)
-        << "Decoder must not return more values than exist after skip";
+    EXPECT_LE(result.size(), 50u) << "Decoder must not return more values than exist after skip";
     // Verify correctness of what was returned.
     for (size_t i = 0; i < result.size(); ++i)
-        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]),
-                  std::bit_cast<uint64_t>(data[250 + i]))
+        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]), std::bit_cast<uint64_t>(data[250 + i]))
             << "Value mismatch at index " << i;
 }
 
@@ -1180,8 +1159,7 @@ TEST_F(ALPEncoderTest, SkipEdge_LimitBeyondAvailable_MultiBlock) {
     auto result = decodeRaw(data, 1050, 9999);
     EXPECT_LE(result.size(), 50u);
     for (size_t i = 0; i < result.size(); ++i)
-        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]),
-                  std::bit_cast<uint64_t>(data[1050 + i]))
+        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]), std::bit_cast<uint64_t>(data[1050 + i]))
             << "Value mismatch at index " << i;
 }
 
@@ -1217,7 +1195,9 @@ static std::vector<double> makeRDData(size_t count, uint64_t seed) {
     std::vector<double> data(count);
     for (auto& v : data) {
         uint64_t bits;
-        do { bits = dist(gen); } while (!std::isfinite(std::bit_cast<double>(bits)));
+        do {
+            bits = dist(gen);
+        } while (!std::isfinite(std::bit_cast<double>(bits)));
         v = std::bit_cast<double>(bits);
     }
     return data;
@@ -1234,8 +1214,7 @@ TEST_F(ALPEncoderTest, SkipEdge_ZeroSkipZeroLimit_ALPRD) {
 TEST_F(ALPEncoderTest, SkipEdge_SkipEqualsTotalCount_ALPRD) {
     auto data = makeRDData(512, 20);
     auto result = decodeRaw(data, data.size(), 10);
-    EXPECT_TRUE(result.empty())
-        << "skip==total_count with ALP_RD should produce empty output";
+    EXPECT_TRUE(result.empty()) << "skip==total_count with ALP_RD should produce empty output";
 }
 
 // 3. skip=total_count-1, limit=1 — ALP_RD scheme.
@@ -1244,8 +1223,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipToLastValue_ALPRD) {
     const size_t last = data.size() - 1;
     auto result = decodeRaw(data, last, 1);
     ASSERT_EQ(result.size(), 1u);
-    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]),
-              std::bit_cast<uint64_t>(data[last]))
+    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]), std::bit_cast<uint64_t>(data[last]))
         << "Should return only the last value (ALP_RD)";
 }
 
@@ -1270,8 +1248,7 @@ TEST_F(ALPEncoderTest, SkipEdge_LimitBeyondAvailable_ALPRD) {
     auto result = decodeRaw(data, 500, 9999);
     EXPECT_LE(result.size(), 12u);
     for (size_t i = 0; i < result.size(); ++i)
-        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]),
-                  std::bit_cast<uint64_t>(data[500 + i]))
+        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]), std::bit_cast<uint64_t>(data[500 + i]))
             << "Value mismatch at index " << i;
 }
 
@@ -1289,8 +1266,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipPlusLimitAtBlockBoundary_ALPRD) {
 // --- ALP_DELTA scheme versions ---
 
 // Helper: produce linearly-increasing data that forces ALP_DELTA.
-static std::vector<double> makeDeltaData(size_t count, double start = 1000.0,
-                                         double step = 1.0) {
+static std::vector<double> makeDeltaData(size_t count, double start = 1000.0, double step = 1.0) {
     std::vector<double> data(count);
     for (size_t i = 0; i < count; ++i)
         data[i] = start + static_cast<double>(i) * step;
@@ -1308,8 +1284,7 @@ TEST_F(ALPEncoderTest, SkipEdge_ZeroSkipZeroLimit_ALPDelta) {
 TEST_F(ALPEncoderTest, SkipEdge_SkipEqualsTotalCount_ALPDelta) {
     auto data = makeDeltaData(512);
     auto result = decodeRaw(data, data.size(), 10);
-    EXPECT_TRUE(result.empty())
-        << "skip==total_count with ALP_DELTA should produce empty output";
+    EXPECT_TRUE(result.empty()) << "skip==total_count with ALP_DELTA should produce empty output";
 }
 
 // 3. skip=total_count-1, limit=1 — ALP_DELTA scheme.
@@ -1318,8 +1293,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipToLastValue_ALPDelta) {
     const size_t last = data.size() - 1;
     auto result = decodeRaw(data, last, 1);
     ASSERT_EQ(result.size(), 1u);
-    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]),
-              std::bit_cast<uint64_t>(data[last]))
+    EXPECT_EQ(std::bit_cast<uint64_t>(result[0]), std::bit_cast<uint64_t>(data[last]))
         << "Should return only the last value (ALP_DELTA)";
 }
 
@@ -1344,8 +1318,7 @@ TEST_F(ALPEncoderTest, SkipEdge_LimitBeyondAvailable_ALPDelta) {
     auto result = decodeRaw(data, 500, 9999);
     EXPECT_LE(result.size(), 12u);
     for (size_t i = 0; i < result.size(); ++i)
-        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]),
-                  std::bit_cast<uint64_t>(data[500 + i]))
+        EXPECT_EQ(std::bit_cast<uint64_t>(result[i]), std::bit_cast<uint64_t>(data[500 + i]))
             << "Value mismatch at index " << i;
 }
 
@@ -1373,25 +1346,22 @@ TEST_F(ALPEncoderTest, SkipEdge_AppendToExistingOutputVector) {
     // First decode: values [0, 100).
     std::vector<double> out;
     {
-        CompressedSlice slice(
-            reinterpret_cast<const uint8_t*>(buffer.data.data()),
-            buffer.data.size() * sizeof(uint64_t));
+        CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()),
+                              buffer.data.size() * sizeof(uint64_t));
         ALPDecoder::decode(slice, 0, 100, out);
     }
     ASSERT_EQ(out.size(), 100u);
 
     // Second decode appended to same vector: values [100, 200).
     {
-        CompressedSlice slice(
-            reinterpret_cast<const uint8_t*>(buffer.data.data()),
-            buffer.data.size() * sizeof(uint64_t));
+        CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()),
+                              buffer.data.size() * sizeof(uint64_t));
         ALPDecoder::decode(slice, 100, 100, out);
     }
     ASSERT_EQ(out.size(), 200u);
 
     for (size_t i = 0; i < data.size(); ++i)
-        EXPECT_EQ(std::bit_cast<uint64_t>(out[i]),
-                  std::bit_cast<uint64_t>(data[i]))
+        EXPECT_EQ(std::bit_cast<uint64_t>(out[i]), std::bit_cast<uint64_t>(data[i]))
             << "Mismatch at combined index " << i;
 }
 
@@ -1407,32 +1377,30 @@ TEST_F(ALPEncoderTest, SkipEdge_BlockBoundarySweep_ALP) {
 
     // Positions that straddle or land on block boundaries (1024, 2048).
     const size_t boundary_skips[] = {
-        alp::ALP_VECTOR_SIZE - 50,   // 974:  50 in block 0, 50 in block 1
-        alp::ALP_VECTOR_SIZE,        // 1024: exactly starts block 1
-        alp::ALP_VECTOR_SIZE + 1,    // 1025: one past boundary
-        2 * alp::ALP_VECTOR_SIZE - 50, // 1998: 50 in block 1, 50 in block 2
-        2 * alp::ALP_VECTOR_SIZE,    // 2048: exactly starts block 2
-        2 * alp::ALP_VECTOR_SIZE + 1,  // 2049: one past second boundary
-        N - 100,                     // last 100 values
-        N - 1,                       // last single value
+        alp::ALP_VECTOR_SIZE - 50,      // 974:  50 in block 0, 50 in block 1
+        alp::ALP_VECTOR_SIZE,           // 1024: exactly starts block 1
+        alp::ALP_VECTOR_SIZE + 1,       // 1025: one past boundary
+        2 * alp::ALP_VECTOR_SIZE - 50,  // 1998: 50 in block 1, 50 in block 2
+        2 * alp::ALP_VECTOR_SIZE,       // 2048: exactly starts block 2
+        2 * alp::ALP_VECTOR_SIZE + 1,   // 2049: one past second boundary
+        N - 100,                        // last 100 values
+        N - 1,                          // last single value
     };
 
     for (size_t skip : boundary_skips) {
         const size_t limit = (skip + 100 <= N) ? 100 : (N - skip);
-        if (limit == 0) continue;
+        if (limit == 0)
+            continue;
 
         auto buffer = ALPEncoder::encode(data);
-        CompressedSlice slice(
-            reinterpret_cast<const uint8_t*>(buffer.data.data()),
-            buffer.data.size() * sizeof(uint64_t));
+        CompressedSlice slice(reinterpret_cast<const uint8_t*>(buffer.data.data()),
+                              buffer.data.size() * sizeof(uint64_t));
         std::vector<double> result;
         ALPDecoder::decode(slice, skip, limit, result);
 
-        ASSERT_EQ(result.size(), limit)
-            << "Size mismatch at skip=" << skip;
+        ASSERT_EQ(result.size(), limit) << "Size mismatch at skip=" << skip;
         for (size_t i = 0; i < limit; ++i)
-            EXPECT_EQ(std::bit_cast<uint64_t>(result[i]),
-                      std::bit_cast<uint64_t>(data[skip + i]))
+            EXPECT_EQ(std::bit_cast<uint64_t>(result[i]), std::bit_cast<uint64_t>(data[skip + i]))
                 << "Value mismatch at skip=" << skip << " i=" << i;
     }
 }

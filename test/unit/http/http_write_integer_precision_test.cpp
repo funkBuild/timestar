@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
-#include <cstdint>
+
 #include <cmath>
+#include <cstdint>
 
 // Tests for integer-to-double precision loss detection.
 // IEEE 754 double-precision can represent integers exactly up to 2^53.
@@ -73,9 +74,8 @@ TEST_F(HttpWriteIntegerPrecisionTest, TwoPow53PlusOneLosesPrecision) {
     // Prove the bug: cast to double and back gives a different value
     double d = static_cast<double>(value);
     int64_t roundtrip = static_cast<int64_t>(d);
-    EXPECT_NE(roundtrip, value)
-        << "Expected precision loss for " << value
-        << " but round-trip gave back the same value";
+    EXPECT_NE(roundtrip, value) << "Expected precision loss for " << value
+                                << " but round-trip gave back the same value";
 }
 
 TEST_F(HttpWriteIntegerPrecisionTest, NegativeTwoPow53MinusOneLosesPrecision) {
@@ -83,9 +83,8 @@ TEST_F(HttpWriteIntegerPrecisionTest, NegativeTwoPow53MinusOneLosesPrecision) {
     EXPECT_TRUE(wouldLosePrecision(value));
     double d = static_cast<double>(value);
     int64_t roundtrip = static_cast<int64_t>(d);
-    EXPECT_NE(roundtrip, value)
-        << "Expected precision loss for " << value
-        << " but round-trip gave back the same value";
+    EXPECT_NE(roundtrip, value) << "Expected precision loss for " << value
+                                << " but round-trip gave back the same value";
 }
 
 TEST_F(HttpWriteIntegerPrecisionTest, TwoPow53PlusThreeLosesPrecision) {
@@ -103,8 +102,7 @@ TEST_F(HttpWriteIntegerPrecisionTest, LargeNanosecondTimestampFlagged) {
     // even though some specific values (like round numbers) may happen
     // to be exactly representable as double.
     int64_t value = 1707998400000000000LL;
-    EXPECT_TRUE(wouldLosePrecision(value))
-        << "Nanosecond timestamp should be flagged (exceeds 2^53)";
+    EXPECT_TRUE(wouldLosePrecision(value)) << "Nanosecond timestamp should be flagged (exceeds 2^53)";
 }
 
 TEST_F(HttpWriteIntegerPrecisionTest, OddNanosecondTimestampActuallyLosesPrecision) {
@@ -113,9 +111,8 @@ TEST_F(HttpWriteIntegerPrecisionTest, OddNanosecondTimestampActuallyLosesPrecisi
     EXPECT_TRUE(wouldLosePrecision(value));
     double d = static_cast<double>(value);
     int64_t roundtrip = static_cast<int64_t>(d);
-    EXPECT_NE(roundtrip, value)
-        << "Odd nanosecond timestamp " << value
-        << " should actually lose precision when stored as double";
+    EXPECT_NE(roundtrip, value) << "Odd nanosecond timestamp " << value
+                                << " should actually lose precision when stored as double";
 }
 
 TEST_F(HttpWriteIntegerPrecisionTest, Int64MaxLosesPrecision) {
@@ -143,19 +140,23 @@ TEST_F(HttpWriteIntegerPrecisionTest, BoundaryExactlyAtThreshold) {
 TEST_F(HttpWriteIntegerPrecisionTest, SafeValuesRoundTripExactly) {
     // Various values within the safe range all round-trip perfectly
     int64_t safe_values[] = {
-        0, 1, -1, 42, -42,
-        1000000, -1000000,
-        1LL << 32,              // 4294967296
+        0,
+        1,
+        -1,
+        42,
+        -42,
+        1000000,
+        -1000000,
+        1LL << 32,  // 4294967296
         -(1LL << 32),
-        (1LL << 52),            // 4503599627370496
+        (1LL << 52),  // 4503599627370496
         -(1LL << 52),
-        MAX_EXACT_DOUBLE_INT,   // 9007199254740992
+        MAX_EXACT_DOUBLE_INT,  // 9007199254740992
         -MAX_EXACT_DOUBLE_INT,
     };
 
     for (int64_t value : safe_values) {
-        EXPECT_FALSE(wouldLosePrecision(value))
-            << "Value " << value << " should be safe";
+        EXPECT_FALSE(wouldLosePrecision(value)) << "Value " << value << " should be safe";
         EXPECT_EQ(static_cast<int64_t>(static_cast<double>(value)), value)
             << "Value " << value << " should round-trip exactly";
     }
@@ -176,8 +177,7 @@ TEST_F(HttpWriteIntegerPrecisionTest, UnsafeValuesDetected) {
     };
 
     for (int64_t value : unsafe_values) {
-        EXPECT_TRUE(wouldLosePrecision(value))
-            << "Value " << value << " should be flagged as unsafe";
+        EXPECT_TRUE(wouldLosePrecision(value)) << "Value " << value << " should be flagged as unsafe";
     }
 }
 
@@ -188,16 +188,14 @@ TEST_F(HttpWriteIntegerPrecisionTest, DemonstrateActualPrecisionLossValues) {
     {
         int64_t value = 9007199254740993LL;
         double d = static_cast<double>(value);
-        EXPECT_EQ(d, 9007199254740992.0)
-            << "2^53+1 should round to 2^53 when cast to double";
+        EXPECT_EQ(d, 9007199254740992.0) << "2^53+1 should round to 2^53 when cast to double";
     }
 
     // 2^53 + 2 -> actually representable (even number)
     {
         int64_t value = 9007199254740994LL;
         double d = static_cast<double>(value);
-        EXPECT_EQ(d, 9007199254740994.0)
-            << "2^53+2 happens to be representable as double (even)";
+        EXPECT_EQ(d, 9007199254740994.0) << "2^53+2 happens to be representable as double (even)";
         // Note: wouldLosePrecision still returns true because
         // the value exceeds the threshold, even though this particular
         // value happens to survive. The check is conservative.
@@ -208,7 +206,6 @@ TEST_F(HttpWriteIntegerPrecisionTest, DemonstrateActualPrecisionLossValues) {
     {
         int64_t value = 9007199254740995LL;
         double d = static_cast<double>(value);
-        EXPECT_EQ(d, 9007199254740996.0)
-            << "2^53+3 should round to 2^53+4 when cast to double";
+        EXPECT_EQ(d, 9007199254740996.0) << "2^53+3 should round to 2^53+4 when cast to double";
     }
 }

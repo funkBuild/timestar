@@ -1,10 +1,11 @@
+#include "../../../lib/storage/slice_buffer.hpp"
+
 #include <gtest/gtest.h>
+
 #include <cstdint>
 #include <cstring>
-#include <vector>
 #include <stdexcept>
-
-#include "../../../lib/storage/slice_buffer.hpp"
+#include <vector>
 
 class CompressedSliceTest : public ::testing::Test {
 protected:

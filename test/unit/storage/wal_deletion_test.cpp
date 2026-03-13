@@ -1,17 +1,18 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <memory>
-#include <seastar/core/seastar.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/sleep.hh>
-#include <iostream>
-
-#include "../../../lib/storage/wal.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/storage/wal_file_manager.hpp"
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/wal.hpp"
+#include "../../../lib/storage/wal_file_manager.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 
 namespace fs = std::filesystem;
 
@@ -27,18 +28,17 @@ static void cleanup_test_data() {
 
 // Helper to check if a VariantQueryResult optional has data
 static bool variantHasData(const std::optional<VariantQueryResult>& result) {
-    if (!result.has_value()) return false;
-    return std::visit([](const auto& r) -> bool {
-        return !r.timestamps.empty();
-    }, *result);
+    if (!result.has_value())
+        return false;
+    return std::visit([](const auto& r) -> bool { return !r.timestamps.empty(); }, *result);
 }
 
 // Safe query wrapper that handles "Series not found" exceptions
 // by returning std::nullopt instead of propagating the exception.
 // This is needed because QueryRunner::runQuery throws on missing series
 // while Engine::query's signature promises std::optional<VariantQueryResult>.
-static seastar::future<std::optional<VariantQueryResult>>
-safeQuery(Engine& engine, const std::string& seriesKey, uint64_t startTime, uint64_t endTime) {
+static seastar::future<std::optional<VariantQueryResult>> safeQuery(Engine& engine, const std::string& seriesKey,
+                                                                    uint64_t startTime, uint64_t endTime) {
     try {
         co_return co_await engine.query(seriesKey, startTime, endTime);
     } catch (const std::runtime_error& e) {
@@ -149,7 +149,7 @@ seastar::future<> test_wal_replay_preserves_partial_field_deletion() {
         std::exception_ptr ex;
 
         try {
-            co_await engine2.init(); // This should replay the WAL
+            co_await engine2.init();  // This should replay the WAL
 
             TimeStarInsert<double> insertA("simple", "fieldA");
             insertA.addTag("id", "test1");

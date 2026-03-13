@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include <fstream>
 #include <string>
 
@@ -26,17 +27,13 @@ protected:
 
     void SetUp() override {
         std::ifstream file(QUERY_RUNNER_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open())
-            << "Could not open query_runner.cpp at: " << QUERY_RUNNER_SOURCE_PATH;
-        sourceCode.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>());
+        ASSERT_TRUE(file.is_open()) << "Could not open query_runner.cpp at: " << QUERY_RUNNER_SOURCE_PATH;
+        sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         ASSERT_FALSE(sourceCode.empty());
 
         // Extract the mergeSmallNSpans function body.
         auto funcPos = sourceCode.find("mergeSmallNSpans(");
-        ASSERT_NE(funcPos, std::string::npos)
-            << "Expected mergeSmallNSpans in query_runner.cpp";
+        ASSERT_NE(funcPos, std::string::npos) << "Expected mergeSmallNSpans in query_runner.cpp";
 
         // Find the opening brace of the function body.
         auto openBrace = sourceCode.find('{', funcPos);
@@ -46,8 +43,10 @@ protected:
         int depth = 1;
         size_t pos = openBrace + 1;
         while (pos < sourceCode.size() && depth > 0) {
-            if (sourceCode[pos] == '{') depth++;
-            else if (sourceCode[pos] == '}') depth--;
+            if (sourceCode[pos] == '{')
+                depth++;
+            else if (sourceCode[pos] == '}')
+                depth--;
             pos++;
         }
         ASSERT_EQ(depth, 0) << "Unmatched braces in mergeSmallNSpans";
@@ -63,16 +62,14 @@ TEST_F(QueryRunnerMergeGuardTest, BestIdxSentinelGuardPresent) {
     // The guard must check for the SIZE_MAX sentinel before using bestIdx.
     // Acceptable forms:
     //   if (bestIdx == SIZE_MAX) break;
-    bool hasGuard =
-        funcBody.find("bestIdx == SIZE_MAX") != std::string::npos ||
-        funcBody.find("SIZE_MAX == bestIdx") != std::string::npos;
+    bool hasGuard = funcBody.find("bestIdx == SIZE_MAX") != std::string::npos ||
+                    funcBody.find("SIZE_MAX == bestIdx") != std::string::npos;
 
-    EXPECT_TRUE(hasGuard)
-        << "mergeSmallNSpans is missing the 'if (bestIdx == SIZE_MAX) break;' "
-        << "guard before 'spans[bestIdx].val()'. "
-        << "If activeCount is stale and all spans are actually exhausted, "
-        << "the inner min-finding loop will leave bestIdx == SIZE_MAX, "
-        << "causing an out-of-bounds access on 'spans[SIZE_MAX]'.";
+    EXPECT_TRUE(hasGuard) << "mergeSmallNSpans is missing the 'if (bestIdx == SIZE_MAX) break;' "
+                          << "guard before 'spans[bestIdx].val()'. "
+                          << "If activeCount is stale and all spans are actually exhausted, "
+                          << "the inner min-finding loop will leave bestIdx == SIZE_MAX, "
+                          << "causing an out-of-bounds access on 'spans[SIZE_MAX]'.";
 }
 
 // Verify the guard appears BEFORE the first use of bestIdx as a vector index.
@@ -87,13 +84,11 @@ TEST_F(QueryRunnerMergeGuardTest, GuardAppearsBeforeSpansBestIdxAccess) {
 
     // Find the first use of spans[bestIdx] after the guard.
     auto accessPos = funcBody.find("spans[bestIdx]", guardPos);
-    ASSERT_NE(accessPos, std::string::npos)
-        << "Expected 'spans[bestIdx]' to appear after the SIZE_MAX guard.";
+    ASSERT_NE(accessPos, std::string::npos) << "Expected 'spans[bestIdx]' to appear after the SIZE_MAX guard.";
 
-    EXPECT_LT(guardPos, accessPos)
-        << "The 'bestIdx == SIZE_MAX' guard must appear BEFORE 'spans[bestIdx]' "
-        << "to be effective. The guard protects the vector access from "
-        << "an out-of-bounds index when no active span was found.";
+    EXPECT_LT(guardPos, accessPos) << "The 'bestIdx == SIZE_MAX' guard must appear BEFORE 'spans[bestIdx]' "
+                                   << "to be effective. The guard protects the vector access from "
+                                   << "an out-of-bounds index when no active span was found.";
 }
 
 // Verify the guard uses a 'break' statement so the while loop terminates
@@ -103,8 +98,7 @@ TEST_F(QueryRunnerMergeGuardTest, GuardUsesBreakToTerminateLoop) {
     if (guardPos == std::string::npos) {
         guardPos = funcBody.find("SIZE_MAX == bestIdx");
     }
-    ASSERT_NE(guardPos, std::string::npos)
-        << "Guard not found; cannot verify break statement.";
+    ASSERT_NE(guardPos, std::string::npos) << "Guard not found; cannot verify break statement.";
 
     // After the guard check, within the next ~50 characters, expect 'break'
     auto nearGuard = funcBody.substr(guardPos, 100);

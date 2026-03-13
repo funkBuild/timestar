@@ -1,16 +1,18 @@
-#include <gtest/gtest.h>
-#include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/sleep.hh>
-#include <seastar/core/sharded.hh>
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/query/query_parser.hpp"
 #include "../test_helpers.hpp"
-#include <random>
+
+#include <gtest/gtest.h>
+
 #include <chrono>
 #include <cstdlib>
+#include <random>
+#include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
 
 using namespace seastar;
 using namespace timestar;
@@ -49,9 +51,7 @@ protected:
         cleanTestShardDirectories();
     }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 
     // Helper to create test timestamps (100 points, 1 second apart)
     static std::vector<uint64_t> createTestTimestamps(int count = 100) {
@@ -73,7 +73,8 @@ protected:
 
     // Helper to calculate average of multiple vectors
     static std::vector<double> calculateAverage(const std::vector<std::vector<double>>& arrays) {
-        if (arrays.empty() || arrays[0].empty()) return {};
+        if (arrays.empty() || arrays[0].empty())
+            return {};
 
         size_t len = arrays[0].size();
         std::vector<double> result(len, 0.0);
@@ -93,14 +94,17 @@ protected:
 
     // Check if values are close (within 5% tolerance)
     static bool isCloseTo(double a, double b, double tolerance = 0.05) {
-        if (b == 0) return std::abs(a) < tolerance;
+        if (b == 0)
+            return std::abs(a) < tolerance;
         return std::abs(a - b) / std::abs(b) < tolerance;
     }
 
     static bool vectorsClose(const std::vector<double>& a, const std::vector<double>& b, double tolerance = 0.05) {
-        if (a.size() != b.size()) return false;
+        if (a.size() != b.size())
+            return false;
         for (size_t i = 0; i < a.size(); i++) {
-            if (!isCloseTo(a[i], b[i], tolerance)) return false;
+            if (!isCloseTo(a[i], b[i], tolerance))
+                return false;
         }
         return true;
     }
@@ -132,8 +136,8 @@ protected:
     // Helper to insert test data using shardedInsert for correct shard routing
     static void insertTestDataSync(seastar::sharded<Engine>& eng) {
         auto timestamps = createTestTimestamps(100);
-        auto insertSeries = [&](const std::string& deviceId, const std::string& paddock,
-                                const std::string& fieldName, double multiplier) {
+        auto insertSeries = [&](const std::string& deviceId, const std::string& paddock, const std::string& fieldName,
+                                double multiplier) {
             TimeStarInsert<double> insert(testMeasurement + ".moisture", fieldName);
             insert.addTag("deviceId", deviceId);
             insert.addTag("paddock", paddock);
@@ -219,7 +223,9 @@ TEST_F(AsyncQueryTest, MinAggregationQuery) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test MAX aggregation function
@@ -250,7 +256,9 @@ TEST_F(AsyncQueryTest, MaxAggregationQuery) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test AVG aggregation function (default)
@@ -280,7 +288,9 @@ TEST_F(AsyncQueryTest, AvgAggregationQuery) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test query with specific fields
@@ -308,7 +318,9 @@ TEST_F(AsyncQueryTest, QueryWithSpecificFields) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test query with scope filtering
@@ -337,7 +349,9 @@ TEST_F(AsyncQueryTest, QueryWithScopeFilter) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test query with group by
@@ -362,8 +376,10 @@ TEST_F(AsyncQueryTest, QueryWithGroupBy) {
         SeriesResult* deviceB = nullptr;
 
         for (auto& series : result.series) {
-            if (series.tags["deviceId"] == "aaaaa") deviceA = &series;
-            if (series.tags["deviceId"] == "bbbbb") deviceB = &series;
+            if (series.tags["deviceId"] == "aaaaa")
+                deviceA = &series;
+            if (series.tags["deviceId"] == "bbbbb")
+                deviceB = &series;
         }
 
         ASSERT_NE(deviceA, nullptr);
@@ -378,7 +394,9 @@ TEST_F(AsyncQueryTest, QueryWithGroupBy) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test boolean data type
@@ -408,7 +426,9 @@ TEST_F(AsyncQueryTest, BooleanDataQuery) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test string/binary data (images)
@@ -441,7 +461,9 @@ TEST_F(AsyncQueryTest, ImageDataQuery) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test with time range filtering
@@ -475,7 +497,9 @@ TEST_F(AsyncQueryTest, TimeRangeFiltering) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test SUM aggregation
@@ -508,7 +532,9 @@ TEST_F(AsyncQueryTest, SumAggregationQuery) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test LATEST aggregation
@@ -541,7 +567,9 @@ TEST_F(AsyncQueryTest, LatestAggregationQuery) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test query error cases
@@ -553,44 +581,31 @@ TEST_F(AsyncQueryTest, InvalidQueryErrors) {
         engineSharded = &eng.eng;
 
         // Missing aggregation method
-        EXPECT_THROW(
-            QueryParser::parseQueryString(testMeasurement + ".moisture(){}"),
-            QueryParseException
-        );
+        EXPECT_THROW(QueryParser::parseQueryString(testMeasurement + ".moisture(){}"), QueryParseException);
 
         // Invalid aggregation method
-        EXPECT_THROW(
-            QueryParser::parseQueryString("invalid:" + testMeasurement + ".moisture(){}"),
-            QueryParseException
-        );
+        EXPECT_THROW(QueryParser::parseQueryString("invalid:" + testMeasurement + ".moisture(){}"),
+                     QueryParseException);
 
         // Missing measurement
-        EXPECT_THROW(
-            QueryParser::parseQueryString("avg:(value1){}"),
-            QueryParseException
-        );
+        EXPECT_THROW(QueryParser::parseQueryString("avg:(value1){}"), QueryParseException);
 
         // Missing fields parentheses
-        EXPECT_THROW(
-            QueryParser::parseQueryString("avg:" + testMeasurement + ".moisture{}"),
-            QueryParseException
-        );
+        EXPECT_THROW(QueryParser::parseQueryString("avg:" + testMeasurement + ".moisture{}"), QueryParseException);
 
         // Unclosed scope brace
-        EXPECT_THROW(
-            QueryParser::parseQueryString("avg:" + testMeasurement + ".moisture(){location:us-west"),
-            QueryParseException
-        );
+        EXPECT_THROW(QueryParser::parseQueryString("avg:" + testMeasurement + ".moisture(){location:us-west"),
+                     QueryParseException);
 
         // Malformed group by
-        EXPECT_THROW(
-            QueryParser::parseQueryString("avg:" + testMeasurement + ".moisture(){} by deviceId}"),
-            QueryParseException
-        );
+        EXPECT_THROW(QueryParser::parseQueryString("avg:" + testMeasurement + ".moisture(){} by deviceId}"),
+                     QueryParseException);
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test inserting new data and cache invalidation
@@ -607,7 +622,7 @@ TEST_F(AsyncQueryTest, CacheInvalidationAfterInsert) {
         std::string query = "avg:" + testMeasurement + ".moisture(){} by {deviceId}";
         auto result1 = executeQuery(query, baseTime - 100000000000ULL, baseTime);
 
-        ASSERT_EQ(result1.series.size(), 3); // aaaaa, bbbbb, ccccc
+        ASSERT_EQ(result1.series.size(), 3);  // aaaaa, bbbbb, ccccc
 
         // Insert new device data using TimeStarInsert
         auto timestamps = createTestTimestamps(100);
@@ -623,7 +638,7 @@ TEST_F(AsyncQueryTest, CacheInvalidationAfterInsert) {
         // Query again
         auto result2 = executeQuery(query, baseTime - 100000000000ULL, baseTime);
 
-        ASSERT_EQ(result2.series.size(), 4); // aaaaa, bbbbb, ccccc, zzzzzz
+        ASSERT_EQ(result2.series.size(), 4);  // aaaaa, bbbbb, ccccc, zzzzzz
 
         // Verify new device is in results
         bool foundNewDevice = false;
@@ -637,7 +652,9 @@ TEST_F(AsyncQueryTest, CacheInvalidationAfterInsert) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test fields with same prefix
@@ -685,7 +702,9 @@ TEST_F(AsyncQueryTest, FieldsWithSamePrefix) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test with aggregation intervals
@@ -720,5 +739,7 @@ TEST_F(AsyncQueryTest, AggregationWithTimeIntervals) {
 
         queryHandler.reset();
         engineSharded = nullptr;
-    }).join().get();
+    })
+        .join()
+        .get();
 }

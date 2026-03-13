@@ -5,15 +5,17 @@
  * using analytically-known inputs and expected outputs.
  */
 
-#include <gtest/gtest.h>
+#include "forecast/forecast_executor.hpp"
 #include "forecast/forecast_result.hpp"
 #include "forecast/linear_forecaster.hpp"
-#include "forecast/seasonal_forecaster.hpp"
-#include "forecast/forecast_executor.hpp"
 #include "forecast/periodicity_detector.hpp"
+#include "forecast/seasonal_forecaster.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cmath>
-#include <random>
 #include <numeric>
+#include <random>
 
 using namespace timestar::forecast;
 using namespace timestar;
@@ -51,7 +53,8 @@ protected:
     //            [...]              [....]   [...]
     bool verifyYuleWalker(const std::vector<double>& r, const std::vector<double>& phi, double tol = 1e-6) {
         size_t p = phi.size();
-        if (r.size() <= p) return false;
+        if (r.size() <= p)
+            return false;
 
         for (size_t i = 0; i < p; ++i) {
             double computed = 0.0;
@@ -223,8 +226,8 @@ TEST_F(ForecastNumericalTest, PredictionIntervalWidth) {
 
     // The width should be approximately 2 * deviations * σ * sqrt(1.04) ≈ 8.16
     // But actual σ from fit may differ slightly
-    EXPECT_GT(intervalWidth, 2.0);  // Should be significantly positive
-    EXPECT_LT(intervalWidth, 20.0); // But not unreasonably large
+    EXPECT_GT(intervalWidth, 2.0);   // Should be significantly positive
+    EXPECT_LT(intervalWidth, 20.0);  // But not unreasonably large
 }
 
 TEST_F(ForecastNumericalTest, LinearExtrapolation) {
@@ -1082,7 +1085,7 @@ TEST_F(ForecastNumericalTest, PeriodicityDetectorPeriodogramPureSine) {
 
     PeriodicityDetector detector;
 
-    size_t n = 128;    // Power of 2: no padding, exact bin alignment
+    size_t n = 128;  // Power of 2: no padding, exact bin alignment
     size_t period = 16;
     std::vector<double> y(n);
     for (size_t i = 0; i < n; ++i) {
@@ -1340,8 +1343,8 @@ TEST_F(ForecastNumericalTest, STLLoessSmoothing) {
     // This measures point-to-point jitter
     double noisyRoughness = 0.0, smoothedRoughness = 0.0;
     for (size_t i = 1; i < 50; ++i) {
-        double noisyDiff = y[i] - y[i-1];
-        double smoothedDiff = smoothed[i] - smoothed[i-1];
+        double noisyDiff = y[i] - y[i - 1];
+        double smoothedDiff = smoothed[i] - smoothed[i - 1];
         noisyRoughness += noisyDiff * noisyDiff;
         smoothedRoughness += smoothedDiff * smoothedDiff;
     }
@@ -1593,8 +1596,8 @@ TEST_F(ForecastNumericalTest, STLMSTLMultiplePeriods) {
     std::vector<double> y(n);
     for (size_t i = 0; i < n; ++i) {
         double trend = 100.0;
-        double dailyCycle = 20.0 * std::sin(2.0 * M_PI * i / 12.0);    // Stronger daily pattern
-        double weeklyCycle = 10.0 * std::sin(2.0 * M_PI * i / 48.0);   // Weaker weekly pattern
+        double dailyCycle = 20.0 * std::sin(2.0 * M_PI * i / 12.0);   // Stronger daily pattern
+        double weeklyCycle = 10.0 * std::sin(2.0 * M_PI * i / 48.0);  // Weaker weekly pattern
         y[i] = trend + dailyCycle + weeklyCycle;
     }
 
@@ -1681,8 +1684,7 @@ TEST_F(ForecastNumericalTest, STLRobustnessWeightsZeroMAD) {
         auto weights = decomposer.computeRobustnessWeights(residuals);
         ASSERT_EQ(weights.size(), 20);
         for (size_t i = 0; i < weights.size(); ++i) {
-            EXPECT_NEAR(weights[i], 1.0, 1e-9)
-                << "weight[" << i << "] should be 1.0 when all residuals are zero";
+            EXPECT_NEAR(weights[i], 1.0, 1e-9) << "weight[" << i << "] should be 1.0 when all residuals are zero";
         }
     }
 
@@ -1704,16 +1706,12 @@ TEST_F(ForecastNumericalTest, STLRobustnessWeightsZeroMAD) {
         auto result = decomposer.decompose(y, 12, 7, 0, /*robust=*/true, 3, 2);
         ASSERT_TRUE(result.success);
         for (size_t i = 0; i < y.size(); ++i) {
-            EXPECT_TRUE(std::isfinite(result.trend[i]))
-                << "trend[" << i << "] is not finite with constant input";
-            EXPECT_TRUE(std::isfinite(result.seasonal[i]))
-                << "seasonal[" << i << "] is not finite with constant input";
-            EXPECT_TRUE(std::isfinite(result.residual[i]))
-                << "residual[" << i << "] is not finite with constant input";
+            EXPECT_TRUE(std::isfinite(result.trend[i])) << "trend[" << i << "] is not finite with constant input";
+            EXPECT_TRUE(std::isfinite(result.seasonal[i])) << "seasonal[" << i << "] is not finite with constant input";
+            EXPECT_TRUE(std::isfinite(result.residual[i])) << "residual[" << i << "] is not finite with constant input";
         }
         for (size_t i = 0; i < y.size(); ++i) {
-            EXPECT_NEAR(result.trend[i], 42.0, 5.0)
-                << "trend[" << i << "] should be ~42 with constant input";
+            EXPECT_NEAR(result.trend[i], 42.0, 5.0) << "trend[" << i << "] should be ~42 with constant input";
         }
     }
 }
@@ -1738,20 +1736,17 @@ TEST_F(ForecastNumericalTest, STLLoessDuplicateXValues) {
     // Every point is at distance 0 from xeval; uniform weights should apply
     // and the result should equal the simple mean of y.
     {
-        std::vector<double> x(10, 5.0);   // all x = 5
-        std::vector<double> y = {1.0, 2.0, 3.0, 4.0, 5.0,
-                                  6.0, 7.0, 8.0, 9.0, 10.0};
+        std::vector<double> x(10, 5.0);  // all x = 5
+        std::vector<double> y = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0};
         std::vector<double> xout = {5.0};
 
         auto result = decomposer.loess(x, y, xout, 1.0);
         ASSERT_EQ(result.size(), 1u);
         EXPECT_TRUE(std::isfinite(result[0]))
-            << "LOESS with all-duplicate x should return a finite value, got "
-            << result[0];
+            << "LOESS with all-duplicate x should return a finite value, got " << result[0];
         // With uniform weights and x centered at xeval=5 (all xi=0),
         // the WLS intercept equals the simple mean: (1+2+...+10)/10 = 5.5
-        EXPECT_NEAR(result[0], 5.5, 1e-6)
-            << "LOESS intercept with uniform weights should be mean of y";
+        EXPECT_NEAR(result[0], 5.5, 1e-6) << "LOESS intercept with uniform weights should be mean of y";
     }
 
     // Case 2: near-duplicate x-values (sub-epsilon floating-point jitter).
@@ -1762,41 +1757,35 @@ TEST_F(ForecastNumericalTest, STLLoessDuplicateXValues) {
     {
         std::vector<double> x(10, 5.0);
         // Add sub-epsilon jitter (1e-15 per step, maxDist ends up ~9e-15)
-        for (size_t i = 0; i < 10; ++i) x[i] += static_cast<double>(i) * 1e-15;
-        std::vector<double> y = {1.0, 2.0, 3.0, 4.0, 5.0,
-                                  6.0, 7.0, 8.0, 9.0, 10.0};
+        for (size_t i = 0; i < 10; ++i)
+            x[i] += static_cast<double>(i) * 1e-15;
+        std::vector<double> y = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0};
         std::vector<double> xout = {5.0};
 
         auto result = decomposer.loess(x, y, xout, 1.0);
         ASSERT_EQ(result.size(), 1u);
         EXPECT_TRUE(std::isfinite(result[0]))
-            << "LOESS with near-duplicate x should return a finite value, got "
-            << result[0];
+            << "LOESS with near-duplicate x should return a finite value, got " << result[0];
         // With the fix (uniform weights when maxDist <= epsilon), result = mean = 5.5.
         // Without the fix, the WLS gives ~3.47, which is wrong.
-        EXPECT_NEAR(result[0], 5.5, 0.1)
-            << "LOESS with near-duplicate x should approximate the mean of y";
+        EXPECT_NEAR(result[0], 5.5, 0.1) << "LOESS with near-duplicate x should approximate the mean of y";
     }
 
     // Case 3: mostly duplicate x with one distant outlier x — the outlier is
     // excluded from the window (span < 1.0) so the result is dominated by the
     // duplicates and must still be finite.
     {
-        std::vector<double> x = {5.0, 5.0, 5.0, 5.0, 5.0,
-                                  5.0, 5.0, 5.0, 5.0, 100.0};
-        std::vector<double> y = {10.0, 10.0, 10.0, 10.0, 10.0,
-                                  10.0, 10.0, 10.0, 10.0, 999.0};
+        std::vector<double> x = {5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 100.0};
+        std::vector<double> y = {10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 999.0};
         std::vector<double> xout = {5.0};
 
         auto result = decomposer.loess(x, y, xout, 0.9);
         ASSERT_EQ(result.size(), 1u);
         EXPECT_TRUE(std::isfinite(result[0]))
-            << "LOESS with mostly-duplicate x must return a finite value, got "
-            << result[0];
+            << "LOESS with mostly-duplicate x must return a finite value, got " << result[0];
         // The 9 duplicates at x=5 dominate; outlier at x=100 is outside the
         // 9-point window, so result should be near 10.0.
-        EXPECT_NEAR(result[0], 10.0, 1.0)
-            << "LOESS should be dominated by the 9 duplicate points near xeval";
+        EXPECT_NEAR(result[0], 10.0, 1.0) << "LOESS should be dominated by the 9 duplicate points near xeval";
     }
 
     // Case 4: full STL decompose on a dataset with duplicate timestamps.
@@ -1873,7 +1862,7 @@ TEST_F(ForecastNumericalTest, ParseDurationToNsDays) {
 
 TEST_F(ForecastNumericalTest, ParseDurationToNsWeeks) {
     // Test week-based durations
-    EXPECT_EQ(parseDurationToNs("1w"), 604'800'000'000'000ULL);  // 7 days
+    EXPECT_EQ(parseDurationToNs("1w"), 604'800'000'000'000ULL);    // 7 days
     EXPECT_EQ(parseDurationToNs("2w"), 1'209'600'000'000'000ULL);  // 14 days
 }
 
@@ -1887,12 +1876,12 @@ TEST_F(ForecastNumericalTest, ParseDurationToNsSmallUnits) {
 
 TEST_F(ForecastNumericalTest, ParseDurationToNsInvalidFormats) {
     // Test invalid formats throw exceptions
-    EXPECT_THROW(parseDurationToNs(""), std::invalid_argument);          // Empty
-    EXPECT_THROW(parseDurationToNs("abc"), std::invalid_argument);       // No number
-    EXPECT_THROW(parseDurationToNs("5"), std::invalid_argument);         // No unit
-    EXPECT_THROW(parseDurationToNs("5x"), std::invalid_argument);        // Invalid unit
-    EXPECT_THROW(parseDurationToNs("-5m"), std::invalid_argument);       // Negative
-    EXPECT_THROW(parseDurationToNs("0m"), std::invalid_argument);        // Zero
+    EXPECT_THROW(parseDurationToNs(""), std::invalid_argument);     // Empty
+    EXPECT_THROW(parseDurationToNs("abc"), std::invalid_argument);  // No number
+    EXPECT_THROW(parseDurationToNs("5"), std::invalid_argument);    // No unit
+    EXPECT_THROW(parseDurationToNs("5x"), std::invalid_argument);   // Invalid unit
+    EXPECT_THROW(parseDurationToNs("-5m"), std::invalid_argument);  // Negative
+    EXPECT_THROW(parseDurationToNs("0m"), std::invalid_argument);   // Zero
 }
 
 // ==================== Seasonal Forecaster AUTO Mode Tests ====================
@@ -1954,7 +1943,7 @@ TEST_F(ForecastNumericalTest, SeasonalForecasterMultiMode) {
     // Daily (24) + Weekly (168) patterns for hourly data
     const size_t dailyPeriod = 24;
     const size_t weeklyPeriod = 168;  // 7 * 24
-    const size_t nWeeks = 3;  // Need at least 2 full cycles of longest period
+    const size_t nWeeks = 3;          // Need at least 2 full cycles of longest period
     const size_t n = weeklyPeriod * nWeeks;
 
     ForecastInput input;
@@ -2063,7 +2052,7 @@ TEST_F(ForecastNumericalTest, HistoryDurationLimitsData) {
     for (size_t i = 0; i < n; ++i) {
         inputFull.timestamps[i] = i * 60'000'000'000ULL;  // 1 minute intervals
         // Level shift halfway through
-        inputFull.values[i] = (i < n/2) ? 100.0 : 200.0;
+        inputFull.values[i] = (i < n / 2) ? 100.0 : 200.0;
     }
 
     ForecastConfig configFull;
@@ -2091,7 +2080,7 @@ TEST_F(ForecastNumericalTest, HistoryDurationLimitsData) {
     // With limited history (all 200s), the slope should be near zero
     // With full history, the slope should be positive due to level shift
     EXPECT_NEAR(outputLimited.slope, 0.0, 0.01);  // Near-flat line
-    EXPECT_GT(outputFull.slope, 0.5);  // Positive slope from level shift
+    EXPECT_GT(outputFull.slope, 0.5);             // Positive slope from level shift
 
     // Forecast from limited history should be around 200
     EXPECT_NEAR(outputLimited.forecast[0], 200.0, 5.0);
@@ -2130,10 +2119,10 @@ TEST_F(ForecastNumericalTest, LinearModelSimpleVsDefaultTrendData) {
     // Create data with steeper trend in first half, flatter in second half
     for (size_t i = 0; i < n; ++i) {
         input.timestamps[i] = i * 60'000'000'000ULL;
-        if (i < n/2) {
+        if (i < n / 2) {
             input.values[i] = 100.0 + 2.0 * i;  // Steep slope = 2
         } else {
-            input.values[i] = 200.0 + 0.5 * (i - n/2);  // Flatter slope = 0.5
+            input.values[i] = 200.0 + 0.5 * (i - n / 2);  // Flatter slope = 0.5
         }
     }
 
@@ -2196,8 +2185,7 @@ TEST_F(ForecastNumericalTest, ExtrapolateTrendDivisionByZeroSinglePoint) {
 
     ASSERT_EQ(result.size(), 5);
     for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_TRUE(std::isfinite(result[i]))
-            << "extrapolateTrend produced non-finite value at index " << i;
+        EXPECT_TRUE(std::isfinite(result[i])) << "extrapolateTrend produced non-finite value at index " << i;
         EXPECT_DOUBLE_EQ(result[i], 42.0);
     }
 }
@@ -2236,8 +2224,7 @@ TEST_F(ForecastNumericalTest, ExtrapolateTrendNormalCase) {
 
     ASSERT_EQ(result.size(), 5);
     for (size_t i = 0; i < result.size(); ++i) {
-        EXPECT_TRUE(std::isfinite(result[i]))
-            << "extrapolateTrend produced non-finite value at index " << i;
+        EXPECT_TRUE(std::isfinite(result[i])) << "extrapolateTrend produced non-finite value at index " << i;
     }
     // The extrapolation should continue the upward trend
     EXPECT_GT(result[0], trend.back() - 1.0);
@@ -2294,8 +2281,7 @@ TEST_F(ForecastNumericalTest, InverseSeasonalDifferenceEmptyOriginal) {
     ASSERT_EQ(result.size(), 3);
     for (size_t i = 0; i < result.size(); ++i) {
         EXPECT_TRUE(std::isfinite(result[i]))
-            << "inverseSeasonalDifference produced non-finite value at index " << i
-            << " with empty original";
+            << "inverseSeasonalDifference produced non-finite value at index " << i << " with empty original";
     }
 }
 
@@ -2336,8 +2322,7 @@ TEST_F(ForecastNumericalTest, AutoCorrelationWithNaN) {
     double acf = detector.autoCorrelation(y, 24);
 
     // Result should be finite (not NaN)
-    EXPECT_TRUE(std::isfinite(acf))
-        << "autoCorrelation should handle NaN input without propagating NaN";
+    EXPECT_TRUE(std::isfinite(acf)) << "autoCorrelation should handle NaN input without propagating NaN";
 }
 
 TEST_F(ForecastNumericalTest, AutoCorrelationAllNaN) {
@@ -2396,13 +2381,11 @@ TEST_F(ForecastNumericalTest, AutoCorrelationWithInf) {
     double acf = detector.autoCorrelation(y, 24);
 
     // Result must be finite — the Inf must have been filtered out
-    EXPECT_TRUE(std::isfinite(acf))
-        << "autoCorrelation should filter Inf the same way it filters NaN";
+    EXPECT_TRUE(std::isfinite(acf)) << "autoCorrelation should filter Inf the same way it filters NaN";
 
     // With only 1 Inf in 100 sinusoidal points the ACF at lag 24 should
     // still be strongly positive (period alignment)
-    EXPECT_GT(acf, 0.5)
-        << "ACF at the true period should remain strongly positive after Inf is filtered";
+    EXPECT_GT(acf, 0.5) << "ACF at the true period should remain strongly positive after Inf is filtered";
 }
 
 TEST_F(ForecastNumericalTest, AutoCorrelationWithNegInf) {
@@ -2418,8 +2401,7 @@ TEST_F(ForecastNumericalTest, AutoCorrelationWithNegInf) {
 
     double acf = detector.autoCorrelation(y, 24);
 
-    EXPECT_TRUE(std::isfinite(acf))
-        << "autoCorrelation should filter -Inf the same way it filters NaN";
+    EXPECT_TRUE(std::isfinite(acf)) << "autoCorrelation should filter -Inf the same way it filters NaN";
     EXPECT_GT(acf, 0.5);
 }
 
@@ -2440,14 +2422,11 @@ TEST_F(ForecastNumericalTest, DetectPeriodsWithInfInput) {
 
     // Should not crash and should still detect the dominant period
     std::vector<DetectedPeriod> periods;
-    EXPECT_NO_THROW({
-        periods = detector.detectPeriods(y, 4, 96, 3, 0.1);
-    });
+    EXPECT_NO_THROW({ periods = detector.detectPeriods(y, 4, 96, 3, 0.1); });
 
     // The period-24 signal is strong enough that it should still be detected
     // after the Inf is filtered from the ACF step
-    ASSERT_FALSE(periods.empty())
-        << "Period detection should survive a single Inf value in the input";
+    ASSERT_FALSE(periods.empty()) << "Period detection should survive a single Inf value in the input";
 
     bool found24 = false;
     for (const auto& p : periods) {
@@ -2455,8 +2434,7 @@ TEST_F(ForecastNumericalTest, DetectPeriodsWithInfInput) {
             found24 = true;
         }
     }
-    EXPECT_TRUE(found24)
-        << "Period near 24 should be detected even with one Inf in the data";
+    EXPECT_TRUE(found24) << "Period near 24 should be detected even with one Inf in the data";
 }
 
 TEST_F(ForecastNumericalTest, RSquaredClampedToValidRange) {
@@ -2487,10 +2465,8 @@ TEST_F(ForecastNumericalTest, RSquaredClampedToValidRange) {
     auto output = forecaster.forecast(input, config, forecastTs);
 
     // R-squared must be in valid range
-    EXPECT_GE(output.rSquared, 0.0)
-        << "R-squared should not be negative";
-    EXPECT_LE(output.rSquared, 1.0)
-        << "R-squared should not exceed 1.0";
+    EXPECT_GE(output.rSquared, 0.0) << "R-squared should not be negative";
+    EXPECT_LE(output.rSquared, 1.0) << "R-squared should not exceed 1.0";
 }
 
 // ==================== Auto-Windowing Tests ====================
@@ -2566,10 +2542,8 @@ TEST_F(ForecastNumericalTest, WindowingPreservesQuality) {
     // should be most reliable.
     size_t checkCount = std::min(output.forecastCount, static_cast<size_t>(20));
     for (size_t i = 0; i < checkCount; ++i) {
-        EXPECT_GT(output.forecast[i], -50.0)
-            << "Forecast point " << i << " diverged too low: " << output.forecast[i];
-        EXPECT_LT(output.forecast[i], 150.0)
-            << "Forecast point " << i << " diverged too high: " << output.forecast[i];
+        EXPECT_GT(output.forecast[i], -50.0) << "Forecast point " << i << " diverged too low: " << output.forecast[i];
+        EXPECT_LT(output.forecast[i], 150.0) << "Forecast point " << i << " diverged too high: " << output.forecast[i];
     }
 }
 
@@ -2674,8 +2648,7 @@ TEST_F(ForecastNumericalTest, ExecuteMultiWindowingConsistency) {
     for (size_t s = 0; s < 2; ++s) {
         seriesValues[s].resize(N);
         for (size_t i = 0; i < N; ++i) {
-            seriesValues[s][i] = (10.0 + s * 5.0) *
-                std::sin(2.0 * M_PI * static_cast<double>(i) / period) + 50.0;
+            seriesValues[s][i] = (10.0 + s * 5.0) * std::sin(2.0 * M_PI * static_cast<double>(i) / period) + 50.0;
         }
     }
 
@@ -2699,8 +2672,7 @@ TEST_F(ForecastNumericalTest, ExecuteMultiWindowingConsistency) {
 
     // Each series piece should have values.size() == times.size()
     for (const auto& piece : result.series) {
-        EXPECT_EQ(piece.values.size(), result.times.size())
-            << "Piece '" << piece.piece << "' size mismatch";
+        EXPECT_EQ(piece.values.size(), result.times.size()) << "Piece '" << piece.piece << "' size mismatch";
     }
 
     // Should have 4 pieces per series (past, forecast, upper, lower) × 2 series
@@ -2842,12 +2814,9 @@ TEST_F(ForecastNumericalTest, SeasonalForecastAllNaNInputReturnsEmpty) {
     // Must not crash. The output should be empty or contain no NaN/Inf.
     if (!output.empty()) {
         for (size_t i = 0; i < output.forecastCount; ++i) {
-            EXPECT_TRUE(std::isfinite(output.forecast[i]))
-                << "forecast[" << i << "] is not finite";
-            EXPECT_TRUE(std::isfinite(output.upper[i]))
-                << "upper[" << i << "] is not finite";
-            EXPECT_TRUE(std::isfinite(output.lower[i]))
-                << "lower[" << i << "] is not finite";
+            EXPECT_TRUE(std::isfinite(output.forecast[i])) << "forecast[" << i << "] is not finite";
+            EXPECT_TRUE(std::isfinite(output.upper[i])) << "upper[" << i << "] is not finite";
+            EXPECT_TRUE(std::isfinite(output.lower[i])) << "lower[" << i << "] is not finite";
         }
     }
 }
@@ -2875,8 +2844,7 @@ TEST_F(ForecastNumericalTest, SeasonalForecastAllNaNAutoSeasonality) {
 
     if (!output.empty()) {
         for (size_t i = 0; i < output.forecastCount; ++i) {
-            EXPECT_TRUE(std::isfinite(output.forecast[i]))
-                << "forecast[" << i << "] is not finite (AUTO seasonality)";
+            EXPECT_TRUE(std::isfinite(output.forecast[i])) << "forecast[" << i << "] is not finite (AUTO seasonality)";
         }
     }
 }
@@ -2939,8 +2907,7 @@ TEST_F(ForecastNumericalTest, FitARCoefficientsAllNaN) {
 
     // All coefficients must be finite (zero is the safe fallback).
     for (size_t i = 0; i < coeffs.size(); ++i) {
-        EXPECT_TRUE(std::isfinite(coeffs[i]))
-            << "AR coefficient[" << i << "] is not finite for all-NaN input";
+        EXPECT_TRUE(std::isfinite(coeffs[i])) << "AR coefficient[" << i << "] is not finite for all-NaN input";
     }
 }
 
@@ -2973,16 +2940,11 @@ TEST_F(ForecastNumericalTest, LinearModelSimpleForecastIsFinite) {
 
     ASSERT_EQ(output.forecastCount, size_t(10));
     for (size_t i = 0; i < output.forecastCount; ++i) {
-        EXPECT_TRUE(std::isfinite(output.forecast[i]))
-            << "forecast[" << i << "] is not finite in SIMPLE mode";
-        EXPECT_TRUE(std::isfinite(output.upper[i]))
-            << "upper[" << i << "] is not finite in SIMPLE mode";
-        EXPECT_TRUE(std::isfinite(output.lower[i]))
-            << "lower[" << i << "] is not finite in SIMPLE mode";
-        EXPECT_GE(output.upper[i], output.forecast[i])
-            << "upper bound must be >= forecast at index " << i;
-        EXPECT_LE(output.lower[i], output.forecast[i])
-            << "lower bound must be <= forecast at index " << i;
+        EXPECT_TRUE(std::isfinite(output.forecast[i])) << "forecast[" << i << "] is not finite in SIMPLE mode";
+        EXPECT_TRUE(std::isfinite(output.upper[i])) << "upper[" << i << "] is not finite in SIMPLE mode";
+        EXPECT_TRUE(std::isfinite(output.lower[i])) << "lower[" << i << "] is not finite in SIMPLE mode";
+        EXPECT_GE(output.upper[i], output.forecast[i]) << "upper bound must be >= forecast at index " << i;
+        EXPECT_LE(output.lower[i], output.forecast[i]) << "lower bound must be <= forecast at index " << i;
     }
 }
 
@@ -3085,8 +3047,7 @@ TEST_F(ForecastNumericalTest, LinearModelSimplePerfectRecentLine) {
     // Intercept: y = 5*x + 1, so intercept = 1
     EXPECT_NEAR(output.intercept, 1.0, 1e-6)
         << "SIMPLE mode should fit the last-half intercept exactly when it is a perfect line";
-    EXPECT_NEAR(output.rSquared, 1.0, 1e-6)
-        << "SIMPLE mode R² should be 1.0 for a perfect line in the last half";
+    EXPECT_NEAR(output.rSquared, 1.0, 1e-6) << "SIMPLE mode R² should be 1.0 for a perfect line in the last half";
 }
 
 TEST_F(ForecastNumericalTest, LinearModelReactiveForecastIsFinite) {
@@ -3116,16 +3077,11 @@ TEST_F(ForecastNumericalTest, LinearModelReactiveForecastIsFinite) {
 
     ASSERT_EQ(output.forecastCount, size_t(10));
     for (size_t i = 0; i < output.forecastCount; ++i) {
-        EXPECT_TRUE(std::isfinite(output.forecast[i]))
-            << "forecast[" << i << "] is not finite in REACTIVE mode";
-        EXPECT_TRUE(std::isfinite(output.upper[i]))
-            << "upper[" << i << "] is not finite in REACTIVE mode";
-        EXPECT_TRUE(std::isfinite(output.lower[i]))
-            << "lower[" << i << "] is not finite in REACTIVE mode";
-        EXPECT_GE(output.upper[i], output.forecast[i])
-            << "upper bound must be >= forecast at index " << i;
-        EXPECT_LE(output.lower[i], output.forecast[i])
-            << "lower bound must be <= forecast at index " << i;
+        EXPECT_TRUE(std::isfinite(output.forecast[i])) << "forecast[" << i << "] is not finite in REACTIVE mode";
+        EXPECT_TRUE(std::isfinite(output.upper[i])) << "upper[" << i << "] is not finite in REACTIVE mode";
+        EXPECT_TRUE(std::isfinite(output.lower[i])) << "lower[" << i << "] is not finite in REACTIVE mode";
+        EXPECT_GE(output.upper[i], output.forecast[i]) << "upper bound must be >= forecast at index " << i;
+        EXPECT_LE(output.lower[i], output.forecast[i]) << "lower bound must be <= forecast at index " << i;
     }
 }
 
@@ -3213,14 +3169,10 @@ TEST_F(ForecastNumericalTest, LinearModelReactivePerfectLine) {
     LinearForecaster forecaster;
     auto output = forecaster.forecast(input, config, forecastTs);
 
-    EXPECT_NEAR(output.slope, 3.0, 1e-6)
-        << "REACTIVE mode should recover exact slope on a perfect line";
-    EXPECT_NEAR(output.intercept, 2.0, 1e-6)
-        << "REACTIVE mode should recover exact intercept on a perfect line";
-    EXPECT_NEAR(output.rSquared, 1.0, 1e-6)
-        << "REACTIVE mode R² should be 1.0 for a perfect line";
-    EXPECT_NEAR(output.residualStdDev, 0.0, 1e-6)
-        << "REACTIVE mode residualStdDev should be 0.0 for a perfect line";
+    EXPECT_NEAR(output.slope, 3.0, 1e-6) << "REACTIVE mode should recover exact slope on a perfect line";
+    EXPECT_NEAR(output.intercept, 2.0, 1e-6) << "REACTIVE mode should recover exact intercept on a perfect line";
+    EXPECT_NEAR(output.rSquared, 1.0, 1e-6) << "REACTIVE mode R² should be 1.0 for a perfect line";
+    EXPECT_NEAR(output.residualStdDev, 0.0, 1e-6) << "REACTIVE mode residualStdDev should be 0.0 for a perfect line";
 }
 
 TEST_F(ForecastNumericalTest, LinearModelReactiveVsDefaultSlopeOrdering) {
@@ -3235,11 +3187,11 @@ TEST_F(ForecastNumericalTest, LinearModelReactiveVsDefaultSlopeOrdering) {
     const size_t n = 100;
     std::vector<double> values(n);
     for (size_t i = 0; i < 50; ++i) {
-        values[i] = static_cast<double>(i);              // 0 .. 49
+        values[i] = static_cast<double>(i);  // 0 .. 49
     }
     for (size_t i = 50; i < n; ++i) {
         // Continue from 49, then decline
-        values[i] = 49.0 - static_cast<double>(i - 50); // 49 .. 0
+        values[i] = 49.0 - static_cast<double>(i - 50);  // 49 .. 0
     }
 
     auto timestamps = generateTimestamps(n);
@@ -3262,20 +3214,17 @@ TEST_F(ForecastNumericalTest, LinearModelReactiveVsDefaultSlopeOrdering) {
     cfgSimple.linearModel = LinearModelType::SIMPLE;
 
     LinearForecaster forecaster;
-    auto outDefault  = forecaster.forecast(input, cfgDefault,  forecastTs);
+    auto outDefault = forecaster.forecast(input, cfgDefault, forecastTs);
     auto outReactive = forecaster.forecast(input, cfgReactive, forecastTs);
-    auto outSimple   = forecaster.forecast(input, cfgSimple,   forecastTs);
+    auto outSimple = forecaster.forecast(input, cfgSimple, forecastTs);
 
     // DEFAULT slope should be near zero (symmetric rise and fall)
-    EXPECT_NEAR(outDefault.slope, 0.0, 0.5)
-        << "DEFAULT slope should be near 0 for a symmetric rise-then-fall";
+    EXPECT_NEAR(outDefault.slope, 0.0, 0.5) << "DEFAULT slope should be near 0 for a symmetric rise-then-fall";
 
     // Both REACTIVE and SIMPLE should produce a negative slope because recent
     // data is declining.
-    EXPECT_LT(outReactive.slope, 0.0)
-        << "REACTIVE slope should be negative when recent data is declining";
-    EXPECT_LT(outSimple.slope, 0.0)
-        << "SIMPLE slope should be negative when recent data is declining";
+    EXPECT_LT(outReactive.slope, 0.0) << "REACTIVE slope should be negative when recent data is declining";
+    EXPECT_LT(outSimple.slope, 0.0) << "SIMPLE slope should be negative when recent data is declining";
 }
 
 TEST_F(ForecastNumericalTest, LinearModelAllModesHorizontalLine) {
@@ -3295,30 +3244,24 @@ TEST_F(ForecastNumericalTest, LinearModelAllModesHorizontalLine) {
 
     LinearForecaster forecaster;
 
-    for (auto model : {LinearModelType::DEFAULT,
-                       LinearModelType::SIMPLE,
-                       LinearModelType::REACTIVE}) {
+    for (auto model : {LinearModelType::DEFAULT, LinearModelType::SIMPLE, LinearModelType::REACTIVE}) {
         ForecastConfig config;
-        config.algorithm  = Algorithm::LINEAR;
+        config.algorithm = Algorithm::LINEAR;
         config.linearModel = model;
-        config.deviations  = 2.0;
+        config.deviations = 2.0;
 
         auto output = forecaster.forecast(input, config, forecastTs);
 
         EXPECT_NEAR(output.slope, 0.0, 1e-9)
-            << "slope should be 0 for flat series, model="
-            << linearModelToString(model);
+            << "slope should be 0 for flat series, model=" << linearModelToString(model);
         EXPECT_NEAR(output.intercept, constVal, 1e-9)
-            << "intercept should equal the constant value, model="
-            << linearModelToString(model);
+            << "intercept should equal the constant value, model=" << linearModelToString(model);
         EXPECT_NEAR(output.rSquared, 1.0, 1e-6)
-            << "R² should be 1.0 for a flat series (zero variance), model="
-            << linearModelToString(model);
+            << "R² should be 1.0 for a flat series (zero variance), model=" << linearModelToString(model);
 
         for (size_t i = 0; i < output.forecastCount; ++i) {
             EXPECT_TRUE(std::isfinite(output.forecast[i]))
-                << "forecast[" << i << "] not finite, model="
-                << linearModelToString(model);
+                << "forecast[" << i << "] not finite, model=" << linearModelToString(model);
             EXPECT_DOUBLE_EQ(output.forecast[i], constVal)
                 << "forecast value mismatch, model=" << linearModelToString(model);
         }
@@ -3339,8 +3282,7 @@ TEST_F(ForecastNumericalTest, LevinsonDurbinZeroVarianceReturnsAllZero) {
         std::vector<double> r = {0.0, 0.0};
         auto phi = forecaster.levinsonDurbin(r, 1);
         ASSERT_EQ(phi.size(), 1u);
-        EXPECT_TRUE(std::isfinite(phi[0]))
-            << "levinsonDurbin(r[0]=0, order=1) produced non-finite phi[0]";
+        EXPECT_TRUE(std::isfinite(phi[0])) << "levinsonDurbin(r[0]=0, order=1) produced non-finite phi[0]";
         EXPECT_DOUBLE_EQ(phi[0], 0.0);
     }
 
@@ -3382,11 +3324,11 @@ TEST_F(ForecastNumericalTest, SeasonalForecasterConstantInputFiniteForecasts) {
 
     ForecastInput input;
     input.timestamps = timestamps;
-    input.values     = values;
+    input.values = values;
 
     ForecastConfig config;
-    config.algorithm  = Algorithm::SEASONAL;
-    config.arOrder    = 3;
+    config.algorithm = Algorithm::SEASONAL;
+    config.arOrder = 3;
     config.seasonalArOrder = 1;
     // Use no explicit seasonality so the differencing path is exercised
     config.seasonality = Seasonality::NONE;
@@ -3424,8 +3366,7 @@ TEST_F(ForecastNumericalTest, GenerateForecastTimestamps_DuplicateTimestamps_Ret
     // Must not return timestamps that are all identical to the last historical
     // value (that would yield division-by-zero in xForecast computation).
     // The safe contract is: return empty when interval == 0.
-    EXPECT_TRUE(forecastTs.empty())
-        << "generateForecastTimestamps should return empty for duplicate timestamps";
+    EXPECT_TRUE(forecastTs.empty()) << "generateForecastTimestamps should return empty for duplicate timestamps";
 }
 
 // ForecastExecutor::executeMulti must return a failed result (not crash,
@@ -3441,16 +3382,10 @@ TEST_F(ForecastNumericalTest, ExecuteMulti_DuplicateTimestamps_ReturnsError) {
     config.minDataPoints = 2;
 
     ForecastExecutor executor;
-    auto result = executor.executeMulti(
-        timestamps,
-        {{values}},
-        {{}},
-        config
-    );
+    auto result = executor.executeMulti(timestamps, {{values}}, {{}}, config);
 
     // Must not crash and must not produce NaN/Inf values
-    EXPECT_FALSE(result.success)
-        << "executeMulti should report failure for duplicate timestamps";
+    EXPECT_FALSE(result.success) << "executeMulti should report failure for duplicate timestamps";
     EXPECT_FALSE(result.errorMessage.empty())
         << "executeMulti should provide an error message for duplicate timestamps";
 
@@ -3458,9 +3393,8 @@ TEST_F(ForecastNumericalTest, ExecuteMulti_DuplicateTimestamps_ReturnsError) {
     for (const auto& piece : result.series) {
         for (const auto& v : piece.values) {
             if (v.has_value()) {
-                EXPECT_TRUE(std::isfinite(*v))
-                    << "executeMulti: series piece '" << piece.piece
-                    << "' contains non-finite value for duplicate timestamps";
+                EXPECT_TRUE(std::isfinite(*v)) << "executeMulti: series piece '" << piece.piece
+                                               << "' contains non-finite value for duplicate timestamps";
             }
         }
     }
@@ -3484,10 +3418,10 @@ TEST_F(ForecastNumericalTest, LinearForecaster_DuplicateTimestamps_FiniteOutput)
 
     ForecastInput input;
     input.timestamps = timestamps;
-    input.values     = values;
+    input.values = values;
 
     ForecastConfig config;
-    config.algorithm  = Algorithm::LINEAR;
+    config.algorithm = Algorithm::LINEAR;
     config.deviations = 2.0;
 
     LinearForecaster forecaster;
@@ -3503,4 +3437,3 @@ TEST_F(ForecastNumericalTest, LinearForecaster_DuplicateTimestamps_FiniteOutput)
             << "LinearForecaster duplicate timestamps: lower[" << i << "] is not finite";
     }
 }
-

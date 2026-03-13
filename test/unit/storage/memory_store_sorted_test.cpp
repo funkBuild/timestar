@@ -1,12 +1,13 @@
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+
 #include <gtest/gtest.h>
+
 #include <algorithm>
 #include <numeric>
 #include <random>
 #include <vector>
-
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 // Tests for InMemorySeries::insert maintaining sorted order.
 // These tests verify that timestamps and values remain correctly paired
@@ -21,8 +22,8 @@ protected:
         ASSERT_EQ(series.timestamps.size(), series.values.size());
         for (size_t i = 1; i < series.timestamps.size(); ++i) {
             EXPECT_LE(series.timestamps[i - 1], series.timestamps[i])
-                << "Timestamps not sorted at index " << i
-                << ": " << series.timestamps[i - 1] << " > " << series.timestamps[i];
+                << "Timestamps not sorted at index " << i << ": " << series.timestamps[i - 1] << " > "
+                << series.timestamps[i];
         }
     }
 
@@ -31,8 +32,7 @@ protected:
     void verifyPairing(const InMemorySeries<double>& series) {
         for (size_t i = 0; i < series.timestamps.size(); ++i) {
             EXPECT_DOUBLE_EQ(series.values[i], static_cast<double>(series.timestamps[i]))
-                << "Value/timestamp mismatch at index " << i
-                << ": timestamp=" << series.timestamps[i]
+                << "Value/timestamp mismatch at index " << i << ": timestamp=" << series.timestamps[i]
                 << " value=" << series.values[i];
         }
     }
@@ -405,8 +405,7 @@ TEST_F(MemoryStoreSortedTest, InsertMemoryMaintainsOrder) {
 
     EXPECT_EQ(result->timestamps.size(), 6);
     for (size_t i = 1; i < result->timestamps.size(); ++i) {
-        EXPECT_LE(result->timestamps[i - 1], result->timestamps[i])
-            << "Timestamps not sorted at index " << i;
+        EXPECT_LE(result->timestamps[i - 1], result->timestamps[i]) << "Timestamps not sorted at index " << i;
     }
 
     // Verify pairing

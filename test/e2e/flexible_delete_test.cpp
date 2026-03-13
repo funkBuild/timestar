@@ -1,13 +1,14 @@
+#include "../test_helpers.hpp"
+#include "engine.hpp"
+#include "timestar_value.hpp"
+
 #include <gtest/gtest.h>
+
+#include <chrono>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
-#include <chrono>
-
-#include "engine.hpp"
-#include "timestar_value.hpp"
-#include "../test_helpers.hpp"
 
 class FlexibleDeleteTest : public ::testing::Test {
 protected:
@@ -18,17 +19,13 @@ protected:
         engine = std::make_unique<Engine>();
 
         // Initialize engine in Seastar context
-        seastar::async([this] {
-            engine->init().get();
-        }).get();
+        seastar::async([this] { engine->init().get(); }).get();
     }
 
     void TearDown() override {
         if (engine) {
             try {
-                seastar::async([this] {
-                    engine->stop().get();
-                }).get();
+                seastar::async([this] { engine->stop().get(); }).get();
             } catch (...) {
                 // Swallow errors during cleanup to avoid segfaults
             }

@@ -2,50 +2,46 @@
 // Tests TSM query execution, memory store integration, result merging,
 // type-based routing, empty result handling, and large result sets.
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <memory>
-#include <vector>
-#include <string>
-
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/query/query_runner.hpp"
-#include "../../../lib/query/query_result.hpp"
 #include "../../../lib/core/series_id.hpp"
-
-#include <seastar/core/coroutine.hh>
-
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/query/query_result.hpp"
+#include "../../../lib/query/query_runner.hpp"
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <memory>
+#include <seastar/core/coroutine.hh>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 class QueryRunnerSeastarTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // Helper: run a block of async test code with Engine lifecycle management.
 // Ensures engine.stop() is always called, even on assertion failure.
-#define WITH_ENGINE(engine_var, body)                              \
-    do {                                                          \
-        Engine engine_var;                                        \
-        std::exception_ptr __ex;                                  \
-        try {                                                     \
-            co_await engine_var.init();                           \
-            body                                                  \
-        } catch (...) {                                           \
-            __ex = std::current_exception();                      \
-        }                                                         \
-        co_await engine_var.stop();                               \
-        if (__ex) std::rethrow_exception(__ex);                   \
+#define WITH_ENGINE(engine_var, body)        \
+    do {                                     \
+        Engine engine_var;                   \
+        std::exception_ptr __ex;             \
+        try {                                \
+            co_await engine_var.init();      \
+            body                             \
+        } catch (...) {                      \
+            __ex = std::current_exception(); \
+        }                                    \
+        co_await engine_var.stop();          \
+        if (__ex)                            \
+            std::rethrow_exception(__ex);    \
     } while (0)
 
 // ---------------------------------------------------------------------------

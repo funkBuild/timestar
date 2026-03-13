@@ -1,13 +1,15 @@
+#include "../../lib/core/timestar_value.hpp"
+#include "../../lib/storage/memory_store.hpp"
+#include "../../lib/storage/wal.hpp"
+#include "../test_helpers.hpp"
+
 #include <gtest/gtest.h>
+
 #include <chrono>
 #include <filesystem>
-#include <vector>
-#include "../../lib/storage/wal.hpp"
-#include "../../lib/storage/memory_store.hpp"
-#include "../../lib/core/timestar_value.hpp"
-#include "../test_helpers.hpp"
 #include <seastar/core/seastar.hh>
 #include <seastar/core/thread.hh>
+#include <vector>
 
 class WALBatchPerformanceTest : public ::testing::Test {
 protected:
@@ -16,9 +18,7 @@ protected:
         std::filesystem::create_directories("shard_0");
     }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {

@@ -7,24 +7,23 @@
 // RC4: prefetchSeriesIndices TSM index warming
 // RC5: latest aggregation full materialization
 
-#include <gtest/gtest.h>
-#include <chrono>
-#include <filesystem>
-#include <iomanip>
-#include <string>
-#include <vector>
-
+#include "../seastar_gtest.hpp"
+#include "../test_helpers.hpp"
 #include "engine.hpp"
 #include "query_parser.hpp"
 #include "query_result.hpp"
 #include "series_id.hpp"
 #include "timestar_value.hpp"
 
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <iomanip>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
-
-#include "../seastar_gtest.hpp"
-#include "../test_helpers.hpp"
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -87,8 +86,8 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC3_QueryAggregatedPushdown) {
 
     if (pushdownResult.has_value()) {
         EXPECT_GT(pushdownResult->totalPoints, 0u) << "Pushdown should have found data points";
-        std::cout << "[RC3] queryAggregated pushdown: " << pushdownResult->totalPoints << " points in " << elapsed.count()
-                  << " µs" << std::endl;
+        std::cout << "[RC3] queryAggregated pushdown: " << pushdownResult->totalPoints << " points in "
+                  << elapsed.count() << " µs" << std::endl;
     }
 
     // Compare with fallback (full materialization) path
@@ -137,8 +136,7 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC3_QueryAggregatedCorrectness) {
     if (result.has_value()) {
         EXPECT_EQ(result->totalPoints, 10u);
         // Streamable method (AVG) with interval=0 produces aggregatedState
-        EXPECT_TRUE(result->aggregatedState.has_value())
-            << "Non-bucketed AVG pushdown should produce collapsed state";
+        EXPECT_TRUE(result->aggregatedState.has_value()) << "Non-bucketed AVG pushdown should produce collapsed state";
         if (result->aggregatedState.has_value()) {
             EXPECT_EQ(result->aggregatedState->count, 10u);
             // AVG of 10,20,...,100 = 55.0
@@ -274,8 +272,7 @@ SEASTAR_TEST_F(QueryBottleneckTest, FullPipeline_PrefetchThenPushdown) {
 
     auto t1 = Clock::now();
     for (int i = 0; i < NUM_SERIES; i++) {
-        auto result =
-            co_await engine.queryAggregated(seriesKeys[i], seriesIds[i], 0, UINT64_MAX, aggregationInterval);
+        auto result = co_await engine.queryAggregated(seriesKeys[i], seriesIds[i], 0, UINT64_MAX, aggregationInterval);
         if (result.has_value()) {
             pushdownHits++;
         } else {
@@ -285,12 +282,11 @@ SEASTAR_TEST_F(QueryBottleneckTest, FullPipeline_PrefetchThenPushdown) {
     auto aggTime = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t1);
 
     std::cout << "[Pipeline] Prefetch: " << prefetchTime.count() << " µs" << std::endl;
-    std::cout << "[Pipeline] Aggregation: " << aggTime.count() << " µs (" << pushdownHits << " pushdown, "
-              << fallbacks << " fallback)" << std::endl;
+    std::cout << "[Pipeline] Aggregation: " << aggTime.count() << " µs (" << pushdownHits << " pushdown, " << fallbacks
+              << " fallback)" << std::endl;
 
     // After fixes, all should use pushdown (TSM-only float data, no overlap)
-    EXPECT_EQ(pushdownHits, static_cast<size_t>(NUM_SERIES))
-        << "All series should use pushdown (TSM-only float data)";
+    EXPECT_EQ(pushdownHits, static_cast<size_t>(NUM_SERIES)) << "All series should use pushdown (TSM-only float data)";
 
     co_await engine.stop();
 }

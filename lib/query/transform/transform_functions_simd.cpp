@@ -1,10 +1,9 @@
 // Highway foreach_target re-inclusion mechanism.
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "query/transform/transform_functions_simd.cpp"
-#include "hwy/foreach_target.h"
-
 #include "transform_functions_simd.hpp"
 
+#include "hwy/foreach_target.h"
 #include "hwy/highway.h"
 
 #include <cmath>
@@ -28,7 +27,8 @@ void Abs(const double* in, double* out, size_t count) {
         auto v = hn::LoadU(d, &in[i]);
         hn::StoreU(hn::Abs(v), d, &out[i]);
     }
-    for (; i < count; ++i) out[i] = std::abs(in[i]);
+    for (; i < count; ++i)
+        out[i] = std::abs(in[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,8 @@ void DefaultZero(const double* in, double* out, size_t count) {
         // Where NaN, use zero; otherwise keep v
         hn::StoreU(hn::IfThenElse(is_nan, zero, v), d, &out[i]);
     }
-    for (; i < count; ++i) out[i] = std::isnan(in[i]) ? 0.0 : in[i];
+    for (; i < count; ++i)
+        out[i] = std::isnan(in[i]) ? 0.0 : in[i];
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +82,8 @@ void CountNotNull(const double* in, double* out, size_t count) {
         auto not_nan = hn::Not(hn::IsNaN(v));
         hn::StoreU(hn::IfThenElseZero(not_nan, one), d, &out[i]);
     }
-    for (; i < count; ++i) out[i] = std::isnan(in[i]) ? 0.0 : 1.0;
+    for (; i < count; ++i)
+        out[i] = std::isnan(in[i]) ? 0.0 : 1.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +170,11 @@ void CutoffMax(const double* in, double threshold, double* out, size_t count) {
 // 9. Diff -- out[0]=NaN, out[i]=in[i]-in[i-1], NaN propagates
 // ---------------------------------------------------------------------------
 void Diff(const double* in, double* out, size_t count) {
-    if (count == 0) return;
+    if (count == 0)
+        return;
     out[0] = std::nan("");
-    if (count < 2) return;
+    if (count < 2)
+        return;
 
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
@@ -199,9 +203,11 @@ void Diff(const double* in, double* out, size_t count) {
 // 10. MonotonicDiff -- like diff but negative => current value (counter reset)
 // ---------------------------------------------------------------------------
 void MonotonicDiff(const double* in, double* out, size_t count) {
-    if (count == 0) return;
+    if (count == 0)
+        return;
     out[0] = std::nan("");
-    if (count < 2) return;
+    if (count < 2)
+        return;
 
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
@@ -251,7 +257,8 @@ void MultiplyInplace(double* values, double factor, size_t count) {
         hn::StoreU(hn::IfThenElse(is_nan, v, scaled), d, &values[i]);
     }
     for (; i < count; ++i) {
-        if (!std::isnan(values[i])) values[i] *= factor;
+        if (!std::isnan(values[i]))
+            values[i] *= factor;
     }
 }
 
@@ -280,70 +287,80 @@ HWY_EXPORT(MonotonicDiff);
 HWY_EXPORT(MultiplyInplace);
 
 std::vector<double> abs(const std::vector<double>& values) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::abs(values);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::abs(values);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(Abs)(values.data(), result.data(), values.size());
     return result;
 }
 
 std::vector<double> default_zero(const std::vector<double>& values) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::default_zero(values);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::default_zero(values);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(DefaultZero)(values.data(), result.data(), values.size());
     return result;
 }
 
 std::vector<double> count_nonzero(const std::vector<double>& values) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::count_nonzero(values);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::count_nonzero(values);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(CountNonzero)(values.data(), result.data(), values.size());
     return result;
 }
 
 std::vector<double> count_not_null(const std::vector<double>& values) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::count_not_null(values);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::count_not_null(values);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(CountNotNull)(values.data(), result.data(), values.size());
     return result;
 }
 
 std::vector<double> clamp_min(const std::vector<double>& values, double minVal) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::clamp_min(values, minVal);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::clamp_min(values, minVal);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(ClampMin)(values.data(), minVal, result.data(), values.size());
     return result;
 }
 
 std::vector<double> clamp_max(const std::vector<double>& values, double maxVal) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::clamp_max(values, maxVal);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::clamp_max(values, maxVal);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(ClampMax)(values.data(), maxVal, result.data(), values.size());
     return result;
 }
 
 std::vector<double> cutoff_min(const std::vector<double>& values, double threshold) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::cutoff_min(values, threshold);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::cutoff_min(values, threshold);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(CutoffMin)(values.data(), threshold, result.data(), values.size());
     return result;
 }
 
 std::vector<double> cutoff_max(const std::vector<double>& values, double threshold) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::cutoff_max(values, threshold);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::cutoff_max(values, threshold);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(CutoffMax)(values.data(), threshold, result.data(), values.size());
     return result;
 }
 
 std::vector<double> diff(const std::vector<double>& values) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::diff(values);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::diff(values);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(Diff)(values.data(), result.data(), values.size());
     return result;
 }
 
 std::vector<double> monotonic_diff(const std::vector<double>& values) {
-    if (values.size() < SIMD_MIN_SIZE) return scalar::monotonic_diff(values);
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::monotonic_diff(values);
     std::vector<double> result(values.size());
     HWY_DYNAMIC_DISPATCH(MonotonicDiff)(values.data(), result.data(), values.size());
     return result;

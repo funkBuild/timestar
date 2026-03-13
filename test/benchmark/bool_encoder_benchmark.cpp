@@ -1,29 +1,29 @@
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <random>
-#include <iomanip>
-#include <algorithm>
-#include <cstring>
-#include <string>
-#include <numeric>
-#include <cassert>
-
 #include "../../lib/encoding/bool_encoder.hpp"
 #include "../../lib/encoding/bool_encoder_rle.hpp"
 #include "../../lib/storage/aligned_buffer.hpp"
 #include "../../lib/storage/slice_buffer.hpp"
 
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <string>
+#include <vector>
+
 // ANSI color codes
-#define RESET   "\033[0m"
-#define BOLD    "\033[1m"
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
+#define RESET "\033[0m"
+#define BOLD "\033[1m"
+#define RED "\033[31m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define BLUE "\033[34m"
 #define MAGENTA "\033[35m"
-#define CYAN    "\033[36m"
-#define DIM     "\033[2m"
+#define CYAN "\033[36m"
+#define DIM "\033[2m"
 
 // ---------------------------------------------------------------------------
 // Dataset generators
@@ -43,7 +43,8 @@ std::vector<bool> genLongRuns(size_t count, size_t runLen = 1000) {
     bool val = true;
     while (v.size() < count) {
         size_t n = std::min(runLen, count - v.size());
-        for (size_t i = 0; i < n; ++i) v.push_back(val);
+        for (size_t i = 0; i < n; ++i)
+            v.push_back(val);
         val = !val;
     }
     return v;
@@ -60,7 +61,8 @@ std::vector<bool> genShortRuns(size_t count, size_t runLen = 10) {
 std::vector<bool> genAlternating(size_t count) {
     std::vector<bool> v;
     v.reserve(count);
-    for (size_t i = 0; i < count; ++i) v.push_back(i % 2 == 0);
+    for (size_t i = 0; i < count; ++i)
+        v.push_back(i % 2 == 0);
     return v;
 }
 
@@ -69,7 +71,8 @@ std::vector<bool> genRandom5050(size_t count) {
     v.reserve(count);
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> dist(0, 1);
-    for (size_t i = 0; i < count; ++i) v.push_back(dist(rng) == 1);
+    for (size_t i = 0; i < count; ++i)
+        v.push_back(dist(rng) == 1);
     return v;
 }
 
@@ -78,7 +81,8 @@ std::vector<bool> genBiased95(size_t count) {
     v.reserve(count);
     std::mt19937 rng(123);
     std::uniform_real_distribution<double> dist(0.0, 1.0);
-    for (size_t i = 0; i < count; ++i) v.push_back(dist(rng) < 0.95);
+    for (size_t i = 0; i < count; ++i)
+        v.push_back(dist(rng) < 0.95);
     return v;
 }
 
@@ -87,7 +91,8 @@ std::vector<bool> genBiased99(size_t count) {
     v.reserve(count);
     std::mt19937 rng(456);
     std::uniform_real_distribution<double> dist(0.0, 1.0);
-    for (size_t i = 0; i < count; ++i) v.push_back(dist(rng) < 0.99);
+    for (size_t i = 0; i < count; ++i)
+        v.push_back(dist(rng) < 0.99);
     return v;
 }
 
@@ -112,7 +117,7 @@ struct DatasetResult {
     EncoderResult rle;
 };
 
-EncoderResult benchBitPack(const std::vector<bool> &data, int warmup, int runs) {
+EncoderResult benchBitPack(const std::vector<bool>& data, int warmup, int runs) {
     EncoderResult r;
     r.encoder_name = "BitPack";
     r.original_values = data.size();
@@ -163,8 +168,7 @@ EncoderResult benchBitPack(const std::vector<bool> &data, int warmup, int runs) 
         for (size_t i = 0; i < data.size(); ++i) {
             if (decoded[i] != data[i]) {
                 r.correct = false;
-                std::cerr << "BitPack mismatch at [" << i << "]: expected "
-                          << data[i] << " got " << decoded[i] << "\n";
+                std::cerr << "BitPack mismatch at [" << i << "]: expected " << data[i] << " got " << decoded[i] << "\n";
                 break;
             }
         }
@@ -173,7 +177,7 @@ EncoderResult benchBitPack(const std::vector<bool> &data, int warmup, int runs) 
     return r;
 }
 
-EncoderResult benchRLE(const std::vector<bool> &data, int warmup, int runs) {
+EncoderResult benchRLE(const std::vector<bool>& data, int warmup, int runs) {
     EncoderResult r;
     r.encoder_name = "RLE";
     r.original_values = data.size();
@@ -224,8 +228,7 @@ EncoderResult benchRLE(const std::vector<bool> &data, int warmup, int runs) {
         for (size_t i = 0; i < data.size(); ++i) {
             if (decoded[i] != data[i]) {
                 r.correct = false;
-                std::cerr << "RLE mismatch at [" << i << "]: expected "
-                          << data[i] << " got " << decoded[i] << "\n";
+                std::cerr << "RLE mismatch at [" << i << "]: expected " << data[i] << " got " << decoded[i] << "\n";
                 break;
             }
         }
@@ -239,17 +242,15 @@ EncoderResult benchRLE(const std::vector<bool> &data, int warmup, int runs) {
 // ---------------------------------------------------------------------------
 
 void printHeader() {
-    std::cout << BOLD << MAGENTA
-              << "\n+======================================================================+\n"
+    std::cout << BOLD << MAGENTA << "\n+======================================================================+\n"
               << "|     BOOLEAN ENCODER COMPARISON: BitPack vs Run-Length Encoding       |\n"
               << "|     BitPack: 1 bit/value  |  RLE: varint run lengths (LEB128)       |\n"
               << "+======================================================================+\n"
               << RESET << "\n";
 }
 
-void printDatasetHeader(const std::string &name, size_t count) {
-    std::cout << BOLD << CYAN << "--- " << name
-              << " (" << count << " values) ---" << RESET << "\n";
+void printDatasetHeader(const std::string& name, size_t count) {
+    std::cout << BOLD << CYAN << "--- " << name << " (" << count << " values) ---" << RESET << "\n";
 }
 
 std::string fmtDelta(double a, double b) {
@@ -265,37 +266,28 @@ std::string fmtDelta(double a, double b) {
     return buf;
 }
 
-void printComparison(const DatasetResult &dr) {
+void printComparison(const DatasetResult& dr) {
     printDatasetHeader(dr.dataset_name, dr.count);
 
-    auto &bp = dr.bitpack;
-    auto &rle = dr.rle;
+    auto& bp = dr.bitpack;
+    auto& rle = dr.rle;
 
     // Table header
-    std::cout << BOLD
-              << "  " << std::setw(12) << std::left << "Encoder"
-              << std::setw(14) << std::right << "Enc ns/val"
-              << std::setw(14) << "Dec ns/val"
-              << std::setw(14) << "Comp bytes"
-              << std::setw(14) << "bits/val"
-              << std::setw(10) << "Ratio"
-              << std::setw(8) << "OK?"
-              << RESET << "\n";
+    std::cout << BOLD << "  " << std::setw(12) << std::left << "Encoder" << std::setw(14) << std::right << "Enc ns/val"
+              << std::setw(14) << "Dec ns/val" << std::setw(14) << "Comp bytes" << std::setw(14) << "bits/val"
+              << std::setw(10) << "Ratio" << std::setw(8) << "OK?" << RESET << "\n";
 
-    size_t raw_bytes = (dr.count + 7) / 8; // minimum: 1 bit per bool
+    size_t raw_bytes = (dr.count + 7) / 8;  // minimum: 1 bit per bool
 
-    auto printRow = [&](const EncoderResult &r) {
-        double ratio = (raw_bytes > 0 && r.compressed_bytes > 0)
-                            ? static_cast<double>(raw_bytes) / r.compressed_bytes
-                            : 0.0;
-        std::cout << "  " << std::setw(12) << std::left << r.encoder_name
-                  << std::setw(14) << std::right << std::fixed << std::setprecision(1) << r.encode_ns_per_value
-                  << std::setw(14) << std::fixed << std::setprecision(1) << r.decode_ns_per_value
-                  << std::setw(14) << r.compressed_bytes
-                  << std::setw(14) << std::fixed << std::setprecision(3) << r.bits_per_value
-                  << std::setw(9) << std::fixed << std::setprecision(1) << ratio << "x"
-                  << "  " << (r.correct ? (GREEN "PASS" RESET) : (RED "FAIL" RESET))
-                  << "\n";
+    auto printRow = [&](const EncoderResult& r) {
+        double ratio =
+            (raw_bytes > 0 && r.compressed_bytes > 0) ? static_cast<double>(raw_bytes) / r.compressed_bytes : 0.0;
+        std::cout << "  " << std::setw(12) << std::left << r.encoder_name << std::setw(14) << std::right << std::fixed
+                  << std::setprecision(1) << r.encode_ns_per_value << std::setw(14) << std::fixed
+                  << std::setprecision(1) << r.decode_ns_per_value << std::setw(14) << r.compressed_bytes
+                  << std::setw(14) << std::fixed << std::setprecision(3) << r.bits_per_value << std::setw(9)
+                  << std::fixed << std::setprecision(1) << ratio << "x"
+                  << "  " << (r.correct ? (GREEN "PASS" RESET) : (RED "FAIL" RESET)) << "\n";
     };
 
     printRow(bp);
@@ -303,34 +295,28 @@ void printComparison(const DatasetResult &dr) {
 
     // Delta summary
     std::cout << DIM << "  RLE vs BitPack: "
-              << "encode " << fmtDelta(rle.encode_ns_per_value, bp.encode_ns_per_value) << DIM
-              << "  decode " << fmtDelta(rle.decode_ns_per_value, bp.decode_ns_per_value) << DIM
-              << "  size " << fmtDelta(static_cast<double>(rle.compressed_bytes),
-                                       static_cast<double>(bp.compressed_bytes))
-              << RESET << "\n\n";
+              << "encode " << fmtDelta(rle.encode_ns_per_value, bp.encode_ns_per_value) << DIM << "  decode "
+              << fmtDelta(rle.decode_ns_per_value, bp.decode_ns_per_value) << DIM << "  size "
+              << fmtDelta(static_cast<double>(rle.compressed_bytes), static_cast<double>(bp.compressed_bytes)) << RESET
+              << "\n\n";
 }
 
-void printSummaryTable(const std::vector<DatasetResult> &results) {
-    std::cout << BOLD << YELLOW
-              << "\n+======================================================================+\n"
+void printSummaryTable(const std::vector<DatasetResult>& results) {
+    std::cout << BOLD << YELLOW << "\n+======================================================================+\n"
               << "|                         SUMMARY TABLE                                |\n"
               << "+======================================================================+\n"
               << RESET;
 
-    std::cout << BOLD
-              << std::setw(28) << std::left << "  Dataset"
-              << std::setw(14) << std::right << "BP bytes"
-              << std::setw(14) << "RLE bytes"
-              << std::setw(16) << "Size reduction"
-              << std::setw(14) << "RLE bits/v"
+    std::cout << BOLD << std::setw(28) << std::left << "  Dataset" << std::setw(14) << std::right << "BP bytes"
+              << std::setw(14) << "RLE bytes" << std::setw(16) << "Size reduction" << std::setw(14) << "RLE bits/v"
               << RESET << "\n"
               << std::string(86, '-') << "\n";
 
-    for (auto &dr : results) {
+    for (auto& dr : results) {
         double size_reduction = 1.0 - (static_cast<double>(dr.rle.compressed_bytes) /
                                        std::max(dr.bitpack.compressed_bytes, static_cast<size_t>(1)));
 
-        const char *size_color = (size_reduction > 0.05) ? GREEN : (size_reduction < -0.05) ? RED : "";
+        const char* size_color = (size_reduction > 0.05) ? GREEN : (size_reduction < -0.05) ? RED : "";
 
         std::cout << std::setw(28) << std::left << ("  " + dr.dataset_name);
         std::cout << std::setw(14) << std::right << dr.bitpack.compressed_bytes;
@@ -364,20 +350,20 @@ int main() {
     };
 
     std::vector<DatasetDef> datasets = {
-        {"All true",           genAllTrue(N)},
-        {"All false",          genAllFalse(N)},
-        {"Long runs (1000)",   genLongRuns(N, 1000)},
-        {"Medium runs (100)",  genMediumRuns(N, 100)},
-        {"Short runs (10)",    genShortRuns(N, 10)},
-        {"Alternating",        genAlternating(N)},
-        {"Random 50/50",       genRandom5050(N)},
-        {"Biased 95/5",        genBiased95(N)},
-        {"Biased 99/1",        genBiased99(N)},
+        {"All true", genAllTrue(N)},
+        {"All false", genAllFalse(N)},
+        {"Long runs (1000)", genLongRuns(N, 1000)},
+        {"Medium runs (100)", genMediumRuns(N, 100)},
+        {"Short runs (10)", genShortRuns(N, 10)},
+        {"Alternating", genAlternating(N)},
+        {"Random 50/50", genRandom5050(N)},
+        {"Biased 95/5", genBiased95(N)},
+        {"Biased 99/1", genBiased99(N)},
     };
 
     std::vector<DatasetResult> results;
 
-    for (auto &ds : datasets) {
+    for (auto& ds : datasets) {
         DatasetResult dr;
         dr.dataset_name = ds.name;
         dr.count = ds.data.size();
@@ -391,7 +377,7 @@ int main() {
 
     // Check all passed
     bool all_correct = true;
-    for (auto &dr : results) {
+    for (auto& dr : results) {
         if (!dr.bitpack.correct || !dr.rle.correct) {
             all_correct = false;
             std::cerr << RED << "CORRECTNESS FAILURE in " << dr.dataset_name << RESET << "\n";

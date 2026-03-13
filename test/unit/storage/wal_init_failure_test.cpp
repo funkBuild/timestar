@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -45,18 +46,22 @@ protected:
     // Extract the WAL::init function body from source
     std::string extractInitFunction() const {
         size_t start = sourceCode.find("WAL::init(");
-        if (start == std::string::npos) return "";
+        if (start == std::string::npos)
+            return "";
 
         // Find the opening brace of the function
         size_t braceStart = sourceCode.find('{', start);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
 
         // Find matching closing brace (simple brace counting)
         int braceCount = 1;
         size_t pos = braceStart + 1;
         while (pos < sourceCode.size() && braceCount > 0) {
-            if (sourceCode[pos] == '{') braceCount++;
-            else if (sourceCode[pos] == '}') braceCount--;
+            if (sourceCode[pos] == '{')
+                braceCount++;
+            else if (sourceCode[pos] == '}')
+                braceCount--;
             pos++;
         }
 
@@ -66,25 +71,20 @@ protected:
 
 // Verify that the source file was successfully loaded
 TEST_F(WALInitFailureTest, SourceFileLoaded) {
-    ASSERT_FALSE(sourceCode.empty())
-        << "Could not load wal.cpp source file";
-    ASSERT_NE(sourceCode.find("WAL::init("), std::string::npos)
-        << "Source file does not contain WAL::init";
+    ASSERT_FALSE(sourceCode.empty()) << "Could not load wal.cpp source file";
+    ASSERT_NE(sourceCode.find("WAL::init("), std::string::npos) << "Source file does not contain WAL::init";
 }
 
 // Verify WAL::init function exists and has the expected structure
 TEST_F(WALInitFailureTest, InitFunctionExists) {
     std::string funcBody = extractInitFunction();
-    ASSERT_FALSE(funcBody.empty())
-        << "Could not extract WAL::init function body";
+    ASSERT_FALSE(funcBody.empty()) << "Could not extract WAL::init function body";
 
     // Should contain the file open call
-    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos)
-        << "WAL::init should call open_file_dma";
+    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos) << "WAL::init should call open_file_dma";
 
     // Should check the walFile result
-    EXPECT_NE(funcBody.find("!walFile"), std::string::npos)
-        << "WAL::init should check if walFile is falsy after open";
+    EXPECT_NE(funcBody.find("!walFile"), std::string::npos) << "WAL::init should check if walFile is falsy after open";
 }
 
 // Core test: WAL::init must throw on file open failure, not silently return.
@@ -97,8 +97,7 @@ TEST_F(WALInitFailureTest, ThrowsOnFileOpenFailure) {
 
     // Find the walFile check
     size_t checkPos = funcBody.find("!walFile");
-    ASSERT_NE(checkPos, std::string::npos)
-        << "Could not find !walFile check in WAL::init";
+    ASSERT_NE(checkPos, std::string::npos) << "Could not find !walFile check in WAL::init";
 
     // Look at the code between the !walFile check and the next meaningful
     // statement (the "Get current file size" section or end of function).
@@ -144,10 +143,9 @@ TEST_F(WALInitFailureTest, NoSilentCoReturnOnFailure) {
     // (co_return with a value would be fine for other patterns, but
     //  "co_return;" means silent void return)
     size_t coReturnPos = errorBlock.find("co_return;");
-    EXPECT_EQ(coReturnPos, std::string::npos)
-        << "BUG: WAL::init has a silent 'co_return;' in the !walFile error path. "
-           "This means callers have no way to know init failed. "
-           "It should throw std::runtime_error instead.";
+    EXPECT_EQ(coReturnPos, std::string::npos) << "BUG: WAL::init has a silent 'co_return;' in the !walFile error path. "
+                                                 "This means callers have no way to know init failed. "
+                                                 "It should throw std::runtime_error instead.";
 }
 
 // Baseline: verify that the recovery path (file not found for recovery)
@@ -158,12 +156,10 @@ TEST_F(WALInitFailureTest, RecoveryPathThrowsBaseline) {
 
     // Find the recovery check ("does not exist for recovery")
     size_t recoveryCheck = funcBody.find("does not exist for recovery");
-    ASSERT_NE(recoveryCheck, std::string::npos)
-        << "Could not find recovery path error message";
+    ASSERT_NE(recoveryCheck, std::string::npos) << "Could not find recovery path error message";
 
     // There should be a throw near this error message
-    std::string recoverySection = funcBody.substr(
-        recoveryCheck > 100 ? recoveryCheck - 100 : 0, 300);
+    std::string recoverySection = funcBody.substr(recoveryCheck > 100 ? recoveryCheck - 100 : 0, 300);
 
     EXPECT_NE(recoverySection.find("throw"), std::string::npos)
         << "The recovery path should throw on missing WAL file (baseline check)";
@@ -184,9 +180,10 @@ TEST_F(WALInitFailureTest, ConsistentErrorHandling) {
         searchPos += 5;
     }
 
-    EXPECT_GE(throwCount, 2u)
-        << "WAL::init should have at least 2 throw statements: "
-           "one for recovery-file-not-found and one for open_file_dma failure. "
-           "Found " << throwCount << " throw(s). Both error paths should use "
-           "consistent error handling (throw, not silent return).";
+    EXPECT_GE(throwCount, 2u) << "WAL::init should have at least 2 throw statements: "
+                                 "one for recovery-file-not-found and one for open_file_dma failure. "
+                                 "Found "
+                              << throwCount
+                              << " throw(s). Both error paths should use "
+                                 "consistent error handling (throw, not silent return).";
 }

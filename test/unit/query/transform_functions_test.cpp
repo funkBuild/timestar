@@ -1,8 +1,10 @@
-#include <gtest/gtest.h>
-#include <cmath>
-#include <vector>
-#include <limits>
 #include "../../../lib/query/transform/transform_functions.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cmath>
+#include <limits>
+#include <vector>
 
 using namespace timestar::transform;
 
@@ -10,20 +12,20 @@ class TransformFunctionsTest : public ::testing::Test {
 protected:
     // Helper to check if two doubles are equal (handling NaN)
     static bool nearEqual(double a, double b, double epsilon = 1e-9) {
-        if (std::isnan(a) && std::isnan(b)) return true;
-        if (std::isnan(a) || std::isnan(b)) return false;
+        if (std::isnan(a) && std::isnan(b))
+            return true;
+        if (std::isnan(a) || std::isnan(b))
+            return false;
         return std::abs(a - b) < epsilon;
     }
 
     // Helper to compare vectors
-    static void expectVectorNear(const std::vector<double>& actual,
-                                  const std::vector<double>& expected,
-                                  double epsilon = 1e-9) {
+    static void expectVectorNear(const std::vector<double>& actual, const std::vector<double>& expected,
+                                 double epsilon = 1e-9) {
         ASSERT_EQ(actual.size(), expected.size());
         for (size_t i = 0; i < actual.size(); ++i) {
             EXPECT_TRUE(nearEqual(actual[i], expected[i], epsilon))
-                << "Mismatch at index " << i << ": actual=" << actual[i]
-                << ", expected=" << expected[i];
+                << "Mismatch at index " << i << ": actual=" << actual[i] << ", expected=" << expected[i];
         }
     }
 };
@@ -64,9 +66,9 @@ TEST_F(TransformFunctionsTest, DtBasic) {
     // Timestamps in nanoseconds, 1 second apart
     std::vector<uint64_t> timestamps = {
         0,
-        1'000'000'000,   // +1 second
-        3'000'000'000,   // +2 seconds
-        4'000'000'000    // +1 second
+        1'000'000'000,  // +1 second
+        3'000'000'000,  // +2 seconds
+        4'000'000'000   // +1 second
     };
     auto result = dt(timestamps);
 
@@ -80,12 +82,7 @@ TEST_F(TransformFunctionsTest, DerivativeBasic) {
     // Values: 0, 10, 30, 60 over 1-second intervals
     // Derivative should be: NaN, 10/s, 20/s, 30/s
     std::vector<double> values = {0.0, 10.0, 30.0, 60.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000};
 
     auto result = derivative(values, timestamps);
 
@@ -100,9 +97,9 @@ TEST_F(TransformFunctionsTest, DerivativeVariableIntervals) {
     std::vector<double> values = {0.0, 100.0, 200.0, 300.0};
     std::vector<uint64_t> timestamps = {
         0,
-        1'000'000'000,   // +1 second: rate = 100/s
-        3'000'000'000,   // +2 seconds: rate = 50/s
-        3'500'000'000    // +0.5 seconds: rate = 200/s
+        1'000'000'000,  // +1 second: rate = 100/s
+        3'000'000'000,  // +2 seconds: rate = 50/s
+        3'500'000'000   // +0.5 seconds: rate = 200/s
     };
 
     auto result = derivative(values, timestamps);
@@ -116,12 +113,7 @@ TEST_F(TransformFunctionsTest, DerivativeVariableIntervals) {
 TEST_F(TransformFunctionsTest, RateCounterIncrement) {
     // Counter that only increases
     std::vector<double> values = {100.0, 150.0, 200.0, 300.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000};
 
     auto result = rate(values, timestamps);
 
@@ -134,19 +126,14 @@ TEST_F(TransformFunctionsTest, RateCounterIncrement) {
 TEST_F(TransformFunctionsTest, RateCounterReset) {
     // Counter that resets (wraps around)
     std::vector<double> values = {100.0, 150.0, 50.0, 100.0};  // Reset at index 2
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000};
 
     auto result = rate(values, timestamps);
 
     EXPECT_TRUE(std::isnan(result[0]));
     EXPECT_DOUBLE_EQ(result[1], 50.0);
-    EXPECT_DOUBLE_EQ(result[2], 0.0);    // Counter reset: treated as 0 rate
-    EXPECT_DOUBLE_EQ(result[3], 50.0);   // Normal increment after reset
+    EXPECT_DOUBLE_EQ(result[2], 0.0);   // Counter reset: treated as 0 rate
+    EXPECT_DOUBLE_EQ(result[3], 50.0);  // Normal increment after reset
 }
 
 TEST_F(TransformFunctionsTest, PerMinuteMultipliesBy60) {
@@ -201,12 +188,12 @@ TEST_F(TransformFunctionsTest, Log2Function) {
 
     auto result = log2(values);
 
-    EXPECT_DOUBLE_EQ(result[0], 0.0);   // log2(1) = 0
-    EXPECT_DOUBLE_EQ(result[1], 1.0);   // log2(2) = 1
-    EXPECT_DOUBLE_EQ(result[2], 2.0);   // log2(4) = 2
-    EXPECT_DOUBLE_EQ(result[3], 3.0);   // log2(8) = 3
-    EXPECT_TRUE(std::isnan(result[4])); // log2(0) = NaN
-    EXPECT_TRUE(std::isnan(result[5])); // log2(-1) = NaN
+    EXPECT_DOUBLE_EQ(result[0], 0.0);    // log2(1) = 0
+    EXPECT_DOUBLE_EQ(result[1], 1.0);    // log2(2) = 1
+    EXPECT_DOUBLE_EQ(result[2], 2.0);    // log2(4) = 2
+    EXPECT_DOUBLE_EQ(result[3], 3.0);    // log2(8) = 3
+    EXPECT_TRUE(std::isnan(result[4]));  // log2(0) = NaN
+    EXPECT_TRUE(std::isnan(result[5]));  // log2(-1) = NaN
 }
 
 TEST_F(TransformFunctionsTest, Log10Function) {
@@ -238,21 +225,15 @@ TEST_F(TransformFunctionsTest, CumsumWithNaN) {
     auto result = cumsum(values);
 
     EXPECT_DOUBLE_EQ(result[0], 1.0);
-    EXPECT_DOUBLE_EQ(result[1], 1.0);   // NaN skipped
-    EXPECT_DOUBLE_EQ(result[2], 4.0);   // 1+3
-    EXPECT_DOUBLE_EQ(result[3], 8.0);   // 1+3+4
+    EXPECT_DOUBLE_EQ(result[1], 1.0);  // NaN skipped
+    EXPECT_DOUBLE_EQ(result[2], 4.0);  // 1+3
+    EXPECT_DOUBLE_EQ(result[3], 8.0);  // 1+3+4
 }
 
 TEST_F(TransformFunctionsTest, IntegralTrapezoid) {
     // Constant value of 10 over 4 seconds = area of 40
     std::vector<double> values = {10.0, 10.0, 10.0, 10.0, 10.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = integral(values, timestamps);
 
@@ -267,11 +248,7 @@ TEST_F(TransformFunctionsTest, IntegralTriangle) {
     // Linear ramp from 0 to 10 over 10 seconds
     // Area = 0.5 * base * height = 0.5 * 10 * 10 = 50
     std::vector<double> values = {0.0, 5.0, 10.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        5'000'000'000,
-        10'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 5'000'000'000, 10'000'000'000};
 
     auto result = integral(values, timestamps);
 
@@ -310,7 +287,8 @@ TEST_F(TransformFunctionsTest, EwmaSmoothsNoise) {
     // Result should be smoother than input
     double inputVariance = 0, outputVariance = 0;
     double inputMean = 100, outputMean = 0;
-    for (auto v : result) outputMean += v;
+    for (auto v : result)
+        outputMean += v;
     outputMean /= result.size();
 
     for (size_t i = 0; i < values.size(); ++i) {
@@ -374,7 +352,7 @@ TEST_F(TransformFunctionsTest, ClampMinBasic) {
 
     auto result = clamp_min(values, 0.0);
 
-    EXPECT_DOUBLE_EQ(result[0], 0.0);   // -5 clamped to 0
+    EXPECT_DOUBLE_EQ(result[0], 0.0);  // -5 clamped to 0
     EXPECT_DOUBLE_EQ(result[1], 0.0);
     EXPECT_DOUBLE_EQ(result[2], 5.0);
     EXPECT_DOUBLE_EQ(result[3], 10.0);
@@ -445,8 +423,8 @@ TEST_F(TransformFunctionsTest, FillLast) {
     auto result = fill(values, "last");
 
     EXPECT_DOUBLE_EQ(result[0], 5.0);
-    EXPECT_DOUBLE_EQ(result[1], 5.0);   // Forward fill
-    EXPECT_DOUBLE_EQ(result[2], 5.0);   // Forward fill
+    EXPECT_DOUBLE_EQ(result[1], 5.0);  // Forward fill
+    EXPECT_DOUBLE_EQ(result[2], 5.0);  // Forward fill
     EXPECT_DOUBLE_EQ(result[3], 10.0);
 }
 
@@ -503,13 +481,7 @@ TEST_F(TransformFunctionsTest, CountNotNull) {
 
 TEST_F(TransformFunctionsTest, MovingRollupAvg) {
     std::vector<double> values = {10.0, 20.0, 30.0, 40.0, 50.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     // 2-second window
     auto result = moving_rollup(values, timestamps, 2.0, "avg");
@@ -520,13 +492,7 @@ TEST_F(TransformFunctionsTest, MovingRollupAvg) {
 
 TEST_F(TransformFunctionsTest, MovingRollupSum) {
     std::vector<double> values = {1.0, 2.0, 3.0, 4.0, 5.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     // 2-second window
     auto result = moving_rollup(values, timestamps, 2.0, "sum");
@@ -537,13 +503,7 @@ TEST_F(TransformFunctionsTest, MovingRollupSum) {
 
 TEST_F(TransformFunctionsTest, MovingRollupMin) {
     std::vector<double> values = {5.0, 3.0, 7.0, 2.0, 8.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = moving_rollup(values, timestamps, 2.0, "min");
 
@@ -553,13 +513,7 @@ TEST_F(TransformFunctionsTest, MovingRollupMin) {
 
 TEST_F(TransformFunctionsTest, MovingRollupMax) {
     std::vector<double> values = {5.0, 3.0, 7.0, 2.0, 8.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = moving_rollup(values, timestamps, 2.0, "max");
 
@@ -572,11 +526,7 @@ TEST_F(TransformFunctionsTest, MovingRollupMax) {
 // ============================================================================
 
 TEST_F(TransformFunctionsTest, TimeshiftForward) {
-    std::vector<uint64_t> timestamps = {
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {1'000'000'000, 2'000'000'000, 3'000'000'000};
 
     auto result = timeshift(timestamps, 1.0);  // Shift forward 1 second
 
@@ -586,11 +536,7 @@ TEST_F(TransformFunctionsTest, TimeshiftForward) {
 }
 
 TEST_F(TransformFunctionsTest, TimeshiftBackward) {
-    std::vector<uint64_t> timestamps = {
-        10'000'000'000,
-        20'000'000'000,
-        30'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {10'000'000'000, 20'000'000'000, 30'000'000'000};
 
     auto result = timeshift(timestamps, -5.0);  // Shift back 5 seconds
 
@@ -719,9 +665,7 @@ TEST_F(TransformFunctionsTest, BottomByMean) {
 }
 
 TEST_F(TransformFunctionsTest, TopOffsetBasic) {
-    std::vector<std::vector<double>> series = {
-        {10.0}, {20.0}, {30.0}, {40.0}, {50.0}
-    };
+    std::vector<std::vector<double>> series = {{10.0}, {20.0}, {30.0}, {40.0}, {50.0}};
 
     // Skip top 2, get next 2
     auto result = top_offset(series, 2, "mean", "desc", 2);
@@ -733,9 +677,9 @@ TEST_F(TransformFunctionsTest, TopOffsetBasic) {
 
 TEST_F(TransformFunctionsTest, TopByL2Norm) {
     std::vector<std::vector<double>> series = {
-        {3.0, 4.0},          // L2 = sqrt(9+16) = 5
-        {1.0, 1.0},          // L2 = sqrt(2) = 1.41
-        {6.0, 8.0}           // L2 = sqrt(36+64) = 10
+        {3.0, 4.0},  // L2 = sqrt(9+16) = 5
+        {1.0, 1.0},  // L2 = sqrt(2) = 1.41
+        {6.0, 8.0}   // L2 = sqrt(36+64) = 10
     };
 
     auto result = top(series, 2, "l2norm", "desc");
@@ -747,9 +691,9 @@ TEST_F(TransformFunctionsTest, TopByL2Norm) {
 
 TEST_F(TransformFunctionsTest, TopByArea) {
     std::vector<std::vector<double>> series = {
-        {-10.0, 10.0},       // area = 20
-        {5.0, 5.0},          // area = 10
-        {-20.0, -10.0}       // area = 30
+        {-10.0, 10.0},  // area = 20
+        {5.0, 5.0},     // area = 10
+        {-20.0, -10.0}  // area = 30
     };
 
     auto result = top(series, 2, "area", "desc");
@@ -760,11 +704,9 @@ TEST_F(TransformFunctionsTest, TopByArea) {
 }
 
 TEST_F(TransformFunctionsTest, TopWithNaNSeries) {
-    std::vector<std::vector<double>> series = {
-        {10.0, 20.0},
-        {std::nan(""), std::nan("")},  // All NaN - excluded
-        {30.0, 40.0}
-    };
+    std::vector<std::vector<double>> series = {{10.0, 20.0},
+                                               {std::nan(""), std::nan("")},  // All NaN - excluded
+                                               {30.0, 40.0}};
 
     auto result = top(series, 3, "mean", "desc");
 
@@ -775,9 +717,7 @@ TEST_F(TransformFunctionsTest, TopWithNaNSeries) {
 }
 
 TEST_F(TransformFunctionsTest, TopMoreThanAvailable) {
-    std::vector<std::vector<double>> series = {
-        {10.0}, {20.0}
-    };
+    std::vector<std::vector<double>> series = {{10.0}, {20.0}};
 
     auto result = top(series, 10, "mean", "desc");
 
@@ -792,13 +732,7 @@ TEST_F(TransformFunctionsTest, TopMoreThanAvailable) {
 TEST_F(TransformFunctionsTest, TrendLinePerfectLinear) {
     // Perfect linear data: y = 2x + 10
     std::vector<double> values = {10.0, 12.0, 14.0, 16.0, 18.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = trend_line(values, timestamps);
 
@@ -813,13 +747,7 @@ TEST_F(TransformFunctionsTest, TrendLinePerfectLinear) {
 TEST_F(TransformFunctionsTest, TrendLineWithNoise) {
     // Linear trend with noise
     std::vector<double> values = {10.0, 13.0, 13.5, 17.0, 19.5};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = trend_line(values, timestamps);
 
@@ -828,20 +756,14 @@ TEST_F(TransformFunctionsTest, TrendLineWithNoise) {
     EXPECT_LT(result[0], result[4]);
     // Check monotonically increasing
     for (size_t i = 1; i < result.size(); ++i) {
-        EXPECT_GE(result[i], result[i-1]);
+        EXPECT_GE(result[i], result[i - 1]);
     }
 }
 
 TEST_F(TransformFunctionsTest, TrendLineExtendedStatistics) {
     // Perfect linear: y = 5x + 0
     std::vector<double> values = {0.0, 5.0, 10.0, 15.0, 20.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = trend_line_extended(values, timestamps);
 
@@ -854,13 +776,7 @@ TEST_F(TransformFunctionsTest, TrendLineExtendedStatistics) {
 TEST_F(TransformFunctionsTest, RobustTrendIgnoresOutliers) {
     // Linear trend with outlier
     std::vector<double> values = {10.0, 12.0, 100.0, 16.0, 18.0};  // 100 is outlier
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto olsResult = trend_line(values, timestamps);
     auto robustResult = robust_trend(values, timestamps);
@@ -882,13 +798,7 @@ TEST_F(TransformFunctionsTest, RobustTrendIgnoresOutliers) {
 TEST_F(TransformFunctionsTest, RobustTrendNormalData) {
     // Normal linear data - robust should match OLS
     std::vector<double> values = {10.0, 12.0, 14.0, 16.0, 18.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto olsResult = trend_line(values, timestamps);
     auto robustResult = robust_trend(values, timestamps);
@@ -914,8 +824,10 @@ TEST_F(TransformFunctionsTest, PiecewiseConstantSingleLevel) {
 TEST_F(TransformFunctionsTest, PiecewiseConstantTwoLevels) {
     // Step change from 10 to 50
     std::vector<double> values;
-    for (int i = 0; i < 10; ++i) values.push_back(10.0);
-    for (int i = 0; i < 10; ++i) values.push_back(50.0);
+    for (int i = 0; i < 10; ++i)
+        values.push_back(10.0);
+    for (int i = 0; i < 10; ++i)
+        values.push_back(50.0);
 
     auto result = piecewise_constant(values, 3, 1.5);
 
@@ -964,10 +876,10 @@ TEST_F(TransformFunctionsTest, RankMethodMin) {
 TEST_F(TransformFunctionsTest, OutliersMADBasic) {
     // 5 series, one is clearly an outlier
     std::vector<std::vector<double>> series = {
-        {10.0, 10.0, 10.0, 10.0, 10.0},  // Normal
-        {11.0, 11.0, 11.0, 11.0, 11.0},  // Normal
-        {9.0, 9.0, 9.0, 9.0, 9.0},       // Normal
-        {10.5, 10.5, 10.5, 10.5, 10.5},  // Normal
+        {10.0, 10.0, 10.0, 10.0, 10.0},      // Normal
+        {11.0, 11.0, 11.0, 11.0, 11.0},      // Normal
+        {9.0, 9.0, 9.0, 9.0, 9.0},           // Normal
+        {10.5, 10.5, 10.5, 10.5, 10.5},      // Normal
         {100.0, 100.0, 100.0, 100.0, 100.0}  // Outlier!
     };
 
@@ -1008,7 +920,7 @@ TEST_F(TransformFunctionsTest, OutliersIndices) {
         {10.0, 10.0, 10.0},
         {100.0, 100.0, 100.0},  // Outlier
         {10.0, 10.0, 10.0},
-        {-50.0, -50.0, -50.0}   // Outlier
+        {-50.0, -50.0, -50.0}  // Outlier
     };
 
     auto indices = outliers_indices(series, "mad", 2.0, 50.0);
@@ -1022,12 +934,10 @@ TEST_F(TransformFunctionsTest, OutliersIndices) {
 }
 
 TEST_F(TransformFunctionsTest, OutliersMask) {
-    std::vector<std::vector<double>> series = {
-        {10.0, 10.0, 100.0, 10.0},  // Outlier at t=2
-        {10.0, 10.0, 10.0, 10.0},
-        {10.0, 10.0, 10.0, 10.0},
-        {10.0, 10.0, 10.0, 10.0}
-    };
+    std::vector<std::vector<double>> series = {{10.0, 10.0, 100.0, 10.0},  // Outlier at t=2
+                                               {10.0, 10.0, 10.0, 10.0},
+                                               {10.0, 10.0, 10.0, 10.0},
+                                               {10.0, 10.0, 10.0, 10.0}};
 
     auto masks = outliers_mask(series, "mad", 2.0);
 
@@ -1037,7 +947,7 @@ TEST_F(TransformFunctionsTest, OutliersMask) {
     // Series 0 should be marked as outlier at time point 2
     EXPECT_FALSE(masks[0][0]);
     EXPECT_FALSE(masks[0][1]);
-    EXPECT_TRUE(masks[0][2]);   // The 100.0 value
+    EXPECT_TRUE(masks[0][2]);  // The 100.0 value
     EXPECT_FALSE(masks[0][3]);
 
     // Other series should have no outlier flags at t=2
@@ -1049,11 +959,7 @@ TEST_F(TransformFunctionsTest, OutliersMask) {
 TEST_F(TransformFunctionsTest, OutliersNoOutliers) {
     // All series are similar - no outliers
     std::vector<std::vector<double>> series = {
-        {10.0, 10.0, 10.0},
-        {10.1, 10.1, 10.1},
-        {9.9, 9.9, 9.9},
-        {10.05, 10.05, 10.05}
-    };
+        {10.0, 10.0, 10.0}, {10.1, 10.1, 10.1}, {9.9, 9.9, 9.9}, {10.05, 10.05, 10.05}};
 
     auto results = outliers(series, "mad", 3.0, 50.0);
 
@@ -1086,24 +992,22 @@ TEST_F(TransformFunctionsTest, OutliersWithNaN) {
 TEST_F(TransformFunctionsTest, OutliersLowTolerance) {
     // With low tolerance, more things become outliers
     std::vector<std::vector<double>> series = {
-        {10.0, 10.0, 10.0},
-        {11.0, 11.0, 11.0},
-        {12.0, 12.0, 12.0},
-        {20.0, 20.0, 20.0}
-    };
+        {10.0, 10.0, 10.0}, {11.0, 11.0, 11.0}, {12.0, 12.0, 12.0}, {20.0, 20.0, 20.0}};
 
     // With high tolerance
     auto highTol = outliers(series, "mad", 5.0, 50.0);
     size_t highOutliers = 0;
     for (const auto& r : highTol) {
-        if (r.isOutlier) highOutliers++;
+        if (r.isOutlier)
+            highOutliers++;
     }
 
     // With low tolerance
     auto lowTol = outliers(series, "mad", 1.5, 50.0);
     size_t lowOutliers = 0;
     for (const auto& r : lowTol) {
-        if (r.isOutlier) lowOutliers++;
+        if (r.isOutlier)
+            lowOutliers++;
     }
 
     // Lower tolerance should find more or equal outliers
@@ -1113,10 +1017,8 @@ TEST_F(TransformFunctionsTest, OutliersLowTolerance) {
 TEST_F(TransformFunctionsTest, OutliersMinPercentage) {
     // Series that's an outlier for only 1 out of 4 points (25%)
     std::vector<std::vector<double>> series = {
-        {10.0, 10.0, 10.0, 10.0},
-        {10.0, 10.0, 10.0, 10.0},
-        {10.0, 10.0, 10.0, 10.0},
-        {100.0, 10.0, 10.0, 10.0}  // Outlier only at t=0
+        {10.0, 10.0, 10.0, 10.0}, {10.0, 10.0, 10.0, 10.0}, {10.0, 10.0, 10.0, 10.0}, {100.0, 10.0, 10.0, 10.0}
+        // Outlier only at t=0
     };
 
     // With 50% threshold, series 3 should NOT be an outlier
@@ -1157,18 +1059,16 @@ TEST_F(TransformFunctionsTest, DerivativeNonMonotonicTimestamps) {
 
     auto result = derivative(values, timestamps);
 
-    EXPECT_TRUE(std::isnan(result[0]));  // First is always NaN
-    EXPECT_TRUE(std::isnan(result[1]));  // Non-monotonic timestamps
+    EXPECT_TRUE(std::isnan(result[0]));       // First is always NaN
+    EXPECT_TRUE(std::isnan(result[1]));       // Non-monotonic timestamps
     EXPECT_DOUBLE_EQ(result[2], 10.0 / 1.5);  // (30-20) / 1.5s
 }
 
 TEST_F(TransformFunctionsTest, RateNonMonotonicTimestamps) {
     std::vector<double> values = {10.0, 20.0, 30.0};
-    std::vector<uint64_t> timestamps = {
-        1'000'000'000,
-        500'000'000,    // Goes backward
-        2'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {1'000'000'000,
+                                        500'000'000,  // Goes backward
+                                        2'000'000'000};
 
     auto result = rate(values, timestamps);
 
@@ -1177,11 +1077,9 @@ TEST_F(TransformFunctionsTest, RateNonMonotonicTimestamps) {
 
 TEST_F(TransformFunctionsTest, IntegralNonMonotonicTimestamps) {
     std::vector<double> values = {10.0, 20.0, 30.0};
-    std::vector<uint64_t> timestamps = {
-        1'000'000'000,
-        500'000'000,    // Goes backward
-        2'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {1'000'000'000,
+                                        500'000'000,  // Goes backward
+                                        2'000'000'000};
 
     auto result = integral(values, timestamps);
 
@@ -1219,8 +1117,7 @@ TEST_F(TransformFunctionsTest, CalculateMedianEvenArray) {
 TEST_F(TransformFunctionsTest, OutliersMaskMismatchedLengths) {
     // Mismatched series lengths should return empty
     std::vector<std::vector<double>> mismatched = {
-        {1.0, 2.0, 3.0},
-        {1.0, 2.0}  // Different length
+        {1.0, 2.0, 3.0}, {1.0, 2.0}  // Different length
     };
 
     auto masks = outliers_mask(mismatched, "mad", 3.0);
@@ -1242,10 +1139,7 @@ TEST_F(TransformFunctionsTest, CalculateMADWithNaN) {
 
 TEST_F(TransformFunctionsTest, PiecewiseConstantWithNaN) {
     // Piecewise constant should handle NaN values
-    std::vector<double> values = {
-        10.0, 10.0, std::nan(""), 10.0, 10.0,
-        50.0, 50.0, 50.0, std::nan(""), 50.0
-    };
+    std::vector<double> values = {10.0, 10.0, std::nan(""), 10.0, 10.0, 50.0, 50.0, 50.0, std::nan(""), 50.0};
 
     auto result = piecewise_constant(values, 3, 2.0);
 
@@ -1299,9 +1193,12 @@ TEST_F(TransformFunctionsTest, SimdCountNonzeroLargeArray) {
     // Test count_nonzero() with a large array
     std::vector<double> values(100);
     for (size_t i = 0; i < values.size(); ++i) {
-        if (i % 3 == 0) values[i] = 0.0;
-        else if (i % 7 == 0) values[i] = std::nan("");
-        else values[i] = static_cast<double>(i);
+        if (i % 3 == 0)
+            values[i] = 0.0;
+        else if (i % 7 == 0)
+            values[i] = std::nan("");
+        else
+            values[i] = static_cast<double>(i);
     }
 
     auto result = count_nonzero(values);
@@ -1309,8 +1206,7 @@ TEST_F(TransformFunctionsTest, SimdCountNonzeroLargeArray) {
     ASSERT_EQ(result.size(), values.size());
     for (size_t i = 0; i < result.size(); ++i) {
         bool isNonzero = !std::isnan(values[i]) && values[i] != 0.0;
-        EXPECT_DOUBLE_EQ(result[i], isNonzero ? 1.0 : 0.0)
-            << "Mismatch at index " << i;
+        EXPECT_DOUBLE_EQ(result[i], isNonzero ? 1.0 : 0.0) << "Mismatch at index " << i;
     }
 }
 
@@ -1468,10 +1364,14 @@ TEST_F(TransformFunctionsTest, SimdConsistencyScalarVsSimd) {
     // Create test data with various patterns
     std::vector<double> testData(256);
     for (size_t i = 0; i < testData.size(); ++i) {
-        if (i % 13 == 0) testData[i] = std::nan("");
-        else if (i % 7 == 0) testData[i] = 0.0;
-        else if (i % 3 == 0) testData[i] = -static_cast<double>(i);
-        else testData[i] = static_cast<double>(i) * 1.5;
+        if (i % 13 == 0)
+            testData[i] = std::nan("");
+        else if (i % 7 == 0)
+            testData[i] = 0.0;
+        else if (i % 3 == 0)
+            testData[i] = -static_cast<double>(i);
+        else
+            testData[i] = static_cast<double>(i) * 1.5;
     }
 
     // Test abs
@@ -1533,9 +1433,9 @@ TEST_F(TransformFunctionsTest, Dbscan1DThreeClusters) {
     // Cluster 1: values around 50 (range 48-52)
     // Cluster 2: values around 100 (range 98-102)
     std::vector<double> values = {
-        10.0, 11.0, 9.0, 12.0, 8.0,     // Cluster around 10
-        50.0, 51.0, 49.0, 52.0, 48.0,   // Cluster around 50
-        100.0, 101.0, 99.0, 102.0, 98.0  // Cluster around 100
+        10.0,  11.0,  9.0,  12.0,  8.0,   // Cluster around 10
+        50.0,  51.0,  49.0, 52.0,  48.0,  // Cluster around 50
+        100.0, 101.0, 99.0, 102.0, 98.0   // Cluster around 100
     };
 
     // epsilon=5 should capture each cluster; minPoints=3
@@ -1547,24 +1447,21 @@ TEST_F(TransformFunctionsTest, Dbscan1DThreeClusters) {
     int cluster0 = clusters[0];
     EXPECT_NE(cluster0, -1);  // Not noise
     for (size_t i = 0; i < 5; ++i) {
-        EXPECT_EQ(clusters[i], cluster0)
-            << "Point " << i << " should be in same cluster as point 0";
+        EXPECT_EQ(clusters[i], cluster0) << "Point " << i << " should be in same cluster as point 0";
     }
 
     // All points in the second cluster should share the same cluster ID
     int cluster1 = clusters[5];
     EXPECT_NE(cluster1, -1);
     for (size_t i = 5; i < 10; ++i) {
-        EXPECT_EQ(clusters[i], cluster1)
-            << "Point " << i << " should be in same cluster as point 5";
+        EXPECT_EQ(clusters[i], cluster1) << "Point " << i << " should be in same cluster as point 5";
     }
 
     // All points in the third cluster should share the same cluster ID
     int cluster2 = clusters[10];
     EXPECT_NE(cluster2, -1);
     for (size_t i = 10; i < 15; ++i) {
-        EXPECT_EQ(clusters[i], cluster2)
-            << "Point " << i << " should be in same cluster as point 10";
+        EXPECT_EQ(clusters[i], cluster2) << "Point " << i << " should be in same cluster as point 10";
     }
 
     // The three clusters should have different IDs
@@ -1576,8 +1473,8 @@ TEST_F(TransformFunctionsTest, Dbscan1DThreeClusters) {
 TEST_F(TransformFunctionsTest, Dbscan1DNoisePoints) {
     // Dense cluster with an isolated outlier
     std::vector<double> values = {
-        1.0, 1.5, 2.0, 2.5, 3.0,  // Tight cluster
-        100.0                       // Isolated point (noise)
+        1.0,  1.5, 2.0, 2.5, 3.0,  // Tight cluster
+        100.0                      // Isolated point (noise)
     };
 
     auto clusters = dbscan1D(values, 2.0, 3);
@@ -1676,13 +1573,7 @@ TEST_F(TransformFunctionsTest, MovingRollupAvgSlidingWindow) {
 TEST_F(TransformFunctionsTest, MovingRollupCountWindow) {
     // Verify count method tracks window size correctly
     std::vector<double> values = {1.0, 2.0, 3.0, 4.0, 5.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = moving_rollup(values, timestamps, 2.0, "count");
 
@@ -1701,13 +1592,7 @@ TEST_F(TransformFunctionsTest, MovingRollupCountWindow) {
 TEST_F(TransformFunctionsTest, MovingRollupWithNaN) {
     // NaN values should be excluded from the window
     std::vector<double> values = {1.0, std::nan(""), 3.0, 4.0, 5.0};
-    std::vector<uint64_t> timestamps = {
-        0,
-        1'000'000'000,
-        2'000'000'000,
-        3'000'000'000,
-        4'000'000'000
-    };
+    std::vector<uint64_t> timestamps = {0, 1'000'000'000, 2'000'000'000, 3'000'000'000, 4'000'000'000};
 
     auto result = moving_rollup(values, timestamps, 2.0, "sum");
 
@@ -1789,9 +1674,9 @@ TEST_F(TransformFunctionsTest, MonotonicDiffCounterResetReturnsCurrentValue) {
     auto result = monotonic_diff(values);
 
     EXPECT_TRUE(std::isnan(result[0]));
-    EXPECT_DOUBLE_EQ(result[1], 50.0);   // 150 - 100 = 50 (positive, kept)
-    EXPECT_DOUBLE_EQ(result[2], 50.0);   // 50 - 150 = -100 (negative, returns values[2] = 50.0)
-    EXPECT_DOUBLE_EQ(result[3], 30.0);   // 80 - 50 = 30 (positive, kept)
+    EXPECT_DOUBLE_EQ(result[1], 50.0);  // 150 - 100 = 50 (positive, kept)
+    EXPECT_DOUBLE_EQ(result[2], 50.0);  // 50 - 150 = -100 (negative, returns values[2] = 50.0)
+    EXPECT_DOUBLE_EQ(result[3], 30.0);  // 80 - 50 = 30 (positive, kept)
 }
 
 TEST_F(TransformFunctionsTest, MonotonicDiffCounterResetLargeArrayConsistency) {
@@ -1802,9 +1687,9 @@ TEST_F(TransformFunctionsTest, MonotonicDiffCounterResetLargeArrayConsistency) {
         values[i] = static_cast<double>(i * 10);
     }
     // Inject counter resets at various positions
-    values[5] = 10.0;    // Reset: 10 - 40 = -30, should return 10.0
-    values[15] = 20.0;   // Reset: 20 - 130 = -110, should return 20.0
-    values[25] = 5.0;    // Reset: 5 - 230 = -225, should return 5.0
+    values[5] = 10.0;   // Reset: 10 - 40 = -30, should return 10.0
+    values[15] = 20.0;  // Reset: 20 - 130 = -110, should return 20.0
+    values[25] = 5.0;   // Reset: 5 - 230 = -225, should return 5.0
 
     auto result = monotonic_diff(values);
 
@@ -1812,12 +1697,9 @@ TEST_F(TransformFunctionsTest, MonotonicDiffCounterResetLargeArrayConsistency) {
     EXPECT_TRUE(std::isnan(result[0]));
 
     // Check counter reset positions return current value
-    EXPECT_DOUBLE_EQ(result[5], 10.0)
-        << "Counter reset at index 5 should return current value (10.0)";
-    EXPECT_DOUBLE_EQ(result[15], 20.0)
-        << "Counter reset at index 15 should return current value (20.0)";
-    EXPECT_DOUBLE_EQ(result[25], 5.0)
-        << "Counter reset at index 25 should return current value (5.0)";
+    EXPECT_DOUBLE_EQ(result[5], 10.0) << "Counter reset at index 5 should return current value (10.0)";
+    EXPECT_DOUBLE_EQ(result[15], 20.0) << "Counter reset at index 15 should return current value (20.0)";
+    EXPECT_DOUBLE_EQ(result[25], 5.0) << "Counter reset at index 25 should return current value (5.0)";
 
     // Also verify that the scalar fallback path gives the same results
     // by directly calling the scalar implementation
@@ -1825,8 +1707,7 @@ TEST_F(TransformFunctionsTest, MonotonicDiffCounterResetLargeArrayConsistency) {
     ASSERT_EQ(scalarResult.size(), result.size());
     for (size_t i = 0; i < result.size(); ++i) {
         EXPECT_TRUE(nearEqual(result[i], scalarResult[i]))
-            << "SIMD and scalar disagree at index " << i
-            << ": simd=" << result[i] << ", scalar=" << scalarResult[i];
+            << "SIMD and scalar disagree at index " << i << ": simd=" << result[i] << ", scalar=" << scalarResult[i];
     }
 }
 
@@ -1836,11 +1717,11 @@ TEST_F(TransformFunctionsTest, MonotonicDiffCounterResetWithNaN) {
 
     auto result = monotonic_diff(values);
 
-    EXPECT_TRUE(std::isnan(result[0]));    // First point
-    EXPECT_TRUE(std::isnan(result[1]));    // NaN input
-    EXPECT_TRUE(std::isnan(result[2]));    // Previous was NaN
-    EXPECT_DOUBLE_EQ(result[3], 30.0);    // 30 - 50 = -20 (negative, returns 30.0)
-    EXPECT_DOUBLE_EQ(result[4], 30.0);    // 60 - 30 = 30 (positive, kept)
+    EXPECT_TRUE(std::isnan(result[0]));  // First point
+    EXPECT_TRUE(std::isnan(result[1]));  // NaN input
+    EXPECT_TRUE(std::isnan(result[2]));  // Previous was NaN
+    EXPECT_DOUBLE_EQ(result[3], 30.0);   // 30 - 50 = -20 (negative, returns 30.0)
+    EXPECT_DOUBLE_EQ(result[4], 30.0);   // 60 - 30 = 30 (positive, kept)
 }
 
 // ============================================================================
@@ -1849,34 +1730,30 @@ TEST_F(TransformFunctionsTest, MonotonicDiffCounterResetWithNaN) {
 
 TEST_F(TransformFunctionsTest, CutoffMinPreservesNaN) {
     // NaN values should be preserved (not converted to NaN by the threshold check)
-    std::vector<double> values = {
-        std::nan(""), 1.0, 5.0, std::nan(""), 10.0, std::nan("")
-    };
+    std::vector<double> values = {std::nan(""), 1.0, 5.0, std::nan(""), 10.0, std::nan("")};
 
     auto result = cutoff_min(values, 3.0);
 
-    EXPECT_TRUE(std::isnan(result[0]));    // NaN preserved
-    EXPECT_TRUE(std::isnan(result[1]));    // 1.0 < 3.0, becomes NaN
-    EXPECT_DOUBLE_EQ(result[2], 5.0);     // 5.0 >= 3.0, kept
-    EXPECT_TRUE(std::isnan(result[3]));    // NaN preserved
-    EXPECT_DOUBLE_EQ(result[4], 10.0);    // 10.0 >= 3.0, kept
-    EXPECT_TRUE(std::isnan(result[5]));    // NaN preserved
+    EXPECT_TRUE(std::isnan(result[0]));  // NaN preserved
+    EXPECT_TRUE(std::isnan(result[1]));  // 1.0 < 3.0, becomes NaN
+    EXPECT_DOUBLE_EQ(result[2], 5.0);    // 5.0 >= 3.0, kept
+    EXPECT_TRUE(std::isnan(result[3]));  // NaN preserved
+    EXPECT_DOUBLE_EQ(result[4], 10.0);   // 10.0 >= 3.0, kept
+    EXPECT_TRUE(std::isnan(result[5]));  // NaN preserved
 }
 
 TEST_F(TransformFunctionsTest, CutoffMaxPreservesNaN) {
     // NaN values should be preserved (not converted to NaN by the threshold check)
-    std::vector<double> values = {
-        std::nan(""), 1.0, 5.0, std::nan(""), 10.0, std::nan("")
-    };
+    std::vector<double> values = {std::nan(""), 1.0, 5.0, std::nan(""), 10.0, std::nan("")};
 
     auto result = cutoff_max(values, 7.0);
 
-    EXPECT_TRUE(std::isnan(result[0]));    // NaN preserved
-    EXPECT_DOUBLE_EQ(result[1], 1.0);     // 1.0 <= 7.0, kept
-    EXPECT_DOUBLE_EQ(result[2], 5.0);     // 5.0 <= 7.0, kept
-    EXPECT_TRUE(std::isnan(result[3]));    // NaN preserved
-    EXPECT_TRUE(std::isnan(result[4]));    // 10.0 > 7.0, becomes NaN
-    EXPECT_TRUE(std::isnan(result[5]));    // NaN preserved
+    EXPECT_TRUE(std::isnan(result[0]));  // NaN preserved
+    EXPECT_DOUBLE_EQ(result[1], 1.0);    // 1.0 <= 7.0, kept
+    EXPECT_DOUBLE_EQ(result[2], 5.0);    // 5.0 <= 7.0, kept
+    EXPECT_TRUE(std::isnan(result[3]));  // NaN preserved
+    EXPECT_TRUE(std::isnan(result[4]));  // 10.0 > 7.0, becomes NaN
+    EXPECT_TRUE(std::isnan(result[5]));  // NaN preserved
 }
 
 TEST_F(TransformFunctionsTest, CutoffMinNaNLargeArraySimd) {
@@ -1896,8 +1773,7 @@ TEST_F(TransformFunctionsTest, CutoffMinNaNLargeArraySimd) {
     for (size_t i = 0; i < result.size(); ++i) {
         if (i % 7 == 0) {
             // NaN inputs should remain NaN (preserved, not set by threshold)
-            EXPECT_TRUE(std::isnan(result[i]))
-                << "NaN should be preserved at index " << i;
+            EXPECT_TRUE(std::isnan(result[i])) << "NaN should be preserved at index " << i;
         } else if (values[i] < 0.0) {
             // Below threshold -> NaN
             EXPECT_TRUE(std::isnan(result[i]))
@@ -1914,8 +1790,7 @@ TEST_F(TransformFunctionsTest, CutoffMinNaNLargeArraySimd) {
     ASSERT_EQ(scalarResult.size(), result.size());
     for (size_t i = 0; i < result.size(); ++i) {
         EXPECT_TRUE(nearEqual(result[i], scalarResult[i]))
-            << "SIMD and scalar disagree at index " << i
-            << ": simd=" << result[i] << ", scalar=" << scalarResult[i];
+            << "SIMD and scalar disagree at index " << i << ": simd=" << result[i] << ", scalar=" << scalarResult[i];
     }
 }
 
@@ -1936,8 +1811,7 @@ TEST_F(TransformFunctionsTest, CutoffMaxNaNLargeArraySimd) {
     for (size_t i = 0; i < result.size(); ++i) {
         if (i % 7 == 0) {
             // NaN inputs should remain NaN (preserved, not set by threshold)
-            EXPECT_TRUE(std::isnan(result[i]))
-                << "NaN should be preserved at index " << i;
+            EXPECT_TRUE(std::isnan(result[i])) << "NaN should be preserved at index " << i;
         } else if (values[i] > 50.0) {
             // Above threshold -> NaN
             EXPECT_TRUE(std::isnan(result[i]))
@@ -1954,7 +1828,6 @@ TEST_F(TransformFunctionsTest, CutoffMaxNaNLargeArraySimd) {
     ASSERT_EQ(scalarResult.size(), result.size());
     for (size_t i = 0; i < result.size(); ++i) {
         EXPECT_TRUE(nearEqual(result[i], scalarResult[i]))
-            << "SIMD and scalar disagree at index " << i
-            << ": simd=" << result[i] << ", scalar=" << scalarResult[i];
+            << "SIMD and scalar disagree at index " << i << ": simd=" << result[i] << ", scalar=" << scalarResult[i];
     }
 }

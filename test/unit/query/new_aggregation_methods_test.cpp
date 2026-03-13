@@ -4,13 +4,15 @@
 //  - AggregationState::getValue: correct computation with known data
 //  - Edge cases: empty state (NaN), single point, all-same values (spread=0, stddev=0)
 
-#include <gtest/gtest.h>
-#include "../../../lib/query/query_parser.hpp"
-#include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/query/aggregator.hpp"
+#include "../../../lib/query/query_parser.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cmath>
-#include <vector>
 #include <numeric>
+#include <vector>
 
 using namespace timestar;
 
@@ -76,8 +78,7 @@ TEST(NewAggregationMethodParserTest, ParseSpreadUppercase) {
 
 // Full query string with scopes and group-by still parses correctly
 TEST(NewAggregationMethodParserTest, ParseCountWithScopesAndGroupBy) {
-    QueryRequest req = QueryParser::parseQueryString(
-        "count:cpu(usage){host:server-01} by {datacenter}");
+    QueryRequest req = QueryParser::parseQueryString("count:cpu(usage){host:server-01} by {datacenter}");
     EXPECT_EQ(req.aggregation, AggregationMethod::COUNT);
     EXPECT_EQ(req.measurement, "cpu");
     EXPECT_EQ(req.fields.size(), 1u);
@@ -88,8 +89,7 @@ TEST(NewAggregationMethodParserTest, ParseCountWithScopesAndGroupBy) {
 }
 
 TEST(NewAggregationMethodParserTest, InvalidMethodStillThrows) {
-    EXPECT_THROW(QueryParser::parseQueryString("percentile:temperature()"),
-                 QueryParseException);
+    EXPECT_THROW(QueryParser::parseQueryString("percentile:temperature()"), QueryParseException);
 }
 
 // ============================================================================
@@ -173,25 +173,29 @@ TEST(NewAggregationStateTest, SinglePoint_Spread_IsZero) {
 
 TEST(NewAggregationStateTest, AllSame_Count) {
     AggregationState s;
-    for (int i = 0; i < 5; ++i) s.addValue(3.0, static_cast<uint64_t>(i * 100));
+    for (int i = 0; i < 5; ++i)
+        s.addValue(3.0, static_cast<uint64_t>(i * 100));
     EXPECT_DOUBLE_EQ(s.getValue(AggregationMethod::COUNT), 5.0);
 }
 
 TEST(NewAggregationStateTest, AllSame_Spread_IsZero) {
     AggregationState s;
-    for (int i = 0; i < 5; ++i) s.addValue(3.0, static_cast<uint64_t>(i * 100));
+    for (int i = 0; i < 5; ++i)
+        s.addValue(3.0, static_cast<uint64_t>(i * 100));
     EXPECT_DOUBLE_EQ(s.getValue(AggregationMethod::SPREAD), 0.0);
 }
 
 TEST(NewAggregationStateTest, AllSame_Stddev_IsZero) {
     AggregationState s;
-    for (int i = 0; i < 5; ++i) s.addValue(3.0, static_cast<uint64_t>(i * 100));
+    for (int i = 0; i < 5; ++i)
+        s.addValue(3.0, static_cast<uint64_t>(i * 100));
     EXPECT_DOUBLE_EQ(s.getValue(AggregationMethod::STDDEV), 0.0);
 }
 
 TEST(NewAggregationStateTest, AllSame_Stdvar_IsZero) {
     AggregationState s;
-    for (int i = 0; i < 5; ++i) s.addValue(3.0, static_cast<uint64_t>(i * 100));
+    for (int i = 0; i < 5; ++i)
+        s.addValue(3.0, static_cast<uint64_t>(i * 100));
     EXPECT_DOUBLE_EQ(s.getValue(AggregationMethod::STDVAR), 0.0);
 }
 
@@ -378,9 +382,13 @@ TEST(NewAggregationStateTest, MergeStddev) {
     AggregationState a, b;
     // Build same dataset as KnownValues test across two states
     // a: 2, 4, 4, 4
-    for (double v : {2.0, 4.0, 4.0, 4.0}) { a.addValue(v, 0); }
+    for (double v : {2.0, 4.0, 4.0, 4.0}) {
+        a.addValue(v, 0);
+    }
     // b: 5, 5, 7, 9
-    for (double v : {5.0, 5.0, 7.0, 9.0}) { b.addValue(v, 0); }
+    for (double v : {5.0, 5.0, 7.0, 9.0}) {
+        b.addValue(v, 0);
+    }
     a.merge(b);
     // Full population: 2, 4, 4, 4, 5, 5, 7, 9 — stddev = 2.0
     EXPECT_NEAR(a.getValue(AggregationMethod::STDDEV), 2.0, 1e-10);
@@ -394,12 +402,8 @@ TEST(NewAggregationStateTest, MergeStddev) {
 class NewAggMethodPipelineTest : public ::testing::Test {
 protected:
     // Create a SeriesResult with double values
-    static SeriesResult makeSeries(
-        const std::string& measurement,
-        const std::string& field,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values)
-    {
+    static SeriesResult makeSeries(const std::string& measurement, const std::string& field,
+                                   const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
         SeriesResult sr;
         sr.measurement = measurement;
         sr.fields[field] = std::make_pair(timestamps, FieldValues(values));
@@ -407,15 +411,13 @@ protected:
     }
 
     // Run the full aggregation pipeline for a single series, no buckets
-    static std::vector<AggregatedPoint> runPipeline(
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values,
-        AggregationMethod method)
-    {
+    static std::vector<AggregatedPoint> runPipeline(const std::vector<uint64_t>& timestamps,
+                                                    const std::vector<double>& values, AggregationMethod method) {
         auto series = makeSeries("test", "value", timestamps, values);
         auto partials = Aggregator::createPartialAggregations({series}, method, 0, {});
         auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, method);
-        if (grouped.empty()) return {};
+        if (grouped.empty())
+            return {};
         return {grouped[0].points.begin(), grouped[0].points.end()};
     }
 };

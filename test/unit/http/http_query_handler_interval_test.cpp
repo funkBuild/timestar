@@ -1,6 +1,8 @@
-#include <gtest/gtest.h>
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/query/query_parser.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cstdint>
 #include <limits>
 

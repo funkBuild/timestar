@@ -7,11 +7,13 @@
  * and a query containing "schema" was incorrectly identified as containing "ema".
  */
 
-#include <gtest/gtest.h>
 #include "functions/function_query_parser.hpp"
+
+#include <gtest/gtest.h>
+
 #include <algorithm>
-#include <vector>
 #include <string>
+#include <vector>
 
 using namespace timestar::functions;
 
@@ -55,8 +57,7 @@ TEST_F(FunctionQueryParserTest, DetectsMultiplyAsWholeWord) {
 // "checksum" contains "sma" but is NOT the sma function
 TEST_F(FunctionQueryParserTest, NoFalsePositiveSmaInChecksum) {
     auto result = parser.parse("checksum(field)");
-    EXPECT_FALSE(hasFunction(result, "sma"))
-        << "'checksum' must NOT be recognised as containing the 'sma' function";
+    EXPECT_FALSE(hasFunction(result, "sma")) << "'checksum' must NOT be recognised as containing the 'sma' function";
 }
 
 // "schema" contains "ema" but is NOT the ema function
@@ -69,8 +70,7 @@ TEST_F(FunctionQueryParserTest, NoFalsePositiveEmaInSchema) {
 // "cinema" contains "ema" — another substring collision case
 TEST_F(FunctionQueryParserTest, NoFalsePositiveEmaInCinema) {
     auto result = parser.parse("cinema");
-    EXPECT_FALSE(hasFunction(result, "ema"))
-        << "'cinema' must NOT be recognised as containing the 'ema' function";
+    EXPECT_FALSE(hasFunction(result, "ema")) << "'cinema' must NOT be recognised as containing the 'ema' function";
 }
 
 // "address" contains "add" but is NOT the add function
@@ -83,8 +83,7 @@ TEST_F(FunctionQueryParserTest, NoFalsePositiveAddInAddress) {
 // "padded" contains "add" but is NOT the add function
 TEST_F(FunctionQueryParserTest, NoFalsePositiveAddInPadded) {
     auto result = parser.parse("padded");
-    EXPECT_FALSE(hasFunction(result, "add"))
-        << "'padded' must NOT be recognised as containing the 'add' function";
+    EXPECT_FALSE(hasFunction(result, "add")) << "'padded' must NOT be recognised as containing the 'add' function";
 }
 
 // "summary" contains "sma" — substring match that should not fire

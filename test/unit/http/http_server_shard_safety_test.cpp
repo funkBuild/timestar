@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include <fstream>
 #include <string>
 
@@ -22,32 +23,34 @@ protected:
 
     void SetUp() override {
         std::ifstream file(HTTP_SERVER_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open())
-            << "Could not open timestar_http_server.cpp at: " << HTTP_SERVER_SOURCE_PATH;
-        sourceCode.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>());
+        ASSERT_TRUE(file.is_open()) << "Could not open timestar_http_server.cpp at: " << HTTP_SERVER_SOURCE_PATH;
+        sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         ASSERT_FALSE(sourceCode.empty());
     }
 
     // Extract the body of a named free function from the source.
     std::string extractFunctionBody(const std::string& funcSignature) const {
         auto pos = sourceCode.find(funcSignature);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
 
         // Find the opening brace of the function body
         auto bracePos = sourceCode.find('{', pos);
-        if (bracePos == std::string::npos) return "";
+        if (bracePos == std::string::npos)
+            return "";
 
         // Brace-match to find the closing brace
         int depth = 1;
         size_t cur = bracePos + 1;
         while (cur < sourceCode.size() && depth > 0) {
-            if (sourceCode[cur] == '{') depth++;
-            else if (sourceCode[cur] == '}') depth--;
+            if (sourceCode[cur] == '{')
+                depth++;
+            else if (sourceCode[cur] == '}')
+                depth--;
             cur++;
         }
-        if (depth != 0) return "";
+        if (depth != 0)
+            return "";
 
         return sourceCode.substr(bracePos, cur - bracePos);
     }
@@ -125,8 +128,7 @@ TEST_F(HttpServerShardSafetyTest, NoGlobalHandlerVariables) {
 // ---------------------------------------------------------------------------
 TEST_F(HttpServerShardSafetyTest, HandlersCreatedInsideSetRoutes) {
     std::string setRoutesBody = extractFunctionBody("void set_routes(");
-    ASSERT_FALSE(setRoutesBody.empty())
-        << "Could not extract set_routes function body";
+    ASSERT_FALSE(setRoutesBody.empty()) << "Could not extract set_routes function body";
 
     // Handlers must be created with new inside set_routes
     EXPECT_NE(setRoutesBody.find("HttpWriteHandler"), std::string::npos)
@@ -150,8 +152,7 @@ TEST_F(HttpServerShardSafetyTest, HandlersCreatedInsideSetRoutes) {
 // ---------------------------------------------------------------------------
 TEST_F(HttpServerShardSafetyTest, HandlersAreHeapAllocated) {
     std::string setRoutesBody = extractFunctionBody("void set_routes(");
-    ASSERT_FALSE(setRoutesBody.empty())
-        << "Could not extract set_routes function body";
+    ASSERT_FALSE(setRoutesBody.empty()) << "Could not extract set_routes function body";
 
     // Check for heap allocation of handlers using new
     EXPECT_NE(setRoutesBody.find("new HttpWriteHandler"), std::string::npos)
@@ -159,10 +160,9 @@ TEST_F(HttpServerShardSafetyTest, HandlersAreHeapAllocated) {
         << "because registerRoutes() captures `this` in route lambdas.";
 
     // HttpQueryHandler might be in timestar:: namespace
-    bool hasQueryHandler = setRoutesBody.find("new timestar::HttpQueryHandler") != std::string::npos
-                        || setRoutesBody.find("new HttpQueryHandler") != std::string::npos;
-    EXPECT_TRUE(hasQueryHandler)
-        << "HttpQueryHandler must be heap-allocated with new inside set_routes.";
+    bool hasQueryHandler = setRoutesBody.find("new timestar::HttpQueryHandler") != std::string::npos ||
+                           setRoutesBody.find("new HttpQueryHandler") != std::string::npos;
+    EXPECT_TRUE(hasQueryHandler) << "HttpQueryHandler must be heap-allocated with new inside set_routes.";
 
     EXPECT_NE(setRoutesBody.find("new HttpDeleteHandler"), std::string::npos)
         << "HttpDeleteHandler must be heap-allocated with new inside set_routes.";
@@ -178,14 +178,12 @@ TEST_F(HttpServerShardSafetyTest, HandlersAreHeapAllocated) {
 // ---------------------------------------------------------------------------
 TEST_F(HttpServerShardSafetyTest, RegisterRoutesCalledInSetRoutes) {
     std::string setRoutesBody = extractFunctionBody("void set_routes(");
-    ASSERT_FALSE(setRoutesBody.empty())
-        << "Could not extract set_routes function body";
+    ASSERT_FALSE(setRoutesBody.empty()) << "Could not extract set_routes function body";
 
     // Count registerRoutes calls - should be at least 4 (one per handler)
     int registerCalls = countOccurrences(setRoutesBody, "registerRoutes");
-    EXPECT_GE(registerCalls, 4)
-        << "set_routes must call registerRoutes() for all 4 handlers "
-        << "(write, query, delete, metadata). Found " << registerCalls << " calls.";
+    EXPECT_GE(registerCalls, 4) << "set_routes must call registerRoutes() for all 4 handlers "
+                                << "(write, query, delete, metadata). Found " << registerCalls << " calls.";
 }
 
 // ---------------------------------------------------------------------------
@@ -197,8 +195,7 @@ TEST_F(HttpServerShardSafetyTest, RegisterRoutesCalledInSetRoutes) {
 TEST_F(HttpServerShardSafetyTest, NoHandlerCreationInMain) {
     // Find the main function body
     std::string mainBody = extractFunctionBody("int main(");
-    ASSERT_FALSE(mainBody.empty())
-        << "Could not extract main function body";
+    ASSERT_FALSE(mainBody.empty()) << "Could not extract main function body";
 
     // The main body should not contain make_unique for any handler type
     EXPECT_EQ(mainBody.find("make_unique<HttpWriteHandler>"), std::string::npos)
@@ -225,8 +222,7 @@ TEST_F(HttpServerShardSafetyTest, NoHandlerCreationInMain) {
 // ---------------------------------------------------------------------------
 TEST_F(HttpServerShardSafetyTest, EnginePointerPassedToHandlers) {
     std::string setRoutesBody = extractFunctionBody("void set_routes(");
-    ASSERT_FALSE(setRoutesBody.empty())
-        << "Could not extract set_routes function body";
+    ASSERT_FALSE(setRoutesBody.empty()) << "Could not extract set_routes function body";
 
     // g_engine must be referenced in set_routes for passing to handlers
     EXPECT_NE(setRoutesBody.find("g_engine"), std::string::npos)

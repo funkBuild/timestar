@@ -1,5 +1,6 @@
-#include <gtest/gtest.h>
 #include <storage/bloom_filter.hpp>
+
+#include <gtest/gtest.h>
 
 #include <fstream>
 #include <regex>
@@ -24,18 +25,15 @@ TEST(BloomFilterAliasingTest, CorrectnessPreserved) {
     auto bf = make_bloom_filter();
 
     std::vector<std::string> keys = {
-        "temperature", "humidity", "pressure",
-        "cpu_usage", "memory_free", "disk_io",
-        "series_key_1234567890", "a", "ab"
-    };
+        "temperature",           "humidity", "pressure", "cpu_usage", "memory_free", "disk_io",
+        "series_key_1234567890", "a",        "ab"};
 
     for (const auto& key : keys) {
         bf.insert(key);
     }
 
     for (const auto& key : keys) {
-        EXPECT_TRUE(bf.contains(key))
-            << "Bloom filter must find inserted key: " << key;
+        EXPECT_TRUE(bf.contains(key)) << "Bloom filter must find inserted key: " << key;
     }
 }
 
@@ -57,8 +55,7 @@ TEST(BloomFilterAliasingTest, NoFalseNegatives) {
     }
 
     for (const auto& key : keys) {
-        EXPECT_TRUE(bf.contains(key))
-            << "False negative detected for key: " << key;
+        EXPECT_TRUE(bf.contains(key)) << "False negative detected for key: " << key;
     }
 }
 
@@ -91,17 +88,16 @@ TEST(BloomFilterAliasingTest, UnalignedData) {
     }
 
     // Also add some varied-content strings of specific remainder lengths
-    keys.push_back("ABCDE");     // 5 bytes: 4-byte + 1-byte remainder
-    keys.push_back("ABCDEF");    // 6 bytes: 4-byte + 2-byte remainder
-    keys.push_back("ABCDEFG");   // 7 bytes: 4-byte + 2-byte + 1-byte remainder
+    keys.push_back("ABCDE");    // 5 bytes: 4-byte + 1-byte remainder
+    keys.push_back("ABCDEF");   // 6 bytes: 4-byte + 2-byte remainder
+    keys.push_back("ABCDEFG");  // 7 bytes: 4-byte + 2-byte + 1-byte remainder
 
     for (const auto& key : keys) {
         bf.insert(key);
     }
 
     for (const auto& key : keys) {
-        EXPECT_TRUE(bf.contains(key))
-            << "Failed for key of length " << key.size() << ": " << key;
+        EXPECT_TRUE(bf.contains(key)) << "Failed for key of length " << key.size() << ": " << key;
     }
 }
 
@@ -114,10 +110,8 @@ TEST(BloomFilterAliasingTest, HashConsistency) {
     auto bf2 = make_bloom_filter();
 
     std::vector<std::string> keys = {
-        "a", "ab", "abc", "abcd", "abcde", "abcdef",
-        "abcdefg", "abcdefgh", "abcdefghi",
-        "this_is_a_longer_key_for_testing_hash_consistency"
-    };
+        "a",      "ab",      "abc",      "abcd",      "abcde",
+        "abcdef", "abcdefg", "abcdefgh", "abcdefghi", "this_is_a_longer_key_for_testing_hash_consistency"};
 
     for (const auto& key : keys) {
         bf1.insert(key);
@@ -129,8 +123,7 @@ TEST(BloomFilterAliasingTest, HashConsistency) {
 
     // Also verify contains is consistent
     for (const auto& key : keys) {
-        EXPECT_EQ(bf1.contains(key), bf2.contains(key))
-            << "Inconsistent contains() result for key: " << key;
+        EXPECT_EQ(bf1.contains(key), bf2.contains(key)) << "Inconsistent contains() result for key: " << key;
     }
 }
 
@@ -147,8 +140,7 @@ TEST(BloomFilterAliasingTest, IntegerTypeInserts) {
     }
 
     for (auto id : series_ids) {
-        EXPECT_TRUE(bf.contains(id))
-            << "Bloom filter must find inserted uint64_t: " << id;
+        EXPECT_TRUE(bf.contains(id)) << "Bloom filter must find inserted uint64_t: " << id;
     }
 }
 
@@ -160,17 +152,14 @@ TEST(BloomFilterAliasingTest, SourceNoReinterpretCast) {
     GTEST_SKIP() << "BLOOM_FILTER_SOURCE_PATH not defined";
 #else
     std::ifstream file(BLOOM_FILTER_SOURCE_PATH);
-    ASSERT_TRUE(file.is_open())
-        << "Cannot open bloom_filter.hpp at: " << BLOOM_FILTER_SOURCE_PATH;
+    ASSERT_TRUE(file.is_open()) << "Cannot open bloom_filter.hpp at: " << BLOOM_FILTER_SOURCE_PATH;
 
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     // Find the hash_ap function definition (not a call site)
     // The definition has the form: hash_ap(const unsigned char*
     auto hash_ap_start = content.find("hash_ap(const unsigned char*");
-    ASSERT_NE(hash_ap_start, std::string::npos)
-        << "Could not find hash_ap function definition in source";
+    ASSERT_NE(hash_ap_start, std::string::npos) << "Could not find hash_ap function definition in source";
 
     // Find the function body (from first { after hash_ap to matching })
     auto body_start = content.find('{', hash_ap_start);
@@ -180,8 +169,10 @@ TEST(BloomFilterAliasingTest, SourceNoReinterpretCast) {
     int depth = 1;
     size_t pos = body_start + 1;
     while (pos < content.size() && depth > 0) {
-        if (content[pos] == '{') ++depth;
-        else if (content[pos] == '}') --depth;
+        if (content[pos] == '{')
+            ++depth;
+        else if (content[pos] == '}')
+            --depth;
         ++pos;
     }
 
@@ -205,17 +196,14 @@ TEST(BloomFilterAliasingTest, SourceUsesMemcpy) {
     GTEST_SKIP() << "BLOOM_FILTER_SOURCE_PATH not defined";
 #else
     std::ifstream file(BLOOM_FILTER_SOURCE_PATH);
-    ASSERT_TRUE(file.is_open())
-        << "Cannot open bloom_filter.hpp at: " << BLOOM_FILTER_SOURCE_PATH;
+    ASSERT_TRUE(file.is_open()) << "Cannot open bloom_filter.hpp at: " << BLOOM_FILTER_SOURCE_PATH;
 
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     // Find the hash_ap function definition (not a call site)
     // The definition has the form: hash_ap(const unsigned char*
     auto hash_ap_start = content.find("hash_ap(const unsigned char*");
-    ASSERT_NE(hash_ap_start, std::string::npos)
-        << "Could not find hash_ap function definition in source";
+    ASSERT_NE(hash_ap_start, std::string::npos) << "Could not find hash_ap function definition in source";
 
     auto body_start = content.find('{', hash_ap_start);
     ASSERT_NE(body_start, std::string::npos);
@@ -223,8 +211,10 @@ TEST(BloomFilterAliasingTest, SourceUsesMemcpy) {
     int depth = 1;
     size_t pos = body_start + 1;
     while (pos < content.size() && depth > 0) {
-        if (content[pos] == '{') ++depth;
-        else if (content[pos] == '}') --depth;
+        if (content[pos] == '{')
+            ++depth;
+        else if (content[pos] == '}')
+            --depth;
         ++pos;
     }
 

@@ -1,21 +1,23 @@
-#include <gtest/gtest.h>
-#include "../../../lib/encoding/float/float_encoder.hpp"
-#include "../../../lib/encoding/float/float_encoder_simd.hpp"
-#include "../../../lib/encoding/float/float_encoder_avx512.hpp"
 #include "../../../lib/encoding/float/float_decoder.hpp"
-#include "../../../lib/encoding/float/float_decoder_simd.hpp"
 #include "../../../lib/encoding/float/float_decoder_avx512.hpp"
+#include "../../../lib/encoding/float/float_decoder_simd.hpp"
+#include "../../../lib/encoding/float/float_encoder.hpp"
+#include "../../../lib/encoding/float/float_encoder_avx512.hpp"
+#include "../../../lib/encoding/float/float_encoder_simd.hpp"
 #include "../../../lib/encoding/integer/integer_encoder.hpp"
-#include "../../../lib/encoding/integer/integer_encoder_simd.hpp"
 #include "../../../lib/encoding/integer/integer_encoder_avx512.hpp"
+#include "../../../lib/encoding/integer/integer_encoder_simd.hpp"
 #include "../../../lib/encoding/zigzag.hpp"
-#include <vector>
-#include <span>
+
+#include <gtest/gtest.h>
+
+#include <bit>
 #include <cmath>
-#include <random>
 #include <limits>
 #include <numeric>
-#include <bit>
+#include <random>
+#include <span>
+#include <vector>
 
 // ============================================================================
 // Helper: decode a CompressedBuffer using a specific float decoder
@@ -67,25 +69,21 @@ protected:
         CompressedBuffer scalarEncoded = FloatEncoderBasic::encode(values);
         std::vector<double> scalarDecoded = decodeWithBasic(scalarEncoded, values.size());
 
-        ASSERT_EQ(scalarDecoded.size(), values.size())
-            << description << ": scalar decode size mismatch";
+        ASSERT_EQ(scalarDecoded.size(), values.size()) << description << ": scalar decode size mismatch";
 
         if (avx2Available_) {
             CompressedBuffer simdEncoded = FloatEncoderSIMD::encode(values);
             std::vector<double> simdDecoded = decodeWithBasic(simdEncoded, values.size());
 
-            ASSERT_EQ(simdDecoded.size(), values.size())
-                << description << ": SIMD encode size mismatch";
+            ASSERT_EQ(simdDecoded.size(), values.size()) << description << ": SIMD encode size mismatch";
 
             for (size_t i = 0; i < values.size(); i++) {
                 if (std::isnan(values[i])) {
-                    EXPECT_TRUE(std::isnan(simdDecoded[i]))
-                        << description << ": SIMD NaN mismatch at index " << i;
+                    EXPECT_TRUE(std::isnan(simdDecoded[i])) << description << ": SIMD NaN mismatch at index " << i;
                 } else {
-                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]),
-                              std::bit_cast<uint64_t>(simdDecoded[i]))
-                        << description << ": SIMD value mismatch at index " << i
-                        << " (scalar=" << scalarDecoded[i] << ", simd=" << simdDecoded[i] << ")";
+                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]), std::bit_cast<uint64_t>(simdDecoded[i]))
+                        << description << ": SIMD value mismatch at index " << i << " (scalar=" << scalarDecoded[i]
+                        << ", simd=" << simdDecoded[i] << ")";
                 }
             }
         }
@@ -94,18 +92,15 @@ protected:
             CompressedBuffer avx512Encoded = FloatEncoderAVX512::encode(values);
             std::vector<double> avx512Decoded = decodeWithBasic(avx512Encoded, values.size());
 
-            ASSERT_EQ(avx512Decoded.size(), values.size())
-                << description << ": AVX512 encode size mismatch";
+            ASSERT_EQ(avx512Decoded.size(), values.size()) << description << ": AVX512 encode size mismatch";
 
             for (size_t i = 0; i < values.size(); i++) {
                 if (std::isnan(values[i])) {
-                    EXPECT_TRUE(std::isnan(avx512Decoded[i]))
-                        << description << ": AVX512 NaN mismatch at index " << i;
+                    EXPECT_TRUE(std::isnan(avx512Decoded[i])) << description << ": AVX512 NaN mismatch at index " << i;
                 } else {
-                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]),
-                              std::bit_cast<uint64_t>(avx512Decoded[i]))
-                        << description << ": AVX512 value mismatch at index " << i
-                        << " (scalar=" << scalarDecoded[i] << ", avx512=" << avx512Decoded[i] << ")";
+                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]), std::bit_cast<uint64_t>(avx512Decoded[i]))
+                        << description << ": AVX512 value mismatch at index " << i << " (scalar=" << scalarDecoded[i]
+                        << ", avx512=" << avx512Decoded[i] << ")";
                 }
             }
         }
@@ -114,41 +109,36 @@ protected:
     // Verify that all decoder variants produce the same output for a given encoded buffer
     void verifyDecoderEquivalence(const CompressedBuffer& encoded, size_t count, const std::string& description) {
         std::vector<double> scalarDecoded = decodeWithBasic(encoded, count);
-        ASSERT_EQ(scalarDecoded.size(), count)
-            << description << ": scalar decode size mismatch";
+        ASSERT_EQ(scalarDecoded.size(), count) << description << ": scalar decode size mismatch";
 
         if (avx2Available_) {
             std::vector<double> simdDecoded = decodeWithSIMD(encoded, count);
-            ASSERT_EQ(simdDecoded.size(), count)
-                << description << ": SIMD decode size mismatch";
+            ASSERT_EQ(simdDecoded.size(), count) << description << ": SIMD decode size mismatch";
 
             for (size_t i = 0; i < count; i++) {
                 if (std::isnan(scalarDecoded[i])) {
                     EXPECT_TRUE(std::isnan(simdDecoded[i]))
                         << description << ": SIMD decoder NaN mismatch at index " << i;
                 } else {
-                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]),
-                              std::bit_cast<uint64_t>(simdDecoded[i]))
-                        << description << ": SIMD decoder mismatch at index " << i
-                        << " (scalar=" << scalarDecoded[i] << ", simd=" << simdDecoded[i] << ")";
+                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]), std::bit_cast<uint64_t>(simdDecoded[i]))
+                        << description << ": SIMD decoder mismatch at index " << i << " (scalar=" << scalarDecoded[i]
+                        << ", simd=" << simdDecoded[i] << ")";
                 }
             }
         }
 
         if (avx512Available_) {
             std::vector<double> avx512Decoded = decodeWithAVX512(encoded, count);
-            ASSERT_EQ(avx512Decoded.size(), count)
-                << description << ": AVX512 decode size mismatch";
+            ASSERT_EQ(avx512Decoded.size(), count) << description << ": AVX512 decode size mismatch";
 
             for (size_t i = 0; i < count; i++) {
                 if (std::isnan(scalarDecoded[i])) {
                     EXPECT_TRUE(std::isnan(avx512Decoded[i]))
                         << description << ": AVX512 decoder NaN mismatch at index " << i;
                 } else {
-                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]),
-                              std::bit_cast<uint64_t>(avx512Decoded[i]))
-                        << description << ": AVX512 decoder mismatch at index " << i
-                        << " (scalar=" << scalarDecoded[i] << ", avx512=" << avx512Decoded[i] << ")";
+                    EXPECT_EQ(std::bit_cast<uint64_t>(scalarDecoded[i]), std::bit_cast<uint64_t>(avx512Decoded[i]))
+                        << description << ": AVX512 decoder mismatch at index " << i << " (scalar=" << scalarDecoded[i]
+                        << ", avx512=" << avx512Decoded[i] << ")";
                 }
             }
         }
@@ -182,13 +172,11 @@ TEST_F(FloatEncoderSIMDCorrectnessTest, FiveValues_OneOverSIMDWidth) {
 }
 
 TEST_F(FloatEncoderSIMDCorrectnessTest, EightValues_ExactAVX512Width) {
-    verifyEncoderEquivalence({1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0},
-                              "eight values (exact AVX512 width)");
+    verifyEncoderEquivalence({1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}, "eight values (exact AVX512 width)");
 }
 
 TEST_F(FloatEncoderSIMDCorrectnessTest, NineValues_OneOverAVX512Width) {
-    verifyEncoderEquivalence({1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0},
-                              "nine values (one over AVX512 width)");
+    verifyEncoderEquivalence({1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0}, "nine values (one over AVX512 width)");
 }
 
 TEST_F(FloatEncoderSIMDCorrectnessTest, AllIdentical) {
@@ -220,8 +208,7 @@ TEST_F(FloatEncoderSIMDCorrectnessTest, NaNValues) {
 
 TEST_F(FloatEncoderSIMDCorrectnessTest, Denormals) {
     double denorm = std::numeric_limits<double>::denorm_min();
-    std::vector<double> values = {denorm, -denorm, denorm * 2, denorm * 3,
-                                   0.0, denorm, -denorm, 1.0, denorm, -denorm};
+    std::vector<double> values = {denorm, -denorm, denorm * 2, denorm * 3, 0.0, denorm, -denorm, 1.0, denorm, -denorm};
     verifyEncoderEquivalence(values, "denormals");
 }
 
@@ -373,8 +360,7 @@ TEST_F(FloatEncoderSIMDCorrectnessTest, CrossEncoderDecoderCompatibility) {
         // Verify SIMD-encoded data produces correct roundtrip
         std::vector<double> simdRoundtrip = decodeWithBasic(simdEncoded, values.size());
         for (size_t i = 0; i < values.size(); i++) {
-            EXPECT_EQ(std::bit_cast<uint64_t>(scalarBaseline[i]),
-                      std::bit_cast<uint64_t>(simdRoundtrip[i]))
+            EXPECT_EQ(std::bit_cast<uint64_t>(scalarBaseline[i]), std::bit_cast<uint64_t>(simdRoundtrip[i]))
                 << "Cross-compat SIMD->Basic mismatch at index " << i;
         }
     }
@@ -385,8 +371,7 @@ TEST_F(FloatEncoderSIMDCorrectnessTest, CrossEncoderDecoderCompatibility) {
 
         std::vector<double> avx512Roundtrip = decodeWithBasic(avx512Encoded, values.size());
         for (size_t i = 0; i < values.size(); i++) {
-            EXPECT_EQ(std::bit_cast<uint64_t>(scalarBaseline[i]),
-                      std::bit_cast<uint64_t>(avx512Roundtrip[i]))
+            EXPECT_EQ(std::bit_cast<uint64_t>(scalarBaseline[i]), std::bit_cast<uint64_t>(avx512Roundtrip[i]))
                 << "Cross-compat AVX512->Basic mismatch at index " << i;
         }
     }
@@ -407,11 +392,11 @@ protected:
     }
 
     // Encode with a given encoder, decode, and return decoded values
-    static std::vector<uint64_t> roundtrip(
-        AlignedBuffer (*encodeFn)(std::span<const uint64_t>),
-        std::pair<size_t, size_t> (*decodeFn)(Slice&, unsigned int, std::vector<uint64_t>&, uint64_t, uint64_t),
-        const std::vector<uint64_t>& values)
-    {
+    static std::vector<uint64_t> roundtrip(AlignedBuffer (*encodeFn)(std::span<const uint64_t>),
+                                           std::pair<size_t, size_t> (*decodeFn)(Slice&, unsigned int,
+                                                                                 std::vector<uint64_t>&, uint64_t,
+                                                                                 uint64_t),
+                                           const std::vector<uint64_t>& values) {
         AlignedBuffer encoded = encodeFn(values);
         Slice slice(encoded.data.data(), encoded.size());
         std::vector<uint64_t> decoded;
@@ -421,26 +406,22 @@ protected:
 
     void verifyEncoderEquivalence(const std::vector<uint64_t>& values, const std::string& description) {
         // Scalar baseline
-        std::vector<uint64_t> scalarResult = roundtrip(
-            IntegerEncoderBasic::encode, IntegerEncoderBasic::decode, values);
+        std::vector<uint64_t> scalarResult =
+            roundtrip(IntegerEncoderBasic::encode, IntegerEncoderBasic::decode, values);
 
-        ASSERT_EQ(scalarResult.size(), values.size())
-            << description << ": scalar roundtrip size mismatch";
+        ASSERT_EQ(scalarResult.size(), values.size()) << description << ": scalar roundtrip size mismatch";
         for (size_t i = 0; i < values.size(); i++) {
-            EXPECT_EQ(scalarResult[i], values[i])
-                << description << ": scalar roundtrip value mismatch at index " << i;
+            EXPECT_EQ(scalarResult[i], values[i]) << description << ": scalar roundtrip value mismatch at index " << i;
         }
 
         if (avx2Available_) {
-            std::vector<uint64_t> simdResult = roundtrip(
-                IntegerEncoderSIMD::encode, IntegerEncoderSIMD::decode, values);
+            std::vector<uint64_t> simdResult =
+                roundtrip(IntegerEncoderSIMD::encode, IntegerEncoderSIMD::decode, values);
 
-            ASSERT_EQ(simdResult.size(), values.size())
-                << description << ": SIMD roundtrip size mismatch";
+            ASSERT_EQ(simdResult.size(), values.size()) << description << ": SIMD roundtrip size mismatch";
             for (size_t i = 0; i < values.size(); i++) {
-                EXPECT_EQ(simdResult[i], values[i])
-                    << description << ": SIMD roundtrip mismatch at index " << i
-                    << " (expected=" << values[i] << ", got=" << simdResult[i] << ")";
+                EXPECT_EQ(simdResult[i], values[i]) << description << ": SIMD roundtrip mismatch at index " << i
+                                                    << " (expected=" << values[i] << ", got=" << simdResult[i] << ")";
             }
 
             // Also cross-check: SIMD encoded data decoded by scalar
@@ -449,8 +430,7 @@ protected:
             std::vector<uint64_t> crossDecoded;
             IntegerEncoderBasic::decode(simdSlice, values.size(), crossDecoded, 0, UINT64_MAX);
 
-            ASSERT_EQ(crossDecoded.size(), values.size())
-                << description << ": SIMD->Basic cross decode size mismatch";
+            ASSERT_EQ(crossDecoded.size(), values.size()) << description << ": SIMD->Basic cross decode size mismatch";
             for (size_t i = 0; i < values.size(); i++) {
                 EXPECT_EQ(crossDecoded[i], values[i])
                     << description << ": SIMD->Basic cross decode mismatch at index " << i;
@@ -458,15 +438,14 @@ protected:
         }
 
         if (avx512Available_) {
-            std::vector<uint64_t> avx512Result = roundtrip(
-                IntegerEncoderAVX512::encode, IntegerEncoderAVX512::decode, values);
+            std::vector<uint64_t> avx512Result =
+                roundtrip(IntegerEncoderAVX512::encode, IntegerEncoderAVX512::decode, values);
 
-            ASSERT_EQ(avx512Result.size(), values.size())
-                << description << ": AVX512 roundtrip size mismatch";
+            ASSERT_EQ(avx512Result.size(), values.size()) << description << ": AVX512 roundtrip size mismatch";
             for (size_t i = 0; i < values.size(); i++) {
                 EXPECT_EQ(avx512Result[i], values[i])
-                    << description << ": AVX512 roundtrip mismatch at index " << i
-                    << " (expected=" << values[i] << ", got=" << avx512Result[i] << ")";
+                    << description << ": AVX512 roundtrip mismatch at index " << i << " (expected=" << values[i]
+                    << ", got=" << avx512Result[i] << ")";
             }
 
             // Cross-check: AVX512 encoded data decoded by scalar
@@ -562,7 +541,7 @@ TEST_F(IntegerEncoderSIMDCorrectnessTest, ZeroValues) {
 TEST_F(IntegerEncoderSIMDCorrectnessTest, LargeValues) {
     std::vector<uint64_t> values = {
         UINT64_MAX - 100, UINT64_MAX - 50, UINT64_MAX - 25, UINT64_MAX - 10,
-        UINT64_MAX - 5, UINT64_MAX - 2, UINT64_MAX - 1, UINT64_MAX,
+        UINT64_MAX - 5,   UINT64_MAX - 2,  UINT64_MAX - 1,  UINT64_MAX,
     };
     verifyEncoderEquivalence(values, "large values near UINT64_MAX");
 }
@@ -611,22 +590,21 @@ TEST_F(IntegerEncoderSIMDCorrectnessTest, TimeRangeFiltering) {
     AlignedBuffer scalarEncoded = IntegerEncoderBasic::encode(values);
     Slice scalarSlice(scalarEncoded.data.data(), scalarEncoded.size());
     std::vector<uint64_t> scalarFiltered;
-    auto [scalarSkipped, scalarAdded] = IntegerEncoderBasic::decode(
-        scalarSlice, values.size(), scalarFiltered, minTime, maxTime);
+    auto [scalarSkipped, scalarAdded] =
+        IntegerEncoderBasic::decode(scalarSlice, values.size(), scalarFiltered, minTime, maxTime);
 
     if (avx2Available_) {
         AlignedBuffer simdEncoded = IntegerEncoderSIMD::encode(values);
         Slice simdSlice(simdEncoded.data.data(), simdEncoded.size());
         std::vector<uint64_t> simdFiltered;
-        auto [simdSkipped, simdAdded] = IntegerEncoderSIMD::decode(
-            simdSlice, values.size(), simdFiltered, minTime, maxTime);
+        auto [simdSkipped, simdAdded] =
+            IntegerEncoderSIMD::decode(simdSlice, values.size(), simdFiltered, minTime, maxTime);
 
         EXPECT_EQ(scalarSkipped, simdSkipped) << "SIMD skip count mismatch";
         EXPECT_EQ(scalarAdded, simdAdded) << "SIMD add count mismatch";
         ASSERT_EQ(scalarFiltered.size(), simdFiltered.size()) << "SIMD filtered size mismatch";
         for (size_t i = 0; i < scalarFiltered.size(); i++) {
-            EXPECT_EQ(scalarFiltered[i], simdFiltered[i])
-                << "SIMD filtered value mismatch at index " << i;
+            EXPECT_EQ(scalarFiltered[i], simdFiltered[i]) << "SIMD filtered value mismatch at index " << i;
         }
     }
 
@@ -634,15 +612,14 @@ TEST_F(IntegerEncoderSIMDCorrectnessTest, TimeRangeFiltering) {
         AlignedBuffer avx512Encoded = IntegerEncoderAVX512::encode(values);
         Slice avx512Slice(avx512Encoded.data.data(), avx512Encoded.size());
         std::vector<uint64_t> avx512Filtered;
-        auto [avx512Skipped, avx512Added] = IntegerEncoderAVX512::decode(
-            avx512Slice, values.size(), avx512Filtered, minTime, maxTime);
+        auto [avx512Skipped, avx512Added] =
+            IntegerEncoderAVX512::decode(avx512Slice, values.size(), avx512Filtered, minTime, maxTime);
 
         EXPECT_EQ(scalarSkipped, avx512Skipped) << "AVX512 skip count mismatch";
         EXPECT_EQ(scalarAdded, avx512Added) << "AVX512 add count mismatch";
         ASSERT_EQ(scalarFiltered.size(), avx512Filtered.size()) << "AVX512 filtered size mismatch";
         for (size_t i = 0; i < scalarFiltered.size(); i++) {
-            EXPECT_EQ(scalarFiltered[i], avx512Filtered[i])
-                << "AVX512 filtered value mismatch at index " << i;
+            EXPECT_EQ(scalarFiltered[i], avx512Filtered[i]) << "AVX512 filtered value mismatch at index " << i;
         }
     }
 }
@@ -651,11 +628,23 @@ TEST_F(IntegerEncoderSIMDCorrectnessTest, TimeRangeFiltering) {
 
 TEST_F(IntegerEncoderSIMDCorrectnessTest, ZigZagRoundtripVariousValues) {
     // Verify that the zigzag encode/decode roundtrip is correct for various values
-    std::vector<int64_t> testValues = {
-        0, 1, -1, 2, -2, 127, -128, 255, -256,
-        INT64_MAX, INT64_MIN, INT64_MAX - 1, INT64_MIN + 1,
-        1000000, -1000000, 123456789, -123456789
-    };
+    std::vector<int64_t> testValues = {0,
+                                       1,
+                                       -1,
+                                       2,
+                                       -2,
+                                       127,
+                                       -128,
+                                       255,
+                                       -256,
+                                       INT64_MAX,
+                                       INT64_MIN,
+                                       INT64_MAX - 1,
+                                       INT64_MIN + 1,
+                                       1000000,
+                                       -1000000,
+                                       123456789,
+                                       -123456789};
 
     for (int64_t v : testValues) {
         uint64_t encoded = ZigZag::zigzagEncode(v);

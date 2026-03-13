@@ -1,11 +1,13 @@
+#include "../../../lib/storage/wal.hpp"
+
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/utils/crc32.hpp"
+
 #include <gtest/gtest.h>
+
 #include <filesystem>
 #include <memory>
-
-#include "../../../lib/storage/wal.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/utils/crc32.hpp"
 
 namespace fs = std::filesystem;
 
@@ -46,7 +48,7 @@ TEST_F(WALTest, SequenceNumberToFilename) {
 
 TEST(CRC32Test, EmptyInput) {
     // CRC32 of empty data is 0x00000000
-    uint32_t crc = CRC32::compute(static_cast<const uint8_t *>(nullptr), 0);
+    uint32_t crc = CRC32::compute(static_cast<const uint8_t*>(nullptr), 0);
     EXPECT_EQ(crc, 0x00000000);
 }
 
@@ -95,8 +97,8 @@ TEST(CRC32Test, SingleBitFlipDetected) {
 
 TEST(CRC32Test, CharOverload) {
     // The char* overload should produce the same result as uint8_t*
-    const char *cdata = "test data";
-    const uint8_t *udata = reinterpret_cast<const uint8_t *>(cdata);
+    const char* cdata = "test data";
+    const uint8_t* udata = reinterpret_cast<const uint8_t*>(cdata);
     size_t len = 9;
 
     EXPECT_EQ(CRC32::compute(cdata, len), CRC32::compute(udata, len));

@@ -1,9 +1,10 @@
 #include "../test_helpers/aggregator_test_helper.hpp"
 #include "aggregator.hpp"
+
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <random>
-#include <iomanip>
 
 using namespace timestar;
 using namespace std::chrono;
@@ -38,8 +39,8 @@ struct BenchmarkResult {
 };
 
 // Generate realistic time series data
-std::pair<std::vector<uint64_t>, std::vector<double>>
-generateTimeSeries(uint64_t startTime, size_t numPoints, uint64_t interval) {
+std::pair<std::vector<uint64_t>, std::vector<double>> generateTimeSeries(uint64_t startTime, size_t numPoints,
+                                                                         uint64_t interval) {
     std::vector<uint64_t> timestamps;
     std::vector<double> values;
     timestamps.reserve(numPoints);
@@ -72,8 +73,7 @@ BenchmarkResult benchmarkNoGroupNoInterval() {
         series.push_back({timestamps, values});
     }
 
-    std::cout << "Generated " << series.size() << " series with "
-              << totalPoints << " total points\n";
+    std::cout << "Generated " << series.size() << " series with " << totalPoints << " total points\n";
     std::cout << "Aggregating across all series (this will be slow)...\n";
 
     // Benchmark aggregation
@@ -110,8 +110,7 @@ BenchmarkResult benchmarkWithTimeInterval() {
         series.push_back({timestamps, values});
     }
 
-    std::cout << "Generated " << series.size() << " series with "
-              << totalPoints << " total points\n";
+    std::cout << "Generated " << series.size() << " series with " << totalPoints << " total points\n";
     std::cout << "Aggregating with 1-hour buckets...\n";
 
     // Benchmark aggregation with 1-hour intervals
@@ -146,7 +145,8 @@ BenchmarkResult benchmarkSingleSeries() {
 
     // Benchmark single series aggregation
     auto start = high_resolution_clock::now();
-    auto result = timestar::test::AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, HOUR_IN_NS);
+    auto result =
+        timestar::test::AggregatorTestHelper::aggregate(timestamps, values, AggregationMethod::AVG, HOUR_IN_NS);
     auto end = high_resolution_clock::now();
 
     double durationMs = duration<double, std::milli>(end - start).count();
@@ -181,8 +181,7 @@ BenchmarkResult benchmarkWorstCase() {
         }
     }
 
-    std::cout << "Generated " << series.size() << " series with "
-              << totalPoints << " total points\n";
+    std::cout << "Generated " << series.size() << " series with " << totalPoints << " total points\n";
     std::cout << "This simulates a group-by query with all fields...\n";
     std::cout << "Aggregating (this will take a while)...\n";
 
@@ -235,15 +234,14 @@ int main() {
     std::cout << "\n" << std::string(70, '=') << "\n";
     std::cout << "PERFORMANCE SUMMARY\n";
     std::cout << std::string(70, '=') << "\n\n";
-    std::cout << std::left << std::setw(45) << "Test"
-              << std::right << std::setw(12) << "Duration (ms)"
-              << std::setw(13) << "Throughput\n";
+    std::cout << std::left << std::setw(45) << "Test" << std::right << std::setw(12) << "Duration (ms)" << std::setw(13)
+              << "Throughput\n";
     std::cout << std::string(70, '-') << "\n";
 
     for (const auto& result : results) {
-        std::cout << std::left << std::setw(45) << result.testName.substr(0, 44)
-                  << std::right << std::setw(12) << std::fixed << std::setprecision(2) << result.durationMs
-                  << std::setw(10) << static_cast<uint64_t>(result.pointsPerSecond) << " p/s\n";
+        std::cout << std::left << std::setw(45) << result.testName.substr(0, 44) << std::right << std::setw(12)
+                  << std::fixed << std::setprecision(2) << result.durationMs << std::setw(10)
+                  << static_cast<uint64_t>(result.pointsPerSecond) << " p/s\n";
     }
 
     std::cout << std::string(70, '=') << "\n";
@@ -254,8 +252,8 @@ int main() {
         double multiSeriesTime = results[1].durationMs;
         double overhead = ((multiSeriesTime / singleSeriesTime) - 1.0) * 100.0;
 
-        std::cout << "\nMulti-series overhead vs single series: "
-                  << std::fixed << std::setprecision(1) << overhead << "%\n";
+        std::cout << "\nMulti-series overhead vs single series: " << std::fixed << std::setprecision(1) << overhead
+                  << "%\n";
     }
 
     if (results.size() >= 4) {
@@ -263,8 +261,8 @@ int main() {
         double actualTime = results[3].durationMs;
         double overhead = ((actualTime / estimatedLinearTime) - 1.0) * 100.0;
 
-        std::cout << "Worst case overhead vs linear scaling: "
-                  << std::fixed << std::setprecision(1) << overhead << "%\n";
+        std::cout << "Worst case overhead vs linear scaling: " << std::fixed << std::setprecision(1) << overhead
+                  << "%\n";
         std::cout << "  (Expected: " << estimatedLinearTime << " ms, Actual: " << actualTime << " ms)\n";
     }
 

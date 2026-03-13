@@ -1,13 +1,15 @@
 // Test for WAL rollover and TSM creation
-#include <gtest/gtest.h>
-#include <iostream>
-#include <filesystem>
-#include <chrono>
-#include <seastar/core/seastar.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/sleep.hh>
 #include "../../lib/core/engine.hpp"
 #include "../../lib/core/timestar_value.hpp"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
 
 namespace fs = std::filesystem;
 
@@ -18,14 +20,13 @@ public:
         fs::create_directories("shard_0");
     }
 
-    void TearDown() override {
-        cleanupTestFiles();
-    }
+    void TearDown() override { cleanupTestFiles(); }
 
     static void cleanupTestFiles() {
         std::string shardDir = "shard_0";
 
-        if (!fs::exists(".")) return;
+        if (!fs::exists("."))
+            return;
 
         // Remove WAL and TSM files
         for (const auto& entry : fs::directory_iterator(".")) {
@@ -44,8 +45,7 @@ public:
         std::string shardDir = "shard_0";
 
         for (const auto& entry : fs::directory_iterator(".")) {
-            if (entry.path().extension() == ".tsm" &&
-                entry.path().string().find(shardDir) != std::string::npos) {
+            if (entry.path().extension() == ".tsm" && entry.path().string().find(shardDir) != std::string::npos) {
                 count++;
                 std::cout << "Found TSM: " << entry.path().filename() << std::endl;
             }
@@ -96,8 +96,7 @@ seastar::future<> testWALRolloverAndTSMCreation() {
 
         // Estimate: ~32 bytes per point (compressed)
         estimatedMB = (totalPoints * 32) / (1024 * 1024);
-        std::cout << "Batch " << (batch + 1) << "/" << BATCHES
-                 << " - Data: ~" << estimatedMB << " MB" << std::endl;
+        std::cout << "Batch " << (batch + 1) << "/" << BATCHES << " - Data: ~" << estimatedMB << " MB" << std::endl;
 
         // Give time for background processing
         co_await seastar::sleep(std::chrono::milliseconds(200));

@@ -1,5 +1,6 @@
-#include <gtest/gtest.h>
 #include "../../../lib/query/query_parser.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
@@ -14,9 +15,9 @@ TEST_F(QueryParserTest, ParseSimpleQuery) {
     std::string query = "avg:temperature()";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "02-01-2024 00:00:00";
-    
+
     QueryRequest request = QueryParser::parse(query, startTime, endTime);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::AVG);
     EXPECT_EQ(request.measurement, "temperature");
     EXPECT_TRUE(request.requestsAllFields());
@@ -27,9 +28,9 @@ TEST_F(QueryParserTest, ParseSimpleQuery) {
 // Test query with specific fields
 TEST_F(QueryParserTest, ParseQueryWithFields) {
     std::string query = "max:cpu(usage_percent,idle_percent)";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::MAX);
     EXPECT_EQ(request.measurement, "cpu");
     EXPECT_EQ(request.fields.size(), 2);
@@ -40,9 +41,9 @@ TEST_F(QueryParserTest, ParseQueryWithFields) {
 // Test query with scopes (filters)
 TEST_F(QueryParserTest, ParseQueryWithScopes) {
     std::string query = "min:temperature(value){location:us-west,sensor:temp-01}";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::MIN);
     EXPECT_EQ(request.measurement, "temperature");
     EXPECT_EQ(request.fields.size(), 1);
@@ -55,9 +56,9 @@ TEST_F(QueryParserTest, ParseQueryWithScopes) {
 // Test query with group by
 TEST_F(QueryParserTest, ParseQueryWithGroupBy) {
     std::string query = "sum:sales(amount){region:north} by {product,category}";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::SUM);
     EXPECT_EQ(request.measurement, "sales");
     EXPECT_EQ(request.fields.size(), 1);
@@ -72,9 +73,9 @@ TEST_F(QueryParserTest, ParseQueryWithGroupBy) {
 // Test latest aggregation
 TEST_F(QueryParserTest, ParseLatestQuery) {
     std::string query = "latest:system.metrics(cpu,memory){}";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::LATEST);
     EXPECT_EQ(request.measurement, "system.metrics");
     EXPECT_EQ(request.fields.size(), 2);
@@ -84,9 +85,9 @@ TEST_F(QueryParserTest, ParseLatestQuery) {
 // Test measurement with dots
 TEST_F(QueryParserTest, ParseMeasurementWithDots) {
     std::string query = "avg:soil.moisture.sensor(value){}";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.measurement, "soil.moisture.sensor");
     EXPECT_EQ(request.fields.size(), 1);
     EXPECT_EQ(request.fields[0], "value");
@@ -95,9 +96,9 @@ TEST_F(QueryParserTest, ParseMeasurementWithDots) {
 // Test whitespace handling
 TEST_F(QueryParserTest, ParseQueryWithWhitespace) {
     std::string query = "  avg : temperature ( value , humidity ) { location : us-west } by { sensor }  ";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::AVG);
     EXPECT_EQ(request.measurement, "temperature");
     EXPECT_EQ(request.fields.size(), 2);
@@ -110,9 +111,9 @@ TEST_F(QueryParserTest, ParseQueryWithWhitespace) {
 // Test time parsing
 TEST_F(QueryParserTest, ParseTimeFormat) {
     std::string timeStr = "15-03-2024 14:30:45";
-    
+
     uint64_t timestamp = QueryParser::parseTime(timeStr);
-    
+
     // Verify it's a reasonable timestamp (March 15, 2024)
     EXPECT_GT(timestamp, 1700000000000000000ULL);  // After Nov 2023
     EXPECT_LT(timestamp, 1800000000000000000ULL);  // Before 2027
@@ -123,12 +124,12 @@ TEST_F(QueryParserTest, ParseFullQueryWithTimeRange) {
     std::string query = "avg:temperature(value){location:office}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "01-01-2024 23:59:59";
-    
+
     QueryRequest request = QueryParser::parse(query, startTime, endTime);
-    
+
     EXPECT_EQ(request.measurement, "temperature");
     EXPECT_LT(request.startTime, request.endTime);
-    
+
     // Check that times are on the same day
     uint64_t timeDiff = request.endTime - request.startTime;
     uint64_t oneDayNanos = 24ULL * 60 * 60 * 1000000000;
@@ -179,16 +180,16 @@ TEST_F(QueryParserTest, ErrorOnStartTimeAfterEndTime) {
     std::string query = "avg:temperature()";
     std::string startTime = "02-01-2024 00:00:00";
     std::string endTime = "01-01-2024 00:00:00";
-    
+
     EXPECT_THROW(QueryParser::parse(query, startTime, endTime), QueryParseException);
 }
 
 // Complex query combinations
 TEST_F(QueryParserTest, ParseComplexQuery1) {
     std::string query = "avg:sensor.data(temp,humidity,pressure){building:A,floor:3} by {room,sensor_id}";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::AVG);
     EXPECT_EQ(request.measurement, "sensor.data");
     EXPECT_EQ(request.fields.size(), 3);
@@ -199,9 +200,9 @@ TEST_F(QueryParserTest, ParseComplexQuery1) {
 TEST_F(QueryParserTest, ParseComplexQuery2) {
     // Query with everything optional omitted
     std::string query = "sum:transactions(){}";
-    
+
     QueryRequest request = QueryParser::parseQueryString(query);
-    
+
     EXPECT_EQ(request.aggregation, AggregationMethod::SUM);
     EXPECT_EQ(request.measurement, "transactions");
     EXPECT_TRUE(request.requestsAllFields());

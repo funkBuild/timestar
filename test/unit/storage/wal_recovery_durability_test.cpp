@@ -1,10 +1,11 @@
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+
 #include <gtest/gtest.h>
+
 #include <memory>
 #include <vector>
-
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 // Tests documenting MemoryStore behavior relevant to WAL recovery durability.
 // These are synchronous unit tests that verify properties of MemoryStore
@@ -14,9 +15,7 @@ class WALRecoveryDurabilityTest : public ::testing::Test {
 protected:
     std::shared_ptr<MemoryStore> store;
 
-    void SetUp() override {
-        store = std::make_shared<MemoryStore>(42);
-    }
+    void SetUp() override { store = std::make_shared<MemoryStore>(42); }
 };
 
 // A freshly constructed MemoryStore has no WAL.

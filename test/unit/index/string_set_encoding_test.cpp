@@ -3,11 +3,13 @@
  * Tests the bounds checking fix in decodeStringSet
  */
 
-#include <gtest/gtest.h>
 #include "../../../lib/index/leveldb_index.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstring>
 #include <set>
 #include <string>
-#include <cstring>
 
 class StringSetEncodingTest : public ::testing::Test {
 protected:
@@ -115,12 +117,7 @@ TEST_F(StringSetEncodingTest, DecodeLargeValidDataset) {
 }
 
 TEST_F(StringSetEncodingTest, EncodeDecodeSpecialCharacters) {
-    std::set<std::string> input = {
-        "hello world",
-        "path/to/file",
-        "key=value",
-        "newline\n\ttab"
-    };
+    std::set<std::string> input = {"hello world", "path/to/file", "key=value", "newline\n\ttab"};
 
     std::string encoded = LevelDBIndex::encodeStringSet(input);
     std::set<std::string> decoded = LevelDBIndex::decodeStringSet(encoded);

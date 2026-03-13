@@ -1,12 +1,13 @@
+#include "../../lib/encoding/float_encoder.hpp"
+#include "../../lib/storage/compressed_buffer.hpp"
+#include "../../lib/utils/util.hpp"
+
 #include <benchmark/benchmark.h>
-#include <vector>
-#include <random>
 #include <immintrin.h>
 #include <x86intrin.h>
 
-#include "../../lib/utils/util.hpp"
-#include "../../lib/storage/compressed_buffer.hpp"
-#include "../../lib/encoding/float_encoder.hpp"
+#include <random>
+#include <vector>
 
 // Test data generators
 std::vector<double> generate_random_floats(size_t count, double min_val = -1000.0, double max_val = 1000.0) {
@@ -86,9 +87,10 @@ static void BM_TZB_Current_Intrinsics(benchmark::State& state) {
 BENCHMARK(BM_TZB_Current_Intrinsics);
 
 // Manual loop implementation for comparison
-template<typename T>
+template <typename T>
 inline size_t getLeadingZeroBits_Manual(T x) {
-    if (x == 0) return sizeof(x) * 8;
+    if (x == 0)
+        return sizeof(x) * 8;
 
     size_t count = 0;
     T mask = T(1) << (sizeof(T) * 8 - 1);
@@ -100,9 +102,10 @@ inline size_t getLeadingZeroBits_Manual(T x) {
     return count;
 }
 
-template<typename T>
+template <typename T>
 inline size_t getTrailingZeroBits_Manual(T x) {
-    if (x == 0) return sizeof(x) * 8;
+    if (x == 0)
+        return sizeof(x) * 8;
 
     size_t count = 0;
     while ((x & 1) == 0) {
@@ -164,7 +167,8 @@ BENCHMARK(BM_XOR_Scalar);
 static void BM_XOR_SIMD_AVX2(benchmark::State& state) {
     auto floats = generate_random_floats(10000);
     // Ensure size is multiple of 4 for SIMD
-    while (floats.size() % 4 != 1) floats.pop_back();
+    while (floats.size() % 4 != 1)
+        floats.pop_back();
 
     std::vector<uint64_t> results;
     results.resize(floats.size() - 1);
@@ -180,12 +184,10 @@ static void BM_XOR_SIMD_AVX2(benchmark::State& state) {
         size_t simd_count = (floats.size() - 1) / 4;
         for (size_t i = 0; i < simd_count; ++i) {
             __m256i current = _mm256_loadu_si256((__m256i*)(input + 1 + i * 4));
-            __m256i prev = _mm256_set_epi64x(
-                (i * 4 + 3 < floats.size() - 1) ? input[i * 4 + 3] : input[i * 4 + 2],
-                (i * 4 + 2 < floats.size() - 1) ? input[i * 4 + 2] : input[i * 4 + 1],
-                (i * 4 + 1 < floats.size() - 1) ? input[i * 4 + 1] : input[i * 4],
-                (i == 0) ? last : input[i * 4]
-            );
+            __m256i prev = _mm256_set_epi64x((i * 4 + 3 < floats.size() - 1) ? input[i * 4 + 3] : input[i * 4 + 2],
+                                             (i * 4 + 2 < floats.size() - 1) ? input[i * 4 + 2] : input[i * 4 + 1],
+                                             (i * 4 + 1 < floats.size() - 1) ? input[i * 4 + 1] : input[i * 4],
+                                             (i == 0) ? last : input[i * 4]);
 
             __m256i xor_result = _mm256_xor_si256(current, prev);
             _mm256_storeu_si256((__m256i*)(output + i * 4), xor_result);
@@ -283,11 +285,11 @@ BENCHMARK(BM_Combined_Batched);
 static void BM_CompressedBuffer_Write_Pattern(benchmark::State& state) {
     const size_t count = 1000;
     std::vector<uint64_t> test_data = {
-        0,           // 1-bit write (common case)
-        0b01,        // 2-bit write
-        0b11,        // 2-bit write
-        31,          // 5-bit write (LZB)
-        63,          // 6-bit write (data bits)
+        0,                     // 1-bit write (common case)
+        0b01,                  // 2-bit write
+        0b11,                  // 2-bit write
+        31,                    // 5-bit write (LZB)
+        63,                    // 6-bit write (data bits)
         0xFFFFFFFFFFFFFFFFULL  // 64-bit write (full value)
     };
 
@@ -392,7 +394,8 @@ BENCHMARK(BM_FloatEncoder_Compressible_Data)->Range(1000, 50000)->Complexity();
 static void BM_LZB_Unrolled(benchmark::State& state) {
     auto xor_values = generate_xor_values(10000);
     // Ensure size is multiple of 4
-    while (xor_values.size() % 4 != 0) xor_values.pop_back();
+    while (xor_values.size() % 4 != 0)
+        xor_values.pop_back();
 
     size_t sum = 0;
 
@@ -400,9 +403,9 @@ static void BM_LZB_Unrolled(benchmark::State& state) {
         for (size_t i = 0; i < xor_values.size(); i += 4) {
             // Unroll loop for 4 operations
             sum += (xor_values[i] != 0) ? getLeadingZeroBitsUnsafe(xor_values[i]) : 64;
-            sum += (xor_values[i+1] != 0) ? getLeadingZeroBitsUnsafe(xor_values[i+1]) : 64;
-            sum += (xor_values[i+2] != 0) ? getLeadingZeroBitsUnsafe(xor_values[i+2]) : 64;
-            sum += (xor_values[i+3] != 0) ? getLeadingZeroBitsUnsafe(xor_values[i+3]) : 64;
+            sum += (xor_values[i + 1] != 0) ? getLeadingZeroBitsUnsafe(xor_values[i + 1]) : 64;
+            sum += (xor_values[i + 2] != 0) ? getLeadingZeroBitsUnsafe(xor_values[i + 2]) : 64;
+            sum += (xor_values[i + 3] != 0) ? getLeadingZeroBitsUnsafe(xor_values[i + 3]) : 64;
         }
     }
     benchmark::DoNotOptimize(sum);

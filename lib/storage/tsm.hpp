@@ -40,10 +40,10 @@ typedef struct TSMIndexBlock {
     double blockMax = std::numeric_limits<double>::lowest();
     uint32_t blockCount = 0;  // 0 means stats not available
     // Extended statistics (populated in v3+ files for Float series)
-    double blockM2 = 0.0;            // Welford's M2 accumulator for STDDEV/STDVAR
-    double blockFirstValue = 0.0;    // Value at earliest timestamp (for FIRST)
-    double blockLatestValue = 0.0;   // Value at latest timestamp (for LATEST)
-    bool hasExtendedStats = false;   // true when M2/first/latest are populated
+    double blockM2 = 0.0;           // Welford's M2 accumulator for STDDEV/STDVAR
+    double blockFirstValue = 0.0;   // Value at earliest timestamp (for FIRST)
+    double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
+    bool hasExtendedStats = false;  // true when M2/first/latest are populated
 } TSMIndexBlock;
 
 // Batch of contiguous blocks for optimized I/O

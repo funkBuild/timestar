@@ -2,25 +2,22 @@
  * Minimal test to debug LevelDB index segfault
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <filesystem>
-
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexMinimalTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void SetUp() override { std::filesystem::remove_all("shard_0"); }
 
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
 SEASTAR_TEST_F(LevelDBIndexMinimalTest, OpenAndClose) {

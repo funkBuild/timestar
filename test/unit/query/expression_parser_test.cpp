@@ -1,6 +1,8 @@
-#include <gtest/gtest.h>
-#include "expression_ast.hpp"
 #include "expression_parser.hpp"
+
+#include "expression_ast.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
@@ -78,7 +80,7 @@ TEST_F(ExpressionParserTest, LexerIdentifiersWithUnderscores) {
 
 TEST_F(ExpressionParserTest, LexerInvalidCharacter) {
     ExpressionLexer lexer("a @ b");
-    lexer.nextToken(); // a
+    lexer.nextToken();  // a
 
     EXPECT_THROW(lexer.nextToken(), ExpressionParseException);
 }
@@ -719,7 +721,8 @@ TEST_F(ExpressionParserTest, FunctionArgLimit_ExactlyAtLimit_Accepted) {
     // Each argument is the scalar "1", separated by commas.
     std::string expr = "avg_of_series(";
     for (int i = 0; i < 1000; ++i) {
-        if (i > 0) expr += ",";
+        if (i > 0)
+            expr += ",";
         expr += "1";
     }
     expr += ")";
@@ -733,7 +736,8 @@ TEST_F(ExpressionParserTest, FunctionArgLimit_OneOverLimit_Throws) {
     // The parser must reject this to prevent OOM from unbounded argument lists.
     std::string expr = "avg_of_series(";
     for (int i = 0; i < 1001; ++i) {
-        if (i > 0) expr += ",";
+        if (i > 0)
+            expr += ",";
         expr += "1";
     }
     expr += ")";

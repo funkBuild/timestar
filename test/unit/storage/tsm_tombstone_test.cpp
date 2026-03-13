@@ -1,8 +1,11 @@
-#include <gtest/gtest.h>
-#include <filesystem>
 #include "../../../lib/storage/tsm_tombstone.hpp"
+
 #include "../../../lib/core/series_id.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 
 using namespace timestar;
 namespace fs = std::filesystem;
@@ -298,7 +301,7 @@ TEST_F(TSMTombstoneTest, PersistenceAndChecksums) {
         } catch (const std::exception& e) {
             // Expected behavior - corruption detected
             EXPECT_TRUE(std::string(e.what()).find("checksum") != std::string::npos ||
-                       std::string(e.what()).find("corrupt") != std::string::npos);
+                        std::string(e.what()).find("corrupt") != std::string::npos);
         }
     }
 }

@@ -10,8 +10,12 @@ namespace anomaly {
 namespace simd {
 
 // SIMD is always available via Highway runtime dispatch.
-inline bool isAvx2Available() { return true; }
-inline bool isAvx512Available() { return true; }
+inline bool isAvx2Available() {
+    return true;
+}
+inline bool isAvx512Available() {
+    return true;
+}
 
 // ==================== Vector Operations ====================
 

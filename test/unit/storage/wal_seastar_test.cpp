@@ -1,15 +1,15 @@
 // Seastar-based tests for WAL write and recovery operations
 
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/wal.hpp"
+#include "../../../lib/utils/crc32.hpp"
+
 #include <gtest/gtest.h>
+
 #include <filesystem>
 #include <fstream>
 #include <memory>
-
-#include "../../../lib/storage/wal.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/utils/crc32.hpp"
-
 #include <seastar/core/coroutine.hh>
 
 namespace fs = std::filesystem;
@@ -67,7 +67,8 @@ seastar::future<> testWALWriteAndRecoverFloat() {
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
     EXPECT_EQ(seriesData.values.size(), 3);
     EXPECT_DOUBLE_EQ(seriesData.values[0], 20.5);
@@ -110,7 +111,8 @@ seastar::future<> testWALWriteAndRecoverBoolean() {
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& seriesData = std::get<InMemorySeries<bool>>(it->second);
     EXPECT_EQ(seriesData.values.size(), 4);
     EXPECT_EQ(seriesData.values[0], true);
@@ -153,7 +155,8 @@ seastar::future<> testWALWriteAndRecoverString() {
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& seriesData = std::get<InMemorySeries<std::string>>(it->second);
     EXPECT_EQ(seriesData.values.size(), 3);
     EXPECT_EQ(seriesData.values[0], "Error: connection failed");
@@ -209,7 +212,8 @@ seastar::future<> testWALBatchInsert() {
     SeriesId128 cpuId = cpuInsert.seriesId128();
     auto cpuIt = recoveredStore->series.find(cpuId);
     EXPECT_NE(cpuIt, recoveredStore->series.end());
-    if (cpuIt == recoveredStore->series.end()) co_return;
+    if (cpuIt == recoveredStore->series.end())
+        co_return;
     auto& cpuData = std::get<InMemorySeries<double>>(cpuIt->second);
     EXPECT_EQ(cpuData.values.size(), 2);
     EXPECT_DOUBLE_EQ(cpuData.values[0], 25.5);
@@ -299,7 +303,8 @@ seastar::future<> testWALDeleteRange() {
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
     EXPECT_EQ(seriesData.values.size(), 3);
     EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);
@@ -346,7 +351,8 @@ seastar::future<> testCRC32RoundtripFloat() {
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
     EXPECT_EQ(seriesData.values.size(), 3);
     EXPECT_DOUBLE_EQ(seriesData.values[0], 42.5);
@@ -381,8 +387,7 @@ seastar::future<> testCRC32CorruptionDetection() {
         // Read the file, flip a byte in the payload area (after length + CRC = 8 bytes),
         // then write it back
         std::ifstream fin(walFile, std::ios::binary);
-        std::vector<char> contents((std::istreambuf_iterator<char>(fin)),
-                                    std::istreambuf_iterator<char>());
+        std::vector<char> contents((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
         fin.close();
 
         // Corrupt a byte well into the payload (offset 12 = past length(4) + crc(4) + a few payload bytes)
@@ -437,8 +442,7 @@ seastar::future<> testCRC32PartialCorruption() {
     {
         std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         std::ifstream fin(walFile, std::ios::binary);
-        std::vector<char> contents((std::istreambuf_iterator<char>(fin)),
-                                    std::istreambuf_iterator<char>());
+        std::vector<char> contents((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
         fin.close();
 
         // Read the first entry length to find where the second entry starts
@@ -473,7 +477,8 @@ seastar::future<> testCRC32PartialCorruption() {
     SeriesId128 seriesId1 = testInsert1.seriesId128();
     auto it1 = recoveredStore->series.find(seriesId1);
     EXPECT_NE(it1, recoveredStore->series.end());
-    if (it1 == recoveredStore->series.end()) co_return;
+    if (it1 == recoveredStore->series.end())
+        co_return;
     auto& data = std::get<InMemorySeries<double>>(it1->second);
     EXPECT_EQ(data.values.size(), 1);
     EXPECT_DOUBLE_EQ(data.values[0], 11.1);
@@ -527,7 +532,8 @@ seastar::future<> testCRC32BatchInsertRoundtrip() {
     TimeStarInsert<double> alphaInsert("batch_crc", "alpha");
     auto alphaIt = recoveredStore->series.find(alphaInsert.seriesId128());
     EXPECT_NE(alphaIt, recoveredStore->series.end());
-    if (alphaIt == recoveredStore->series.end()) co_return;
+    if (alphaIt == recoveredStore->series.end())
+        co_return;
     auto& alphaData = std::get<InMemorySeries<double>>(alphaIt->second);
     EXPECT_EQ(alphaData.values.size(), 2);
     EXPECT_DOUBLE_EQ(alphaData.values[0], 10.0);
@@ -536,7 +542,8 @@ seastar::future<> testCRC32BatchInsertRoundtrip() {
     TimeStarInsert<double> betaInsert("batch_crc", "beta");
     auto betaIt = recoveredStore->series.find(betaInsert.seriesId128());
     EXPECT_NE(betaIt, recoveredStore->series.end());
-    if (betaIt == recoveredStore->series.end()) co_return;
+    if (betaIt == recoveredStore->series.end())
+        co_return;
     auto& betaData = std::get<InMemorySeries<double>>(betaIt->second);
     EXPECT_EQ(betaData.values.size(), 2);
     EXPECT_DOUBLE_EQ(betaData.values[0], 30.0);
@@ -580,7 +587,8 @@ seastar::future<> testCRC32DeleteRangeRoundtrip() {
     SeriesId128 seriesId = testInsert.seriesId128();
     auto it = recoveredStore->series.find(seriesId);
     EXPECT_NE(it, recoveredStore->series.end());
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
     // After delete range [2000,3000], we should have values at t=1000 and t=4000
     EXPECT_EQ(seriesData.values.size(), 2);
@@ -626,8 +634,7 @@ seastar::future<> testPaddingRecoveryWithImmediateFlush() {
     }
 
     EXPECT_EQ(recoveredStore->series.size(), static_cast<size_t>(numEntries))
-        << "Expected all " << numEntries
-        << " entries to be recovered after immediate-flush padding";
+        << "Expected all " << numEntries << " entries to be recovered after immediate-flush padding";
 
     co_return;
 }
@@ -716,16 +723,16 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    EXPECT_EQ(recoveredStore->series.size(), 4u)
-        << "Expected all 4 mixed-type entries to be recovered after "
-           "immediate-flush padding";
+    EXPECT_EQ(recoveredStore->series.size(), 4u) << "Expected all 4 mixed-type entries to be recovered after "
+                                                    "immediate-flush padding";
 
     // Verify each entry
     {
         TimeStarInsert<double> ti("mixed", "temperature");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it == recoveredStore->series.end()) co_return;
+        if (it == recoveredStore->series.end())
+            co_return;
         auto& s = std::get<InMemorySeries<double>>(it->second);
         EXPECT_EQ(s.values.size(), 1u);
         EXPECT_DOUBLE_EQ(s.values[0], 23.5);
@@ -734,7 +741,8 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
         TimeStarInsert<bool> ti("mixed", "active");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it == recoveredStore->series.end()) co_return;
+        if (it == recoveredStore->series.end())
+            co_return;
         auto& s = std::get<InMemorySeries<bool>>(it->second);
         EXPECT_EQ(s.values.size(), 1u);
         EXPECT_EQ(s.values[0], true);
@@ -743,7 +751,8 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
         TimeStarInsert<std::string> ti("mixed", "status");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it == recoveredStore->series.end()) co_return;
+        if (it == recoveredStore->series.end())
+            co_return;
         auto& s = std::get<InMemorySeries<std::string>>(it->second);
         EXPECT_EQ(s.values.size(), 1u);
         EXPECT_EQ(s.values[0], "running");
@@ -752,7 +761,8 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
         TimeStarInsert<double> ti("mixed", "humidity");
         auto it = recoveredStore->series.find(ti.seriesId128());
         EXPECT_NE(it, recoveredStore->series.end());
-        if (it == recoveredStore->series.end()) co_return;
+        if (it == recoveredStore->series.end())
+            co_return;
         auto& s = std::get<InMemorySeries<double>>(it->second);
         EXPECT_EQ(s.values.size(), 1u);
         EXPECT_DOUBLE_EQ(s.values[0], 65.0);
@@ -818,7 +828,8 @@ seastar::future<> testFinalFlushAfterBufferedInserts() {
     auto it = recoveredStore->series.find(testInsert.seriesId128());
     EXPECT_NE(it, recoveredStore->series.end())
         << "Data must be recoverable after finalFlush() without immediate flush";
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& s = std::get<InMemorySeries<double>>(it->second);
     EXPECT_EQ(s.values.size(), 3u);
     EXPECT_DOUBLE_EQ(s.values[0], 1.1);
@@ -840,7 +851,7 @@ seastar::future<> testUnflushedBytesAccumulatesAcrossMultipleInserts() {
     unsigned int sequenceNumber = 301;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
-    const int N = 7; // odd number to ensure non-zero remainder mod DMA alignment
+    const int N = 7;  // odd number to ensure non-zero remainder mod DMA alignment
 
     {
         WAL wal(sequenceNumber);
@@ -911,8 +922,7 @@ seastar::future<> testUnflushedBytesAfterBatchInsert() {
         co_await reader.readAll(recoveredStore.get());
     }
 
-    EXPECT_EQ(recoveredStore->series.size(), 5u)
-        << "All 5 batch entries must be recoverable after finalFlush()";
+    EXPECT_EQ(recoveredStore->series.size(), 5u) << "All 5 batch entries must be recoverable after finalFlush()";
 
     co_return;
 }
@@ -960,7 +970,8 @@ seastar::future<> testUnflushedBytesAfterDeleteRange() {
     auto it = recoveredStore->series.find(testInsert.seriesId128());
     EXPECT_NE(it, recoveredStore->series.end())
         << "Series must be recoverable after insert + deleteRange + finalFlush()";
-    if (it == recoveredStore->series.end()) co_return;
+    if (it == recoveredStore->series.end())
+        co_return;
     auto& s = std::get<InMemorySeries<double>>(it->second);
     // t=2000 was deleted, so only t=1000 and t=3000 remain.
     EXPECT_EQ(s.values.size(), 2u);

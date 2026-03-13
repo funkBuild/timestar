@@ -10,22 +10,21 @@
 //   2. MEDIAN correctly falls back (returns nullopt from pushdown)
 //   3. Cross-shard merge of collapsed states via mergePartialAggregationsGrouped
 
-#include <gtest/gtest.h>
-#include <cmath>
-#include <filesystem>
-#include <string>
-
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/series_id.hpp"
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/block_aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
-#include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/series_id.hpp"
-
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers.hpp"
 
+#include <gtest/gtest.h>
+
+#include <cmath>
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
+#include <string>
 
 namespace fs = std::filesystem;
 
@@ -61,13 +60,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, AVG_ReturnsCorrectAverage) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::AVG);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::AVG);
 
     EXPECT_TRUE(result.has_value()) << "AVG pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_EQ(result->aggregatedState->count, 10u);
     // AVG of 10,20,...,100 = 55.0
     double avg = result->aggregatedState->getValue(timestar::AggregationMethod::AVG);
@@ -87,13 +92,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MIN_ReturnsCorrectMinimum) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MIN);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MIN);
 
     EXPECT_TRUE(result.has_value()) << "MIN pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_EQ(result->aggregatedState->count, 10u);
     double minVal = result->aggregatedState->getValue(timestar::AggregationMethod::MIN);
     EXPECT_DOUBLE_EQ(minVal, 10.0);
@@ -112,13 +123,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MAX_ReturnsCorrectMaximum) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MAX);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MAX);
 
     EXPECT_TRUE(result.has_value()) << "MAX pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_EQ(result->aggregatedState->count, 10u);
     double maxVal = result->aggregatedState->getValue(timestar::AggregationMethod::MAX);
     EXPECT_DOUBLE_EQ(maxVal, 100.0);
@@ -137,13 +154,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, COUNT_ReturnsCorrectCount) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::COUNT);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::COUNT);
 
     EXPECT_TRUE(result.has_value()) << "COUNT pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_EQ(result->aggregatedState->count, 10u);
     double count = result->aggregatedState->getValue(timestar::AggregationMethod::COUNT);
     EXPECT_DOUBLE_EQ(count, 10.0);
@@ -162,13 +185,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SUM_ReturnsCorrectSum) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SUM);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SUM);
 
     EXPECT_TRUE(result.has_value()) << "SUM pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_EQ(result->aggregatedState->count, 10u);
     // SUM of 10+20+...+100 = 550
     double sum = result->aggregatedState->getValue(timestar::AggregationMethod::SUM);
@@ -188,13 +217,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SPREAD_ReturnsCorrectSpread) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SPREAD);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SPREAD);
 
     EXPECT_TRUE(result.has_value()) << "SPREAD pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     // SPREAD = max - min = 100 - 10 = 90
     double spread = result->aggregatedState->getValue(timestar::AggregationMethod::SPREAD);
     EXPECT_DOUBLE_EQ(spread, 90.0);
@@ -213,13 +248,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDDEV_ReturnsCorrectStdDev) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDDEV);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDDEV);
 
     EXPECT_TRUE(result.has_value()) << "STDDEV pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
 
     double stddev = result->aggregatedState->getValue(timestar::AggregationMethod::STDDEV);
     // Population stddev of 10,20,...,100:
@@ -241,13 +282,19 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDVAR_ReturnsCorrectVariance) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDVAR);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDVAR);
 
     EXPECT_TRUE(result.has_value()) << "STDVAR pushdown should succeed";
-    if (!result.has_value()) { co_await engine.stop(); co_return; }
+    if (!result.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
     EXPECT_TRUE(result->aggregatedState.has_value()) << "Should produce collapsed state";
-    if (!result->aggregatedState.has_value()) { co_await engine.stop(); co_return; }
+    if (!result->aggregatedState.has_value()) {
+        co_await engine.stop();
+        co_return;
+    }
 
     double stdvar = result->aggregatedState->getValue(timestar::AggregationMethod::STDVAR);
     // Population variance of 10,20,...,100 = 825.0
@@ -267,11 +314,10 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_FallsBackToNullopt) {
     std::string seriesKey = "pushdown_test,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    auto result = co_await engine.queryAggregated(
-        seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MEDIAN);
+    auto result =
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MEDIAN);
 
-    EXPECT_FALSE(result.has_value())
-        << "MEDIAN with interval=0 should return nullopt (not streamable)";
+    EXPECT_FALSE(result.has_value()) << "MEDIAN with interval=0 should return nullopt (not streamable)";
 
     co_await engine.stop();
 }

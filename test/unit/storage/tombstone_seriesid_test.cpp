@@ -1,6 +1,7 @@
-#include <gtest/gtest.h>
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/tsm_tombstone.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 

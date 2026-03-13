@@ -1,33 +1,34 @@
-#include <iostream>
-#include <chrono>
-#include <vector>
-#include <random>
-#include <iomanip>
-#include <cmath>
-#include <algorithm>
-#include <numeric>
-#include <cstring>
-#include "../../lib/encoding/float_encoder.hpp"
-#include "../../lib/encoding/float/float_encoder_simd.hpp"
-#include "../../lib/encoding/float/float_encoder_avx512.hpp"
-#include "../../lib/encoding/float/float_decoder_simd.hpp"
 #include "../../lib/encoding/float/float_decoder_avx512.hpp"
+#include "../../lib/encoding/float/float_decoder_simd.hpp"
+#include "../../lib/encoding/float/float_encoder_avx512.hpp"
+#include "../../lib/encoding/float/float_encoder_simd.hpp"
+#include "../../lib/encoding/float_encoder.hpp"
 #include "../../lib/storage/compressed_buffer.hpp"
 #include "../../lib/storage/slice_buffer.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <vector>
 
 using namespace std::chrono;
 
 // ANSI color codes for terminal output
-#define RESET   "\033[0m"
-#define BLACK   "\033[30m"
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
+#define RESET "\033[0m"
+#define BLACK "\033[30m"
+#define RED "\033[31m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define BLUE "\033[34m"
 #define MAGENTA "\033[35m"
-#define CYAN    "\033[36m"
-#define WHITE   "\033[37m"
-#define BOLD    "\033[1m"
+#define CYAN "\033[36m"
+#define WHITE "\033[37m"
+#define BOLD "\033[1m"
 
 struct BenchmarkResult {
     std::string name;
@@ -77,7 +78,7 @@ public:
             // Daily pattern
             base += 20.0 * sin(i * 2 * M_PI / 1440);  // 1440 minutes/day
             // Hourly pattern
-            base += 10.0 * sin(i * 2 * M_PI / 60);    // 60 minutes/hour
+            base += 10.0 * sin(i * 2 * M_PI / 60);  // 60 minutes/hour
             // Noise
             base += (rand() % 100) / 50.0;
             data.push_back(base);
@@ -115,15 +116,15 @@ public:
 // Verify that decoded data matches original
 bool verifyDecoding(const std::vector<double>& original, const std::vector<double>& decoded) {
     if (original.size() != decoded.size()) {
-        std::cout << RED << "  Size mismatch! Original: " << original.size()
-                  << " vs Decoded: " << decoded.size() << RESET << std::endl;
+        std::cout << RED << "  Size mismatch! Original: " << original.size() << " vs Decoded: " << decoded.size()
+                  << RESET << std::endl;
         return false;
     }
 
     for (size_t i = 0; i < original.size(); i++) {
         if (std::memcmp(&original[i], &decoded[i], sizeof(double)) != 0) {
-            std::cout << RED << "  Value mismatch at index " << i
-                      << ": " << original[i] << " vs " << decoded[i] << RESET << std::endl;
+            std::cout << RED << "  Value mismatch at index " << i << ": " << original[i] << " vs " << decoded[i]
+                      << RESET << std::endl;
             return false;
         }
     }
@@ -158,13 +159,12 @@ void printResult(const BenchmarkResult& result) {
         color = YELLOW;
     }
 
-    std::cout << "| " << std::left << std::setw(30) << result.name
-              << " | " << std::right << std::setw(12) << std::fixed << std::setprecision(3) << result.encode_time_ms
-              << " | " << std::setw(12) << std::setprecision(3) << result.decode_time_ms
-              << " | " << std::setw(12) << std::setprecision(1) << result.decode_throughput_mbps << " MB/s"
-              << " | " << std::setw(12) << std::setprecision(2) << (result.compressed_size / 1024.0)
-              << " | " << color << std::setw(8) << std::setprecision(2) << result.speedup << "x" << RESET
-              << " | ";
+    std::cout << "| " << std::left << std::setw(30) << result.name << " | " << std::right << std::setw(12) << std::fixed
+              << std::setprecision(3) << result.encode_time_ms << " | " << std::setw(12) << std::setprecision(3)
+              << result.decode_time_ms << " | " << std::setw(12) << std::setprecision(1)
+              << result.decode_throughput_mbps << " MB/s"
+              << " | " << std::setw(12) << std::setprecision(2) << (result.compressed_size / 1024.0) << " | " << color
+              << std::setw(8) << std::setprecision(2) << result.speedup << "x" << RESET << " | ";
 
     if (!result.available) {
         std::cout << RED << std::setw(10) << "N/A" << RESET;
@@ -194,8 +194,9 @@ void printResult(const BenchmarkResult& result) {
 }
 
 void benchmarkDataset(const std::string& dataset_name, const std::vector<double>& data) {
-    std::cout << "\n" << BOLD << BLUE << "═══ Dataset: " << dataset_name
-              << " (" << data.size() << " values) ═══" << RESET << std::endl;
+    std::cout << "\n"
+              << BOLD << BLUE << "═══ Dataset: " << dataset_name << " (" << data.size() << " values) ═══" << RESET
+              << std::endl;
 
     const int warmup_runs = 3;
     const int benchmark_runs = 10;
@@ -218,18 +219,21 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
     // Warmup
     for (int i = 0; i < warmup_runs; i++) {
         std::vector<double> temp;
-        CompressedSlice slice((const uint8_t*)encoded_original.data.data(), encoded_original.data.size() * sizeof(uint64_t));
+        CompressedSlice slice((const uint8_t*)encoded_original.data.data(),
+                              encoded_original.data.size() * sizeof(uint64_t));
         FloatDecoderBasic::decode(slice, 0, data.size(), temp);
 
         if (FloatDecoderSIMD::isAvailable()) {
             std::vector<double> temp2;
-            CompressedSlice slice2((const uint8_t*)encoded_original.data.data(), encoded_original.data.size() * sizeof(uint64_t));
+            CompressedSlice slice2((const uint8_t*)encoded_original.data.data(),
+                                   encoded_original.data.size() * sizeof(uint64_t));
             FloatDecoderSIMD::decode(slice2, 0, data.size(), temp2);
         }
 
         if (FloatDecoderAVX512::isAvailable()) {
             std::vector<double> temp3;
-            CompressedSlice slice3((const uint8_t*)encoded_original.data.data(), encoded_original.data.size() * sizeof(uint64_t));
+            CompressedSlice slice3((const uint8_t*)encoded_original.data.data(),
+                                   encoded_original.data.size() * sizeof(uint64_t));
             FloatDecoderAVX512::decode(slice3, 0, data.size(), temp3);
         }
     }
@@ -253,7 +257,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         // Measure decoding time
         for (int r = 0; r < benchmark_runs; r++) {
             decoded.clear();
-            CompressedSlice slice((const uint8_t*)encoded_original.data.data(), encoded_original.data.size() * sizeof(uint64_t));
+            CompressedSlice slice((const uint8_t*)encoded_original.data.data(),
+                                  encoded_original.data.size() * sizeof(uint64_t));
 
             auto start = high_resolution_clock::now();
             FloatDecoderBasic::decode(slice, 0, data.size(), decoded);
@@ -268,16 +273,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         double avg_decode = decode_time / benchmark_runs;
         double throughput = (input_bytes / (1024.0 * 1024.0)) / (avg_decode / 1000.0);
 
-        results.push_back({
-            "Original Decoder (Baseline)",
-            avg_encode,
-            avg_decode,
-            compressed_size,
-            throughput,
-            1.0,
-            true,
-            correct
-        });
+        results.push_back(
+            {"Original Decoder (Baseline)", avg_encode, avg_decode, compressed_size, throughput, 1.0, true, correct});
     }
 
     // 2. Original decoder with prefetch hints
@@ -295,7 +292,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         for (int r = 0; r < benchmark_runs; r++) {
             decoded.clear();
             decoded.reserve(data.size());
-            CompressedSlice slice((const uint8_t*)encoded_original.data.data(), encoded_original.data.size() * sizeof(uint64_t));
+            CompressedSlice slice((const uint8_t*)encoded_original.data.data(),
+                                  encoded_original.data.size() * sizeof(uint64_t));
 
             auto start = high_resolution_clock::now();
 
@@ -316,16 +314,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         double avg_decode = decode_time / benchmark_runs;
         double throughput = (input_bytes / (1024.0 * 1024.0)) / (avg_decode / 1000.0);
 
-        results.push_back({
-            "Original + Prefetch",
-            avg_encode,
-            avg_decode,
-            compressed_size,
-            throughput,
-            results[0].decode_time_ms / avg_decode,
-            true,
-            correct
-        });
+        results.push_back({"Original + Prefetch", avg_encode, avg_decode, compressed_size, throughput,
+                           results[0].decode_time_ms / avg_decode, true, correct});
     }
 
     // 3. SIMD AVX2 Decoder
@@ -347,7 +337,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         // Measure SIMD decoding time
         for (int r = 0; r < benchmark_runs; r++) {
             decoded.clear();
-            CompressedSlice slice((const uint8_t*)encoded_simd.data.data(), encoded_simd.data.size() * sizeof(uint64_t));
+            CompressedSlice slice((const uint8_t*)encoded_simd.data.data(),
+                                  encoded_simd.data.size() * sizeof(uint64_t));
 
             auto start = high_resolution_clock::now();
             FloatDecoderSIMD::decode(slice, 0, data.size(), decoded);
@@ -362,16 +353,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         double avg_decode = decode_time / benchmark_runs;
         double throughput = (input_bytes / (1024.0 * 1024.0)) / (avg_decode / 1000.0);
 
-        results.push_back({
-            "SIMD AVX2 Decoder",
-            avg_encode,
-            avg_decode,
-            compressed_size,
-            throughput,
-            results[0].decode_time_ms / avg_decode,
-            true,
-            correct
-        });
+        results.push_back({"SIMD AVX2 Decoder", avg_encode, avg_decode, compressed_size, throughput,
+                           results[0].decode_time_ms / avg_decode, true, correct});
     } else {
         results.push_back({"SIMD AVX2 Decoder", 0, 0, 0, 0, 0, false, false});
     }
@@ -385,7 +368,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         // Measure safe decoding time (includes runtime checks)
         for (int r = 0; r < benchmark_runs; r++) {
             decoded.clear();
-            CompressedSlice slice((const uint8_t*)encoded_simd.data.data(), encoded_simd.data.size() * sizeof(uint64_t));
+            CompressedSlice slice((const uint8_t*)encoded_simd.data.data(),
+                                  encoded_simd.data.size() * sizeof(uint64_t));
 
             auto start = high_resolution_clock::now();
             FloatDecoderSIMD::decodeSafe(slice, 0, data.size(), decoded);
@@ -399,16 +383,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         double avg_decode = decode_time / benchmark_runs;
         double throughput = (input_bytes / (1024.0 * 1024.0)) / (avg_decode / 1000.0);
 
-        results.push_back({
-            "SIMD Safe (with checks)",
-            results[2].encode_time_ms,
-            avg_decode,
-            results[2].compressed_size,
-            throughput,
-            results[0].decode_time_ms / avg_decode,
-            true,
-            correct
-        });
+        results.push_back({"SIMD Safe (with checks)", results[2].encode_time_ms, avg_decode, results[2].compressed_size,
+                           throughput, results[0].decode_time_ms / avg_decode, true, correct});
     } else {
         results.push_back({"SIMD Safe", 0, 0, 0, 0, 0, false, false});
     }
@@ -432,7 +408,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         // Measure AVX-512 decoding time
         for (int r = 0; r < benchmark_runs; r++) {
             decoded.clear();
-            CompressedSlice slice((const uint8_t*)encoded_avx512.data.data(), encoded_avx512.data.size() * sizeof(uint64_t));
+            CompressedSlice slice((const uint8_t*)encoded_avx512.data.data(),
+                                  encoded_avx512.data.size() * sizeof(uint64_t));
 
             auto start = high_resolution_clock::now();
             FloatDecoderAVX512::decode(slice, 0, data.size(), decoded);
@@ -447,16 +424,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         double avg_decode = decode_time / benchmark_runs;
         double throughput = (input_bytes / (1024.0 * 1024.0)) / (avg_decode / 1000.0);
 
-        results.push_back({
-            "AVX-512 Decoder",
-            avg_encode,
-            avg_decode,
-            compressed_size,
-            throughput,
-            results[0].decode_time_ms / avg_decode,
-            true,
-            correct
-        });
+        results.push_back({"AVX-512 Decoder", avg_encode, avg_decode, compressed_size, throughput,
+                           results[0].decode_time_ms / avg_decode, true, correct});
     } else {
         results.push_back({"AVX-512 Decoder", 0, 0, 0, 0, 0, false, false});
     }
@@ -470,7 +439,8 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         // Measure safe decoding time (includes runtime checks)
         for (int r = 0; r < benchmark_runs; r++) {
             decoded.clear();
-            CompressedSlice slice((const uint8_t*)encoded_avx512.data.data(), encoded_avx512.data.size() * sizeof(uint64_t));
+            CompressedSlice slice((const uint8_t*)encoded_avx512.data.data(),
+                                  encoded_avx512.data.size() * sizeof(uint64_t));
 
             auto start = high_resolution_clock::now();
             FloatDecoderAVX512::decodeSafe(slice, 0, data.size(), decoded);
@@ -484,16 +454,9 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
         double avg_decode = decode_time / benchmark_runs;
         double throughput = (input_bytes / (1024.0 * 1024.0)) / (avg_decode / 1000.0);
 
-        results.push_back({
-            "AVX-512 Safe (with checks)",
-            results[4].encode_time_ms,
-            avg_decode,
-            results[4].compressed_size,
-            throughput,
-            results[0].decode_time_ms / avg_decode,
-            true,
-            correct
-        });
+        results.push_back({"AVX-512 Safe (with checks)", results[4].encode_time_ms, avg_decode,
+                           results[4].compressed_size, throughput, results[0].decode_time_ms / avg_decode, true,
+                           correct});
     } else {
         results.push_back({"AVX-512 Safe", 0, 0, 0, 0, 0, false, false});
     }
@@ -509,18 +472,18 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
     std::cout << "\n" << BOLD << "Summary:" << RESET << std::endl;
     std::cout << "  Input size: " << (input_bytes / 1024.0) << " KB" << std::endl;
     std::cout << "  Compressed size: " << (results[0].compressed_size / 1024.0) << " KB" << std::endl;
-    std::cout << "  Compression ratio: " << std::setprecision(2)
-              << ((double)input_bytes / results[0].compressed_size) << ":1" << std::endl;
+    std::cout << "  Compression ratio: " << std::setprecision(2) << ((double)input_bytes / results[0].compressed_size)
+              << ":1" << std::endl;
 
     // Find best decoder
-    auto best = std::max_element(results.begin(), results.end(),
-        [](const BenchmarkResult& a, const BenchmarkResult& b) {
+    auto best =
+        std::max_element(results.begin(), results.end(), [](const BenchmarkResult& a, const BenchmarkResult& b) {
             return a.available && b.available && a.correct && b.correct && a.speedup < b.speedup;
         });
 
     if (best != results.end() && best->available && best->correct) {
-        std::cout << "  Best decoder: " << GREEN << best->name
-                  << " (" << std::setprecision(2) << best->speedup << "x speedup)" << RESET << std::endl;
+        std::cout << "  Best decoder: " << GREEN << best->name << " (" << std::setprecision(2) << best->speedup
+                  << "x speedup)" << RESET << std::endl;
     }
 
     // Check for any failures
@@ -538,17 +501,17 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<double>
 }
 
 void runScalabilityTest() {
-    std::cout << "\n" << BOLD << MAGENTA << "════════════════════ DECODER SCALABILITY TEST ════════════════════" << RESET << std::endl;
+    std::cout << "\n"
+              << BOLD << MAGENTA << "════════════════════ DECODER SCALABILITY TEST ════════════════════" << RESET
+              << std::endl;
     std::cout << "Testing decoder performance across different dataset sizes" << std::endl;
 
     std::vector<size_t> sizes = {100, 1000, 10000, 100000, 1000000};
 
-    std::cout << "\n" << BOLD << std::setw(12) << "Size"
-              << std::setw(20) << "Original Decode"
-              << std::setw(20) << "AVX2 Decode"
-              << std::setw(20) << "AVX-512 Decode"
-              << std::setw(15) << "AVX2 Speedup"
-              << std::setw(18) << "AVX512 Speedup" << RESET << std::endl;
+    std::cout << "\n"
+              << BOLD << std::setw(12) << "Size" << std::setw(20) << "Original Decode" << std::setw(20) << "AVX2 Decode"
+              << std::setw(20) << "AVX-512 Decode" << std::setw(15) << "AVX2 Speedup" << std::setw(18)
+              << "AVX512 Speedup" << RESET << std::endl;
     std::cout << std::string(105, '-') << std::endl;
 
     for (size_t size : sizes) {
@@ -591,23 +554,21 @@ void runScalabilityTest() {
             avx512_speedup = original_ms / avx512_ms;
         }
 
-        std::cout << std::setw(12) << size
-                  << std::setw(20) << std::fixed << std::setprecision(3) << original_ms << " ms";
+        std::cout << std::setw(12) << size << std::setw(20) << std::fixed << std::setprecision(3) << original_ms
+                  << " ms";
 
         if (FloatDecoderSIMD::isAvailable()) {
-            std::cout << std::setw(20) << avx2_ms << " ms"
-                      << CYAN << std::setw(13) << std::setprecision(2) << avx2_speedup << "x" << RESET;
+            std::cout << std::setw(20) << avx2_ms << " ms" << CYAN << std::setw(13) << std::setprecision(2)
+                      << avx2_speedup << "x" << RESET;
         } else {
-            std::cout << std::setw(20) << "N/A"
-                      << std::setw(15) << "N/A";
+            std::cout << std::setw(20) << "N/A" << std::setw(15) << "N/A";
         }
 
         if (FloatDecoderAVX512::isAvailable()) {
             std::cout << std::setw(18) << avx512_ms << " ms";
             std::cout << GREEN << std::setw(13) << std::setprecision(2) << avx512_speedup << "x" << RESET;
         } else {
-            std::cout << std::setw(18) << "N/A"
-                      << std::setw(15) << "N/A";
+            std::cout << std::setw(18) << "N/A" << std::setw(15) << "N/A";
         }
 
         std::cout << std::endl;
@@ -615,25 +576,22 @@ void runScalabilityTest() {
 }
 
 void runCorrectnessTest() {
-    std::cout << "\n" << BOLD << YELLOW << "════════════════════ CORRECTNESS VERIFICATION ════════════════════" << RESET << std::endl;
+    std::cout << "\n"
+              << BOLD << YELLOW << "════════════════════ CORRECTNESS VERIFICATION ════════════════════" << RESET
+              << std::endl;
     std::cout << "Verifying all decoders produce identical output" << std::endl;
 
     // Test edge cases
     std::vector<std::vector<double>> test_cases = {
-        {0.0, 1.0, -1.0, 100.0, -100.0},  // Basic values
-        {1e-10, 1e10, -1e-10, -1e10},      // Extreme magnitudes
-        {M_PI, M_E, sqrt(2), sqrt(3)},     // Irrational numbers
-        {0.1, 0.2, 0.3, 0.4, 0.5},         // Decimal values
-        DatasetGenerator::generateSensorData(1000),    // Real data
+        {0.0, 1.0, -1.0, 100.0, -100.0},             // Basic values
+        {1e-10, 1e10, -1e-10, -1e10},                // Extreme magnitudes
+        {M_PI, M_E, sqrt(2), sqrt(3)},               // Irrational numbers
+        {0.1, 0.2, 0.3, 0.4, 0.5},                   // Decimal values
+        DatasetGenerator::generateSensorData(1000),  // Real data
     };
 
-    std::vector<std::string> test_names = {
-        "Basic values",
-        "Extreme magnitudes",
-        "Irrational numbers",
-        "Decimal values",
-        "Sensor data (1000 points)"
-    };
+    std::vector<std::string> test_names = {"Basic values", "Extreme magnitudes", "Irrational numbers", "Decimal values",
+                                           "Sensor data (1000 points)"};
 
     int test_num = 0;
     bool all_passed = true;
@@ -659,9 +617,11 @@ void runCorrectnessTest() {
             FloatDecoderSIMD::decode(slice2, 0, test_data.size(), decoded_simd);
 
             bool simd_correct = verifyDecoding(test_data, decoded_simd);
-            std::cout << "  SIMD AVX2 Decoder: " << (simd_correct ? GREEN "✓ PASS" : RED "✗ FAIL") << RESET << std::endl;
+            std::cout << "  SIMD AVX2 Decoder: " << (simd_correct ? GREEN "✓ PASS" : RED "✗ FAIL") << RESET
+                      << std::endl;
 
-            if (!simd_correct) all_passed = false;
+            if (!simd_correct)
+                all_passed = false;
         }
 
         // Test AVX-512 decoder if available
@@ -671,12 +631,15 @@ void runCorrectnessTest() {
             FloatDecoderAVX512::decode(slice3, 0, test_data.size(), decoded_avx512);
 
             bool avx512_correct = verifyDecoding(test_data, decoded_avx512);
-            std::cout << "  AVX-512 Decoder: " << (avx512_correct ? GREEN "✓ PASS" : RED "✗ FAIL") << RESET << std::endl;
+            std::cout << "  AVX-512 Decoder: " << (avx512_correct ? GREEN "✓ PASS" : RED "✗ FAIL") << RESET
+                      << std::endl;
 
-            if (!avx512_correct) all_passed = false;
+            if (!avx512_correct)
+                all_passed = false;
         }
 
-        if (!orig_correct) all_passed = false;
+        if (!orig_correct)
+            all_passed = false;
     }
 
     std::cout << "\n" << BOLD;
@@ -728,16 +691,20 @@ int main() {
     runScalabilityTest();
 
     // Final conclusions
-    std::cout << "\n" << BOLD << YELLOW << "═══════════════════ DECODER PERFORMANCE CONCLUSIONS ═══════════════════" << RESET << std::endl;
+    std::cout << "\n"
+              << BOLD << YELLOW << "═══════════════════ DECODER PERFORMANCE CONCLUSIONS ═══════════════════" << RESET
+              << std::endl;
     std::cout << BOLD << "\nKey Findings:" << RESET << std::endl;
     std::cout << "  1. Decoding is inherently sequential due to XOR dependencies" << std::endl;
-    std::cout << "  2. " << CYAN << "AVX2" << RESET << " provides modest speedup through better prefetching" << std::endl;
+    std::cout << "  2. " << CYAN << "AVX2" << RESET << " provides modest speedup through better prefetching"
+              << std::endl;
     std::cout << "  3. " << GREEN << "AVX-512" << RESET << " mask registers enable branchless decoding" << std::endl;
     std::cout << "  4. Prefetching provides 5-10% improvement in cache utilization" << std::endl;
     std::cout << "  5. Safe fallback versions have minimal overhead (~2-3%)" << std::endl;
 
     std::cout << BOLD << "\nRecommendations:" << RESET << std::endl;
-    std::cout << "  • Use " << GREEN << "AVX-512" << RESET << " decoder when available for best performance" << std::endl;
+    std::cout << "  • Use " << GREEN << "AVX-512" << RESET << " decoder when available for best performance"
+              << std::endl;
     std::cout << "  • Fall back to " << CYAN << "AVX2" << RESET << " decoder on older CPUs" << std::endl;
     std::cout << "  • Always verify correctness with edge cases" << std::endl;
     std::cout << "  • Consider safe versions for production use" << std::endl;

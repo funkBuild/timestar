@@ -4,16 +4,18 @@
  * This test file uses SEASTAR_TEST_F macro to test async LevelDB index operations
  */
 
-#include <gtest/gtest.h>
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <filesystem>
 
 // Need to include these after filesystem to avoid conflicts
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
 
 class LevelDBIndexAsyncTest : public ::testing::Test {
 protected:
@@ -31,7 +33,7 @@ protected:
 };
 
 SEASTAR_TEST_F(LevelDBIndexAsyncTest, BasicIndexOperations) {
-    LevelDBIndex index(0); // Use shard 999 for testing
+    LevelDBIndex index(0);  // Use shard 999 for testing
 
     co_await index.open();
 
@@ -78,7 +80,7 @@ SEASTAR_TEST_F(LevelDBIndexAsyncTest, BasicIndexOperations) {
 }
 
 SEASTAR_TEST_F(LevelDBIndexAsyncTest, SeriesIdGeneration) {
-    LevelDBIndex index(0); // Use shard 998 for this test
+    LevelDBIndex index(0);  // Use shard 998 for this test
 
     co_await index.open();
 

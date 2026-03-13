@@ -1,7 +1,8 @@
 #include <gtest/gtest.h>
-#include <string>
+
 #include <fstream>
 #include <sstream>
+#include <string>
 
 // Source-inspection tests for TSM::open() file handle cleanup.
 //
@@ -51,18 +52,22 @@ protected:
     // Extract the TSM::open() function body from source
     std::string extractOpenFunction() const {
         size_t start = sourceCode.find("TSM::open()");
-        if (start == std::string::npos) return "";
+        if (start == std::string::npos)
+            return "";
 
         // Find the opening brace of the function
         size_t braceStart = sourceCode.find('{', start);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
 
         // Find matching closing brace (simple brace counting)
         int braceCount = 1;
         size_t pos = braceStart + 1;
         while (pos < sourceCode.size() && braceCount > 0) {
-            if (sourceCode[pos] == '{') braceCount++;
-            else if (sourceCode[pos] == '}') braceCount--;
+            if (sourceCode[pos] == '{')
+                braceCount++;
+            else if (sourceCode[pos] == '}')
+                braceCount--;
             pos++;
         }
 
@@ -72,29 +77,23 @@ protected:
 
 // Verify that the source file was successfully loaded
 TEST_F(TSMOpenCleanupTest, SourceFileLoaded) {
-    ASSERT_FALSE(sourceCode.empty())
-        << "Could not load tsm.cpp source file";
-    ASSERT_NE(sourceCode.find("TSM::open()"), std::string::npos)
-        << "Source file does not contain TSM::open()";
+    ASSERT_FALSE(sourceCode.empty()) << "Could not load tsm.cpp source file";
+    ASSERT_NE(sourceCode.find("TSM::open()"), std::string::npos) << "Source file does not contain TSM::open()";
 }
 
 // Verify TSM::open() function exists and has the expected structure
 TEST_F(TSMOpenCleanupTest, OpenFunctionHasExpectedStructure) {
     std::string funcBody = extractOpenFunction();
-    ASSERT_FALSE(funcBody.empty())
-        << "Could not extract TSM::open() function body";
+    ASSERT_FALSE(funcBody.empty()) << "Could not extract TSM::open() function body";
 
     // Should contain the file open call
-    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos)
-        << "TSM::open() should call open_file_dma";
+    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos) << "TSM::open() should call open_file_dma";
 
     // Should contain readSparseIndex
-    EXPECT_NE(funcBody.find("readSparseIndex"), std::string::npos)
-        << "TSM::open() should call readSparseIndex()";
+    EXPECT_NE(funcBody.find("readSparseIndex"), std::string::npos) << "TSM::open() should call readSparseIndex()";
 
     // Should contain loadTombstones
-    EXPECT_NE(funcBody.find("loadTombstones"), std::string::npos)
-        << "TSM::open() should call loadTombstones()";
+    EXPECT_NE(funcBody.find("loadTombstones"), std::string::npos) << "TSM::open() should call loadTombstones()";
 }
 
 // Core test: TSM::open() must have a try/catch block for cleanup
@@ -109,15 +108,13 @@ TEST_F(TSMOpenCleanupTest, HasTryCatchForCleanup) {
 
     // There should be a try block after the file open
     size_t tryPos = funcBody.find("try", openPos);
-    ASSERT_NE(tryPos, std::string::npos)
-        << "BUG: TSM::open() has no try block after open_file_dma. "
-           "If readSparseIndex() or loadTombstones() throws, the file handle leaks.";
+    ASSERT_NE(tryPos, std::string::npos) << "BUG: TSM::open() has no try block after open_file_dma. "
+                                            "If readSparseIndex() or loadTombstones() throws, the file handle leaks.";
 
     // There should be a catch block
     size_t catchPos = funcBody.find("catch", tryPos);
-    ASSERT_NE(catchPos, std::string::npos)
-        << "BUG: TSM::open() has a try block but no catch block. "
-           "The file handle will leak on exception.";
+    ASSERT_NE(catchPos, std::string::npos) << "BUG: TSM::open() has a try block but no catch block. "
+                                              "The file handle will leak on exception.";
 }
 
 // Core test: On failure, the file handle must be closed.
@@ -139,8 +136,7 @@ TEST_F(TSMOpenCleanupTest, FileHandleClosedOnFailure) {
     ASSERT_NE(catchPos, std::string::npos);
 
     size_t closePos = funcBody.find("tsmFile.close()", catchPos);
-    EXPECT_NE(closePos, std::string::npos)
-        << "tsmFile.close() should appear after the catch block for cleanup";
+    EXPECT_NE(closePos, std::string::npos) << "tsmFile.close() should appear after the catch block for cleanup";
 }
 
 // Core test: The original exception must be re-thrown after cleanup.
@@ -150,18 +146,14 @@ TEST_F(TSMOpenCleanupTest, OriginalExceptionRethrown) {
     ASSERT_FALSE(funcBody.empty());
 
     // Must use exception_ptr to capture and rethrow
-    bool hasExceptionCapture =
-        funcBody.find("std::current_exception()") != std::string::npos;
-    EXPECT_TRUE(hasExceptionCapture)
-        << "BUG: TSM::open() does not capture the exception with "
-           "std::current_exception(). The caller must know that open() failed.";
+    bool hasExceptionCapture = funcBody.find("std::current_exception()") != std::string::npos;
+    EXPECT_TRUE(hasExceptionCapture) << "BUG: TSM::open() does not capture the exception with "
+                                        "std::current_exception(). The caller must know that open() failed.";
 
-    bool hasRethrow =
-        funcBody.find("std::rethrow_exception") != std::string::npos ||
-        funcBody.find("rethrow_exception") != std::string::npos;
-    EXPECT_TRUE(hasRethrow)
-        << "BUG: TSM::open() does not rethrow the captured exception. "
-           "The caller must know that open() failed.";
+    bool hasRethrow = funcBody.find("std::rethrow_exception") != std::string::npos ||
+                      funcBody.find("rethrow_exception") != std::string::npos;
+    EXPECT_TRUE(hasRethrow) << "BUG: TSM::open() does not rethrow the captured exception. "
+                               "The caller must know that open() failed.";
 }
 
 // Core test: The close() call must be guarded by its own try/catch
@@ -184,19 +176,16 @@ TEST_F(TSMOpenCleanupTest, CloseIsGuardedByNestedTryCatch) {
     std::string errorPath = funcBody.substr(mainCatchPos);
     size_t tryInErrorPath = errorPath.find("try");
     size_t closeInErrorPath = errorPath.find("tsmFile.close()");
-    ASSERT_NE(tryInErrorPath, std::string::npos)
-        << "BUG: The close() call in the error path is not wrapped "
-           "in a try block. If close() throws, the original exception "
-           "will be lost.";
+    ASSERT_NE(tryInErrorPath, std::string::npos) << "BUG: The close() call in the error path is not wrapped "
+                                                    "in a try block. If close() throws, the original exception "
+                                                    "will be lost.";
 
-    EXPECT_LT(tryInErrorPath, closeInErrorPath)
-        << "The try block should appear before tsmFile.close()";
+    EXPECT_LT(tryInErrorPath, closeInErrorPath) << "The try block should appear before tsmFile.close()";
 
     // There should also be a catch block for the close
     size_t catchInErrorPath = errorPath.find("catch", tryInErrorPath + 3);
-    ASSERT_NE(catchInErrorPath, std::string::npos)
-        << "BUG: The close() call has a try but no catch. "
-           "Close errors must be silently ignored.";
+    ASSERT_NE(catchInErrorPath, std::string::npos) << "BUG: The close() call has a try but no catch. "
+                                                      "Close errors must be silently ignored.";
 }
 
 // Verify the try block wraps readSparseIndex and loadTombstones
@@ -218,8 +207,10 @@ TEST_F(TSMOpenCleanupTest, TryBlockWrapsPostOpenOperations) {
     int braceCount = 1;
     size_t pos = tryBrace + 1;
     while (pos < funcBody.size() && braceCount > 0) {
-        if (funcBody[pos] == '{') braceCount++;
-        else if (funcBody[pos] == '}') braceCount--;
+        if (funcBody[pos] == '{')
+            braceCount++;
+        else if (funcBody[pos] == '}')
+            braceCount--;
         pos++;
     }
     std::string tryBody = funcBody.substr(tryPos, pos - tryPos);
@@ -262,15 +253,13 @@ TEST_F(TSMOpenCleanupTest, ExceptionPtrDeclaredBeforeTry) {
     ASSERT_FALSE(funcBody.empty());
 
     size_t exPtrPos = funcBody.find("exception_ptr");
-    ASSERT_NE(exPtrPos, std::string::npos)
-        << "TSM::open() should declare a std::exception_ptr variable";
+    ASSERT_NE(exPtrPos, std::string::npos) << "TSM::open() should declare a std::exception_ptr variable";
 
     size_t tryPos = funcBody.find("try {");
     ASSERT_NE(tryPos, std::string::npos);
 
-    EXPECT_LT(exPtrPos, tryPos)
-        << "The exception_ptr variable must be declared before the try block "
-           "so it can be set in the catch block and checked afterwards.";
+    EXPECT_LT(exPtrPos, tryPos) << "The exception_ptr variable must be declared before the try block "
+                                   "so it can be set in the catch block and checked afterwards.";
 }
 
 // Regression test: The normal open path should not be broken
@@ -279,12 +268,8 @@ TEST_F(TSMOpenCleanupTest, NormalPathStillCallsAllOperations) {
     ASSERT_FALSE(funcBody.empty());
 
     // All these operations should still be present in the function
-    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos)
-        << "open_file_dma should still be called";
-    EXPECT_NE(funcBody.find("tsmFile.size()"), std::string::npos)
-        << "tsmFile.size() should still be called";
-    EXPECT_NE(funcBody.find("readSparseIndex"), std::string::npos)
-        << "readSparseIndex() should still be called";
-    EXPECT_NE(funcBody.find("loadTombstones"), std::string::npos)
-        << "loadTombstones() should still be called";
+    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos) << "open_file_dma should still be called";
+    EXPECT_NE(funcBody.find("tsmFile.size()"), std::string::npos) << "tsmFile.size() should still be called";
+    EXPECT_NE(funcBody.find("readSparseIndex"), std::string::npos) << "readSparseIndex() should still be called";
+    EXPECT_NE(funcBody.find("loadTombstones"), std::string::npos) << "loadTombstones() should still be called";
 }

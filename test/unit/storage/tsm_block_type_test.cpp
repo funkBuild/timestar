@@ -1,7 +1,8 @@
-#include <gtest/gtest.h>
-#include <string>
-
 #include "../../../lib/storage/tsm.hpp"
+
+#include <gtest/gtest.h>
+
+#include <string>
 
 // Test suite for TSM block type validation logic
 class TSMBlockTypeTest : public ::testing::Test {};

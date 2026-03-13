@@ -1,10 +1,9 @@
 // Highway foreach_target re-inclusion mechanism.
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "query/simd_aggregator.cpp"
-#include "hwy/foreach_target.h"
-
 #include "simd_aggregator.hpp"
 
+#include "hwy/foreach_target.h"
 #include "hwy/highway.h"
 
 #include <algorithm>
@@ -150,8 +149,8 @@ double DotProduct(const double* a, const double* b, size_t count) {
 // SIMD-accelerated histogram bin assignment.
 // Computes bin indices in SIMD, then scatters to histogram bins in scalar
 // (scatter is inherently serial due to potential bin conflicts).
-void ComputeHistogram(const double* values, size_t count, double min_val,
-                      double scale, size_t num_bins, uint32_t* histogram) {
+void ComputeHistogram(const double* values, size_t count, double min_val, double scale, size_t num_bins,
+                      uint32_t* histogram) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
 

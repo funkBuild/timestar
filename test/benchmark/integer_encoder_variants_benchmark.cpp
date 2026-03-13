@@ -1,27 +1,27 @@
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <random>
-#include <iomanip>
-#include <algorithm>
-#include <cstring>
-
-#include "../../lib/encoding/integer_encoder.hpp"
 #include "../../lib/encoding/integer/integer_encoder.hpp"
-#include "../../lib/encoding/integer/integer_encoder_simd.hpp"
 #include "../../lib/encoding/integer/integer_encoder_avx512.hpp"
+#include "../../lib/encoding/integer/integer_encoder_simd.hpp"
+#include "../../lib/encoding/integer_encoder.hpp"
 #include "../../lib/storage/aligned_buffer.hpp"
 #include "../../lib/storage/slice_buffer.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <vector>
+
 // ANSI color codes
-#define RESET   "\033[0m"
-#define BOLD    "\033[1m"
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
+#define RESET "\033[0m"
+#define BOLD "\033[1m"
+#define RED "\033[31m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define BLUE "\033[34m"
 #define MAGENTA "\033[35m"
-#define CYAN    "\033[36m"
+#define CYAN "\033[36m"
 
 struct BenchmarkResult {
     std::string implementation;
@@ -36,7 +36,8 @@ struct BenchmarkResult {
 };
 
 // Generate test datasets
-std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start = 1000000000000ULL, uint64_t interval = 1000) {
+std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start = 1000000000000ULL,
+                                                  uint64_t interval = 1000) {
     std::vector<uint64_t> data;
     data.reserve(count);
     uint64_t current = start;
@@ -47,7 +48,8 @@ std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start =
     return data;
 }
 
-std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 1000000000000ULL, uint64_t interval = 1000, uint64_t jitter = 100) {
+std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 1000000000000ULL,
+                                                 uint64_t interval = 1000, uint64_t jitter = 100) {
     std::vector<uint64_t> data;
     data.reserve(count);
     std::random_device rd;
@@ -57,7 +59,7 @@ std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 
     uint64_t current = start;
     for (size_t i = 0; i < count; i++) {
         data.push_back(current);
-        current += interval + dist(gen) - jitter/2;
+        current += interval + dist(gen) - jitter / 2;
     }
     return data;
 }
@@ -130,8 +132,10 @@ void compareAllVariants(const std::string& dataset_name, const std::vector<uint6
         auto decode_end = std::chrono::high_resolution_clock::now();
 
         // Calculate times
-        result.encode_time_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
-        result.decode_time_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
+        result.encode_time_ms =
+            std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
+        result.decode_time_ms =
+            std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
 
         // Verify correctness
         result.correct = (decoded == data);
@@ -181,8 +185,10 @@ void compareAllVariants(const std::string& dataset_name, const std::vector<uint6
             auto decode_end = std::chrono::high_resolution_clock::now();
 
             // Calculate times
-            result.encode_time_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
-            result.decode_time_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
+            result.encode_time_ms =
+                std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
+            result.decode_time_ms =
+                std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
 
             // Verify correctness
             result.correct = (decoded == data);
@@ -233,8 +239,10 @@ void compareAllVariants(const std::string& dataset_name, const std::vector<uint6
             auto decode_end = std::chrono::high_resolution_clock::now();
 
             // Calculate times
-            result.encode_time_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
-            result.decode_time_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
+            result.encode_time_ms =
+                std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
+            result.decode_time_ms =
+                std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
 
             // Verify correctness
             result.correct = (decoded == data);
@@ -287,8 +295,10 @@ void compareAllVariants(const std::string& dataset_name, const std::vector<uint6
         auto decode_end = std::chrono::high_resolution_clock::now();
 
         // Calculate times
-        result.encode_time_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
-        result.decode_time_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
+        result.encode_time_ms =
+            std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
+        result.decode_time_ms =
+            std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
 
         // Verify correctness
         result.correct = (decoded == data);
@@ -306,14 +316,9 @@ void compareAllVariants(const std::string& dataset_name, const std::vector<uint6
 
     // Print results table
     std::cout << BOLD;
-    std::cout << std::setw(25) << std::left << "Implementation"
-              << std::setw(12) << std::right << "Encode(ms)"
-              << std::setw(12) << "Decode(ms)"
-              << std::setw(15) << "Enc MB/s"
-              << std::setw(15) << "Dec MB/s"
-              << std::setw(12) << "Enc Speedup"
-              << std::setw(12) << "Dec Speedup"
-              << std::setw(12) << "Status" << "\n";
+    std::cout << std::setw(25) << std::left << "Implementation" << std::setw(12) << std::right << "Encode(ms)"
+              << std::setw(12) << "Decode(ms)" << std::setw(15) << "Enc MB/s" << std::setw(15) << "Dec MB/s"
+              << std::setw(12) << "Enc Speedup" << std::setw(12) << "Dec Speedup" << std::setw(12) << "Status" << "\n";
     std::cout << std::string(118, '-') << "\n" << RESET;
 
     for (const auto& result : results) {
@@ -354,7 +359,8 @@ void compareAllVariants(const std::string& dataset_name, const std::vector<uint6
 }
 
 void testForceImplementation() {
-    std::cout << BOLD << YELLOW << "\n═══════════════════ TESTING FORCED IMPLEMENTATIONS ═══════════════════\n" << RESET;
+    std::cout << BOLD << YELLOW << "\n═══════════════════ TESTING FORCED IMPLEMENTATIONS ═══════════════════\n"
+              << RESET;
 
     auto data = generateMonotonicTimestamps(10000);
 
@@ -390,8 +396,10 @@ int main() {
 
     // Check CPU features
     std::cout << BOLD << "\nCPU Features:\n" << RESET;
-    std::cout << "  AVX2:    " << (IntegerEncoder::hasAVX2() ? GREEN "✓ Available" : RED "✗ Not Available") << RESET << "\n";
-    std::cout << "  AVX-512: " << (IntegerEncoder::hasAVX512() ? GREEN "✓ Available" : RED "✗ Not Available") << RESET << "\n";
+    std::cout << "  AVX2:    " << (IntegerEncoder::hasAVX2() ? GREEN "✓ Available" : RED "✗ Not Available") << RESET
+              << "\n";
+    std::cout << "  AVX-512: " << (IntegerEncoder::hasAVX512() ? GREEN "✓ Available" : RED "✗ Not Available") << RESET
+              << "\n";
 
     // Test different datasets
     compareAllVariants("Monotonic Timestamps (10K)", generateMonotonicTimestamps(10000));

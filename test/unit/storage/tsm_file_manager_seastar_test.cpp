@@ -1,20 +1,20 @@
 // Seastar-based tests for TSMFileManager component
 
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/tsm.hpp"
+#include "../../../lib/storage/tsm_file_manager.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
+
 #include <gtest/gtest.h>
+
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <vector>
-
-#include "../../../lib/storage/tsm_file_manager.hpp"
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
-
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -31,15 +31,11 @@ public:
         fs::create_directories(tsmDir);
     }
 
-    void TearDown() override {
-        fs::remove_all(shardDir);
-    }
+    void TearDown() override { fs::remove_all(shardDir); }
 
     // Helper to create a TSM file with float data on disk
-    void createTestTSMFile(const std::string& filename,
-                           const std::string& seriesKey,
-                           const std::vector<uint64_t>& timestamps,
-                           const std::vector<double>& values) {
+    void createTestTSMFile(const std::string& filename, const std::string& seriesKey,
+                           const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
         std::string path = tsmDir + "/" + filename;
         TSMWriter writer(path);
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -49,10 +45,8 @@ public:
     }
 
     // Helper to create a TSM file with boolean data on disk
-    void createTestTSMFileBool(const std::string& filename,
-                               const std::string& seriesKey,
-                               const std::vector<uint64_t>& timestamps,
-                               const std::vector<bool>& values) {
+    void createTestTSMFileBool(const std::string& filename, const std::string& seriesKey,
+                               const std::vector<uint64_t>& timestamps, const std::vector<bool>& values) {
         std::string path = tsmDir + "/" + filename;
         TSMWriter writer(path);
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -84,10 +78,8 @@ TEST_F(TSMFileManagerSeastarTest, InitEmpty) {
 // ---------------------------------------------------------------------------
 seastar::future<> testFMInitDiscoversExistingFiles(TSMFileManagerSeastarTest* self) {
     // Create some TSM files before init
-    self->createTestTSMFile("0_1.tsm", "cpu.usage",
-                            {1000, 2000, 3000}, {10.0, 20.0, 30.0});
-    self->createTestTSMFile("0_2.tsm", "mem.usage",
-                            {1000, 2000}, {65.0, 70.0});
+    self->createTestTSMFile("0_1.tsm", "cpu.usage", {1000, 2000, 3000}, {10.0, 20.0, 30.0});
+    self->createTestTSMFile("0_2.tsm", "mem.usage", {1000, 2000}, {65.0, 70.0});
 
     TSMFileManager mgr;
     co_await mgr.init();
@@ -106,10 +98,8 @@ TEST_F(TSMFileManagerSeastarTest, InitDiscoversExistingFiles) {
 // ---------------------------------------------------------------------------
 seastar::future<> testFMSequenceNumberTracking(TSMFileManagerSeastarTest* self) {
     // Create files with seq 3 and seq 7
-    self->createTestTSMFile("0_3.tsm", "cpu.usage",
-                            {1000, 2000}, {10.0, 20.0});
-    self->createTestTSMFile("0_7.tsm", "mem.usage",
-                            {1000, 2000}, {65.0, 70.0});
+    self->createTestTSMFile("0_3.tsm", "cpu.usage", {1000, 2000}, {10.0, 20.0});
+    self->createTestTSMFile("0_7.tsm", "mem.usage", {1000, 2000}, {65.0, 70.0});
 
     TSMFileManager mgr;
     co_await mgr.init();
@@ -147,14 +137,10 @@ TEST_F(TSMFileManagerSeastarTest, SequenceNumberTracking) {
 // ---------------------------------------------------------------------------
 seastar::future<> testFMTierBasedTracking(TSMFileManagerSeastarTest* self) {
     // Create files in different tiers
-    self->createTestTSMFile("0_1.tsm", "series.a",
-                            {1000, 2000}, {1.0, 2.0});
-    self->createTestTSMFile("0_2.tsm", "series.b",
-                            {1000, 2000}, {3.0, 4.0});
-    self->createTestTSMFile("1_3.tsm", "series.c",
-                            {1000, 2000}, {5.0, 6.0});
-    self->createTestTSMFile("2_4.tsm", "series.d",
-                            {1000, 2000}, {7.0, 8.0});
+    self->createTestTSMFile("0_1.tsm", "series.a", {1000, 2000}, {1.0, 2.0});
+    self->createTestTSMFile("0_2.tsm", "series.b", {1000, 2000}, {3.0, 4.0});
+    self->createTestTSMFile("1_3.tsm", "series.c", {1000, 2000}, {5.0, 6.0});
+    self->createTestTSMFile("2_4.tsm", "series.d", {1000, 2000}, {7.0, 8.0});
 
     TSMFileManager mgr;
     co_await mgr.init();
@@ -174,12 +160,9 @@ TEST_F(TSMFileManagerSeastarTest, TierBasedTracking) {
 // Test: getFilesInTier returns correct files
 // ---------------------------------------------------------------------------
 seastar::future<> testFMGetFilesInTier(TSMFileManagerSeastarTest* self) {
-    self->createTestTSMFile("0_1.tsm", "series.a",
-                            {1000, 2000}, {1.0, 2.0});
-    self->createTestTSMFile("0_2.tsm", "series.b",
-                            {1000, 2000}, {3.0, 4.0});
-    self->createTestTSMFile("1_3.tsm", "series.c",
-                            {1000, 2000}, {5.0, 6.0});
+    self->createTestTSMFile("0_1.tsm", "series.a", {1000, 2000}, {1.0, 2.0});
+    self->createTestTSMFile("0_2.tsm", "series.b", {1000, 2000}, {3.0, 4.0});
+    self->createTestTSMFile("1_3.tsm", "series.c", {1000, 2000}, {5.0, 6.0});
 
     TSMFileManager mgr;
     co_await mgr.init();
@@ -233,8 +216,7 @@ seastar::future<> testFMAddTSMFile(TSMFileManagerSeastarTest* self) {
     EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
 
     // Create a TSM file and add it via addTSMFile
-    self->createTestTSMFile("1_10.tsm", "added.series",
-                            {1000, 2000, 3000}, {10.0, 20.0, 30.0});
+    self->createTestTSMFile("1_10.tsm", "added.series", {1000, 2000, 3000}, {10.0, 20.0, 30.0});
 
     std::string absPath = fs::canonical(fs::absolute(self->tsmDir + "/1_10.tsm")).string();
     auto tsmFile = seastar::make_shared<TSM>(absPath);
@@ -274,7 +256,7 @@ seastar::future<> testFMRemoveTSMFiles(TSMFileManagerSeastarTest* self) {
 
     // Remove one file
     auto tier0Files = mgr.getFilesInTier(0);
-    std::vector<seastar::shared_ptr<TSM>> toRemove = { tier0Files[0] };
+    std::vector<seastar::shared_ptr<TSM>> toRemove = {tier0Files[0]};
     co_await mgr.removeTSMFiles(toRemove);
 
     EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 2);
@@ -296,11 +278,12 @@ seastar::future<> testFMRemoveDeletesFiles(TSMFileManagerSeastarTest* self) {
 
     auto tier0Files = mgr.getFilesInTier(0);
     EXPECT_EQ(tier0Files.size(), 1);
-    if (tier0Files.size() != 1) co_return;
+    if (tier0Files.size() != 1)
+        co_return;
 
     auto fileToRemove = tier0Files[0];
 
-    co_await mgr.removeTSMFiles({ fileToRemove });
+    co_await mgr.removeTSMFiles({fileToRemove});
 
     // After removeTSMFiles, the physical file should be deleted from disk
     EXPECT_FALSE(fs::exists("shard_0/tsm/0_1.tsm"));
@@ -410,10 +393,8 @@ TEST_F(TSMFileManagerSeastarTest, MultipleWriteMemstoreSequence) {
 // Test: getSeriesType looks up series across multiple TSM files
 // ---------------------------------------------------------------------------
 seastar::future<> testFMGetSeriesType(TSMFileManagerSeastarTest* self) {
-    self->createTestTSMFile("0_1.tsm", "cpu.usage",
-                            {1000, 2000}, {10.0, 20.0});
-    self->createTestTSMFileBool("0_2.tsm", "door.open",
-                                {1000, 2000}, {true, false});
+    self->createTestTSMFile("0_1.tsm", "cpu.usage", {1000, 2000}, {10.0, 20.0});
+    self->createTestTSMFileBool("0_2.tsm", "door.open", {1000, 2000}, {true, false});
 
     TSMFileManager mgr;
     co_await mgr.init();
@@ -458,8 +439,7 @@ TEST_F(TSMFileManagerSeastarTest, GetFileCountInTierOutOfRange) {
 // ---------------------------------------------------------------------------
 seastar::future<> testFMInitIgnoresNonTSMFiles(TSMFileManagerSeastarTest* self) {
     // Create a valid TSM file
-    self->createTestTSMFile("0_1.tsm", "valid.series",
-                            {1000, 2000}, {1.0, 2.0});
+    self->createTestTSMFile("0_1.tsm", "valid.series", {1000, 2000}, {1.0, 2.0});
 
     // Create some non-TSM files that should be ignored
     {
@@ -487,8 +467,7 @@ TEST_F(TSMFileManagerSeastarTest, InitIgnoresNonTSMFiles) {
 // ---------------------------------------------------------------------------
 seastar::future<> testFMInitHandlesCorruptedFile(TSMFileManagerSeastarTest* self) {
     // Create a valid TSM file
-    self->createTestTSMFile("0_1.tsm", "valid.series",
-                            {1000, 2000}, {1.0, 2.0});
+    self->createTestTSMFile("0_1.tsm", "valid.series", {1000, 2000}, {1.0, 2.0});
 
     // Create a file with a valid .tsm extension but invalid content
     {
@@ -516,8 +495,7 @@ seastar::future<> testFMAddTSMFileUpdatesSequenceNumber(TSMFileManagerSeastarTes
     co_await mgr.init();
 
     // Create and add a file with a high sequence number
-    self->createTestTSMFile("0_50.tsm", "series.high",
-                            {1000}, {1.0});
+    self->createTestTSMFile("0_50.tsm", "series.high", {1000}, {1.0});
 
     std::string absPath = fs::canonical(fs::absolute(self->tsmDir + "/0_50.tsm")).string();
     auto tsmFile = seastar::make_shared<TSM>(absPath);
@@ -632,7 +610,7 @@ seastar::future<> testFMAddAndRemoveInterleaved() {
 
     // Remove the first file
     auto files = mgr.getFilesInTier(0);
-    co_await mgr.removeTSMFiles({ files[0] });
+    co_await mgr.removeTSMFiles({files[0]});
 
     EXPECT_EQ(mgr.getFileCountInTier(0), 2);
 
@@ -662,7 +640,8 @@ seastar::future<> testFMRemoveDeletesDirectly(TSMFileManagerSeastarTest* self) {
 
     auto files = mgr.getFilesInTier(0);
     EXPECT_EQ(files.size(), 1);
-    if (files.size() != 1) co_return;
+    if (files.size() != 1)
+        co_return;
 
     // Verify file exists before removal
     EXPECT_TRUE(fs::exists("shard_0/tsm/0_1.tsm"));

@@ -1,9 +1,10 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-
 #include "../../../lib/index/leveldb_index.hpp"
+
 #include "../../../lib/core/timestar_value.hpp"
 
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 
 class LevelDBIndexTest : public ::testing::Test {
@@ -20,7 +21,7 @@ protected:
 };
 
 seastar::future<> runIndexTest() {
-    LevelDBIndex index(0); // Use shard 0 for testing
+    LevelDBIndex index(0);  // Use shard 0 for testing
 
     co_await index.open();
 
@@ -73,7 +74,6 @@ seastar::future<> runIndexTest() {
     EXPECT_TRUE(locationValues.count("us-west") > 0);
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, BasicIndexOperations) {
@@ -82,7 +82,7 @@ TEST_F(LevelDBIndexTest, BasicIndexOperations) {
 
 // Additional integration tests for series ID generation
 seastar::future<> testSeriesIdGeneration() {
-    LevelDBIndex index(0); // Use shard 0 for this test
+    LevelDBIndex index(0);  // Use shard 0 for this test
 
     co_await index.open();
 
@@ -128,7 +128,6 @@ seastar::future<> testSeriesIdGeneration() {
     EXPECT_EQ(id4, id4_check);
 
     co_await index2.close();
-
 }
 
 TEST_F(LevelDBIndexTest, SeriesIdGeneration) {
@@ -137,24 +136,18 @@ TEST_F(LevelDBIndexTest, SeriesIdGeneration) {
 
 // Test metadata indexing
 seastar::future<> testMetadataIndexing() {
-    LevelDBIndex index(0); // Use shard 0 for this test
+    LevelDBIndex index(0);  // Use shard 0 for this test
 
     co_await index.open();
 
     // Create multiple series with various combinations
-    co_await index.getOrCreateSeriesId("temperature",
-        {{"location", "us-west"}, {"sensor", "temp-01"}}, "value");
-    co_await index.getOrCreateSeriesId("temperature",
-        {{"location", "us-west"}, {"sensor", "temp-02"}}, "value");
-    co_await index.getOrCreateSeriesId("temperature",
-        {{"location", "us-east"}, {"sensor", "temp-01"}}, "value");
-    co_await index.getOrCreateSeriesId("temperature",
-        {{"location", "us-east"}, {"sensor", "temp-01"}}, "humidity");
+    co_await index.getOrCreateSeriesId("temperature", {{"location", "us-west"}, {"sensor", "temp-01"}}, "value");
+    co_await index.getOrCreateSeriesId("temperature", {{"location", "us-west"}, {"sensor", "temp-02"}}, "value");
+    co_await index.getOrCreateSeriesId("temperature", {{"location", "us-east"}, {"sensor", "temp-01"}}, "value");
+    co_await index.getOrCreateSeriesId("temperature", {{"location", "us-east"}, {"sensor", "temp-01"}}, "humidity");
 
-    co_await index.getOrCreateSeriesId("pressure",
-        {{"location", "us-west"}, {"sensor", "press-01"}}, "value");
-    co_await index.getOrCreateSeriesId("pressure",
-        {{"location", "us-central"}}, "value");
+    co_await index.getOrCreateSeriesId("pressure", {{"location", "us-west"}, {"sensor", "press-01"}}, "value");
+    co_await index.getOrCreateSeriesId("pressure", {{"location", "us-central"}}, "value");
 
     // Test field indexing
     auto tempFields = co_await index.getFields("temperature");
@@ -194,7 +187,6 @@ seastar::future<> testMetadataIndexing() {
     EXPECT_TRUE(pressureLocations.count("us-central") > 0);
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, MetadataIndexing) {
@@ -208,14 +200,10 @@ seastar::future<> testFindSeries() {
     co_await index.open();
 
     // Create multiple series with different tag combinations
-    auto id1 = co_await index.getOrCreateSeriesId("cpu",
-        {{"host", "server-01"}, {"datacenter", "dc1"}}, "usage");
-    auto id2 = co_await index.getOrCreateSeriesId("cpu",
-        {{"host", "server-02"}, {"datacenter", "dc1"}}, "usage");
-    auto id3 = co_await index.getOrCreateSeriesId("cpu",
-        {{"host", "server-01"}, {"datacenter", "dc2"}}, "usage");
-    auto id4 = co_await index.getOrCreateSeriesId("memory",
-        {{"host", "server-01"}, {"datacenter", "dc1"}}, "usage");
+    auto id1 = co_await index.getOrCreateSeriesId("cpu", {{"host", "server-01"}, {"datacenter", "dc1"}}, "usage");
+    auto id2 = co_await index.getOrCreateSeriesId("cpu", {{"host", "server-02"}, {"datacenter", "dc1"}}, "usage");
+    auto id3 = co_await index.getOrCreateSeriesId("cpu", {{"host", "server-01"}, {"datacenter", "dc2"}}, "usage");
+    auto id4 = co_await index.getOrCreateSeriesId("memory", {{"host", "server-01"}, {"datacenter", "dc1"}}, "usage");
 
     // Test 1: Find all series for a measurement (no filters)
     auto allCpuSeries = (co_await index.findSeries("cpu")).value();
@@ -226,8 +214,7 @@ seastar::future<> testFindSeries() {
     EXPECT_EQ(dc1Series.size(), 2);
 
     // Test 3: Find series with multiple tag filters
-    auto server01Dc1 = (co_await index.findSeries("cpu",
-        {{"host", "server-01"}, {"datacenter", "dc1"}})).value();
+    auto server01Dc1 = (co_await index.findSeries("cpu", {{"host", "server-01"}, {"datacenter", "dc1"}})).value();
     EXPECT_EQ(server01Dc1.size(), 1);
     EXPECT_EQ(server01Dc1[0], id1);
 
@@ -241,7 +228,6 @@ seastar::future<> testFindSeries() {
     EXPECT_EQ(memSeries[0], id4);
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, FindSeries) {
@@ -255,12 +241,10 @@ seastar::future<> testFindSeriesByTag() {
     co_await index.open();
 
     // Create series with various tags
-    auto id1 = co_await index.getOrCreateSeriesId("requests",
-        {{"endpoint", "/api/users"}, {"method", "GET"}}, "count");
-    auto id2 = co_await index.getOrCreateSeriesId("requests",
-        {{"endpoint", "/api/posts"}, {"method", "GET"}}, "count");
-    auto id3 = co_await index.getOrCreateSeriesId("requests",
-        {{"endpoint", "/api/users"}, {"method", "POST"}}, "count");
+    auto id1 = co_await index.getOrCreateSeriesId("requests", {{"endpoint", "/api/users"}, {"method", "GET"}}, "count");
+    auto id2 = co_await index.getOrCreateSeriesId("requests", {{"endpoint", "/api/posts"}, {"method", "GET"}}, "count");
+    auto id3 =
+        co_await index.getOrCreateSeriesId("requests", {{"endpoint", "/api/users"}, {"method", "POST"}}, "count");
 
     // Test 1: Find by method=GET
     auto getSeries = co_await index.findSeriesByTag("requests", "method", "GET");
@@ -280,7 +264,6 @@ seastar::future<> testFindSeriesByTag() {
     EXPECT_EQ(noResults.size(), 0);
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, FindSeriesByTag) {
@@ -294,16 +277,11 @@ seastar::future<> testGetSeriesGroupedByTag() {
     co_await index.open();
 
     // Create series across multiple regions and hosts
-    auto id1 = co_await index.getOrCreateSeriesId("disk",
-        {{"region", "us-west"}, {"host", "web-01"}}, "usage");
-    auto id2 = co_await index.getOrCreateSeriesId("disk",
-        {{"region", "us-west"}, {"host", "web-02"}}, "usage");
-    auto id3 = co_await index.getOrCreateSeriesId("disk",
-        {{"region", "us-east"}, {"host", "web-03"}}, "usage");
-    auto id4 = co_await index.getOrCreateSeriesId("disk",
-        {{"region", "us-east"}, {"host", "web-04"}}, "usage");
-    auto id5 = co_await index.getOrCreateSeriesId("disk",
-        {{"region", "eu-west"}, {"host", "web-05"}}, "usage");
+    auto id1 = co_await index.getOrCreateSeriesId("disk", {{"region", "us-west"}, {"host", "web-01"}}, "usage");
+    auto id2 = co_await index.getOrCreateSeriesId("disk", {{"region", "us-west"}, {"host", "web-02"}}, "usage");
+    auto id3 = co_await index.getOrCreateSeriesId("disk", {{"region", "us-east"}, {"host", "web-03"}}, "usage");
+    auto id4 = co_await index.getOrCreateSeriesId("disk", {{"region", "us-east"}, {"host", "web-04"}}, "usage");
+    auto id5 = co_await index.getOrCreateSeriesId("disk", {{"region", "eu-west"}, {"host", "web-05"}}, "usage");
 
     // Test 1: Group by region
     auto byRegion = co_await index.getSeriesGroupedByTag("disk", "region");
@@ -313,10 +291,8 @@ seastar::future<> testGetSeriesGroupedByTag() {
     EXPECT_EQ(byRegion["eu-west"].size(), 1);
 
     // Verify correct series in each group
-    EXPECT_TRUE(std::find(byRegion["us-west"].begin(), byRegion["us-west"].end(), id1)
-                != byRegion["us-west"].end());
-    EXPECT_TRUE(std::find(byRegion["us-west"].begin(), byRegion["us-west"].end(), id2)
-                != byRegion["us-west"].end());
+    EXPECT_TRUE(std::find(byRegion["us-west"].begin(), byRegion["us-west"].end(), id1) != byRegion["us-west"].end());
+    EXPECT_TRUE(std::find(byRegion["us-west"].begin(), byRegion["us-west"].end(), id2) != byRegion["us-west"].end());
 
     // Test 2: Group by host (each host should have 1 series)
     auto byHost = co_await index.getSeriesGroupedByTag("disk", "host");
@@ -329,7 +305,6 @@ seastar::future<> testGetSeriesGroupedByTag() {
     EXPECT_EQ(byNonExistent.size(), 0);
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, GetSeriesGroupedByTag) {
@@ -366,7 +341,6 @@ seastar::future<> testFieldTypes() {
     EXPECT_EQ(unknownType, "");
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, FieldTypes) {
@@ -380,26 +354,24 @@ seastar::future<> testFieldStatistics() {
     co_await index.open();
 
     // Create series and track statistics
-    auto seriesId1 = co_await index.getOrCreateSeriesId("temperature",
-        {{"location", "us-west"}}, "value");
-    auto seriesId2 = co_await index.getOrCreateSeriesId("temperature",
-        {{"location", "us-east"}}, "value");
+    auto seriesId1 = co_await index.getOrCreateSeriesId("temperature", {{"location", "us-west"}}, "value");
+    auto seriesId2 = co_await index.getOrCreateSeriesId("temperature", {{"location", "us-east"}}, "value");
 
     // Update field stats for first series
     LevelDBIndex::FieldStats stats1{
-        "float",           // dataType
-        1000000000,        // minTime
-        2000000000,        // maxTime
-        1000               // pointCount
+        "float",     // dataType
+        1000000000,  // minTime
+        2000000000,  // maxTime
+        1000         // pointCount
     };
     co_await index.updateFieldStats(seriesId1, "value", stats1);
 
     // Update field stats for second series
     LevelDBIndex::FieldStats stats2{
-        "float",           // dataType
-        1500000000,        // minTime
-        2500000000,        // maxTime
-        500                // pointCount
+        "float",     // dataType
+        1500000000,  // minTime
+        2500000000,  // maxTime
+        500          // pointCount
     };
     co_await index.updateFieldStats(seriesId2, "value", stats2);
 
@@ -425,7 +397,6 @@ seastar::future<> testFieldStatistics() {
     EXPECT_FALSE(noStats.has_value());
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, FieldStatistics) {
@@ -440,10 +411,7 @@ seastar::future<> testSeriesMetadata() {
 
     // Create series and retrieve metadata
     std::map<std::string, std::string> tags1 = {
-        {"host", "web-server-01"},
-        {"region", "us-west-2"},
-        {"environment", "production"}
-    };
+        {"host", "web-server-01"}, {"region", "us-west-2"}, {"environment", "production"}};
 
     auto seriesId1 = co_await index.getOrCreateSeriesId("http_requests", tags1, "count");
 
@@ -460,9 +428,7 @@ seastar::future<> testSeriesMetadata() {
     }
 
     // Create another series
-    std::map<std::string, std::string> tags2 = {
-        {"sensor", "temp-01"}
-    };
+    std::map<std::string, std::string> tags2 = {{"sensor", "temp-01"}};
 
     auto seriesId2 = co_await index.getOrCreateSeriesId("temperature", tags2, "celsius");
 
@@ -481,7 +447,6 @@ seastar::future<> testSeriesMetadata() {
     EXPECT_FALSE(noMetadata.has_value());
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, SeriesMetadata) {
@@ -512,7 +477,6 @@ seastar::future<> testGetAllMeasurements() {
     EXPECT_TRUE(measurements.count("network") > 0);
 
     co_await index.close();
-
 }
 
 TEST_F(LevelDBIndexTest, GetAllMeasurements) {
@@ -526,8 +490,7 @@ seastar::future<> testOpenCloseLifecycle() {
         LevelDBIndex index(0);
         co_await index.open();
 
-        auto id = co_await index.getOrCreateSeriesId("lifecycle_test",
-            {{"tag", "value1"}}, "field1");
+        auto id = co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value1"}}, "field1");
         EXPECT_TRUE(id.toHex().size() > 0);
 
         co_await index.close();
@@ -539,8 +502,7 @@ seastar::future<> testOpenCloseLifecycle() {
         co_await index.open();
 
         // Previously created series should still exist
-        auto id = co_await index.getOrCreateSeriesId("lifecycle_test",
-            {{"tag", "value1"}}, "field1");
+        auto id = co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value1"}}, "field1");
         EXPECT_TRUE(id.toHex().size() > 0);
 
         auto fields = co_await index.getFields("lifecycle_test");
@@ -554,8 +516,7 @@ seastar::future<> testOpenCloseLifecycle() {
         LevelDBIndex index(0);
         co_await index.open();
 
-        co_await index.getOrCreateSeriesId("lifecycle_test",
-            {{"tag", "value2"}}, "field2");
+        co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value2"}}, "field2");
 
         // Destructor should clean up db, filter policy, etc. without leaking
     }
@@ -572,7 +533,6 @@ seastar::future<> testOpenCloseLifecycle() {
 
         co_await index.close();
     }
-
 }
 
 TEST_F(LevelDBIndexTest, OpenCloseLifecycle) {

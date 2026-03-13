@@ -73,8 +73,7 @@ public:
         size_t removed = 0;
         for (auto it = list_.begin(); it != list_.end();) {
             if constexpr (std::is_same_v<Key, std::string>) {
-                if (it->key.size() >= prefix.size() &&
-                    std::memcmp(it->key.data(), prefix.data(), prefix.size()) == 0) {
+                if (it->key.size() >= prefix.size() && std::memcmp(it->key.data(), prefix.data(), prefix.size()) == 0) {
                     currentBytes_ -= it->entrySize;
                     map_.erase(it->key);
                     it = list_.erase(it);

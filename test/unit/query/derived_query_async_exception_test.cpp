@@ -17,25 +17,24 @@
 // 14. Integration (Seastar): sub-query returning multiple series throws DerivedQueryException.
 // 15. Integration (Seastar): anomaly formula with undefined query reference throws.
 
-#include <gtest/gtest.h>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <regex>
-
-#include "../../../lib/query/derived_query_executor.hpp"
-#include "../../../lib/query/derived_query.hpp"
-#include "../../../lib/query/expression_parser.hpp"
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
-
-#include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/sharded.hh>
-
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/query/derived_query.hpp"
+#include "../../../lib/query/derived_query_executor.hpp"
+#include "../../../lib/query/expression_parser.hpp"
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
+#include <fstream>
+#include <regex>
+#include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/thread.hh>
+#include <sstream>
+#include <string>
 
 using namespace timestar;
 
@@ -45,7 +44,8 @@ using namespace timestar;
 
 static std::string readSourceFile(const std::string& path) {
     std::ifstream f(path);
-    if (!f.is_open()) return "";
+    if (!f.is_open())
+        return "";
     std::ostringstream ss;
     ss << f.rdbuf();
     return ss.str();
@@ -68,23 +68,19 @@ static int countOccurrences(const std::string& haystack, const std::string& need
 
 class DerivedQueryAsyncExceptionTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // Helper: insert float data into the sharded engine.
-static void insertFloatData(seastar::sharded<Engine>& eng,
-                            const std::string& measurement,
-                            const std::string& field,
+static void insertFloatData(seastar::sharded<Engine>& eng, const std::string& measurement, const std::string& field,
                             const std::map<std::string, std::string>& tags,
                             const std::vector<std::pair<uint64_t, double>>& points) {
     TimeStarInsert<double> ins(measurement, field);
-    for (const auto& [k, v] : tags) ins.addTag(k, v);
-    for (const auto& [ts, val] : points) ins.addValue(ts, val);
+    for (const auto& [k, v] : tags)
+        ins.addTag(k, v);
+    for (const auto& [ts, val] : points)
+        ins.addValue(ts, val);
     shardedInsert(eng, std::move(ins));
 }
 
@@ -262,7 +258,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, RequestValidation_EmptyFormulaThrowsDeriv
 // from entering the async path with a broken formula.
 TEST_F(DerivedQueryAsyncExceptionTest, RequestValidation_UndefinedQueryReferenceThrows) {
     DerivedQueryRequest request;
-    request.formula = "a + b";   // "b" is not defined
+    request.formula = "a + b";  // "b" is not defined
     request.queries["a"] = QueryRequest();
     request.startTime = 1000;
     request.endTime = 2000;
@@ -277,11 +273,11 @@ TEST_F(DerivedQueryAsyncExceptionTest, RequestValidation_UndefinedQueryReference
 TEST_F(DerivedQueryAsyncExceptionTest, CreateErrorResponse_AlwaysProducesValidJson) {
     // Various error codes and messages
     const std::vector<std::pair<std::string, std::string>> cases = {
-        {"QUERY_ERROR",    "Formula error: unexpected token"},
+        {"QUERY_ERROR", "Formula error: unexpected token"},
         {"INTERNAL_ERROR", "Execution error: engine threw"},
-        {"EMPTY_REQUEST",  "Request body is required"},
-        {"QUERY_ERROR",    ""},    // empty message
-        {"",              "some message"},  // empty code
+        {"EMPTY_REQUEST", "Request body is required"},
+        {"QUERY_ERROR", ""},   // empty message
+        {"", "some message"},  // empty code
     };
 
     for (const auto& [code, msg] : cases) {
@@ -289,8 +285,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, CreateErrorResponse_AlwaysProducesValidJs
         EXPECT_FALSE(json.empty()) << "createErrorResponse must not return empty string";
         EXPECT_TRUE(json.find("\"error\"") != std::string::npos)
             << "Response must contain 'error' key. code='" << code << "' msg='" << msg << "'";
-        EXPECT_TRUE(json.find("\"status\"") != std::string::npos)
-            << "Response must contain 'status' key";
+        EXPECT_TRUE(json.find("\"status\"") != std::string::npos) << "Response must contain 'status' key";
     }
 }
 
@@ -329,7 +324,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, Execute_ParseErrorWrappedasDerivedQueryEx
 
         // "a +" is syntactically incomplete — ExpressionParser will throw
         DerivedQueryRequest request;
-        request.formula = "a +";          // incomplete expression
+        request.formula = "a +";  // incomplete expression
         request.startTime = 1000;
         request.endTime = 5000;
 
@@ -348,17 +343,17 @@ TEST_F(DerivedQueryAsyncExceptionTest, Execute_ParseErrorWrappedasDerivedQueryEx
             // Correct: wrapped by the catch clause in execute()
             std::string what(e.what());
             // Message should mention "Formula error" or "Evaluation error" or "Execution error"
-            EXPECT_TRUE(
-                what.find("Formula error") != std::string::npos ||
-                what.find("Evaluation error") != std::string::npos ||
-                what.find("Execution error") != std::string::npos ||
-                !what.empty()
-            ) << "Exception message should be non-empty: " << what;
+            EXPECT_TRUE(what.find("Formula error") != std::string::npos ||
+                        what.find("Evaluation error") != std::string::npos ||
+                        what.find("Execution error") != std::string::npos || !what.empty())
+                << "Exception message should be non-empty: " << what;
         } catch (const std::exception& e) {
             FAIL() << "Exception should have been caught and re-wrapped as DerivedQueryException, "
                    << "but got: " << e.what();
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 13: execute() with formula referencing undefined variable throws DerivedQueryException.
@@ -387,7 +382,9 @@ TEST_F(DerivedQueryAsyncExceptionTest, Execute_UndefinedVariableInFormulaThrows)
         // "undefined_var" is not in queries map
 
         EXPECT_THROW(executor.execute(request).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 14: executeFromJsonWithAnomaly() propagates DerivedQueryException from execute().
@@ -414,7 +411,9 @@ TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJsonWithAnomaly_PropagatesDeri
 
         // DerivedQueryException must propagate (not be swallowed)
         EXPECT_THROW(executor.executeFromJsonWithAnomaly(json).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 15: executeWithAnomaly() with an anomaly formula referencing missing query throws.
@@ -444,7 +443,9 @@ TEST_F(DerivedQueryAsyncExceptionTest, ExecuteWithAnomaly_MissingQueryRefThrows)
         // NOTE: "q" is not in queries — executeAnomalyDetection will throw
 
         EXPECT_THROW(executor.executeWithAnomaly(request).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 16: executeWithAnomaly() with a forecast formula referencing missing query throws.
@@ -469,7 +470,9 @@ TEST_F(DerivedQueryAsyncExceptionTest, ExecuteWithAnomaly_ForecastMissingQueryRe
         // "missing_ref" is not in queries
 
         EXPECT_THROW(executor.executeWithAnomaly(request).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 17: Source-inspection verifies convertQueryResponse() checks for multi-series result.
@@ -540,7 +543,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, Execute_EmptyFormulaThrowsDerivedQueryExc
         DerivedQueryExecutor executor(&eng.eng);
 
         DerivedQueryRequest request;
-        request.formula = "";     // empty
+        request.formula = "";  // empty
         request.startTime = 1000;
         request.endTime = 5000;
 
@@ -552,7 +555,9 @@ TEST_F(DerivedQueryAsyncExceptionTest, Execute_EmptyFormulaThrowsDerivedQueryExc
         request.queries["a"] = qr;
 
         EXPECT_THROW(executor.execute(request).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 20: execute() with too many sub-queries throws DerivedQueryException.
@@ -584,7 +589,9 @@ TEST_F(DerivedQueryAsyncExceptionTest, Execute_TooManySubQueriesThrowsDerivedQue
 
         // 2 sub-queries exceeds maxSubQueries=1
         EXPECT_THROW(executor.execute(request).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 21: executeFromJson() with missing formula field throws DerivedQueryException.
@@ -608,7 +615,9 @@ TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJson_MissingFormulaPropagatesE
         })json";
 
         EXPECT_THROW(executor.executeFromJson(json).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Test 22: All exception types thrown by execute() are subcategories of std::exception.

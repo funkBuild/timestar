@@ -1,11 +1,13 @@
-#include <gtest/gtest.h>
 #include "../../../lib/query/simd_aggregator.hpp"
-#include <vector>
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
 #include <cmath>
-#include <random>
 #include <limits>
 #include <numeric>
-#include <algorithm>
+#include <random>
+#include <vector>
 
 using timestar::simd::SimdAggregator;
 namespace scalar = timestar::simd::scalar;
@@ -68,15 +70,15 @@ TEST_F(SimdAggregatorCorrectnessTest, Sum_LargeArray) {
     std::uniform_real_distribution<double> dist(-1000.0, 1000.0);
 
     std::vector<double> values(10000);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     double simd = SimdAggregator::calculateSum(values.data(), values.size());
     double scl = scalar::calculateSum(values.data(), values.size());
 
     // Allow small relative error due to different summation order
     double tolerance = std::abs(scl) * 1e-10 + 1e-10;
-    EXPECT_NEAR(simd, scl, tolerance)
-        << "Sum differs for large array (SIMD=" << simd << ", scalar=" << scl << ")";
+    EXPECT_NEAR(simd, scl, tolerance) << "Sum differs for large array (SIMD=" << simd << ", scalar=" << scl << ")";
 }
 
 TEST_F(SimdAggregatorCorrectnessTest, Sum_AllZeros) {
@@ -119,8 +121,7 @@ TEST_F(SimdAggregatorCorrectnessTest, Sum_VariousSizes) {
         }
         double simd = SimdAggregator::calculateSum(values.data(), n);
         double expected = static_cast<double>(n * (n + 1)) / 2.0;
-        EXPECT_DOUBLE_EQ(simd, expected)
-            << "Sum mismatch for n=" << n;
+        EXPECT_DOUBLE_EQ(simd, expected) << "Sum mismatch for n=" << n;
     }
 }
 
@@ -140,7 +141,8 @@ TEST_F(SimdAggregatorCorrectnessTest, Avg_MatchesScalar) {
     std::uniform_real_distribution<double> dist(-500.0, 500.0);
 
     std::vector<double> values(1000);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     double simd = SimdAggregator::calculateAvg(values.data(), values.size());
     double scl = scalar::calculateAvg(values.data(), values.size());
@@ -205,8 +207,7 @@ TEST_F(SimdAggregatorCorrectnessTest, Min_VariousSizes) {
         }
         double simd = SimdAggregator::calculateMin(values.data(), n);
         double scl = scalar::calculateMin(values.data(), n);
-        EXPECT_DOUBLE_EQ(simd, scl)
-            << "Min mismatch for n=" << n;
+        EXPECT_DOUBLE_EQ(simd, scl) << "Min mismatch for n=" << n;
     }
 }
 
@@ -215,7 +216,8 @@ TEST_F(SimdAggregatorCorrectnessTest, Min_LargeRandom) {
     std::uniform_real_distribution<double> dist(-1e6, 1e6);
 
     std::vector<double> values(10000);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     double simd = SimdAggregator::calculateMin(values.data(), values.size());
     double scl = scalar::calculateMin(values.data(), values.size());
@@ -265,8 +267,7 @@ TEST_F(SimdAggregatorCorrectnessTest, Max_VariousSizes) {
         }
         double simd = SimdAggregator::calculateMax(values.data(), n);
         double scl = scalar::calculateMax(values.data(), n);
-        EXPECT_DOUBLE_EQ(simd, scl)
-            << "Max mismatch for n=" << n;
+        EXPECT_DOUBLE_EQ(simd, scl) << "Max mismatch for n=" << n;
     }
 }
 
@@ -275,7 +276,8 @@ TEST_F(SimdAggregatorCorrectnessTest, Max_LargeRandom) {
     std::uniform_real_distribution<double> dist(-1e6, 1e6);
 
     std::vector<double> values(10000);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     double simd = SimdAggregator::calculateMax(values.data(), values.size());
     double scl = scalar::calculateMax(values.data(), values.size());
@@ -314,15 +316,15 @@ TEST_F(SimdAggregatorCorrectnessTest, Variance_MatchesScalar) {
     std::uniform_real_distribution<double> dist(-100.0, 100.0);
 
     std::vector<double> values(1000);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     double mean = scalar::calculateAvg(values.data(), values.size());
     double simd = SimdAggregator::calculateVariance(values.data(), values.size(), mean);
     double scl = scalar::calculateVariance(values.data(), values.size(), mean);
 
     double tolerance = std::abs(scl) * 1e-9 + 1e-10;
-    EXPECT_NEAR(simd, scl, tolerance)
-        << "Variance differs (SIMD=" << simd << ", scalar=" << scl << ")";
+    EXPECT_NEAR(simd, scl, tolerance) << "Variance differs (SIMD=" << simd << ", scalar=" << scl << ")";
 }
 
 TEST_F(SimdAggregatorCorrectnessTest, Variance_VariousSizes) {
@@ -336,8 +338,7 @@ TEST_F(SimdAggregatorCorrectnessTest, Variance_VariousSizes) {
         double scl = scalar::calculateVariance(values.data(), n, mean);
 
         double tolerance = std::abs(scl) * 1e-12 + 1e-12;
-        EXPECT_NEAR(simd, scl, tolerance)
-            << "Variance mismatch for n=" << n;
+        EXPECT_NEAR(simd, scl, tolerance) << "Variance mismatch for n=" << n;
     }
 }
 
@@ -396,8 +397,7 @@ TEST_F(SimdAggregatorCorrectnessTest, BucketSums_BasicCase) {
     std::vector<size_t> bucket_indices = {0, 4, 8};
     std::vector<double> bucket_sums(3, 0.0);
 
-    SimdAggregator::calculateBucketSums(
-        values.data(), bucket_indices.data(), 3, 4, bucket_sums.data());
+    SimdAggregator::calculateBucketSums(values.data(), bucket_indices.data(), 3, 4, bucket_sums.data());
 
     EXPECT_DOUBLE_EQ(bucket_sums[0], 10.0);    // 1+2+3+4
     EXPECT_DOUBLE_EQ(bucket_sums[1], 100.0);   // 10+20+30+40
@@ -409,8 +409,7 @@ TEST_F(SimdAggregatorCorrectnessTest, BucketSums_UnevenBuckets) {
     std::vector<size_t> bucket_indices = {0, 5};
     std::vector<double> bucket_sums(2, 0.0);
 
-    SimdAggregator::calculateBucketSums(
-        values.data(), bucket_indices.data(), 2, 3, bucket_sums.data());
+    SimdAggregator::calculateBucketSums(values.data(), bucket_indices.data(), 2, 3, bucket_sums.data());
 
     EXPECT_DOUBLE_EQ(bucket_sums[0], 15.0);  // 1+2+3+4+5
     EXPECT_DOUBLE_EQ(bucket_sums[1], 60.0);  // 10+20+30
@@ -422,12 +421,12 @@ TEST_F(SimdAggregatorCorrectnessTest, Histogram_BasicCase) {
     std::vector<double> values = {0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5};
     std::vector<uint32_t> histogram(5, 0);
 
-    SimdAggregator::computeHistogram(
-        values.data(), values.size(), 0.0, 4.5, 5, histogram.data());
+    SimdAggregator::computeHistogram(values.data(), values.size(), 0.0, 4.5, 5, histogram.data());
 
     // Every value should be counted
     uint32_t total = 0;
-    for (auto h : histogram) total += h;
+    for (auto h : histogram)
+        total += h;
     EXPECT_EQ(total, 10u);
 }
 
@@ -435,11 +434,11 @@ TEST_F(SimdAggregatorCorrectnessTest, Histogram_AllSameBin) {
     std::vector<double> values(100, 5.0);
     std::vector<uint32_t> histogram(10, 0);
 
-    SimdAggregator::computeHistogram(
-        values.data(), values.size(), 0.0, 10.0, 10, histogram.data());
+    SimdAggregator::computeHistogram(values.data(), values.size(), 0.0, 10.0, 10, histogram.data());
 
     uint32_t total = 0;
-    for (auto h : histogram) total += h;
+    for (auto h : histogram)
+        total += h;
     EXPECT_EQ(total, 100u);
 }
 
@@ -448,25 +447,26 @@ TEST_F(SimdAggregatorCorrectnessTest, Histogram_LargeRandom) {
     std::uniform_real_distribution<double> dist(0.0, 100.0);
 
     std::vector<double> values(10000);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     std::vector<uint32_t> histogram(100, 0);
 
-    SimdAggregator::computeHistogram(
-        values.data(), values.size(), 0.0, 100.0, 100, histogram.data());
+    SimdAggregator::computeHistogram(values.data(), values.size(), 0.0, 100.0, 100, histogram.data());
 
     // All values should be counted
     uint32_t total = 0;
-    for (auto h : histogram) total += h;
+    for (auto h : histogram)
+        total += h;
     EXPECT_EQ(total, 10000u);
 
     // Most bins should be non-empty in a uniform distribution with 10k samples
     uint32_t nonEmptyBins = 0;
     for (size_t i = 0; i < 100; i++) {
-        if (histogram[i] > 0) nonEmptyBins++;
+        if (histogram[i] > 0)
+            nonEmptyBins++;
     }
-    EXPECT_GE(nonEmptyBins, 90u)
-        << "Expected at least 90% of bins non-empty in uniform distribution";
+    EXPECT_GE(nonEmptyBins, 90u) << "Expected at least 90% of bins non-empty in uniform distribution";
 }
 
 // ==================== Multiple Aggregations Consistency ====================
@@ -478,18 +478,16 @@ TEST_F(SimdAggregatorCorrectnessTest, ConsistencyCheck_MinLEAvgLEMax) {
     for (int trial = 0; trial < 10; trial++) {
         size_t n = 50 + trial * 100;
         std::vector<double> values(n);
-        for (auto& v : values) v = dist(rng);
+        for (auto& v : values)
+            v = dist(rng);
 
         double minVal = SimdAggregator::calculateMin(values.data(), n);
         double maxVal = SimdAggregator::calculateMax(values.data(), n);
         double avgVal = SimdAggregator::calculateAvg(values.data(), n);
 
-        EXPECT_LE(minVal, avgVal)
-            << "Min (" << minVal << ") > Avg (" << avgVal << ") for n=" << n;
-        EXPECT_LE(avgVal, maxVal)
-            << "Avg (" << avgVal << ") > Max (" << maxVal << ") for n=" << n;
-        EXPECT_LE(minVal, maxVal)
-            << "Min (" << minVal << ") > Max (" << maxVal << ") for n=" << n;
+        EXPECT_LE(minVal, avgVal) << "Min (" << minVal << ") > Avg (" << avgVal << ") for n=" << n;
+        EXPECT_LE(avgVal, maxVal) << "Avg (" << avgVal << ") > Max (" << maxVal << ") for n=" << n;
+        EXPECT_LE(minVal, maxVal) << "Min (" << minVal << ") > Max (" << maxVal << ") for n=" << n;
     }
 }
 
@@ -498,7 +496,8 @@ TEST_F(SimdAggregatorCorrectnessTest, ConsistencyCheck_SumEqualsAvgTimesCount) {
     std::uniform_real_distribution<double> dist(-100.0, 100.0);
 
     std::vector<double> values(500);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     double sum = SimdAggregator::calculateSum(values.data(), values.size());
     double avg = SimdAggregator::calculateAvg(values.data(), values.size());
@@ -515,12 +514,12 @@ TEST_F(SimdAggregatorCorrectnessTest, ConsistencyCheck_VarianceNonNegative) {
     for (int trial = 0; trial < 10; trial++) {
         size_t n = 10 + trial * 50;
         std::vector<double> values(n);
-        for (auto& v : values) v = dist(rng);
+        for (auto& v : values)
+            v = dist(rng);
 
         double mean = SimdAggregator::calculateAvg(values.data(), n);
         double var = SimdAggregator::calculateVariance(values.data(), n, mean);
 
-        EXPECT_GE(var, 0.0)
-            << "Negative variance (" << var << ") for n=" << n;
+        EXPECT_GE(var, 0.0) << "Negative variance (" << var << ") for n=" << n;
     }
 }

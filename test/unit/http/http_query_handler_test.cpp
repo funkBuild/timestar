@@ -1,7 +1,10 @@
-#include <gtest/gtest.h>
 #include "../../../lib/http/http_query_handler.hpp"
+
 #include "../../../lib/query/query_parser.hpp"
+
 #include <glaze/glaze.hpp>
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
@@ -16,12 +19,8 @@ struct GlazeQueryRequest {
 template <>
 struct glz::meta<GlazeQueryRequest> {
     using T = GlazeQueryRequest;
-    static constexpr auto value = object(
-        "query", &T::query,
-        "startTime", &T::startTime,
-        "endTime", &T::endTime,
-        "aggregationInterval", &T::aggregationInterval
-    );
+    static constexpr auto value = object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime,
+                                         "aggregationInterval", &T::aggregationInterval);
 };
 
 // Glaze structures for parsing HTTP responses (matching http_query_handler.cpp structures)
@@ -58,66 +57,47 @@ struct GlazeErrorResponse {
 template <>
 struct glz::meta<GlazeFieldData> {
     using T = GlazeFieldData;
-    static constexpr auto value = object(
-        "timestamps", &T::timestamps,
-        "values", &T::values
-    );
+    static constexpr auto value = object("timestamps", &T::timestamps, "values", &T::values);
 };
 
 template <>
 struct glz::meta<GlazeSeriesData> {
     using T = GlazeSeriesData;
-    static constexpr auto value = object(
-        "measurement", &T::measurement,
-        "groupTags", &T::groupTags,
-        "fields", &T::fields
-    );
+    static constexpr auto value =
+        object("measurement", &T::measurement, "groupTags", &T::groupTags, "fields", &T::fields);
 };
 
 template <>
 struct glz::meta<GlazeStatistics> {
     using T = GlazeStatistics;
-    static constexpr auto value = object(
-        "series_count", &T::series_count,
-        "point_count", &T::point_count,
-        "execution_time_ms", &T::execution_time_ms
-    );
+    static constexpr auto value = object("series_count", &T::series_count, "point_count", &T::point_count,
+                                         "execution_time_ms", &T::execution_time_ms);
 };
 
 template <>
 struct glz::meta<GlazeQueryResponse> {
     using T = GlazeQueryResponse;
-    static constexpr auto value = object(
-        "status", &T::status,
-        "series", &T::series,
-        "statistics", &T::statistics
-    );
+    static constexpr auto value = object("status", &T::status, "series", &T::series, "statistics", &T::statistics);
 };
 
 template <>
 struct glz::meta<GlazeErrorResponse> {
     using T = GlazeErrorResponse;
-    static constexpr auto value = object(
-        "status", &T::status,
-        "message", &T::message,
-        "error", &T::error
-    );
+    static constexpr auto value = object("status", &T::status, "message", &T::message, "error", &T::error);
 };
 
 class HttpQueryHandlerTest : public ::testing::Test {
 protected:
     void SetUp() override {}
     void TearDown() override {}
-    
+
     // Helper to create JSON string using Glaze
-    std::string createJsonRequest(const std::string& query, 
-                                 const std::string& startTime,
-                                 const std::string& endTime) {
+    std::string createJsonRequest(const std::string& query, const std::string& startTime, const std::string& endTime) {
         GlazeQueryRequest req;
         req.query = query;
         req.startTime = startTime;
         req.endTime = endTime;
-        
+
         return glz::write_json(req).value_or("{}");
     }
 };
@@ -125,19 +105,19 @@ protected:
 // Test QueryResponse formatting
 TEST_F(HttpQueryHandlerTest, FormatEmptyResponse) {
     HttpQueryHandler handler(nullptr);  // Using nullptr for mock
-    
+
     QueryResponse response;
     response.success = true;
     response.statistics.seriesCount = 0;
     response.statistics.pointCount = 0;
     response.statistics.executionTimeMs = 5.5;
-    
+
     std::string json = handler.formatQueryResponse(response);
-    
+
     // Parse and verify using Glaze
     GlazeQueryResponse parsedResponse;
     auto error = glz::read_json(parsedResponse, json);
-    
+
     ASSERT_FALSE(error) << "JSON parse error: " << glz::format_error(error);
     EXPECT_EQ(parsedResponse.status, "success");
     EXPECT_EQ(parsedResponse.series.size(), 0);
@@ -148,42 +128,44 @@ TEST_F(HttpQueryHandlerTest, FormatEmptyResponse) {
 
 TEST_F(HttpQueryHandlerTest, FormatResponseWithData) {
     HttpQueryHandler handler(nullptr);
-    
+
     QueryResponse response;
     response.success = true;
-    
+
     // Create a series with data
     SeriesResult series;
     series.measurement = "temperature";
     series.tags["location"] = "office";
     series.tags["sensor"] = "temp-01";
-    
+
     std::vector<uint64_t> timestamps = {1000000000, 2000000000, 3000000000};
     std::vector<double> values = {20.5, 21.0, 21.5};
     series.fields["value"] = std::make_pair(timestamps, values);
-    
+
     response.series.push_back(series);
     response.statistics.seriesCount = 1;
     response.statistics.pointCount = 3;
     response.statistics.executionTimeMs = 10.0;
-    
+
     std::string json = handler.formatQueryResponse(response);
-    
+
     // Parse and verify using Glaze
     GlazeQueryResponse parsedResponse;
     auto error = glz::read_json(parsedResponse, json);
-    
+
     ASSERT_FALSE(error) << "JSON parse error: " << glz::format_error(error);
     EXPECT_EQ(parsedResponse.status, "success");
     EXPECT_EQ(parsedResponse.series.size(), 1);
-    
+
     const auto& seriesObj = parsedResponse.series[0];
     EXPECT_EQ(seriesObj.measurement, "temperature");
     // The response format uses groupTags array instead of tags map, so check groupTags
     EXPECT_EQ(seriesObj.groupTags.size(), 2);
-    EXPECT_TRUE(std::find(seriesObj.groupTags.begin(), seriesObj.groupTags.end(), "location=office") != seriesObj.groupTags.end());
-    EXPECT_TRUE(std::find(seriesObj.groupTags.begin(), seriesObj.groupTags.end(), "sensor=temp-01") != seriesObj.groupTags.end());
-    
+    EXPECT_TRUE(std::find(seriesObj.groupTags.begin(), seriesObj.groupTags.end(), "location=office") !=
+                seriesObj.groupTags.end());
+    EXPECT_TRUE(std::find(seriesObj.groupTags.begin(), seriesObj.groupTags.end(), "sensor=temp-01") !=
+                seriesObj.groupTags.end());
+
     const auto& fieldData = seriesObj.fields.at("value");
     EXPECT_EQ(fieldData.timestamps.size(), 3);
     auto& doubleValues = std::get<std::vector<double>>(fieldData.values);
@@ -194,13 +176,13 @@ TEST_F(HttpQueryHandlerTest, FormatResponseWithData) {
 
 TEST_F(HttpQueryHandlerTest, FormatErrorResponse) {
     HttpQueryHandler handler(nullptr);
-    
+
     std::string json = handler.createErrorResponse("INVALID_QUERY", "Missing measurement");
-    
+
     // Parse and verify using Glaze
     GlazeErrorResponse parsedResponse;
     auto error = glz::read_json(parsedResponse, json);
-    
+
     ASSERT_FALSE(error) << "JSON parse error: " << glz::format_error(error);
     EXPECT_EQ(parsedResponse.status, "error");
     EXPECT_EQ(parsedResponse.error, "Missing measurement");
@@ -210,19 +192,16 @@ TEST_F(HttpQueryHandlerTest, FormatErrorResponse) {
 // Test request parsing
 TEST_F(HttpQueryHandlerTest, ParseValidQueryRequest) {
     HttpQueryHandler handler(nullptr);
-    
-    std::string jsonStr = createJsonRequest(
-        "avg:temperature(value){location:office}",
-        "1640995200000000000",
-        "1641081599000000000"
-    );
-    
+
+    std::string jsonStr =
+        createJsonRequest("avg:temperature(value){location:office}", "1640995200000000000", "1641081599000000000");
+
     GlazeQueryRequest glazeReq;
     auto error = glz::read_json(glazeReq, jsonStr);
     ASSERT_FALSE(error);
-    
+
     QueryRequest request = handler.parseQueryRequest(glazeReq);
-    
+
     EXPECT_EQ(request.measurement, "temperature");
     EXPECT_EQ(request.fields.size(), 1);
     EXPECT_EQ(request.fields[0], "value");
@@ -236,17 +215,18 @@ TEST_F(HttpQueryHandlerTest, ParseValidQueryRequest) {
 // Test shard determination
 TEST_F(HttpQueryHandlerTest, DetermineTargetShards) {
     HttpQueryHandler handler(nullptr);
-    
+
     QueryRequest request;
     request.measurement = "temperature";
-    
+
     // With no filters, should target all shards
     auto shards = handler.determineTargetShards(request);
     EXPECT_GT(shards.size(), 0);
-    
+
     // Verify all shards are included
     unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0) shardCount = 1; // Test environment default
+    if (shardCount == 0)
+        shardCount = 1;  // Test environment default
     for (unsigned i = 0; i < shardCount; ++i) {
         EXPECT_TRUE(std::find(shards.begin(), shards.end(), i) != shards.end());
     }
@@ -255,10 +235,10 @@ TEST_F(HttpQueryHandlerTest, DetermineTargetShards) {
 // Test result merging
 TEST_F(HttpQueryHandlerTest, MergeResults) {
     HttpQueryHandler handler(nullptr);
-    
+
     // Create results from different shards
     std::vector<std::vector<SeriesResult>> shardResults(2);
-    
+
     // Shard 0 results
     SeriesResult series1;
     series1.measurement = "temperature";
@@ -267,8 +247,8 @@ TEST_F(HttpQueryHandlerTest, MergeResults) {
     std::vector<double> vals1 = {20.0, 21.0};
     series1.fields["value"] = std::make_pair(ts1, vals1);
     shardResults[0].push_back(series1);
-    
-    // Shard 1 results  
+
+    // Shard 1 results
     SeriesResult series2;
     series2.measurement = "temperature";
     series2.tags["location"] = "warehouse";
@@ -276,7 +256,7 @@ TEST_F(HttpQueryHandlerTest, MergeResults) {
     std::vector<double> vals2 = {18.0, 19.0};
     series2.fields["value"] = std::make_pair(ts2, vals2);
     shardResults[1].push_back(series2);
-    
+
     auto merged = handler.mergeResults(shardResults);
 
     EXPECT_EQ(merged.size(), 2);  // Should have both series

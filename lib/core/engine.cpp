@@ -319,9 +319,11 @@ seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string ser
     }
 }
 
-seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated(
-    const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-    uint64_t aggregationInterval, timestar::AggregationMethod method) {
+seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated(const std::string& seriesKey,
+                                                                                 const SeriesId128& seriesId,
+                                                                                 uint64_t startTime, uint64_t endTime,
+                                                                                 uint64_t aggregationInterval,
+                                                                                 timestar::AggregationMethod method) {
     QueryRunner runner(&tsmFileManager, &walFileManager);
     co_return co_await runner.queryTsmAggregated(std::string(seriesKey), seriesId, startTime, endTime,
                                                  aggregationInterval, method);

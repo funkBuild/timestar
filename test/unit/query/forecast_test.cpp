@@ -8,12 +8,14 @@
  * - Expression parser integration
  */
 
-#include <gtest/gtest.h>
+#include "expression_parser.hpp"
+#include "forecast/forecast_executor.hpp"
 #include "forecast/forecast_result.hpp"
 #include "forecast/linear_forecaster.hpp"
 #include "forecast/seasonal_forecaster.hpp"
-#include "forecast/forecast_executor.hpp"
-#include "expression_parser.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cmath>
 #include <random>
 
@@ -47,8 +49,8 @@ protected:
     }
 
     // Generate sinusoidal data with optional trend
-    std::vector<double> generateSeasonalData(double baseline, double amplitude, size_t period,
-                                             double trend = 0.0, double noise = 0.0) {
+    std::vector<double> generateSeasonalData(double baseline, double amplitude, size_t period, double trend = 0.0,
+                                             double noise = 0.0) {
         std::vector<double> values;
         std::mt19937 gen(42);
         std::normal_distribution<> dist(0.0, noise);
@@ -281,10 +283,14 @@ TEST_F(ForecastTest, ExecutorMultiSeries) {
     // Check piece types
     int pastCount = 0, forecastCount = 0, upperCount = 0, lowerCount = 0;
     for (const auto& piece : result.series) {
-        if (piece.piece == "past") pastCount++;
-        else if (piece.piece == "forecast") forecastCount++;
-        else if (piece.piece == "upper") upperCount++;
-        else if (piece.piece == "lower") lowerCount++;
+        if (piece.piece == "past")
+            pastCount++;
+        else if (piece.piece == "forecast")
+            forecastCount++;
+        else if (piece.piece == "upper")
+            upperCount++;
+        else if (piece.piece == "lower")
+            lowerCount++;
     }
     EXPECT_EQ(pastCount, 2);
     EXPECT_EQ(forecastCount, 2);
@@ -337,24 +343,30 @@ TEST_F(ForecastTest, ParseForecastFunctionSeasonal) {
 }
 
 TEST_F(ForecastTest, ParseForecastFunctionInvalidAlgorithm) {
-    EXPECT_THROW({
-        ExpressionParser parser("forecast(cpu, 'invalid', 2)");
-        parser.parse();
-    }, ExpressionParseException);
+    EXPECT_THROW(
+        {
+            ExpressionParser parser("forecast(cpu, 'invalid', 2)");
+            parser.parse();
+        },
+        ExpressionParseException);
 }
 
 TEST_F(ForecastTest, ParseForecastFunctionInvalidDeviations) {
     // Deviations < 1
-    EXPECT_THROW({
-        ExpressionParser parser("forecast(cpu, 'linear', 0.5)");
-        parser.parse();
-    }, ExpressionParseException);
+    EXPECT_THROW(
+        {
+            ExpressionParser parser("forecast(cpu, 'linear', 0.5)");
+            parser.parse();
+        },
+        ExpressionParseException);
 
     // Deviations > 4
-    EXPECT_THROW({
-        ExpressionParser parser("forecast(cpu, 'linear', 5)");
-        parser.parse();
-    }, ExpressionParseException);
+    EXPECT_THROW(
+        {
+            ExpressionParser parser("forecast(cpu, 'linear', 5)");
+            parser.parse();
+        },
+        ExpressionParseException);
 }
 
 TEST_F(ForecastTest, ForecastFunctionToString) {
@@ -836,8 +848,7 @@ TEST_F(ForecastTest, DeviationsAffectsBoundWidth) {
 
     // Verify bounds width increases with deviations
     for (size_t i = 1; i < widthsAtMidpoint.size(); ++i) {
-        EXPECT_GT(widthsAtMidpoint[i], widthsAtMidpoint[i-1])
-            << "Width should increase with deviations";
+        EXPECT_GT(widthsAtMidpoint[i], widthsAtMidpoint[i - 1]) << "Width should increase with deviations";
     }
 
     // Verify roughly proportional scaling
@@ -908,8 +919,7 @@ TEST_F(ForecastTest, AutoDetectDailySeasonality) {
 
     SeasonalForecaster forecaster;
 
-    uint64_t intervalNs = (hourlyTimestamps.back() - hourlyTimestamps.front()) /
-                          (hourlyTimestamps.size() - 1);
+    uint64_t intervalNs = (hourlyTimestamps.back() - hourlyTimestamps.front()) / (hourlyTimestamps.size() - 1);
     size_t detectedPeriod = forecaster.detectSeasonalPeriod(values, intervalNs);
 
     // Should detect period close to 24

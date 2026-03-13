@@ -1,13 +1,12 @@
 // Highway foreach_target re-inclusion mechanism.
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "encoding/integer/integer_encoder_ffor.cpp"
-#include "hwy/foreach_target.h"
-
 #include "integer_encoder_ffor.hpp"
 
 #include "../alp/alp_ffor.hpp"
 #include "../zigzag.hpp"
 
+#include "hwy/foreach_target.h"
 #include "hwy/highway.h"
 
 #include <algorithm>
@@ -31,10 +30,8 @@ namespace hn = hwy::HWY_NAMESPACE;
 // `deltas` are pre-computed delta-of-delta values (sequential dependency,
 // computed scalar by the caller).  Handles any count (including tail elements
 // that don't fill a full vector).
-void ZigZagEncodeAndMinMax(const int64_t* HWY_RESTRICT deltas,
-                           uint64_t* HWY_RESTRICT out, size_t count,
-                           uint64_t* HWY_RESTRICT min_out,
-                           uint64_t* HWY_RESTRICT max_out) {
+void ZigZagEncodeAndMinMax(const int64_t* HWY_RESTRICT deltas, uint64_t* HWY_RESTRICT out, size_t count,
+                           uint64_t* HWY_RESTRICT min_out, uint64_t* HWY_RESTRICT max_out) {
     const hn::ScalableTag<int64_t> di;
     const hn::ScalableTag<uint64_t> du;
     const size_t N = hn::Lanes(di);
@@ -94,9 +91,7 @@ HWY_EXPORT(ZigZagEncodeAndMinMax);
 
 // Wrapper callable from outside ffor_enc namespace (HWY_DYNAMIC_DISPATCH
 // must resolve the dispatch table in the same namespace as HWY_EXPORT).
-inline void dispatchZigZagEncodeAndMinMax(const int64_t* deltas,
-                                          uint64_t* out, size_t count,
-                                          uint64_t* min_out,
+inline void dispatchZigZagEncodeAndMinMax(const int64_t* deltas, uint64_t* out, size_t count, uint64_t* min_out,
                                           uint64_t* max_out) {
     HWY_DYNAMIC_DISPATCH(ZigZagEncodeAndMinMax)(deltas, out, count, min_out, max_out);
 }
@@ -117,7 +112,7 @@ struct FFORScratchBuffers {
     std::vector<uint64_t> exc_values;     // up to BLOCK_SIZE/4
 
     // Scratch for scalar delta-of-delta values before SIMD zigzag encode
-    std::vector<int64_t> deltas;          // up to BLOCK_SIZE (1024)
+    std::vector<int64_t> deltas;  // up to BLOCK_SIZE (1024)
 
     // Decode path: no scratch buffers needed - decode uses a stack-allocated
     // block buffer (8KB) that stays hot in L1 cache.
@@ -432,8 +427,8 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
     auto& scratch = getScratch();
     auto& zigzag = scratch.zigzag;
     auto& deltas = scratch.deltas;
-    zigzag.resize(BS);   // ensure capacity; only reallocates on first call
-    deltas.resize(BS);   // scratch for delta-of-delta values
+    zigzag.resize(BS);  // ensure capacity; only reallocates on first call
+    deltas.resize(BS);  // scratch for delta-of-delta values
 
     // Estimate: header + base + worst-case packed data per block
     buf.reserve(buf.size() + num_blocks * (16 + BS * 8));
@@ -501,8 +496,7 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
             // Highway SIMD dispatch: zigzag-encode deltas[] into zigzag[zz_idx..],
             // updating block_min/block_max along the way.  The kernel handles
             // both the SIMD main loop and scalar tail internally.
-            ffor_enc::dispatchZigZagEncodeAndMinMax(
-                deltas.data(), &zigzag[zz_idx], dd_count, &block_min, &block_max);
+            ffor_enc::dispatchZigZagEncodeAndMinMax(deltas.data(), &zigzag[zz_idx], dd_count, &block_min, &block_max);
 
             val_idx += dd_count;
             zz_idx += dd_count;

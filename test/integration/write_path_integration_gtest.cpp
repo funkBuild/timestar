@@ -4,28 +4,26 @@
  * Tests the complete write path through Engine including WAL, memory store, and TSM files
  */
 
-#include <gtest/gtest.h>
-#include "../seastar_gtest.hpp"
-#include "../test_helpers.hpp"
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/sleep.hh>
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/query/query_result.hpp"
+#include "../seastar_gtest.hpp"
+#include "../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
 #include <filesystem>
 #include <functional>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/sleep.hh>
 #include <variant>
 
 class WritePathIntegrationTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 SEASTAR_TEST_F(WritePathIntegrationTest, BasicWriteAndQuery) {
@@ -39,7 +37,7 @@ SEASTAR_TEST_F(WritePathIntegrationTest, BasicWriteAndQuery) {
     tempInsert.addTag("location", "us-midwest");
     tempInsert.addTag("host", "server-01");
 
-    int64_t baseTime = 1638360000000000000LL; // Dec 1, 2021
+    int64_t baseTime = 1638360000000000000LL;  // Dec 1, 2021
     tempInsert.addValue(baseTime, 82.5);
 
     co_await engine.insert(tempInsert);

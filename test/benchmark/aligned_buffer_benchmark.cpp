@@ -1,19 +1,19 @@
-#include <iostream>
+#include "storage/aligned_buffer.hpp"
+
 #include <chrono>
-#include <vector>
 #include <cstring>
 #include <iomanip>
-#include "storage/aligned_buffer.hpp"
+#include <iostream>
+#include <vector>
 
 using namespace std::chrono;
 
 class BenchmarkTimer {
     high_resolution_clock::time_point start;
     std::string name;
+
 public:
-    BenchmarkTimer(const std::string& n) : name(n) {
-        start = high_resolution_clock::now();
-    }
+    BenchmarkTimer(const std::string& n) : name(n) { start = high_resolution_clock::now(); }
 
     double elapsed_ms() {
         auto end = high_resolution_clock::now();
@@ -25,10 +25,9 @@ public:
         double ops_per_sec = (operations / ms) * 1000.0;
         double mb_per_sec = (bytes / (1024.0 * 1024.0)) / (ms / 1000.0);
 
-        std::cout << std::setw(30) << std::left << name << ": "
-                  << std::fixed << std::setprecision(2) << std::setw(8) << ms << " ms, "
-                  << std::setw(12) << ops_per_sec << " ops/sec, "
-                  << std::setw(10) << mb_per_sec << " MB/s" << std::endl;
+        std::cout << std::setw(30) << std::left << name << ": " << std::fixed << std::setprecision(2) << std::setw(8)
+                  << ms << " ms, " << std::setw(12) << ops_per_sec << " ops/sec, " << std::setw(10) << mb_per_sec
+                  << " MB/s" << std::endl;
     }
 };
 
@@ -105,8 +104,8 @@ void benchmark_mixed_workload() {
         buffer.write(static_cast<double>(i * 1.1));
     }
 
-    size_t total_bytes = iterations * (sizeof(uint64_t) + sizeof(uint32_t) +
-                                       sizeof(uint16_t) + sizeof(uint8_t) + sizeof(double));
+    size_t total_bytes =
+        iterations * (sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(double));
     timer.report(iterations * 5, total_bytes);
 }
 

@@ -7,26 +7,25 @@
 //   3. Calling stop() twice is safe (idempotent / gracefully errors).
 //   4. After stop(), write/query operations fail gracefully (not UB/crash).
 
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../test_helpers.hpp"
+
 #include <gtest/gtest.h>
-#include <filesystem>
-#include <vector>
-#include <string>
+
 #include <atomic>
 #include <chrono>
-
-#include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
-
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
-#include <seastar/core/gate.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
-
-#include "../../test_helpers.hpp"
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -36,13 +35,9 @@ namespace fs = std::filesystem;
 
 class EngineShutdownTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // ===========================================================================
@@ -81,7 +76,9 @@ TEST_F(EngineShutdownTest, WriteAfterStopThrowsGracefully) {
         // Nullify the engine pointer so ScopedEngine destructor does not call
         // stop() a second time (which is safe but noisy with logs).
         eng.engine.reset();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -105,7 +102,9 @@ TEST_F(EngineShutdownTest, BatchWriteAfterStopThrowsGracefully) {
         EXPECT_THROW(eng->insertBatch(std::move(batch)).get(), seastar::gate_closed_exception);
 
         eng.engine.reset();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -150,7 +149,9 @@ TEST_F(EngineShutdownTest, QueryAfterStopDoesNotCrash) {
         SUCCEED() << (threw ? "query threw after stop (acceptable)" : "query returned after stop (acceptable)");
 
         eng.engine.reset();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -173,7 +174,9 @@ TEST_F(EngineShutdownTest, DoubleStopIsSafe) {
         EXPECT_NO_THROW(eng->stop().get());
 
         eng.engine.reset();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -220,7 +223,9 @@ TEST_F(EngineShutdownTest, DataSurvivesShutdownViaWALFlush) {
 
             eng.stop().get();
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -264,15 +269,16 @@ TEST_F(EngineShutdownTest, InsertCompletesBeforeStopDrainsGate) {
         eng2.init().get();
 
         auto result = eng2.query("drain_test value", 0, UINT64_MAX).get();
-        ASSERT_TRUE(result.has_value())
-            << "All inserted data must be persisted after stop()";
+        ASSERT_TRUE(result.has_value()) << "All inserted data must be persisted after stop()";
         const auto& qr = std::get<QueryResult<double>>(result.value());
         EXPECT_EQ(qr.timestamps.size(), numBatches * pointsPerBatch)
             << "stop() must drain the WAL gate so all data is flushed to TSM";
 
         eng2.stop().get();
         eng.engine.reset();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -288,34 +294,35 @@ TEST_F(EngineShutdownTest, ShardedEngineStopIsSafe) {
         // Start a sharded engine with background tasks.
         seastar::sharded<Engine> rawEng;
         rawEng.start().get();
-        rawEng.invoke_on_all([](Engine& engine) {
-            return engine.init();
-        }).get();
-        rawEng.invoke_on_all([&rawEng](Engine& engine) {
-            engine.setShardedRef(&rawEng);
-            return seastar::make_ready_future<>();
-        }).get();
+        rawEng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
+        rawEng
+            .invoke_on_all([&rawEng](Engine& engine) {
+                engine.setShardedRef(&rawEng);
+                return seastar::make_ready_future<>();
+            })
+            .get();
 
         // Insert on all shards before stopping.
         for (unsigned s = 0; s < seastar::smp::count; ++s) {
-            rawEng.invoke_on(s, [s](Engine& engine) {
-                TimeStarInsert<double> ins("shard_metric", "value");
-                ins.addTag("shard", std::to_string(s));
-                ins.addValue(1000, static_cast<double>(s));
-                return engine.insert(std::move(ins));
-            }).get();
+            rawEng
+                .invoke_on(s,
+                           [s](Engine& engine) {
+                               TimeStarInsert<double> ins("shard_metric", "value");
+                               ins.addTag("shard", std::to_string(s));
+                               ins.addValue(1000, static_cast<double>(s));
+                               return engine.insert(std::move(ins));
+                           })
+                .get();
         }
 
         // Stop all shards — must complete without throwing.
-        EXPECT_NO_THROW(
-            rawEng.invoke_on_all([](Engine& engine) {
-                return engine.stop();
-            }).get()
-        );
+        EXPECT_NO_THROW(rawEng.invoke_on_all([](Engine& engine) { return engine.stop(); }).get());
 
         // Seastar container teardown.
         EXPECT_NO_THROW(rawEng.stop().get());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -335,15 +342,13 @@ TEST_F(EngineShutdownTest, ShardedEngineStopIsSafe) {
 
 #ifdef ENGINE_CPP_SOURCE_PATH
 
-#include <fstream>
+    #include <fstream>
 
 TEST_F(EngineShutdownTest, StopClosesInsertGateBeforeWALClose) {
     std::ifstream file(ENGINE_CPP_SOURCE_PATH);
-    ASSERT_TRUE(file.is_open())
-        << "Could not open engine.cpp at: " << ENGINE_CPP_SOURCE_PATH;
+    ASSERT_TRUE(file.is_open()) << "Could not open engine.cpp at: " << ENGINE_CPP_SOURCE_PATH;
 
-    std::string source((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
+    std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     // Find the stop() function body.
     std::string pattern = "Engine::stop()";
@@ -357,39 +362,35 @@ TEST_F(EngineShutdownTest, StopClosesInsertGateBeforeWALClose) {
     int depth = 1;
     size_t cur = bracePos + 1;
     while (cur < source.size() && depth > 0) {
-        if (source[cur] == '{') depth++;
-        else if (source[cur] == '}') depth--;
+        if (source[cur] == '{')
+            depth++;
+        else if (source[cur] == '}')
+            depth--;
         cur++;
     }
     std::string stopBody = source.substr(bracePos, cur - bracePos);
 
     // _insertGate must appear before walFileManager.close()
-    auto insertGatePos  = stopBody.find("_insertGate");
-    auto walClosePos    = stopBody.find("walFileManager.close()");
-    auto indexClosePos  = stopBody.find("index.close()");
+    auto insertGatePos = stopBody.find("_insertGate");
+    auto walClosePos = stopBody.find("walFileManager.close()");
+    auto indexClosePos = stopBody.find("index.close()");
 
-    ASSERT_NE(insertGatePos, std::string::npos)
-        << "stop() must reference _insertGate";
-    ASSERT_NE(walClosePos, std::string::npos)
-        << "stop() must call walFileManager.close()";
-    ASSERT_NE(indexClosePos, std::string::npos)
-        << "stop() must call index.close()";
+    ASSERT_NE(insertGatePos, std::string::npos) << "stop() must reference _insertGate";
+    ASSERT_NE(walClosePos, std::string::npos) << "stop() must call walFileManager.close()";
+    ASSERT_NE(indexClosePos, std::string::npos) << "stop() must call index.close()";
 
-    EXPECT_LT(insertGatePos, walClosePos)
-        << "_insertGate must be closed before walFileManager.close() to prevent "
-           "concurrent inserts from writing to a partially-destroyed WAL";
+    EXPECT_LT(insertGatePos, walClosePos) << "_insertGate must be closed before walFileManager.close() to prevent "
+                                             "concurrent inserts from writing to a partially-destroyed WAL";
 
-    EXPECT_LT(walClosePos, indexClosePos)
-        << "walFileManager.close() must precede index.close() because WAL flush "
-           "may perform metadata lookups via the index";
+    EXPECT_LT(walClosePos, indexClosePos) << "walFileManager.close() must precede index.close() because WAL flush "
+                                             "may perform metadata lookups via the index";
 }
 
 TEST_F(EngineShutdownTest, StopChecksGateClosedBeforeClosingEach) {
     std::ifstream file(ENGINE_CPP_SOURCE_PATH);
     ASSERT_TRUE(file.is_open());
 
-    std::string source((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
+    std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     std::string pattern = "Engine::stop()";
     auto stopPos = source.find(pattern);
@@ -399,8 +400,10 @@ TEST_F(EngineShutdownTest, StopChecksGateClosedBeforeClosingEach) {
     int depth = 1;
     size_t cur = bracePos + 1;
     while (cur < source.size() && depth > 0) {
-        if (source[cur] == '{') depth++;
-        else if (source[cur] == '}') depth--;
+        if (source[cur] == '{')
+            depth++;
+        else if (source[cur] == '}')
+            depth--;
         cur++;
     }
     std::string stopBody = source.substr(bracePos, cur - bracePos);
@@ -417,8 +420,7 @@ TEST_F(EngineShutdownTest, InsertHoldsGateDuringOperation) {
     std::ifstream file(ENGINE_CPP_SOURCE_PATH);
     ASSERT_TRUE(file.is_open());
 
-    std::string source((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
+    std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     // Locate insert() function (template instantiation bodies use the same name)
     std::string pattern = "Engine::insert(";
@@ -429,8 +431,10 @@ TEST_F(EngineShutdownTest, InsertHoldsGateDuringOperation) {
     int depth = 1;
     size_t cur = bracePos + 1;
     while (cur < source.size() && depth > 0) {
-        if (source[cur] == '{') depth++;
-        else if (source[cur] == '}') depth--;
+        if (source[cur] == '{')
+            depth++;
+        else if (source[cur] == '}')
+            depth--;
         cur++;
     }
     std::string insertBody = source.substr(bracePos, cur - bracePos);
@@ -441,4 +445,4 @@ TEST_F(EngineShutdownTest, InsertHoldsGateDuringOperation) {
            "protocol and ensure stop() waits for in-flight inserts";
 }
 
-#endif // ENGINE_CPP_SOURCE_PATH
+#endif  // ENGINE_CPP_SOURCE_PATH

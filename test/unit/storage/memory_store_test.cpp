@@ -1,12 +1,14 @@
+#include "../../../lib/storage/memory_store.hpp"
+
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/wal.hpp"
+
 #include <gtest/gtest.h>
+
+#include <filesystem>
 #include <memory>
 #include <vector>
-#include <filesystem>
-
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/storage/wal.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 namespace fs = std::filesystem;
 
@@ -21,9 +23,7 @@ protected:
         fs::create_directories(testDir + "/shard_0");
     }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 };
 
 TEST_F(MemoryStoreTest, InsertFloatValues) {
@@ -34,7 +34,7 @@ TEST_F(MemoryStoreTest, InsertFloatValues) {
     insert.addValue(3000, 21.5);
     insert.addValue(4000, 22.0);
     insert.addValue(5000, 22.5);
-    
+
     auto seriesKey = insert.seriesKey();
     SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
@@ -62,7 +62,7 @@ TEST_F(MemoryStoreTest, InsertBooleanValues) {
     insert.addValue(1000, true);
     insert.addValue(2000, false);
     insert.addValue(3000, true);
-    
+
     auto seriesKey = insert.seriesKey();
     SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
@@ -141,7 +141,7 @@ TEST_F(MemoryStoreTest, AppendToExistingSeries) {
     // Verify all values exist
     auto it = store->series.find(seriesId);
     ASSERT_NE(it, store->series.end());
-    
+
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
     EXPECT_EQ(seriesData.values.size(), 4);
     EXPECT_DOUBLE_EQ(seriesData.values[0], 100.0);
@@ -159,12 +159,12 @@ TEST_F(MemoryStoreTest, EmptyStore) {
     EXPECT_TRUE(store->isEmpty());
     EXPECT_FALSE(store->isClosed());
     // isFull() is now async, skip in sync test
-    
+
     // Add data
     TimeStarInsert<double> insert("test", "series");
     insert.addValue(1000, 1.0);
     store->insertMemory(std::move(insert));
-    
+
     EXPECT_FALSE(store->isEmpty());
 }
 
@@ -174,15 +174,15 @@ TEST_F(MemoryStoreTest, SeriesKeyFormat) {
     insert.addTag("location", "seattle");
     insert.addTag("sensor", "outdoor");
     insert.addValue(1000, 15.5);
-    
+
     auto seriesKey = insert.seriesKey();
-    
+
     // Series key should contain measurement, tags, and field
     EXPECT_NE(seriesKey.find("weather"), std::string::npos);
     EXPECT_NE(seriesKey.find("temperature"), std::string::npos);
     EXPECT_NE(seriesKey.find("location=seattle"), std::string::npos);
     EXPECT_NE(seriesKey.find("sensor=outdoor"), std::string::npos);
-    
+
     SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
 
@@ -192,14 +192,14 @@ TEST_F(MemoryStoreTest, SeriesKeyFormat) {
 
 TEST_F(MemoryStoreTest, SortingTimestamps) {
     TimeStarInsert<double> insert("test", "ordering");
-    
+
     // Insert out of order
     insert.addValue(3000, 3.0);
     insert.addValue(1000, 1.0);
     insert.addValue(2000, 2.0);
     insert.addValue(5000, 5.0);
     insert.addValue(4000, 4.0);
-    
+
     auto seriesKey = insert.seriesKey();
     SeriesId128 seriesId = insert.seriesId128();
     store->insertMemory(std::move(insert));
@@ -212,12 +212,12 @@ TEST_F(MemoryStoreTest, SortingTimestamps) {
 
     // Sort the series
     seriesData.sort();
-    
+
     // Verify timestamps are in order
     for (size_t i = 1; i < seriesData.timestamps.size(); i++) {
-        EXPECT_GT(seriesData.timestamps[i], seriesData.timestamps[i-1]);
+        EXPECT_GT(seriesData.timestamps[i], seriesData.timestamps[i - 1]);
     }
-    
+
     // Verify values correspond to correct timestamps
     for (size_t i = 0; i < seriesData.values.size(); i++) {
         EXPECT_DOUBLE_EQ(seriesData.values[i], seriesData.timestamps[i] / 1000.0);
@@ -339,7 +339,7 @@ TEST_F(MemoryStoreTest, DeleteRangeFloat) {
     ASSERT_NE(it, store->series.end());
 
     auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-    EXPECT_EQ(seriesData.values.size(), 3);  // Should have 3 values left
+    EXPECT_EQ(seriesData.values.size(), 3);        // Should have 3 values left
     EXPECT_DOUBLE_EQ(seriesData.values[0], 10.0);  // 1000
     EXPECT_DOUBLE_EQ(seriesData.values[1], 40.0);  // 4000
     EXPECT_DOUBLE_EQ(seriesData.values[2], 50.0);  // 5000
@@ -408,4 +408,3 @@ TEST_F(MemoryStoreTest, LongStringValues) {
     EXPECT_EQ(seriesData.values[0].length(), 10000);
     EXPECT_EQ(seriesData.values[1], "short");
 }
-

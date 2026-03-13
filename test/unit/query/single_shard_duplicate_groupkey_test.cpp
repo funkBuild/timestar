@@ -11,9 +11,11 @@
 // (mergePartialAggregationsGrouped). These tests verify correctness of
 // that merge path for pushdown-style partials across all aggregation methods.
 
-#include <gtest/gtest.h>
-#include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/http/http_query_handler.hpp"  // For SeriesResult
+#include "../../../lib/query/aggregator.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cmath>
 #include <string>
 #include <unordered_set>
@@ -44,11 +46,9 @@ protected:
     }
 
     // Create a pushdown-style partial with sortedTimestamps + sortedValues (non-bucketed)
-    static PartialAggregationResult makePushdownPartial(
-        const std::string& measurement, const std::string& fieldName,
-        const std::map<std::string, std::string>& relevantTags,
-        std::vector<uint64_t> timestamps, std::vector<double> values) {
-
+    static PartialAggregationResult makePushdownPartial(const std::string& measurement, const std::string& fieldName,
+                                                        const std::map<std::string, std::string>& relevantTags,
+                                                        std::vector<uint64_t> timestamps, std::vector<double> values) {
         PartialAggregationResult partial;
         partial.measurement = measurement;
         partial.fieldName = fieldName;
@@ -69,7 +69,6 @@ protected:
         const std::string& measurement, const std::string& fieldName,
         const std::map<std::string, std::string>& relevantTags,
         const std::vector<std::pair<uint64_t, std::vector<std::pair<double, uint64_t>>>>& bucketData) {
-
         PartialAggregationResult partial;
         partial.measurement = measurement;
         partial.fieldName = fieldName;
@@ -117,7 +116,8 @@ TEST_F(SingleShardDuplicateGroupKeyTest, DetectsDuplicateGroupKeys) {
         }
     }
 
-    EXPECT_TRUE(hasDuplicateGroupKeys) << "3 series with same measurement+field and no group-by must produce duplicate groupKeys";
+    EXPECT_TRUE(hasDuplicateGroupKeys)
+        << "3 series with same measurement+field and no group-by must produce duplicate groupKeys";
 }
 
 TEST_F(SingleShardDuplicateGroupKeyTest, NoDuplicatesWhenGroupKeysUnique) {
@@ -345,7 +345,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_LATEST_AcrossThreeSeries)
     // All unique timestamps merged, sorted
     auto& pts = grouped[0].points;
     std::sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.timestamp < b.timestamp; });
-    EXPECT_EQ(pts.size(), 5); // 5 unique timestamps
+    EXPECT_EQ(pts.size(), 5);  // 5 unique timestamps
 
     // The latest timestamp (5000) should have value 50.0
     EXPECT_EQ(pts.back().timestamp, 5000);
@@ -364,12 +364,9 @@ TEST_F(SingleShardDuplicateGroupKeyTest, BugReproducer_LastPartialOverwritesEarl
     //
     // With the fix, duplicate groupKeys are detected and routed to the merge
     // path, which correctly aggregates across all series.
-    auto deviceA = makePushdownPartial("sensor_data", "temperature", {},
-                                       {1000, 2000, 3000}, {25.0, 26.0, 24.0});
-    auto deviceB = makePushdownPartial("sensor_data", "temperature", {},
-                                       {1000, 2000, 3000}, {18.0, 19.0, 17.0});
-    auto deviceC = makePushdownPartial("sensor_data", "temperature", {},
-                                       {1000, 2000, 3000}, {22.0, 23.0, 21.0});
+    auto deviceA = makePushdownPartial("sensor_data", "temperature", {}, {1000, 2000, 3000}, {25.0, 26.0, 24.0});
+    auto deviceB = makePushdownPartial("sensor_data", "temperature", {}, {1000, 2000, 3000}, {18.0, 19.0, 17.0});
+    auto deviceC = makePushdownPartial("sensor_data", "temperature", {}, {1000, 2000, 3000}, {22.0, 23.0, 21.0});
 
     // Verify all three share the same groupKey (precondition for the bug)
     ASSERT_EQ(deviceA.groupKey, deviceB.groupKey);
@@ -404,12 +401,9 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_BucketedMIN_AcrossThreeSe
     // 3 devices, bucketed at 10-second intervals, no group-by
     // Bucket 0: Device A=30, B=10, C=20  → min=10
     // Bucket 10000: Device A=25, B=15, C=22  → min=15
-    auto pA = makeBucketedPartial("m", "value", {},
-        {{0, {{30.0, 100}}}, {10000, {{25.0, 10100}}}});
-    auto pB = makeBucketedPartial("m", "value", {},
-        {{0, {{10.0, 200}}}, {10000, {{15.0, 10200}}}});
-    auto pC = makeBucketedPartial("m", "value", {},
-        {{0, {{20.0, 300}}}, {10000, {{22.0, 10300}}}});
+    auto pA = makeBucketedPartial("m", "value", {}, {{0, {{30.0, 100}}}, {10000, {{25.0, 10100}}}});
+    auto pB = makeBucketedPartial("m", "value", {}, {{0, {{10.0, 200}}}, {10000, {{15.0, 10200}}}});
+    auto pC = makeBucketedPartial("m", "value", {}, {{0, {{20.0, 300}}}, {10000, {{22.0, 10300}}}});
 
     ASSERT_EQ(pA.groupKey, pB.groupKey);
     ASSERT_EQ(pB.groupKey, pC.groupKey);
@@ -432,12 +426,9 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_BucketedMIN_AcrossThreeSe
 }
 
 TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_BucketedAVG_AcrossThreeSeries) {
-    auto pA = makeBucketedPartial("m", "value", {},
-        {{0, {{30.0, 100}}}});
-    auto pB = makeBucketedPartial("m", "value", {},
-        {{0, {{10.0, 200}}}});
-    auto pC = makeBucketedPartial("m", "value", {},
-        {{0, {{20.0, 300}}}});
+    auto pA = makeBucketedPartial("m", "value", {}, {{0, {{30.0, 100}}}});
+    auto pB = makeBucketedPartial("m", "value", {}, {{0, {{10.0, 200}}}});
+    auto pC = makeBucketedPartial("m", "value", {}, {{0, {{20.0, 300}}}});
 
     std::vector<PartialAggregationResult> partials;
     partials.push_back(std::move(pA));
@@ -497,8 +488,10 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MixedDuplicateAndUniqueGroupKeys) {
     GroupedAggregationResult* tempResult = nullptr;
     GroupedAggregationResult* humidResult = nullptr;
     for (auto& g : grouped) {
-        if (g.fieldName == "temperature") tempResult = &g;
-        if (g.fieldName == "humidity") humidResult = &g;
+        if (g.fieldName == "temperature")
+            tempResult = &g;
+        if (g.fieldName == "humidity")
+            humidResult = &g;
     }
 
     ASSERT_NE(tempResult, nullptr);
@@ -526,8 +519,8 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_MIN) {
     // 10 devices reporting to the same measurement, no group-by
     std::vector<PartialAggregationResult> partials;
     for (int i = 0; i < 10; ++i) {
-        partials.push_back(makePushdownPartial("sensor", "value", {},
-            {1000, 2000}, {static_cast<double>(i * 10 + 5), static_cast<double>(i * 10 + 8)}));
+        partials.push_back(makePushdownPartial("sensor", "value", {}, {1000, 2000},
+                                               {static_cast<double>(i * 10 + 5), static_cast<double>(i * 10 + 8)}));
     }
 
     // All share the same groupKey
@@ -552,8 +545,8 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_MIN) {
 TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_SUM) {
     std::vector<PartialAggregationResult> partials;
     for (int i = 0; i < 10; ++i) {
-        partials.push_back(makePushdownPartial("sensor", "value", {},
-            {1000}, {static_cast<double>(i + 1)}));  // values: 1, 2, ..., 10
+        partials.push_back(
+            makePushdownPartial("sensor", "value", {}, {1000}, {static_cast<double>(i + 1)}));  // values: 1, 2, ..., 10
     }
 
     auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM);
@@ -568,8 +561,8 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_SUM) {
 TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_AVG) {
     std::vector<PartialAggregationResult> partials;
     for (int i = 0; i < 10; ++i) {
-        partials.push_back(makePushdownPartial("sensor", "value", {},
-            {1000}, {static_cast<double>(i + 1)}));  // values: 1, 2, ..., 10
+        partials.push_back(
+            makePushdownPartial("sensor", "value", {}, {1000}, {static_cast<double>(i + 1)}));  // values: 1, 2, ..., 10
     }
 
     auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
@@ -670,24 +663,23 @@ TEST_F(SingleShardDuplicateGroupKeyTest, CreatePartialAggregations_ProducesDupli
     SeriesResult sr1;
     sr1.measurement = "cpu";
     sr1.tags = {{"host", "server1"}};
-    sr1.fields["usage"] = std::make_pair(
-        std::vector<uint64_t>{1000, 2000}, FieldValues(std::vector<double>{10.0, 20.0}));
+    sr1.fields["usage"] =
+        std::make_pair(std::vector<uint64_t>{1000, 2000}, FieldValues(std::vector<double>{10.0, 20.0}));
 
     SeriesResult sr2;
     sr2.measurement = "cpu";
     sr2.tags = {{"host", "server2"}};
-    sr2.fields["usage"] = std::make_pair(
-        std::vector<uint64_t>{1000, 2000}, FieldValues(std::vector<double>{30.0, 40.0}));
+    sr2.fields["usage"] =
+        std::make_pair(std::vector<uint64_t>{1000, 2000}, FieldValues(std::vector<double>{30.0, 40.0}));
 
     SeriesResult sr3;
     sr3.measurement = "cpu";
     sr3.tags = {{"host", "server3"}};
-    sr3.fields["usage"] = std::make_pair(
-        std::vector<uint64_t>{1000, 2000}, FieldValues(std::vector<double>{50.0, 60.0}));
+    sr3.fields["usage"] =
+        std::make_pair(std::vector<uint64_t>{1000, 2000}, FieldValues(std::vector<double>{50.0, 60.0}));
 
     // No group-by tags → all partials get the same groupKey
-    auto partials = Aggregator::createPartialAggregations(
-        {sr1, sr2, sr3}, AggregationMethod::MIN, 0, {});
+    auto partials = Aggregator::createPartialAggregations({sr1, sr2, sr3}, AggregationMethod::MIN, 0, {});
 
     // createPartialAggregations merges them into ONE partial (same groupKey)
     // This is the fallback path behavior — it aggregates in the map phase.

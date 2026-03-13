@@ -1,13 +1,13 @@
 // Seastar-based tests for TSM read and tombstone operations
 
-#include <gtest/gtest.h>
-#include <filesystem>
-
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm.hpp"
-#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/tsm.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
 
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 
 namespace fs = std::filesystem;
@@ -16,17 +16,11 @@ class TSMSeastarTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_tsm_seastar_files";
 
-    void SetUp() override {
-        fs::create_directories(testDir);
-    }
+    void SetUp() override { fs::create_directories(testDir); }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 
-    std::string getTestFilePath(const std::string& filename) {
-        return testDir + "/" + filename;
-    }
+    std::string getTestFilePath(const std::string& filename) { return testDir + "/" + filename; }
 };
 
 seastar::future<> testTSMReadFloat(std::string filename) {

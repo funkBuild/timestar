@@ -1,15 +1,16 @@
-#include <gtest/gtest.h>
 #include "query_result.hpp"
 #include "tsm_result.hpp"
+
+#include <gtest/gtest.h>
+
 #include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
 // Helper to create a TSMBlock with given timestamps and values
-static std::unique_ptr<TSMBlock<double>> makeRankTestBlock(
-    const std::vector<uint64_t>& timestamps,
-    const std::vector<double>& values) {
+static std::unique_ptr<TSMBlock<double>> makeRankTestBlock(const std::vector<uint64_t>& timestamps,
+                                                           const std::vector<double>& values) {
     auto block = std::make_unique<TSMBlock<double>>(timestamps.size());
     for (size_t i = 0; i < timestamps.size(); i++) {
         block->timestamps.push_back(timestamps[i]);
@@ -157,11 +158,9 @@ TEST_F(QueryResultRankTest, SameRankFirstWins) {
 TEST_F(QueryResultRankTest, RankFieldInIterationState) {
 #ifdef QUERY_RESULT_SOURCE_PATH
     std::ifstream file(QUERY_RESULT_SOURCE_PATH);
-    ASSERT_TRUE(file.is_open()) << "Could not open query_result.hpp at: "
-                                << QUERY_RESULT_SOURCE_PATH;
+    ASSERT_TRUE(file.is_open()) << "Could not open query_result.hpp at: " << QUERY_RESULT_SOURCE_PATH;
 
-    std::string content((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     // Verify the TSMIterationState struct contains a rank field
     EXPECT_NE(content.find("uint64_t rank"), std::string::npos)

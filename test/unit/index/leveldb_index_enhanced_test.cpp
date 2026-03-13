@@ -3,15 +3,16 @@
  * Tests group-by support, field statistics, and improved series discovery
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <filesystem>
-
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexEnhancedTest : public ::testing::Test {
 protected:
@@ -87,7 +88,7 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, GetSeriesGroupedByTag) {
     // Get series grouped by host
     auto grouped = co_await index.getSeriesGroupedByTag(measurement, "host");
 
-    EXPECT_EQ(grouped.size(), 3); // 3 unique hosts
+    EXPECT_EQ(grouped.size(), 3);  // 3 unique hosts
 
     // Check server1 has 2 series
     EXPECT_EQ(grouped["server1"].size(), 2);
@@ -165,11 +166,9 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, ComplexTagQueries) {
     for (int dc = 1; dc <= 2; dc++) {
         for (int host = 1; host <= 3; host++) {
             for (int cpu = 0; cpu <= 1; cpu++) {
-                std::map<std::string, std::string> tags = {
-                    {"datacenter", "dc" + std::to_string(dc)},
-                    {"host", "host" + std::to_string(host)},
-                    {"cpu", std::to_string(cpu)}
-                };
+                std::map<std::string, std::string> tags = {{"datacenter", "dc" + std::to_string(dc)},
+                                                           {"host", "host" + std::to_string(host)},
+                                                           {"cpu", std::to_string(cpu)}};
 
                 SeriesId128 id = co_await index.getOrCreateSeriesId(measurement, tags, "usage");
                 allIds.push_back(id);
@@ -182,11 +181,11 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, ComplexTagQueries) {
 
     // Find all series in dc1
     auto dc1Series = co_await index.findSeriesByTag(measurement, "datacenter", "dc1");
-    EXPECT_EQ(dc1Series.size(), 6); // 3 hosts * 2 cpus
+    EXPECT_EQ(dc1Series.size(), 6);  // 3 hosts * 2 cpus
 
     // Find all series on host2
     auto host2Series = co_await index.findSeriesByTag(measurement, "host", "host2");
-    EXPECT_EQ(host2Series.size(), 4); // 2 datacenters * 2 cpus
+    EXPECT_EQ(host2Series.size(), 4);  // 2 datacenters * 2 cpus
 
     // Group by datacenter
     auto byDatacenter = co_await index.getSeriesGroupedByTag(measurement, "datacenter");
@@ -197,7 +196,7 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, ComplexTagQueries) {
     // Group by CPU
     auto byCpu = co_await index.getSeriesGroupedByTag(measurement, "cpu");
     EXPECT_EQ(byCpu.size(), 2);
-    EXPECT_EQ(byCpu["0"].size(), 6); // 2 datacenters * 3 hosts
+    EXPECT_EQ(byCpu["0"].size(), 6);  // 2 datacenters * 3 hosts
     EXPECT_EQ(byCpu["1"].size(), 6);
 
     co_await index.close();

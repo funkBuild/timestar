@@ -49,7 +49,7 @@ struct IndexConfig {
     uint64_t max_file_size = 64 * 1024 * 1024;
     uint64_t series_cache_size = 1000000;
     uint64_t metadata_cache_bytes = 48 * 1024 * 1024;   // 48MB for series metadata LRU cache
-    uint64_t discovery_cache_bytes = 16 * 1024 * 1024;   // 16MB for discovery result LRU cache
+    uint64_t discovery_cache_bytes = 16 * 1024 * 1024;  // 16MB for discovery result LRU cache
 };
 
 struct StreamingConfig {

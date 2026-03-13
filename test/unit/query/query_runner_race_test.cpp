@@ -1,7 +1,8 @@
 #include <gtest/gtest.h>
+
 #include <fstream>
-#include <string>
 #include <regex>
+#include <string>
 
 // =============================================================================
 // Source code inspection tests: verify the parallel_for_each race condition fix
@@ -25,25 +26,20 @@ protected:
 
     void SetUp() override {
         std::ifstream file(QUERY_RUNNER_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open())
-            << "Could not open query_runner.cpp at: " << QUERY_RUNNER_SOURCE_PATH;
-        sourceCode.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>());
+        ASSERT_TRUE(file.is_open()) << "Could not open query_runner.cpp at: " << QUERY_RUNNER_SOURCE_PATH;
+        sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         ASSERT_FALSE(sourceCode.empty());
 
         // Extract the parallel_for_each lambda body by brace-matching.
         // We find "parallel_for_each" then the lambda's opening '{' and
         // match braces to locate its closing '}'.
         auto pfePos = sourceCode.find("parallel_for_each");
-        ASSERT_NE(pfePos, std::string::npos)
-            << "Expected parallel_for_each in query_runner.cpp";
+        ASSERT_NE(pfePos, std::string::npos) << "Expected parallel_for_each in query_runner.cpp";
 
         // Find the lambda opening brace: look for "-> seastar::future<> {" pattern
         // which is the opening of the lambda body
         auto lambdaSig = sourceCode.find("-> seastar::future<>", pfePos);
-        ASSERT_NE(lambdaSig, std::string::npos)
-            << "Expected lambda signature in parallel_for_each";
+        ASSERT_NE(lambdaSig, std::string::npos) << "Expected lambda signature in parallel_for_each";
 
         auto lambdaOpen = sourceCode.find('{', lambdaSig);
         ASSERT_NE(lambdaOpen, std::string::npos);
@@ -52,8 +48,10 @@ protected:
         int depth = 1;
         size_t pos = lambdaOpen + 1;
         while (pos < sourceCode.size() && depth > 0) {
-            if (sourceCode[pos] == '{') depth++;
-            else if (sourceCode[pos] == '}') depth--;
+            if (sourceCode[pos] == '{')
+                depth++;
+            else if (sourceCode[pos] == '}')
+                depth--;
             pos++;
         }
         ASSERT_EQ(depth, 0) << "Unmatched braces in parallel_for_each lambda";
@@ -105,13 +103,11 @@ TEST_F(QueryRunnerRaceTest, IndexAssignmentBeforeCoAwait) {
 
     // Find the first co_await in the lambda body
     auto firstCoAwait = pfeBody.find("co_await");
-    ASSERT_NE(firstCoAwait, std::string::npos)
-        << "Expected co_await in the parallel_for_each lambda.";
+    ASSERT_NE(firstCoAwait, std::string::npos) << "Expected co_await in the parallel_for_each lambda.";
 
     // The index assignment must come BEFORE the first co_await
-    EXPECT_LT(idxAssignPos, firstCoAwait)
-        << "Index assignment (myIdx) must occur BEFORE the first co_await "
-        << "to be safe in Seastar's cooperative scheduling. "
-        << "parallel_for_each invokes the lambda sequentially before suspension, "
-        << "so the index increment is safe only if it precedes co_await.";
+    EXPECT_LT(idxAssignPos, firstCoAwait) << "Index assignment (myIdx) must occur BEFORE the first co_await "
+                                          << "to be safe in Seastar's cooperative scheduling. "
+                                          << "parallel_for_each invokes the lambda sequentially before suspension, "
+                                          << "so the index increment is safe only if it precedes co_await.";
 }

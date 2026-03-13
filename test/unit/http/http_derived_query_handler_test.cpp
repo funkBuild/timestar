@@ -1,10 +1,12 @@
-#include <gtest/gtest.h>
-#include <glaze/glaze.hpp>
-
 #include "../../../lib/http/http_derived_query_handler.hpp"
+
 #include "../../../lib/query/derived_query.hpp"
 #include "../../../lib/query/derived_query_executor.hpp"
 #include "../../../lib/query/expression_parser.hpp"
+
+#include <glaze/glaze.hpp>
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
@@ -24,13 +26,8 @@ struct TestGlazeDerivedQueryRequest {
 template <>
 struct glz::meta<TestGlazeDerivedQueryRequest> {
     using T = TestGlazeDerivedQueryRequest;
-    static constexpr auto value = object(
-        "queries", &T::queries,
-        "formula", &T::formula,
-        "startTime", &T::startTime,
-        "endTime", &T::endTime,
-        "aggregationInterval", &T::aggregationInterval
-    );
+    static constexpr auto value = object("queries", &T::queries, "formula", &T::formula, "startTime", &T::startTime,
+                                         "endTime", &T::endTime, "aggregationInterval", &T::aggregationInterval);
 };
 
 // Structure for parsing derived query JSON responses
@@ -58,34 +55,22 @@ struct TestDerivedResponse {
 template <>
 struct glz::meta<TestDerivedResponseStatistics> {
     using T = TestDerivedResponseStatistics;
-    static constexpr auto value = object(
-        "point_count", &T::point_count,
-        "execution_time_ms", &T::execution_time_ms,
-        "sub_queries_executed", &T::sub_queries_executed,
-        "points_dropped_due_to_alignment", &T::points_dropped_due_to_alignment
-    );
+    static constexpr auto value =
+        object("point_count", &T::point_count, "execution_time_ms", &T::execution_time_ms, "sub_queries_executed",
+               &T::sub_queries_executed, "points_dropped_due_to_alignment", &T::points_dropped_due_to_alignment);
 };
 
 template <>
 struct glz::meta<TestDerivedResponseError> {
     using T = TestDerivedResponseError;
-    static constexpr auto value = object(
-        "code", &T::code,
-        "message", &T::message
-    );
+    static constexpr auto value = object("code", &T::code, "message", &T::message);
 };
 
 template <>
 struct glz::meta<TestDerivedResponse> {
     using T = TestDerivedResponse;
-    static constexpr auto value = object(
-        "status", &T::status,
-        "timestamps", &T::timestamps,
-        "values", &T::values,
-        "formula", &T::formula,
-        "statistics", &T::statistics,
-        "error", &T::error
-    );
+    static constexpr auto value = object("status", &T::status, "timestamps", &T::timestamps, "values", &T::values,
+                                         "formula", &T::formula, "statistics", &T::statistics, "error", &T::error);
 };
 
 // =============================================================================
@@ -111,8 +96,7 @@ TEST_F(HttpDerivedQueryHandlerTest, MaxBodySizeIs1MB) {
 // =============================================================================
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseBasic) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "QUERY_ERROR", "Invalid formula syntax");
+    std::string json = DerivedQueryExecutor::createErrorResponse("QUERY_ERROR", "Invalid formula syntax");
 
     TestDerivedResponse parsed;
     auto ec = glz::read_json(parsed, json);
@@ -124,8 +108,7 @@ TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseBasic) {
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseEmptyBody) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "EMPTY_REQUEST", "Request body is required");
+    std::string json = DerivedQueryExecutor::createErrorResponse("EMPTY_REQUEST", "Request body is required");
 
     TestDerivedResponse parsed;
     auto ec = glz::read_json(parsed, json);
@@ -137,8 +120,7 @@ TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseEmptyBody) {
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseBodyTooLarge) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "BODY_TOO_LARGE", "Request body too large (max 1MB)");
+    std::string json = DerivedQueryExecutor::createErrorResponse("BODY_TOO_LARGE", "Request body too large (max 1MB)");
 
     TestDerivedResponse parsed;
     auto ec = glz::read_json(parsed, json);
@@ -150,8 +132,8 @@ TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseBodyTooLarge) {
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseUnsupportedMediaType) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json");
+    std::string json =
+        DerivedQueryExecutor::createErrorResponse("UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json");
 
     TestDerivedResponse parsed;
     auto ec = glz::read_json(parsed, json);
@@ -163,8 +145,7 @@ TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseUnsupportedMediaType) {
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseInternalError) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "INTERNAL_ERROR", "Unexpected error during execution");
+    std::string json = DerivedQueryExecutor::createErrorResponse("INTERNAL_ERROR", "Unexpected error during execution");
 
     TestDerivedResponse parsed;
     auto ec = glz::read_json(parsed, json);
@@ -176,13 +157,11 @@ TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseInternalError) {
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseSpecialCharacters) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "QUERY_ERROR", "Unexpected token '<' at position 5");
+    std::string json = DerivedQueryExecutor::createErrorResponse("QUERY_ERROR", "Unexpected token '<' at position 5");
 
     TestDerivedResponse parsed;
     auto ec = glz::read_json(parsed, json);
-    ASSERT_FALSE(ec) << "Failed to parse error response with special chars: "
-                     << glz::format_error(ec);
+    ASSERT_FALSE(ec) << "Failed to parse error response with special chars: " << glz::format_error(ec);
 
     EXPECT_EQ(parsed.status, "error");
     EXPECT_NE(parsed.error.message.find("<"), std::string::npos);
@@ -743,11 +722,7 @@ TEST_F(HttpDerivedQueryHandlerTest, BuilderBasicQuery) {
     subQuery.startTime = 1000;
     subQuery.endTime = 2000;
 
-    auto request = builder
-        .addQuery("a", subQuery)
-        .setFormula("a")
-        .setTimeRange(1000, 2000)
-        .build();
+    auto request = builder.addQuery("a", subQuery).setFormula("a").setTimeRange(1000, 2000).build();
 
     EXPECT_EQ(request.queries.size(), 1u);
     EXPECT_EQ(request.formula, "a");
@@ -768,12 +743,8 @@ TEST_F(HttpDerivedQueryHandlerTest, BuilderMultipleQueries) {
     subQueryB.startTime = 1000;
     subQueryB.endTime = 2000;
 
-    auto request = builder
-        .addQuery("a", subQueryA)
-        .addQuery("b", subQueryB)
-        .setFormula("a + b")
-        .setTimeRange(1000, 2000)
-        .build();
+    auto request =
+        builder.addQuery("a", subQueryA).addQuery("b", subQueryB).setFormula("a + b").setTimeRange(1000, 2000).build();
 
     EXPECT_EQ(request.queries.size(), 2u);
     EXPECT_EQ(request.formula, "a + b");
@@ -782,11 +753,7 @@ TEST_F(HttpDerivedQueryHandlerTest, BuilderMultipleQueries) {
 TEST_F(HttpDerivedQueryHandlerTest, BuilderWithQueryString) {
     DerivedQueryBuilder builder;
 
-    auto request = builder
-        .addQuery("a", "avg:cpu(usage)")
-        .setFormula("a")
-        .setTimeRange(1000, 2000)
-        .build();
+    auto request = builder.addQuery("a", "avg:cpu(usage)").setFormula("a").setTimeRange(1000, 2000).build();
 
     EXPECT_EQ(request.queries.size(), 1u);
     EXPECT_EQ(request.queries.at("a").measurement, "cpu");
@@ -802,12 +769,11 @@ TEST_F(HttpDerivedQueryHandlerTest, BuilderWithAggregationInterval) {
     subQuery.startTime = 1000;
     subQuery.endTime = 2000;
 
-    auto request = builder
-        .addQuery("a", subQuery)
-        .setFormula("a")
-        .setTimeRange(1000, 2000)
-        .setAggregationInterval(300000000000ULL)  // 5 minutes
-        .build();
+    auto request = builder.addQuery("a", subQuery)
+                       .setFormula("a")
+                       .setTimeRange(1000, 2000)
+                       .setAggregationInterval(300000000000ULL)  // 5 minutes
+                       .build();
 
     EXPECT_EQ(request.aggregationInterval, 300000000000ULL);
 }
@@ -816,9 +782,7 @@ TEST_F(HttpDerivedQueryHandlerTest, BuilderValidationFailsOnBuild) {
     DerivedQueryBuilder builder;
 
     // No queries added, formula references "a"
-    EXPECT_THROW(
-        builder.setFormula("a").setTimeRange(1000, 2000).build(),
-        DerivedQueryException);
+    EXPECT_THROW(builder.setFormula("a").setTimeRange(1000, 2000).build(), DerivedQueryException);
 }
 
 // =============================================================================
@@ -1129,8 +1093,7 @@ TEST_F(HttpDerivedQueryHandlerTest, ExecutorConstructWithCustomConfig) {
 
 TEST_F(HttpDerivedQueryHandlerTest, ErrorResponseRoundTrip) {
     // Create error -> parse -> verify
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "PARSE_ERROR", "Missing formula field");
+    std::string json = DerivedQueryExecutor::createErrorResponse("PARSE_ERROR", "Missing formula field");
 
     TestDerivedResponse parsed;
     auto ec = glz::read_json(parsed, json);

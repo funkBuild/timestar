@@ -1,25 +1,26 @@
-#include <iostream>
-#include <chrono>
-#include <vector>
-#include <random>
-#include <iomanip>
-#include <cmath>
-#include <numeric>
-#include <cstring>
-#include "../../lib/encoding/float_encoder.hpp"
-#include "../../lib/encoding/float/float_decoder_simd.hpp"
 #include "../../lib/encoding/float/float_decoder_avx512.hpp"
+#include "../../lib/encoding/float/float_decoder_simd.hpp"
+#include "../../lib/encoding/float_encoder.hpp"
 #include "../../lib/storage/compressed_buffer.hpp"
 #include "../../lib/storage/slice_buffer.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <vector>
 
 using namespace std::chrono;
 
 // ANSI color codes
-#define RESET   "\033[0m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define CYAN    "\033[36m"
-#define BOLD    "\033[1m"
+#define RESET "\033[0m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define CYAN "\033[36m"
+#define BOLD "\033[1m"
 
 std::vector<double> generateTestData(size_t count) {
     std::vector<double> data;
@@ -42,12 +43,8 @@ struct MemoryStats {
 };
 
 // Test different buffer management strategies
-void testBufferStrategy(const std::string& name,
-                        const CompressedBuffer& encoded,
-                        const std::vector<double>& original,
-                        bool pre_reserve,
-                        bool exact_size,
-                        MemoryStats& stats) {
+void testBufferStrategy(const std::string& name, const CompressedBuffer& encoded, const std::vector<double>& original,
+                        bool pre_reserve, bool exact_size, MemoryStats& stats) {
     const int runs = 100;
     double total_time = 0;
 
@@ -59,12 +56,11 @@ void testBufferStrategy(const std::string& name,
             if (exact_size) {
                 decoded.reserve(original.size());
             } else {
-                decoded.reserve(original.size() + original.size() / 4); // 25% extra
+                decoded.reserve(original.size() + original.size() / 4);  // 25% extra
             }
         }
 
-        CompressedSlice slice((const uint8_t*)encoded.data.data(),
-                             encoded.data.size() * sizeof(uint64_t));
+        CompressedSlice slice((const uint8_t*)encoded.data.data(), encoded.data.size() * sizeof(uint64_t));
 
         auto start = high_resolution_clock::now();
         FloatDecoderBasic::decode(slice, 0, original.size(), decoded);
@@ -91,12 +87,8 @@ void runMemoryEfficiencyTest() {
     std::vector<size_t> sizes = {100, 1000, 10000, 100000};
 
     std::cout << "\n" << BOLD << "Strategy Comparison:" << RESET << std::endl;
-    std::cout << std::setw(20) << "Size"
-              << std::setw(25) << "Strategy"
-              << std::setw(15) << "Time (ms)"
-              << std::setw(15) << "MB/s"
-              << std::setw(15) << "Allocations"
-              << std::setw(15) << "Memory (KB)" << std::endl;
+    std::cout << std::setw(20) << "Size" << std::setw(25) << "Strategy" << std::setw(15) << "Time (ms)" << std::setw(15)
+              << "MB/s" << std::setw(15) << "Allocations" << std::setw(15) << "Memory (KB)" << std::endl;
     std::cout << std::string(100, '-') << std::endl;
 
     for (size_t size : sizes) {
@@ -108,11 +100,7 @@ void runMemoryEfficiencyTest() {
             std::string name;
             bool pre_reserve;
             bool exact_size;
-        } strategies[] = {
-            {"No Reserve", false, false},
-            {"Reserve Exact", true, true},
-            {"Reserve +25%", true, false}
-        };
+        } strategies[] = {{"No Reserve", false, false}, {"Reserve Exact", true, true}, {"Reserve +25%", true, false}};
 
         MemoryStats best_stats;
         double best_throughput = 0;
@@ -120,16 +108,12 @@ void runMemoryEfficiencyTest() {
 
         for (const auto& strategy : strategies) {
             MemoryStats stats;
-            testBufferStrategy(strategy.name, encoded, data,
-                             strategy.pre_reserve, strategy.exact_size, stats);
+            testBufferStrategy(strategy.name, encoded, data, strategy.pre_reserve, strategy.exact_size, stats);
 
-            std::cout << std::setw(20) << size
-                      << std::setw(25) << strategy.name
-                      << std::setw(15) << std::fixed << std::setprecision(3) << stats.decode_time_ms
-                      << std::setw(15) << std::setprecision(1) << stats.throughput_mbps
-                      << std::setw(15) << stats.reallocations
-                      << std::setw(15) << std::setprecision(2) << (stats.total_bytes / 1024.0)
-                      << std::endl;
+            std::cout << std::setw(20) << size << std::setw(25) << strategy.name << std::setw(15) << std::fixed
+                      << std::setprecision(3) << stats.decode_time_ms << std::setw(15) << std::setprecision(1)
+                      << stats.throughput_mbps << std::setw(15) << stats.reallocations << std::setw(15)
+                      << std::setprecision(2) << (stats.total_bytes / 1024.0) << std::endl;
 
             if (stats.throughput_mbps > best_throughput) {
                 best_throughput = stats.throughput_mbps;
@@ -138,8 +122,8 @@ void runMemoryEfficiencyTest() {
             }
         }
 
-        std::cout << GREEN << "  Best: " << best_strategy
-                  << " (" << std::setprecision(1) << best_throughput << " MB/s)" << RESET << std::endl;
+        std::cout << GREEN << "  Best: " << best_strategy << " (" << std::setprecision(1) << best_throughput << " MB/s)"
+                  << RESET << std::endl;
     }
 }
 
@@ -149,12 +133,10 @@ void testOptimizedDecoder() {
     std::vector<size_t> sizes = {1000, 10000, 100000};
     const int runs = 100;
 
-    std::cout << "\n" << std::setw(15) << "Size"
-              << std::setw(20) << "Original (ms)"
-              << std::setw(20) << "SIMD AVX2 (ms)"
-              << std::setw(15) << "AVX2 Speedup"
-              << std::setw(20) << "AVX-512 (ms)"
-              << std::setw(15) << "AVX512 Speedup" << std::endl;
+    std::cout << "\n"
+              << std::setw(15) << "Size" << std::setw(20) << "Original (ms)" << std::setw(20) << "SIMD AVX2 (ms)"
+              << std::setw(15) << "AVX2 Speedup" << std::setw(20) << "AVX-512 (ms)" << std::setw(15) << "AVX512 Speedup"
+              << std::endl;
     std::cout << std::string(105, '-') << std::endl;
 
     for (size_t size : sizes) {
@@ -166,8 +148,7 @@ void testOptimizedDecoder() {
         for (int r = 0; r < runs; r++) {
             std::vector<double> decoded;
             decoded.reserve(size);
-            CompressedSlice slice((const uint8_t*)encoded.data.data(),
-                                 encoded.data.size() * sizeof(uint64_t));
+            CompressedSlice slice((const uint8_t*)encoded.data.data(), encoded.data.size() * sizeof(uint64_t));
 
             auto start = high_resolution_clock::now();
             FloatDecoderBasic::decode(slice, 0, size, decoded);
@@ -181,8 +162,7 @@ void testOptimizedDecoder() {
         if (FloatDecoderSIMD::isAvailable()) {
             for (int r = 0; r < runs; r++) {
                 std::vector<double> decoded;
-                CompressedSlice slice((const uint8_t*)encoded.data.data(),
-                                     encoded.data.size() * sizeof(uint64_t));
+                CompressedSlice slice((const uint8_t*)encoded.data.data(), encoded.data.size() * sizeof(uint64_t));
 
                 auto start = high_resolution_clock::now();
                 FloatDecoderSIMD::decode(slice, 0, size, decoded);
@@ -197,8 +177,7 @@ void testOptimizedDecoder() {
         if (FloatDecoderAVX512::isAvailable()) {
             for (int r = 0; r < runs; r++) {
                 std::vector<double> decoded;
-                CompressedSlice slice((const uint8_t*)encoded.data.data(),
-                                     encoded.data.size() * sizeof(uint64_t));
+                CompressedSlice slice((const uint8_t*)encoded.data.data(), encoded.data.size() * sizeof(uint64_t));
 
                 auto start = high_resolution_clock::now();
                 FloatDecoderAVX512::decode(slice, 0, size, decoded);
@@ -208,8 +187,7 @@ void testOptimizedDecoder() {
             avx512_time /= runs;
         }
 
-        std::cout << std::setw(15) << size
-                  << std::setw(20) << std::fixed << std::setprecision(3) << original_time;
+        std::cout << std::setw(15) << size << std::setw(20) << std::fixed << std::setprecision(3) << original_time;
 
         if (FloatDecoderSIMD::isAvailable()) {
             std::cout << std::setw(20) << simd_time;
@@ -266,7 +244,7 @@ void testBatchDecoding() {
             std::vector<double> decoded;
             decoded.reserve(values_per_series);
             CompressedSlice slice((const uint8_t*)all_encoded[i].data.data(),
-                                 all_encoded[i].data.size() * sizeof(uint64_t));
+                                  all_encoded[i].data.size() * sizeof(uint64_t));
             FloatDecoderBasic::decode(slice, 0, values_per_series, decoded);
         }
 
@@ -278,14 +256,13 @@ void testBatchDecoding() {
     std::cout << "\nBatch Processing Results:" << std::endl;
     std::cout << "  Series count: " << series_count << std::endl;
     std::cout << "  Values per series: " << values_per_series << std::endl;
-    std::cout << "  Individual decode time: " << std::fixed << std::setprecision(3)
-              << individual_time << " ms" << std::endl;
+    std::cout << "  Individual decode time: " << std::fixed << std::setprecision(3) << individual_time << " ms"
+              << std::endl;
     std::cout << "  Per-series time: " << (individual_time / series_count) << " ms" << std::endl;
 
     size_t total_bytes = series_count * values_per_series * sizeof(double);
     double throughput = (total_bytes / (1024.0 * 1024.0)) / (individual_time / 1000.0);
-    std::cout << "  Total throughput: " << std::setprecision(1)
-              << throughput << " MB/s" << std::endl;
+    std::cout << "  Total throughput: " << std::setprecision(1) << throughput << " MB/s" << std::endl;
 }
 
 int main() {
@@ -295,12 +272,12 @@ int main() {
 
     // Check CPU capabilities
     std::cout << "\n" << BOLD << "System Capabilities:" << RESET << std::endl;
-    std::cout << "  SIMD AVX2: " << (FloatDecoderSIMD::isAvailable() ?
-                                    GREEN "✓ Available" RESET :
-                                    "\033[31m✗ Not Available" RESET) << std::endl;
-    std::cout << "  AVX-512: " << (FloatDecoderAVX512::isAvailable() ?
-                                  GREEN "✓ Available" RESET :
-                                  "\033[31m✗ Not Available" RESET) << std::endl;
+    std::cout << "  SIMD AVX2: "
+              << (FloatDecoderSIMD::isAvailable() ? GREEN "✓ Available" RESET : "\033[31m✗ Not Available" RESET)
+              << std::endl;
+    std::cout << "  AVX-512: "
+              << (FloatDecoderAVX512::isAvailable() ? GREEN "✓ Available" RESET : "\033[31m✗ Not Available" RESET)
+              << std::endl;
 
     runMemoryEfficiencyTest();
     testOptimizedDecoder();

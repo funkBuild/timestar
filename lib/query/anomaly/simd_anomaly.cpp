@@ -1,10 +1,9 @@
 // Highway foreach_target re-inclusion mechanism.
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "query/anomaly/simd_anomaly.cpp"
-#include "hwy/foreach_target.h"
-
 #include "simd_anomaly.hpp"
 
+#include "hwy/foreach_target.h"
 #include "hwy/highway.h"
 
 #include <algorithm>
@@ -25,8 +24,8 @@ namespace hn = hwy::HWY_NAMESPACE;
 
 // --- Element-wise operations ---
 
-void VectorSubtractKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
-                          double* HWY_RESTRICT result, size_t count) {
+void VectorSubtractKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b, double* HWY_RESTRICT result,
+                          size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
 
@@ -41,8 +40,8 @@ void VectorSubtractKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRI
     }
 }
 
-void VectorAddKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
-                     double* HWY_RESTRICT result, size_t count) {
+void VectorAddKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b, double* HWY_RESTRICT result,
+                     size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
 
@@ -57,8 +56,8 @@ void VectorAddKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
     }
 }
 
-void VectorMultiplyKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
-                          double* HWY_RESTRICT result, size_t count) {
+void VectorMultiplyKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b, double* HWY_RESTRICT result,
+                          size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
 
@@ -73,8 +72,8 @@ void VectorMultiplyKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRI
     }
 }
 
-void VectorScalarMultiplyKernel(const double* HWY_RESTRICT a, double scalar,
-                                double* HWY_RESTRICT result, size_t count) {
+void VectorScalarMultiplyKernel(const double* HWY_RESTRICT a, double scalar, double* HWY_RESTRICT result,
+                                size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
     const auto vs = hn::Set(d, scalar);
@@ -90,8 +89,8 @@ void VectorScalarMultiplyKernel(const double* HWY_RESTRICT a, double scalar,
 }
 
 // result[i] = a[i] + b[i] * scalar  (fused multiply-add)
-void VectorFMAKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
-                     double scalar, double* HWY_RESTRICT result, size_t count) {
+void VectorFMAKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b, double scalar,
+                     double* HWY_RESTRICT result, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
     const auto vs = hn::Set(d, scalar);
@@ -150,8 +149,7 @@ double VectorSumSquaredDiffKernel(const double* HWY_RESTRICT values, size_t coun
     return result;
 }
 
-double WeightedSumKernel(const double* HWY_RESTRICT values,
-                         const double* HWY_RESTRICT weights, size_t count) {
+double WeightedSumKernel(const double* HWY_RESTRICT values, const double* HWY_RESTRICT weights, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
 
@@ -177,10 +175,8 @@ double WeightedSumKernel(const double* HWY_RESTRICT values,
 // lower[i] = predictions[i] - bounds * scale[i]
 // Uses separate Mul + Add/Sub (NOT MulAdd) to match the non-FMA semantics
 // of the original implementation and existing tests.
-void ComputeBoundsKernel(const double* HWY_RESTRICT predictions,
-                         const double* HWY_RESTRICT scale, double bounds,
-                         double* HWY_RESTRICT upper, double* HWY_RESTRICT lower,
-                         size_t count) {
+void ComputeBoundsKernel(const double* HWY_RESTRICT predictions, const double* HWY_RESTRICT scale, double bounds,
+                         double* HWY_RESTRICT upper, double* HWY_RESTRICT lower, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
     const auto vbounds = hn::Set(d, bounds);
@@ -201,10 +197,8 @@ void ComputeBoundsKernel(const double* HWY_RESTRICT predictions,
 }
 
 // score[i] = max(0, val - upper) + max(0, lower - val)
-void ComputeAnomalyScoresKernel(const double* HWY_RESTRICT values,
-                                const double* HWY_RESTRICT upper,
-                                const double* HWY_RESTRICT lower,
-                                double* HWY_RESTRICT scores, size_t count) {
+void ComputeAnomalyScoresKernel(const double* HWY_RESTRICT values, const double* HWY_RESTRICT upper,
+                                const double* HWY_RESTRICT lower, double* HWY_RESTRICT scores, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
     const auto zero = hn::Zero(d);
@@ -228,8 +222,7 @@ void ComputeAnomalyScoresKernel(const double* HWY_RESTRICT values,
 
 // --- LOESS: tricube weights ---
 // weight = (1 - |d|^3)^3 where |d| < 1, else 0
-void ComputeTricubeWeightsKernel(const double* HWY_RESTRICT distances,
-                                 double* HWY_RESTRICT weights, size_t count) {
+void ComputeTricubeWeightsKernel(const double* HWY_RESTRICT distances, double* HWY_RESTRICT weights, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
     const auto one = hn::Set(d, 1.0);
@@ -266,11 +259,8 @@ void ComputeTricubeWeightsKernel(const double* HWY_RESTRICT distances,
 }
 
 // --- Weighted linear regression helper: compute wxx and wxy arrays ---
-void WeightedProductsKernel(const double* HWY_RESTRICT x,
-                            const double* HWY_RESTRICT y,
-                            const double* HWY_RESTRICT weights,
-                            double* HWY_RESTRICT wxx,
-                            double* HWY_RESTRICT wxy,
+void WeightedProductsKernel(const double* HWY_RESTRICT x, const double* HWY_RESTRICT y,
+                            const double* HWY_RESTRICT weights, double* HWY_RESTRICT wxx, double* HWY_RESTRICT wxy,
                             size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);

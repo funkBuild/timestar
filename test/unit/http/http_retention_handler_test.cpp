@@ -16,13 +16,15 @@
  *      without calling co_await so we can unit-test every rejection path
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/http/http_retention_handler.hpp"
+
+#include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/query/query_parser.hpp"
+#include "../../../lib/retention/retention_policy.hpp"
+
 #include <glaze/glaze.hpp>
 
-#include "../../../lib/http/http_retention_handler.hpp"
-#include "../../../lib/http/http_query_handler.hpp"
-#include "../../../lib/retention/retention_policy.hpp"
-#include "../../../lib/query/query_parser.hpp"
+#include <gtest/gtest.h>
 
 // ---------------------------------------------------------------------------
 // Helper: parse a JSON string into a RetentionPolicyRequest (same call as
@@ -61,13 +63,21 @@ static std::string validatePutRequest(const RetentionPolicyRequest& req) {
 
     if (req.downsample.has_value()) {
         const auto& ds = *req.downsample;
-        if (ds.after.empty())    return "downsample.after is required";
-        if (ds.interval.empty()) return "downsample.interval is required";
-        if (ds.method.empty())   return "downsample.method is required";
+        if (ds.after.empty())
+            return "downsample.after is required";
+        if (ds.interval.empty())
+            return "downsample.interval is required";
+        if (ds.method.empty())
+            return "downsample.method is required";
 
         const auto& validMethods = {"avg", "min", "max", "sum", "latest"};
         bool methodOk = false;
-        for (auto& m : validMethods) { if (ds.method == m) { methodOk = true; break; } }
+        for (auto& m : validMethods) {
+            if (ds.method == m) {
+                methodOk = true;
+                break;
+            }
+        }
         if (!methodOk) {
             return "Invalid downsample.method: must be one of avg, min, max, sum, latest";
         }
@@ -91,7 +101,7 @@ static std::string validatePutRequest(const RetentionPolicyRequest& req) {
         }
     }
 
-    return ""; // success
+    return "";  // success
 }
 
 // =============================================================================
@@ -226,8 +236,7 @@ TEST_F(HttpRetentionHandlerParseDurationTest, ParseHours) {
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseDays) {
-    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("30d"),
-              30ULL * 86400ULL * 1'000'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("30d"), 30ULL * 86400ULL * 1'000'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseMilliseconds) {
@@ -240,14 +249,11 @@ TEST_F(HttpRetentionHandlerParseDurationTest, ParseNanoseconds) {
 
 TEST_F(HttpRetentionHandlerParseDurationTest, ParseTypicalRetentionPeriods) {
     // 7d
-    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("7d"),
-              7ULL * 86400ULL * 1'000'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("7d"), 7ULL * 86400ULL * 1'000'000'000ULL);
     // 90d
-    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("90d"),
-              90ULL * 86400ULL * 1'000'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("90d"), 90ULL * 86400ULL * 1'000'000'000ULL);
     // 365d
-    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("365d"),
-              365ULL * 86400ULL * 1'000'000'000ULL);
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("365d"), 365ULL * 86400ULL * 1'000'000'000ULL);
 }
 
 TEST_F(HttpRetentionHandlerParseDurationTest, EmptyStringThrows) {
@@ -296,9 +302,9 @@ TEST_F(RetentionPolicyRequestParsingTest, ParseValidDownsampleOnly) {
     EXPECT_EQ(req.measurement, "temperature");
     EXPECT_FALSE(req.ttl.has_value());
     ASSERT_TRUE(req.downsample.has_value());
-    EXPECT_EQ(req.downsample->after,    "30d");
+    EXPECT_EQ(req.downsample->after, "30d");
     EXPECT_EQ(req.downsample->interval, "5m");
-    EXPECT_EQ(req.downsample->method,   "avg");
+    EXPECT_EQ(req.downsample->method, "avg");
 }
 
 TEST_F(RetentionPolicyRequestParsingTest, ParseBothTtlAndDownsample) {
@@ -321,7 +327,8 @@ TEST_F(RetentionPolicyRequestParsingTest, ParseBothTtlAndDownsample) {
 
 TEST_F(RetentionPolicyRequestParsingTest, ParseDownsampleAllMethods) {
     for (const char* method : {"avg", "min", "max", "sum", "latest"}) {
-        std::string json = std::string(R"({"measurement":"m","downsample":{"after":"1d","interval":"5m","method":")") + method + R"("}})";
+        std::string json = std::string(R"({"measurement":"m","downsample":{"after":"1d","interval":"5m","method":")") +
+                           method + R"("}})";
         auto req = parseRequest(json);
         ASSERT_TRUE(req.downsample.has_value()) << "method=" << method;
         EXPECT_EQ(req.downsample->method, method) << "method=" << method;
@@ -369,7 +376,7 @@ TEST_F(RetentionPolicyRequestParsingTest, DownsampleNanosFieldsPreservedOnRoundT
     })");
 
     ASSERT_TRUE(req.downsample.has_value());
-    EXPECT_EQ(req.downsample->afterNanos,    604800000000000ULL);
+    EXPECT_EQ(req.downsample->afterNanos, 604800000000000ULL);
     EXPECT_EQ(req.downsample->intervalNanos, 3600000000000ULL);
 }
 
@@ -406,9 +413,8 @@ TEST_F(HttpRetentionHandlerPutValidationTest, ValidBothTtlAndDownsampleAccepted)
 
 TEST_F(HttpRetentionHandlerPutValidationTest, AllValidMethodsAccepted) {
     for (const char* m : {"avg", "min", "max", "sum", "latest"}) {
-        std::string json = std::string(
-            R"({"measurement":"x","downsample":{"after":"1d","interval":"5m","method":")") +
-            m + R"("}})";
+        std::string json =
+            std::string(R"({"measurement":"x","downsample":{"after":"1d","interval":"5m","method":")") + m + R"("}})";
         auto req = parseRequest(json);
         EXPECT_EQ(validatePutRequest(req), "") << "method=" << m;
     }
@@ -428,8 +434,7 @@ TEST_F(HttpRetentionHandlerPutValidationTest, EmptyMeasurementRejected) {
 
 TEST_F(HttpRetentionHandlerPutValidationTest, NeitherTtlNorDownsampleRejected) {
     auto req = parseRequest(R"({"measurement":"cpu"})");
-    EXPECT_EQ(validatePutRequest(req),
-              "At least one of 'ttl' or 'downsample' is required");
+    EXPECT_EQ(validatePutRequest(req), "At least one of 'ttl' or 'downsample' is required");
 }
 
 // --- Invalid TTL ---
@@ -573,8 +578,7 @@ TEST_F(HttpRetentionHandlerDeleteParsingTest, ErrorResponseForMissingMeasurement
 
 TEST_F(HttpRetentionHandlerDeleteParsingTest, ErrorResponseForNotFound) {
     std::string measurement = "nonexistent_metric";
-    std::string json = handler.createErrorResponse(
-        "No retention policy found for measurement: " + measurement);
+    std::string json = handler.createErrorResponse("No retention policy found for measurement: " + measurement);
 
     glz::generic parsed;
     auto ec = glz::read_json(parsed, json);
@@ -596,8 +600,8 @@ class HttpRetentionHandlerGetResponseTest : public ::testing::Test {};
 TEST_F(HttpRetentionHandlerGetResponseTest, SinglePolicyResponseFormat) {
     RetentionPolicy policy;
     policy.measurement = "cpu";
-    policy.ttl         = "90d";
-    policy.ttlNanos    = 90ULL * 86400ULL * 1'000'000'000ULL;
+    policy.ttl = "90d";
+    policy.ttlNanos = 90ULL * 86400ULL * 1'000'000'000ULL;
 
     auto responseObj = glz::obj{"status", "success", "policy", policy};
     auto json = glz::write_json(responseObj);
@@ -617,14 +621,14 @@ TEST_F(HttpRetentionHandlerGetResponseTest, AllPoliciesResponseFormat) {
 
     RetentionPolicy p1;
     p1.measurement = "cpu";
-    p1.ttl         = "90d";
-    p1.ttlNanos    = 90ULL * 86400ULL * 1'000'000'000ULL;
+    p1.ttl = "90d";
+    p1.ttlNanos = 90ULL * 86400ULL * 1'000'000'000ULL;
     policies.push_back(p1);
 
     RetentionPolicy p2;
     p2.measurement = "mem";
-    p2.ttl         = "30d";
-    p2.ttlNanos    = 30ULL * 86400ULL * 1'000'000'000ULL;
+    p2.ttl = "30d";
+    p2.ttlNanos = 30ULL * 86400ULL * 1'000'000'000ULL;
     policies.push_back(p2);
 
     auto responseObj = glz::obj{"status", "success", "policies", policies};
@@ -656,8 +660,7 @@ TEST_F(HttpRetentionHandlerGetResponseTest, EmptyPoliciesListFormat) {
 
 TEST_F(HttpRetentionHandlerGetResponseTest, NotFoundErrorFormat) {
     HttpRetentionHandler handler{nullptr};
-    std::string json = handler.createErrorResponse(
-        "No retention policy found for measurement: cpu");
+    std::string json = handler.createErrorResponse("No retention policy found for measurement: cpu");
 
     glz::generic parsed;
     auto ec = glz::read_json(parsed, json);
@@ -671,15 +674,15 @@ TEST_F(HttpRetentionHandlerGetResponseTest, NotFoundErrorFormat) {
 TEST_F(HttpRetentionHandlerGetResponseTest, PolicyWithDownsampleSerializesCorrectly) {
     RetentionPolicy policy;
     policy.measurement = "temperature";
-    policy.ttl         = "90d";
-    policy.ttlNanos    = 90ULL * 86400ULL * 1'000'000'000ULL;
+    policy.ttl = "90d";
+    policy.ttlNanos = 90ULL * 86400ULL * 1'000'000'000ULL;
 
     DownsamplePolicy ds;
-    ds.after         = "30d";
-    ds.afterNanos    = 30ULL * 86400ULL * 1'000'000'000ULL;
-    ds.interval      = "5m";
+    ds.after = "30d";
+    ds.afterNanos = 30ULL * 86400ULL * 1'000'000'000ULL;
+    ds.interval = "5m";
     ds.intervalNanos = 5ULL * 60ULL * 1'000'000'000ULL;
-    ds.method        = "avg";
+    ds.method = "avg";
     policy.downsample = ds;
 
     auto responseObj = glz::obj{"status", "success", "policy", policy};
@@ -707,8 +710,8 @@ class HttpRetentionHandlerPutResponseTest : public ::testing::Test {};
 TEST_F(HttpRetentionHandlerPutResponseTest, SuccessResponseContainsStatusAndPolicy) {
     RetentionPolicy policy;
     policy.measurement = "cpu";
-    policy.ttl         = "90d";
-    policy.ttlNanos    = 90ULL * 86400ULL * 1'000'000'000ULL;
+    policy.ttl = "90d";
+    policy.ttlNanos = 90ULL * 86400ULL * 1'000'000'000ULL;
 
     auto responseObj = glz::obj{"status", "success", "policy", policy};
     auto json = glz::write_json(responseObj);
@@ -726,10 +729,7 @@ TEST_F(HttpRetentionHandlerPutResponseTest, SuccessResponseContainsStatusAndPoli
 TEST_F(HttpRetentionHandlerPutResponseTest, DeleteSuccessResponseFormat) {
     std::string measurement = "cpu";
     std::string message = "Retention policy deleted for measurement: " + measurement;
-    auto responseObj = glz::obj{
-        "status",  "success",
-        "message", message
-    };
+    auto responseObj = glz::obj{"status", "success", "message", message};
     auto json = glz::write_json(responseObj);
     ASSERT_TRUE(json.has_value());
 

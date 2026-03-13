@@ -1,8 +1,9 @@
-#include <gtest/gtest.h>
-#include <string>
-#include <map>
-
 #include "line_parser.hpp"
+
+#include <gtest/gtest.h>
+
+#include <map>
+#include <string>
 
 TEST(SeriesKeyParserTest, SimpleMeasurementAndField) {
     std::string key = "cpu value";

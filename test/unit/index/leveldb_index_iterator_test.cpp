@@ -1,7 +1,8 @@
 #include <gtest/gtest.h>
+
 #include <fstream>
-#include <string>
 #include <sstream>
+#include <string>
 
 // =============================================================================
 // Source-inspection tests: verify all LevelDB iterators use RAII (unique_ptr)
@@ -13,11 +14,8 @@ protected:
 
     void SetUp() override {
         std::ifstream file(LEVELDB_INDEX_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open())
-            << "Could not open leveldb_index.cpp at: " << LEVELDB_INDEX_SOURCE_PATH;
-        sourceCode.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>());
+        ASSERT_TRUE(file.is_open()) << "Could not open leveldb_index.cpp at: " << LEVELDB_INDEX_SOURCE_PATH;
+        sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         ASSERT_FALSE(sourceCode.empty());
     }
 
@@ -26,20 +24,24 @@ protected:
     // opening '{' to the matching closing '}'.
     std::string extractMethodBody(const std::string& methodName) const {
         size_t pos = sourceCode.find(methodName);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
 
         // Find the opening brace of the method body
         size_t braceStart = sourceCode.find('{', pos);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
 
         // Match braces to find the end of the method
         int depth = 0;
         size_t i = braceStart;
         for (; i < sourceCode.size(); ++i) {
-            if (sourceCode[i] == '{') depth++;
+            if (sourceCode[i] == '{')
+                depth++;
             else if (sourceCode[i] == '}') {
                 depth--;
-                if (depth == 0) break;
+                if (depth == 0)
+                    break;
             }
         }
 
@@ -59,7 +61,7 @@ protected:
                 line.find("leveldb::Iterator *") != std::string::npos) {
                 // It's OK if it's inside a unique_ptr declaration
                 if (line.find("unique_ptr") == std::string::npos) {
-                    return true; // Raw pointer found!
+                    return true;  // Raw pointer found!
                 }
             }
         }
@@ -71,14 +73,13 @@ protected:
         // Search for "delete it;" with flexible whitespace
         size_t pos = 0;
         while ((pos = text.find("delete", pos)) != std::string::npos) {
-            size_t afterDelete = pos + 6; // length of "delete"
+            size_t afterDelete = pos + 6;  // length of "delete"
             // Skip whitespace after "delete"
             while (afterDelete < text.size() && (text[afterDelete] == ' ' || text[afterDelete] == '\t')) {
                 afterDelete++;
             }
             // Check if the next token is "it" followed by ";"
-            if (afterDelete + 2 <= text.size() &&
-                text[afterDelete] == 'i' && text[afterDelete + 1] == 't') {
+            if (afterDelete + 2 <= text.size() && text[afterDelete] == 'i' && text[afterDelete + 1] == 't') {
                 size_t afterIt = afterDelete + 2;
                 // Skip whitespace after "it"
                 while (afterIt < text.size() && (text[afterIt] == ' ' || text[afterIt] == '\t')) {
@@ -102,8 +103,7 @@ TEST_F(LevelDBIndexIteratorTest, FindSeriesByTagUsesUniquePtr) {
     EXPECT_NE(body.find("std::unique_ptr<leveldb::Iterator>"), std::string::npos)
         << "findSeriesByTag should use std::unique_ptr<leveldb::Iterator> for RAII.";
 
-    EXPECT_FALSE(hasRawIteratorPointer(body))
-        << "findSeriesByTag should NOT use raw leveldb::Iterator* pointer.";
+    EXPECT_FALSE(hasRawIteratorPointer(body)) << "findSeriesByTag should NOT use raw leveldb::Iterator* pointer.";
 }
 
 // 2. getSeriesGroupedByTag uses unique_ptr, not raw pointer
@@ -114,8 +114,7 @@ TEST_F(LevelDBIndexIteratorTest, GetSeriesGroupedByTagUsesUniquePtr) {
     EXPECT_NE(body.find("std::unique_ptr<leveldb::Iterator>"), std::string::npos)
         << "getSeriesGroupedByTag should use std::unique_ptr<leveldb::Iterator> for RAII.";
 
-    EXPECT_FALSE(hasRawIteratorPointer(body))
-        << "getSeriesGroupedByTag should NOT use raw leveldb::Iterator* pointer.";
+    EXPECT_FALSE(hasRawIteratorPointer(body)) << "getSeriesGroupedByTag should NOT use raw leveldb::Iterator* pointer.";
 }
 
 // 3. getAllSeriesForMeasurement uses unique_ptr, not raw pointer
@@ -134,9 +133,8 @@ TEST_F(LevelDBIndexIteratorTest, GetAllSeriesForMeasurementUsesUniquePtr) {
 TEST_F(LevelDBIndexIteratorTest, NoRawDeleteIterator) {
     // "delete it;" should not appear anywhere in the file -- the unique_ptr
     // handles cleanup automatically, including on exception paths.
-    EXPECT_FALSE(hasDeleteIt(sourceCode))
-        << "Found 'delete it;' in leveldb_index.cpp. All LevelDB iterators "
-           "should be managed by std::unique_ptr -- manual delete is not needed.";
+    EXPECT_FALSE(hasDeleteIt(sourceCode)) << "Found 'delete it;' in leveldb_index.cpp. All LevelDB iterators "
+                                             "should be managed by std::unique_ptr -- manual delete is not needed.";
 }
 
 // 5. Every NewIterator() call in the file is wrapped in unique_ptr
@@ -153,7 +151,8 @@ TEST_F(LevelDBIndexIteratorTest, ConsistentIteratorPattern) {
         // Check if this NewIterator is preceded by "unique_ptr<leveldb::Iterator>"
         // within the same line (look backwards for the pattern)
         size_t lineStart = sourceCode.rfind('\n', pos);
-        if (lineStart == std::string::npos) lineStart = 0;
+        if (lineStart == std::string::npos)
+            lineStart = 0;
         std::string linePrefix = sourceCode.substr(lineStart, pos - lineStart);
 
         if (linePrefix.find("unique_ptr<leveldb::Iterator>") != std::string::npos) {
@@ -163,8 +162,7 @@ TEST_F(LevelDBIndexIteratorTest, ConsistentIteratorPattern) {
         pos += searchStr.length();
     }
 
-    ASSERT_GT(totalNewIterator, 0u)
-        << "Expected at least one NewIterator() call in leveldb_index.cpp";
+    ASSERT_GT(totalNewIterator, 0u) << "Expected at least one NewIterator() call in leveldb_index.cpp";
     EXPECT_EQ(totalNewIterator, uniquePtrNewIterator)
         << "All " << totalNewIterator << " NewIterator() calls should be wrapped in "
         << "std::unique_ptr<leveldb::Iterator>, but only " << uniquePtrNewIterator

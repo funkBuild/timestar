@@ -8,15 +8,16 @@
  * gracefully instead of crashing.
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <filesystem>
-
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexNullCheckTest : public ::testing::Test {
 protected:
@@ -25,15 +26,13 @@ protected:
         std::filesystem::remove_all("shard_1");
     }
 
-    void TearDown() override {
-        std::filesystem::remove_all("shard_1");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_1"); }
 };
 
 // Test the primary bug: getSeriesMetadata on non-zero shard should return
 // std::nullopt instead of crashing with a null pointer dereference.
 SEASTAR_TEST_F(LevelDBIndexNullCheckTest, GetSeriesMetadataOnNonZeroShard) {
-    LevelDBIndex index(1); // Shard 1 -- db will be null
+    LevelDBIndex index(1);  // Shard 1 -- db will be null
 
     // open() on non-zero shard simply skips LevelDB initialization
     co_await index.open();

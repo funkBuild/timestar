@@ -31,8 +31,7 @@ public:
     // Maximum number of per-timestamp entries in non-bucketed mode.
     static constexpr size_t MAX_UNBUCKETED_STATES = 10'000'000;
 
-    BlockAggregator(uint64_t interval)
-        : interval_(interval), method_(AggregationMethod::AVG), methodAware_(false) {}
+    BlockAggregator(uint64_t interval) : interval_(interval), method_(AggregationMethod::AVG), methodAware_(false) {}
 
     BlockAggregator(uint64_t interval, AggregationMethod method)
         : interval_(interval), method_(method), methodAware_(true) {}
@@ -89,14 +88,17 @@ public:
                 case AggregationMethod::STDVAR:
                 case AggregationMethod::LATEST:
                 case AggregationMethod::FIRST:
-                    if (!hasExtendedStats) return false;
+                    if (!hasExtendedStats)
+                        return false;
                     break;
                 default:
                     break;
             }
         }
-        if (interval_ == 0) return foldToSingleState_;
-        if (singleBucketState_) return true;
+        if (interval_ == 0)
+            return foldToSingleState_;
+        if (singleBucketState_)
+            return true;
         // Multi-bucket: block must fit within a single bucket
         uint64_t minBucket = (blockMinTime / interval_) * interval_;
         uint64_t maxBucket = (blockMaxTime / interval_) * interval_;
@@ -106,8 +108,7 @@ public:
     // Merge pre-computed block statistics without decoding the block.
     // Only valid when canUseBlockStats() returns true, the entire block
     // falls within the query time range, and there are no tombstones.
-    void addBlockStats(double sum, double bmin, double bmax, uint32_t count,
-                       uint64_t minTime, uint64_t maxTime,
+    void addBlockStats(double sum, double bmin, double bmax, uint32_t count, uint64_t minTime, uint64_t maxTime,
                        double m2 = 0.0, double firstValue = 0.0, double latestValue = 0.0) {
         pointCount_ += count;
         AggregationState blockState;
@@ -137,9 +138,7 @@ public:
 
     // Returns true when only point counts are needed (COUNT method), enabling
     // the caller to skip value decoding entirely.
-    bool isCountOnly() const {
-        return methodAware_ && method_ == AggregationMethod::COUNT;
-    }
+    bool isCountOnly() const { return methodAware_ && method_ == AggregationMethod::COUNT; }
 
     // Add timestamps without values (COUNT optimization — skips value decode).
     // Increments count for each timestamp's bucket without touching other accumulators.

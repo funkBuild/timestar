@@ -37,18 +37,18 @@
 //   3. A synthetic "double-call" scenario using seastar::when_all to confirm
 //      the post-await re-check prevents duplicate LRU list nodes.
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <vector>
-#include <string>
-
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/storage/tsm.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
 
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/when_all.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/when_all.hh>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -56,31 +56,22 @@ class TSMLRUCacheParallelTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_tsm_lru_cache_parallel";
 
-    void SetUp() override {
-        fs::create_directories(testDir);
-    }
+    void SetUp() override { fs::create_directories(testDir); }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 
-    std::string getTestFilePath(const std::string& filename) {
-        return testDir + "/" + filename;
-    }
+    std::string getTestFilePath(const std::string& filename) { return testDir + "/" + filename; }
 
     // Write a TSM file with `numSeries` distinct float series, each with a
     // single data point.  Returns the list of SeriesId128 values written.
-    std::vector<SeriesId128> writeTSMWithManySeries(
-        const std::string& path,
-        int numSeries
-    ) {
+    std::vector<SeriesId128> writeTSMWithManySeries(const std::string& path, int numSeries) {
         TSMWriter writer(path);
         std::vector<SeriesId128> ids;
         for (int i = 0; i < numSeries; ++i) {
             std::string key = "lru.test.series" + std::to_string(i);
             SeriesId128 sid = SeriesId128::fromSeriesKey(key);
             std::vector<uint64_t> ts = {static_cast<uint64_t>(1000 + i * 100)};
-            std::vector<double>   vs = {static_cast<double>(i) * 1.5};
+            std::vector<double> vs = {static_cast<double>(i) * 1.5};
             writer.writeSeries(TSMValueType::Float, sid, ts, vs);
             ids.push_back(sid);
         }
@@ -115,7 +106,7 @@ seastar::future<> testParallelGetFullIndexEntryManyDistinctSeries(std::string pa
             std::string key = "lru.parallel." + std::to_string(i);
             SeriesId128 sid = SeriesId128::fromSeriesKey(key);
             std::vector<uint64_t> ts = {static_cast<uint64_t>(1000 + i)};
-            std::vector<double>   vs = {static_cast<double>(i) * 2.0};
+            std::vector<double> vs = {static_cast<double>(i) * 2.0};
             writer.writeSeries(TSMValueType::Float, sid, ts, vs);
             ids.push_back(sid);
         }
@@ -135,13 +126,10 @@ seastar::future<> testParallelGetFullIndexEntryManyDistinctSeries(std::string pa
     // Now verify every series is retrievable and returns the correct data.
     for (int i = 0; i < NUM_SERIES; ++i) {
         auto* entry = co_await tsm.getFullIndexEntry(ids[i]);
-        EXPECT_NE(entry, nullptr)
-            << "Expected non-null entry for series " << i;
+        EXPECT_NE(entry, nullptr) << "Expected non-null entry for series " << i;
         if (entry) {
-            EXPECT_EQ(entry->seriesType, TSMValueType::Float)
-                << "Wrong type for series " << i;
-            EXPECT_EQ(entry->indexBlocks.size(), 1u)
-                << "Expected 1 block for series " << i;
+            EXPECT_EQ(entry->seriesType, TSMValueType::Float) << "Wrong type for series " << i;
+            EXPECT_EQ(entry->indexBlocks.size(), 1u) << "Expected 1 block for series " << i;
         }
     }
 
@@ -149,9 +137,7 @@ seastar::future<> testParallelGetFullIndexEntryManyDistinctSeries(std::string pa
 }
 
 TEST_F(TSMLRUCacheParallelTest, ParallelGetFullIndexEntryManyDistinctSeries) {
-    testParallelGetFullIndexEntryManyDistinctSeries(
-        getTestFilePath("0_10.tsm")
-    ).get();
+    testParallelGetFullIndexEntryManyDistinctSeries(getTestFilePath("0_10.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +160,7 @@ seastar::future<> testConcurrentSameSeriesDoesNotDoubleInsert(std::string path) 
     {
         TSMWriter writer(path);
         std::vector<uint64_t> ts = {1000, 2000, 3000};
-        std::vector<double>   vs = {1.0, 2.0, 3.0};
+        std::vector<double> vs = {1.0, 2.0, 3.0};
         writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -187,10 +173,7 @@ seastar::future<> testConcurrentSameSeriesDoesNotDoubleInsert(std::string path) 
     // seastar::when_all starts both futures before awaiting either, so both
     // are in-flight simultaneously and will interleave at the co_await inside
     // getFullIndexEntry().
-    auto [f1, f2] = co_await seastar::when_all(
-        tsm.getFullIndexEntry(seriesId),
-        tsm.getFullIndexEntry(seriesId)
-    );
+    auto [f1, f2] = co_await seastar::when_all(tsm.getFullIndexEntry(seriesId), tsm.getFullIndexEntry(seriesId));
 
     TSMIndexEntry* ptr1 = f1.get();
     TSMIndexEntry* ptr2 = f2.get();
@@ -229,9 +212,7 @@ seastar::future<> testConcurrentSameSeriesDoesNotDoubleInsert(std::string path) 
 }
 
 TEST_F(TSMLRUCacheParallelTest, ConcurrentSameSeriesDoesNotDoubleInsert) {
-    testConcurrentSameSeriesDoesNotDoubleInsert(
-        getTestFilePath("0_11.tsm")
-    ).get();
+    testConcurrentSameSeriesDoesNotDoubleInsert(getTestFilePath("0_11.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +235,7 @@ seastar::future<> testLRUEvictionUnderParallelLoad(std::string path) {
             SeriesId128 sid = SeriesId128::fromSeriesKey(key);
             double val = static_cast<double>(i) * 3.7 + 1.0;
             std::vector<uint64_t> ts = {static_cast<uint64_t>(500 + i * 10)};
-            std::vector<double>   vs = {val};
+            std::vector<double> vs = {val};
             writer.writeSeries(TSMValueType::Float, sid, ts, vs);
             ids.push_back(sid);
             expectedValues.push_back(val);
@@ -273,13 +254,10 @@ seastar::future<> testLRUEvictionUnderParallelLoad(std::string path) {
         // After each wave, check all entries are accessible and correct.
         for (int i = 0; i < NUM_SERIES; ++i) {
             auto* entry = co_await tsm.getFullIndexEntry(ids[i]);
-            EXPECT_NE(entry, nullptr)
-                << "Wave " << wave << ": null entry for series " << i;
+            EXPECT_NE(entry, nullptr) << "Wave " << wave << ": null entry for series " << i;
             if (entry) {
-                EXPECT_EQ(entry->seriesType, TSMValueType::Float)
-                    << "Wave " << wave << ": wrong type for series " << i;
-                EXPECT_EQ(entry->indexBlocks.size(), 1u)
-                    << "Wave " << wave << ": wrong block count for series " << i;
+                EXPECT_EQ(entry->seriesType, TSMValueType::Float) << "Wave " << wave << ": wrong type for series " << i;
+                EXPECT_EQ(entry->indexBlocks.size(), 1u) << "Wave " << wave << ": wrong block count for series " << i;
             }
 
             // Also read the actual data to confirm the block offset/size are
@@ -287,11 +265,9 @@ seastar::future<> testLRUEvictionUnderParallelLoad(std::string path) {
             TSMResult<double> res(0);
             co_await tsm.readSeries(ids[i], 0, UINT64_MAX, res);
             auto [ts, vs] = res.getAllData();
-            EXPECT_EQ(vs.size(), 1u)
-                << "Wave " << wave << ": wrong value count for series " << i;
+            EXPECT_EQ(vs.size(), 1u) << "Wave " << wave << ": wrong value count for series " << i;
             if (!vs.empty()) {
-                EXPECT_DOUBLE_EQ(vs[0], expectedValues[i])
-                    << "Wave " << wave << ": wrong value for series " << i;
+                EXPECT_DOUBLE_EQ(vs[0], expectedValues[i]) << "Wave " << wave << ": wrong value for series " << i;
             }
         }
     }
@@ -318,7 +294,7 @@ seastar::future<> testSequentialCallsSameSeriesAreSafe(std::string path) {
     {
         TSMWriter writer(path);
         std::vector<uint64_t> ts = {100, 200};
-        std::vector<double>   vs = {9.9, 8.8};
+        std::vector<double> vs = {9.9, 8.8};
         writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -337,8 +313,7 @@ seastar::future<> testSequentialCallsSameSeriesAreSafe(std::string path) {
 
     if (entry1 && entry2) {
         // Both must refer to the same cached entry (pointer equality).
-        EXPECT_EQ(entry1, entry2)
-            << "Sequential calls returned different pointers — LRU node replaced unexpectedly";
+        EXPECT_EQ(entry1, entry2) << "Sequential calls returned different pointers — LRU node replaced unexpectedly";
 
         EXPECT_EQ(entry1->seriesType, TSMValueType::Float);
         EXPECT_EQ(entry1->indexBlocks.size(), 1u);

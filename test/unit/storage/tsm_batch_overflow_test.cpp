@@ -1,9 +1,10 @@
+#include "../../../lib/storage/tsm.hpp"
+
 #include <gtest/gtest.h>
+
 #include <cstdint>
 #include <limits>
 #include <vector>
-
-#include "../../../lib/storage/tsm.hpp"
 
 // Test fixture for groupContiguousBlocks overflow testing.
 // TSM constructor only stores the file path; no Seastar I/O needed.
@@ -13,8 +14,7 @@ protected:
 
     // Helper to build a contiguous sequence of blocks starting at `baseOffset`,
     // each with the given `blockSize`.
-    std::vector<TSMIndexBlock> makeContiguousBlocks(
-        size_t count, uint32_t blockSize, uint64_t baseOffset = 0) {
+    std::vector<TSMIndexBlock> makeContiguousBlocks(size_t count, uint32_t blockSize, uint64_t baseOffset = 0) {
         std::vector<TSMIndexBlock> blocks;
         blocks.reserve(count);
         uint64_t offset = baseOffset;
@@ -83,7 +83,7 @@ TEST_F(TSMBatchOverflowTest, NonContiguousBlocksSplitBatches) {
 
 // Blocks exceeding MAX_BATCH_SIZE (16MB) are split into separate batches
 TEST_F(TSMBatchOverflowTest, ExceedingMaxBatchSizeSplitsBatches) {
-    constexpr uint64_t MAX_BATCH = 16u * 1024u * 1024u; // 16 MB
+    constexpr uint64_t MAX_BATCH = 16u * 1024u * 1024u;  // 16 MB
     // Each block is 4MB; 4 blocks = 16MB (exactly at limit), 5th should start new batch
     constexpr uint32_t blockSize = 4u * 1024u * 1024u;
     auto blocks = makeContiguousBlocks(5, blockSize);
@@ -101,7 +101,7 @@ TEST_F(TSMBatchOverflowTest, ExceedingMaxBatchSizeSplitsBatches) {
 TEST_F(TSMBatchOverflowTest, ExactlyAtMaxBatchSizeStaysOneBatch) {
     constexpr uint64_t MAX_BATCH = 16u * 1024u * 1024u;
     // Two blocks that together equal exactly MAX_BATCH_SIZE
-    constexpr uint32_t blockSize = 8u * 1024u * 1024u; // 8MB each
+    constexpr uint32_t blockSize = 8u * 1024u * 1024u;  // 8MB each
     auto blocks = makeContiguousBlocks(2, blockSize);
 
     auto batches = tsm.groupContiguousBlocks(blocks);
@@ -161,7 +161,7 @@ TEST_F(TSMBatchOverflowTest, TotalSizeFieldHandlesLargeValues) {
 //   uint32_t sum after 5 blocks = 5,000,000,000 mod 2^32 = 705,032,704
 //   With uint32_t arithmetic, block 5 might incorrectly merge.
 TEST_F(TSMBatchOverflowTest, ManyLargeBlocksOverflowHandledCorrectly) {
-    constexpr uint32_t blockSize = 1'000'000'000u; // 1GB each
+    constexpr uint32_t blockSize = 1'000'000'000u;  // 1GB each
     auto blocks = makeContiguousBlocks(5, blockSize);
 
     auto batches = tsm.groupContiguousBlocks(blocks);
@@ -191,7 +191,7 @@ TEST_F(TSMBatchOverflowTest, SpecificWraparoundValuesDetected) {
     constexpr uint32_t sizeB = 2'000'000u;
 
     // Verify the wraparound assumption
-    uint32_t wrappedSum = sizeA + sizeB; // intentional uint32_t overflow
+    uint32_t wrappedSum = sizeA + sizeB;  // intentional uint32_t overflow
     ASSERT_LT(wrappedSum, 16u * 1024u * 1024u) << "Test assumption: uint32_t sum should wrap to < 16MB";
 
     uint64_t correctSum = static_cast<uint64_t>(sizeA) + sizeB;

@@ -25,10 +25,10 @@ static constexpr size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_
 // Decode a float block directly into thread-local scratch buffers and fold into
 // a BlockAggregator, avoiding per-block unique_ptr<TSMBlock> heap allocation.
 // Returns number of decoded points (0 on error or empty block).
-static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
-                                        uint64_t startTime, uint64_t endTime,
+static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
                                         timestar::BlockAggregator& aggregator) {
-    if (blockSize < BLOCK_HEADER_SIZE) return 0;
+    if (blockSize < BLOCK_HEADER_SIZE)
+        return 0;
 
     Slice blockSlice(data, blockSize);
     auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
@@ -36,7 +36,8 @@ static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
     uint32_t timestampSize = headerSlice.read<uint32_t>();
     uint32_t timestampBytes = headerSlice.read<uint32_t>();
 
-    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE) return 0;
+    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
+        return 0;
 
     // Reuse thread-local scratch buffers to avoid per-block allocation
     static thread_local std::vector<uint64_t> tsScratch;
@@ -49,10 +50,12 @@ static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
     auto [nSkipped, nTimestamps] =
         IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
 
-    if (nTimestamps == 0) return 0;
+    if (nTimestamps == 0)
+        return 0;
 
     size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-    if (valueByteSize > blockSize) return 0;
+    if (valueByteSize > blockSize)
+        return 0;
 
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
     FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, valScratch);
@@ -63,10 +66,10 @@ static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
 
 // COUNT-only block decode: decode timestamps only, skip value decompression.
 // Folds timestamp counts into the BlockAggregator's per-bucket counters.
-static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize,
-                                    uint64_t startTime, uint64_t endTime,
-                                    timestar::BlockAggregator& aggregator) {
-    if (blockSize < BLOCK_HEADER_SIZE) return 0;
+static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
+                                   timestar::BlockAggregator& aggregator) {
+    if (blockSize < BLOCK_HEADER_SIZE)
+        return 0;
 
     Slice blockSlice(data, blockSize);
     auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
@@ -74,7 +77,8 @@ static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize,
     uint32_t timestampSize = headerSlice.read<uint32_t>();
     uint32_t timestampBytes = headerSlice.read<uint32_t>();
 
-    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE) return 0;
+    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
+        return 0;
 
     static thread_local std::vector<uint64_t> tsScratch;
     tsScratch.clear();
@@ -84,7 +88,8 @@ static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize,
     auto [nSkipped, nTimestamps] =
         IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
 
-    if (nTimestamps == 0) return 0;
+    if (nTimestamps == 0)
+        return 0;
 
     // Skip value decode entirely — only count timestamps per bucket
     aggregator.addTimestampsOnly(tsScratch);
@@ -840,13 +845,12 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
         bool anyNeedsDecode = false;
         for (const auto& block : batch.blocks) {
             bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
-            bool canSkip = !hasTombstoneRanges && blockFullyContained &&
-                           block.blockCount > 0 &&
+            bool canSkip = !hasTombstoneRanges && blockFullyContained && block.blockCount > 0 &&
                            aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
             if (canSkip) {
-                aggregator.addBlockStats(block.blockSum, block.blockMin, block.blockMax,
-                                         block.blockCount, block.minTime, block.maxTime,
-                                         block.blockM2, block.blockFirstValue, block.blockLatestValue);
+                aggregator.addBlockStats(block.blockSum, block.blockMin, block.blockMax, block.blockCount,
+                                         block.minTime, block.maxTime, block.blockM2, block.blockFirstValue,
+                                         block.blockLatestValue);
                 totalPoints += block.blockCount;
             } else {
                 anyNeedsDecode = true;
@@ -864,8 +868,7 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
         for (const auto& block : batch.blocks) {
             // Skip blocks already handled via stats
             bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
-            bool wasSkipped = !hasTombstoneRanges && blockFullyContained &&
-                              block.blockCount > 0 &&
+            bool wasSkipped = !hasTombstoneRanges && blockFullyContained && block.blockCount > 0 &&
                               aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
             if (wasSkipped) {
                 bufferOffset += block.size;
@@ -877,11 +880,10 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                 size_t n;
                 if (countOnly) {
                     // COUNT optimization: decode timestamps only, skip value decompression
-                    n = decodeBlockCountOnly(batchBuf.get() + bufferOffset,
-                                              block.size, startTime, endTime, aggregator);
+                    n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, startTime, endTime, aggregator);
                 } else {
-                    n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset,
-                                                   block.size, startTime, endTime, aggregator);
+                    n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
+                                                  aggregator);
                 }
                 totalPoints += n;
             } else {
@@ -918,8 +920,8 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
 }
 
 seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-                                                       timestar::BlockAggregator& aggregator, bool reverse,
-                                                       size_t maxPoints) {
+                                                      timestar::BlockAggregator& aggregator, bool reverse,
+                                                      size_t maxPoints) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry || indexEntry->seriesType != TSMValueType::Float) {
         co_return 0;
@@ -1017,9 +1019,9 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
 }
 
 seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-                                                      timestar::BlockAggregator& aggregator, bool reverse,
-                                                      uint64_t interval, std::unordered_set<uint64_t>& filledBuckets,
-                                                      size_t totalBuckets) {
+                                                     timestar::BlockAggregator& aggregator, bool reverse,
+                                                     uint64_t interval, std::unordered_set<uint64_t>& filledBuckets,
+                                                     size_t totalBuckets) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry || indexEntry->seriesType != TSMValueType::Float) {
         co_return 0;

@@ -1,5 +1,7 @@
-#include <gtest/gtest.h>
 #include "series_aligner.hpp"
+
+#include <gtest/gtest.h>
+
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -12,9 +14,7 @@ protected:
     void SetUp() override {}
     void TearDown() override {}
 
-    SubQueryResult makeResult(const std::string& name,
-                             std::vector<uint64_t> ts,
-                             std::vector<double> vals) {
+    SubQueryResult makeResult(const std::string& name, std::vector<uint64_t> ts, std::vector<double> vals) {
         SubQueryResult result;
         result.queryName = name;
         result.timestamps = std::move(ts);
@@ -377,15 +377,9 @@ TEST_F(SeriesAlignerTest, IntersectionThreeOrMoreSeries) {
     // c:             3000, 4000, 5000
     // Intersection: 3000, 4000, 5000
 
-    series["a"] = makeResult("a",
-        {1000, 2000, 3000, 4000, 5000, 6000},
-        {1.0, 2.0, 3.0, 4.0, 5.0, 6.0});
-    series["b"] = makeResult("b",
-        {2000, 3000, 4000, 5000, 6000, 7000},
-        {20.0, 30.0, 40.0, 50.0, 60.0, 70.0});
-    series["c"] = makeResult("c",
-        {3000, 4000, 5000},
-        {300.0, 400.0, 500.0});
+    series["a"] = makeResult("a", {1000, 2000, 3000, 4000, 5000, 6000}, {1.0, 2.0, 3.0, 4.0, 5.0, 6.0});
+    series["b"] = makeResult("b", {2000, 3000, 4000, 5000, 6000, 7000}, {20.0, 30.0, 40.0, 50.0, 60.0, 70.0});
+    series["c"] = makeResult("c", {3000, 4000, 5000}, {300.0, 400.0, 500.0});
 
     auto result = aligner.align(series);
 
@@ -468,15 +462,14 @@ TEST_F(SeriesAlignerTest, IntersectionLargeDatasetPerformance) {
     EXPECT_EQ(*result["a"].timestamps, *result["b"].timestamps);
 
     // Verify values are correct
-    EXPECT_DOUBLE_EQ(result["a"].values[0], 5.0);     // tsA[5] = 50 -> valsA[5] = 5.0
-    EXPECT_DOUBLE_EQ(result["b"].values[0], 5.0);     // tsB[0] = 50 -> valsB[0] = 5.0
+    EXPECT_DOUBLE_EQ(result["a"].values[0], 5.0);  // tsA[5] = 50 -> valsA[5] = 5.0
+    EXPECT_DOUBLE_EQ(result["b"].values[0], 5.0);  // tsB[0] = 50 -> valsB[0] = 5.0
 
     // Performance: with the O(n) algorithm using set_intersection on sorted
     // vectors, 50K elements should complete well under 1 second.
     // The old O(n log n) std::set approach would be noticeably slower.
-    EXPECT_LT(elapsed.count(), 1000)
-        << "Intersection of 50K-element series took " << elapsed.count()
-        << "ms, expected < 1000ms";
+    EXPECT_LT(elapsed.count(), 1000) << "Intersection of 50K-element series took " << elapsed.count()
+                                     << "ms, expected < 1000ms";
 
     // Test with 3 large series
     SeriesAligner aligner3(AlignmentStrategy::INNER);
@@ -503,7 +496,6 @@ TEST_F(SeriesAlignerTest, IntersectionLargeDatasetPerformance) {
     ASSERT_EQ(result3["a"].size(), N - 5);
     EXPECT_EQ((*result3["a"].timestamps)[0], 50);
 
-    EXPECT_LT(elapsed3.count(), 1000)
-        << "Intersection of three 50K-element series took " << elapsed3.count()
-        << "ms, expected < 1000ms";
+    EXPECT_LT(elapsed3.count(), 1000) << "Intersection of three 50K-element series took " << elapsed3.count()
+                                      << "ms, expected < 1000ms";
 }

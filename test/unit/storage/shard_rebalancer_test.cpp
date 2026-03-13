@@ -1,13 +1,15 @@
+#include "../../../lib/storage/shard_rebalancer.hpp"
+
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/tsm.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
+
 #include <gtest/gtest.h>
+
+#include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <cmath>
-
-#include "../../../lib/storage/shard_rebalancer.hpp"
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 namespace fs = std::filesystem;
 
@@ -20,9 +22,7 @@ protected:
         fs::create_directories(testDir);
     }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 
     // Helper to create a shard directory structure with TSM files
     void createShardWithTSM(unsigned shardId, const std::vector<std::string>& seriesKeys,
@@ -50,9 +50,7 @@ protected:
     }
 
     // Helper to write shard_count.meta
-    void writeMetaFile(unsigned count) {
-        timestar::ShardRebalancer::writeShardCountMeta(testDir, count);
-    }
+    void writeMetaFile(unsigned count) { timestar::ShardRebalancer::writeShardCountMeta(testDir, count); }
 };
 
 // ---------------------------------------------------------------------------
@@ -140,7 +138,7 @@ TEST_F(ShardRebalancerTest, InProgressStateTriggersRebalance) {
     // Simulate a crash during rebalance: write an InProgress state file
     std::string stateFile = testDir + "/rebalance.state";
     std::ofstream ofs(stateFile);
-    ofs << "1 4 8\n"; // InProgress, old=4, new=8
+    ofs << "1 4 8\n";  // InProgress, old=4, new=8
     ofs.close();
 
     timestar::ShardRebalancer rebalancer(testDir);
@@ -252,13 +250,11 @@ TEST_F(ShardRebalancerTest, CutoverRenameSimulation) {
 
     // Simulate rename: old -> _old
     for (unsigned s = 0; s < oldCount; ++s) {
-        fs::rename(testDir + "/shard_" + std::to_string(s),
-                   testDir + "/shard_" + std::to_string(s) + "_old");
+        fs::rename(testDir + "/shard_" + std::to_string(s), testDir + "/shard_" + std::to_string(s) + "_old");
     }
     // Simulate rename: _new -> final
     for (unsigned s = 0; s < newCount; ++s) {
-        fs::rename(testDir + "/shard_" + std::to_string(s) + "_new",
-                   testDir + "/shard_" + std::to_string(s));
+        fs::rename(testDir + "/shard_" + std::to_string(s) + "_new", testDir + "/shard_" + std::to_string(s));
     }
 
     // Verify final state
@@ -318,7 +314,6 @@ TEST_F(ShardRebalancerTest, ScaleDownMergesShards) {
 
     // Each new shard should receive data from at least 2 old shards
     for (unsigned s = 0; s < newCount; ++s) {
-        EXPECT_GE(newToOldShards[s].size(), 2u)
-            << "New shard " << s << " should merge from >=2 old shards";
+        EXPECT_GE(newToOldShards[s].size(), 2u) << "New shard " << s << " should merge from >=2 old shards";
     }
 }

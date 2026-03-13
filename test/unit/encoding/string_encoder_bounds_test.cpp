@@ -1,11 +1,12 @@
+#include "../../../lib/encoding/string_encoder.hpp"
+
 #include <gtest/gtest.h>
-#include <vector>
-#include <string>
+
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-
-#include "../../../lib/encoding/string_encoder.hpp"
+#include <string>
+#include <vector>
 
 // =============================================================================
 // StringEncoderBoundsTest: Tests for uint32_t overflow validation in encode()
@@ -100,9 +101,7 @@ TEST_F(StringEncoderBoundsTest, OverflowErrorIsCorrectType) {
     // Verify that std::overflow_error is throwable and catchable as expected.
     // This documents the contract: the encoder uses std::overflow_error for
     // uint32_t overflow conditions.
-    auto throwOverflow = []() {
-        throw std::overflow_error("String encoder: test overflow");
-    };
+    auto throwOverflow = []() { throw std::overflow_error("String encoder: test overflow"); };
     EXPECT_THROW(throwOverflow(), std::overflow_error);
 
     // Also verify it's a subclass of std::runtime_error

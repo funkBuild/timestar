@@ -1,8 +1,10 @@
-#include <gtest/gtest.h>
-#include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/http/http_query_handler.hpp"  // For SeriesResult
-#include <vector>
+#include "../../../lib/query/aggregator.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cmath>
+#include <vector>
 
 using namespace timestar;
 
@@ -14,13 +16,9 @@ protected:
     }
 
     // Helper to create a SeriesResult with double values
-    SeriesResult createSeriesResult(
-        const std::string& measurement,
-        const std::map<std::string, std::string>& tags,
-        const std::string& fieldName,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values) {
-
+    SeriesResult createSeriesResult(const std::string& measurement, const std::map<std::string, std::string>& tags,
+                                    const std::string& fieldName, const std::vector<uint64_t>& timestamps,
+                                    const std::vector<double>& values) {
         SeriesResult sr;
         sr.measurement = measurement;
         sr.tags = tags;
@@ -52,11 +50,11 @@ TEST_F(DistributedAggregatorTest, AggregationStateAddValue) {
     EXPECT_EQ(state.latestTimestamp, 2000);
     EXPECT_EQ(state.count, 2);
 
-    state.addValue(5.0, 1500); // Earlier timestamp but lower value
+    state.addValue(5.0, 1500);  // Earlier timestamp but lower value
     EXPECT_DOUBLE_EQ(state.sum, 35.0);
     EXPECT_DOUBLE_EQ(state.min, 5.0);
     EXPECT_DOUBLE_EQ(state.max, 20.0);
-    EXPECT_DOUBLE_EQ(state.latest, 20.0); // Latest should remain 20.0 (timestamp 2000)
+    EXPECT_DOUBLE_EQ(state.latest, 20.0);  // Latest should remain 20.0 (timestamp 2000)
     EXPECT_EQ(state.latestTimestamp, 2000);
     EXPECT_EQ(state.count, 3);
 }
@@ -72,10 +70,10 @@ TEST_F(DistributedAggregatorTest, AggregationStateMerge) {
 
     state1.merge(state2);
 
-    EXPECT_DOUBLE_EQ(state1.sum, 70.0); // 10 + 20 + 15 + 25
+    EXPECT_DOUBLE_EQ(state1.sum, 70.0);  // 10 + 20 + 15 + 25
     EXPECT_DOUBLE_EQ(state1.min, 10.0);
     EXPECT_DOUBLE_EQ(state1.max, 25.0);
-    EXPECT_DOUBLE_EQ(state1.latest, 25.0); // Latest from state2
+    EXPECT_DOUBLE_EQ(state1.latest, 25.0);  // Latest from state2
     EXPECT_EQ(state1.latestTimestamp, 2500);
     EXPECT_EQ(state1.count, 4);
 }
@@ -86,7 +84,7 @@ TEST_F(DistributedAggregatorTest, AggregationStateGetValueAVG) {
     state.addValue(20.0, 2000);
     state.addValue(30.0, 3000);
 
-    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::AVG), 20.0); // (10+20+30)/3
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::AVG), 20.0);  // (10+20+30)/3
 }
 
 TEST_F(DistributedAggregatorTest, AggregationStateGetValueMIN) {
@@ -122,7 +120,7 @@ TEST_F(DistributedAggregatorTest, AggregationStateGetValueLATEST) {
     state.addValue(20.0, 1000);
     state.addValue(30.0, 2000);
 
-    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::LATEST), 10.0); // Latest by timestamp (3000)
+    EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::LATEST), 10.0);  // Latest by timestamp (3000)
 }
 
 // ============================================================================
@@ -136,8 +134,7 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsBasic) {
     SeriesResult sr = createSeriesResult("cpu", {{"host", "server1"}}, "usage", timestamps, values);
     std::vector<SeriesResult> seriesResults = {sr};
 
-    auto partials = Aggregator::createPartialAggregations(
-        seriesResults, AggregationMethod::AVG, 0, {});
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {});
 
     ASSERT_EQ(partials.size(), 1);
     EXPECT_EQ(partials[0].measurement, "cpu");
@@ -151,25 +148,24 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsBasic) {
 
 TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithInterval) {
     std::vector<uint64_t> timestamps = {
-        1000000000,           // Bucket 0
-        2000000000,           // Bucket 2000000000
-        3000000000,           // Bucket 3000000000
-        4000000000,           // Bucket 4000000000
-        5000000000            // Bucket 5000000000
+        1000000000,  // Bucket 0
+        2000000000,  // Bucket 2000000000
+        3000000000,  // Bucket 3000000000
+        4000000000,  // Bucket 4000000000
+        5000000000   // Bucket 5000000000
     };
     std::vector<double> values = {10.0, 20.0, 30.0, 40.0, 50.0};
 
     SeriesResult sr = createSeriesResult("cpu", {{"host", "server1"}}, "usage", timestamps, values);
     std::vector<SeriesResult> seriesResults = {sr};
 
-    uint64_t interval = 2000000000; // 2 second buckets
-    auto partials = Aggregator::createPartialAggregations(
-        seriesResults, AggregationMethod::AVG, interval, {});
+    uint64_t interval = 2000000000;  // 2 second buckets
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, interval, {});
 
     ASSERT_EQ(partials.size(), 1);
 
     // Should have bucket states (interval > 0)
-    EXPECT_EQ(partials[0].bucketStates.size(), 3); // Buckets at 0, 2000000000, 4000000000
+    EXPECT_EQ(partials[0].bucketStates.size(), 3);  // Buckets at 0, 2000000000, 4000000000
     EXPECT_TRUE(partials[0].sortedTimestamps.empty());
 }
 
@@ -179,23 +175,22 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithGroupBy) {
     std::vector<double> values1 = {10.0, 20.0, 30.0};
     std::vector<double> values2 = {15.0, 25.0, 35.0};
 
-    SeriesResult sr1 = createSeriesResult("cpu", {{"host", "server1"}, {"region", "us-west"}},
-                                          "usage", timestamps, values1);
-    SeriesResult sr2 = createSeriesResult("cpu", {{"host", "server2"}, {"region", "us-west"}},
-                                          "usage", timestamps, values2);
+    SeriesResult sr1 =
+        createSeriesResult("cpu", {{"host", "server1"}, {"region", "us-west"}}, "usage", timestamps, values1);
+    SeriesResult sr2 =
+        createSeriesResult("cpu", {{"host", "server2"}, {"region", "us-west"}}, "usage", timestamps, values2);
 
     std::vector<SeriesResult> seriesResults = {sr1, sr2};
 
     // Group by region (should merge server1 and server2 into one group)
-    auto partials = Aggregator::createPartialAggregations(
-        seriesResults, AggregationMethod::AVG, 0, {"region"});
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {"region"});
 
-    ASSERT_EQ(partials.size(), 1); // Only one group (us-west)
+    ASSERT_EQ(partials.size(), 1);  // Only one group (us-west)
     // Tags are encoded in groupKey, not stored separately
     auto parsedTags = PartialAggregationResult::parseTagsFromGroupKey(partials[0].groupKey);
     EXPECT_EQ(parsedTags.size(), 1);
     EXPECT_EQ(parsedTags["region"], "us-west");
-    EXPECT_EQ(partials[0].totalPoints, 6); // 3 points from each series
+    EXPECT_EQ(partials[0].totalPoints, 6);  // 3 points from each series
 
     // cachedTags should be populated by buildGroupKeyDirect()
     EXPECT_EQ(partials[0].cachedTags.size(), 1);
@@ -215,8 +210,7 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsMultipleFields) {
 
     std::vector<SeriesResult> seriesResults = {sr};
 
-    auto partials = Aggregator::createPartialAggregations(
-        seriesResults, AggregationMethod::AVG, 0, {});
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {});
 
     // Should create separate partials for each field
     ASSERT_EQ(partials.size(), 2);
@@ -226,8 +220,10 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsMultipleFields) {
     PartialAggregationResult* memPartial = nullptr;
 
     for (auto& p : partials) {
-        if (p.fieldName == "cpu") cpuPartial = &p;
-        if (p.fieldName == "memory") memPartial = &p;
+        if (p.fieldName == "cpu")
+            cpuPartial = &p;
+        if (p.fieldName == "memory")
+            memPartial = &p;
     }
 
     ASSERT_NE(cpuPartial, nullptr);
@@ -260,10 +256,10 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedBasic) {
 
     auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG);
 
-    ASSERT_EQ(grouped.size(), 1); // One group (same measurement/tags/field)
+    ASSERT_EQ(grouped.size(), 1);  // One group (same measurement/tags/field)
     EXPECT_EQ(grouped[0].measurement, "cpu");
     EXPECT_EQ(grouped[0].fieldName, "usage");
-    EXPECT_EQ(grouped[0].points.size(), 4); // 4 unique timestamps
+    EXPECT_EQ(grouped[0].points.size(), 4);  // 4 unique timestamps
 
     // Verify values
     EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 10.0);
@@ -284,7 +280,7 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedWithBuckets) {
     SeriesResult sr1 = createSeriesResult("cpu", {{"host", "server1"}}, "usage", timestamps, values1);
     SeriesResult sr2 = createSeriesResult("cpu", {{"host", "server2"}}, "usage", timestamps, values2);
 
-    uint64_t interval = 2000000000; // 2 second buckets
+    uint64_t interval = 2000000000;  // 2 second buckets
 
     auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, interval, {"host"});
     auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, interval, {"host"});
@@ -328,7 +324,7 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedAVG) {
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
-    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 20.0); // (10+20+30)/3 = 20
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 20.0);  // (10+20+30)/3 = 20
     EXPECT_EQ(grouped[0].points[0].count, 3);
 }
 
@@ -355,7 +351,7 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedMIN) {
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
-    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 10.0); // MIN of 30, 10, 20
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 10.0);  // MIN of 30, 10, 20
 }
 
 TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedMAX) {
@@ -381,7 +377,7 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedMAX) {
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
-    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 30.0); // MAX of 30, 10, 20
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 30.0);  // MAX of 30, 10, 20
 }
 
 TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedSUM) {
@@ -407,7 +403,7 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedSUM) {
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
-    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 60.0); // SUM of 10+20+30
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 60.0);  // SUM of 10+20+30
 }
 
 TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedLATEST) {
@@ -462,8 +458,10 @@ TEST_F(DistributedAggregatorTest, HashBasedGroupingConsistency) {
     std::vector<double> values = {10.0};
 
     // Create series with same metadata but in different order
-    SeriesResult sr1 = createSeriesResult("cpu", {{"host", "server1"}, {"region", "us-west"}}, "usage", timestamps, values);
-    SeriesResult sr2 = createSeriesResult("cpu", {{"host", "server1"}, {"region", "us-west"}}, "usage", timestamps, values);
+    SeriesResult sr1 =
+        createSeriesResult("cpu", {{"host", "server1"}, {"region", "us-west"}}, "usage", timestamps, values);
+    SeriesResult sr2 =
+        createSeriesResult("cpu", {{"host", "server1"}, {"region", "us-west"}}, "usage", timestamps, values);
 
     auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, 0, {"host", "region"});
     auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, 0, {"host", "region"});

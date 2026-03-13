@@ -1,5 +1,7 @@
-#include <gtest/gtest.h>
 #include "../../../lib/query/query_parser.hpp"
+
+#include <gtest/gtest.h>
+
 #include <iostream>
 
 using namespace timestar;
@@ -9,7 +11,7 @@ protected:
     void SetUp() override {
         // Setup code if needed
     }
-    
+
     void TearDown() override {
         // Cleanup code if needed
     }
@@ -23,7 +25,7 @@ TEST_F(QueryParserDetailedTest, BasicQueryWithEmptyScopes) {
     std::string query = "avg:temperature(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.aggregation, AggregationMethod::AVG);
@@ -38,7 +40,7 @@ TEST_F(QueryParserDetailedTest, QueryWithoutScopes) {
     std::string query = "avg:temperature(value)";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     // This should handle missing scopes gracefully
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
@@ -52,7 +54,7 @@ TEST_F(QueryParserDetailedTest, QueryWithEmptyFields) {
     std::string query = "avg:temperature(){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_TRUE(request.fields.empty());
@@ -67,7 +69,7 @@ TEST_F(QueryParserDetailedTest, ScopeWithSimpleValue) {
     std::string query = "avg:temperature(value){host:server1}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes.size(), 1);
@@ -79,7 +81,7 @@ TEST_F(QueryParserDetailedTest, ScopeWithHyphen) {
     std::string query = "avg:temperature(value){host:server-01}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes.size(), 1);
@@ -91,7 +93,7 @@ TEST_F(QueryParserDetailedTest, ScopeWithUnderscore) {
     std::string query = "avg:temperature(value){host:server_01}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes.size(), 1);
@@ -103,7 +105,7 @@ TEST_F(QueryParserDetailedTest, ScopeWithDot) {
     std::string query = "avg:temperature(value){host:server.prod.01}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes.size(), 1);
@@ -115,7 +117,7 @@ TEST_F(QueryParserDetailedTest, ScopeWithNumbers) {
     std::string query = "avg:temperature(value){host:server123}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes.size(), 1);
@@ -127,7 +129,7 @@ TEST_F(QueryParserDetailedTest, MultipleScopes) {
     std::string query = "avg:temperature(value){host:server-01,region:us-west}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes.size(), 2);
@@ -140,7 +142,7 @@ TEST_F(QueryParserDetailedTest, ComplexScopeValues) {
     std::string query = "avg:temperature(value){host:prod-server-01.example.com,env:staging_v2}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes.size(), 2);
@@ -157,7 +159,7 @@ TEST_F(QueryParserDetailedTest, MultipleFields) {
     std::string query = "avg:temperature(value,humidity,pressure){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.fields.size(), 3);
@@ -171,7 +173,7 @@ TEST_F(QueryParserDetailedTest, FieldsWithSpaces) {
     std::string query = "avg:temperature(value, humidity, pressure){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.fields.size(), 3);
@@ -190,7 +192,7 @@ TEST_F(QueryParserDetailedTest, MinAggregation) {
     std::string query = "min:temperature(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.aggregation, AggregationMethod::MIN);
@@ -201,7 +203,7 @@ TEST_F(QueryParserDetailedTest, MaxAggregation) {
     std::string query = "max:temperature(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.aggregation, AggregationMethod::MAX);
@@ -212,7 +214,7 @@ TEST_F(QueryParserDetailedTest, SumAggregation) {
     std::string query = "sum:temperature(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.aggregation, AggregationMethod::SUM);
@@ -223,7 +225,7 @@ TEST_F(QueryParserDetailedTest, LatestAggregation) {
     std::string query = "latest:temperature(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.aggregation, AggregationMethod::LATEST);
@@ -238,7 +240,7 @@ TEST_F(QueryParserDetailedTest, MeasurementWithUnderscore) {
     std::string query = "avg:cpu_usage(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.measurement, "cpu_usage");
@@ -249,7 +251,7 @@ TEST_F(QueryParserDetailedTest, MeasurementWithDot) {
     std::string query = "avg:system.cpu.usage(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.measurement, "system.cpu.usage");
@@ -260,7 +262,7 @@ TEST_F(QueryParserDetailedTest, MeasurementWithHyphen) {
     std::string query = "avg:cpu-usage(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.measurement, "cpu-usage");
@@ -275,7 +277,7 @@ TEST_F(QueryParserDetailedTest, TimeFormatWithSingleDigitDay) {
     std::string query = "avg:temperature(value){}";
     std::string startTime = "1-1-2024 00:00:00";
     std::string endTime = "9-1-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_GT(request.startTime, 0);
@@ -287,7 +289,7 @@ TEST_F(QueryParserDetailedTest, TimeFormatWithSingleDigitMonth) {
     std::string query = "avg:temperature(value){}";
     std::string startTime = "01-1-2024 00:00:00";
     std::string endTime = "31-1-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_GT(request.startTime, 0);
@@ -299,10 +301,10 @@ TEST_F(QueryParserDetailedTest, TimeFormatWithMidnight) {
     std::string query = "avg:temperature(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "01-01-2024 00:00:01";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
-        EXPECT_EQ(request.endTime - request.startTime, 1000000000); // 1 second in nanoseconds
+        EXPECT_EQ(request.endTime - request.startTime, 1000000000);  // 1 second in nanoseconds
     });
 }
 
@@ -310,10 +312,10 @@ TEST_F(QueryParserDetailedTest, TimeFormatWithNoon) {
     std::string query = "avg:temperature(value){}";
     std::string startTime = "01-01-2024 12:00:00";
     std::string endTime = "01-01-2024 12:00:01";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
-        EXPECT_EQ(request.endTime - request.startTime, 1000000000); // 1 second in nanoseconds
+        EXPECT_EQ(request.endTime - request.startTime, 1000000000);  // 1 second in nanoseconds
     });
 }
 
@@ -321,10 +323,10 @@ TEST_F(QueryParserDetailedTest, TimeFormatEndOfDay) {
     std::string query = "avg:temperature(value){}";
     std::string startTime = "01-01-2024 23:59:58";
     std::string endTime = "01-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
-        EXPECT_EQ(request.endTime - request.startTime, 1000000000); // 1 second in nanoseconds
+        EXPECT_EQ(request.endTime - request.startTime, 1000000000);  // 1 second in nanoseconds
     });
 }
 
@@ -336,50 +338,40 @@ TEST_F(QueryParserDetailedTest, InvalidQueryFormatNoColon) {
     std::string query = "avgtemperature(value){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
-    EXPECT_THROW({
-        QueryParser::parse(query, startTime, endTime);
-    }, QueryParseException);
+
+    EXPECT_THROW({ QueryParser::parse(query, startTime, endTime); }, QueryParseException);
 }
 
 TEST_F(QueryParserDetailedTest, InvalidScopeFormatNoColon) {
     std::string query = "avg:temperature(value){hostserver1}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
-    EXPECT_THROW({
-        QueryParser::parse(query, startTime, endTime);
-    }, QueryParseException);
+
+    EXPECT_THROW({ QueryParser::parse(query, startTime, endTime); }, QueryParseException);
 }
 
 TEST_F(QueryParserDetailedTest, EmptyScopeKey) {
     std::string query = "avg:temperature(value){:value1}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
-    EXPECT_THROW({
-        QueryParser::parse(query, startTime, endTime);
-    }, QueryParseException);
+
+    EXPECT_THROW({ QueryParser::parse(query, startTime, endTime); }, QueryParseException);
 }
 
 TEST_F(QueryParserDetailedTest, EmptyScopeValue) {
     std::string query = "avg:temperature(value){host:}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
-    EXPECT_THROW({
-        QueryParser::parse(query, startTime, endTime);
-    }, QueryParseException);
+
+    EXPECT_THROW({ QueryParser::parse(query, startTime, endTime); }, QueryParseException);
 }
 
 TEST_F(QueryParserDetailedTest, InvalidTimeFormat) {
     std::string query = "avg:temperature(value){}";
-    std::string startTime = "2024-01-01 00:00:00"; // Wrong format (should be dd-mm-yyyy)
+    std::string startTime = "2024-01-01 00:00:00";  // Wrong format (should be dd-mm-yyyy)
     std::string endTime = "2024-01-31 23:59:59";
-    
-    EXPECT_THROW({
-        QueryParser::parse(query, startTime, endTime);
-    }, QueryParseException);
+
+    EXPECT_THROW({ QueryParser::parse(query, startTime, endTime); }, QueryParseException);
 }
 
 // ============================================================================
@@ -390,7 +382,7 @@ TEST_F(QueryParserDetailedTest, ExtraSpacesInQuery) {
     std::string query = "  avg : temperature ( value , humidity ) { host : server1 , region : west }  ";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.aggregation, AggregationMethod::AVG);
@@ -405,7 +397,7 @@ TEST_F(QueryParserDetailedTest, VeryLongTagValue) {
     std::string query = "avg:temperature(value){host:" + longValue + "}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.scopes["host"], longValue);
@@ -416,7 +408,7 @@ TEST_F(QueryParserDetailedTest, SpecialCharactersInFieldNames) {
     std::string query = "avg:temperature(cpu_usage,memory.used,disk-io){}";
     std::string startTime = "01-01-2024 00:00:00";
     std::string endTime = "31-01-2024 23:59:59";
-    
+
     ASSERT_NO_THROW({
         auto request = QueryParser::parse(query, startTime, endTime);
         EXPECT_EQ(request.fields.size(), 3);
@@ -427,7 +419,7 @@ TEST_F(QueryParserDetailedTest, SpecialCharactersInFieldNames) {
 }
 
 // Main function for running tests
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -1,17 +1,17 @@
-#include <iostream>
-#include <iomanip>
-#include <vector>
-#include <string>
+#include "alp/alp_decoder.hpp"
+#include "alp/alp_encoder.hpp"
+#include "compressed_buffer.hpp"
+#include "float_encoder.hpp"
+#include "slice_buffer.hpp"
+
 #include <chrono>
 #include <cmath>
-#include <random>
 #include <functional>
-
-#include "float_encoder.hpp"
-#include "alp/alp_encoder.hpp"
-#include "alp/alp_decoder.hpp"
-#include "compressed_buffer.hpp"
-#include "slice_buffer.hpp"
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
 
 using Clock = std::chrono::high_resolution_clock;
 
@@ -54,7 +54,7 @@ std::vector<double> genFinancialTicks(size_t n) {
     std::vector<double> data(n);
     data[0] = 150.25;
     for (size_t i = 1; i < n; ++i) {
-        data[i] = std::round((data[i-1] + dist(gen)) * 100.0) / 100.0;
+        data[i] = std::round((data[i - 1] + dist(gen)) * 100.0) / 100.0;
     }
     return data;
 }
@@ -133,12 +133,8 @@ BenchResult benchmarkGorilla(const std::vector<double>& data) {
     auto dec_end = Clock::now();
     double dec_secs = std::chrono::duration<double>(dec_end - dec_start).count() / BENCH_ITERS;
 
-    return {
-        (raw_bytes / (1024.0 * 1024.0)) / enc_secs,
-        (raw_bytes / (1024.0 * 1024.0)) / dec_secs,
-        static_cast<double>(raw_bytes) / compressed_bytes,
-        compressed_bytes
-    };
+    return {(raw_bytes / (1024.0 * 1024.0)) / enc_secs, (raw_bytes / (1024.0 * 1024.0)) / dec_secs,
+            static_cast<double>(raw_bytes) / compressed_bytes, compressed_bytes};
 }
 
 BenchResult benchmarkALP(const std::vector<double>& data) {
@@ -176,12 +172,8 @@ BenchResult benchmarkALP(const std::vector<double>& data) {
     auto dec_end = Clock::now();
     double dec_secs = std::chrono::duration<double>(dec_end - dec_start).count() / BENCH_ITERS;
 
-    return {
-        (raw_bytes / (1024.0 * 1024.0)) / enc_secs,
-        (raw_bytes / (1024.0 * 1024.0)) / dec_secs,
-        static_cast<double>(raw_bytes) / compressed_bytes,
-        compressed_bytes
-    };
+    return {(raw_bytes / (1024.0 * 1024.0)) / enc_secs, (raw_bytes / (1024.0 * 1024.0)) / dec_secs,
+            static_cast<double>(raw_bytes) / compressed_bytes, compressed_bytes};
 }
 
 // ============================================================
@@ -195,13 +187,13 @@ int main() {
     };
 
     std::vector<PatternDef> patterns = {
-        {"Sensor Temp",       genSensorTemp},
-        {"Integer Counters",  genIntegerCounters},
-        {"CPU Percentages",   genCpuPercentages},
-        {"Financial Ticks",   genFinancialTicks},
-        {"Random Doubles",    genRandomDoubles},
-        {"Sparse + Zeros",    genSparseWithZeros},
-        {"Constant",          genConstant},
+        {"Sensor Temp", genSensorTemp},
+        {"Integer Counters", genIntegerCounters},
+        {"CPU Percentages", genCpuPercentages},
+        {"Financial Ticks", genFinancialTicks},
+        {"Random Doubles", genRandomDoubles},
+        {"Sparse + Zeros", genSparseWithZeros},
+        {"Constant", genConstant},
     };
 
     std::vector<size_t> sizes = {10000, 100000, 1000000};
@@ -211,8 +203,7 @@ int main() {
     std::cout << std::string(130, '=') << "\n\n";
 
     for (auto sz : sizes) {
-        std::cout << "Dataset size: " << sz << " doubles ("
-                  << (sz * 8) / 1024 << " KB raw)\n";
+        std::cout << "Dataset size: " << sz << " doubles (" << (sz * 8) / 1024 << " KB raw)\n";
         std::cout << std::string(130, '-') << "\n";
 
         // Header
@@ -246,8 +237,8 @@ int main() {
             auto gor = benchmarkGorilla(data);
             auto alp = benchmarkALP(data);
 
-            std::cout << std::left << std::setw(20) << pat.name
-                      << " | " << std::right << std::setw(10) << std::fixed << std::setprecision(1) << gor.encode_mbs << "  "
+            std::cout << std::left << std::setw(20) << pat.name << " | " << std::right << std::setw(10) << std::fixed
+                      << std::setprecision(1) << gor.encode_mbs << "  "
                       << " | " << std::setw(10) << alp.encode_mbs << "  "
                       << " | " << std::setw(10) << gor.decode_mbs << "  "
                       << " | " << std::setw(10) << alp.decode_mbs << "  "

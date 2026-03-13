@@ -1,8 +1,9 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-
-#include "../../../lib/index/leveldb_index.hpp"
 #include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 
 // =============================================================================
 // LevelDB Index Field Type Integration Tests
@@ -13,13 +14,9 @@
 
 class LevelDBIndexFieldTypeTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void SetUp() override { std::filesystem::remove_all("shard_0"); }
 
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
 // Test that indexInsert<double> stores field type as "float"
@@ -194,8 +191,7 @@ seastar::future<> testUnknownFieldTypeReturnsEmpty() {
 
     // Manually create a series without going through indexInsert
     // (simulating legacy data that existed before field type tracking)
-    co_await index.getOrCreateSeriesId("legacy_measurement",
-        {{"tag", "value"}}, "some_field");
+    co_await index.getOrCreateSeriesId("legacy_measurement", {{"tag", "value"}}, "some_field");
 
     // getFieldType should return empty since setFieldType was not called
     // (getOrCreateSeriesId doesn't call setFieldType directly)

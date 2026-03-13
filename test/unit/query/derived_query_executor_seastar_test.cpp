@@ -3,26 +3,25 @@
 // sharded Engine, verifying sub-query fan-out, formula evaluation, alignment,
 // and error propagation under the Seastar reactor.
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <vector>
-#include <string>
-#include <cmath>
-
-#include "../../../lib/query/derived_query_executor.hpp"
-#include "../../../lib/query/derived_query.hpp"
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
-
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/sharded.hh>
-#include <seastar/core/smp.hh>
-
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/query/derived_query.hpp"
+#include "../../../lib/query/derived_query_executor.hpp"
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cmath>
+#include <filesystem>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/thread.hh>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -30,21 +29,15 @@ using namespace timestar;
 
 class DerivedQueryExecutorSeastarTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // ---------------------------------------------------------------------------
 // Helper: insert float data via the shardedInsert helper
 // ---------------------------------------------------------------------------
-static void insertFloatSeries(seastar::sharded<Engine>& eng,
-                              const std::string& measurement,
-                              const std::string& field,
+static void insertFloatSeries(seastar::sharded<Engine>& eng, const std::string& measurement, const std::string& field,
                               const std::map<std::string, std::string>& tags,
                               const std::vector<std::pair<uint64_t, double>>& points) {
     TimeStarInsert<double> insert(measurement, field);
@@ -101,7 +94,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, SingleSubQueryIdentityFormula) {
         EXPECT_EQ(result.timestamps.size(), 5u);
         EXPECT_DOUBLE_EQ(result.values[0], 10.0);
         EXPECT_DOUBLE_EQ(result.values[4], 50.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -156,10 +151,11 @@ TEST_F(DerivedQueryExecutorSeastarTest, TwoSubQueryArithmeticFormula) {
         EXPECT_EQ(result.timestamps.size(), 3u);
 
         for (size_t i = 0; i < result.values.size(); ++i) {
-            EXPECT_NEAR(result.values[i], 25.0, 0.01)
-                << "Formula evaluation mismatch at index " << i;
+            EXPECT_NEAR(result.values[i], 25.0, 0.01) << "Formula evaluation mismatch at index " << i;
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -190,7 +186,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, EmptySubQueryResult) {
 
         EXPECT_TRUE(result.empty());
         EXPECT_EQ(result.timestamps.size(), 0u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -221,7 +219,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, TooManySubQueriesThrows) {
         }
 
         EXPECT_THROW(executor.execute(request).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -240,7 +240,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, InvalidFormulaThrows) {
         request.queries["a"] = QueryRequest();
 
         EXPECT_THROW(executor.execute(request).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -280,7 +282,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteFromJsonRoundTrip) {
         for (double v : result.values) {
             EXPECT_NEAR(v, 84.0, 0.01);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -296,7 +300,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteFromJsonInvalidJsonThrows) {
 
         std::string badJson = "{ not valid json";
         EXPECT_THROW(executor.executeFromJson(badJson).get(), DerivedQueryException);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -337,7 +343,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, FormatResponseRoundTrip) {
         EXPECT_TRUE(jsonResponse.find("\"success\"") != std::string::npos);
         EXPECT_TRUE(jsonResponse.find("\"timestamps\"") != std::string::npos);
         EXPECT_TRUE(jsonResponse.find("\"values\"") != std::string::npos);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -380,7 +388,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteWithAnomalyRegularFormula) {
         for (double v : result.values) {
             EXPECT_NEAR(v, 15.0, 0.01);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -394,11 +404,12 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteWithAnomalyDetection) {
 
         // Insert 100 data points for anomaly detection to work
         std::vector<std::pair<uint64_t, double>> points;
-        uint64_t intervalNs = 60000000000ULL; // 1 minute
+        uint64_t intervalNs = 60000000000ULL;  // 1 minute
         uint64_t startNs = 1704067200000000000ULL;
         for (size_t i = 0; i < 100; ++i) {
             double val = 50.0;
-            if (i == 75) val = 200.0; // anomaly
+            if (i == 75)
+                val = 200.0;  // anomaly
             points.push_back({startNs + i * intervalNs, val});
         }
         insertFloatSeries(eng.eng, "cpu", "usage", {{"host", "s1"}}, points);
@@ -432,7 +443,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteWithAnomalyDetection) {
         // Statistics
         EXPECT_EQ(anomalyResult.statistics.algorithm, "basic");
         EXPECT_EQ(anomalyResult.statistics.totalPoints, 100u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -460,7 +473,7 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteWithForecast) {
         request.formula = "forecast(a, 'linear', 2)";
         // Set the time range such that forecastHorizon can be computed
         request.startTime = startNs;
-        request.endTime = startNs + 200 * intervalNs; // extended range for forecast
+        request.endTime = startNs + 200 * intervalNs;  // extended range for forecast
 
         QueryRequest qr;
         qr.measurement = "metric";
@@ -485,7 +498,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteWithForecast) {
         EXPECT_EQ(forecastResult.statistics.algorithm, "linear");
         EXPECT_GT(forecastResult.statistics.historicalPoints, 0u);
         EXPECT_GT(forecastResult.statistics.forecastPoints, 0u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -539,7 +554,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, FormatResponseVariantAllTypes) {
             EXPECT_TRUE(json.find("\"success\"") != std::string::npos);
             EXPECT_TRUE(json.find("\"linear\"") != std::string::npos);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -557,7 +574,8 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteFromJsonWithAnomalyPath) {
         uint64_t startNs = 1704067200000000000ULL;
         for (size_t i = 0; i < 100; ++i) {
             double val = 50.0;
-            if (i == 80) val = 300.0;
+            if (i == 80)
+                val = 300.0;
             points.push_back({startNs + i * intervalNs, val});
         }
         insertFloatSeries(eng.eng, "load", "cpu", {{"dc", "us"}}, points);
@@ -580,7 +598,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, ExecuteFromJsonWithAnomalyPath) {
         auto& anomalyResult = std::get<anomaly::AnomalyQueryResult>(variantResult);
         EXPECT_TRUE(anomalyResult.success);
         EXPECT_GE(anomalyResult.series.size(), 4u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -619,7 +639,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, TimeRangeFilteredSubQuery) {
         EXPECT_EQ(result.timestamps.size(), 5u);
         EXPECT_EQ(result.timestamps.front(), 3000u);
         EXPECT_EQ(result.timestamps.back(), 7000u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -669,7 +691,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, UnusedQueriesNotExecuted) {
         // Only "a" should have been executed
         EXPECT_EQ(result.stats.subQueriesExecuted, 1u);
         EXPECT_EQ(result.timestamps.size(), 3u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -701,7 +725,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, AnomalyEmptySubQueryReturnsEmpty) {
         auto& result = std::get<anomaly::AnomalyQueryResult>(variantResult);
         EXPECT_TRUE(result.success);
         EXPECT_TRUE(result.empty());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -733,7 +759,9 @@ TEST_F(DerivedQueryExecutorSeastarTest, ForecastEmptySubQueryReturnsEmpty) {
         auto& result = std::get<forecast::ForecastQueryResult>(variantResult);
         EXPECT_TRUE(result.success);
         EXPECT_TRUE(result.empty());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================

@@ -1,12 +1,13 @@
-#include <iostream>
-#include <chrono>
-#include <vector>
-#include <cstring>
-#include <iomanip>
-#include <numeric>
-#include <algorithm>
 #include "storage/aligned_buffer.hpp"
 #include "storage/aligned_buffer_optimized.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <vector>
 
 using namespace std::chrono;
 
@@ -17,15 +18,15 @@ class PerformanceTest {
 public:
     PerformanceTest(const std::string& n) : name(n) {}
 
-    template<typename Func>
+    template <typename Func>
     void run(Func test_func, size_t iterations = 10) {
         // Warmup
-        for(size_t i = 0; i < 3; ++i) {
+        for (size_t i = 0; i < 3; ++i) {
             test_func();
         }
 
         // Actual measurements
-        for(size_t i = 0; i < iterations; ++i) {
+        for (size_t i = 0; i < iterations; ++i) {
             auto start = high_resolution_clock::now();
             test_func();
             auto end = high_resolution_clock::now();
@@ -40,13 +41,9 @@ public:
         return sorted[sorted.size() / 2];
     }
 
-    double mean() const {
-        return std::accumulate(measurements.begin(), measurements.end(), 0.0) / measurements.size();
-    }
+    double mean() const { return std::accumulate(measurements.begin(), measurements.end(), 0.0) / measurements.size(); }
 
-    double min() const {
-        return *std::min_element(measurements.begin(), measurements.end());
-    }
+    double min() const { return *std::min_element(measurements.begin(), measurements.end()); }
 };
 
 void realistic_performance_test() {
@@ -65,20 +62,24 @@ void realistic_performance_test() {
     std::cout << "───────────────────────────────────" << std::endl;
 
     PerformanceTest original_seq("Original");
-    original_seq.run([NUM_OPERATIONS]() {
-        AlignedBuffer buffer;
-        for(size_t i = 0; i < NUM_OPERATIONS; ++i) {
-            buffer.write(static_cast<uint64_t>(i));
-        }
-    }, NUM_RUNS);
+    original_seq.run(
+        [NUM_OPERATIONS]() {
+            AlignedBuffer buffer;
+            for (size_t i = 0; i < NUM_OPERATIONS; ++i) {
+                buffer.write(static_cast<uint64_t>(i));
+            }
+        },
+        NUM_RUNS);
 
     PerformanceTest optimized_seq("Optimized");
-    optimized_seq.run([NUM_OPERATIONS]() {
-        AlignedBufferOptimized buffer;
-        for(size_t i = 0; i < NUM_OPERATIONS; ++i) {
-            buffer.write(static_cast<uint64_t>(i));
-        }
-    }, NUM_RUNS);
+    optimized_seq.run(
+        [NUM_OPERATIONS]() {
+            AlignedBufferOptimized buffer;
+            for (size_t i = 0; i < NUM_OPERATIONS; ++i) {
+                buffer.write(static_cast<uint64_t>(i));
+            }
+        },
+        NUM_RUNS);
 
     double orig_time = original_seq.median();
     double opt_time = optimized_seq.median();
@@ -99,24 +100,28 @@ void realistic_performance_test() {
     const size_t MIXED_OPS = 100000;
 
     PerformanceTest original_mixed("Original");
-    original_mixed.run([MIXED_OPS]() {
-        AlignedBuffer buffer;
-        for(size_t i = 0; i < MIXED_OPS; ++i) {
-            buffer.write(static_cast<uint64_t>(i));
-            buffer.write(static_cast<uint32_t>(i));
-            buffer.write(static_cast<double>(i * 1.1));
-        }
-    }, NUM_RUNS);
+    original_mixed.run(
+        [MIXED_OPS]() {
+            AlignedBuffer buffer;
+            for (size_t i = 0; i < MIXED_OPS; ++i) {
+                buffer.write(static_cast<uint64_t>(i));
+                buffer.write(static_cast<uint32_t>(i));
+                buffer.write(static_cast<double>(i * 1.1));
+            }
+        },
+        NUM_RUNS);
 
     PerformanceTest optimized_mixed("Optimized");
-    optimized_mixed.run([MIXED_OPS]() {
-        AlignedBufferOptimized buffer;
-        for(size_t i = 0; i < MIXED_OPS; ++i) {
-            buffer.write(static_cast<uint64_t>(i));
-            buffer.write(static_cast<uint32_t>(i));
-            buffer.write(static_cast<double>(i * 1.1));
-        }
-    }, NUM_RUNS);
+    optimized_mixed.run(
+        [MIXED_OPS]() {
+            AlignedBufferOptimized buffer;
+            for (size_t i = 0; i < MIXED_OPS; ++i) {
+                buffer.write(static_cast<uint64_t>(i));
+                buffer.write(static_cast<uint32_t>(i));
+                buffer.write(static_cast<double>(i * 1.1));
+            }
+        },
+        NUM_RUNS);
 
     orig_time = original_mixed.median();
     opt_time = optimized_mixed.median();
@@ -138,21 +143,25 @@ void realistic_performance_test() {
     const size_t EXPECTED_SIZE = PRE_ALLOC_OPS * sizeof(uint64_t);
 
     PerformanceTest original_prealloc("Original");
-    original_prealloc.run([PRE_ALLOC_OPS, EXPECTED_SIZE]() {
-        AlignedBuffer buffer(EXPECTED_SIZE);
-        for(size_t i = 0; i < PRE_ALLOC_OPS; ++i) {
-            buffer.write(static_cast<uint64_t>(i));
-        }
-    }, NUM_RUNS);
+    original_prealloc.run(
+        [PRE_ALLOC_OPS, EXPECTED_SIZE]() {
+            AlignedBuffer buffer(EXPECTED_SIZE);
+            for (size_t i = 0; i < PRE_ALLOC_OPS; ++i) {
+                buffer.write(static_cast<uint64_t>(i));
+            }
+        },
+        NUM_RUNS);
 
     PerformanceTest optimized_prealloc("Optimized");
-    optimized_prealloc.run([PRE_ALLOC_OPS]() {
-        AlignedBufferOptimized buffer;
-        buffer.reserve(PRE_ALLOC_OPS * sizeof(uint64_t));
-        for(size_t i = 0; i < PRE_ALLOC_OPS; ++i) {
-            buffer.write(static_cast<uint64_t>(i));
-        }
-    }, NUM_RUNS);
+    optimized_prealloc.run(
+        [PRE_ALLOC_OPS]() {
+            AlignedBufferOptimized buffer;
+            buffer.reserve(PRE_ALLOC_OPS * sizeof(uint64_t));
+            for (size_t i = 0; i < PRE_ALLOC_OPS; ++i) {
+                buffer.write(static_cast<uint64_t>(i));
+            }
+        },
+        NUM_RUNS);
 
     orig_time = original_prealloc.median();
     opt_time = optimized_prealloc.median();
@@ -173,27 +182,31 @@ void realistic_performance_test() {
     const size_t ARRAY_SIZE = 10000;
     const size_t ARRAY_ITERATIONS = 1000;
     std::vector<uint64_t> test_array(ARRAY_SIZE);
-    for(size_t i = 0; i < ARRAY_SIZE; ++i) {
+    for (size_t i = 0; i < ARRAY_SIZE; ++i) {
         test_array[i] = i;
     }
 
     PerformanceTest original_bulk("Original");
-    original_bulk.run([&test_array, ARRAY_ITERATIONS]() {
-        AlignedBuffer buffer;
-        for(size_t iter = 0; iter < ARRAY_ITERATIONS; ++iter) {
-            for(const auto& val : test_array) {
-                buffer.write(val);
+    original_bulk.run(
+        [&test_array, ARRAY_ITERATIONS]() {
+            AlignedBuffer buffer;
+            for (size_t iter = 0; iter < ARRAY_ITERATIONS; ++iter) {
+                for (const auto& val : test_array) {
+                    buffer.write(val);
+                }
             }
-        }
-    }, NUM_RUNS);
+        },
+        NUM_RUNS);
 
     PerformanceTest optimized_bulk("Optimized");
-    optimized_bulk.run([&test_array, ARRAY_ITERATIONS]() {
-        AlignedBufferOptimized buffer;
-        for(size_t iter = 0; iter < ARRAY_ITERATIONS; ++iter) {
-            buffer.write_array(test_array.data(), test_array.size());
-        }
-    }, NUM_RUNS);
+    optimized_bulk.run(
+        [&test_array, ARRAY_ITERATIONS]() {
+            AlignedBufferOptimized buffer;
+            for (size_t iter = 0; iter < ARRAY_ITERATIONS; ++iter) {
+                buffer.write_array(test_array.data(), test_array.size());
+            }
+        },
+        NUM_RUNS);
 
     orig_time = original_bulk.median();
     opt_time = optimized_bulk.median();
@@ -218,7 +231,7 @@ void memory_efficiency_test() {
     // Original buffer
     {
         AlignedBuffer buffer;
-        for(size_t i = 0; i < NUM_WRITES; ++i) {
+        for (size_t i = 0; i < NUM_WRITES; ++i) {
             buffer.write(static_cast<uint64_t>(i));
         }
         std::cout << "Original AlignedBuffer:" << std::endl;
@@ -234,7 +247,7 @@ void memory_efficiency_test() {
     // Optimized buffer
     {
         AlignedBufferOptimized buffer;
-        for(size_t i = 0; i < NUM_WRITES; ++i) {
+        for (size_t i = 0; i < NUM_WRITES; ++i) {
             buffer.write(static_cast<uint64_t>(i));
         }
         std::cout << "Optimized AlignedBuffer:" << std::endl;
@@ -251,7 +264,7 @@ void memory_efficiency_test() {
     {
         AlignedBufferOptimized buffer;
         buffer.reserve(NUM_WRITES * sizeof(uint64_t));
-        for(size_t i = 0; i < NUM_WRITES; ++i) {
+        for (size_t i = 0; i < NUM_WRITES; ++i) {
             buffer.write(static_cast<uint64_t>(i));
         }
         std::cout << "Optimized with reserve():" << std::endl;

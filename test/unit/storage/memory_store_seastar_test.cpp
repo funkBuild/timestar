@@ -1,16 +1,16 @@
 // Seastar-based tests for MemoryStore WAL integration
 
-#include <gtest/gtest.h>
-#include <memory>
-#include <vector>
-#include <filesystem>
-
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/wal.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <memory>
 #include <seastar/core/coroutine.hh>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -23,9 +23,7 @@ protected:
         fs::create_directories(testDir + "/shard_0");
     }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 };
 
 seastar::future<> testMemoryStoreInitWAL() {
@@ -101,7 +99,8 @@ seastar::future<> testMemoryStoreInitFromWAL() {
         SeriesId128 cpuId = cpuInsert.seriesId128();
         auto cpuIt = recoveredStore->series.find(cpuId);
         EXPECT_NE(cpuIt, recoveredStore->series.end());
-        if (cpuIt == recoveredStore->series.end()) co_return;
+        if (cpuIt == recoveredStore->series.end())
+            co_return;
         auto& cpuData = std::get<InMemorySeries<double>>(cpuIt->second);
         EXPECT_EQ(cpuData.values.size(), 2);
         EXPECT_DOUBLE_EQ(cpuData.values[0], 25.5);
@@ -117,7 +116,8 @@ seastar::future<> testMemoryStoreInitFromWAL() {
         SeriesId128 appId = appInsert.seriesId128();
         auto appIt = recoveredStore->series.find(appId);
         EXPECT_NE(appIt, recoveredStore->series.end());
-        if (appIt == recoveredStore->series.end()) co_return;
+        if (appIt == recoveredStore->series.end())
+            co_return;
         auto& appData = std::get<InMemorySeries<std::string>>(appIt->second);
         EXPECT_EQ(appData.values[0], "running");
     }
@@ -146,7 +146,8 @@ seastar::future<> testMemoryStoreBatchInsert() {
     SeriesId128 seriesId = queryInsert.seriesId128();
     auto it = store->series.find(seriesId);
     EXPECT_NE(it, store->series.end());
-    if (it == store->series.end()) co_return;
+    if (it == store->series.end())
+        co_return;
     auto& data = std::get<InMemorySeries<double>>(it->second);
     EXPECT_EQ(data.values.size(), 100);
 

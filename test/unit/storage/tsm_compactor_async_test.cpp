@@ -10,27 +10,27 @@
 //   - Concurrent compaction requests
 //   - Data integrity verification after compaction
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <set>
-#include <map>
-#include <atomic>
-
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/tsm_compactor.hpp"
 #include "../../../lib/storage/tsm_file_manager.hpp"
-#include "../../../lib/storage/tsm_writer.hpp"
 #include "../../../lib/storage/tsm_reader.hpp"
 #include "../../../lib/storage/tsm_tombstone.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/series_id.hpp"
-
+#include "../../../lib/storage/tsm_writer.hpp"
 #include "../../seastar_gtest.hpp"
-#include <seastar/core/reactor.hh>
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <filesystem>
+#include <map>
 #include <seastar/core/future.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -70,23 +70,15 @@ public:
 
     // Create a TSM file with float data.  Each series gets `pointsPerSeries`
     // data points starting at `startTime` with a stride of 1000 ns.
-    seastar::shared_ptr<TSM> createTestTSMFile(
-        uint64_t tier,
-        uint64_t seqNum,
-        const std::string& seriesPrefix,
-        int numSeries,
-        int pointsPerSeries,
-        uint64_t startTime = 1000000) {
-
+    seastar::shared_ptr<TSM> createTestTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesPrefix,
+                                               int numSeries, int pointsPerSeries, uint64_t startTime = 1000000) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
 
         TSMWriter writer(filename);
 
         for (int s = 0; s < numSeries; s++) {
-            SeriesId128 seriesId =
-                SeriesId128::fromSeriesKey(seriesPrefix + std::to_string(s));
+            SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesPrefix + std::to_string(s));
             std::vector<uint64_t> timestamps;
             std::vector<double> values;
 
@@ -95,8 +87,7 @@ public:
                 values.push_back(s * 100.0 + p);
             }
 
-            writer.writeSeries(TSMValueType::Float, seriesId,
-                               timestamps, values);
+            writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
         }
 
         writer.writeIndex();
@@ -111,16 +102,11 @@ public:
 
     // Create a TSM file with a single float series whose timestamps and values
     // are given explicitly.
-    seastar::shared_ptr<TSM> createTestTSMFileExplicit(
-        uint64_t tier,
-        uint64_t seqNum,
-        const std::string& seriesKey,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values) {
-
+    seastar::shared_ptr<TSM> createTestTSMFileExplicit(uint64_t tier, uint64_t seqNum, const std::string& seriesKey,
+                                                       const std::vector<uint64_t>& timestamps,
+                                                       const std::vector<double>& values) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
 
         TSMWriter writer(filename);
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -136,10 +122,8 @@ public:
 
     // Helper: read all float data from a TSM file for a given series key.
     // Returns a sorted map of timestamp -> value.
-    static seastar::future<std::map<uint64_t, double>> readAllFloatData(
-        seastar::shared_ptr<TSM> tsm,
-        const std::string& seriesKey) {
-
+    static seastar::future<std::map<uint64_t, double>> readAllFloatData(seastar::shared_ptr<TSM> tsm,
+                                                                        const std::string& seriesKey) {
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
         TSMResult<double> result(0);
         co_await tsm->readSeries(seriesId, 0, UINT64_MAX, result);
@@ -161,8 +145,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, BackgroundCompactionLoopStartStop) {
     // Create enough tier-0 files to trigger compaction (4 is the threshold)
     std::vector<seastar::shared_ptr<TSM>> files;
     for (int i = 0; i < 5; i++) {
-        auto tsm = self->createTestTSMFile(0, i, "bg.", 2, 50,
-                                           1000000 + i * 50000);
+        auto tsm = self->createTestTSMFile(0, i, "bg.", 2, 50, 1000000 + i * 50000);
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
@@ -197,8 +180,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
     // Phase 1: create initial files
     std::vector<seastar::shared_ptr<TSM>> files;
     for (int i = 0; i < 4; i++) {
-        auto tsm = self->createTestTSMFile(0, i, "wr.", 3, 100,
-                                           1000000 + i * 100000);
+        auto tsm = self->createTestTSMFile(0, i, "wr.", 3, 100, 1000000 + i * 100000);
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
@@ -211,8 +193,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
     // Phase 3: while compaction is running, create a new file that simulates
     // a concurrent write (non-overlapping timestamps so the new file is
     // independent of the compaction input).
-    auto newTsm = self->createTestTSMFile(0, 100, "wr_new.", 2, 50,
-                                          9000000);
+    auto newTsm = self->createTestTSMFile(0, 100, "wr_new.", 2, 50, 9000000);
     co_await newTsm->open();
     co_await newTsm->readSparseIndex();
     self->fileManager->setSequencedTsmFile(100, newTsm);
@@ -224,8 +205,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
     EXPECT_TRUE(fs::exists(compactedFile));
 
     // The new file (seqNum=100) should still be present and readable
-    EXPECT_NE(self->fileManager->getSequencedTsmFiles().find(100),
-              self->fileManager->getSequencedTsmFiles().end());
+    EXPECT_NE(self->fileManager->getSequencedTsmFiles().find(100), self->fileManager->getSequencedTsmFiles().end());
 
     // Verify the compacted file contains expected data
     auto compactedTSM = seastar::make_shared<TSM>(compactedFile);
@@ -233,7 +213,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
     co_await compactedTSM->readSparseIndex();
 
     auto seriesIds = compactedTSM->getSeriesIds();
-    EXPECT_GE(seriesIds.size(), 3); // The 3 original series
+    EXPECT_GE(seriesIds.size(), 3);  // The 3 original series
 
     co_return;
 }
@@ -245,10 +225,9 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MultiTierCompactionChain) {
     // Step 1: Create 4 tier-0 files with disjoint timestamps
     std::vector<seastar::shared_ptr<TSM>> tier0Files;
     for (int i = 0; i < 4; i++) {
-        auto tsm = self->createTestTSMFileExplicit(
-            0, i, "chain.series",
-            {uint64_t(1000 + i * 1000), uint64_t(1500 + i * 1000)},
-            {double(i) * 10.0, double(i) * 10.0 + 5.0});
+        auto tsm = self->createTestTSMFileExplicit(0, i, "chain.series",
+                                                   {uint64_t(1000 + i * 1000), uint64_t(1500 + i * 1000)},
+                                                   {double(i) * 10.0, double(i) * 10.0 + 5.0});
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         tier0Files.push_back(tsm);
@@ -264,10 +243,9 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MultiTierCompactionChain) {
 
     // Step 2: Create 3 more tier-1 files so we reach the compaction threshold
     for (int i = 10; i < 13; i++) {
-        auto tsm = self->createTestTSMFileExplicit(
-            1, i, "chain.series",
-            {uint64_t(50000 + i * 1000), uint64_t(50500 + i * 1000)},
-            {double(i) * 100.0, double(i) * 100.0 + 50.0});
+        auto tsm = self->createTestTSMFileExplicit(1, i, "chain.series",
+                                                   {uint64_t(50000 + i * 1000), uint64_t(50500 + i * 1000)},
+                                                   {double(i) * 100.0, double(i) * 100.0 + 50.0});
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         co_await self->fileManager->addTSMFile(tsm);
@@ -287,8 +265,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MultiTierCompactionChain) {
     auto tier2Files = self->fileManager->getFilesInTier(2);
     EXPECT_GE(tier2Files.size(), 1);
 
-    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(
-        tier2Files[0], "chain.series");
+    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(tier2Files[0], "chain.series");
     // All timestamps from the tier-0 and tier-1 files should be present
     EXPECT_GT(data.size(), 0);
 
@@ -325,8 +302,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ErrorRecoveryDuringCompaction) {
     auto compacted = seastar::make_shared<TSM>(singleResult);
     co_await compacted->open();
     co_await compacted->readSparseIndex();
-    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(
-        compacted, "err.0");
+    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(compacted, "err.0");
     EXPECT_EQ(data.size(), 20);
 
     co_return;
@@ -343,8 +319,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneIntegrationDuringCompaction) {
 
     for (int f = 0; f < 2; f++) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/00_%010d.tsm", f);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", f);
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts;
@@ -353,9 +328,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneIntegrationDuringCompaction) {
             ts.push_back(p * 1000);
             vals.push_back(f * 100.0 + p);
         }
-        writer.writeSeries(TSMValueType::Float,
-                           SeriesId128::fromSeriesKey("ts.sensor"),
-                           ts, vals);
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("ts.sensor"), ts, vals);
         writer.writeIndex();
         writer.close();
 
@@ -384,8 +357,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneIntegrationDuringCompaction) {
     co_await compactedTSM->open();
     co_await compactedTSM->readSparseIndex();
 
-    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(
-        compactedTSM, "ts.sensor");
+    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(compactedTSM, "ts.sensor");
 
     // Timestamps 3000, 4000, 5000 should be absent (tombstoned).
     // Remaining: 1000, 2000, 6000, 7000, 8000, 9000, 10000 = 7 points
@@ -411,14 +383,12 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ConcurrentCompactionRequests) {
     std::vector<seastar::shared_ptr<TSM>> setB;
 
     for (int i = 0; i < 4; i++) {
-        auto tsmA = self->createTestTSMFile(0, i, "setA.", 2, 50,
-                                            1000000 + i * 50000);
+        auto tsmA = self->createTestTSMFile(0, i, "setA.", 2, 50, 1000000 + i * 50000);
         co_await tsmA->open();
         co_await tsmA->readSparseIndex();
         setA.push_back(tsmA);
 
-        auto tsmB = self->createTestTSMFile(0, 100 + i, "setB.", 2, 50,
-                                            5000000 + i * 50000);
+        auto tsmB = self->createTestTSMFile(0, 100 + i, "setB.", 2, 50, 5000000 + i * 50000);
         co_await tsmB->open();
         co_await tsmB->readSparseIndex();
         setB.push_back(tsmB);
@@ -485,17 +455,11 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, DataIntegrityAfterCompaction) {
         uint64_t endTs;
         double baseValue;
     };
-    std::vector<FileSpec> specs = {
-        {1000, 5000, 10.0},
-        {3000, 7000, 130.0},
-        {5000, 9000, 250.0},
-        {7000, 11000, 370.0}
-    };
+    std::vector<FileSpec> specs = {{1000, 5000, 10.0}, {3000, 7000, 130.0}, {5000, 9000, 250.0}, {7000, 11000, 370.0}};
 
     for (int f = 0; f < 4; f++) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/00_%010d.tsm", f);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", f);
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts;
@@ -506,9 +470,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, DataIntegrityAfterCompaction) {
             vals.push_back(v);
             v += 10.0;
         }
-        writer.writeSeries(TSMValueType::Float,
-                           SeriesId128::fromSeriesKey("integrity.test"),
-                           ts, vals);
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("integrity.test"), ts, vals);
         writer.writeIndex();
         writer.close();
 
@@ -527,31 +489,20 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, DataIntegrityAfterCompaction) {
     co_await compacted->open();
     co_await compacted->readSparseIndex();
 
-    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(
-        compacted, "integrity.test");
+    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(compacted, "integrity.test");
 
     // Build expected map
-    std::map<uint64_t, double> expected = {
-        {1000,  10.0},
-        {2000,  20.0},
-        {3000,  130.0},
-        {4000,  140.0},
-        {5000,  250.0},
-        {6000,  260.0},
-        {7000,  370.0},
-        {8000,  380.0},
-        {9000,  390.0},
-        {10000, 400.0},
-        {11000, 410.0}
-    };
+    std::map<uint64_t, double> expected = {{1000, 10.0},  {2000, 20.0},   {3000, 130.0}, {4000, 140.0},
+                                           {5000, 250.0}, {6000, 260.0},  {7000, 370.0}, {8000, 380.0},
+                                           {9000, 390.0}, {10000, 400.0}, {11000, 410.0}};
 
     EXPECT_EQ(data.size(), expected.size());
     for (const auto& [ts, val] : expected) {
         auto it = data.find(ts);
         EXPECT_NE(it, data.end()) << "Missing timestamp " << ts;
-        if (it == data.end()) continue;
-        EXPECT_DOUBLE_EQ(it->second, val)
-            << "Wrong value at timestamp " << ts;
+        if (it == data.end())
+            continue;
+        EXPECT_DOUBLE_EQ(it->second, val) << "Wrong value at timestamp " << ts;
     }
 
     co_return;
@@ -565,9 +516,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ForceFullCompactionAcrossTiers) {
     int seq = 0;
     for (uint64_t tier = 0; tier < 3; tier++) {
         for (int i = 0; i < 3; i++) {
-            auto tsm = self->createTestTSMFile(
-                tier, seq, "full.", 2, 20,
-                1000000 + seq * 20000);
+            auto tsm = self->createTestTSMFile(tier, seq, "full.", 2, 20, 1000000 + seq * 20000);
             co_await tsm->open();
             co_await tsm->readSparseIndex();
             self->fileManager->setSequencedTsmFile(seq, tsm);
@@ -594,8 +543,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
 
     for (int i = 0; i < 3; i++) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/00_%010d.tsm", i);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
 
         TSMWriter writer(filename);
 
@@ -607,9 +555,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
                 ts.push_back(1000 + p * 100);
                 vals.push_back(i * 10.0 + p);
             }
-            writer.writeSeries(TSMValueType::Float,
-                               SeriesId128::fromSeriesKey("mixed.temp"),
-                               ts, vals);
+            writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("mixed.temp"), ts, vals);
         }
 
         // Boolean series
@@ -620,9 +566,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
                 ts.push_back(1000 + p * 100);
                 vals.push_back((i + p) % 2 == 0);
             }
-            writer.writeSeries(TSMValueType::Boolean,
-                               SeriesId128::fromSeriesKey("mixed.status"),
-                               ts, vals);
+            writer.writeSeries(TSMValueType::Boolean, SeriesId128::fromSeriesKey("mixed.status"), ts, vals);
         }
 
         // String series
@@ -631,12 +575,9 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
             std::vector<std::string> vals;
             for (int p = 0; p < 20; p++) {
                 ts.push_back(1000 + p * 100);
-                vals.push_back("file" + std::to_string(i) +
-                               "_point" + std::to_string(p));
+                vals.push_back("file" + std::to_string(i) + "_point" + std::to_string(p));
             }
-            writer.writeSeries(TSMValueType::String,
-                               SeriesId128::fromSeriesKey("mixed.label"),
-                               ts, vals);
+            writer.writeSeries(TSMValueType::String, SeriesId128::fromSeriesKey("mixed.label"), ts, vals);
         }
 
         writer.writeIndex();
@@ -663,32 +604,23 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
     EXPECT_EQ(ids.size(), 3);
 
     // Verify types
-    EXPECT_EQ(compacted->getSeriesType(
-        SeriesId128::fromSeriesKey("mixed.temp")).value(),
-        TSMValueType::Float);
-    EXPECT_EQ(compacted->getSeriesType(
-        SeriesId128::fromSeriesKey("mixed.status")).value(),
-        TSMValueType::Boolean);
-    EXPECT_EQ(compacted->getSeriesType(
-        SeriesId128::fromSeriesKey("mixed.label")).value(),
-        TSMValueType::String);
+    EXPECT_EQ(compacted->getSeriesType(SeriesId128::fromSeriesKey("mixed.temp")).value(), TSMValueType::Float);
+    EXPECT_EQ(compacted->getSeriesType(SeriesId128::fromSeriesKey("mixed.status")).value(), TSMValueType::Boolean);
+    EXPECT_EQ(compacted->getSeriesType(SeriesId128::fromSeriesKey("mixed.label")).value(), TSMValueType::String);
 
     // Verify float data is deduplicated to 20 points (all files overlap)
-    auto floatData = co_await TSMCompactorAsyncTest::readAllFloatData(
-        compacted, "mixed.temp");
+    auto floatData = co_await TSMCompactorAsyncTest::readAllFloatData(compacted, "mixed.temp");
     EXPECT_EQ(floatData.size(), 20);
 
     // Verify string data is deduplicated to 20 points
     TSMResult<std::string> strResult(0);
-    co_await compacted->readSeries(
-        SeriesId128::fromSeriesKey("mixed.label"), 0, UINT64_MAX, strResult);
+    co_await compacted->readSeries(SeriesId128::fromSeriesKey("mixed.label"), 0, UINT64_MAX, strResult);
     auto [strTs, strVals] = strResult.getAllData();
     EXPECT_EQ(strTs.size(), 20);
 
     // Newest file (seqNum=2) should win -- verify string values
     for (size_t i = 0; i < strVals.size(); i++) {
-        EXPECT_EQ(strVals[i].substr(0, 5), "file2")
-            << "At index " << i << ": got " << strVals[i];
+        EXPECT_EQ(strVals[i].substr(0, 5), "file2") << "At index " << i << ": got " << strVals[i];
     }
 
     co_return;
@@ -700,8 +632,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
 SEASTAR_TEST_F(TSMCompactorAsyncTest, ExecuteCompactionLifecycle) {
     // Create 5 tier-0 files
     for (int i = 0; i < 5; i++) {
-        auto tsm = self->createTestTSMFile(0, i, "lifecycle.", 2, 30,
-                                           1000000 + i * 30000);
+        auto tsm = self->createTestTSMFile(0, i, "lifecycle.", 2, 30, 1000000 + i * 30000);
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         co_await self->fileManager->addTSMFile(tsm);
@@ -732,8 +663,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ExecuteCompactionLifecycle) {
     auto tier1Files = self->fileManager->getFilesInTier(1);
     EXPECT_GE(tier1Files.size(), 1);
 
-    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(
-        tier1Files[0], "lifecycle.0");
+    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(tier1Files[0], "lifecycle.0");
     // 5 files x 30 points each, non-overlapping, so all 150 points preserved
     EXPECT_EQ(data.size(), 150);
 
@@ -750,8 +680,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneMultipleFilesCompaction) {
 
     for (int f = 0; f < 2; f++) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/00_%010d.tsm", f);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", f);
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {1000, 2000, 3000, 4000, 5000};
@@ -759,9 +688,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneMultipleFilesCompaction) {
         for (int p = 0; p < 5; p++) {
             vals.push_back(f * 100.0 + p + 1);
         }
-        writer.writeSeries(TSMValueType::Float,
-                           SeriesId128::fromSeriesKey("tomb.multi"),
-                           ts, vals);
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("tomb.multi"), ts, vals);
         writer.writeIndex();
         writer.close();
 
@@ -788,8 +715,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneMultipleFilesCompaction) {
     co_await compacted->open();
     co_await compacted->readSparseIndex();
 
-    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(
-        compacted, "tomb.multi");
+    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(compacted, "tomb.multi");
 
     // Both tombstone ranges should be applied.
     // Timestamps 1000, 2000, 4000, 5000 should be gone.
@@ -867,9 +793,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, LargeScaleCompactionIntegrity) {
     std::vector<seastar::shared_ptr<TSM>> files;
 
     for (int f = 0; f < 4; f++) {
-        auto tsm = self->createTestTSMFile(
-            0, f, "large.", 10, 500,
-            1000000 + f * 250000); // 50% overlap between adjacent files
+        auto tsm = self->createTestTSMFile(0, f, "large.", 10, 500,
+                                           1000000 + f * 250000);  // 50% overlap between adjacent files
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
@@ -890,8 +815,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, LargeScaleCompactionIntegrity) {
     // Check series 0: file 0 starts at 1000000, file 3 ends at
     // 1000000 + 3*250000 + 499*1000 = 1000000 + 750000 + 499000 = 2249000
     // Total range: [1000000, 2249000], step 1000 = 1250 unique timestamps
-    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(
-        compacted, "large.0");
+    auto data = co_await TSMCompactorAsyncTest::readAllFloatData(compacted, "large.0");
     EXPECT_EQ(data.size(), 1250);
 
     // Verify monotonic timestamps
@@ -929,8 +853,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionStatisticsTracking) {
 
     for (int i = 0; i < 3; i++) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/00_%010d.tsm", i);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts;
@@ -939,9 +862,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionStatisticsTracking) {
             ts.push_back(1000 + p * 10);
             vals.push_back(i * 1000.0 + p);
         }
-        writer.writeSeries(TSMValueType::Float,
-                           SeriesId128::fromSeriesKey("stats.metric"),
-                           ts, vals);
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("stats.metric"), ts, vals);
         writer.writeIndex();
         writer.close();
 

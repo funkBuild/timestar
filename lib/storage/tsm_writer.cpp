@@ -259,8 +259,10 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     for (size_t i = 0; i < values.size(); ++i) {
         double v = values[i];
         sum += v;
-        if (v < bmin) bmin = v;
-        if (v > bmax) bmax = v;
+        if (v < bmin)
+            bmin = v;
+        if (v > bmax)
+            bmax = v;
         // Welford's online algorithm for M2
         double delta = v - mean;
         mean += delta / static_cast<double>(i + 1);
@@ -318,8 +320,8 @@ void TSMWriter::writeCompressedBlock(TSMValueType seriesType, const SeriesId128&
 }
 
 void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const SeriesId128& seriesId,
-                                               seastar::temporary_buffer<uint8_t>&& compressedData,
-                                               const TSMIndexBlock& srcBlock) {
+                                              seastar::temporary_buffer<uint8_t>&& compressedData,
+                                              const TSMIndexBlock& srcBlock) {
     size_t blockStartOffset = buffer.size();
     buffer.write_bytes(reinterpret_cast<const char*>(compressedData.get()), compressedData.size());
 

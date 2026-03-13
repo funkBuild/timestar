@@ -2,15 +2,15 @@
 // Verifies estimation, threshold logic, tier preservation,
 // tombstone file removal, and data correctness after rewrite.
 
-#include <gtest/gtest.h>
-#include <filesystem>
-
-#include "../../../lib/storage/tsm_writer.hpp"
+#include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/tsm_compactor.hpp"
 #include "../../../lib/storage/tsm_file_manager.hpp"
-#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
 
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 
 namespace fs = std::filesystem;
@@ -19,25 +19,16 @@ class TSMTombstoneRewriteTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_tombstone_rewrite_files";
 
-    void SetUp() override {
-        fs::create_directories(testDir);
-    }
+    void SetUp() override { fs::create_directories(testDir); }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 
 public:
-    std::string getTestFilePath(const std::string& filename) {
-        return testDir + "/" + filename;
-    }
+    std::string getTestFilePath(const std::string& filename) { return testDir + "/" + filename; }
 
     // Helper: create a TSM file with a known number of evenly-spaced points
-    void createTestFile(const std::string& filename,
-                        const std::string& seriesKey,
-                        size_t numPoints,
-                        uint64_t baseTime = 1000,
-                        uint64_t timeStep = 1000) {
+    void createTestFile(const std::string& filename, const std::string& seriesKey, size_t numPoints,
+                        uint64_t baseTime = 1000, uint64_t timeStep = 1000) {
         TSMWriter writer(filename);
         std::vector<uint64_t> timestamps;
         std::vector<double> values;
@@ -54,11 +45,8 @@ public:
     }
 
     // Helper: create a TSM file with multiple series
-    void createMultiSeriesFile(const std::string& filename,
-                               const std::vector<std::string>& seriesKeys,
-                               size_t pointsPerSeries,
-                               uint64_t baseTime = 1000,
-                               uint64_t timeStep = 1000) {
+    void createMultiSeriesFile(const std::string& filename, const std::vector<std::string>& seriesKeys,
+                               size_t pointsPerSeries, uint64_t baseTime = 1000, uint64_t timeStep = 1000) {
         TSMWriter writer(filename);
         for (const auto& key : seriesKeys) {
             std::vector<uint64_t> timestamps;
@@ -78,8 +66,7 @@ public:
 };
 
 // Test: estimateTombstoneCoverage returns 0.0 when no tombstones exist
-seastar::future<> testEstimateNoTombstones(std::string filename,
-                                            TSMTombstoneRewriteTest* self) {
+seastar::future<> testEstimateNoTombstones(std::string filename, TSMTombstoneRewriteTest* self) {
     self->createTestFile(filename, "test.no_tombstones", 100);
 
     TSM tsm(filename);
@@ -98,8 +85,7 @@ TEST_F(TSMTombstoneRewriteTest, EstimateNoTombstones) {
 }
 
 // Test: estimateTombstoneCoverage returns >0 when tombstones cover data
-seastar::future<> testEstimateWithTombstones(std::string filename,
-                                              TSMTombstoneRewriteTest* self) {
+seastar::future<> testEstimateWithTombstones(std::string filename, TSMTombstoneRewriteTest* self) {
     // Create file with 100 points: timestamps 1000..100000 (step 1000)
     self->createTestFile(filename, "test.with_tombstones", 100);
 
@@ -127,8 +113,7 @@ TEST_F(TSMTombstoneRewriteTest, EstimateWithTombstones) {
 }
 
 // Test: small tombstone coverage (<10%) should be below threshold
-seastar::future<> testEstimateBelowThreshold(std::string filename,
-                                              TSMTombstoneRewriteTest* self) {
+seastar::future<> testEstimateBelowThreshold(std::string filename, TSMTombstoneRewriteTest* self) {
     // Create file with 1000 points: timestamps 1000..1000000 (step 1000)
     self->createTestFile(filename, "test.below_threshold", 1000);
 
@@ -155,8 +140,7 @@ TEST_F(TSMTombstoneRewriteTest, EstimateBelowThreshold) {
 }
 
 // Test: full deletion gives coverage near 1.0
-seastar::future<> testEstimateFullDeletion(std::string filename,
-                                            TSMTombstoneRewriteTest* self) {
+seastar::future<> testEstimateFullDeletion(std::string filename, TSMTombstoneRewriteTest* self) {
     self->createTestFile(filename, "test.full_delete", 100);
 
     TSM tsm(filename);
@@ -183,8 +167,7 @@ TEST_F(TSMTombstoneRewriteTest, EstimateFullDeletion) {
 }
 
 // Test: multi-series file with partial tombstones
-seastar::future<> testEstimateMultiSeries(std::string filename,
-                                           TSMTombstoneRewriteTest* self) {
+seastar::future<> testEstimateMultiSeries(std::string filename, TSMTombstoneRewriteTest* self) {
     self->createMultiSeriesFile(filename, {"series.a", "series.b", "series.c"}, 100);
 
     TSM tsm(filename);
@@ -208,8 +191,7 @@ TEST_F(TSMTombstoneRewriteTest, EstimateMultiSeries) {
 }
 
 // Test: queryWithTombstones after rewrite returns only live data
-seastar::future<> testDataCorrectnessAfterRewrite(std::string filename,
-                                                    TSMTombstoneRewriteTest* self) {
+seastar::future<> testDataCorrectnessAfterRewrite(std::string filename, TSMTombstoneRewriteTest* self) {
     // Create file with known data: 10 points at timestamps 1000..10000
     self->createTestFile(filename, "test.rewrite_data", 10);
 
@@ -253,8 +235,7 @@ TEST_F(TSMTombstoneRewriteTest, IsFileInActiveCompactionDefault) {
 }
 
 // Test: tombstone file existence check
-seastar::future<> testTombstoneFileExists(std::string filename,
-                                           TSMTombstoneRewriteTest* self) {
+seastar::future<> testTombstoneFileExists(std::string filename, TSMTombstoneRewriteTest* self) {
     self->createTestFile(filename, "test.tombstone_file", 10);
 
     TSM tsm(filename);

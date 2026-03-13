@@ -1,8 +1,11 @@
-#include <gtest/gtest.h>
 #include "bool_encoder.hpp"
+
 #include "slice_buffer.hpp"
-#include <vector>
+
+#include <gtest/gtest.h>
+
 #include <random>
+#include <vector>
 
 TEST(BoolEncoderTest, AllTrue) {
     std::vector<bool> values(100, true);
@@ -179,8 +182,8 @@ TEST(BoolEncoderTest, DecodeWithSkip) {
 
     ASSERT_EQ(decoded.size(), 10u);
     for (size_t i = 0; i < 10; i++) {
-        EXPECT_EQ(decoded[i], values[i + 5]) << "Mismatch at decoded index " << i
-                                              << " (original index " << (i + 5) << ")";
+        EXPECT_EQ(decoded[i], values[i + 5])
+            << "Mismatch at decoded index " << i << " (original index " << (i + 5) << ")";
     }
 }
 
@@ -388,8 +391,7 @@ TEST(BoolEncoderTest, EncodeIntoEdgeSizes) {
         AlignedBuffer encoded2;
         BoolEncoder::encodeInto(values, encoded2);
 
-        ASSERT_EQ(encoded1.size(), encoded2.size())
-            << "encode() vs encodeInto() size mismatch for n=" << n;
+        ASSERT_EQ(encoded1.size(), encoded2.size()) << "encode() vs encodeInto() size mismatch for n=" << n;
         ASSERT_EQ(0, std::memcmp(encoded1.data.data(), encoded2.data.data(), encoded1.size()))
             << "encode() vs encodeInto() content mismatch for n=" << n;
 
@@ -399,8 +401,7 @@ TEST(BoolEncoderTest, EncodeIntoEdgeSizes) {
         BoolEncoder::decode(slice, 0, n, decoded);
         ASSERT_EQ(decoded.size(), n) << "decode size mismatch for n=" << n;
         for (size_t i = 0; i < n; i++) {
-            EXPECT_EQ(decoded[i], values[i])
-                << "Round-trip mismatch at index " << i << " for n=" << n;
+            EXPECT_EQ(decoded[i], values[i]) << "Round-trip mismatch at index " << i << " for n=" << n;
         }
     }
 }

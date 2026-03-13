@@ -1,28 +1,29 @@
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <random>
-#include <iomanip>
-#include <algorithm>
-#include <cstring>
-
 #include "../../lib/encoding/integer_encoder.hpp"
 #include "../../lib/storage/aligned_buffer.hpp"
 #include "../../lib/storage/slice_buffer.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <vector>
+
 // ANSI color codes
-#define RESET   "\033[0m"
-#define BOLD    "\033[1m"
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
+#define RESET "\033[0m"
+#define BOLD "\033[1m"
+#define RED "\033[31m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define BLUE "\033[34m"
 #define MAGENTA "\033[35m"
-#define CYAN    "\033[36m"
+#define CYAN "\033[36m"
 
 // This benchmark now just tests the optimized implementation which has replaced the original
 
-std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start = 1000000000000ULL, uint64_t interval = 1000) {
+std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start = 1000000000000ULL,
+                                                  uint64_t interval = 1000) {
     std::vector<uint64_t> data;
     data.reserve(count);
     uint64_t current = start;
@@ -33,7 +34,8 @@ std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start =
     return data;
 }
 
-std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 1000000000000ULL, uint64_t interval = 1000, uint64_t jitter = 100) {
+std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 1000000000000ULL,
+                                                 uint64_t interval = 1000, uint64_t jitter = 100) {
     std::vector<uint64_t> data;
     data.reserve(count);
     std::random_device rd;
@@ -43,7 +45,7 @@ std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 
     uint64_t current = start;
     for (size_t i = 0; i < count; i++) {
         data.push_back(current);
-        current += interval + dist(gen) - jitter/2;
+        current += interval + dist(gen) - jitter / 2;
     }
     return data;
 }
@@ -95,8 +97,10 @@ void benchmarkDataset(const std::string& dataset_name, const std::vector<uint64_
     auto decode_end = std::chrono::high_resolution_clock::now();
 
     // Calculate times
-    double encode_time_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
-    double decode_time_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
+    double encode_time_ms =
+        std::chrono::duration<double, std::milli>(encode_end - encode_start).count() / benchmark_runs;
+    double decode_time_ms =
+        std::chrono::duration<double, std::milli>(decode_end - decode_start).count() / benchmark_runs;
 
     // Verify correctness
     bool correct = (decoded == data);

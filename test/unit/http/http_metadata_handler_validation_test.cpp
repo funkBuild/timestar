@@ -1,7 +1,9 @@
+#include "../../../lib/http/http_metadata_handler.hpp"
+
 #include <gtest/gtest.h>
+
 #include <fstream>
 #include <string>
-#include "../../../lib/http/http_metadata_handler.hpp"
 
 // =============================================================================
 // HttpMetadataHandler query-parameter validation tests
@@ -30,24 +32,20 @@ protected:
 TEST_F(HttpMetadataHandlerValidationTest, NullByteInMeasurementNameRejected) {
     std::string name = std::string("temperature") + '\0' + "../secret";
     auto err = HttpMetadataHandler::validateQueryParam(name, "measurement");
-    EXPECT_FALSE(err.empty())
-        << "validateQueryParam must reject names containing null bytes";
-    EXPECT_NE(err.find("null"), std::string::npos)
-        << "Error message should mention 'null'";
+    EXPECT_FALSE(err.empty()) << "validateQueryParam must reject names containing null bytes";
+    EXPECT_NE(err.find("null"), std::string::npos) << "Error message should mention 'null'";
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, NullByteAtStartRejected) {
     std::string name = std::string("\0cpu", 4);
     auto err = HttpMetadataHandler::validateQueryParam(name, "measurement");
-    EXPECT_FALSE(err.empty())
-        << "validateQueryParam must reject names beginning with a null byte";
+    EXPECT_FALSE(err.empty()) << "validateQueryParam must reject names beginning with a null byte";
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, NullByteAtEndRejected) {
     std::string name = std::string("cpu\0", 4);
     auto err = HttpMetadataHandler::validateQueryParam(name, "measurement");
-    EXPECT_FALSE(err.empty())
-        << "validateQueryParam must reject names ending with a null byte";
+    EXPECT_FALSE(err.empty()) << "validateQueryParam must reject names ending with a null byte";
 }
 
 // ---------------------------------------------------------------------------
@@ -57,22 +55,19 @@ TEST_F(HttpMetadataHandlerValidationTest, NullByteAtEndRejected) {
 TEST_F(HttpMetadataHandlerValidationTest, ControlCharNewlineRejected) {
     std::string name = "cpu\nusage";
     auto err = HttpMetadataHandler::validateQueryParam(name, "measurement");
-    EXPECT_FALSE(err.empty())
-        << "validateQueryParam must reject names containing newline (\\n)";
+    EXPECT_FALSE(err.empty()) << "validateQueryParam must reject names containing newline (\\n)";
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, ControlCharTabRejected) {
     std::string name = "cpu\tusage";
     auto err = HttpMetadataHandler::validateQueryParam(name, "measurement");
-    EXPECT_FALSE(err.empty())
-        << "validateQueryParam must reject names containing tab (\\t)";
+    EXPECT_FALSE(err.empty()) << "validateQueryParam must reject names containing tab (\\t)";
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, ControlCharCarriageReturnRejected) {
     std::string name = "cpu\rusage";
     auto err = HttpMetadataHandler::validateQueryParam(name, "measurement");
-    EXPECT_FALSE(err.empty())
-        << "validateQueryParam must reject names containing carriage return (\\r)";
+    EXPECT_FALSE(err.empty()) << "validateQueryParam must reject names containing carriage return (\\r)";
 }
 
 // ---------------------------------------------------------------------------
@@ -81,8 +76,7 @@ TEST_F(HttpMetadataHandlerValidationTest, ControlCharCarriageReturnRejected) {
 
 TEST_F(HttpMetadataHandlerValidationTest, EmptyNameRejected) {
     auto err = HttpMetadataHandler::validateQueryParam("", "measurement");
-    EXPECT_FALSE(err.empty())
-        << "validateQueryParam must reject empty names";
+    EXPECT_FALSE(err.empty()) << "validateQueryParam must reject empty names";
 }
 
 // ---------------------------------------------------------------------------
@@ -91,38 +85,32 @@ TEST_F(HttpMetadataHandlerValidationTest, EmptyNameRejected) {
 
 TEST_F(HttpMetadataHandlerValidationTest, ValidSimpleNameAccepted) {
     auto err = HttpMetadataHandler::validateQueryParam("temperature", "measurement");
-    EXPECT_TRUE(err.empty())
-        << "validateQueryParam must accept plain ASCII names: " << err;
+    EXPECT_TRUE(err.empty()) << "validateQueryParam must accept plain ASCII names: " << err;
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, ValidNameWithDotsAccepted) {
     auto err = HttpMetadataHandler::validateQueryParam("system.cpu.usage", "measurement");
-    EXPECT_TRUE(err.empty())
-        << "validateQueryParam must accept names with dots: " << err;
+    EXPECT_TRUE(err.empty()) << "validateQueryParam must accept names with dots: " << err;
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, ValidNameWithHyphensAccepted) {
     auto err = HttpMetadataHandler::validateQueryParam("cpu-usage-total", "measurement");
-    EXPECT_TRUE(err.empty())
-        << "validateQueryParam must accept names with hyphens: " << err;
+    EXPECT_TRUE(err.empty()) << "validateQueryParam must accept names with hyphens: " << err;
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, ValidNameWithUnderscoresAccepted) {
     auto err = HttpMetadataHandler::validateQueryParam("cpu_usage", "measurement");
-    EXPECT_TRUE(err.empty())
-        << "validateQueryParam must accept names with underscores: " << err;
+    EXPECT_TRUE(err.empty()) << "validateQueryParam must accept names with underscores: " << err;
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, ValidNameWithDigitsAccepted) {
     auto err = HttpMetadataHandler::validateQueryParam("server01", "measurement");
-    EXPECT_TRUE(err.empty())
-        << "validateQueryParam must accept names with digits: " << err;
+    EXPECT_TRUE(err.empty()) << "validateQueryParam must accept names with digits: " << err;
 }
 
 TEST_F(HttpMetadataHandlerValidationTest, ValidTagNameAccepted) {
     auto err = HttpMetadataHandler::validateQueryParam("location", "tag");
-    EXPECT_TRUE(err.empty())
-        << "validateQueryParam must accept simple tag name: " << err;
+    EXPECT_TRUE(err.empty()) << "validateQueryParam must accept simple tag name: " << err;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,12 +123,9 @@ protected:
 
     void SetUp() override {
         std::ifstream file(HTTP_METADATA_HANDLER_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open())
-            << "Could not open http_metadata_handler.cpp at: "
-            << HTTP_METADATA_HANDLER_SOURCE_PATH;
-        sourceCode.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>());
+        ASSERT_TRUE(file.is_open()) << "Could not open http_metadata_handler.cpp at: "
+                                    << HTTP_METADATA_HANDLER_SOURCE_PATH;
+        sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         ASSERT_FALSE(sourceCode.empty());
     }
 };
@@ -148,8 +133,7 @@ protected:
 TEST_F(MetadataHandlerNullByteSourceTest, HandleTagsCallsValidateQueryParam) {
     // Find handleTags function body
     auto sigPos = sourceCode.rfind("HttpMetadataHandler::handleTags");
-    ASSERT_NE(sigPos, std::string::npos)
-        << "Could not find HttpMetadataHandler::handleTags in source";
+    ASSERT_NE(sigPos, std::string::npos) << "Could not find HttpMetadataHandler::handleTags in source";
 
     // Find the opening brace of the function body
     auto closeParen = sourceCode.find(')', sigPos);
@@ -161,8 +145,10 @@ TEST_F(MetadataHandlerNullByteSourceTest, HandleTagsCallsValidateQueryParam) {
     int depth = 1;
     size_t pos = openBrace + 1;
     while (pos < sourceCode.size() && depth > 0) {
-        if (sourceCode[pos] == '{') depth++;
-        else if (sourceCode[pos] == '}') depth--;
+        if (sourceCode[pos] == '{')
+            depth++;
+        else if (sourceCode[pos] == '}')
+            depth--;
         pos++;
     }
     std::string body = sourceCode.substr(openBrace, pos - openBrace);
@@ -176,8 +162,7 @@ TEST_F(MetadataHandlerNullByteSourceTest, HandleTagsCallsValidateQueryParam) {
 TEST_F(MetadataHandlerNullByteSourceTest, HandleFieldsCallsValidateQueryParam) {
     // Find handleFields function body
     auto sigPos = sourceCode.rfind("HttpMetadataHandler::handleFields");
-    ASSERT_NE(sigPos, std::string::npos)
-        << "Could not find HttpMetadataHandler::handleFields in source";
+    ASSERT_NE(sigPos, std::string::npos) << "Could not find HttpMetadataHandler::handleFields in source";
 
     auto closeParen = sourceCode.find(')', sigPos);
     ASSERT_NE(closeParen, std::string::npos);
@@ -187,8 +172,10 @@ TEST_F(MetadataHandlerNullByteSourceTest, HandleFieldsCallsValidateQueryParam) {
     int depth = 1;
     size_t pos = openBrace + 1;
     while (pos < sourceCode.size() && depth > 0) {
-        if (sourceCode[pos] == '{') depth++;
-        else if (sourceCode[pos] == '}') depth--;
+        if (sourceCode[pos] == '{')
+            depth++;
+        else if (sourceCode[pos] == '}')
+            depth--;
         pos++;
     }
     std::string body = sourceCode.substr(openBrace, pos - openBrace);

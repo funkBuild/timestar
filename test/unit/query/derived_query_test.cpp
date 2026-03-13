@@ -1,6 +1,8 @@
-#include <gtest/gtest.h>
 #include "derived_query.hpp"
+
 #include "query_parser.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
@@ -125,11 +127,11 @@ TEST_F(DerivedQueryTest, ApplyGlobalTimeRange) {
 
 TEST_F(DerivedQueryTest, BuilderBasicUsage) {
     auto request = DerivedQueryBuilder()
-        .addQuery("a", makeSimpleQuery("cpu", "usage"))
-        .addQuery("b", makeSimpleQuery("cpu", "idle"))
-        .setFormula("a + b")
-        .setTimeRange(1000, 2000)
-        .build();
+                       .addQuery("a", makeSimpleQuery("cpu", "usage"))
+                       .addQuery("b", makeSimpleQuery("cpu", "idle"))
+                       .setFormula("a + b")
+                       .setTimeRange(1000, 2000)
+                       .build();
 
     EXPECT_EQ(request.queries.size(), 2);
     EXPECT_EQ(request.formula, "a + b");
@@ -139,11 +141,11 @@ TEST_F(DerivedQueryTest, BuilderBasicUsage) {
 
 TEST_F(DerivedQueryTest, BuilderWithQueryString) {
     auto request = DerivedQueryBuilder()
-        .addQuery("a", "avg:cpu(usage){host:server1}")
-        .addQuery("b", "avg:cpu(idle){host:server1}")
-        .setFormula("a / (a + b) * 100")
-        .setTimeRange(1000000000, 2000000000)
-        .build();
+                       .addQuery("a", "avg:cpu(usage){host:server1}")
+                       .addQuery("b", "avg:cpu(idle){host:server1}")
+                       .setFormula("a / (a + b) * 100")
+                       .setTimeRange(1000000000, 2000000000)
+                       .build();
 
     EXPECT_EQ(request.queries["a"].measurement, "cpu");
     EXPECT_EQ(request.queries["a"].fields[0], "usage");
@@ -152,22 +154,24 @@ TEST_F(DerivedQueryTest, BuilderWithQueryString) {
 
 TEST_F(DerivedQueryTest, BuilderWithAggregationInterval) {
     auto request = DerivedQueryBuilder()
-        .addQuery("a", makeSimpleQuery("cpu", "usage"))
-        .setFormula("a")
-        .setTimeRange(1000, 2000)
-        .setAggregationInterval(60000000000)  // 1 minute in ns
-        .build();
+                       .addQuery("a", makeSimpleQuery("cpu", "usage"))
+                       .setFormula("a")
+                       .setTimeRange(1000, 2000)
+                       .setAggregationInterval(60000000000)  // 1 minute in ns
+                       .build();
 
     EXPECT_EQ(request.aggregationInterval, 60000000000);
 }
 
 TEST_F(DerivedQueryTest, BuilderValidationFailsOnBuild) {
-    EXPECT_THROW({
-        DerivedQueryBuilder()
-            .addQuery("a", makeSimpleQuery("cpu", "usage"))
-            .setFormula("a + undefined")  // References undefined query
-            .build();
-    }, DerivedQueryException);
+    EXPECT_THROW(
+        {
+            DerivedQueryBuilder()
+                .addQuery("a", makeSimpleQuery("cpu", "usage"))
+                .setFormula("a + undefined")  // References undefined query
+                .build();
+        },
+        DerivedQueryException);
 }
 
 // ==================== SubQueryResult Tests ====================
@@ -215,11 +219,11 @@ TEST_F(DerivedQueryTest, DerivedQueryResultWithData) {
 TEST_F(DerivedQueryTest, ErrorRateFormula) {
     // errors / total * 100
     auto request = DerivedQueryBuilder()
-        .addQuery("errors", makeSimpleQuery("http", "errors"))
-        .addQuery("total", makeSimpleQuery("http", "requests"))
-        .setFormula("errors / total * 100")
-        .setTimeRange(1000000000, 2000000000)
-        .build();
+                       .addQuery("errors", makeSimpleQuery("http", "errors"))
+                       .addQuery("total", makeSimpleQuery("http", "requests"))
+                       .setFormula("errors / total * 100")
+                       .setTimeRange(1000000000, 2000000000)
+                       .build();
 
     EXPECT_EQ(request.queries.size(), 2);
     auto refs = request.getReferencedQueries();
@@ -230,11 +234,11 @@ TEST_F(DerivedQueryTest, ErrorRateFormula) {
 TEST_F(DerivedQueryTest, CPUUtilizationFormula) {
     // (a / (a + b)) * 100 where a=usage, b=idle
     auto request = DerivedQueryBuilder()
-        .addQuery("a", makeSimpleQuery("cpu", "usage"))
-        .addQuery("b", makeSimpleQuery("cpu", "idle"))
-        .setFormula("(a / (a + b)) * 100")
-        .setTimeRange(1000000000, 2000000000)
-        .build();
+                       .addQuery("a", makeSimpleQuery("cpu", "usage"))
+                       .addQuery("b", makeSimpleQuery("cpu", "idle"))
+                       .setFormula("(a / (a + b)) * 100")
+                       .setTimeRange(1000000000, 2000000000)
+                       .build();
 
     EXPECT_NO_THROW(request.validate());
 }
@@ -242,11 +246,11 @@ TEST_F(DerivedQueryTest, CPUUtilizationFormula) {
 TEST_F(DerivedQueryTest, MemoryUsageFormula) {
     // (used / total) * 100
     auto request = DerivedQueryBuilder()
-        .addQuery("used", makeSimpleQuery("memory", "used"))
-        .addQuery("total", makeSimpleQuery("memory", "total"))
-        .setFormula("(used / total) * 100")
-        .setTimeRange(1000000000, 2000000000)
-        .build();
+                       .addQuery("used", makeSimpleQuery("memory", "used"))
+                       .addQuery("total", makeSimpleQuery("memory", "total"))
+                       .setFormula("(used / total) * 100")
+                       .setTimeRange(1000000000, 2000000000)
+                       .build();
 
     EXPECT_NO_THROW(request.validate());
 }
@@ -254,12 +258,12 @@ TEST_F(DerivedQueryTest, MemoryUsageFormula) {
 TEST_F(DerivedQueryTest, MinMaxNormalizationFormula) {
     // (value - min_val) / (max_val - min_val)
     auto request = DerivedQueryBuilder()
-        .addQuery("value", makeSimpleQuery("sensor", "temperature"))
-        .addQuery("min_val", makeSimpleQuery("sensor", "temp_min"))
-        .addQuery("max_val", makeSimpleQuery("sensor", "temp_max"))
-        .setFormula("(value - min_val) / (max_val - min_val)")
-        .setTimeRange(1000000000, 2000000000)
-        .build();
+                       .addQuery("value", makeSimpleQuery("sensor", "temperature"))
+                       .addQuery("min_val", makeSimpleQuery("sensor", "temp_min"))
+                       .addQuery("max_val", makeSimpleQuery("sensor", "temp_max"))
+                       .setFormula("(value - min_val) / (max_val - min_val)")
+                       .setTimeRange(1000000000, 2000000000)
+                       .build();
 
     EXPECT_NO_THROW(request.validate());
 }
@@ -267,11 +271,11 @@ TEST_F(DerivedQueryTest, MinMaxNormalizationFormula) {
 TEST_F(DerivedQueryTest, ComplexFormulaWithFunctions) {
     // abs(a - b) / max(a, b)
     auto request = DerivedQueryBuilder()
-        .addQuery("a", makeSimpleQuery("sensor", "value1"))
-        .addQuery("b", makeSimpleQuery("sensor", "value2"))
-        .setFormula("abs(a - b) / max(a, b)")
-        .setTimeRange(1000000000, 2000000000)
-        .build();
+                       .addQuery("a", makeSimpleQuery("sensor", "value1"))
+                       .addQuery("b", makeSimpleQuery("sensor", "value2"))
+                       .setFormula("abs(a - b) / max(a, b)")
+                       .setTimeRange(1000000000, 2000000000)
+                       .build();
 
     EXPECT_NO_THROW(request.validate());
 }

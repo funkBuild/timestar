@@ -1,12 +1,13 @@
-#include <iostream>
-#include <chrono>
-#include <vector>
-#include <random>
-#include <iomanip>
-#include <numeric>
+#include "encoding/float_encoder.hpp"
 #include "storage/compressed_buffer.hpp"
 #include "storage/compressed_buffer_optimized.hpp"
-#include "encoding/float_encoder.hpp"
+
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <vector>
 
 using namespace std::chrono;
 
@@ -21,6 +22,7 @@ struct BenchmarkResult {
 
 class Timer {
     high_resolution_clock::time_point start;
+
 public:
     Timer() : start(high_resolution_clock::now()) {}
     double elapsed_ms() {
@@ -38,7 +40,7 @@ BenchmarkResult benchmark_sequential_writes(int bits) {
     {
         CompressedBuffer buffer;
         Timer timer;
-        for(size_t i = 0; i < iterations; ++i) {
+        for (size_t i = 0; i < iterations; ++i) {
             buffer.write(i & mask, bits);
         }
         original_ms = timer.elapsed_ms();
@@ -49,21 +51,19 @@ BenchmarkResult benchmark_sequential_writes(int bits) {
     {
         CompressedBufferOptimized buffer;
         Timer timer;
-        for(size_t i = 0; i < iterations; ++i) {
+        for (size_t i = 0; i < iterations; ++i) {
             buffer.write(i & mask, bits);
         }
         optimized_ms = timer.elapsed_ms();
     }
 
     size_t total_bytes = (iterations * bits) / 8;
-    return {
-        std::to_string(bits) + "-bit writes",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {std::to_string(bits) + "-bit writes",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_float_encoder_pattern() {
@@ -74,8 +74,8 @@ BenchmarkResult benchmark_float_encoder_pattern() {
     {
         CompressedBuffer buffer;
         Timer timer;
-        for(size_t i = 0; i < iterations; ++i) {
-            if(i % 3 == 0) {
+        for (size_t i = 0; i < iterations; ++i) {
+            if (i % 3 == 0) {
                 buffer.write(0b11, 2);
                 buffer.write(i & 0x1F, 5);
                 buffer.write(i & 0x3F, 6);
@@ -92,8 +92,8 @@ BenchmarkResult benchmark_float_encoder_pattern() {
     {
         CompressedBufferOptimized buffer;
         Timer timer;
-        for(size_t i = 0; i < iterations; ++i) {
-            if(i % 3 == 0) {
+        for (size_t i = 0; i < iterations; ++i) {
+            if (i % 3 == 0) {
                 buffer.writeFixed<0b11, 2>();
                 buffer.write<5>(i & 0x1F);
                 buffer.write<6>(i & 0x3F);
@@ -107,14 +107,12 @@ BenchmarkResult benchmark_float_encoder_pattern() {
 
     size_t avg_bits = (2 + 48) + (5 + 6) / 3;
     size_t total_bytes = (iterations * avg_bits) / 8;
-    return {
-        "Float pattern",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"Float pattern",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_with_preallocation() {
@@ -126,7 +124,7 @@ BenchmarkResult benchmark_with_preallocation() {
     {
         CompressedBuffer buffer;
         Timer timer;
-        for(size_t i = 0; i < iterations; ++i) {
+        for (size_t i = 0; i < iterations; ++i) {
             buffer.write(i, 32);
         }
         original_ms = timer.elapsed_ms();
@@ -138,21 +136,19 @@ BenchmarkResult benchmark_with_preallocation() {
         CompressedBufferOptimized buffer;
         buffer.reserve(expected_words);
         Timer timer;
-        for(size_t i = 0; i < iterations; ++i) {
+        for (size_t i = 0; i < iterations; ++i) {
             buffer.write(i, 32);
         }
         optimized_ms = timer.elapsed_ms();
     }
 
     size_t total_bytes = (iterations * 32) / 8;
-    return {
-        "Pre-allocated 32-bit",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"Pre-allocated 32-bit",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_bulk_writes() {
@@ -160,7 +156,7 @@ BenchmarkResult benchmark_bulk_writes() {
     const size_t iterations = 100;
 
     std::vector<uint64_t> data(array_size);
-    for(size_t i = 0; i < array_size; ++i) {
+    for (size_t i = 0; i < array_size; ++i) {
         data[i] = i * 123456789;
     }
 
@@ -169,8 +165,8 @@ BenchmarkResult benchmark_bulk_writes() {
     {
         CompressedBuffer buffer;
         Timer timer;
-        for(size_t iter = 0; iter < iterations; ++iter) {
-            for(size_t i = 0; i < array_size; ++i) {
+        for (size_t iter = 0; iter < iterations; ++iter) {
+            for (size_t i = 0; i < array_size; ++i) {
                 buffer.write(data[i], 48);
             }
         }
@@ -182,21 +178,19 @@ BenchmarkResult benchmark_bulk_writes() {
     {
         CompressedBufferOptimized buffer;
         Timer timer;
-        for(size_t iter = 0; iter < iterations; ++iter) {
+        for (size_t iter = 0; iter < iterations; ++iter) {
             buffer.write_bulk(data.data(), array_size, 48);
         }
         optimized_ms = timer.elapsed_ms();
     }
 
     size_t total_bytes = (iterations * array_size * 48) / 8;
-    return {
-        "Bulk 48-bit writes",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"Bulk 48-bit writes",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 void memory_efficiency_test() {
@@ -209,7 +203,7 @@ void memory_efficiency_test() {
     // Original
     {
         CompressedBuffer buffer;
-        for(size_t i = 0; i < num_writes; ++i) {
+        for (size_t i = 0; i < num_writes; ++i) {
             buffer.write(i, 32);
         }
         std::cout << "\nOriginal CompressedBuffer:" << std::endl;
@@ -223,7 +217,7 @@ void memory_efficiency_test() {
     // Optimized without reserve
     {
         CompressedBufferOptimized buffer;
-        for(size_t i = 0; i < num_writes; ++i) {
+        for (size_t i = 0; i < num_writes; ++i) {
             buffer.write(i, 32);
         }
         std::cout << "\nOptimized (no reserve):" << std::endl;
@@ -239,7 +233,7 @@ void memory_efficiency_test() {
         CompressedBufferOptimized buffer;
         size_t expected_words = (num_writes * 32 + 63) / 64;
         buffer.reserve(expected_words);
-        for(size_t i = 0; i < num_writes; ++i) {
+        for (size_t i = 0; i < num_writes; ++i) {
             buffer.write(i, 32);
         }
         buffer.shrink_to_fit();
@@ -259,20 +253,19 @@ void print_results(const std::vector<BenchmarkResult>& results) {
     std::cout << "║ Test                │ Original (ms) │ Optimized (ms) │ Speedup │ Throughput     ║" << std::endl;
     std::cout << "╟─────────────────────┼───────────────┼────────────────┼─────────┼─────────────────╢" << std::endl;
 
-    for(const auto& r : results) {
-        std::cout << "║ " << std::setw(19) << std::left << r.name
-                  << " │ " << std::setw(13) << std::right << std::fixed << std::setprecision(2) << r.original_ms
-                  << " │ " << std::setw(14) << std::right << r.optimized_ms
+    for (const auto& r : results) {
+        std::cout << "║ " << std::setw(19) << std::left << r.name << " │ " << std::setw(13) << std::right << std::fixed
+                  << std::setprecision(2) << r.original_ms << " │ " << std::setw(14) << std::right << r.optimized_ms
                   << " │ " << std::setw(6) << std::right << std::setprecision(1) << r.speedup << "x"
-                  << " │ " << std::setw(8) << std::right << std::setprecision(0) << r.optimized_throughput
-                  << " MB/s ║" << std::endl;
+                  << " │ " << std::setw(8) << std::right << std::setprecision(0) << r.optimized_throughput << " MB/s ║"
+                  << std::endl;
     }
 
     std::cout << "╚════════════════════════════════════════════════════════════════════════════════╝" << std::endl;
 
     // Calculate average speedup
     double avg_speedup = 0;
-    for(const auto& r : results) {
+    for (const auto& r : results) {
         avg_speedup += r.speedup;
     }
     avg_speedup /= results.size();
@@ -291,7 +284,7 @@ int main() {
 
     // Test different bit widths
     std::vector<int> bit_widths = {1, 8, 32, 48, 64};
-    for(int bits : bit_widths) {
+    for (int bits : bit_widths) {
         std::cout << "   Testing " << bits << "-bit writes..." << std::flush;
         results.push_back(benchmark_sequential_writes(bits));
         std::cout << " ✓" << std::endl;

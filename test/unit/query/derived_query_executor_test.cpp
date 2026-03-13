@@ -1,7 +1,10 @@
-#include <gtest/gtest.h>
 #include "derived_query_executor.hpp"
+
 #include "derived_query.hpp"
+
 #include <glaze/glaze.hpp>
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
@@ -37,46 +40,29 @@ struct TestGlazeDerivedQueryResponse {
 template <>
 struct glz::meta<TestGlazeDerivedQueryRequest> {
     using T = TestGlazeDerivedQueryRequest;
-    static constexpr auto value = object(
-        "queries", &T::queries,
-        "formula", &T::formula,
-        "startTime", &T::startTime,
-        "endTime", &T::endTime,
-        "aggregationInterval", &T::aggregationInterval
-    );
+    static constexpr auto value = object("queries", &T::queries, "formula", &T::formula, "startTime", &T::startTime,
+                                         "endTime", &T::endTime, "aggregationInterval", &T::aggregationInterval);
 };
 
 template <>
 struct glz::meta<TestGlazeDerivedQueryResponse::Statistics> {
     using T = TestGlazeDerivedQueryResponse::Statistics;
-    static constexpr auto value = object(
-        "point_count", &T::pointCount,
-        "execution_time_ms", &T::executionTimeMs,
-        "sub_queries_executed", &T::subQueriesExecuted,
-        "points_dropped_due_to_alignment", &T::pointsDroppedDueToAlignment
-    );
+    static constexpr auto value =
+        object("point_count", &T::pointCount, "execution_time_ms", &T::executionTimeMs, "sub_queries_executed",
+               &T::subQueriesExecuted, "points_dropped_due_to_alignment", &T::pointsDroppedDueToAlignment);
 };
 
 template <>
 struct glz::meta<TestGlazeDerivedQueryResponse::Error> {
     using T = TestGlazeDerivedQueryResponse::Error;
-    static constexpr auto value = object(
-        "code", &T::code,
-        "message", &T::message
-    );
+    static constexpr auto value = object("code", &T::code, "message", &T::message);
 };
 
 template <>
 struct glz::meta<TestGlazeDerivedQueryResponse> {
     using T = TestGlazeDerivedQueryResponse;
-    static constexpr auto value = object(
-        "status", &T::status,
-        "timestamps", &T::timestamps,
-        "values", &T::values,
-        "formula", &T::formula,
-        "statistics", &T::statistics,
-        "error", &T::error
-    );
+    static constexpr auto value = object("status", &T::status, "timestamps", &T::timestamps, "values", &T::values,
+                                         "formula", &T::formula, "statistics", &T::statistics, "error", &T::error);
 };
 
 class DerivedQueryExecutorTest : public ::testing::Test {
@@ -259,9 +245,8 @@ TEST_F(DerivedQueryExecutorTest, CreateErrorResponse) {
 }
 
 TEST_F(DerivedQueryExecutorTest, CreateQueryParseErrorResponse) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "QUERY_PARSE_ERROR",
-        "Error parsing query 'a': Invalid measurement name");
+    std::string json = DerivedQueryExecutor::createErrorResponse("QUERY_PARSE_ERROR",
+                                                                 "Error parsing query 'a': Invalid measurement name");
 
     TestGlazeDerivedQueryResponse response;
     auto parseResult = glz::read_json(response, json);
@@ -273,9 +258,7 @@ TEST_F(DerivedQueryExecutorTest, CreateQueryParseErrorResponse) {
 }
 
 TEST_F(DerivedQueryExecutorTest, CreateTimeoutErrorResponse) {
-    std::string json = DerivedQueryExecutor::createErrorResponse(
-        "TIMEOUT",
-        "Query execution exceeded 30000ms timeout");
+    std::string json = DerivedQueryExecutor::createErrorResponse("TIMEOUT", "Query execution exceeded 30000ms timeout");
 
     TestGlazeDerivedQueryResponse response;
     auto parseResult = glz::read_json(response, json);
@@ -306,9 +289,7 @@ TEST_F(DerivedQueryExecutorTest, CustomConfig) {
     config.timeoutMs = 60000;
 
     // Verify construction with custom config does not throw
-    EXPECT_NO_THROW({
-        DerivedQueryExecutor executor(nullptr, nullptr, config);
-    });
+    EXPECT_NO_THROW({ DerivedQueryExecutor executor(nullptr, nullptr, config); });
 }
 
 // ==================== Request Validation Tests ====================
@@ -401,12 +382,12 @@ TEST_F(DerivedQueryExecutorTest, GetReferencedQueriesWithFunctions) {
 
 TEST_F(DerivedQueryExecutorTest, BuilderCreatesValidRequest) {
     auto request = DerivedQueryBuilder()
-        .addQuery("cpu", "avg:cpu(usage){host:server1}")
-        .addQuery("mem", "avg:memory(used){host:server1}")
-        .setFormula("cpu / mem * 100")
-        .setTimeRange(1000, 2000)
-        .setAggregationInterval(60000)
-        .build();
+                       .addQuery("cpu", "avg:cpu(usage){host:server1}")
+                       .addQuery("mem", "avg:memory(used){host:server1}")
+                       .setFormula("cpu / mem * 100")
+                       .setTimeRange(1000, 2000)
+                       .setAggregationInterval(60000)
+                       .build();
 
     EXPECT_EQ(request.formula, "cpu / mem * 100");
     EXPECT_EQ(request.startTime, 1000);

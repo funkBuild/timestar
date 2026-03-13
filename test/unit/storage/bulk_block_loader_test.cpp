@@ -12,18 +12,19 @@
 //   - BulkMergeContext traversal
 //   - BlockMetadata overlap detection and ordering
 
+#include "../../../lib/storage/bulk_block_loader.hpp"
+
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/storage/tsm_reader.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
+#include "../../seastar_gtest.hpp"
+
 #include <gtest/gtest.h>
+
 #include <filesystem>
 #include <map>
-
-#include "../../../lib/storage/bulk_block_loader.hpp"
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm_reader.hpp"
-#include "../../../lib/core/series_id.hpp"
-
-#include "../../seastar_gtest.hpp"
-#include <seastar/core/reactor.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
 
@@ -56,16 +57,10 @@ public:
     }
 
     // Create a TSM file with a single float series (explicit timestamps/values).
-    seastar::shared_ptr<TSM> createTSMFile(
-        uint64_t tier,
-        uint64_t seqNum,
-        const std::string& seriesKey,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values) {
-
+    seastar::shared_ptr<TSM> createTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesKey,
+                                           const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
 
         TSMWriter writer(filename);
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -80,23 +75,16 @@ public:
     }
 
     // Create a TSM file with multiple float series.
-    seastar::shared_ptr<TSM> createMultiSeriesTSMFile(
-        uint64_t tier,
-        uint64_t seqNum,
-        const std::string& seriesPrefix,
-        int numSeries,
-        int pointsPerSeries,
-        uint64_t startTime = 1000000) {
-
+    seastar::shared_ptr<TSM> createMultiSeriesTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesPrefix,
+                                                      int numSeries, int pointsPerSeries,
+                                                      uint64_t startTime = 1000000) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
 
         TSMWriter writer(filename);
 
         for (int s = 0; s < numSeries; s++) {
-            SeriesId128 seriesId =
-                SeriesId128::fromSeriesKey(seriesPrefix + std::to_string(s));
+            SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesPrefix + std::to_string(s));
             std::vector<uint64_t> timestamps;
             std::vector<double> values;
 
@@ -105,8 +93,7 @@ public:
                 values.push_back(s * 100.0 + p);
             }
 
-            writer.writeSeries(TSMValueType::Float, seriesId,
-                               timestamps, values);
+            writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
         }
 
         writer.writeIndex();
@@ -192,18 +179,15 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileTimeRangeFilter) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("range.sensor");
 
     // Request only the middle portion [1200, 1500]
-    auto result = co_await BulkBlockLoader<double>::loadFromFile(
-        tsm, seriesId, 1200, 1500);
+    auto result = co_await BulkBlockLoader<double>::loadFromFile(tsm, seriesId, 1200, 1500);
 
     // The block-level filtering may return the whole block that overlaps the range,
     // but the point-level filtering within readSingleBlock should trim to the range.
     // Verify all returned timestamps are within [1200, 1500].
     for (const auto& block : result.blocks) {
         for (size_t i = 0; i < block->timestamps.size(); i++) {
-            EXPECT_GE(block->timestamps.at(i), 1200)
-                << "Timestamp below startTime";
-            EXPECT_LE(block->timestamps.at(i), 1500)
-                << "Timestamp above endTime";
+            EXPECT_GE(block->timestamps.at(i), 1200) << "Timestamp below startTime";
+            EXPECT_LE(block->timestamps.at(i), 1500) << "Timestamp above endTime";
         }
     }
 
@@ -270,8 +254,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromMultipleFiles) {
     }
 
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("multi.file");
-    auto allBlocks = co_await BulkBlockLoader<double>::loadFromFiles(
-        files, seriesId);
+    auto allBlocks = co_await BulkBlockLoader<double>::loadFromFiles(files, seriesId);
 
     // Should have results from all 3 files
     EXPECT_EQ(allBlocks.size(), 3);
@@ -303,8 +286,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFilesSkipsMissingFiles) {
     std::vector<seastar::shared_ptr<TSM>> files = {tsm0, tsm1};
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("present.series");
 
-    auto allBlocks = co_await BulkBlockLoader<double>::loadFromFiles(
-        files, seriesId);
+    auto allBlocks = co_await BulkBlockLoader<double>::loadFromFiles(files, seriesId);
 
     // Only 1 file has the series
     EXPECT_EQ(allBlocks.size(), 1);
@@ -338,8 +320,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFilesWithTimeRange) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("timerange.series");
 
     // Only request [1500, 2500] -- should get File 1 data only
-    auto allBlocks = co_await BulkBlockLoader<double>::loadFromFiles(
-        files, seriesId, 1500, 2500);
+    auto allBlocks = co_await BulkBlockLoader<double>::loadFromFiles(files, seriesId, 1500, 2500);
 
     // File 0 (1000-1090) is out of range, File 2 (3000-3090) is out of range
     // File 1 (2000-2090) is within range
@@ -492,13 +473,11 @@ TEST(BulkBlockLoaderUnit, BulkMergeContextAdvanceNullSourceNoCrash) {
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayNonOverlapping) {
     // File 0: timestamps 1000, 2000, 3000
     // File 1: timestamps 4000, 5000, 6000
-    auto tsm0 = self->createTSMFile(0, 0, "merge2.series",
-        {1000, 2000, 3000}, {10.0, 20.0, 30.0});
+    auto tsm0 = self->createTSMFile(0, 0, "merge2.series", {1000, 2000, 3000}, {10.0, 20.0, 30.0});
     co_await tsm0->open();
     co_await tsm0->readSparseIndex();
 
-    auto tsm1 = self->createTSMFile(0, 1, "merge2.series",
-        {4000, 5000, 6000}, {40.0, 50.0, 60.0});
+    auto tsm1 = self->createTSMFile(0, 1, "merge2.series", {4000, 5000, 6000}, {40.0, 50.0, 60.0});
     co_await tsm1->open();
     co_await tsm1->readSparseIndex();
 
@@ -537,13 +516,11 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayOverlappingDedup) {
     // File 0 (tier 0, seq 0 -> rank lower): timestamps 1000, 2000, 3000
     // File 1 (tier 0, seq 1 -> rank higher): timestamps 2000, 3000, 4000
     // On duplicates (2000, 3000), file 1 should win since it has higher rank.
-    auto tsm0 = self->createTSMFile(0, 0, "dedup2.series",
-        {1000, 2000, 3000}, {10.0, 20.0, 30.0});
+    auto tsm0 = self->createTSMFile(0, 0, "dedup2.series", {1000, 2000, 3000}, {10.0, 20.0, 30.0});
     co_await tsm0->open();
     co_await tsm0->readSparseIndex();
 
-    auto tsm1 = self->createTSMFile(0, 1, "dedup2.series",
-        {2000, 3000, 4000}, {200.0, 300.0, 400.0});
+    auto tsm1 = self->createTSMFile(0, 1, "dedup2.series", {2000, 3000, 4000}, {200.0, 300.0, 400.0});
     co_await tsm1->open();
     co_await tsm1->readSparseIndex();
 
@@ -565,10 +542,10 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayOverlappingDedup) {
     }
 
     EXPECT_EQ(merged.size(), 4);
-    EXPECT_DOUBLE_EQ(merged[1000], 10.0);    // Only in file 0
-    EXPECT_DOUBLE_EQ(merged[2000], 200.0);   // Dup: file 1 wins (higher rank)
-    EXPECT_DOUBLE_EQ(merged[3000], 300.0);   // Dup: file 1 wins (higher rank)
-    EXPECT_DOUBLE_EQ(merged[4000], 400.0);   // Only in file 1
+    EXPECT_DOUBLE_EQ(merged[1000], 10.0);   // Only in file 0
+    EXPECT_DOUBLE_EQ(merged[2000], 200.0);  // Dup: file 1 wins (higher rank)
+    EXPECT_DOUBLE_EQ(merged[3000], 300.0);  // Dup: file 1 wins (higher rank)
+    EXPECT_DOUBLE_EQ(merged[4000], 400.0);  // Only in file 1
 
     co_return;
 }
@@ -577,13 +554,11 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayOverlappingDedup) {
 // 13. BulkMerger2Way: nextBatch
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayBatchProcessing) {
-    auto tsm0 = self->createTSMFile(0, 0, "batch2.series",
-        {1000, 2000, 3000, 4000, 5000}, {1.0, 2.0, 3.0, 4.0, 5.0});
+    auto tsm0 = self->createTSMFile(0, 0, "batch2.series", {1000, 2000, 3000, 4000, 5000}, {1.0, 2.0, 3.0, 4.0, 5.0});
     co_await tsm0->open();
     co_await tsm0->readSparseIndex();
 
-    auto tsm1 = self->createTSMFile(0, 1, "batch2.series",
-        {6000, 7000, 8000, 9000, 10000}, {6.0, 7.0, 8.0, 9.0, 10.0});
+    auto tsm1 = self->createTSMFile(0, 1, "batch2.series", {6000, 7000, 8000, 9000, 10000}, {6.0, 7.0, 8.0, 9.0, 10.0});
     co_await tsm1->open();
     co_await tsm1->readSparseIndex();
 
@@ -626,18 +601,15 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayBatchProcessing) {
 // 14. BulkMerger3Way: basic 3-way merge
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayBasic) {
-    auto tsm0 = self->createTSMFile(0, 0, "merge3.series",
-        {1000, 4000, 7000}, {10.0, 40.0, 70.0});
+    auto tsm0 = self->createTSMFile(0, 0, "merge3.series", {1000, 4000, 7000}, {10.0, 40.0, 70.0});
     co_await tsm0->open();
     co_await tsm0->readSparseIndex();
 
-    auto tsm1 = self->createTSMFile(0, 1, "merge3.series",
-        {2000, 5000, 8000}, {20.0, 50.0, 80.0});
+    auto tsm1 = self->createTSMFile(0, 1, "merge3.series", {2000, 5000, 8000}, {20.0, 50.0, 80.0});
     co_await tsm1->open();
     co_await tsm1->readSparseIndex();
 
-    auto tsm2 = self->createTSMFile(0, 2, "merge3.series",
-        {3000, 6000, 9000}, {30.0, 60.0, 90.0});
+    auto tsm2 = self->createTSMFile(0, 2, "merge3.series", {3000, 6000, 9000}, {30.0, 60.0, 90.0});
     co_await tsm2->open();
     co_await tsm2->readSparseIndex();
 
@@ -680,18 +652,15 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayBasic) {
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayDedup) {
     // All three files share timestamp 5000; file 2 (highest seq) should win
-    auto tsm0 = self->createTSMFile(0, 0, "dedup3.series",
-        {1000, 5000}, {10.0, 50.0});
+    auto tsm0 = self->createTSMFile(0, 0, "dedup3.series", {1000, 5000}, {10.0, 50.0});
     co_await tsm0->open();
     co_await tsm0->readSparseIndex();
 
-    auto tsm1 = self->createTSMFile(0, 1, "dedup3.series",
-        {3000, 5000}, {30.0, 500.0});
+    auto tsm1 = self->createTSMFile(0, 1, "dedup3.series", {3000, 5000}, {30.0, 500.0});
     co_await tsm1->open();
     co_await tsm1->readSparseIndex();
 
-    auto tsm2 = self->createTSMFile(0, 2, "dedup3.series",
-        {5000, 9000}, {5000.0, 90.0});
+    auto tsm2 = self->createTSMFile(0, 2, "dedup3.series", {5000, 9000}, {5000.0, 90.0});
     co_await tsm2->open();
     co_await tsm2->readSparseIndex();
 
@@ -727,18 +696,15 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayDedup) {
 // 16. BulkMerger3Way: nextBatch
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayBatchProcessing) {
-    auto tsm0 = self->createTSMFile(0, 0, "batch3.series",
-        {1000, 2000}, {1.0, 2.0});
+    auto tsm0 = self->createTSMFile(0, 0, "batch3.series", {1000, 2000}, {1.0, 2.0});
     co_await tsm0->open();
     co_await tsm0->readSparseIndex();
 
-    auto tsm1 = self->createTSMFile(0, 1, "batch3.series",
-        {3000, 4000}, {3.0, 4.0});
+    auto tsm1 = self->createTSMFile(0, 1, "batch3.series", {3000, 4000}, {3.0, 4.0});
     co_await tsm1->open();
     co_await tsm1->readSparseIndex();
 
-    auto tsm2 = self->createTSMFile(0, 2, "batch3.series",
-        {5000, 6000}, {5.0, 6.0});
+    auto tsm2 = self->createTSMFile(0, 2, "batch3.series", {5000, 6000}, {5.0, 6.0});
     co_await tsm2->open();
     co_await tsm2->readSparseIndex();
 
@@ -806,8 +772,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, MergerNWayFourSources) {
 
     // All points should be in sorted timestamp order
     for (size_t i = 1; i < merged.size(); i++) {
-        EXPECT_GT(merged[i].first, merged[i - 1].first)
-            << "Timestamps not sorted at index " << i;
+        EXPECT_GT(merged[i].first, merged[i - 1].first) << "Timestamps not sorted at index " << i;
     }
 
     co_return;
@@ -822,8 +787,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, MergerNWayDedup) {
     std::vector<seastar::shared_ptr<TSM>> files;
 
     for (int f = 0; f < 4; f++) {
-        auto tsm = self->createTSMFile(0, f, "ndedup.series",
-            {1000, 2000, 3000}, {f * 10.0, f * 20.0, f * 30.0});
+        auto tsm = self->createTSMFile(0, f, "ndedup.series", {1000, 2000, 3000}, {f * 10.0, f * 20.0, f * 30.0});
         co_await tsm->open();
         co_await tsm->readSparseIndex();
         files.push_back(tsm);
@@ -845,9 +809,9 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, MergerNWayDedup) {
     EXPECT_EQ(batch.size(), 3);
 
     // File 3 (highest rank) should win
-    EXPECT_DOUBLE_EQ(batch[0].second, 30.0);   // 3 * 10.0
-    EXPECT_DOUBLE_EQ(batch[1].second, 60.0);   // 3 * 20.0
-    EXPECT_DOUBLE_EQ(batch[2].second, 90.0);   // 3 * 30.0
+    EXPECT_DOUBLE_EQ(batch[0].second, 30.0);  // 3 * 10.0
+    EXPECT_DOUBLE_EQ(batch[1].second, 60.0);  // 3 * 20.0
+    EXPECT_DOUBLE_EQ(batch[2].second, 90.0);  // 3 * 30.0
 
     co_return;
 }
@@ -1065,8 +1029,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LargeScaleMergeIntegrity) {
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, FileRankPropagation) {
     // Tier 1, seq 5 -> rank = (1 << 60) + 5
-    auto tsm = self->createTSMFile(1, 5, "rank.series",
-        {1000, 2000}, {10.0, 20.0});
+    auto tsm = self->createTSMFile(1, 5, "rank.series", {1000, 2000}, {10.0, 20.0});
     co_await tsm->open();
     co_await tsm->readSparseIndex();
 
@@ -1088,8 +1051,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, FileRankPropagation) {
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayOneSourceExhaustedEarly) {
     // Source 0: just 1 point; Source 1: many points
-    auto tsm0 = self->createTSMFile(0, 0, "exhaust2.series",
-        {5000}, {50.0});
+    auto tsm0 = self->createTSMFile(0, 0, "exhaust2.series", {5000}, {50.0});
     co_await tsm0->open();
     co_await tsm0->readSparseIndex();
 
@@ -1150,8 +1112,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileTimeRangeNoOverlap) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("nolap.series");
 
     // Request a time range that doesn't overlap: [5000, 6000]
-    auto result = co_await BulkBlockLoader<double>::loadFromFile(
-        tsm, seriesId, 5000, 6000);
+    auto result = co_await BulkBlockLoader<double>::loadFromFile(tsm, seriesId, 5000, 6000);
 
     EXPECT_EQ(result.totalPoints, 0);
     EXPECT_TRUE(result.blocks.empty());

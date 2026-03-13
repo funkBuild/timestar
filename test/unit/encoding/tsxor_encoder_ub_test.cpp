@@ -1,13 +1,15 @@
-#include <gtest/gtest.h>
 #include "tsxor_encoder.hpp"
-#include <vector>
-#include <cstdint>
-#include <cmath>
-#include <limits>
+
+#include <gtest/gtest.h>
+
 #include <bit>
+#include <cmath>
+#include <cstdint>
 #include <fstream>
-#include <string>
+#include <limits>
 #include <regex>
+#include <string>
+#include <vector>
 
 // =============================================================================
 // Source code inspection tests: verify the UB fixes are in place
@@ -20,11 +22,8 @@ protected:
     void SetUp() override {
         // Read the source file to inspect for UB patterns
         std::ifstream file(TSXOR_ENCODER_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open())
-            << "Could not open tsxor_encoder.cpp at: " << TSXOR_ENCODER_SOURCE_PATH;
-        sourceCode.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>());
+        ASSERT_TRUE(file.is_open()) << "Could not open tsxor_encoder.cpp at: " << TSXOR_ENCODER_SOURCE_PATH;
+        sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         ASSERT_FALSE(sourceCode.empty());
     }
 };
@@ -82,8 +81,7 @@ TEST(TsxorEncoderUBFunctionalTest, BitCastProducesCorrectPatterns) {
     EXPECT_EQ(std::bit_cast<uint64_t>(1.0), 0x3FF0000000000000ULL)
         << "bit_cast<uint64_t>(1.0) should produce IEEE 754 pattern 0x3FF0000000000000";
 
-    EXPECT_EQ(std::bit_cast<uint64_t>(0.0), 0x0000000000000000ULL)
-        << "bit_cast<uint64_t>(0.0) should be all zeros";
+    EXPECT_EQ(std::bit_cast<uint64_t>(0.0), 0x0000000000000000ULL) << "bit_cast<uint64_t>(0.0) should be all zeros";
 
     EXPECT_EQ(std::bit_cast<uint64_t>(-1.0), 0xBFF0000000000000ULL)
         << "bit_cast<uint64_t>(-1.0) should have sign bit set";
@@ -96,24 +94,19 @@ TEST(TsxorEncoderUBFunctionalTest, BitCastProducesCorrectPatterns) {
         << "bit_cast<uint64_t>(-0.0) should have only sign bit set";
 
     // Infinity
-    EXPECT_EQ(std::bit_cast<uint64_t>(std::numeric_limits<double>::infinity()),
-              0x7FF0000000000000ULL)
+    EXPECT_EQ(std::bit_cast<uint64_t>(std::numeric_limits<double>::infinity()), 0x7FF0000000000000ULL)
         << "+infinity should be 0x7FF0000000000000";
 
-    EXPECT_EQ(std::bit_cast<uint64_t>(-std::numeric_limits<double>::infinity()),
-              0xFFF0000000000000ULL)
+    EXPECT_EQ(std::bit_cast<uint64_t>(-std::numeric_limits<double>::infinity()), 0xFFF0000000000000ULL)
         << "-infinity should be 0xFFF0000000000000";
 
     // NaN has exponent all 1s and non-zero mantissa
     uint64_t nan_bits = std::bit_cast<uint64_t>(std::numeric_limits<double>::quiet_NaN());
-    EXPECT_EQ(nan_bits & 0x7FF0000000000000ULL, 0x7FF0000000000000ULL)
-        << "NaN should have all exponent bits set";
-    EXPECT_NE(nan_bits & 0x000FFFFFFFFFFFFFULL, 0ULL)
-        << "NaN should have non-zero mantissa";
+    EXPECT_EQ(nan_bits & 0x7FF0000000000000ULL, 0x7FF0000000000000ULL) << "NaN should have all exponent bits set";
+    EXPECT_NE(nan_bits & 0x000FFFFFFFFFFFFFULL, 0ULL) << "NaN should have non-zero mantissa";
 
     // Denormalized minimum
-    EXPECT_EQ(std::bit_cast<uint64_t>(std::numeric_limits<double>::denorm_min()),
-              0x0000000000000001ULL)
+    EXPECT_EQ(std::bit_cast<uint64_t>(std::numeric_limits<double>::denorm_min()), 0x0000000000000001ULL)
         << "denorm_min should be 0x0000000000000001";
 }
 
@@ -126,19 +119,17 @@ TEST(TsxorEncoderUBFunctionalTest, EncodeSpecificDoubles) {
 
 // Verify encoding of special IEEE 754 values
 TEST(TsxorEncoderUBFunctionalTest, EncodeSpecialIEEE754Values) {
-    std::vector<double> values = {
-        0.0,
-        -0.0,
-        1.0,
-        -1.0,
-        std::numeric_limits<double>::quiet_NaN(),
-        std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::min(),
-        std::numeric_limits<double>::max(),
-        std::numeric_limits<double>::denorm_min(),
-        std::numeric_limits<double>::epsilon()
-    };
+    std::vector<double> values = {0.0,
+                                  -0.0,
+                                  1.0,
+                                  -1.0,
+                                  std::numeric_limits<double>::quiet_NaN(),
+                                  std::numeric_limits<double>::infinity(),
+                                  -std::numeric_limits<double>::infinity(),
+                                  std::numeric_limits<double>::min(),
+                                  std::numeric_limits<double>::max(),
+                                  std::numeric_limits<double>::denorm_min(),
+                                  std::numeric_limits<double>::epsilon()};
 
     // Should not crash or produce UB
     CompressedBuffer result = TsxorEncoder::encode(values);
@@ -155,8 +146,7 @@ TEST(TsxorEncoderUBFunctionalTest, EncodeRepeatedValues) {
 
     // With all identical values, the window hit path should compress well
     size_t rawSize = 200 * sizeof(double);
-    EXPECT_LT(result.size(), rawSize)
-        << "Repeated values should compress to less than the raw size";
+    EXPECT_LT(result.size(), rawSize) << "Repeated values should compress to less than the raw size";
 }
 
 // Verify encoding of alternating values (exercises window candidate path with | 0x80)
@@ -177,8 +167,7 @@ TEST(TsxorEncoderUBFunctionalTest, DeterministicEncoding) {
     CompressedBuffer result1 = TsxorEncoder::encode(values);
     CompressedBuffer result2 = TsxorEncoder::encode(values);
 
-    EXPECT_EQ(result1.size(), result2.size())
-        << "Same input should always produce same output size";
+    EXPECT_EQ(result1.size(), result2.size()) << "Same input should always produce same output size";
 }
 
 // Verify the low-byte extraction is correct: offset & 0xFF should match
@@ -187,10 +176,9 @@ TEST(TsxorEncoderUBFunctionalTest, LowByteExtractionEquivalence) {
     // On little-endian (x86), (uint8_t*)&val gives the low byte,
     // which is the same as val & 0xFF. Verify this equivalence.
     for (int val = 0; val < 256; val++) {
-        uint8_t *bytes = (uint8_t *)&val;
+        uint8_t* bytes = (uint8_t*)&val;
         uint8_t low_byte = static_cast<uint8_t>(val & 0xFF);
-        EXPECT_EQ(bytes[0], low_byte)
-            << "On this platform, (uint8_t*)&val and val & 0xFF differ for val=" << val;
+        EXPECT_EQ(bytes[0], low_byte) << "On this platform, (uint8_t*)&val and val & 0xFF differ for val=" << val;
     }
 }
 
@@ -212,9 +200,7 @@ TEST(TsxorEncoderUBFunctionalTest, OffsetHighBitPreserved) {
     for (int offset = 0; offset < 127; offset++) {
         int modified = offset | 0x80;
         uint8_t extracted = static_cast<uint8_t>(modified & 0xFF);
-        EXPECT_TRUE(extracted & 0x80)
-            << "Bit 7 should be set after |= 0x80 for offset=" << offset;
-        EXPECT_EQ(extracted & 0x7F, offset)
-            << "Low 7 bits should be preserved for offset=" << offset;
+        EXPECT_TRUE(extracted & 0x80) << "Bit 7 should be set after |= 0x80 for offset=" << offset;
+        EXPECT_EQ(extracted & 0x7F, offset) << "Low 7 bits should be preserved for offset=" << offset;
     }
 }

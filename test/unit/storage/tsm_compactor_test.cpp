@@ -1,25 +1,26 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <random>
-#include <chrono>
-#include <thread>
-#include <atomic>
-
 #include "../../../lib/storage/tsm_compactor.hpp"
-#include "../../../lib/storage/tsm_file_manager.hpp"
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm_reader.hpp"
-#include "../../../lib/storage/memory_store.hpp"
+
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/series_id.hpp"
-
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/tsm_file_manager.hpp"
+#include "../../../lib/storage/tsm_reader.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
 #include "../../seastar_gtest.hpp"
-#include <seastar/core/reactor.hh>
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <random>
 #include <seastar/core/future.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -61,14 +62,8 @@ public:
     }
 
     // Helper to create TSM files with test data
-    seastar::shared_ptr<TSM> createTestTSMFile(
-        uint64_t tier,
-        uint64_t seqNum,
-        const std::string& seriesPrefix,
-        int numSeries,
-        int pointsPerSeries,
-        uint64_t startTime = 1000000) {
-
+    seastar::shared_ptr<TSM> createTestTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesPrefix,
+                                               int numSeries, int pointsPerSeries, uint64_t startTime = 1000000) {
         char filename[256];
         snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
 
@@ -98,11 +93,7 @@ public:
     }
 
     // Helper to verify compacted file contents
-    bool verifyCompactedFile(
-        const std::string& filename,
-        int expectedSeries,
-        int expectedPointsPerSeries) {
-
+    bool verifyCompactedFile(const std::string& filename, int expectedSeries, int expectedPointsPerSeries) {
         if (!fs::exists(filename)) {
             return false;
         }
@@ -110,7 +101,7 @@ public:
         // Would need to implement TSM reading to fully verify
         // For now, just check file exists and has reasonable size
         auto fileSize = fs::file_size(filename);
-        return fileSize > 0 && fileSize < 10 * 1024 * 1024; // Less than 10MB
+        return fileSize > 0 && fileSize < 10 * 1024 * 1024;  // Less than 10MB
     }
 };
 
@@ -155,7 +146,7 @@ SEASTAR_TEST_F(TSMCompactorTest, DeduplicationDuringCompaction) {
         // Each file has same timestamps but different values
         for (int p = 0; p < 100; p++) {
             timestamps.push_back(1000000 + p * 1000);
-            values.push_back(i * 10.0 + p); // Different values per file
+            values.push_back(i * 10.0 + p);  // Different values per file
         }
 
         writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("temperature.sensor1"), timestamps, values);
@@ -190,7 +181,7 @@ SEASTAR_TEST_F(TSMCompactorTest, DeduplicationDuringCompaction) {
         totalPoints += block->timestamps.size();
     }
 
-    EXPECT_EQ(totalPoints, 100); // Should be deduplicated to 100 points
+    EXPECT_EQ(totalPoints, 100);  // Should be deduplicated to 100 points
 
     co_return;
 }
@@ -400,12 +391,10 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
     std::vector<seastar::shared_ptr<TSM>> level0Files;
 
     // Explicit sorted timestamp arrays for each file
-    std::vector<std::vector<uint64_t>> fileTimestamps = {
-        {1000, 2000, 5000, 8000, 9000},
-        {3000, 4000, 5000, 10000, 11000},
-        {5000, 6000, 7000, 12000, 13000},
-        {5000, 14000, 15000, 16000, 17000}
-    };
+    std::vector<std::vector<uint64_t>> fileTimestamps = {{1000, 2000, 5000, 8000, 9000},
+                                                         {3000, 4000, 5000, 10000, 11000},
+                                                         {5000, 6000, 7000, 12000, 13000},
+                                                         {5000, 14000, 15000, 16000, 17000}};
 
     for (int fileNum = 0; fileNum < 4; fileNum++) {
         char filename[256];
@@ -547,8 +536,8 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionPlanGeneration) {
     auto plan = self->compactor->planCompaction(0);
 
     EXPECT_TRUE(plan.isValid());
-    EXPECT_GE(plan.sourceFiles.size(), 4); // Should select at least 4 files
-    EXPECT_EQ(plan.targetTier, 1); // Should promote to tier 1
+    EXPECT_GE(plan.sourceFiles.size(), 4);  // Should select at least 4 files
+    EXPECT_EQ(plan.targetTier, 1);          // Should promote to tier 1
 
     // Check that tier 0 files are selected
     for (const auto& file : plan.sourceFiles) {
@@ -563,9 +552,9 @@ TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
     LeveledCompactionStrategy strategy;
 
     // Test should compact logic
-    EXPECT_TRUE(strategy.shouldCompact(0, 4, 50 * 1024 * 1024)); // 4 files in tier 0
-    EXPECT_FALSE(strategy.shouldCompact(0, 3, 50 * 1024 * 1024)); // Only 3 files
-    EXPECT_TRUE(strategy.shouldCompact(0, 2, 200 * 1024 * 1024)); // Size exceeds limit
+    EXPECT_TRUE(strategy.shouldCompact(0, 4, 50 * 1024 * 1024));   // 4 files in tier 0
+    EXPECT_FALSE(strategy.shouldCompact(0, 3, 50 * 1024 * 1024));  // Only 3 files
+    EXPECT_TRUE(strategy.shouldCompact(0, 2, 200 * 1024 * 1024));  // Size exceeds limit
 
     // Test file selection
     std::vector<seastar::shared_ptr<TSM>> availableFiles;
@@ -578,7 +567,7 @@ TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
     }
 
     auto selected = strategy.selectFiles(availableFiles, 0);
-    EXPECT_EQ(selected.size(), 8); // Max files per tier for tier 0
+    EXPECT_EQ(selected.size(), 8);  // Max files per tier for tier 0
 
     // Verify oldest files are selected first
     for (size_t i = 0; i < selected.size(); i++) {
@@ -586,10 +575,10 @@ TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
     }
 
     // Test target tier calculation
-    EXPECT_EQ(strategy.getTargetTier(0, 4), 1); // Promote from 0 to 1
-    EXPECT_EQ(strategy.getTargetTier(1, 4), 2); // Promote from 1 to 2
-    EXPECT_EQ(strategy.getTargetTier(2, 4), 3); // Promote from 2 to 3
-    EXPECT_EQ(strategy.getTargetTier(3, 4), 3); // Stay at tier 3
+    EXPECT_EQ(strategy.getTargetTier(0, 4), 1);  // Promote from 0 to 1
+    EXPECT_EQ(strategy.getTargetTier(1, 4), 2);  // Promote from 1 to 2
+    EXPECT_EQ(strategy.getTargetTier(2, 4), 3);  // Promote from 2 to 3
+    EXPECT_EQ(strategy.getTargetTier(3, 4), 3);  // Stay at tier 3
 }
 
 // Test concurrent reads during compaction
@@ -775,7 +764,8 @@ SEASTAR_TEST_F(TSMCompactorTest, MixedDataTypeCompaction) {
             floatTimestamps.push_back(1000 + p * 100);
             floatValues.push_back(i * 10.0 + p);
         }
-        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("temperature"), floatTimestamps, floatValues);
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("temperature"), floatTimestamps,
+                           floatValues);
 
         // Boolean series
         std::vector<uint64_t> boolTimestamps;

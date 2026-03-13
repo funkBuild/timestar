@@ -5,18 +5,19 @@
  * SIMD is always available via Google Highway runtime dispatch.
  */
 
-#include <benchmark/benchmark.h>
-#include "anomaly_result.hpp"
+#include "agile_detector.hpp"
 #include "anomaly_detector.hpp"
+#include "anomaly_result.hpp"
 #include "basic_detector.hpp"
 #include "robust_detector.hpp"
-#include "agile_detector.hpp"
-#include "stl_decomposition.hpp"
 #include "simd_anomaly.hpp"
+#include "stl_decomposition.hpp"
 
-#include <vector>
-#include <random>
+#include <benchmark/benchmark.h>
+
 #include <cmath>
+#include <random>
+#include <vector>
 
 using namespace timestar::anomaly;
 
@@ -146,8 +147,7 @@ static void BM_ComputeBounds_SIMD(benchmark::State& state) {
     double bounds = 2.0;
 
     for (auto _ : state) {
-        simd::computeBounds(predictions.data(), scale.data(), bounds,
-                           upper.data(), lower.data(), count);
+        simd::computeBounds(predictions.data(), scale.data(), bounds, upper.data(), lower.data(), count);
         benchmark::DoNotOptimize(upper.data());
         benchmark::DoNotOptimize(lower.data());
     }

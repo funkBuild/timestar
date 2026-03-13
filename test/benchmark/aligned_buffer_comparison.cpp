@@ -1,11 +1,12 @@
-#include <iostream>
-#include <chrono>
-#include <vector>
-#include <cstring>
-#include <iomanip>
-#include <sstream>
 #include "storage/aligned_buffer.hpp"
 #include "storage/aligned_buffer_optimized.hpp"
+
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <vector>
 
 using namespace std::chrono;
 
@@ -20,10 +21,9 @@ struct BenchmarkResult {
 
 class BenchmarkTimer {
     high_resolution_clock::time_point start;
+
 public:
-    BenchmarkTimer() {
-        start = high_resolution_clock::now();
-    }
+    BenchmarkTimer() { start = high_resolution_clock::now(); }
 
     double elapsed_ms() {
         auto end = high_resolution_clock::now();
@@ -68,14 +68,12 @@ BenchmarkResult benchmark_sequential_writes() {
     }
 
     size_t total_bytes = iterations * sizeof(uint64_t);
-    return {
-        "Sequential uint64_t writes",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"Sequential uint64_t writes",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_mixed_writes() {
@@ -111,16 +109,14 @@ BenchmarkResult benchmark_mixed_writes() {
         optimized_ms = timer.elapsed_ms();
     }
 
-    size_t total_bytes = iterations * (sizeof(uint64_t) + sizeof(uint32_t) +
-                                       sizeof(uint16_t) + sizeof(uint8_t) + sizeof(double));
-    return {
-        "Mixed type writes",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    size_t total_bytes =
+        iterations * (sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(double));
+    return {"Mixed type writes",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_string_writes() {
@@ -158,19 +154,17 @@ BenchmarkResult benchmark_string_writes() {
         optimized_ms = timer.elapsed_ms();
     }
 
-    return {
-        "String writes",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"String writes",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_large_buffer_writes() {
-    const size_t iterations = 10000;  // Increased iterations for better timing
-    const size_t buffer_size = 1024 * 10; // 10KB buffers
+    const size_t iterations = 10000;       // Increased iterations for better timing
+    const size_t buffer_size = 1024 * 10;  // 10KB buffers
 
     // Prepare source buffers
     std::vector<AlignedBuffer> source_buffers_orig;
@@ -210,14 +204,12 @@ BenchmarkResult benchmark_large_buffer_writes() {
     }
 
     size_t total_bytes = iterations * buffer_size;
-    return {
-        "Large buffer copies (10KB)",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"Large buffer copies (10KB)",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_bulk_writes() {
@@ -254,14 +246,12 @@ BenchmarkResult benchmark_bulk_writes() {
     }
 
     size_t total_bytes = iterations * array_size * sizeof(uint64_t);
-    return {
-        "Bulk array writes (10K elements)",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"Bulk array writes (10K elements)",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 BenchmarkResult benchmark_preallocated() {
@@ -292,32 +282,36 @@ BenchmarkResult benchmark_preallocated() {
     }
 
     size_t total_bytes = iterations * sizeof(uint64_t);
-    return {
-        "Pre-allocated writes",
-        original_ms,
-        optimized_ms,
-        original_ms / optimized_ms,
-        (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
-        (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)
-    };
+    return {"Pre-allocated writes",
+            original_ms,
+            optimized_ms,
+            original_ms / optimized_ms,
+            (total_bytes / (1024.0 * 1024.0)) / (original_ms / 1000.0),
+            (total_bytes / (1024.0 * 1024.0)) / (optimized_ms / 1000.0)};
 }
 
 void print_results(const std::vector<BenchmarkResult>& results) {
-    std::cout << "\n╔════════════════════════════════════════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║                         AlignedBuffer Performance Comparison                              ║" << std::endl;
-    std::cout << "╠════════════════════════════════════════════════════════════════════════════════════════╣" << std::endl;
-    std::cout << "║ Benchmark                      │ Original (ms) │ Optimized (ms) │ Speedup │ Throughput  ║" << std::endl;
-    std::cout << "╟────────────────────────────────┼───────────────┼────────────────┼─────────┼──────────────╢" << std::endl;
+    std::cout << "\n╔════════════════════════════════════════════════════════════════════════════════════════╗"
+              << std::endl;
+    std::cout << "║                         AlignedBuffer Performance Comparison                              ║"
+              << std::endl;
+    std::cout << "╠════════════════════════════════════════════════════════════════════════════════════════╣"
+              << std::endl;
+    std::cout << "║ Benchmark                      │ Original (ms) │ Optimized (ms) │ Speedup │ Throughput  ║"
+              << std::endl;
+    std::cout << "╟────────────────────────────────┼───────────────┼────────────────┼─────────┼──────────────╢"
+              << std::endl;
 
     for (const auto& r : results) {
-        std::cout << "║ " << std::setw(30) << std::left << r.name
-                  << " │ " << std::setw(13) << std::right << std::fixed << std::setprecision(2) << r.original_ms
-                  << " │ " << std::setw(14) << std::right << r.optimized_ms
+        std::cout << "║ " << std::setw(30) << std::left << r.name << " │ " << std::setw(13) << std::right << std::fixed
+                  << std::setprecision(2) << r.original_ms << " │ " << std::setw(14) << std::right << r.optimized_ms
                   << " │ " << std::setw(6) << std::right << std::setprecision(1) << r.speedup << "x"
-                  << " │ " << std::setw(6) << std::right << std::setprecision(0) << r.optimized_throughput << " MB/s ║" << std::endl;
+                  << " │ " << std::setw(6) << std::right << std::setprecision(0) << r.optimized_throughput << " MB/s ║"
+                  << std::endl;
     }
 
-    std::cout << "╚════════════════════════════════════════════════════════════════════════════════════════╝" << std::endl;
+    std::cout << "╚════════════════════════════════════════════════════════════════════════════════════════╝"
+              << std::endl;
 
     // Calculate average speedup
     double avg_speedup = 0;
@@ -331,12 +325,14 @@ void print_results(const std::vector<BenchmarkResult>& results) {
 
     // Find best and worst improvements
     auto best = std::max_element(results.begin(), results.end(),
-        [](const auto& a, const auto& b) { return a.speedup < b.speedup; });
+                                 [](const auto& a, const auto& b) { return a.speedup < b.speedup; });
     auto worst = std::min_element(results.begin(), results.end(),
-        [](const auto& a, const auto& b) { return a.speedup < b.speedup; });
+                                  [](const auto& a, const auto& b) { return a.speedup < b.speedup; });
 
-    std::cout << "   Best Improvement: " << best->name << " (" << std::setprecision(2) << best->speedup << "x)" << std::endl;
-    std::cout << "   Least Improvement: " << worst->name << " (" << std::setprecision(2) << worst->speedup << "x)" << std::endl;
+    std::cout << "   Best Improvement: " << best->name << " (" << std::setprecision(2) << best->speedup << "x)"
+              << std::endl;
+    std::cout << "   Least Improvement: " << worst->name << " (" << std::setprecision(2) << worst->speedup << "x)"
+              << std::endl;
 }
 
 int main() {

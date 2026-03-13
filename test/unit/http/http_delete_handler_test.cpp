@@ -1,5 +1,6 @@
-#include <gtest/gtest.h>
 #include <glaze/glaze.hpp>
+
+#include <gtest/gtest.h>
 
 // Define GlazeDeleteRequest before including the handler header.
 // The header forward-declares this struct, and parseDeleteRequest takes it by const ref.
@@ -22,15 +23,9 @@ struct GlazeDeleteRequest {
 template <>
 struct glz::meta<GlazeDeleteRequest> {
     using T = GlazeDeleteRequest;
-    static constexpr auto value = object(
-        "series", &T::series,
-        "measurement", &T::measurement,
-        "tags", &T::tags,
-        "field", &T::field,
-        "fields", &T::fields,
-        "startTime", &T::startTime,
-        "endTime", &T::endTime
-    );
+    static constexpr auto value =
+        object("series", &T::series, "measurement", &T::measurement, "tags", &T::tags, "field", &T::field, "fields",
+               &T::fields, "startTime", &T::startTime, "endTime", &T::endTime);
 };
 
 #include "../../../lib/http/http_delete_handler.hpp"

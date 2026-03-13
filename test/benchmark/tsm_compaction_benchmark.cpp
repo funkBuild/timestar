@@ -1,13 +1,12 @@
-#include <iostream>
-#include <filesystem>
-#include <chrono>
-#include <random>
-
-#include "../../lib/storage/tsm_writer.hpp"
+#include "../../lib/core/timestar_value.hpp"
 #include "../../lib/storage/tsm.hpp"
 #include "../../lib/storage/tsm_compactor.hpp"
-#include "../../lib/core/timestar_value.hpp"
+#include "../../lib/storage/tsm_writer.hpp"
 
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <random>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
@@ -15,11 +14,11 @@
 namespace fs = std::filesystem;
 
 // Configuration for benchmark
-constexpr size_t NUM_FILES = 4;  // Match TIER0_MIN_FILES threshold
+constexpr size_t NUM_FILES = 4;                        // Match TIER0_MIN_FILES threshold
 constexpr size_t TARGET_FILE_SIZE = 50 * 1024 * 1024;  // 50MB per file
-constexpr size_t NUM_SERIES = 500;  // Number of unique time series (5x more realistic)
-constexpr size_t POINTS_PER_SERIES_PER_FILE = 20000;  // 20K points = 2 blocks per series (multi-block!)
-constexpr size_t POINTS_PER_BATCH = 10000;  // Points written per batch
+constexpr size_t NUM_SERIES = 500;                     // Number of unique time series (5x more realistic)
+constexpr size_t POINTS_PER_SERIES_PER_FILE = 20000;   // 20K points = 2 blocks per series (multi-block!)
+constexpr size_t POINTS_PER_BATCH = 10000;             // Points written per batch
 
 // Global state for benchmark
 struct BenchmarkState {
@@ -47,13 +46,13 @@ seastar::future<> generateTSMFile(const std::string& filename, size_t fileIndex,
     // File 1: timestamps 40K-80K
     // File 2: timestamps 80K-120K
     // File 3: timestamps 120K-160K
-    uint64_t baseTimestamp = 1700000000000000000ULL;  // Nov 2023
+    uint64_t baseTimestamp = 1700000000000000000ULL;                                   // Nov 2023
     uint64_t fileTimeOffset = fileIndex * POINTS_PER_SERIES_PER_FILE * 1000000000ULL;  // 1 second intervals
     uint64_t currentTimestamp = baseTimestamp + fileTimeOffset;
 
     std::cout << "Generating TSM file " << (fileIndex + 1) << "/" << NUM_FILES << ": " << filename << std::endl;
-    std::cout << "  Time range: " << currentTimestamp
-              << " - " << (currentTimestamp + POINTS_PER_SERIES_PER_FILE * 1000000000ULL) << std::endl;
+    std::cout << "  Time range: " << currentTimestamp << " - "
+              << (currentTimestamp + POINTS_PER_SERIES_PER_FILE * 1000000000ULL) << std::endl;
     std::cout << "  Series: " << NUM_SERIES << ", Points per series: " << POINTS_PER_SERIES_PER_FILE << std::endl;
 
     // Write all series once with their full time range for this file
@@ -96,8 +95,8 @@ seastar::future<> generateTSMFile(const std::string& filename, size_t fileIndex,
 
     // Get actual file size
     size_t actualSize = fs::file_size(filename);
-    std::cout << "  Generated: " << (actualSize / (1024.0 * 1024.0)) << " MB, "
-              << pointsWritten << " total points" << std::endl;
+    std::cout << "  Generated: " << (actualSize / (1024.0 * 1024.0)) << " MB, " << pointsWritten << " total points"
+              << std::endl;
 
     benchState.totalBytesGenerated += actualSize;
     benchState.totalPointsGenerated += pointsWritten;
@@ -110,10 +109,11 @@ seastar::future<> setupBenchmark() {
     std::cout << "\n=== TSM Compaction Benchmark Setup ===" << std::endl;
     std::cout << "Files: " << NUM_FILES << std::endl;
     std::cout << "Series per file: " << NUM_SERIES << std::endl;
-    std::cout << "Points per series per file: " << POINTS_PER_SERIES_PER_FILE << " (multi-block: "
-              << (POINTS_PER_SERIES_PER_FILE / 10000) << " blocks)" << std::endl;
+    std::cout << "Points per series per file: " << POINTS_PER_SERIES_PER_FILE
+              << " (multi-block: " << (POINTS_PER_SERIES_PER_FILE / 10000) << " blocks)" << std::endl;
     std::cout << "Total points per file: " << (NUM_SERIES * POINTS_PER_SERIES_PER_FILE) << std::endl;
-    std::cout << "Total points across all files: " << (NUM_FILES * NUM_SERIES * POINTS_PER_SERIES_PER_FILE) << std::endl;
+    std::cout << "Total points across all files: " << (NUM_FILES * NUM_SERIES * POINTS_PER_SERIES_PER_FILE)
+              << std::endl;
     std::cout << "Non-overlapping time ranges: Each file has distinct timestamps (no duplicates)" << std::endl;
 
     // Clean and create test directory
@@ -135,10 +135,11 @@ seastar::future<> setupBenchmark() {
     std::cout << "\nSetup complete in " << (duration.count() / 1000.0) << " seconds" << std::endl;
     std::cout << "Total data: " << (benchState.totalBytesGenerated / (1024.0 * 1024.0)) << " MB" << std::endl;
     std::cout << "Total points: " << benchState.totalPointsGenerated << std::endl;
-    std::cout << "Average file size: " << (benchState.totalBytesGenerated / NUM_FILES / (1024.0 * 1024.0)) << " MB" << std::endl;
+    std::cout << "Average file size: " << (benchState.totalBytesGenerated / NUM_FILES / (1024.0 * 1024.0)) << " MB"
+              << std::endl;
     std::cout << "Write throughput: "
-              << (benchState.totalBytesGenerated / (1024.0 * 1024.0)) / (duration.count() / 1000.0)
-              << " MB/s" << std::endl;
+              << (benchState.totalBytesGenerated / (1024.0 * 1024.0)) / (duration.count() / 1000.0) << " MB/s"
+              << std::endl;
 }
 
 // Benchmark: Compact 4 files into 1
@@ -149,8 +150,7 @@ seastar::future<CompactionStats> runCompactionBenchmark() {
     benchState.loadedFiles.clear();
     for (size_t i = 0; i < benchState.tsmFiles.size(); i++) {
         const auto& filename = benchState.tsmFiles[i];
-        std::cout << "Loading file " << (i+1) << "/" << benchState.tsmFiles.size()
-                  << ": " << filename << std::endl;
+        std::cout << "Loading file " << (i + 1) << "/" << benchState.tsmFiles.size() << ": " << filename << std::endl;
 
         try {
             auto tsm = seastar::make_shared<TSM>(filename);
@@ -161,8 +161,7 @@ seastar::future<CompactionStats> runCompactionBenchmark() {
 
             benchState.loadedFiles.push_back(tsm);
 
-            std::cout << "  Loaded: (Tier: " << tsm->tierNum
-                      << ", Seq: " << tsm->seqNum
+            std::cout << "  Loaded: (Tier: " << tsm->tierNum << ", Seq: " << tsm->seqNum
                       << ", Series: " << tsm->getSeriesIds().size() << ")" << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "  ERROR loading " << filename << ": " << e.what() << std::endl;
@@ -212,8 +211,8 @@ seastar::future<CompactionStats> runCompactionBenchmark() {
 // Print detailed benchmark results
 void printResults(const CompactionStats& stats) {
     std::cout << "\n=== Compaction Results ===" << std::endl;
-    std::cout << "Duration: " << stats.duration.count() << " ms ("
-              << (stats.duration.count() / 1000.0) << " seconds)" << std::endl;
+    std::cout << "Duration: " << stats.duration.count() << " ms (" << (stats.duration.count() / 1000.0) << " seconds)"
+              << std::endl;
     std::cout << "Files compacted: " << stats.filesCompacted << std::endl;
     std::cout << "Bytes read: " << (stats.bytesRead / (1024.0 * 1024.0)) << " MB" << std::endl;
     std::cout << "Bytes written: " << (stats.bytesWritten / (1024.0 * 1024.0)) << " MB" << std::endl;
@@ -316,9 +315,7 @@ int main(int argc, char** argv) {
 
     try {
         return app.run(argc, argv, [] {
-            return runBenchmark().then([](int exitCode) {
-                return seastar::make_ready_future<int>(exitCode);
-            });
+            return runBenchmark().then([](int exitCode) { return seastar::make_ready_future<int>(exitCode); });
         });
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << std::endl;

@@ -36,17 +36,17 @@ struct MetadataOp {
 };
 
 enum IndexKeyType : uint8_t {
-    SERIES_INDEX = 0x01,        // series_key -> series_id
-    MEASUREMENT_FIELDS = 0x02,  // measurement -> fields set
-    MEASUREMENT_TAGS = 0x03,    // measurement -> tag keys set
-    TAG_VALUES = 0x04,          // measurement+tag_key -> values set
-    SERIES_METADATA = 0x05,     // series_id -> metadata
-    TAG_INDEX = 0x06,           // measurement+tag_key+tag_value -> series_ids
-    GROUP_BY_INDEX = 0x07,      // measurement+tag_key+tag_value -> series_ids (for group-by)
-    FIELD_STATS = 0x08,         // series_id+field -> stats
-    FIELD_TYPE = 0x09,          // measurement+field -> field type (float, bool, string, integer)
-    MEASUREMENT_SERIES = 0x0A,     // measurement+\0+series_id -> (empty) for fast measurement->series lookup
-    RETENTION_POLICY = 0x0B,       // measurement -> JSON retention policy
+    SERIES_INDEX = 0x01,             // series_key -> series_id
+    MEASUREMENT_FIELDS = 0x02,       // measurement -> fields set
+    MEASUREMENT_TAGS = 0x03,         // measurement -> tag keys set
+    TAG_VALUES = 0x04,               // measurement+tag_key -> values set
+    SERIES_METADATA = 0x05,          // series_id -> metadata
+    TAG_INDEX = 0x06,                // measurement+tag_key+tag_value -> series_ids
+    GROUP_BY_INDEX = 0x07,           // measurement+tag_key+tag_value -> series_ids (for group-by)
+    FIELD_STATS = 0x08,              // series_id+field -> stats
+    FIELD_TYPE = 0x09,               // measurement+field -> field type (float, bool, string, integer)
+    MEASUREMENT_SERIES = 0x0A,       // measurement+\0+series_id -> (empty) for fast measurement->series lookup
+    RETENTION_POLICY = 0x0B,         // measurement -> JSON retention policy
     MEASUREMENT_FIELD_SERIES = 0x0C  // measurement+\0+field+\0+series_id -> (empty) for single-field lookup
 };
 
@@ -293,9 +293,8 @@ public:
     // The caller must not modify the returned vector's elements.
     seastar::future<std::expected<std::shared_ptr<const std::vector<SeriesWithMetadata>>, SeriesLimitExceeded>>
     findSeriesWithMetadataCached(const std::string& measurement,
-                                const std::map<std::string, std::string>& tagFilters = {},
-                                const std::unordered_set<std::string>& fieldFilter = {},
-                                size_t maxSeries = 0);
+                                 const std::map<std::string, std::string>& tagFilters = {},
+                                 const std::unordered_set<std::string>& fieldFilter = {}, size_t maxSeries = 0);
 
     // Invalidate all discovery cache entries for a given measurement.
     void invalidateDiscoveryCache(const std::string& measurement);

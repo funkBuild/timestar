@@ -1,5 +1,5 @@
-#include <iostream>
 #include <cmath>
+#include <iostream>
 
 int main() {
     std::cout << "AVX-512 Optimization Analysis Report Generated" << std::endl;

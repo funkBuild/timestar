@@ -6,9 +6,10 @@
 //   3. scheduleDelete() properly closes the file and removes it from disk
 
 #include <gtest/gtest.h>
+
 #include <fstream>
-#include <string>
 #include <sstream>
+#include <string>
 
 namespace {
 
@@ -64,8 +65,7 @@ TEST(TSMDeletionTest, RefCountRemoved) {
     std::string hdr = readSourceFile(TSM_HPP_SOURCE_PATH);
     ASSERT_FALSE(hdr.empty());
 
-    EXPECT_EQ(hdr.find("refCount"), std::string::npos)
-        << "refCount should be removed from tsm.hpp (dead code)";
+    EXPECT_EQ(hdr.find("refCount"), std::string::npos) << "refCount should be removed from tsm.hpp (dead code)";
 }
 
 // ---------------------------------------------------------------------------
@@ -75,14 +75,11 @@ TEST(TSMDeletionTest, RefCountMethodsRemoved) {
     std::string hdr = readSourceFile(TSM_HPP_SOURCE_PATH);
     ASSERT_FALSE(hdr.empty());
 
-    EXPECT_EQ(hdr.find("addRef"), std::string::npos)
-        << "addRef() should be removed from tsm.hpp (dead code)";
+    EXPECT_EQ(hdr.find("addRef"), std::string::npos) << "addRef() should be removed from tsm.hpp (dead code)";
 
-    EXPECT_EQ(hdr.find("releaseRef"), std::string::npos)
-        << "releaseRef() should be removed from tsm.hpp (dead code)";
+    EXPECT_EQ(hdr.find("releaseRef"), std::string::npos) << "releaseRef() should be removed from tsm.hpp (dead code)";
 
-    EXPECT_EQ(hdr.find("getRefCount"), std::string::npos)
-        << "getRefCount() should be removed from tsm.hpp (dead code)";
+    EXPECT_EQ(hdr.find("getRefCount"), std::string::npos) << "getRefCount() should be removed from tsm.hpp (dead code)";
 }
 
 // ---------------------------------------------------------------------------
@@ -114,8 +111,7 @@ TEST(TSMDeletionTest, ScheduleDeleteMethodExists) {
     std::string hdr = readSourceFile(TSM_HPP_SOURCE_PATH);
     ASSERT_FALSE(hdr.empty());
 
-    EXPECT_NE(hdr.find("scheduleDelete"), std::string::npos)
-        << "scheduleDelete() should be declared in tsm.hpp";
+    EXPECT_NE(hdr.find("scheduleDelete"), std::string::npos) << "scheduleDelete() should be declared in tsm.hpp";
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +123,7 @@ TEST(TSMDeletionTest, ScheduleDeleteUnlinksFile) {
     // references with in-flight DMA reads.  The fd is closed naturally when
     // the last shared_ptr<TSM> drops and ~seastar::file runs.
     std::string hppPath(TSM_HPP_SOURCE_PATH);
-    std::string cppPath = hppPath.substr(0, hppPath.size() - 3) + "cpp"; // .hpp -> .cpp
+    std::string cppPath = hppPath.substr(0, hppPath.size() - 3) + "cpp";  // .hpp -> .cpp
 
     std::string src = readSourceFile(cppPath.c_str());
     ASSERT_FALSE(src.empty()) << "Could not read tsm.cpp at: " << cppPath;
@@ -148,10 +144,14 @@ TEST(TSMDeletionTest, ScheduleDeleteUnlinksFile) {
     int depth = 0;
     size_t funcEnd = bodyStart;
     for (size_t i = bodyStart; i < src.size(); ++i) {
-        if (src[i] == '{') ++depth;
+        if (src[i] == '{')
+            ++depth;
         else if (src[i] == '}') {
             --depth;
-            if (depth == 0) { funcEnd = i; break; }
+            if (depth == 0) {
+                funcEnd = i;
+                break;
+            }
         }
     }
 
@@ -233,10 +233,14 @@ TEST(TSMDeletionTest, PrefetchSnapshotsTsmFileMap) {
     int depth = 0;
     size_t funcEnd = bodyStart;
     for (size_t i = bodyStart; i < src.size(); ++i) {
-        if (src[i] == '{') ++depth;
+        if (src[i] == '{')
+            ++depth;
         else if (src[i] == '}') {
             --depth;
-            if (depth == 0) { funcEnd = i; break; }
+            if (depth == 0) {
+                funcEnd = i;
+                break;
+            }
         }
     }
     std::string funcBody = src.substr(bodyStart, funcEnd - bodyStart + 1);

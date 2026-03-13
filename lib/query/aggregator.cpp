@@ -280,8 +280,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 
             // Build composite group key directly from allTags + groupByTags,
             // avoiding intermediate std::map allocation for relevantTags
-            auto gkr = timestar::buildGroupKeyDirect(series.measurement, fieldName,
-                                                      series.tags, groupByTags);
+            auto gkr = timestar::buildGroupKeyDirect(series.measurement, fieldName, series.tags, groupByTags);
 
             // Hash once via PrehashedString; try_emplace avoids rehashing on lookup
             PrehashedString pkey(std::move(gkr.key), gkr.hash);
@@ -291,8 +290,8 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             if (inserted) {
                 partial.measurement = series.measurement;
                 partial.fieldName = fieldName;
-                partial.groupKey = it->first.value;     // Read from the emplaced key
-                partial.groupKeyHash = keyHash;          // Reuse pre-computed hash
+                partial.groupKey = it->first.value;        // Read from the emplaced key
+                partial.groupKeyHash = keyHash;            // Reuse pre-computed hash
                 partial.cachedTags = std::move(gkr.tags);  // Cache parsed tags once
                 // Pre-reserve bucket map: at most one bucket per unique timestamp,
                 // so timestamps.size() is a safe upper bound that prevents rehashing
@@ -504,8 +503,8 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
 
                         for (size_t i = 1; i < groupPartials.size(); ++i) {
                             mergeSortedRawValuesInto(mergedTs, mergedVals, mergedCounts,
-                                                     groupPartials[i]->sortedTimestamps,
-                                                     groupPartials[i]->sortedValues, method);
+                                                     groupPartials[i]->sortedTimestamps, groupPartials[i]->sortedValues,
+                                                     method);
                         }
 
                         groupedResult.points.reserve(mergedTs.size());

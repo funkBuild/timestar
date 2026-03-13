@@ -1,8 +1,9 @@
+#include "series_id.hpp"
+
 #include <gtest/gtest.h>
+
 #include <string>
 #include <unordered_map>
-
-#include "series_id.hpp"
 
 TEST(SeriesId128Test, DefaultConstructorIsZero) {
     SeriesId128 id;

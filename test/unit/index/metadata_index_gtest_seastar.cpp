@@ -5,15 +5,17 @@
  * TEST_F for pure synchronous tests.
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/index/metadata_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
-#include "../../../lib/index/metadata_index.hpp"
-#include <filesystem>
 
 static const std::string TEST_DB_PATH = "/tmp/test_metadata_index_gtest";
 
@@ -25,13 +27,9 @@ static void cleanup_test_db() {
 // Test fixture
 class MetadataIndexAsyncTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanup_test_db();
-    }
+    void SetUp() override { cleanup_test_db(); }
 
-    void TearDown() override {
-        cleanup_test_db();
-    }
+    void TearDown() override { cleanup_test_db(); }
 };
 
 TEST_F(MetadataIndexAsyncTest, MetadataSeriesInfoSerialization) {
@@ -60,10 +58,7 @@ TEST_F(MetadataIndexAsyncTest, MetadataSeriesInfoSerialization) {
 
 TEST_F(MetadataIndexAsyncTest, SeriesKeyGeneration) {
     std::string measurement = "temperature";
-    std::map<std::string, std::string> tags = {
-        {"location", "room1"},
-        {"sensor", "temp01"}
-    };
+    std::map<std::string, std::string> tags = {{"location", "room1"}, {"sensor", "temp01"}};
     std::string field = "value";
 
     std::string key1 = MetadataSeriesInfo::generateSeriesKey(measurement, tags, field);
@@ -87,10 +82,7 @@ SEASTAR_TEST_F(MetadataIndexAsyncTest, GetOrCreateSeriesId) {
     co_await index->init();
 
     std::string measurement = "temperature";
-    std::map<std::string, std::string> tags = {
-        {"location", "room1"},
-        {"sensor", "temp01"}
-    };
+    std::map<std::string, std::string> tags = {{"location", "room1"}, {"sensor", "temp01"}};
     std::string field = "value";
 
     // First call should create new series
@@ -123,9 +115,7 @@ SEASTAR_TEST_F(MetadataIndexAsyncTest, FindSeriesByMeasurement) {
 
     // Create multiple series for same measurement
     for (int i = 0; i < 5; i++) {
-        std::map<std::string, std::string> tags = {
-            {"location", "room" + std::to_string(i)}
-        };
+        std::map<std::string, std::string> tags = {{"location", "room" + std::to_string(i)}};
         uint64_t id = co_await index->getOrCreateSeriesId(measurement, tags, "value");
         createdIds.push_back(id);
     }
@@ -154,27 +144,17 @@ SEASTAR_TEST_F(MetadataIndexAsyncTest, FindSeriesByTag) {
     std::string measurement = "temperature";
 
     // Create series with different tag values
-    std::map<std::string, std::string> tags1 = {
-        {"location", "room1"},
-        {"sensor", "temp01"}
-    };
+    std::map<std::string, std::string> tags1 = {{"location", "room1"}, {"sensor", "temp01"}};
     uint64_t id1 = co_await index->getOrCreateSeriesId(measurement, tags1, "value");
 
-    std::map<std::string, std::string> tags2 = {
-        {"location", "room1"},
-        {"sensor", "temp02"}
-    };
+    std::map<std::string, std::string> tags2 = {{"location", "room1"}, {"sensor", "temp02"}};
     uint64_t id2 = co_await index->getOrCreateSeriesId(measurement, tags2, "value");
 
-    std::map<std::string, std::string> tags3 = {
-        {"location", "room2"},
-        {"sensor", "temp01"}
-    };
+    std::map<std::string, std::string> tags3 = {{"location", "room2"}, {"sensor", "temp01"}};
     uint64_t id3 = co_await index->getOrCreateSeriesId(measurement, tags3, "value");
 
     // Find series by location=room1
-    std::vector<uint64_t> foundIds = co_await index->findSeriesByTag(
-        measurement, "location", "room1");
+    std::vector<uint64_t> foundIds = co_await index->findSeriesByTag(measurement, "location", "room1");
 
     EXPECT_EQ(foundIds.size(), 2);
     std::sort(foundIds.begin(), foundIds.end());
@@ -193,22 +173,13 @@ SEASTAR_TEST_F(MetadataIndexAsyncTest, FindSeriesByTags) {
     std::string measurement = "temperature";
 
     // Create series with various tag combinations
-    std::map<std::string, std::string> tags1 = {
-        {"location", "room1"},
-        {"sensor", "temp01"}
-    };
+    std::map<std::string, std::string> tags1 = {{"location", "room1"}, {"sensor", "temp01"}};
     uint64_t id1 = co_await index->getOrCreateSeriesId(measurement, tags1, "value");
 
-    std::map<std::string, std::string> tags2 = {
-        {"location", "room1"},
-        {"sensor", "temp02"}
-    };
+    std::map<std::string, std::string> tags2 = {{"location", "room1"}, {"sensor", "temp02"}};
     co_await index->getOrCreateSeriesId(measurement, tags2, "value");
 
-    std::map<std::string, std::string> tags3 = {
-        {"location", "room2"},
-        {"sensor", "temp01"}
-    };
+    std::map<std::string, std::string> tags3 = {{"location", "room2"}, {"sensor", "temp01"}};
     co_await index->getOrCreateSeriesId(measurement, tags3, "value");
 
     // Find series with exact tag match
@@ -226,10 +197,7 @@ SEASTAR_TEST_F(MetadataIndexAsyncTest, GetMetadataSeriesInfo) {
     co_await index->init();
 
     std::string measurement = "temperature";
-    std::map<std::string, std::string> tags = {
-        {"location", "room1"},
-        {"sensor", "temp01"}
-    };
+    std::map<std::string, std::string> tags = {{"location", "room1"}, {"sensor", "temp01"}};
     std::string field = "value";
 
     // Create series
@@ -296,9 +264,7 @@ SEASTAR_TEST_F(MetadataIndexAsyncTest, ConcurrentSeriesCreation) {
 
     // Create multiple series concurrently
     for (int i = 0; i < 100; i++) {
-        std::map<std::string, std::string> tags = {
-            {"location", "room" + std::to_string(i)}
-        };
+        std::map<std::string, std::string> tags = {{"location", "room" + std::to_string(i)}};
         futures.push_back(index->getOrCreateSeriesId(measurement, tags, "value"));
     }
 
@@ -323,9 +289,7 @@ SEASTAR_TEST_F(MetadataIndexAsyncTest, GetStats) {
 
     // Create some data
     for (int i = 0; i < 10; i++) {
-        std::map<std::string, std::string> tags = {
-            {"location", "room" + std::to_string(i)}
-        };
+        std::map<std::string, std::string> tags = {{"location", "room" + std::to_string(i)}};
         co_await index->getOrCreateSeriesId("temperature", tags, "value");
     }
 

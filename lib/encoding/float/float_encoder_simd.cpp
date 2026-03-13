@@ -1,10 +1,9 @@
 // Highway foreach_target re-inclusion mechanism.
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "encoding/float/float_encoder_simd.cpp"
-#include "hwy/foreach_target.h"
-
 #include "float_encoder_simd.hpp"
 
+#include "hwy/foreach_target.h"
 #include "hwy/highway.h"
 
 #include <bit>
@@ -205,10 +204,10 @@ CompressedBuffer FloatEncoderSIMD::encodeSafe(std::span<const double> values) {
     return encode(values);
 }
 
-// ---- FloatEncoderAVX512 public methods ----
-// Both classes delegate to the same Highway dispatch function.
-// Highway automatically selects AVX-512 when the CPU supports it.
-#include "float_encoder_avx512.hpp"
+    // ---- FloatEncoderAVX512 public methods ----
+    // Both classes delegate to the same Highway dispatch function.
+    // Highway automatically selects AVX-512 when the CPU supports it.
+    #include "float_encoder_avx512.hpp"
 
 bool FloatEncoderAVX512::isAvailable() {
     return true;

@@ -7,32 +7,32 @@
 // parsing/formatting), these tests spin up a real sharded Engine via
 // ScopedShardedEngine and invoke the handler coroutines directly.
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <string>
-#include <vector>
-#include <map>
-#include <set>
-
 #include <glaze/glaze.hpp>
 
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <map>
 #include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
-#include <seastar/http/request.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/http/reply.hh>
+#include <seastar/http/request.hh>
+#include <set>
+#include <string>
+#include <vector>
 
 // Engine and helpers
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../test_helpers.hpp"
 
 // HTTP handlers
-#include "../../../lib/http/http_write_handler.hpp"
-#include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/http/http_metadata_handler.hpp"
+#include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/http/http_write_handler.hpp"
 
 // Delete handler requires GlazeDeleteRequest to be defined before the header
 struct GlazeDeleteRequest {
@@ -48,15 +48,9 @@ struct GlazeDeleteRequest {
 template <>
 struct glz::meta<GlazeDeleteRequest> {
     using T = GlazeDeleteRequest;
-    static constexpr auto value = object(
-        "series", &T::series,
-        "measurement", &T::measurement,
-        "tags", &T::tags,
-        "field", &T::field,
-        "fields", &T::fields,
-        "startTime", &T::startTime,
-        "endTime", &T::endTime
-    );
+    static constexpr auto value =
+        object("series", &T::series, "measurement", &T::measurement, "tags", &T::tags, "field", &T::field, "fields",
+               &T::fields, "startTime", &T::startTime, "endTime", &T::endTime);
 };
 
 #include "../../../lib/http/http_delete_handler.hpp"
@@ -74,9 +68,7 @@ protected:
     // CWD corruption caused by other test fixtures (e.g. WALSeastarTest).
     static inline fs::path expectedCwd;
 
-    static void SetUpTestSuite() {
-        expectedCwd = fs::current_path();
-    }
+    static void SetUpTestSuite() { expectedCwd = fs::current_path(); }
 
     void SetUp() override {
         // Recover from CWD corruption: if a previous test fixture (e.g.
@@ -88,9 +80,7 @@ protected:
         robustCleanShardDirectories();
     }
 
-    void TearDown() override {
-        robustCleanShardDirectories();
-    }
+    void TearDown() override { robustCleanShardDirectories(); }
 
     // More robust cleanup that tolerates partially-cleaned directories.
     // Uses the non-throwing overload of fs::remove_all and retries
@@ -104,10 +94,12 @@ protected:
                 std::string shardPath = "shard_" + std::to_string(i);
                 if (fs::exists(shardPath, ec)) {
                     fs::remove_all(shardPath, ec);
-                    if (ec) anyFailed = true;
+                    if (ec)
+                        anyFailed = true;
                 }
             }
-            if (!anyFailed) break;
+            if (!anyFailed)
+                break;
         }
     }
 
@@ -120,18 +112,15 @@ protected:
         return req;
     }
 
-    static std::unique_ptr<seastar::http::request> makeQueryRequest(
-            const std::string& query,
-            uint64_t startTime,
-            uint64_t endTime,
-            const std::string& aggregationInterval = "") {
+    static std::unique_ptr<seastar::http::request> makeQueryRequest(const std::string& query, uint64_t startTime,
+                                                                    uint64_t endTime,
+                                                                    const std::string& aggregationInterval = "") {
         auto req = std::make_unique<seastar::http::request>();
         req->_headers["Content-Type"] = "application/json";
 
         // Build JSON body
-        std::string body = R"({"query":")" + query +
-            R"(","startTime":)" + std::to_string(startTime) +
-            R"(,"endTime":)" + std::to_string(endTime);
+        std::string body = R"({"query":")" + query + R"(","startTime":)" + std::to_string(startTime) +
+                           R"(,"endTime":)" + std::to_string(endTime);
         if (!aggregationInterval.empty()) {
             body += R"(,"aggregationInterval":")" + aggregationInterval + R"(")";
         }
@@ -147,9 +136,8 @@ protected:
         return req;
     }
 
-    static std::unique_ptr<seastar::http::request> makeMetadataRequest(
-            const std::string& measurement = "",
-            const std::string& tag = "") {
+    static std::unique_ptr<seastar::http::request> makeMetadataRequest(const std::string& measurement = "",
+                                                                       const std::string& tag = "") {
         auto req = std::make_unique<seastar::http::request>();
         if (!measurement.empty()) {
             req->set_query_param("measurement", measurement);
@@ -167,9 +155,7 @@ protected:
         return std::to_string(static_cast<int>(rep._status));
     }
 
-    static bool isOk(const seastar::http::reply& rep) {
-        return rep._status == seastar::http::reply::status_type::ok;
-    }
+    static bool isOk(const seastar::http::reply& rep) { return rep._status == seastar::http::reply::status_type::ok; }
 };
 
 // ============================================================================
@@ -201,7 +187,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteSinglePoint) {
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["status"].get<std::string>(), "success");
         EXPECT_GE(obj["points_written"].get<double>(), 1.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteBatchPoints) {
@@ -244,7 +232,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteBatchPoints) {
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["status"].get<std::string>(), "success");
         EXPECT_GE(obj["points_written"].get<double>(), 3.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteArrayValues) {
@@ -271,7 +261,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteArrayValues) {
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["status"].get<std::string>(), "success");
         EXPECT_GE(obj["points_written"].get<double>(), 3.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteMixedTypes) {
@@ -295,7 +287,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteMixedTypes) {
 
         auto rep = handler.handleWrite(std::move(req)).get();
         ASSERT_TRUE(isOk(*rep)) << "Reply body: " << rep->_content;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteEmptyBodyReturnsError) {
@@ -310,7 +304,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteEmptyBodyReturnsError) {
         auto rep = handler.handleWrite(std::move(req)).get();
 
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::bad_request);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteInvalidJsonReturnsError) {
@@ -325,7 +321,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteInvalidJsonReturnsError) {
         auto rep = handler.handleWrite(std::move(req)).get();
 
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::bad_request);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteOversizedBodyReturnsError) {
@@ -342,7 +340,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteOversizedBodyReturnsError) {
         auto rep = handler.handleWrite(std::move(req)).get();
 
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::payload_too_large);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ============================================================================
@@ -394,7 +394,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteAndQueryRoundTrip) {
             EXPECT_GE(values.size(), 1u);
             EXPECT_NEAR(values[0].get<double>(), 72.5, 0.001);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteMultipleSeriesThenQuery) {
@@ -451,7 +453,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteMultipleSeriesThenQuery) {
         auto& stats = obj["statistics"].get<glz::generic::object_t>();
         EXPECT_GE(stats["series_count"].get<double>(), 1.0);
         EXPECT_GE(stats["point_count"].get<double>(), 1.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteThenQueryWithTimeFilter) {
@@ -487,7 +491,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteThenQueryWithTimeFilter) {
         // Aggregated to a single point for avg, so point_count should be 1
         // but the avg should reflect only the filtered points
         EXPECT_GE(stats["point_count"].get<double>(), 1.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteThenQueryWithAggregationInterval) {
@@ -522,7 +528,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteThenQueryWithAggregationInterval) {
         // With 2s buckets over [0, 4s], we should get multiple time-bucketed points
         auto& stats = obj["statistics"].get<glz::generic::object_t>();
         EXPECT_GE(stats["point_count"].get<double>(), 1.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ============================================================================
@@ -548,7 +556,9 @@ TEST_F(HttpHandlerIntegrationTest, QueryEmptyDatabaseReturnsSuccess) {
 
         auto& series = obj["series"].get<glz::generic::array_t>();
         EXPECT_EQ(series.size(), 0u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, QueryInvalidJsonReturnsError) {
@@ -564,7 +574,9 @@ TEST_F(HttpHandlerIntegrationTest, QueryInvalidJsonReturnsError) {
 
         auto rep = handler.handleQuery(std::move(req)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::bad_request);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, QueryInvalidTimeRangeReturnsError) {
@@ -578,7 +590,9 @@ TEST_F(HttpHandlerIntegrationTest, QueryInvalidTimeRangeReturnsError) {
         auto req = makeQueryRequest("avg:metric(value)", 5000000000, 1000000000);
         auto rep = handler.handleQuery(std::move(req)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::bad_request);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, QueryGroupBy) {
@@ -629,7 +643,9 @@ TEST_F(HttpHandlerIntegrationTest, QueryGroupBy) {
         // Should have at least 2 series (one per dc group)
         auto& series = obj["series"].get<glz::generic::array_t>();
         EXPECT_GE(series.size(), 2u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, QueryMaxAggregation) {
@@ -670,7 +686,9 @@ TEST_F(HttpHandlerIntegrationTest, QueryMaxAggregation) {
         auto& values = tempField["values"].get<glz::generic::array_t>();
         ASSERT_GE(values.size(), 1u);
         EXPECT_NEAR(values[0].get<double>(), 30.0, 0.001);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, QuerySumAggregation) {
@@ -711,7 +729,9 @@ TEST_F(HttpHandlerIntegrationTest, QuerySumAggregation) {
         auto& values = reqField["values"].get<glz::generic::array_t>();
         ASSERT_GE(values.size(), 1u);
         EXPECT_NEAR(values[0].get<double>(), 600.0, 0.001);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ============================================================================
@@ -773,7 +793,9 @@ TEST_F(HttpHandlerIntegrationTest, MetadataMeasurements) {
         EXPECT_TRUE(found.count("meta_meas_temp") > 0);
         EXPECT_TRUE(found.count("meta_meas_humid") > 0);
         EXPECT_TRUE(found.count("meta_meas_press") > 0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, MetadataTagsForMeasurement) {
@@ -826,7 +848,9 @@ TEST_F(HttpHandlerIntegrationTest, MetadataTagsForMeasurement) {
         // Verify dc tag values
         auto& dcValues = tags["dc"].get<glz::generic::array_t>();
         EXPECT_GE(dcValues.size(), 2u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, MetadataSpecificTag) {
@@ -877,7 +901,9 @@ TEST_F(HttpHandlerIntegrationTest, MetadataSpecificTag) {
         }
         EXPECT_TRUE(hostValues.count("server-01") > 0);
         EXPECT_TRUE(hostValues.count("server-02") > 0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, MetadataFieldsForMeasurement) {
@@ -920,7 +946,9 @@ TEST_F(HttpHandlerIntegrationTest, MetadataFieldsForMeasurement) {
         EXPECT_TRUE(fields.count("cpu_usage") > 0);
         EXPECT_TRUE(fields.count("memory_usage") > 0);
         EXPECT_TRUE(fields.count("disk_usage") > 0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, MetadataMissingMeasurementParam) {
@@ -939,7 +967,9 @@ TEST_F(HttpHandlerIntegrationTest, MetadataMissingMeasurementParam) {
         auto fieldsReq = makeMetadataRequest();
         auto fieldsRep = metaHandler.handleFields(std::move(fieldsReq)).get();
         EXPECT_EQ(fieldsRep->_status, seastar::http::reply::status_type::bad_request);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, MetadataEmptyDatabase) {
@@ -960,7 +990,9 @@ TEST_F(HttpHandlerIntegrationTest, MetadataEmptyDatabase) {
 
         auto& measurements = obj["measurements"].get<glz::generic::array_t>();
         EXPECT_EQ(measurements.size(), 0u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ============================================================================
@@ -1000,7 +1032,9 @@ TEST_F(HttpHandlerIntegrationTest, DeleteBySeriesKey) {
         ASSERT_FALSE(ec);
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["status"].get<std::string>(), "success");
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, DeleteByStructuredFormat) {
@@ -1045,7 +1079,9 @@ TEST_F(HttpHandlerIntegrationTest, DeleteByStructuredFormat) {
         auto& stats = qObj["statistics"].get<glz::generic::object_t>();
         // After deleting t=2000000000, we should have fewer points than original 3
         EXPECT_GE(stats["point_count"].get<double>(), 1.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, DeleteByPatternMultipleFields) {
@@ -1096,7 +1132,9 @@ TEST_F(HttpHandlerIntegrationTest, DeleteByPatternMultipleFields) {
         ASSERT_FALSE(ec);
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["status"].get<std::string>(), "success");
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, DeleteInvalidJsonReturnsError) {
@@ -1109,7 +1147,9 @@ TEST_F(HttpHandlerIntegrationTest, DeleteInvalidJsonReturnsError) {
         auto delReq = makeDeleteRequest("invalid json");
         auto delRep = deleteHandler.handleDelete(std::move(delReq)).get();
         EXPECT_EQ(delRep->_status, seastar::http::reply::status_type::bad_request);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, DeleteMissingRequiredFieldsReturnsError) {
@@ -1123,7 +1163,9 @@ TEST_F(HttpHandlerIntegrationTest, DeleteMissingRequiredFieldsReturnsError) {
         auto delReq = makeDeleteRequest(R"({"startTime": 1000})");
         auto delRep = deleteHandler.handleDelete(std::move(delReq)).get();
         EXPECT_EQ(delRep->_status, seastar::http::reply::status_type::bad_request);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ============================================================================
@@ -1190,7 +1232,9 @@ TEST_F(HttpHandlerIntegrationTest, FullWriteQueryDeleteCycle) {
             // The exact count depends on aggregation, but should be at least 1
             EXPECT_GE(pointCount, 1.0);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteQueryMetadataFullCycle) {
@@ -1292,7 +1336,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteQueryMetadataFullCycle) {
             auto& series = obj["series"].get<glz::generic::array_t>();
             EXPECT_GE(series.size(), 1u);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ============================================================================
@@ -1311,11 +1357,14 @@ TEST_F(HttpHandlerIntegrationTest, WriteThenQueryCrossShardData) {
         // lands on different shards (unique measurement name for test isolation)
         std::string batchJson = R"({"writes": [)";
         for (int i = 0; i < 20; ++i) {
-            if (i > 0) batchJson += ",";
+            if (i > 0)
+                batchJson += ",";
             batchJson += R"({
                 "measurement": "distributed_xshard",
-                "tags": {"node": "node_)" + std::to_string(i) + R"("},
-                "fields": {"value": )" + std::to_string(10.0 + i) + R"(},
+                "tags": {"node": "node_)" +
+                         std::to_string(i) + R"("},
+                "fields": {"value": )" +
+                         std::to_string(10.0 + i) + R"(},
                 "timestamp": 1000000000
             })";
         }
@@ -1339,7 +1388,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteThenQueryCrossShardData) {
         auto& stats = obj["statistics"].get<glz::generic::object_t>();
         EXPECT_GE(stats["series_count"].get<double>(), 1.0);
         EXPECT_GE(stats["point_count"].get<double>(), 1.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(HttpHandlerIntegrationTest, WriteThenQueryScopedFiltering) {
@@ -1398,7 +1449,9 @@ TEST_F(HttpHandlerIntegrationTest, WriteThenQueryScopedFiltering) {
             // us-west latency should be 10.0
             EXPECT_NEAR(values[0].get<double>(), 10.0, 0.001);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ============================================================================
@@ -1420,14 +1473,18 @@ TEST_F(HttpHandlerIntegrationTest, ConcurrentBatchWrites) {
         for (int batch = 0; batch < numBatches; ++batch) {
             std::string batchJson = R"({"writes": [)";
             for (int i = 0; i < pointsPerBatch; ++i) {
-                if (i > 0) batchJson += ",";
+                if (i > 0)
+                    batchJson += ",";
                 uint64_t ts = (batch * pointsPerBatch + i + 1) * 1000000000ULL;
                 double val = static_cast<double>(batch * 100 + i);
                 batchJson += R"({
                     "measurement": "conc_load_test",
-                    "tags": {"batch": ")" + std::to_string(batch) + R"("},
-                    "fields": {"value": )" + std::to_string(val) + R"(},
-                    "timestamp": )" + std::to_string(ts) + R"(
+                    "tags": {"batch": ")" +
+                             std::to_string(batch) + R"("},
+                    "fields": {"value": )" +
+                             std::to_string(val) + R"(},
+                    "timestamp": )" +
+                             std::to_string(ts) + R"(
                 })";
             }
             batchJson += "]}";
@@ -1453,5 +1510,7 @@ TEST_F(HttpHandlerIntegrationTest, ConcurrentBatchWrites) {
         // We wrote data in numBatches different batch tags, so we should find them
         EXPECT_GE(stats["series_count"].get<double>(), 1.0);
         EXPECT_GE(stats["point_count"].get<double>(), 1.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }

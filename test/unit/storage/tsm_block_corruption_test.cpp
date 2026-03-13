@@ -23,16 +23,16 @@
 //   offsets 5-8   : uint32_t — timestampBytes (byte length of encoded timestamps)
 //   offsets 9+    : compressed timestamps, then compressed values
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <fstream>
-#include <cstring>
-
-#include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/slice_buffer.hpp"
+#include "../../../lib/storage/tsm.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
 
+#include <gtest/gtest.h>
+
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <seastar/core/coroutine.hh>
 
 namespace fs = std::filesystem;
@@ -55,12 +55,10 @@ protected:
     //   typeVal        : raw uint8_t stored in the file
     //   timestampSize  : number of timestamp entries declared in the block
     //   timestampBytes : byte length of the compressed timestamp region
-    static std::vector<uint8_t> makeHeader(uint8_t typeVal,
-                                           uint32_t timestampSize,
-                                           uint32_t timestampBytes) {
+    static std::vector<uint8_t> makeHeader(uint8_t typeVal, uint32_t timestampSize, uint32_t timestampBytes) {
         std::vector<uint8_t> hdr(9);
         hdr[0] = typeVal;
-        std::memcpy(hdr.data() + 1, &timestampSize,  4);
+        std::memcpy(hdr.data() + 1, &timestampSize, 4);
         std::memcpy(hdr.data() + 5, &timestampBytes, 4);
         return hdr;
     }
@@ -80,10 +78,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_FloatBlockDecodedAsBool) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<bool>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<bool>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -95,10 +90,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_FloatBlockDecodedAsString) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<std::string>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<std::string>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,10 +102,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_BoolBlockDecodedAsDouble) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,10 +114,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_BoolBlockDecodedAsString) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<std::string>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<std::string>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,10 +126,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_StringBlockDecodedAsDouble) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -155,10 +138,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_StringBlockDecodedAsBool) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<bool>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<bool>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -170,10 +150,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_IntegerBlockDecodedAsDouble) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,10 +164,7 @@ TEST_F(TSMDecodeBlockTest, TypeMismatch_InvalidTypeByte) {
     uint32_t blockSize = static_cast<uint32_t>(hdr.size());
     Slice blockSlice(hdr.data(), hdr.size());
 
-    EXPECT_THROW(
-        (dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)),
-        std::runtime_error
-    );
+    EXPECT_THROW((dummyTsm.decodeBlock<double>(blockSlice, blockSize, 0, UINT64_MAX)), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -250,17 +224,11 @@ class TSMBlockCorruptionTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_tsm_block_corruption";
 
-    void SetUp() override {
-        fs::create_directories(testDir);
-    }
+    void SetUp() override { fs::create_directories(testDir); }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 
-    std::string getTestFilePath(const std::string& name) {
-        return testDir + "/" + name;
-    }
+    std::string getTestFilePath(const std::string& name) { return testDir + "/" + name; }
 
     // Patch a single byte at the given file offset.
     static void patchFileByte(const std::string& path, uint64_t fileOffset, uint8_t value) {
@@ -281,8 +249,8 @@ seastar::future<> testReadSingleBlockFloatHappyPath(std::string filename) {
 
     {
         TSMWriter writer(filename);
-        std::vector<uint64_t> ts  = {1000, 2000, 3000};
-        std::vector<double>   vs  = {1.1, 2.2, 3.3};
+        std::vector<uint64_t> ts = {1000, 2000, 3000};
+        std::vector<double> vs = {1.1, 2.2, 3.3};
         writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -321,8 +289,8 @@ seastar::future<> testReadSingleBlockStringHappyPath(std::string filename) {
 
     {
         TSMWriter writer(filename);
-        std::vector<uint64_t>     ts = {100, 200, 300};
-        std::vector<std::string>  vs = {"alpha", "beta", "gamma"};
+        std::vector<uint64_t> ts = {100, 200, 300};
+        std::vector<std::string> vs = {"alpha", "beta", "gamma"};
         writer.writeSeries(TSMValueType::String, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -362,11 +330,11 @@ seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::strin
 
     // Write valid float block.
     uint64_t blockOffset = 0;
-    uint32_t blockSize   = 0;
+    uint32_t blockSize = 0;
     {
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {5000, 6000, 7000};
-        std::vector<double>   vs = {9.9, 8.8, 7.7};
+        std::vector<double> vs = {9.9, 8.8, 7.7};
         writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -379,7 +347,7 @@ seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::strin
         auto* entry = co_await tsm.getFullIndexEntry(seriesId);
         EXPECT_NE(entry, nullptr);
         blockOffset = entry->indexBlocks[0].offset;
-        blockSize   = entry->indexBlocks[0].size;
+        blockSize = entry->indexBlocks[0].size;
         co_await tsm.close();
     }
 
@@ -387,7 +355,7 @@ seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::strin
     {
         int fd = ::open(filename.c_str(), O_WRONLY);
         EXPECT_GE(fd, 0);
-        uint8_t badType = 1; // Boolean
+        uint8_t badType = 1;  // Boolean
         [[maybe_unused]] auto pwriteRet1 = ::pwrite(fd, &badType, 1, static_cast<off_t>(blockOffset));
         ::close(fd);
     }
@@ -398,7 +366,7 @@ seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::strin
 
     TSMIndexBlock corruptedIndexBlock{};
     corruptedIndexBlock.offset = blockOffset;
-    corruptedIndexBlock.size   = blockSize;
+    corruptedIndexBlock.size = blockSize;
 
     bool threw = false;
     try {
@@ -415,8 +383,7 @@ seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::strin
 }
 
 TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeMismatch_FloatCorruptedToBool) {
-    testReadSingleBlockTypeMismatchFloatCorruptedToBool(
-        getTestFilePath("0_202.tsm")).get();
+    testReadSingleBlockTypeMismatchFloatCorruptedToBool(getTestFilePath("0_202.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------
@@ -427,11 +394,11 @@ seastar::future<> testReadSingleBlockTypeMismatchBoolCorruptedToFloat(std::strin
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("corrupt.type.bool2float");
 
     uint64_t blockOffset = 0;
-    uint32_t blockSize   = 0;
+    uint32_t blockSize = 0;
     {
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {1000, 2000};
-        std::vector<bool>     vs = {true, false};
+        std::vector<bool> vs = {true, false};
         writer.writeSeries(TSMValueType::Boolean, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -443,7 +410,7 @@ seastar::future<> testReadSingleBlockTypeMismatchBoolCorruptedToFloat(std::strin
         auto* entry = co_await tsm.getFullIndexEntry(seriesId);
         EXPECT_NE(entry, nullptr);
         blockOffset = entry->indexBlocks[0].offset;
-        blockSize   = entry->indexBlocks[0].size;
+        blockSize = entry->indexBlocks[0].size;
         co_await tsm.close();
     }
 
@@ -461,7 +428,7 @@ seastar::future<> testReadSingleBlockTypeMismatchBoolCorruptedToFloat(std::strin
 
     TSMIndexBlock corruptedBlock{};
     corruptedBlock.offset = blockOffset;
-    corruptedBlock.size   = blockSize;
+    corruptedBlock.size = blockSize;
 
     bool threw = false;
     try {
@@ -478,8 +445,7 @@ seastar::future<> testReadSingleBlockTypeMismatchBoolCorruptedToFloat(std::strin
 }
 
 TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeMismatch_BoolCorruptedToFloat) {
-    testReadSingleBlockTypeMismatchBoolCorruptedToFloat(
-        getTestFilePath("0_203.tsm")).get();
+    testReadSingleBlockTypeMismatchBoolCorruptedToFloat(getTestFilePath("0_203.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------
@@ -490,10 +456,10 @@ seastar::future<> testReadSingleBlockTypeMismatchStringCorruptedToFloat(std::str
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("corrupt.type.str2float");
 
     uint64_t blockOffset = 0;
-    uint32_t blockSize   = 0;
+    uint32_t blockSize = 0;
     {
         TSMWriter writer(filename);
-        std::vector<uint64_t>    ts = {100, 200};
+        std::vector<uint64_t> ts = {100, 200};
         std::vector<std::string> vs = {"x", "y"};
         writer.writeSeries(TSMValueType::String, seriesId, ts, vs);
         writer.writeIndex();
@@ -506,7 +472,7 @@ seastar::future<> testReadSingleBlockTypeMismatchStringCorruptedToFloat(std::str
         auto* entry = co_await tsm.getFullIndexEntry(seriesId);
         EXPECT_NE(entry, nullptr);
         blockOffset = entry->indexBlocks[0].offset;
-        blockSize   = entry->indexBlocks[0].size;
+        blockSize = entry->indexBlocks[0].size;
         co_await tsm.close();
     }
 
@@ -524,7 +490,7 @@ seastar::future<> testReadSingleBlockTypeMismatchStringCorruptedToFloat(std::str
 
     TSMIndexBlock corruptedBlock{};
     corruptedBlock.offset = blockOffset;
-    corruptedBlock.size   = blockSize;
+    corruptedBlock.size = blockSize;
 
     bool threw = false;
     try {
@@ -541,8 +507,7 @@ seastar::future<> testReadSingleBlockTypeMismatchStringCorruptedToFloat(std::str
 }
 
 TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeMismatch_StringCorruptedToFloat) {
-    testReadSingleBlockTypeMismatchStringCorruptedToFloat(
-        getTestFilePath("0_204.tsm")).get();
+    testReadSingleBlockTypeMismatchStringCorruptedToFloat(getTestFilePath("0_204.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +521,7 @@ seastar::future<> testReadSingleBlockFloatReadAsString(std::string filename) {
     {
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {1000, 2000, 3000};
-        std::vector<double>   vs = {1.0, 2.0, 3.0};
+        std::vector<double> vs = {1.0, 2.0, 3.0};
         writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -598,7 +563,7 @@ seastar::future<> testReadSingleBlockStringReadAsBool(std::string filename) {
 
     {
         TSMWriter writer(filename);
-        std::vector<uint64_t>    ts = {100};
+        std::vector<uint64_t> ts = {100};
         std::vector<std::string> vs = {"hello"};
         writer.writeSeries(TSMValueType::String, seriesId, ts, vs);
         writer.writeIndex();
@@ -642,7 +607,7 @@ seastar::future<> testReadSingleBlockTimeRangeExcludesAll(std::string filename) 
     {
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {1000, 2000, 3000};
-        std::vector<double>   vs = {1.0, 2.0, 3.0};
+        std::vector<double> vs = {1.0, 2.0, 3.0};
         writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -663,8 +628,7 @@ seastar::future<> testReadSingleBlockTimeRangeExcludesAll(std::string filename) 
     // itself returns the (empty) block — callers decide whether to discard it.
     EXPECT_NE(block, nullptr);
     if (block) {
-        EXPECT_EQ(block->timestamps.size(), 0u)
-            << "Expected zero timestamps after time-range exclusion";
+        EXPECT_EQ(block->timestamps.size(), 0u) << "Expected zero timestamps after time-range exclusion";
     }
 
     co_await tsm.close();
@@ -687,7 +651,7 @@ seastar::future<> testReadSingleBlockTruncatedBlockThrows(std::string filename) 
     {
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {1000, 2000};
-        std::vector<double>   vs = {5.5, 6.6};
+        std::vector<double> vs = {5.5, 6.6};
         writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -710,7 +674,7 @@ seastar::future<> testReadSingleBlockTruncatedBlockThrows(std::string filename) 
 
     TSMIndexBlock truncatedBlock{};
     truncatedBlock.offset = blockOffset;
-    truncatedBlock.size   = 4;  // too small for the 9-byte header
+    truncatedBlock.size = 4;  // too small for the 9-byte header
 
     bool threw = false;
     try {
@@ -719,8 +683,7 @@ seastar::future<> testReadSingleBlockTruncatedBlockThrows(std::string filename) 
         threw = true;
         // The error should mention bounds or getSlice failure.
         std::string msg(e.what());
-        EXPECT_FALSE(msg.empty())
-            << "Expected non-empty exception message for truncated block";
+        EXPECT_FALSE(msg.empty()) << "Expected non-empty exception message for truncated block";
     }
     EXPECT_TRUE(threw) << "Expected an exception when block size < BLOCK_HEADER_SIZE";
 
@@ -741,7 +704,7 @@ seastar::future<> testReadSingleBlockBoolHappyPath(std::string filename) {
     {
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {100, 200, 300, 400};
-        std::vector<bool>     vs = {true, false, true, true};
+        std::vector<bool> vs = {true, false, true, true};
         writer.writeSeries(TSMValueType::Boolean, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -782,8 +745,8 @@ seastar::future<> testReadSingleBlockIntegerHappyPath(std::string filename) {
 
     {
         TSMWriter writer(filename);
-        std::vector<uint64_t> ts  = {100, 200, 300};
-        std::vector<int64_t>  vs  = {-10, 0, 42};
+        std::vector<uint64_t> ts = {100, 200, 300};
+        std::vector<int64_t> vs = {-10, 0, 42};
         writer.writeSeries(TSMValueType::Integer, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();
@@ -824,7 +787,7 @@ seastar::future<> testReadSingleBlockIntegerReadAsFloat(std::string filename) {
     {
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {100, 200};
-        std::vector<int64_t>  vs = {7, 8};
+        std::vector<int64_t> vs = {7, 8};
         writer.writeSeries(TSMValueType::Integer, seriesId, ts, vs);
         writer.writeIndex();
         writer.close();

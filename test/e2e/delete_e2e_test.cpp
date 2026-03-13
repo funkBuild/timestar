@@ -1,28 +1,25 @@
+#include "../test_helpers.hpp"
+#include "engine.hpp"
+#include "query_result.hpp"
+#include "timestar_value.hpp"
+
 #include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
-#include <chrono>
-#include <filesystem>
-
-#include "engine.hpp"
-#include "timestar_value.hpp"
-#include "query_result.hpp"
-#include "../test_helpers.hpp"
 
 namespace fs = std::filesystem;
 
 class DeleteE2ETest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 
     // Helper to insert test data
     seastar::future<> insertTestData(Engine* engine) {
@@ -78,9 +75,7 @@ protected:
 
     // Helper to verify query results
     void verifyQueryResult(const std::optional<VariantQueryResult>& result,
-                          const std::vector<uint64_t>& expectedTimestamps,
-                          const std::vector<double>& expectedValues) {
-
+                           const std::vector<uint64_t>& expectedTimestamps, const std::vector<double>& expectedValues) {
         ASSERT_TRUE(result.has_value()) << "Expected query result but got nullopt";
 
         if (std::holds_alternative<QueryResult<double>>(*result)) {
@@ -110,9 +105,8 @@ TEST_F(DeleteE2ETest, DeleteTimeRangeVerifyQuery) {
         // Query before deletion to verify data exists
         std::string seriesKey = "cpu,host=server01,region=us-east usage";
         auto beforeResult = engine->query(seriesKey, 0, UINT64_MAX).get();
-        verifyQueryResult(beforeResult,
-            {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
-            {10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5});
+        verifyQueryResult(beforeResult, {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
+                          {10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5});
 
         // Delete middle time range (3000-7000)
         bool deleted = engine->deleteRange(seriesKey, 3000, 7000).get();
@@ -120,10 +114,10 @@ TEST_F(DeleteE2ETest, DeleteTimeRangeVerifyQuery) {
 
         // Query after deletion - should only return points outside deleted range
         auto afterResult = engine->query(seriesKey, 0, UINT64_MAX).get();
-        verifyQueryResult(afterResult,
-            {1000, 2000, 8000, 9000, 10000},
-            {10.5, 20.5, 80.5, 90.5, 100.5});
-    }).join().get();
+        verifyQueryResult(afterResult, {1000, 2000, 8000, 9000, 10000}, {10.5, 20.5, 80.5, 90.5, 100.5});
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, DeleteByPatternVerifyQuery) {
@@ -154,7 +148,7 @@ TEST_F(DeleteE2ETest, DeleteByPatternVerifyQuery) {
         request.endTime = UINT64_MAX;
 
         auto result = engine->deleteByPattern(request).get();
-        EXPECT_EQ(result.seriesDeleted, 2); // usage and temperature fields
+        EXPECT_EQ(result.seriesDeleted, 2);  // usage and temperature fields
 
         // Query after deletion - cpu series should be empty
         auto cpuAfter1 = engine->query(cpuSeries1, 0, UINT64_MAX).get();
@@ -165,10 +159,11 @@ TEST_F(DeleteE2ETest, DeleteByPatternVerifyQuery) {
 
         // Memory series should still have data
         auto memoryAfter = engine->query(memorySeries, 0, UINT64_MAX).get();
-        verifyQueryResult(memoryAfter,
-            {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
-            {1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240});
-    }).join().get();
+        verifyQueryResult(memoryAfter, {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
+                          {1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240});
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, DeleteSpecificFieldVerifyQuery) {
@@ -197,14 +192,15 @@ TEST_F(DeleteE2ETest, DeleteSpecificFieldVerifyQuery) {
 
         // Usage field should still have data
         auto usageResult = engine->query(usageSeries, 0, UINT64_MAX).get();
-        verifyQueryResult(usageResult,
-            {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
-            {10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5});
+        verifyQueryResult(usageResult, {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
+                          {10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5});
 
         // Temperature field should be deleted
         auto tempResult = engine->query(tempSeries, 0, UINT64_MAX).get();
         EXPECT_TRUE(isQueryResultEmpty(tempResult));
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, PartialDeleteVerifyTimeRange) {
@@ -231,9 +227,7 @@ TEST_F(DeleteE2ETest, PartialDeleteVerifyTimeRange) {
 
         // Query full range
         auto fullResult = engine->query(seriesKey, 0, UINT64_MAX).get();
-        verifyQueryResult(fullResult,
-            {1000, 2000, 3000, 8000, 9000, 10000},
-            {10.5, 20.5, 30.5, 80.5, 90.5, 100.5});
+        verifyQueryResult(fullResult, {1000, 2000, 3000, 8000, 9000, 10000}, {10.5, 20.5, 30.5, 80.5, 90.5, 100.5});
 
         // Query deleted range - should return empty
         auto deletedRangeResult = engine->query(seriesKey, 4000, 7000).get();
@@ -241,10 +235,10 @@ TEST_F(DeleteE2ETest, PartialDeleteVerifyTimeRange) {
 
         // Query partial overlap with deleted range
         auto overlapResult = engine->query(seriesKey, 2000, 8000).get();
-        verifyQueryResult(overlapResult,
-            {2000, 3000, 8000},
-            {20.5, 30.5, 80.5});
-    }).join().get();
+        verifyQueryResult(overlapResult, {2000, 3000, 8000}, {20.5, 30.5, 80.5});
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, DeleteNonExistentDataVerifyNoChange) {
@@ -268,10 +262,11 @@ TEST_F(DeleteE2ETest, DeleteNonExistentDataVerifyNoChange) {
         // Verify existing data is unchanged
         std::string seriesKey = "cpu,host=server01,region=us-east usage";
         auto queryResult = engine->query(seriesKey, 0, UINT64_MAX).get();
-        verifyQueryResult(queryResult,
-            {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
-            {10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5});
-    }).join().get();
+        verifyQueryResult(queryResult, {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
+                          {10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5});
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, DeleteAllMeasurementDataVerifyEmpty) {
@@ -290,26 +285,25 @@ TEST_F(DeleteE2ETest, DeleteAllMeasurementDataVerifyEmpty) {
         request.endTime = UINT64_MAX;
 
         auto result = engine->deleteByPattern(request).get();
-        EXPECT_EQ(result.seriesDeleted, 3); // server01 usage & temp, server02 usage
+        EXPECT_EQ(result.seriesDeleted, 3);  // server01 usage & temp, server02 usage
 
         // Query all cpu series - should be empty
-        std::vector<std::string> cpuSeries = {
-            "cpu,host=server01,region=us-east usage",
-            "cpu,host=server01,region=us-east temperature",
-            "cpu,host=server02,region=us-east usage"
-        };
+        std::vector<std::string> cpuSeries = {"cpu,host=server01,region=us-east usage",
+                                              "cpu,host=server01,region=us-east temperature",
+                                              "cpu,host=server02,region=us-east usage"};
 
         for (const auto& series : cpuSeries) {
             auto result = engine->query(series, 0, UINT64_MAX).get();
-            EXPECT_TRUE(isQueryResultEmpty(result))
-                << "Series " << series << " should be empty after deletion";
+            EXPECT_TRUE(isQueryResultEmpty(result)) << "Series " << series << " should be empty after deletion";
         }
 
         // Memory series should still exist
         std::string memorySeries = "memory,host=server01,region=us-east usage";
         auto memoryResult = engine->query(memorySeries, 0, UINT64_MAX).get();
         ASSERT_FALSE(isQueryResultEmpty(memoryResult));
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, DeleteNonExistentSeriesIsGracefulNoOp) {
@@ -331,7 +325,9 @@ TEST_F(DeleteE2ETest, DeleteNonExistentSeriesIsGracefulNoOp) {
         auto result = engine->deleteByPattern(request).get();
         EXPECT_EQ(result.seriesDeleted, 0);
         EXPECT_TRUE(result.deletedSeries.empty());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, DeleteRangeNonExistentSeriesKeyIsGraceful) {
@@ -346,7 +342,9 @@ TEST_F(DeleteE2ETest, DeleteRangeNonExistentSeriesKeyIsGraceful) {
         std::string seriesKey = "nonexistent,host=nowhere usage";
         bool deleted = engine->deleteRange(seriesKey, 0, UINT64_MAX).get();
         EXPECT_FALSE(deleted);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(DeleteE2ETest, QueryNonExistentSeriesReturnsEmptyAfterInsert) {
@@ -363,7 +361,9 @@ TEST_F(DeleteE2ETest, QueryNonExistentSeriesReturnsEmptyAfterInsert) {
         std::string seriesKey = "disk,host=server99,region=eu-west iops";
         auto result = engine->query(seriesKey, 0, UINT64_MAX).get();
         EXPECT_TRUE(isQueryResultEmpty(result));
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // Note: This test file needs to be compiled with the Seastar test framework

@@ -2,27 +2,26 @@
 // Tests init/recovery, WAL-to-TSM conversion, memory store rollover,
 // concurrent batch inserts, error handling during WAL replay, and graceful shutdown.
 
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/tsm_file_manager.hpp"
+#include "../../../lib/storage/wal.hpp"
+#include "../../../lib/storage/wal_file_manager.hpp"
+#include "../../test_helpers.hpp"
+
 #include <gtest/gtest.h>
+
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <vector>
-#include <string>
-
-#include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
-#include "../../../lib/storage/wal_file_manager.hpp"
-#include "../../../lib/storage/tsm_file_manager.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/storage/wal.hpp"
-
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
 #include <seastar/core/shared_ptr.hh>
-
-#include "../../test_helpers.hpp"
+#include <seastar/core/thread.hh>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -32,13 +31,9 @@ namespace fs = std::filesystem;
 
 class WALFileManagerSeastarTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // ===========================================================================
@@ -61,7 +56,9 @@ TEST_F(WALFileManagerSeastarTest, InitCreatesMemoryStore) {
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 1u);
         EXPECT_DOUBLE_EQ(result.values[0], 20.5);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -83,7 +80,9 @@ TEST_F(WALFileManagerSeastarTest, RecoverFromExistingWALFiles) {
             eng->insert(std::move(insert)).get();
 
             // Engine stop flushes the current memory store WAL to disk
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 
     // Phase 2: Re-init the engine. WALFileManager should discover the WAL
@@ -101,7 +100,9 @@ TEST_F(WALFileManagerSeastarTest, RecoverFromExistingWALFiles) {
             EXPECT_DOUBLE_EQ(result.values[0], 50.0);
             EXPECT_DOUBLE_EQ(result.values[1], 60.0);
             EXPECT_DOUBLE_EQ(result.values[2], 70.0);
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 }
 
@@ -133,7 +134,9 @@ TEST_F(WALFileManagerSeastarTest, RecoverMultipleWALFiles) {
             eng->insert(std::move(insert2)).get();
 
             // Stop leaves the second WAL on disk
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 
     // Phase 2: Re-init should recover the remaining WAL file
@@ -153,7 +156,9 @@ TEST_F(WALFileManagerSeastarTest, RecoverMultipleWALFiles) {
             ASSERT_TRUE(r2.has_value());
             auto& result2 = std::get<QueryResult<double>>(r2.value());
             EXPECT_EQ(result2.timestamps.size(), 2u);
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 }
 
@@ -183,7 +188,9 @@ TEST_F(WALFileManagerSeastarTest, ConvertWalToTsmViaRollover) {
         EXPECT_EQ(result.timestamps.size(), 10u);
         EXPECT_DOUBLE_EQ(result.values[0], 1000.0);
         EXPECT_DOUBLE_EQ(result.values[9], 10000.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -246,7 +253,9 @@ TEST_F(WALFileManagerSeastarTest, ConvertWalToTsmMixedTypes) {
             EXPECT_EQ(qr.values[0], "running");
             EXPECT_EQ(qr.values[1], "stopped");
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -277,9 +286,10 @@ TEST_F(WALFileManagerSeastarTest, MultipleSequentialRollovers) {
         auto resultOpt = eng->query("load_test value", 0, UINT64_MAX).get();
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
-        EXPECT_EQ(result.timestamps.size(),
-                  static_cast<size_t>(numRollovers * pointsPerBatch));
-    }).join().get();
+        EXPECT_EQ(result.timestamps.size(), static_cast<size_t>(numRollovers * pointsPerBatch));
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -324,7 +334,9 @@ TEST_F(WALFileManagerSeastarTest, RolloverPreservesDataIntegrity) {
         EXPECT_EQ(result.timestamps.size(), 6u);
         EXPECT_DOUBLE_EQ(result.values[0], 10.0);
         EXPECT_DOUBLE_EQ(result.values[5], 60.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -354,13 +366,13 @@ TEST_F(WALFileManagerSeastarTest, BatchInsertMultipleSeries) {
         for (int i = 0; i < batchSize; ++i) {
             std::string seriesKey = "batch_test field_" + std::to_string(i);
             auto resultOpt = eng->query(seriesKey, 0, UINT64_MAX).get();
-            ASSERT_TRUE(resultOpt.has_value())
-                << "Series " << seriesKey << " not found";
+            ASSERT_TRUE(resultOpt.has_value()) << "Series " << seriesKey << " not found";
             auto& result = std::get<QueryResult<double>>(resultOpt.value());
-            EXPECT_EQ(result.timestamps.size(), 50u)
-                << "Series " << seriesKey << " has wrong number of points";
+            EXPECT_EQ(result.timestamps.size(), 50u) << "Series " << seriesKey << " has wrong number of points";
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -389,9 +401,10 @@ TEST_F(WALFileManagerSeastarTest, SequentialBatchInsertsSameSeries) {
         auto resultOpt = eng->query("sequential value", 0, UINT64_MAX).get();
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
-        EXPECT_EQ(result.timestamps.size(),
-                  static_cast<size_t>(numBatches * pointsPerBatch));
-    }).join().get();
+        EXPECT_EQ(result.timestamps.size(), static_cast<size_t>(numBatches * pointsPerBatch));
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -406,7 +419,9 @@ TEST_F(WALFileManagerSeastarTest, EmptyBatchInsertIsNoop) {
         std::vector<TimeStarInsert<double>> empty;
         auto timing = eng->insertBatch(std::move(empty)).get();
         EXPECT_EQ(timing.walWriteCount, 0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -430,7 +445,9 @@ TEST_F(WALFileManagerSeastarTest, WALReplayPreservesDeletes) {
 
             // Delete middle range
             eng->deleteRange("metric value", 2000, 4000).get();
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 
     // Phase 2: Re-init - WAL replay should apply the delete
@@ -446,7 +463,9 @@ TEST_F(WALFileManagerSeastarTest, WALReplayPreservesDeletes) {
             EXPECT_EQ(result.timestamps.size(), 2u);
             EXPECT_DOUBLE_EQ(result.values[0], 10.0);
             EXPECT_DOUBLE_EQ(result.values[1], 50.0);
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 }
 
@@ -467,7 +486,9 @@ TEST_F(WALFileManagerSeastarTest, GracefulShutdownPreservesData) {
             eng->insert(std::move(insert)).get();
 
             // ScopedEngine destructor calls engine->stop() which triggers close()
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 
     // Phase 2: Re-init should recover the data
@@ -482,7 +503,9 @@ TEST_F(WALFileManagerSeastarTest, GracefulShutdownPreservesData) {
             EXPECT_EQ(result.timestamps.size(), 2u);
             EXPECT_DOUBLE_EQ(result.values[0], 100.0);
             EXPECT_DOUBLE_EQ(result.values[1], 200.0);
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 }
 
@@ -517,7 +540,9 @@ TEST_F(WALFileManagerSeastarTest, InsertAfterRolloverWorks) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 4u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -537,7 +562,9 @@ TEST_F(WALFileManagerSeastarTest, GetSeriesTypeFloat) {
         auto resultOpt = eng->query("temperature value", 0, UINT64_MAX).get();
         ASSERT_TRUE(resultOpt.has_value());
         EXPECT_TRUE(std::holds_alternative<QueryResult<double>>(resultOpt.value()));
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(WALFileManagerSeastarTest, GetSeriesTypeBool) {
@@ -552,7 +579,9 @@ TEST_F(WALFileManagerSeastarTest, GetSeriesTypeBool) {
         auto resultOpt = eng->query("door open", 0, UINT64_MAX).get();
         ASSERT_TRUE(resultOpt.has_value());
         EXPECT_TRUE(std::holds_alternative<QueryResult<bool>>(resultOpt.value()));
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(WALFileManagerSeastarTest, GetSeriesTypeString) {
@@ -567,7 +596,9 @@ TEST_F(WALFileManagerSeastarTest, GetSeriesTypeString) {
         auto resultOpt = eng->query("app log", 0, UINT64_MAX).get();
         ASSERT_TRUE(resultOpt.has_value());
         EXPECT_TRUE(std::holds_alternative<QueryResult<std::string>>(resultOpt.value()));
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -590,7 +621,9 @@ TEST_F(WALFileManagerSeastarTest, QueryMemoryStoreReturnsData) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 3u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -619,7 +652,9 @@ TEST_F(WALFileManagerSeastarTest, DeleteFromMemoryStores) {
         EXPECT_EQ(result.timestamps.size(), 2u);
         EXPECT_DOUBLE_EQ(result.values[0], 10.0);
         EXPECT_DOUBLE_EQ(result.values[1], 40.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -634,7 +669,9 @@ TEST_F(WALFileManagerSeastarTest, DeleteNonExistentSeriesFromMemoryStore) {
         // Delete from a series that was never inserted
         bool deleted = eng->deleteRange("nonexistent value", 0, UINT64_MAX).get();
         EXPECT_FALSE(deleted);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -673,7 +710,9 @@ TEST_F(WALFileManagerSeastarTest, LargeBatchInsertAndRollover) {
             EXPECT_EQ(result.timestamps.size(), static_cast<size_t>(pointsPerSeries))
                 << "Series " << key << " has wrong point count after rollover";
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -705,7 +744,9 @@ TEST_F(WALFileManagerSeastarTest, MixedTypeRecovery) {
                 insert.addValue(2000, std::string("zone-b"));
                 eng->insert(std::move(insert)).get();
             }
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 
     // Phase 2: Recover and verify all types
@@ -735,7 +776,9 @@ TEST_F(WALFileManagerSeastarTest, MixedTypeRecovery) {
                 EXPECT_EQ(qr.values.size(), 2u);
                 EXPECT_EQ(qr.values[0], "zone-a");
             }
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 }
 
@@ -767,7 +810,9 @@ TEST_F(WALFileManagerSeastarTest, InsertWithTagsPreservedThroughRollover) {
         EXPECT_EQ(result.timestamps.size(), 2u);
         EXPECT_DOUBLE_EQ(result.values[0], 72.5);
         EXPECT_DOUBLE_EQ(result.values[1], 73.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -791,7 +836,9 @@ TEST_F(WALFileManagerSeastarTest, RolloverEmptyMemoryStoreIsSafe) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 1u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -835,7 +882,9 @@ TEST_F(WALFileManagerSeastarTest, BatchInsertBooleanType) {
             auto& qr = std::get<QueryResult<bool>>(r.value());
             EXPECT_EQ(qr.values.size(), 2u);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -878,7 +927,9 @@ TEST_F(WALFileManagerSeastarTest, BatchInsertStringType) {
             EXPECT_EQ(qr.values.size(), 2u);
             EXPECT_EQ(qr.values[0], "INFO");
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -910,7 +961,9 @@ TEST_F(WALFileManagerSeastarTest, RecoveryAfterInsertRolloverInsertCycle) {
             }
 
             // Shutdown - second batch WAL remains on disk
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 
     // Phase 2: Recovery should bring back both batches
@@ -938,7 +991,9 @@ TEST_F(WALFileManagerSeastarTest, RecoveryAfterInsertRolloverInsertCycle) {
                 EXPECT_DOUBLE_EQ(qr.values[0], 3.0);
                 EXPECT_DOUBLE_EQ(qr.values[1], 4.0);
             }
-        }).join().get();
+        })
+            .join()
+            .get();
     }
 }
 
@@ -969,9 +1024,9 @@ TEST_F(WALFileManagerSeastarTest, ShardedWALFileManagerOperatesIndependently) {
             SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
             unsigned shard = SeriesId128::Hash{}(sid) % seastar::smp::count;
 
-            auto resultOpt = eng.eng.invoke_on(shard, [seriesKey](Engine& engine) {
-                return engine.query(seriesKey, 0, UINT64_MAX);
-            }).get();
+            auto resultOpt =
+                eng.eng.invoke_on(shard, [seriesKey](Engine& engine) { return engine.query(seriesKey, 0, UINT64_MAX); })
+                    .get();
 
             if (resultOpt.has_value()) {
                 auto& result = std::get<QueryResult<double>>(resultOpt.value());
@@ -980,7 +1035,9 @@ TEST_F(WALFileManagerSeastarTest, ShardedWALFileManagerOperatesIndependently) {
             }
         }
         EXPECT_EQ(foundCount, 8);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -1007,7 +1064,9 @@ TEST_F(WALFileManagerSeastarTest, DoubleRolloverWithoutInsert) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 1u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -1038,7 +1097,9 @@ TEST_F(WALFileManagerSeastarTest, DeleteThenRolloverPreservesDeletion) {
         EXPECT_EQ(result.timestamps.size(), 2u);
         EXPECT_DOUBLE_EQ(result.values[0], 10.0);
         EXPECT_DOUBLE_EQ(result.values[1], 30.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -1061,5 +1122,7 @@ TEST_F(WALFileManagerSeastarTest, ManySmallInserts) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), static_cast<size_t>(numInserts));
-    }).join().get();
+    })
+        .join()
+        .get();
 }

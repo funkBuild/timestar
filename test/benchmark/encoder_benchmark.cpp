@@ -1,19 +1,19 @@
+#include "aligned_buffer.hpp"
+#include "bool_encoder.hpp"
+#include "compressed_buffer.hpp"
+#include "float_encoder.hpp"
+#include "integer_encoder.hpp"
+#include "slice_buffer.hpp"
+
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <vector>
-#include <cstring>
-#include <cmath>
-#include <algorithm>
-#include <numeric>
-
-#include "integer_encoder.hpp"
-#include "float_encoder.hpp"
-#include "bool_encoder.hpp"
-#include "aligned_buffer.hpp"
-#include "compressed_buffer.hpp"
-#include "slice_buffer.hpp"
 
 using namespace std::chrono;
 
@@ -58,7 +58,7 @@ std::vector<uint64_t> generateIntegerData(size_t count, bool sorted = true) {
     std::vector<uint64_t> data;
     data.reserve(count);
 
-    std::mt19937_64 gen(42);  // Fixed seed for reproducibility
+    std::mt19937_64 gen(42);                 // Fixed seed for reproducibility
     uint64_t base = 1700000000000000000ULL;  // Realistic timestamp base (nanoseconds)
 
     if (sorted) {
@@ -132,27 +132,26 @@ std::vector<bool> generateBoolData(size_t count, double true_probability = 0.5) 
 }
 
 // Verify data correctness
-template<typename T>
+template <typename T>
 bool verifyData(const std::vector<T>& original, const std::vector<T>& decoded) {
     if (original.size() != decoded.size()) {
-        std::cerr << RED << "Size mismatch: original=" << original.size()
-                  << " decoded=" << decoded.size() << RESET << std::endl;
+        std::cerr << RED << "Size mismatch: original=" << original.size() << " decoded=" << decoded.size() << RESET
+                  << std::endl;
         return false;
     }
 
     for (size_t i = 0; i < original.size(); ++i) {
         if (original[i] != decoded[i]) {
-            std::cerr << RED << "Data mismatch at index " << i
-                      << ": original=" << original[i]
+            std::cerr << RED << "Data mismatch at index " << i << ": original=" << original[i]
                       << " decoded=" << decoded[i] << RESET << std::endl;
             // For debugging, show more context
             if (i > 0) {
-                std::cerr << "  Previous [" << (i-1) << "]: orig=" << original[i-1]
-                         << " decoded=" << decoded[i-1] << std::endl;
+                std::cerr << "  Previous [" << (i - 1) << "]: orig=" << original[i - 1] << " decoded=" << decoded[i - 1]
+                          << std::endl;
             }
             if (i < original.size() - 1) {
-                std::cerr << "  Next [" << (i+1) << "]: orig=" << original[i+1]
-                         << " decoded=" << decoded[i+1] << std::endl;
+                std::cerr << "  Next [" << (i + 1) << "]: orig=" << original[i + 1] << " decoded=" << decoded[i + 1]
+                          << std::endl;
             }
             return false;
         }
@@ -162,11 +161,11 @@ bool verifyData(const std::vector<T>& original, const std::vector<T>& decoded) {
 }
 
 // Specialized version for floating point comparison with epsilon
-template<>
+template <>
 bool verifyData<double>(const std::vector<double>& original, const std::vector<double>& decoded) {
     if (original.size() != decoded.size()) {
-        std::cerr << RED << "Size mismatch: original=" << original.size()
-                  << " decoded=" << decoded.size() << RESET << std::endl;
+        std::cerr << RED << "Size mismatch: original=" << original.size() << " decoded=" << decoded.size() << RESET
+                  << std::endl;
         return false;
     }
 
@@ -174,14 +173,11 @@ bool verifyData<double>(const std::vector<double>& original, const std::vector<d
     for (size_t i = 0; i < original.size(); ++i) {
         double diff = std::abs(original[i] - decoded[i]);
         // Check both absolute and relative error
-        bool matches = (diff < epsilon) ||
-                      (diff < epsilon * std::abs(original[i]));
+        bool matches = (diff < epsilon) || (diff < epsilon * std::abs(original[i]));
 
         if (!matches) {
-            std::cerr << RED << "Data mismatch at index " << i
-                      << ": original=" << std::fixed << std::setprecision(6) << original[i]
-                      << " decoded=" << decoded[i]
-                      << " (diff=" << diff << ")" << RESET << std::endl;
+            std::cerr << RED << "Data mismatch at index " << i << ": original=" << std::fixed << std::setprecision(6)
+                      << original[i] << " decoded=" << decoded[i] << " (diff=" << diff << ")" << RESET << std::endl;
             return false;
         }
     }
@@ -238,16 +234,14 @@ BenchmarkResult benchmarkIntegerEncoder(const std::vector<uint64_t>& data) {
     auto decode_end = high_resolution_clock::now();
 
     // Calculate metrics
-    result.encode_time_ms = duration_cast<microseconds>(encode_end - encode_start).count() /
-                            (1000.0 * BENCHMARK_ITERATIONS);
-    result.decode_time_ms = duration_cast<microseconds>(decode_end - decode_start).count() /
-                            (1000.0 * BENCHMARK_ITERATIONS);
+    result.encode_time_ms =
+        duration_cast<microseconds>(encode_end - encode_start).count() / (1000.0 * BENCHMARK_ITERATIONS);
+    result.decode_time_ms =
+        duration_cast<microseconds>(decode_end - decode_start).count() / (1000.0 * BENCHMARK_ITERATIONS);
 
     result.compression_ratio = static_cast<double>(result.original_size) / result.encoded_size;
-    result.encode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) /
-                                    (result.encode_time_ms / 1000.0);
-    result.decode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) /
-                                    (result.decode_time_ms / 1000.0);
+    result.encode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) / (result.encode_time_ms / 1000.0);
+    result.decode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) / (result.decode_time_ms / 1000.0);
 
     // Verify correctness
     result.correct = verifyData(data, decoded);
@@ -270,7 +264,7 @@ BenchmarkResult benchmarkFloatEncoder(const std::vector<double>& data) {
         encodeBuffer = FloatEncoder::encode(data);
         decoded.clear();
         CompressedSlice slice(reinterpret_cast<const uint8_t*>(encodeBuffer.data.data()),
-                             encodeBuffer.data.size() * sizeof(uint64_t));
+                              encodeBuffer.data.size() * sizeof(uint64_t));
         FloatDecoder::decode(slice, 0, data.size(), decoded);
     }
 
@@ -288,22 +282,20 @@ BenchmarkResult benchmarkFloatEncoder(const std::vector<double>& data) {
     for (size_t i = 0; i < BENCHMARK_ITERATIONS; ++i) {
         decoded.clear();
         CompressedSlice slice(reinterpret_cast<const uint8_t*>(encodeBuffer.data.data()),
-                             encodeBuffer.data.size() * sizeof(uint64_t));
+                              encodeBuffer.data.size() * sizeof(uint64_t));
         FloatDecoder::decode(slice, 0, data.size(), decoded);
     }
     auto decode_end = high_resolution_clock::now();
 
     // Calculate metrics
-    result.encode_time_ms = duration_cast<microseconds>(encode_end - encode_start).count() /
-                            (1000.0 * BENCHMARK_ITERATIONS);
-    result.decode_time_ms = duration_cast<microseconds>(decode_end - decode_start).count() /
-                            (1000.0 * BENCHMARK_ITERATIONS);
+    result.encode_time_ms =
+        duration_cast<microseconds>(encode_end - encode_start).count() / (1000.0 * BENCHMARK_ITERATIONS);
+    result.decode_time_ms =
+        duration_cast<microseconds>(decode_end - decode_start).count() / (1000.0 * BENCHMARK_ITERATIONS);
 
     result.compression_ratio = static_cast<double>(result.original_size) / result.encoded_size;
-    result.encode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) /
-                                    (result.encode_time_ms / 1000.0);
-    result.decode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) /
-                                    (result.decode_time_ms / 1000.0);
+    result.encode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) / (result.encode_time_ms / 1000.0);
+    result.decode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) / (result.decode_time_ms / 1000.0);
 
     // Verify correctness
     result.correct = verifyData(data, decoded);
@@ -348,16 +340,14 @@ BenchmarkResult benchmarkBoolEncoder(const std::vector<bool>& data) {
     auto decode_end = high_resolution_clock::now();
 
     // Calculate metrics
-    result.encode_time_ms = duration_cast<microseconds>(encode_end - encode_start).count() /
-                            (1000.0 * BENCHMARK_ITERATIONS);
-    result.decode_time_ms = duration_cast<microseconds>(decode_end - decode_start).count() /
-                            (1000.0 * BENCHMARK_ITERATIONS);
+    result.encode_time_ms =
+        duration_cast<microseconds>(encode_end - encode_start).count() / (1000.0 * BENCHMARK_ITERATIONS);
+    result.decode_time_ms =
+        duration_cast<microseconds>(decode_end - decode_start).count() / (1000.0 * BENCHMARK_ITERATIONS);
 
     result.compression_ratio = static_cast<double>(result.original_size) / result.encoded_size;
-    result.encode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) /
-                                    (result.encode_time_ms / 1000.0);
-    result.decode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) /
-                                    (result.decode_time_ms / 1000.0);
+    result.encode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) / (result.encode_time_ms / 1000.0);
+    result.decode_throughput_mbps = (result.original_size / (1024.0 * 1024.0)) / (result.decode_time_ms / 1000.0);
 
     // Verify correctness
     result.correct = verifyData(data, decoded);
@@ -380,21 +370,21 @@ void printResult(const std::string& encoder_name, const BenchmarkResult& result)
     std::cout << "\nSize Metrics:" << std::endl;
     std::cout << "  Original size:    " << formatBytes(result.original_size) << std::endl;
     std::cout << "  Encoded size:     " << formatBytes(result.encoded_size) << std::endl;
-    std::cout << "  Compression ratio: " << std::fixed << std::setprecision(2)
-              << result.compression_ratio << ":1" << std::endl;
+    std::cout << "  Compression ratio: " << std::fixed << std::setprecision(2) << result.compression_ratio << ":1"
+              << std::endl;
     std::cout << "  Space saving:     " << std::fixed << std::setprecision(1)
-              << ((1.0 - 1.0/result.compression_ratio) * 100) << "%" << std::endl;
+              << ((1.0 - 1.0 / result.compression_ratio) * 100) << "%" << std::endl;
 
     // Performance metrics
     std::cout << "\nPerformance Metrics:" << std::endl;
-    std::cout << "  Encode time:      " << std::fixed << std::setprecision(3)
-              << result.encode_time_ms << " ms" << std::endl;
-    std::cout << "  Decode time:      " << std::fixed << std::setprecision(3)
-              << result.decode_time_ms << " ms" << std::endl;
-    std::cout << "  Encode throughput: " << BOLD << formatThroughput(result.encode_throughput_mbps)
-              << RESET << std::endl;
-    std::cout << "  Decode throughput: " << BOLD << formatThroughput(result.decode_throughput_mbps)
-              << RESET << std::endl;
+    std::cout << "  Encode time:      " << std::fixed << std::setprecision(3) << result.encode_time_ms << " ms"
+              << std::endl;
+    std::cout << "  Decode time:      " << std::fixed << std::setprecision(3) << result.decode_time_ms << " ms"
+              << std::endl;
+    std::cout << "  Encode throughput: " << BOLD << formatThroughput(result.encode_throughput_mbps) << RESET
+              << std::endl;
+    std::cout << "  Decode throughput: " << BOLD << formatThroughput(result.decode_throughput_mbps) << RESET
+              << std::endl;
 }
 
 // Print summary table
@@ -403,32 +393,25 @@ void printSummaryTable(const std::vector<std::pair<std::string, BenchmarkResult>
     std::cout << std::endl;
 
     // Header
-    std::cout << std::left << std::setw(15) << "Encoder"
-              << std::right << std::setw(12) << "Compression"
-              << std::setw(15) << "Encode (MB/s)"
-              << std::setw(15) << "Decode (MB/s)"
-              << std::setw(12) << "Correctness" << std::endl;
+    std::cout << std::left << std::setw(15) << "Encoder" << std::right << std::setw(12) << "Compression"
+              << std::setw(15) << "Encode (MB/s)" << std::setw(15) << "Decode (MB/s)" << std::setw(12) << "Correctness"
+              << std::endl;
     std::cout << std::string(69, '-') << std::endl;
 
     // Data rows
     for (const auto& [name, result] : results) {
-        std::cout << std::left << std::setw(15) << name
-                  << std::right << std::setw(11) << std::fixed << std::setprecision(2)
-                  << result.compression_ratio << ":1"
-                  << std::setw(15) << std::fixed << std::setprecision(2)
-                  << result.encode_throughput_mbps
-                  << std::setw(15) << std::fixed << std::setprecision(2)
-                  << result.decode_throughput_mbps
-                  << std::setw(12) << (result.correct ? "✓ PASS" : "✗ FAIL")
-                  << std::endl;
+        std::cout << std::left << std::setw(15) << name << std::right << std::setw(11) << std::fixed
+                  << std::setprecision(2) << result.compression_ratio << ":1" << std::setw(15) << std::fixed
+                  << std::setprecision(2) << result.encode_throughput_mbps << std::setw(15) << std::fixed
+                  << std::setprecision(2) << result.decode_throughput_mbps << std::setw(12)
+                  << (result.correct ? "✓ PASS" : "✗ FAIL") << std::endl;
     }
 }
 
 int main() {
     std::cout << BOLD << "TimeStar Encoder Benchmark Suite" << RESET << std::endl;
     std::cout << "Dataset size: " << DATASET_SIZE << " entries per encoder" << std::endl;
-    std::cout << "Iterations: " << BENCHMARK_ITERATIONS << " (after "
-              << WARMUP_ITERATIONS << " warmup)" << std::endl;
+    std::cout << "Iterations: " << BENCHMARK_ITERATIONS << " (after " << WARMUP_ITERATIONS << " warmup)" << std::endl;
 
     std::vector<std::pair<std::string, BenchmarkResult>> all_results;
 
@@ -465,7 +448,8 @@ int main() {
     // Benchmark Float Encoder (random)
     {
         std::cout << "\n" << YELLOW << "Generating random float data..." << RESET << std::endl;
-        std::cout << RED << "NOTE: Known bug with random float data - see BUG_REPORT_FLOAT_ENCODER.md" << RESET << std::endl;
+        std::cout << RED << "NOTE: Known bug with random float data - see BUG_REPORT_FLOAT_ENCODER.md" << RESET
+                  << std::endl;
         auto data = generateFloatData(DATASET_SIZE, false);
         std::cout << "Running float encoder benchmark..." << std::endl;
         auto result = benchmarkFloatEncoder(data);
@@ -475,8 +459,7 @@ int main() {
 
     // Benchmark Bool Encoder (balanced)
     {
-        std::cout << "\n" << YELLOW << "Generating balanced boolean data (50% true)..."
-                  << RESET << std::endl;
+        std::cout << "\n" << YELLOW << "Generating balanced boolean data (50% true)..." << RESET << std::endl;
         auto data = generateBoolData(DATASET_SIZE, 0.5);
         std::cout << "Running bool encoder benchmark..." << std::endl;
         auto result = benchmarkBoolEncoder(data);
@@ -486,8 +469,7 @@ int main() {
 
     // Benchmark Bool Encoder (sparse)
     {
-        std::cout << "\n" << YELLOW << "Generating sparse boolean data (10% true)..."
-                  << RESET << std::endl;
+        std::cout << "\n" << YELLOW << "Generating sparse boolean data (10% true)..." << RESET << std::endl;
         auto data = generateBoolData(DATASET_SIZE, 0.1);
         std::cout << "Running bool encoder benchmark..." << std::endl;
         auto result = benchmarkBoolEncoder(data);
@@ -500,12 +482,13 @@ int main() {
 
     // Final verdict
     std::cout << "\n" << BOLD;
-    bool all_correct = std::all_of(all_results.begin(), all_results.end(),
-                                   [](const auto& p) { return p.second.correct; });
+    bool all_correct =
+        std::all_of(all_results.begin(), all_results.end(), [](const auto& p) { return p.second.correct; });
     if (all_correct) {
         std::cout << GREEN << "✓ All encoders passed correctness tests!" << RESET << std::endl;
     } else {
-        std::cout << YELLOW << "⚠ Float encoder has a known bug with random data containing large deltas." << RESET << std::endl;
+        std::cout << YELLOW << "⚠ Float encoder has a known bug with random data containing large deltas." << RESET
+                  << std::endl;
         std::cout << YELLOW << "  See BUG_REPORT_FLOAT_ENCODER.md for details." << RESET << std::endl;
         std::cout << YELLOW << "  Other encoders passed correctness tests." << RESET << std::endl;
     }

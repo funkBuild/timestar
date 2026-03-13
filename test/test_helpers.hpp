@@ -1,14 +1,15 @@
 #pragma once
 
+#include "engine.hpp"
+#include "series_id.hpp"
+
 #include <exception>
 #include <filesystem>
 #include <iostream>
-#include <string>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
-#include "engine.hpp"
-#include "series_id.hpp"
+#include <string>
 
 namespace fs = std::filesystem;
 
@@ -25,14 +26,12 @@ inline void shardedInsert(seastar::sharded<Engine>& eng, TimeStarInsert<T> inser
     unsigned shard = SeriesId128::Hash{}(seriesId) % seastar::smp::count;
 
     // Index metadata on shard 0 first
-    eng.invoke_on(0, [insert](Engine& engine) mutable {
-        return engine.indexMetadata(insert);
-    }).get();
+    eng.invoke_on(0, [insert](Engine& engine) mutable { return engine.indexMetadata(insert); }).get();
 
     // Insert data on the target shard
-    eng.invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
-        return engine.insert(std::move(insert));
-    }).get();
+    eng.invoke_on(shard,
+                  [insert = std::move(insert)](Engine& engine) mutable { return engine.insert(std::move(insert)); })
+        .get();
 }
 
 /**
@@ -72,9 +71,7 @@ public:
 
     ScopedEngine() : engine(std::make_unique<Engine>()) {}
 
-    void init() {
-        engine->init().get();
-    }
+    void init() { engine->init().get(); }
 
     void initWithBackground() {
         engine->init().get();
@@ -121,29 +118,25 @@ public:
 
     void start() {
         eng.start().get();
-        eng.invoke_on_all([](Engine& engine) {
-            return engine.init();
-        }).get();
+        eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
         // Set back-reference for cross-shard metadata indexing
         eng.invoke_on_all([this](Engine& engine) {
-            engine.setShardedRef(&eng);
-            return seastar::make_ready_future<>();
-        }).get();
+               engine.setShardedRef(&eng);
+               return seastar::make_ready_future<>();
+           })
+            .get();
     }
 
     void startWithBackground() {
         eng.start().get();
-        eng.invoke_on_all([](Engine& engine) {
-            return engine.init();
-        }).get();
+        eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
         // Set back-reference for cross-shard metadata indexing
         eng.invoke_on_all([this](Engine& engine) {
-            engine.setShardedRef(&eng);
-            return seastar::make_ready_future<>();
-        }).get();
-        eng.invoke_on_all([](Engine& engine) {
-            return engine.startBackgroundTasks();
-        }).get();
+               engine.setShardedRef(&eng);
+               return seastar::make_ready_future<>();
+           })
+            .get();
+        eng.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); }).get();
     }
 
     seastar::sharded<Engine>& operator*() { return eng; }
@@ -151,9 +144,7 @@ public:
 
     ~ScopedShardedEngine() {
         try {
-            eng.invoke_on_all([](Engine& engine) {
-                return engine.stop();
-            }).get();
+            eng.invoke_on_all([](Engine& engine) { return engine.stop(); }).get();
             eng.stop().get();
         } catch (...) {
             // Swallow errors during cleanup

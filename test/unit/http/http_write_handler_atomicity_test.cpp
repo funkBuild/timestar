@@ -1,8 +1,9 @@
 #include <gtest/gtest.h>
-#include <string>
-#include <vector>
+
 #include <map>
+#include <string>
 #include <variant>
+#include <vector>
 
 // This test file verifies the ordering contract in processWritePoint():
 // Data must be inserted BEFORE metadata is indexed. This is the crash-safe
@@ -64,18 +65,22 @@ protected:
     // Extract the processWritePoint function body from source
     std::string extractProcessWritePoint() const {
         size_t start = sourceCode.find("HttpWriteHandler::processWritePoint(");
-        if (start == std::string::npos) return "";
+        if (start == std::string::npos)
+            return "";
 
         // Find the opening brace of the function
         size_t braceStart = sourceCode.find('{', start);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
 
         // Find matching closing brace (simple brace counting)
         int braceCount = 1;
         size_t pos = braceStart + 1;
         while (pos < sourceCode.size() && braceCount > 0) {
-            if (sourceCode[pos] == '{') braceCount++;
-            else if (sourceCode[pos] == '}') braceCount--;
+            if (sourceCode[pos] == '{')
+                braceCount++;
+            else if (sourceCode[pos] == '}')
+                braceCount--;
             pos++;
         }
 
@@ -85,8 +90,7 @@ protected:
 
 // Verify that the source file was successfully loaded
 TEST_F(HttpWriteHandlerAtomicityTest, SourceFileLoaded) {
-    ASSERT_FALSE(sourceCode.empty())
-        << "Could not load http_write_handler.cpp source file";
+    ASSERT_FALSE(sourceCode.empty()) << "Could not load http_write_handler.cpp source file";
     ASSERT_NE(sourceCode.find("processWritePoint"), std::string::npos)
         << "Source file does not contain processWritePoint";
 }
@@ -94,18 +98,13 @@ TEST_F(HttpWriteHandlerAtomicityTest, SourceFileLoaded) {
 // Verify processWritePoint function exists and has the expected structure
 TEST_F(HttpWriteHandlerAtomicityTest, ProcessWritePointExists) {
     std::string funcBody = extractProcessWritePoint();
-    ASSERT_FALSE(funcBody.empty())
-        << "Could not extract processWritePoint function body";
+    ASSERT_FALSE(funcBody.empty()) << "Could not extract processWritePoint function body";
 
     // Should contain all 4 type branches
-    EXPECT_NE(funcBody.find("holds_alternative<double>"), std::string::npos)
-        << "Missing double branch";
-    EXPECT_NE(funcBody.find("holds_alternative<bool>"), std::string::npos)
-        << "Missing bool branch";
-    EXPECT_NE(funcBody.find("holds_alternative<std::string>"), std::string::npos)
-        << "Missing string branch";
-    EXPECT_NE(funcBody.find("holds_alternative<int64_t>"), std::string::npos)
-        << "Missing int64_t branch";
+    EXPECT_NE(funcBody.find("holds_alternative<double>"), std::string::npos) << "Missing double branch";
+    EXPECT_NE(funcBody.find("holds_alternative<bool>"), std::string::npos) << "Missing bool branch";
+    EXPECT_NE(funcBody.find("holds_alternative<std::string>"), std::string::npos) << "Missing string branch";
+    EXPECT_NE(funcBody.find("holds_alternative<int64_t>"), std::string::npos) << "Missing int64_t branch";
 }
 
 // Core test: In processWritePoint, data dispatch (when_all_succeed on shard inserts)
@@ -123,12 +122,10 @@ TEST_F(HttpWriteHandlerAtomicityTest, DoubleBranchDataBeforeMetadata) {
 
     ASSERT_NE(dataDispatchPos, std::string::npos)
         << "Could not find when_all_succeed (parallel shard dispatch) in processWritePoint";
-    ASSERT_NE(metadataPos, std::string::npos)
-        << "Could not find indexMetadataSync in processWritePoint";
+    ASSERT_NE(metadataPos, std::string::npos) << "Could not find indexMetadataSync in processWritePoint";
 
-    EXPECT_LT(dataDispatchPos, metadataPos)
-        << "BUG: indexMetadataSync appears BEFORE when_all_succeed. "
-           "Data must be inserted before metadata for crash safety.";
+    EXPECT_LT(dataDispatchPos, metadataPos) << "BUG: indexMetadataSync appears BEFORE when_all_succeed. "
+                                               "Data must be inserted before metadata for crash safety.";
 }
 
 // Verify all 4 type branches exist in the grouping phase
@@ -137,20 +134,15 @@ TEST_F(HttpWriteHandlerAtomicityTest, BoolBranchDataBeforeMetadata) {
     ASSERT_FALSE(funcBody.empty());
 
     // All 4 type branches should exist in the grouping phase
-    EXPECT_NE(funcBody.find("holds_alternative<double>"), std::string::npos)
-        << "Missing double type handling";
-    EXPECT_NE(funcBody.find("holds_alternative<bool>"), std::string::npos)
-        << "Missing bool type handling";
-    EXPECT_NE(funcBody.find("holds_alternative<std::string>"), std::string::npos)
-        << "Missing string type handling";
-    EXPECT_NE(funcBody.find("holds_alternative<int64_t>"), std::string::npos)
-        << "Missing int64_t type handling";
+    EXPECT_NE(funcBody.find("holds_alternative<double>"), std::string::npos) << "Missing double type handling";
+    EXPECT_NE(funcBody.find("holds_alternative<bool>"), std::string::npos) << "Missing bool type handling";
+    EXPECT_NE(funcBody.find("holds_alternative<std::string>"), std::string::npos) << "Missing string type handling";
+    EXPECT_NE(funcBody.find("holds_alternative<int64_t>"), std::string::npos) << "Missing int64_t type handling";
 
     // Inserts should be dispatched via engine.insert or engine.insertBatch
     bool hasInsert = funcBody.find("engine.insert(") != std::string::npos ||
                      funcBody.find("engine.insertBatch(") != std::string::npos;
-    EXPECT_TRUE(hasInsert)
-        << "Could not find engine.insert() or engine.insertBatch() in processWritePoint";
+    EXPECT_TRUE(hasInsert) << "Could not find engine.insert() or engine.insertBatch() in processWritePoint";
 }
 
 // Verify metadata uses synchronous indexMetadataSync, not per-field individual calls
@@ -168,15 +160,13 @@ TEST_F(HttpWriteHandlerAtomicityTest, StringBranchDataBeforeMetadata) {
     int individualCalls = 0;
     while ((pos = funcBody.find("indexMetadata(", pos)) != std::string::npos) {
         // Check it's not indexMetadataBatch or indexMetadataSync
-        if (funcBody.substr(pos, 19) != "indexMetadataBatch(" &&
-            funcBody.substr(pos, 18) != "indexMetadataSync(") {
+        if (funcBody.substr(pos, 19) != "indexMetadataBatch(" && funcBody.substr(pos, 18) != "indexMetadataSync(") {
             individualCalls++;
         }
         pos++;
     }
-    EXPECT_EQ(individualCalls, 0)
-        << "processWritePoint should not call individual indexMetadata(); "
-           "use indexMetadataSync() instead for synchronous metadata indexing";
+    EXPECT_EQ(individualCalls, 0) << "processWritePoint should not call individual indexMetadata(); "
+                                     "use indexMetadataSync() instead for synchronous metadata indexing";
 }
 
 // Verify parallel shard dispatch structure exists
@@ -191,11 +181,10 @@ TEST_F(HttpWriteHandlerAtomicityTest, Int64BranchDataBeforeMetadata) {
         << "processWritePoint should use when_all_succeed for parallel shard dispatch";
 
     // The skipMetadataIndexing=true pattern should be used
-    bool hasSkipMeta = funcBody.find("true") != std::string::npos &&
-                       (funcBody.find("skipMetadata") != std::string::npos ||
-                        funcBody.find("engine.insert(std::move(") != std::string::npos);
-    EXPECT_TRUE(hasSkipMeta)
-        << "processWritePoint should pass skipMetadataIndexing=true to engine.insert()";
+    bool hasSkipMeta =
+        funcBody.find("true") != std::string::npos && (funcBody.find("skipMetadata") != std::string::npos ||
+                                                       funcBody.find("engine.insert(std::move(") != std::string::npos);
+    EXPECT_TRUE(hasSkipMeta) << "processWritePoint should pass skipMetadataIndexing=true to engine.insert()";
 }
 
 // Verify that the batch path (processMultiWritePoint) already has the correct ordering:
@@ -213,8 +202,10 @@ TEST_F(HttpWriteHandlerAtomicityTest, BatchPathDataBeforeMetadata) {
     int braceCount = 1;
     size_t pos = braceStart + 1;
     while (pos < sourceCode.size() && braceCount > 0) {
-        if (sourceCode[pos] == '{') braceCount++;
-        else if (sourceCode[pos] == '}') braceCount--;
+        if (sourceCode[pos] == '{')
+            braceCount++;
+        else if (sourceCode[pos] == '}')
+            braceCount--;
         pos++;
     }
     std::string batchBody = sourceCode.substr(funcStart, pos - funcStart);
@@ -238,12 +229,9 @@ TEST_F(HttpWriteHandlerAtomicityTest, CrashSafetyCommentExists) {
     // Check that there is a comment explaining the ordering rationale
     bool hasDataFirstComment =
         funcBody.find("data before metadata") != std::string::npos ||
-        funcBody.find("data first") != std::string::npos ||
-        funcBody.find("Insert data first") != std::string::npos ||
-        funcBody.find("crash safety") != std::string::npos ||
-        funcBody.find("crash-safe") != std::string::npos;
+        funcBody.find("data first") != std::string::npos || funcBody.find("Insert data first") != std::string::npos ||
+        funcBody.find("crash safety") != std::string::npos || funcBody.find("crash-safe") != std::string::npos;
 
-    EXPECT_TRUE(hasDataFirstComment)
-        << "processWritePoint should contain a comment explaining the "
-           "data-before-metadata ordering rationale for crash safety";
+    EXPECT_TRUE(hasDataFirstComment) << "processWritePoint should contain a comment explaining the "
+                                        "data-before-metadata ordering rationale for crash safety";
 }

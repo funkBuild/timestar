@@ -69,7 +69,8 @@ inline GroupKeyResult buildGroupKeyDirect(const std::string& measurement, const 
             }
         }
     }
-    if (matchCount > 8) matches = matchVec.data();
+    if (matchCount > 8)
+        matches = matchVec.data();
 
     // Phase 2: Build key with pre-reserved capacity
     size_t totalSize = measurement.size() + tagTotalBytes + 1 + fieldName.size();

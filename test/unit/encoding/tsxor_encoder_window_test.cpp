@@ -1,10 +1,12 @@
-#include <gtest/gtest.h>
 #include "tsxor_encoder.hpp"
-#include <vector>
-#include <cstdint>
+
+#include <gtest/gtest.h>
+
 #include <cmath>
-#include <random>
+#include <cstdint>
 #include <numeric>
+#include <random>
+#include <vector>
 
 // Test 1: Verify the window is actually being used during encoding by checking
 // that repeated values compress better than unique values.
@@ -18,7 +20,7 @@ TEST(TsxorEncoderWindowTest, WindowUpdateTest) {
     std::vector<double> unique_vals(500);
     std::mt19937_64 rng(12345);
     std::uniform_real_distribution<double> dist(-1e15, 1e15);
-    for (auto &v : unique_vals) {
+    for (auto& v : unique_vals) {
         v = dist(rng);
     }
     CompressedBuffer unique_result = TsxorEncoder::encode(unique_vals);
@@ -27,8 +29,7 @@ TEST(TsxorEncoderWindowTest, WindowUpdateTest) {
     // With the window working, repeated values are 1 byte each (8-bit index),
     // while unique values require 8-bit index + 2-bit marker + 5-bit lzb + 6-bit data_bits + data.
     EXPECT_LT(repeated_result.size(), unique_result.size())
-        << "Repeated values (" << repeated_result.size()
-        << " bytes) should compress much better than unique values ("
+        << "Repeated values (" << repeated_result.size() << " bytes) should compress much better than unique values ("
         << unique_result.size() << " bytes)";
 
     // The repeated values should be at most 25% the size of unique values
@@ -43,7 +44,7 @@ TEST(TsxorEncoderWindowTest, CompressionRatioTest) {
     std::vector<double> values(1000, 42.0);
     CompressedBuffer result = TsxorEncoder::encode(values);
 
-    size_t raw_size = 1000 * sizeof(double); // 8000 bytes
+    size_t raw_size = 1000 * sizeof(double);  // 8000 bytes
     double ratio = static_cast<double>(result.size()) / static_cast<double>(raw_size);
 
     // With the window fix, 1000 identical doubles should compress extremely well.
@@ -51,14 +52,12 @@ TEST(TsxorEncoderWindowTest, CompressionRatioTest) {
     // 999 values each need only 1 byte (8-bit window index). So the compressed
     // size should be around ~1000 bytes plus overhead for the first value.
     // This is well under 50% of 8000 = 4000 bytes.
-    EXPECT_LT(ratio, 0.50)
-        << "Compression ratio " << (ratio * 100) << "% is too high for constant data. "
-        << "Compressed: " << result.size() << " bytes, Raw: " << raw_size << " bytes. "
-        << "This may indicate the window is not being updated.";
+    EXPECT_LT(ratio, 0.50) << "Compression ratio " << (ratio * 100) << "% is too high for constant data. "
+                           << "Compressed: " << result.size() << " bytes, Raw: " << raw_size << " bytes. "
+                           << "This may indicate the window is not being updated.";
 
     // Even stronger: should be under 25%
-    EXPECT_LT(ratio, 0.25)
-        << "Compression ratio " << (ratio * 100) << "% - expected under 25% for constant data";
+    EXPECT_LT(ratio, 0.25) << "Compression ratio " << (ratio * 100) << "% - expected under 25% for constant data";
 }
 
 // Test 3: Encode alternating values like [1.0, 2.0, 1.0, 2.0, ...] and verify
@@ -74,7 +73,7 @@ TEST(TsxorEncoderWindowTest, RepeatedPatternTest) {
     std::vector<double> random_vals(1000);
     std::mt19937_64 rng(67890);
     std::uniform_real_distribution<double> dist(-1e15, 1e15);
-    for (auto &v : random_vals) {
+    for (auto& v : random_vals) {
         v = dist(rng);
     }
     CompressedBuffer rand_result = TsxorEncoder::encode(random_vals);
@@ -82,16 +81,14 @@ TEST(TsxorEncoderWindowTest, RepeatedPatternTest) {
     // Alternating pattern should compress much better since both values are
     // always in the window after the first two entries.
     EXPECT_LT(alt_result.size(), rand_result.size())
-        << "Alternating pattern (" << alt_result.size()
-        << " bytes) should compress better than random data ("
+        << "Alternating pattern (" << alt_result.size() << " bytes) should compress better than random data ("
         << rand_result.size() << " bytes)";
 
     // Alternating values should be very compact (each is a window hit after warmup)
     size_t raw_size = 1000 * sizeof(double);
     double ratio = static_cast<double>(alt_result.size()) / static_cast<double>(raw_size);
-    EXPECT_LT(ratio, 0.25)
-        << "Alternating pattern compression ratio " << (ratio * 100)
-        << "% is too high - window should catch repeating values";
+    EXPECT_LT(ratio, 0.25) << "Alternating pattern compression ratio " << (ratio * 100)
+                           << "% is too high - window should catch repeating values";
 }
 
 // Test 4: After encoding a sequence, the second encoding of the same pattern
@@ -103,14 +100,12 @@ TEST(TsxorEncoderWindowTest, WindowPopulationTest) {
     CompressedBuffer result2 = TsxorEncoder::encode(values);
 
     // Both encodings should produce identical output
-    EXPECT_EQ(result1.size(), result2.size())
-        << "Encoding the same data twice should produce the same size output";
+    EXPECT_EQ(result1.size(), result2.size()) << "Encoding the same data twice should produce the same size output";
 
     // Verify word-level equality by checking the underlying data vector
     ASSERT_EQ(result1.data.size(), result2.data.size());
     for (size_t i = 0; i < result1.data.size(); i++) {
-        EXPECT_EQ(result1.data[i], result2.data[i])
-            << "Mismatch at word " << i << " of compressed output";
+        EXPECT_EQ(result1.data[i], result2.data[i]) << "Mismatch at word " << i << " of compressed output";
     }
 }
 
@@ -131,18 +126,15 @@ TEST(TsxorEncoderWindowTest, LargeDatasetCompressionTest) {
     }
 
     CompressedBuffer result = TsxorEncoder::encode(values);
-    size_t raw_size = N * sizeof(double); // 80000 bytes
+    size_t raw_size = N * sizeof(double);  // 80000 bytes
 
     // Realistic time series data with quantization should have many repeated values
     // and nearby values, leading to good compression.
-    EXPECT_LT(result.size(), raw_size)
-        << "Compressed size (" << result.size()
-        << ") should be less than raw size (" << raw_size << ")";
+    EXPECT_LT(result.size(), raw_size) << "Compressed size (" << result.size() << ") should be less than raw size ("
+                                       << raw_size << ")";
 
     double ratio = static_cast<double>(result.size()) / static_cast<double>(raw_size);
-    EXPECT_LT(ratio, 0.75)
-        << "Compression ratio " << (ratio * 100)
-        << "% is too high for realistic time series data";
+    EXPECT_LT(ratio, 0.75) << "Compression ratio " << (ratio * 100) << "% is too high for realistic time series data";
 }
 
 // Test 6: Compare compression of constant data vs random data; constant should
@@ -158,7 +150,7 @@ TEST(TsxorEncoderWindowTest, RepeatedConstantBetterThanRandom) {
     std::vector<double> random_vals(N);
     std::mt19937_64 rng(99999);
     std::uniform_real_distribution<double> dist(-1e300, 1e300);
-    for (auto &v : random_vals) {
+    for (auto& v : random_vals) {
         v = dist(rng);
     }
     CompressedBuffer rand_result = TsxorEncoder::encode(random_vals);
@@ -167,15 +159,13 @@ TEST(TsxorEncoderWindowTest, RepeatedConstantBetterThanRandom) {
     // Random data: ~8+ bytes per value (index + XOR diff bits)
     // The constant data should be at most 1/4 the size of random data.
     EXPECT_LT(const_result.size() * 4, rand_result.size())
-        << "Constant data (" << const_result.size()
-        << " bytes) should be at most 1/4 the size of random data ("
+        << "Constant data (" << const_result.size() << " bytes) should be at most 1/4 the size of random data ("
         << rand_result.size() << " bytes). "
         << "This strongly indicates the window is not being populated.";
 
     // Absolute check: constant data should be very small
     // ~1 byte per value for window hits = ~2000 bytes, plus overhead for first value
-    EXPECT_LT(const_result.size(), N * 2)
-        << "Constant data should compress to under 2 bytes per value on average";
+    EXPECT_LT(const_result.size(), N * 2) << "Constant data should compress to under 2 bytes per value on average";
 }
 
 // Test 7: Values that change slowly (like real timestamps) should compress well
@@ -194,7 +184,7 @@ TEST(TsxorEncoderWindowTest, SlowlyChangingValuesTest) {
     // Random values for comparison
     std::mt19937_64 rng(77777);
     std::uniform_real_distribution<double> dist(0.0, 1e6);
-    for (auto &v : random_values) {
+    for (auto& v : random_values) {
         v = dist(rng);
     }
 
@@ -205,14 +195,12 @@ TEST(TsxorEncoderWindowTest, SlowlyChangingValuesTest) {
     // The window will have nearby values, and XOR differences will have
     // many leading/trailing zero bits, requiring fewer data bits to encode.
     EXPECT_LT(slow_result.size(), rand_result.size())
-        << "Slowly changing data (" << slow_result.size()
-        << " bytes) should compress better than random data ("
+        << "Slowly changing data (" << slow_result.size() << " bytes) should compress better than random data ("
         << rand_result.size() << " bytes)";
 
     // Check meaningful compression relative to raw size
-    size_t raw_size = N * sizeof(double); // 40000 bytes
+    size_t raw_size = N * sizeof(double);  // 40000 bytes
     double ratio = static_cast<double>(slow_result.size()) / static_cast<double>(raw_size);
-    EXPECT_LT(ratio, 0.80)
-        << "Slowly changing values should compress to under 80% of raw size, got "
-        << (ratio * 100) << "%";
+    EXPECT_LT(ratio, 0.80) << "Slowly changing values should compress to under 80% of raw size, got " << (ratio * 100)
+                           << "%";
 }

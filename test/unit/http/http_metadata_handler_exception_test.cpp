@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include <fstream>
 #include <string>
 
@@ -22,14 +23,10 @@ protected:
 
     void SetUp() override {
         std::ifstream file(HTTP_METADATA_HANDLER_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open())
-            << "Could not open http_metadata_handler.cpp at: "
-            << HTTP_METADATA_HANDLER_SOURCE_PATH;
-        sourceCode.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>());
-        ASSERT_FALSE(sourceCode.empty())
-            << "http_metadata_handler.cpp is unexpectedly empty";
+        ASSERT_TRUE(file.is_open()) << "Could not open http_metadata_handler.cpp at: "
+                                    << HTTP_METADATA_HANDLER_SOURCE_PATH;
+        sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        ASSERT_FALSE(sourceCode.empty()) << "http_metadata_handler.cpp is unexpectedly empty";
     }
 
     // Extract the body of a named member function by brace-matching.
@@ -46,7 +43,8 @@ protected:
         size_t searchFrom = 0;
         while (true) {
             size_t found = sourceCode.find(funcSignatureSubstr, searchFrom);
-            if (found == std::string::npos) break;
+            if (found == std::string::npos)
+                break;
             sigPos = found;
             searchFrom = found + 1;
         }
@@ -67,8 +65,10 @@ protected:
         int depth = 1;
         size_t pos = openBrace + 1;
         while (pos < sourceCode.size() && depth > 0) {
-            if (sourceCode[pos] == '{') depth++;
-            else if (sourceCode[pos] == '}') depth--;
+            if (sourceCode[pos] == '{')
+                depth++;
+            else if (sourceCode[pos] == '}')
+                depth--;
             pos++;
         }
         if (depth != 0) {
@@ -89,20 +89,17 @@ TEST_F(MetadataHandlerExceptionSafetyTest, HandleMeasurementsTryCatchBeforeCoAwa
 
     // The function must contain a co_await engineSharded call
     auto coAwaitPos = body.find("co_await engineSharded");
-    ASSERT_NE(coAwaitPos, std::string::npos)
-        << "handleMeasurements does not contain 'co_await engineSharded'. "
-        << "If the engine call was removed, update this test.";
+    ASSERT_NE(coAwaitPos, std::string::npos) << "handleMeasurements does not contain 'co_await engineSharded'. "
+                                             << "If the engine call was removed, update this test.";
 
     // A 'try {' must appear BEFORE the first co_await engineSharded
     auto tryPos = body.find("try {");
-    ASSERT_NE(tryPos, std::string::npos)
-        << "handleMeasurements has no 'try {' block. "
-        << "Engine exceptions would propagate as unhandled coroutine exceptions "
-        << "instead of being returned as HTTP 500 responses.";
+    ASSERT_NE(tryPos, std::string::npos) << "handleMeasurements has no 'try {' block. "
+                                         << "Engine exceptions would propagate as unhandled coroutine exceptions "
+                                         << "instead of being returned as HTTP 500 responses.";
 
-    EXPECT_LT(tryPos, coAwaitPos)
-        << "In handleMeasurements, 'try {' must appear before 'co_await engineSharded'. "
-        << "Without this, an engine I/O error escapes the coroutine unhandled.";
+    EXPECT_LT(tryPos, coAwaitPos) << "In handleMeasurements, 'try {' must appear before 'co_await engineSharded'. "
+                                  << "Without this, an engine I/O error escapes the coroutine unhandled.";
 
     // A matching catch block for std::exception must exist
     EXPECT_NE(body.find("catch (const std::exception&"), std::string::npos)
@@ -116,24 +113,20 @@ TEST_F(MetadataHandlerExceptionSafetyTest, HandleMeasurementsTryCatchBeforeCoAwa
 // ---------------------------------------------------------------------------
 TEST_F(MetadataHandlerExceptionSafetyTest, HandleTagsTryCatchBeforeCoAwait) {
     std::string body = extractFunctionBody("HttpMetadataHandler::handleTags");
-    ASSERT_FALSE(body.empty())
-        << "Could not locate HttpMetadataHandler::handleTags in http_metadata_handler.cpp";
+    ASSERT_FALSE(body.empty()) << "Could not locate HttpMetadataHandler::handleTags in http_metadata_handler.cpp";
 
     auto coAwaitPos = body.find("co_await engineSharded");
-    ASSERT_NE(coAwaitPos, std::string::npos)
-        << "handleTags does not contain 'co_await engineSharded'. "
-        << "If the engine call was removed, update this test.";
+    ASSERT_NE(coAwaitPos, std::string::npos) << "handleTags does not contain 'co_await engineSharded'. "
+                                             << "If the engine call was removed, update this test.";
 
     auto tryPos = body.find("try {");
-    ASSERT_NE(tryPos, std::string::npos)
-        << "handleTags has no 'try {' block. "
-        << "Engine exceptions would propagate as unhandled coroutine exceptions "
-        << "instead of being returned as HTTP 500 responses.";
+    ASSERT_NE(tryPos, std::string::npos) << "handleTags has no 'try {' block. "
+                                         << "Engine exceptions would propagate as unhandled coroutine exceptions "
+                                         << "instead of being returned as HTTP 500 responses.";
 
-    EXPECT_LT(tryPos, coAwaitPos)
-        << "In handleTags, 'try {' must appear before 'co_await engineSharded'. "
-        << "Without this, an engine I/O error (e.g. LevelDB read failure) "
-        << "escapes the coroutine unhandled.";
+    EXPECT_LT(tryPos, coAwaitPos) << "In handleTags, 'try {' must appear before 'co_await engineSharded'. "
+                                  << "Without this, an engine I/O error (e.g. LevelDB read failure) "
+                                  << "escapes the coroutine unhandled.";
 
     EXPECT_NE(body.find("catch (const std::exception&"), std::string::npos)
         << "handleTags is missing 'catch (const std::exception&'. "
@@ -146,24 +139,20 @@ TEST_F(MetadataHandlerExceptionSafetyTest, HandleTagsTryCatchBeforeCoAwait) {
 // ---------------------------------------------------------------------------
 TEST_F(MetadataHandlerExceptionSafetyTest, HandleFieldsTryCatchBeforeCoAwait) {
     std::string body = extractFunctionBody("HttpMetadataHandler::handleFields");
-    ASSERT_FALSE(body.empty())
-        << "Could not locate HttpMetadataHandler::handleFields in http_metadata_handler.cpp";
+    ASSERT_FALSE(body.empty()) << "Could not locate HttpMetadataHandler::handleFields in http_metadata_handler.cpp";
 
     auto coAwaitPos = body.find("co_await engineSharded");
-    ASSERT_NE(coAwaitPos, std::string::npos)
-        << "handleFields does not contain 'co_await engineSharded'. "
-        << "If the engine call was removed, update this test.";
+    ASSERT_NE(coAwaitPos, std::string::npos) << "handleFields does not contain 'co_await engineSharded'. "
+                                             << "If the engine call was removed, update this test.";
 
     auto tryPos = body.find("try {");
-    ASSERT_NE(tryPos, std::string::npos)
-        << "handleFields has no 'try {' block. "
-        << "Engine exceptions would propagate as unhandled coroutine exceptions "
-        << "instead of being returned as HTTP 500 responses.";
+    ASSERT_NE(tryPos, std::string::npos) << "handleFields has no 'try {' block. "
+                                         << "Engine exceptions would propagate as unhandled coroutine exceptions "
+                                         << "instead of being returned as HTTP 500 responses.";
 
-    EXPECT_LT(tryPos, coAwaitPos)
-        << "In handleFields, 'try {' must appear before 'co_await engineSharded'. "
-        << "Without this, an engine I/O error (e.g. LevelDB read failure during "
-        << "getMeasurementFields or getFieldType) escapes unhandled.";
+    EXPECT_LT(tryPos, coAwaitPos) << "In handleFields, 'try {' must appear before 'co_await engineSharded'. "
+                                  << "Without this, an engine I/O error (e.g. LevelDB read failure during "
+                                  << "getMeasurementFields or getFieldType) escapes unhandled.";
 
     EXPECT_NE(body.find("catch (const std::exception&"), std::string::npos)
         << "handleFields is missing 'catch (const std::exception&'. "
@@ -193,11 +182,10 @@ TEST_F(MetadataHandlerExceptionSafetyTest, ErrorPathSetsHttp500Status) {
         count++;
         pos++;
     }
-    EXPECT_GE(count, 3u)
-        << "Expected at least 3 occurrences of 'internal_server_error' in "
-        << "http_metadata_handler.cpp (one per handler catch block). "
-        << "Found: " << count << ". "
-        << "Each handler's catch block must set the reply status to HTTP 500.";
+    EXPECT_GE(count, 3u) << "Expected at least 3 occurrences of 'internal_server_error' in "
+                         << "http_metadata_handler.cpp (one per handler catch block). "
+                         << "Found: " << count << ". "
+                         << "Each handler's catch block must set the reply status to HTTP 500.";
 }
 
 // ---------------------------------------------------------------------------
@@ -213,10 +201,9 @@ TEST_F(MetadataHandlerExceptionSafetyTest, ErrorPathUsesCreateErrorResponse) {
         pos++;
     }
     // At least one definition + 3 call sites (one per catch block)
-    EXPECT_GE(count, 4u)
-        << "Expected at least 4 occurrences of 'createErrorResponse' in "
-        << "http_metadata_handler.cpp (1 definition + 3 call sites in catch blocks). "
-        << "Found: " << count << ". "
-        << "Each handler catch block must call createErrorResponse() to return "
-        << "a structured JSON error body instead of a raw exception message.";
+    EXPECT_GE(count, 4u) << "Expected at least 4 occurrences of 'createErrorResponse' in "
+                         << "http_metadata_handler.cpp (1 definition + 3 call sites in catch blocks). "
+                         << "Found: " << count << ". "
+                         << "Each handler catch block must call createErrorResponse() to return "
+                         << "a structured JSON error body instead of a raw exception message.";
 }

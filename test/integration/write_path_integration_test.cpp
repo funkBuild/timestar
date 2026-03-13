@@ -1,27 +1,23 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <chrono>
-
 #include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
 #include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/query/query_runner.hpp"
 #include "../test_helpers.hpp"
 
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
 
 class WritePathEndToEndTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // End-to-end test: Write data through Engine and read it back
@@ -63,8 +59,7 @@ seastar::future<> testWriteAndRead() {
         messageInsert.addTag("sensor", "temp-01");
 
         for (int i = 0; i < 10; i++) {
-            messageInsert.addValue(baseTime + static_cast<uint64_t>(i) * 1000000000,
-                                 "Status " + std::to_string(i));
+            messageInsert.addValue(baseTime + static_cast<uint64_t>(i) * 1000000000, "Status " + std::to_string(i));
         }
 
         co_await engine.insert(messageInsert);
@@ -137,7 +132,8 @@ seastar::future<> testWriteAndRead() {
     }
 
     co_await engine.stop();
-    if (eptr) std::rethrow_exception(eptr);
+    if (eptr)
+        std::rethrow_exception(eptr);
 }
 
 TEST_F(WritePathEndToEndTest, WriteAndRead) {
@@ -200,7 +196,8 @@ seastar::future<> testMetadataQueries() {
     }
 
     co_await engine.stop();
-    if (eptr) std::rethrow_exception(eptr);
+    if (eptr)
+        std::rethrow_exception(eptr);
 }
 
 TEST_F(WritePathEndToEndTest, MetadataQueries) {
@@ -234,7 +231,8 @@ seastar::future<> testPersistence() {
         }
 
         co_await engine.stop();
-        if (eptr) std::rethrow_exception(eptr);
+        if (eptr)
+            std::rethrow_exception(eptr);
     }
 
     // Phase 2: Read data after restart
@@ -245,11 +243,8 @@ seastar::future<> testPersistence() {
         std::exception_ptr eptr;
         try {
             // Query using structured query
-            auto result = co_await engine.queryBySeries("cpu",
-                {{"host", "server-01"}, {"cpu", "cpu0"}},
-                "usage",
-                1638202821000000000,
-                1638202821000000000 + 100LL * 1000000000);
+            auto result = co_await engine.queryBySeries("cpu", {{"host", "server-01"}, {"cpu", "cpu0"}}, "usage",
+                                                        1638202821000000000, 1638202821000000000 + 100LL * 1000000000);
 
             if (std::holds_alternative<QueryResult<double>>(result)) {
                 auto& floatResult = std::get<QueryResult<double>>(result);
@@ -269,7 +264,8 @@ seastar::future<> testPersistence() {
         }
 
         co_await engine.stop();
-        if (eptr) std::rethrow_exception(eptr);
+        if (eptr)
+            std::rethrow_exception(eptr);
     }
 }
 

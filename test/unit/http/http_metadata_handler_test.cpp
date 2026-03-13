@@ -1,6 +1,8 @@
-#include <gtest/gtest.h>
-#include <glaze/glaze.hpp>
 #include "../../../lib/http/http_metadata_handler.hpp"
+
+#include <glaze/glaze.hpp>
+
+#include <gtest/gtest.h>
 
 // =============================================================================
 // HttpMetadataHandler Tests
@@ -251,8 +253,7 @@ TEST_F(HttpMetadataHandlerTest, FormatFieldsResponseNoFilters) {
     EXPECT_EQ(obj["measurement"].get<std::string>(), "weather");
 
     // filtered_by should be absent or null when no filters
-    EXPECT_TRUE(obj.find("filtered_by") == obj.end() ||
-                obj["filtered_by"].is_null());
+    EXPECT_TRUE(obj.find("filtered_by") == obj.end() || obj["filtered_by"].is_null());
 }
 
 TEST_F(HttpMetadataHandlerTest, FormatFieldsResponseEmpty) {
@@ -295,40 +296,30 @@ TEST_F(HttpMetadataHandlerTest, ParsePaginationParamDefault) {
 
 TEST_F(HttpMetadataHandlerTest, ParsePaginationParamInvalidThrows) {
     // Non-numeric string must throw HttpBadRequestException, not crash
-    EXPECT_THROW(
-        HttpMetadataHandler::parsePaginationParam("abc", "limit", 100),
-        HttpMetadataHandler::BadRequestException
-    );
+    EXPECT_THROW(HttpMetadataHandler::parsePaginationParam("abc", "limit", 100),
+                 HttpMetadataHandler::BadRequestException);
 }
 
 TEST_F(HttpMetadataHandlerTest, ParsePaginationParamNegativeThrows) {
     // Negative numbers must throw (stoul rejects them)
-    EXPECT_THROW(
-        HttpMetadataHandler::parsePaginationParam("-1", "offset", 0),
-        HttpMetadataHandler::BadRequestException
-    );
+    EXPECT_THROW(HttpMetadataHandler::parsePaginationParam("-1", "offset", 0),
+                 HttpMetadataHandler::BadRequestException);
 }
 
 TEST_F(HttpMetadataHandlerTest, ParsePaginationParamFloatThrows) {
     // Floating-point strings must throw
-    EXPECT_THROW(
-        HttpMetadataHandler::parsePaginationParam("3.14", "limit", 100),
-        HttpMetadataHandler::BadRequestException
-    );
+    EXPECT_THROW(HttpMetadataHandler::parsePaginationParam("3.14", "limit", 100),
+                 HttpMetadataHandler::BadRequestException);
 }
 
 TEST_F(HttpMetadataHandlerTest, ParsePaginationParamAlphanumericThrows) {
     // Alphanumeric strings must throw
-    EXPECT_THROW(
-        HttpMetadataHandler::parsePaginationParam("10abc", "limit", 100),
-        HttpMetadataHandler::BadRequestException
-    );
+    EXPECT_THROW(HttpMetadataHandler::parsePaginationParam("10abc", "limit", 100),
+                 HttpMetadataHandler::BadRequestException);
 }
 
 TEST_F(HttpMetadataHandlerTest, ParsePaginationParamOverflowThrows) {
     // Values that overflow size_t must throw
-    EXPECT_THROW(
-        HttpMetadataHandler::parsePaginationParam("99999999999999999999999999999", "limit", 100),
-        HttpMetadataHandler::BadRequestException
-    );
+    EXPECT_THROW(HttpMetadataHandler::parsePaginationParam("99999999999999999999999999999", "limit", 100),
+                 HttpMetadataHandler::BadRequestException);
 }

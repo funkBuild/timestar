@@ -1,20 +1,21 @@
+#include "../test_helpers.hpp"
+#include "engine.hpp"
+#include "query_result.hpp"
+#include "timestar_value.hpp"
+
 #include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <iomanip>
+#include <random>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
-#include <chrono>
-#include <filesystem>
-#include <random>
-#include <iomanip>
 #include <sstream>
-
-#include "engine.hpp"
-#include "timestar_value.hpp"
-#include "query_result.hpp"
-#include "../test_helpers.hpp"
 
 namespace fs = std::filesystem;
 
@@ -123,13 +124,9 @@ protected:
         cleanupTestDirectories();
     }
 
-    void TearDown() override {
-        cleanupTestDirectories();
-    }
+    void TearDown() override { cleanupTestDirectories(); }
 
-    void cleanupTestDirectories() {
-        cleanTestShardDirectories();
-    }
+    void cleanupTestDirectories() { cleanTestShardDirectories(); }
 
     // Generate test data
     struct TestData {
@@ -144,21 +141,19 @@ protected:
         std::uniform_int_distribution<size_t> regionDist;
         std::uniform_int_distribution<size_t> fieldDist;
 
-        TestData() : rng(42),  // Fixed seed for reproducibility
-                     measurementDist(0, measurements.size() - 1),
-                     hostDist(0, hosts.size() - 1),
-                     regionDist(0, regions.size() - 1),
-                     fieldDist(0, fields.size() - 1) {}
+        TestData()
+            : rng(42),  // Fixed seed for reproducibility
+              measurementDist(0, measurements.size() - 1),
+              hostDist(0, hosts.size() - 1),
+              regionDist(0, regions.size() - 1),
+              fieldDist(0, fields.size() - 1) {}
 
         TimeStarInsert<double> generateInsert(uint64_t timestamp, int batchSize = 10) {
             std::string measurement = measurements[measurementDist(rng)];
             std::string field = fields[fieldDist(rng)];
 
             TimeStarInsert<double> insert(measurement, field);
-            insert.tags = {
-                {"host", hosts[hostDist(rng)]},
-                {"region", regions[regionDist(rng)]}
-            };
+            insert.tags = {{"host", hosts[hostDist(rng)]}, {"region", regions[regionDist(rng)]}};
 
             // Generate batch of data points
             for (int i = 0; i < batchSize; ++i) {
@@ -232,8 +227,7 @@ TEST_F(BenchmarkTest, InsertAndQueryPerformance) {
         }
 
         auto insertEndTime = std::chrono::high_resolution_clock::now();
-        auto totalInsertTime = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            insertEndTime - insertStartTime);
+        auto totalInsertTime = std::chrono::duration_cast<std::chrono::nanoseconds>(insertEndTime - insertStartTime);
 
         std::cout << "Inserts completed: " << NUM_INSERTS << "/" << NUM_INSERTS << std::endl;
 
@@ -297,8 +291,7 @@ TEST_F(BenchmarkTest, InsertAndQueryPerformance) {
         }
 
         auto queryEndTime = std::chrono::high_resolution_clock::now();
-        auto totalQueryTime = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            queryEndTime - queryStartTime);
+        auto totalQueryTime = std::chrono::duration_cast<std::chrono::nanoseconds>(queryEndTime - queryStartTime);
 
         std::cout << "Queries completed: " << NUM_QUERIES << "/" << NUM_QUERIES << std::endl;
 
@@ -311,8 +304,8 @@ TEST_F(BenchmarkTest, InsertAndQueryPerformance) {
         std::cout << "Throughput:      " << formatThroughput(NUM_QUERIES, totalQueryTime) << std::endl;
         std::cout << "Points returned: " << totalPointsReturned << std::endl;
         std::cout << "Avg points/query: " << (totalPointsReturned / (double)NUM_QUERIES) << std::endl;
-        std::cout << "Empty queries:   " << emptyQueries << " ("
-                  << (emptyQueries * 100.0 / NUM_QUERIES) << "%)" << std::endl;
+        std::cout << "Empty queries:   " << emptyQueries << " (" << (emptyQueries * 100.0 / NUM_QUERIES) << "%)"
+                  << std::endl;
         queryStats.print("Query Latency");
 
         // Combined statistics
@@ -339,13 +332,13 @@ TEST_F(BenchmarkTest, InsertAndQueryPerformance) {
             }
         }
 
-        std::cout << "Disk usage:      " << (totalDiskUsage / 1024.0 / 1024.0)
-                  << " MB" << std::endl;
-        std::cout << "Bytes per point: " << (totalDiskUsage / (double)(NUM_INSERTS * BATCH_SIZE))
-                  << std::endl;
+        std::cout << "Disk usage:      " << (totalDiskUsage / 1024.0 / 1024.0) << " MB" << std::endl;
+        std::cout << "Bytes per point: " << (totalDiskUsage / (double)(NUM_INSERTS * BATCH_SIZE)) << std::endl;
 
         std::cout << "\n========================================" << std::endl;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(BenchmarkTest, BurstPerformance) {
@@ -376,22 +369,19 @@ TEST_F(BenchmarkTest, BurstPerformance) {
 
             // Send burst of inserts
             for (size_t i = 0; i < BURST_SIZE; ++i) {
-                auto insert = testData.generateInsert(
-                    baseTimestamp + burst * 1000000 + i * 1000,
-                    POINTS_PER_INSERT
-                );
+                auto insert = testData.generateInsert(baseTimestamp + burst * 1000000 + i * 1000, POINTS_PER_INSERT);
                 engine->insert(insert).get();
             }
 
             auto burstEnd = std::chrono::high_resolution_clock::now();
-            auto burstDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                burstEnd - burstStart);
+            auto burstDuration = std::chrono::duration_cast<std::chrono::milliseconds>(burstEnd - burstStart);
             burstTimes.push_back(burstDuration.count());
 
-            std::cout << "Burst " << (burst + 1) << "/" << NUM_BURSTS
-                      << " completed in " << burstDuration.count() << " ms"
-                      << " (" << formatThroughput(BURST_SIZE * POINTS_PER_INSERT,
-                                                  std::chrono::duration_cast<std::chrono::nanoseconds>(burstDuration))
+            std::cout << "Burst " << (burst + 1) << "/" << NUM_BURSTS << " completed in " << burstDuration.count()
+                      << " ms"
+                      << " ("
+                      << formatThroughput(BURST_SIZE * POINTS_PER_INSERT,
+                                          std::chrono::duration_cast<std::chrono::nanoseconds>(burstDuration))
                       << " points)" << std::endl;
 
             // Small delay between bursts
@@ -403,9 +393,11 @@ TEST_F(BenchmarkTest, BurstPerformance) {
 
         std::cout << "\nAverage burst throughput: "
                   << formatThroughput(BURST_SIZE * POINTS_PER_INSERT,
-                                     std::chrono::milliseconds(static_cast<long>(burstStats.mean)))
+                                      std::chrono::milliseconds(static_cast<long>(burstStats.mean)))
                   << " points" << std::endl;
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(BenchmarkTest, ConcurrentQueries) {
@@ -460,12 +452,14 @@ TEST_F(BenchmarkTest, ConcurrentQueries) {
             auto end = std::chrono::high_resolution_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-            std::cout << "Iteration " << (iter + 1) << ": "
-                      << CONCURRENT_QUERIES << " queries in " << duration.count() << " ms"
-                      << " (" << formatThroughput(CONCURRENT_QUERIES,
-                                                 std::chrono::duration_cast<std::chrono::nanoseconds>(duration))
+            std::cout << "Iteration " << (iter + 1) << ": " << CONCURRENT_QUERIES << " queries in " << duration.count()
+                      << " ms"
+                      << " ("
+                      << formatThroughput(CONCURRENT_QUERIES,
+                                          std::chrono::duration_cast<std::chrono::nanoseconds>(duration))
                       << ")" << std::endl;
         }
-
-    }).join().get();
+    })
+        .join()
+        .get();
 }

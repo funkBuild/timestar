@@ -1,9 +1,10 @@
+#include "../../../lib/storage/compressed_buffer.hpp"
+
 #include <gtest/gtest.h>
+
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
-
-#include "../../../lib/storage/compressed_buffer.hpp"
 
 class CompressedBufferBoundsTest : public ::testing::Test {};
 

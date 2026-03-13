@@ -1,29 +1,27 @@
-#include <gtest/gtest.h>
 #include "topk_filter.hpp"
+
 #include "expression_evaluator.hpp"
 #include "expression_parser.hpp"
 
+#include <gtest/gtest.h>
+
 #include <cmath>
 #include <limits>
-#include <vector>
 #include <map>
 #include <string>
+#include <vector>
 
 using namespace timestar;
 
 // ==================== Helper Utilities ====================
 
-static AlignedSeries makeSeries(
-    const std::vector<uint64_t>& ts,
-    const std::vector<double>& vals) {
+static AlignedSeries makeSeries(const std::vector<uint64_t>& ts, const std::vector<double>& vals) {
     return AlignedSeries(ts, vals);
 }
 
 // Build a GroupedSeries with the given tag key/value pair and series data.
-static GroupedSeries makeGroup(
-    const std::string& tagKey, const std::string& tagValue,
-    const std::vector<uint64_t>& ts,
-    const std::vector<double>& vals) {
+static GroupedSeries makeGroup(const std::string& tagKey, const std::string& tagValue, const std::vector<uint64_t>& ts,
+                               const std::vector<double>& vals) {
     GroupedSeries g;
     g.group_tags[tagKey] = tagValue;
     g.series = makeSeries(ts, vals);
@@ -31,10 +29,8 @@ static GroupedSeries makeGroup(
 }
 
 // Build a GroupedSeries with arbitrary tag map.
-static GroupedSeries makeGroupTags(
-    const std::map<std::string, std::string>& tags,
-    const std::vector<uint64_t>& ts,
-    const std::vector<double>& vals) {
+static GroupedSeries makeGroupTags(const std::map<std::string, std::string>& tags, const std::vector<uint64_t>& ts,
+                                   const std::vector<double>& vals) {
     GroupedSeries g;
     g.group_tags = tags;
     g.series = makeSeries(ts, vals);
@@ -42,8 +38,7 @@ static GroupedSeries makeGroupTags(
 }
 
 // Shared timestamps used in most tests (4 points, 1s apart in ns)
-static const std::vector<uint64_t> kTs4 = {1000000000ULL, 2000000000ULL,
-                                             3000000000ULL, 4000000000ULL};
+static const std::vector<uint64_t> kTs4 = {1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL};
 
 // ==================== seriesMeanIgnoreNaN Tests ====================
 
@@ -55,8 +50,7 @@ TEST(SeriesMeanIgnoreNaN, AllFinite) {
 
 TEST(SeriesMeanIgnoreNaN, SomeNaN) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
-    auto s = makeSeries({1000, 2000, 3000, 4000},
-                        {nan, 2.0, nan, 4.0});
+    auto s = makeSeries({1000, 2000, 3000, 4000}, {nan, 2.0, nan, 4.0});
     double m = seriesMeanIgnoreNaN(s);
     // mean of {2.0, 4.0} = 3.0
     EXPECT_DOUBLE_EQ(m, 3.0);
@@ -91,10 +85,10 @@ TEST(TopkFilter, TopkFourGroupsKeepTwo) {
     // 4 groups with means: host1=10, host2=40, host3=20, host4=30
     // topk(2, ...) should keep host2 (mean=40) and host4 (mean=30)
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "host1", kTs4, {8.0,  10.0, 10.0, 12.0})); // mean=10
-    groups.push_back(makeGroup("host", "host2", kTs4, {38.0, 40.0, 40.0, 42.0})); // mean=40
-    groups.push_back(makeGroup("host", "host3", kTs4, {18.0, 20.0, 20.0, 22.0})); // mean=20
-    groups.push_back(makeGroup("host", "host4", kTs4, {28.0, 30.0, 30.0, 32.0})); // mean=30
+    groups.push_back(makeGroup("host", "host1", kTs4, {8.0, 10.0, 10.0, 12.0}));   // mean=10
+    groups.push_back(makeGroup("host", "host2", kTs4, {38.0, 40.0, 40.0, 42.0}));  // mean=40
+    groups.push_back(makeGroup("host", "host3", kTs4, {18.0, 20.0, 20.0, 22.0}));  // mean=20
+    groups.push_back(makeGroup("host", "host4", kTs4, {28.0, 30.0, 30.0, 32.0}));  // mean=30
 
     auto result = topk(2, std::move(groups));
 
@@ -108,10 +102,10 @@ TEST(TopkFilter, BottomkFourGroupsKeepTwo) {
     // 4 groups with means: host1=10, host2=40, host3=20, host4=30
     // bottomk(2, ...) should keep host1 (mean=10) and host3 (mean=20)
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "host1", kTs4, {8.0,  10.0, 10.0, 12.0})); // mean=10
-    groups.push_back(makeGroup("host", "host2", kTs4, {38.0, 40.0, 40.0, 42.0})); // mean=40
-    groups.push_back(makeGroup("host", "host3", kTs4, {18.0, 20.0, 20.0, 22.0})); // mean=20
-    groups.push_back(makeGroup("host", "host4", kTs4, {28.0, 30.0, 30.0, 32.0})); // mean=30
+    groups.push_back(makeGroup("host", "host1", kTs4, {8.0, 10.0, 10.0, 12.0}));   // mean=10
+    groups.push_back(makeGroup("host", "host2", kTs4, {38.0, 40.0, 40.0, 42.0}));  // mean=40
+    groups.push_back(makeGroup("host", "host3", kTs4, {18.0, 20.0, 20.0, 22.0}));  // mean=20
+    groups.push_back(makeGroup("host", "host4", kTs4, {28.0, 30.0, 30.0, 32.0}));  // mean=30
 
     auto result = bottomk(2, std::move(groups));
 
@@ -176,10 +170,10 @@ TEST(TopkFilter, BottomkNGreaterThanGroupCount) {
 TEST(TopkFilter, TopkN1KeepsHighestGroup) {
     // topk(1, ...) with 4 groups: only the group with the highest mean is kept
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "a", kTs4, {1.0, 1.0, 1.0, 1.0}));   // mean=1
-    groups.push_back(makeGroup("host", "b", kTs4, {99.0, 99.0, 99.0, 99.0})); // mean=99
-    groups.push_back(makeGroup("host", "c", kTs4, {50.0, 50.0, 50.0, 50.0})); // mean=50
-    groups.push_back(makeGroup("host", "d", kTs4, {10.0, 10.0, 10.0, 10.0})); // mean=10
+    groups.push_back(makeGroup("host", "a", kTs4, {1.0, 1.0, 1.0, 1.0}));      // mean=1
+    groups.push_back(makeGroup("host", "b", kTs4, {99.0, 99.0, 99.0, 99.0}));  // mean=99
+    groups.push_back(makeGroup("host", "c", kTs4, {50.0, 50.0, 50.0, 50.0}));  // mean=50
+    groups.push_back(makeGroup("host", "d", kTs4, {10.0, 10.0, 10.0, 10.0}));  // mean=10
 
     auto result = topk(1, std::move(groups));
 
@@ -194,10 +188,10 @@ TEST(TopkFilter, TopkN1KeepsHighestGroup) {
 TEST(TopkFilter, BottomkN1KeepsLowestGroup) {
     // bottomk(1, ...) with 4 groups: only the group with the lowest mean is kept
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "a", kTs4, {1.0, 1.0, 1.0, 1.0}));   // mean=1
-    groups.push_back(makeGroup("host", "b", kTs4, {99.0, 99.0, 99.0, 99.0})); // mean=99
-    groups.push_back(makeGroup("host", "c", kTs4, {50.0, 50.0, 50.0, 50.0})); // mean=50
-    groups.push_back(makeGroup("host", "d", kTs4, {10.0, 10.0, 10.0, 10.0})); // mean=10
+    groups.push_back(makeGroup("host", "a", kTs4, {1.0, 1.0, 1.0, 1.0}));      // mean=1
+    groups.push_back(makeGroup("host", "b", kTs4, {99.0, 99.0, 99.0, 99.0}));  // mean=99
+    groups.push_back(makeGroup("host", "c", kTs4, {50.0, 50.0, 50.0, 50.0}));  // mean=50
+    groups.push_back(makeGroup("host", "d", kTs4, {10.0, 10.0, 10.0, 10.0}));  // mean=10
 
     auto result = bottomk(1, std::move(groups));
 
@@ -236,12 +230,9 @@ TEST(TopkFilter, NanOnlyGroupRanksLowestForTopk) {
     // A NaN-only group has mean=-inf, so it ranks last in topk and is excluded first.
     const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "nan_host",
-        kTs4, {nan, nan, nan, nan}));   // mean=-inf
-    groups.push_back(makeGroup("host", "low_host",
-        kTs4, {2.0, 2.0, 2.0, 2.0}));  // mean=2
-    groups.push_back(makeGroup("host", "high_host",
-        kTs4, {8.0, 8.0, 8.0, 8.0}));  // mean=8
+    groups.push_back(makeGroup("host", "nan_host", kTs4, {nan, nan, nan, nan}));   // mean=-inf
+    groups.push_back(makeGroup("host", "low_host", kTs4, {2.0, 2.0, 2.0, 2.0}));   // mean=2
+    groups.push_back(makeGroup("host", "high_host", kTs4, {8.0, 8.0, 8.0, 8.0}));  // mean=8
 
     // topk(2, ...) keeps the 2 highest: high_host (8) and low_host (2)
     auto result = topk(2, std::move(groups));
@@ -258,12 +249,9 @@ TEST(TopkFilter, NanOnlyGroupRanksLowestForBottomk) {
     // bottomk(1, ...) keeps only the NaN group.
     const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "normal1",
-        kTs4, {5.0, 5.0, 5.0, 5.0}));  // mean=5
-    groups.push_back(makeGroup("host", "nan_host",
-        kTs4, {nan, nan, nan, nan}));   // mean=-inf -> lowest
-    groups.push_back(makeGroup("host", "normal2",
-        kTs4, {3.0, 3.0, 3.0, 3.0}));  // mean=3
+    groups.push_back(makeGroup("host", "normal1", kTs4, {5.0, 5.0, 5.0, 5.0}));   // mean=5
+    groups.push_back(makeGroup("host", "nan_host", kTs4, {nan, nan, nan, nan}));  // mean=-inf -> lowest
+    groups.push_back(makeGroup("host", "normal2", kTs4, {3.0, 3.0, 3.0, 3.0}));   // mean=3
 
     // bottomk(1, ...) keeps the 1 lowest: nan_host (mean=-inf)
     auto result = bottomk(1, std::move(groups));
@@ -277,14 +265,11 @@ TEST(TopkFilter, MixedNaNAndFiniteTopk) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<GroupedSeries> groups;
     // Group A: values {nan, 10, nan, 10} -> mean=10 (ignoring NaN)
-    groups.push_back(makeGroup("zone", "A",
-        kTs4, {nan, 10.0, nan, 10.0}));
+    groups.push_back(makeGroup("zone", "A", kTs4, {nan, 10.0, nan, 10.0}));
     // Group B: values {5, 5, 5, 5} -> mean=5
-    groups.push_back(makeGroup("zone", "B",
-        kTs4, {5.0, 5.0, 5.0, 5.0}));
+    groups.push_back(makeGroup("zone", "B", kTs4, {5.0, 5.0, 5.0, 5.0}));
     // Group C: values {20, 20, 20, 20} -> mean=20
-    groups.push_back(makeGroup("zone", "C",
-        kTs4, {20.0, 20.0, 20.0, 20.0}));
+    groups.push_back(makeGroup("zone", "C", kTs4, {20.0, 20.0, 20.0, 20.0}));
 
     // topk(2, ...) keeps C (mean=20) and A (mean=10)
     auto result = topk(2, std::move(groups));
@@ -300,14 +285,11 @@ TEST(TopkFilter, MixedNaNAndFiniteBottomk) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<GroupedSeries> groups;
     // Group A: values {nan, 10, nan, 10} -> mean=10
-    groups.push_back(makeGroup("zone", "A",
-        kTs4, {nan, 10.0, nan, 10.0}));
+    groups.push_back(makeGroup("zone", "A", kTs4, {nan, 10.0, nan, 10.0}));
     // Group B: values {5, 5, 5, 5} -> mean=5
-    groups.push_back(makeGroup("zone", "B",
-        kTs4, {5.0, 5.0, 5.0, 5.0}));
+    groups.push_back(makeGroup("zone", "B", kTs4, {5.0, 5.0, 5.0, 5.0}));
     // Group C: values {20, 20, 20, 20} -> mean=20
-    groups.push_back(makeGroup("zone", "C",
-        kTs4, {20.0, 20.0, 20.0, 20.0}));
+    groups.push_back(makeGroup("zone", "C", kTs4, {20.0, 20.0, 20.0, 20.0}));
 
     // bottomk(2, ...) keeps B (mean=5) and A (mean=10)
     auto result = bottomk(2, std::move(groups));
@@ -370,10 +352,10 @@ TEST(TopkFilter, OriginalOrderPreservedTopk) {
     // topk(3, ...) keeps A, C, D (drop B which has mean=1)
     // Selected in original order: A(idx 0), C(idx 2), D(idx 3)
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("g", "A", kTs4, {3.0, 3.0, 3.0, 3.0})); // mean=3
-    groups.push_back(makeGroup("g", "B", kTs4, {1.0, 1.0, 1.0, 1.0})); // mean=1 <- dropped
-    groups.push_back(makeGroup("g", "C", kTs4, {5.0, 5.0, 5.0, 5.0})); // mean=5
-    groups.push_back(makeGroup("g", "D", kTs4, {2.0, 2.0, 2.0, 2.0})); // mean=2
+    groups.push_back(makeGroup("g", "A", kTs4, {3.0, 3.0, 3.0, 3.0}));  // mean=3
+    groups.push_back(makeGroup("g", "B", kTs4, {1.0, 1.0, 1.0, 1.0}));  // mean=1 <- dropped
+    groups.push_back(makeGroup("g", "C", kTs4, {5.0, 5.0, 5.0, 5.0}));  // mean=5
+    groups.push_back(makeGroup("g", "D", kTs4, {2.0, 2.0, 2.0, 2.0}));  // mean=2
 
     auto result = topk(3, std::move(groups));
 
@@ -388,10 +370,10 @@ TEST(TopkFilter, OriginalOrderPreservedBottomk) {
     // bottomk(2, ...) keeps B (mean=1) and D (mean=2)
     // Selected in original order: B(idx 1), D(idx 3)
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("g", "A", kTs4, {3.0, 3.0, 3.0, 3.0})); // mean=3
-    groups.push_back(makeGroup("g", "B", kTs4, {1.0, 1.0, 1.0, 1.0})); // mean=1 <- kept
-    groups.push_back(makeGroup("g", "C", kTs4, {5.0, 5.0, 5.0, 5.0})); // mean=5
-    groups.push_back(makeGroup("g", "D", kTs4, {2.0, 2.0, 2.0, 2.0})); // mean=2 <- kept
+    groups.push_back(makeGroup("g", "A", kTs4, {3.0, 3.0, 3.0, 3.0}));  // mean=3
+    groups.push_back(makeGroup("g", "B", kTs4, {1.0, 1.0, 1.0, 1.0}));  // mean=1 <- kept
+    groups.push_back(makeGroup("g", "C", kTs4, {5.0, 5.0, 5.0, 5.0}));  // mean=5
+    groups.push_back(makeGroup("g", "D", kTs4, {2.0, 2.0, 2.0, 2.0}));  // mean=2 <- kept
 
     auto result = bottomk(2, std::move(groups));
 
@@ -403,12 +385,9 @@ TEST(TopkFilter, OriginalOrderPreservedBottomk) {
 TEST(TopkFilter, MultiTagGroups) {
     // Groups identified by multiple tags
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroupTags({{"host", "a"}, {"dc", "east"}},
-        kTs4, {10.0, 10.0, 10.0, 10.0})); // mean=10
-    groups.push_back(makeGroupTags({{"host", "b"}, {"dc", "west"}},
-        kTs4, {30.0, 30.0, 30.0, 30.0})); // mean=30
-    groups.push_back(makeGroupTags({{"host", "c"}, {"dc", "east"}},
-        kTs4, {20.0, 20.0, 20.0, 20.0})); // mean=20
+    groups.push_back(makeGroupTags({{"host", "a"}, {"dc", "east"}}, kTs4, {10.0, 10.0, 10.0, 10.0}));  // mean=10
+    groups.push_back(makeGroupTags({{"host", "b"}, {"dc", "west"}}, kTs4, {30.0, 30.0, 30.0, 30.0}));  // mean=30
+    groups.push_back(makeGroupTags({{"host", "c"}, {"dc", "east"}}, kTs4, {20.0, 20.0, 20.0, 20.0}));  // mean=20
 
     // topk(2, ...) should keep host=b (mean=30) and host=c (mean=20)
     auto result = topk(2, std::move(groups));
@@ -422,11 +401,11 @@ TEST(TopkFilter, SeriesDataIntactAfterFilter) {
     // Verify that the actual AlignedSeries timestamps and values survive the filter
     std::vector<GroupedSeries> groups;
     std::vector<uint64_t> ts1 = {100ULL, 200ULL, 300ULL};
-    std::vector<double>   v1  = {1.0, 2.0, 3.0};
+    std::vector<double> v1 = {1.0, 2.0, 3.0};
     std::vector<uint64_t> ts2 = {100ULL, 200ULL, 300ULL};
-    std::vector<double>   v2  = {10.0, 20.0, 30.0};
+    std::vector<double> v2 = {10.0, 20.0, 30.0};
 
-    groups.push_back(makeGroup("role", "low",  ts1, v1));  // mean=2
+    groups.push_back(makeGroup("role", "low", ts1, v1));   // mean=2
     groups.push_back(makeGroup("role", "high", ts2, v2));  // mean=20
 
     auto result = topk(1, std::move(groups));
@@ -492,14 +471,20 @@ TEST(TopkFilterParser, BottomkGetQueryReferences) {
 TEST(TopkFilterParser, TopkWrongArgCountThrows) {
     // topk with 1 arg should throw
     EXPECT_THROW(
-        { ExpressionParser p("topk(2)"); p.parse(); },
+        {
+            ExpressionParser p("topk(2)");
+            p.parse();
+        },
         ExpressionParseException);
 }
 
 TEST(TopkFilterParser, BottomkWrongArgCountThrows) {
     // bottomk with 3 args should throw
     EXPECT_THROW(
-        { ExpressionParser p("bottomk(1, a, b)"); p.parse(); },
+        {
+            ExpressionParser p("bottomk(1, a, b)");
+            p.parse();
+        },
         ExpressionParseException);
 }
 
@@ -589,8 +574,8 @@ TEST(CrossSeries, SumOfSeriesThreeGroups) {
     // Values {1,2,3,4}, {10,20,30,40}, {100,200,300,400}
     // Sums: 111, 222, 333, 444
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "a", kCsTs, {1.0,   2.0,   3.0,   4.0}));
-    groups.push_back(makeGroup("host", "b", kCsTs, {10.0,  20.0,  30.0,  40.0}));
+    groups.push_back(makeGroup("host", "a", kCsTs, {1.0, 2.0, 3.0, 4.0}));
+    groups.push_back(makeGroup("host", "b", kCsTs, {10.0, 20.0, 30.0, 40.0}));
     groups.push_back(makeGroup("host", "c", kCsTs, {100.0, 200.0, 300.0, 400.0}));
 
     auto result = sum_of_series(std::move(groups));
@@ -623,17 +608,17 @@ TEST(CrossSeries, SumOfSeriesNaNIgnored) {
 TEST(CrossSeries, MinOfSeriesThreeGroups) {
     // At each timestamp the minimum across 3 groups
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "a", kCsTs, {10.0, 5.0,  2.0, 8.0}));
-    groups.push_back(makeGroup("host", "b", kCsTs, {3.0,  9.0,  7.0, 1.0}));
-    groups.push_back(makeGroup("host", "c", kCsTs, {6.0,  4.0, 11.0, 3.0}));
+    groups.push_back(makeGroup("host", "a", kCsTs, {10.0, 5.0, 2.0, 8.0}));
+    groups.push_back(makeGroup("host", "b", kCsTs, {3.0, 9.0, 7.0, 1.0}));
+    groups.push_back(makeGroup("host", "c", kCsTs, {6.0, 4.0, 11.0, 3.0}));
 
     auto result = min_of_series(std::move(groups));
 
     ASSERT_EQ(result.series.size(), 4u);
-    EXPECT_DOUBLE_EQ(result.series.values[0], 3.0);   // min(10,3,6)
-    EXPECT_DOUBLE_EQ(result.series.values[1], 4.0);   // min(5,9,4)
-    EXPECT_DOUBLE_EQ(result.series.values[2], 2.0);   // min(2,7,11)
-    EXPECT_DOUBLE_EQ(result.series.values[3], 1.0);   // min(8,1,3)
+    EXPECT_DOUBLE_EQ(result.series.values[0], 3.0);  // min(10,3,6)
+    EXPECT_DOUBLE_EQ(result.series.values[1], 4.0);  // min(5,9,4)
+    EXPECT_DOUBLE_EQ(result.series.values[2], 2.0);  // min(2,7,11)
+    EXPECT_DOUBLE_EQ(result.series.values[3], 1.0);  // min(8,1,3)
 }
 
 TEST(CrossSeries, MinOfSeriesNaNIgnored) {
@@ -644,19 +629,19 @@ TEST(CrossSeries, MinOfSeriesNaNIgnored) {
 
     auto result = min_of_series(std::move(groups));
 
-    EXPECT_DOUBLE_EQ(result.series.values[0], 5.0);   // only b
-    EXPECT_DOUBLE_EQ(result.series.values[1], 3.0);   // only a
-    EXPECT_TRUE(std::isnan(result.series.values[2])); // both NaN
-    EXPECT_DOUBLE_EQ(result.series.values[3], 2.0);   // min(9,2)
+    EXPECT_DOUBLE_EQ(result.series.values[0], 5.0);    // only b
+    EXPECT_DOUBLE_EQ(result.series.values[1], 3.0);    // only a
+    EXPECT_TRUE(std::isnan(result.series.values[2]));  // both NaN
+    EXPECT_DOUBLE_EQ(result.series.values[3], 2.0);    // min(9,2)
 }
 
 // ------ max_of_series ------
 
 TEST(CrossSeries, MaxOfSeriesThreeGroups) {
     std::vector<GroupedSeries> groups;
-    groups.push_back(makeGroup("host", "a", kCsTs, {10.0, 5.0,  2.0, 8.0}));
-    groups.push_back(makeGroup("host", "b", kCsTs, {3.0,  9.0,  7.0, 1.0}));
-    groups.push_back(makeGroup("host", "c", kCsTs, {6.0,  4.0, 11.0, 3.0}));
+    groups.push_back(makeGroup("host", "a", kCsTs, {10.0, 5.0, 2.0, 8.0}));
+    groups.push_back(makeGroup("host", "b", kCsTs, {3.0, 9.0, 7.0, 1.0}));
+    groups.push_back(makeGroup("host", "c", kCsTs, {6.0, 4.0, 11.0, 3.0}));
 
     auto result = max_of_series(std::move(groups));
 
@@ -675,10 +660,10 @@ TEST(CrossSeries, MaxOfSeriesNaNIgnored) {
 
     auto result = max_of_series(std::move(groups));
 
-    EXPECT_DOUBLE_EQ(result.series.values[0], 5.0);   // only b
-    EXPECT_DOUBLE_EQ(result.series.values[1], 3.0);   // only a
-    EXPECT_TRUE(std::isnan(result.series.values[2])); // both NaN
-    EXPECT_DOUBLE_EQ(result.series.values[3], 9.0);   // max(9,2)
+    EXPECT_DOUBLE_EQ(result.series.values[0], 5.0);    // only b
+    EXPECT_DOUBLE_EQ(result.series.values[1], 3.0);    // only a
+    EXPECT_TRUE(std::isnan(result.series.values[2]));  // both NaN
+    EXPECT_DOUBLE_EQ(result.series.values[3], 9.0);    // max(9,2)
 }
 
 // ------ percentile_of_series ------
@@ -708,11 +693,11 @@ TEST(CrossSeries, PercentileP0SameAsMin) {
     std::vector<GroupedSeries> gMin, gP0;
     for (auto* gp : {&gMin, &gP0}) {
         gp->push_back(makeGroup("h", "a", kCsTs, {1.0, 4.0, 9.0, 16.0}));
-        gp->push_back(makeGroup("h", "b", kCsTs, {3.0, 2.0, 5.0,  8.0}));
+        gp->push_back(makeGroup("h", "b", kCsTs, {3.0, 2.0, 5.0, 8.0}));
         gp->push_back(makeGroup("h", "c", kCsTs, {2.0, 7.0, 3.0, 12.0}));
     }
     auto minResult = min_of_series(std::move(gMin));
-    auto p0Result  = percentile_of_series(0.0, std::move(gP0));
+    auto p0Result = percentile_of_series(0.0, std::move(gP0));
 
     ASSERT_EQ(minResult.series.size(), p0Result.series.size());
     for (size_t i = 0; i < minResult.series.size(); ++i) {
@@ -725,10 +710,10 @@ TEST(CrossSeries, PercentileP100SameAsMax) {
     std::vector<GroupedSeries> gMax, gP100;
     for (auto* gp : {&gMax, &gP100}) {
         gp->push_back(makeGroup("h", "a", kCsTs, {1.0, 4.0, 9.0, 16.0}));
-        gp->push_back(makeGroup("h", "b", kCsTs, {3.0, 2.0, 5.0,  8.0}));
+        gp->push_back(makeGroup("h", "b", kCsTs, {3.0, 2.0, 5.0, 8.0}));
         gp->push_back(makeGroup("h", "c", kCsTs, {2.0, 7.0, 3.0, 12.0}));
     }
-    auto maxResult  = max_of_series(std::move(gMax));
+    auto maxResult = max_of_series(std::move(gMax));
     auto p100Result = percentile_of_series(100.0, std::move(gP100));
 
     ASSERT_EQ(maxResult.series.size(), p100Result.series.size());
@@ -761,10 +746,10 @@ TEST(CrossSeries, PercentileWithNaN) {
 
     auto result = percentile_of_series(50.0, std::move(groups));
 
-    EXPECT_DOUBLE_EQ(result.series.values[0], 6.0);   // median of [5,7]
-    EXPECT_DOUBLE_EQ(result.series.values[1], 3.0);   // single value
-    EXPECT_TRUE(std::isnan(result.series.values[2])); // all NaN
-    EXPECT_DOUBLE_EQ(result.series.values[3], 6.0);   // median of [4,8]
+    EXPECT_DOUBLE_EQ(result.series.values[0], 6.0);    // median of [5,7]
+    EXPECT_DOUBLE_EQ(result.series.values[1], 3.0);    // single value
+    EXPECT_TRUE(std::isnan(result.series.values[2]));  // all NaN
+    EXPECT_DOUBLE_EQ(result.series.values[3], 6.0);    // median of [4,8]
 }
 
 TEST(CrossSeries, PercentileInvalidPThrows) {
@@ -846,10 +831,10 @@ TEST(CrossSeriesEval, AvgOfSeriesTwoSeries) {
     auto result = evaluator.evaluate(*ast, qr);
 
     ASSERT_EQ(result.size(), 4u);
-    EXPECT_DOUBLE_EQ(result.values[0], 2.0);   // (1+3)/2
-    EXPECT_DOUBLE_EQ(result.values[1], 4.0);   // (3+5)/2
-    EXPECT_DOUBLE_EQ(result.values[2], 6.0);   // (5+7)/2
-    EXPECT_DOUBLE_EQ(result.values[3], 8.0);   // (7+9)/2
+    EXPECT_DOUBLE_EQ(result.values[0], 2.0);  // (1+3)/2
+    EXPECT_DOUBLE_EQ(result.values[1], 4.0);  // (3+5)/2
+    EXPECT_DOUBLE_EQ(result.values[2], 6.0);  // (5+7)/2
+    EXPECT_DOUBLE_EQ(result.values[3], 8.0);  // (7+9)/2
 }
 
 TEST(CrossSeriesEval, SumOfSeriesTwoSeries) {
@@ -1002,7 +987,10 @@ TEST(CrossSeriesParser, PercentileOfSeriesToStringRoundTrip) {
 TEST(CrossSeriesParser, PercentileOfSeriesOneArgThrows) {
     // Only the p argument, no series → should throw (needs >= 2 args)
     EXPECT_THROW(
-        { ExpressionParser p("percentile_of_series(50)"); p.parse(); },
+        {
+            ExpressionParser p("percentile_of_series(50)");
+            p.parse();
+        },
         ExpressionParseException);
 }
 

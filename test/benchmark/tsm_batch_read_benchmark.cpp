@@ -1,13 +1,14 @@
+#include "series_id.hpp"
 #include "tsm.hpp"
 #include "tsm_writer.hpp"
-#include "series_id.hpp"
-#include <seastar/core/app-template.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/reactor.hh>
-#include <iostream>
+
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
+#include <iostream>
+#include <seastar/core/app-template.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/reactor.hh>
 
 namespace fs = std::filesystem;
 
@@ -40,11 +41,8 @@ struct BenchmarkResult {
 };
 
 // Create TSM file with specified number of blocks
-seastar::future<std::string> createTestFile(
-    const std::string& filename,
-    size_t numBlocks,
-    size_t pointsPerBlock = 10000
-) {
+seastar::future<std::string> createTestFile(const std::string& filename, size_t numBlocks,
+                                            size_t pointsPerBlock = 10000) {
     TSMWriter writer(filename);
 
     std::vector<uint64_t> allTimestamps;
@@ -65,17 +63,14 @@ seastar::future<std::string> createTestFile(
     writer.writeIndex();
     writer.close();
 
-    std::cout << "Created test file: " << filename << " with " << numBlocks
-              << " blocks (" << totalPoints << " points)\n";
+    std::cout << "Created test file: " << filename << " with " << numBlocks << " blocks (" << totalPoints
+              << " points)\n";
 
     co_return filename;
 }
 
 // Benchmark old method (individual block reads)
-seastar::future<double> benchmarkOldMethod(
-    const std::string& filename,
-    size_t iterations = 10
-) {
+seastar::future<double> benchmarkOldMethod(const std::string& filename, size_t iterations = 10) {
     std::vector<double> timings;
     timings.reserve(iterations);
 
@@ -102,10 +97,7 @@ seastar::future<double> benchmarkOldMethod(
 }
 
 // Benchmark new method (batched block reads)
-seastar::future<double> benchmarkNewMethod(
-    const std::string& filename,
-    size_t iterations = 10
-) {
+seastar::future<double> benchmarkNewMethod(const std::string& filename, size_t iterations = 10) {
     std::vector<double> timings;
     timings.reserve(iterations);
 
@@ -131,12 +123,8 @@ seastar::future<double> benchmarkNewMethod(
     co_return timings[timings.size() / 2];
 }
 
-seastar::future<BenchmarkResult> runBenchmark(
-    const std::string& scenario,
-    size_t numBlocks,
-    size_t pointsPerBlock = 10000,
-    int fileNum = 1
-) {
+seastar::future<BenchmarkResult> runBenchmark(const std::string& scenario, size_t numBlocks,
+                                              size_t pointsPerBlock = 10000, int fileNum = 1) {
     // TSM expects filenames in format: tier_sequence.tsm
     std::string filename = "./benchmark_tsm/0_" + std::to_string(fileNum) + ".tsm";
 
@@ -249,9 +237,5 @@ seastar::future<> runAllBenchmarks() {
 int main(int argc, char** argv) {
     seastar::app_template app;
 
-    return app.run(argc, argv, [] {
-        return runAllBenchmarks().then([] {
-            std::cout << "\nBenchmark complete!\n";
-        });
-    });
+    return app.run(argc, argv, [] { return runAllBenchmarks().then([] { std::cout << "\nBenchmark complete!\n"; }); });
 }

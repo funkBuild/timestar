@@ -1,7 +1,8 @@
 #include <gtest/gtest.h>
-#include <string>
+
 #include <fstream>
 #include <sstream>
+#include <string>
 
 // Source-inspection tests for TSMTombstone::flush() file handle cleanup.
 //
@@ -51,18 +52,22 @@ protected:
     // Extract the TSMTombstone::flush() function body from source
     std::string extractFlushFunction() const {
         size_t start = sourceCode.find("TSMTombstone::flush()");
-        if (start == std::string::npos) return "";
+        if (start == std::string::npos)
+            return "";
 
         // Find the opening brace of the function
         size_t braceStart = sourceCode.find('{', start);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
 
         // Find matching closing brace (simple brace counting)
         int braceCount = 1;
         size_t pos = braceStart + 1;
         while (pos < sourceCode.size() && braceCount > 0) {
-            if (sourceCode[pos] == '{') braceCount++;
-            else if (sourceCode[pos] == '}') braceCount--;
+            if (sourceCode[pos] == '{')
+                braceCount++;
+            else if (sourceCode[pos] == '}')
+                braceCount--;
             pos++;
         }
 
@@ -72,8 +77,7 @@ protected:
 
 // Verify that the source file was successfully loaded
 TEST_F(TombstoneFlushCleanupTest, SourceFileLoaded) {
-    ASSERT_FALSE(sourceCode.empty())
-        << "Could not load tsm_tombstone.cpp source file";
+    ASSERT_FALSE(sourceCode.empty()) << "Could not load tsm_tombstone.cpp source file";
     ASSERT_NE(sourceCode.find("TSMTombstone::flush()"), std::string::npos)
         << "Source file does not contain TSMTombstone::flush()";
 }
@@ -81,8 +85,7 @@ TEST_F(TombstoneFlushCleanupTest, SourceFileLoaded) {
 // Verify flush() function exists and has the expected structure
 TEST_F(TombstoneFlushCleanupTest, FlushFunctionHasExpectedStructure) {
     std::string funcBody = extractFlushFunction();
-    ASSERT_FALSE(funcBody.empty())
-        << "Could not extract TSMTombstone::flush() function body";
+    ASSERT_FALSE(funcBody.empty()) << "Could not extract TSMTombstone::flush() function body";
 
     // Should contain the file open call
     EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos)
@@ -125,14 +128,12 @@ TEST_F(TombstoneFlushCleanupTest, OutputStreamClosedUnconditionally) {
     // The output_stream.close() should appear after the catch block,
     // meaning it executes regardless of whether an exception was thrown.
     size_t catchPos = funcBody.find("catch");
-    ASSERT_NE(catchPos, std::string::npos)
-        << "flush() should have a catch block";
+    ASSERT_NE(catchPos, std::string::npos) << "flush() should have a catch block";
 
     size_t closePos = funcBody.find("output_stream.close()", catchPos);
-    EXPECT_NE(closePos, std::string::npos)
-        << "BUG: output_stream.close() must appear after the catch block so "
-           "the file descriptor is closed on both success and error paths. "
-           "Without this, the underlying file descriptor leaks on write failures.";
+    EXPECT_NE(closePos, std::string::npos) << "BUG: output_stream.close() must appear after the catch block so "
+                                              "the file descriptor is closed on both success and error paths. "
+                                              "Without this, the underlying file descriptor leaks on write failures.";
 }
 
 // Core test: The close call must NOT be only inside the try block
@@ -147,11 +148,10 @@ TEST_F(TombstoneFlushCleanupTest, CloseNotOnlyInsideTryBlock) {
 
     // Find close after the main catch - this is the unconditional cleanup
     size_t closeAfterCatch = funcBody.find("output_stream.close()", mainCatchPos);
-    EXPECT_NE(closeAfterCatch, std::string::npos)
-        << "BUG: output_stream.close() only appears inside the try block. "
-           "If any write throws, the stream is never closed and the file "
-           "descriptor leaks. Move close() outside the try/catch for "
-           "unconditional cleanup.";
+    EXPECT_NE(closeAfterCatch, std::string::npos) << "BUG: output_stream.close() only appears inside the try block. "
+                                                     "If any write throws, the stream is never closed and the file "
+                                                     "descriptor leaks. Move close() outside the try/catch for "
+                                                     "unconditional cleanup.";
 }
 
 // Core test: The close call should be wrapped in its own try/catch
@@ -172,19 +172,16 @@ TEST_F(TombstoneFlushCleanupTest, CloseIsGuardedByNestedTryCatch) {
     std::string afterCatch = funcBody.substr(mainCatchPos);
     size_t tryInCleanup = afterCatch.find("try");
     size_t closeInCleanup = afterCatch.find("output_stream.close()");
-    ASSERT_NE(tryInCleanup, std::string::npos)
-        << "BUG: The close() call in the cleanup path is not wrapped in a "
-           "try block. If close() throws, the original exception will be lost.";
+    ASSERT_NE(tryInCleanup, std::string::npos) << "BUG: The close() call in the cleanup path is not wrapped in a "
+                                                  "try block. If close() throws, the original exception will be lost.";
 
-    EXPECT_LT(tryInCleanup, closeInCleanup)
-        << "The try block should appear before output_stream.close()";
+    EXPECT_LT(tryInCleanup, closeInCleanup) << "The try block should appear before output_stream.close()";
 
     // There should also be a catch block for the close
     size_t catchInCleanup = afterCatch.find("catch", tryInCleanup + 3);
-    ASSERT_NE(catchInCleanup, std::string::npos)
-        << "BUG: The close() call has a try but no catch. "
-           "Close errors must be silently ignored to avoid masking "
-           "the original exception.";
+    ASSERT_NE(catchInCleanup, std::string::npos) << "BUG: The close() call has a try but no catch. "
+                                                    "Close errors must be silently ignored to avoid masking "
+                                                    "the original exception.";
 }
 
 // Core test: The original exception must be re-thrown after cleanup
@@ -192,12 +189,10 @@ TEST_F(TombstoneFlushCleanupTest, OriginalExceptionRethrown) {
     std::string funcBody = extractFlushFunction();
     ASSERT_FALSE(funcBody.empty());
 
-    bool hasRethrow =
-        funcBody.find("std::rethrow_exception") != std::string::npos ||
-        funcBody.find("rethrow_exception") != std::string::npos;
-    EXPECT_TRUE(hasRethrow)
-        << "BUG: flush() does not rethrow the captured exception after "
-           "cleanup. The caller must know that flush() failed.";
+    bool hasRethrow = funcBody.find("std::rethrow_exception") != std::string::npos ||
+                      funcBody.find("rethrow_exception") != std::string::npos;
+    EXPECT_TRUE(hasRethrow) << "BUG: flush() does not rethrow the captured exception after "
+                               "cleanup. The caller must know that flush() failed.";
 }
 
 // Verify the exception_ptr variable is declared before the try block
@@ -206,8 +201,7 @@ TEST_F(TombstoneFlushCleanupTest, ExceptionPtrDeclaredBeforeTry) {
     ASSERT_FALSE(funcBody.empty());
 
     size_t exPtrPos = funcBody.find("exception_ptr");
-    ASSERT_NE(exPtrPos, std::string::npos)
-        << "flush() should declare a std::exception_ptr variable";
+    ASSERT_NE(exPtrPos, std::string::npos) << "flush() should declare a std::exception_ptr variable";
 
     // Find the try block that wraps the write operations (after open_file_dma)
     size_t openPos = funcBody.find("open_file_dma");
@@ -216,9 +210,8 @@ TEST_F(TombstoneFlushCleanupTest, ExceptionPtrDeclaredBeforeTry) {
     size_t tryPos = funcBody.find("try", openPos);
     ASSERT_NE(tryPos, std::string::npos);
 
-    EXPECT_LT(exPtrPos, tryPos)
-        << "The exception_ptr variable must be declared before the try block "
-           "so it can be set in the catch block and checked afterwards.";
+    EXPECT_LT(exPtrPos, tryPos) << "The exception_ptr variable must be declared before the try block "
+                                   "so it can be set in the catch block and checked afterwards.";
 }
 
 // Verify the catch block uses catch(...) to handle all exception types
@@ -267,14 +260,11 @@ TEST_F(TombstoneFlushCleanupTest, NormalPathStillWritesAllComponents) {
     ASSERT_FALSE(funcBody.empty());
 
     // All these operations should still be present
-    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos)
-        << "open_file_dma should still be called";
+    EXPECT_NE(funcBody.find("open_file_dma"), std::string::npos) << "open_file_dma should still be called";
     EXPECT_NE(funcBody.find("sortAndMergeEntries"), std::string::npos)
         << "sortAndMergeEntries() should still be called";
-    EXPECT_NE(funcBody.find("TOMBSTONE_MAGIC"), std::string::npos)
-        << "Header magic number should still be written";
+    EXPECT_NE(funcBody.find("TOMBSTONE_MAGIC"), std::string::npos) << "Header magic number should still be written";
     EXPECT_NE(funcBody.find("calculateFileChecksum"), std::string::npos)
         << "File checksum should still be calculated and written";
-    EXPECT_NE(funcBody.find("isDirty = false"), std::string::npos)
-        << "isDirty should still be set to false on success";
+    EXPECT_NE(funcBody.find("isDirty = false"), std::string::npos) << "isDirty should still be set to false on success";
 }

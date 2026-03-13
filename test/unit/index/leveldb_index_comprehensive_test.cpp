@@ -23,28 +23,25 @@
  *  19. addField()/addTag() on non-zero shard throw
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/storage/tsm.hpp"  // for TSMValueType
 #include "../../seastar_gtest.hpp"
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/future.hh>
+
+#include <gtest/gtest.h>
+
 #include <filesystem>
 #include <map>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
 #include <set>
 #include <vector>
 
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
-#include "../../../lib/storage/tsm.hpp"  // for TSMValueType
-
 class LevelDBIndexComprehensiveTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        std::filesystem::remove_all("shard_0");
-    }
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void SetUp() override { std::filesystem::remove_all("shard_0"); }
+    void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
 // ---------------------------------------------------------------------------
@@ -58,14 +55,10 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, RebuildMeasurementSeriesIndex) {
         LevelDBIndex index(0);
         co_await index.open();
 
-        originalIds.push_back(co_await index.getOrCreateSeriesId(
-            "rebuild_test", {{"host", "h1"}}, "cpu"));
-        originalIds.push_back(co_await index.getOrCreateSeriesId(
-            "rebuild_test", {{"host", "h2"}}, "cpu"));
-        originalIds.push_back(co_await index.getOrCreateSeriesId(
-            "rebuild_test", {{"host", "h3"}}, "cpu"));
-        originalIds.push_back(co_await index.getOrCreateSeriesId(
-            "other_measurement", {{"tag", "v1"}}, "value"));
+        originalIds.push_back(co_await index.getOrCreateSeriesId("rebuild_test", {{"host", "h1"}}, "cpu"));
+        originalIds.push_back(co_await index.getOrCreateSeriesId("rebuild_test", {{"host", "h2"}}, "cpu"));
+        originalIds.push_back(co_await index.getOrCreateSeriesId("rebuild_test", {{"host", "h3"}}, "cpu"));
+        originalIds.push_back(co_await index.getOrCreateSeriesId("other_measurement", {{"tag", "v1"}}, "value"));
 
         co_await index.close();
     }
@@ -80,8 +73,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, RebuildMeasurementSeriesIndex) {
 
         // After rebuild, getAllSeriesForMeasurement should find the same series
         auto rebuildResult = co_await index.getAllSeriesForMeasurement("rebuild_test");
-        EXPECT_TRUE(rebuildResult.has_value())
-            << "getAllSeriesForMeasurement should succeed after rebuild";
+        EXPECT_TRUE(rebuildResult.has_value()) << "getAllSeriesForMeasurement should succeed after rebuild";
         if (rebuildResult.has_value()) {
             EXPECT_EQ(rebuildResult.value().size(), 3u);
         }
@@ -124,12 +116,9 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, GetSeriesMetadataBatch) {
     co_await index.open();
 
     // Create several series
-    auto id1 = co_await index.getOrCreateSeriesId("batch_test",
-        {{"region", "us-west"}, {"env", "prod"}}, "latency");
-    auto id2 = co_await index.getOrCreateSeriesId("batch_test",
-        {{"region", "eu-west"}, {"env", "staging"}}, "latency");
-    auto id3 = co_await index.getOrCreateSeriesId("other",
-        {{"host", "srv1"}}, "cpu");
+    auto id1 = co_await index.getOrCreateSeriesId("batch_test", {{"region", "us-west"}, {"env", "prod"}}, "latency");
+    auto id2 = co_await index.getOrCreateSeriesId("batch_test", {{"region", "eu-west"}, {"env", "staging"}}, "latency");
+    auto id3 = co_await index.getOrCreateSeriesId("other", {{"host", "srv1"}}, "cpu");
 
     // Fetch metadata in batch for all three
     std::vector<SeriesId128> ids = {id1, id2, id3};
@@ -162,8 +151,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, GetSeriesMetadataBatchMixed) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    auto existingId = co_await index.getOrCreateSeriesId("m",
-        {{"k", "v"}}, "f");
+    auto existingId = co_await index.getOrCreateSeriesId("m", {{"k", "v"}}, "f");
     SeriesId128 nonExistentId = SeriesId128::fromSeriesKey("completely_fake_series_key");
 
     auto batchResults = co_await index.getSeriesMetadataBatch({existingId, nonExistentId});
@@ -204,12 +192,9 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, IndexMetadataBatchNewSeries) {
 
     // Build a batch of MetadataOp entries
     std::vector<MetadataOp> ops;
-    ops.push_back({TSMValueType::Float, "sensors", "temperature",
-                   {{"location", "room1"}, {"floor", "1"}}});
-    ops.push_back({TSMValueType::Float, "sensors", "humidity",
-                   {{"location", "room1"}, {"floor", "1"}}});
-    ops.push_back({TSMValueType::Boolean, "alerts", "triggered",
-                   {{"severity", "high"}}});
+    ops.push_back({TSMValueType::Float, "sensors", "temperature", {{"location", "room1"}, {"floor", "1"}}});
+    ops.push_back({TSMValueType::Float, "sensors", "humidity", {{"location", "room1"}, {"floor", "1"}}});
+    ops.push_back({TSMValueType::Boolean, "alerts", "triggered", {{"severity", "high"}}});
 
     co_await index.indexMetadataBatch(ops);
 
@@ -263,12 +248,11 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, IndexMetadataBatchIdempotent) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    MetadataOp op{TSMValueType::Float, "idempotent_test", "value",
-                  {{"host", "server1"}}};
+    MetadataOp op{TSMValueType::Float, "idempotent_test", "value", {{"host", "server1"}}};
     std::vector<MetadataOp> ops = {op};
 
     co_await index.indexMetadataBatch(ops);
-    co_await index.indexMetadataBatch(ops); // Second call should be a no-op
+    co_await index.indexMetadataBatch(ops);  // Second call should be a no-op
 
     // Should only have 1 series
     auto count = co_await index.getSeriesCount();
@@ -288,17 +272,17 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, IndexMetadataBatchAllTypes) {
     co_await index.open();
 
     std::vector<MetadataOp> ops = {
-        {TSMValueType::Float,   "types_test", "float_field",   {{"t", "v"}}},
-        {TSMValueType::Boolean, "types_test", "bool_field",    {{"t", "v"}}},
-        {TSMValueType::String,  "types_test", "string_field",  {{"t", "v"}}},
+        {TSMValueType::Float, "types_test", "float_field", {{"t", "v"}}},
+        {TSMValueType::Boolean, "types_test", "bool_field", {{"t", "v"}}},
+        {TSMValueType::String, "types_test", "string_field", {{"t", "v"}}},
         {TSMValueType::Integer, "types_test", "integer_field", {{"t", "v"}}},
     };
 
     co_await index.indexMetadataBatch(ops);
 
-    EXPECT_EQ(co_await index.getFieldType("types_test", "float_field"),   "float");
-    EXPECT_EQ(co_await index.getFieldType("types_test", "bool_field"),    "boolean");
-    EXPECT_EQ(co_await index.getFieldType("types_test", "string_field"),  "string");
+    EXPECT_EQ(co_await index.getFieldType("types_test", "float_field"), "float");
+    EXPECT_EQ(co_await index.getFieldType("types_test", "bool_field"), "boolean");
+    EXPECT_EQ(co_await index.getFieldType("types_test", "string_field"), "string");
     EXPECT_EQ(co_await index.getFieldType("types_test", "integer_field"), "integer");
 
     co_await index.close();
@@ -313,12 +297,9 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, FindSeriesWithMetadataBasic) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    co_await index.getOrCreateSeriesId("http_req",
-        {{"endpoint", "/api/users"}, {"method", "GET"}}, "count");
-    co_await index.getOrCreateSeriesId("http_req",
-        {{"endpoint", "/api/posts"}, {"method", "POST"}}, "count");
-    co_await index.getOrCreateSeriesId("http_req",
-        {{"endpoint", "/api/users"}, {"method", "POST"}}, "duration");
+    co_await index.getOrCreateSeriesId("http_req", {{"endpoint", "/api/users"}, {"method", "GET"}}, "count");
+    co_await index.getOrCreateSeriesId("http_req", {{"endpoint", "/api/posts"}, {"method", "POST"}}, "count");
+    co_await index.getOrCreateSeriesId("http_req", {{"endpoint", "/api/users"}, {"method", "POST"}}, "duration");
 
     // Find all series for measurement (no filter, no field filter)
     auto allResult = co_await index.findSeriesWithMetadata("http_req");
@@ -341,16 +322,12 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, FindSeriesWithMetadataTagFilter) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    auto id1 = co_await index.getOrCreateSeriesId("cpu",
-        {{"host", "srv1"}, {"dc", "dc1"}}, "usage");
-    auto id2 = co_await index.getOrCreateSeriesId("cpu",
-        {{"host", "srv2"}, {"dc", "dc1"}}, "usage");
-    auto id3 = co_await index.getOrCreateSeriesId("cpu",
-        {{"host", "srv3"}, {"dc", "dc2"}}, "usage");
+    auto id1 = co_await index.getOrCreateSeriesId("cpu", {{"host", "srv1"}, {"dc", "dc1"}}, "usage");
+    auto id2 = co_await index.getOrCreateSeriesId("cpu", {{"host", "srv2"}, {"dc", "dc1"}}, "usage");
+    auto id3 = co_await index.getOrCreateSeriesId("cpu", {{"host", "srv3"}, {"dc", "dc2"}}, "usage");
 
     // Filter by dc=dc1
-    auto dc1Result = co_await index.findSeriesWithMetadata(
-        "cpu", {{"dc", "dc1"}});
+    auto dc1Result = co_await index.findSeriesWithMetadata("cpu", {{"dc", "dc1"}});
     EXPECT_TRUE(dc1Result.has_value());
     if (dc1Result.has_value()) {
         EXPECT_EQ(dc1Result.value().size(), 2u);
@@ -368,17 +345,13 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, FindSeriesWithMetadataFieldFilter)
     LevelDBIndex index(0);
     co_await index.open();
 
-    co_await index.getOrCreateSeriesId("sensor",
-        {{"device", "d1"}}, "temperature");
-    co_await index.getOrCreateSeriesId("sensor",
-        {{"device", "d1"}}, "humidity");
-    co_await index.getOrCreateSeriesId("sensor",
-        {{"device", "d2"}}, "temperature");
+    co_await index.getOrCreateSeriesId("sensor", {{"device", "d1"}}, "temperature");
+    co_await index.getOrCreateSeriesId("sensor", {{"device", "d1"}}, "humidity");
+    co_await index.getOrCreateSeriesId("sensor", {{"device", "d2"}}, "temperature");
 
     // Field filter to only return "temperature" series
     std::unordered_set<std::string> fieldFilter = {"temperature"};
-    auto result = co_await index.findSeriesWithMetadata(
-        "sensor", {}, fieldFilter);
+    auto result = co_await index.findSeriesWithMetadata("sensor", {}, fieldFilter);
     EXPECT_TRUE(result.has_value());
     if (result.has_value()) {
         EXPECT_EQ(result.value().size(), 2u);
@@ -417,8 +390,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, GetAllSeriesForMeasurementLimitExc
 
     // Create 5 series
     for (int i = 0; i < 5; ++i) {
-        co_await index.getOrCreateSeriesId("limit_test",
-            {{"id", std::to_string(i)}}, "value");
+        co_await index.getOrCreateSeriesId("limit_test", {{"id", std::to_string(i)}}, "value");
     }
 
     // Request with maxSeries=3: should return SeriesLimitExceeded
@@ -453,8 +425,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, FindSeriesLimitExceededNoFilter) {
     co_await index.open();
 
     for (int i = 0; i < 4; ++i) {
-        co_await index.getOrCreateSeriesId("find_limit",
-            {{"n", std::to_string(i)}}, "v");
+        co_await index.getOrCreateSeriesId("find_limit", {{"n", std::to_string(i)}}, "v");
     }
 
     // Limit of 2 should be exceeded with 4 series
@@ -479,8 +450,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, FindSeriesLimitExceededWithFilter)
 
     // Create 5 series all with dc=prod
     for (int i = 0; i < 5; ++i) {
-        co_await index.getOrCreateSeriesId("tagged_limit",
-            {{"dc", "prod"}, {"host", "h" + std::to_string(i)}}, "v");
+        co_await index.getOrCreateSeriesId("tagged_limit", {{"dc", "prod"}, {"host", "h" + std::to_string(i)}}, "v");
     }
 
     // Limit of 2 should be exceeded
@@ -503,12 +473,10 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, FindSeriesShortCircuitEmptyTag) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    co_await index.getOrCreateSeriesId("shortcircuit",
-        {{"env", "prod"}, {"region", "us-west"}}, "v");
+    co_await index.getOrCreateSeriesId("shortcircuit", {{"env", "prod"}, {"region", "us-west"}}, "v");
 
     // Filter with a tag that has no matches: short-circuit should return empty
-    auto result = co_await index.findSeries("shortcircuit",
-        {{"env", "prod"}, {"region", "nonexistent"}});
+    auto result = co_await index.findSeries("shortcircuit", {{"env", "prod"}, {"region", "nonexistent"}});
     EXPECT_TRUE(result.has_value());
     if (result.has_value()) {
         EXPECT_TRUE(result.value().empty());
@@ -524,8 +492,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, FindSeriesWithMetadataLimitExceede
     co_await index.open();
 
     for (int i = 0; i < 5; ++i) {
-        co_await index.getOrCreateSeriesId("meta_limit",
-            {{"id", std::to_string(i)}}, "value");
+        co_await index.getOrCreateSeriesId("meta_limit", {{"id", std::to_string(i)}}, "value");
     }
 
     // maxSeries=2 should be exceeded
@@ -547,7 +514,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, AddFieldStandalone) {
     // Add fields directly (without creating series)
     co_await index.addField("direct_fields", "field_one");
     co_await index.addField("direct_fields", "field_two");
-    co_await index.addField("direct_fields", "field_one"); // idempotent
+    co_await index.addField("direct_fields", "field_one");  // idempotent
 
     auto fields = co_await index.getFields("direct_fields");
     EXPECT_EQ(fields.size(), 2u);
@@ -570,7 +537,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, AddTagStandalone) {
     co_await index.addTag("direct_tags", "region", "us-east");
     co_await index.addTag("direct_tags", "region", "eu-west");
     co_await index.addTag("direct_tags", "env", "prod");
-    co_await index.addTag("direct_tags", "region", "us-east"); // idempotent
+    co_await index.addTag("direct_tags", "region", "us-east");  // idempotent
 
     // Check tag keys
     auto tagKeys = co_await index.getTags("direct_tags");
@@ -604,10 +571,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, AddFieldsAndTagsDirect) {
     LevelDBIndex index(0);
     co_await index.open();
 
-    std::map<std::string, std::string> tags = {
-        {"host", "srv1"},
-        {"datacenter", "dc1"}
-    };
+    std::map<std::string, std::string> tags = {{"host", "srv1"}, {"datacenter", "dc1"}};
 
     co_await index.addFieldsAndTags("metrics", "cpu_usage", tags);
     co_await index.addFieldsAndTags("metrics", "mem_usage", tags);
@@ -690,8 +654,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, GetSeriesIdExisting) {
 
     // First create the series
     std::map<std::string, std::string> tags = {{"host", "srv1"}};
-    SeriesId128 createdId = co_await index.getOrCreateSeriesId(
-        "lookup_test", tags, "cpu");
+    SeriesId128 createdId = co_await index.getOrCreateSeriesId("lookup_test", tags, "cpu");
 
     // Then look it up with getSeriesId
     auto lookedUpId = co_await index.getSeriesId("lookup_test", tags, "cpu");
@@ -709,10 +672,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, GetSeriesIdNonExistent) {
     co_await index.open();
 
     // Look up a series that was never created
-    auto result = co_await index.getSeriesId(
-        "nonexistent_measurement",
-        {{"tag", "value"}},
-        "field");
+    auto result = co_await index.getSeriesId("nonexistent_measurement", {{"tag", "value"}}, "field");
 
     // Should return nullopt (not create a new series)
     EXPECT_FALSE(result.has_value());
@@ -735,18 +695,15 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, SeriesWithEmptyTags) {
 
     // Create series with no tags
     std::map<std::string, std::string> emptyTags;
-    SeriesId128 id1 = co_await index.getOrCreateSeriesId(
-        "notag_series", emptyTags, "value");
+    SeriesId128 id1 = co_await index.getOrCreateSeriesId("notag_series", emptyTags, "value");
     EXPECT_FALSE(id1.isZero());
 
     // Same series should return same ID (idempotency)
-    SeriesId128 id1_again = co_await index.getOrCreateSeriesId(
-        "notag_series", emptyTags, "value");
+    SeriesId128 id1_again = co_await index.getOrCreateSeriesId("notag_series", emptyTags, "value");
     EXPECT_EQ(id1, id1_again);
 
     // Different field with empty tags should get different ID
-    SeriesId128 id2 = co_await index.getOrCreateSeriesId(
-        "notag_series", emptyTags, "count");
+    SeriesId128 id2 = co_await index.getOrCreateSeriesId("notag_series", emptyTags, "count");
     EXPECT_NE(id1, id2);
 
     // Metadata should not contain any tags
@@ -812,10 +769,8 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, CompactPreservesData) {
     co_await index.open();
 
     // Insert series
-    auto id1 = co_await index.getOrCreateSeriesId("compact_test",
-        {{"host", "h1"}}, "value");
-    auto id2 = co_await index.getOrCreateSeriesId("compact_test",
-        {{"host", "h2"}}, "value");
+    auto id1 = co_await index.getOrCreateSeriesId("compact_test", {{"host", "h1"}}, "value");
+    auto id2 = co_await index.getOrCreateSeriesId("compact_test", {{"host", "h2"}}, "value");
 
     // Run compaction
     co_await index.compact();
@@ -848,7 +803,7 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, CompactPreservesData) {
 // ---------------------------------------------------------------------------
 
 SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, NonZeroShardThrowsOnWriteMethods) {
-    LevelDBIndex index(1); // Non-zero shard
+    LevelDBIndex index(1);  // Non-zero shard
     co_await index.open();  // This should be a no-op (non-zero shards skip LevelDB)
 
     // getOrCreateSeriesId should throw
@@ -1041,10 +996,8 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, PersistenceAfterReopenComplex) {
         LevelDBIndex index(0);
         co_await index.open();
 
-        savedId = co_await index.getOrCreateSeriesId(
-            "persist_test",
-            {{"region", "us-east"}, {"tier", "web"}},
-            "requests");
+        savedId =
+            co_await index.getOrCreateSeriesId("persist_test", {{"region", "us-east"}, {"tier", "web"}}, "requests");
 
         co_await index.addField("persist_test", "errors");
         co_await index.addTag("persist_test", "tier", "cache");
@@ -1059,10 +1012,8 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, PersistenceAfterReopenComplex) {
         co_await index.open();
 
         // Series ID should be the same (deterministic)
-        SeriesId128 reloadedId = co_await index.getOrCreateSeriesId(
-            "persist_test",
-            {{"region", "us-east"}, {"tier", "web"}},
-            "requests");
+        SeriesId128 reloadedId =
+            co_await index.getOrCreateSeriesId("persist_test", {{"region", "us-east"}, {"tier", "web"}}, "requests");
         EXPECT_EQ(savedId, reloadedId);
 
         // Fields should persist (both the one from series creation and addField)
@@ -1103,12 +1054,8 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, IndexMetadataBatchMultipleMeasurem
     // Mix of measurements in a single batch
     std::vector<MetadataOp> ops;
     for (int i = 0; i < 3; ++i) {
-        ops.push_back({TSMValueType::Float, "m1",
-                       "field_" + std::to_string(i),
-                       {{"host", "h" + std::to_string(i)}}});
-        ops.push_back({TSMValueType::Integer, "m2",
-                       "count",
-                       {{"id", std::to_string(i)}}});
+        ops.push_back({TSMValueType::Float, "m1", "field_" + std::to_string(i), {{"host", "h" + std::to_string(i)}}});
+        ops.push_back({TSMValueType::Integer, "m2", "count", {{"id", std::to_string(i)}}});
     }
 
     co_await index.indexMetadataBatch(ops);
@@ -1134,15 +1081,14 @@ SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, IndexMetadataBatchMultipleMeasurem
 // ---------------------------------------------------------------------------
 
 SEASTAR_TEST_F(LevelDBIndexComprehensiveTest, GetSeriesMetadataBatchNonZeroShard) {
-    LevelDBIndex index(1); // Non-zero shard — db is null
+    LevelDBIndex index(1);  // Non-zero shard — db is null
     co_await index.open();
 
     SeriesId128 id = SeriesId128::fromSeriesKey("fake_key");
     auto results = co_await index.getSeriesMetadataBatch({id});
 
     EXPECT_EQ(results.size(), 1u);
-    EXPECT_FALSE(results[0].second.has_value())
-        << "Non-zero shard should return nullopt for all series in batch";
+    EXPECT_FALSE(results[0].second.has_value()) << "Non-zero shard should return nullopt for all series in batch";
 
     co_await index.close();
     co_return;

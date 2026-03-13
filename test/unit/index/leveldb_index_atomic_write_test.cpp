@@ -21,25 +21,22 @@
  * Use EXPECT_* throughout.
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <filesystem>
-
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexAtomicWriteTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void SetUp() override { std::filesystem::remove_all("shard_0"); }
 
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
 // After getOrCreateSeriesId, ALL index keys for the series must exist.
@@ -51,19 +48,15 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, AllIndexKeysWrittenAtomically) {
     co_await index.open();
 
     const std::string measurement = "weather";
-    const std::string field       = "temperature";
-    std::map<std::string, std::string> tags = {
-        {"location", "us-west"},
-        {"host",     "server-01"}
-    };
+    const std::string field = "temperature";
+    std::map<std::string, std::string> tags = {{"location", "us-west"}, {"host", "server-01"}};
 
     SeriesId128 seriesId = co_await index.getOrCreateSeriesId(measurement, tags, field);
     EXPECT_FALSE(seriesId.isZero()) << "Series ID must be non-zero after creation";
 
     // 1. Series metadata must exist (SERIES_METADATA key).
     auto meta = co_await index.getSeriesMetadata(seriesId);
-    EXPECT_TRUE(meta.has_value())
-        << "SERIES_METADATA key is missing after getOrCreateSeriesId";
+    EXPECT_TRUE(meta.has_value()) << "SERIES_METADATA key is missing after getOrCreateSeriesId";
     if (meta.has_value()) {
         EXPECT_EQ(meta->measurement, measurement);
         EXPECT_EQ(meta->field, field);
@@ -72,22 +65,19 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, AllIndexKeysWrittenAtomically) {
 
     // 2. MEASUREMENT_FIELDS must include the new field.
     auto fields = co_await index.getFields(measurement);
-    EXPECT_GT(fields.count(field), 0u)
-        << "MEASUREMENT_FIELDS entry missing field '" << field << "' after atomic write";
+    EXPECT_GT(fields.count(field), 0u) << "MEASUREMENT_FIELDS entry missing field '" << field << "' after atomic write";
 
     // 3. MEASUREMENT_TAGS must include each tag key.
     auto tagKeys = co_await index.getTags(measurement);
     for (const auto& [k, v] : tags) {
-        EXPECT_GT(tagKeys.count(k), 0u)
-            << "MEASUREMENT_TAGS entry missing tag key '" << k << "' after atomic write";
+        EXPECT_GT(tagKeys.count(k), 0u) << "MEASUREMENT_TAGS entry missing tag key '" << k << "' after atomic write";
     }
 
     // 4. TAG_VALUES must include each tag value.
     for (const auto& [k, v] : tags) {
         auto tagValues = co_await index.getTagValues(measurement, k);
         EXPECT_GT(tagValues.count(v), 0u)
-            << "TAG_VALUES entry missing value '" << v << "' for key '" << k
-            << "' after atomic write";
+            << "TAG_VALUES entry missing value '" << v << "' for key '" << k << "' after atomic write";
     }
 
     // 5. findSeriesByTag must discover the series via the TAG_INDEX entry.
@@ -95,11 +85,12 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, AllIndexKeysWrittenAtomically) {
         auto found = co_await index.findSeriesByTag(measurement, k, v);
         bool containsId = false;
         for (const auto& id : found) {
-            if (id == seriesId) { containsId = true; break; }
+            if (id == seriesId) {
+                containsId = true;
+                break;
+            }
         }
-        EXPECT_TRUE(containsId)
-            << "TAG_INDEX entry missing for " << k << "=" << v
-            << " after atomic write";
+        EXPECT_TRUE(containsId) << "TAG_INDEX entry missing for " << k << "=" << v << " after atomic write";
     }
 
     // 6. MEASUREMENT_SERIES index must contain the series ID.
@@ -108,10 +99,12 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, AllIndexKeysWrittenAtomically) {
     if (allSeriesResult.has_value()) {
         bool foundInMeasurement = false;
         for (const auto& id : allSeriesResult.value()) {
-            if (id == seriesId) { foundInMeasurement = true; break; }
+            if (id == seriesId) {
+                foundInMeasurement = true;
+                break;
+            }
         }
-        EXPECT_TRUE(foundInMeasurement)
-            << "MEASUREMENT_SERIES entry missing after atomic write";
+        EXPECT_TRUE(foundInMeasurement) << "MEASUREMENT_SERIES entry missing after atomic write";
     }
 
     co_await index.close();
@@ -126,25 +119,19 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, MultipleSeriesFieldsAndTagsConsisten
     const std::string measurement = "cpu";
 
     // First series
-    co_await index.getOrCreateSeriesId(
-        measurement,
-        {{"host", "h1"}, {"region", "us-east"}},
-        "usage");
+    co_await index.getOrCreateSeriesId(measurement, {{"host", "h1"}, {"region", "us-east"}}, "usage");
 
     // Second series, same measurement, different tags and field
-    co_await index.getOrCreateSeriesId(
-        measurement,
-        {{"host", "h2"}, {"region", "eu-west"}},
-        "idle");
+    co_await index.getOrCreateSeriesId(measurement, {{"host", "h2"}, {"region", "eu-west"}}, "idle");
 
     // Both fields must appear in MEASUREMENT_FIELDS
     auto fields = co_await index.getFields(measurement);
     EXPECT_GT(fields.count("usage"), 0u) << "Field 'usage' missing from MEASUREMENT_FIELDS";
-    EXPECT_GT(fields.count("idle"),  0u) << "Field 'idle' missing from MEASUREMENT_FIELDS";
+    EXPECT_GT(fields.count("idle"), 0u) << "Field 'idle' missing from MEASUREMENT_FIELDS";
 
     // Both tag keys must appear in MEASUREMENT_TAGS
     auto tagKeys = co_await index.getTags(measurement);
-    EXPECT_GT(tagKeys.count("host"),   0u) << "Tag key 'host' missing from MEASUREMENT_TAGS";
+    EXPECT_GT(tagKeys.count("host"), 0u) << "Tag key 'host' missing from MEASUREMENT_TAGS";
     EXPECT_GT(tagKeys.count("region"), 0u) << "Tag key 'region' missing from MEASUREMENT_TAGS";
 
     // TAG_VALUES for 'host' must contain both values
@@ -167,7 +154,7 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, IdempotentSecondCall) {
     co_await index.open();
 
     const std::string measurement = "disk";
-    const std::string field       = "used";
+    const std::string field = "used";
     std::map<std::string, std::string> tags = {{"device", "sda"}, {"host", "srv01"}};
 
     SeriesId128 id1 = co_await index.getOrCreateSeriesId(measurement, tags, field);
@@ -188,7 +175,7 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, IdempotentSecondCall) {
 
     auto tagKeys = co_await index.getTags(measurement);
     EXPECT_GT(tagKeys.count("device"), 0u);
-    EXPECT_GT(tagKeys.count("host"),   0u);
+    EXPECT_GT(tagKeys.count("host"), 0u);
 
     co_await index.close();
 }
@@ -201,7 +188,7 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, IndexInsertConsistency) {
 
     TimeStarInsert<double> insert("metrics", "latency");
     insert.addTag("service", "api");
-    insert.addTag("env",     "prod");
+    insert.addTag("env", "prod");
 
     SeriesId128 id = co_await index.indexInsert(insert);
     EXPECT_FALSE(id.isZero());
@@ -217,7 +204,7 @@ SEASTAR_TEST_F(LevelDBIndexAtomicWriteTest, IndexInsertConsistency) {
     // Tag keys in MEASUREMENT_TAGS
     auto tagKeys = co_await index.getTags("metrics");
     EXPECT_GT(tagKeys.count("service"), 0u) << "MEASUREMENT_TAGS missing 'service'";
-    EXPECT_GT(tagKeys.count("env"),     0u) << "MEASUREMENT_TAGS missing 'env'";
+    EXPECT_GT(tagKeys.count("env"), 0u) << "MEASUREMENT_TAGS missing 'env'";
 
     // Tag values in TAG_VALUES
     auto svcValues = co_await index.getTagValues("metrics", "service");

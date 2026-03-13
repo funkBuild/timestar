@@ -7,18 +7,19 @@
 // buffer.  It must produce identical data to encode() and the result must
 // survive a round-trip through the corresponding decoder.
 
+#include "aligned_buffer.hpp"
+#include "compressed_buffer.hpp"
+#include "float_encoder.hpp"
+#include "integer_encoder.hpp"
+#include "slice_buffer.hpp"
+#include "string_encoder.hpp"
+
 #include <gtest/gtest.h>
-#include <vector>
+
 #include <cmath>
 #include <cstring>
 #include <limits>
-
-#include "float_encoder.hpp"
-#include "integer_encoder.hpp"
-#include "string_encoder.hpp"
-#include "aligned_buffer.hpp"
-#include "slice_buffer.hpp"
-#include "compressed_buffer.hpp"
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Helper: build a CompressedSlice from an AlignedBuffer that was written by
@@ -113,11 +114,8 @@ TEST(FloatEncodeIntoTest, NaNRoundTrip) {
 }
 
 TEST(FloatEncodeIntoTest, InfRoundTrip) {
-    std::vector<double> values = {
-        std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
-        0.0
-    };
+    std::vector<double> values = {std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                                  0.0};
     AlignedBuffer buf;
     FloatEncoder::encodeInto(values, buf);
 
@@ -147,11 +145,8 @@ TEST(FloatEncodeIntoTest, MatchesEncodeOutput) {
     CompressedBuffer cb = FloatEncoder::encode(values);
     const size_t cbBytes = cb.data.size() * sizeof(uint64_t);
 
-    ASSERT_EQ(buf.size(), cbBytes)
-        << "encodeInto byte count should match encode() CompressedBuffer size";
-    EXPECT_EQ(0, std::memcmp(buf.data.data(),
-                             reinterpret_cast<const uint8_t*>(cb.data.data()),
-                             cbBytes))
+    ASSERT_EQ(buf.size(), cbBytes) << "encodeInto byte count should match encode() CompressedBuffer size";
+    EXPECT_EQ(0, std::memcmp(buf.data.data(), reinterpret_cast<const uint8_t*>(cb.data.data()), cbBytes))
         << "encodeInto content should be identical to encode()";
 }
 
@@ -200,8 +195,8 @@ static void verifyIntRoundTripViaEncodeInto(const std::vector<uint64_t>& input) 
 
     Slice slice(buf.data.data(), buf.size());
     std::vector<uint64_t> decoded;
-    auto [skipped, added] = IntegerEncoder::decode(
-        slice, static_cast<unsigned int>(input.size()), decoded, 0, UINT64_MAX);
+    auto [skipped, added] =
+        IntegerEncoder::decode(slice, static_cast<unsigned int>(input.size()), decoded, 0, UINT64_MAX);
 
     ASSERT_EQ(added, input.size());
     ASSERT_EQ(decoded.size(), input.size());
@@ -232,7 +227,7 @@ TEST(IntegerEncodeIntoTest, LargerInput) {
     uint64_t ts = 1'000'000'000ULL;
     for (int i = 0; i < 500; i++) {
         values.push_back(ts);
-        ts += 1'000'000ULL; // 1 ms increments in nanoseconds
+        ts += 1'000'000ULL;  // 1 ms increments in nanoseconds
     }
     verifyIntRoundTripViaEncodeInto(values);
 }
@@ -254,8 +249,7 @@ TEST(IntegerEncodeIntoTest, MatchesEncodeOutput) {
     // Via encode
     AlignedBuffer bufEncode = IntegerEncoder::encode(values);
 
-    ASSERT_EQ(bufInto.size(), bufEncode.size())
-        << "encodeInto and encode should produce the same byte count";
+    ASSERT_EQ(bufInto.size(), bufEncode.size()) << "encodeInto and encode should produce the same byte count";
     EXPECT_EQ(0, std::memcmp(bufInto.data.data(), bufEncode.data.data(), bufInto.size()))
         << "encodeInto and encode should produce identical bytes";
 }
@@ -281,8 +275,8 @@ TEST(IntegerEncodeIntoTest, AppendsToExistingBuffer) {
     // Encoded payload must decode correctly.
     Slice slice(buf.data.data() + sentinelSize, written);
     std::vector<uint64_t> decoded;
-    auto [skipped, added] = IntegerEncoder::decode(
-        slice, static_cast<unsigned int>(values.size()), decoded, 0, UINT64_MAX);
+    auto [skipped, added] =
+        IntegerEncoder::decode(slice, static_cast<unsigned int>(values.size()), decoded, 0, UINT64_MAX);
     ASSERT_EQ(added, values.size());
     for (size_t i = 0; i < values.size(); i++) {
         EXPECT_EQ(decoded[i], values[i]) << "Mismatch at index " << i;
@@ -335,12 +329,7 @@ TEST(StringEncodeIntoTest, SingleString) {
 }
 
 TEST(StringEncodeIntoTest, MultipleStrings) {
-    verifyStringRoundTripViaEncodeInto({
-        "first",
-        "second",
-        "third string with spaces",
-        "fourth"
-    });
+    verifyStringRoundTripViaEncodeInto({"first", "second", "third string with spaces", "fourth"});
 }
 
 TEST(StringEncodeIntoTest, EmptyStringsInVector) {
@@ -357,13 +346,9 @@ TEST(StringEncodeIntoTest, LargeStrings) {
 }
 
 TEST(StringEncodeIntoTest, SpecialCharacters) {
-    verifyStringRoundTripViaEncodeInto({
-        "Tab:\there",
-        "Newline:\nhere",
-        "UTF-8: \xc3\xa9\xc3\xbc\xe4\xb8\xad\xe6\x96\x87",
-        "Symbols: !@#$%^&*()",
-        "JSON: {\"key\": \"value\"}"
-    });
+    verifyStringRoundTripViaEncodeInto({"Tab:\there", "Newline:\nhere",
+                                        "UTF-8: \xc3\xa9\xc3\xbc\xe4\xb8\xad\xe6\x96\x87", "Symbols: !@#$%^&*()",
+                                        "JSON: {\"key\": \"value\"}"});
 }
 
 TEST(StringEncodeIntoTest, ManyStrings) {
@@ -377,9 +362,7 @@ TEST(StringEncodeIntoTest, ManyStrings) {
 
 TEST(StringEncodeIntoTest, MatchesEncodeOutput) {
     // encodeInto must produce the same bytes as encode().
-    std::vector<std::string> input = {
-        "alpha", "beta", "gamma", "delta", "epsilon"
-    };
+    std::vector<std::string> input = {"alpha", "beta", "gamma", "delta", "epsilon"};
 
     // Via encodeInto
     AlignedBuffer bufInto;
@@ -388,8 +371,7 @@ TEST(StringEncodeIntoTest, MatchesEncodeOutput) {
     // Via encode
     AlignedBuffer bufEncode = StringEncoder::encode(input);
 
-    ASSERT_EQ(bufInto.size(), bufEncode.size())
-        << "encodeInto and encode should produce the same byte count";
+    ASSERT_EQ(bufInto.size(), bufEncode.size()) << "encodeInto and encode should produce the same byte count";
     EXPECT_EQ(0, std::memcmp(bufInto.data.data(), bufEncode.data.data(), bufInto.size()))
         << "encodeInto and encode should produce identical bytes";
 }

@@ -1,27 +1,27 @@
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <random>
-#include <iomanip>
-#include <algorithm>
-#include <cstring>
-#include <sstream>
-
 #include "../../lib/encoding/integer_encoder.hpp"
 #include "../../lib/encoding/simple16.hpp"
 #include "../../lib/encoding/zigzag.hpp"
 #include "../../lib/storage/aligned_buffer.hpp"
 #include "../../lib/storage/slice_buffer.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <sstream>
+#include <vector>
+
 // ANSI color codes for output
-#define RESET   "\033[0m"
-#define BOLD    "\033[1m"
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
+#define RESET "\033[0m"
+#define BOLD "\033[1m"
+#define RED "\033[31m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define BLUE "\033[34m"
 #define MAGENTA "\033[35m"
-#define CYAN    "\033[36m"
+#define CYAN "\033[36m"
 
 struct BenchmarkResult {
     std::string name;
@@ -35,7 +35,8 @@ struct BenchmarkResult {
 };
 
 // Generate different types of integer datasets
-std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start = 1000000000000ULL, uint64_t interval = 1000) {
+std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start = 1000000000000ULL,
+                                                  uint64_t interval = 1000) {
     std::vector<uint64_t> data;
     data.reserve(count);
     uint64_t current = start;
@@ -48,7 +49,8 @@ std::vector<uint64_t> generateMonotonicTimestamps(size_t count, uint64_t start =
     return data;
 }
 
-std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 1000000000000ULL, uint64_t interval = 1000, uint64_t jitter = 100) {
+std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 1000000000000ULL,
+                                                 uint64_t interval = 1000, uint64_t jitter = 100) {
     std::vector<uint64_t> data;
     data.reserve(count);
     std::random_device rd;
@@ -59,7 +61,7 @@ std::vector<uint64_t> generateJitteredTimestamps(size_t count, uint64_t start = 
 
     for (size_t i = 0; i < count; i++) {
         data.push_back(current);
-        current += interval + dist(gen) - jitter/2;
+        current += interval + dist(gen) - jitter / 2;
     }
 
     return data;
@@ -183,18 +185,14 @@ BenchmarkResult benchmarkEncoder(const std::string& name, const std::vector<uint
 }
 
 void printResults(const std::vector<BenchmarkResult>& results) {
-    std::cout << BOLD << CYAN << "\n═══════════════════════════ BENCHMARK RESULTS ═══════════════════════════\n" << RESET;
+    std::cout << BOLD << CYAN << "\n═══════════════════════════ BENCHMARK RESULTS ═══════════════════════════\n"
+              << RESET;
 
     // Print header
     std::cout << BOLD;
-    std::cout << std::setw(25) << std::left << "Dataset"
-              << std::setw(12) << std::right << "Encode(ms)"
-              << std::setw(12) << "Decode(ms)"
-              << std::setw(12) << "Enc MB/s"
-              << std::setw(12) << "Dec MB/s"
-              << std::setw(12) << "Size(KB)"
-              << std::setw(12) << "Ratio"
-              << std::setw(12) << "Status" << "\n";
+    std::cout << std::setw(25) << std::left << "Dataset" << std::setw(12) << std::right << "Encode(ms)" << std::setw(12)
+              << "Decode(ms)" << std::setw(12) << "Enc MB/s" << std::setw(12) << "Dec MB/s" << std::setw(12)
+              << "Size(KB)" << std::setw(12) << "Ratio" << std::setw(12) << "Status" << "\n";
     std::cout << std::string(103, '-') << "\n" << RESET;
 
     // Print results
@@ -227,24 +225,19 @@ void analyzeSimple16Performance() {
         std::vector<uint64_t> values;
     };
 
-    std::vector<TestCase> test_cases = {
-        {"2-bit values (0-3)", generateSmallIntegers(1000, 3)},
-        {"4-bit values (0-15)", generateSmallIntegers(1000, 15)},
-        {"8-bit values (0-255)", generateSmallIntegers(1000, 255)},
-        {"12-bit values (0-4095)", generateSmallIntegers(1000, 4095)},
-        {"16-bit values (0-65535)", generateSmallIntegers(1000, 65535)},
-        {"20-bit values", generateRandomIntegers(1000, 0, (1ULL << 20) - 1)},
-        {"30-bit values", generateRandomIntegers(1000, 0, (1ULL << 30) - 1)},
-        {"60-bit values", generateRandomIntegers(1000, 0, (1ULL << 60) - 1)},
-        {"Mixed sizes", generateMixedSizeIntegers(1000)}
-    };
+    std::vector<TestCase> test_cases = {{"2-bit values (0-3)", generateSmallIntegers(1000, 3)},
+                                        {"4-bit values (0-15)", generateSmallIntegers(1000, 15)},
+                                        {"8-bit values (0-255)", generateSmallIntegers(1000, 255)},
+                                        {"12-bit values (0-4095)", generateSmallIntegers(1000, 4095)},
+                                        {"16-bit values (0-65535)", generateSmallIntegers(1000, 65535)},
+                                        {"20-bit values", generateRandomIntegers(1000, 0, (1ULL << 20) - 1)},
+                                        {"30-bit values", generateRandomIntegers(1000, 0, (1ULL << 30) - 1)},
+                                        {"60-bit values", generateRandomIntegers(1000, 0, (1ULL << 60) - 1)},
+                                        {"Mixed sizes", generateMixedSizeIntegers(1000)}};
 
-    std::cout << BOLD << std::setw(25) << std::left << "Value Distribution"
-              << std::setw(15) << std::right << "Orig Size(KB)"
-              << std::setw(15) << "Comp Size(KB)"
-              << std::setw(12) << "Ratio"
-              << std::setw(15) << "Encode(µs)"
-              << std::setw(15) << "Decode(µs)" << "\n";
+    std::cout << BOLD << std::setw(25) << std::left << "Value Distribution" << std::setw(15) << std::right
+              << "Orig Size(KB)" << std::setw(15) << "Comp Size(KB)" << std::setw(12) << "Ratio" << std::setw(15)
+              << "Encode(µs)" << std::setw(15) << "Decode(µs)" << "\n";
     std::cout << std::string(92, '-') << "\n" << RESET;
 
     for (auto& test : test_cases) {
@@ -295,7 +288,8 @@ void profileDecoderBottlenecks() {
         auto decoded = Simple16::decode(slice, timestamps.size());
     }
     auto simple16_end = std::chrono::high_resolution_clock::now();
-    auto simple16_us = std::chrono::duration_cast<std::chrono::microseconds>(simple16_end - simple16_start).count() / runs;
+    auto simple16_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(simple16_end - simple16_start).count() / runs;
 
     // 2. Full decode with delta reconstruction
     auto full_start = std::chrono::high_resolution_clock::now();
@@ -320,8 +314,8 @@ void profileDecoderBottlenecks() {
     std::cout << "  Simple16 decode only:    " << std::setw(8) << simple16_us << " µs\n";
     std::cout << "  Full decode with delta:  " << std::setw(8) << full_us << " µs\n";
     std::cout << "  Memory allocation:       " << std::setw(8) << alloc_us << " µs\n";
-    std::cout << "  Delta reconstruction:    " << std::setw(8) << (full_us - simple16_us) << " µs ("
-              << std::fixed << std::setprecision(1) << ((full_us - simple16_us) * 100.0 / full_us) << "%)\n";
+    std::cout << "  Delta reconstruction:    " << std::setw(8) << (full_us - simple16_us) << " µs (" << std::fixed
+              << std::setprecision(1) << ((full_us - simple16_us) * 100.0 / full_us) << "%)\n";
     std::cout << "  Overhead percentage:     " << std::setw(8) << std::fixed << std::setprecision(1)
               << (alloc_us * 100.0 / full_us) << "%\n";
 }

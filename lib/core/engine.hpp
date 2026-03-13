@@ -115,8 +115,7 @@ public:
     // inapplicable (non-float, memory store data, cross-file overlap).
     seastar::future<std::optional<timestar::PushdownResult>> queryAggregated(
         const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-        uint64_t aggregationInterval,
-        timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
+        uint64_t aggregationInterval, timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 
     // --- Retention policy management ---
     // Update a single policy in this shard's cache (called via invoke_on_all)

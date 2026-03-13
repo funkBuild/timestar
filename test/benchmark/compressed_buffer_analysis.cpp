@@ -1,13 +1,14 @@
-#include <iostream>
-#include <chrono>
-#include <vector>
-#include <random>
-#include <iomanip>
-#include <cstring>
-#include <cmath>
-#include <map>
-#include "storage/compressed_buffer.hpp"
 #include "encoding/float_encoder.hpp"
+#include "storage/compressed_buffer.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <random>
+#include <vector>
 
 using namespace std::chrono;
 
@@ -17,7 +18,7 @@ void analyze_float_encoder_pattern() {
 
     // Generate realistic float data
     std::vector<double> test_data;
-    for(int i = 0; i < 10000; i++) {
+    for (int i = 0; i < 10000; i++) {
         test_data.push_back(20.0 + sin(i * 0.1) * 5.0 + (rand() % 100) / 100.0);
     }
 
@@ -40,23 +41,25 @@ void analyze_float_encoder_pattern() {
     write_histogram[64]++;  // Initial value
     total_writes++;
 
-    for(size_t i = 1; i < test_data.size(); i++) {
+    for (size_t i = 1; i < test_data.size(); i++) {
         const uint64_t current_value = *((uint64_t*)&test_data[i]);
         const uint64_t xor_value = current_value ^ last_value;
 
-        if(xor_value == 0) {
+        if (xor_value == 0) {
             write_histogram[1]++;  // writeFixed<0b0, 1>
             control_bits_written += 1;
             total_writes++;
         } else {
             int lzb = 0;
-            for(int i = 63; i >= 0; i--) {
-                if((xor_value >> i) & 1) break;
+            for (int i = 63; i >= 0; i--) {
+                if ((xor_value >> i) & 1)
+                    break;
                 lzb++;
             }
             int tzb = 0;
-            for(int i = 0; i < 64; i++) {
-                if((xor_value >> i) & 1) break;
+            for (int i = 0; i < 64; i++) {
+                if ((xor_value >> i) & 1)
+                    break;
                 tzb++;
             }
 
@@ -65,12 +68,13 @@ void analyze_float_encoder_pattern() {
                 control_bits_written += 2;
                 total_writes++;
             } else {
-                if(lzb > 31) lzb = 31;
+                if (lzb > 31)
+                    lzb = 31;
                 data_bits = 64 - lzb - tzb;
 
-                write_histogram[2]++;   // writeFixed<0b11, 2>
-                write_histogram[5]++;   // write<5>(lzb)
-                write_histogram[6]++;   // write<6>(data_bits)
+                write_histogram[2]++;  // writeFixed<0b11, 2>
+                write_histogram[5]++;  // write<5>(lzb)
+                write_histogram[6]++;  // write<6>(data_bits)
                 control_bits_written += 2 + 5 + 6;
                 total_writes += 3;
 
@@ -95,18 +99,17 @@ void analyze_float_encoder_pattern() {
               << (100.0 * data_bits_written / (control_bits_written + data_bits_written)) << "%)" << std::endl;
 
     std::cout << "\nWrite Size Distribution:" << std::endl;
-    for(auto& [bits, count] : write_histogram) {
-        if(count > 0) {
-            std::cout << "  " << std::setw(2) << bits << "-bit: " << std::setw(6) << count
-                      << " (" << std::setw(5) << std::fixed << std::setprecision(1)
-                      << (100.0 * count / total_writes) << "%)" << std::endl;
+    for (auto& [bits, count] : write_histogram) {
+        if (count > 0) {
+            std::cout << "  " << std::setw(2) << bits << "-bit: " << std::setw(6) << count << " (" << std::setw(5)
+                      << std::fixed << std::setprecision(1) << (100.0 * count / total_writes) << "%)" << std::endl;
         }
     }
 
     // Calculate overhead
     int small_writes = write_histogram[1] + write_histogram[2] + write_histogram[5] + write_histogram[6];
-    std::cout << "\nSmall writes (≤6 bits): " << small_writes
-              << " (" << (100.0 * small_writes / total_writes) << "% of all writes)" << std::endl;
+    std::cout << "\nSmall writes (≤6 bits): " << small_writes << " (" << (100.0 * small_writes / total_writes)
+              << "% of all writes)" << std::endl;
 }
 
 // Test batched write performance
@@ -119,7 +122,7 @@ void test_batched_writes() {
     {
         CompressedBuffer buffer;
         auto start = high_resolution_clock::now();
-        for(size_t i = 0; i < iterations; i++) {
+        for (size_t i = 0; i < iterations; i++) {
             buffer.writeFixed<0b11, 2>();
             buffer.write<5>(i & 0x1F);
             buffer.write<6>(i & 0x3F);
@@ -133,7 +136,7 @@ void test_batched_writes() {
     {
         CompressedBuffer buffer;
         auto start = high_resolution_clock::now();
-        for(size_t i = 0; i < iterations; i++) {
+        for (size_t i = 0; i < iterations; i++) {
             uint64_t combined = (0b11 << 11) | ((i & 0x1F) << 6) | (i & 0x3F);
             buffer.write(combined, 13);
         }
@@ -149,7 +152,7 @@ void test_precalculation() {
 
     // Generate test data
     std::vector<double> test_data;
-    for(int i = 0; i < 10000; i++) {
+    for (int i = 0; i < 10000; i++) {
         test_data.push_back(20.0 + sin(i * 0.1) * 5.0);
     }
 
@@ -167,16 +170,16 @@ void test_precalculation() {
         auto start = high_resolution_clock::now();
 
         // First pass: calculate total bits needed
-        size_t total_bits = 64; // First value
+        size_t total_bits = 64;  // First value
         uint64_t last_value = *((uint64_t*)&test_data[0]);
         int data_bits = 0;
         int prev_lzb = -1, prev_tzb = -1;
 
-        for(size_t i = 1; i < test_data.size(); i++) {
+        for (size_t i = 1; i < test_data.size(); i++) {
             const uint64_t current_value = *((uint64_t*)&test_data[i]);
             const uint64_t xor_value = current_value ^ last_value;
 
-            if(xor_value == 0) {
+            if (xor_value == 0) {
                 total_bits += 1;
             } else {
                 auto lzb = __builtin_clzll(xor_value);
@@ -185,7 +188,8 @@ void test_precalculation() {
                 if (data_bits != 0 && prev_lzb <= lzb && prev_tzb <= tzb) {
                     total_bits += 2;
                 } else {
-                    if(lzb > 31) lzb = 31;
+                    if (lzb > 31)
+                        lzb = 31;
                     data_bits = 64 - lzb - tzb;
                     total_bits += 2 + 5 + 6;
                     prev_lzb = lzb;

@@ -4,29 +4,28 @@
 // The ForecastExecutor itself is synchronous, but it is invoked asynchronously
 // via DerivedQueryExecutor::executeForecast() which reads from a real engine.
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <vector>
-#include <string>
-#include <cmath>
-#include <random>
-
-#include "../../../lib/query/derived_query_executor.hpp"
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/query/derived_query.hpp"
+#include "../../../lib/query/derived_query_executor.hpp"
 #include "../../../lib/query/forecast/forecast_executor.hpp"
 #include "../../../lib/query/forecast/forecast_result.hpp"
-#include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
-
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/sharded.hh>
-#include <seastar/core/smp.hh>
-
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cmath>
+#include <filesystem>
+#include <random>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/thread.hh>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -35,18 +34,12 @@ using namespace timestar::forecast;
 
 class ForecastExecutorSeastarTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 
     // Insert a series of float data points via shardedInsert
-    static void insertSeries(seastar::sharded<Engine>& eng,
-                             const std::string& measurement,
-                             const std::string& field,
+    static void insertSeries(seastar::sharded<Engine>& eng, const std::string& measurement, const std::string& field,
                              const std::map<std::string, std::string>& tags,
                              const std::vector<std::pair<uint64_t, double>>& points) {
         TimeStarInsert<double> insert(measurement, field);
@@ -122,7 +115,9 @@ TEST_F(ForecastExecutorSeastarTest, LinearForecastViaExecutor) {
 
         // Slope should be close to 0.5
         EXPECT_NEAR(result.statistics.slope, 0.5, 0.1);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -168,7 +163,9 @@ TEST_F(ForecastExecutorSeastarTest, SeasonalForecastViaExecutor) {
         EXPECT_FALSE(result.empty());
         EXPECT_EQ(result.statistics.algorithm, "seasonal");
         EXPECT_GE(result.series.size(), 4u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -218,12 +215,14 @@ TEST_F(ForecastExecutorSeastarTest, LargeDatasetForecast) {
 
         // Verify execution completed in reasonable time
         EXPECT_GT(result.statistics.executionTimeMs, 0.0);
-        EXPECT_LT(result.statistics.executionTimeMs, 30000.0); // under 30s
+        EXPECT_LT(result.statistics.executionTimeMs, 30000.0);  // under 30s
 
         // Should have forecast points
         EXPECT_GT(result.statistics.forecastPoints, 0u);
         EXPECT_EQ(result.statistics.historicalPoints, 1000u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -265,10 +264,7 @@ TEST_F(ForecastExecutorSeastarTest, SmallDatasetDoesNotCrash) {
         uint64_t intervalNs = 60000000000ULL;
         uint64_t startNs = 1704067200000000000ULL;
         std::vector<std::pair<uint64_t, double>> points = {
-            {startNs, 1.0},
-            {startNs + intervalNs, 2.0},
-            {startNs + 2 * intervalNs, 3.0}
-        };
+            {startNs, 1.0}, {startNs + intervalNs, 2.0}, {startNs + 2 * intervalNs, 3.0}};
         insertSeries(eng.eng, "metric", "val", {}, points);
 
         DerivedQueryExecutor executor(&eng.eng);
@@ -297,7 +293,9 @@ TEST_F(ForecastExecutorSeastarTest, SmallDatasetDoesNotCrash) {
             // still complete successfully without crashing.
             EXPECT_TRUE(result.success);
         });
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -351,7 +349,9 @@ TEST_F(ForecastExecutorSeastarTest, ForecastResponseFormatting) {
         DerivedQueryResultVariant variant{result};
         auto json2 = executor.formatResponseVariant(variant);
         EXPECT_TRUE(json2.find("\"success\"") != std::string::npos);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -374,9 +374,7 @@ TEST_F(ForecastExecutorSeastarTest, ForecastAfterRolloverToTSM) {
         insertSeries(eng.eng, "metric", "val", {{"host", "h1"}}, batch1);
 
         // Force rollover to TSM
-        eng.eng.invoke_on_all([](Engine& engine) {
-            return engine.rolloverMemoryStore();
-        }).get();
+        eng.eng.invoke_on_all([](Engine& engine) { return engine.rolloverMemoryStore(); }).get();
 
         // Insert second batch (stays in memory)
         std::vector<std::pair<uint64_t, double>> batch2;
@@ -411,7 +409,9 @@ TEST_F(ForecastExecutorSeastarTest, ForecastAfterRolloverToTSM) {
         // The merged data from TSM + memory should produce a linear trend
         EXPECT_GT(result.statistics.historicalPoints, 0u);
         EXPECT_NEAR(result.statistics.slope, 0.2, 0.05);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -433,14 +433,11 @@ TEST_F(ForecastExecutorSeastarTest, MultiSeriesDirectExecution) {
     // Two series with different slopes
     std::vector<std::vector<double>> seriesValues(2);
     for (size_t i = 0; i < 50; ++i) {
-        seriesValues[0].push_back(10.0 + 0.5 * i);  // slope 0.5
-        seriesValues[1].push_back(100.0 + 1.0 * i); // slope 1.0
+        seriesValues[0].push_back(10.0 + 0.5 * i);   // slope 0.5
+        seriesValues[1].push_back(100.0 + 1.0 * i);  // slope 1.0
     }
 
-    std::vector<std::vector<std::string>> seriesGroupTags = {
-        {"host=server1"},
-        {"host=server2"}
-    };
+    std::vector<std::vector<std::string>> seriesGroupTags = {{"host=server1"}, {"host=server2"}};
 
     ForecastConfig config;
     config.algorithm = Algorithm::LINEAR;
@@ -459,10 +456,14 @@ TEST_F(ForecastExecutorSeastarTest, MultiSeriesDirectExecution) {
     // Check piece types
     int pastCount = 0, forecastCount = 0, upperCount = 0, lowerCount = 0;
     for (const auto& piece : result.series) {
-        if (piece.piece == "past") pastCount++;
-        else if (piece.piece == "forecast") forecastCount++;
-        else if (piece.piece == "upper") upperCount++;
-        else if (piece.piece == "lower") lowerCount++;
+        if (piece.piece == "past")
+            pastCount++;
+        else if (piece.piece == "forecast")
+            forecastCount++;
+        else if (piece.piece == "upper")
+            upperCount++;
+        else if (piece.piece == "lower")
+            lowerCount++;
     }
     EXPECT_EQ(pastCount, 2);
     EXPECT_EQ(forecastCount, 2);
@@ -473,5 +474,5 @@ TEST_F(ForecastExecutorSeastarTest, MultiSeriesDirectExecution) {
     EXPECT_EQ(result.forecastStartIndex, 50u);
 
     // Verify timestamps include historical + forecast
-    EXPECT_EQ(result.times.size(), 60u); // 50 historical + 10 forecast
+    EXPECT_EQ(result.times.size(), 60u);  // 50 historical + 10 forecast
 }

@@ -20,8 +20,10 @@
 //    SPREAD) are unaffected because they compute from running scalar accumulators
 //    that are always updated regardless of saturation.
 
-#include <gtest/gtest.h>
 #include "../../../lib/query/aggregator.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cmath>
 #include <vector>
 
@@ -30,7 +32,9 @@ using namespace timestar;
 // ---------------------------------------------------------------------------
 // Helper: confirm a double is NaN
 // ---------------------------------------------------------------------------
-static bool isNaN(double v) { return std::isnan(v); }
+static bool isNaN(double v) {
+    return std::isnan(v);
+}
 
 // ============================================================================
 // addValue() — saturation via direct insertion
@@ -285,14 +289,14 @@ TEST(AggregationStateCapTest, LargeMultiShardMerge_CorrectBehavior) {
 
     // Build one partial state per shard, all with value = 1.0
     std::vector<AggregationState> shards(shardsCount);
-    for (auto& sh : shards) sh.collectRaw = true;
+    for (auto& sh : shards)
+        sh.collectRaw = true;
     for (size_t s = 0; s < shardsCount; ++s) {
         for (size_t i = 0; i < pointsPerShard; ++i) {
             shards[s].addValue(1.0, static_cast<uint64_t>(s * pointsPerShard + i));
         }
         // Each individual shard is below the limit
-        ASSERT_FALSE(shards[s].rawValuesSaturated)
-            << "Shard " << s << " pre-saturated before merge";
+        ASSERT_FALSE(shards[s].rawValuesSaturated) << "Shard " << s << " pre-saturated before merge";
     }
 
     // Merge all shards into shard 0
@@ -310,10 +314,8 @@ TEST(AggregationStateCapTest, LargeMultiShardMerge_CorrectBehavior) {
     EXPECT_TRUE(merged.rawValuesSaturated);
 
     // Scalar methods must be correct
-    EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::COUNT),
-                     static_cast<double>(totalPoints));
-    EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::SUM),
-                     static_cast<double>(totalPoints));
+    EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::COUNT), static_cast<double>(totalPoints));
+    EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::SUM), static_cast<double>(totalPoints));
     EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::AVG), 1.0);
     EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::MIN), 1.0);
     EXPECT_DOUBLE_EQ(merged.getValue(AggregationMethod::MAX), 1.0);

@@ -1,7 +1,8 @@
 #include <gtest/gtest.h>
+
 #include <fstream>
-#include <string>
 #include <sstream>
+#include <string>
 
 // =============================================================================
 // Source code inspection tests for compaction error handling
@@ -21,38 +22,37 @@ protected:
     void SetUp() override {
         // Load tsm_compactor.cpp
         std::ifstream compactorFile(TSM_COMPACTOR_SOURCE_PATH);
-        ASSERT_TRUE(compactorFile.is_open())
-            << "Could not open tsm_compactor.cpp at: " << TSM_COMPACTOR_SOURCE_PATH;
-        compactorSource.assign(
-            std::istreambuf_iterator<char>(compactorFile),
-            std::istreambuf_iterator<char>());
+        ASSERT_TRUE(compactorFile.is_open()) << "Could not open tsm_compactor.cpp at: " << TSM_COMPACTOR_SOURCE_PATH;
+        compactorSource.assign(std::istreambuf_iterator<char>(compactorFile), std::istreambuf_iterator<char>());
         ASSERT_FALSE(compactorSource.empty());
 
         // Load tsm_file_manager.cpp
         std::ifstream fileManagerFile(TSM_FILE_MANAGER_CPP_SOURCE_PATH);
         ASSERT_TRUE(fileManagerFile.is_open())
             << "Could not open tsm_file_manager.cpp at: " << TSM_FILE_MANAGER_CPP_SOURCE_PATH;
-        fileManagerSource.assign(
-            std::istreambuf_iterator<char>(fileManagerFile),
-            std::istreambuf_iterator<char>());
+        fileManagerSource.assign(std::istreambuf_iterator<char>(fileManagerFile), std::istreambuf_iterator<char>());
         ASSERT_FALSE(fileManagerSource.empty());
     }
 
     // Extract a method body from source code given the method signature pattern
     std::string extractMethodBody(const std::string& source, const std::string& signature) {
         auto pos = source.find(signature);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
 
         // Find the opening brace of the method
         auto bracePos = source.find('{', pos);
-        if (bracePos == std::string::npos) return "";
+        if (bracePos == std::string::npos)
+            return "";
 
         // Track brace depth to find the end of the method
         int depth = 1;
         size_t i = bracePos + 1;
         while (i < source.size() && depth > 0) {
-            if (source[i] == '{') depth++;
-            else if (source[i] == '}') depth--;
+            if (source[i] == '{')
+                depth++;
+            else if (source[i] == '}')
+                depth--;
             i++;
         }
 
@@ -64,7 +64,8 @@ protected:
     bool hasTrappedCall(const std::string& methodBody, const std::string& call) {
         // Find the call
         auto callPos = methodBody.find(call);
-        if (callPos == std::string::npos) return false;
+        if (callPos == std::string::npos)
+            return false;
 
         // Look backwards from the call for a 'try' keyword
         // The try must appear before the call and its matching '{' must
@@ -73,18 +74,22 @@ protected:
 
         // Find the last 'try' before the call
         auto tryPos = beforeCall.rfind("try");
-        if (tryPos == std::string::npos) return false;
+        if (tryPos == std::string::npos)
+            return false;
 
         // Find the opening brace after 'try'
         auto tryBrace = beforeCall.find('{', tryPos);
-        if (tryBrace == std::string::npos) return false;
+        if (tryBrace == std::string::npos)
+            return false;
 
         // Verify the try block's opening brace is still open at the call site
         // (count braces between try's '{' and the call)
         int depth = 1;
         for (size_t j = tryBrace + 1; j < callPos && depth > 0; j++) {
-            if (beforeCall[j] == '{') depth++;
-            else if (beforeCall[j] == '}') depth--;
+            if (beforeCall[j] == '{')
+                depth++;
+            else if (beforeCall[j] == '}')
+                depth--;
         }
 
         // depth > 0 means the try block is still open at the call site
@@ -95,22 +100,27 @@ protected:
     bool catchBlockDoesNotRethrow(const std::string& methodBody, const std::string& call) {
         // Find the call
         auto callPos = methodBody.find(call);
-        if (callPos == std::string::npos) return false;
+        if (callPos == std::string::npos)
+            return false;
 
         // Find the catch block after the call
         auto catchPos = methodBody.find("catch", callPos);
-        if (catchPos == std::string::npos) return false;
+        if (catchPos == std::string::npos)
+            return false;
 
         // Find the opening brace of the catch block
         auto catchBrace = methodBody.find('{', catchPos);
-        if (catchBrace == std::string::npos) return false;
+        if (catchBrace == std::string::npos)
+            return false;
 
         // Find the closing brace of the catch block
         int depth = 1;
         size_t i = catchBrace + 1;
         while (i < methodBody.size() && depth > 0) {
-            if (methodBody[i] == '{') depth++;
-            else if (methodBody[i] == '}') depth--;
+            if (methodBody[i] == '{')
+                depth++;
+            else if (methodBody[i] == '}')
+                depth--;
             i++;
         }
 
@@ -118,8 +128,8 @@ protected:
 
         // Check that the catch block does NOT contain 'throw;' or 'throw '
         // (which would rethrow the exception)
-        bool hasRethrow = (catchBody.find("throw;") != std::string::npos) ||
-                          (catchBody.find("throw ") != std::string::npos);
+        bool hasRethrow =
+            (catchBody.find("throw;") != std::string::npos) || (catchBody.find("throw ") != std::string::npos);
 
         return !hasRethrow;
     }
@@ -128,8 +138,7 @@ protected:
 // Test 1: runCompactionLoop has try/catch around executeCompaction
 TEST_F(CompactionErrorHandlingTest, RunCompactionLoopHasTryCatchAroundExecuteCompaction) {
     std::string loopBody = extractMethodBody(compactorSource, "TSMCompactor::runCompactionLoop()");
-    ASSERT_FALSE(loopBody.empty())
-        << "Could not find TSMCompactor::runCompactionLoop() in source";
+    ASSERT_FALSE(loopBody.empty()) << "Could not find TSMCompactor::runCompactionLoop() in source";
 
     // Verify executeCompaction is called
     ASSERT_NE(loopBody.find("executeCompaction"), std::string::npos)
@@ -153,8 +162,7 @@ TEST_F(CompactionErrorHandlingTest, RunCompactionLoopCatchBlockLogsError) {
     ASSERT_NE(execPos, std::string::npos);
 
     auto catchPos = loopBody.find("catch", execPos);
-    ASSERT_NE(catchPos, std::string::npos)
-        << "No catch block found after executeCompaction in runCompactionLoop()";
+    ASSERT_NE(catchPos, std::string::npos) << "No catch block found after executeCompaction in runCompactionLoop()";
 
     // Find the catch body
     auto catchBrace = loopBody.find('{', catchPos);
@@ -163,8 +171,10 @@ TEST_F(CompactionErrorHandlingTest, RunCompactionLoopCatchBlockLogsError) {
     int depth = 1;
     size_t i = catchBrace + 1;
     while (i < loopBody.size() && depth > 0) {
-        if (loopBody[i] == '{') depth++;
-        else if (loopBody[i] == '}') depth--;
+        if (loopBody[i] == '{')
+            depth++;
+        else if (loopBody[i] == '}')
+            depth--;
         i++;
     }
 
@@ -174,18 +184,16 @@ TEST_F(CompactionErrorHandlingTest, RunCompactionLoopCatchBlockLogsError) {
     bool logsError = (catchBody.find("compactor_log.error") != std::string::npos) ||
                      (catchBody.find("log.error") != std::string::npos);
 
-    EXPECT_TRUE(logsError)
-        << "The catch block in runCompactionLoop() does not log an error. "
-        << "Compaction failures should be logged so operators can diagnose issues. "
-        << "Catch body:\n" << catchBody;
+    EXPECT_TRUE(logsError) << "The catch block in runCompactionLoop() does not log an error. "
+                           << "Compaction failures should be logged so operators can diagnose issues. "
+                           << "Catch body:\n"
+                           << catchBody;
 }
 
 // Test 3: checkAndTriggerCompaction has try/catch around executeCompaction
 TEST_F(CompactionErrorHandlingTest, CheckAndTriggerCompactionHasTryCatchAroundExecuteCompaction) {
-    std::string methodBody = extractMethodBody(fileManagerSource,
-        "TSMFileManager::checkAndTriggerCompaction()");
-    ASSERT_FALSE(methodBody.empty())
-        << "Could not find TSMFileManager::checkAndTriggerCompaction() in source";
+    std::string methodBody = extractMethodBody(fileManagerSource, "TSMFileManager::checkAndTriggerCompaction()");
+    ASSERT_FALSE(methodBody.empty()) << "Could not find TSMFileManager::checkAndTriggerCompaction() in source";
 
     // Verify executeCompaction is called
     ASSERT_NE(methodBody.find("executeCompaction"), std::string::npos)
@@ -211,8 +219,7 @@ TEST_F(CompactionErrorHandlingTest, RunCompactionLoopContinuesAfterError) {
 
 // Test 5: checkAndTriggerCompaction catch block does NOT rethrow
 TEST_F(CompactionErrorHandlingTest, CheckAndTriggerCompactionContinuesAfterError) {
-    std::string methodBody = extractMethodBody(fileManagerSource,
-        "TSMFileManager::checkAndTriggerCompaction()");
+    std::string methodBody = extractMethodBody(fileManagerSource, "TSMFileManager::checkAndTriggerCompaction()");
     ASSERT_FALSE(methodBody.empty());
 
     EXPECT_TRUE(catchBlockDoesNotRethrow(methodBody, "executeCompaction"))

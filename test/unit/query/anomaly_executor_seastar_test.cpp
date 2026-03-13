@@ -4,29 +4,28 @@
 // anomaly algorithms. The AnomalyExecutor itself is synchronous, but it is
 // invoked asynchronously via DerivedQueryExecutor::executeAnomalyDetection().
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <vector>
-#include <string>
-#include <cmath>
-#include <random>
-
-#include "../../../lib/query/derived_query_executor.hpp"
-#include "../../../lib/query/derived_query.hpp"
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/query/anomaly/anomaly_executor.hpp"
 #include "../../../lib/query/anomaly/anomaly_result.hpp"
-#include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
-
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
-#include <seastar/core/sharded.hh>
-#include <seastar/core/smp.hh>
-
+#include "../../../lib/query/derived_query.hpp"
+#include "../../../lib/query/derived_query_executor.hpp"
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cmath>
+#include <filesystem>
+#include <random>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/thread.hh>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -35,17 +34,11 @@ using namespace timestar::anomaly;
 
 class AnomalyExecutorSeastarTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 
-    static void insertSeries(seastar::sharded<Engine>& eng,
-                             const std::string& measurement,
-                             const std::string& field,
+    static void insertSeries(seastar::sharded<Engine>& eng, const std::string& measurement, const std::string& field,
                              const std::map<std::string, std::string>& tags,
                              const std::vector<std::pair<uint64_t, double>>& points) {
         TimeStarInsert<double> insert(measurement, field);
@@ -74,7 +67,8 @@ TEST_F(AnomalyExecutorSeastarTest, BasicAnomalyViaExecutor) {
         std::vector<std::pair<uint64_t, double>> points;
         for (size_t i = 0; i < 100; ++i) {
             double val = 50.0;
-            if (i == 75) val = 200.0; // obvious anomaly
+            if (i == 75)
+                val = 200.0;  // obvious anomaly
             points.push_back({startNs + i * intervalNs, val});
         }
         insertSeries(eng.eng, "cpu", "usage", {{"host", "s1"}}, points);
@@ -120,7 +114,9 @@ TEST_F(AnomalyExecutorSeastarTest, BasicAnomalyViaExecutor) {
         EXPECT_DOUBLE_EQ(result.statistics.bounds, 2.0);
         EXPECT_EQ(result.statistics.totalPoints, 100u);
         EXPECT_GE(result.statistics.anomalyCount, 1u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -137,7 +133,7 @@ TEST_F(AnomalyExecutorSeastarTest, AgileAlgorithmViaExecutor) {
         uint64_t startNs = 1704067200000000000ULL;
         std::vector<std::pair<uint64_t, double>> points;
         for (size_t i = 0; i < 200; ++i) {
-            double val = (i < 100) ? 50.0 : 100.0; // level shift at i=100
+            double val = (i < 100) ? 50.0 : 100.0;  // level shift at i=100
             points.push_back({startNs + i * intervalNs, val});
         }
         insertSeries(eng.eng, "load", "avg", {{"dc", "us"}}, points);
@@ -166,7 +162,9 @@ TEST_F(AnomalyExecutorSeastarTest, AgileAlgorithmViaExecutor) {
         EXPECT_EQ(result.times.size(), 200u);
         EXPECT_EQ(result.statistics.algorithm, "agile");
         EXPECT_GE(result.series.size(), 4u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -184,7 +182,8 @@ TEST_F(AnomalyExecutorSeastarTest, RobustAlgorithmViaExecutor) {
         std::vector<std::pair<uint64_t, double>> points;
         for (size_t i = 0; i < 100; ++i) {
             double val = 80.0;
-            if (i == 60) val = 300.0;
+            if (i == 60)
+                val = 300.0;
             points.push_back({startNs + i * intervalNs, val});
         }
         insertSeries(eng.eng, "net", "bytes", {{"iface", "eth0"}}, points);
@@ -213,7 +212,9 @@ TEST_F(AnomalyExecutorSeastarTest, RobustAlgorithmViaExecutor) {
         EXPECT_EQ(result.statistics.algorithm, "robust");
         EXPECT_DOUBLE_EQ(result.statistics.bounds, 3.0);
         EXPECT_GE(result.series.size(), 4u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -231,7 +232,8 @@ TEST_F(AnomalyExecutorSeastarTest, AlertValueComputed) {
         std::vector<std::pair<uint64_t, double>> points;
         for (size_t i = 0; i < 100; ++i) {
             double val = 50.0;
-            if (i == 80) val = 500.0; // large outlier
+            if (i == 80)
+                val = 500.0;  // large outlier
             points.push_back({startNs + i * intervalNs, val});
         }
         insertSeries(eng.eng, "metric", "val", {}, points);
@@ -262,7 +264,9 @@ TEST_F(AnomalyExecutorSeastarTest, AlertValueComputed) {
         ASSERT_NE(scores, nullptr);
         ASSERT_TRUE(scores->alertValue.has_value());
         EXPECT_GT(scores->alertValue.value(), 0.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -284,7 +288,7 @@ TEST_F(AnomalyExecutorSeastarTest, LargeDatasetAnomalyDetection) {
         for (size_t i = 0; i < 1000; ++i) {
             double val = 100.0 + noise(gen);
             if (i == 200 || i == 500 || i == 800) {
-                val += 100.0; // inject anomalies
+                val += 100.0;  // inject anomalies
             }
             points.push_back({startNs + i * intervalNs, val});
         }
@@ -320,7 +324,9 @@ TEST_F(AnomalyExecutorSeastarTest, LargeDatasetAnomalyDetection) {
         // Execution time should be reasonable
         EXPECT_GT(result.statistics.executionTimeMs, 0.0);
         EXPECT_LT(result.statistics.executionTimeMs, 30000.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -372,7 +378,9 @@ TEST_F(AnomalyExecutorSeastarTest, AnomalyResponseFormatting) {
         DerivedQueryResultVariant variant{anomalyResult};
         auto json2 = executor.formatResponseVariant(variant);
         EXPECT_TRUE(json2.find("\"success\"") != std::string::npos);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -394,15 +402,14 @@ TEST_F(AnomalyExecutorSeastarTest, AnomalyAfterRolloverToTSM) {
         }
         insertSeries(eng.eng, "metric", "val", {{"host", "h1"}}, batch1);
 
-        eng.eng.invoke_on_all([](Engine& engine) {
-            return engine.rolloverMemoryStore();
-        }).get();
+        eng.eng.invoke_on_all([](Engine& engine) { return engine.rolloverMemoryStore(); }).get();
 
         // Batch 2: stays in memory with an anomaly
         std::vector<std::pair<uint64_t, double>> batch2;
         for (size_t i = 50; i < 100; ++i) {
             double val = 50.0;
-            if (i == 75) val = 300.0;
+            if (i == 75)
+                val = 300.0;
             batch2.push_back({startNs + i * intervalNs, val});
         }
         insertSeries(eng.eng, "metric", "val", {{"host", "h1"}}, batch2);
@@ -430,7 +437,9 @@ TEST_F(AnomalyExecutorSeastarTest, AnomalyAfterRolloverToTSM) {
         EXPECT_TRUE(result.success);
         EXPECT_EQ(result.times.size(), 100u);
         EXPECT_GE(result.statistics.anomalyCount, 1u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -454,13 +463,10 @@ TEST_F(AnomalyExecutorSeastarTest, MultiSeriesDirectExecution) {
         seriesValues[0].push_back(50.0);
         seriesValues[1].push_back(50.0);
     }
-    seriesValues[0][60] = 300.0; // anomaly in first series
-    seriesValues[1][80] = 300.0; // anomaly in second series
+    seriesValues[0][60] = 300.0;  // anomaly in first series
+    seriesValues[1][80] = 300.0;  // anomaly in second series
 
-    std::vector<std::vector<std::string>> seriesGroupTags = {
-        {"host=server1"},
-        {"host=server2"}
-    };
+    std::vector<std::vector<std::string>> seriesGroupTags = {{"host=server1"}, {"host=server2"}};
 
     AnomalyConfig config;
     config.algorithm = Algorithm::BASIC;
@@ -563,8 +569,7 @@ TEST_F(AnomalyExecutorSeastarTest, GroupTagsPreserved) {
 
     // All pieces should have the same group tags
     for (const auto& piece : result.series) {
-        EXPECT_EQ(piece.groupTags, groupTags)
-            << "Group tags mismatch in piece: " << piece.piece;
+        EXPECT_EQ(piece.groupTags, groupTags) << "Group tags mismatch in piece: " << piece.piece;
     }
 }
 
@@ -583,7 +588,8 @@ TEST_F(AnomalyExecutorSeastarTest, ExecuteFromJsonWithAnomalyPath) {
         std::vector<std::pair<uint64_t, double>> points;
         for (size_t i = 0; i < 100; ++i) {
             double val = 50.0;
-            if (i == 90) val = 400.0;
+            if (i == 90)
+                val = 400.0;
             points.push_back({startNs + i * intervalNs, val});
         }
         insertSeries(eng.eng, "disk", "iops", {{"vol", "ssd"}}, points);
@@ -606,5 +612,7 @@ TEST_F(AnomalyExecutorSeastarTest, ExecuteFromJsonWithAnomalyPath) {
         EXPECT_TRUE(result.success);
         EXPECT_GE(result.series.size(), 4u);
         EXPECT_EQ(result.statistics.algorithm, "basic");
-    }).join().get();
+    })
+        .join()
+        .get();
 }

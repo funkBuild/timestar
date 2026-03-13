@@ -14,16 +14,17 @@
  * - The smaller metadata caches (fieldsCache, tagsCache) are not affected
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <filesystem>
 #include <string>
-
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
 
 class LevelDBIndexCacheBoundsTest : public ::testing::Test {
 protected:
@@ -32,9 +33,7 @@ protected:
         std::filesystem::remove_all("shard_0");
     }
 
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
 // Verify the default max cache size is 1,000,000
@@ -92,11 +91,7 @@ SEASTAR_TEST_F(LevelDBIndexCacheBoundsTest, CacheClearedWhenExceedingMax) {
 
     // Insert 6 series to exceed the limit
     for (int i = 0; i < 6; ++i) {
-        co_await index.getOrCreateSeriesId(
-            "measurement",
-            {{"host", "server-" + std::to_string(i)}},
-            "value"
-        );
+        co_await index.getOrCreateSeriesId("measurement", {{"host", "server-" + std::to_string(i)}}, "value");
     }
 
     // After exceeding the limit, the cache should have been cleared and
@@ -120,21 +115,13 @@ SEASTAR_TEST_F(LevelDBIndexCacheBoundsTest, LookupsWorkAfterEviction) {
     // Insert 4 series (triggers eviction on the 4th)
     std::vector<SeriesId128> seriesIds;
     for (int i = 0; i < 4; ++i) {
-        auto id = co_await index.getOrCreateSeriesId(
-            "cpu",
-            {{"host", "h" + std::to_string(i)}},
-            "usage"
-        );
+        auto id = co_await index.getOrCreateSeriesId("cpu", {{"host", "h" + std::to_string(i)}}, "usage");
         seriesIds.push_back(id);
     }
 
     // Now re-query the first series (was evicted from cache, should still
     // work via LevelDB lookup)
-    auto id_again = co_await index.getOrCreateSeriesId(
-        "cpu",
-        {{"host", "h0"}},
-        "usage"
-    );
+    auto id_again = co_await index.getOrCreateSeriesId("cpu", {{"host", "h0"}}, "usage");
 
     // Should get the same deterministic SeriesId128
     EXPECT_EQ(seriesIds[0], id_again);
@@ -174,11 +161,7 @@ SEASTAR_TEST_F(LevelDBIndexCacheBoundsTest, CacheNeverExceedsMaxByMoreThanOne) {
 
     // Insert many series and check after each insert
     for (int i = 0; i < 50; ++i) {
-        co_await index.getOrCreateSeriesId(
-            "sensor",
-            {{"id", std::to_string(i)}},
-            "reading"
-        );
+        co_await index.getOrCreateSeriesId("sensor", {{"id", std::to_string(i)}}, "reading");
         // After each insert, the cache should not exceed maxSize
         // (it may be 1 right after a clear, or up to maxSize)
         EXPECT_LE(index.getSeriesCacheSize(), maxSize);
@@ -239,9 +222,7 @@ SEASTAR_TEST_F(LevelDBIndexCacheBoundsTest, ZeroMaxSizeDisablesCache) {
 
     // Multiple inserts should still work
     for (int i = 0; i < 10; ++i) {
-        co_await index.getOrCreateSeriesId(
-            "m", {{"k", "v" + std::to_string(i)}}, "f"
-        );
+        co_await index.getOrCreateSeriesId("m", {{"k", "v" + std::to_string(i)}}, "f");
         EXPECT_LE(index.getSeriesCacheSize(), 1u);
     }
 

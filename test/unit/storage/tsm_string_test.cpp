@@ -1,18 +1,18 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <vector>
-#include <string>
-
-#include "../../../lib/storage/tsm_writer.hpp"
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/tsm_result.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
-
+#include "../../../lib/storage/tsm_writer.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -20,17 +20,11 @@ class TSMStringTest : public ::testing::Test {
 public:
     std::string testDir = "./test_tsm_string_files";
 
-    void SetUp() override {
-        fs::create_directories(testDir);
-    }
+    void SetUp() override { fs::create_directories(testDir); }
 
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
+    void TearDown() override { fs::remove_all(testDir); }
 
-    std::string getTestFilePath(const std::string& filename) {
-        return testDir + "/" + filename;
-    }
+    std::string getTestFilePath(const std::string& filename) { return testDir + "/" + filename; }
 };
 
 SEASTAR_TEST_F(TSMStringTest, WriteAndReadStringData) {
@@ -110,7 +104,8 @@ SEASTAR_TEST_F(TSMStringTest, WriteMixedDataTypes) {
             floatTimestamps.push_back(baseTime + i * 1000);
             floatValues.push_back(20.0 + i * 0.5);
         }
-        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("temperature"), floatTimestamps, floatValues);
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("temperature"), floatTimestamps,
+                           floatValues);
 
         // Write string data
         std::vector<uint64_t> stringTimestamps;
@@ -215,14 +210,14 @@ SEASTAR_TEST_F(TSMStringTest, LargeStringDataset) {
 
     auto fileSize = fs::file_size(filename);
     EXPECT_TRUE(fs::exists(filename));
-    EXPECT_GT(fileSize, 1000); // Should be at least 1KB
+    EXPECT_GT(fileSize, 1000);  // Should be at least 1KB
 
     // Calculate uncompressed size
     size_t uncompressedSize = 0;
     for (int i = 0; i < 1000; i++) {
-        uncompressedSize += 8; // timestamp
-        uncompressedSize += 4; // string length prefix
-        uncompressedSize += 50; // approximate string length
+        uncompressedSize += 8;   // timestamp
+        uncompressedSize += 4;   // string length prefix
+        uncompressedSize += 50;  // approximate string length
     }
 
     // Should achieve compression
@@ -313,11 +308,11 @@ SEASTAR_TEST_F(TSMStringTest, EmptyAndSpecialStrings) {
 
     // Verify special character handling
     if (values2.size() >= 6) {
-        EXPECT_EQ(values2[0], "");  // Empty string
-        EXPECT_EQ(values2[1], "Line1\nLine2\nLine3");  // Newlines
-        EXPECT_EQ(values2[2], "\t\t\tTabbed");  // Tabs
-        EXPECT_EQ(values2[3], "Path: /usr/local/bin");  // Path
-        EXPECT_EQ(values2[4], "");  // Another empty string
+        EXPECT_EQ(values2[0], "");                           // Empty string
+        EXPECT_EQ(values2[1], "Line1\nLine2\nLine3");        // Newlines
+        EXPECT_EQ(values2[2], "\t\t\tTabbed");               // Tabs
+        EXPECT_EQ(values2[3], "Path: /usr/local/bin");       // Path
+        EXPECT_EQ(values2[4], "");                           // Another empty string
         EXPECT_EQ(values2[5], "JSON: {\"key\":\"value\"}");  // JSON with quotes
     }
 
@@ -347,7 +342,7 @@ SEASTAR_TEST_F(TSMStringTest, StringBlockBoundaries) {
     }
 
     EXPECT_TRUE(fs::exists(filename));
-    EXPECT_GT(fs::file_size(filename), 10000); // Should be reasonably large
+    EXPECT_GT(fs::file_size(filename), 10000);  // Should be reasonably large
 
     // Test reading large dataset that spans multiple blocks
     auto tsm = seastar::make_shared<TSM>(filename);
@@ -374,7 +369,7 @@ SEASTAR_TEST_F(TSMStringTest, StringBlockBoundaries) {
 
     // Verify timestamp ordering
     for (size_t i = 1; i < timestamps2.size(); i++) {
-        EXPECT_GT(timestamps2[i], timestamps2[i-1]); // Should be sorted
+        EXPECT_GT(timestamps2[i], timestamps2[i - 1]);  // Should be sorted
     }
 
     co_return;
@@ -427,11 +422,19 @@ SEASTAR_TEST_F(TSMStringTest, StringSeriesCompression) {
 
             // Repetitive pattern
             std::string status;
-            switch(i % 4) {
-                case 0: status = "SENSOR_OK: All systems operational"; break;
-                case 1: status = "SENSOR_OK: All systems operational"; break;
-                case 2: status = "SENSOR_WARN: Temperature slightly elevated"; break;
-                case 3: status = "SENSOR_OK: All systems operational"; break;
+            switch (i % 4) {
+                case 0:
+                    status = "SENSOR_OK: All systems operational";
+                    break;
+                case 1:
+                    status = "SENSOR_OK: All systems operational";
+                    break;
+                case 2:
+                    status = "SENSOR_WARN: Temperature slightly elevated";
+                    break;
+                case 3:
+                    status = "SENSOR_OK: All systems operational";
+                    break;
             }
             values.push_back(status);
         }
@@ -446,7 +449,7 @@ SEASTAR_TEST_F(TSMStringTest, StringSeriesCompression) {
 
     // With repetitive data, should achieve good compression
     // Uncompressed would be ~40KB (1000 * ~40 bytes per string)
-    EXPECT_LT(fileSize, 20000); // Should be less than 20KB with compression
+    EXPECT_LT(fileSize, 20000);  // Should be less than 20KB with compression
 
     // Test time-range reading
     auto tsm = seastar::make_shared<TSM>(filename);
@@ -455,12 +458,12 @@ SEASTAR_TEST_F(TSMStringTest, StringSeriesCompression) {
 
     // Read first half of the data (first 500 entries)
     SeriesId128 sensorStatusId = SeriesId128::fromSeriesKey("sensor.status");
-    uint64_t endTime = baseTime + 499 * 100; // Exclude the 500th entry
+    uint64_t endTime = baseTime + 499 * 100;  // Exclude the 500th entry
     TSMResult<std::string> result(0);
     co_await tsm->readSeries(sensorStatusId, baseTime, endTime, result);
 
     auto [timestamps2, values2] = result.getAllData();
-    EXPECT_EQ(timestamps2.size(), 500); // Should be exactly 500
+    EXPECT_EQ(timestamps2.size(), 500);  // Should be exactly 500
     EXPECT_EQ(timestamps2.size(), values2.size());
 
     // Verify all timestamps are in range
@@ -478,7 +481,7 @@ SEASTAR_TEST_F(TSMStringTest, StringSeriesCompression) {
                 okCount++;
             }
         }
-        EXPECT_GT(okCount, values2.size() * 0.6); // At least 60% should be OK status
+        EXPECT_GT(okCount, values2.size() * 0.6);  // At least 60% should be OK status
     }
 
     co_return;

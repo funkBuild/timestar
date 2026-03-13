@@ -2,8 +2,10 @@
  * Simple test to check if coroutines work at all
  */
 
-#include <gtest/gtest.h>
 #include "../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 

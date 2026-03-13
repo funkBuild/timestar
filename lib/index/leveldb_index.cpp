@@ -21,10 +21,8 @@
 
 LevelDBIndex::LevelDBIndex(int _shardId)
     : shardId(_shardId),
-      seriesMetadataCache_(
-          _shardId == 0 ? timestar::config().index.metadata_cache_bytes : 0),
-      discoveryCache_(
-          _shardId == 0 ? timestar::config().index.discovery_cache_bytes : 0) {
+      seriesMetadataCache_(_shardId == 0 ? timestar::config().index.metadata_cache_bytes : 0),
+      discoveryCache_(_shardId == 0 ? timestar::config().index.discovery_cache_bytes : 0) {
     indexPath = "shard_" + std::to_string(shardId) + "/index";
 }
 
@@ -333,7 +331,7 @@ std::string LevelDBIndex::encodeMeasurementSeriesPrefix(const std::string& measu
 }
 
 static std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, const std::string& field,
-                                                    const SeriesId128& seriesId) {
+                                                   const SeriesId128& seriesId) {
     std::string key;
     key.reserve(1 + measurement.size() + 1 + field.size() + 1 + 16);
     key.push_back(static_cast<char>(MEASUREMENT_FIELD_SERIES));
@@ -1672,16 +1670,16 @@ LevelDBIndex::findSeriesWithMetadata(const std::string& measurement,
             auto it = std::unique_ptr<leveldb::Iterator>(db->NewIterator(readOpts));
             for (it->Seek(prefix); it->Valid(); it->Next()) {
                 auto key = it->key();
-                if (key.size() < prefix.size() ||
-                    std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+                if (key.size() < prefix.size() || std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
                     break;
                 }
                 // Extract SeriesId128 from the suffix (16 bytes after prefix)
                 size_t suffixLen = key.size() - prefix.size();
-                if (suffixLen != 16) continue;
-                ids.push_back(SeriesId128::fromBytes(
-                    std::string(key.data() + prefix.size(), 16)));
-                if (maxSeries > 0 && ids.size() > maxSeries) break;
+                if (suffixLen != 16)
+                    continue;
+                ids.push_back(SeriesId128::fromBytes(std::string(key.data() + prefix.size(), 16)));
+                if (maxSeries > 0 && ids.size() > maxSeries)
+                    break;
             }
             return ids;
         });
@@ -1723,7 +1721,8 @@ LevelDBIndex::findSeriesWithMetadata(const std::string& measurement,
             });
 
             for (size_t j = 0; j < missIndices.size(); ++j) {
-                if (!rawResults[j].first.ok()) continue;
+                if (!rawResults[j].first.ok())
+                    continue;
                 auto metadata = decodeSeriesMetadata(rawResults[j].second);
                 seriesMetadataCache_.put(seriesIds[missIndices[j]], metadata);
                 output.push_back({seriesIds[missIndices[j]], std::move(metadata)});
@@ -1852,7 +1851,8 @@ static std::string buildDiscoveryCacheKey(const std::string& measurement,
     return key;
 }
 
-seastar::future<std::expected<std::shared_ptr<const std::vector<LevelDBIndex::SeriesWithMetadata>>, SeriesLimitExceeded>>
+seastar::future<
+    std::expected<std::shared_ptr<const std::vector<LevelDBIndex::SeriesWithMetadata>>, SeriesLimitExceeded>>
 LevelDBIndex::findSeriesWithMetadataCached(const std::string& measurement,
                                            const std::map<std::string, std::string>& tagFilters,
                                            const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {

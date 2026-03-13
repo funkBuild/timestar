@@ -1,5 +1,6 @@
-#include <gtest/gtest.h>
 #include "subscription_manager.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
@@ -7,10 +8,8 @@ class SubscriptionManagerTest : public ::testing::Test {
 protected:
     SubscriptionManager mgr;
 
-    Subscription makeSub(
-        const std::string& measurement,
-        const std::map<std::string, std::string>& scopes = {},
-        const std::vector<std::string>& fields = {}) {
+    Subscription makeSub(const std::string& measurement, const std::map<std::string, std::string>& scopes = {},
+                         const std::vector<std::string>& fields = {}) {
         Subscription sub;
         sub.id = mgr.allocateId();
         sub.measurement = measurement;
@@ -55,15 +54,13 @@ TEST(SubscriptionMatchTest, TagScopeExactMatch) {
     sub.measurement = "temperature";
     sub.scopes = {{"location", "us-west"}, {"host", "server-01"}};
 
-    std::map<std::string, std::string> matchingTags = {
-        {"location", "us-west"}, {"host", "server-01"}};
+    std::map<std::string, std::string> matchingTags = {{"location", "us-west"}, {"host", "server-01"}};
     EXPECT_TRUE(sub.matches("temperature", matchingTags, "value"));
 
     std::map<std::string, std::string> partialTags = {{"location", "us-west"}};
     EXPECT_FALSE(sub.matches("temperature", partialTags, "value"));
 
-    std::map<std::string, std::string> wrongTags = {
-        {"location", "us-east"}, {"host", "server-01"}};
+    std::map<std::string, std::string> wrongTags = {{"location", "us-east"}, {"host", "server-01"}};
     EXPECT_FALSE(sub.matches("temperature", wrongTags, "value"));
 }
 
@@ -71,8 +68,7 @@ TEST(SubscriptionMatchTest, EmptyScopesMatchAllTags) {
     Subscription sub;
     sub.measurement = "temperature";
 
-    std::map<std::string, std::string> anyTags = {
-        {"location", "us-west"}, {"host", "server-99"}};
+    std::map<std::string, std::string> anyTags = {{"location", "us-west"}, {"host", "server-99"}};
     EXPECT_TRUE(sub.matches("temperature", anyTags, "value"));
     EXPECT_TRUE(sub.matches("temperature", {}, "value"));
 }
@@ -163,8 +159,7 @@ TEST_F(SubscriptionManagerTest, NotifyMatchingSubscriberLocal) {
     std::vector<uint64_t> ts = {1000, 2000, 3000};
     std::vector<double> vals = {23.5, 24.0, 24.5};
 
-    auto remotes = mgr.notifySubscribers(
-        "temperature", {{"location", "us-west"}}, "value", ts, vals);
+    auto remotes = mgr.notifySubscribers("temperature", {{"location", "us-west"}}, "value", ts, vals);
     EXPECT_TRUE(remotes.empty());  // local delivery, no remotes
 
     EXPECT_FALSE(queue.empty());
@@ -202,14 +197,12 @@ TEST_F(SubscriptionManagerTest, NotifyFiltersByTags) {
     std::vector<double> vals = {42.0};
 
     // Matching tags
-    mgr.notifySubscribers(
-        "temperature", {{"location", "us-west"}}, "value", ts, vals);
+    mgr.notifySubscribers("temperature", {{"location", "us-west"}}, "value", ts, vals);
     EXPECT_FALSE(queue.empty());
     queue.pop();
 
     // Non-matching tags
-    mgr.notifySubscribers(
-        "temperature", {{"location", "us-east"}}, "value", ts, vals);
+    mgr.notifySubscribers("temperature", {{"location", "us-east"}}, "value", ts, vals);
     EXPECT_TRUE(queue.empty());
 }
 
@@ -244,8 +237,7 @@ TEST_F(SubscriptionManagerTest, NotifyMultipleSubscribers) {
     std::vector<uint64_t> ts = {1000, 2000};
     std::vector<double> vals = {23.5, 24.0};
 
-    auto remotes = mgr.notifySubscribers(
-        "temperature", {{"location", "us-west"}}, "value", ts, vals);
+    auto remotes = mgr.notifySubscribers("temperature", {{"location", "us-west"}}, "value", ts, vals);
     EXPECT_TRUE(remotes.empty());
     EXPECT_FALSE(q1.empty());
     EXPECT_FALSE(q2.empty());
@@ -302,7 +294,7 @@ TEST_F(SubscriptionManagerTest, DropNoteCarriesAccumulatedCountAfterQueueDrains)
     mgr.notifySubscribers("temperature", {}, "value", ts, vals);  // +2 dropped
     mgr.notifySubscribers("temperature", {}, "value", ts, vals);  // +2 dropped
     mgr.notifySubscribers("temperature", {}, "value", ts, vals);  // +2 dropped
-    EXPECT_EQ(queue.size(), 2u);  // unchanged
+    EXPECT_EQ(queue.size(), 2u);                                  // unchanged
 
     auto stats = mgr.getStats();
     ASSERT_EQ(stats.size(), 1u);
@@ -408,7 +400,9 @@ TEST_F(SubscriptionManagerTest, SequenceIdIncrementsPerSubscription) {
     auto b1 = queue.pop();
     auto b2 = queue.pop();
     auto b3 = queue.pop();
-    ASSERT_TRUE(b1); ASSERT_TRUE(b2); ASSERT_TRUE(b3);
+    ASSERT_TRUE(b1);
+    ASSERT_TRUE(b2);
+    ASSERT_TRUE(b3);
 
     EXPECT_EQ(b1->sequenceId, 0u);
     EXPECT_EQ(b2->sequenceId, 1u);
@@ -487,7 +481,7 @@ TEST_F(SubscriptionManagerTest, GetStatsReturnsLocalSubscriptions) {
     EXPECT_EQ(stats[0].fields[0], "value");
     EXPECT_EQ(stats[0].queueCapacity, 32u);
     EXPECT_EQ(stats[0].queueDepth, 0u);  // We drained it
-    EXPECT_EQ(stats[0].eventsSent, 2u);   // Two notifications
+    EXPECT_EQ(stats[0].eventsSent, 2u);  // Two notifications
     EXPECT_EQ(stats[0].droppedPoints, 0u);
 }
 
@@ -580,7 +574,8 @@ TEST_F(SubscriptionManagerTest, MultipleLabelsOnSharedQueue) {
     ASSERT_EQ(queue.size(), 2u);
     auto b1 = queue.pop();
     auto b2 = queue.pop();
-    ASSERT_TRUE(b1); ASSERT_TRUE(b2);
+    ASSERT_TRUE(b1);
+    ASSERT_TRUE(b2);
 
     // Order depends on notification order
     std::set<std::string> labels = {b1->label, b2->label};

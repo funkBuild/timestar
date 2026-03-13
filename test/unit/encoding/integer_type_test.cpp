@@ -1,18 +1,19 @@
-#include <gtest/gtest.h>
-#include "integer_encoder.hpp"
-#include "integer/integer_encoder_ffor.hpp"
-#include "zigzag.hpp"
-#include "tsm.hpp"
 #include "aligned_buffer.hpp"
+#include "integer/integer_encoder_ffor.hpp"
+#include "integer_encoder.hpp"
 #include "slice_buffer.hpp"
+#include "tsm.hpp"
+#include "zigzag.hpp"
 
-#include <vector>
-#include <cstdint>
+#include <gtest/gtest.h>
+
 #include <climits>
-#include <variant>
-#include <string>
+#include <cstdint>
 #include <numeric>
 #include <random>
+#include <string>
+#include <variant>
+#include <vector>
 
 // The variant used by the HTTP write handler and internally for field values.
 using TimeStarValue = std::variant<double, bool, std::string, int64_t>;
@@ -33,8 +34,8 @@ protected:
         // Decode
         Slice slice(encoded.data.data(), encoded.size());
         std::vector<uint64_t> decoded;
-        auto [skipped, added] = IntegerEncoder::decode(
-            slice, static_cast<unsigned int>(zigzagged.size()), decoded, 0, UINT64_MAX);
+        auto [skipped, added] =
+            IntegerEncoder::decode(slice, static_cast<unsigned int>(zigzagged.size()), decoded, 0, UINT64_MAX);
 
         ASSERT_EQ(skipped, 0u);
         ASSERT_EQ(added, original.size());
@@ -45,9 +46,8 @@ protected:
         ASSERT_EQ(recovered.size(), original.size());
 
         for (size_t i = 0; i < original.size(); i++) {
-            EXPECT_EQ(recovered[i], original[i])
-                << "IntegerEncoder round-trip mismatch at index " << i
-                << ": expected " << original[i] << " got " << recovered[i];
+            EXPECT_EQ(recovered[i], original[i]) << "IntegerEncoder round-trip mismatch at index " << i << ": expected "
+                                                 << original[i] << " got " << recovered[i];
         }
     }
 
@@ -61,8 +61,8 @@ protected:
 
         Slice slice(encoded.data.data(), encoded.size());
         std::vector<uint64_t> decoded;
-        auto [skipped, added] = IntegerEncoderFFOR::decode(
-            slice, static_cast<unsigned int>(zigzagged.size()), decoded, 0, UINT64_MAX);
+        auto [skipped, added] =
+            IntegerEncoderFFOR::decode(slice, static_cast<unsigned int>(zigzagged.size()), decoded, 0, UINT64_MAX);
 
         ASSERT_EQ(skipped, 0u);
         ASSERT_EQ(added, original.size());
@@ -73,8 +73,7 @@ protected:
 
         for (size_t i = 0; i < original.size(); i++) {
             EXPECT_EQ(recovered[i], original[i])
-                << "FFOR round-trip mismatch at index " << i
-                << ": expected " << original[i] << " got " << recovered[i];
+                << "FFOR round-trip mismatch at index " << i << ": expected " << original[i] << " got " << recovered[i];
         }
     }
 };
@@ -126,8 +125,7 @@ TEST_F(IntegerTypeTest, IntegerEncoder_MixedPositiveNegative) {
 TEST_F(IntegerTypeTest, IntegerEncoder_AlternatingSign) {
     std::vector<int64_t> values;
     for (int i = 0; i < 200; i++) {
-        values.push_back(i % 2 == 0 ? static_cast<int64_t>(i) * 1000
-                                     : -static_cast<int64_t>(i) * 1000);
+        values.push_back(i % 2 == 0 ? static_cast<int64_t>(i) * 1000 : -static_cast<int64_t>(i) * 1000);
     }
     verifyIntegerEncoderRoundTrip(values);
 }
@@ -243,10 +241,7 @@ TEST_F(IntegerTypeTest, FFOR_ExtremeValues) {
 
 TEST_F(IntegerTypeTest, FFOR_NearInt64Boundaries) {
     std::vector<int64_t> values = {
-        INT64_MIN, INT64_MIN + 1, INT64_MIN + 2,
-        INT64_MAX - 2, INT64_MAX - 1, INT64_MAX,
-        0, -1, 1
-    };
+        INT64_MIN, INT64_MIN + 1, INT64_MIN + 2, INT64_MAX - 2, INT64_MAX - 1, INT64_MAX, 0, -1, 1};
     verifyFFORRoundTrip(values);
 }
 
@@ -373,8 +368,7 @@ TEST_F(IntegerTypeTest, Variant_AllIndicesMatchTSMValueType) {
     // Verify the compile-time guarantee that variant indices line up with the enum
     static_assert(std::is_same_v<std::variant_alternative_t<0, TimeStarValue>, double>,
                   "Index 0 must be double (Float)");
-    static_assert(std::is_same_v<std::variant_alternative_t<1, TimeStarValue>, bool>,
-                  "Index 1 must be bool (Boolean)");
+    static_assert(std::is_same_v<std::variant_alternative_t<1, TimeStarValue>, bool>, "Index 1 must be bool (Boolean)");
     static_assert(std::is_same_v<std::variant_alternative_t<2, TimeStarValue>, std::string>,
                   "Index 2 must be std::string (String)");
     static_assert(std::is_same_v<std::variant_alternative_t<3, TimeStarValue>, int64_t>,
@@ -394,11 +388,10 @@ TEST_F(IntegerTypeTest, Variant_AllIndicesMatchTSMValueType) {
 TEST_F(IntegerTypeTest, IntegerEncoder_VarintBoundaryValues) {
     // Varint encoding boundaries: 7-bit, 14-bit, 21-bit, 28-bit thresholds
     std::vector<int64_t> values = {
-        0, 1, -1,
-        127, 128, -128, -129,              // 7-bit boundary
-        16383, 16384, -16383, -16384,      // 14-bit boundary
-        2097151, 2097152,                   // 21-bit boundary
-        268435455, 268435456,              // 28-bit boundary
+        0,         1,         -1,     127,    128, -128, -129,  // 7-bit boundary
+        16383,     16384,     -16383, -16384,                   // 14-bit boundary
+        2097151,   2097152,                                     // 21-bit boundary
+        268435455, 268435456,                                   // 28-bit boundary
         INT64_MIN, INT64_MAX,
     };
     verifyIntegerEncoderRoundTrip(values);
@@ -406,12 +399,8 @@ TEST_F(IntegerTypeTest, IntegerEncoder_VarintBoundaryValues) {
 
 TEST_F(IntegerTypeTest, FFOR_VarintBoundaryValues) {
     std::vector<int64_t> values = {
-        0, 1, -1,
-        127, 128, -128, -129,
-        16383, 16384, -16383, -16384,
-        2097151, 2097152,
-        268435455, 268435456,
-        INT64_MIN, INT64_MAX,
+        0,      1,      -1,      127,     128,       -128,      -129,      16383,     16384,
+        -16383, -16384, 2097151, 2097152, 268435455, 268435456, INT64_MIN, INT64_MAX,
     };
     verifyFFORRoundTrip(values);
 }
@@ -422,24 +411,44 @@ TEST_F(IntegerTypeTest, FFOR_VarintBoundaryValues) {
 
 TEST_F(IntegerTypeTest, ZigZagPreservation_ThroughIntegerEncoder) {
     // Verify that individual ZigZag values survive the full encode/decode pipeline
-    std::vector<int64_t> specials = {
-        0, 1, -1, 127, -128, 255, -256, 32767, -32768,
-        65535, -65536, INT32_MAX, INT32_MIN,
-        static_cast<int64_t>(INT32_MAX) + 1,
-        static_cast<int64_t>(INT32_MIN) - 1,
-        INT64_MAX, INT64_MIN
-    };
+    std::vector<int64_t> specials = {0,
+                                     1,
+                                     -1,
+                                     127,
+                                     -128,
+                                     255,
+                                     -256,
+                                     32767,
+                                     -32768,
+                                     65535,
+                                     -65536,
+                                     INT32_MAX,
+                                     INT32_MIN,
+                                     static_cast<int64_t>(INT32_MAX) + 1,
+                                     static_cast<int64_t>(INT32_MIN) - 1,
+                                     INT64_MAX,
+                                     INT64_MIN};
     verifyIntegerEncoderRoundTrip(specials);
 }
 
 TEST_F(IntegerTypeTest, ZigZagPreservation_ThroughFFOR) {
-    std::vector<int64_t> specials = {
-        0, 1, -1, 127, -128, 255, -256, 32767, -32768,
-        65535, -65536, INT32_MAX, INT32_MIN,
-        static_cast<int64_t>(INT32_MAX) + 1,
-        static_cast<int64_t>(INT32_MIN) - 1,
-        INT64_MAX, INT64_MIN
-    };
+    std::vector<int64_t> specials = {0,
+                                     1,
+                                     -1,
+                                     127,
+                                     -128,
+                                     255,
+                                     -256,
+                                     32767,
+                                     -32768,
+                                     65535,
+                                     -65536,
+                                     INT32_MAX,
+                                     INT32_MIN,
+                                     static_cast<int64_t>(INT32_MAX) + 1,
+                                     static_cast<int64_t>(INT32_MIN) - 1,
+                                     INT64_MAX,
+                                     INT64_MIN};
     verifyFFORRoundTrip(specials);
 }
 
@@ -458,20 +467,17 @@ TEST_F(IntegerTypeTest, IntegerEncoder_And_FFOR_ProduceSameResults) {
     AlignedBuffer enc1 = IntegerEncoder::encode(zigzagged);
     Slice slice1(enc1.data.data(), enc1.size());
     std::vector<uint64_t> dec1;
-    IntegerEncoder::decode(slice1, static_cast<unsigned int>(zigzagged.size()),
-                           dec1, 0, UINT64_MAX);
+    IntegerEncoder::decode(slice1, static_cast<unsigned int>(zigzagged.size()), dec1, 0, UINT64_MAX);
 
     // Encode/decode with FFOR
     AlignedBuffer enc2 = IntegerEncoderFFOR::encode(zigzagged);
     Slice slice2(enc2.data.data(), enc2.size());
     std::vector<uint64_t> dec2;
-    IntegerEncoderFFOR::decode(slice2, static_cast<unsigned int>(zigzagged.size()),
-                               dec2, 0, UINT64_MAX);
+    IntegerEncoderFFOR::decode(slice2, static_cast<unsigned int>(zigzagged.size()), dec2, 0, UINT64_MAX);
 
     ASSERT_EQ(dec1.size(), dec2.size());
     for (size_t i = 0; i < dec1.size(); i++) {
-        EXPECT_EQ(dec1[i], dec2[i])
-            << "IntegerEncoder and FFOR disagree at index " << i;
+        EXPECT_EQ(dec1[i], dec2[i]) << "IntegerEncoder and FFOR disagree at index " << i;
     }
 
     // Both should recover the original int64_t values

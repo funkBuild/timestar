@@ -10,23 +10,24 @@
  *   - Cross-component metadata coordination
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/metadata_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <numeric>
+#include <random>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/core/when_all.hh>
 #include <seastar/core/timer.hh>
-#include <filesystem>
-#include <chrono>
-#include <random>
-#include <numeric>
-
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/index/metadata_index.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
+#include <seastar/core/when_all.hh>
 
 // ---------------------------------------------------------------------------
 //  Test fixtures
@@ -36,24 +37,16 @@ static const std::string STRESS_METADATA_PATH = "/tmp/test_metadata_index_stress
 
 class LevelDBIndexStressTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void SetUp() override { std::filesystem::remove_all("shard_0"); }
 
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
 class MetadataIndexStressTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        std::filesystem::remove_all(STRESS_METADATA_PATH);
-    }
+    void SetUp() override { std::filesystem::remove_all(STRESS_METADATA_PATH); }
 
-    void TearDown() override {
-        std::filesystem::remove_all(STRESS_METADATA_PATH);
-    }
+    void TearDown() override { std::filesystem::remove_all(STRESS_METADATA_PATH); }
 };
 
 // ---------------------------------------------------------------------------
@@ -71,15 +64,11 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentFiberSeriesCreation) {
 
     // Launch many concurrent getOrCreateSeriesId calls
     for (int i = 0; i < NUM_CONCURRENT; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "server-" + std::to_string(i % 20)},
-            {"region", "region-" + std::to_string(i % 5)},
-            {"cpu", std::to_string(i % 4)}
-        };
+        std::map<std::string, std::string> tags = {{"host", "server-" + std::to_string(i % 20)},
+                                                   {"region", "region-" + std::to_string(i % 5)},
+                                                   {"cpu", std::to_string(i % 4)}};
         futures.push_back(
-            index.getOrCreateSeriesId("stress_metric",
-                                      std::move(tags),
-                                      "field_" + std::to_string(i % 3)));
+            index.getOrCreateSeriesId("stress_metric", std::move(tags), "field_" + std::to_string(i % 3)));
     }
 
     auto ids = co_await seastar::when_all_succeed(futures.begin(), futures.end());
@@ -117,10 +106,8 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentReadWriteMix) {
     const int SEED_COUNT = 50;
     std::vector<SeriesId128> seededIds;
     for (int i = 0; i < SEED_COUNT; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "host-" + std::to_string(i)},
-            {"dc", "dc-" + std::to_string(i % 3)}
-        };
+        std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                   {"dc", "dc-" + std::to_string(i % 3)}};
         auto id = co_await index.getOrCreateSeriesId("rw_metric", tags, "value");
         seededIds.push_back(id);
     }
@@ -133,23 +120,18 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentReadWriteMix) {
     for (int i = 0; i < MIX_OPS; i++) {
         if (i % 3 == 0) {
             // Write: create new series
-            std::map<std::string, std::string> tags = {
-                {"host", "new-host-" + std::to_string(i)},
-                {"dc", "dc-" + std::to_string(i % 5)}
-            };
+            std::map<std::string, std::string> tags = {{"host", "new-host-" + std::to_string(i)},
+                                                       {"dc", "dc-" + std::to_string(i % 5)}};
             mixFutures.push_back(
-                index.getOrCreateSeriesId("rw_metric", std::move(tags),
-                                          "field_" + std::to_string(i % 2))
+                index.getOrCreateSeriesId("rw_metric", std::move(tags), "field_" + std::to_string(i % 2))
                     .discard_result());
         } else if (i % 3 == 1) {
             // Read: query metadata for an existing series
             auto sid = seededIds[i % SEED_COUNT];
-            mixFutures.push_back(
-                index.getSeriesMetadata(sid).discard_result());
+            mixFutures.push_back(index.getSeriesMetadata(sid).discard_result());
         } else {
             // Read: get fields for measurement
-            mixFutures.push_back(
-                index.getFields("rw_metric").discard_result());
+            mixFutures.push_back(index.getFields("rw_metric").discard_result());
         }
     }
 
@@ -185,21 +167,17 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, LargeScaleIndexing) {
         std::string measurement = "large_metric_" + std::to_string(m);
         for (int h = 0; h < NUM_HOSTS; h++) {
             for (int f = 0; f < NUM_FIELDS; f++) {
-                std::map<std::string, std::string> tags = {
-                    {"host", "host-" + std::to_string(h)},
-                    {"datacenter", "dc-" + std::to_string(h % 5)},
-                    {"rack", "rack-" + std::to_string(h % 10)}
-                };
-                auto id = co_await index.getOrCreateSeriesId(
-                    measurement, tags, "field_" + std::to_string(f));
+                std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(h)},
+                                                           {"datacenter", "dc-" + std::to_string(h % 5)},
+                                                           {"rack", "rack-" + std::to_string(h % 10)}};
+                auto id = co_await index.getOrCreateSeriesId(measurement, tags, "field_" + std::to_string(f));
                 allIds.push_back(id);
             }
         }
     }
 
     auto endTime = std::chrono::steady_clock::now();
-    auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        endTime - startTime).count();
+    auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
 
     // Verify total series count
     size_t totalCount = co_await index.getSeriesCount();
@@ -228,8 +206,8 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, LargeScaleIndexing) {
 
     // Performance sanity check: should complete in reasonable time
     // (generous threshold to avoid flaky tests)
-    EXPECT_LT(durationMs, 30000) << "Indexing " << TOTAL_SERIES
-        << " series took " << durationMs << "ms (expected < 30s)";
+    EXPECT_LT(durationMs, 30000) << "Indexing " << TOTAL_SERIES << " series took " << durationMs
+                                 << "ms (expected < 30s)";
 
     co_await index.close();
     co_return;
@@ -246,10 +224,8 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, IdempotencyUnderLoad) {
     // First pass: create all series and record IDs
     std::vector<SeriesId128> expectedIds;
     for (int i = 0; i < NUM_SERIES; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "host-" + std::to_string(i)},
-            {"env", i % 2 == 0 ? "prod" : "staging"}
-        };
+        std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                   {"env", i % 2 == 0 ? "prod" : "staging"}};
         auto id = co_await index.getOrCreateSeriesId("idempotent_metric", tags, "value");
         expectedIds.push_back(id);
     }
@@ -260,19 +236,14 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, IdempotencyUnderLoad) {
         futures.reserve(NUM_SERIES);
 
         for (int i = 0; i < NUM_SERIES; i++) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(i)},
-                {"env", i % 2 == 0 ? "prod" : "staging"}
-            };
-            futures.push_back(
-                index.getOrCreateSeriesId("idempotent_metric",
-                                          std::move(tags), "value"));
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                       {"env", i % 2 == 0 ? "prod" : "staging"}};
+            futures.push_back(index.getOrCreateSeriesId("idempotent_metric", std::move(tags), "value"));
         }
 
         auto ids = co_await seastar::when_all_succeed(futures.begin(), futures.end());
         for (int i = 0; i < NUM_SERIES; i++) {
-            EXPECT_EQ(ids[i], expectedIds[i])
-                << "Mismatch at series " << i << " on repetition " << r;
+            EXPECT_EQ(ids[i], expectedIds[i]) << "Mismatch at series " << i << " on repetition " << r;
         }
     }
 
@@ -296,13 +267,10 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, PersistenceUnderLoad) {
         co_await index->open();
 
         for (int i = 0; i < NUM_SERIES; i++) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(i)},
-                {"region", "region-" + std::to_string(i % 10)},
-                {"service", "svc-" + std::to_string(i % 7)}
-            };
-            auto id = co_await index->getOrCreateSeriesId(
-                "persist_metric", tags, "field_" + std::to_string(i % 4));
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                       {"region", "region-" + std::to_string(i % 10)},
+                                                       {"service", "svc-" + std::to_string(i % 7)}};
+            auto id = co_await index->getOrCreateSeriesId("persist_metric", tags, "field_" + std::to_string(i % 4));
             originalIds.push_back(id);
         }
 
@@ -320,15 +288,11 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, PersistenceUnderLoad) {
 
         // Verify each series returns the same ID
         for (int i = 0; i < NUM_SERIES; i++) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(i)},
-                {"region", "region-" + std::to_string(i % 10)},
-                {"service", "svc-" + std::to_string(i % 7)}
-            };
-            auto id = co_await index->getOrCreateSeriesId(
-                "persist_metric", tags, "field_" + std::to_string(i % 4));
-            EXPECT_EQ(id, originalIds[i])
-                << "ID mismatch for series " << i << " after reopen";
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                       {"region", "region-" + std::to_string(i % 10)},
+                                                       {"service", "svc-" + std::to_string(i % 7)}};
+            auto id = co_await index->getOrCreateSeriesId("persist_metric", tags, "field_" + std::to_string(i % 4));
+            EXPECT_EQ(id, originalIds[i]) << "ID mismatch for series " << i << " after reopen";
         }
 
         // Verify metadata is intact
@@ -357,10 +321,8 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentTagQueries) {
     const int NUM_DCS = 4;
     for (int h = 0; h < NUM_HOSTS; h++) {
         for (int dc = 0; dc < NUM_DCS; dc++) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(h)},
-                {"datacenter", "dc-" + std::to_string(dc)}
-            };
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(h)},
+                                                       {"datacenter", "dc-" + std::to_string(dc)}};
             co_await index.getOrCreateSeriesId("query_metric", tags, "value");
         }
     }
@@ -373,12 +335,10 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentTagQueries) {
     for (int q = 0; q < NUM_QUERIES; q++) {
         if (q % 2 == 0) {
             queryFutures.push_back(
-                index.findSeriesByTag("query_metric", "datacenter",
-                                      "dc-" + std::to_string(q % NUM_DCS)));
+                index.findSeriesByTag("query_metric", "datacenter", "dc-" + std::to_string(q % NUM_DCS)));
         } else {
             queryFutures.push_back(
-                index.findSeriesByTag("query_metric", "host",
-                                      "host-" + std::to_string(q % NUM_HOSTS)));
+                index.findSeriesByTag("query_metric", "host", "host-" + std::to_string(q % NUM_HOSTS)));
         }
     }
 
@@ -388,12 +348,10 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentTagQueries) {
     for (int q = 0; q < NUM_QUERIES; q++) {
         if (q % 2 == 0) {
             // Datacenter query: each DC has NUM_HOSTS series
-            EXPECT_EQ(results[q].size(), static_cast<size_t>(NUM_HOSTS))
-                << "DC query " << q << " returned wrong count";
+            EXPECT_EQ(results[q].size(), static_cast<size_t>(NUM_HOSTS)) << "DC query " << q << " returned wrong count";
         } else {
             // Host query: each host has NUM_DCS series
-            EXPECT_EQ(results[q].size(), static_cast<size_t>(NUM_DCS))
-                << "Host query " << q << " returned wrong count";
+            EXPECT_EQ(results[q].size(), static_cast<size_t>(NUM_DCS)) << "Host query " << q << " returned wrong count";
         }
     }
 
@@ -412,11 +370,9 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, GroupByAtScale) {
     // Create series across many regions and hosts
     for (int r = 0; r < NUM_REGIONS; r++) {
         for (int h = 0; h < HOSTS_PER_REGION; h++) {
-            std::map<std::string, std::string> tags = {
-                {"region", "region-" + std::to_string(r)},
-                {"host", "host-" + std::to_string(r * 100 + h)},
-                {"tier", h < 5 ? "critical" : "standard"}
-            };
+            std::map<std::string, std::string> tags = {{"region", "region-" + std::to_string(r)},
+                                                       {"host", "host-" + std::to_string(r * 100 + h)},
+                                                       {"tier", h < 5 ? "critical" : "standard"}};
             co_await index.getOrCreateSeriesId("groupby_metric", tags, "value");
         }
     }
@@ -434,8 +390,7 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, GroupByAtScale) {
     EXPECT_EQ(byTier.size(), 2u);  // critical and standard
     EXPECT_EQ(byTier["critical"].size(),
               static_cast<size_t>(NUM_REGIONS * 5));  // 5 per region
-    EXPECT_EQ(byTier["standard"].size(),
-              static_cast<size_t>(NUM_REGIONS * (HOSTS_PER_REGION - 5)));
+    EXPECT_EQ(byTier["standard"].size(), static_cast<size_t>(NUM_REGIONS * (HOSTS_PER_REGION - 5)));
 
     co_await index.close();
     co_return;
@@ -450,9 +405,7 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentFieldStatsUpdates) {
     const int NUM_SERIES = 30;
     std::vector<SeriesId128> seriesIds;
     for (int i = 0; i < NUM_SERIES; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "host-" + std::to_string(i)}
-        };
+        std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)}};
         auto id = co_await index.getOrCreateSeriesId("stats_metric", tags, "value");
         seriesIds.push_back(id);
     }
@@ -468,8 +421,7 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, ConcurrentFieldStatsUpdates) {
         stats.maxTime = static_cast<int64_t>(i + 1) * 1000000;
         stats.pointCount = static_cast<uint64_t>((i + 1) * 100);
 
-        updateFutures.push_back(
-            index.updateFieldStats(seriesIds[i], "value", stats));
+        updateFutures.push_back(index.updateFieldStats(seriesIds[i], "value", stats));
     }
 
     co_await seastar::when_all_succeed(updateFutures.begin(), updateFutures.end());
@@ -498,11 +450,9 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, CompactionAfterHeavyWrites) {
     // Write a substantial number of series to generate LevelDB sstable files
     const int NUM_SERIES = 500;
     for (int i = 0; i < NUM_SERIES; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "host-" + std::to_string(i)},
-            {"env", "env-" + std::to_string(i % 3)},
-            {"cluster", "cluster-" + std::to_string(i % 7)}
-        };
+        std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                   {"env", "env-" + std::to_string(i % 3)},
+                                                   {"cluster", "cluster-" + std::to_string(i % 7)}};
         co_await index.getOrCreateSeriesId("compact_metric", tags, "value");
     }
 
@@ -581,10 +531,8 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, MultipleMeasurementsIsolation) {
     for (int m = 0; m < NUM_MEASUREMENTS; m++) {
         std::string measurement = "isolation_metric_" + std::to_string(m);
         for (int s = 0; s < SERIES_PER_MEASUREMENT; s++) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(s)},
-                {"type", "type-" + std::to_string(s % 3)}
-            };
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(s)},
+                                                       {"type", "type-" + std::to_string(s % 3)}};
             co_await index.getOrCreateSeriesId(measurement, tags, "value");
         }
     }
@@ -609,8 +557,7 @@ SEASTAR_TEST_F(LevelDBIndexStressTest, MultipleMeasurementsIsolation) {
 
     // Total series count should be NUM_MEASUREMENTS * SERIES_PER_MEASUREMENT
     size_t totalCount = co_await index.getSeriesCount();
-    EXPECT_EQ(totalCount,
-              static_cast<size_t>(NUM_MEASUREMENTS * SERIES_PER_MEASUREMENT));
+    EXPECT_EQ(totalCount, static_cast<size_t>(NUM_MEASUREMENTS * SERIES_PER_MEASUREMENT));
 
     co_await index.close();
     co_return;
@@ -630,12 +577,9 @@ SEASTAR_TEST_F(MetadataIndexStressTest, ConcurrentSeriesCreation) {
     futures.reserve(NUM_CONCURRENT);
 
     for (int i = 0; i < NUM_CONCURRENT; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "host-" + std::to_string(i)},
-            {"dc", "dc-" + std::to_string(i % 5)}
-        };
-        futures.push_back(
-            index->getOrCreateSeriesId("stress_measurement", tags, "value"));
+        std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                   {"dc", "dc-" + std::to_string(i % 5)}};
+        futures.push_back(index->getOrCreateSeriesId("stress_measurement", tags, "value"));
     }
 
     auto ids = co_await seastar::when_all_succeed(futures.begin(), futures.end());
@@ -667,9 +611,7 @@ SEASTAR_TEST_F(MetadataIndexStressTest, IdempotentConcurrentAccess) {
     // Create initial series
     std::vector<uint64_t> expectedIds;
     for (int i = 0; i < NUM_SERIES; i++) {
-        std::map<std::string, std::string> tags = {
-            {"sensor", "sensor-" + std::to_string(i)}
-        };
+        std::map<std::string, std::string> tags = {{"sensor", "sensor-" + std::to_string(i)}};
         auto id = co_await index->getOrCreateSeriesId("idempotent_test", tags, "value");
         expectedIds.push_back(id);
     }
@@ -679,16 +621,12 @@ SEASTAR_TEST_F(MetadataIndexStressTest, IdempotentConcurrentAccess) {
         std::vector<seastar::future<uint64_t>> futures;
         futures.reserve(NUM_SERIES);
         for (int i = 0; i < NUM_SERIES; i++) {
-            std::map<std::string, std::string> tags = {
-                {"sensor", "sensor-" + std::to_string(i)}
-            };
-            futures.push_back(
-                index->getOrCreateSeriesId("idempotent_test", tags, "value"));
+            std::map<std::string, std::string> tags = {{"sensor", "sensor-" + std::to_string(i)}};
+            futures.push_back(index->getOrCreateSeriesId("idempotent_test", tags, "value"));
         }
         auto ids = co_await seastar::when_all_succeed(futures.begin(), futures.end());
         for (int i = 0; i < NUM_SERIES; i++) {
-            EXPECT_EQ(ids[i], expectedIds[i])
-                << "ID mismatch at series " << i << " wave " << w;
+            EXPECT_EQ(ids[i], expectedIds[i]) << "ID mismatch at series " << i << " wave " << w;
         }
     }
 
@@ -712,12 +650,9 @@ SEASTAR_TEST_F(MetadataIndexStressTest, PersistenceAfterBulkWrites) {
         co_await index->init();
 
         for (int i = 0; i < NUM_SERIES; i++) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(i)},
-                {"app", "app-" + std::to_string(i % 8)}
-            };
-            auto id = co_await index->getOrCreateSeriesId(
-                "persist_test", tags, "metric_" + std::to_string(i % 4));
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                       {"app", "app-" + std::to_string(i % 8)}};
+            auto id = co_await index->getOrCreateSeriesId("persist_test", tags, "metric_" + std::to_string(i % 4));
             originalIds.push_back(id);
         }
 
@@ -735,14 +670,10 @@ SEASTAR_TEST_F(MetadataIndexStressTest, PersistenceAfterBulkWrites) {
 
         // Verify IDs match (spot check every 10th series)
         for (int i = 0; i < NUM_SERIES; i += 10) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(i)},
-                {"app", "app-" + std::to_string(i % 8)}
-            };
-            auto id = co_await index->getOrCreateSeriesId(
-                "persist_test", tags, "metric_" + std::to_string(i % 4));
-            EXPECT_EQ(id, originalIds[i])
-                << "ID mismatch for series " << i << " after reopen";
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                       {"app", "app-" + std::to_string(i % 8)}};
+            auto id = co_await index->getOrCreateSeriesId("persist_test", tags, "metric_" + std::to_string(i % 4));
+            EXPECT_EQ(id, originalIds[i]) << "ID mismatch for series " << i << " after reopen";
         }
 
         // Verify tag values are persisted
@@ -763,7 +694,7 @@ SEASTAR_TEST_F(MetadataIndexStressTest, TagQueryAtScale) {
     auto index = std::make_unique<MetadataIndex>(STRESS_METADATA_PATH);
     co_await index->init();
 
-    const int NUM_ENVS = 3;        // prod, staging, dev
+    const int NUM_ENVS = 3;  // prod, staging, dev
     const int NUM_SERVICES = 10;
     const int NUM_INSTANCES = 5;
     const int TOTAL = NUM_ENVS * NUM_SERVICES * NUM_INSTANCES;
@@ -774,11 +705,9 @@ SEASTAR_TEST_F(MetadataIndexStressTest, TagQueryAtScale) {
     for (int e = 0; e < NUM_ENVS; e++) {
         for (int s = 0; s < NUM_SERVICES; s++) {
             for (int inst = 0; inst < NUM_INSTANCES; inst++) {
-                std::map<std::string, std::string> tags = {
-                    {"env", envNames[e]},
-                    {"service", "svc-" + std::to_string(s)},
-                    {"instance", "inst-" + std::to_string(inst)}
-                };
+                std::map<std::string, std::string> tags = {{"env", envNames[e]},
+                                                           {"service", "svc-" + std::to_string(s)},
+                                                           {"instance", "inst-" + std::to_string(inst)}};
                 co_await index->getOrCreateSeriesId("scale_query", tags, "latency");
             }
         }
@@ -786,18 +715,13 @@ SEASTAR_TEST_F(MetadataIndexStressTest, TagQueryAtScale) {
 
     // Query by single tag
     auto prodSeries = co_await index->findSeriesByTag("scale_query", "env", "prod");
-    EXPECT_EQ(prodSeries.size(),
-              static_cast<size_t>(NUM_SERVICES * NUM_INSTANCES));
+    EXPECT_EQ(prodSeries.size(), static_cast<size_t>(NUM_SERVICES * NUM_INSTANCES));
 
     auto svc0Series = co_await index->findSeriesByTag("scale_query", "service", "svc-0");
-    EXPECT_EQ(svc0Series.size(),
-              static_cast<size_t>(NUM_ENVS * NUM_INSTANCES));
+    EXPECT_EQ(svc0Series.size(), static_cast<size_t>(NUM_ENVS * NUM_INSTANCES));
 
     // Query by composite tags
-    std::map<std::string, std::string> filter = {
-        {"env", "prod"},
-        {"service", "svc-0"}
-    };
+    std::map<std::string, std::string> filter = {{"env", "prod"}, {"service", "svc-0"}};
     auto filtered = co_await index->findSeriesByTags("scale_query", filter);
     EXPECT_EQ(filtered.size(), static_cast<size_t>(NUM_INSTANCES));
 
@@ -805,8 +729,7 @@ SEASTAR_TEST_F(MetadataIndexStressTest, TagQueryAtScale) {
     auto groupedByEnv = co_await index->getSeriesGroupedByTag("scale_query", "env");
     EXPECT_EQ(groupedByEnv.size(), static_cast<size_t>(NUM_ENVS));
     for (const auto& [env, ids] : groupedByEnv) {
-        EXPECT_EQ(ids.size(), static_cast<size_t>(NUM_SERVICES * NUM_INSTANCES))
-            << "Wrong count for env: " << env;
+        EXPECT_EQ(ids.size(), static_cast<size_t>(NUM_SERVICES * NUM_INSTANCES)) << "Wrong count for env: " << env;
     }
 
     // Verify total
@@ -828,9 +751,7 @@ SEASTAR_TEST_F(MetadataIndexStressTest, UpdateAndDeleteUnderLoad) {
 
     // Create series
     for (int i = 0; i < NUM_SERIES; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "host-" + std::to_string(i)}
-        };
+        std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)}};
         auto id = co_await index->getOrCreateSeriesId("delete_test", tags, "value");
         ids.push_back(id);
     }
@@ -870,15 +791,13 @@ SEASTAR_TEST_F(MetadataIndexStressTest, UpdateAndDeleteUnderLoad) {
     // Verify deleted series are gone
     for (int i = 0; i < NUM_SERIES; i += 2) {
         auto meta = co_await index->getSeriesMetadata(ids[i]);
-        EXPECT_FALSE(meta.has_value())
-            << "Series " << ids[i] << " should have been deleted";
+        EXPECT_FALSE(meta.has_value()) << "Series " << ids[i] << " should have been deleted";
     }
 
     // Verify remaining series are intact
     for (int i = 1; i < NUM_SERIES; i += 2) {
         auto meta = co_await index->getSeriesMetadata(ids[i]);
-        EXPECT_TRUE(meta.has_value())
-            << "Series " << ids[i] << " should still exist";
+        EXPECT_TRUE(meta.has_value()) << "Series " << ids[i] << " should still exist";
     }
 
     co_await index->close();
@@ -896,9 +815,7 @@ SEASTAR_TEST_F(MetadataIndexStressTest, FieldStatsAtScale) {
 
     // Create series
     for (int i = 0; i < NUM_SERIES; i++) {
-        std::map<std::string, std::string> tags = {
-            {"sensor", "sensor-" + std::to_string(i)}
-        };
+        std::map<std::string, std::string> tags = {{"sensor", "sensor-" + std::to_string(i)}};
         auto id = co_await index->getOrCreateSeriesId("fstats_test", tags, "temp");
         seriesIds.push_back(id);
     }
@@ -915,9 +832,7 @@ SEASTAR_TEST_F(MetadataIndexStressTest, FieldStatsAtScale) {
             stats.maxValue = static_cast<double>(i + round * 10);
             stats.pointCount = static_cast<uint64_t>((round + 1) * 100);
 
-            futures.push_back(
-                index->updateFieldStats("fstats_test", "temp",
-                                        seriesIds[i], stats));
+            futures.push_back(index->updateFieldStats("fstats_test", "temp", seriesIds[i], stats));
         }
 
         co_await seastar::when_all_succeed(futures.begin(), futures.end());
@@ -943,10 +858,8 @@ SEASTAR_TEST_F(MetadataIndexStressTest, CrossMeasurementIsolation) {
     for (int m = 0; m < NUM_MEASUREMENTS; m++) {
         std::string measurement = "isolated_" + std::to_string(m);
         for (int s = 0; s < SERIES_PER; s++) {
-            std::map<std::string, std::string> tags = {
-                {"host", "host-" + std::to_string(s)},
-                {"level", s < 10 ? "critical" : "normal"}
-            };
+            std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(s)},
+                                                       {"level", s < 10 ? "critical" : "normal"}};
             co_await index->getOrCreateSeriesId(measurement, tags, "value");
         }
     }
@@ -956,8 +869,7 @@ SEASTAR_TEST_F(MetadataIndexStressTest, CrossMeasurementIsolation) {
         std::string measurement = "isolated_" + std::to_string(m);
 
         auto seriesIds = co_await index->findSeriesByMeasurement(measurement);
-        EXPECT_EQ(seriesIds.size(), static_cast<size_t>(SERIES_PER))
-            << "Wrong count for measurement " << measurement;
+        EXPECT_EQ(seriesIds.size(), static_cast<size_t>(SERIES_PER)) << "Wrong count for measurement " << measurement;
 
         // Verify tag values are measurement-scoped
         auto hostValues = co_await index->getTagValues(measurement, "host");
@@ -980,10 +892,8 @@ SEASTAR_TEST_F(MetadataIndexStressTest, MixedConcurrentOperations) {
     const int SEED = 50;
     std::vector<uint64_t> seededIds;
     for (int i = 0; i < SEED; i++) {
-        std::map<std::string, std::string> tags = {
-            {"host", "host-" + std::to_string(i)},
-            {"env", i % 2 == 0 ? "prod" : "staging"}
-        };
+        std::map<std::string, std::string> tags = {{"host", "host-" + std::to_string(i)},
+                                                   {"env", i % 2 == 0 ? "prod" : "staging"}};
         auto id = co_await index->getOrCreateSeriesId("mixed_ops", tags, "value");
         seededIds.push_back(id);
     }
@@ -998,42 +908,29 @@ SEASTAR_TEST_F(MetadataIndexStressTest, MixedConcurrentOperations) {
         switch (op) {
             case 0: {
                 // Create new series
-                std::map<std::string, std::string> tags = {
-                    {"host", "new-host-" + std::to_string(i)},
-                    {"env", "dev"}
-                };
-                futures.push_back(
-                    index->getOrCreateSeriesId("mixed_ops", std::move(tags), "value")
-                        .discard_result());
+                std::map<std::string, std::string> tags = {{"host", "new-host-" + std::to_string(i)}, {"env", "dev"}};
+                futures.push_back(index->getOrCreateSeriesId("mixed_ops", std::move(tags), "value").discard_result());
                 break;
             }
             case 1: {
                 // Get metadata for an existing series
-                futures.push_back(
-                    index->getSeriesMetadata(seededIds[i % SEED])
-                        .discard_result());
+                futures.push_back(index->getSeriesMetadata(seededIds[i % SEED]).discard_result());
                 break;
             }
             case 2: {
                 // Find series by measurement
-                futures.push_back(
-                    index->findSeriesByMeasurement("mixed_ops")
-                        .discard_result());
+                futures.push_back(index->findSeriesByMeasurement("mixed_ops").discard_result());
                 break;
             }
             case 3: {
                 // Find series by tag
                 futures.push_back(
-                    index->findSeriesByTag("mixed_ops", "env",
-                                           i % 2 == 0 ? "prod" : "staging")
-                        .discard_result());
+                    index->findSeriesByTag("mixed_ops", "env", i % 2 == 0 ? "prod" : "staging").discard_result());
                 break;
             }
             case 4: {
                 // Get tag values
-                futures.push_back(
-                    index->getTagValues("mixed_ops", "env")
-                        .discard_result());
+                futures.push_back(index->getTagValues("mixed_ops", "env").discard_result());
                 break;
             }
         }

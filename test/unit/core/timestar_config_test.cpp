@@ -1,3 +1,5 @@
+#include "../../../lib/config/timestar_config.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -5,8 +7,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#include "../../../lib/config/timestar_config.hpp"
 
 // ---------------------------------------------------------------------------
 // Helper: build a minimal SeastarConfig with one setting.
@@ -36,8 +36,7 @@ TEST(TimestarConfigValidateTest, TaskQuotaMsValidNumericPasses) {
     auto cfg = makeValidConfigWith(makeSeastarConfig("task_quota_ms", "0.5"));
     auto errors = cfg.validate();
     for (const auto& e : errors) {
-        EXPECT_EQ(e.find("task_quota_ms"), std::string::npos)
-            << "Unexpected task_quota_ms error: " << e;
+        EXPECT_EQ(e.find("task_quota_ms"), std::string::npos) << "Unexpected task_quota_ms error: " << e;
     }
 }
 
@@ -46,16 +45,14 @@ TEST(TimestarConfigValidateTest, TaskQuotaMsInvalidStringReturnsError) {
     // crashing the server on startup.  After the fix it must return an error.
     auto cfg = makeValidConfigWith(makeSeastarConfig("task_quota_ms", "abc"));
     std::vector<std::string> errors;
-    ASSERT_NO_THROW(errors = cfg.validate())
-        << "validate() must not propagate std::invalid_argument from std::stod";
+    ASSERT_NO_THROW(errors = cfg.validate()) << "validate() must not propagate std::invalid_argument from std::stod";
     bool found = false;
     for (const auto& e : errors) {
         if (e.find("task_quota_ms") != std::string::npos) {
             found = true;
         }
     }
-    EXPECT_TRUE(found)
-        << "Expected a validation error mentioning 'task_quota_ms' for value \"abc\"";
+    EXPECT_TRUE(found) << "Expected a validation error mentioning 'task_quota_ms' for value \"abc\"";
 }
 
 TEST(TimestarConfigValidateTest, TaskQuotaMsEmptyStringReturnsError) {
@@ -68,8 +65,7 @@ TEST(TimestarConfigValidateTest, TaskQuotaMsEmptyStringReturnsError) {
             found = true;
         }
     }
-    EXPECT_TRUE(found)
-        << "Expected a validation error mentioning 'task_quota_ms' for empty string";
+    EXPECT_TRUE(found) << "Expected a validation error mentioning 'task_quota_ms' for empty string";
 }
 
 TEST(TimestarConfigValidateTest, TaskQuotaMsNegativeValueReturnsError) {
@@ -107,8 +103,7 @@ TEST(TimestarConfigValidateTest, TaskQuotaMsWhitespaceStringReturnsError) {
             found = true;
         }
     }
-    EXPECT_TRUE(found)
-        << "Expected a validation error for whitespace task_quota_ms";
+    EXPECT_TRUE(found) << "Expected a validation error for whitespace task_quota_ms";
 }
 
 TEST(TimestarConfigValidateTest, TaskQuotaMsTrailingGarbageReturnsError) {
@@ -123,8 +118,7 @@ TEST(TimestarConfigValidateTest, TaskQuotaMsTrailingGarbageReturnsError) {
             found = true;
         }
     }
-    EXPECT_TRUE(found)
-        << "Expected a validation error for task_quota_ms = \"1.0abc\" (trailing garbage)";
+    EXPECT_TRUE(found) << "Expected a validation error for task_quota_ms = \"1.0abc\" (trailing garbage)";
 }
 
 // ===========================================================================
@@ -151,8 +145,7 @@ TEST(TimestarConfigValidateTest, ReactorBackendInvalidValueReturnsError) {
             found = true;
         }
     }
-    EXPECT_TRUE(found)
-        << "Expected a validation error for reactor_backend = \"kqueue\"";
+    EXPECT_TRUE(found) << "Expected a validation error for reactor_backend = \"kqueue\"";
 }
 
 // ===========================================================================
@@ -171,11 +164,11 @@ TEST(TimestarConfigValidateTest, EmptySeastarSectionProducesNoSeastarErrors) {
 // ===========================================================================
 // Helper: return only the errors whose text contains the given substring.
 // ===========================================================================
-static std::vector<std::string> errorsMatching(const std::vector<std::string>& errors,
-                                                const std::string& needle) {
+static std::vector<std::string> errorsMatching(const std::vector<std::string>& errors, const std::string& needle) {
     std::vector<std::string> out;
     for (const auto& e : errors) {
-        if (e.find(needle) != std::string::npos) out.push_back(e);
+        if (e.find(needle) != std::string::npos)
+            out.push_back(e);
     }
     return out;
 }
@@ -540,8 +533,7 @@ TEST(TimestarConfigValidateTest, MultipleInvalidFieldsReturnsAllErrors) {
 TEST(TimestarConfigValidateTest, DefaultConfigIsValid) {
     timestar::TimestarConfig cfg;
     auto errors = cfg.validate();
-    EXPECT_TRUE(errors.empty())
-        << "Default-constructed TimestarConfig should be valid; got errors:";
+    EXPECT_TRUE(errors.empty()) << "Default-constructed TimestarConfig should be valid; got errors:";
     for (const auto& e : errors) {
         ADD_FAILURE() << "  " << e;
     }
@@ -557,7 +549,8 @@ public:
     ScopedEnv(const char* name, const char* value) : name_(name) {
         auto* prev = std::getenv(name);
         had_prev_ = (prev != nullptr);
-        if (had_prev_) prev_value_ = prev;
+        if (had_prev_)
+            prev_value_ = prev;
         setenv(name, value, 1);
     }
     ~ScopedEnv() {
@@ -569,6 +562,7 @@ public:
     }
     ScopedEnv(const ScopedEnv&) = delete;
     ScopedEnv& operator=(const ScopedEnv&) = delete;
+
 private:
     std::string name_;
     std::string prev_value_;

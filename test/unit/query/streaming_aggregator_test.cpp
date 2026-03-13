@@ -1,17 +1,15 @@
-#include <gtest/gtest.h>
 #include "streaming_aggregator.hpp"
-#include "http_stream_handler.hpp"
-#include "expression_parser.hpp"
+
 #include "expression_evaluator.hpp"
+#include "expression_parser.hpp"
+#include "http_stream_handler.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace timestar;
 
-static StreamingDataPoint makePoint(
-    const std::string& measurement,
-    const std::string& field,
-    const std::map<std::string, std::string>& tags,
-    uint64_t timestamp,
-    double value) {
+static StreamingDataPoint makePoint(const std::string& measurement, const std::string& field,
+                                    const std::map<std::string, std::string>& tags, uint64_t timestamp, double value) {
     StreamingDataPoint pt;
     pt.measurement = measurement;
     pt.field = field;
@@ -32,7 +30,7 @@ TEST(StreamingAggregatorTest, AvgAggregation) {
 
     auto batch = agg.closeBuckets();
     ASSERT_EQ(batch.points.size(), 1u);
-    EXPECT_EQ(batch.points[0].timestamp, 0u);  // bucket start
+    EXPECT_EQ(batch.points[0].timestamp, 0u);                         // bucket start
     EXPECT_DOUBLE_EQ(std::get<double>(batch.points[0].value), 20.0);  // avg
     EXPECT_EQ(batch.points[0].measurement, "temp");
     EXPECT_EQ(batch.points[0].field, "value");
@@ -187,17 +185,11 @@ TEST(StreamingAggregatorTest, EmptyBucketComputeResultIsNaN) {
     // count == 0: no data points were ever added
     ASSERT_EQ(state.count, 0u);
 
-    for (AggregationMethod method : {
-            AggregationMethod::AVG,
-            AggregationMethod::SUM,
-            AggregationMethod::MIN,
-            AggregationMethod::MAX,
-            AggregationMethod::LATEST}) {
+    for (AggregationMethod method : {AggregationMethod::AVG, AggregationMethod::SUM, AggregationMethod::MIN,
+                                     AggregationMethod::MAX, AggregationMethod::LATEST}) {
         double result = state.computeResult(method);
-        EXPECT_TRUE(std::isnan(result))
-            << "Expected NaN for empty bucket with method "
-            << static_cast<int>(method)
-            << " but got " << result;
+        EXPECT_TRUE(std::isnan(result)) << "Expected NaN for empty bucket with method " << static_cast<int>(method)
+                                        << " but got " << result;
     }
 }
 
@@ -347,8 +339,10 @@ TEST(StreamingFormulaTest, DiffFunction) {
     for (const auto& pt : result.points) {
         double val = std::get<double>(pt.value);
         if (!std::isnan(val)) {
-            if (std::abs(val - 30.0) < 0.001) found30 = true;
-            if (std::abs(val - 15.0) < 0.001) found15 = true;
+            if (std::abs(val - 30.0) < 0.001)
+                found30 = true;
+            if (std::abs(val - 15.0) < 0.001)
+                found15 = true;
         }
     }
     EXPECT_TRUE(found30);

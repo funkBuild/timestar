@@ -7,16 +7,16 @@
 //   - Tombstone filtering in selective/bucketed paths
 //   - Bucket key consistency with BlockAggregator
 
-#include <gtest/gtest.h>
-#include <filesystem>
-
+#include "../../../lib/core/series_id.hpp"
 #include "../../../lib/query/block_aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/tsm_writer.hpp"
-#include "../../../lib/core/series_id.hpp"
-
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 
@@ -47,15 +47,10 @@ public:
     }
 
     // Helper: create a TSM file with a single float series.
-    seastar::shared_ptr<TSM> createTSMFile(
-        uint64_t tier, uint64_t seqNum,
-        const std::string& seriesKey,
-        const std::vector<uint64_t>& timestamps,
-        const std::vector<double>& values) {
-
+    seastar::shared_ptr<TSM> createTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesKey,
+                                           const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
         char filename[256];
-        snprintf(filename, sizeof(filename),
-                 "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
 
         TSMWriter writer(filename);
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -68,12 +63,11 @@ public:
         tsm->seqNum = seqNum;
         return tsm;
     }
-
 };
 
 // Free function so SEASTAR_TEST_F-generated functions can call it.
-static void generatePoints(uint64_t baseTime, int count, uint64_t step,
-                           std::vector<uint64_t>& ts, std::vector<double>& vals) {
+static void generatePoints(uint64_t baseTime, int count, uint64_t step, std::vector<uint64_t>& ts,
+                           std::vector<double>& vals) {
     ts.reserve(count);
     vals.reserve(count);
     for (int i = 0; i < count; i++) {
@@ -99,8 +93,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestSelectiveReturnsSingleLatestPoint) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sel.latest");
     timestar::BlockAggregator aggregator(0);  // non-bucketed
 
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 1990, aggregator, /*reverse=*/true, /*maxPoints=*/1);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1990, aggregator, /*reverse=*/true, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     EXPECT_EQ(aggregator.pointCount(), 1u);
@@ -127,8 +121,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, FirstSelectiveReturnsSingleEarliestPoint) 
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sel.first");
     timestar::BlockAggregator aggregator(0);
 
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 1990, aggregator, /*reverse=*/false, /*maxPoints=*/1);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1990, aggregator, /*reverse=*/false, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();
@@ -153,8 +147,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestSelectiveMaxPointsThree) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sel.multi");
     timestar::BlockAggregator aggregator(0);
 
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 1490, aggregator, /*reverse=*/true, /*maxPoints=*/3);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1490, aggregator, /*reverse=*/true, /*maxPoints=*/3);
 
     EXPECT_EQ(pts, 3u);
     auto timestamps = aggregator.takeTimestamps();
@@ -178,8 +172,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, SelectiveSeriesNotFound) {
     SeriesId128 missingId = SeriesId128::fromSeriesKey("sel.missing");
     timestar::BlockAggregator aggregator(0);
 
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        missingId, 0, 99999, aggregator, true, 1);
+    size_t pts = co_await tsm->aggregateSeriesSelective(missingId, 0, 99999, aggregator, true, 1);
     EXPECT_EQ(pts, 0u);
 
     co_return;
@@ -198,8 +191,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, SelectiveTimeRangeFilter) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sel.range");
     timestar::BlockAggregator aggregator(0);
 
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1500, 1700, aggregator, /*reverse=*/true, /*maxPoints=*/1);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1500, 1700, aggregator, /*reverse=*/true, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();
@@ -230,8 +223,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestSelectiveSkipsTombstonedPoints) {
     co_await tsm->deleteRange(seriesId, 1070, 1090);
 
     timestar::BlockAggregator aggregator(0);
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 1090, aggregator, /*reverse=*/true, /*maxPoints=*/1);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1090, aggregator, /*reverse=*/true, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();
@@ -257,8 +250,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, FirstSelectiveSkipsTombstonedPoints) {
     co_await tsm->deleteRange(seriesId, 1000, 1020);
 
     timestar::BlockAggregator aggregator(0);
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 1090, aggregator, /*reverse=*/false, /*maxPoints=*/1);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1090, aggregator, /*reverse=*/false, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();
@@ -299,9 +292,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestBucketedFillsBuckets) {
     std::unordered_set<uint64_t> filledBuckets;
     timestar::BlockAggregator aggregator(interval, startTime, endTime);
 
-    size_t pts = co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/true,
-        interval, filledBuckets, totalBuckets);
+    size_t pts = co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/true,
+                                                       interval, filledBuckets, totalBuckets);
 
     // Should have filled all buckets, one point each
     EXPECT_EQ(filledBuckets.size(), totalBuckets);
@@ -310,10 +302,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestBucketedFillsBuckets) {
     // Verify bucket keys match BlockAggregator's formula
     auto bucketStates = aggregator.takeBucketStates();
     for (const auto& [key, state] : bucketStates) {
-        EXPECT_EQ(key, (key / interval) * interval)
-            << "Bucket key should be interval-aligned (absolute truncation)";
-        EXPECT_TRUE(filledBuckets.count(key))
-            << "filledBuckets should contain same keys as aggregator bucketStates";
+        EXPECT_EQ(key, (key / interval) * interval) << "Bucket key should be interval-aligned (absolute truncation)";
+        EXPECT_TRUE(filledBuckets.count(key)) << "filledBuckets should contain same keys as aggregator bucketStates";
     }
 
     co_return;
@@ -340,9 +330,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, FirstBucketedFillsBuckets) {
     std::unordered_set<uint64_t> filledBuckets;
     timestar::BlockAggregator aggregator(interval, startTime, endTime);
 
-    size_t pts = co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/false,
-        interval, filledBuckets, totalBuckets);
+    size_t pts = co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/false,
+                                                       interval, filledBuckets, totalBuckets);
 
     EXPECT_EQ(filledBuckets.size(), totalBuckets);
     EXPECT_EQ(pts, totalBuckets);
@@ -373,9 +362,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, BucketedLatestGetsActualLatestPerBucket) {
     std::unordered_set<uint64_t> filledBuckets;
     timestar::BlockAggregator aggregator(interval, startTime, endTime);
 
-    co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/true,
-        interval, filledBuckets, totalBuckets);
+    co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/true, interval,
+                                          filledBuckets, totalBuckets);
 
     EXPECT_EQ(filledBuckets.size(), 1u);
 
@@ -409,9 +397,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, BucketedFirstGetsActualFirstPerBucket) {
     std::unordered_set<uint64_t> filledBuckets;
     timestar::BlockAggregator aggregator(interval, startTime, endTime);
 
-    co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/false,
-        interval, filledBuckets, totalBuckets);
+    co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/false, interval,
+                                          filledBuckets, totalBuckets);
 
     auto bucketStates = aggregator.takeBucketStates();
     EXPECT_EQ(bucketStates.size(), 1u);
@@ -452,9 +439,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, BucketedSkipsAlreadyFilledBuckets) {
     // Manually add a "pre-existing" point for bucket 1000
     aggregator.addPoint(1499, 999.0);
 
-    co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/true,
-        interval, filledBuckets, totalBuckets);
+    co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/true, interval,
+                                          filledBuckets, totalBuckets);
 
     // The pre-filled bucket should still have only 1 point (from our manual add)
     // plus one point per remaining bucket
@@ -498,9 +484,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, BucketedEarlyTerminationWhenAllFilled) {
 
     timestar::BlockAggregator aggregator(interval, startTime, endTime);
 
-    size_t pts = co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/true,
-        interval, filledBuckets, totalBuckets);
+    size_t pts = co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/true,
+                                                       interval, filledBuckets, totalBuckets);
 
     EXPECT_EQ(pts, 0u);
     EXPECT_EQ(aggregator.pointCount(), 0u);
@@ -531,9 +516,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, BucketedWithTombstones) {
     std::unordered_set<uint64_t> filledBuckets;
     timestar::BlockAggregator aggregator(interval, startTime, endTime);
 
-    co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/true,
-        interval, filledBuckets, totalBuckets);
+    co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/true, interval,
+                                          filledBuckets, totalBuckets);
 
     auto bucketStates = aggregator.takeBucketStates();
     EXPECT_EQ(bucketStates.size(), 1u);
@@ -570,29 +554,26 @@ SEASTAR_TEST_F(PushdownSelectiveTest, BucketKeyConsistencyUnalignedStartTime) {
     uint64_t endTime = 1540;
 
     // Compute buckets using the aggregator's formula
-    uint64_t firstBucket = (startTime / interval) * interval;  // 1000
-    uint64_t lastBucket = (endTime / interval) * interval;      // 1500
+    uint64_t firstBucket = (startTime / interval) * interval;                              // 1000
+    uint64_t lastBucket = (endTime / interval) * interval;                                 // 1500
     size_t totalBuckets = static_cast<size_t>((lastBucket - firstBucket) / interval + 1);  // 2
 
     std::unordered_set<uint64_t> filledBuckets;
     timestar::BlockAggregator aggregator(interval, startTime, endTime);
 
-    co_await tsm->aggregateSeriesBucketed(
-        seriesId, startTime, endTime, aggregator, /*reverse=*/true,
-        interval, filledBuckets, totalBuckets);
+    co_await tsm->aggregateSeriesBucketed(seriesId, startTime, endTime, aggregator, /*reverse=*/true, interval,
+                                          filledBuckets, totalBuckets);
 
     // Verify filledBuckets contains keys matching aggregator's formula
     EXPECT_EQ(filledBuckets.size(), totalBuckets);
     for (uint64_t b = firstBucket; b <= lastBucket; b += interval) {
-        EXPECT_TRUE(filledBuckets.count(b))
-            << "Expected bucket key " << b << " (absolute truncation) in filledBuckets";
+        EXPECT_TRUE(filledBuckets.count(b)) << "Expected bucket key " << b << " (absolute truncation) in filledBuckets";
     }
 
     // Verify aggregator's bucketStates keys are the same
     auto bucketStates = aggregator.takeBucketStates();
     for (const auto& [key, _] : bucketStates) {
-        EXPECT_TRUE(filledBuckets.count(key))
-            << "Aggregator bucket key " << key << " not found in filledBuckets";
+        EXPECT_TRUE(filledBuckets.count(key)) << "Aggregator bucket key " << key << " not found in filledBuckets";
     }
 
     co_return;
@@ -617,8 +598,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestSelectiveMultiBlock) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sel.multiblock");
     timestar::BlockAggregator aggregator(0);
 
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 50990, aggregator, /*reverse=*/true, /*maxPoints=*/1);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 50990, aggregator, /*reverse=*/true, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();
@@ -640,8 +621,8 @@ SEASTAR_TEST_F(PushdownSelectiveTest, FirstSelectiveMultiBlock) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("sel.multiblock.first");
     timestar::BlockAggregator aggregator(0);
 
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 50990, aggregator, /*reverse=*/false, /*maxPoints=*/1);
+    size_t pts =
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 50990, aggregator, /*reverse=*/false, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();
@@ -668,8 +649,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, SinglePointFile) {
     // LATEST
     {
         timestar::BlockAggregator aggregator(0);
-        size_t pts = co_await tsm->aggregateSeriesSelective(
-            seriesId, 0, 99999, aggregator, true, 1);
+        size_t pts = co_await tsm->aggregateSeriesSelective(seriesId, 0, 99999, aggregator, true, 1);
         EXPECT_EQ(pts, 1u);
         auto timestamps = aggregator.takeTimestamps();
         EXPECT_EQ(timestamps[0], 5000u);
@@ -678,8 +658,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, SinglePointFile) {
     // FIRST
     {
         timestar::BlockAggregator aggregator(0);
-        size_t pts = co_await tsm->aggregateSeriesSelective(
-            seriesId, 0, 99999, aggregator, false, 1);
+        size_t pts = co_await tsm->aggregateSeriesSelective(seriesId, 0, 99999, aggregator, false, 1);
         EXPECT_EQ(pts, 1u);
         auto timestamps = aggregator.takeTimestamps();
         EXPECT_EQ(timestamps[0], 5000u);
@@ -701,8 +680,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, EmptyTimeRange) {
     timestar::BlockAggregator aggregator(0);
 
     // Query a time range that doesn't overlap any data
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 9000, 9999, aggregator, true, 1);
+    size_t pts = co_await tsm->aggregateSeriesSelective(seriesId, 9000, 9999, aggregator, true, 1);
     EXPECT_EQ(pts, 0u);
 
     co_return;
@@ -721,8 +699,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, AllPointsTombstoned) {
     co_await tsm->deleteRange(seriesId, 1000, 1090);
 
     timestar::BlockAggregator aggregator(0);
-    size_t pts = co_await tsm->aggregateSeriesSelective(
-        seriesId, 1000, 1090, aggregator, true, 1);
+    size_t pts = co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1090, aggregator, true, 1);
     EXPECT_EQ(pts, 0u);
 
     co_return;

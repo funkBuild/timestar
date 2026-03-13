@@ -12,8 +12,8 @@
 #include <map>
 #include <optional>
 #include <queue>
-#include <unordered_set>
 #include <seastar/core/distributed.hh>
+#include <unordered_set>
 
 typedef std::chrono::high_resolution_clock Clock;
 
@@ -248,9 +248,8 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
     // parallel_for_each coroutines could push_back concurrently after co_await points.
     // Snapshot the TSM file map so that compaction cannot mutate it
     // mid-iteration across co_await suspension points.
-    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFiles(
-        fileManager->getSequencedTsmFiles().begin(),
-        fileManager->getSequencedTsmFiles().end());
+    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFiles(fileManager->getSequencedTsmFiles().begin(),
+                                                                        fileManager->getSequencedTsmFiles().end());
     std::vector<std::optional<TSMResult<T>>> tsmSlots(seqFiles.size());
 
     // First query TSM files
@@ -577,8 +576,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         // Snapshot the TSM file map so that compaction cannot mutate it
         // mid-iteration across co_await suspension points.
         std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
-            fileManager->getSequencedTsmFiles().begin(),
-            fileManager->getSequencedTsmFiles().end());
+            fileManager->getSequencedTsmFiles().begin(), fileManager->getSequencedTsmFiles().end());
 
         // Filter files using in-memory checks only (no I/O).
         std::vector<seastar::shared_ptr<TSM>> candidateFiles;
@@ -618,8 +616,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         if (aggregationInterval == 0) {
             // Non-bucketed: need only 1 point total from TSM.
             for (auto& file : candidateFiles) {
-                size_t pts = co_await file->aggregateSeriesSelective(
-                    seriesId, startTime, tsmEndTime, aggregator, reverse, 1);
+                size_t pts =
+                    co_await file->aggregateSeriesSelective(seriesId, startTime, tsmEndTime, aggregator, reverse, 1);
                 if (pts > 0) {
                     break;  // Got our point
                 }
@@ -637,9 +635,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
                 if (filledBuckets.size() >= totalBuckets) {
                     break;
                 }
-                co_await file->aggregateSeriesBucketed(
-                    seriesId, startTime, tsmEndTime, aggregator, reverse, aggregationInterval, filledBuckets,
-                    totalBuckets);
+                co_await file->aggregateSeriesBucketed(seriesId, startTime, tsmEndTime, aggregator, reverse,
+                                                       aggregationInterval, filledBuckets, totalBuckets);
             }
         }
 
@@ -681,9 +678,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
     // Snapshot the TSM file map so that compaction cannot mutate it
     // mid-iteration across co_await suspension points.
-    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
-        fileManager->getSequencedTsmFiles().begin(),
-        fileManager->getSequencedTsmFiles().end());
+    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(fileManager->getSequencedTsmFiles().begin(),
+                                                                            fileManager->getSequencedTsmFiles().end());
 
     for (const auto& [rank, tsmFile] : seqFilesSnap) {
         auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);

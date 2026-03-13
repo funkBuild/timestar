@@ -18,15 +18,16 @@
 // static API, giving full indirect coverage without needing to expose them.
 // =============================================================================
 
-#include <gtest/gtest.h>
-#include "../../../lib/http/http_stream_handler.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/http/http_stream_handler.hpp"
 #include "../../../lib/query/expression_parser.hpp"
 
-#include <string>
-#include <vector>
+#include <gtest/gtest.h>
+
 #include <map>
+#include <string>
 #include <variant>
+#include <vector>
 
 using namespace timestar;
 
@@ -35,14 +36,9 @@ using namespace timestar;
 // ---------------------------------------------------------------------------
 
 // Build a minimal StreamingBatch from a single double data point.
-static StreamingBatch makeBatch(
-        const std::string& measurement,
-        const std::map<std::string, std::string>& tags,
-        const std::string& field,
-        uint64_t timestamp,
-        double value,
-        uint64_t seqId = 0,
-        const std::string& label = "") {
+static StreamingBatch makeBatch(const std::string& measurement, const std::map<std::string, std::string>& tags,
+                                const std::string& field, uint64_t timestamp, double value, uint64_t seqId = 0,
+                                const std::string& label = "") {
     StreamingBatch batch;
     batch.sequenceId = seqId;
     batch.label = label;
@@ -66,36 +62,31 @@ class SSEEventFormatTest : public ::testing::Test {};
 TEST_F(SSEEventFormatTest, EventStartsWithId) {
     auto batch = makeBatch("cpu", {}, "usage", 1000, 50.0, 42);
     std::string event = HttpStreamHandler::formatSSEEvent(batch);
-    EXPECT_EQ(event.substr(0, 4), "id: ")
-        << "SSE event must start with 'id: '";
+    EXPECT_EQ(event.substr(0, 4), "id: ") << "SSE event must start with 'id: '";
 }
 
 TEST_F(SSEEventFormatTest, EventContainsSequenceId) {
     auto batch = makeBatch("cpu", {}, "usage", 1000, 50.0, 7);
     std::string event = HttpStreamHandler::formatSSEEvent(batch);
-    EXPECT_NE(event.find("id: 7\n"), std::string::npos)
-        << "SSE event must contain the sequence id";
+    EXPECT_NE(event.find("id: 7\n"), std::string::npos) << "SSE event must contain the sequence id";
 }
 
 TEST_F(SSEEventFormatTest, EventTypeIsData) {
     auto batch = makeBatch("cpu", {}, "usage", 1000, 50.0, 0);
     std::string event = HttpStreamHandler::formatSSEEvent(batch);
-    EXPECT_NE(event.find("\nevent: data\n"), std::string::npos)
-        << "formatSSEEvent must emit 'event: data'";
+    EXPECT_NE(event.find("\nevent: data\n"), std::string::npos) << "formatSSEEvent must emit 'event: data'";
 }
 
 TEST_F(SSEEventFormatTest, EventEndsWithDoubleNewline) {
     auto batch = makeBatch("cpu", {}, "usage", 1000, 50.0, 0);
     std::string event = HttpStreamHandler::formatSSEEvent(batch);
-    EXPECT_EQ(event.substr(event.size() - 2), "\n\n")
-        << "SSE event must end with double newline";
+    EXPECT_EQ(event.substr(event.size() - 2), "\n\n") << "SSE event must end with double newline";
 }
 
 TEST_F(SSEEventFormatTest, EventContainsDataPrefix) {
     auto batch = makeBatch("cpu", {}, "usage", 1000, 50.0, 0);
     std::string event = HttpStreamHandler::formatSSEEvent(batch);
-    EXPECT_NE(event.find("\ndata: "), std::string::npos)
-        << "SSE event must contain 'data: ' line";
+    EXPECT_NE(event.find("\ndata: "), std::string::npos) << "SSE event must contain 'data: ' line";
 }
 
 TEST_F(SSEEventFormatTest, BackfillEventTypeIsBackfill) {
@@ -122,7 +113,7 @@ TEST_F(SSEEventFormatTest, DataAndBackfillDifferOnlyInEventType) {
     auto batchA = makeBatch("cpu", {}, "usage", 1000, 50.0, 5);
     auto batchB = makeBatch("cpu", {}, "usage", 1000, 50.0, 5);
 
-    std::string evData     = HttpStreamHandler::formatSSEEvent(batchA);
+    std::string evData = HttpStreamHandler::formatSSEEvent(batchA);
     std::string evBackfill = HttpStreamHandler::formatSSEBackfillEvent(batchB);
 
     // Replace the differing event type keyword and compare the rest
@@ -134,7 +125,7 @@ TEST_F(SSEEventFormatTest, DataAndBackfillDifferOnlyInEventType) {
         }
         return s;
     };
-    std::string normalizedData     = replaceAll(evData,     "event: data",     "event: X");
+    std::string normalizedData = replaceAll(evData, "event: data", "event: X");
     std::string normalizedBackfill = replaceAll(evBackfill, "event: backfill", "event: X");
 
     EXPECT_EQ(normalizedData, normalizedBackfill)
@@ -151,10 +142,12 @@ protected:
     static std::string extractPayload(const std::string& event) {
         const std::string prefix = "\ndata: ";
         auto pos = event.find(prefix);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         pos += prefix.size();
         auto end = event.rfind("\n\n");
-        if (end == std::string::npos) return event.substr(pos);
+        if (end == std::string::npos)
+            return event.substr(pos);
         return event.substr(pos, end - pos);
     }
 };
@@ -274,8 +267,7 @@ TEST_F(SSEPayloadContentTest, PayloadStringValueIsQuoted) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("\"hello world\""), std::string::npos)
-        << "String values must be JSON-quoted in the payload";
+    EXPECT_NE(payload.find("\"hello world\""), std::string::npos) << "String values must be JSON-quoted in the payload";
 }
 
 TEST_F(SSEPayloadContentTest, PayloadInfDoubleBecomesNull) {
@@ -289,8 +281,7 @@ TEST_F(SSEPayloadContentTest, PayloadInfDoubleBecomesNull) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("null"), std::string::npos)
-        << "Inf double must be serialized as null in JSON";
+    EXPECT_NE(payload.find("null"), std::string::npos) << "Inf double must be serialized as null in JSON";
 }
 
 TEST_F(SSEPayloadContentTest, PayloadNegInfDoubleBecomesNull) {
@@ -304,8 +295,7 @@ TEST_F(SSEPayloadContentTest, PayloadNegInfDoubleBecomesNull) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("null"), std::string::npos)
-        << "Negative Inf must be serialized as null";
+    EXPECT_NE(payload.find("null"), std::string::npos) << "Negative Inf must be serialized as null";
 }
 
 TEST_F(SSEPayloadContentTest, PayloadNaNDoubleBecomesNull) {
@@ -319,8 +309,7 @@ TEST_F(SSEPayloadContentTest, PayloadNaNDoubleBecomesNull) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("null"), std::string::npos)
-        << "NaN must be serialized as null";
+    EXPECT_NE(payload.find("null"), std::string::npos) << "NaN must be serialized as null";
 }
 
 // ---------------------------------------------------------------------------
@@ -332,10 +321,12 @@ protected:
     static std::string extractPayload(const std::string& event) {
         const std::string prefix = "\ndata: ";
         auto pos = event.find(prefix);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         pos += prefix.size();
         auto end = event.rfind("\n\n");
-        if (end == std::string::npos) return event.substr(pos);
+        if (end == std::string::npos)
+            return event.substr(pos);
         return event.substr(pos, end - pos);
     }
 };
@@ -343,8 +334,7 @@ protected:
 TEST_F(SSEJsonEscapeTest, DoubleQuoteInMeasurementIsEscaped) {
     auto batch = makeBatch("meas\"ure", {}, "value", 1000, 1.0);
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("meas\\\"ure"), std::string::npos)
-        << "Double-quote in measurement must be escaped as \\\"";
+    EXPECT_NE(payload.find("meas\\\"ure"), std::string::npos) << "Double-quote in measurement must be escaped as \\\"";
     // Raw unescaped double quote should not appear in the JSON key value
     EXPECT_EQ(payload.find("\"meas\"ure\""), std::string::npos)
         << "Unescaped double-quote should NOT appear in measurement name";
@@ -353,8 +343,7 @@ TEST_F(SSEJsonEscapeTest, DoubleQuoteInMeasurementIsEscaped) {
 TEST_F(SSEJsonEscapeTest, BackslashInTagValueIsEscaped) {
     auto batch = makeBatch("cpu", {{"path", "C:\\Windows"}}, "usage", 1000, 50.0);
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("C:\\\\Windows"), std::string::npos)
-        << "Backslash must be escaped as \\\\";
+    EXPECT_NE(payload.find("C:\\\\Windows"), std::string::npos) << "Backslash must be escaped as \\\\";
 }
 
 TEST_F(SSEJsonEscapeTest, NewlineInStringValueIsEscaped) {
@@ -368,8 +357,7 @@ TEST_F(SSEJsonEscapeTest, NewlineInStringValueIsEscaped) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("\\n"), std::string::npos)
-        << "Newline in string value must be escaped as \\n";
+    EXPECT_NE(payload.find("\\n"), std::string::npos) << "Newline in string value must be escaped as \\n";
     // The literal newline character must NOT appear inside the JSON value
     // (it would break SSE framing if it appeared in the data: line)
     std::string afterData = payload;
@@ -389,8 +377,7 @@ TEST_F(SSEJsonEscapeTest, CarriageReturnIsEscaped) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("\\r"), std::string::npos)
-        << "Carriage return must be escaped as \\r";
+    EXPECT_NE(payload.find("\\r"), std::string::npos) << "Carriage return must be escaped as \\r";
 }
 
 TEST_F(SSEJsonEscapeTest, TabIsEscaped) {
@@ -404,8 +391,7 @@ TEST_F(SSEJsonEscapeTest, TabIsEscaped) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("\\t"), std::string::npos)
-        << "Tab must be escaped as \\t";
+    EXPECT_NE(payload.find("\\t"), std::string::npos) << "Tab must be escaped as \\t";
 }
 
 TEST_F(SSEJsonEscapeTest, ControlCharacterBelowSpace) {
@@ -420,8 +406,7 @@ TEST_F(SSEJsonEscapeTest, ControlCharacterBelowSpace) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("\\u0001"), std::string::npos)
-        << "Control character 0x01 must be escaped as \\u0001";
+    EXPECT_NE(payload.find("\\u0001"), std::string::npos) << "Control character 0x01 must be escaped as \\u0001";
 }
 
 TEST_F(SSEJsonEscapeTest, NullByteIsEscaped) {
@@ -440,15 +425,13 @@ TEST_F(SSEJsonEscapeTest, NullByteIsEscaped) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("\\u0000"), std::string::npos)
-        << "Null byte must be escaped as \\u0000";
+    EXPECT_NE(payload.find("\\u0000"), std::string::npos) << "Null byte must be escaped as \\u0000";
 }
 
 TEST_F(SSEJsonEscapeTest, NormalAsciiNotEscaped) {
     auto batch = makeBatch("hello_world", {{"key", "value123"}}, "field_a", 1000, 42.0);
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("hello_world"), std::string::npos)
-        << "Normal ASCII must NOT be escaped";
+    EXPECT_NE(payload.find("hello_world"), std::string::npos) << "Normal ASCII must NOT be escaped";
     EXPECT_NE(payload.find("value123"), std::string::npos);
 }
 
@@ -463,8 +446,7 @@ TEST_F(SSEJsonEscapeTest, DoubleQuoteInFieldNameIsEscaped) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("fi\\\"eld"), std::string::npos)
-        << "Double-quote in field name must be escaped";
+    EXPECT_NE(payload.find("fi\\\"eld"), std::string::npos) << "Double-quote in field name must be escaped";
 }
 
 TEST_F(SSEJsonEscapeTest, LabelWithSpecialCharsIsEscaped) {
@@ -479,8 +461,7 @@ TEST_F(SSEJsonEscapeTest, LabelWithSpecialCharsIsEscaped) {
     batch.points.push_back(std::move(pt));
 
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("lab\\\"el"), std::string::npos)
-        << "Double-quote in label must be escaped";
+    EXPECT_NE(payload.find("lab\\\"el"), std::string::npos) << "Double-quote in label must be escaped";
 }
 
 // ---------------------------------------------------------------------------
@@ -492,10 +473,12 @@ protected:
     static std::string extractPayload(const std::string& event) {
         const std::string prefix = "\ndata: ";
         auto pos = event.find(prefix);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         pos += prefix.size();
         auto end = event.rfind("\n\n");
-        if (end == std::string::npos) return event.substr(pos);
+        if (end == std::string::npos)
+            return event.substr(pos);
         return event.substr(pos, end - pos);
     }
 };
@@ -581,8 +564,7 @@ TEST_F(SSEPayloadGroupingTest, TwoFieldsSameSeries) {
         ++measCount;
         ++pos;
     }
-    EXPECT_EQ(measCount, 1u)
-        << "Two fields from same (measurement, tags) should be in one series entry";
+    EXPECT_EQ(measCount, 1u) << "Two fields from same (measurement, tags) should be in one series entry";
     EXPECT_NE(payload.find("\"temperature\""), std::string::npos);
     EXPECT_NE(payload.find("\"humidity\""), std::string::npos);
 }
@@ -717,8 +699,7 @@ TEST_F(QueryResponseToBatchesTest, SeriesWithNoFieldsProducesNoBatch) {
     sr.measurement = "empty";
 
     auto batches = HttpStreamHandler::queryResponseToBatches({sr}, "");
-    EXPECT_TRUE(batches.empty())
-        << "A series with no fields should produce no batch";
+    EXPECT_TRUE(batches.empty()) << "A series with no fields should produce no batch";
 }
 
 TEST_F(QueryResponseToBatchesTest, MultipleFieldsInOneSeries) {
@@ -726,7 +707,7 @@ TEST_F(QueryResponseToBatchesTest, MultipleFieldsInOneSeries) {
     sr.measurement = "weather";
     sr.tags = {{"station", "s01"}};
     sr.fields["temperature"] = {{1000, 2000}, FieldValues{std::vector<double>{20.0, 21.0}}};
-    sr.fields["humidity"]    = {{1000, 2000}, FieldValues{std::vector<double>{60.0, 62.0}}};
+    sr.fields["humidity"] = {{1000, 2000}, FieldValues{std::vector<double>{60.0, 62.0}}};
 
     // Multiple fields are all folded into a single batch for the same series
     auto batches = HttpStreamHandler::queryResponseToBatches({sr}, "");
@@ -744,10 +725,12 @@ protected:
     static std::string extractPayload(const std::string& event) {
         const std::string prefix = "\ndata: ";
         auto pos = event.find(prefix);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         pos += prefix.size();
         auto end = event.rfind("\n\n");
-        if (end == std::string::npos) return event.substr(pos);
+        if (end == std::string::npos)
+            return event.substr(pos);
         return event.substr(pos, end - pos);
     }
 };
@@ -805,10 +788,12 @@ protected:
     static std::string extractPayload(const std::string& event) {
         const std::string prefix = "\ndata: ";
         auto pos = event.find(prefix);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         pos += prefix.size();
         auto end = event.rfind("\n\n");
-        if (end == std::string::npos) return event.substr(pos);
+        if (end == std::string::npos)
+            return event.substr(pos);
         return event.substr(pos, end - pos);
     }
 };
@@ -817,19 +802,18 @@ TEST_F(SSEEdgeCasesTest, EmptyBatchProducesEmptySeriesArray) {
     StreamingBatch empty;
     empty.sequenceId = 0;
 
-    std::string event   = HttpStreamHandler::formatSSEEvent(empty);
+    std::string event = HttpStreamHandler::formatSSEEvent(empty);
     std::string payload = extractPayload(event);
 
     // Outer JSON must still be valid: {"series":[]}
-    EXPECT_NE(payload.find("\"series\":[]"), std::string::npos)
-        << "Empty batch should produce {\"series\":[]}";
+    EXPECT_NE(payload.find("\"series\":[]"), std::string::npos) << "Empty batch should produce {\"series\":[]}";
 }
 
 TEST_F(SSEEdgeCasesTest, EmptyBatchBackfillProducesEmptySeriesArray) {
     StreamingBatch empty;
     empty.sequenceId = 1;
 
-    std::string event   = HttpStreamHandler::formatSSEBackfillEvent(empty);
+    std::string event = HttpStreamHandler::formatSSEBackfillEvent(empty);
     std::string payload = extractPayload(event);
     EXPECT_NE(payload.find("\"series\":[]"), std::string::npos);
 }
@@ -837,8 +821,7 @@ TEST_F(SSEEdgeCasesTest, EmptyBatchBackfillProducesEmptySeriesArray) {
 TEST_F(SSEEdgeCasesTest, SequenceIdZeroIsIncluded) {
     auto batch = makeBatch("cpu", {}, "v", 1000, 1.0, 0);
     std::string event = HttpStreamHandler::formatSSEEvent(batch);
-    EXPECT_NE(event.find("id: 0\n"), std::string::npos)
-        << "Sequence id 0 must appear (not be omitted)";
+    EXPECT_NE(event.find("id: 0\n"), std::string::npos) << "Sequence id 0 must appear (not be omitted)";
 }
 
 TEST_F(SSEEdgeCasesTest, LargeSequenceIdFormattedCorrectly) {
@@ -860,15 +843,13 @@ TEST_F(SSEEdgeCasesTest, LargeTimestampFormattedCorrectly) {
 TEST_F(SSEEdgeCasesTest, ZeroTimestamp) {
     auto batch = makeBatch("cpu", {}, "v", 0ULL, 1.0, 0);
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("\"timestamps\":[0]"), std::string::npos)
-        << "Timestamp 0 must appear as 0 in the JSON";
+    EXPECT_NE(payload.find("\"timestamps\":[0]"), std::string::npos) << "Timestamp 0 must appear as 0 in the JSON";
 }
 
 TEST_F(SSEEdgeCasesTest, NegativeDoubleValue) {
     auto batch = makeBatch("temp", {}, "val", 1000, -273.15, 0);
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("-273.15"), std::string::npos)
-        << "Negative double must be serialized correctly";
+    EXPECT_NE(payload.find("-273.15"), std::string::npos) << "Negative double must be serialized correctly";
 }
 
 TEST_F(SSEEdgeCasesTest, ZeroDoubleValue) {
@@ -882,8 +863,7 @@ TEST_F(SSEEdgeCasesTest, UnicodeInTagValueIsPassedThrough) {
     // Non-ASCII bytes (valid UTF-8) should pass through unchanged
     auto batch = makeBatch("sensor", {{"region", "東京"}}, "temp", 1000, 25.0);
     std::string payload = extractPayload(HttpStreamHandler::formatSSEEvent(batch));
-    EXPECT_NE(payload.find("東京"), std::string::npos)
-        << "Valid UTF-8 non-ASCII characters must not be escaped";
+    EXPECT_NE(payload.find("東京"), std::string::npos) << "Valid UTF-8 non-ASCII characters must not be escaped";
 }
 
 // ---------------------------------------------------------------------------
@@ -895,20 +875,19 @@ protected:
     static std::string extractPayload(const std::string& event) {
         const std::string prefix = "\ndata: ";
         auto pos = event.find(prefix);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         pos += prefix.size();
         auto end = event.rfind("\n\n");
-        if (end == std::string::npos) return event.substr(pos);
+        if (end == std::string::npos)
+            return event.substr(pos);
         return event.substr(pos, end - pos);
     }
 
     // Build a batch that has double values for formula evaluation
-    StreamingBatch makeDoubleBatch(
-            const std::string& measurement,
-            const std::string& field,
-            const std::vector<uint64_t>& timestamps,
-            const std::vector<double>& values,
-            uint64_t seqId = 0) {
+    StreamingBatch makeDoubleBatch(const std::string& measurement, const std::string& field,
+                                   const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
+                                   uint64_t seqId = 0) {
         StreamingBatch batch;
         batch.sequenceId = seqId;
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
@@ -1117,5 +1096,5 @@ TEST_F(SSEStructuralTest, DataLineContainsValidJSONObject) {
 
     std::string json = event.substr(pos, endPos - pos);
     EXPECT_EQ(json.front(), '{') << "data line must start with '{'";
-    EXPECT_EQ(json.back(),  '}') << "data line must end with '}'";
+    EXPECT_EQ(json.back(), '}') << "data line must end with '}'";
 }

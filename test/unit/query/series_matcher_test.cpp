@@ -1,5 +1,7 @@
-#include <gtest/gtest.h>
 #include "../../../lib/query/series_matcher.hpp"
+
+#include <gtest/gtest.h>
+
 #include <map>
 #include <string>
 
@@ -14,45 +16,29 @@ protected:
 // Test exact matching
 TEST_F(SeriesMatcherTest, ExactMatch) {
     std::map<std::string, std::string> seriesTags = {
-        {"host", "server-01"},
-        {"datacenter", "dc1"},
-        {"region", "us-west"}
-    };
-    
+        {"host", "server-01"}, {"datacenter", "dc1"}, {"region", "us-west"}};
+
     // Exact match - should match
-    std::map<std::string, std::string> scopes1 = {
-        {"host", "server-01"},
-        {"datacenter", "dc1"}
-    };
+    std::map<std::string, std::string> scopes1 = {{"host", "server-01"}, {"datacenter", "dc1"}};
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes1));
-    
+
     // Exact match with all tags - should match
-    std::map<std::string, std::string> scopes2 = {
-        {"host", "server-01"},
-        {"datacenter", "dc1"},
-        {"region", "us-west"}
-    };
+    std::map<std::string, std::string> scopes2 = {{"host", "server-01"}, {"datacenter", "dc1"}, {"region", "us-west"}};
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes2));
-    
+
     // Different value - should not match
-    std::map<std::string, std::string> scopes3 = {
-        {"host", "server-02"}
-    };
+    std::map<std::string, std::string> scopes3 = {{"host", "server-02"}};
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes3));
-    
+
     // Missing tag in series - should not match
-    std::map<std::string, std::string> scopes4 = {
-        {"nonexistent", "value"}
-    };
+    std::map<std::string, std::string> scopes4 = {{"nonexistent", "value"}};
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes4));
 }
 
 // Test empty scopes (match all)
 TEST_F(SeriesMatcherTest, EmptyScopes) {
-    std::map<std::string, std::string> seriesTags = {
-        {"host", "server-01"}
-    };
-    
+    std::map<std::string, std::string> seriesTags = {{"host", "server-01"}};
+
     std::map<std::string, std::string> emptyScopes;
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, emptyScopes));
 }
@@ -66,14 +52,16 @@ TEST_F(SeriesMatcherTest, WildcardMatching) {
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("production", "prod*"));
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("production", "*"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("server-01", "client-*"));
-    
+
     // Test question mark wildcard
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("server-01", "server-0?"));
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("server-09", "server-0?"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("server-123", "server-0?"));
-    
+
     // Test combined wildcards
-    EXPECT_TRUE(SeriesMatcher::matchesWildcard("server-01-prod", "server-?""?-*"));
+    EXPECT_TRUE(SeriesMatcher::matchesWildcard("server-01-prod",
+                                               "server-?"
+                                               "?-*"));
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("host-a-test", "host-?-*"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("host-abc-test", "host-?-*"));
 }
@@ -84,19 +72,18 @@ TEST_F(SeriesMatcherTest, RegexMatching) {
     EXPECT_TRUE(SeriesMatcher::matchesRegex("server-01", "server-[0-9]+"));
     EXPECT_TRUE(SeriesMatcher::matchesRegex("server-123", "server-[0-9]+"));
     EXPECT_FALSE(SeriesMatcher::matchesRegex("server-abc", "server-[0-9]+"));
-    
+
     // Complex regex
     EXPECT_TRUE(SeriesMatcher::matchesRegex("prod-us-west-2", "prod-us-(west|east)-[0-9]"));
     EXPECT_TRUE(SeriesMatcher::matchesRegex("prod-us-east-1", "prod-us-(west|east)-[0-9]"));
     EXPECT_FALSE(SeriesMatcher::matchesRegex("prod-us-north-1", "prod-us-(west|east)-[0-9]"));
-    
+
     // Anchored regex
     EXPECT_TRUE(SeriesMatcher::matchesRegex("test123", "test[0-9]+"));
     EXPECT_FALSE(SeriesMatcher::matchesRegex("mytest123", "^test[0-9]+"));
-    
+
     // Invalid regex should throw std::invalid_argument, not silently return false
-    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "[invalid"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "[invalid"), std::invalid_argument);
 }
 
 // Test tag matching with wildcards
@@ -105,7 +92,7 @@ TEST_F(SeriesMatcherTest, TagMatchingWithWildcards) {
     EXPECT_TRUE(SeriesMatcher::matchesTag("server-01", "server-*"));
     EXPECT_TRUE(SeriesMatcher::matchesTag("server-01", "server-0?"));
     EXPECT_FALSE(SeriesMatcher::matchesTag("server-01", "client-*"));
-    
+
     // Exact match
     EXPECT_TRUE(SeriesMatcher::matchesTag("production", "production"));
     EXPECT_FALSE(SeriesMatcher::matchesTag("production", "staging"));
@@ -117,7 +104,7 @@ TEST_F(SeriesMatcherTest, TagMatchingWithRegex) {
     EXPECT_TRUE(SeriesMatcher::matchesTag("server-01", "/server-[0-9]+/"));
     EXPECT_TRUE(SeriesMatcher::matchesTag("server-123", "/server-[0-9]+/"));
     EXPECT_FALSE(SeriesMatcher::matchesTag("server-abc", "/server-[0-9]+/"));
-    
+
     // Invalid regex format (no closing /)
     EXPECT_FALSE(SeriesMatcher::matchesTag("server-01", "/server-[0-9]+"));
 }
@@ -125,51 +112,33 @@ TEST_F(SeriesMatcherTest, TagMatchingWithRegex) {
 // Test complete series matching with wildcards
 TEST_F(SeriesMatcherTest, SeriesMatchingWithWildcards) {
     std::map<std::string, std::string> seriesTags = {
-        {"host", "server-01"},
-        {"env", "production"},
-        {"region", "us-west-2"}
-    };
-    
+        {"host", "server-01"}, {"env", "production"}, {"region", "us-west-2"}};
+
     // Wildcard in scopes
-    std::map<std::string, std::string> scopes1 = {
-        {"host", "server-*"},
-        {"env", "production"}
-    };
+    std::map<std::string, std::string> scopes1 = {{"host", "server-*"}, {"env", "production"}};
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes1));
-    
+
     // Multiple wildcards
-    std::map<std::string, std::string> scopes2 = {
-        {"host", "server-??"},
-        {"region", "us-*"}
-    };
+    std::map<std::string, std::string> scopes2 = {{"host", "server-??"}, {"region", "us-*"}};
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes2));
-    
+
     // Mixed exact and wildcard
     std::map<std::string, std::string> scopes3 = {
-        {"host", "server-*"},
-        {"env", "staging"}  // Exact match fails
+        {"host", "server-*"}, {"env", "staging"}  // Exact match fails
     };
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes3));
 }
 
 // Test complete series matching with regex
 TEST_F(SeriesMatcherTest, SeriesMatchingWithRegex) {
-    std::map<std::string, std::string> seriesTags = {
-        {"host", "server-42"},
-        {"datacenter", "dc1"}
-    };
-    
+    std::map<std::string, std::string> seriesTags = {{"host", "server-42"}, {"datacenter", "dc1"}};
+
     // Regex pattern in scopes
-    std::map<std::string, std::string> scopes1 = {
-        {"host", "/server-[0-9]+/"},
-        {"datacenter", "dc1"}
-    };
+    std::map<std::string, std::string> scopes1 = {{"host", "/server-[0-9]+/"}, {"datacenter", "dc1"}};
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes1));
-    
+
     // Regex that doesn't match
-    std::map<std::string, std::string> scopes2 = {
-        {"host", "/client-[0-9]+/"}
-    };
+    std::map<std::string, std::string> scopes2 = {{"host", "/client-[0-9]+/"}};
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes2));
 }
 
@@ -177,57 +146,45 @@ TEST_F(SeriesMatcherTest, SeriesMatchingWithRegex) {
 TEST_F(SeriesMatcherTest, WildcardToRegexConversion) {
     // The wildcardToRegex function is private, so we test it indirectly
     // through matchesWildcard
-    
+
     // Test that special regex characters are escaped
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("file.txt", "file.txt"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("fileatxt", "file.txt"));
-    
+
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("value+plus", "value+plus"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("valueplus", "value+plus"));
-    
+
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("test[1]", "test[1]"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("test1", "test[1]"));
 }
 
 // Test edge cases
 TEST_F(SeriesMatcherTest, EdgeCases) {
-    std::map<std::string, std::string> seriesTags = {
-        {"key", "value"}
-    };
-    
+    std::map<std::string, std::string> seriesTags = {{"key", "value"}};
+
     // Empty string values
-    std::map<std::string, std::string> emptyValueScope = {
-        {"key", ""}
-    };
+    std::map<std::string, std::string> emptyValueScope = {{"key", ""}};
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, emptyValueScope));
-    
+
     // Special characters in exact match
-    std::map<std::string, std::string> specialTags = {
-        {"key", "value-with.special+chars[]"}
-    };
-    std::map<std::string, std::string> specialScope = {
-        {"key", "value-with.special+chars[]"}
-    };
+    std::map<std::string, std::string> specialTags = {{"key", "value-with.special+chars[]"}};
+    std::map<std::string, std::string> specialScope = {{"key", "value-with.special+chars[]"}};
     EXPECT_TRUE(SeriesMatcher::matches(specialTags, specialScope));
 }
 
 // Test case sensitivity
 TEST_F(SeriesMatcherTest, CaseSensitivity) {
-    std::map<std::string, std::string> seriesTags = {
-        {"host", "Server-01"}
-    };
-    
+    std::map<std::string, std::string> seriesTags = {{"host", "Server-01"}};
+
     // Case sensitive exact match
-    std::map<std::string, std::string> scopes1 = {
-        {"host", "Server-01"}
-    };
+    std::map<std::string, std::string> scopes1 = {{"host", "Server-01"}};
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes1));
-    
+
     std::map<std::string, std::string> scopes2 = {
         {"host", "server-01"}  // Different case
     };
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes2));
-    
+
     // Case sensitive wildcard
     EXPECT_TRUE(SeriesMatcher::matchesWildcard("Server-01", "Server-*"));
     EXPECT_FALSE(SeriesMatcher::matchesWildcard("Server-01", "server-*"));
@@ -252,8 +209,7 @@ TEST_F(SeriesMatcherTest, TildeRegexMatching) {
     EXPECT_FALSE(SeriesMatcher::matchesTag("server-04", "~server-0[1-3]"));
 
     // Invalid ~regex should throw std::invalid_argument, not silently return false
-    EXPECT_THROW(SeriesMatcher::matchesTag("test", "~[invalid"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesTag("test", "~[invalid"), std::invalid_argument);
 }
 
 // Test classifyScope
@@ -301,12 +257,9 @@ TEST_F(SeriesMatcherTest, ExtractLiteralPrefix) {
 // Test invalid regex patterns are rejected, not silently treated as exact matches
 TEST_F(SeriesMatcherTest, InvalidRegexThrows) {
     // matchesRegex must throw std::invalid_argument for malformed patterns
-    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "[0-9"),
-                 std::invalid_argument);
-    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "(unclosed"),
-                 std::invalid_argument);
-    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "a{2,1}"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "[0-9"), std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "(unclosed"), std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", "a{2,1}"), std::invalid_argument);
 }
 
 // Test valid /regex/ delimited patterns work correctly
@@ -330,12 +283,10 @@ TEST_F(SeriesMatcherTest, ValidSlashRegexMatchesCorrectly) {
 TEST_F(SeriesMatcherTest, InvalidSlashRegexThrows) {
     // /[0-9/ — unclosed bracket; the embedded / makes rfind return a non-zero
     // position, so the extracted pattern is "[0-9" which is invalid.
-    EXPECT_THROW(SeriesMatcher::matchesTag("42", "/[0-9/"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesTag("42", "/[0-9/"), std::invalid_argument);
 
     // /(unclosed — unclosed group
-    EXPECT_THROW(SeriesMatcher::matchesTag("x", "/(unclosed/"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesTag("x", "/(unclosed/"), std::invalid_argument);
 }
 
 // Test that matchesWildcard does NOT silently fall back to exact match
@@ -344,50 +295,36 @@ TEST_F(SeriesMatcherTest, InvalidSlashRegexThrows) {
 // unreachable, but we keep a belt-and-suspenders assertion here.)
 TEST_F(SeriesMatcherTest, InvalidTildeRegexThrows) {
     // ~[0-9 — unclosed bracket via the ~ path should throw
-    EXPECT_THROW(SeriesMatcher::matchesTag("test", "~[0-9"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesTag("test", "~[0-9"), std::invalid_argument);
 }
 
 // Test series matching with ~regex in scopes
 TEST_F(SeriesMatcherTest, SeriesMatchingWithTildeRegex) {
-    std::map<std::string, std::string> seriesTags = {
-        {"host", "server-42"},
-        {"datacenter", "dc1"}
-    };
+    std::map<std::string, std::string> seriesTags = {{"host", "server-42"}, {"datacenter", "dc1"}};
 
-    std::map<std::string, std::string> scopes1 = {
-        {"host", "~server-[0-9]+"},
-        {"datacenter", "dc1"}
-    };
+    std::map<std::string, std::string> scopes1 = {{"host", "~server-[0-9]+"}, {"datacenter", "dc1"}};
     EXPECT_TRUE(SeriesMatcher::matches(seriesTags, scopes1));
 
-    std::map<std::string, std::string> scopes2 = {
-        {"host", "~client-[0-9]+"}
-    };
+    std::map<std::string, std::string> scopes2 = {{"host", "~client-[0-9]+"}};
     EXPECT_FALSE(SeriesMatcher::matches(seriesTags, scopes2));
 }
 
 // Test ReDoS protection: nested quantifiers are rejected
 TEST_F(SeriesMatcherTest, ReDoSNestedQuantifiersRejected) {
     // (a+)+ -- classic ReDoS pattern
-    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a+)+"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a+)+"), std::invalid_argument);
     // (a+)* -- variant
-    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a+)*"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a+)*"), std::invalid_argument);
     // (a*)+
-    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a*)+"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "(a*)+"), std::invalid_argument);
     // Nested group with quantifier followed by quantifier
-    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "((a+)b+)+"),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("aaaaaa", "((a+)b+)+"), std::invalid_argument);
 }
 
 // Test ReDoS protection: overly long patterns are rejected
 TEST_F(SeriesMatcherTest, ReDoSLongPatternRejected) {
     std::string longPattern(600, 'a');
-    EXPECT_THROW(SeriesMatcher::matchesRegex("test", longPattern),
-                 std::invalid_argument);
+    EXPECT_THROW(SeriesMatcher::matchesRegex("test", longPattern), std::invalid_argument);
 }
 
 // Test that legitimate patterns still work

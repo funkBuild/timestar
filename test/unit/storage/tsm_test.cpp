@@ -1,55 +1,51 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <random>
-#include <chrono>
-
-#include "../../../lib/storage/tsm_writer.hpp"
 #include "../../../lib/storage/tsm.hpp"
-#include "../../../lib/storage/memory_store.hpp"
-#include "../../../lib/storage/compressed_buffer.hpp"
+
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/encoding/float_encoder.hpp"
 #include "../../../lib/encoding/integer_encoder.hpp"
-#include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/storage/compressed_buffer.hpp"
+#include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <random>
 
 namespace fs = std::filesystem;
 
 class TSMTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_tsm_files";
-    
-    void SetUp() override {
-        fs::create_directories(testDir);
-    }
-    
-    void TearDown() override {
-        fs::remove_all(testDir);
-    }
-    
-    std::string getTestFilePath(const std::string& filename) {
-        return testDir + "/" + filename;
-    }
+
+    void SetUp() override { fs::create_directories(testDir); }
+
+    void TearDown() override { fs::remove_all(testDir); }
+
+    std::string getTestFilePath(const std::string& filename) { return testDir + "/" + filename; }
 };
 
 TEST_F(TSMTest, BasicTSMWriterFloat) {
     std::string filename = getTestFilePath("test_float.tsm");
-    
+
     TSMWriter writer(filename);
-    
+
     std::vector<uint64_t> timestamps;
     std::vector<double> values;
-    
+
     uint64_t baseTime = 1600000000000;
     for (int i = 0; i < 1000; i++) {
         timestamps.push_back(baseTime + i * 1000);
         values.push_back(100.0 + sin(i * 0.1) * 10.0);
     }
-    
+
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("temperature.sensor1");
     writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
-    
+
     // Verify file was created
     EXPECT_TRUE(fs::exists(filename));
     EXPECT_GT(fs::file_size(filename), 0);
@@ -57,23 +53,23 @@ TEST_F(TSMTest, BasicTSMWriterFloat) {
 
 TEST_F(TSMTest, BasicTSMWriterBoolean) {
     std::string filename = getTestFilePath("test_bool.tsm");
-    
+
     TSMWriter writer(filename);
-    
+
     std::vector<uint64_t> timestamps;
     std::vector<bool> values;
-    
+
     uint64_t baseTime = 1600000000000;
     for (int i = 0; i < 500; i++) {
         timestamps.push_back(baseTime + i * 1000);
         values.push_back(i % 2 == 0);
     }
-    
+
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("status.online");
     writer.writeSeries(TSMValueType::Boolean, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
-    
+
     // Verify file was created
     EXPECT_TRUE(fs::exists(filename));
     EXPECT_GT(fs::file_size(filename), 0);
@@ -81,11 +77,11 @@ TEST_F(TSMTest, BasicTSMWriterBoolean) {
 
 TEST_F(TSMTest, WriteMultipleSeries) {
     std::string filename = getTestFilePath("test_multi.tsm");
-    
+
     TSMWriter writer(filename);
-    
+
     uint64_t baseTime = 1600000000000;
-    
+
     // Series 1: Temperature
     std::vector<uint64_t> tempTimestamps;
     std::vector<double> tempValues;
@@ -95,7 +91,7 @@ TEST_F(TSMTest, WriteMultipleSeries) {
     }
     SeriesId128 tempSeriesId = SeriesId128::fromSeriesKey("temperature.room1");
     writer.writeSeries(TSMValueType::Float, tempSeriesId, tempTimestamps, tempValues);
-    
+
     // Series 2: Humidity
     std::vector<uint64_t> humidTimestamps;
     std::vector<double> humidValues;
@@ -105,7 +101,7 @@ TEST_F(TSMTest, WriteMultipleSeries) {
     }
     SeriesId128 humidSeriesId = SeriesId128::fromSeriesKey("humidity.room1");
     writer.writeSeries(TSMValueType::Float, humidSeriesId, humidTimestamps, humidValues);
-    
+
     // Series 3: Door status
     std::vector<uint64_t> doorTimestamps;
     std::vector<bool> doorValues;
@@ -115,10 +111,10 @@ TEST_F(TSMTest, WriteMultipleSeries) {
     }
     SeriesId128 doorSeriesId = SeriesId128::fromSeriesKey("door.status");
     writer.writeSeries(TSMValueType::Boolean, doorSeriesId, doorTimestamps, doorValues);
-    
+
     writer.writeIndex();
     writer.close();
-    
+
     // Verify file was created
     EXPECT_TRUE(fs::exists(filename));
     EXPECT_GT(fs::file_size(filename), 0);
@@ -126,33 +122,33 @@ TEST_F(TSMTest, WriteMultipleSeries) {
 
 TEST_F(TSMTest, LargeDataset) {
     std::string filename = getTestFilePath("test_large.tsm");
-    
+
     const int NUM_POINTS = 100000;
     uint64_t baseTime = 1600000000000;
-    
+
     TSMWriter writer(filename);
-    
+
     std::vector<uint64_t> timestamps;
     std::vector<double> values;
-    
+
     std::default_random_engine generator;
     std::normal_distribution<double> distribution(100.0, 10.0);
-    
+
     for (int i = 0; i < NUM_POINTS; i++) {
         timestamps.push_back(baseTime + i * 100);
         values.push_back(distribution(generator));
     }
-    
+
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("metrics.large");
     writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
-    
+
     // Verify file was created and has reasonable size
     EXPECT_TRUE(fs::exists(filename));
     auto fileSize = fs::file_size(filename);
-    EXPECT_GT(fileSize, 1000); // Should be at least 1KB
-    
+    EXPECT_GT(fileSize, 1000);  // Should be at least 1KB
+
     // Check compression ratio (rough estimate)
     // Uncompressed would be ~1.6MB (100k * 16 bytes per point)
     // Good compression should get it under 1MB
@@ -161,26 +157,26 @@ TEST_F(TSMTest, LargeDataset) {
 
 TEST_F(TSMTest, BlockBoundaries) {
     std::string filename = getTestFilePath("test_blocks.tsm");
-    
+
     // Test data that spans multiple blocks (MaxPointsPerBlock = 10000)
-    const int NUM_POINTS = 25000; // Should create 3 blocks
-    
+    const int NUM_POINTS = 25000;  // Should create 3 blocks
+
     TSMWriter writer(filename);
-    
+
     std::vector<uint64_t> timestamps;
     std::vector<double> values;
-    
+
     uint64_t baseTime = 1600000000000;
     for (int i = 0; i < NUM_POINTS; i++) {
         timestamps.push_back(baseTime + i * 1000);
         values.push_back(i * 1.0);
     }
-    
+
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("metrics.blocks");
     writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
     writer.writeIndex();
     writer.close();
-    
+
     EXPECT_TRUE(fs::exists(filename));
     EXPECT_GT(fs::file_size(filename), 0);
 }
@@ -204,9 +200,7 @@ TEST_F(TSMTest, ReferenceCountingBasic) {
     // TSM no longer has reference counting; the shard-per-core model
     // guarantees single-threaded access, so files are deleted directly
     // in removeTSMFiles() via scheduleDelete().
-    EXPECT_NO_THROW({
-        TSM tsm(filename);
-    });
+    EXPECT_NO_THROW({ TSM tsm(filename); });
 }
 
 // getValueType tests

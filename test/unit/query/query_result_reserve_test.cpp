@@ -1,13 +1,14 @@
-#include <gtest/gtest.h>
 #include "query_result.hpp"
 #include "tsm_result.hpp"
+
+#include <gtest/gtest.h>
+
 #include <memory>
 #include <vector>
 
 // Helper to create a TSMBlock with given timestamps and values
-static std::unique_ptr<TSMBlock<double>> makeReserveTestBlock(
-    const std::vector<uint64_t>& timestamps,
-    const std::vector<double>& values) {
+static std::unique_ptr<TSMBlock<double>> makeReserveTestBlock(const std::vector<uint64_t>& timestamps,
+                                                              const std::vector<double>& values) {
     auto block = std::make_unique<TSMBlock<double>>(timestamps.size());
     for (size_t i = 0; i < timestamps.size(); i++) {
         block->timestamps.push_back(timestamps[i]);

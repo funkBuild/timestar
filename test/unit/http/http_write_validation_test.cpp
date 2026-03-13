@@ -1,5 +1,6 @@
-#include <gtest/gtest.h>
 #include "http_write_handler.hpp"
+
+#include <gtest/gtest.h>
 
 class HttpWriteValidationTest : public ::testing::Test {};
 

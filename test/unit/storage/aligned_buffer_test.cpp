@@ -1,8 +1,9 @@
+#include "../../../lib/storage/aligned_buffer.hpp"
+
 #include <gtest/gtest.h>
+
 #include <cstdint>
 #include <limits>
-
-#include "../../../lib/storage/aligned_buffer.hpp"
 
 class AlignedBufferTest : public ::testing::Test {
 protected:

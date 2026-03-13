@@ -13,9 +13,10 @@
 // reading and parsing the source code.
 
 #include <gtest/gtest.h>
-#include <string>
+
 #include <fstream>
 #include <sstream>
+#include <string>
 
 class EngineDeletePhantomTest : public ::testing::Test {
 protected:
@@ -51,18 +52,22 @@ protected:
     // Extract the deleteRangeBySeries function body from source
     std::string extractDeleteRangeBySeriesFunction() const {
         size_t start = sourceCode.find("Engine::deleteRangeBySeries");
-        if (start == std::string::npos) return "";
+        if (start == std::string::npos)
+            return "";
 
         // Find the opening brace of the function
         size_t braceStart = sourceCode.find('{', start);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
 
         // Find matching closing brace (simple brace counting)
         int braceCount = 1;
         size_t pos = braceStart + 1;
         while (pos < sourceCode.size() && braceCount > 0) {
-            if (sourceCode[pos] == '{') braceCount++;
-            else if (sourceCode[pos] == '}') braceCount--;
+            if (sourceCode[pos] == '{')
+                braceCount++;
+            else if (sourceCode[pos] == '}')
+                braceCount--;
             pos++;
         }
 
@@ -72,8 +77,7 @@ protected:
 
 // Verify that the source file was successfully loaded
 TEST_F(EngineDeletePhantomTest, SourceFileLoaded) {
-    ASSERT_FALSE(sourceCode.empty())
-        << "Could not load engine.cpp source file";
+    ASSERT_FALSE(sourceCode.empty()) << "Could not load engine.cpp source file";
     ASSERT_NE(sourceCode.find("Engine::deleteRangeBySeries"), std::string::npos)
         << "Source file does not contain Engine::deleteRangeBySeries()";
 }
@@ -81,8 +85,7 @@ TEST_F(EngineDeletePhantomTest, SourceFileLoaded) {
 // Core test: deleteRangeBySeries must NOT use getOrCreateSeriesId
 TEST_F(EngineDeletePhantomTest, DoesNotUseGetOrCreateSeriesId) {
     std::string funcBody = extractDeleteRangeBySeriesFunction();
-    ASSERT_FALSE(funcBody.empty())
-        << "Could not extract deleteRangeBySeries() function body";
+    ASSERT_FALSE(funcBody.empty()) << "Could not extract deleteRangeBySeries() function body";
 
     EXPECT_EQ(funcBody.find("getOrCreateSeriesId"), std::string::npos)
         << "BUG: deleteRangeBySeries() still uses getOrCreateSeriesId(). "
@@ -108,15 +111,12 @@ TEST_F(EngineDeletePhantomTest, HandlesNulloptByReturningFalse) {
 
     // Should check has_value() or !seriesIdOpt or similar
     bool checksOptional =
-        funcBody.find("has_value") != std::string::npos ||
-        funcBody.find("!seriesId") != std::string::npos ||
-        funcBody.find("nullopt") != std::string::npos ||
-        funcBody.find("std::nullopt") != std::string::npos;
+        funcBody.find("has_value") != std::string::npos || funcBody.find("!seriesId") != std::string::npos ||
+        funcBody.find("nullopt") != std::string::npos || funcBody.find("std::nullopt") != std::string::npos;
 
-    EXPECT_TRUE(checksOptional)
-        << "BUG: deleteRangeBySeries() does not check whether getSeriesId() "
-           "returned std::nullopt. If the series doesn't exist, it should "
-           "return false early (no-op).";
+    EXPECT_TRUE(checksOptional) << "BUG: deleteRangeBySeries() does not check whether getSeriesId() "
+                                   "returned std::nullopt. If the series doesn't exist, it should "
+                                   "return false early (no-op).";
 
     // Should co_return false when series doesn't exist
     EXPECT_NE(funcBody.find("co_return false"), std::string::npos)
@@ -154,14 +154,12 @@ TEST_F(EngineDeletePhantomTest, RoutesMetadataCheckToShard0) {
 
     // The function should use shardedRef or invoke_on(0,...) for cross-shard
     // metadata lookup, or at minimum check the shard and handle accordingly
-    bool routesToShard0 =
-        funcBody.find("invoke_on(0") != std::string::npos ||
-        funcBody.find("invoke_on( 0") != std::string::npos ||
-        funcBody.find("shardedRef") != std::string::npos;
+    bool routesToShard0 = funcBody.find("invoke_on(0") != std::string::npos ||
+                          funcBody.find("invoke_on( 0") != std::string::npos ||
+                          funcBody.find("shardedRef") != std::string::npos;
 
-    EXPECT_TRUE(routesToShard0)
-        << "deleteRangeBySeries() must route the getSeriesId() metadata "
-           "lookup to shard 0 (via shardedRef->invoke_on(0, ...)) because "
-           "metadata is only stored in shard 0's LevelDB. Without this, "
-           "the lookup will always return nullopt on non-zero shards.";
+    EXPECT_TRUE(routesToShard0) << "deleteRangeBySeries() must route the getSeriesId() metadata "
+                                   "lookup to shard 0 (via shardedRef->invoke_on(0, ...)) because "
+                                   "metadata is only stored in shard 0's LevelDB. Without this, "
+                                   "the lookup will always return nullopt on non-zero shards.";
 }

@@ -1,13 +1,13 @@
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <chrono>
-#include <random>
-#include <atomic>
-
+#include "../test_helpers.hpp"
 #include "engine.hpp"
 #include "timestar_value.hpp"
-#include "../test_helpers.hpp"
 
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <random>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
@@ -16,22 +16,16 @@
 
 class WritePerformanceTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // Helper to shut down a sharded engine using co_await (safe in coroutine context).
 // seastar::defer with .get() cannot be used in coroutines because .get() requires
 // a seastar::thread context, but coroutine destructors run on the reactor.
 static seastar::future<> shutdownShardedEngine(seastar::sharded<Engine>& engineSharded) {
-    co_await engineSharded.invoke_on_all([](Engine& engine) {
-        return engine.stop();
-    });
+    co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.stop(); });
     co_await engineSharded.stop();
 }
 
@@ -40,12 +34,8 @@ seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
     seastar::sharded<Engine> engineSharded;
 
     co_await engineSharded.start();
-    co_await engineSharded.invoke_on_all([](Engine& engine) {
-        return engine.init();
-    });
-    co_await engineSharded.invoke_on_all([](Engine& engine) {
-        return engine.startBackgroundTasks();
-    });
+    co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.init(); });
+    co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); });
 
     std::exception_ptr eptr;
     try {
@@ -73,8 +63,8 @@ seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
             // Determine shard based on measurement
             size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
 
-            writes.push_back(engineSharded.invoke_on(shard,
-                [insert = std::move(insert), &totalPointsWritten, pointsPerSeries](Engine& engine) mutable {
+            writes.push_back(engineSharded.invoke_on(
+                shard, [insert = std::move(insert), &totalPointsWritten, pointsPerSeries](Engine& engine) mutable {
                     return engine.insert(std::move(insert)).then([&totalPointsWritten, pointsPerSeries] {
                         totalPointsWritten += pointsPerSeries;
                     });
@@ -94,20 +84,20 @@ seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
         std::cout << "  Points per series: " << pointsPerSeries << std::endl;
         std::cout << "  Total points: " << totalPoints << std::endl;
         std::cout << "  Time: " << duration.count() << " ms" << std::endl;
-        std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
-                  << throughput << " points/second" << std::endl;
+        std::cout << "  Throughput: " << std::fixed << std::setprecision(0) << throughput << " points/second"
+                  << std::endl;
 
         // Verify we can read some data back
         auto result = co_await engineSharded.invoke_on(0, [baseTime](Engine& engine) {
-            return engine.query("metrics,host=server-0,metric=metric-0 value",
-                              baseTime, baseTime + 10LL * 1000000000LL);
+            return engine.query("metrics,host=server-0,metric=metric-0 value", baseTime,
+                                baseTime + 10LL * 1000000000LL);
         });
 
         if (result.has_value() && std::holds_alternative<QueryResult<double>>(*result)) {
             auto& floatResult = std::get<QueryResult<double>>(*result);
             EXPECT_GT(floatResult.values.size(), 0);
-            std::cout << "  Verification: Successfully read back "
-                      << floatResult.values.size() << " points" << std::endl;
+            std::cout << "  Verification: Successfully read back " << floatResult.values.size() << " points"
+                      << std::endl;
         }
 
         // Sanity-check: catch catastrophic regressions but tolerate slow CI/debug/ASAN builds
@@ -132,12 +122,8 @@ seastar::future<> testConcurrentWrites() {
     seastar::sharded<Engine> engineSharded;
 
     co_await engineSharded.start();
-    co_await engineSharded.invoke_on_all([](Engine& engine) {
-        return engine.init();
-    });
-    co_await engineSharded.invoke_on_all([](Engine& engine) {
-        return engine.startBackgroundTasks();
-    });
+    co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.init(); });
+    co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); });
 
     std::exception_ptr eptr;
     try {
@@ -162,9 +148,10 @@ seastar::future<> testConcurrentWrites() {
                 }
 
                 size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
-                engineSharded.invoke_on(shard, [insert = std::move(insert)](Engine& engine) mutable {
-                    return engine.insert(std::move(insert));
-                }).get();
+                engineSharded
+                    .invoke_on(shard, [insert = std::move(insert)](
+                                          Engine& engine) mutable { return engine.insert(std::move(insert)); })
+                    .get();
             }));
         }
 
@@ -181,8 +168,8 @@ seastar::future<> testConcurrentWrites() {
         std::cout << "  Points per write: " << pointsPerWrite << std::endl;
         std::cout << "  Total points: " << totalPoints << std::endl;
         std::cout << "  Time: " << duration.count() << " ms" << std::endl;
-        std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
-                  << throughput << " points/second" << std::endl;
+        std::cout << "  Throughput: " << std::fixed << std::setprecision(0) << throughput << " points/second"
+                  << std::endl;
 
         EXPECT_GT(throughput, 100);  // Sanity-check: catch catastrophic regressions
     } catch (...) {
@@ -205,12 +192,8 @@ seastar::future<> testBatchWritePerformance() {
     seastar::sharded<Engine> engineSharded;
 
     co_await engineSharded.start();
-    co_await engineSharded.invoke_on_all([](Engine& engine) {
-        return engine.init();
-    });
-    co_await engineSharded.invoke_on_all([](Engine& engine) {
-        return engine.startBackgroundTasks();
-    });
+    co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.init(); });
+    co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); });
 
     std::exception_ptr eptr;
     try {
@@ -238,10 +221,9 @@ seastar::future<> testBatchWritePerformance() {
                 }
 
                 size_t shard = std::hash<std::string>{}(insert.measurement) % seastar::smp::count;
-                batchWrites.push_back(engineSharded.invoke_on(shard,
-                    [insert = std::move(insert)](Engine& engine) mutable {
-                        return engine.insert(std::move(insert));
-                    }));
+                batchWrites.push_back(engineSharded.invoke_on(
+                    shard,
+                    [insert = std::move(insert)](Engine& engine) mutable { return engine.insert(std::move(insert)); }));
             }
 
             co_await seastar::when_all(batchWrites.begin(), batchWrites.end());
@@ -260,10 +242,10 @@ seastar::future<> testBatchWritePerformance() {
         std::cout << "  Points per series: " << pointsPerSeries << std::endl;
         std::cout << "  Total points: " << totalPoints << std::endl;
         std::cout << "  Time: " << duration.count() << " ms" << std::endl;
-        std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
-                  << throughput << " points/second" << std::endl;
-        std::cout << "  Batch rate: " << std::fixed << std::setprecision(1)
-                  << batchesPerSecond << " batches/second" << std::endl;
+        std::cout << "  Throughput: " << std::fixed << std::setprecision(0) << throughput << " points/second"
+                  << std::endl;
+        std::cout << "  Batch rate: " << std::fixed << std::setprecision(1) << batchesPerSecond << " batches/second"
+                  << std::endl;
 
         EXPECT_GT(throughput, 100);  // Sanity-check: catch catastrophic regressions
     } catch (...) {

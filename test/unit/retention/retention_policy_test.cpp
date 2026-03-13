@@ -2,25 +2,23 @@
  * Tests for retention policy CRUD, validation, and cache distribution.
  */
 
-#include <gtest/gtest.h>
+#include "../../../lib/retention/retention_policy.hpp"
+
+#include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/index/leveldb_index.hpp"
 #include "../../seastar_gtest.hpp"
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <filesystem>
-
-#include "../../../lib/index/leveldb_index.hpp"
-#include "../../../lib/retention/retention_policy.hpp"
-#include "../../../lib/http/http_query_handler.hpp"
 
 class RetentionPolicyTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void SetUp() override { std::filesystem::remove_all("shard_0"); }
 
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
 // Test basic policy CRUD operations

@@ -1,26 +1,25 @@
 // Seastar-based tests for the Engine component
 // Tests async lifecycle, multi-shard coordination, queries, deletes, and metadata indexing.
 
-#include <gtest/gtest.h>
-#include <filesystem>
-#include <chrono>
-#include <random>
-#include <vector>
-#include <string>
-#include <set>
-#include <map>
-
 #include "../../../lib/core/engine.hpp"
-#include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../test_helpers.hpp"
 
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+#include <map>
+#include <random>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/thread.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
-
-#include "../../test_helpers.hpp"
+#include <seastar/core/thread.hh>
+#include <set>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -30,13 +29,9 @@ namespace fs = std::filesystem;
 
 class EngineSeastarTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        cleanTestShardDirectories();
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
 
-    void TearDown() override {
-        cleanTestShardDirectories();
-    }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
 // ===========================================================================
@@ -49,7 +44,9 @@ TEST_F(EngineSeastarTest, InitAndStopSingleEngine) {
         eng.init();
         // If we reach here without exception the lifecycle succeeded.
         SUCCEED();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, InitAndStopShardedEngine) {
@@ -58,7 +55,9 @@ TEST_F(EngineSeastarTest, InitAndStopShardedEngine) {
         eng.start();
         // Verify all shards started
         SUCCEED();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, InitWithBackgroundTasks) {
@@ -66,7 +65,9 @@ TEST_F(EngineSeastarTest, InitWithBackgroundTasks) {
         ScopedShardedEngine eng;
         eng.startWithBackground();
         SUCCEED();
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, DoubleInitThrowsDueToLock) {
@@ -76,7 +77,9 @@ TEST_F(EngineSeastarTest, DoubleInitThrowsDueToLock) {
         ScopedEngine eng;
         eng.init();
         EXPECT_THROW(eng.engine->init().get(), std::runtime_error);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -107,7 +110,9 @@ TEST_F(EngineSeastarTest, InsertAndQueryFloat) {
         EXPECT_DOUBLE_EQ(result.values[0], 20.5);
         EXPECT_DOUBLE_EQ(result.values[1], 21.0);
         EXPECT_DOUBLE_EQ(result.values[2], 21.5);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, InsertAndQueryBoolean) {
@@ -133,7 +138,9 @@ TEST_F(EngineSeastarTest, InsertAndQueryBoolean) {
         EXPECT_EQ(result.values[0], true);
         EXPECT_EQ(result.values[1], false);
         EXPECT_EQ(result.values[2], true);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, InsertAndQueryString) {
@@ -159,7 +166,9 @@ TEST_F(EngineSeastarTest, InsertAndQueryString) {
         EXPECT_EQ(result.values[0], "startup");
         EXPECT_EQ(result.values[1], "running");
         EXPECT_EQ(result.values[2], "shutdown");
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -173,7 +182,9 @@ TEST_F(EngineSeastarTest, QueryNonExistentSeriesReturnsNullopt) {
 
         auto resultOpt = eng->query("no_such_series value", 0, UINT64_MAX).get();
         EXPECT_FALSE(resultOpt.has_value());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -199,7 +210,9 @@ TEST_F(EngineSeastarTest, QueryTimeRangeFiltering) {
         EXPECT_EQ(result.timestamps.size(), 5u);
         EXPECT_EQ(result.timestamps.front(), 3000u);
         EXPECT_EQ(result.timestamps.back(), 7000u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -240,7 +253,9 @@ TEST_F(EngineSeastarTest, InsertBatchFloat) {
             ASSERT_TRUE(r.has_value());
             EXPECT_EQ(std::get<QueryResult<double>>(r.value()).values.size(), 2u);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, InsertBatchEmpty) {
@@ -251,7 +266,9 @@ TEST_F(EngineSeastarTest, InsertBatchEmpty) {
         std::vector<TimeStarInsert<double>> empty;
         auto timing = eng->insertBatch(std::move(empty)).get();
         EXPECT_EQ(timing.walWriteCount, 0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -282,15 +299,17 @@ TEST_F(EngineSeastarTest, MultiShardInsertAndQuery) {
             SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
             unsigned shard = SeriesId128::Hash{}(sid) % seastar::smp::count;
 
-            auto resultOpt = eng.eng.invoke_on(shard, [seriesKey](Engine& engine) {
-                return engine.query(seriesKey, 0, UINT64_MAX);
-            }).get();
+            auto resultOpt =
+                eng.eng.invoke_on(shard, [seriesKey](Engine& engine) { return engine.query(seriesKey, 0, UINT64_MAX); })
+                    .get();
 
             ASSERT_TRUE(resultOpt.has_value()) << "Series " << seriesKey << " not found on shard " << shard;
             auto& result = std::get<QueryResult<double>>(resultOpt.value());
             EXPECT_EQ(result.timestamps.size(), 5u);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -319,34 +338,30 @@ TEST_F(EngineSeastarTest, MetadataIndexing) {
         }
 
         // Metadata queries run on shard 0 (where index lives)
-        auto measurements = eng.eng.invoke_on(0, [](Engine& engine) {
-            return engine.getAllMeasurements();
-        }).get();
+        auto measurements = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getAllMeasurements(); }).get();
         EXPECT_GE(measurements.size(), 1u);
         bool foundWeather = false;
         for (const auto& m : measurements) {
-            if (m == "weather") foundWeather = true;
+            if (m == "weather")
+                foundWeather = true;
         }
         EXPECT_TRUE(foundWeather);
 
-        auto fields = eng.eng.invoke_on(0, [](Engine& engine) {
-            return engine.getMeasurementFields("weather");
-        }).get();
+        auto fields = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementFields("weather"); }).get();
         EXPECT_TRUE(fields.count("temperature") > 0);
         EXPECT_TRUE(fields.count("humidity") > 0);
 
-        auto tags = eng.eng.invoke_on(0, [](Engine& engine) {
-            return engine.getMeasurementTags("weather");
-        }).get();
+        auto tags = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementTags("weather"); }).get();
         EXPECT_TRUE(tags.count("location") > 0);
         EXPECT_TRUE(tags.count("host") > 0);
 
-        auto locations = eng.eng.invoke_on(0, [](Engine& engine) {
-            return engine.getTagValues("weather", "location");
-        }).get();
+        auto locations =
+            eng.eng.invoke_on(0, [](Engine& engine) { return engine.getTagValues("weather", "location"); }).get();
         EXPECT_TRUE(locations.count("us-west") > 0);
         EXPECT_TRUE(locations.count("us-east") > 0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, IndexMetadataOnShard0Only) {
@@ -361,20 +376,18 @@ TEST_F(EngineSeastarTest, IndexMetadataOnShard0Only) {
         // indexMetadata must be called on shard 0 -- calling on another shard should throw
         if (seastar::smp::count > 1) {
             EXPECT_THROW(
-                eng.eng.invoke_on(1, [insert](Engine& engine) mutable {
-                    return engine.indexMetadata(insert);
-                }).get(),
-                std::runtime_error
-            );
+                eng.eng.invoke_on(1, [insert](Engine& engine) mutable { return engine.indexMetadata(insert); }).get(),
+                std::runtime_error);
         }
 
         // Calling on shard 0 should succeed
-        auto sid = eng.eng.invoke_on(0, [insert](Engine& engine) mutable {
-            return engine.indexMetadata(insert);
-        }).get();
+        auto sid =
+            eng.eng.invoke_on(0, [insert](Engine& engine) mutable { return engine.indexMetadata(insert); }).get();
         // The returned SeriesId128 should be non-zero
         EXPECT_FALSE(sid.toHex().empty());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -395,9 +408,12 @@ TEST_F(EngineSeastarTest, QueryBySeries) {
 
         // queryBySeries routes through the index on shard 0
         std::map<std::string, std::string> tags = {{"location", "us-west"}};
-        auto result = eng.eng.invoke_on(0, [tags](Engine& engine) {
-            return engine.queryBySeries("weather", tags, "temperature", 0, UINT64_MAX);
-        }).get();
+        auto result = eng.eng
+                          .invoke_on(0,
+                                     [tags](Engine& engine) {
+                                         return engine.queryBySeries("weather", tags, "temperature", 0, UINT64_MAX);
+                                     })
+                          .get();
 
         // The result may or may not have data depending on whether shard 0
         // actually stores this series. The important thing is no crash.
@@ -409,7 +425,9 @@ TEST_F(EngineSeastarTest, QueryBySeries) {
                 EXPECT_DOUBLE_EQ(qr.values[0], 72.5);
             }
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, QueryBySeriesNonExistent) {
@@ -419,16 +437,21 @@ TEST_F(EngineSeastarTest, QueryBySeriesNonExistent) {
 
         // Query a series that was never inserted
         std::map<std::string, std::string> tags = {{"location", "nowhere"}};
-        auto result = eng.eng.invoke_on(0, [tags](Engine& engine) {
-            return engine.queryBySeries("nonexistent", tags, "field", 0, UINT64_MAX);
-        }).get();
+        auto result = eng.eng
+                          .invoke_on(0,
+                                     [tags](Engine& engine) {
+                                         return engine.queryBySeries("nonexistent", tags, "field", 0, UINT64_MAX);
+                                     })
+                          .get();
 
         // Should return an empty QueryResult (no crash)
         if (std::holds_alternative<QueryResult<double>>(result)) {
             auto& qr = std::get<QueryResult<double>>(result);
             EXPECT_TRUE(qr.timestamps.empty());
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -462,7 +485,9 @@ TEST_F(EngineSeastarTest, DeleteRangeFromMemoryStore) {
         EXPECT_EQ(result.timestamps.size(), 2u);
         EXPECT_DOUBLE_EQ(result.values[0], 10.0);
         EXPECT_DOUBLE_EQ(result.values[1], 50.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, DeleteRangeNonExistentSeries) {
@@ -473,7 +498,9 @@ TEST_F(EngineSeastarTest, DeleteRangeNonExistentSeries) {
         // Deleting from a series that doesn't exist should return false
         bool deleted = eng->deleteRange("nonexistent value", 0, UINT64_MAX).get();
         EXPECT_FALSE(deleted);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, DeleteRangeBySeries) {
@@ -498,7 +525,9 @@ TEST_F(EngineSeastarTest, DeleteRangeBySeries) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 2u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -534,15 +563,15 @@ TEST_F(EngineSeastarTest, DeleteByPatternAllFields) {
         req.endTime = UINT64_MAX;
 
         // Execute delete on shard 0 (where the index lives and where data may be)
-        auto result = eng.eng.invoke_on(0, [req](Engine& engine) {
-            return engine.deleteByPattern(req);
-        }).get();
+        auto result = eng.eng.invoke_on(0, [req](Engine& engine) { return engine.deleteByPattern(req); }).get();
 
         // We should have deleted some series on shard 0.
         // Due to sharding, not all data may be on shard 0, but
         // the delete operation itself should not crash.
         EXPECT_GE(result.seriesDeleted, 0u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, DeleteByPatternSpecificFields) {
@@ -581,7 +610,9 @@ TEST_F(EngineSeastarTest, DeleteByPatternSpecificFields) {
         auto& qr = std::get<QueryResult<double>>(humidResult.value());
         EXPECT_EQ(qr.values.size(), 1u);
         EXPECT_DOUBLE_EQ(qr.values[0], 50.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, DeleteByPatternNoMatch) {
@@ -596,7 +627,9 @@ TEST_F(EngineSeastarTest, DeleteByPatternNoMatch) {
 
         auto result = eng->deleteByPattern(req).get();
         EXPECT_EQ(result.seriesDeleted, 0u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -623,7 +656,9 @@ TEST_F(EngineSeastarTest, RolloverMemoryStore) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 10u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -661,7 +696,9 @@ TEST_F(EngineSeastarTest, InsertAfterRollover) {
         EXPECT_EQ(result.timestamps.size(), 10u);
         EXPECT_EQ(result.timestamps.front(), 1000u);
         EXPECT_EQ(result.timestamps.back(), 10000u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -711,7 +748,9 @@ TEST_F(EngineSeastarTest, MixedDataTypes) {
             ASSERT_TRUE(std::holds_alternative<QueryResult<std::string>>(r.value()));
             EXPECT_EQ(std::get<QueryResult<std::string>>(r.value()).values[0], "healthy");
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -747,7 +786,9 @@ TEST_F(EngineSeastarTest, LargeBatchInsert) {
             ASSERT_TRUE(r.has_value());
             EXPECT_EQ(std::get<QueryResult<double>>(r.value()).values.size(), 100u);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -784,7 +825,9 @@ TEST_F(EngineSeastarTest, DeleteThenReinsert) {
         EXPECT_EQ(result.timestamps.size(), 2u);
         EXPECT_DOUBLE_EQ(result.values[0], 30.0);
         EXPECT_DOUBLE_EQ(result.values[1], 40.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -814,9 +857,9 @@ TEST_F(EngineSeastarTest, CrossShardQueryAllShards) {
             SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
             unsigned shard = SeriesId128::Hash{}(sid) % seastar::smp::count;
 
-            auto resultOpt = eng.eng.invoke_on(shard, [seriesKey](Engine& engine) {
-                return engine.query(seriesKey, 0, UINT64_MAX);
-            }).get();
+            auto resultOpt =
+                eng.eng.invoke_on(shard, [seriesKey](Engine& engine) { return engine.query(seriesKey, 0, UINT64_MAX); })
+                    .get();
 
             if (resultOpt.has_value()) {
                 auto& qr = std::get<QueryResult<double>>(resultOpt.value());
@@ -825,7 +868,9 @@ TEST_F(EngineSeastarTest, CrossShardQueryAllShards) {
             }
         }
         EXPECT_EQ(foundCount, numSeries);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -866,7 +911,9 @@ TEST_F(EngineSeastarTest, ExecuteLocalQueryWithSeriesIds) {
             EXPECT_EQ(results[0].measurement, "weather");
             EXPECT_TRUE(results[0].fields.count("temperature") > 0);
         }
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 TEST_F(EngineSeastarTest, ExecuteLocalQueryEmptySeriesIds) {
@@ -881,7 +928,9 @@ TEST_F(EngineSeastarTest, ExecuteLocalQueryEmptySeriesIds) {
 
         auto results = eng->executeLocalQuery(shardQuery).get();
         EXPECT_TRUE(results.empty());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -896,7 +945,9 @@ TEST_F(EngineSeastarTest, BasePathContainsShardId) {
         std::string path = eng->basePath();
         // Should contain "shard_" followed by the shard id
         EXPECT_TRUE(path.find("shard_") != std::string::npos);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -921,7 +972,9 @@ TEST_F(EngineSeastarTest, SequentialInsertsToSameSeries) {
         ASSERT_TRUE(resultOpt.has_value());
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.timestamps.size(), 500u);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -941,7 +994,9 @@ TEST_F(EngineSeastarTest, MetadataForNonExistentMeasurement) {
 
         auto values = eng->getTagValues("nonexistent", "any_tag").get();
         EXPECT_TRUE(values.empty());
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -966,7 +1021,9 @@ TEST_F(EngineSeastarTest, InsertWithTagsQueryBySeriesKey) {
         auto& result = std::get<QueryResult<double>>(resultOpt.value());
         EXPECT_EQ(result.values.size(), 1u);
         EXPECT_DOUBLE_EQ(result.values[0], 99.0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
 
 // ===========================================================================
@@ -987,24 +1044,21 @@ TEST_F(EngineSeastarTest, ShardedMetadataConsistency) {
         }
 
         // All metadata should be discoverable on shard 0
-        auto fields = eng.eng.invoke_on(0, [](Engine& engine) {
-            return engine.getMeasurementFields("metrics");
-        }).get();
+        auto fields = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementFields("metrics"); }).get();
 
         // All 8 fields should be indexed regardless of which shard stores the data
         EXPECT_EQ(fields.size(), 8u);
 
-        auto tags = eng.eng.invoke_on(0, [](Engine& engine) {
-            return engine.getMeasurementTags("metrics");
-        }).get();
+        auto tags = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementTags("metrics"); }).get();
         EXPECT_TRUE(tags.count("region") > 0);
 
-        auto regions = eng.eng.invoke_on(0, [](Engine& engine) {
-            return engine.getTagValues("metrics", "region");
-        }).get();
+        auto regions =
+            eng.eng.invoke_on(0, [](Engine& engine) { return engine.getTagValues("metrics", "region"); }).get();
         EXPECT_EQ(regions.size(), 3u);
         EXPECT_TRUE(regions.count("region_0") > 0);
         EXPECT_TRUE(regions.count("region_1") > 0);
         EXPECT_TRUE(regions.count("region_2") > 0);
-    }).join().get();
+    })
+        .join()
+        .get();
 }
