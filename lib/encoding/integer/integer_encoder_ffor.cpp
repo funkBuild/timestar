@@ -1,12 +1,19 @@
-// Highway foreach_target re-inclusion mechanism.
+// CRITICAL: foreach_target.h MUST be the first include after HWY_TARGET_INCLUDE.
+// Highway re-includes this entire file once per SIMD target (SSE4, AVX2, etc.).
+// If other headers appear before foreach_target.h, Highway only compiles the
+// baseline target and silently drops all higher ISAs — causing a ~10% perf regression
+// with no build errors. clang-format will try to alphabetize this; the guards prevent it.
+// clang-format off
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "encoding/integer/integer_encoder_ffor.cpp"
+#include "hwy/foreach_target.h"
+// clang-format on
+
 #include "integer_encoder_ffor.hpp"
 
 #include "../alp/alp_ffor.hpp"
 #include "../zigzag.hpp"
 
-#include "hwy/foreach_target.h"
 #include "hwy/highway.h"
 
 #include <algorithm>

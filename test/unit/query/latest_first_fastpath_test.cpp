@@ -92,13 +92,14 @@ SEASTAR_TEST_F(LatestFirstFastPathTest, LatestAcrossMultipleTsmFiles) {
         EXPECT_TRUE(result.has_value()) << "LATEST pushdown should succeed for TSM-only float data";
         if (!result.has_value())
             co_return;
-        EXPECT_EQ(result->totalPoints, 1u);
-        EXPECT_EQ(result->sortedTimestamps.size(), 1u);
-        if (result->sortedTimestamps.empty())
+        // Non-bucketed LATEST folds to a single AggregationState
+        EXPECT_TRUE(result->aggregatedState.has_value()) << "Non-bucketed LATEST should return aggregatedState";
+        if (!result->aggregatedState.has_value())
             co_return;
-        // Latest point: t=3090, val=30.0
-        EXPECT_EQ(result->sortedTimestamps[0], 3090u);
-        EXPECT_DOUBLE_EQ(result->sortedValues[0], 30.0);
+        auto& state = *result->aggregatedState;
+        EXPECT_EQ(state.latestTimestamp, 3090u);
+        EXPECT_DOUBLE_EQ(state.latest, 30.0);
+        EXPECT_EQ(state.count, 1u);
     });
     co_return;
 }
@@ -125,13 +126,14 @@ SEASTAR_TEST_F(LatestFirstFastPathTest, FirstAcrossMultipleTsmFiles) {
         EXPECT_TRUE(result.has_value()) << "FIRST pushdown should succeed for TSM-only float data";
         if (!result.has_value())
             co_return;
-        EXPECT_EQ(result->totalPoints, 1u);
-        EXPECT_EQ(result->sortedTimestamps.size(), 1u);
-        if (result->sortedTimestamps.empty())
+        // Non-bucketed FIRST folds to a single AggregationState
+        EXPECT_TRUE(result->aggregatedState.has_value()) << "Non-bucketed FIRST should return aggregatedState";
+        if (!result->aggregatedState.has_value())
             co_return;
-        // First point: t=1000, val=1.0
-        EXPECT_EQ(result->sortedTimestamps[0], 1000u);
-        EXPECT_DOUBLE_EQ(result->sortedValues[0], 1.0);
+        auto& state = *result->aggregatedState;
+        EXPECT_EQ(state.firstTimestamp, 1000u);
+        EXPECT_DOUBLE_EQ(state.first, 1.0);
+        EXPECT_EQ(state.count, 1u);
     });
     co_return;
 }
@@ -162,13 +164,14 @@ SEASTAR_TEST_F(LatestFirstFastPathTest, LatestSkipsTombstonedNewestFile) {
         EXPECT_TRUE(result.has_value()) << "LATEST pushdown should succeed even with tombstones";
         if (!result.has_value())
             co_return;
-        EXPECT_EQ(result->totalPoints, 1u);
-        EXPECT_EQ(result->sortedTimestamps.size(), 1u);
-        if (result->sortedTimestamps.empty())
+        // Non-bucketed LATEST folds to a single AggregationState
+        EXPECT_TRUE(result->aggregatedState.has_value()) << "Non-bucketed LATEST should return aggregatedState";
+        if (!result->aggregatedState.has_value())
             co_return;
+        auto& state = *result->aggregatedState;
         // Latest non-tombstoned: t=1090, val=10.0
-        EXPECT_EQ(result->sortedTimestamps[0], 1090u);
-        EXPECT_DOUBLE_EQ(result->sortedValues[0], 10.0);
+        EXPECT_EQ(state.latestTimestamp, 1090u);
+        EXPECT_DOUBLE_EQ(state.latest, 10.0);
     });
     co_return;
 }

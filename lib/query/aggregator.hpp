@@ -204,6 +204,14 @@ struct AggregationState {
     }
 
     // Extract final aggregated value based on method
+    // Return the representative timestamp for a collapsed state.
+    // LATEST uses latestTimestamp; FIRST uses firstTimestamp; others use firstTimestamp
+    // as a sensible default (earliest data point in the state).
+    uint64_t getTimestamp(AggregationMethod method) const {
+        if (method == AggregationMethod::LATEST) return latestTimestamp;
+        return firstTimestamp;
+    }
+
     double getValue(AggregationMethod method) const {
         if (count == 0) {
             return std::numeric_limits<double>::quiet_NaN();

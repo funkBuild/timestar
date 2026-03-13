@@ -526,13 +526,84 @@ static bool isStreamableMethod(timestar::AggregationMethod method) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// aggregateMemoryStores — fold MemoryStore data directly into a
+// BlockAggregator without materialising intermediate QueryResult vectors.
+// Returns the number of points aggregated.
+// ---------------------------------------------------------------------------
+static size_t aggregateMemoryStores(WALFileManager* walFileManager, const SeriesId128& seriesId, uint64_t startTime,
+                                    uint64_t endTime, timestar::BlockAggregator& aggregator) {
+    auto memoryMatches = walFileManager->queryAllMemoryStores<double>(seriesId);
+    size_t totalPoints = 0;
+    for (const auto& match : memoryMatches) {
+        const auto& storeData = *match.series;
+        if (storeData.timestamps.empty())
+            continue;
+        auto beginIt = std::lower_bound(storeData.timestamps.begin(), storeData.timestamps.end(), startTime);
+        auto endIt = std::upper_bound(beginIt, storeData.timestamps.end(), endTime);
+        size_t startIdx = static_cast<size_t>(beginIt - storeData.timestamps.begin());
+        size_t endIdx = static_cast<size_t>(endIt - storeData.timestamps.begin());
+        size_t count = endIdx - startIdx;
+        if (count == 0)
+            continue;
+
+        // Feed points directly into the aggregator — no vector copy.
+        for (size_t i = startIdx; i < endIdx; ++i) {
+            aggregator.addPoint(storeData.timestamps[i], storeData.values[i]);
+        }
+        totalPoints += count;
+    }
+    return totalPoints;
+}
+
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
     std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
     timestar::AggregationMethod method) {
-    // Gate 0: Skip pushdown entirely if there are no TSM files — all data
-    // is in memory stores and the full materialisation path is appropriate.
-    if (fileManager->getSequencedTsmFiles().empty()) {
+    // Gate 0.5: MEDIAN needs all raw values for nth_element — cannot stream.
+    if (aggregationInterval == 0 && method == timestar::AggregationMethod::MEDIAN) {
         co_return std::nullopt;
+    }
+
+    const bool noTsmFiles = fileManager->getSequencedTsmFiles().empty();
+    const bool isLatest = (method == timestar::AggregationMethod::LATEST);
+    const bool isFirst = (method == timestar::AggregationMethod::FIRST);
+
+    // Gate 0: No TSM files — all data is in memory stores.
+    // Instead of falling back to full materialisation, aggregate MemoryStore
+    // data directly into a BlockAggregator (avoids copying all raw points
+    // into intermediate QueryResult vectors).
+    //
+    // For bucketed queries (aggregationInterval > 0) this folds N points into
+    // M buckets — a huge win when N >> M.  For non-bucketed queries
+    // (aggregationInterval == 0) we still store raw (timestamp, value) pairs
+    // in the aggregator rather than folding to a single state, because callers
+    // (e.g. DerivedQueryExecutor) may need per-point data.
+    if (noTsmFiles) {
+        // LATEST/FIRST without interval: fold all MemoryStore points into a
+        // single AggregationState (returns 1 point, not N raw points).
+        const bool foldLatestFirst = (aggregationInterval == 0) && (isLatest || isFirst);
+        timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
+        if (foldLatestFirst) {
+            aggregator.setFoldToSingleState(false);
+        }
+
+        size_t pts = aggregateMemoryStores(walFileManager, seriesId, startTime, endTime, aggregator);
+        if (pts == 0) {
+            co_return std::nullopt;
+        }
+
+        timestar::PushdownResult result;
+        result.totalPoints = aggregator.pointCount();
+        if (aggregationInterval > 0) {
+            result.bucketStates = aggregator.takeBucketStates();
+        } else if (foldLatestFirst) {
+            result.aggregatedState = aggregator.takeSingleState();
+        } else {
+            aggregator.sortTimestamps();
+            result.sortedTimestamps = aggregator.takeTimestamps();
+            result.sortedValues = aggregator.takeValues();
+        }
+        co_return result;
     }
 
     // Gate 1 (split logic): Instead of rejecting entirely when memory data
@@ -550,23 +621,47 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     if (memMinTimeOpt.has_value()) {
         uint64_t memMinTime = *memMinTimeOpt;
         if (memMinTime <= startTime || memMinTime == 0) {
-            // Entire requested range overlaps with memory (or edge case
-            // where memMinTime==0 would underflow) — cannot split, fall back.
-            co_return std::nullopt;
+            // Entire requested range overlaps with memory — aggregate both
+            // TSM and memory data directly instead of falling back to full
+            // materialisation with intermediate QueryResult vectors.
+            const bool foldLatestFirst = (aggregationInterval == 0) && (isLatest || isFirst);
+            timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
+            if (foldLatestFirst) {
+                aggregator.setFoldToSingleState(false);
+            }
+
+            // Aggregate TSM data first.
+            std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqSnap(
+                fileManager->getSequencedTsmFiles().begin(), fileManager->getSequencedTsmFiles().end());
+            for (const auto& [rank, tsmFile] : seqSnap) {
+                co_await tsmFile->aggregateSeries(seriesId, startTime, endTime, aggregator);
+            }
+
+            // Then fold in MemoryStore data.
+            aggregateMemoryStores(walFileManager, seriesId, startTime, endTime, aggregator);
+
+            if (aggregator.pointCount() == 0) {
+                co_return std::nullopt;
+            }
+
+            timestar::PushdownResult result;
+            result.totalPoints = aggregator.pointCount();
+            if (aggregationInterval > 0) {
+                result.bucketStates = aggregator.takeBucketStates();
+            } else if (foldLatestFirst) {
+                result.aggregatedState = aggregator.takeSingleState();
+            } else {
+                aggregator.sortTimestamps();
+                result.sortedTimestamps = aggregator.takeTimestamps();
+                result.sortedValues = aggregator.takeValues();
+            }
+            co_return result;
         }
         // Split: pushdown [startTime, memMinTime-1], fallback [memMinTime, endTime]
         tsmEndTime = memMinTime - 1;
         fallbackStartTime = memMinTime;
         needsFallback = true;
     }
-
-    // Gate 1.5: MEDIAN needs all raw values for nth_element — cannot stream.
-    if (aggregationInterval == 0 && method == timestar::AggregationMethod::MEDIAN) {
-        co_return std::nullopt;
-    }
-
-    const bool isLatest = (method == timestar::AggregationMethod::LATEST);
-    const bool isFirst = (method == timestar::AggregationMethod::FIRST);
 
     // Fast path for LATEST/FIRST: skip the expensive Gate 2 overlap check.
     // LATEST/FIRST don't aggregate across blocks (no double-counting risk),
@@ -579,8 +674,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             fileManager->getSequencedTsmFiles().begin(), fileManager->getSequencedTsmFiles().end());
 
         // Filter files using in-memory checks only (no I/O).
+        // seriesMayOverlapTime checks bloom filter + sparse time bounds.
         std::vector<seastar::shared_ptr<TSM>> candidateFiles;
         for (const auto& [rank, tsmFile] : seqFilesSnap) {
+            if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, tsmEndTime))
+                continue;
             auto type = tsmFile->getSeriesType(seriesId);
             if (!type.has_value())
                 continue;
@@ -611,7 +709,13 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
                       });
         }
 
-        timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime);
+        // Non-bucketed LATEST/FIRST: fold TSM + MemoryStore data into a single
+        // AggregationState so we return 1 point total, not N raw points.
+        const bool foldNonBucketed = (aggregationInterval == 0);
+        timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime, method, true);
+        if (foldNonBucketed) {
+            aggregator.setFoldToSingleState(false);
+        }
 
         if (aggregationInterval == 0) {
             // Non-bucketed: need only 1 point total from TSM.
@@ -628,33 +732,45 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
             uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
             size_t totalBuckets = static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1);
-            std::unordered_set<uint64_t> filledBuckets;
-            filledBuckets.reserve(totalBuckets);
 
-            for (auto& file : candidateFiles) {
-                if (filledBuckets.size() >= totalBuckets) {
-                    break;
+            if (totalBuckets == 1) {
+                // Single-bucket LATEST/FIRST: only need 1 point from the
+                // preferred end.  Use the selective path (reads 1 block) instead
+                // of aggregateSeriesBucketed (reads all blocks).
+                for (auto& file : candidateFiles) {
+                    size_t pts = co_await file->aggregateSeriesSelective(seriesId, startTime, tsmEndTime, aggregator,
+                                                                         reverse, 1);
+                    if (pts > 0) {
+                        break;
+                    }
                 }
-                co_await file->aggregateSeriesBucketed(seriesId, startTime, tsmEndTime, aggregator, reverse,
-                                                       aggregationInterval, filledBuckets, totalBuckets);
+            } else {
+                std::unordered_set<uint64_t> filledBuckets;
+                filledBuckets.reserve(totalBuckets);
+
+                for (auto& file : candidateFiles) {
+                    if (filledBuckets.size() >= totalBuckets) {
+                        break;
+                    }
+                    co_await file->aggregateSeriesBucketed(seriesId, startTime, tsmEndTime, aggregator, reverse,
+                                                           aggregationInterval, filledBuckets, totalBuckets);
+                }
             }
         }
 
-        // Fallback: query the overlap range [memMinTime, endTime] via the full
-        // materialisation path (queryTsm handles TSM+memory dedup) and fold
-        // the resulting points into the same BlockAggregator.
+        // Fallback: fold MemoryStore data directly into the aggregator
+        // for the overlap range [fallbackStartTime, endTime].  This avoids
+        // materialising intermediate QueryResult vectors.
         if (needsFallback) {
-            QueryResult<double> fallbackResult =
-                co_await queryTsm<double>(seriesKey, seriesId, fallbackStartTime, endTime);
-            if (!fallbackResult.timestamps.empty()) {
-                aggregator.addPoints(fallbackResult.timestamps, fallbackResult.values);
-            }
+            aggregateMemoryStores(walFileManager, seriesId, fallbackStartTime, endTime, aggregator);
         }
 
         timestar::PushdownResult result;
         result.totalPoints = aggregator.pointCount();
         if (aggregationInterval > 0) {
             result.bucketStates = aggregator.takeBucketStates();
+        } else if (foldNonBucketed) {
+            result.aggregatedState = aggregator.takeSingleState();
         } else {
             aggregator.sortTimestamps();
             result.sortedTimestamps = aggregator.takeTimestamps();
@@ -681,14 +797,22 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(fileManager->getSequencedTsmFiles().begin(),
                                                                             fileManager->getSequencedTsmFiles().end());
 
+    // Pre-filter: skip files whose sparse time bounds don't overlap the query
+    // range. This avoids loading full index entries (DMA reads) for files that
+    // cannot contribute data — critical for narrow-range queries with many files.
+    bool hasNonFloat = false;
     for (const auto& [rank, tsmFile] : seqFilesSnap) {
+        if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, tsmEndTime))
+            continue;
+
         auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);
         if (!indexEntry)
             continue;
 
         // If any file reports a non-Float type, pushdown is inapplicable.
         if (indexEntry->seriesType != TSMValueType::Float) {
-            co_return std::nullopt;
+            hasNonFloat = true;
+            break;
         }
 
         FileRef ref{tsmFile};
@@ -702,6 +826,10 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         if (ref.maxBlockTime > 0) {
             filesWithData.push_back(std::move(ref));
         }
+    }
+
+    if (hasNonFloat) {
+        co_return std::nullopt;
     }
 
     if (filesWithData.empty() && !needsFallback) {
@@ -732,14 +860,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator);
     }
 
-    // Fallback: query the overlap range [memMinTime, endTime] via the full
-    // materialisation path (queryTsm handles TSM+memory dedup) and fold
-    // the resulting points into the same BlockAggregator.
+    // Fallback: fold MemoryStore data directly into the aggregator
+    // for the overlap range [fallbackStartTime, endTime].  This avoids
+    // materialising intermediate QueryResult vectors.
     if (needsFallback) {
-        QueryResult<double> fallbackResult = co_await queryTsm<double>(seriesKey, seriesId, fallbackStartTime, endTime);
-        if (!fallbackResult.timestamps.empty()) {
-            aggregator.addPoints(fallbackResult.timestamps, fallbackResult.values);
-        }
+        aggregateMemoryStores(walFileManager, seriesId, fallbackStartTime, endTime, aggregator);
     }
 
     timestar::PushdownResult result;

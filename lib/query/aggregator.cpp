@@ -318,6 +318,19 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                     state.addValue(doubleValues[i], timestamps[i]);
                     partial.totalPoints++;
                 }
+            } else if (method == AggregationMethod::LATEST || method == AggregationMethod::FIRST) {
+                // LATEST/FIRST without interval: fold all points into a single
+                // collapsed state — return 1 point per group, not N raw points.
+                // Without this, a "latest:metric()" query over 500K points would
+                // materialise 500K AggregationStates and return a 14MB response.
+                partial.totalPoints += timestamps.size();
+                if (!partial.collapsedState.has_value()) {
+                    partial.collapsedState.emplace();
+                }
+                auto& state = *partial.collapsedState;
+                for (size_t i = 0; i < timestamps.size(); ++i) {
+                    state.addValueForMethod(doubleValues[i], timestamps[i], method);
+                }
             } else {
                 // No interval - sorted vector aggregation by timestamp.
                 // Input timestamps are sorted (from queryTsm). Use sorted merge
@@ -453,7 +466,7 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     merged.merge(*p->collapsedState);
                 }
                 if (merged.count > 0) {
-                    groupedResult.points.push_back({merged.firstTimestamp, merged.getValue(method), merged.count});
+                    groupedResult.points.push_back({merged.getTimestamp(method), merged.getValue(method), merged.count});
                 }
             } else {
                 // Not all collapsed: convert any collapsed partials to

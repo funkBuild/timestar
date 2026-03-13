@@ -61,6 +61,11 @@ struct SparseIndexEntry {
     uint64_t fileOffset;      // 8 bytes - where to read in file
     uint32_t entrySize;       // 4 bytes - how much to read
     TSMValueType seriesType;  // series value type (captured during sparse index parse)
+    // Per-series time bounds (parsed from first/last block during sparse index load).
+    // Enables skipping entire files for time-filtered queries without loading the
+    // full index entry — critical for narrow-range queries with many TSM files.
+    uint64_t minTime = 0;
+    uint64_t maxTime = 0;
 };
 
 typedef struct TSMIndexEntry {
@@ -131,6 +136,18 @@ public:
     seastar::future<> readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
                                      TSMResult<T>& results);
     std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
+
+    // Check if a series in this file could overlap a time range using sparse
+    // index bounds (no I/O).  Returns false if the series is absent or its
+    // time range is entirely outside [startTime, endTime].
+    bool seriesMayOverlapTime(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) const {
+        if (!seriesBloomFilter.contains(seriesId.getRawData()))
+            return false;
+        auto it = sparseIndex.find(seriesId);
+        if (it == sparseIndex.end())
+            return false;
+        return it->second.minTime <= endTime && startTime <= it->second.maxTime;
+    }
 
     // Block batching utilities
     std::vector<BlockBatch> groupContiguousBlocks(const std::vector<TSMIndexBlock>& blocks) const;

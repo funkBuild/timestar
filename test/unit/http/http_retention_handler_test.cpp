@@ -268,9 +268,9 @@ TEST_F(HttpRetentionHandlerParseDurationTest, UnknownUnitThrows) {
     EXPECT_THROW(timestar::HttpQueryHandler::parseInterval("5x"), timestar::QueryParseException);
 }
 
-TEST_F(HttpRetentionHandlerParseDurationTest, OverflowThrows) {
-    // So large it would overflow uint64_t in nanoseconds
-    EXPECT_THROW(timestar::HttpQueryHandler::parseInterval("99999999999d"), timestar::QueryParseException);
+TEST_F(HttpRetentionHandlerParseDurationTest, OverflowSaturates) {
+    // So large it would overflow uint64_t in nanoseconds — clamps to UINT64_MAX
+    EXPECT_EQ(timestar::HttpQueryHandler::parseInterval("99999999999d"), std::numeric_limits<uint64_t>::max());
 }
 
 // =============================================================================

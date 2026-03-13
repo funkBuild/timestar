@@ -94,7 +94,7 @@ static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& p
             // Non-bucketed streaming pushdown — single collapsed AggregationState
             auto& state = *partial.collapsedState;
             if (state.count > 0) {
-                timestamps.push_back(state.firstTimestamp);
+                timestamps.push_back(state.getTimestamp(method));
                 values.push_back(state.getValue(method));
             }
         } else if (!partial.sortedValues.empty()) {
@@ -1157,17 +1157,17 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
             throw QueryParseException("Invalid interval: '" + interval + "' must be a finite positive number");
         }
         double result = value * static_cast<double>(multiplier);
-        // Re-check after multiplication: large-but-finite * large multiplier can overflow to Inf.
+        // Clamp to UINT64_MAX on overflow — any interval larger than the query
+        // range simply produces a single bucket, so saturation is correct.
         if (!std::isfinite(result) || result > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
-            throw QueryParseException("Interval value overflow: " + interval +
-                                      " exceeds maximum representable nanoseconds");
+            return std::numeric_limits<uint64_t>::max();
         }
         return static_cast<uint64_t>(result);
     } else {
         uint64_t value = std::stoull(valueStr);
+        // Clamp to UINT64_MAX on overflow (same rationale as decimal path).
         if (multiplier > 1 && value > std::numeric_limits<uint64_t>::max() / multiplier) {
-            throw QueryParseException("Interval value overflow: " + interval +
-                                      " exceeds maximum representable nanoseconds");
+            return std::numeric_limits<uint64_t>::max();
         }
         return value * multiplier;
     }

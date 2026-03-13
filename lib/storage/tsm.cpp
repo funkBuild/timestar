@@ -241,14 +241,31 @@ seastar::future<> TSM::readSparseIndex() {
         // Calculate size of this entry
         uint32_t entrySize = 16 + 1 + 2 + static_cast<uint32_t>(blockBytes);
 
+        // Peek at first block's minTime and last block's maxTime for sparse
+        // time bounds (blocks start with minTime:u64, maxTime:u64).
+        // These enable skipping entire files for narrow-range queries without
+        // loading the full index entry.
+        uint64_t seriesMinTime = 0;
+        uint64_t seriesMaxTime = 0;
+        if (blockCount > 0) {
+            size_t blockStart = indexSlice.offset;
+            // First block's minTime (offset 0 within block data)
+            std::memcpy(&seriesMinTime, indexSlice.data + blockStart, sizeof(uint64_t));
+            // Last block's maxTime (offset 8 within last block)
+            size_t lastBlockStart = blockStart + (blockCount - 1) * perBlockBytes;
+            std::memcpy(&seriesMaxTime, indexSlice.data + lastBlockStart + 8, sizeof(uint64_t));
+        }
+
         // Skip over the blocks (don't parse them yet)
         indexSlice.offset += blockBytes;
 
-        // Store sparse entry (including type for fast getSeriesType lookups)
+        // Store sparse entry (including type and time bounds for fast lookups)
         SparseIndexEntry sparseEntry{.seriesId = seriesId,
                                      .fileOffset = entryStartOffset,
                                      .entrySize = entrySize,
-                                     .seriesType = static_cast<TSMValueType>(type)};
+                                     .seriesType = static_cast<TSMValueType>(type),
+                                     .minTime = seriesMinTime,
+                                     .maxTime = seriesMaxTime};
         sparseIndex.insert({seriesId, sparseEntry});
 
         // Collect series ID for bloom filter
@@ -1073,6 +1090,28 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
         }
         if (allBlockBucketsFilled) {
             continue;  // Skip this block entirely
+        }
+
+        // Extended-stats shortcut: when block has v3 stats and fits in one
+        // bucket, extract the first/latest endpoint directly without DMA
+        // read + decode.  This preserves 1-point-per-bucket semantics.
+        bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
+        if (!hasTombstoneRanges && blockFullyContained && block.hasExtendedStats) {
+            uint64_t bFirst = (block.minTime / interval) * interval;
+            uint64_t bLast = (block.maxTime / interval) * interval;
+            if (bFirst == bLast) {
+                // Single-bucket block: use the relevant endpoint
+                if (filledBuckets.find(bFirst) == filledBuckets.end()) {
+                    if (reverse) {
+                        aggregator.addPoint(block.maxTime, block.blockLatestValue);
+                    } else {
+                        aggregator.addPoint(block.minTime, block.blockFirstValue);
+                    }
+                    filledBuckets.insert(bFirst);
+                    totalPoints++;
+                }
+                continue;
+            }
         }
 
         auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);

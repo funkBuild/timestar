@@ -430,18 +430,10 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedLATEST) {
     auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
 
     ASSERT_EQ(grouped.size(), 1);
-    // Should have 3 points (one per unique timestamp)
-    EXPECT_EQ(grouped[0].points.size(), 3);
-
-    // Find the point with value 30.0 (latest by timestamp)
-    bool foundLatest = false;
-    for (const auto& point : grouped[0].points) {
-        if (point.timestamp == 3000) {
-            EXPECT_DOUBLE_EQ(point.value, 30.0);
-            foundLatest = true;
-        }
-    }
-    EXPECT_TRUE(foundLatest);
+    // LATEST without interval collapses to 1 point (the latest across all shards)
+    EXPECT_EQ(grouped[0].points.size(), 1);
+    EXPECT_EQ(grouped[0].points[0].timestamp, 3000);
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 30.0);
 }
 
 TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedEmptyInput) {

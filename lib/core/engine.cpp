@@ -336,9 +336,10 @@ seastar::future<> Engine::prefetchSeriesIndices(const std::vector<SeriesId128>& 
     for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
         tsmSnapshot.push_back(tsmFile);
     }
-    for (const auto& tsmFile : tsmSnapshot) {
-        co_await tsmFile->prefetchFullIndexEntries(seriesIds);
-    }
+    // Prefetch all TSM files in parallel (was sequential: one co_await per file).
+    co_await seastar::parallel_for_each(tsmSnapshot, [&seriesIds](seastar::shared_ptr<TSM>& tsmFile) {
+        return tsmFile->prefetchFullIndexEntries(seriesIds);
+    });
 }
 
 seastar::future<> Engine::startBackgroundTasks() {

@@ -453,8 +453,8 @@ TEST_F(NewAggMethodPipelineTest, First_ReturnsEarliestValue) {
     std::vector<uint64_t> ts = {1000, 2000, 3000};
     std::vector<double> vals = {100.0, 200.0, 300.0};
     auto result = runPipeline(ts, vals, AggregationMethod::FIRST);
-    // Non-bucketed: one per timestamp; each has count=1 so first == that value
-    ASSERT_EQ(result.size(), 3u);
+    // FIRST without interval collapses to 1 point (the earliest value)
+    ASSERT_EQ(result.size(), 1u);
     EXPECT_DOUBLE_EQ(result[0].value, 100.0);
 }
 

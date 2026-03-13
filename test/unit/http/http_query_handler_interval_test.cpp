@@ -76,21 +76,21 @@ TEST_F(HttpQueryHandlerIntervalTest, BareNumberErrorMessage) {
     }
 }
 
-// ---- Overflow detection ----
+// ---- Overflow saturation (clamp to UINT64_MAX) ----
 
-TEST_F(HttpQueryHandlerIntervalTest, OverflowDaysThrows) {
-    // 99999999999 days in nanoseconds would overflow uint64_t
-    EXPECT_THROW(HttpQueryHandler::parseInterval("99999999999d"), QueryParseException);
+TEST_F(HttpQueryHandlerIntervalTest, OverflowDaysSaturates) {
+    // 99999999999 days in nanoseconds would overflow uint64_t — clamps to UINT64_MAX
+    EXPECT_EQ(HttpQueryHandler::parseInterval("99999999999d"), std::numeric_limits<uint64_t>::max());
 }
 
-TEST_F(HttpQueryHandlerIntervalTest, OverflowHoursThrows) {
-    // A very large hour value that overflows
-    EXPECT_THROW(HttpQueryHandler::parseInterval("99999999999h"), QueryParseException);
+TEST_F(HttpQueryHandlerIntervalTest, OverflowHoursSaturates) {
+    // A very large hour value that overflows — clamps to UINT64_MAX
+    EXPECT_EQ(HttpQueryHandler::parseInterval("99999999999h"), std::numeric_limits<uint64_t>::max());
 }
 
-TEST_F(HttpQueryHandlerIntervalTest, OverflowDecimalThrows) {
-    // Very large decimal that overflows
-    EXPECT_THROW(HttpQueryHandler::parseInterval("999999999999999.0d"), QueryParseException);
+TEST_F(HttpQueryHandlerIntervalTest, OverflowDecimalSaturates) {
+    // Very large decimal that overflows — clamps to UINT64_MAX
+    EXPECT_EQ(HttpQueryHandler::parseInterval("999999999999999.0d"), std::numeric_limits<uint64_t>::max());
 }
 
 // ---- Boundary: largest non-overflowing values ----
@@ -102,9 +102,9 @@ TEST_F(HttpQueryHandlerIntervalTest, LargestNonOverflowingSeconds) {
     EXPECT_GT(result, 0ULL);
 }
 
-TEST_F(HttpQueryHandlerIntervalTest, SmallestOverflowingSeconds) {
-    // 18446744074s would overflow (18446744074 * 1e9 > UINT64_MAX)
-    EXPECT_THROW(HttpQueryHandler::parseInterval("18446744074s"), QueryParseException);
+TEST_F(HttpQueryHandlerIntervalTest, SmallestOverflowingSecondsSaturates) {
+    // 18446744074s would overflow (18446744074 * 1e9 > UINT64_MAX) — clamps to UINT64_MAX
+    EXPECT_EQ(HttpQueryHandler::parseInterval("18446744074s"), std::numeric_limits<uint64_t>::max());
 }
 
 // ---- NaN / Inf / non-finite inputs ----
