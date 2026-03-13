@@ -48,6 +48,8 @@ struct IndexConfig {
     uint32_t max_open_files = 1000;
     uint64_t max_file_size = 64 * 1024 * 1024;
     uint64_t series_cache_size = 1000000;
+    uint64_t metadata_cache_bytes = 48 * 1024 * 1024;   // 48MB for series metadata LRU cache
+    uint64_t discovery_cache_bytes = 16 * 1024 * 1024;   // 16MB for discovery result LRU cache
 };
 
 struct StreamingConfig {
@@ -156,7 +158,8 @@ struct glz::meta<timestar::IndexConfig> {
     static constexpr auto value =
         object("bloom_filter_bits", &T::bloom_filter_bits, "block_size", &T::block_size, "write_buffer_size",
                &T::write_buffer_size, "max_open_files", &T::max_open_files, "max_file_size", &T::max_file_size,
-               "series_cache_size", &T::series_cache_size);
+               "series_cache_size", &T::series_cache_size, "metadata_cache_bytes", &T::metadata_cache_bytes,
+               "discovery_cache_bytes", &T::discovery_cache_bytes);
 };
 
 template <>

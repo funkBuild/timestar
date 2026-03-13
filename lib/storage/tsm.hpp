@@ -12,6 +12,7 @@
 #include <tsl/robin_map.h>
 
 #include <fstream>
+#include <limits>
 #include <list>
 #include <memory>
 #include <optional>
@@ -20,6 +21,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Forward declarations
@@ -32,6 +34,16 @@ typedef struct TSMIndexBlock {
     uint64_t maxTime;
     uint64_t offset;
     uint32_t size;
+    // Block-level statistics (populated in v2+ files for Float series)
+    double blockSum = 0.0;
+    double blockMin = std::numeric_limits<double>::max();
+    double blockMax = std::numeric_limits<double>::lowest();
+    uint32_t blockCount = 0;  // 0 means stats not available
+    // Extended statistics (populated in v3+ files for Float series)
+    double blockM2 = 0.0;            // Welford's M2 accumulator for STDDEV/STDVAR
+    double blockFirstValue = 0.0;    // Value at earliest timestamp (for FIRST)
+    double blockLatestValue = 0.0;   // Value at latest timestamp (for LATEST)
+    bool hasExtendedStats = false;   // true when M2/first/latest are populated
 } TSMIndexBlock;
 
 // Batch of contiguous blocks for optimized I/O
@@ -57,11 +69,19 @@ typedef struct TSMIndexEntry {
     std::vector<TSMIndexBlock> indexBlocks;
 } TSMIndexEntry;
 
+// TSM file format versions:
+//   v1: original format (28 bytes per index block)
+//   v2: adds block-level statistics for Float series (56 bytes per Float block, 28 for others)
+//   v3: adds extended statistics (M2, firstValue, latestValue) for Float series (80 bytes per Float block)
+static constexpr uint8_t TSM_VERSION_STATS = 2;
+static constexpr uint8_t TSM_VERSION_EXTENDED_STATS = 3;
+
 class TSM {
 private:
     std::string filePath;
     seastar::file tsmFile;
     uint64_t length = 0;
+    uint8_t fileVersion = 1;
 
     // Lazy loading: sparse index + bloom filter for memory efficiency
     tsl::robin_map<SeriesId128, SparseIndexEntry, SeriesId128::Hash> sparseIndex;
@@ -184,6 +204,24 @@ public:
     // Only works for Float series; returns 0 for other types.
     seastar::future<size_t> aggregateSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                             timestar::BlockAggregator& aggregator);
+
+    // Selective block reading for LATEST/FIRST without bucketing (interval=0).
+    // Reads blocks in forward (reverse=false) or reverse (reverse=true) order,
+    // stopping after collecting maxPoints non-tombstoned points.
+    // Returns the number of points aggregated.
+    seastar::future<size_t> aggregateSeriesSelective(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                                     timestar::BlockAggregator& aggregator, bool reverse,
+                                                     size_t maxPoints);
+
+    // Bucketed block reading for LATEST/FIRST with time buckets (interval>0).
+    // Reads blocks in forward/reverse order, skipping blocks whose buckets are
+    // already filled. Stops when all buckets in [startTime, endTime] are filled.
+    // filledBuckets is shared across files for cross-file early termination.
+    // Returns the number of points aggregated.
+    seastar::future<size_t> aggregateSeriesBucketed(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                                    timestar::BlockAggregator& aggregator, bool reverse,
+                                                    uint64_t interval, std::unordered_set<uint64_t>& filledBuckets,
+                                                    size_t totalBuckets);
 
     // Estimate fraction of file data covered by tombstones (metadata-only, no data reads)
     // Returns value in [0.0, 1.0] representing estimated dead bytes / file size

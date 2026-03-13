@@ -2,6 +2,7 @@
 
 #include "aggregator.hpp"
 #include "engine.hpp"
+#include "group_key.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "query_parser.hpp"
@@ -19,6 +20,7 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_timeout.hh>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -58,6 +60,81 @@ static std::string buildMergeKey(const std::string& measurement, const std::map<
         key.append(v);
     }
     return key;
+}
+
+// Finalize partial aggregation results from a single shard directly into the query response,
+// bypassing the mergePartialAggregationsGrouped() → GroupedAggregationResult pipeline.
+// Precondition: each partial must have a unique groupKey (i.e. no two partials share the
+// same measurement+field+tags combination). When multiple series produce partials with the
+// same groupKey (e.g. non-group-by queries with multiple matching series), callers must use
+// the merge fallback path instead.
+static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials, AggregationMethod method,
+                                        QueryResponse& response) {
+    response.series.reserve(partials.size());
+
+    for (auto& partial : partials) {
+        std::vector<uint64_t> timestamps;
+        std::vector<double> values;
+
+        if (!partial.bucketStates.empty()) {
+            // Bucketed: extract getValue() per bucket, sort by timestamp
+            std::vector<std::pair<uint64_t, AggregationState*>> buckets;
+            buckets.reserve(partial.bucketStates.size());
+            for (auto& [ts, state] : partial.bucketStates) {
+                buckets.emplace_back(ts, &state);
+            }
+            std::sort(buckets.begin(), buckets.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            timestamps.reserve(buckets.size());
+            values.reserve(buckets.size());
+            for (auto& [ts, state] : buckets) {
+                timestamps.push_back(ts);
+                values.push_back(state->getValue(method));
+            }
+        } else if (partial.collapsedState.has_value()) {
+            // Non-bucketed streaming pushdown — single collapsed AggregationState
+            auto& state = *partial.collapsedState;
+            if (state.count > 0) {
+                timestamps.push_back(state.firstTimestamp);
+                values.push_back(state.getValue(method));
+            }
+        } else if (!partial.sortedValues.empty()) {
+            // Non-bucketed raw values from pushdown — zero-copy move
+            if (method == AggregationMethod::COUNT) {
+                timestamps = std::move(partial.sortedTimestamps);
+                values.assign(timestamps.size(), 1.0);
+            } else {
+                timestamps = std::move(partial.sortedTimestamps);
+                values = std::move(partial.sortedValues);
+            }
+        } else if (!partial.sortedStates.empty()) {
+            // Non-bucketed states from fallback aggregation
+            timestamps.reserve(partial.sortedStates.size());
+            values.reserve(partial.sortedStates.size());
+            for (size_t i = 0; i < partial.sortedStates.size(); ++i) {
+                timestamps.push_back(partial.sortedTimestamps[i]);
+                values.push_back(partial.sortedStates[i].getValue(method));
+            }
+        } else {
+            continue;
+        }
+
+        if (timestamps.empty())
+            continue;
+
+        // Both pushdown and fallback paths now populate cachedTags via buildGroupKeyDirect()
+        auto tags = std::move(partial.cachedTags);
+
+        // Each partial produces its own series entry (one field per series).
+        // The API returns each field as a separate series — clients merge if needed.
+        SeriesResult series;
+        series.measurement = std::move(partial.measurement);
+        series.tags = std::move(tags);
+        series.fields[std::move(partial.fieldName)] =
+            std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+
+        response.series.push_back(std::move(series));
+    }
 }
 
 // Timing structure to track query execution steps
@@ -351,7 +428,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 auto& index = engine.getIndex();
 
                 std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
-                auto findResult = co_await index.findSeriesWithMetadata(measurement, scopes, fieldFilter, maxSeries);
+                auto findResult = co_await index.findSeriesWithMetadataCached(measurement, scopes, fieldFilter, maxSeries);
 
                 // Check if series limit was exceeded (early bailout from index layer)
                 if (!findResult.has_value()) {
@@ -362,7 +439,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     co_return result;
                 }
 
-                auto& seriesWithMeta = findResult.value();
+                const auto& seriesWithMeta = *findResult.value();
 
                 LOG_QUERY_PATH(timestar::http_log, info,
                                "[QUERY] Shard 0 (metadata) found {} series for measurement '{}' with {} scopes",
@@ -374,7 +451,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     shardCount = 1;
                 result.seriesByShard.resize(shardCount);
 
-                for (auto& swm : seriesWithMeta) {
+                for (const auto& swm : seriesWithMeta) {
                     std::string seriesKey =
                         buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
 
@@ -384,8 +461,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     SeriesQueryContext ctx;
                     ctx.seriesKey = std::move(seriesKey);
                     ctx.seriesId = dataSeriesId;
-                    ctx.field = std::move(swm.metadata.field);
-                    ctx.tags = std::move(swm.metadata.tags);
+                    ctx.field = swm.metadata.field;
+                    ctx.tags = swm.metadata.tags;
                     result.seriesByShard[shardId].push_back(std::move(ctx));
                 }
 
@@ -485,13 +562,14 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                             co_await seastar::max_concurrent_for_each(
                                 contexts, MAX_CONCURRENT_SERIES_QUERIES,
                                 [&engine, &pushdownPartials, &fallbackResults, &measurement, startTime, endTime,
-                                 shardId, aggregationInterval,
+                                 shardId, aggregationInterval, aggregation,
                                  &groupByTags](SeriesQueryContext& ctx) -> seastar::future<> {
                                     // ---- PUSHDOWN PATH ----
                                     // Try aggregating directly from TSM blocks, skipping the
                                     // full TSMResult → QueryResult → SeriesResult pipeline.
                                     auto pushdownResult = co_await engine.queryAggregated(
-                                        ctx.seriesKey, ctx.seriesId, startTime, endTime, aggregationInterval);
+                                        ctx.seriesKey, ctx.seriesId, startTime, endTime, aggregationInterval,
+                                        aggregation);
 
                                     if (pushdownResult.has_value()) {
                                         // Build PartialAggregationResult directly from PushdownResult
@@ -501,31 +579,16 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                         partial.totalPoints = pushdownResult->totalPoints;
 
                                         // Build composite groupKey (same format as createPartialAggregations)
-                                        std::map<std::string, std::string> relevantTags;
-                                        if (!groupByTags.empty()) {
-                                            for (const auto& tagName : groupByTags) {
-                                                auto it = ctx.tags.find(tagName);
-                                                if (it != ctx.tags.end()) {
-                                                    relevantTags[tagName] = it->second;
-                                                }
-                                            }
-                                        }
-                                        std::string compositeKey;
-                                        compositeKey += measurement;
-                                        for (const auto& [k, v] : relevantTags) {
-                                            compositeKey += '\0';
-                                            compositeKey += k;
-                                            compositeKey += '=';
-                                            compositeKey += v;
-                                        }
-                                        compositeKey += '\0';
-                                        compositeKey += ctx.field;
-
-                                        partial.groupKeyHash = std::hash<std::string>{}(compositeKey);
-                                        partial.groupKey = std::move(compositeKey);
+                                        auto gkr = timestar::buildGroupKeyDirect(measurement, ctx.field,
+                                                                                  ctx.tags, groupByTags);
+                                        partial.groupKey = std::move(gkr.key);
+                                        partial.groupKeyHash = gkr.hash;
+                                        partial.cachedTags = std::move(gkr.tags);
 
                                         if (aggregationInterval > 0) {
                                             partial.bucketStates = std::move(pushdownResult->bucketStates);
+                                        } else if (pushdownResult->aggregatedState.has_value()) {
+                                            partial.collapsedState = std::move(pushdownResult->aggregatedState);
                                         } else {
                                             partial.sortedTimestamps = std::move(pushdownResult->sortedTimestamps);
                                             partial.sortedValues = std::move(pushdownResult->sortedValues);
@@ -582,14 +645,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                                 }
                                             } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
                                                 if (!result.timestamps.empty()) {
-                                                    std::vector<double> doubleValues;
-                                                    doubleValues.reserve(result.values.size());
-                                                    for (bool v : result.values) {
-                                                        doubleValues.push_back(v ? 1.0 : 0.0);
-                                                    }
+                                                    std::vector<bool> boolValues(result.values.begin(),
+                                                                                 result.values.end());
                                                     seriesResult.fields[ctx.field] =
                                                         std::make_pair(std::move(result.timestamps),
-                                                                       FieldValues(std::move(doubleValues)));
+                                                                       FieldValues(std::move(boolValues)));
                                                 }
                                             } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
                                                 if (!result.timestamps.empty()) {
@@ -612,18 +672,20 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                     }
                                 });
 
-                            // Separate string-typed fallback results from numeric results.
+                            // Separate non-numeric (string/bool) fallback results from numeric.
+                            // String and boolean data bypass aggregation and are returned as-is.
                             std::vector<timestar::SeriesResult> stringResults;
                             std::vector<timestar::SeriesResult> numericResults;
                             for (auto& sr : fallbackResults) {
-                                bool hasStringField = false;
+                                bool hasNonNumericField = false;
                                 for (const auto& [fn, fd] : sr.fields) {
-                                    if (std::holds_alternative<std::vector<std::string>>(fd.second)) {
-                                        hasStringField = true;
+                                    if (std::holds_alternative<std::vector<std::string>>(fd.second) ||
+                                        std::holds_alternative<std::vector<bool>>(fd.second)) {
+                                        hasNonNumericField = true;
                                         break;
                                     }
                                 }
-                                if (hasStringField) {
+                                if (hasNonNumericField) {
                                     stringResults.push_back(std::move(sr));
                                 } else {
                                     numericResults.push_back(std::move(sr));
@@ -675,6 +737,145 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         auto shardQueriesEnd = std::chrono::high_resolution_clock::now();
         timing.shardQueriesMs = std::chrono::duration<double, std::milli>(shardQueriesEnd - shardQueriesStart).count();
 
+        if (shardResults.size() == 1) {
+            // === SINGLE-SHARD FAST PATH ===
+            // All matching series live on one shard — skip the cross-shard merge pipeline.
+            // finalizeSingleShardPartials() produces SeriesResult entries directly from
+            // PartialAggregationResult, bypassing mergePartialAggregationsGrouped() and
+            // the GroupedAggregationResult intermediary.
+            auto& [singleShardId, sqr] = shardResults[0];
+            timing.perShardQueryMs.push_back({singleShardId, sqr.shardMs});
+
+            for (const auto& partial : sqr.partialResults) {
+                timing.totalPointsRetrieved += partial.totalPoints;
+            }
+            timing.resultCollectionMs = 0.0;
+
+            bool aggregationReducesOutput = request.aggregationInterval > 0 || !request.groupByTags.empty();
+            if (!aggregationReducesOutput) {
+                for (const auto& p : sqr.partialResults) {
+                    if (p.collapsedState.has_value()) {
+                        aggregationReducesOutput = true;
+                        break;
+                    }
+                }
+            }
+            if (!aggregationReducesOutput && timing.totalPointsRetrieved > maxTotalPoints()) {
+                QueryResponse limitResponse;
+                limitResponse.success = false;
+                limitResponse.errorCode = "TOO_MANY_POINTS";
+                limitResponse.errorMessage = "Total points " + std::to_string(timing.totalPointsRetrieved) +
+                                             " exceeds limit of " + std::to_string(maxTotalPoints());
+                limitResponse.statistics.truncated = true;
+                limitResponse.statistics.truncationReason = limitResponse.errorMessage;
+                co_return limitResponse;
+            }
+
+            auto aggregationStart = std::chrono::high_resolution_clock::now();
+            std::unordered_set<std::string> requestedFieldSet(request.fields.begin(), request.fields.end());
+            if (!sqr.partialResults.empty()) {
+                // Check for duplicate groupKeys: non-group-by queries with multiple matching
+                // series produce partials that share the same groupKey. finalizeSingleShardPartials
+                // would overwrite earlier data, so we fall back to the merge path for correctness.
+                bool hasDuplicateGroupKeys = false;
+                if (sqr.partialResults.size() > 1) {
+                    std::unordered_set<std::string_view> seen;
+                    seen.reserve(sqr.partialResults.size());
+                    for (const auto& p : sqr.partialResults) {
+                        if (!seen.insert(p.groupKey).second) {
+                            hasDuplicateGroupKeys = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!hasDuplicateGroupKeys) {
+                    // All groupKeys unique — direct finalization (no merge needed)
+                    finalizeSingleShardPartials(sqr.partialResults, request.aggregation, response);
+                } else {
+                    // Duplicate groupKeys — must merge partials before finalizing
+                    auto groupedResults =
+                        Aggregator::mergePartialAggregationsGrouped(sqr.partialResults, request.aggregation);
+
+                    response.series.reserve(groupedResults.size());
+                    for (auto& groupedResult : groupedResults) {
+                        std::vector<uint64_t> timestamps;
+                        std::vector<double> values;
+                        if (!groupedResult.rawTimestamps.empty()) {
+                            timestamps = std::move(groupedResult.rawTimestamps);
+                            values = std::move(groupedResult.rawValues);
+                        } else {
+                            timestamps.reserve(groupedResult.points.size());
+                            values.reserve(groupedResult.points.size());
+                            for (const auto& point : groupedResult.points) {
+                                timestamps.push_back(point.timestamp);
+                                values.push_back(point.value);
+                            }
+                        }
+
+                        // Each grouped result produces its own series (one field per series)
+                        SeriesResult series;
+                        series.measurement = std::move(groupedResult.measurement);
+                        series.tags = std::move(groupedResult.tags);
+                        std::string fieldName = std::move(groupedResult.fieldName);
+                        series.fields[fieldName] =
+                            std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+
+                        size_t newIdx = response.series.size();
+                        response.series.push_back(std::move(series));
+                    }
+                }
+
+                if (!requestedFieldSet.empty()) {
+                    std::erase_if(response.series, [&](const SeriesResult& s) {
+                        for (const auto& [fn, _] : s.fields) {
+                            if (!requestedFieldSet.contains(fn))
+                                return true;
+                        }
+                        return s.fields.empty();
+                    });
+                }
+            }
+
+            if (!sqr.stringResults.empty()) {
+                if (!requestedFieldSet.empty()) {
+                    for (auto& sr : sqr.stringResults) {
+                        std::erase_if(sr.fields,
+                                      [&](const auto& item) { return !requestedFieldSet.contains(item.first); });
+                    }
+                    std::erase_if(sqr.stringResults, [](const SeriesResult& s) { return s.fields.empty(); });
+                }
+                // Each string/bool result is its own series entry (one field per series)
+                for (auto& strResult : sqr.stringResults) {
+                    response.series.push_back(std::move(strResult));
+                }
+            }
+
+            response.statistics.pointCount = 0;
+            timing.finalPointsReturned = 0;
+            for (const auto& series : response.series) {
+                for (const auto& [fieldName, fieldData] : series.fields) {
+                    size_t points = fieldData.first.size();
+                    response.statistics.pointCount += points;
+                    timing.finalPointsReturned += points;
+                }
+            }
+            if (response.statistics.pointCount > maxTotalPoints()) {
+                response.statistics.truncated = true;
+                response.statistics.truncationReason = "Total points " +
+                                                       std::to_string(response.statistics.pointCount) +
+                                                       " exceeds limit of " + std::to_string(maxTotalPoints());
+                response.success = false;
+                response.errorCode = "TOO_MANY_POINTS";
+                response.errorMessage = response.statistics.truncationReason;
+                co_return response;
+            }
+
+            auto aggregationEnd = std::chrono::high_resolution_clock::now();
+            timing.aggregationMs =
+                std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count();
+        } else {
+        // === MULTI-SHARD GENERAL PATH ===
         // Collect partial aggregations from all shards
         auto mergeStart = std::chrono::high_resolution_clock::now();
 
@@ -711,7 +912,21 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         // Early point-count check: totalPointsRetrieved is an upper bound on
         // the final output (merging can only reduce counts via timestamp dedup).
         // Fail fast before the expensive merge + JSON serialization phase.
-        if (request.aggregationInterval == 0 && timing.totalPointsRetrieved > maxTotalPoints()) {
+        //
+        // Skip when aggregation or group-by is active: the aggregation pipeline
+        // (including pushdown) reduces output far below the raw point count, so
+        // totalPointsRetrieved would be a massive overcount.  The final output
+        // limit is still enforced after aggregation (line ~884).
+        bool aggregationReducesOutput = request.aggregationInterval > 0 || !request.groupByTags.empty();
+        if (!aggregationReducesOutput) {
+            for (const auto& p : allPartialResults) {
+                if (p.collapsedState.has_value()) {
+                    aggregationReducesOutput = true;
+                    break;
+                }
+            }
+        }
+        if (!aggregationReducesOutput && timing.totalPointsRetrieved > maxTotalPoints()) {
             QueryResponse limitResponse;
             limitResponse.success = false;
             limitResponse.errorCode = "TOO_MANY_POINTS";
@@ -728,16 +943,6 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         // Build field filter set once, shared by both numeric and string result paths
         std::unordered_set<std::string> requestedFieldSet(request.fields.begin(), request.fields.end());
 
-        // seriesMergeKeys tracks the merge key for each entry in response.series by index.
-        // Populated by the numeric path so the string-result path can reuse the cached keys
-        // without calling buildMergeKey() a second time for the same series.
-        std::vector<std::string> seriesMergeKeys;
-
-        // seriesKeyToIndex is hoisted here so it spans both the numeric and string result
-        // processing paths. Built once during numeric processing; reused directly by the
-        // string path below — no second construction or map rebuild.
-        std::unordered_map<std::string, size_t> seriesKeyToIndex;
-
         if (!allPartialResults.empty()) {
             LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merging {} partial aggregations from {} shards",
                            allPartialResults.size(), timing.shardsQueried);
@@ -747,19 +952,10 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
             LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results", groupedResults.size());
 
-            // Merge GroupedAggregationResult entries that share the same
-            // measurement+tags into a single SeriesResult with multiple fields.
-            // This is important when a query returns multiple fields for the
-            // same series (e.g., avg:measurement(){} returns value1, value2, value3).
-            // P6: Use unordered_map for O(1) merge key lookup (also used for string results below)
+            // Each grouped result produces its own series (one field per series).
             response.series.reserve(groupedResults.size());
-            seriesMergeKeys.reserve(groupedResults.size());
 
             for (auto& groupedResult : groupedResults) {
-                // P7: Build merge key once per grouped result — reused for both
-                // the index lookup and (if a new series) insertion into seriesKeyToIndex.
-                std::string seriesMergeKey = buildMergeKey(groupedResult.measurement, groupedResult.tags);
-
                 // Build timestamps and values for this field.
                 // Fast path: if the merge returned raw vectors (single-partial
                 // pushdown), move them directly without the AggregatedPoint split.
@@ -777,55 +973,25 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     }
                 }
 
-                auto it = seriesKeyToIndex.find(seriesMergeKey);
-                if (it != seriesKeyToIndex.end()) {
-                    // Merge into existing SeriesResult — key already cached in seriesMergeKeys
-                    response.series[it->second].fields[std::move(groupedResult.fieldName)] =
-                        std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
-                } else {
-                    // Create new SeriesResult — cache key before moving it into the map
-                    SeriesResult series;
-                    series.measurement = std::move(groupedResult.measurement);
-                    series.tags = std::move(groupedResult.tags);
-                    series.fields[std::move(groupedResult.fieldName)] =
-                        std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
+                // Each grouped result produces its own series (one field per series)
+                SeriesResult series;
+                series.measurement = std::move(groupedResult.measurement);
+                series.tags = std::move(groupedResult.tags);
+                series.fields[std::move(groupedResult.fieldName)] =
+                    std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
 
-                    size_t newIdx = response.series.size();
-                    seriesKeyToIndex[seriesMergeKey] = newIdx;
-                    seriesMergeKeys.push_back(std::move(seriesMergeKey));
-                    response.series.push_back(std::move(series));
-                }
+                response.series.push_back(std::move(series));
             }
 
-            // P5: Filter fields using O(1) unordered_set lookup instead of O(n) std::find.
-            // When requestedFieldSet is empty (all fields requested), skip filtering entirely.
-            // When filtering is needed, erase non-matching fields in-place to avoid
-            // building a temporary map and copying/moving entries.
+            // Filter fields: remove series whose single field doesn't match the request.
             if (!requestedFieldSet.empty()) {
-                for (auto& series : response.series) {
-                    std::erase_if(series.fields,
-                                  [&](const auto& item) { return !requestedFieldSet.contains(item.first); });
-                }
-                // Remove series that have no fields after filtering.
-                // Use index-based compaction to keep seriesMergeKeys in sync.
-                size_t writeIdx = 0;
-                for (size_t readIdx = 0; readIdx < response.series.size(); ++readIdx) {
-                    if (!response.series[readIdx].fields.empty()) {
-                        if (writeIdx != readIdx) {
-                            response.series[writeIdx] = std::move(response.series[readIdx]);
-                            seriesMergeKeys[writeIdx] = std::move(seriesMergeKeys[readIdx]);
-                        }
-                        ++writeIdx;
+                std::erase_if(response.series, [&](const SeriesResult& s) {
+                    for (const auto& [fn, _] : s.fields) {
+                        if (!requestedFieldSet.contains(fn))
+                            return true;
                     }
-                }
-                response.series.resize(writeIdx);
-                seriesMergeKeys.resize(writeIdx);
-
-                // Rebuild the index map after removals — reuse cached keys, no buildMergeKey() calls
-                seriesKeyToIndex.clear();
-                for (size_t i = 0; i < seriesMergeKeys.size(); ++i) {
-                    seriesKeyToIndex[seriesMergeKeys[i]] = i;
-                }
+                    return s.fields.empty();
+                });
             }
         }
         // Add string results that bypassed aggregation directly to response
@@ -844,28 +1010,9 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                        allStringResults.end());
             }
 
-            // seriesKeyToIndex is already up-to-date from the numeric path above
-            // (hoisted to outer scope). Reserve additional capacity for string results
-            // and merge directly — no rebuild needed.
-            seriesKeyToIndex.reserve(seriesKeyToIndex.size() + allStringResults.size());
-
-            // Merge string results using O(1) index map lookup.
-            // Compute the merge key once per string result and reuse for both
-            // the lookup and (if a new series) the index insertion.
+            // Each string/bool result is its own series entry (one field per series)
             for (auto& strResult : allStringResults) {
-                std::string seriesMergeKey = buildMergeKey(strResult.measurement, strResult.tags);
-
-                auto it = seriesKeyToIndex.find(seriesMergeKey);
-                if (it != seriesKeyToIndex.end()) {
-                    // Merge string fields into existing series
-                    for (auto& [fieldName, fieldData] : strResult.fields) {
-                        response.series[it->second].fields[fieldName] = std::move(fieldData);
-                    }
-                } else {
-                    // Add as new series and update the index
-                    seriesKeyToIndex[std::move(seriesMergeKey)] = response.series.size();
-                    response.series.push_back(std::move(strResult));
-                }
+                response.series.push_back(std::move(strResult));
             }
         }
 
@@ -893,6 +1040,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
         auto aggregationEnd = std::chrono::high_resolution_clock::now();
         timing.aggregationMs = std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count();
+        } // end multi-shard general path
 
         response.statistics.seriesCount = response.series.size();
 

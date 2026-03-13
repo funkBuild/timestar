@@ -19,6 +19,15 @@ struct SeriesCompactionData {
         seastar::temporary_buffer<uint8_t> data;
         uint64_t minTime;
         uint64_t maxTime;
+        // Block-level stats carried forward from source (0 = unavailable)
+        double blockSum = 0.0;
+        double blockMin = 0.0;
+        double blockMax = 0.0;
+        uint32_t blockCount = 0;
+        double blockM2 = 0.0;
+        double blockFirstValue = 0.0;
+        double blockLatestValue = 0.0;
+        bool hasExtendedStats = false;
     };
     std::vector<CompressedBlock> compressedBlocks;
     bool isZeroCopy = false;

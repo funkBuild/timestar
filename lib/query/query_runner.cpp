@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <queue>
+#include <unordered_set>
 #include <seastar/core/distributed.hh>
 
 typedef std::chrono::high_resolution_clock Clock;
@@ -245,7 +246,11 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
     // Pre-allocate indexed slots to avoid concurrent push_back on a shared vector.
     // Each coroutine writes to its own slot, eliminating the race condition where
     // parallel_for_each coroutines could push_back concurrently after co_await points.
-    const auto& seqFiles = fileManager->getSequencedTsmFiles();
+    // Snapshot the TSM file map so that compaction cannot mutate it
+    // mid-iteration across co_await suspension points.
+    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFiles(
+        fileManager->getSequencedTsmFiles().begin(),
+        fileManager->getSequencedTsmFiles().end());
     std::vector<std::optional<TSMResult<T>>> tsmSlots(seqFiles.size());
 
     // First query TSM files
@@ -503,8 +508,28 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey,
 // Pushdown aggregation
 // ---------------------------------------------------------------------------
 
+// Methods that can be computed via streaming fold (addValue) without
+// materialising all raw values. MEDIAN requires nth_element on the full
+// dataset, LATEST/FIRST have their own fast path.
+static bool isStreamableMethod(timestar::AggregationMethod method) {
+    switch (method) {
+        case timestar::AggregationMethod::AVG:
+        case timestar::AggregationMethod::MIN:
+        case timestar::AggregationMethod::MAX:
+        case timestar::AggregationMethod::SUM:
+        case timestar::AggregationMethod::COUNT:
+        case timestar::AggregationMethod::SPREAD:
+        case timestar::AggregationMethod::STDDEV:
+        case timestar::AggregationMethod::STDVAR:
+            return true;
+        default:
+            return false;
+    }
+}
+
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
-    std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval) {
+    std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
+    timestar::AggregationMethod method) {
     // Gate 0: Skip pushdown entirely if there are no TSM files — all data
     // is in memory stores and the full materialisation path is appropriate.
     if (fileManager->getSequencedTsmFiles().empty()) {
@@ -536,17 +561,131 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         needsFallback = true;
     }
 
+    // Gate 1.5: MEDIAN needs all raw values for nth_element — cannot stream.
+    if (aggregationInterval == 0 && method == timestar::AggregationMethod::MEDIAN) {
+        co_return std::nullopt;
+    }
+
+    const bool isLatest = (method == timestar::AggregationMethod::LATEST);
+    const bool isFirst = (method == timestar::AggregationMethod::FIRST);
+
+    // Fast path for LATEST/FIRST: skip the expensive Gate 2 overlap check.
+    // LATEST/FIRST don't aggregate across blocks (no double-counting risk),
+    // so we can filter files using getSeriesType() (bloom filter + sparse
+    // index, pure in-memory, no I/O) instead of getFullIndexEntry() (DMA read).
+    if (isLatest || isFirst) {
+        // Snapshot the TSM file map so that compaction cannot mutate it
+        // mid-iteration across co_await suspension points.
+        std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
+            fileManager->getSequencedTsmFiles().begin(),
+            fileManager->getSequencedTsmFiles().end());
+
+        // Filter files using in-memory checks only (no I/O).
+        std::vector<seastar::shared_ptr<TSM>> candidateFiles;
+        for (const auto& [rank, tsmFile] : seqFilesSnap) {
+            auto type = tsmFile->getSeriesType(seriesId);
+            if (!type.has_value())
+                continue;
+            // Only float series support pushdown aggregation.
+            if (*type != TSMValueType::Float) {
+                co_return std::nullopt;
+            }
+            candidateFiles.push_back(tsmFile);
+        }
+
+        if (candidateFiles.empty() && !needsFallback) {
+            co_return std::nullopt;
+        }
+
+        // Sort by seqNum: monotonically increasing proxy for data recency.
+        // LATEST: newest first (descending seqNum).
+        // FIRST: oldest first (ascending seqNum).
+        const bool reverse = isLatest;
+        if (reverse) {
+            std::sort(candidateFiles.begin(), candidateFiles.end(),
+                      [](const seastar::shared_ptr<TSM>& a, const seastar::shared_ptr<TSM>& b) {
+                          return a->seqNum > b->seqNum;
+                      });
+        } else {
+            std::sort(candidateFiles.begin(), candidateFiles.end(),
+                      [](const seastar::shared_ptr<TSM>& a, const seastar::shared_ptr<TSM>& b) {
+                          return a->seqNum < b->seqNum;
+                      });
+        }
+
+        timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime);
+
+        if (aggregationInterval == 0) {
+            // Non-bucketed: need only 1 point total from TSM.
+            for (auto& file : candidateFiles) {
+                size_t pts = co_await file->aggregateSeriesSelective(
+                    seriesId, startTime, tsmEndTime, aggregator, reverse, 1);
+                if (pts > 0) {
+                    break;  // Got our point
+                }
+            }
+        } else {
+            // Bucketed: iterate files in preferred order, share filledBuckets
+            // across files for cross-file early termination.
+            uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
+            uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
+            size_t totalBuckets = static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1);
+            std::unordered_set<uint64_t> filledBuckets;
+            filledBuckets.reserve(totalBuckets);
+
+            for (auto& file : candidateFiles) {
+                if (filledBuckets.size() >= totalBuckets) {
+                    break;
+                }
+                co_await file->aggregateSeriesBucketed(
+                    seriesId, startTime, tsmEndTime, aggregator, reverse, aggregationInterval, filledBuckets,
+                    totalBuckets);
+            }
+        }
+
+        // Fallback: query the overlap range [memMinTime, endTime] via the full
+        // materialisation path (queryTsm handles TSM+memory dedup) and fold
+        // the resulting points into the same BlockAggregator.
+        if (needsFallback) {
+            QueryResult<double> fallbackResult =
+                co_await queryTsm<double>(seriesKey, seriesId, fallbackStartTime, endTime);
+            if (!fallbackResult.timestamps.empty()) {
+                aggregator.addPoints(fallbackResult.timestamps, fallbackResult.values);
+            }
+        }
+
+        timestar::PushdownResult result;
+        result.totalPoints = aggregator.pointCount();
+        if (aggregationInterval > 0) {
+            result.bucketStates = aggregator.takeBucketStates();
+        } else {
+            aggregator.sortTimestamps();
+            result.sortedTimestamps = aggregator.takeTimestamps();
+            result.sortedValues = aggregator.takeValues();
+        }
+
+        co_return result;
+    }
+
     // Gate 2: Collect index-block time ranges from every TSM file for this
     // series and verify that no blocks overlap across files within the
     // TSM-only range [startTime, tsmEndTime].  Overlapping blocks would
     // cause double-counting in SUM/AVG/COUNT.
     struct FileRef {
         seastar::shared_ptr<TSM> file;
+        uint64_t maxBlockTime = 0;  // Latest block maxTime for this series in this file
+        uint64_t minBlockTime = std::numeric_limits<uint64_t>::max();  // Earliest block minTime
     };
     std::vector<FileRef> filesWithData;
     std::vector<std::pair<uint64_t, uint64_t>> allBlockRanges;
 
-    for (const auto& [rank, tsmFile] : fileManager->getSequencedTsmFiles()) {
+    // Snapshot the TSM file map so that compaction cannot mutate it
+    // mid-iteration across co_await suspension points.
+    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
+        fileManager->getSequencedTsmFiles().begin(),
+        fileManager->getSequencedTsmFiles().end());
+
+    for (const auto& [rank, tsmFile] : seqFilesSnap) {
         auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);
         if (!indexEntry)
             continue;
@@ -556,15 +695,16 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             co_return std::nullopt;
         }
 
-        bool hasBlocks = false;
+        FileRef ref{tsmFile};
         for (const auto& block : indexEntry->indexBlocks) {
             if (block.minTime <= tsmEndTime && startTime <= block.maxTime) {
                 allBlockRanges.push_back({block.minTime, block.maxTime});
-                hasBlocks = true;
+                ref.maxBlockTime = std::max(ref.maxBlockTime, block.maxTime);
+                ref.minBlockTime = std::min(ref.minBlockTime, block.minTime);
             }
         }
-        if (hasBlocks) {
-            filesWithData.push_back({tsmFile});
+        if (ref.maxBlockTime > 0) {
+            filesWithData.push_back(std::move(ref));
         }
     }
 
@@ -585,8 +725,13 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
     // Gate checks passed — perform pushdown aggregation on TSM-only range.
     // Pass startTime/tsmEndTime so the constructor can pre-reserve the bucket map.
-    timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime);
+    const bool canFold = (aggregationInterval == 0) && isStreamableMethod(method);
+    timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime, method, true);
+    if (canFold) {
+        aggregator.setFoldToSingleState(false);  // no collectRaw needed for streaming methods
+    }
 
+    // Default path: all aggregation methods other than LATEST/FIRST — read all blocks.
     for (auto& ref : filesWithData) {
         co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator);
     }
@@ -605,6 +750,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     result.totalPoints = aggregator.pointCount();
     if (aggregationInterval > 0) {
         result.bucketStates = aggregator.takeBucketStates();
+    } else if (canFold) {
+        result.aggregatedState = aggregator.takeSingleState();
     } else {
         // Non-bucketed: ensure per-timestamp data is sorted (batches may
         // complete in non-deterministic order via parallel_for_each).

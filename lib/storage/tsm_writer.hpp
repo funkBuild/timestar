@@ -55,6 +55,10 @@ public:
     // Phase 2: Write compressed block bytes directly (zero-copy transfer)
     void writeCompressedBlock(TSMValueType seriesType, const SeriesId128& seriesId,
                               seastar::temporary_buffer<uint8_t>&& compressedData, uint64_t minTime, uint64_t maxTime);
+    // Write compressed block carrying forward block stats from source file
+    void writeCompressedBlockWithStats(TSMValueType seriesType, const SeriesId128& seriesId,
+                                       seastar::temporary_buffer<uint8_t>&& compressedData,
+                                       const TSMIndexBlock& srcBlock);
 
     void writeIndex();
 
@@ -62,6 +66,8 @@ public:
     void writeIndexParallel();
 
     void writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEntry& indexEntry, size_t blockStartOffset);
+    void writeIndexBlock(std::span<const uint64_t> timestamps, std::span<const double> values,
+                         TSMIndexEntry& indexEntry, size_t blockStartOffset);
 
     // Blocking close using POSIX I/O (for use in tests or seastar::async contexts)
     void close();

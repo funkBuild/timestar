@@ -119,20 +119,13 @@ TEST(TSMDeletionTest, ScheduleDeleteMethodExists) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. scheduleDelete closes file and calls remove_file
+// 9. scheduleDelete unlinks file (deferred close — fd stays open for readers)
 // ---------------------------------------------------------------------------
-TEST(TSMDeletionTest, ScheduleDeleteClosesAndRemovesFile) {
-    // Read the .cpp that implements scheduleDelete()
-    // TSM_COMPACTOR_SOURCE_PATH points to tsm_compactor.cpp, but scheduleDelete
-    // is in tsm.cpp.  We can use TSM_FILE_MANAGER_CPP_SOURCE_PATH's directory to
-    // derive the tsm.cpp path, but simpler: the compile definition for
-    // TSM_HPP_SOURCE_PATH is ".../tsm.hpp".  scheduleDelete is declared there
-    // and implemented in tsm.cpp which sits next to it.  We just need to find
-    // "remove_file" and "close" in the implementation.  Since
-    // TSM_FILE_MANAGER_CPP_SOURCE_PATH also lives in the same directory, we can
-    // derive the path.  But we already verified the header declares it.
-    // For the implementation, check the compactor source which is in the same dir.
-    // Actually, we can construct the path from TSM_HPP_SOURCE_PATH.
+TEST(TSMDeletionTest, ScheduleDeleteUnlinksFile) {
+    // scheduleDelete must call remove_file (unlink) but must NOT explicitly
+    // close the file handle — concurrent readers may still hold shared_ptr<TSM>
+    // references with in-flight DMA reads.  The fd is closed naturally when
+    // the last shared_ptr<TSM> drops and ~seastar::file runs.
     std::string hppPath(TSM_HPP_SOURCE_PATH);
     std::string cppPath = hppPath.substr(0, hppPath.size() - 3) + "cpp"; // .hpp -> .cpp
 
@@ -140,10 +133,33 @@ TEST(TSMDeletionTest, ScheduleDeleteClosesAndRemovesFile) {
     ASSERT_FALSE(src.empty()) << "Could not read tsm.cpp at: " << cppPath;
 
     EXPECT_NE(src.find("remove_file"), std::string::npos)
-        << "scheduleDelete should call seastar::remove_file to delete the physical file";
+        << "scheduleDelete should call seastar::remove_file to unlink the physical file";
 
-    EXPECT_NE(src.find("close"), std::string::npos)
-        << "scheduleDelete should close the file before deleting it";
+    // Extract the scheduleDelete function body and verify it does NOT call close()
+    auto funcStart = src.find("TSM::scheduleDelete()");
+    ASSERT_NE(funcStart, std::string::npos) << "scheduleDelete function not found in tsm.cpp";
+
+    // Find the end of the function (next function or end of file)
+    // Look for the closing brace pattern of the function
+    auto bodyStart = src.find('{', funcStart);
+    ASSERT_NE(bodyStart, std::string::npos);
+
+    // Simple brace-matching to find function end
+    int depth = 0;
+    size_t funcEnd = bodyStart;
+    for (size_t i = bodyStart; i < src.size(); ++i) {
+        if (src[i] == '{') ++depth;
+        else if (src[i] == '}') {
+            --depth;
+            if (depth == 0) { funcEnd = i; break; }
+        }
+    }
+
+    std::string funcBody = src.substr(bodyStart, funcEnd - bodyStart + 1);
+
+    // The function should NOT contain tsmFile.close() — deferred close pattern
+    EXPECT_EQ(funcBody.find("tsmFile.close()"), std::string::npos)
+        << "scheduleDelete must NOT explicitly close the file handle (deferred close pattern)";
 }
 
 // ---------------------------------------------------------------------------
@@ -155,4 +171,77 @@ TEST(TSMDeletionTest, RemoveTSMFilesDeletesTombstones) {
 
     EXPECT_NE(src.find("deleteTombstoneFile"), std::string::npos)
         << "removeTSMFiles should delete associated tombstone files";
+}
+
+// ---------------------------------------------------------------------------
+// 11. Deferred-close: query paths snapshot the TSM file map
+// ---------------------------------------------------------------------------
+TEST(TSMDeletionTest, QueryPathsSnapshotTsmFileMap) {
+    // queryTsm and queryTsmAggregated must copy the file map into a local
+    // vector before iterating, so that compaction removing files mid-query
+    // does not invalidate iterators.
+    std::string hppPath(TSM_HPP_SOURCE_PATH);
+    std::string dir = hppPath.substr(0, hppPath.rfind('/'));
+    // query_runner.cpp lives under lib/query — go up from lib/storage
+    std::string qrDir = dir.substr(0, dir.rfind('/')) + "/query";
+    std::string qrPath = qrDir + "/query_runner.cpp";
+
+    std::string src = readSourceFile(qrPath.c_str());
+    ASSERT_FALSE(src.empty()) << "Could not read query_runner.cpp at: " << qrPath;
+
+    // The snapshot pattern creates a local vector from the map's begin/end
+    // instead of taking a const& to the live map.
+    auto countOccurrences = [](const std::string& hay, const std::string& needle) {
+        size_t count = 0;
+        size_t pos = 0;
+        while ((pos = hay.find(needle, pos)) != std::string::npos) {
+            ++count;
+            pos += needle.size();
+        }
+        return count;
+    };
+
+    // queryTsm used to take a const& — verify it no longer does
+    EXPECT_EQ(src.find("const auto& seqFiles = fileManager->getSequencedTsmFiles()"), std::string::npos)
+        << "queryTsm should snapshot the TSM file map, not take a const reference";
+
+    // There should be at least two snapshot vectors (queryTsm + queryTsmAggregated)
+    EXPECT_GE(countOccurrences(src, "getSequencedTsmFiles().begin()"), 2u)
+        << "Both queryTsm and queryTsmAggregated should snapshot the TSM file map";
+}
+
+// ---------------------------------------------------------------------------
+// 12. Deferred-close: prefetchSeriesIndices snapshots the file map
+// ---------------------------------------------------------------------------
+TEST(TSMDeletionTest, PrefetchSnapshotsTsmFileMap) {
+    std::string hppPath(TSM_HPP_SOURCE_PATH);
+    std::string dir = hppPath.substr(0, hppPath.rfind('/'));
+    // engine.cpp lives under lib/core
+    std::string engineDir = dir.substr(0, dir.rfind('/')) + "/core";
+    std::string enginePath = engineDir + "/engine.cpp";
+
+    std::string src = readSourceFile(enginePath.c_str());
+    ASSERT_FALSE(src.empty()) << "Could not read engine.cpp at: " << enginePath;
+
+    // Find the prefetchSeriesIndices function
+    auto funcStart = src.find("Engine::prefetchSeriesIndices");
+    ASSERT_NE(funcStart, std::string::npos) << "prefetchSeriesIndices not found in engine.cpp";
+
+    // Extract function body
+    auto bodyStart = src.find('{', funcStart);
+    ASSERT_NE(bodyStart, std::string::npos);
+    int depth = 0;
+    size_t funcEnd = bodyStart;
+    for (size_t i = bodyStart; i < src.size(); ++i) {
+        if (src[i] == '{') ++depth;
+        else if (src[i] == '}') {
+            --depth;
+            if (depth == 0) { funcEnd = i; break; }
+        }
+    }
+    std::string funcBody = src.substr(bodyStart, funcEnd - bodyStart + 1);
+
+    // Should create a snapshot vector, not iterate the map directly
+    EXPECT_NE(funcBody.find("tsmSnapshot"), std::string::npos)
+        << "prefetchSeriesIndices should use a snapshot vector of TSM file pointers";
 }

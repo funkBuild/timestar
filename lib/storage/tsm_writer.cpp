@@ -34,7 +34,7 @@ TSMWriter::TSMWriter(std::string _filename) {
 void TSMWriter::writeHeader() {
     std::string magic("TASM");
     buffer.write(magic);
-    buffer.write((uint8_t)1);  // Version number
+    buffer.write(TSM_VERSION_EXTENDED_STATS);  // Version 3: includes extended block statistics
 }
 
 template <class T>
@@ -123,7 +123,12 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         static_assert(sizeof(T) == 0, "Unsupported TSM value type");
     }
 
-    writeIndexBlock(timestamps, indexEntry, blockStartOffset);
+    // For Float series, pass values to compute block-level stats
+    if constexpr (std::is_same_v<T, double>) {
+        writeIndexBlock(timestamps, values, indexEntry, blockStartOffset);
+    } else {
+        writeIndexBlock(timestamps, indexEntry, blockStartOffset);
+    }
 }
 
 // Phase 3.2: Move semantics version for zero-copy writes from batch pool
@@ -195,7 +200,11 @@ void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128& ser
     }
 
     // Write index block (timestamps still valid as lvalue)
-    writeIndexBlock(timestamps, indexEntry, blockStartOffset);
+    if constexpr (std::is_same_v<T, double>) {
+        writeIndexBlock(timestamps, values, indexEntry, blockStartOffset);
+    } else {
+        writeIndexBlock(timestamps, indexEntry, blockStartOffset);
+    }
 }
 
 void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEntry& indexEntry,
@@ -217,6 +226,58 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     indexBlock.maxTime = *maxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
+
+    indexEntry.indexBlocks.push_back(std::move(indexBlock));
+}
+
+void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<const double> values,
+                                TSMIndexEntry& indexEntry, size_t blockStartOffset) {
+    if (timestamps.empty()) {
+        return;
+    }
+    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    size_t blockSize = buffer.size() - blockStartOffset;
+
+    if (blockSize > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("TSM block size " + std::to_string(blockSize) + " exceeds uint32_t maximum (" +
+                                  std::to_string(std::numeric_limits<uint32_t>::max()) +
+                                  "); block would be truncated in the index");
+    }
+
+    TSMIndexBlock indexBlock;
+    indexBlock.minTime = *minTime;
+    indexBlock.maxTime = *maxTime;
+    indexBlock.offset = blockStartOffset;
+    indexBlock.size = static_cast<uint32_t>(blockSize);
+
+    // Compute block-level statistics for Float series
+    double sum = 0.0;
+    double bmin = std::numeric_limits<double>::max();
+    double bmax = std::numeric_limits<double>::lowest();
+    double m2 = 0.0;
+    double mean = 0.0;
+    for (size_t i = 0; i < values.size(); ++i) {
+        double v = values[i];
+        sum += v;
+        if (v < bmin) bmin = v;
+        if (v > bmax) bmax = v;
+        // Welford's online algorithm for M2
+        double delta = v - mean;
+        mean += delta / static_cast<double>(i + 1);
+        double delta2 = v - mean;
+        m2 += delta * delta2;
+    }
+    indexBlock.blockSum = sum;
+    indexBlock.blockMin = bmin;
+    indexBlock.blockMax = bmax;
+    indexBlock.blockCount = static_cast<uint32_t>(values.size());
+    indexBlock.blockM2 = m2;
+    // firstValue/latestValue: values at min/max timestamp positions
+    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
+    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    indexBlock.blockFirstValue = values[firstIdx];
+    indexBlock.blockLatestValue = values[latestIdx];
+    indexBlock.hasExtendedStats = true;
 
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
@@ -256,6 +317,40 @@ void TSMWriter::writeCompressedBlock(TSMValueType seriesType, const SeriesId128&
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
 
+void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const SeriesId128& seriesId,
+                                               seastar::temporary_buffer<uint8_t>&& compressedData,
+                                               const TSMIndexBlock& srcBlock) {
+    size_t blockStartOffset = buffer.size();
+    buffer.write_bytes(reinterpret_cast<const char*>(compressedData.get()), compressedData.size());
+
+    auto& indexEntry = indexEntries[seriesId];
+    if (indexEntry.seriesId != seriesId) {
+        indexEntry.seriesId = seriesId;
+        indexEntry.seriesType = seriesType;
+    }
+
+    if (compressedData.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("TSM compressed block size exceeds uint32_t maximum");
+    }
+
+    TSMIndexBlock indexBlock;
+    indexBlock.minTime = srcBlock.minTime;
+    indexBlock.maxTime = srcBlock.maxTime;
+    indexBlock.offset = blockStartOffset;
+    indexBlock.size = static_cast<uint32_t>(compressedData.size());
+    // Carry forward block stats from source file
+    indexBlock.blockSum = srcBlock.blockSum;
+    indexBlock.blockMin = srcBlock.blockMin;
+    indexBlock.blockMax = srcBlock.blockMax;
+    indexBlock.blockCount = srcBlock.blockCount;
+    indexBlock.blockM2 = srcBlock.blockM2;
+    indexBlock.blockFirstValue = srcBlock.blockFirstValue;
+    indexBlock.blockLatestValue = srcBlock.blockLatestValue;
+    indexBlock.hasExtendedStats = srcBlock.hasExtendedStats;
+
+    indexEntry.indexBlocks.push_back(std::move(indexBlock));
+}
+
 void TSMWriter::writeIndex() {
     // std::map maintains sorted order automatically
     size_t indexStartOffset = buffer.size();
@@ -284,6 +379,17 @@ void TSMWriter::writeIndex() {
             buffer.write(block.maxTime);  // maxTime
             buffer.write(block.offset);   // byte offset from start of file
             buffer.write(block.size);     // block size
+            // v2+: block-level statistics for Float series
+            if (indexEntry.seriesType == TSMValueType::Float) {
+                buffer.write(block.blockSum);
+                buffer.write(block.blockMin);
+                buffer.write(block.blockMax);
+                buffer.write(block.blockCount);
+                // v3: extended statistics
+                buffer.write(block.blockM2);
+                buffer.write(block.blockFirstValue);
+                buffer.write(block.blockLatestValue);
+            }
         }
     }
 

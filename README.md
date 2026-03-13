@@ -205,12 +205,15 @@ cd test_api && npm install && npm test
 
 ## Performance
 
-Benchmarked on a 4-core system with 8 connections per shard:
+Benchmarked against InfluxDB 2.7 with 100M points (10 fields, 10K batch size, 8 client threads):
 
-- **Write throughput:** 11.8M points/sec (100M points, 10 fields, 10K batch size)
-- **Median write latency:** 74ms
-- **P99 write latency:** 405ms
-- **Compression:** ~44% improvement with ALP over baseline XOR for floats
+| Cores | Insert (pts/sec) | vs InfluxDB | Query (total ms) | vs InfluxDB |
+|------:|------------------:|------------:|------------------:|------------:|
+| 1 | 21.49M | **24.0x** | 1,788 | **3.3x** |
+| 4 | 33.46M | **10.0x** | 735 | **6.1x** |
+| 12 | 35.09M | **6.6x** | 512 | **8.0x** |
+
+Full results, methodology, and reproduction instructions: **[BENCHMARKS.md](BENCHMARKS.md)**
 
 ## License
 

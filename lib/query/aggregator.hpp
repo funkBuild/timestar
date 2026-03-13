@@ -109,6 +109,63 @@ struct AggregationState {
         }
     }
 
+    // Method-aware fast path: skips branches not needed for the given method.
+    // Use from pushdown aggregation where the method is known at call time.
+    void addValueForMethod(double value, uint64_t timestamp, AggregationMethod method) {
+        if (std::isnan(value)) [[unlikely]]
+            return;
+        switch (method) {
+            case AggregationMethod::AVG:
+            case AggregationMethod::SUM:
+                sum += value;
+                count++;
+                break;
+            case AggregationMethod::COUNT:
+                count++;
+                break;
+            case AggregationMethod::MIN:
+                min = std::min(min, value);
+                count++;
+                break;
+            case AggregationMethod::MAX:
+                max = std::max(max, value);
+                count++;
+                break;
+            case AggregationMethod::SPREAD:
+                min = std::min(min, value);
+                max = std::max(max, value);
+                count++;
+                break;
+            case AggregationMethod::LATEST:
+                if (timestamp >= latestTimestamp) {
+                    latest = value;
+                    latestTimestamp = timestamp;
+                }
+                count++;
+                break;
+            case AggregationMethod::FIRST:
+                if (timestamp <= firstTimestamp) {
+                    first = value;
+                    firstTimestamp = timestamp;
+                }
+                count++;
+                break;
+            case AggregationMethod::STDDEV:
+            case AggregationMethod::STDVAR: {
+                sum += value;
+                double oldMean = (count > 0) ? (sum - value) / count : 0.0;
+                count++;
+                double newMean = sum / count;
+                m2 += (value - oldMean) * (value - newMean);
+                break;
+            }
+            default:
+                // MEDIAN and unknown methods fall back to full addValue
+                addValue(value, timestamp);
+                break;
+        }
+    }
+
     // Merge another state into this one (commutative & associative)
     void merge(const AggregationState& other) {
         // Parallel Welford merge: combine M2 accumulators from two partitions
@@ -242,6 +299,10 @@ struct PartialAggregationResult {
     std::vector<uint64_t> sortedTimestamps;
     std::vector<AggregationState> sortedStates;
     std::vector<double> sortedValues;  // raw values from pushdown (compact path)
+
+    // For non-bucketed streaming pushdown (interval == 0, streamable method):
+    // a single pre-folded AggregationState covering the entire time range.
+    std::optional<AggregationState> collapsedState;
 
     // Statistics
     size_t totalPoints = 0;

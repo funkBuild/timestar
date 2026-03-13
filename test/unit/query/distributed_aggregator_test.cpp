@@ -196,6 +196,10 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithGroupBy) {
     EXPECT_EQ(parsedTags.size(), 1);
     EXPECT_EQ(parsedTags["region"], "us-west");
     EXPECT_EQ(partials[0].totalPoints, 6); // 3 points from each series
+
+    // cachedTags should be populated by buildGroupKeyDirect()
+    EXPECT_EQ(partials[0].cachedTags.size(), 1);
+    EXPECT_EQ(partials[0].cachedTags["region"], "us-west");
 }
 
 TEST_F(DistributedAggregatorTest, CreatePartialAggregationsMultipleFields) {

@@ -545,7 +545,35 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         if (existing.valueType == valueType && existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
             return existing;
         }
-        // Type mismatch or size overflow: create a disambiguated candidate
+        // Integer/Float promotion: JSON serializers (e.g. JavaScript) encode
+        // exact-integer doubles like 1.0 as "1" (no decimal point), which
+        // generic_u64 parses as int64_t. Promote the candidate to Float so
+        // all numeric values for the same field are stored in one series.
+        if (existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
+            if (existing.valueType == TSMValueType::Integer && valueType == TSMValueType::Float) {
+                // Promote existing integer candidate to float
+                existing.doubleValues.reserve(existing.integerValues.size() + numValuesToAdd);
+                for (int64_t v : existing.integerValues) {
+                    existing.doubleValues.push_back(static_cast<double>(v));
+                }
+                existing.integerValues.clear();
+                existing.integerValues.shrink_to_fit();
+                existing.valueType = TSMValueType::Float;
+                return existing;
+            }
+            if (existing.valueType == TSMValueType::Float && valueType == TSMValueType::Integer) {
+                // Existing is already float; caller will add value as double via addScalarToCandidate
+                // after we return with the promoted type. We just need to signal
+                // the caller to treat the incoming integer as a float.
+                // Since we return the existing Float candidate, the caller's
+                // valueType variable won't match, but the caller uses the
+                // candidate's valueType for storage. Let's handle this by
+                // returning the existing candidate directly — the caller
+                // must cast the integer to double before adding.
+                return existing;
+            }
+        }
+        // Non-numeric type mismatch or size overflow: create a disambiguated candidate
         size_t suffix = 1;
         static constexpr size_t MAX_DISAMBIGUATE = 10000;
         std::string altKey;
@@ -772,7 +800,9 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
                     CoalesceCandidate& candidate = findOrCreateCandidate(seriesKey, measurement, sharedTags, fieldName,
                                                                          valueType, 1, seriesKeyPrefix);
-                    addScalarToCandidate(candidate, valueType, timestamps[0], fieldValue);
+                    // Use candidate.valueType: findOrCreateCandidate may have promoted
+                    // Integer→Float when mixing JSON integers (e.g. "1") with floats (e.g. "1.1")
+                    addScalarToCandidate(candidate, candidate.valueType, timestamps[0], fieldValue);
                 }
             }
         } catch (const std::exception& e) {

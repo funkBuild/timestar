@@ -1,5 +1,6 @@
 #include "aggregator.hpp"
 
+#include "group_key.hpp"
 #include "http_query_handler.hpp"  // For SeriesResult
 #include "simd_aggregator.hpp"
 
@@ -277,41 +278,22 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
 
             const auto& doubleValues = *doubleValuesPtr;
 
-            // Extract only the groupByTags (tags map is already sorted)
-            std::map<std::string, std::string> relevantTags;
-            if (!groupByTags.empty()) {
-                for (const auto& tagName : groupByTags) {
-                    auto it = series.tags.find(tagName);
-                    if (it != series.tags.end()) {
-                        relevantTags[tagName] = it->second;
-                    }
-                }
-            }
-
-            // Build composite group key: measurement + sorted tag k=v pairs + fieldName
-            // separated by '\0' delimiter to guarantee uniqueness (no hash collisions)
-            std::string compositeKey;
-            compositeKey += series.measurement;
-            for (const auto& [k, v] : relevantTags) {
-                compositeKey += '\0';
-                compositeKey += k;
-                compositeKey += '=';
-                compositeKey += v;
-            }
-            compositeKey += '\0';
-            compositeKey += fieldName;
+            // Build composite group key directly from allTags + groupByTags,
+            // avoiding intermediate std::map allocation for relevantTags
+            auto gkr = timestar::buildGroupKeyDirect(series.measurement, fieldName,
+                                                      series.tags, groupByTags);
 
             // Hash once via PrehashedString; try_emplace avoids rehashing on lookup
-            PrehashedString pkey(std::move(compositeKey));
-            const size_t keyHash = pkey.hash;
+            PrehashedString pkey(std::move(gkr.key), gkr.hash);
+            const size_t keyHash = gkr.hash;
             auto [it, inserted] = partialResults.try_emplace(std::move(pkey), PartialAggregationResult{});
             auto& partial = it->second;
             if (inserted) {
                 partial.measurement = series.measurement;
                 partial.fieldName = fieldName;
-                partial.groupKey = it->first.value;  // Read from the emplaced key
-                partial.groupKeyHash = keyHash;      // Reuse pre-computed hash
-                partial.cachedTags = relevantTags;   // Cache parsed tags once
+                partial.groupKey = it->first.value;     // Read from the emplaced key
+                partial.groupKeyHash = keyHash;          // Reuse pre-computed hash
+                partial.cachedTags = std::move(gkr.tags);  // Cache parsed tags once
                 // Pre-reserve bucket map: at most one bucket per unique timestamp,
                 // so timestamps.size() is a safe upper bound that prevents rehashing
                 // for the typical case where this is the only series in the group.
@@ -455,92 +437,122 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                       [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
 
         } else {
-            // Non-bucketed merge. Check if all partials carry compact raw
-            // values (from pushdown) — if so, merge without constructing
-            // any AggregationState objects (~6x less memory per point).
-            bool allRaw = true;
+            // Non-bucketed merge. First check if all partials carry collapsed
+            // states (streaming pushdown) — if so, merge O(K) states directly.
+            bool allCollapsed = true;
             for (const auto* p : groupPartials) {
-                if (p->sortedValues.empty() && !p->sortedTimestamps.empty()) {
-                    allRaw = false;
+                if (!p->collapsedState.has_value()) {
+                    allCollapsed = false;
                     break;
                 }
             }
 
-            if (allRaw && !groupPartials.empty()) {
-                // Fast path: merge raw (timestamp, value) vectors directly.
-                auto* first = groupPartials[0];
+            if (allCollapsed && !groupPartials.empty()) {
+                // Fast path: merge collapsed AggregationStates directly.
+                AggregationState merged;
+                for (const auto* p : groupPartials) {
+                    merged.merge(*p->collapsedState);
+                }
+                if (merged.count > 0) {
+                    groupedResult.points.push_back({merged.firstTimestamp, merged.getValue(method), merged.count});
+                }
+            } else {
+                // Not all collapsed: convert any collapsed partials to
+                // single-element sortedStates so the existing merge works.
+                for (auto* p : groupPartials) {
+                    if (p->collapsedState.has_value() && p->sortedValues.empty() && p->sortedStates.empty()) {
+                        auto& s = *p->collapsedState;
+                        if (s.count > 0) {
+                            p->sortedTimestamps.push_back(s.firstTimestamp);
+                            p->sortedStates.push_back(std::move(s));
+                        }
+                        p->collapsedState.reset();
+                    }
+                }
 
-                if (groupPartials.size() == 1) {
-                    // Single partial — zero-copy move, no merge needed.
-                    // Move raw vectors directly to avoid creating N
-                    // AggregatedPoint structs that the query handler would
-                    // immediately split back into timestamp/value vectors.
-                    if (method == AggregationMethod::COUNT) {
-                        // COUNT needs to return 1.0 per point; can't use raw values
-                        auto& ts = first->sortedTimestamps;
-                        groupedResult.points.reserve(ts.size());
-                        for (size_t i = 0; i < ts.size(); ++i) {
-                            groupedResult.points.push_back({ts[i], 1.0, 1});
+                // Check if all partials carry compact raw values (from pushdown)
+                // — if so, merge without constructing any AggregationState objects.
+                bool allRaw = true;
+                for (const auto* p : groupPartials) {
+                    if (p->sortedValues.empty() && !p->sortedTimestamps.empty()) {
+                        allRaw = false;
+                        break;
+                    }
+                }
+
+                if (allRaw && !groupPartials.empty()) {
+                    // Fast path: merge raw (timestamp, value) vectors directly.
+                    auto* first = groupPartials[0];
+
+                    if (groupPartials.size() == 1) {
+                        // Single partial — zero-copy move, no merge needed.
+                        if (method == AggregationMethod::COUNT) {
+                            auto& ts = first->sortedTimestamps;
+                            groupedResult.points.reserve(ts.size());
+                            for (size_t i = 0; i < ts.size(); ++i) {
+                                groupedResult.points.push_back({ts[i], 1.0, 1});
+                            }
+                        } else {
+                            groupedResult.rawTimestamps = std::move(first->sortedTimestamps);
+                            groupedResult.rawValues = std::move(first->sortedValues);
                         }
                     } else {
-                        groupedResult.rawTimestamps = std::move(first->sortedTimestamps);
-                        groupedResult.rawValues = std::move(first->sortedValues);
+                        // Multiple partials with raw values — sorted merge.
+                        std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
+                        std::vector<double> mergedVals = std::move(first->sortedValues);
+                        std::vector<size_t> mergedCounts(mergedTs.size(), 1);
+
+                        for (size_t i = 1; i < groupPartials.size(); ++i) {
+                            mergeSortedRawValuesInto(mergedTs, mergedVals, mergedCounts,
+                                                     groupPartials[i]->sortedTimestamps,
+                                                     groupPartials[i]->sortedValues, method);
+                        }
+
+                        groupedResult.points.reserve(mergedTs.size());
+                        for (size_t i = 0; i < mergedTs.size(); ++i) {
+                            double finalValue = mergedVals[i];
+                            if (method == AggregationMethod::AVG && mergedCounts[i] > 1) {
+                                finalValue /= mergedCounts[i];
+                            } else if (method == AggregationMethod::COUNT) {
+                                finalValue = static_cast<double>(mergedCounts[i]);
+                            }
+                            groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
+                        }
                     }
                 } else {
-                    // Multiple partials with raw values — sorted merge.
+                    // Fallback: some partials have AggregationStates (from the
+                    // createPartialAggregations path). Convert any raw-value
+                    // partials to states, then merge normally.
+                    for (auto* p : groupPartials) {
+                        if (!p->sortedValues.empty() && p->sortedStates.empty()) {
+                            p->sortedStates.reserve(p->sortedTimestamps.size());
+                            for (size_t i = 0; i < p->sortedTimestamps.size(); ++i) {
+                                AggregationState s;
+                                s.addValue(p->sortedValues[i], p->sortedTimestamps[i]);
+                                p->sortedStates.push_back(s);
+                            }
+                            p->sortedValues.clear();
+                            p->sortedValues.shrink_to_fit();
+                        }
+                    }
+
+                    auto* first = groupPartials[0];
                     std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
-                    std::vector<double> mergedVals = std::move(first->sortedValues);
-                    std::vector<size_t> mergedCounts(mergedTs.size(), 1);
+                    std::vector<AggregationState> mergedStates = std::move(first->sortedStates);
 
                     for (size_t i = 1; i < groupPartials.size(); ++i) {
-                        mergeSortedRawValuesInto(mergedTs, mergedVals, mergedCounts, groupPartials[i]->sortedTimestamps,
-                                                 groupPartials[i]->sortedValues, method);
+                        mergeSortedStatesInto(mergedTs, mergedStates, groupPartials[i]->sortedTimestamps,
+                                              groupPartials[i]->sortedStates);
                     }
 
                     groupedResult.points.reserve(mergedTs.size());
                     for (size_t i = 0; i < mergedTs.size(); ++i) {
-                        double finalValue = mergedVals[i];
-                        if (method == AggregationMethod::AVG && mergedCounts[i] > 1) {
-                            finalValue /= mergedCounts[i];
-                        } else if (method == AggregationMethod::COUNT) {
-                            finalValue = static_cast<double>(mergedCounts[i]);
-                        }
-                        groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
+                        AggregatedPoint point;
+                        point.timestamp = mergedTs[i];
+                        point.count = mergedStates[i].count;
+                        point.value = mergedStates[i].getValue(method);
+                        groupedResult.points.push_back(point);
                     }
-                }
-            } else {
-                // Fallback: some partials have AggregationStates (from the
-                // createPartialAggregations path). Convert any raw-value
-                // partials to states, then merge normally.
-                for (auto* p : groupPartials) {
-                    if (!p->sortedValues.empty() && p->sortedStates.empty()) {
-                        p->sortedStates.reserve(p->sortedTimestamps.size());
-                        for (size_t i = 0; i < p->sortedTimestamps.size(); ++i) {
-                            AggregationState s;
-                            s.addValue(p->sortedValues[i], p->sortedTimestamps[i]);
-                            p->sortedStates.push_back(s);
-                        }
-                        p->sortedValues.clear();
-                        p->sortedValues.shrink_to_fit();
-                    }
-                }
-
-                auto* first = groupPartials[0];
-                std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
-                std::vector<AggregationState> mergedStates = std::move(first->sortedStates);
-
-                for (size_t i = 1; i < groupPartials.size(); ++i) {
-                    mergeSortedStatesInto(mergedTs, mergedStates, groupPartials[i]->sortedTimestamps,
-                                          groupPartials[i]->sortedStates);
-                }
-
-                groupedResult.points.reserve(mergedTs.size());
-                for (size_t i = 0; i < mergedTs.size(); ++i) {
-                    AggregatedPoint point;
-                    point.timestamp = mergedTs[i];
-                    point.count = mergedStates[i].count;
-                    point.value = mergedStates[i].getValue(method);
-                    groupedResult.points.push_back(point);
                 }
             }
         }

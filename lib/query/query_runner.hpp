@@ -2,6 +2,7 @@
 #define QUERY_RUNNER_H_INCLUDED
 
 #include "block_aggregator.hpp"
+#include "query_parser.hpp"
 #include "query_result.hpp"
 #include "series_id.hpp"
 #include "tsm_file_manager.hpp"
@@ -33,10 +34,10 @@ public:
     // bypassing the full QueryResult materialisation pipeline.
     // Returns nullopt when pushdown is not applicable (non-float type, memory
     // store data present, or cross-TSM block time overlap).
-    seastar::future<std::optional<timestar::PushdownResult>> queryTsmAggregated(std::string seriesKey,
-                                                                                SeriesId128 seriesId,
-                                                                                uint64_t startTime, uint64_t endTime,
-                                                                                uint64_t aggregationInterval);
+    seastar::future<std::optional<timestar::PushdownResult>> queryTsmAggregated(
+        std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime,
+        uint64_t aggregationInterval,
+        timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 };
 
 #endif

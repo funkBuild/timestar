@@ -4,6 +4,7 @@
 #include "block_aggregator.hpp"
 #include "http_query_handler.hpp"
 #include "leveldb_index.hpp"
+#include "query_parser.hpp"
 #include "query_planner.hpp"
 #include "query_result.hpp"
 #include "retention_policy.hpp"
@@ -112,10 +113,10 @@ public:
     // Pushdown aggregation: returns aggregated state directly from TSM blocks,
     // bypassing full point materialisation. Returns nullopt when pushdown is
     // inapplicable (non-float, memory store data, cross-file overlap).
-    seastar::future<std::optional<timestar::PushdownResult>> queryAggregated(const std::string& seriesKey,
-                                                                             const SeriesId128& seriesId,
-                                                                             uint64_t startTime, uint64_t endTime,
-                                                                             uint64_t aggregationInterval);
+    seastar::future<std::optional<timestar::PushdownResult>> queryAggregated(
+        const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+        uint64_t aggregationInterval,
+        timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 
     // --- Retention policy management ---
     // Update a single policy in this shard's cache (called via invoke_on_all)

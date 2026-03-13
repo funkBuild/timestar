@@ -576,8 +576,8 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(const SeriesId128& seriesId,
                 const auto& meta = blockMeta[i];
                 auto compressedData = std::move(compressedBlocks[i].get());
 
-                writer.writeCompressedBlock(TSM::getValueType<T>(), seriesId, std::move(compressedData), meta.minTime,
-                                            meta.maxTime);
+                writer.writeCompressedBlockWithStats(TSM::getValueType<T>(), seriesId, std::move(compressedData),
+                                                     meta.indexBlock);
 
                 // Zero-copy path - we don't decompress so we don't know exact point counts
                 // Stats tracking happens at byte level in calling code
@@ -770,6 +770,14 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             block.data = std::move(compressedData[i].get());
             block.minTime = blockMeta[i].minTime;
             block.maxTime = blockMeta[i].maxTime;
+            block.blockSum = blockMeta[i].indexBlock.blockSum;
+            block.blockMin = blockMeta[i].indexBlock.blockMin;
+            block.blockMax = blockMeta[i].indexBlock.blockMax;
+            block.blockCount = blockMeta[i].indexBlock.blockCount;
+            block.blockM2 = blockMeta[i].indexBlock.blockM2;
+            block.blockFirstValue = blockMeta[i].indexBlock.blockFirstValue;
+            block.blockLatestValue = blockMeta[i].indexBlock.blockLatestValue;
+            block.hasExtendedStats = blockMeta[i].indexBlock.hasExtendedStats;
             result.compressedBlocks.push_back(std::move(block));
         }
 
@@ -937,10 +945,20 @@ template <typename T>
 void TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, SeriesCompactionData<T>&& data,
                                              CompactionStats& stats) {
     if (data.isZeroCopy) {
-        // Zero-copy path: write compressed blocks directly
+        // Zero-copy path: write compressed blocks directly, carrying forward stats
         for (auto& block : data.compressedBlocks) {
-            writer.writeCompressedBlock(data.seriesType, data.seriesId, std::move(block.data), block.minTime,
-                                        block.maxTime);
+            TSMIndexBlock srcBlock;
+            srcBlock.minTime = block.minTime;
+            srcBlock.maxTime = block.maxTime;
+            srcBlock.blockSum = block.blockSum;
+            srcBlock.blockMin = block.blockMin;
+            srcBlock.blockMax = block.blockMax;
+            srcBlock.blockCount = block.blockCount;
+            srcBlock.blockM2 = block.blockM2;
+            srcBlock.blockFirstValue = block.blockFirstValue;
+            srcBlock.blockLatestValue = block.blockLatestValue;
+            srcBlock.hasExtendedStats = block.hasExtendedStats;
+            writer.writeCompressedBlockWithStats(data.seriesType, data.seriesId, std::move(block.data), srcBlock);
         }
     } else {
         // Slow path: write decompressed data

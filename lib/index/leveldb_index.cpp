@@ -19,7 +19,12 @@
 #include <string_view>
 #include <type_traits>
 
-LevelDBIndex::LevelDBIndex(int _shardId) : shardId(_shardId) {
+LevelDBIndex::LevelDBIndex(int _shardId)
+    : shardId(_shardId),
+      seriesMetadataCache_(
+          _shardId == 0 ? timestar::config().index.metadata_cache_bytes : 0),
+      discoveryCache_(
+          _shardId == 0 ? timestar::config().index.discovery_cache_bytes : 0) {
     indexPath = "shard_" + std::to_string(shardId) + "/index";
 }
 
@@ -327,6 +332,30 @@ std::string LevelDBIndex::encodeMeasurementSeriesPrefix(const std::string& measu
     return prefix;
 }
 
+static std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, const std::string& field,
+                                                    const SeriesId128& seriesId) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1 + field.size() + 1 + 16);
+    key.push_back(static_cast<char>(MEASUREMENT_FIELD_SERIES));
+    key += measurement;
+    key.push_back('\0');
+    key += field;
+    key.push_back('\0');
+    seriesId.appendTo(key);
+    return key;
+}
+
+static std::string encodeMeasurementFieldSeriesPrefix(const std::string& measurement, const std::string& field) {
+    std::string prefix;
+    prefix.reserve(1 + measurement.size() + 1 + field.size() + 1);
+    prefix.push_back(static_cast<char>(MEASUREMENT_FIELD_SERIES));
+    prefix += measurement;
+    prefix.push_back('\0');
+    prefix += field;
+    prefix.push_back('\0');
+    return prefix;
+}
+
 std::string LevelDBIndex::encodeSeriesMetadata(const SeriesMetadata& metadata) {
     try {
         // Add defensive checks to prevent corruption-related crashes
@@ -575,6 +604,9 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     // MEASUREMENT_SERIES index entry for fast measurement -> series lookup
     batch.Put(encodeMeasurementSeriesKey(measurement, seriesId), "");
 
+    // MEASUREMENT_FIELD_SERIES index entry for single-field queries
+    batch.Put(encodeMeasurementFieldSeriesKey(measurement, field, seriesId), "");
+
     // TAG_INDEX and GROUP_BY_INDEX entries for efficient tag-based queries.
     // Build one key and reuse it for GROUP_BY_INDEX by mutating the prefix byte,
     // avoiding a second near-identical string allocation per tag.
@@ -631,6 +663,12 @@ seastar::future<SeriesId128> LevelDBIndex::getOrCreateSeriesId(std::string measu
     }
 
     timestar::index_log.debug("Created new series ID {} for key: {}", seriesId.toHex(), seriesKeyStr);
+
+    // Proactively populate the series metadata cache with the newly created metadata
+    seriesMetadataCache_.put(seriesId, metadata);
+
+    // Invalidate discovery cache for this measurement since a new series was added
+    invalidateDiscoveryCache(measurement);
 
     // Add to cache now that it's written. Move is safe since seriesKeyStr is
     // not used after this point. seriesCacheInsert handles incremental eviction.
@@ -1283,8 +1321,14 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
         std::string metadataKey = encodeSeriesMetadataKey(p.seriesId);
         batch.Put(metadataKey, encodeSeriesMetadata(metadata));
 
+        // Proactively populate the series metadata cache
+        seriesMetadataCache_.put(p.seriesId, metadata);
+
         // MEASUREMENT_SERIES index entry for fast measurement -> series lookup
         batch.Put(encodeMeasurementSeriesKey(op.measurement, p.seriesId), "");
+
+        // MEASUREMENT_FIELD_SERIES index entry for single-field queries
+        batch.Put(encodeMeasurementFieldSeriesKey(op.measurement, op.fieldName, p.seriesId), "");
 
         // Update measurement series cache if populated for this measurement
         auto msIt = measurementSeriesCache.find(op.measurement);
@@ -1501,6 +1545,17 @@ seastar::future<> LevelDBIndex::indexMetadataBatch(const std::vector<MetadataOp>
             throw std::runtime_error("Failed to write metadata batch: " + status.ToString());
         }
         LOG_INSERT_PATH(timestar::index_log, debug, "[INDEX] indexMetadataBatch wrote batch for {} ops", ops.size());
+
+        // Invalidate discovery cache for measurements that got new series
+        std::unordered_set<std::string> affectedMeasurements;
+        for (auto& p : pending) {
+            if (p.isNew) {
+                affectedMeasurements.insert(ops[p.opIdx].measurement);
+            }
+        }
+        for (const auto& m : affectedMeasurements) {
+            invalidateDiscoveryCache(m);
+        }
     }
 
     co_return;
@@ -1604,6 +1659,80 @@ seastar::future<std::expected<std::vector<LevelDBIndex::SeriesWithMetadata>, Ser
 LevelDBIndex::findSeriesWithMetadata(const std::string& measurement,
                                      const std::map<std::string, std::string>& tagFilters,
                                      const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
+    // Fast path: single-field, no tag filters — use MEASUREMENT_FIELD_SERIES index
+    // to get only series for this field, then fetch metadata only for those series.
+    if (fieldFilter.size() == 1 && tagFilters.empty()) {
+        const std::string& field = *fieldFilter.begin();
+        std::string prefix = encodeMeasurementFieldSeriesPrefix(measurement, field);
+
+        auto seriesIds = co_await seastar::async([this, &prefix, maxSeries] {
+            std::vector<SeriesId128> ids;
+            leveldb::ReadOptions readOpts;
+            readOpts.fill_cache = false;
+            auto it = std::unique_ptr<leveldb::Iterator>(db->NewIterator(readOpts));
+            for (it->Seek(prefix); it->Valid(); it->Next()) {
+                auto key = it->key();
+                if (key.size() < prefix.size() ||
+                    std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+                    break;
+                }
+                // Extract SeriesId128 from the suffix (16 bytes after prefix)
+                size_t suffixLen = key.size() - prefix.size();
+                if (suffixLen != 16) continue;
+                ids.push_back(SeriesId128::fromBytes(
+                    std::string(key.data() + prefix.size(), 16)));
+                if (maxSeries > 0 && ids.size() > maxSeries) break;
+            }
+            return ids;
+        });
+
+        if (maxSeries > 0 && seriesIds.size() > maxSeries) {
+            co_return std::unexpected(SeriesLimitExceeded{seriesIds.size(), maxSeries});
+        }
+
+        // Fetch metadata for these series (they all match the field already)
+        std::vector<SeriesWithMetadata> output;
+        output.reserve(seriesIds.size());
+
+        std::vector<size_t> missIndices;
+        for (size_t i = 0; i < seriesIds.size(); ++i) {
+            if (auto* cached = seriesMetadataCache_.get(seriesIds[i])) {
+                output.push_back({seriesIds[i], *cached});
+            } else {
+                missIndices.push_back(i);
+            }
+        }
+
+        if (!missIndices.empty()) {
+            std::vector<std::string> metadataKeys;
+            metadataKeys.reserve(missIndices.size());
+            for (size_t idx : missIndices) {
+                metadataKeys.push_back(encodeSeriesMetadataKey(seriesIds[idx]));
+            }
+
+            auto rawResults = co_await seastar::async([this, &metadataKeys] {
+                std::vector<std::pair<leveldb::Status, std::string>> results;
+                results.reserve(metadataKeys.size());
+                leveldb::ReadOptions readOpts;
+                for (const auto& key : metadataKeys) {
+                    std::string val;
+                    auto status = db->Get(readOpts, key, &val);
+                    results.emplace_back(status, std::move(val));
+                }
+                return results;
+            });
+
+            for (size_t j = 0; j < missIndices.size(); ++j) {
+                if (!rawResults[j].first.ok()) continue;
+                auto metadata = decodeSeriesMetadata(rawResults[j].second);
+                seriesMetadataCache_.put(seriesIds[missIndices[j]], metadata);
+                output.push_back({seriesIds[missIndices[j]], std::move(metadata)});
+            }
+        }
+
+        co_return output;
+    }
+
     // Pass maxSeries to findSeries for early bailout before metadata Gets
     auto findResult = co_await findSeries(measurement, tagFilters, maxSeries);
 
@@ -1618,35 +1747,58 @@ LevelDBIndex::findSeriesWithMetadata(const std::string& measurement,
         co_return std::vector<SeriesWithMetadata>{};
     }
 
-    std::vector<std::string> metadataKeys;
-    metadataKeys.reserve(candidateIds.size());
-    for (const auto& id : candidateIds) {
-        metadataKeys.push_back(encodeSeriesMetadataKey(id));
-    }
-
-    auto rawResults = co_await seastar::async([this, &metadataKeys] {
-        std::vector<std::pair<leveldb::Status, std::string>> results;
-        results.reserve(metadataKeys.size());
-        leveldb::ReadOptions readOpts;
-        for (const auto& key : metadataKeys) {
-            std::string val;
-            auto status = db->Get(readOpts, key, &val);
-            results.emplace_back(status, std::move(val));
-        }
-        return results;
-    });
-
+    // Partition candidates into cache hits and misses
     std::vector<SeriesWithMetadata> output;
     output.reserve(candidateIds.size());
+
+    std::vector<size_t> missIndices;  // Indices into candidateIds that need LevelDB lookup
+    missIndices.reserve(candidateIds.size());
+
     for (size_t i = 0; i < candidateIds.size(); ++i) {
-        if (!rawResults[i].first.ok()) {
-            continue;
+        if (auto* cached = seriesMetadataCache_.get(candidateIds[i])) {
+            // Cache hit: apply field filter
+            if (!fieldFilter.empty() && fieldFilter.count(cached->field) == 0) {
+                continue;
+            }
+            output.push_back({candidateIds[i], *cached});
+        } else {
+            missIndices.push_back(i);
         }
-        auto metadata = decodeSeriesMetadata(rawResults[i].second);
-        if (!fieldFilter.empty() && fieldFilter.count(metadata.field) == 0) {
-            continue;
+    }
+
+    // Only issue LevelDB Gets for cache misses
+    if (!missIndices.empty()) {
+        std::vector<std::string> metadataKeys;
+        metadataKeys.reserve(missIndices.size());
+        for (size_t idx : missIndices) {
+            metadataKeys.push_back(encodeSeriesMetadataKey(candidateIds[idx]));
         }
-        output.push_back({candidateIds[i], std::move(metadata)});
+
+        auto rawResults = co_await seastar::async([this, &metadataKeys] {
+            std::vector<std::pair<leveldb::Status, std::string>> results;
+            results.reserve(metadataKeys.size());
+            leveldb::ReadOptions readOpts;
+            for (const auto& key : metadataKeys) {
+                std::string val;
+                auto status = db->Get(readOpts, key, &val);
+                results.emplace_back(status, std::move(val));
+            }
+            return results;
+        });
+
+        for (size_t j = 0; j < missIndices.size(); ++j) {
+            if (!rawResults[j].first.ok()) {
+                continue;
+            }
+            auto metadata = decodeSeriesMetadata(rawResults[j].second);
+            // Populate cache with newly fetched metadata
+            seriesMetadataCache_.put(candidateIds[missIndices[j]], metadata);
+
+            if (!fieldFilter.empty() && fieldFilter.count(metadata.field) == 0) {
+                continue;
+            }
+            output.push_back({candidateIds[missIndices[j]], std::move(metadata)});
+        }
     }
 
     // After field filtering, the actual output may be smaller than candidateIds.
@@ -1657,6 +1809,83 @@ LevelDBIndex::findSeriesWithMetadata(const std::string& measurement,
     }
 
     co_return output;
+}
+
+// --- Discovery cache helpers ---
+
+// Build a canonical cache key from measurement + sorted scope pairs + sorted fields.
+// The key is deterministic regardless of iteration order of unordered containers.
+static std::string buildDiscoveryCacheKey(const std::string& measurement,
+                                          const std::map<std::string, std::string>& tagFilters,
+                                          const std::unordered_set<std::string>& fieldFilter) {
+    // Estimate size: measurement + scopes + fields + separators
+    size_t estimatedSize = measurement.size() + 1;
+    for (const auto& [k, v] : tagFilters) {
+        estimatedSize += k.size() + v.size() + 2;
+    }
+    for (const auto& f : fieldFilter) {
+        estimatedSize += f.size() + 1;
+    }
+
+    std::string key;
+    key.reserve(estimatedSize);
+    key.append(measurement);
+    key.push_back('\0');
+
+    // tagFilters is std::map (already sorted)
+    for (const auto& [k, v] : tagFilters) {
+        key.append(k);
+        key.push_back('=');
+        key.append(v);
+        key.push_back('\1');
+    }
+    key.push_back('\0');
+
+    // fieldFilter is unordered, so sort for canonical key
+    std::vector<std::string> sortedFields(fieldFilter.begin(), fieldFilter.end());
+    std::sort(sortedFields.begin(), sortedFields.end());
+    for (const auto& f : sortedFields) {
+        key.append(f);
+        key.push_back('\1');
+    }
+
+    return key;
+}
+
+seastar::future<std::expected<std::shared_ptr<const std::vector<LevelDBIndex::SeriesWithMetadata>>, SeriesLimitExceeded>>
+LevelDBIndex::findSeriesWithMetadataCached(const std::string& measurement,
+                                           const std::map<std::string, std::string>& tagFilters,
+                                           const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
+    std::string cacheKey = buildDiscoveryCacheKey(measurement, tagFilters, fieldFilter);
+
+    // Check discovery cache
+    if (auto* cached = discoveryCache_.get(cacheKey)) {
+        auto& vec = *cached;
+        // Check limit on the cached result
+        if (maxSeries > 0 && vec->size() > maxSeries) {
+            co_return std::unexpected(SeriesLimitExceeded{vec->size(), maxSeries});
+        }
+        // Return the shared_ptr directly — no deep copy
+        co_return vec;
+    }
+
+    // Cache miss: perform the full lookup
+    auto findResult = co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
+
+    // Only cache successful results (not limit-exceeded errors)
+    if (findResult.has_value()) {
+        auto ptr = std::make_shared<const std::vector<SeriesWithMetadata>>(std::move(findResult.value()));
+        discoveryCache_.put(cacheKey, ptr);
+        co_return ptr;
+    }
+
+    co_return std::unexpected(findResult.error());
+}
+
+void LevelDBIndex::invalidateDiscoveryCache(const std::string& measurement) {
+    std::string prefix = measurement;
+    prefix.push_back('\0');
+    discoveryCache_.clearByPrefix(prefix);
 }
 
 seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> LevelDBIndex::getAllSeriesForMeasurement(
@@ -1942,6 +2171,11 @@ seastar::future<std::optional<SeriesMetadata>> LevelDBIndex::getSeriesMetadata(c
         co_return std::nullopt;
     }
 
+    // Check metadata cache first (shard 0 only; other shards have 0-capacity cache)
+    if (auto* cached = seriesMetadataCache_.get(seriesId)) {
+        co_return *cached;
+    }
+
     std::string metadataKey = encodeSeriesMetadataKey(seriesId);
 
     // Offload blocking LevelDB I/O to Seastar thread pool
@@ -1952,7 +2186,10 @@ seastar::future<std::optional<SeriesMetadata>> LevelDBIndex::getSeriesMetadata(c
     });
 
     if (status.ok()) {
-        co_return decodeSeriesMetadata(value);
+        auto metadata = decodeSeriesMetadata(value);
+        // Populate cache with fetched metadata
+        seriesMetadataCache_.put(seriesId, metadata);
+        co_return metadata;
     } else if (status.IsNotFound()) {
         co_return std::nullopt;
     } else {
@@ -1976,38 +2213,58 @@ LevelDBIndex::getSeriesMetadataBatch(const std::vector<SeriesId128>& seriesIds) 
         co_return std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>{};
     }
 
-    // Pre-encode all keys on the reactor thread (cheap CPU work, no I/O)
-    std::vector<std::string> metadataKeys;
-    metadataKeys.reserve(seriesIds.size());
-    for (const auto& seriesId : seriesIds) {
-        metadataKeys.push_back(encodeSeriesMetadataKey(seriesId));
+    // Partition into cache hits and misses
+    std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>> results;
+    results.resize(seriesIds.size());
+
+    // Track which indices need LevelDB lookup
+    std::vector<size_t> missIndices;
+    missIndices.reserve(seriesIds.size());
+
+    for (size_t i = 0; i < seriesIds.size(); ++i) {
+        if (auto* cached = seriesMetadataCache_.get(seriesIds[i])) {
+            results[i] = {seriesIds[i], *cached};
+        } else {
+            missIndices.push_back(i);
+        }
     }
 
-    // Perform ALL LevelDB Gets in a single seastar::async block.
-    // This turns N coroutine suspensions + N thread pool dispatches into 1 of each.
+    // If all entries were cached, skip LevelDB entirely
+    if (missIndices.empty()) {
+        co_return results;
+    }
+
+    // Pre-encode keys only for cache misses
+    std::vector<std::string> metadataKeys;
+    metadataKeys.reserve(missIndices.size());
+    for (size_t idx : missIndices) {
+        metadataKeys.push_back(encodeSeriesMetadataKey(seriesIds[idx]));
+    }
+
+    // Perform LevelDB Gets only for cache misses in a single seastar::async block
     auto rawResults = co_await seastar::async([this, &metadataKeys] {
-        std::vector<std::pair<leveldb::Status, std::string>> results;
-        results.reserve(metadataKeys.size());
+        std::vector<std::pair<leveldb::Status, std::string>> rawRes;
+        rawRes.reserve(metadataKeys.size());
 
         leveldb::ReadOptions readOpts;
         for (const auto& key : metadataKeys) {
             std::string val;
             auto status = db->Get(readOpts, key, &val);
-            results.emplace_back(status, std::move(val));
+            rawRes.emplace_back(status, std::move(val));
         }
-        return results;
+        return rawRes;
     });
 
-    // Decode results back on the reactor thread
-    std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>> results;
-    results.reserve(seriesIds.size());
-
-    for (size_t i = 0; i < seriesIds.size(); ++i) {
-        const auto& [status, value] = rawResults[i];
+    // Decode results and populate cache for misses
+    for (size_t j = 0; j < missIndices.size(); ++j) {
+        size_t i = missIndices[j];
+        const auto& [status, value] = rawResults[j];
         if (status.ok()) {
-            results.emplace_back(seriesIds[i], decodeSeriesMetadata(value));
+            auto metadata = decodeSeriesMetadata(value);
+            seriesMetadataCache_.put(seriesIds[i], metadata);
+            results[i] = {seriesIds[i], std::move(metadata)};
         } else if (status.IsNotFound()) {
-            results.emplace_back(seriesIds[i], std::nullopt);
+            results[i] = {seriesIds[i], std::nullopt};
         } else {
             throw std::runtime_error("Failed to get series metadata in batch: " + status.ToString());
         }

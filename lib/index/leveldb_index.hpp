@@ -2,6 +2,7 @@
 #define LEVELDB_INDEX_H_INCLUDED
 
 #include "line_parser.hpp"
+#include "lru_cache.hpp"
 #include "retention_policy.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
@@ -44,8 +45,9 @@ enum IndexKeyType : uint8_t {
     GROUP_BY_INDEX = 0x07,      // measurement+tag_key+tag_value -> series_ids (for group-by)
     FIELD_STATS = 0x08,         // series_id+field -> stats
     FIELD_TYPE = 0x09,          // measurement+field -> field type (float, bool, string, integer)
-    MEASUREMENT_SERIES = 0x0A,  // measurement+\0+series_id -> (empty) for fast measurement->series lookup
-    RETENTION_POLICY = 0x0B     // measurement -> JSON retention policy
+    MEASUREMENT_SERIES = 0x0A,     // measurement+\0+series_id -> (empty) for fast measurement->series lookup
+    RETENTION_POLICY = 0x0B,       // measurement -> JSON retention policy
+    MEASUREMENT_FIELD_SERIES = 0x0C  // measurement+\0+field+\0+series_id -> (empty) for single-field lookup
 };
 
 // Metadata for a time series
@@ -62,6 +64,58 @@ struct SeriesLimitExceeded {
     size_t discovered;  // Number of series discovered before bailing out
     size_t limit;       // The limit that was exceeded
 };
+
+// CacheSizeEstimator specializations for LRU cache value types
+
+namespace timestar {
+
+template <>
+struct CacheSizeEstimator<SeriesId128> {
+    static size_t estimate(const SeriesId128&) { return sizeof(SeriesId128); }
+};
+
+template <>
+struct CacheSizeEstimator<SeriesMetadata> {
+    static size_t estimate(const SeriesMetadata& m) {
+        size_t sz = sizeof(SeriesMetadata);
+        sz += m.measurement.capacity();
+        sz += m.field.capacity();
+        // std::map overhead: ~48 bytes per node (key+value+pointers+color)
+        for (const auto& [k, v] : m.tags) {
+            sz += 48 + k.capacity() + v.capacity();
+        }
+        return sz;
+    }
+};
+
+// SeriesWithMetadata is used both inside LevelDBIndex and by external CacheSizeEstimator.
+// Defined at namespace scope to allow LRU cache members in the class private section.
+struct SeriesWithMetadata {
+    SeriesId128 seriesId;
+    SeriesMetadata metadata;
+};
+
+template <>
+struct CacheSizeEstimator<std::shared_ptr<const std::vector<SeriesWithMetadata>>> {
+    static size_t estimate(const std::shared_ptr<const std::vector<SeriesWithMetadata>>& ptr) {
+        if (!ptr)
+            return sizeof(std::shared_ptr<const std::vector<SeriesWithMetadata>>);
+        // shared_ptr control block (~32 bytes) + vector overhead + per-element size
+        size_t sz = 32 + sizeof(std::vector<SeriesWithMetadata>);
+        sz += ptr->capacity() * sizeof(SeriesWithMetadata);
+        for (const auto& swm : *ptr) {
+            // Add heap allocations from strings and maps within each element
+            sz += swm.metadata.measurement.capacity();
+            sz += swm.metadata.field.capacity();
+            for (const auto& [k, v] : swm.metadata.tags) {
+                sz += 48 + k.capacity() + v.capacity();
+            }
+        }
+        return sz;
+    }
+};
+
+}  // namespace timestar
 
 class LevelDBIndex {
 private:
@@ -124,6 +178,17 @@ private:
     // Populated on first getAllSeriesForMeasurement() call per measurement, then maintained
     // incrementally during inserts. Bounded by the number of unique measurements. Cleared if needed.
     std::unordered_map<std::string, std::vector<SeriesId128>> measurementSeriesCache;
+
+    // Size-aware LRU cache for series metadata (SeriesId128 -> SeriesMetadata).
+    // Used to avoid redundant LevelDB Gets during query series discovery.
+    // Shard 0 only; other shards use 0-byte capacity (effectively disabled).
+    // SeriesMetadata is immutable, so no invalidation is needed.
+    timestar::LRUCache<SeriesId128, SeriesMetadata, SeriesId128::Hash> seriesMetadataCache_;
+
+    // Size-aware LRU cache for discovery results (canonical query key -> results).
+    // Invalidated per-measurement when new series are created.
+    // Shard 0 only; other shards use 0-byte capacity (effectively disabled).
+    timestar::LRUCache<std::string, std::shared_ptr<const std::vector<timestar::SeriesWithMetadata>>> discoveryCache_;
 
     // Helper methods for key encoding
     std::string encodeSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
@@ -209,10 +274,10 @@ public:
         const std::string& measurement, const std::map<std::string, std::string>& tagFilters = {},
         size_t maxSeries = 0);
 
-    struct SeriesWithMetadata {
-        SeriesId128 seriesId;
-        SeriesMetadata metadata;
-    };
+    // SeriesWithMetadata is defined at namespace scope (above this class) and
+    // aliased here for backward compatibility with existing code that uses
+    // LevelDBIndex::SeriesWithMetadata.
+    using SeriesWithMetadata = ::timestar::SeriesWithMetadata;
 
     // maxSeries: if > 0, returns SeriesLimitExceeded error when the series count
     // exceeds the limit. Checked after findSeries() and before metadata Gets,
@@ -220,6 +285,26 @@ public:
     seastar::future<std::expected<std::vector<SeriesWithMetadata>, SeriesLimitExceeded>> findSeriesWithMetadata(
         const std::string& measurement, const std::map<std::string, std::string>& tagFilters = {},
         const std::unordered_set<std::string>& fieldFilter = {}, size_t maxSeries = 0);
+
+    // Cached version of findSeriesWithMetadata: checks the discovery cache first,
+    // then falls back to the full findSeriesWithMetadata path on miss.
+    // Cache is keyed by a canonical string built from measurement + scopes + fields.
+    // Returns a shared_ptr to avoid deep-copying cached vectors (which contain std::map tags).
+    // The caller must not modify the returned vector's elements.
+    seastar::future<std::expected<std::shared_ptr<const std::vector<SeriesWithMetadata>>, SeriesLimitExceeded>>
+    findSeriesWithMetadataCached(const std::string& measurement,
+                                const std::map<std::string, std::string>& tagFilters = {},
+                                const std::unordered_set<std::string>& fieldFilter = {},
+                                size_t maxSeries = 0);
+
+    // Invalidate all discovery cache entries for a given measurement.
+    void invalidateDiscoveryCache(const std::string& measurement);
+
+    // Cache statistics accessors (for testing and monitoring)
+    size_t getMetadataCacheSize() const { return seriesMetadataCache_.size(); }
+    size_t getMetadataCacheBytes() const { return seriesMetadataCache_.currentBytes(); }
+    size_t getDiscoveryCacheSize() const { return discoveryCache_.size(); }
+    size_t getDiscoveryCacheBytes() const { return discoveryCache_.currentBytes(); }
 
     // Find series by single tag (optimized, exact match only).
     // maxSeries: if > 0, stops scanning early when the count exceeds the limit.
