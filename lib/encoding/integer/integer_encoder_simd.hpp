@@ -9,10 +9,11 @@
 #include <vector>
 
 /**
- * IntegerEncoderSIMD - AVX2 optimized implementation
+ * IntegerEncoderSIMD - Google Highway optimized implementation
  *
- * Uses AVX2 SIMD instructions for improved performance
- * Falls back to basic implementation if AVX2 not available
+ * Uses Highway SIMD intrinsics for portable vectorized ZigZag encoding.
+ * Highway automatically selects the best available target at runtime
+ * (SSE4, AVX2, AVX-512, etc.) via its dynamic dispatch mechanism.
  */
 class IntegerEncoderSIMD {
 public:

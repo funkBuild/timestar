@@ -5,27 +5,13 @@
 #include <cstddef>
 #include <vector>
 
-// Compile-time flag to disable SIMD optimizations
-// Set to 1 to use scalar fallbacks for all operations
-// Can be defined via CMake: -DTIMESTAR_ANOMALY_DISABLE_SIMD=1
-#ifndef TIMESTAR_ANOMALY_DISABLE_SIMD
-    #define TIMESTAR_ANOMALY_DISABLE_SIMD 0
-#endif
-
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-    #include <immintrin.h>
-#else
-    #undef TIMESTAR_ANOMALY_DISABLE_SIMD
-    #define TIMESTAR_ANOMALY_DISABLE_SIMD 1
-#endif
-
 namespace timestar {
 namespace anomaly {
 namespace simd {
 
-// Check SIMD availability
-bool isAvx2Available();
-bool isAvx512Available();
+// SIMD is always available via Highway runtime dispatch.
+inline bool isAvx2Available() { return true; }
+inline bool isAvx512Available() { return true; }
 
 // ==================== Vector Operations ====================
 

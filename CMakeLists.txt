@@ -137,10 +137,19 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+  highway
+  GIT_REPOSITORY https://github.com/google/highway.git
+  GIT_TAG 1.2.0
+  GIT_SHALLOW TRUE
+)
+
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(glaze googlebenchmark robin-map)
+FetchContent_MakeAvailable(glaze googlebenchmark robin-map highway)
 
 # ─────────────────────────────── sub‑directories ─────────────────────────────
 

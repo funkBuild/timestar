@@ -1,9 +1,8 @@
 /**
  * Anomaly Detection Benchmark
  *
- * Measures performance of anomaly detection algorithms with and without SIMD.
- * Run with SIMD: ./anomaly_detection_benchmark
- * Run without SIMD: Rebuild with -DTIMESTAR_ANOMALY_DISABLE_SIMD=1
+ * Measures performance of anomaly detection algorithms.
+ * SIMD is always available via Google Highway runtime dispatch.
  */
 
 #include <benchmark/benchmark.h>

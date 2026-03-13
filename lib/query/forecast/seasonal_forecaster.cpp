@@ -1,20 +1,12 @@
 #include "seasonal_forecaster.hpp"
 
 #include "../anomaly/simd_anomaly.hpp"
-#include "../simd_helpers.hpp"
 #include "periodicity_detector.hpp"
 #include "stl_decomposition.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-using timestar::simd::hsum_avx;
-static inline double hsum_avx_local(__m256d v) {
-    return hsum_avx(v);
-}
-#endif
 
 namespace timestar {
 namespace forecast {
@@ -102,58 +94,9 @@ double SeasonalForecaster::autoCorrelation(const std::vector<double>& y, double 
     const size_t count = n - lag;
     double sum = 0.0;
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && count >= 16) {
-        // AVX2 path: 4 accumulators to hide FMA latency (4-cycle throughput)
-        const double* py = y.data();
-        const double* pyL = y.data() + lag;
-        __m256d vMean = _mm256_set1_pd(mean);
-        __m256d acc0 = _mm256_setzero_pd();
-        __m256d acc1 = _mm256_setzero_pd();
-        __m256d acc2 = _mm256_setzero_pd();
-        __m256d acc3 = _mm256_setzero_pd();
-
-        const size_t simd_end = count & ~size_t(15);  // round down to multiple of 16
-
-        for (size_t i = 0; i < simd_end; i += 16) {
-            // Block 0: i..i+3
-            __m256d a0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), vMean);
-            __m256d b0 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i), vMean);
-            acc0 = _mm256_fmadd_pd(a0, b0, acc0);
-
-            // Block 1: i+4..i+7
-            __m256d a1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), vMean);
-            __m256d b1 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 4), vMean);
-            acc1 = _mm256_fmadd_pd(a1, b1, acc1);
-
-            // Block 2: i+8..i+11
-            __m256d a2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), vMean);
-            __m256d b2 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 8), vMean);
-            acc2 = _mm256_fmadd_pd(a2, b2, acc2);
-
-            // Block 3: i+12..i+15
-            __m256d a3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), vMean);
-            __m256d b3 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 12), vMean);
-            acc3 = _mm256_fmadd_pd(a3, b3, acc3);
-        }
-
-        // Reduce 4 accumulators -> 1
-        acc0 = _mm256_add_pd(acc0, acc1);
-        acc2 = _mm256_add_pd(acc2, acc3);
-        acc0 = _mm256_add_pd(acc0, acc2);
-        sum = hsum_avx_local(acc0);
-
-        // Scalar remainder
-        for (size_t i = simd_end; i < count; ++i) {
-            sum += (py[i] - mean) * (pyL[i] - mean);
-        }
-    } else
-#endif
-    {
-        // Scalar fallback
-        for (size_t i = 0; i < count; ++i) {
-            sum += (y[i] - mean) * (y[i + lag] - mean);
-        }
+    // Scalar fallback
+    for (size_t i = 0; i < count; ++i) {
+        sum += (y[i] - mean) * (y[i + lag] - mean);
     }
 
     // Normalize by sum of squared deviations: (n-1)*variance when using
@@ -668,30 +611,8 @@ ForecastOutput SeasonalForecaster::forecastMSTL(const ForecastInput& input, cons
     std::vector<double> boundsScale(nForecast);
     {
         const double invN = 1.0 / static_cast<double>(n);
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-        if (anomaly::simd::isAvx2Available() && nForecast >= 4) {
-            __m256d vInvN = _mm256_set1_pd(invN);
-            __m256d vStd = _mm256_set1_pd(residualStdDev);
-            __m256d vOne = _mm256_set1_pd(1.0);
-            const size_t simd_end = nForecast & ~size_t(3);
-            for (size_t i = 0; i < simd_end; i += 4) {
-                __m256d vIdx = _mm256_set_pd(static_cast<double>(i + 3), static_cast<double>(i + 2),
-                                             static_cast<double>(i + 1), static_cast<double>(i));
-                // sqrt(1.0 + i / n)
-                __m256d inner = _mm256_fmadd_pd(vIdx, vInvN, vOne);
-                __m256d sq = _mm256_sqrt_pd(inner);
-                __m256d sc = _mm256_mul_pd(vStd, sq);
-                _mm256_storeu_pd(&boundsScale[i], sc);
-            }
-            for (size_t i = simd_end; i < nForecast; ++i) {
-                boundsScale[i] = residualStdDev * std::sqrt(1.0 + static_cast<double>(i) * invN);
-            }
-        } else
-#endif
-        {
-            for (size_t i = 0; i < nForecast; ++i) {
-                boundsScale[i] = residualStdDev * std::sqrt(1.0 + static_cast<double>(i) * invN);
-            }
+        for (size_t i = 0; i < nForecast; ++i) {
+            boundsScale[i] = residualStdDev * std::sqrt(1.0 + static_cast<double>(i) * invN);
         }
     }
     // SIMD-optimized bounds: upper = forecast + deviations*scale, lower = forecast - deviations*scale

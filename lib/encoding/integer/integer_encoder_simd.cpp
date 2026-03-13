@@ -1,63 +1,139 @@
+// Highway foreach_target re-inclusion mechanism.
+// clang-format off
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "encoding/integer/integer_encoder_simd.cpp"
+#include "hwy/foreach_target.h"
+// clang-format on
+
 #include "integer_encoder_simd.hpp"
 
 #include "../simple16.hpp"
 #include "../zigzag.hpp"
 
-#include <cpuid.h>
-#include <immintrin.h>
+#include "hwy/highway.h"
 
 #include <cstring>
 
-// Check for AVX2 support (cached - CPUID only called once)
+HWY_BEFORE_NAMESPACE();
+namespace timestar {
+namespace encoding {
+namespace integer_simd {
+namespace HWY_NAMESPACE {
+
+namespace hn = hwy::HWY_NAMESPACE;
+
+// ---------------------------------------------------------------------------
+// SIMD ZigZag encode: (x << 1) ^ (x >> 63)    [arithmetic shift for signed]
+// ---------------------------------------------------------------------------
+void ZigZagEncodeBatch(const int64_t* HWY_RESTRICT in, uint64_t* HWY_RESTRICT out, size_t count) {
+    const hn::ScalableTag<int64_t> di;
+    const hn::ScalableTag<uint64_t> du;
+    const size_t N = hn::Lanes(di);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(di, &in[i]);
+
+        // (x << 1): shift left by 1 on unsigned reinterpretation
+        auto shifted = hn::ShiftLeft<1>(hn::BitCast(du, v));
+
+        // (x >> 63): arithmetic right shift by 63 on signed gives 0 or -1
+        auto sign = hn::ShiftRight<63>(v);
+
+        // XOR: (x << 1) ^ (x >> 63)
+        auto result = hn::Xor(shifted, hn::BitCast(du, sign));
+
+        hn::StoreU(result, du, &out[i]);
+    }
+
+    // Scalar tail
+    for (; i < count; ++i) {
+        out[i] = ZigZag::zigzagEncode(in[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIMD ZigZag decode: (y >> 1) ^ -(y & 1)
+// ---------------------------------------------------------------------------
+void ZigZagDecodeBatch(const uint64_t* HWY_RESTRICT in, int64_t* HWY_RESTRICT out, size_t count) {
+    const hn::ScalableTag<uint64_t> du;
+    const hn::ScalableTag<int64_t> di;
+    const size_t N = hn::Lanes(du);
+
+    const auto one = hn::Set(du, uint64_t{1});
+    const auto zero = hn::Zero(du);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto y = hn::LoadU(du, &in[i]);
+
+        // y >> 1
+        auto shifted = hn::ShiftRight<1>(y);
+
+        // y & 1
+        auto lsb = hn::And(y, one);
+
+        // -(y & 1)  =  0 - (y & 1)
+        auto neg_lsb = hn::Sub(zero, lsb);
+
+        // (y >> 1) ^ -(y & 1)
+        auto result = hn::Xor(shifted, neg_lsb);
+
+        hn::StoreU(hn::BitCast(di, result), di, &out[i]);
+    }
+
+    // Scalar tail
+    for (; i < count; ++i) {
+        out[i] = ZigZag::zigzagDecode(in[i]);
+    }
+}
+
+}  // namespace HWY_NAMESPACE
+}  // namespace integer_simd
+}  // namespace encoding
+}  // namespace timestar
+HWY_AFTER_NAMESPACE();
+
+// ── Dispatch table + public API (compiled once) ─────────────────────────────
+#if HWY_ONCE
+
+#include "integer_encoder_avx512.hpp"
+
+namespace timestar {
+namespace encoding {
+namespace integer_simd {
+
+HWY_EXPORT(ZigZagEncodeBatch);
+HWY_EXPORT(ZigZagDecodeBatch);
+
+// Internal dispatch wrappers (must be in same namespace as HWY_EXPORT)
+void dispatchZigZagEncode(const int64_t* in, uint64_t* out, size_t count) {
+    HWY_DYNAMIC_DISPATCH(ZigZagEncodeBatch)(in, out, count);
+}
+
+void dispatchZigZagDecode(const uint64_t* in, int64_t* out, size_t count) {
+    HWY_DYNAMIC_DISPATCH(ZigZagDecodeBatch)(in, out, count);
+}
+
+}  // namespace integer_simd
+}  // namespace encoding
+}  // namespace timestar
+
+// Convenience aliases
+static inline void hwZigZagEncode(const int64_t* in, uint64_t* out, size_t count) {
+    timestar::encoding::integer_simd::dispatchZigZagEncode(in, out, count);
+}
+
+static inline void hwZigZagDecode(const uint64_t* in, int64_t* out, size_t count) {
+    timestar::encoding::integer_simd::dispatchZigZagDecode(in, out, count);
+}
+
+// ---------------------------------------------------------------------------
+// IntegerEncoderSIMD -- public API
+// ---------------------------------------------------------------------------
+
 bool IntegerEncoderSIMD::isAvailable() {
-    static const bool available = []() {
-        unsigned int eax, ebx, ecx, edx;
-        if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-            return (ebx & (1 << 5)) != 0;  // AVX2 is bit 5 of EBX
-        }
-        return false;
-    }();
-    return available;
-}
-
-// SIMD zigzag encode for 4 values at once using AVX2
-static inline __m256i zigzagEncode4_avx2(const int64_t* values) {
-    // Load 4 int64 values
-    __m256i v = _mm256_loadu_si256((__m256i*)values);
-
-    // Shift left by 1: (x << 1)
-    __m256i shifted = _mm256_slli_epi64(v, 1);
-
-    // AVX2 alternative: use comparison to emulate arithmetic right shift by 63
-    __m256i zero = _mm256_setzero_si256();
-    __m256i sign = _mm256_cmpgt_epi64(zero, v);  // All 1s if negative, all 0s if positive
-
-    // XOR: ((x << 1) ^ -(x >> 63))
-    __m256i result = _mm256_xor_si256(shifted, sign);
-
-    return result;
-}
-
-// SIMD zigzag decode for 4 values at once using AVX2
-static inline __m256i zigzagDecode4_avx2(const uint64_t* values) {
-    // Load 4 uint64 values
-    __m256i y = _mm256_loadu_si256((__m256i*)values);
-
-    // y >> 1
-    __m256i shifted = _mm256_srli_epi64(y, 1);
-
-    // y & 1
-    __m256i one = _mm256_set1_epi64x(1);
-    __m256i lsb = _mm256_and_si256(y, one);
-
-    // -(y & 1)
-    __m256i zero = _mm256_setzero_si256();
-    __m256i neg_lsb = _mm256_sub_epi64(zero, lsb);
-
-    // (y >> 1) ^ -(y & 1)
-    __m256i result = _mm256_xor_si256(shifted, neg_lsb);
-
-    return result;
+    return true;  // Highway handles runtime dispatch
 }
 
 AlignedBuffer IntegerEncoderSIMD::encode(std::span<const uint64_t> values) {
@@ -81,15 +157,13 @@ AlignedBuffer IntegerEncoderSIMD::encode(std::span<const uint64_t> values) {
     const size_t size = values.size();
     size_t i = 2;
 
-    // Use AVX2 for batch processing with better efficiency
-    if (isAvailable() && size >= 10) {
-        // Process 8 values at a time - split into 2x4 for AVX2 efficiency
-        alignas(32) int64_t deltas[8];
-        alignas(32) uint64_t encoded_batch[8];
+    // Batch delta-of-delta computation + Highway SIMD ZigZag encode.
+    // Process in chunks of 8 for good throughput on both AVX2 and AVX-512.
+    if (size >= 10) {
+        alignas(64) int64_t deltas[8];
+        alignas(64) uint64_t encoded_batch[8];
 
         for (; i + 7 < size; i += 8) {
-            // Calculate delta-of-deltas for 8 values
-            // Unroll for better pipeline utilization
             deltas[0] = (static_cast<int64_t>(values[i + 0]) - static_cast<int64_t>(values[i - 1])) -
                         (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
             deltas[1] = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i + 0])) -
@@ -107,52 +181,39 @@ AlignedBuffer IntegerEncoderSIMD::encode(std::span<const uint64_t> values) {
             deltas[7] = (static_cast<int64_t>(values[i + 7]) - static_cast<int64_t>(values[i + 6])) -
                         (static_cast<int64_t>(values[i + 6]) - static_cast<int64_t>(values[i + 5]));
 
-            // SIMD zigzag encode in two batches of 4
-            __m256i enc1 = zigzagEncode4_avx2(&deltas[0]);
-            __m256i enc2 = zigzagEncode4_avx2(&deltas[4]);
+            hwZigZagEncode(deltas, encoded_batch, 8);
 
-            // Store results
-            _mm256_storeu_si256((__m256i*)&encoded_batch[0], enc1);
-            _mm256_storeu_si256((__m256i*)&encoded_batch[4], enc2);
-
-            // Add to output
             for (size_t j = 0; j < 8; j++) {
                 encoded.push_back(encoded_batch[j]);
             }
         }
     }
 
-    // Process remaining values with 4x unrolling
-    for (; i + 3 < size; i += 4) {
-        int64_t d0 = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
-                     (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
-        int64_t d1 = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i])) -
-                     (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]));
-        int64_t d2 = (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1])) -
-                     (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i]));
-        int64_t d3 = (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2])) -
-                     (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1]));
+    // Process remaining values with 4x unrolling + SIMD ZigZag
+    if (i + 3 < size) {
+        alignas(64) int64_t deltas[4];
+        alignas(64) uint64_t encoded_batch[4];
 
-        // Use SIMD for zigzag if available
-        if (isAvailable()) {
-            alignas(32) int64_t batch[4] = {d0, d1, d2, d3};
-            alignas(32) uint64_t result[4];
-            __m256i enc = zigzagEncode4_avx2(batch);
-            _mm256_storeu_si256((__m256i*)result, enc);
+        for (; i + 3 < size; i += 4) {
+            deltas[0] = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
+                        (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
+            deltas[1] = (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i])) -
+                        (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1]));
+            deltas[2] = (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1])) -
+                        (static_cast<int64_t>(values[i + 1]) - static_cast<int64_t>(values[i]));
+            deltas[3] = (static_cast<int64_t>(values[i + 3]) - static_cast<int64_t>(values[i + 2])) -
+                        (static_cast<int64_t>(values[i + 2]) - static_cast<int64_t>(values[i + 1]));
 
-            encoded.push_back(result[0]);
-            encoded.push_back(result[1]);
-            encoded.push_back(result[2]);
-            encoded.push_back(result[3]);
-        } else {
-            encoded.push_back(ZigZag::zigzagEncode(d0));
-            encoded.push_back(ZigZag::zigzagEncode(d1));
-            encoded.push_back(ZigZag::zigzagEncode(d2));
-            encoded.push_back(ZigZag::zigzagEncode(d3));
+            hwZigZagEncode(deltas, encoded_batch, 4);
+
+            encoded.push_back(encoded_batch[0]);
+            encoded.push_back(encoded_batch[1]);
+            encoded.push_back(encoded_batch[2]);
+            encoded.push_back(encoded_batch[3]);
         }
     }
 
-    // Handle remaining values
+    // Handle remaining values (scalar)
     for (; i < size; i++) {
         int64_t D = (static_cast<int64_t>(values[i]) - static_cast<int64_t>(values[i - 1])) -
                     (static_cast<int64_t>(values[i - 1]) - static_cast<int64_t>(values[i - 2]));
@@ -213,33 +274,22 @@ std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice& encoded, unsigned in
     const size_t size = deltaValues.size();
     size_t i = 2;
 
-    if (isAvailable() && size >= 10) {
-        // Process in batches of 8 using SIMD zigzag decode
-        alignas(32) int64_t decoded_batch[8];
+    // Process in batches of 8 using Highway-dispatched SIMD ZigZag decode
+    if (size >= 10) {
+        alignas(64) int64_t decoded_batch[8];
 
         for (; i + 7 < size; i += 8) {
-            // SIMD zigzag decode in two batches of 4
-            __m256i dec1 = zigzagDecode4_avx2(&deltaValues[i]);
-            __m256i dec2 = zigzagDecode4_avx2(&deltaValues[i + 4]);
+            hwZigZagDecode(&deltaValues[i], decoded_batch, 8);
 
-            // Store decoded values
-            _mm256_storeu_si256((__m256i*)&decoded_batch[0], dec1);
-            _mm256_storeu_si256((__m256i*)&decoded_batch[4], dec2);
-
-// Sequential reconstruction with prefetching
-#pragma unroll 8
+            // Sequential reconstruction (data-dependent prefix sum)
             for (size_t j = 0; j < 8; j++) {
                 delta += decoded_batch[j];
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
 
-                // Branchless min/max check
-                bool in_range = (last_decoded >= minTime) & (last_decoded <= maxTime);
-                if (!in_range) {
-                    if (last_decoded < minTime) {
-                        nSkipped++;
-                    } else {
-                        return {nSkipped, nAdded};
-                    }
+                if (last_decoded < minTime) {
+                    nSkipped++;
+                } else if (last_decoded > maxTime) {
+                    return {nSkipped, nAdded};
                 } else {
                     values.push_back(last_decoded);
                     nAdded++;
@@ -248,16 +298,13 @@ std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice& encoded, unsigned in
         }
     }
 
-    // Process 4 values at a time with SIMD zigzag
-    if (isAvailable()) {
-        alignas(32) int64_t decoded_batch[4];
+    // Process 4 values at a time with SIMD ZigZag
+    {
+        alignas(64) int64_t decoded_batch[4];
 
         for (; i + 3 < size; i += 4) {
-            // SIMD zigzag decode
-            __m256i dec = zigzagDecode4_avx2(&deltaValues[i]);
-            _mm256_storeu_si256((__m256i*)decoded_batch, dec);
+            hwZigZagDecode(&deltaValues[i], decoded_batch, 4);
 
-            // Unrolled reconstruction
             delta += decoded_batch[0];
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
             if (last_decoded < minTime) {
@@ -302,61 +349,9 @@ std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice& encoded, unsigned in
                 nAdded++;
             }
         }
-    } else {
-        // Fallback to non-SIMD 4x unrolling
-        for (; i + 3 < size; i += 4) {
-            int64_t dd0 = ZigZag::zigzagDecode(deltaValues[i]);
-            int64_t dd1 = ZigZag::zigzagDecode(deltaValues[i + 1]);
-            int64_t dd2 = ZigZag::zigzagDecode(deltaValues[i + 2]);
-            int64_t dd3 = ZigZag::zigzagDecode(deltaValues[i + 3]);
-
-            delta += dd0;
-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-            if (last_decoded < minTime) {
-                nSkipped++;
-            } else if (last_decoded > maxTime) {
-                return {nSkipped, nAdded};
-            } else {
-                values.push_back(last_decoded);
-                nAdded++;
-            }
-
-            delta += dd1;
-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-            if (last_decoded < minTime) {
-                nSkipped++;
-            } else if (last_decoded > maxTime) {
-                return {nSkipped, nAdded};
-            } else {
-                values.push_back(last_decoded);
-                nAdded++;
-            }
-
-            delta += dd2;
-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-            if (last_decoded < minTime) {
-                nSkipped++;
-            } else if (last_decoded > maxTime) {
-                return {nSkipped, nAdded};
-            } else {
-                values.push_back(last_decoded);
-                nAdded++;
-            }
-
-            delta += dd3;
-            last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-            if (last_decoded < minTime) {
-                nSkipped++;
-            } else if (last_decoded > maxTime) {
-                return {nSkipped, nAdded};
-            } else {
-                values.push_back(last_decoded);
-                nAdded++;
-            }
-        }
     }
 
-    // Handle remaining values
+    // Handle remaining values (scalar)
     for (; i < size; i++) {
         int64_t encD = ZigZag::zigzagDecode(deltaValues[i]);
         delta += encD;
@@ -377,3 +372,25 @@ std::pair<size_t, size_t> IntegerEncoderSIMD::decode(Slice& encoded, unsigned in
 
     return {nSkipped, nAdded};
 }
+
+// ---------------------------------------------------------------------------
+// IntegerEncoderAVX512 -- delegates to the same Highway dispatch.
+// Since Highway automatically selects the best target (including AVX-512
+// when available), both classes produce identical results.
+// ---------------------------------------------------------------------------
+
+bool IntegerEncoderAVX512::isAvailable() {
+    return true;  // Highway handles runtime dispatch
+}
+
+AlignedBuffer IntegerEncoderAVX512::encode(std::span<const uint64_t> values) {
+    return IntegerEncoderSIMD::encode(values);
+}
+
+std::pair<size_t, size_t> IntegerEncoderAVX512::decode(Slice& encoded, unsigned int timestampSize,
+                                                       std::vector<uint64_t>& values, uint64_t minTime,
+                                                       uint64_t maxTime) {
+    return IntegerEncoderSIMD::decode(encoded, timestampSize, values, minTime, maxTime);
+}
+
+#endif  // HWY_ONCE

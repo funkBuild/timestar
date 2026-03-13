@@ -1,19 +1,11 @@
 #include "linear_forecaster.hpp"
 
 #include "../anomaly/simd_anomaly.hpp"
-#include "../simd_helpers.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
-
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-using timestar::simd::hsum_avx;
-static inline double hsum_avx_local(__m256d v) {
-    return hsum_avx(v);
-}
-#endif
 
 namespace timestar {
 namespace forecast {
@@ -54,75 +46,12 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
     double weightedSumX = 0.0;
     double weightedSumY = 0.0;
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && n >= 16) {
-        // AVX2 path: 4 accumulators per reduction to hide FMA latency
-        __m256d accW0 = _mm256_setzero_pd();
-        __m256d accW1 = _mm256_setzero_pd();
-        __m256d accW2 = _mm256_setzero_pd();
-        __m256d accW3 = _mm256_setzero_pd();
-        __m256d accWX0 = _mm256_setzero_pd();
-        __m256d accWX1 = _mm256_setzero_pd();
-        __m256d accWX2 = _mm256_setzero_pd();
-        __m256d accWX3 = _mm256_setzero_pd();
-        __m256d accWY0 = _mm256_setzero_pd();
-        __m256d accWY1 = _mm256_setzero_pd();
-        __m256d accWY2 = _mm256_setzero_pd();
-        __m256d accWY3 = _mm256_setzero_pd();
-
-        const size_t simd_end = n & ~size_t(15);
-
-        for (size_t i = 0; i < simd_end; i += 16) {
-            // Block 0: i..i+3
-            __m256d w0 = _mm256_loadu_pd(pw + i);
-            accW0 = _mm256_add_pd(accW0, w0);
-            accWX0 = _mm256_fmadd_pd(w0, _mm256_loadu_pd(px + i), accWX0);
-            accWY0 = _mm256_fmadd_pd(w0, _mm256_loadu_pd(py + i), accWY0);
-
-            // Block 1: i+4..i+7
-            __m256d w1 = _mm256_loadu_pd(pw + i + 4);
-            accW1 = _mm256_add_pd(accW1, w1);
-            accWX1 = _mm256_fmadd_pd(w1, _mm256_loadu_pd(px + i + 4), accWX1);
-            accWY1 = _mm256_fmadd_pd(w1, _mm256_loadu_pd(py + i + 4), accWY1);
-
-            // Block 2: i+8..i+11
-            __m256d w2 = _mm256_loadu_pd(pw + i + 8);
-            accW2 = _mm256_add_pd(accW2, w2);
-            accWX2 = _mm256_fmadd_pd(w2, _mm256_loadu_pd(px + i + 8), accWX2);
-            accWY2 = _mm256_fmadd_pd(w2, _mm256_loadu_pd(py + i + 8), accWY2);
-
-            // Block 3: i+12..i+15
-            __m256d w3 = _mm256_loadu_pd(pw + i + 12);
-            accW3 = _mm256_add_pd(accW3, w3);
-            accWX3 = _mm256_fmadd_pd(w3, _mm256_loadu_pd(px + i + 12), accWX3);
-            accWY3 = _mm256_fmadd_pd(w3, _mm256_loadu_pd(py + i + 12), accWY3);
-        }
-
-        // Reduce 4 accumulators -> 1
-        accW0 = _mm256_add_pd(_mm256_add_pd(accW0, accW1), _mm256_add_pd(accW2, accW3));
-        accWX0 = _mm256_add_pd(_mm256_add_pd(accWX0, accWX1), _mm256_add_pd(accWX2, accWX3));
-        accWY0 = _mm256_add_pd(_mm256_add_pd(accWY0, accWY1), _mm256_add_pd(accWY2, accWY3));
-        sumWeights = hsum_avx_local(accW0);
-        weightedSumX = hsum_avx_local(accWX0);
-        weightedSumY = hsum_avx_local(accWY0);
-
-        // Scalar remainder (skip NaN values)
-        for (size_t i = simd_end; i < n; ++i) {
-            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
-            sumWeights += w;
-            weightedSumX += w * px[i];
-            weightedSumY += w * py[i];
-        }
-    } else
-#endif
-    {
-        // Scalar fallback (skip NaN values by zeroing their weight)
-        for (size_t i = 0; i < n; ++i) {
-            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
-            sumWeights += w;
-            weightedSumX += w * px[i];
-            weightedSumY += w * py[i];
-        }
+    // Scalar fallback (skip NaN values by zeroing their weight)
+    for (size_t i = 0; i < n; ++i) {
+        double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
+        sumWeights += w;
+        weightedSumX += w * px[i];
+        weightedSumY += w * py[i];
     }
 
     if (sumWeights <= 0.0) {
@@ -149,93 +78,14 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
     double sumXX = 0.0;
     double sumYY = 0.0;
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && n >= 16) {
-        __m256d vMeanX = _mm256_set1_pd(fit.meanX);
-        __m256d vMeanY = _mm256_set1_pd(meanY);
-
-        __m256d accXX0 = _mm256_setzero_pd();
-        __m256d accXX1 = _mm256_setzero_pd();
-        __m256d accXX2 = _mm256_setzero_pd();
-        __m256d accXX3 = _mm256_setzero_pd();
-        __m256d accXY0 = _mm256_setzero_pd();
-        __m256d accXY1 = _mm256_setzero_pd();
-        __m256d accXY2 = _mm256_setzero_pd();
-        __m256d accXY3 = _mm256_setzero_pd();
-        __m256d accYY0 = _mm256_setzero_pd();
-        __m256d accYY1 = _mm256_setzero_pd();
-        __m256d accYY2 = _mm256_setzero_pd();
-        __m256d accYY3 = _mm256_setzero_pd();
-
-        const size_t simd_end = n & ~size_t(15);
-
-        for (size_t i = 0; i < simd_end; i += 16) {
-            // Block 0
-            __m256d w0 = _mm256_loadu_pd(pw + i);
-            __m256d dx0 = _mm256_sub_pd(_mm256_loadu_pd(px + i), vMeanX);
-            __m256d dy0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), vMeanY);
-            __m256d wdx0 = _mm256_mul_pd(w0, dx0);
-            accXX0 = _mm256_fmadd_pd(wdx0, dx0, accXX0);
-            accXY0 = _mm256_fmadd_pd(wdx0, dy0, accXY0);
-            accYY0 = _mm256_fmadd_pd(_mm256_mul_pd(w0, dy0), dy0, accYY0);
-
-            // Block 1
-            __m256d w1 = _mm256_loadu_pd(pw + i + 4);
-            __m256d dx1 = _mm256_sub_pd(_mm256_loadu_pd(px + i + 4), vMeanX);
-            __m256d dy1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), vMeanY);
-            __m256d wdx1 = _mm256_mul_pd(w1, dx1);
-            accXX1 = _mm256_fmadd_pd(wdx1, dx1, accXX1);
-            accXY1 = _mm256_fmadd_pd(wdx1, dy1, accXY1);
-            accYY1 = _mm256_fmadd_pd(_mm256_mul_pd(w1, dy1), dy1, accYY1);
-
-            // Block 2
-            __m256d w2 = _mm256_loadu_pd(pw + i + 8);
-            __m256d dx2 = _mm256_sub_pd(_mm256_loadu_pd(px + i + 8), vMeanX);
-            __m256d dy2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), vMeanY);
-            __m256d wdx2 = _mm256_mul_pd(w2, dx2);
-            accXX2 = _mm256_fmadd_pd(wdx2, dx2, accXX2);
-            accXY2 = _mm256_fmadd_pd(wdx2, dy2, accXY2);
-            accYY2 = _mm256_fmadd_pd(_mm256_mul_pd(w2, dy2), dy2, accYY2);
-
-            // Block 3
-            __m256d w3 = _mm256_loadu_pd(pw + i + 12);
-            __m256d dx3 = _mm256_sub_pd(_mm256_loadu_pd(px + i + 12), vMeanX);
-            __m256d dy3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), vMeanY);
-            __m256d wdx3 = _mm256_mul_pd(w3, dx3);
-            accXX3 = _mm256_fmadd_pd(wdx3, dx3, accXX3);
-            accXY3 = _mm256_fmadd_pd(wdx3, dy3, accXY3);
-            accYY3 = _mm256_fmadd_pd(_mm256_mul_pd(w3, dy3), dy3, accYY3);
-        }
-
-        // Reduce 4 accumulators -> 1
-        accXX0 = _mm256_add_pd(_mm256_add_pd(accXX0, accXX1), _mm256_add_pd(accXX2, accXX3));
-        accXY0 = _mm256_add_pd(_mm256_add_pd(accXY0, accXY1), _mm256_add_pd(accXY2, accXY3));
-        accYY0 = _mm256_add_pd(_mm256_add_pd(accYY0, accYY1), _mm256_add_pd(accYY2, accYY3));
-        sumXX = hsum_avx_local(accXX0);
-        sumXY = hsum_avx_local(accXY0);
-        sumYY = hsum_avx_local(accYY0);
-
-        // Scalar remainder (skip NaN values)
-        for (size_t i = simd_end; i < n; ++i) {
-            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
-            double dx = px[i] - fit.meanX;
-            double dy = py[i] - meanY;
-            sumXX += w * dx * dx;
-            sumXY += w * dx * dy;
-            sumYY += w * dy * dy;
-        }
-    } else
-#endif
-    {
-        // Scalar fallback (skip NaN values)
-        for (size_t i = 0; i < n; ++i) {
-            double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
-            double dx = px[i] - fit.meanX;
-            double dy = py[i] - meanY;
-            sumXY += w * dx * dy;
-            sumXX += w * dx * dx;
-            sumYY += w * dy * dy;
-        }
+    // Scalar fallback (skip NaN values)
+    for (size_t i = 0; i < n; ++i) {
+        double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
+        double dx = px[i] - fit.meanX;
+        double dy = py[i] - meanY;
+        sumXY += w * dx * dy;
+        sumXX += w * dx * dx;
+        sumYY += w * dy * dy;
     }
 
     fit.sumSquaredX = sumXX;
@@ -265,63 +115,11 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
     // ======================================================================
     double sse = 0.0;
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && n >= 16) {
-        __m256d vSlope = _mm256_set1_pd(fit.slope);
-        __m256d vIntercept = _mm256_set1_pd(fit.intercept);
-
-        __m256d accSSE0 = _mm256_setzero_pd();
-        __m256d accSSE1 = _mm256_setzero_pd();
-        __m256d accSSE2 = _mm256_setzero_pd();
-        __m256d accSSE3 = _mm256_setzero_pd();
-
-        const size_t simd_end = n & ~size_t(15);
-
-        for (size_t i = 0; i < simd_end; i += 16) {
-            // Block 0: residual = y[i] - (slope*x[i] + intercept)
-            __m256d pred0 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i), vIntercept);
-            __m256d res0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), pred0);
-            __m256d wres0 = _mm256_mul_pd(_mm256_loadu_pd(pw + i), res0);
-            accSSE0 = _mm256_fmadd_pd(wres0, res0, accSSE0);
-
-            // Block 1
-            __m256d pred1 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i + 4), vIntercept);
-            __m256d res1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), pred1);
-            __m256d wres1 = _mm256_mul_pd(_mm256_loadu_pd(pw + i + 4), res1);
-            accSSE1 = _mm256_fmadd_pd(wres1, res1, accSSE1);
-
-            // Block 2
-            __m256d pred2 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i + 8), vIntercept);
-            __m256d res2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), pred2);
-            __m256d wres2 = _mm256_mul_pd(_mm256_loadu_pd(pw + i + 8), res2);
-            accSSE2 = _mm256_fmadd_pd(wres2, res2, accSSE2);
-
-            // Block 3
-            __m256d pred3 = _mm256_fmadd_pd(vSlope, _mm256_loadu_pd(px + i + 12), vIntercept);
-            __m256d res3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), pred3);
-            __m256d wres3 = _mm256_mul_pd(_mm256_loadu_pd(pw + i + 12), res3);
-            accSSE3 = _mm256_fmadd_pd(wres3, res3, accSSE3);
-        }
-
-        // Reduce 4 accumulators -> 1
-        accSSE0 = _mm256_add_pd(_mm256_add_pd(accSSE0, accSSE1), _mm256_add_pd(accSSE2, accSSE3));
-        sse = hsum_avx_local(accSSE0);
-
-        // Scalar remainder
-        for (size_t i = simd_end; i < n; ++i) {
-            double predicted = fit.slope * px[i] + fit.intercept;
-            double residual = py[i] - predicted;
-            sse += pw[i] * residual * residual;
-        }
-    } else
-#endif
-    {
-        // Scalar fallback
-        for (size_t i = 0; i < n; ++i) {
-            double predicted = fit.slope * px[i] + fit.intercept;
-            double residual = py[i] - predicted;
-            sse += pw[i] * residual * residual;
-        }
+    // Scalar fallback
+    for (size_t i = 0; i < n; ++i) {
+        double predicted = fit.slope * px[i] + fit.intercept;
+        double residual = py[i] - predicted;
+        sse += pw[i] * residual * residual;
     }
 
     if (n > 2) {

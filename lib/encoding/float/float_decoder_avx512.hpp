@@ -3,32 +3,30 @@
 
 #include "../../storage/slice_buffer.hpp"
 
-#include <immintrin.h>
-
 #include <cstdint>
 #include <vector>
 
 /**
- * AVX-512 optimized float decoder
+ * Float decoder (AVX-512 tier)
  *
- * While decoding is inherently sequential, AVX-512 provides:
- * 1. More aggressive prefetching capabilities
- * 2. Mask registers for branchless operations
- * 3. Wider registers for potential future optimizations
+ * Gorilla/XOR decoding is inherently sequential: each value depends on the
+ * previous via XOR, so there is no meaningful SIMD parallelism in the decode
+ * loop. This class delegates to FloatDecoderBasic and always reports itself
+ * as available so the dispatcher in FloatDecoder works on every platform.
  */
 class FloatDecoderAVX512 {
 public:
-    // Runtime AVX-512 detection
+    // Always available -- decoding delegates to the scalar FloatDecoderBasic.
     static bool isAvailable();
 
-    // Check for specific AVX-512 features we need
-    static bool hasAVX512F();   // Foundation
-    static bool hasAVX512DQ();  // Double/Quad word instructions
+    // Kept for API compatibility; always returns true.
+    static bool hasAVX512F();
+    static bool hasAVX512DQ();
 
-    // AVX-512 optimized decoding
+    // Decode (delegates to FloatDecoderBasic).
     static void decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 
-    // Safe decoding with automatic fallback
+    // Safe variant (identical to decode since isAvailable() is always true).
     static void decodeSafe(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 };
 

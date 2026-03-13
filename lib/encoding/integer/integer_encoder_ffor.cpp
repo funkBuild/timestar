@@ -1,7 +1,14 @@
+// Highway foreach_target re-inclusion mechanism.
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "encoding/integer/integer_encoder_ffor.cpp"
+#include "hwy/foreach_target.h"
+
 #include "integer_encoder_ffor.hpp"
 
 #include "../alp/alp_ffor.hpp"
 #include "../zigzag.hpp"
+
+#include "hwy/highway.h"
 
 #include <algorithm>
 #include <array>
@@ -10,9 +17,90 @@
 #include <limits>
 #include <vector>
 
-#ifdef __AVX2__
-    #include <immintrin.h>
-#endif
+// =============================================================================
+// SIMD kernels (compiled once per target ISA by foreach_target)
+// =============================================================================
+HWY_BEFORE_NAMESPACE();
+namespace ffor_enc {
+namespace HWY_NAMESPACE {
+
+namespace hn = hwy::HWY_NAMESPACE;
+
+// ZigZag-encode a block of int64_t deltas into uint64_t output, and
+// simultaneously track unsigned min/max across all output values.
+// `deltas` are pre-computed delta-of-delta values (sequential dependency,
+// computed scalar by the caller).  Handles any count (including tail elements
+// that don't fill a full vector).
+void ZigZagEncodeAndMinMax(const int64_t* HWY_RESTRICT deltas,
+                           uint64_t* HWY_RESTRICT out, size_t count,
+                           uint64_t* HWY_RESTRICT min_out,
+                           uint64_t* HWY_RESTRICT max_out) {
+    const hn::ScalableTag<int64_t> di;
+    const hn::ScalableTag<uint64_t> du;
+    const size_t N = hn::Lanes(di);
+
+    auto vmin = hn::Set(du, *min_out);
+    auto vmax = hn::Set(du, *max_out);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        // Load signed deltas
+        auto v = hn::LoadU(di, &deltas[i]);
+
+        // ZigZag encode: (x << 1) ^ (x >> 63)
+        // ShiftRight on signed int64_t is arithmetic (sign-extending) in Highway.
+        auto shifted = hn::ShiftLeft<1>(v);
+        auto sign = hn::ShiftRight<63>(v);
+        auto zz = hn::BitCast(du, hn::Xor(shifted, sign));
+
+        // Store zigzag-encoded values
+        hn::StoreU(zz, du, &out[i]);
+
+        // Track unsigned min/max
+        vmin = hn::Min(vmin, zz);
+        vmax = hn::Max(vmax, zz);
+    }
+
+    // Horizontal reduction of SIMD accumulators
+    uint64_t cur_min = hn::ReduceMin(du, vmin);
+    uint64_t cur_max = hn::ReduceMax(du, vmax);
+
+    // Scalar tail: process remaining elements that don't fill a full vector
+    for (; i < count; ++i) {
+        int64_t x = deltas[i];
+        uint64_t zz = (static_cast<uint64_t>(x) << 1) ^ static_cast<uint64_t>(x >> 63);
+        out[i] = zz;
+        if (zz < cur_min)
+            cur_min = zz;
+        if (zz > cur_max)
+            cur_max = zz;
+    }
+
+    *min_out = cur_min;
+    *max_out = cur_max;
+}
+
+}  // namespace HWY_NAMESPACE
+}  // namespace ffor_enc
+HWY_AFTER_NAMESPACE();
+
+// =============================================================================
+// Non-SIMD code + dispatch table (compiled once)
+// =============================================================================
+#if HWY_ONCE
+
+namespace ffor_enc {
+HWY_EXPORT(ZigZagEncodeAndMinMax);
+
+// Wrapper callable from outside ffor_enc namespace (HWY_DYNAMIC_DISPATCH
+// must resolve the dispatch table in the same namespace as HWY_EXPORT).
+inline void dispatchZigZagEncodeAndMinMax(const int64_t* deltas,
+                                          uint64_t* out, size_t count,
+                                          uint64_t* min_out,
+                                          uint64_t* max_out) {
+    HWY_DYNAMIC_DISPATCH(ZigZagEncodeAndMinMax)(deltas, out, count, min_out, max_out);
+}
+}  // namespace ffor_enc
 
 namespace {
 
@@ -28,6 +116,9 @@ struct FFORScratchBuffers {
     std::vector<uint16_t> exc_positions;  // up to BLOCK_SIZE/4
     std::vector<uint64_t> exc_values;     // up to BLOCK_SIZE/4
 
+    // Scratch for scalar delta-of-delta values before SIMD zigzag encode
+    std::vector<int64_t> deltas;          // up to BLOCK_SIZE (1024)
+
     // Decode path: no scratch buffers needed - decode uses a stack-allocated
     // block buffer (8KB) that stays hot in L1 cache.
 
@@ -36,6 +127,7 @@ struct FFORScratchBuffers {
         clean.reserve(1024);
         exc_positions.reserve(256);
         exc_values.reserve(256);
+        deltas.reserve(1024);
     }
 };
 
@@ -265,7 +357,7 @@ size_t decodeBlockInto(Slice& s, uint64_t* out) {
         const uint8_t* packed_ptr = s.data + s.offset;
         s.offset += packed_bytes;
 
-        // Copy to an aligned stack buffer — the source slice may not be 8-byte
+        // Copy to an aligned stack buffer -- the source slice may not be 8-byte
         // aligned, and reinterpret_cast<const uint64_t*> on unaligned data
         // is UB (crashes with SIGBUS on ARM / Graviton).
         // Max packed_words = ceil(BLOCK_SIZE * 64 / 64) = BLOCK_SIZE = 1024 (8KB stack).
@@ -328,13 +420,20 @@ size_t decodeBlockInto(Slice& s, uint64_t* out) {
 // per-block min/max tracking, eliminating a redundant min/max scan in encodeBlock().
 // Zigzag values are computed block-at-a-time into the scratch buffer, and min/max
 // are tracked simultaneously during that computation.
+//
+// The delta-of-delta computation has sequential memory dependencies and stays
+// scalar.  The zigzag encode + min/max tracking is dispatched to the best
+// available SIMD target via Highway (AVX-512, AVX2, SSE4, NEON, ...).
 void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
     constexpr size_t BS = IntegerEncoderFFOR::BLOCK_SIZE;
     const size_t sz = values.size();
     const size_t num_blocks = (sz + BS - 1) / BS;
 
-    auto& zigzag = getScratch().zigzag;
-    zigzag.resize(BS);  // ensure capacity; only reallocates on first call
+    auto& scratch = getScratch();
+    auto& zigzag = scratch.zigzag;
+    auto& deltas = scratch.deltas;
+    zigzag.resize(BS);   // ensure capacity; only reallocates on first call
+    deltas.resize(BS);   // scratch for delta-of-delta values
 
     // Estimate: header + base + worst-case packed data per block
     buf.reserve(buf.size() + num_blocks * (16 + BS * 8));
@@ -379,103 +478,40 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
             }
         }
 
-        // Remaining values in this block: zigzag(delta-of-delta)
-        // Process 4 values at a time for better ILP on min/max tracking.
-#if defined(__AVX2__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
-        // AVX2 + AVX-512 VL path: use 256-bit YMM registers for 4x int64 operations.
-        // The delta-of-delta computation stays scalar (sequential memory dependencies),
-        // but zigzag encode and min/max tracking use full 256-bit SIMD.
+        // Remaining values in this block: zigzag(delta-of-delta).
+        // Phase 1: Compute delta-of-delta values into the scratch buffer (scalar,
+        //          sequential memory dependency prevents SIMD here).
+        // Phase 2: ZigZag-encode and track min/max via Highway SIMD dispatch.
+
+        // Count how many delta-of-delta values we'll compute this block
+        size_t dd_count = 0;
         {
-            __m256i vmin = _mm256_set1_epi64x(static_cast<int64_t>(block_min));
-            __m256i vmax = _mm256_set1_epi64x(static_cast<int64_t>(block_max));
-
-            for (; zz_idx + 3 < block_count && val_idx >= 2; val_idx += 4, zz_idx += 4) {
-                // Delta-of-delta: sequential memory accesses, kept scalar
-                int64_t D0 = (static_cast<int64_t>(values[val_idx]) - static_cast<int64_t>(values[val_idx - 1])) -
-                             (static_cast<int64_t>(values[val_idx - 1]) - static_cast<int64_t>(values[val_idx - 2]));
-                int64_t D1 = (static_cast<int64_t>(values[val_idx + 1]) - static_cast<int64_t>(values[val_idx])) -
-                             (static_cast<int64_t>(values[val_idx]) - static_cast<int64_t>(values[val_idx - 1]));
-                int64_t D2 = (static_cast<int64_t>(values[val_idx + 2]) - static_cast<int64_t>(values[val_idx + 1])) -
-                             (static_cast<int64_t>(values[val_idx + 1]) - static_cast<int64_t>(values[val_idx]));
-                int64_t D3 = (static_cast<int64_t>(values[val_idx + 3]) - static_cast<int64_t>(values[val_idx + 2])) -
-                             (static_cast<int64_t>(values[val_idx + 2]) - static_cast<int64_t>(values[val_idx + 1]));
-
-                // Load 4 deltas into a YMM register
-                __m256i deltas = _mm256_set_epi64x(D3, D2, D1, D0);
-
-                // ZigZag encode 4 values: (x << 1) ^ (x >> 63)
-                // AVX-512 VL provides vpsraq for 64-bit arithmetic right shift on YMM
-                __m256i shifted = _mm256_slli_epi64(deltas, 1);
-                __m256i sign = _mm256_srai_epi64(deltas, 63);  // AVX-512 VL
-                __m256i zz_vec = _mm256_xor_si256(shifted, sign);
-
-                // Store 4 zigzag values directly to scratch buffer
-                _mm256_storeu_si256(reinterpret_cast<__m256i*>(&zigzag[zz_idx]), zz_vec);
-
-                // Unsigned min/max tracking using AVX-512 VL vpminuq/vpmaxuq on YMM
-                vmin = _mm256_min_epu64(vmin, zz_vec);
-                vmax = _mm256_max_epu64(vmax, zz_vec);
+            size_t vi = val_idx;
+            size_t zi = zz_idx;
+            while (zi < block_count && vi < sz && vi >= 2) {
+                deltas[dd_count] = (static_cast<int64_t>(values[vi]) - static_cast<int64_t>(values[vi - 1])) -
+                                   (static_cast<int64_t>(values[vi - 1]) - static_cast<int64_t>(values[vi - 2]));
+                ++dd_count;
+                ++vi;
+                ++zi;
             }
-
-            // Horizontal reduction of vmin/vmax: reduce 4 lanes -> 1 scalar each
-            // Extract high 128-bit half and reduce with low half
-            __m128i min_lo = _mm256_castsi256_si128(vmin);
-            __m128i min_hi = _mm256_extracti128_si256(vmin, 1);
-            __m128i min_r = _mm_min_epu64(min_lo, min_hi);  // AVX-512 VL: 2 lanes
-            // Reduce 2 lanes to 1: shuffle high lane to low and reduce
-            __m128i min_shuf = _mm_unpackhi_epi64(min_r, min_r);
-            min_r = _mm_min_epu64(min_r, min_shuf);
-            block_min = static_cast<uint64_t>(_mm_cvtsi128_si64(min_r));
-
-            __m128i max_lo = _mm256_castsi256_si128(vmax);
-            __m128i max_hi = _mm256_extracti128_si256(vmax, 1);
-            __m128i max_r = _mm_max_epu64(max_lo, max_hi);
-            __m128i max_shuf = _mm_unpackhi_epi64(max_r, max_r);
-            max_r = _mm_max_epu64(max_r, max_shuf);
-            block_max = static_cast<uint64_t>(_mm_cvtsi128_si64(max_r));
         }
-#else
-        // Scalar fallback: process 4 values at a time with manual min/max reduction
-        for (; zz_idx + 3 < block_count && val_idx >= 2; val_idx += 4, zz_idx += 4) {
-            int64_t D0 = (static_cast<int64_t>(values[val_idx]) - static_cast<int64_t>(values[val_idx - 1])) -
-                         (static_cast<int64_t>(values[val_idx - 1]) - static_cast<int64_t>(values[val_idx - 2]));
-            int64_t D1 = (static_cast<int64_t>(values[val_idx + 1]) - static_cast<int64_t>(values[val_idx])) -
-                         (static_cast<int64_t>(values[val_idx]) - static_cast<int64_t>(values[val_idx - 1]));
-            int64_t D2 = (static_cast<int64_t>(values[val_idx + 2]) - static_cast<int64_t>(values[val_idx + 1])) -
-                         (static_cast<int64_t>(values[val_idx + 1]) - static_cast<int64_t>(values[val_idx]));
-            int64_t D3 = (static_cast<int64_t>(values[val_idx + 3]) - static_cast<int64_t>(values[val_idx + 2])) -
-                         (static_cast<int64_t>(values[val_idx + 2]) - static_cast<int64_t>(values[val_idx + 1]));
 
-            uint64_t zz0 = ZigZag::zigzagEncode(D0);
-            uint64_t zz1 = ZigZag::zigzagEncode(D1);
-            uint64_t zz2 = ZigZag::zigzagEncode(D2);
-            uint64_t zz3 = ZigZag::zigzagEncode(D3);
+        if (dd_count > 0) {
+            // Highway SIMD dispatch: zigzag-encode deltas[] into zigzag[zz_idx..],
+            // updating block_min/block_max along the way.  The kernel handles
+            // both the SIMD main loop and scalar tail internally.
+            ffor_enc::dispatchZigZagEncodeAndMinMax(
+                deltas.data(), &zigzag[zz_idx], dd_count, &block_min, &block_max);
 
-            zigzag[zz_idx] = zz0;
-            zigzag[zz_idx + 1] = zz1;
-            zigzag[zz_idx + 2] = zz2;
-            zigzag[zz_idx + 3] = zz3;
-
-            uint64_t lo01 = zz0 < zz1 ? zz0 : zz1;
-            uint64_t hi01 = zz0 > zz1 ? zz0 : zz1;
-            uint64_t lo23 = zz2 < zz3 ? zz2 : zz3;
-            uint64_t hi23 = zz2 > zz3 ? zz2 : zz3;
-            uint64_t lo = lo01 < lo23 ? lo01 : lo23;
-            uint64_t hi = hi01 > hi23 ? hi01 : hi23;
-            if (lo < block_min)
-                block_min = lo;
-            if (hi > block_max)
-                block_max = hi;
+            val_idx += dd_count;
+            zz_idx += dd_count;
         }
-#endif
 
-        // Scalar tail for remaining values in this block
+        // Handle edge case: val_idx < 2 with remaining values in block
+        // (only possible for tiny blocks where block_count <= 2, already handled above)
         for (; zz_idx < block_count && val_idx < sz; ++zz_idx, ++val_idx) {
             if (val_idx < 2) {
-                // This handles the edge case where block_count <= 2 and we're
-                // still in the first two values (already handled above, but guard).
-                // Decrement zz_idx so the loop increment doesn't skip a buffer slot,
-                // leaving stale/uninitialized data in zigzag[].
                 --zz_idx;
                 continue;
             }
@@ -526,7 +562,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
     // Fused decode: unpack one FFOR block at a time into a small stack buffer,
     // then immediately perform zigzag decode + delta reconstruction + time filtering.
     // Benefits:
-    //   1. 8KB block buffer (1024 × 8B) stays hot in L1 cache
+    //   1. 8KB block buffer (1024 x 8B) stays hot in L1 cache
     //   2. No large intermediate deltaValues allocation
     //   3. Early exit when maxTime exceeded (skip remaining blocks)
 
@@ -739,3 +775,5 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
 
     return {nSkipped, nAdded};
 }
+
+#endif  // HWY_ONCE

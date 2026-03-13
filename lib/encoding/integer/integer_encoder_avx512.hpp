@@ -9,10 +9,12 @@
 #include <vector>
 
 /**
- * IntegerEncoderAVX512 - AVX-512 optimized implementation
+ * IntegerEncoderAVX512 - Google Highway optimized implementation
  *
- * Uses AVX-512 SIMD instructions for maximum performance
- * Processes 8x64-bit values in parallel where possible
+ * Delegates to IntegerEncoderSIMD which uses Highway for portable SIMD dispatch.
+ * Highway automatically selects the best available target at runtime
+ * (SSE4, AVX2, AVX-512, etc.), so this class produces identical results
+ * to IntegerEncoderSIMD.
  */
 class IntegerEncoderAVX512 {
 public:

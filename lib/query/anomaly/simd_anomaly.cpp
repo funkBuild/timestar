@@ -1,151 +1,260 @@
+// Highway foreach_target re-inclusion mechanism.
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "query/anomaly/simd_anomaly.cpp"
+#include "hwy/foreach_target.h"
+
 #include "simd_anomaly.hpp"
 
-#include "../simd_helpers.hpp"
+#include "hwy/highway.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <numeric>
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    #include <cpuid.h>
-#endif
-
+// =============================================================================
+// SIMD kernels (compiled once per target ISA by foreach_target)
+// =============================================================================
+HWY_BEFORE_NAMESPACE();
 namespace timestar {
 namespace anomaly {
 namespace simd {
+namespace HWY_NAMESPACE {
 
-// ==================== SIMD Detection ====================
+namespace hn = hwy::HWY_NAMESPACE;
 
-bool isAvx2Available() {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    return false;
-#else
-    static const bool available = []() {
-        unsigned int eax, ebx, ecx, edx;
-        if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-            bool avx = (ecx & (1 << 28)) != 0;
-            if (avx && __get_cpuid_max(0, nullptr) >= 7) {
-                __cpuid_count(7, 0, eax, ebx, ecx, edx);
-                return (ebx & (1 << 5)) != 0;  // AVX2
-            }
-        }
-        return false;
-    }();
-    return available;
-#endif
-}
+// --- Element-wise operations ---
 
-bool isAvx512Available() {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    return false;
-#else
-    static const bool available = []() {
-        unsigned int eax, ebx, ecx, edx;
-        if (__get_cpuid_max(0, nullptr) >= 7) {
-            __cpuid_count(7, 0, eax, ebx, ecx, edx);
-            bool avx512f = (ebx & (1 << 16)) != 0;
-            bool avx512dq = (ebx & (1 << 17)) != 0;
-            return avx512f && avx512dq;
-        }
-        return false;
-    }();
-    return available;
-#endif
-}
+void VectorSubtractKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
+                          double* HWY_RESTRICT result, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
 
-// ==================== Helper Functions ====================
-
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-using ::timestar::simd::hsum_avx;
-#endif
-
-// ==================== Scalar Implementations ====================
-
-namespace scalar {
-
-void vectorSubtract(const double* a, const double* b, double* result, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto va = hn::LoadU(d, &a[i]);
+        auto vb = hn::LoadU(d, &b[i]);
+        hn::StoreU(hn::Sub(va, vb), d, &result[i]);
+    }
+    for (; i < count; ++i) {
         result[i] = a[i] - b[i];
     }
 }
 
-void vectorAdd(const double* a, const double* b, double* result, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+void VectorAddKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
+                     double* HWY_RESTRICT result, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto va = hn::LoadU(d, &a[i]);
+        auto vb = hn::LoadU(d, &b[i]);
+        hn::StoreU(hn::Add(va, vb), d, &result[i]);
+    }
+    for (; i < count; ++i) {
         result[i] = a[i] + b[i];
     }
 }
 
-void vectorMultiply(const double* a, const double* b, double* result, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+void VectorMultiplyKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
+                          double* HWY_RESTRICT result, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto va = hn::LoadU(d, &a[i]);
+        auto vb = hn::LoadU(d, &b[i]);
+        hn::StoreU(hn::Mul(va, vb), d, &result[i]);
+    }
+    for (; i < count; ++i) {
         result[i] = a[i] * b[i];
     }
 }
 
-void vectorScalarMultiply(const double* a, double scalar, double* result, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+void VectorScalarMultiplyKernel(const double* HWY_RESTRICT a, double scalar,
+                                double* HWY_RESTRICT result, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto vs = hn::Set(d, scalar);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto va = hn::LoadU(d, &a[i]);
+        hn::StoreU(hn::Mul(va, vs), d, &result[i]);
+    }
+    for (; i < count; ++i) {
         result[i] = a[i] * scalar;
     }
 }
 
-void vectorFMA(const double* a, const double* b, double scalar, double* result, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+// result[i] = a[i] + b[i] * scalar  (fused multiply-add)
+void VectorFMAKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b,
+                     double scalar, double* HWY_RESTRICT result, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto vs = hn::Set(d, scalar);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto va = hn::LoadU(d, &a[i]);
+        auto vb = hn::LoadU(d, &b[i]);
+        // MulAdd(b, s, a) = b * s + a
+        hn::StoreU(hn::MulAdd(vb, vs, va), d, &result[i]);
+    }
+    for (; i < count; ++i) {
         result[i] = a[i] + b[i] * scalar;
     }
 }
 
-// Kahan summation for improved precision
-double vectorSum(const double* values, size_t count) {
-    double sum = 0.0, c = 0.0;
-    for (size_t i = 0; i < count; ++i) {
-        double y = values[i] - c;
-        double t = sum + y;
-        c = (t - sum) - y;
-        sum = t;
+// --- Reduction operations ---
+
+double VectorSumKernel(const double* HWY_RESTRICT values, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+
+    auto acc = hn::Zero(d);
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &values[i]);
+        acc = hn::Add(acc, v);
+    }
+
+    double sum = hn::ReduceSum(d, acc);
+    for (; i < count; ++i) {
+        sum += values[i];
     }
     return sum;
 }
 
-double vectorMean(const double* values, size_t count) {
-    if (count == 0)
-        return 0.0;
-    return vectorSum(values, count) / static_cast<double>(count);
-}
+double VectorSumSquaredDiffKernel(const double* HWY_RESTRICT values, size_t count, double mean) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto vmean = hn::Set(d, mean);
 
-double vectorSumSquaredDiff(const double* values, size_t count, double mean) {
-    double result = 0.0;
-    for (size_t i = 0; i < count; ++i) {
+    auto acc = hn::Zero(d);
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &values[i]);
+        auto diff = hn::Sub(v, vmean);
+        // MulAdd(diff, diff, acc) = diff * diff + acc
+        acc = hn::MulAdd(diff, diff, acc);
+    }
+
+    double result = hn::ReduceSum(d, acc);
+    for (; i < count; ++i) {
         double diff = values[i] - mean;
         result += diff * diff;
     }
     return result;
 }
 
-double vectorVariance(const double* values, size_t count, double mean) {
-    if (count <= 1)
-        return 0.0;
-    return vectorSumSquaredDiff(values, count, mean) / static_cast<double>(count - 1);
+double WeightedSumKernel(const double* HWY_RESTRICT values,
+                         const double* HWY_RESTRICT weights, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+
+    auto acc = hn::Zero(d);
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &values[i]);
+        auto w = hn::LoadU(d, &weights[i]);
+        // MulAdd(v, w, acc) = v * w + acc
+        acc = hn::MulAdd(v, w, acc);
+    }
+
+    double sum = hn::ReduceSum(d, acc);
+    for (; i < count; ++i) {
+        sum += values[i] * weights[i];
+    }
+    return sum;
 }
 
-void computeBounds(const double* predictions, const double* scale, double bounds, double* upper, double* lower,
-                   size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+// --- Bounds and scoring ---
+
+// upper[i] = predictions[i] + bounds * scale[i]
+// lower[i] = predictions[i] - bounds * scale[i]
+// Uses separate Mul + Add/Sub (NOT MulAdd) to match the non-FMA semantics
+// of the original implementation and existing tests.
+void ComputeBoundsKernel(const double* HWY_RESTRICT predictions,
+                         const double* HWY_RESTRICT scale, double bounds,
+                         double* HWY_RESTRICT upper, double* HWY_RESTRICT lower,
+                         size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto vbounds = hn::Set(d, bounds);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto pred = hn::LoadU(d, &predictions[i]);
+        auto sc = hn::LoadU(d, &scale[i]);
+        auto margin = hn::Mul(vbounds, sc);
+        hn::StoreU(hn::Add(pred, margin), d, &upper[i]);
+        hn::StoreU(hn::Sub(pred, margin), d, &lower[i]);
+    }
+    for (; i < count; ++i) {
         double margin = bounds * scale[i];
         upper[i] = predictions[i] + margin;
         lower[i] = predictions[i] - margin;
     }
 }
 
-void computeAnomalyScores(const double* values, const double* upper, const double* lower, double* scores,
-                          size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+// score[i] = max(0, val - upper) + max(0, lower - val)
+void ComputeAnomalyScoresKernel(const double* HWY_RESTRICT values,
+                                const double* HWY_RESTRICT upper,
+                                const double* HWY_RESTRICT lower,
+                                double* HWY_RESTRICT scores, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto zero = hn::Zero(d);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto val = hn::LoadU(d, &values[i]);
+        auto up = hn::LoadU(d, &upper[i]);
+        auto lo = hn::LoadU(d, &lower[i]);
+
+        auto above = hn::Max(zero, hn::Sub(val, up));
+        auto below = hn::Max(zero, hn::Sub(lo, val));
+        hn::StoreU(hn::Add(above, below), d, &scores[i]);
+    }
+    for (; i < count; ++i) {
         double above = std::max(0.0, values[i] - upper[i]);
         double below = std::max(0.0, lower[i] - values[i]);
         scores[i] = above + below;
     }
 }
 
-void computeTricubeWeights(const double* distances, double* weights, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
+// --- LOESS: tricube weights ---
+// weight = (1 - |d|^3)^3 where |d| < 1, else 0
+void ComputeTricubeWeightsKernel(const double* HWY_RESTRICT distances,
+                                 double* HWY_RESTRICT weights, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto one = hn::Set(d, 1.0);
+
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto dist = hn::LoadU(d, &distances[i]);
+        auto u = hn::Abs(dist);
+
+        // u^3 = u * u * u
+        auto u2 = hn::Mul(u, u);
+        auto u3 = hn::Mul(u2, u);
+
+        // t = 1 - u^3
+        auto t = hn::Sub(one, u3);
+
+        // t^3 = t * t * t
+        auto t2 = hn::Mul(t, t);
+        auto t3 = hn::Mul(t2, t);
+
+        // Zero out where u >= 1.0
+        auto mask = hn::Lt(u, one);
+        hn::StoreU(hn::IfThenElseZero(mask, t3), d, &weights[i]);
+    }
+    for (; i < count; ++i) {
         double u = std::abs(distances[i]);
         if (u >= 1.0) {
             weights[i] = 0.0;
@@ -156,175 +265,81 @@ void computeTricubeWeights(const double* distances, double* weights, size_t coun
     }
 }
 
-void computeMovingAverage(const double* values, size_t count, size_t windowSize, double* result) {
-    if (count == 0 || windowSize == 0)
-        return;
+// --- Weighted linear regression helper: compute wxx and wxy arrays ---
+void WeightedProductsKernel(const double* HWY_RESTRICT x,
+                            const double* HWY_RESTRICT y,
+                            const double* HWY_RESTRICT weights,
+                            double* HWY_RESTRICT wxx,
+                            double* HWY_RESTRICT wxy,
+                            size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
 
-    size_t halfWindow = windowSize / 2;
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto vx = hn::LoadU(d, &x[i]);
+        auto vy = hn::LoadU(d, &y[i]);
+        auto vw = hn::LoadU(d, &weights[i]);
 
-    // Use sliding window sum for O(N) instead of O(N*W)
-    double windowSum = 0.0;
-    size_t windowCount = 0;
-
-    // Initialize first window [0, halfWindow] inclusive
-    size_t initEnd = std::min(halfWindow + 1, count);
-    for (size_t i = 0; i < initEnd; ++i) {
-        if (!std::isnan(values[i])) {
-            windowSum += values[i];
-            ++windowCount;
-        }
+        auto vwx = hn::Mul(vw, vx);
+        hn::StoreU(hn::Mul(vwx, vx), d, &wxx[i]);
+        hn::StoreU(hn::Mul(vwx, vy), d, &wxy[i]);
     }
-
-    for (size_t i = 0; i < count; ++i) {
-        // Add new element entering window
-        size_t addIdx = i + halfWindow + 1;
-        if (addIdx < count && !std::isnan(values[addIdx])) {
-            windowSum += values[addIdx];
-            ++windowCount;
-        }
-
-        // Remove element leaving window
-        if (i > halfWindow) {
-            size_t removeIdx = i - halfWindow - 1;
-            if (!std::isnan(values[removeIdx])) {
-                windowSum -= values[removeIdx];
-                --windowCount;
-            }
-        }
-
-        result[i] = (windowCount > 0) ? windowSum / static_cast<double>(windowCount) : 0.0;
+    for (; i < count; ++i) {
+        wxx[i] = weights[i] * x[i] * x[i];
+        wxy[i] = weights[i] * x[i] * y[i];
     }
 }
 
-double weightedSum(const double* values, const double* weights, size_t count) {
-    double sum = 0.0;
-    for (size_t i = 0; i < count; ++i) {
-        sum += values[i] * weights[i];
-    }
-    return sum;
-}
+}  // namespace HWY_NAMESPACE
+}  // namespace simd
+}  // namespace anomaly
+}  // namespace timestar
+HWY_AFTER_NAMESPACE();
 
-}  // namespace scalar
+// =============================================================================
+// Dispatch table + public API (compiled once)
+// =============================================================================
+#if HWY_ONCE
+
+namespace timestar {
+namespace anomaly {
+namespace simd {
+
+// HWY_EXPORT declarations
+HWY_EXPORT(VectorSubtractKernel);
+HWY_EXPORT(VectorAddKernel);
+HWY_EXPORT(VectorMultiplyKernel);
+HWY_EXPORT(VectorScalarMultiplyKernel);
+HWY_EXPORT(VectorFMAKernel);
+HWY_EXPORT(VectorSumKernel);
+HWY_EXPORT(VectorSumSquaredDiffKernel);
+HWY_EXPORT(WeightedSumKernel);
+HWY_EXPORT(ComputeBoundsKernel);
+HWY_EXPORT(ComputeAnomalyScoresKernel);
+HWY_EXPORT(ComputeTricubeWeightsKernel);
+HWY_EXPORT(WeightedProductsKernel);
 
 // ==================== Vector Operations ====================
 
 void vectorSubtract(const double* a, const double* b, double* result, size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::vectorSubtract(a, b, result, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::vectorSubtract(a, b, result, count);
-        return;
-    }
-
-    size_t simd_end = count - (count % 4);
-    for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d va = _mm256_loadu_pd(&a[i]);
-        __m256d vb = _mm256_loadu_pd(&b[i]);
-        __m256d vr = _mm256_sub_pd(va, vb);
-        _mm256_storeu_pd(&result[i], vr);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        result[i] = a[i] - b[i];
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(VectorSubtractKernel)(a, b, result, count);
 }
 
 void vectorAdd(const double* a, const double* b, double* result, size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::vectorAdd(a, b, result, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::vectorAdd(a, b, result, count);
-        return;
-    }
-
-    size_t simd_end = count - (count % 4);
-    for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d va = _mm256_loadu_pd(&a[i]);
-        __m256d vb = _mm256_loadu_pd(&b[i]);
-        __m256d vr = _mm256_add_pd(va, vb);
-        _mm256_storeu_pd(&result[i], vr);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        result[i] = a[i] + b[i];
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(VectorAddKernel)(a, b, result, count);
 }
 
 void vectorMultiply(const double* a, const double* b, double* result, size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::vectorMultiply(a, b, result, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::vectorMultiply(a, b, result, count);
-        return;
-    }
-
-    size_t simd_end = count - (count % 4);
-    for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d va = _mm256_loadu_pd(&a[i]);
-        __m256d vb = _mm256_loadu_pd(&b[i]);
-        __m256d vr = _mm256_mul_pd(va, vb);
-        _mm256_storeu_pd(&result[i], vr);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        result[i] = a[i] * b[i];
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(VectorMultiplyKernel)(a, b, result, count);
 }
 
 void vectorScalarMultiply(const double* a, double scalar, double* result, size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::vectorScalarMultiply(a, scalar, result, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::vectorScalarMultiply(a, scalar, result, count);
-        return;
-    }
-
-    __m256d vs = _mm256_set1_pd(scalar);
-    size_t simd_end = count - (count % 4);
-
-    for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d va = _mm256_loadu_pd(&a[i]);
-        __m256d vr = _mm256_mul_pd(va, vs);
-        _mm256_storeu_pd(&result[i], vr);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        result[i] = a[i] * scalar;
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(VectorScalarMultiplyKernel)(a, scalar, result, count);
 }
 
 void vectorFMA(const double* a, const double* b, double scalar, double* result, size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::vectorFMA(a, b, scalar, result, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::vectorFMA(a, b, scalar, result, count);
-        return;
-    }
-
-    __m256d vs = _mm256_set1_pd(scalar);
-    size_t simd_end = count - (count % 4);
-
-    for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d va = _mm256_loadu_pd(&a[i]);
-        __m256d vb = _mm256_loadu_pd(&b[i]);
-        // FMA: a + b * scalar
-        __m256d vr = _mm256_fmadd_pd(vb, vs, va);
-        _mm256_storeu_pd(&result[i], vr);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        result[i] = a[i] + b[i] * scalar;
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(VectorFMAKernel)(a, b, scalar, result, count);
 }
 
 // ==================== Sum and Mean ====================
@@ -332,44 +347,7 @@ void vectorFMA(const double* a, const double* b, double scalar, double* result, 
 double vectorSum(const double* values, size_t count) {
     if (count == 0)
         return 0.0;
-
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    return scalar::vectorSum(values, count);
-#else
-    if (isAvx512Available() && count >= 16) {
-        __m512d sum_vec = _mm512_setzero_pd();
-        size_t simd_end = count - (count % 8);
-
-        for (size_t i = 0; i < simd_end; i += 8) {
-            __m512d vals = _mm512_loadu_pd(&values[i]);
-            sum_vec = _mm512_add_pd(sum_vec, vals);
-        }
-
-        double sum = _mm512_reduce_add_pd(sum_vec);
-        for (size_t i = simd_end; i < count; ++i) {
-            sum += values[i];
-        }
-        return sum;
-    }
-
-    if (isAvx2Available() && count >= 8) {
-        __m256d sum_vec = _mm256_setzero_pd();
-        size_t simd_end = count - (count % 4);
-
-        for (size_t i = 0; i < simd_end; i += 4) {
-            __m256d vals = _mm256_loadu_pd(&values[i]);
-            sum_vec = _mm256_add_pd(sum_vec, vals);
-        }
-
-        double sum = hsum_avx(sum_vec);
-        for (size_t i = simd_end; i < count; ++i) {
-            sum += values[i];
-        }
-        return sum;
-    }
-
-    return scalar::vectorSum(values, count);
-#endif
+    return HWY_DYNAMIC_DISPATCH(VectorSumKernel)(values, count);
 }
 
 double vectorMean(const double* values, size_t count) {
@@ -383,32 +361,7 @@ double vectorMean(const double* values, size_t count) {
 double vectorSumSquaredDiff(const double* values, size_t count, double mean) {
     if (count == 0)
         return 0.0;
-
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    return scalar::vectorSumSquaredDiff(values, count, mean);
-#else
-    if (isAvx2Available() && count >= 8) {
-        __m256d mean_vec = _mm256_set1_pd(mean);
-        __m256d sum_sq = _mm256_setzero_pd();
-        size_t simd_end = count - (count % 4);
-
-        for (size_t i = 0; i < simd_end; i += 4) {
-            __m256d vals = _mm256_loadu_pd(&values[i]);
-            __m256d diff = _mm256_sub_pd(vals, mean_vec);
-            __m256d sq = _mm256_mul_pd(diff, diff);
-            sum_sq = _mm256_add_pd(sum_sq, sq);
-        }
-
-        double result = hsum_avx(sum_sq);
-        for (size_t i = simd_end; i < count; ++i) {
-            double diff = values[i] - mean;
-            result += diff * diff;
-        }
-        return result;
-    }
-
-    return scalar::vectorSumSquaredDiff(values, count, mean);
-#endif
+    return HWY_DYNAMIC_DISPATCH(VectorSumSquaredDiffKernel)(values, count, mean);
 }
 
 double vectorVariance(const double* values, size_t count, double mean) {
@@ -513,9 +466,44 @@ void IncrementalRollingStats::reset() {
 // ==================== Moving Average ====================
 
 void computeMovingAverage(const double* values, size_t count, size_t windowSize, double* result) {
-    // The sliding window algorithm is already O(N), so SIMD doesn't help much here
-    // Use the scalar implementation which is already optimized
-    scalar::computeMovingAverage(values, count, windowSize, result);
+    // The sliding window algorithm is already O(N), inherently serial.
+    if (count == 0 || windowSize == 0)
+        return;
+
+    size_t halfWindow = windowSize / 2;
+
+    // Use sliding window sum for O(N) instead of O(N*W)
+    double windowSum = 0.0;
+    size_t windowCount = 0;
+
+    // Initialize first window [0, halfWindow] inclusive
+    size_t initEnd = std::min(halfWindow + 1, count);
+    for (size_t i = 0; i < initEnd; ++i) {
+        if (!std::isnan(values[i])) {
+            windowSum += values[i];
+            ++windowCount;
+        }
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        // Add new element entering window
+        size_t addIdx = i + halfWindow + 1;
+        if (addIdx < count && !std::isnan(values[addIdx])) {
+            windowSum += values[addIdx];
+            ++windowCount;
+        }
+
+        // Remove element leaving window
+        if (i > halfWindow) {
+            size_t removeIdx = i - halfWindow - 1;
+            if (!std::isnan(values[removeIdx])) {
+                windowSum -= values[removeIdx];
+                --windowCount;
+            }
+        }
+
+        result[i] = (windowCount > 0) ? windowSum / static_cast<double>(windowCount) : 0.0;
+    }
 }
 
 // ==================== Weighted Operations ====================
@@ -523,30 +511,7 @@ void computeMovingAverage(const double* values, size_t count, size_t windowSize,
 double weightedSum(const double* values, const double* weights, size_t count) {
     if (count == 0)
         return 0.0;
-
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    return scalar::weightedSum(values, weights, count);
-#else
-    if (isAvx2Available() && count >= 8) {
-        __m256d sum_vec = _mm256_setzero_pd();
-        size_t simd_end = count - (count % 4);
-
-        for (size_t i = 0; i < simd_end; i += 4) {
-            __m256d vals = _mm256_loadu_pd(&values[i]);
-            __m256d wts = _mm256_loadu_pd(&weights[i]);
-            __m256d prod = _mm256_mul_pd(vals, wts);
-            sum_vec = _mm256_add_pd(sum_vec, prod);
-        }
-
-        double sum = hsum_avx(sum_vec);
-        for (size_t i = simd_end; i < count; ++i) {
-            sum += values[i] * weights[i];
-        }
-        return sum;
-    }
-
-    return scalar::weightedSum(values, weights, count);
-#endif
+    return HWY_DYNAMIC_DISPATCH(WeightedSumKernel)(values, weights, count);
 }
 
 double weightedMean(const double* values, const double* weights, size_t count) {
@@ -564,121 +529,18 @@ double weightedMean(const double* values, const double* weights, size_t count) {
 
 void computeBounds(const double* predictions, const double* scale, double bounds, double* upper, double* lower,
                    size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::computeBounds(predictions, scale, bounds, upper, lower, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::computeBounds(predictions, scale, bounds, upper, lower, count);
-        return;
-    }
-
-    __m256d bounds_vec = _mm256_set1_pd(bounds);
-    size_t simd_end = count - (count % 4);
-
-    for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d pred = _mm256_loadu_pd(&predictions[i]);
-        __m256d sc = _mm256_loadu_pd(&scale[i]);
-        __m256d margin = _mm256_mul_pd(bounds_vec, sc);
-
-        __m256d up = _mm256_add_pd(pred, margin);
-        __m256d lo = _mm256_sub_pd(pred, margin);
-
-        _mm256_storeu_pd(&upper[i], up);
-        _mm256_storeu_pd(&lower[i], lo);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        double margin = bounds * scale[i];
-        upper[i] = predictions[i] + margin;
-        lower[i] = predictions[i] - margin;
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(ComputeBoundsKernel)(predictions, scale, bounds, upper, lower, count);
 }
 
 void computeAnomalyScores(const double* values, const double* upper, const double* lower, double* scores,
                           size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::computeAnomalyScores(values, upper, lower, scores, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::computeAnomalyScores(values, upper, lower, scores, count);
-        return;
-    }
-
-    __m256d zero = _mm256_setzero_pd();
-    size_t simd_end = count - (count % 4);
-
-    for (size_t i = 0; i < simd_end; i += 4) {
-        __m256d val = _mm256_loadu_pd(&values[i]);
-        __m256d up = _mm256_loadu_pd(&upper[i]);
-        __m256d lo = _mm256_loadu_pd(&lower[i]);
-
-        // above = max(0, val - upper)
-        __m256d above = _mm256_max_pd(zero, _mm256_sub_pd(val, up));
-        // below = max(0, lower - val)
-        __m256d below = _mm256_max_pd(zero, _mm256_sub_pd(lo, val));
-        // score = above + below
-        __m256d score = _mm256_add_pd(above, below);
-
-        _mm256_storeu_pd(&scores[i], score);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        double above = std::max(0.0, values[i] - upper[i]);
-        double below = std::max(0.0, lower[i] - values[i]);
-        scores[i] = above + below;
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(ComputeAnomalyScoresKernel)(values, upper, lower, scores, count);
 }
 
 // ==================== LOESS Helpers ====================
 
 void computeTricubeWeights(const double* distances, double* weights, size_t count) {
-#if TIMESTAR_ANOMALY_DISABLE_SIMD
-    scalar::computeTricubeWeights(distances, weights, count);
-#else
-    if (!isAvx2Available() || count < 8) {
-        scalar::computeTricubeWeights(distances, weights, count);
-        return;
-    }
-
-    __m256d one = _mm256_set1_pd(1.0);
-    __m256d zero = _mm256_setzero_pd();
-    __m256d sign_mask = _mm256_set1_pd(-0.0);  // sign bit mask for abs
-    size_t simd_end = count - (count % 4);
-
-    for (size_t i = 0; i < simd_end; i += 4) {
-        // Take absolute value of distances
-        __m256d u = _mm256_andnot_pd(sign_mask, _mm256_loadu_pd(&distances[i]));
-
-        // u^3
-        __m256d u2 = _mm256_mul_pd(u, u);
-        __m256d u3 = _mm256_mul_pd(u2, u);
-
-        // t = 1 - u^3
-        __m256d t = _mm256_sub_pd(one, u3);
-
-        // t^3
-        __m256d t2 = _mm256_mul_pd(t, t);
-        __m256d t3 = _mm256_mul_pd(t2, t);
-
-        // Zero out where u >= 1
-        __m256d mask = _mm256_cmp_pd(u, one, _CMP_LT_OQ);
-        __m256d result = _mm256_blendv_pd(zero, t3, mask);
-
-        _mm256_storeu_pd(&weights[i], result);
-    }
-
-    for (size_t i = simd_end; i < count; ++i) {
-        double u = std::abs(distances[i]);
-        if (u >= 1.0) {
-            weights[i] = 0.0;
-        } else {
-            double t = 1.0 - u * u * u;
-            weights[i] = t * t * t;
-        }
-    }
-#endif
+    HWY_DYNAMIC_DISPATCH(ComputeTricubeWeightsKernel)(distances, weights, count);
 }
 
 LinearFit weightedLinearRegression(const double* x, const double* y, const double* weights, size_t count) {
@@ -695,38 +557,9 @@ LinearFit weightedLinearRegression(const double* x, const double* y, const doubl
     double sumWX = weightedSum(x, weights, count);
     double sumWY = weightedSum(y, weights, count);
 
-    // Compute weighted products
+    // Compute weighted products via Highway dispatch
     std::vector<double> wxx(count), wxy(count);
-
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (isAvx2Available() && count >= 8) {
-        size_t simd_end = count - (count % 4);
-
-        for (size_t i = 0; i < simd_end; i += 4) {
-            __m256d vx = _mm256_loadu_pd(&x[i]);
-            __m256d vy = _mm256_loadu_pd(&y[i]);
-            __m256d vw = _mm256_loadu_pd(&weights[i]);
-
-            __m256d vwx = _mm256_mul_pd(vw, vx);
-            __m256d vwxx = _mm256_mul_pd(vwx, vx);
-            __m256d vwxy = _mm256_mul_pd(vwx, vy);
-
-            _mm256_storeu_pd(&wxx[i], vwxx);
-            _mm256_storeu_pd(&wxy[i], vwxy);
-        }
-
-        for (size_t i = simd_end; i < count; ++i) {
-            wxx[i] = weights[i] * x[i] * x[i];
-            wxy[i] = weights[i] * x[i] * y[i];
-        }
-    } else
-#endif
-    {
-        for (size_t i = 0; i < count; ++i) {
-            wxx[i] = weights[i] * x[i] * x[i];
-            wxy[i] = weights[i] * x[i] * y[i];
-        }
-    }
+    HWY_DYNAMIC_DISPATCH(WeightedProductsKernel)(x, y, weights, wxx.data(), wxy.data(), count);
 
     double sumWXX = vectorSum(wxx.data(), count);
     double sumWXY = vectorSum(wxy.data(), count);
@@ -749,3 +582,5 @@ LinearFit weightedLinearRegression(const double* x, const double* y, const doubl
 }  // namespace simd
 }  // namespace anomaly
 }  // namespace timestar
+
+#endif  // HWY_ONCE

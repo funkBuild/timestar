@@ -3,29 +3,26 @@
 
 #include "../../storage/slice_buffer.hpp"
 
-#include <immintrin.h>
-
 #include <cstdint>
 #include <vector>
 
 /**
- * SIMD-optimized float decoder using AVX2 instructions
+ * Float decoder (AVX2 tier)
  *
- * While decoding is inherently sequential due to variable-length encoding
- * and XOR dependencies, we can still optimize:
- * 1. Batch XOR operations when multiple values share the same pattern
- * 2. Use SIMD for the XOR operations themselves
- * 3. Prefetch data for better cache utilization
+ * Gorilla/XOR decoding is inherently sequential: each value depends on the
+ * previous via XOR, so there is no meaningful SIMD parallelism in the decode
+ * loop. This class delegates to FloatDecoderBasic and always reports itself
+ * as available so the dispatcher in FloatDecoder works on every platform.
  */
 class FloatDecoderSIMD {
 public:
-    // Check if AVX2 is available at runtime
+    // Always available -- decoding delegates to the scalar FloatDecoderBasic.
     static bool isAvailable();
 
-    // SIMD-optimized decoding
+    // Decode (delegates to FloatDecoderBasic).
     static void decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 
-    // Fallback to regular decoder if SIMD not available
+    // Safe variant (identical to decode since isAvailable() is always true).
     static void decodeSafe(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 };
 

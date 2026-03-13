@@ -1,8 +1,6 @@
 #ifndef SIMD_AGGREGATOR_H_INCLUDED
 #define SIMD_AGGREGATOR_H_INCLUDED
 
-#include <immintrin.h>  // For AVX2 intrinsics
-
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -10,16 +8,19 @@
 namespace timestar {
 namespace simd {
 
-// SIMD-optimized aggregation functions using AVX2 (256-bit vectors)
-// These process 4 doubles at a time for significant speedup on large datasets
+// SIMD-optimized aggregation functions using Google Highway.
+// Highway automatically selects the best available ISA at runtime
+// (AVX-512, AVX2, SSE4, NEON, etc.) via its foreach_target mechanism.
 
 class SimdAggregator {
 public:
-    // Check if AVX2 is available at runtime
-    static bool isAvx2Available();
+    // Check if AVX2 is available at runtime.
+    // With Highway, dispatch is handled automatically — always returns true.
+    static inline bool isAvx2Available() { return true; }
 
-    // Check if AVX512 is available at runtime
-    static bool isAvx512Available();
+    // Check if AVX512 is available at runtime.
+    // With Highway, dispatch is handled automatically — always returns true.
+    static inline bool isAvx512Available() { return true; }
 
     // SIMD-optimized sum calculation
     // ~4x faster than scalar for large arrays
@@ -29,7 +30,7 @@ public:
     static double calculateAvg(const double* values, size_t count);
 
     // SIMD-optimized minimum calculation
-    // Uses parallel comparison to find min across 4 lanes
+    // Uses parallel comparison to find min across vector lanes
     static double calculateMin(const double* values, size_t count);
 
     // SIMD-optimized maximum calculation
@@ -56,7 +57,7 @@ private:
     static void alignedFree(double* ptr);
 };
 
-// Fallback scalar implementations for when SIMD isn't available
+// Fallback scalar implementations for when NaN is detected in min/max
 namespace scalar {
 double calculateSum(const double* values, size_t count);
 double calculateAvg(const double* values, size_t count);

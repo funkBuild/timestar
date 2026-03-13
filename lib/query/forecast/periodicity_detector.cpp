@@ -1,20 +1,12 @@
 #include "periodicity_detector.hpp"
 
 #include "../anomaly/simd_anomaly.hpp"
-#include "../simd_helpers.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
-
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-using timestar::simd::hsum_avx;
-static inline double hsum_avx_local(__m256d v) {
-    return hsum_avx(v);
-}
-#endif
 
 namespace timestar {
 namespace forecast {
@@ -41,90 +33,11 @@ std::vector<double> PeriodicityDetector::detrend(const std::vector<double>& y) {
     double numerator = 0.0;
     double denominator = 0.0;
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && n >= 16) {
-        // AVX2 path: 4 accumulators to hide FMA latency
-        __m256d vMeanX = _mm256_set1_pd(meanX);
-        __m256d vMeanY = _mm256_set1_pd(meanY);
-
-        // Index vectors: idx0 = {0, 1, 2, 3}, incremented by 4 each iteration
-        __m256d vIdx0 = _mm256_set_pd(3.0, 2.0, 1.0, 0.0);
-        __m256d vIdx1 = _mm256_set_pd(7.0, 6.0, 5.0, 4.0);
-        __m256d vIdx2 = _mm256_set_pd(11.0, 10.0, 9.0, 8.0);
-        __m256d vIdx3 = _mm256_set_pd(15.0, 14.0, 13.0, 12.0);
-        __m256d vStep = _mm256_set1_pd(16.0);
-
-        // Accumulators for numerator and denominator
-        __m256d numAcc0 = _mm256_setzero_pd();
-        __m256d numAcc1 = _mm256_setzero_pd();
-        __m256d numAcc2 = _mm256_setzero_pd();
-        __m256d numAcc3 = _mm256_setzero_pd();
-        __m256d denAcc0 = _mm256_setzero_pd();
-        __m256d denAcc1 = _mm256_setzero_pd();
-        __m256d denAcc2 = _mm256_setzero_pd();
-        __m256d denAcc3 = _mm256_setzero_pd();
-
-        const double* py = y.data();
-        const size_t simd_end = n & ~size_t(15);  // round down to multiple of 16
-
-        for (size_t i = 0; i < simd_end; i += 16) {
-            // Block 0: dx = idx - meanX, dy = y[i] - meanY
-            __m256d dx0 = _mm256_sub_pd(vIdx0, vMeanX);
-            __m256d dy0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), vMeanY);
-            numAcc0 = _mm256_fmadd_pd(dx0, dy0, numAcc0);
-            denAcc0 = _mm256_fmadd_pd(dx0, dx0, denAcc0);
-
-            // Block 1
-            __m256d dx1 = _mm256_sub_pd(vIdx1, vMeanX);
-            __m256d dy1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), vMeanY);
-            numAcc1 = _mm256_fmadd_pd(dx1, dy1, numAcc1);
-            denAcc1 = _mm256_fmadd_pd(dx1, dx1, denAcc1);
-
-            // Block 2
-            __m256d dx2 = _mm256_sub_pd(vIdx2, vMeanX);
-            __m256d dy2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), vMeanY);
-            numAcc2 = _mm256_fmadd_pd(dx2, dy2, numAcc2);
-            denAcc2 = _mm256_fmadd_pd(dx2, dx2, denAcc2);
-
-            // Block 3
-            __m256d dx3 = _mm256_sub_pd(vIdx3, vMeanX);
-            __m256d dy3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), vMeanY);
-            numAcc3 = _mm256_fmadd_pd(dx3, dy3, numAcc3);
-            denAcc3 = _mm256_fmadd_pd(dx3, dx3, denAcc3);
-
-            // Advance index vectors
-            vIdx0 = _mm256_add_pd(vIdx0, vStep);
-            vIdx1 = _mm256_add_pd(vIdx1, vStep);
-            vIdx2 = _mm256_add_pd(vIdx2, vStep);
-            vIdx3 = _mm256_add_pd(vIdx3, vStep);
-        }
-
-        // Reduce 4 accumulators -> 1
-        numAcc0 = _mm256_add_pd(numAcc0, numAcc1);
-        numAcc2 = _mm256_add_pd(numAcc2, numAcc3);
-        numAcc0 = _mm256_add_pd(numAcc0, numAcc2);
-        numerator = hsum_avx_local(numAcc0);
-
-        denAcc0 = _mm256_add_pd(denAcc0, denAcc1);
-        denAcc2 = _mm256_add_pd(denAcc2, denAcc3);
-        denAcc0 = _mm256_add_pd(denAcc0, denAcc2);
-        denominator = hsum_avx_local(denAcc0);
-
-        // Scalar remainder
-        for (size_t i = simd_end; i < n; ++i) {
-            double dx = i - meanX;
-            numerator += dx * (y[i] - meanY);
-            denominator += dx * dx;
-        }
-    } else
-#endif
-    {
-        // Scalar fallback
-        for (size_t i = 0; i < n; ++i) {
-            double dx = i - meanX;
-            numerator += dx * (y[i] - meanY);
-            denominator += dx * dx;
-        }
+    // Scalar fallback
+    for (size_t i = 0; i < n; ++i) {
+        double dx = i - meanX;
+        numerator += dx * (y[i] - meanY);
+        denominator += dx * dx;
     }
 
     double slope = (denominator > 1e-10) ? (numerator / denominator) : 0.0;
@@ -133,60 +46,9 @@ std::vector<double> PeriodicityDetector::detrend(const std::vector<double>& y) {
     // Subtract linear trend
     std::vector<double> detrended(n);
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && n >= 16) {
-        // AVX2 path: result[i] = y[i] - intercept - slope * i
-        __m256d vSlope = _mm256_set1_pd(slope);
-        __m256d vIntercept = _mm256_set1_pd(intercept);
-
-        // Index vectors
-        __m256d vIdx0 = _mm256_set_pd(3.0, 2.0, 1.0, 0.0);
-        __m256d vIdx1 = _mm256_set_pd(7.0, 6.0, 5.0, 4.0);
-        __m256d vIdx2 = _mm256_set_pd(11.0, 10.0, 9.0, 8.0);
-        __m256d vIdx3 = _mm256_set_pd(15.0, 14.0, 13.0, 12.0);
-        __m256d vStep = _mm256_set1_pd(16.0);
-
-        const double* py = y.data();
-        double* pOut = detrended.data();
-        const size_t simd_end = n & ~size_t(15);
-
-        for (size_t i = 0; i < simd_end; i += 16) {
-            // Block 0: y[i] - (intercept + slope * i)
-            //        = y[i] - intercept - slope * i
-            // Use fnmadd: -(slope * idx) + (y - intercept)
-            __m256d base0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), vIntercept);
-            _mm256_storeu_pd(pOut + i, _mm256_fnmadd_pd(vSlope, vIdx0, base0));
-
-            // Block 1
-            __m256d base1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), vIntercept);
-            _mm256_storeu_pd(pOut + i + 4, _mm256_fnmadd_pd(vSlope, vIdx1, base1));
-
-            // Block 2
-            __m256d base2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), vIntercept);
-            _mm256_storeu_pd(pOut + i + 8, _mm256_fnmadd_pd(vSlope, vIdx2, base2));
-
-            // Block 3
-            __m256d base3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), vIntercept);
-            _mm256_storeu_pd(pOut + i + 12, _mm256_fnmadd_pd(vSlope, vIdx3, base3));
-
-            // Advance index vectors
-            vIdx0 = _mm256_add_pd(vIdx0, vStep);
-            vIdx1 = _mm256_add_pd(vIdx1, vStep);
-            vIdx2 = _mm256_add_pd(vIdx2, vStep);
-            vIdx3 = _mm256_add_pd(vIdx3, vStep);
-        }
-
-        // Scalar remainder
-        for (size_t i = simd_end; i < n; ++i) {
-            detrended[i] = y[i] - (slope * i + intercept);
-        }
-    } else
-#endif
-    {
-        // Scalar fallback
-        for (size_t i = 0; i < n; ++i) {
-            detrended[i] = y[i] - (slope * i + intercept);
-        }
+    // Scalar fallback
+    for (size_t i = 0; i < n; ++i) {
+        detrended[i] = y[i] - (slope * i + intercept);
     }
 
     return detrended;
@@ -299,56 +161,9 @@ std::vector<double> PeriodicityDetector::computePeriodogram(const std::vector<do
     const size_t numBins = X.size();
     std::vector<double> periodogram(numBins);
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && numBins >= 8) {
-        // AVX2 path: std::complex<double> is layout-compatible with double[2],
-        // so X is stored as {re0, im0, re1, im1, re2, im2, ...} in memory.
-        // Process 4 complex values (8 doubles) per iteration:
-        //   Load 4 doubles = 2 complex values per __m256d register
-        //   Square them, then use hadd to sum adjacent pairs (re*re + im*im)
-        const double* raw = reinterpret_cast<const double*>(X.data());
-        double* pOut = periodogram.data();
-        const __m256d vInvN = _mm256_set1_pd(invN);
-
-        const size_t simd_end = numBins & ~size_t(3);  // round down to multiple of 4
-
-        for (size_t k = 0; k < simd_end; k += 4) {
-            // Load 4 complex values = 8 doubles
-            // reg0 = {re0, im0, re1, im1}, reg1 = {re2, im2, re3, im3}
-            __m256d reg0 = _mm256_loadu_pd(raw + k * 2);
-            __m256d reg1 = _mm256_loadu_pd(raw + k * 2 + 4);
-
-            // Square: {re0*re0, im0*im0, re1*re1, im1*im1}
-            __m256d sq0 = _mm256_mul_pd(reg0, reg0);
-            __m256d sq1 = _mm256_mul_pd(reg1, reg1);
-
-            // Horizontal add adjacent pairs: {re0^2+im0^2, re1^2+im1^2, ...}
-            // _mm256_hadd_pd adds adjacent pairs within 128-bit lanes:
-            // hadd({a,b,c,d}, {e,f,g,h}) = {a+b, e+f, c+d, g+h}
-            __m256d norms = _mm256_hadd_pd(sq0, sq1);
-
-            // hadd gives us {norm0, norm2, norm1, norm3} due to lane structure
-            // We need {norm0, norm1, norm2, norm3}
-            // Use permute to fix: swap lanes 1 and 2
-            norms = _mm256_permute4x64_pd(norms, 0b11011000);  // 0,2,1,3 -> 0,1,2,3
-
-            // Divide by effectiveN
-            norms = _mm256_mul_pd(norms, vInvN);
-
-            _mm256_storeu_pd(pOut + k, norms);
-        }
-
-        // Scalar remainder
-        for (size_t k = simd_end; k < numBins; ++k) {
-            periodogram[k] = std::norm(X[k]) * invN;
-        }
-    } else
-#endif
-    {
-        // Scalar fallback: std::norm(z) = re*re + im*im (no sqrt)
-        for (size_t k = 0; k < numBins; ++k) {
-            periodogram[k] = std::norm(X[k]) * invN;
-        }
+    // Scalar fallback: std::norm(z) = re*re + im*im (no sqrt)
+    for (size_t k = 0; k < numBins; ++k) {
+        periodogram[k] = std::norm(X[k]) * invN;
     }
 
     return periodogram;
@@ -454,57 +269,9 @@ double PeriodicityDetector::autoCorrelation(const std::vector<double>& y, size_t
     const size_t count = n - lag;
     double autocovariance = 0.0;
 
-#if !TIMESTAR_ANOMALY_DISABLE_SIMD
-    if (anomaly::simd::isAvx2Available() && count >= 16) {
-        // AVX2 path: 4 accumulators to hide FMA latency
-        const double* pyL = py + lag;
-        __m256d vMean = _mm256_set1_pd(mean);
-        __m256d acc0 = _mm256_setzero_pd();
-        __m256d acc1 = _mm256_setzero_pd();
-        __m256d acc2 = _mm256_setzero_pd();
-        __m256d acc3 = _mm256_setzero_pd();
-
-        const size_t simd_end = count & ~size_t(15);  // round down to multiple of 16
-
-        for (size_t i = 0; i < simd_end; i += 16) {
-            // Block 0: i..i+3
-            __m256d a0 = _mm256_sub_pd(_mm256_loadu_pd(py + i), vMean);
-            __m256d b0 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i), vMean);
-            acc0 = _mm256_fmadd_pd(a0, b0, acc0);
-
-            // Block 1: i+4..i+7
-            __m256d a1 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 4), vMean);
-            __m256d b1 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 4), vMean);
-            acc1 = _mm256_fmadd_pd(a1, b1, acc1);
-
-            // Block 2: i+8..i+11
-            __m256d a2 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 8), vMean);
-            __m256d b2 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 8), vMean);
-            acc2 = _mm256_fmadd_pd(a2, b2, acc2);
-
-            // Block 3: i+12..i+15
-            __m256d a3 = _mm256_sub_pd(_mm256_loadu_pd(py + i + 12), vMean);
-            __m256d b3 = _mm256_sub_pd(_mm256_loadu_pd(pyL + i + 12), vMean);
-            acc3 = _mm256_fmadd_pd(a3, b3, acc3);
-        }
-
-        // Reduce 4 accumulators -> 1
-        acc0 = _mm256_add_pd(acc0, acc1);
-        acc2 = _mm256_add_pd(acc2, acc3);
-        acc0 = _mm256_add_pd(acc0, acc2);
-        autocovariance = hsum_avx_local(acc0);
-
-        // Scalar remainder
-        for (size_t i = simd_end; i < count; ++i) {
-            autocovariance += (py[i] - mean) * (py[i + lag] - mean);
-        }
-    } else
-#endif
-    {
-        // Scalar fallback
-        for (size_t i = 0; i < count; ++i) {
-            autocovariance += (y[i] - mean) * (y[i + lag] - mean);
-        }
+    // Scalar fallback
+    for (size_t i = 0; i < count; ++i) {
+        autocovariance += (y[i] - mean) * (y[i + lag] - mean);
     }
 
     // Normalize by variance (sum of squared diffs, not sample variance)

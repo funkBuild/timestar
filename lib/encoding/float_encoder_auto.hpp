@@ -11,24 +11,24 @@
 /**
  * FloatEncoderAuto - Automatically selects the best available encoder
  *
- * Priority order (based on benchmarks):
- * 1. AVX-512 (2.10x speedup on large datasets)
- * 2. AVX2 SIMD (2.4x theoretical speedup)
- * 3. Original optimized (baseline)
+ * Both FloatEncoderSIMD and FloatEncoderAVX512 now delegate to the same
+ * Google Highway implementation which automatically selects the best ISA
+ * (AVX-512, AVX2, SSE4, etc.) via HWY_DYNAMIC_DISPATCH.
  */
 class FloatEncoderAuto {
 public:
     /**
-     * Encode using the best available implementation
-     * Automatically detects CPU features and selects optimal encoder
+     * Encode using the best available implementation.
+     * Both SIMD classes delegate to the same Highway dispatch, so the
+     * priority order is preserved for API compatibility but both paths
+     * produce identical results.
      */
     static CompressedBuffer encode(const std::vector<double>& values) {
-        // AVX-512 is fastest when available (2.10x speedup)
+        // Highway-dispatched (selects best ISA at runtime)
         if (FloatEncoderAVX512::isAvailable()) {
             return FloatEncoderAVX512::encode(values);
         }
 
-        // AVX2 is second best (2.4x theoretical, not tested on this system)
         if (FloatEncoderSIMD::isAvailable()) {
             return FloatEncoderSIMD::encode(values);
         }
@@ -49,17 +49,11 @@ public:
      * Get information about which encoder will be used
      */
     static std::string getEncoderName() {
-        if (FloatEncoderAVX512::isAvailable()) {
-            return "AVX-512 (8x parallel)";
-        }
-        if (FloatEncoderSIMD::isAvailable()) {
-            return "AVX2 SIMD (4x parallel)";
-        }
-        return "Original (optimized)";
+        return "Highway SIMD (auto-dispatch)";
     }
 
     /**
-     * Check feature availability
+     * Check feature availability -- always true with Highway
      */
     static bool hasAVX512() { return FloatEncoderAVX512::isAvailable(); }
 
