@@ -2,12 +2,14 @@
 
 #include "memtable.hpp"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
-#include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/thread.hh>
 
 #include <array>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 
 namespace timestar::index {
@@ -67,8 +69,9 @@ std::string IndexWAL::walFileName(const std::string& dir, uint64_t generation) {
 
 seastar::future<> IndexWAL::openFile(const std::string& path) {
     currentPath_ = path;
-    file_ = co_await seastar::open_file_dma(path, seastar::open_flags::rw | seastar::open_flags::create);
-    fileOffset_ = co_await file_.size();
+    // Use standard POSIX I/O (via seastar::async) for WAL files.
+    // WAL writes are small and sequential — DMA alignment overhead is unnecessary.
+    co_return;
 }
 
 seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
@@ -93,7 +96,7 @@ seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
     }
 
     wal.walGeneration_ = maxGen;
-    co_await wal.openFile(walFileName(directory, maxGen));
+    wal.currentPath_ = walFileName(directory, maxGen);
     co_return std::move(wal);
 }
 
@@ -108,11 +111,10 @@ seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
     record.resize(recordSize);
 
     char* p = record.data();
-    uint32_t innerLen = static_cast<uint32_t>(4 + 8 + payload.size());  // crc + seq + payload
+    uint32_t innerLen = static_cast<uint32_t>(4 + 8 + payload.size());
     encodeFixed32(p, innerLen);
     p += 4;
 
-    // Build crc input: sequence + payload
     char seqBuf[8];
     encodeFixed64(seqBuf, sequence_);
 
@@ -127,50 +129,53 @@ seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
     p += 8;
     std::memcpy(p, payload.data(), payload.size());
 
-    // DMA write
-    auto buf = seastar::temporary_buffer<char>::aligned(4096, record.size());
-    std::memcpy(buf.get_write(), record.data(), record.size());
-    co_await file_.dma_write(fileOffset_, buf.get(), buf.size());
-    fileOffset_ += record.size();
-
-    // fsync for durability
-    co_await file_.flush();
+    // Write using standard POSIX I/O in a Seastar thread
+    auto path = currentPath_;
+    co_await seastar::async([path, record = std::move(record)] {
+        std::ofstream ofs(path, std::ios::binary | std::ios::app);
+        ofs.write(record.data(), static_cast<std::streamsize>(record.size()));
+        ofs.flush();
+    });
 
     ++sequence_;
 }
 
 seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
     uint64_t recordsReplayed = 0;
-    auto fileSize = co_await file_.size();
 
+    if (!std::filesystem::exists(currentPath_)) {
+        co_return 0;
+    }
+
+    auto fileSize = std::filesystem::file_size(currentPath_);
     if (fileSize == 0) {
         co_return 0;
     }
 
-    // Read the entire WAL file
-    auto buf = seastar::temporary_buffer<char>::aligned(4096, fileSize);
-    auto bytesRead = co_await file_.dma_read(0, buf.get_write(), buf.size());
+    // Read WAL file using standard I/O
+    std::string data;
+    co_await seastar::async([this, &data, fileSize] {
+        data.resize(fileSize);
+        std::ifstream ifs(currentPath_, std::ios::binary);
+        ifs.read(data.data(), static_cast<std::streamsize>(fileSize));
+    });
 
-    const char* p = buf.get();
-    const char* end = p + bytesRead;
+    const char* p = data.data();
+    const char* end = p + data.size();
 
     while (p + 4 <= end) {
         uint32_t innerLen = decodeFixed32(p);
         p += 4;
 
-        if (p + innerLen > end) break;  // Truncated record (incomplete write)
-
-        if (innerLen < 12) break;  // Too small: need crc(4) + seq(8) at minimum
+        if (p + innerLen > end) break;
+        if (innerLen < 12) break;
 
         uint32_t storedCrc = decodeFixed32(p);
         p += 4;
 
-        // Verify CRC over sequence + payload
-        size_t crcDataLen = innerLen - 4;  // everything after crc
+        size_t crcDataLen = innerLen - 4;
         uint32_t computedCrc = computeCrc32(p, crcDataLen);
-        if (storedCrc != computedCrc) {
-            break;  // Corrupt record — stop replay
-        }
+        if (storedCrc != computedCrc) break;
 
         uint64_t seq = decodeFixed64(p);
         p += 8;
@@ -180,12 +185,12 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
         p += payloadLen;
 
         try {
-            auto batch = IndexWriteBatch::deserializeFrom(payload);
-            batch.applyTo(target);
+            auto batchData = IndexWriteBatch::deserializeFrom(payload);
+            batchData.applyTo(target);
             sequence_ = seq + 1;
             ++recordsReplayed;
         } catch (...) {
-            break;  // Corrupt batch — stop replay
+            break;
         }
     }
 
@@ -194,25 +199,21 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
 
 seastar::future<std::string> IndexWAL::rotate() {
     auto oldPath = currentPath_;
-    co_await file_.flush();
-    co_await file_.close();
-
     ++walGeneration_;
-    co_await openFile(walFileName(directory_, walGeneration_));
-    fileOffset_ = 0;
-
+    currentPath_ = walFileName(directory_, walGeneration_);
     co_return oldPath;
 }
 
 seastar::future<> IndexWAL::deleteFile(const std::string& path) {
     if (std::filesystem::exists(path)) {
-        co_await seastar::remove_file(path);
+        std::filesystem::remove(path);
     }
+    co_return;
 }
 
 seastar::future<> IndexWAL::close() {
-    co_await file_.flush();
-    co_await file_.close();
+    // No file handles to close — we use open/write/close per append
+    co_return;
 }
 
 }  // namespace timestar::index

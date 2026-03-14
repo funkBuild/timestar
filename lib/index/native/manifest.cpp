@@ -1,11 +1,13 @@
 #include "manifest.hpp"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
-#include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/thread.hh>
 
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 
 namespace timestar::index {
@@ -46,26 +48,26 @@ seastar::future<Manifest> Manifest::open(std::string directory) {
     m.manifestPath_ = directory + "/MANIFEST";
 
     if (std::filesystem::exists(m.manifestPath_)) {
-        m.file_ = co_await seastar::open_file_dma(m.manifestPath_, seastar::open_flags::rw);
         co_await m.recover();
     } else {
-        m.file_ = co_await seastar::open_file_dma(m.manifestPath_,
-                                                    seastar::open_flags::rw | seastar::open_flags::create);
-        // Write initial empty snapshot
         co_await m.writeSnapshot();
     }
 
     co_return std::move(m);
 }
 
+std::vector<SSTableMetadata> Manifest::filesAtLevel(int level) const {
+    std::vector<SSTableMetadata> result;
+    for (const auto& f : files_) {
+        if (f.level == level) result.push_back(f);
+    }
+    return result;
+}
+
 std::string Manifest::serializeSnapshot() const {
     std::string record;
     record.push_back(static_cast<char>(RecordType::Snapshot));
-
-    // next_file_number (8 bytes)
     encodeFixed64(record, nextFileNumber_);
-
-    // file_count (4 bytes)
     encodeFixed32(record, static_cast<uint32_t>(files_.size()));
 
     for (const auto& f : files_) {
@@ -104,24 +106,16 @@ std::string Manifest::serializeRemoveFile(uint64_t fileNumber) const {
 }
 
 seastar::future<> Manifest::appendRecord(const std::string& record) {
-    // Length-prefix the record: [len (4 bytes)] [record]
     std::string frame;
     encodeFixed32(frame, static_cast<uint32_t>(record.size()));
     frame.append(record);
 
-    auto buf = seastar::temporary_buffer<char>::aligned(4096, frame.size());
-    std::memcpy(buf.get_write(), frame.data(), frame.size());
-    co_await file_.dma_write(fileOffset_, buf.get(), buf.size());
-    fileOffset_ += frame.size();
-    co_await file_.flush();
-}
-
-std::vector<SSTableMetadata> Manifest::filesAtLevel(int level) const {
-    std::vector<SSTableMetadata> result;
-    for (const auto& f : files_) {
-        if (f.level == level) result.push_back(f);
-    }
-    return result;
+    auto path = manifestPath_;
+    co_await seastar::async([path, frame = std::move(frame)] {
+        std::ofstream ofs(path, std::ios::binary | std::ios::app);
+        ofs.write(frame.data(), static_cast<std::streamsize>(frame.size()));
+        ofs.flush();
+    });
 }
 
 seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
@@ -140,45 +134,38 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
 }
 
 seastar::future<> Manifest::writeSnapshot() {
-    // Rewrite the manifest file with a fresh snapshot
-    co_await file_.close();
-
-    // Write to a temp file, then rename for atomicity
-    auto tmpPath = manifestPath_ + ".tmp";
-    auto tmpFile =
-        co_await seastar::open_file_dma(tmpPath, seastar::open_flags::wo | seastar::open_flags::create |
-                                                      seastar::open_flags::truncate);
-
     auto snapshot = serializeSnapshot();
     std::string frame;
     encodeFixed32(frame, static_cast<uint32_t>(snapshot.size()));
     frame.append(snapshot);
 
-    auto buf = seastar::temporary_buffer<char>::aligned(4096, frame.size());
-    std::memcpy(buf.get_write(), frame.data(), frame.size());
-    co_await tmpFile.dma_write(0, buf.get(), buf.size());
-    co_await tmpFile.truncate(frame.size());
-    co_await tmpFile.flush();
-    co_await tmpFile.close();
-
-    // Atomic rename
-    std::filesystem::rename(tmpPath, manifestPath_);
-
-    // Reopen
-    file_ = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::rw);
-    fileOffset_ = frame.size();
+    auto path = manifestPath_;
+    co_await seastar::async([path, frame = std::move(frame)] {
+        // Write atomically: write to temp, then rename
+        auto tmpPath = path + ".tmp";
+        {
+            std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+            ofs.write(frame.data(), static_cast<std::streamsize>(frame.size()));
+            ofs.flush();
+        }
+        std::filesystem::rename(tmpPath, path);
+    });
 }
 
 seastar::future<> Manifest::recover() {
     files_.clear();
-    auto fileSize = co_await file_.size();
+    auto fileSize = std::filesystem::file_size(manifestPath_);
     if (fileSize == 0) co_return;
 
-    auto buf = seastar::temporary_buffer<char>::aligned(4096, fileSize);
-    co_await file_.dma_read(0, buf.get_write(), buf.size());
+    std::string data;
+    co_await seastar::async([this, &data, fileSize] {
+        data.resize(fileSize);
+        std::ifstream ifs(manifestPath_, std::ios::binary);
+        ifs.read(data.data(), static_cast<std::streamsize>(fileSize));
+    });
 
-    const char* p = buf.get();
-    const char* end = p + fileSize;
+    const char* p = data.data();
+    const char* end = p + data.size();
 
     while (p + 4 <= end) {
         uint32_t recordLen = decodeFixed32(p);
@@ -263,13 +250,11 @@ seastar::future<> Manifest::recover() {
             std::erase_if(files_, [fn](const SSTableMetadata& ff) { return ff.fileNumber == fn; });
         }
     }
-
-    fileOffset_ = fileSize;
 }
 
 seastar::future<> Manifest::close() {
-    co_await file_.flush();
-    co_await file_.close();
+    // No file handles to close — we use open/write/close per operation
+    co_return;
 }
 
 }  // namespace timestar::index

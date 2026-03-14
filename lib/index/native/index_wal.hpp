@@ -4,7 +4,6 @@
 #include "write_batch.hpp"
 
 #include <cstdint>
-#include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <string>
 
@@ -49,9 +48,7 @@ private:
 
     std::string directory_;
     std::string currentPath_;
-    seastar::file file_;
     uint64_t sequence_ = 0;
-    uint64_t fileOffset_ = 0;
     uint64_t walGeneration_ = 0;
 
     static uint32_t computeCrc32(const char* data, size_t len);

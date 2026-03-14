@@ -10,6 +10,16 @@
 
 namespace timestar::index {
 
+// --- Helper: aligned DMA write ---
+
+static seastar::future<> dmaWriteAligned(seastar::file& file, uint64_t offset, const void* data, size_t len) {
+    size_t alignedSize = (len + 4095) & ~4095UL;
+    auto buf = seastar::temporary_buffer<char>::aligned(4096, alignedSize);
+    std::memset(buf.get_write(), 0, alignedSize);
+    std::memcpy(buf.get_write(), data, len);
+    co_await file.dma_write(offset, buf.get(), alignedSize);
+}
+
 // --- Helper: encode/decode fixed integers ---
 
 static void encodeFixed32(char* buf, uint32_t v) {
@@ -96,10 +106,7 @@ seastar::future<> SSTableWriter::flushBlock() {
     entry.size = static_cast<uint32_t>(blockData.size());
     index_.push_back(std::move(entry));
 
-    // DMA write requires aligned buffer — use temporary_buffer
-    auto alignedBuf = seastar::temporary_buffer<char>::aligned(4096, blockData.size());
-    std::memcpy(alignedBuf.get_write(), blockData.data(), blockData.size());
-    co_await file_.dma_write(fileOffset_, alignedBuf.get(), alignedBuf.size());
+    co_await dmaWriteAligned(file_, fileOffset_, blockData.data(), blockData.size());
     fileOffset_ += blockData.size();
 
     currentBlock_.reset();
@@ -116,9 +123,7 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     uint64_t bloomOffset = fileOffset_;
 
     if (!bloomData.empty()) {
-        auto bloomBuf = seastar::temporary_buffer<char>::aligned(4096, bloomData.size());
-        std::memcpy(bloomBuf.get_write(), bloomData.data(), bloomData.size());
-        co_await file_.dma_write(fileOffset_, bloomBuf.get(), bloomBuf.size());
+        co_await dmaWriteAligned(file_, fileOffset_, bloomData.data(), bloomData.size());
         fileOffset_ += bloomData.size();
     }
 
@@ -146,9 +151,7 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     }
 
     if (!indexData.empty()) {
-        auto indexBuf = seastar::temporary_buffer<char>::aligned(4096, indexData.size());
-        std::memcpy(indexBuf.get_write(), indexData.data(), indexData.size());
-        co_await file_.dma_write(fileOffset_, indexBuf.get(), indexBuf.size());
+        co_await dmaWriteAligned(file_, fileOffset_, indexData.data(), indexData.size());
         fileOffset_ += indexData.size();
     }
 
@@ -162,9 +165,7 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     encodeFixed32(footer + 40, SSTABLE_MAGIC);
     encodeFixed32(footer + 44, SSTABLE_VERSION);
 
-    auto footerBuf = seastar::temporary_buffer<char>::aligned(4096, SSTABLE_FOOTER_SIZE);
-    std::memcpy(footerBuf.get_write(), footer, SSTABLE_FOOTER_SIZE);
-    co_await file_.dma_write(fileOffset_, footerBuf.get(), footerBuf.size());
+    co_await dmaWriteAligned(file_, fileOffset_, footer, SSTABLE_FOOTER_SIZE);
     fileOffset_ += SSTABLE_FOOTER_SIZE;
 
     // Truncate file to exact size and flush
@@ -198,9 +199,10 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     }
 
     // Read footer
-    auto footerBuf = seastar::temporary_buffer<char>::aligned(4096, SSTABLE_FOOTER_SIZE);
+    size_t footerAligned = (SSTABLE_FOOTER_SIZE + 4095) & ~4095UL;
+    auto footerBuf = seastar::temporary_buffer<char>::aligned(4096, footerAligned);
     auto footerRead =
-        co_await reader->file_.dma_read(fileSize - SSTABLE_FOOTER_SIZE, footerBuf.get_write(), footerBuf.size());
+        co_await reader->file_.dma_read(fileSize - SSTABLE_FOOTER_SIZE, footerBuf.get_write(), footerAligned);
     if (footerRead < SSTABLE_FOOTER_SIZE) {
         throw std::runtime_error("SSTable footer read incomplete: " + filename);
     }

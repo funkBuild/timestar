@@ -4,8 +4,10 @@
 #include "sstable.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace timestar::index {
@@ -56,8 +58,6 @@ private:
 
     std::string directory_;
     std::string manifestPath_;
-    seastar::file file_;
-    uint64_t fileOffset_ = 0;
     uint64_t nextFileNumber_ = 1;
     std::vector<SSTableMetadata> files_;
 
