@@ -4,17 +4,46 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
-#include <seastar/core/thread.hh>
+#include <seastar/core/temporary_buffer.hh>
 
 #include <array>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace timestar::index {
 
-// Simple CRC32 (same polynomial as zlib)
+// CRC32C using SSE 4.2 hardware intrinsics (Castagnoli polynomial).
+// Falls back to software table for non-x86 platforms.
+#if defined(__x86_64__) || defined(_M_X64)
+#include <nmmintrin.h>  // SSE 4.2 CRC32C intrinsics
+
+__attribute__((target("sse4.2")))
+uint32_t IndexWAL::computeCrc32(const char* data, size_t len) {
+    uint64_t crc = 0xFFFFFFFF;
+    const auto* p = reinterpret_cast<const uint8_t*>(data);
+
+    // Process 8 bytes at a time
+    while (len >= 8) {
+        uint64_t val;
+        std::memcpy(&val, p, 8);
+        crc = _mm_crc32_u64(crc, val);
+        p += 8;
+        len -= 8;
+    }
+
+    // Process remaining bytes
+    while (len-- > 0) {
+        crc = _mm_crc32_u8(static_cast<uint32_t>(crc), *p++);
+    }
+
+    return static_cast<uint32_t>(crc ^ 0xFFFFFFFF);
+}
+
+#else
+// Software fallback: CRC32 with zlib polynomial
 static constexpr auto makeCrc32Table() {
     std::array<uint32_t, 256> table{};
     for (uint32_t i = 0; i < 256; ++i) {
@@ -36,6 +65,7 @@ uint32_t IndexWAL::computeCrc32(const char* data, size_t len) {
     }
     return crc ^ 0xFFFFFFFF;
 }
+#endif
 
 static void encodeFixed32(char* buf, uint32_t v) {
     buf[0] = static_cast<char>(v & 0xff);
@@ -67,11 +97,86 @@ std::string IndexWAL::walFileName(const std::string& dir, uint64_t generation) {
     return dir + "/" + buf;
 }
 
-seastar::future<> IndexWAL::openFile(const std::string& path) {
-    currentPath_ = path;
-    // Use standard POSIX I/O (via seastar::async) for WAL files.
-    // WAL writes are small and sequential — DMA alignment overhead is unnecessary.
-    co_return;
+IndexWAL::~IndexWAL() {
+    // If there's unflushed data, write it directly via POSIX I/O.
+    // Can't use async operations in destructors, so bypass Seastar.
+    if ((!buffer_.empty() || !tailBuf_.empty()) && !currentPath_.empty()) {
+        int fd = ::open(currentPath_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            if (!tailBuf_.empty()) ::write(fd, tailBuf_.data(), tailBuf_.size());
+            if (!buffer_.empty()) ::write(fd, buffer_.data(), buffer_.size());
+            ::fsync(fd);
+            ::close(fd);
+        }
+    }
+    // Close the Seastar file handle
+    if (walFile_) {
+        walFile_->close().handle_exception([](auto) {});
+        walFile_.reset();
+    }
+}
+
+// Open Seastar DMA file handle for the current WAL path.
+// Truncates existing file — safe because replay() has already consumed data.
+seastar::future<> IndexWAL::openFile() {
+    walFile_.emplace(co_await seastar::open_file_dma(currentPath_,
+        seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate));
+    dmaAlignment_ = walFile_->disk_write_dma_alignment();
+    writePos_ = 0;
+    dmaWritePos_ = 0;
+    buffer_.clear();
+    buffer_.reserve(BUFFER_CAPACITY);
+    tailBuf_.clear();
+}
+
+// Flush the write buffer to disk using DMA.
+// Uses a tail buffer to avoid reading existing data back from disk.
+// Only writes new aligned blocks; keeps the partial tail in memory.
+seastar::future<> IndexWAL::flushBuffer() {
+    if (buffer_.empty()) co_return;
+
+    // Prepend any existing tail (partial block from previous flush)
+    std::string combined;
+    if (!tailBuf_.empty()) {
+        combined.reserve(tailBuf_.size() + buffer_.size());
+        combined = std::move(tailBuf_);
+        combined.append(buffer_);
+    } else {
+        combined = std::move(buffer_);
+    }
+    buffer_.clear();
+    tailBuf_.clear();
+
+    const size_t totalSize = combined.size();
+    const size_t alignedSize = totalSize & ~(dmaAlignment_ - 1);  // round down
+    const size_t tailSize = totalSize - alignedSize;
+
+    // Write full aligned blocks
+    if (alignedSize > 0) {
+        const size_t paddedSize = alignedSize;  // already aligned
+        auto buf = seastar::temporary_buffer<char>::aligned(dmaAlignment_, paddedSize);
+        std::memcpy(buf.get_write(), combined.data(), alignedSize);
+
+        // DMA write offset must be aligned — dmaWritePos_ is always aligned
+        size_t written = 0;
+        while (written < paddedSize) {
+            auto n = co_await walFile_->dma_write(dmaWritePos_ + written, buf.get() + written, paddedSize - written);
+            if (n == 0) throw std::runtime_error("IndexWAL dma_write returned 0");
+            written += n;
+        }
+        dmaWritePos_ += alignedSize;
+    }
+
+    // Keep the partial tail in memory for the next flush
+    if (tailSize > 0) {
+        tailBuf_.assign(combined.data() + alignedSize, tailSize);
+    }
+
+    writePos_ += totalSize;
+
+    // Truncate + flush to ensure data is on disk
+    co_await walFile_->truncate(writePos_);
+    co_await walFile_->flush();
 }
 
 seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
@@ -97,51 +202,58 @@ seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
 
     wal.walGeneration_ = maxGen;
     wal.currentPath_ = walFileName(directory, maxGen);
+
+    // Don't open file yet — replay() needs to read first.
+    // File opened lazily on first append().
+
     co_return std::move(wal);
 }
 
 seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
-    // Serialize the batch
-    std::string payload;
-    batch.serializeTo(payload);
+    // Lazy file open — after replay() has consumed existing data
+    if (!walFile_) {
+        co_await openFile();
+    }
 
-    // Build record: length(4) + crc32(4) + sequence(8) + payload
-    size_t recordSize = 4 + 4 + 8 + payload.size();
-    std::string record;
-    record.resize(recordSize);
+    // Serialize batch directly into the WAL buffer — no intermediate payload string.
+    // Record layout: length(4) + CRC(4) + sequence(8) + payload(variable)
 
-    char* p = record.data();
-    uint32_t innerLen = static_cast<uint32_t>(4 + 8 + payload.size());
-    encodeFixed32(p, innerLen);
-    p += 4;
+    size_t headerOffset = buffer_.size();
+    // Reserve space for header: length(4) + CRC(4) + sequence(8) = 16 bytes
+    buffer_.resize(headerOffset + 16);
 
-    char seqBuf[8];
-    encodeFixed64(seqBuf, sequence_);
+    // Serialize batch payload directly into buffer_ (appends after the header).
+    // This may reallocate buffer_, so all header writes use offsets computed AFTER.
+    batch.serializeTo(buffer_);
 
-    std::string crcInput;
-    crcInput.append(seqBuf, 8);
-    crcInput.append(payload);
-    uint32_t crc = computeCrc32(crcInput.data(), crcInput.size());
-    encodeFixed32(p, crc);
-    p += 4;
+    // Fill in the header (all pointer arithmetic done after final buffer_ state)
+    size_t payloadSize = buffer_.size() - headerOffset - 16;
+    uint32_t innerLen = static_cast<uint32_t>(4 + 8 + payloadSize);
+    char* hdr = buffer_.data() + headerOffset;
 
-    std::memcpy(p, seqBuf, 8);
-    p += 8;
-    std::memcpy(p, payload.data(), payload.size());
+    encodeFixed32(hdr, innerLen);       // record length at offset 0
+    encodeFixed64(hdr + 8, sequence_);  // sequence number at offset 8
 
-    // Write using standard POSIX I/O in a Seastar thread
-    auto path = currentPath_;
-    co_await seastar::async([path, record = std::move(record)] {
-        std::ofstream ofs(path, std::ios::binary | std::ios::app);
-        ofs.write(record.data(), static_cast<std::streamsize>(record.size()));
-        ofs.flush();
-    });
+    // Compute CRC over sequence(8) + payload (starts at offset 8)
+    uint32_t crc = computeCrc32(hdr + 8, 8 + payloadSize);
+    encodeFixed32(hdr + 4, crc);        // CRC at offset 4
+
+    // Flush when buffer exceeds capacity
+    if (buffer_.size() >= BUFFER_CAPACITY) {
+        co_await flushBuffer();
+    }
 
     ++sequence_;
 }
 
 seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
     uint64_t recordsReplayed = 0;
+
+    // Flush any buffered writes (including tail) before reading
+    if (walFile_) {
+        co_await flushBuffer();
+        co_await flushTail();
+    }
 
     if (!std::filesystem::exists(currentPath_)) {
         co_return 0;
@@ -152,14 +264,14 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
         co_return 0;
     }
 
-    // Read WAL file using standard I/O
-    std::string data;
-    co_await seastar::async([this, &data, fileSize] {
-        data.resize(fileSize);
-        std::ifstream ifs(currentPath_, std::ios::binary);
-        ifs.read(data.data(), static_cast<std::streamsize>(fileSize));
-    });
+    // Read WAL file using Seastar DMA I/O
+    auto f = co_await seastar::open_file_dma(currentPath_, seastar::open_flags::ro);
+    auto is = seastar::make_file_input_stream(f);
+    auto buf = co_await is.read_exactly(fileSize);
+    co_await is.close();
+    co_await f.close();
 
+    std::string data(buf.get(), buf.size());
     const char* p = data.data();
     const char* end = p + data.size();
 
@@ -198,9 +310,20 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
 }
 
 seastar::future<std::string> IndexWAL::rotate() {
+    // Flush everything (including tail) and close current file
+    if (walFile_) {
+        co_await flushBuffer();
+        co_await flushTail();
+        co_await walFile_->close();
+        walFile_.reset();
+    }
+
     auto oldPath = currentPath_;
     ++walGeneration_;
     currentPath_ = walFileName(directory_, walGeneration_);
+
+    // File opened lazily on next append()
+
     co_return oldPath;
 }
 
@@ -211,9 +334,39 @@ seastar::future<> IndexWAL::deleteFile(const std::string& path) {
     co_return;
 }
 
+// Write the remaining tail buffer (partial DMA block) to disk.
+// Called before close/rotate to ensure all data is persisted.
+seastar::future<> IndexWAL::flushTail() {
+    if (tailBuf_.empty()) co_return;
+
+    const size_t tailSize = tailBuf_.size();
+    const size_t paddedSize = (tailSize + dmaAlignment_ - 1) & ~(dmaAlignment_ - 1);
+
+    auto buf = seastar::temporary_buffer<char>::aligned(dmaAlignment_, paddedSize);
+    std::memset(buf.get_write(), 0, paddedSize);
+    std::memcpy(buf.get_write(), tailBuf_.data(), tailSize);
+
+    size_t written = 0;
+    while (written < paddedSize) {
+        auto n = co_await walFile_->dma_write(dmaWritePos_ + written, buf.get() + written, paddedSize - written);
+        if (n == 0) throw std::runtime_error("IndexWAL flushTail dma_write returned 0");
+        written += n;
+    }
+    dmaWritePos_ += paddedSize;
+    tailBuf_.clear();
+
+    // Truncate to logical size (remove DMA padding)
+    co_await walFile_->truncate(writePos_);
+    co_await walFile_->flush();
+}
+
 seastar::future<> IndexWAL::close() {
-    // No file handles to close — we use open/write/close per append
-    co_return;
+    if (walFile_) {
+        co_await flushBuffer();
+        co_await flushTail();
+        co_await walFile_->close();
+        walFile_.reset();
+    }
 }
 
 }  // namespace timestar::index

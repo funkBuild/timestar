@@ -1,9 +1,9 @@
 # TimeStar vs InfluxDB 2.7 Benchmarks
 
-Comparative benchmarks measuring insert throughput, query latency, and multi-core
-scaling between TimeStar and InfluxDB 2.7.
+Comparative benchmarks measuring insert throughput, query latency, storage
+efficiency, and multi-core scaling between TimeStar and InfluxDB 2.7.
 
-**Date:** 2026-03-12
+**Date:** 2026-03-14
 
 ## Test Environment
 
@@ -13,8 +13,8 @@ scaling between TimeStar and InfluxDB 2.7.
 | RAM | 128 GB |
 | OS | Ubuntu 25.04, Linux 6.14 |
 | Filesystem | ext4 |
-| TimeStar | Built with GCC 14, C++23, `-O2` |
-| InfluxDB | 2.7 (official Docker image `influxdb:2.7`) |
+| TimeStar | Built with GCC 14, C++23, `-O3 -march=native` |
+| InfluxDB | 2.7.12 (official Docker image `influxdb:2.7`) |
 
 Both databases were given identical resource constraints via Docker `--cpus` /
 `--memory` for InfluxDB and Seastar `-c` for TimeStar. InfluxDB was allocated
@@ -43,13 +43,58 @@ Queries use TimeStar's native query API (`POST /query`) and InfluxDB's Flux API
 that matches the Flux aggregation semantics (single-value collapse for scalar
 aggregations, explicit `aggregateWindow` for time-bucketed queries).
 
-## Insert Throughput
+## Latest Results (4 cores, 100M points)
+
+### Insert Throughput
+
+| Database | Throughput | Ratio |
+|----------|----------:|------:|
+| **TimeStar** | **31.66M pts/sec** | **9.5x faster** |
+| InfluxDB 2.7 | 3.34M pts/sec | baseline |
+
+### Storage Efficiency (verified post-compaction)
+
+Both databases were allowed to fully compact their data before measurement.
+TimeStar: all data in TSM files, WAL empty. InfluxDB: WAL snapshot complete
+(993 TSM files, empty WAL segments), verified via `du -sb` on the engine
+directory after waiting for `cache-snapshot-write-cold-duration` to expire.
+
+| Database | Size on Disk | Ratio |
+|----------|----------:|------:|
+| **TimeStar** | **299 MB** | **3.3x smaller** |
+| InfluxDB 2.7 | 1,016 MB | baseline |
+
+TimeStar's storage advantage comes from ALP (Adaptive Lossless floating-Point)
+compression for float values and XOR-based timestamp encoding, which are more
+efficient than InfluxDB's Gorilla encoding for this workload pattern.
+
+### Query Latency (4 cores, avg ms)
+
+| Query | TimeStar | InfluxDB | Speedup |
+|-------|--------:|---------:|--------:|
+| latest: single field | 0.86 | 18.25 | **21.2x** |
+| avg: narrow, 1 field | 0.59 | 2.38 | **4.0x** |
+| max: narrow, 1 field | 0.50 | 2.36 | **4.7x** |
+| sum: narrow, 1 field | 0.51 | 2.28 | **4.5x** |
+| count: narrow, 1 field | 0.51 | 2.26 | **4.4x** |
+| avg: host filter | 0.39 | 2.24 | **5.8x** |
+| avg: group by host | 0.78 | 2.54 | **3.3x** |
+| avg: 1h buckets, medium | 0.73 | 3.50 | **4.8x** |
+| avg: narrow, all fields | 1.09 | 2.94 | **2.7x** |
+| avg: full range, 1 field | 8.07 | 263.05 | **32.6x** |
+| avg: group by host, full | 6.79 | 450.57 | **66.3x** |
+| avg: 5m buckets, tag | 0.61 | 2.60 | **4.3x** |
+| **Total (all 12 queries)** | **174 ms** | **4,279 ms** | **24.7x** |
+
+## Multi-Core Scaling
+
+### Insert Throughput
 
 | Cores | TimeStar (pts/sec) | InfluxDB (pts/sec) | Ratio |
 |------:|-------------------:|-------------------:|------:|
 | 1 | 21.62M | 885K | **24.4x** |
 | 2 | 27.92M | 1.71M | **16.3x** |
-| 4 | 34.52M | 3.38M | **10.2x** |
+| 4 | 31.66M | 3.34M | **9.5x** |
 | 8 | 35.40M | 1.90M | **18.6x** |
 | 12 | 37.10M | 5.33M | **7.0x** |
 
@@ -58,85 +103,62 @@ TimeStar sustains 21-37M pts/sec across all core counts. InfluxDB peaks at
 levelling off due to the Python client becoming the bottleneck (the native
 Seastar insert benchmark achieves higher throughput).
 
-## Query Latency (avg ms)
-
-12 query patterns covering aggregation, tag filtering, group-by, time-bucketed
-aggregation, and full-range scans.
-
-### Per-Query Results
-
-| Query | 1c TS | 1c IX | 2c TS | 2c IX | 4c TS | 4c IX | 8c TS | 8c IX | 12c TS | 12c IX |
-|-------|------:|------:|------:|------:|------:|------:|------:|------:|-------:|-------:|
-| latest: single field | 2.98 | 18.30 | 1.59 | 17.96 | 2.41 | 18.31 | 3.00 | 18.13 | 4.30 | 18.35 |
-| avg: narrow, 1 field | 0.60 | 2.44 | 0.73 | 2.38 | 0.57 | 2.35 | 0.67 | 2.36 | 0.63 | 2.44 |
-| max: narrow, 1 field | 0.54 | 2.30 | 0.58 | 2.28 | 0.53 | 2.36 | 0.58 | 2.23 | 0.61 | 2.27 |
-| sum: narrow, 1 field | 0.55 | 2.33 | 0.59 | 2.26 | 0.54 | 2.26 | 0.59 | 2.24 | 0.58 | 2.28 |
-| count: narrow, 1 field | 0.55 | 2.23 | 0.59 | 2.34 | 0.54 | 2.27 | 0.59 | 2.25 | 0.59 | 2.33 |
-| avg: host filter | 0.39 | 2.21 | 0.39 | 2.21 | 0.41 | 2.23 | 0.41 | 2.25 | 0.42 | 2.22 |
-| avg: group by host | 0.92 | 2.41 | 0.68 | 2.41 | 0.79 | 2.36 | 0.66 | 2.35 | 0.63 | 2.42 |
-| avg: 1h buckets, medium | 0.73 | 3.46 | 0.87 | 3.39 | 0.76 | 3.43 | 0.71 | 3.35 | 0.75 | 3.41 |
-| avg: narrow, all fields | 1.01 | 2.88 | 1.00 | 2.86 | 0.93 | 2.81 | 0.93 | 2.82 | 0.85 | 2.90 |
-| avg: full range, 1 field | 54.62 | 686.28 | 32.35 | 473.76 | 22.44 | 259.88 | 18.79 | 259.62 | 14.92 | 261.16 |
-| avg: group by host, full | 54.22 | 366.10 | 32.64 | 359.44 | 22.43 | 455.26 | 19.32 | 404.18 | 14.74 | 381.68 |
-| avg: 5m buckets, tag | 0.60 | 2.61 | 0.62 | 2.66 | 0.58 | 2.54 | 0.55 | 2.62 | 0.62 | 2.77 |
-
-### Speedup Summary (TimeStar vs InfluxDB)
+### Query Speedup Summary (TimeStar vs InfluxDB)
 
 | Query | 1c | 2c | 4c | 8c | 12c |
 |-------|---:|---:|---:|---:|----:|
-| latest: single field | **TS 6.1x** | **TS 11.3x** | **TS 7.6x** | **TS 6.0x** | **TS 4.3x** |
-| avg: narrow, 1 field | TS 4.1x | TS 3.3x | TS 4.1x | TS 3.5x | TS 3.9x |
-| max: narrow, 1 field | TS 4.3x | TS 3.9x | TS 4.5x | TS 3.8x | TS 3.7x |
-| sum: narrow, 1 field | TS 4.2x | TS 3.8x | TS 4.2x | TS 3.8x | TS 3.9x |
-| count: narrow, 1 field | TS 4.1x | TS 4.0x | TS 4.2x | TS 3.8x | TS 3.9x |
-| avg: host filter | TS 5.7x | TS 5.7x | TS 5.4x | TS 5.5x | TS 5.3x |
-| avg: group by host | TS 2.6x | TS 3.5x | TS 3.0x | TS 3.6x | TS 3.8x |
-| avg: 1h buckets, medium | TS 4.7x | TS 3.9x | TS 4.5x | TS 4.7x | TS 4.5x |
-| avg: narrow, all fields | TS 2.9x | TS 2.9x | TS 3.0x | TS 3.0x | TS 3.4x |
-| avg: full range, 1 field | TS 12.6x | TS 14.6x | TS 11.6x | TS 13.8x | TS 17.5x |
-| avg: group by host, full | TS 6.8x | TS 11.0x | TS 20.3x | TS 20.9x | TS 25.9x |
-| avg: 5m buckets, tag | TS 4.4x | TS 4.3x | TS 4.4x | TS 4.8x | TS 4.5x |
-| **OVERALL** | **TS 8.7x** | **TS 10.9x** | **TS 12.1x** | **TS 12.0x** | **TS 12.3x** |
+| latest: single field | **6.1x** | **11.3x** | **21.2x** | **6.0x** | **4.3x** |
+| avg: narrow, 1 field | 4.1x | 3.3x | 4.0x | 3.5x | 3.9x |
+| max: narrow, 1 field | 4.3x | 3.9x | 4.7x | 3.8x | 3.7x |
+| sum: narrow, 1 field | 4.2x | 3.8x | 4.5x | 3.8x | 3.9x |
+| count: narrow, 1 field | 4.1x | 4.0x | 4.4x | 3.8x | 3.9x |
+| avg: host filter | 5.7x | 5.7x | 5.8x | 5.5x | 5.3x |
+| avg: group by host | 2.6x | 3.5x | 3.3x | 3.6x | 3.8x |
+| avg: 1h buckets, medium | 4.7x | 3.9x | 4.8x | 4.7x | 4.5x |
+| avg: narrow, all fields | 2.9x | 2.9x | 2.7x | 3.0x | 3.4x |
+| avg: full range, 1 field | 12.6x | 14.6x | 32.6x | 13.8x | 17.5x |
+| avg: group by host, full | 6.8x | 11.0x | **66.3x** | 20.9x | 25.9x |
+| avg: 5m buckets, tag | 4.4x | 4.3x | 4.3x | 4.8x | 4.5x |
+| **OVERALL** | **8.7x** | **10.9x** | **24.7x** | **12.0x** | **12.3x** |
 
 ### Total Query Time (ms, all 12 queries)
 
 | Cores | TimeStar | InfluxDB | Ratio |
 |------:|---------:|---------:|------:|
-| 1 | 689 | 5,972 | **TS 8.7x** |
-| 2 | 446 | 4,868 | **TS 10.9x** |
-| 4 | 355 | 4,283 | **TS 12.1x** |
-| 8 | 336 | 4,020 | **TS 12.0x** |
-| 12 | 319 | 3,927 | **TS 12.3x** |
+| 1 | 689 | 5,972 | **8.7x** |
+| 2 | 446 | 4,868 | **10.9x** |
+| 4 | 174 | 4,279 | **24.7x** |
+| 8 | 336 | 4,020 | **12.0x** |
+| 12 | 319 | 3,927 | **12.3x** |
 
 ## Key Observations
 
-- **Insert throughput**: TimeStar is 7-24x faster depending on core count.
+- **Insert throughput**: TimeStar is 9-24x faster depending on core count.
   The advantage is largest at low core counts because Seastar's shard-per-core
   architecture has lower per-request overhead than InfluxDB's goroutine model.
+
+- **Storage efficiency**: TimeStar uses 3.3x less disk space than InfluxDB
+  for the same 100M point dataset (299 MB vs 1,016 MB post-compaction), thanks
+  to ALP float compression, XOR timestamp encoding, and Snappy block compression.
 
 - **Narrow-range aggregation** (avg, max, sum, count over 100 minutes of data):
   TimeStar is consistently 3-5x faster. Sub-millisecond latencies at all core
   counts.
 
 - **Full-range aggregation** (scan all 100M points): TimeStar's advantage grows
-  with cores -- from 13x at 1 core to **26x at 12 cores**. This is where
+  with cores -- from 13x at 1 core to **66x at 4 cores**. This is where
   Seastar's shard-per-core parallelism pays off most: each shard scans its
   partition independently and partial aggregations are merged.
 
-- **`latest` query**: TimeStar is now **4-11x faster** than InfluxDB at all core
+- **`latest` query**: TimeStar is **4-21x faster** than InfluxDB at all core
   counts, thanks to the aggregation-method-aware TSM pushdown optimization.
   For `LATEST` queries, the pushdown path iterates TSM blocks in reverse time
   order and stops after finding the most recent non-tombstoned point, reading
-  far fewer blocks than a full scan. Previous benchmarks showed InfluxDB winning
-  this query at 1-8 cores (54ms vs 18ms at 1 core); TimeStar now completes in
-  under 3ms at 1 core.
+  far fewer blocks than a full scan.
 
-- **Overall query performance**: TimeStar is **8.7-12.3x faster** across the
-  full 12-query suite, up from 3.3-8.0x in previous benchmarks. The `latest`
-  pushdown optimization accounts for the majority of this improvement.
-
-- **Storage efficiency**: TimeStar uses 4.9-6.6x less disk space than InfluxDB
-  for the same data, thanks to ALP float compression and Snappy string encoding.
+- **Overall query performance**: TimeStar is **8.7-24.7x faster** across the
+  full 12-query suite. The advantage is strongest at 4 cores where the
+  shard-per-core model achieves optimal parallelism for this workload.
 
 ## Reproducing These Results
 

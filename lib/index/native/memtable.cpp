@@ -3,16 +3,19 @@
 namespace timestar::index {
 
 void MemTable::put(std::string_view key, std::string_view value) {
-    auto [it, inserted] = entries_.emplace(std::string(key), std::string(value));
-    if (inserted) {
-        // New entry: account for key + value + map node overhead (~80 bytes)
-        approxMemory_ += key.size() + value.size() + 80;
-    } else {
-        // Update: adjust for value size change
+    // Use lower_bound + emplace_hint for O(1) amortized insertion when
+    // keys arrive in sorted or nearly-sorted order (common in batch inserts).
+    auto it = entries_.lower_bound(key);
+    if (it != entries_.end() && it->first == key) {
+        // Update existing entry
         size_t oldSize = it->second ? it->second->size() : 0;
         approxMemory_ -= oldSize;
         approxMemory_ += value.size();
         it->second = std::string(value);
+    } else {
+        // Insert new entry with position hint
+        entries_.emplace_hint(it, std::string(key), std::string(value));
+        approxMemory_ += key.size() + value.size() + 80;
     }
 }
 
@@ -29,13 +32,14 @@ std::optional<std::string_view> MemTable::get(std::string_view key) const {
 }
 
 void MemTable::remove(std::string_view key) {
-    auto [it, inserted] = entries_.emplace(std::string(key), std::nullopt);
-    if (inserted) {
-        approxMemory_ += key.size() + 80;
-    } else {
+    auto it = entries_.lower_bound(key);
+    if (it != entries_.end() && it->first == key) {
         size_t oldSize = it->second ? it->second->size() : 0;
         approxMemory_ -= oldSize;
         it->second = std::nullopt;
+    } else {
+        entries_.emplace_hint(it, std::string(key), std::nullopt);
+        approxMemory_ += key.size() + 80;
     }
 }
 

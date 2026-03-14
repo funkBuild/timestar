@@ -47,6 +47,16 @@ static uint32_t readFixed32(const char* p) {
 }
 
 void IndexWriteBatch::serializeTo(std::string& output) const {
+    // Pre-compute total size to avoid reallocations
+    size_t totalSize = 4; // op count
+    for (const auto& op : ops_) {
+        totalSize += 1 + 4 + op.key.size(); // type + key_len + key
+        if (op.type == OpType::Put) {
+            totalSize += 4 + op.value.size(); // value_len + value
+        }
+    }
+    output.reserve(output.size() + totalSize);
+
     appendFixed32(output, static_cast<uint32_t>(ops_.size()));
 
     for (const auto& op : ops_) {

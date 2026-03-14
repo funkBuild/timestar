@@ -1,5 +1,6 @@
 #include "sstable.hpp"
 
+#include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -208,30 +209,40 @@ seastar::future<> SSTableWriter::abort() {
 seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string filename) {
     auto reader = std::unique_ptr<SSTableReader>(new SSTableReader());
     reader->filename_ = filename;
-    reader->file_ = co_await seastar::open_file_dma(filename, seastar::open_flags::ro);
 
-    auto fileSize = co_await reader->file_.size();
+    auto file = co_await seastar::open_file_dma(filename, seastar::open_flags::ro);
+
+    auto fileSize = co_await file.size();
     if (fileSize < SSTABLE_FOOTER_SIZE) {
+        co_await file.close();
         throw std::runtime_error("SSTable file too small: " + filename);
     }
 
     // Read the entire file into an aligned buffer (metadata files are small).
     // DMA reads require both offset and size to be page-aligned.
-    const size_t dmaAlign = reader->file_.disk_read_dma_alignment();
+    const size_t dmaAlign = file.disk_read_dma_alignment();
     const size_t alignedFileSize = (fileSize + dmaAlign - 1) & ~(dmaAlign - 1);
     auto fileBuf = seastar::temporary_buffer<char>::aligned(dmaAlign, alignedFileSize);
     size_t totalRead = 0;
     while (totalRead < alignedFileSize) {
-        auto n = co_await reader->file_.dma_read(totalRead, fileBuf.get_write() + totalRead, alignedFileSize - totalRead);
+        auto n = co_await file.dma_read(totalRead, fileBuf.get_write() + totalRead, alignedFileSize - totalRead);
         if (n == 0) break;
         totalRead += n;
     }
     if (totalRead < fileSize) {
+        co_await file.close();
         throw std::runtime_error("SSTable read incomplete: " + filename);
     }
 
-    // Extract footer from end of file data
-    const char* fp = fileBuf.get() + fileSize - SSTABLE_FOOTER_SIZE;
+    // Close file handle immediately — all data is now in memory.
+    // Frees the file descriptor; no further I/O needed.
+    co_await file.close();
+
+    // Cache the file data
+    reader->fileData_.assign(fileBuf.get(), fileSize);
+
+    // Extract footer from cached file data
+    const char* fp = reader->fileData_.data() + fileSize - SSTABLE_FOOTER_SIZE;
     uint64_t bloomOffset = decodeFixed64(fp + 0);
     uint64_t bloomSize = decodeFixed64(fp + 8);
     uint64_t indexOffset = decodeFixed64(fp + 16);
@@ -250,17 +261,17 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     reader->metadata_.entryCount = entryCount;
     reader->metadata_.fileSize = fileSize;
 
-    // Read bloom filter (from already-loaded file buffer)
+    // Read bloom filter from cached file data
     if (bloomSize > 0 && bloomOffset + bloomSize <= fileSize) {
         reader->bloom_ = BloomFilter::deserializeFrom(
-            std::string_view(fileBuf.get() + bloomOffset, bloomSize));
+            std::string_view(reader->fileData_.data() + bloomOffset, bloomSize));
     } else {
         reader->bloom_ = BloomFilter::createNull();
     }
 
-    // Read index block (from already-loaded file buffer)
+    // Read index block from cached file data
     if (indexSize > 0 && indexOffset + indexSize <= fileSize) {
-        const char* ip = fileBuf.get() + indexOffset;
+        const char* ip = reader->fileData_.data() + indexOffset;
         const char* iend = ip + indexSize;
 
         if (ip + 4 > iend) throw std::runtime_error("SSTable index truncated");
@@ -288,59 +299,48 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
 
         if (!reader->index_.empty()) {
             reader->metadata_.minKey = reader->index_.front().firstKey;
-            // Max key is the last key in the last block, but we don't store that.
-            // We leave maxKey empty for now.
         }
     }
+
+    // Eagerly decompress all data blocks into memory.
+    // Metadata index files are small, so this is always worthwhile.
+    reader->decompressedBlocks_.resize(reader->index_.size());
+    for (size_t i = 0; i < reader->index_.size(); ++i) {
+        const auto& entry = reader->index_[i];
+        const char* blockStart = reader->fileData_.data() + entry.offset;
+        if (entry.size < 4) {
+            throw std::runtime_error("SSTable block too small");
+        }
+        uint32_t uncompressedSize = decodeFixed32(blockStart);
+        reader->decompressedBlocks_[i].resize(uncompressedSize);
+        if (!snappy::RawUncompress(blockStart + 4, entry.size - 4,
+                                    reader->decompressedBlocks_[i].data())) {
+            throw std::runtime_error("SSTable Snappy decompression failed");
+        }
+    }
+
+    // fileData_ is kept for the lifetime of the reader (blocks reference it
+    // only during decompression which is done above, but we keep it to avoid
+    // invalidating anything and because the memory cost is small).
 
     co_return std::move(reader);
 }
 
-seastar::future<std::string> SSTableReader::readBlock(size_t blockIndex) {
-    if (blockIndex >= index_.size()) {
+const std::string& SSTableReader::readBlock(size_t blockIndex) {
+    if (blockIndex >= decompressedBlocks_.size()) {
         throw std::runtime_error("SSTable block index out of range");
     }
-
-    const auto& entry = index_[blockIndex];
-
-    // DMA reads require aligned offset and size
-    const size_t dmaAlign = file_.disk_read_dma_alignment();
-    uint64_t alignedOffset = entry.offset & ~(dmaAlign - 1);
-    size_t offsetWithinPage = entry.offset - alignedOffset;
-    size_t readSize = (offsetWithinPage + entry.size + dmaAlign - 1) & ~(dmaAlign - 1);
-    auto buf = seastar::temporary_buffer<char>::aligned(dmaAlign, readSize);
-    auto bytesRead = co_await file_.dma_read(alignedOffset, buf.get_write(), readSize);
-    if (bytesRead < offsetWithinPage + entry.size) {
-        throw std::runtime_error("SSTable block read incomplete");
-    }
-
-    // Extract the actual block data from the aligned read
-    const char* blockStart = buf.get() + offsetWithinPage;
-
-    // First 4 bytes: uncompressed size
-    if (entry.size < 4) {
-        throw std::runtime_error("SSTable block too small");
-    }
-    uint32_t uncompressedSize = decodeFixed32(blockStart);
-
-    // Decompress
-    std::string decompressed;
-    decompressed.resize(uncompressedSize);
-    if (!snappy::RawUncompress(blockStart + 4, entry.size - 4, decompressed.data())) {
-        throw std::runtime_error("SSTable Snappy decompression failed");
-    }
-
-    co_return decompressed;
+    return decompressedBlocks_[blockIndex];
 }
 
-seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view key) {
+std::optional<std::string> SSTableReader::get(std::string_view key) {
     // Bloom filter check
     if (!bloom_.mayContain(key)) {
-        co_return std::nullopt;
+        return std::nullopt;
     }
 
     if (index_.empty()) {
-        co_return std::nullopt;
+        return std::nullopt;
     }
 
     // Binary search index to find the right data block.
@@ -355,41 +355,37 @@ seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view 
         }
     }
 
-    // Read and search the block
-    auto blockData = co_await readBlock(lo);
-    BlockReader reader(blockData);
-    if (!reader.valid()) {
-        co_return std::nullopt;
+    // Read and search the block (synchronous — data is cached)
+    const auto& blockData = readBlock(lo);
+    BlockReader blockReader(blockData);
+    if (!blockReader.valid()) {
+        return std::nullopt;
     }
 
-    auto it = reader.newIterator();
+    auto it = blockReader.newIterator();
     it.seek(key);
     if (it.valid() && it.key() == key) {
-        co_return std::string(it.value());
+        return std::string(it.value());
     }
 
-    co_return std::nullopt;
-}
-
-seastar::future<> SSTableReader::close() {
-    co_await file_.close();
+    return std::nullopt;
 }
 
 // --- SSTableReader::Iterator ---
 
 SSTableReader::Iterator::Iterator(SSTableReader* reader) : reader_(reader) {}
 
-seastar::future<> SSTableReader::Iterator::loadBlock(size_t idx) {
+void SSTableReader::Iterator::loadBlock(size_t idx) {
     if (idx >= reader_->index_.size()) {
         valid_ = false;
-        co_return;
+        return;
     }
     blockIndex_ = idx;
-    blockData_ = co_await reader_->readBlock(idx);
-    blockReader_ = std::make_unique<BlockReader>(blockData_);
+    const auto& blockData = reader_->readBlock(idx);
+    blockReader_ = std::make_unique<BlockReader>(blockData);
     if (!blockReader_->valid()) {
         valid_ = false;
-        co_return;
+        return;
     }
     blockIter_ = blockReader_->newIterator();
 }
@@ -404,22 +400,22 @@ void SSTableReader::Iterator::updateFromBlockIter() {
     }
 }
 
-seastar::future<> SSTableReader::Iterator::seekToFirst() {
+void SSTableReader::Iterator::seekToFirst() {
     if (reader_->index_.empty()) {
         valid_ = false;
-        co_return;
+        return;
     }
-    co_await loadBlock(0);
+    loadBlock(0);
     if (blockReader_ && blockReader_->valid()) {
         blockIter_.seekToFirst();
         updateFromBlockIter();
     }
 }
 
-seastar::future<> SSTableReader::Iterator::seek(std::string_view target) {
+void SSTableReader::Iterator::seek(std::string_view target) {
     if (reader_->index_.empty()) {
         valid_ = false;
-        co_return;
+        return;
     }
 
     // Binary search for the right block
@@ -433,17 +429,17 @@ seastar::future<> SSTableReader::Iterator::seek(std::string_view target) {
         }
     }
 
-    co_await loadBlock(lo);
+    loadBlock(lo);
     if (!blockReader_ || !blockReader_->valid()) {
         valid_ = false;
-        co_return;
+        return;
     }
     blockIter_.seek(target);
     updateFromBlockIter();
 
     // If not found in this block, try the next block
     if (!valid_ && lo + 1 < reader_->index_.size()) {
-        co_await loadBlock(lo + 1);
+        loadBlock(lo + 1);
         if (blockReader_ && blockReader_->valid()) {
             blockIter_.seekToFirst();
             updateFromBlockIter();
@@ -451,15 +447,15 @@ seastar::future<> SSTableReader::Iterator::seek(std::string_view target) {
     }
 }
 
-seastar::future<> SSTableReader::Iterator::next() {
-    if (!valid_) co_return;
+void SSTableReader::Iterator::next() {
+    if (!valid_) return;
 
     blockIter_.next();
     updateFromBlockIter();
 
     // If current block exhausted, move to next block
     if (!valid_ && blockIndex_ + 1 < reader_->index_.size()) {
-        co_await loadBlock(blockIndex_ + 1);
+        loadBlock(blockIndex_ + 1);
         if (blockReader_ && blockReader_->valid()) {
             blockIter_.seekToFirst();
             updateFromBlockIter();
@@ -467,8 +463,8 @@ seastar::future<> SSTableReader::Iterator::next() {
     }
 }
 
-seastar::future<std::unique_ptr<SSTableReader::Iterator>> SSTableReader::newIterator() {
-    co_return std::make_unique<Iterator>(this);
+std::unique_ptr<SSTableReader::Iterator> SSTableReader::newIterator() {
+    return std::make_unique<Iterator>(this);
 }
 
 }  // namespace timestar::index

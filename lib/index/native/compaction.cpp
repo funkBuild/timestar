@@ -12,16 +12,25 @@
 
 namespace timestar::index {
 
-// Adapts an SSTableReader::Iterator to the IteratorSource interface.
+// Adapts a synchronous SSTableReader::Iterator to the async IteratorSource interface.
 class SSTableIteratorSource : public IteratorSource {
 public:
     SSTableIteratorSource(std::unique_ptr<SSTableReader> reader, std::unique_ptr<SSTableReader::Iterator> iter,
                           int priority)
         : reader_(std::move(reader)), iter_(std::move(iter)), priority_(priority) {}
 
-    seastar::future<> seek(std::string_view target) override { co_await iter_->seek(target); }
-    seastar::future<> seekToFirst() override { co_await iter_->seekToFirst(); }
-    seastar::future<> next() override { co_await iter_->next(); }
+    seastar::future<> seek(std::string_view target) override {
+        iter_->seek(target);
+        return seastar::make_ready_future<>();
+    }
+    seastar::future<> seekToFirst() override {
+        iter_->seekToFirst();
+        return seastar::make_ready_future<>();
+    }
+    seastar::future<> next() override {
+        iter_->next();
+        return seastar::make_ready_future<>();
+    }
 
     bool valid() const override { return iter_->valid(); }
     std::string_view key() const override { return iter_->key(); }
@@ -80,7 +89,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     int priority = 0;
     for (const auto& fileMeta : job.inputFiles) {
         auto reader = co_await SSTableReader::open(sstFilename(fileMeta.fileNumber));
-        auto iter = co_await reader->newIterator();
+        auto iter = reader->newIterator();
         sources.push_back(
             std::make_unique<SSTableIteratorSource>(std::move(reader), std::move(iter), priority++));
     }

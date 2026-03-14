@@ -5,6 +5,7 @@
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
+#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
 #include <format>
@@ -63,14 +64,14 @@ SEASTAR_TEST_F(CompactionTest, CompactFourL0Files) {
     // Verify the merged file contains all 100 keys
     auto l1Files = manifest.filesAtLevel(1);
     auto reader = co_await SSTableReader::open(self->sstFilename(l1Files[0].fileNumber));
-    auto it = co_await reader->newIterator();
-    co_await it->seekToFirst();
+    auto it = reader->newIterator();
+    it->seekToFirst();
 
     int count = 0;
     while (it->valid()) {
         EXPECT_EQ(it->key(), std::format("key:{:04d}", count));
         ++count;
-        co_await it->next();
+        it->next();
     }
     EXPECT_EQ(count, 100);
 

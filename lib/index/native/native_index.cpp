@@ -20,6 +20,85 @@ static seastar::logger native_index_log("timestar.native_index");
 
 namespace timestar::index {
 
+// ============================================================================
+// Iterator adapters for MergeIterator (used by kvPrefixScan)
+// ============================================================================
+
+// Wraps MemTable::Iterator (synchronous) as IteratorSource.
+class MemTableIteratorSource : public IteratorSource {
+public:
+    explicit MemTableIteratorSource(MemTable::Iterator iter, int priority)
+        : iter_(std::move(iter)), priority_(priority) {}
+
+    seastar::future<> seek(std::string_view target) override {
+        iter_.seek(target);
+        return seastar::make_ready_future<>();
+    }
+    seastar::future<> seekToFirst() override {
+        iter_.seekToFirst();
+        return seastar::make_ready_future<>();
+    }
+    seastar::future<> next() override {
+        iter_.next();
+        return seastar::make_ready_future<>();
+    }
+
+    // Synchronous fast path — no future wrapping
+    void seekSync(std::string_view target) override { iter_.seek(target); }
+    void seekToFirstSync() override { iter_.seekToFirst(); }
+    void nextSync() override { iter_.next(); }
+
+    bool valid() const override { return iter_.valid(); }
+    std::string_view key() const override { return iter_.key(); }
+    std::string_view value() const override { return iter_.value(); }
+    bool isTombstone() const override { return iter_.isTombstone(); }
+    int priority() const override { return priority_; }
+
+private:
+    MemTable::Iterator iter_;
+    int priority_;
+};
+
+// Non-owning SSTable iterator source — borrows reader, doesn't own it.
+// (Unlike compaction.cpp's SSTableIteratorSource which takes ownership.)
+class SSTableBorrowedIteratorSource : public IteratorSource {
+public:
+    SSTableBorrowedIteratorSource(SSTableReader* reader, int priority)
+        : iter_(reader->newIterator()), priority_(priority) {}
+
+    seastar::future<> seek(std::string_view target) override {
+        iter_->seek(target);
+        return seastar::make_ready_future<>();
+    }
+    seastar::future<> seekToFirst() override {
+        iter_->seekToFirst();
+        return seastar::make_ready_future<>();
+    }
+    seastar::future<> next() override {
+        iter_->next();
+        return seastar::make_ready_future<>();
+    }
+
+    // Synchronous fast path — no future wrapping
+    void seekSync(std::string_view target) override { iter_->seek(target); }
+    void seekToFirstSync() override { iter_->seekToFirst(); }
+    void nextSync() override { iter_->next(); }
+
+    bool valid() const override { return iter_->valid(); }
+    std::string_view key() const override { return iter_->key(); }
+    std::string_view value() const override { return iter_->value(); }
+    bool isTombstone() const override { return false; }  // SSTables don't store tombstones
+    int priority() const override { return priority_; }
+
+private:
+    std::unique_ptr<SSTableReader::Iterator> iter_;
+    int priority_;
+};
+
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 NativeIndex::NativeIndex(int shardId)
     : shardId_(shardId),
       seriesMetadataCache_(shardId == 0 ? timestar::config().index.metadata_cache_bytes : 0),
@@ -67,8 +146,9 @@ seastar::future<> NativeIndex::open() {
 seastar::future<> NativeIndex::close() {
     if (shardId_ != 0) co_return;
 
-    // Flush MemTable to SSTable before closing (data also preserved in WAL)
+    // Wait for any in-flight background flush, then flush remaining data
     try {
+        co_await waitForFlush();
         if (memtable_ && !memtable_->empty()) {
             co_await flushMemTable();
         }
@@ -116,26 +196,39 @@ seastar::future<> NativeIndex::refreshSSTables() {
     }
 }
 
-seastar::future<std::optional<std::string>> NativeIndex::kvGet(const std::string& key) {
-    // 1. Check MemTable first (newest)
+// Synchronous — all data is in memory (MemTable + cached SSTables).
+// No coroutine frame overhead.
+// Synchronous — all data is in memory (MemTable + cached SSTables).
+std::optional<std::string> NativeIndex::kvGet(std::string_view key) {
+    // 1. Check active MemTable first (newest)
     auto memResult = memtable_->get(key);
     if (memResult.has_value()) {
-        co_return std::string(*memResult);
+        return std::string(*memResult);
     }
-    // Check if it's a tombstone
     if (memtable_->isTombstone(key)) {
-        co_return std::nullopt;
+        return std::nullopt;
     }
 
-    // 2. Check SSTables (newest to oldest)
-    for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
-        auto result = co_await (*it)->get(key);
-        if (result.has_value()) {
-            co_return result;
+    // 2. Check immutable MemTable (being flushed)
+    if (immutableMemtable_) {
+        auto immResult = immutableMemtable_->get(key);
+        if (immResult.has_value()) {
+            return std::string(*immResult);
+        }
+        if (immutableMemtable_->isTombstone(key)) {
+            return std::nullopt;
         }
     }
 
-    co_return std::nullopt;
+    // 3. Check SSTables (newest to oldest)
+    for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
+        auto result = (*it)->get(key);
+        if (result.has_value()) {
+            return result;
+        }
+    }
+
+    return std::nullopt;
 }
 
 seastar::future<> NativeIndex::kvPut(const std::string& key, const std::string& value) {
@@ -159,87 +252,170 @@ seastar::future<> NativeIndex::kvWriteBatch(const IndexWriteBatch& batch) {
     co_await maybeFlushMemTable();
 }
 
-seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallback fn) {
-    // For simplicity, iterate MemTable directly for prefix scans.
-    // In a full implementation, this would merge MemTable + SSTable iterators.
-    // For now, we check MemTable first, then fall through to SSTables.
+// Synchronous streaming kvPrefixScan using MergeIterator.
+// All data is in memory — no coroutine overhead.
+void NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallback fn) {
+    // Count valid sources and track if we can use the single-source fast path
+    bool memtableEmpty = memtable_->empty();
+    bool immutableEmpty = !immutableMemtable_ || immutableMemtable_->empty();
+    size_t sstCount = sstableReaders_.size();
 
-    // Collect all results from MemTable
-    std::map<std::string, std::optional<std::string>> merged;
-
-    // MemTable entries
-    auto memIt = memtable_->newIterator();
-    memIt.seek(prefix);
-    while (memIt.valid() && memIt.key().substr(0, prefix.size()) == prefix) {
-        if (memIt.isTombstone()) {
-            merged[std::string(memIt.key())] = std::nullopt;  // Tombstone
-        } else {
-            merged[std::string(memIt.key())] = std::string(memIt.value());
-        }
-        memIt.next();
-    }
-
-    // SSTable entries (oldest to newest, so newer overwrites older)
-    for (auto& reader : sstableReaders_) {
-        auto it = co_await reader->newIterator();
-        co_await it->seek(prefix);
-        while (it->valid() && it->key().substr(0, prefix.size()) == prefix) {
-            auto key = std::string(it->key());
-            // Only add if not already in merged (MemTable wins, then newer SSTables)
-            if (merged.find(key) == merged.end()) {
-                merged[key] = std::string(it->value());
+    // Fast path: single SSTable, empty memtables — skip MergeIterator entirely.
+    // This is the common case after compaction.
+    if (memtableEmpty && immutableEmpty && sstCount == 1) {
+        auto iter = sstableReaders_[0]->newIterator();
+        iter->seek(prefix);
+        while (iter->valid()) {
+            auto key = iter->key();
+            if (key.size() < prefix.size() ||
+                std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+                break;
             }
-            co_await it->next();
+            if (!fn(key, iter->value())) break;
+            iter->next();
         }
+        return;
     }
 
-    // Call the callback for all live entries
-    for (const auto& [key, value] : merged) {
-        if (value.has_value()) {
-            if (!fn(key, *value)) break;
+    // Fast path: single MemTable, no SSTables — skip MergeIterator entirely.
+    if (!memtableEmpty && immutableEmpty && sstCount == 0) {
+        auto iter = memtable_->newIterator();
+        iter.seek(prefix);
+        while (iter.valid()) {
+            auto key = iter.key();
+            if (key.size() < prefix.size() ||
+                std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+                break;
+            }
+            // Skip tombstones in single-source scan
+            if (!iter.isTombstone()) {
+                if (!fn(key, iter.value())) break;
+            }
+            iter.next();
         }
+        return;
+    }
+
+    // General path: multiple sources — use MergeIterator
+    std::vector<std::unique_ptr<IteratorSource>> sources;
+    sources.push_back(std::make_unique<MemTableIteratorSource>(memtable_->newIterator(), 0));
+
+    int nextPriority = 1;
+    if (immutableMemtable_) {
+        sources.push_back(std::make_unique<MemTableIteratorSource>(immutableMemtable_->newIterator(), nextPriority));
+        ++nextPriority;
+    }
+
+    int sstPriority = nextPriority + static_cast<int>(sstableReaders_.size());
+    for (auto& reader : sstableReaders_) {
+        sources.push_back(std::make_unique<SSTableBorrowedIteratorSource>(reader.get(), sstPriority));
+        --sstPriority;
+    }
+
+    MergeIterator merger(std::move(sources));
+    merger.seekSync(prefix);
+
+    while (merger.valid()) {
+        auto key = merger.key();
+        if (key.size() < prefix.size() ||
+            std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+            break;
+        }
+        if (!fn(key, merger.value())) break;
+        merger.nextSync();
+    }
+}
+
+seastar::future<> NativeIndex::waitForFlush() {
+    if (flushFuture_) {
+        co_await std::move(*flushFuture_);
+        flushFuture_.reset();
     }
 }
 
 seastar::future<> NativeIndex::maybeFlushMemTable() {
     auto usage = memtable_->approximateMemoryUsage();
     auto threshold = timestar::config().index.write_buffer_size;
-    if (usage >= threshold) {
-        ::native_index_log.info("Flushing MemTable: {} bytes >= {} threshold", usage, threshold);
-        co_await flushMemTable();
-    }
+    if (usage < threshold) co_return;
+
+    ::native_index_log.info("Flushing MemTable: {} bytes >= {} threshold", usage, threshold);
+
+    // If a previous flush is still in progress, wait for it (like LevelDB's imm_ check)
+    co_await waitForFlush();
+
+    // Swap: active memtable becomes immutable, create fresh active
+    immutableMemtable_ = std::move(memtable_);
+    memtable_ = std::make_unique<MemTable>();
+
+    // Rotate WAL so new writes go to a fresh log
+    auto oldWalPath = co_await wal_->rotate();
+
+    // Schedule the flush asynchronously — writer is NOT blocked.
+    // Use a lambda coroutine that owns the oldWalPath by value.
+    flushFuture_.emplace([](NativeIndex* self, std::string walPath) -> seastar::future<> {
+        co_await self->doFlushImmutableMemTable();
+        co_await IndexWAL::deleteFile(walPath);
+        self->immutableMemtable_.reset();
+        co_await self->compaction_->maybeCompact();
+        co_await self->refreshSSTables();
+    }(this, std::move(oldWalPath)));
 }
 
+// Blocking flush — used by close() and compact() where we need synchronous completion.
 seastar::future<> NativeIndex::flushMemTable() {
-    if (memtable_->empty()) co_return;
+    if (memtable_->empty()) {
+        co_await waitForFlush();
+        co_return;
+    }
 
-    ::native_index_log.info("Flushing MemTable: {} entries, {} approx bytes", memtable_->size(),
-                            memtable_->approximateMemoryUsage());
+    // Wait for any in-flight flush first
+    co_await waitForFlush();
+
+    // Swap to immutable
+    immutableMemtable_ = std::move(memtable_);
+    memtable_ = std::make_unique<MemTable>();
+
+    auto oldWalPath = co_await wal_->rotate();
+
+    // Flush synchronously (blocking)
+    co_await doFlushImmutableMemTable();
+    co_await IndexWAL::deleteFile(oldWalPath);
+    immutableMemtable_.reset();
+
+    co_await compaction_->maybeCompact();
+    co_await refreshSSTables();
+}
+
+// Writes the immutable memtable to an SSTable. Does NOT touch active memtable.
+seastar::future<> NativeIndex::doFlushImmutableMemTable() {
+    if (!immutableMemtable_ || immutableMemtable_->empty()) co_return;
+
+    ::native_index_log.info("Flushing immutable MemTable: {} entries, {} approx bytes",
+                            immutableMemtable_->size(), immutableMemtable_->approximateMemoryUsage());
 
     // Count live (non-tombstone) entries
     size_t liveCount = 0;
     {
-        auto countIt = memtable_->newIterator();
+        auto countIt = immutableMemtable_->newIterator();
         countIt.seekToFirst();
         while (countIt.valid()) {
             if (!countIt.isTombstone()) ++liveCount;
             countIt.next();
         }
     }
-    ::native_index_log.info("MemTable has {} live entries (excluding tombstones)", liveCount);
+    ::native_index_log.info("Immutable MemTable has {} live entries (excluding tombstones)", liveCount);
     if (liveCount == 0) {
         ::native_index_log.info("Skipping SSTable flush — no live entries");
-        memtable_ = std::make_unique<MemTable>();
         co_return;
     }
 
-    // Write MemTable to a new SSTable
+    // Write immutable MemTable to a new SSTable
     uint64_t fileNum = manifest_->nextFileNumber();
     auto path = sstFilename(fileNum);
     auto writer = co_await SSTableWriter::create(path, timestar::config().index.block_size,
                                                   timestar::config().index.bloom_filter_bits);
 
-    auto it = memtable_->newIterator();
+    auto it = immutableMemtable_->newIterator();
     it.seekToFirst();
     while (it.valid()) {
         if (!it.isTombstone()) {
@@ -253,21 +429,9 @@ seastar::future<> NativeIndex::flushMemTable() {
     ::native_index_log.info("SSTable write complete: {} entries, {} bytes", meta.entryCount, meta.fileSize);
     meta.fileNumber = fileNum;
     meta.level = 0;
-    ::native_index_log.info("Adding file to manifest");
     co_await manifest_->addFile(meta);
 
-    // Rotate WAL
-    auto oldWal = co_await wal_->rotate();
-    co_await IndexWAL::deleteFile(oldWal);
-
-    // Reset MemTable
-    memtable_ = std::make_unique<MemTable>();
-
-    // Refresh SSTable readers
-    co_await refreshSSTables();
-
-    // Maybe compact
-    co_await compaction_->maybeCompact();
+    // Refresh SSTable readers so queries see the new file
     co_await refreshSSTables();
 }
 
@@ -275,12 +439,12 @@ seastar::future<> NativeIndex::flushMemTable() {
 // Series cache (same two-generation design as LevelDBIndex)
 // ============================================================================
 
-bool NativeIndex::seriesCacheContains(const std::string& key) const {
-    return indexedSeriesCache_.count(key) || indexedSeriesCacheRetired_.count(key);
+bool NativeIndex::seriesCacheContains(const SeriesId128& id) const {
+    return indexedSeriesCache_.count(id) || indexedSeriesCacheRetired_.count(id);
 }
 
-void NativeIndex::seriesCacheInsert(std::string key) {
-    indexedSeriesCache_.insert(std::move(key));
+void NativeIndex::seriesCacheInsert(const SeriesId128& id) {
+    indexedSeriesCache_.insert(id);
     seriesCacheEvictIncremental();
 }
 
@@ -301,6 +465,8 @@ void NativeIndex::seriesCacheEvictIncremental() {
 // Series indexing
 // ============================================================================
 
+// Stage 4: Coalesced insert — all metadata (series, fields, tags) written
+// in a single WAL batch instead of 2-6 separate writes.
 seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measurement,
                                                                 std::map<std::string, std::string> tags,
                                                                 std::string field) {
@@ -308,24 +474,28 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
         throw std::runtime_error("getOrCreateSeriesId must be called on shard 0");
     }
 
-    std::string seriesKeyStr = ke::encodeSeriesKey(measurement, tags, field);
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKeyStr);
+    // Compute SeriesId128 directly from components — no encoded string needed.
+    // This avoids 2+2M temporary string allocations from escapeKeyComponent().
+    SeriesId128 seriesId = SeriesId128::fromComponents(measurement, tags, field);
 
-    // Fast path: already indexed
-    if (seriesCacheContains(seriesKeyStr)) {
+    // Fast path: already indexed (no string allocation needed)
+    if (seriesCacheContains(seriesId)) {
         co_return seriesId;
     }
 
     // Check if series exists in storage
     auto metaKey = ke::encodeSeriesMetadataKey(seriesId);
-    auto existing = co_await kvGet(metaKey);
+    auto existing = kvGet(metaKey);
     if (existing.has_value()) {
-        seriesCacheInsert(std::move(seriesKeyStr));
+        seriesCacheInsert(seriesId);
         co_return seriesId;
     }
 
-    // New series — create all index entries in a single batch
+    // New series — create ALL index entries in a single batch (Stage 4).
+    // Previously this was split across getOrCreateSeriesId + addFieldsAndTags
+    // = 2-6 separate WAL writes. Now it's exactly 1.
     IndexWriteBatch batch;
+    batch.reserve(5 + 2 * tags.size());  // metadata + indexes + per-tag TAG_INDEX + GROUP_BY_INDEX
 
     // Series metadata
     SeriesMetadata metadata{measurement, tags, field};
@@ -339,9 +509,12 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
 
     // Tag index and group-by index
     std::string encodedSeriesId = ke::encodeSeriesId(seriesId);
+    // Reusable buffer for tag index keys — avoids per-tag allocation
+    std::string tagIdxKey;
+    tagIdxKey.reserve(1 + measurement.size() + 1 + 32 + 1 + 32 + 1 + 16);
     for (const auto& [tagKey, tagValue] : tags) {
         // TAG_INDEX
-        std::string tagIdxKey;
+        tagIdxKey.clear();
         tagIdxKey.push_back(TAG_INDEX);
         tagIdxKey += measurement;
         tagIdxKey.push_back('\0');
@@ -352,14 +525,56 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
         tagIdxKey += encodedSeriesId;
         batch.put(tagIdxKey, encodedSeriesId);
 
-        // GROUP_BY_INDEX (same key with different prefix)
-        std::string groupByKey = tagIdxKey;
-        groupByKey[0] = GROUP_BY_INDEX;
-        batch.put(groupByKey, encodedSeriesId);
+        // GROUP_BY_INDEX — same key, flip first byte in-place (no copy)
+        tagIdxKey[0] = GROUP_BY_INDEX;
+        batch.put(tagIdxKey, encodedSeriesId);
     }
 
+    // --- Field metadata (was addField) ---
+    auto& fieldCache = fieldsCache_[measurement];
+    if (fieldCache.empty()) {
+        auto val = kvGet(ke::encodeMeasurementFieldsKey(measurement));
+        if (val.has_value()) fieldCache = ke::decodeStringSet(*val);
+    }
+    if (fieldCache.insert(field).second) {
+        batch.put(ke::encodeMeasurementFieldsKey(measurement), ke::encodeStringSet(fieldCache));
+    }
+
+    // --- Tag metadata (was addTag for each tag) ---
+    auto& tagKeysCache = tagsCache_[measurement];
+    if (tagKeysCache.empty()) {
+        auto val = kvGet(ke::encodeMeasurementTagsKey(measurement));
+        if (val.has_value()) tagKeysCache = ke::decodeStringSet(*val);
+    }
+    // Reusable buffer for tag-values cache key
+    std::string tvCacheKey;
+    tvCacheKey.reserve(measurement.size() + 1 + 32);
+    for (const auto& [tagKey, tagValue] : tags) {
+        if (tagKeysCache.insert(tagKey).second) {
+            batch.put(ke::encodeMeasurementTagsKey(measurement), ke::encodeStringSet(tagKeysCache));
+        }
+
+        tvCacheKey.clear();
+        tvCacheKey += measurement;
+        tvCacheKey.push_back('\0');
+        tvCacheKey += tagKey;
+        auto& tagVals = tagValuesCache_[tvCacheKey];
+        if (tagVals.empty()) {
+            auto val = kvGet(ke::encodeTagValuesKey(measurement, tagKey));
+            if (val.has_value()) tagVals = ke::decodeStringSet(*val);
+        }
+        if (tagVals.insert(tagValue).second) {
+            batch.put(ke::encodeTagValuesKey(measurement, tagKey), ke::encodeStringSet(tagVals));
+        }
+    }
+
+    // Single WAL write for everything
     co_await kvWriteBatch(batch);
-    seriesCacheInsert(std::move(seriesKeyStr));
+    seriesCacheInsert(seriesId);
+
+    // Pre-populate metadata cache — avoids decode cost on future lookups.
+    // The metadata object is already constructed; move it into cache.
+    seriesMetadataCache_.put(seriesId, std::move(metadata));
 
     // Invalidate discovery cache for this measurement
     invalidateDiscoveryCache(measurement);
@@ -368,9 +583,6 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
     if (measurementSeriesCache_.count(measurement)) {
         measurementSeriesCache_[measurement].push_back(seriesId);
     }
-
-    // Also add field/tag metadata
-    co_await addFieldsAndTags(measurement, field, tags);
 
     co_return seriesId;
 }
@@ -383,7 +595,7 @@ seastar::future<std::optional<SeriesId128>> NativeIndex::getSeriesId(
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKeyStr);
 
     auto metaKey = ke::encodeSeriesMetadataKey(seriesId);
-    auto existing = co_await kvGet(metaKey);
+    auto existing = kvGet(metaKey);
     if (existing.has_value()) {
         co_return seriesId;
     }
@@ -398,7 +610,7 @@ seastar::future<std::optional<SeriesMetadata>> NativeIndex::getSeriesMetadata(co
     if (cached) co_return *cached;
 
     auto key = ke::encodeSeriesMetadataKey(seriesId);
-    auto val = co_await kvGet(key);
+    auto val = kvGet(key);
     if (!val.has_value()) co_return std::nullopt;
 
     auto metadata = ke::decodeSeriesMetadata(*val);
@@ -406,14 +618,38 @@ seastar::future<std::optional<SeriesMetadata>> NativeIndex::getSeriesMetadata(co
     co_return metadata;
 }
 
+// Stage 3: Batch metadata resolution — inlines cache checks and avoids
+// N sequential getSeriesMetadata coroutine calls.
 seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>> NativeIndex::getSeriesMetadataBatch(
     const std::vector<SeriesId128>& seriesIds) {
     std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>> results;
     results.reserve(seriesIds.size());
 
+    // Reusable key buffer — avoids re-allocating 17-byte string per ID
+    std::string key;
+    key.reserve(1 + 16);
+
     for (const auto& id : seriesIds) {
-        auto meta = co_await getSeriesMetadata(id);
-        results.push_back({id, std::move(meta)});
+        // Inline cache check — avoids coroutine overhead of getSeriesMetadata()
+        auto cached = seriesMetadataCache_.get(id);
+        if (cached) {
+            results.push_back({id, *cached});
+            continue;
+        }
+
+        // Cache miss — build key in reusable buffer
+        key.clear();
+        key.push_back(static_cast<char>(SERIES_METADATA));
+        id.appendTo(key);
+
+        auto val = kvGet(key);
+        if (val.has_value()) {
+            auto metadata = ke::decodeSeriesMetadata(*val);
+            seriesMetadataCache_.put(id, metadata);
+            results.push_back({id, std::move(metadata)});
+        } else {
+            results.push_back({id, std::nullopt});
+        }
     }
 
     co_return results;
@@ -432,7 +668,7 @@ seastar::future<> NativeIndex::addField(const std::string& measurement, const st
     // Load from storage if cache is empty
     if (cached.empty()) {
         auto key = ke::encodeMeasurementFieldsKey(measurement);
-        auto val = co_await kvGet(key);
+        auto val = kvGet(key);
         if (val.has_value()) {
             cached = ke::decodeStringSet(*val);
         }
@@ -451,7 +687,7 @@ seastar::future<> NativeIndex::addTag(const std::string& measurement, const std:
     auto& tagKeys = tagsCache_[measurement];
     if (tagKeys.empty()) {
         auto key = ke::encodeMeasurementTagsKey(measurement);
-        auto val = co_await kvGet(key);
+        auto val = kvGet(key);
         if (val.has_value()) {
             tagKeys = ke::decodeStringSet(*val);
         }
@@ -464,7 +700,7 @@ seastar::future<> NativeIndex::addTag(const std::string& measurement, const std:
     auto& tagVals = tagValuesCache_[tvCacheKey];
     if (tagVals.empty()) {
         auto key = ke::encodeTagValuesKey(measurement, tagKey);
-        auto val = co_await kvGet(key);
+        auto val = kvGet(key);
         if (val.has_value()) {
             tagVals = ke::decodeStringSet(*val);
         }
@@ -508,7 +744,7 @@ seastar::future<> NativeIndex::setFieldType(const std::string& measurement, cons
 seastar::future<std::string> NativeIndex::getFieldType(const std::string& measurement, const std::string& field) {
     if (shardId_ != 0) co_return "";
 
-    auto val = co_await kvGet(ke::encodeFieldTypeKey(measurement, field));
+    auto val = kvGet(ke::encodeFieldTypeKey(measurement, field));
     co_return val.value_or("");
 }
 
@@ -517,7 +753,7 @@ seastar::future<std::set<std::string>> NativeIndex::getAllMeasurements() {
 
     std::set<std::string> result;
     std::string prefix(1, static_cast<char>(MEASUREMENT_FIELDS));
-    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
+    kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
         result.insert(std::string(key.substr(1)));  // Skip prefix byte
         return true;
     });
@@ -530,7 +766,7 @@ seastar::future<std::set<std::string>> NativeIndex::getFields(const std::string&
     auto& cached = fieldsCache_[measurement];
     if (!cached.empty()) co_return cached;
 
-    auto val = co_await kvGet(ke::encodeMeasurementFieldsKey(measurement));
+    auto val = kvGet(ke::encodeMeasurementFieldsKey(measurement));
     if (val.has_value()) {
         cached = ke::decodeStringSet(*val);
     }
@@ -543,7 +779,7 @@ seastar::future<std::set<std::string>> NativeIndex::getTags(const std::string& m
     auto& cached = tagsCache_[measurement];
     if (!cached.empty()) co_return cached;
 
-    auto val = co_await kvGet(ke::encodeMeasurementTagsKey(measurement));
+    auto val = kvGet(ke::encodeMeasurementTagsKey(measurement));
     if (val.has_value()) {
         cached = ke::decodeStringSet(*val);
     }
@@ -558,7 +794,7 @@ seastar::future<std::set<std::string>> NativeIndex::getTagValues(const std::stri
     auto& cached = tagValuesCache_[tvCacheKey];
     if (!cached.empty()) co_return cached;
 
-    auto val = co_await kvGet(ke::encodeTagValuesKey(measurement, tagKey));
+    auto val = kvGet(ke::encodeTagValuesKey(measurement, tagKey));
     if (val.has_value()) {
         cached = ke::decodeStringSet(*val);
     }
@@ -625,6 +861,8 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
     co_return res;
 }
 
+// Fused series discovery + metadata resolution.
+// Avoids the intermediate metaBatch vector and its 2000 SeriesMetadata deep copies.
 seastar::future<std::expected<std::vector<IndexBackend::SeriesWithMetadata>, SeriesLimitExceeded>>
 NativeIndex::findSeriesWithMetadata(const std::string& measurement,
                                      const std::map<std::string, std::string>& tagFilters,
@@ -636,14 +874,49 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
         co_return std::unexpected(findResult.error());
     }
 
+    // Fused metadata resolution + filtering — resolve each ID inline,
+    // copy metadata only for results that pass the field filter.
+    const auto& seriesIds = *findResult;
     std::vector<SeriesWithMetadata> results;
-    for (const auto& seriesId : *findResult) {
-        auto meta = co_await getSeriesMetadata(seriesId);
-        if (meta.has_value()) {
-            if (!fieldFilter.empty() && !fieldFilter.count(meta->field)) {
-                continue;
+    results.reserve(seriesIds.size());
+
+    std::string key;
+    key.reserve(1 + 16);
+
+    for (const auto& id : seriesIds) {
+        // Check metadata cache (returns pointer, no copy)
+        auto cached = seriesMetadataCache_.get(id);
+        const SeriesMetadata* meta = nullptr;
+        std::optional<SeriesMetadata> decoded;
+
+        if (cached) {
+            meta = cached;
+        } else {
+            // Cache miss — fetch and decode
+            key.clear();
+            key.push_back(static_cast<char>(SERIES_METADATA));
+            id.appendTo(key);
+
+            auto val = kvGet(key);
+            if (val.has_value()) {
+                decoded.emplace(ke::decodeSeriesMetadata(*val));
+                seriesMetadataCache_.put(id, *decoded);
+                meta = &*decoded;
             }
-            results.push_back({seriesId, std::move(*meta)});
+        }
+
+        if (!meta) continue;
+
+        // Apply field filter BEFORE copying metadata
+        if (!fieldFilter.empty() && !fieldFilter.count(meta->field)) {
+            continue;
+        }
+
+        // Only copy metadata for results that pass the filter
+        if (decoded) {
+            results.push_back({id, std::move(*decoded)});
+        } else {
+            results.push_back({id, *meta});
         }
     }
 
@@ -714,7 +987,7 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTag(const std
     prefix.push_back('\0');
 
     std::vector<SeriesId128> result;
-    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) {
+    kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) {
         if (value.size() >= 16) {
             result.push_back(SeriesId128::fromBytes(value.data(), 16));
         }
@@ -746,7 +1019,7 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
     prefix.push_back('\0');
 
     std::map<std::string, std::vector<SeriesId128>> result;
-    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) {
+    kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) {
         // Extract tag value from key: prefix + tagValue + \0 + seriesId
         auto afterPrefix = key.substr(prefix.size());
         auto nullPos = afterPrefix.find('\0');
@@ -796,7 +1069,7 @@ seastar::future<std::optional<IndexFieldStats>> NativeIndex::getFieldStats(const
     key.push_back('\0');
     key += field;
 
-    auto val = co_await kvGet(key);
+    auto val = kvGet(key);
     if (!val.has_value()) co_return std::nullopt;
 
     IndexFieldStats stats;
@@ -844,7 +1117,7 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
     std::string prefix = ke::encodeMeasurementSeriesPrefix(measurement);
     std::vector<SeriesId128> result;
 
-    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
+    kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
         // SeriesId128 is the last 16 bytes of the key
         if (key.size() >= prefix.size() + 16) {
             result.push_back(SeriesId128::fromBytes(key.data() + prefix.size(), 16));
@@ -894,7 +1167,7 @@ seastar::future<std::optional<RetentionPolicy>> NativeIndex::getRetentionPolicy(
     if (shardId_ != 0) co_return std::nullopt;
 
     auto key = ke::encodeRetentionPolicyKey(measurement);
-    auto val = co_await kvGet(key);
+    auto val = kvGet(key);
     if (!val.has_value()) co_return std::nullopt;
 
     RetentionPolicy policy;
@@ -909,7 +1182,7 @@ seastar::future<std::vector<RetentionPolicy>> NativeIndex::getAllRetentionPolici
     std::string prefix(1, static_cast<char>(RETENTION_POLICY));
     std::vector<RetentionPolicy> result;
 
-    co_await kvPrefixScan(prefix, [&](std::string_view, std::string_view value) {
+    kvPrefixScan(prefix, [&](std::string_view, std::string_view value) {
         RetentionPolicy policy;
         std::string valStr(value);
         auto ec = glz::read_json(policy, valStr);
@@ -926,7 +1199,7 @@ seastar::future<bool> NativeIndex::deleteRetentionPolicy(const std::string& meas
     if (shardId_ != 0) co_return false;
 
     auto key = ke::encodeRetentionPolicyKey(measurement);
-    auto existing = co_await kvGet(key);
+    auto existing = kvGet(key);
     if (!existing.has_value()) co_return false;
 
     co_await kvDelete(key);
@@ -942,7 +1215,7 @@ seastar::future<size_t> NativeIndex::getSeriesCount() {
 
     size_t count = 0;
     std::string prefix(1, static_cast<char>(SERIES_METADATA));
-    co_await kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
+    kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
         ++count;
         return true;
     });
@@ -952,7 +1225,8 @@ seastar::future<size_t> NativeIndex::getSeriesCount() {
 seastar::future<> NativeIndex::compact() {
     if (shardId_ != 0) co_return;
 
-    // Flush MemTable to SSTable if non-empty
+    // Wait for any in-flight background flush, then flush active memtable
+    co_await waitForFlush();
     if (memtable_ && !memtable_->empty()) {
         co_await flushMemTable();
     }
@@ -965,6 +1239,9 @@ seastar::future<> NativeIndex::compact() {
 
     co_await compaction_->compactAll();
     co_await refreshSSTables();
+
+    // Clear measurement series cache — will be repopulated on demand
+    measurementSeriesCache_.clear();
 }
 
 // ============================================================================

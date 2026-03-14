@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <string>
 #include <string_view>
@@ -88,21 +87,25 @@ private:
 };
 
 // Reads an SSTable file and provides point lookups and range iteration.
+// After open(), the entire file is cached in memory and the file handle is
+// released. All subsequent operations are synchronous memory accesses.
 class SSTableReader {
 public:
-    // Open an existing SSTable file.
+    // Open an existing SSTable file. Reads entire file into memory,
+    // decompresses all blocks eagerly, then closes the file handle.
     static seastar::future<std::unique_ptr<SSTableReader>> open(std::string filename);
 
     // Point lookup: returns the value for a key, or nullopt if not found.
     // Uses bloom filter to skip unnecessary block reads.
-    seastar::future<std::optional<std::string>> get(std::string_view key);
+    // Synchronous — all data is in memory after open().
+    std::optional<std::string> get(std::string_view key);
 
-    // Range iteration
+    // Range iteration — all operations are synchronous after open().
     class Iterator {
     public:
-        seastar::future<> seek(std::string_view target);
-        seastar::future<> seekToFirst();
-        seastar::future<> next();
+        void seek(std::string_view target);
+        void seekToFirst();
+        void next();
 
         bool valid() const { return valid_; }
         std::string_view key() const { return key_; }
@@ -116,33 +119,35 @@ public:
         SSTableReader* reader_;
         bool valid_ = false;
         size_t blockIndex_ = 0;  // Current index entry
-        std::string blockData_;  // Current decompressed block
         std::unique_ptr<BlockReader> blockReader_;
         BlockReader::Iterator blockIter_;
         std::string key_;
         std::string_view value_;
 
-        seastar::future<> loadBlock(size_t idx);
+        void loadBlock(size_t idx);
         void updateFromBlockIter();
     };
 
-    seastar::future<std::unique_ptr<Iterator>> newIterator();
+    std::unique_ptr<Iterator> newIterator();
 
     const SSTableMetadata& metadata() const { return metadata_; }
     const std::string& filename() const { return filename_; }
 
-    seastar::future<> close();
+    // No-op: file handle released after open().
+    seastar::future<> close() { return seastar::make_ready_future<>(); }
 
 private:
     SSTableReader() = default;
 
-    seastar::future<std::string> readBlock(size_t blockIndex);
+    // Returns a reference to the cached decompressed block data.
+    const std::string& readBlock(size_t blockIndex);
 
-    seastar::file file_;
     std::string filename_;
     SSTableMetadata metadata_;
     BloomFilter bloom_;
     std::vector<IndexEntry> index_;
+    std::string fileData_;                        // Entire file cached in memory
+    std::vector<std::string> decompressedBlocks_; // Eagerly decompressed blocks
 };
 
 }  // namespace timestar::index

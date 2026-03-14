@@ -155,25 +155,34 @@ private:
 
     // --- LSM storage ---
     std::unique_ptr<MemTable> memtable_;
+    std::unique_ptr<MemTable> immutableMemtable_;  // Being flushed to SSTable in background
+    std::optional<seastar::future<>> flushFuture_;  // Tracks background flush
     std::unique_ptr<IndexWAL> wal_;
     std::unique_ptr<Manifest> manifest_;
     std::unique_ptr<CompactionEngine> compaction_;
     std::vector<std::unique_ptr<SSTableReader>> sstableReaders_;
 
     // --- Low-level KV operations ---
-    seastar::future<std::optional<std::string>> kvGet(const std::string& key);
+    // kvGet is synchronous — all data is in memory (MemTable + cached SSTables).
+    std::optional<std::string> kvGet(std::string_view key);
     seastar::future<> kvPut(const std::string& key, const std::string& value);
     seastar::future<> kvDelete(const std::string& key);
     seastar::future<> kvWriteBatch(const IndexWriteBatch& batch);
 
     // Prefix scan: iterate all keys with the given prefix, calling fn for each.
     // fn receives (key, value) and returns true to continue, false to stop.
+    // Synchronous — all data is in memory (MemTable + cached SSTables).
     using ScanCallback = std::function<bool(std::string_view key, std::string_view value)>;
-    seastar::future<> kvPrefixScan(const std::string& prefix, ScanCallback fn);
+    void kvPrefixScan(const std::string& prefix, ScanCallback fn);
 
-    // Flush MemTable to SSTable when it exceeds the size threshold.
+    // Non-blocking memtable flush (double-buffered, like LevelDB).
+    // maybeFlushMemTable swaps the active memtable to immutable and returns immediately.
+    // The actual SSTable write happens asynchronously. If a second flush triggers
+    // while the first is still in progress, we wait for it (like LevelDB's imm_ check).
     seastar::future<> maybeFlushMemTable();
     seastar::future<> flushMemTable();
+    seastar::future<> doFlushImmutableMemTable();  // Background flush work
+    seastar::future<> waitForFlush();  // Wait for any in-flight flush to complete
 
     // Reopen SSTable readers after flush or compaction.
     seastar::future<> refreshSSTables();
@@ -183,10 +192,10 @@ private:
     static size_t defaultMaxSeriesCacheSize() { return timestar::config().index.series_cache_size; }
     static constexpr size_t EVICTION_BATCH_SIZE = 256;
     size_t maxSeriesCacheSize_ = defaultMaxSeriesCacheSize();
-    std::unordered_set<std::string> indexedSeriesCache_;
-    std::unordered_set<std::string> indexedSeriesCacheRetired_;
-    bool seriesCacheContains(const std::string& key) const;
-    void seriesCacheInsert(std::string key);
+    std::unordered_set<SeriesId128, SeriesId128::Hash> indexedSeriesCache_;
+    std::unordered_set<SeriesId128, SeriesId128::Hash> indexedSeriesCacheRetired_;
+    bool seriesCacheContains(const SeriesId128& id) const;
+    void seriesCacheInsert(const SeriesId128& id);
     void seriesCacheEvictIncremental();
 
     std::unordered_map<std::string, std::set<std::string>> fieldsCache_;

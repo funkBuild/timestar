@@ -3,6 +3,7 @@
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
+#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
 

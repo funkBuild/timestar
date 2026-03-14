@@ -22,6 +22,12 @@ void BloomFilter::addKey(std::string_view key) {
     ++numKeys_;
 }
 
+// Fast modulo replacement: maps a 32-bit value uniformly to [0, n) without division.
+// Uses the "fastrange" trick: (uint32_t)(((uint64_t)x * n) >> 32)
+static inline size_t fastRange(uint32_t x, size_t n) {
+    return static_cast<size_t>((static_cast<uint64_t>(x) * static_cast<uint64_t>(n)) >> 32);
+}
+
 void BloomFilter::build() {
     if (numKeys_ == 0) {
         filter_.clear();
@@ -38,17 +44,15 @@ void BloomFilter::build() {
     filter_.assign(numBytes, 0);
 
     for (uint64_t h : hashes_) {
-        // Split the 64-bit hash into two 32-bit values for double hashing
         uint32_t h1 = static_cast<uint32_t>(h);
         uint32_t h2 = static_cast<uint32_t>(h >> 32);
 
         for (int i = 0; i < k_; ++i) {
-            size_t bitPos = (h1 + static_cast<uint64_t>(i) * h2) % numBits;
+            size_t bitPos = fastRange(h1 + static_cast<uint32_t>(i) * h2, numBits);
             setBit(bitPos);
         }
     }
 
-    // Free the hash storage — no longer needed after build
     hashes_.clear();
     hashes_.shrink_to_fit();
     built_ = true;
@@ -65,7 +69,7 @@ bool BloomFilter::mayContain(std::string_view key) const {
     uint32_t h2 = static_cast<uint32_t>(h >> 32);
 
     for (int i = 0; i < k_; ++i) {
-        size_t bitPos = (h1 + static_cast<uint64_t>(i) * h2) % numBits;
+        size_t bitPos = fastRange(h1 + static_cast<uint32_t>(i) * h2, numBits);
         if (!getBit(bitPos)) {
             return false;
         }

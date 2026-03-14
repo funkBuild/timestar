@@ -26,6 +26,7 @@ public:
     void put(std::string_view key, std::string_view value);
     void remove(std::string_view key);
     void clear();
+    void reserve(size_t n) { ops_.reserve(n); }
 
     size_t count() const { return ops_.size(); }
     bool empty() const { return ops_.empty(); }

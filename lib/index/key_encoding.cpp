@@ -1,4 +1,5 @@
 #include "key_encoding.hpp"
+#include "key_encoding_simd.hpp"
 
 #include <charconv>
 #include <cstring>
@@ -6,27 +7,44 @@
 
 namespace timestar::index::keys {
 
-std::string escapeKeyComponent(const std::string& s) {
-    bool needsEscape = false;
-    for (char c : s) {
-        if (c == '\\' || c == ',' || c == '=' || c == ' ') {
-            needsEscape = true;
-            break;
-        }
-    }
-    if (!needsEscape) return s;
+// Append escaped component directly to output — no temporary string allocation.
+// Uses SIMD to scan for escape characters in 16-32 byte chunks.
+static void appendEscaped(std::string& out, const std::string& s) {
+    // SIMD scan for first escape character
+    size_t firstEscape = (s.size() >= simd::kSimdThreshold)
+        ? simd::findFirstEscapeChar(s.data(), s.size())
+        : [&]() -> size_t {
+            for (size_t i = 0; i < s.size(); ++i) {
+                char c = s[i];
+                if (c == '\\' || c == ',' || c == '=' || c == ' ') return i;
+            }
+            return s.size();
+        }();
 
-    std::string out;
-    out.reserve(s.size() + s.size() / 4);
-    for (char c : s) {
-        switch (c) {
-            case '\\': out += "\\\\"; break;
-            case ',': out += "\\,"; break;
-            case '=': out += "\\="; break;
-            case ' ': out += "\\ "; break;
-            default: out += c; break;
+    if (firstEscape == s.size()) {
+        // No escaping needed — fast append
+        out.append(s);
+        return;
+    }
+
+    out.reserve(out.size() + s.size() + s.size() / 4);
+    // Append the clean prefix in one shot
+    out.append(s.data(), firstEscape);
+    // Escape the rest
+    for (size_t i = firstEscape; i < s.size(); ++i) {
+        switch (s[i]) {
+            case '\\': out.append("\\\\", 2); break;
+            case ',': out.append("\\,", 2); break;
+            case '=': out.append("\\=", 2); break;
+            case ' ': out.append("\\ ", 2); break;
+            default: out.push_back(s[i]); break;
         }
     }
+}
+
+std::string escapeKeyComponent(const std::string& s) {
+    std::string out;
+    appendEscaped(out, s);
     return out;
 }
 
@@ -40,17 +58,17 @@ std::string encodeSeriesKey(const std::string& measurement, const std::map<std::
     std::string key;
     key.reserve(estimatedSize + estimatedSize / 4);
     key.push_back(static_cast<char>(SERIES_INDEX));
-    key += escapeKeyComponent(measurement);
+    appendEscaped(key, measurement);
 
     for (const auto& tag : tags) {
-        key += ',';
-        key += escapeKeyComponent(tag.first);
-        key += '=';
-        key += escapeKeyComponent(tag.second);
+        key.push_back(',');
+        appendEscaped(key, tag.first);
+        key.push_back('=');
+        appendEscaped(key, tag.second);
     }
 
-    key += ' ';
-    key += escapeKeyComponent(field);
+    key.push_back(' ');
+    appendEscaped(key, field);
     return key;
 }
 
@@ -161,8 +179,12 @@ std::string encodeSeriesMetadata(const SeriesMetadata& metadata) {
         throw std::runtime_error("SeriesMetadata has too many tags");
     }
 
-    std::string tagCountStr = std::to_string(metadata.tags.size());
-    size_t totalSize = metadata.measurement.size() + 1 + metadata.field.size() + 1 + tagCountStr.size() + 1;
+    // Convert tag count to string without std::to_string allocation
+    char tagCountBuf[16];
+    auto [tcEnd, tcEc] = std::to_chars(tagCountBuf, tagCountBuf + sizeof(tagCountBuf), metadata.tags.size());
+    size_t tagCountLen = static_cast<size_t>(tcEnd - tagCountBuf);
+
+    size_t totalSize = metadata.measurement.size() + 1 + metadata.field.size() + 1 + tagCountLen + 1;
     for (const auto& [k, v] : metadata.tags) {
         if (k.length() > 1000 || v.length() > 1000) {
             throw std::runtime_error("SeriesMetadata tag key/value too long");
@@ -176,7 +198,7 @@ std::string encodeSeriesMetadata(const SeriesMetadata& metadata) {
     result.push_back('\0');
     result.append(metadata.field);
     result.push_back('\0');
-    result.append(tagCountStr);
+    result.append(tagCountBuf, tagCountLen);
     result.push_back('\0');
 
     for (const auto& [k, v] : metadata.tags) {
@@ -189,25 +211,26 @@ std::string encodeSeriesMetadata(const SeriesMetadata& metadata) {
     return result;
 }
 
-SeriesMetadata decodeSeriesMetadata(const std::string& encoded) {
+SeriesMetadata decodeSeriesMetadata(std::string_view encoded) {
     return decodeSeriesMetadata(encoded.data(), encoded.size());
 }
 
 SeriesMetadata decodeSeriesMetadata(const char* rawData, size_t rawLen) {
     SeriesMetadata metadata;
-    std::string_view data(rawData, rawLen);
-    size_t pos = 0;
+    const char* p = rawData;
+    const char* end = rawData + rawLen;
 
+    // Fast null-byte scanner using memchr
     auto nextField = [&]() -> std::string_view {
-        if (pos >= data.size()) return {};
-        size_t end = data.find('\0', pos);
-        if (end == std::string_view::npos) {
-            std::string_view field = data.substr(pos);
-            pos = data.size();
+        if (p >= end) return {};
+        const char* nul = static_cast<const char*>(std::memchr(p, '\0', static_cast<size_t>(end - p)));
+        if (!nul) {
+            std::string_view field(p, static_cast<size_t>(end - p));
+            p = end;
             return field;
         }
-        std::string_view field = data.substr(pos, end - pos);
-        pos = end + 1;
+        std::string_view field(p, static_cast<size_t>(nul - p));
+        p = nul + 1;
         return field;
     };
 
@@ -226,10 +249,12 @@ SeriesMetadata decodeSeriesMetadata(const char* rawData, size_t rawLen) {
         throw std::runtime_error("tagCount exceeds maximum of 1000");
     }
 
+    // Tags are stored in sorted order (from std::map during encoding).
+    // Use emplace_hint at end() for O(1) amortized insertion.
     for (size_t i = 0; i < tagCount; ++i) {
         std::string_view key = nextField();
         std::string_view value = nextField();
-        metadata.tags[std::string(key)] = std::string(value);
+        metadata.tags.emplace_hint(metadata.tags.end(), std::string(key), std::string(value));
     }
 
     return metadata;
@@ -246,7 +271,7 @@ std::string encodeStringSet(const std::set<std::string>& strings) {
     return result;
 }
 
-std::set<std::string> decodeStringSet(const std::string& encoded) {
+std::set<std::string> decodeStringSet(std::string_view encoded) {
     std::set<std::string> result;
     const char* data = encoded.data();
     size_t size = encoded.size();

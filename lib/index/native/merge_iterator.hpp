@@ -18,9 +18,16 @@ class IteratorSource {
 public:
     virtual ~IteratorSource() = default;
 
+    // Async interface (used by compaction path)
     virtual seastar::future<> seek(std::string_view target) = 0;
     virtual seastar::future<> seekToFirst() = 0;
     virtual seastar::future<> next() = 0;
+
+    // Synchronous interface (used by query path — all data is in memory)
+    // Default implementations call .get() on the async versions.
+    virtual void seekSync(std::string_view target) { seek(target).get(); }
+    virtual void seekToFirstSync() { seekToFirst().get(); }
+    virtual void nextSync() { next().get(); }
 
     virtual bool valid() const = 0;
     virtual std::string_view key() const = 0;
@@ -41,9 +48,15 @@ class MergeIterator {
 public:
     explicit MergeIterator(std::vector<std::unique_ptr<IteratorSource>> sources);
 
+    // Async interface (used by compaction)
     seastar::future<> seek(std::string_view target);
     seastar::future<> seekToFirst();
     seastar::future<> next();
+
+    // Synchronous interface (used by query path — all sources are in-memory)
+    void seekSync(std::string_view target);
+    void seekToFirstSync();
+    void nextSync();
 
     bool valid() const { return valid_; }
     std::string_view key() const { return currentKey_; }
@@ -70,6 +83,7 @@ private:
 
     // Advance past duplicate keys and tombstones
     seastar::future<> findNext();
+    void findNextSync();
 };
 
 }  // namespace timestar::index

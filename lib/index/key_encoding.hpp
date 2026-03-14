@@ -37,10 +37,10 @@ SeriesId128 decodeSeriesId(const char* data, size_t len);
 
 std::string encodeSeriesMetadata(const SeriesMetadata& metadata);
 SeriesMetadata decodeSeriesMetadata(const char* data, size_t len);
-SeriesMetadata decodeSeriesMetadata(const std::string& encoded);
+SeriesMetadata decodeSeriesMetadata(std::string_view encoded);
 
 std::string encodeStringSet(const std::set<std::string>& strings);
-std::set<std::string> decodeStringSet(const std::string& encoded);
+std::set<std::string> decodeStringSet(std::string_view encoded);
 
 std::string escapeKeyComponent(const std::string& input);
 

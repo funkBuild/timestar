@@ -128,4 +128,74 @@ seastar::future<> MergeIterator::findNext() {
     valid_ = false;
 }
 
+// ============================================================================
+// Synchronous interface — same logic, no coroutine overhead.
+// Used by kvPrefixScan where all sources are in-memory.
+// ============================================================================
+
+void MergeIterator::seekToFirstSync() {
+    for (auto& src : sources_) {
+        src->seekToFirstSync();
+    }
+    rebuildHeap();
+    findNextSync();
+}
+
+void MergeIterator::seekSync(std::string_view target) {
+    for (auto& src : sources_) {
+        src->seekSync(target);
+    }
+    rebuildHeap();
+    findNextSync();
+}
+
+void MergeIterator::nextSync() {
+    if (!valid_) return;
+
+    // Advance all sources positioned at the current key
+    while (!heap_.empty()) {
+        auto& top = sources_[heap_[0].sourceIndex];
+        if (top->key() != currentKey_) break;
+
+        top->nextSync();
+        if (top->valid()) {
+            siftDown(0);
+        } else {
+            heap_[0] = heap_.back();
+            heap_.pop_back();
+            if (!heap_.empty()) siftDown(0);
+        }
+    }
+
+    findNextSync();
+}
+
+void MergeIterator::findNextSync() {
+    while (!heap_.empty()) {
+        auto& winner = sources_[heap_[0].sourceIndex];
+        if (!winner->isTombstone()) {
+            currentKey_.assign(winner->key().data(), winner->key().size());
+            currentValue_ = winner->value();
+            valid_ = true;
+            return;
+        }
+
+        // Tombstone: skip all sources at this key
+        std::string tombstoneKey(winner->key());
+        while (!heap_.empty() && sources_[heap_[0].sourceIndex]->key() == tombstoneKey) {
+            auto& src = sources_[heap_[0].sourceIndex];
+            src->nextSync();
+            if (src->valid()) {
+                siftDown(0);
+            } else {
+                heap_[0] = heap_.back();
+                heap_.pop_back();
+                if (!heap_.empty()) siftDown(0);
+            }
+        }
+    }
+
+    valid_ = false;
+}
+
 }  // namespace timestar::index

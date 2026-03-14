@@ -6,6 +6,7 @@
 #include <compare>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 
 /**
@@ -34,6 +35,13 @@ public:
 
     // Generate SeriesId128 from SeriesKey using XXH3_128bits hash
     static SeriesId128 fromSeriesKey(const std::string& seriesKey);
+
+    // Generate SeriesId128 directly from components (measurement, tags, field)
+    // without building the intermediate encoded series key string.
+    // Produces the same hash as fromSeriesKey(encodeSeriesKey(m, tags, f)).
+    static SeriesId128 fromComponents(const std::string& measurement,
+                                       const std::map<std::string, std::string>& tags,
+                                       const std::string& field);
 
     // Comparison operators (required for LevelDB keys and std::map)
     auto operator<=>(const SeriesId128& other) const = default;

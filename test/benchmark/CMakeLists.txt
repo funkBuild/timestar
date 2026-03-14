@@ -395,3 +395,4 @@ add_custom_target(run-bool-bench
     COMMENT "Running BitPack vs RLE boolean encoder comparison benchmark"
 )
 
+

@@ -3,6 +3,7 @@
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
+#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
 #include <format>
@@ -42,11 +43,11 @@ SEASTAR_TEST_F(SSTableTest, WriteAndReadSingle) {
     EXPECT_EQ(meta.maxKey, "hello");
 
     auto reader = co_await SSTableReader::open(path);
-    auto val = co_await reader->get("hello");
+    auto val = reader->get("hello");
     EXPECT_TRUE(val.has_value());
     EXPECT_EQ(*val, "world");
 
-    auto missing = co_await reader->get("nothere");
+    auto missing = reader->get("nothere");
     EXPECT_FALSE(missing.has_value());
 
     co_await reader->close();
@@ -69,13 +70,13 @@ SEASTAR_TEST_F(SSTableTest, WriteAndReadMany) {
 
     // Point lookups
     for (int i = 0; i < N; i += 50) {
-        auto val = co_await reader->get(std::format("key:{:04d}", i));
+        auto val = reader->get(std::format("key:{:04d}", i));
         EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
         EXPECT_EQ(*val, std::format("val:{:04d}", i));
     }
 
     // Non-existent keys
-    auto missing = co_await reader->get("key:9999");
+    auto missing = reader->get("key:9999");
     EXPECT_FALSE(missing.has_value());
 
     co_await reader->close();
@@ -91,15 +92,15 @@ SEASTAR_TEST_F(SSTableTest, IteratorFullScan) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto it = co_await reader->newIterator();
-    co_await it->seekToFirst();
+    auto it = reader->newIterator();
+    it->seekToFirst();
 
     int count = 0;
     while (it->valid()) {
         EXPECT_EQ(it->key(), std::format("k:{:04d}", count));
         EXPECT_EQ(it->value(), std::format("v:{:04d}", count));
         ++count;
-        co_await it->next();
+        it->next();
     }
     EXPECT_EQ(count, N);
 
@@ -116,25 +117,25 @@ SEASTAR_TEST_F(SSTableTest, IteratorSeek) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto it = co_await reader->newIterator();
+    auto it = reader->newIterator();
 
     // Seek to exact key
-    co_await it->seek("key:0050");
+    it->seek("key:0050");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "key:0050");
 
     // Seek between keys
-    co_await it->seek("key:0050a");
+    it->seek("key:0050a");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "key:0051");
 
     // Seek before first
-    co_await it->seek("aaa");
+    it->seek("aaa");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "key:0000");
 
     // Seek past last
-    co_await it->seek("zzz");
+    it->seek("zzz");
     EXPECT_FALSE(it->valid());
 
     co_await reader->close();
@@ -149,13 +150,13 @@ SEASTAR_TEST_F(SSTableTest, IteratorSeekAndIterate) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto it = co_await reader->newIterator();
+    auto it = reader->newIterator();
 
-    co_await it->seek("key:0095");
+    it->seek("key:0095");
     int count = 0;
     while (it->valid()) {
         ++count;
-        co_await it->next();
+        it->next();
     }
     EXPECT_EQ(count, 5);  // keys 95-99
 
@@ -177,11 +178,11 @@ SEASTAR_TEST_F(SSTableTest, BinaryKeysAndValues) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto v1 = co_await reader->get(key1);
+    auto v1 = reader->get(key1);
     EXPECT_TRUE(v1.has_value());
     EXPECT_EQ(*v1, val1);
 
-    auto v2 = co_await reader->get(key2);
+    auto v2 = reader->get(key2);
     EXPECT_TRUE(v2.has_value());
     EXPECT_EQ(*v2, val2);
 
@@ -197,11 +198,11 @@ SEASTAR_TEST_F(SSTableTest, EmptyValues) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto v1 = co_await reader->get("key1");
+    auto v1 = reader->get("key1");
     EXPECT_TRUE(v1.has_value());
     EXPECT_EQ(*v1, "");
 
-    auto v3 = co_await reader->get("key3");
+    auto v3 = reader->get("key3");
     EXPECT_TRUE(v3.has_value());
     EXPECT_EQ(*v3, "value3");
 
@@ -222,7 +223,7 @@ SEASTAR_TEST_F(SSTableTest, BloomFilterRejects) {
     // (no disk read needed). We can't directly observe this, but we can
     // verify correctness.
     for (int i = 0; i < 100; ++i) {
-        auto val = co_await reader->get(std::format("noexist:{:04d}", i));
+        auto val = reader->get(std::format("noexist:{:04d}", i));
         EXPECT_FALSE(val.has_value());
     }
 
@@ -246,15 +247,15 @@ SEASTAR_TEST_F(SSTableTest, PrefixScan) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto it = co_await reader->newIterator();
+    auto it = reader->newIterator();
 
     // Scan prefix \x05meas1
     std::string prefix = "\x05meas1";
-    co_await it->seek(prefix);
+    it->seek(prefix);
     int count = 0;
     while (it->valid() && it->key().substr(0, prefix.size()) == prefix) {
         ++count;
-        co_await it->next();
+        it->next();
     }
     EXPECT_EQ(count, 10);
 
