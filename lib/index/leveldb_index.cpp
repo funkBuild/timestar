@@ -2502,7 +2502,7 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> LevelDBIndex::g
 }
 
 seastar::future<> LevelDBIndex::updateFieldStats(const SeriesId128& seriesId, const std::string& field,
-                                                 const FieldStats& stats) {
+                                                 const IndexFieldStats& stats) {
     if (!db) {
         co_return;
     }
@@ -2535,8 +2535,8 @@ seastar::future<> LevelDBIndex::updateFieldStats(const SeriesId128& seriesId, co
     co_return;
 }
 
-seastar::future<std::optional<LevelDBIndex::FieldStats>> LevelDBIndex::getFieldStats(const SeriesId128& seriesId,
-                                                                                     const std::string& field) {
+seastar::future<std::optional<IndexFieldStats>> LevelDBIndex::getFieldStats(const SeriesId128& seriesId,
+                                                                             const std::string& field) {
     if (!db) {
         co_return std::nullopt;
     }
@@ -2558,7 +2558,7 @@ seastar::future<std::optional<LevelDBIndex::FieldStats>> LevelDBIndex::getFieldS
 
     if (status.ok()) {
         // Decode stats — validate null delimiters to avoid crash on corrupt data
-        FieldStats stats;
+        IndexFieldStats stats;
         size_t pos = 0;
 
         auto findDelim = [&](size_t from) -> size_t {

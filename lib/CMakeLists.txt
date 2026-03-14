@@ -55,6 +55,7 @@ target_include_directories(libtimestar PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/encoding
     ${CMAKE_CURRENT_SOURCE_DIR}/query
     ${CMAKE_CURRENT_SOURCE_DIR}/index
+    ${CMAKE_CURRENT_SOURCE_DIR}/index/native
     ${CMAKE_CURRENT_SOURCE_DIR}/http
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/retention
