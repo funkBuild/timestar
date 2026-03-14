@@ -39,7 +39,7 @@ SEASTAR_TEST_F(CompactionTest, CompactFourL0Files) {
         auto writer = co_await SSTableWriter::create(path, 512);
 
         for (int i = fileIdx; i < 100; i += 4) {
-            co_await writer.add(std::format("key:{:04d}", i), std::format("val_f{}:{:04d}", fileIdx, i));
+            writer.add(std::format("key:{:04d}", i), std::format("val_f{}:{:04d}", fileIdx, i));
         }
 
         auto meta = co_await writer.finish();
@@ -89,7 +89,7 @@ SEASTAR_TEST_F(CompactionTest, CompactAll) {
 
         for (int i = 0; i < 50; ++i) {
             // Different values for same keys
-            co_await writer.add(std::format("dup:{:04d}", i), std::format("v{}", fileIdx));
+            writer.add(std::format("dup:{:04d}", i), std::format("v{}", fileIdx));
         }
         auto meta = co_await writer.finish();
         meta.fileNumber = fn;
@@ -114,7 +114,7 @@ SEASTAR_TEST_F(CompactionTest, NoCompactionNeeded) {
         uint64_t fn = manifest.nextFileNumber();
         auto path = self->sstFilename(fn);
         auto writer = co_await SSTableWriter::create(path);
-        co_await writer.add("key", "val");
+        writer.add("key", "val");
         auto meta = co_await writer.finish();
         meta.fileNumber = fn;
         meta.level = 0;

@@ -57,7 +57,8 @@ public:
                                                   int bloomBitsPerKey = 15);
 
     // Add a key-value pair. Keys MUST be added in sorted order.
-    seastar::future<> add(std::string_view key, std::string_view value);
+    // Buffers data in memory — no I/O until finish().
+    void add(std::string_view key, std::string_view value);
 
     // Finalize the SSTable: flush remaining block, write bloom filter,
     // index block, and footer. Returns metadata about the written file.
@@ -71,13 +72,13 @@ public:
 private:
     SSTableWriter() = default;
 
-    seastar::future<> flushBlock();
+    void flushBlock();
 
-    seastar::file file_;
     std::string filename_;
     BlockBuilder currentBlock_;
     BloomFilter bloom_;
     std::vector<IndexEntry> index_;
+    std::string pendingData_;  // All block data buffered here until finish()
     uint64_t fileOffset_ = 0;
     size_t entryCount_ = 0;
     int blockSize_;

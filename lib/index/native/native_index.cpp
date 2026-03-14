@@ -37,7 +37,7 @@ seastar::future<> NativeIndex::open() {
         co_return;
     }
 
-    indexPath_ = "shard_0/native_index";
+    indexPath_ = std::filesystem::absolute("shard_0/native_index").string();
     std::filesystem::create_directories(indexPath_);
 
     // Open manifest
@@ -67,8 +67,14 @@ seastar::future<> NativeIndex::open() {
 seastar::future<> NativeIndex::close() {
     if (shardId_ != 0) co_return;
 
-    // Write MemTable contents to WAL for recovery on next open
-    // (skip SSTable flush to avoid DMA file lifecycle issues during shutdown)
+    // Flush MemTable to SSTable before closing (data also preserved in WAL)
+    try {
+        if (memtable_ && !memtable_->empty()) {
+            co_await flushMemTable();
+        }
+    } catch (const std::exception& e) {
+        ::native_index_log.warn("Failed to flush MemTable on close: {} — data preserved in WAL", e.what());
+    }
 
     // Close all SSTable readers
     for (auto& reader : sstableReaders_) {
@@ -207,6 +213,26 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
 seastar::future<> NativeIndex::flushMemTable() {
     if (memtable_->empty()) co_return;
 
+    ::native_index_log.info("Flushing MemTable: {} entries, {} approx bytes", memtable_->size(),
+                            memtable_->approximateMemoryUsage());
+
+    // Count live (non-tombstone) entries
+    size_t liveCount = 0;
+    {
+        auto countIt = memtable_->newIterator();
+        countIt.seekToFirst();
+        while (countIt.valid()) {
+            if (!countIt.isTombstone()) ++liveCount;
+            countIt.next();
+        }
+    }
+    ::native_index_log.info("MemTable has {} live entries (excluding tombstones)", liveCount);
+    if (liveCount == 0) {
+        ::native_index_log.info("Skipping SSTable flush — no live entries");
+        memtable_ = std::make_unique<MemTable>();
+        co_return;
+    }
+
     // Write MemTable to a new SSTable
     uint64_t fileNum = manifest_->nextFileNumber();
     auto path = sstFilename(fileNum);
@@ -217,14 +243,17 @@ seastar::future<> NativeIndex::flushMemTable() {
     it.seekToFirst();
     while (it.valid()) {
         if (!it.isTombstone()) {
-            co_await writer.add(it.key(), it.value());
+            writer.add(it.key(), it.value());
         }
         it.next();
     }
 
+    ::native_index_log.info("SSTable write starting for file {}", fileNum);
     auto meta = co_await writer.finish();
+    ::native_index_log.info("SSTable write complete: {} entries, {} bytes", meta.entryCount, meta.fileSize);
     meta.fileNumber = fileNum;
     meta.level = 0;
+    ::native_index_log.info("Adding file to manifest");
     co_await manifest_->addFile(meta);
 
     // Rotate WAL

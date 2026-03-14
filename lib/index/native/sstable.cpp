@@ -10,16 +10,6 @@
 
 namespace timestar::index {
 
-// --- Helper: aligned DMA write ---
-
-static seastar::future<> dmaWriteAligned(seastar::file& file, uint64_t offset, const void* data, size_t len) {
-    size_t alignedSize = (len + 4095) & ~4095UL;
-    auto buf = seastar::temporary_buffer<char>::aligned(4096, alignedSize);
-    std::memset(buf.get_write(), 0, alignedSize);
-    std::memcpy(buf.get_write(), data, len);
-    co_await file.dma_write(offset, buf.get(), alignedSize);
-}
-
 // --- Helper: encode/decode fixed integers ---
 
 static void encodeFixed32(char* buf, uint32_t v) {
@@ -58,13 +48,11 @@ seastar::future<SSTableWriter> SSTableWriter::create(std::string filename, int b
     writer.blockSize_ = blockSize;
     writer.bloom_ = BloomFilter(bloomBitsPerKey);
     writer.currentBlock_ = BlockBuilder(16);
-
-    writer.file_ = co_await seastar::open_file_dma(filename, seastar::open_flags::wo | seastar::open_flags::create |
-                                                                  seastar::open_flags::truncate);
+    // No file opened here — everything is buffered until finish()
     co_return std::move(writer);
 }
 
-seastar::future<> SSTableWriter::add(std::string_view key, std::string_view value) {
+void SSTableWriter::add(std::string_view key, std::string_view value) {
     if (entryCount_ == 0) {
         firstKey_.assign(key.data(), key.size());
     }
@@ -78,14 +66,14 @@ seastar::future<> SSTableWriter::add(std::string_view key, std::string_view valu
     currentBlock_.add(key, value);
     ++entryCount_;
 
-    // Flush block when it exceeds the target size
+    // Flush block to in-memory buffer when it exceeds the target size
     if (currentBlock_.currentSize() >= static_cast<size_t>(blockSize_)) {
-        co_await flushBlock();
+        flushBlock();
     }
 }
 
-seastar::future<> SSTableWriter::flushBlock() {
-    if (currentBlock_.empty()) co_return;
+void SSTableWriter::flushBlock() {
+    if (currentBlock_.empty()) return;
 
     auto rawBlock = currentBlock_.finish();
 
@@ -94,84 +82,113 @@ seastar::future<> SSTableWriter::flushBlock() {
     snappy::Compress(rawBlock.data(), rawBlock.size(), &compressed);
 
     // Prepend uncompressed size as fixed32 so reader can allocate decompression buffer
-    std::string blockData;
-    blockData.resize(4);
-    encodeFixed32(blockData.data(), static_cast<uint32_t>(rawBlock.size()));
-    blockData.append(compressed);
+    char sizeBuf[4];
+    encodeFixed32(sizeBuf, static_cast<uint32_t>(rawBlock.size()));
 
-    // Record index entry
+    // Record index entry (offset is within pendingData_)
     IndexEntry entry;
     entry.firstKey = std::move(currentBlockFirstKey_);
     entry.offset = fileOffset_;
-    entry.size = static_cast<uint32_t>(blockData.size());
+    entry.size = static_cast<uint32_t>(4 + compressed.size());
     index_.push_back(std::move(entry));
 
-    co_await dmaWriteAligned(file_, fileOffset_, blockData.data(), blockData.size());
-    fileOffset_ += blockData.size();
+    // Append to in-memory buffer
+    pendingData_.append(sizeBuf, 4);
+    pendingData_.append(compressed);
+    fileOffset_ += 4 + compressed.size();
 
     currentBlock_.reset();
 }
 
 seastar::future<SSTableMetadata> SSTableWriter::finish() {
-    // Flush any remaining entries
-    co_await flushBlock();
+    // Flush any remaining entries to buffer
+    flushBlock();
 
-    // Build and write bloom filter
+    // Build bloom filter and append to buffer
     bloom_.build();
     std::string bloomData;
     bloom_.serializeTo(bloomData);
     uint64_t bloomOffset = fileOffset_;
+    pendingData_.append(bloomData);
+    fileOffset_ += bloomData.size();
 
-    if (!bloomData.empty()) {
-        co_await dmaWriteAligned(file_, fileOffset_, bloomData.data(), bloomData.size());
-        fileOffset_ += bloomData.size();
-    }
-
-    // Write index block: [entry_count (4 bytes)] then per entry:
-    //   [key_len (4 bytes)] [key] [offset (8 bytes)] [size (4 bytes)]
+    // Build index block and append to buffer
     uint64_t indexOffset = fileOffset_;
-    std::string indexData;
     {
         char buf[4];
         encodeFixed32(buf, static_cast<uint32_t>(index_.size()));
-        indexData.append(buf, 4);
+        pendingData_.append(buf, 4);
+        fileOffset_ += 4;
 
         for (const auto& entry : index_) {
             encodeFixed32(buf, static_cast<uint32_t>(entry.firstKey.size()));
-            indexData.append(buf, 4);
-            indexData.append(entry.firstKey);
+            pendingData_.append(buf, 4);
+            pendingData_.append(entry.firstKey);
 
             char buf8[8];
             encodeFixed64(buf8, entry.offset);
-            indexData.append(buf8, 8);
+            pendingData_.append(buf8, 8);
 
             encodeFixed32(buf, entry.size);
-            indexData.append(buf, 4);
+            pendingData_.append(buf, 4);
+
+            fileOffset_ += 4 + entry.firstKey.size() + 8 + 4;
         }
     }
+    uint64_t indexSize = fileOffset_ - indexOffset;
 
-    if (!indexData.empty()) {
-        co_await dmaWriteAligned(file_, fileOffset_, indexData.data(), indexData.size());
-        fileOffset_ += indexData.size();
-    }
-
-    // Write footer (48 bytes)
+    // Build footer and append to buffer
     char footer[SSTABLE_FOOTER_SIZE];
     encodeFixed64(footer + 0, bloomOffset);
     encodeFixed64(footer + 8, bloomData.size());
     encodeFixed64(footer + 16, indexOffset);
-    encodeFixed64(footer + 24, indexData.size());
+    encodeFixed64(footer + 24, indexSize);
     encodeFixed64(footer + 32, entryCount_);
     encodeFixed32(footer + 40, SSTABLE_MAGIC);
     encodeFixed32(footer + 44, SSTABLE_VERSION);
-
-    co_await dmaWriteAligned(file_, fileOffset_, footer, SSTABLE_FOOTER_SIZE);
+    pendingData_.append(footer, SSTABLE_FOOTER_SIZE);
     fileOffset_ += SSTABLE_FOOTER_SIZE;
 
-    // Truncate file to exact size and flush
-    co_await file_.truncate(fileOffset_);
-    co_await file_.flush();
-    co_await file_.close();
+    // === Single DMA write of the entire buffer (TSM pattern) ===
+    if (pendingData_.empty()) {
+        co_return SSTableMetadata{0, 0, 0, "", ""};
+    }
+
+    std::string_view filenameView{filename_};
+    auto file = co_await seastar::open_file_dma(
+        filenameView, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+
+    std::exception_ptr err;
+    try {
+        const size_t dataSize = pendingData_.size();
+        const size_t dmaAlign = file.disk_write_dma_alignment();
+        const size_t paddedSize = (dataSize + dmaAlign - 1) & ~(dmaAlign - 1);
+
+        auto buf = seastar::temporary_buffer<char>::aligned(dmaAlign, paddedSize);
+        std::memset(buf.get_write(), 0, paddedSize);
+        std::memcpy(buf.get_write(), pendingData_.data(), dataSize);
+
+        size_t written = 0;
+        while (written < paddedSize) {
+            auto n = co_await file.dma_write(written, buf.get() + written, paddedSize - written);
+            if (n == 0) throw std::runtime_error("SSTable dma_write returned 0");
+            written += n;
+        }
+
+        if (paddedSize != dataSize) {
+            co_await file.truncate(dataSize);
+        }
+        co_await file.flush();
+    } catch (...) {
+        err = std::current_exception();
+    }
+
+    co_await file.close();
+    if (err) std::rethrow_exception(err);
+
+    // Free the buffer
+    pendingData_.clear();
+    pendingData_.shrink_to_fit();
 
     SSTableMetadata meta;
     meta.entryCount = entryCount_;
@@ -182,8 +199,8 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
 }
 
 seastar::future<> SSTableWriter::abort() {
-    co_await file_.close();
-    co_await seastar::remove_file(filename_);
+    // No file handle to close — nothing was opened yet
+    co_return;
 }
 
 // --- SSTableReader ---
@@ -198,16 +215,23 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
         throw std::runtime_error("SSTable file too small: " + filename);
     }
 
-    // Read footer
-    size_t footerAligned = (SSTABLE_FOOTER_SIZE + 4095) & ~4095UL;
-    auto footerBuf = seastar::temporary_buffer<char>::aligned(4096, footerAligned);
-    auto footerRead =
-        co_await reader->file_.dma_read(fileSize - SSTABLE_FOOTER_SIZE, footerBuf.get_write(), footerAligned);
-    if (footerRead < SSTABLE_FOOTER_SIZE) {
-        throw std::runtime_error("SSTable footer read incomplete: " + filename);
+    // Read the entire file into an aligned buffer (metadata files are small).
+    // DMA reads require both offset and size to be page-aligned.
+    const size_t dmaAlign = reader->file_.disk_read_dma_alignment();
+    const size_t alignedFileSize = (fileSize + dmaAlign - 1) & ~(dmaAlign - 1);
+    auto fileBuf = seastar::temporary_buffer<char>::aligned(dmaAlign, alignedFileSize);
+    size_t totalRead = 0;
+    while (totalRead < alignedFileSize) {
+        auto n = co_await reader->file_.dma_read(totalRead, fileBuf.get_write() + totalRead, alignedFileSize - totalRead);
+        if (n == 0) break;
+        totalRead += n;
+    }
+    if (totalRead < fileSize) {
+        throw std::runtime_error("SSTable read incomplete: " + filename);
     }
 
-    const char* fp = footerBuf.get();
+    // Extract footer from end of file data
+    const char* fp = fileBuf.get() + fileSize - SSTABLE_FOOTER_SIZE;
     uint64_t bloomOffset = decodeFixed64(fp + 0);
     uint64_t bloomSize = decodeFixed64(fp + 8);
     uint64_t indexOffset = decodeFixed64(fp + 16);
@@ -226,21 +250,17 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     reader->metadata_.entryCount = entryCount;
     reader->metadata_.fileSize = fileSize;
 
-    // Read bloom filter
-    if (bloomSize > 0) {
-        auto bloomBuf = seastar::temporary_buffer<char>::aligned(4096, bloomSize);
-        co_await reader->file_.dma_read(bloomOffset, bloomBuf.get_write(), bloomBuf.size());
-        reader->bloom_ = BloomFilter::deserializeFrom(std::string_view(bloomBuf.get(), bloomSize));
+    // Read bloom filter (from already-loaded file buffer)
+    if (bloomSize > 0 && bloomOffset + bloomSize <= fileSize) {
+        reader->bloom_ = BloomFilter::deserializeFrom(
+            std::string_view(fileBuf.get() + bloomOffset, bloomSize));
     } else {
         reader->bloom_ = BloomFilter::createNull();
     }
 
-    // Read index block
-    if (indexSize > 0) {
-        auto indexBuf = seastar::temporary_buffer<char>::aligned(4096, indexSize);
-        co_await reader->file_.dma_read(indexOffset, indexBuf.get_write(), indexBuf.size());
-
-        const char* ip = indexBuf.get();
+    // Read index block (from already-loaded file buffer)
+    if (indexSize > 0 && indexOffset + indexSize <= fileSize) {
+        const char* ip = fileBuf.get() + indexOffset;
         const char* iend = ip + indexSize;
 
         if (ip + 4 > iend) throw std::runtime_error("SSTable index truncated");
@@ -282,22 +302,31 @@ seastar::future<std::string> SSTableReader::readBlock(size_t blockIndex) {
     }
 
     const auto& entry = index_[blockIndex];
-    auto buf = seastar::temporary_buffer<char>::aligned(4096, entry.size);
-    auto bytesRead = co_await file_.dma_read(entry.offset, buf.get_write(), buf.size());
-    if (bytesRead < entry.size) {
+
+    // DMA reads require aligned offset and size
+    const size_t dmaAlign = file_.disk_read_dma_alignment();
+    uint64_t alignedOffset = entry.offset & ~(dmaAlign - 1);
+    size_t offsetWithinPage = entry.offset - alignedOffset;
+    size_t readSize = (offsetWithinPage + entry.size + dmaAlign - 1) & ~(dmaAlign - 1);
+    auto buf = seastar::temporary_buffer<char>::aligned(dmaAlign, readSize);
+    auto bytesRead = co_await file_.dma_read(alignedOffset, buf.get_write(), readSize);
+    if (bytesRead < offsetWithinPage + entry.size) {
         throw std::runtime_error("SSTable block read incomplete");
     }
+
+    // Extract the actual block data from the aligned read
+    const char* blockStart = buf.get() + offsetWithinPage;
 
     // First 4 bytes: uncompressed size
     if (entry.size < 4) {
         throw std::runtime_error("SSTable block too small");
     }
-    uint32_t uncompressedSize = decodeFixed32(buf.get());
+    uint32_t uncompressedSize = decodeFixed32(blockStart);
 
     // Decompress
     std::string decompressed;
     decompressed.resize(uncompressedSize);
-    if (!snappy::RawUncompress(buf.get() + 4, entry.size - 4, decompressed.data())) {
+    if (!snappy::RawUncompress(blockStart + 4, entry.size - 4, decompressed.data())) {
         throw std::runtime_error("SSTable Snappy decompression failed");
     }
 

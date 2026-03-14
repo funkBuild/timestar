@@ -253,11 +253,6 @@ SEASTAR_TEST_F(NativeIndexTest, ManySeries) {
     co_await index.close();
 }
 
-// TODO: Fix SSTable DMA file lifecycle in flushMemTable/compact.
-// The SSTable writer's DMA writes need proper alignment handling
-// when called from within the NativeIndex compact path.
-// Uncomment when DMA issue is resolved.
-/*
 SEASTAR_TEST_F(NativeIndexTest, CompactThenQuery) {
     NativeIndex index(0);
     co_await index.open();
@@ -279,4 +274,3 @@ SEASTAR_TEST_F(NativeIndexTest, CompactThenQuery) {
 
     co_await index.close();
 }
-*/

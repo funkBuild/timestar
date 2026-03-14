@@ -34,7 +34,7 @@ public:
 SEASTAR_TEST_F(SSTableTest, WriteAndReadSingle) {
     auto path = self->sstPath("single.sst");
     auto writer = co_await SSTableWriter::create(path);
-    co_await writer.add("hello", "world");
+    writer.add("hello", "world");
     auto meta = co_await writer.finish();
 
     EXPECT_EQ(meta.entryCount, 1u);
@@ -57,7 +57,7 @@ SEASTAR_TEST_F(SSTableTest, WriteAndReadMany) {
     auto writer = co_await SSTableWriter::create(path, 512);  // Small blocks to force multiple
     const int N = 500;
     for (int i = 0; i < N; ++i) {
-        co_await writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+        writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
     }
     auto meta = co_await writer.finish();
 
@@ -86,7 +86,7 @@ SEASTAR_TEST_F(SSTableTest, IteratorFullScan) {
     auto writer = co_await SSTableWriter::create(path, 512);
     const int N = 200;
     for (int i = 0; i < N; ++i) {
-        co_await writer.add(std::format("k:{:04d}", i), std::format("v:{:04d}", i));
+        writer.add(std::format("k:{:04d}", i), std::format("v:{:04d}", i));
     }
     co_await writer.finish();
 
@@ -111,7 +111,7 @@ SEASTAR_TEST_F(SSTableTest, IteratorSeek) {
     auto writer = co_await SSTableWriter::create(path, 512);
     const int N = 100;
     for (int i = 0; i < N; ++i) {
-        co_await writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+        writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
     }
     co_await writer.finish();
 
@@ -144,7 +144,7 @@ SEASTAR_TEST_F(SSTableTest, IteratorSeekAndIterate) {
     auto path = self->sstPath("seekiter.sst");
     auto writer = co_await SSTableWriter::create(path, 512);
     for (int i = 0; i < 100; ++i) {
-        co_await writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+        writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
     }
     co_await writer.finish();
 
@@ -172,8 +172,8 @@ SEASTAR_TEST_F(SSTableTest, BinaryKeysAndValues) {
     std::string val1 = std::string("measurement\0field\0tag", 21);
     std::string val2 = std::string("data\0with\0nulls", 15);
 
-    co_await writer.add(key1, val1);
-    co_await writer.add(key2, val2);
+    writer.add(key1, val1);
+    writer.add(key2, val2);
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
@@ -191,9 +191,9 @@ SEASTAR_TEST_F(SSTableTest, BinaryKeysAndValues) {
 SEASTAR_TEST_F(SSTableTest, EmptyValues) {
     auto path = self->sstPath("empty_vals.sst");
     auto writer = co_await SSTableWriter::create(path);
-    co_await writer.add("key1", "");
-    co_await writer.add("key2", "");
-    co_await writer.add("key3", "value3");
+    writer.add("key1", "");
+    writer.add("key2", "");
+    writer.add("key3", "value3");
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
@@ -212,7 +212,7 @@ SEASTAR_TEST_F(SSTableTest, BloomFilterRejects) {
     auto path = self->sstPath("bloom.sst");
     auto writer = co_await SSTableWriter::create(path, 16384, 15);
     for (int i = 0; i < 1000; ++i) {
-        co_await writer.add(std::format("exist:{:04d}", i), "v");
+        writer.add(std::format("exist:{:04d}", i), "v");
     }
     co_await writer.finish();
 
@@ -235,13 +235,13 @@ SEASTAR_TEST_F(SSTableTest, PrefixScan) {
 
     // Write entries simulating index key patterns
     for (int i = 0; i < 10; ++i) {
-        co_await writer.add(std::format("\x05meas1:{:02d}", i), "data");
+        writer.add(std::format("\x05meas1:{:02d}", i), "data");
     }
     for (int i = 0; i < 5; ++i) {
-        co_await writer.add(std::format("\x05meas2:{:02d}", i), "data");
+        writer.add(std::format("\x05meas2:{:02d}", i), "data");
     }
     for (int i = 0; i < 3; ++i) {
-        co_await writer.add(std::format("\x06tag:{:02d}", i), "data");
+        writer.add(std::format("\x06tag:{:02d}", i), "data");
     }
     co_await writer.finish();
 

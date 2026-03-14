@@ -103,7 +103,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     auto writer = co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey);
 
     while (merger.valid()) {
-        co_await writer.add(merger.key(), merger.value());
+        writer.add(merger.key(), merger.value());
         co_await merger.next();
     }
 

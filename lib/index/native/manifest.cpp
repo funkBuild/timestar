@@ -113,7 +113,13 @@ seastar::future<> Manifest::appendRecord(const std::string& record) {
     auto path = manifestPath_;
     co_await seastar::async([path, frame = std::move(frame)] {
         std::ofstream ofs(path, std::ios::binary | std::ios::app);
+        if (!ofs.is_open()) {
+            throw std::runtime_error("Failed to open manifest for append: " + path);
+        }
         ofs.write(frame.data(), static_cast<std::streamsize>(frame.size()));
+        if (!ofs.good()) {
+            throw std::runtime_error("Failed to write to manifest: " + path);
+        }
         ofs.flush();
     });
 }
