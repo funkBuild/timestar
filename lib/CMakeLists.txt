@@ -11,6 +11,8 @@ file(GLOB_RECURSE SRC_FILES
     config/*.cpp
     functions/*.cpp
 )
+# Exclude deprecated LevelDB implementation files
+list(FILTER SRC_FILES EXCLUDE REGEX ".*/deprecated/.*")
 
 find_package (Snappy REQUIRED)
 find_package (Threads REQUIRED)
@@ -30,22 +32,12 @@ message(STATUS "Found xxHash: ${XXHASH_LIBRARY}")
 
 # Glaze is provided via FetchContent from parent CMakeLists.txt
 
-# Find LevelDB
-find_path(LEVELDB_INCLUDE_DIR NAMES leveldb/db.h)
-find_library(LEVELDB_LIBRARY NAMES leveldb)
-
-if(NOT LEVELDB_INCLUDE_DIR OR NOT LEVELDB_LIBRARY)
-    message(FATAL_ERROR "LevelDB not found. Please install libleveldb-dev (Ubuntu/Debian) or leveldb-devel (CentOS/RHEL)")
-endif()
-
-message(STATUS "Found LevelDB: ${LEVELDB_LIBRARY}")
-
 # All SIMD files use Google Highway foreach_target for automatic runtime ISA
 # dispatch — no manual -mavx flags needed. Highway handles per-target
 # compilation internally.
 
 add_library(libtimestar STATIC ${SRC_FILES})
-target_link_libraries(libtimestar Threads::Threads Seastar::seastar Snappy::snappy ${LEVELDB_LIBRARY} glaze::glaze ${XXHASH_LIBRARY} hwy)
+target_link_libraries(libtimestar Threads::Threads Seastar::seastar Snappy::snappy glaze::glaze ${XXHASH_LIBRARY} hwy)
 
 # Include both the lib directory and all subdirectories for header resolution
 target_include_directories(libtimestar PUBLIC
@@ -61,7 +53,6 @@ target_include_directories(libtimestar PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/retention
     ${CMAKE_CURRENT_SOURCE_DIR}/config
     ${CMAKE_CURRENT_SOURCE_DIR}/functions
-    ${LEVELDB_INCLUDE_DIR}
     ${XXHASH_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include
 )

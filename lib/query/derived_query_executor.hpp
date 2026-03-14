@@ -22,7 +22,6 @@
 
 // Forward declarations
 class Engine;
-class LevelDBIndex;
 class DerivedQueryMultiSeriesTest;
 
 namespace timestar {

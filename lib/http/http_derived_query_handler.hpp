@@ -10,7 +10,6 @@
 
 // Forward declarations
 class Engine;
-class LevelDBIndex;
 
 namespace timestar {
 

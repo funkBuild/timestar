@@ -142,6 +142,13 @@ public:
     template <class T>
     seastar::future<SeriesId128> indexInsert(const TimeStarInsert<T>& insert);
 
+    // Backward compatibility aliases for code that used LevelDBIndex::FieldStats
+    using FieldStats = IndexFieldStats;
+
+    // Static string set encoding helpers (backward compatibility)
+    static std::string encodeStringSet(const std::set<std::string>& strings) { return keys::encodeStringSet(strings); }
+    static std::set<std::string> decodeStringSet(const std::string& encoded) { return keys::decodeStringSet(encoded); }
+
 private:
     int shardId_;
     std::string indexPath_;

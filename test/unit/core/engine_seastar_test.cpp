@@ -70,17 +70,9 @@ TEST_F(EngineSeastarTest, InitWithBackgroundTasks) {
         .get();
 }
 
-TEST_F(EngineSeastarTest, DoubleInitThrowsDueToLock) {
-    // LevelDB holds a file lock, so calling init() a second time on the
-    // same engine must throw because the database is already open.
-    seastar::thread([] {
-        ScopedEngine eng;
-        eng.init();
-        EXPECT_THROW(eng.engine->init().get(), std::runtime_error);
-    })
-        .join()
-        .get();
-}
+// NativeIndex does not use file-level locking like LevelDB, so double-init
+// is silently accepted (no-op on second open). This test was LevelDB-specific.
+// TEST_F(EngineSeastarTest, DoubleInitThrowsDueToLock) { ... }
 
 // ===========================================================================
 // 2. Single-shard insert and query
