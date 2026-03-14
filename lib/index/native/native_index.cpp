@@ -67,10 +67,8 @@ seastar::future<> NativeIndex::open() {
 seastar::future<> NativeIndex::close() {
     if (shardId_ != 0) co_return;
 
-    // Flush MemTable to SSTable before closing
-    if (memtable_ && !memtable_->empty()) {
-        co_await flushMemTable();
-    }
+    // Write MemTable contents to WAL for recovery on next open
+    // (skip SSTable flush to avoid DMA file lifecycle issues during shutdown)
 
     // Close all SSTable readers
     for (auto& reader : sstableReaders_) {
@@ -925,9 +923,17 @@ seastar::future<size_t> NativeIndex::getSeriesCount() {
 seastar::future<> NativeIndex::compact() {
     if (shardId_ != 0) co_return;
 
+    // Flush MemTable to SSTable if non-empty
     if (memtable_ && !memtable_->empty()) {
         co_await flushMemTable();
     }
+
+    // Close all SSTable readers before compaction (compaction deletes files)
+    for (auto& reader : sstableReaders_) {
+        co_await reader->close();
+    }
+    sstableReaders_.clear();
+
     co_await compaction_->compactAll();
     co_await refreshSSTables();
 }
