@@ -289,7 +289,7 @@ TEST_F(EngineSeastarTest, MultiShardInsertAndQuery) {
             tmp.addTag("region", "region_" + std::to_string(i));
             std::string seriesKey = tmp.seriesKey();
             SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
-            unsigned shard = SeriesId128::Hash{}(sid) % seastar::smp::count;
+            unsigned shard = timestar::routeToCore(sid);
 
             auto resultOpt =
                 eng.eng.invoke_on(shard, [seriesKey](Engine& engine) { return engine.query(seriesKey, 0, UINT64_MAX); })
@@ -356,7 +356,7 @@ TEST_F(EngineSeastarTest, MetadataIndexing) {
         .get();
 }
 
-TEST_F(EngineSeastarTest, IndexMetadataOnShard0Only) {
+TEST_F(EngineSeastarTest, IndexMetadataOnAnyShard) {
     seastar::thread([] {
         ScopedShardedEngine eng;
         eng.start();
@@ -365,18 +365,19 @@ TEST_F(EngineSeastarTest, IndexMetadataOnShard0Only) {
         insert.addTag("host", "h1");
         insert.addValue(1000, 50.0);
 
-        // indexMetadata must be called on shard 0 -- calling on another shard should throw
-        if (seastar::smp::count > 1) {
-            EXPECT_THROW(
-                eng.eng.invoke_on(1, [insert](Engine& engine) mutable { return engine.indexMetadata(insert); }).get(),
-                std::runtime_error);
-        }
-
-        // Calling on shard 0 should succeed
+        // With distributed index, indexMetadata works on any shard
         auto sid =
             eng.eng.invoke_on(0, [insert](Engine& engine) mutable { return engine.indexMetadata(insert); }).get();
-        // The returned SeriesId128 should be non-zero
         EXPECT_FALSE(sid.toHex().empty());
+
+        if (seastar::smp::count > 1) {
+            TimeStarInsert<double> insert2("cpu", "idle");
+            insert2.addTag("host", "h2");
+            insert2.addValue(2000, 95.0);
+            auto sid2 =
+                eng.eng.invoke_on(1, [insert2](Engine& engine) mutable { return engine.indexMetadata(insert2); }).get();
+            EXPECT_FALSE(sid2.toHex().empty());
+        }
     })
         .join()
         .get();
@@ -847,7 +848,7 @@ TEST_F(EngineSeastarTest, CrossShardQueryAllShards) {
             tmp.addTag("node", "node_" + std::to_string(i));
             std::string seriesKey = tmp.seriesKey();
             SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
-            unsigned shard = SeriesId128::Hash{}(sid) % seastar::smp::count;
+            unsigned shard = timestar::routeToCore(sid);
 
             auto resultOpt =
                 eng.eng.invoke_on(shard, [seriesKey](Engine& engine) { return engine.query(seriesKey, 0, UINT64_MAX); })

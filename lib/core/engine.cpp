@@ -1,7 +1,10 @@
 #include "engine.hpp"
 
 #include "aggregator.hpp"
+#include "key_encoding.hpp"
 #include "logger.hpp"
+#include "placement_table.hpp"
+#include "series_key.hpp"
 #include "logging_config.hpp"
 #include "query_runner.hpp"
 #include "tsm_compactor.hpp"
@@ -14,6 +17,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/when_all.hh>
 #include <unordered_set>
 #include <vector>
 
@@ -115,28 +119,12 @@ seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetad
                     insertRequest.seriesKey(), insertRequest.measurement, insertRequest.field,
                     insertRequest.values.size());
 
-    // Index metadata on shard 0 so that findSeries/queries can discover this series.
-    // When called from the HTTP write handler, skipMetadataIndexing is true because
-    // the handler already indexes metadata separately (avoiding double indexing).
-    // Direct Engine::insert() callers (tests, benchmarks, internal code) leave
-    // skipMetadataIndexing as false so metadata is indexed automatically.
+    // Index metadata locally — each shard maintains its own NativeIndex
+    // for the series it owns. Schema changes are broadcast via indexMetadataSync.
     if (!skipMetadataIndexing) {
-        if (shardId == 0) {
-            LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata for series: '{}'",
-                            insertRequest.seriesKey());
-            co_await index.indexInsert(insertRequest);
-        } else if (shardedRef) {
-            // Forward metadata indexing to shard 0 where the LevelDB index lives.
-            // Copy the insert request for safe cross-shard transfer.
-            LOG_INSERT_PATH(timestar::engine_log, debug,
-                            "[ENGINE] Forwarding metadata indexing to shard 0 for series: '{}'",
-                            insertRequest.seriesKey());
-            TimeStarInsert<T> metaCopy = insertRequest;
-            co_await shardedRef->invoke_on(
-                0, [metaCopy = std::move(metaCopy)](Engine& engine) mutable -> seastar::future<> {
-                    co_await engine.indexMetadata(metaCopy);
-                });
-        }
+        LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata locally for series: '{}'",
+                        insertRequest.seriesKey());
+        co_await index.indexInsert(insertRequest);
     }
 
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Processing data storage for series: '{}'",
@@ -255,25 +243,18 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
 
 template <class T>
 seastar::future<SeriesId128> Engine::indexMetadata(TimeStarInsert<T> insertRequest) {
-    if (seastar::this_shard_id() != 0) {
-        throw std::runtime_error("indexMetadata must be called on shard 0");
-    }
-
-    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata for series: '{}'",
-                    insertRequest.seriesKey());
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata for series: '{}' on shard {}",
+                    insertRequest.seriesKey(), shardId);
     SeriesId128 seriesId = co_await index.indexInsert(insertRequest);
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Metadata indexed, series ID: {}", seriesId.toHex());
     co_return seriesId;
 }
 
 seastar::future<> Engine::indexMetadataBatch(const std::vector<MetadataOp>& ops) {
-    if (seastar::this_shard_id() != 0) {
-        throw std::runtime_error("indexMetadataBatch must be called on shard 0");
-    }
-
-    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Batch indexing metadata for {} ops", ops.size());
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Batch indexing metadata for {} ops on shard {}", ops.size(),
+                    shardId);
     co_await index.indexMetadataBatch(ops);
-    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Batch metadata indexing complete");
+    LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Batch metadata indexing complete on shard {}", shardId);
 }
 
 seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
@@ -286,8 +267,51 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
         co_return;
     }
 
-    co_await shardedRef->invoke_on(0, [metaOps = std::move(metaOps)](Engine& engine) mutable -> seastar::future<> {
-        co_await engine.index.indexMetadataBatch(metaOps);
+    // Group MetadataOps by target shard based on series hash
+    unsigned shardCount = seastar::smp::count;
+    std::vector<std::vector<MetadataOp>> opsByShard(shardCount);
+
+    for (auto& op : metaOps) {
+        // Use the same hash as the write handler to ensure metadata lands on the
+        // same shard as the data. buildSeriesKey + fromSeriesKey is the canonical path.
+        std::string seriesKey = timestar::buildSeriesKey(op.measurement, op.tags, op.fieldName);
+        SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+        unsigned targetShard = timestar::routeToCore(seriesId);
+        opsByShard[targetShard].push_back(std::move(op));
+    }
+
+    // Dispatch each group to its owning shard IN PARALLEL (not sequential co_await).
+    // Sequential dispatch was a critical scaling bottleneck: N cross-shard RPCs in series.
+    std::vector<seastar::future<timestar::index::SchemaUpdate>> futures;
+    futures.reserve(shardCount);
+    for (unsigned s = 0; s < shardCount; ++s) {
+        if (opsByShard[s].empty()) continue;
+        futures.push_back(shardedRef->invoke_on(
+            s, [ops = std::move(opsByShard[s])](Engine& engine) mutable -> seastar::future<timestar::index::SchemaUpdate> {
+                co_return co_await engine.index.indexMetadataBatchWithSchema(ops);
+            }));
+    }
+
+    timestar::index::SchemaUpdate combined;
+    if (!futures.empty()) {
+        auto results = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+        for (auto& update : results) {
+            combined.merge(update);
+        }
+    }
+
+    // Broadcast schema changes — fire-and-forget (don't block write response).
+    // Schema caches are eventually consistent; queries will see updates on next read.
+    if (!combined.empty()) {
+        (void)broadcastSchemaUpdate(std::move(combined));
+    }
+}
+
+seastar::future<> Engine::broadcastSchemaUpdate(timestar::index::SchemaUpdate update) {
+    if (!shardedRef || update.empty()) co_return;
+    co_await shardedRef->invoke_on_all([update = std::move(update)](Engine& e) {
+        e.getIndex().applySchemaUpdate(update);
+        return seastar::make_ready_future<>();
     });
 }
 
@@ -402,17 +426,8 @@ seastar::future<std::vector<timestar::SeriesResult>> Engine::executeLocalQuery(c
         co_return results;
     }
 
-    // Batch-fetch all series metadata in a single cross-shard RPC (P-H3).
-    // This replaces N sequential invoke_on(0, ...) calls with one batched call.
-    std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>> metadataBatch;
-    if (shardId == 0) {
-        metadataBatch = co_await index.getSeriesMetadataBatch(shardQuery.seriesIds);
-    } else if (shardedRef) {
-        metadataBatch = co_await shardedRef->invoke_on(
-            0, [ids = shardQuery.seriesIds](Engine& engine) { return engine.getIndex().getSeriesMetadataBatch(ids); });
-    } else {
-        co_return results;  // Can't look up metadata without shardedRef
-    }
+    // Fetch metadata from local index — each shard owns its own series metadata
+    auto metadataBatch = co_await index.getSeriesMetadataBatch(shardQuery.seriesIds);
 
     // Process each series with its pre-fetched metadata
     for (const auto& [seriesId, seriesMetaOpt] : metadataBatch) {
@@ -557,18 +572,8 @@ seastar::future<bool> Engine::deleteRangeBySeries(std::string measurement, std::
                                                   std::string field, uint64_t startTime, uint64_t endTime) {
     auto gate_holder = _insertGate.hold();
     // Look up series ID without creating it — deleting a non-existent series is a no-op.
-    // Metadata lives only on shard 0's LevelDB, so route the lookup there via shardedRef.
-    std::optional<SeriesId128> seriesIdOpt;
-    if (shardId == 0) {
-        seriesIdOpt = co_await index.getSeriesId(measurement, tags, field);
-    } else if (shardedRef) {
-        seriesIdOpt = co_await shardedRef->invoke_on(0, [measurement, tags, field](Engine& engine) {
-            return engine.getIndex().getSeriesId(measurement, tags, field);
-        });
-    } else {
-        // No shardedRef and not on shard 0 — cannot check metadata, treat as not found
-        co_return false;
-    }
+    // Each shard has its own index now — look up locally.
+    auto seriesIdOpt = co_await index.getSeriesId(measurement, tags, field);
 
     if (!seriesIdOpt.has_value()) {
         co_return false;  // Series doesn't exist, nothing to delete
@@ -591,39 +596,17 @@ seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteReques
     // timestar::engine_log.info("deleteByPattern called on shard {} for measurement: {}",
     //                       shardId, request.measurement);
 
-    // Step 1: Find all series IDs that match the pattern
-    // Delete operations don't enforce a series limit (0 = unlimited)
+    // Step 1: Find all series IDs that match the pattern from local index
+    // Each shard's index only has its own series
     std::vector<SeriesId128> seriesIds;
-
-    // Index metadata lives on shard 0 only — route lookups there
-    if (shardId == 0) {
-        if (request.tags.empty()) {
-            auto result = co_await index.getAllSeriesForMeasurement(request.measurement);
-            if (result.has_value())
-                seriesIds = std::move(result.value());
-        } else {
-            auto result = co_await index.findSeries(request.measurement, request.tags);
-            if (result.has_value())
-                seriesIds = std::move(result.value());
-        }
-    } else if (shardedRef) {
-        if (request.tags.empty()) {
-            seriesIds = co_await shardedRef->invoke_on(
-                0, [measurement = request.measurement](Engine& engine) -> seastar::future<std::vector<SeriesId128>> {
-                    auto result = co_await engine.getIndex().getAllSeriesForMeasurement(measurement);
-                    co_return result.has_value() ? std::move(result.value()) : std::vector<SeriesId128>{};
-                });
-        } else {
-            seriesIds = co_await shardedRef->invoke_on(
-                0,
-                [measurement = request.measurement,
-                 tags = request.tags](Engine& engine) -> seastar::future<std::vector<SeriesId128>> {
-                    auto result = co_await engine.getIndex().findSeries(measurement, tags);
-                    co_return result.has_value() ? std::move(result.value()) : std::vector<SeriesId128>{};
-                });
-        }
+    if (request.tags.empty()) {
+        auto findResult = co_await index.getAllSeriesForMeasurement(request.measurement);
+        if (findResult.has_value())
+            seriesIds = std::move(findResult.value());
     } else {
-        co_return result;  // Can't look up metadata without shardedRef
+        auto findResult = co_await index.findSeries(request.measurement, request.tags);
+        if (findResult.has_value())
+            seriesIds = std::move(findResult.value());
     }
 
     // Step 2: Get metadata for each series to check field filters
@@ -650,27 +633,8 @@ seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteReques
         co_return result;
     };
 
-    if (shardId == 0) {
-        seriesToDelete = co_await filterAndBuild(seriesIds, index);
-    } else if (shardedRef) {
-        seriesToDelete = co_await shardedRef->invoke_on(
-            0,
-            [ids = seriesIds,
-             ff = fieldFilter](Engine& engine) -> seastar::future<std::vector<std::pair<SeriesId128, std::string>>> {
-                std::vector<std::pair<SeriesId128, std::string>> result;
-                for (const auto& seriesId : ids) {
-                    auto metadata = co_await engine.getIndex().getSeriesMetadata(seriesId);
-                    if (!metadata.has_value())
-                        continue;
-                    if (!ff.empty() && ff.count(metadata->field) == 0)
-                        continue;
-                    TimeStarInsert<double> temp(metadata->measurement, metadata->field);
-                    temp.tags = metadata->tags;
-                    result.push_back({seriesId, temp.seriesKey()});
-                }
-                co_return result;
-            });
-    }
+    // Metadata is local — each shard's index has only its own series
+    seriesToDelete = co_await filterAndBuild(seriesIds, index);
 
     // Step 3: Delete each matching series
     for (const auto& [seriesId, seriesKey] : seriesToDelete) {
@@ -810,22 +774,14 @@ seastar::future<> Engine::sweepExpiredFiles() {
         co_return;
     }
 
-    // Build seriesId -> measurement map by querying shard 0's index
-    // for each measurement with a TTL policy
+    // Build seriesId -> measurement map from local index
+    // Each shard's index only has series owned by this shard
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMeasurementMap;
     for (const auto& [measurement, cutoff] : ttlCutoffs) {
+        auto result = co_await index.getAllSeriesForMeasurement(measurement);
         std::vector<SeriesId128> seriesIds;
-        if (shardId == 0) {
-            auto result = co_await index.getAllSeriesForMeasurement(measurement);
-            if (result.has_value()) {
-                seriesIds = std::move(result.value());
-            }
-        } else if (shardedRef) {
-            seriesIds = co_await shardedRef->invoke_on(
-                0, [measurement](Engine& engine) -> seastar::future<std::vector<SeriesId128>> {
-                    auto result = co_await engine.getIndex().getAllSeriesForMeasurement(measurement);
-                    co_return result.has_value() ? std::move(result.value()) : std::vector<SeriesId128>{};
-                });
+        if (result.has_value()) {
+            seriesIds = std::move(result.value());
         }
         for (const auto& sid : seriesIds) {
             seriesMeasurementMap[sid] = measurement;
@@ -874,6 +830,12 @@ seastar::future<> Engine::sweepExpiredFiles() {
         timestar::engine_log.info("[RETENTION] Shard {}: removing {} fully expired TSM files", shardId,
                                   fullyExpiredFiles.size());
         co_await tsmFileManager.removeTSMFiles(fullyExpiredFiles);
+    }
+
+    // Phase 3: Clean up expired day bitmaps from the index
+    for (const auto& [measurement, cutoff] : ttlCutoffs) {
+        uint32_t cutoffDay = timestar::index::keys::dayBucketFromNs(cutoff);
+        co_await index.removeExpiredDayBitmaps(measurement, cutoffDay);
     }
 }
 

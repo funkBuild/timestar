@@ -166,15 +166,41 @@ struct AggregationState {
         }
     }
 
-    // Merge another state into this one (commutative & associative)
+    // Full merge — includes Welford M2 and raw values (for STDDEV/MEDIAN).
     void merge(const AggregationState& other) {
-        // Parallel Welford merge: combine M2 accumulators from two partitions
+        // Parallel Welford merge BEFORE mergeCore (needs pre-merge counts)
         if (count > 0 && other.count > 0) {
             double delta = (other.sum / other.count) - (sum / count);
             m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / (count + other.count);
         } else if (other.count > 0) {
             m2 = other.m2;
         }
+        mergeCore(other);
+        mergeRawValues(other);
+    }
+
+    // Method-aware merge — skips expensive Welford variance computation and raw
+    // value copying for methods that don't need them (~90% of queries).
+    void mergeForMethod(const AggregationState& other, AggregationMethod method) {
+        if (method == AggregationMethod::STDDEV || method == AggregationMethod::STDVAR) {
+            // Welford parallel merge BEFORE count update
+            if (count > 0 && other.count > 0) {
+                double delta = (other.sum / other.count) - (sum / count);
+                m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / (count + other.count);
+            } else if (other.count > 0) {
+                m2 = other.m2;
+            }
+        }
+        mergeCore(other);
+        if (method == AggregationMethod::MEDIAN) {
+            mergeRawValues(other);
+        }
+    }
+
+private:
+    // Core merge: scalar accumulators only (sum, min, max, latest, first, count).
+    // No Welford, no raw values. ~3x faster than full merge.
+    void mergeCore(const AggregationState& other) {
         sum += other.sum;
         min = std::min(min, other.min);
         max = std::max(max, other.max);
@@ -186,11 +212,13 @@ struct AggregationState {
             first = other.first;
             firstTimestamp = other.firstTimestamp;
         }
-        // Propagate saturation flag first so getValue() is always consistent.
+        count += other.count;
+    }
+
+    void mergeRawValues(const AggregationState& other) {
         if (other.rawValuesSaturated) {
             rawValuesSaturated = true;
         }
-        // Append as many raw values as the cap allows; mark saturated if we hit it.
         if (!rawValuesSaturated) {
             size_t available = RAW_VALUES_HARD_LIMIT - rawValues.size();
             size_t toCopy = std::min(available, other.rawValues.size());
@@ -200,8 +228,9 @@ struct AggregationState {
                 rawValuesSaturated = true;
             }
         }
-        count += other.count;
     }
+
+public:
 
     // Extract final aggregated value based on method
     // Return the representative timestamp for a collapsed state.

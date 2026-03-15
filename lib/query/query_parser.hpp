@@ -78,6 +78,7 @@ private:
 
     // Helper functions
     static std::string trim(const std::string& str);
+    static std::string_view trimView(std::string_view str);
     static std::vector<std::string> split(const std::string& str, char delimiter);
     static void skipWhitespace(const std::string& str, size_t& pos);
 };

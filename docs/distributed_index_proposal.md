@@ -20,6 +20,44 @@ Every production TSDB studied — InfluxDB, VictoriaMetrics, Prometheus, M3DB, E
 4. **Aggregate at the shard, not the coordinator** — Ship partial aggregation states, not raw data. (ClickHouse, Elasticsearch)
 5. **Prune before scanning** — Use bloom filters and time bounds to skip irrelevant shards/blocks before touching the index. (M3DB, Thanos, ClickHouse)
 
+## Storage Engine: NativeIndex
+
+The metadata index backend is **NativeIndex** — a Seastar-native LSM tree that replaced LevelDB. Understanding its architecture is essential because this proposal builds directly on it.
+
+### NativeIndex Components
+
+```
+NativeIndex (per-shard instance)
+├── MemTable          — in-memory std::map (sorted write buffer, ~16MB)
+├── Immutable MemTable — previous MemTable being flushed (brief window)
+├── IndexWAL          — DMA-aligned write-ahead log (CRC32C checksums)
+├── SSTableReader[]   — immutable on-disk sorted tables, FULLY CACHED IN RAM
+│   ├── BlockReader   — prefix-compressed blocks with restart points
+│   └── BloomFilter   — double-hashing for point-lookup acceleration
+├── Manifest          — append-only file tracking (levels, file numbers)
+└── CompactionEngine  — background level-based compaction (async coroutines)
+```
+
+### Key Properties for Distribution
+
+1. **All reads are synchronous** — `kvGet()` and `kvPrefixScan()` never `co_await`. Every SSTable is fully cached in memory after `open()`. This means index reads have **zero I/O overhead** — they're pure in-memory lookups. Distributing the index across shards doesn't add I/O; it adds memory parallelism.
+
+2. **Writes are async (WAL + flush)** — `kvPut()` appends to the IndexWAL via Seastar DMA, then inserts into MemTable. When the MemTable exceeds `write_buffer_size`, it's swapped to an immutable MemTable, a new SSTable is written, and the WAL is rotated. All async, non-blocking.
+
+3. **No thread-pool crossings** — Unlike LevelDB (which required `seastar::async()` for every operation), NativeIndex uses Seastar coroutines and DMA natively. No external threads, no mutex contention.
+
+4. **Batch writes** — `kvWriteBatch()` applies multiple keys atomically in a single WAL record. Currently used by `getOrCreateSeriesId()` to batch 5+ metadata entries per new series.
+
+5. **SSTable format** — Custom "TSIX" format with Snappy compression, prefix-compressed blocks, bloom filters, and a footer index. Files are stored at `shard_N/native_index/idx_NNNNNN.sst`.
+
+6. **Compaction** — Level-based (L0→L1→L2...) via async coroutines. Triggered when L0 exceeds 4 files. Uses MergeIterator to merge sorted streams. No external threads — runs on the Seastar reactor.
+
+### Implications for This Proposal
+
+The NativeIndex architecture means the "LevelDB compaction thread contention" concern from the original analysis **does not apply**. NativeIndex compaction runs as Seastar coroutines on the reactor thread — no external threads compete for CPU. This removes a major risk of per-shard index instances.
+
+Additionally, since SSTables are fully cached in RAM, the per-shard memory cost is proportional to the total index size, not the number of instances. With N shards, each shard's NativeIndex holds ~1/N of the total data — total memory usage is approximately the same as a single centralized instance.
+
 ## Architecture Overview
 
 ```
@@ -27,22 +65,24 @@ Every production TSDB studied — InfluxDB, VictoriaMetrics, Prometheus, M3DB, E
 │                        EVERY SHARD (0..N-1)                     │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Mutable Index (in-memory)                   │   │
+│  │              NativeIndex (per-shard LSM tree)            │   │
 │  │                                                         │   │
-│  │  Postings:  (meas, tagK, tagV) → sorted vec<LocalId>   │   │
-│  │  Time-scoped: (day, meas, tagK, tagV) → vec<LocalId>   │   │
-│  │  ID Map:    SeriesId128 ↔ LocalId (uint32)              │   │
-│  │  Bloom:     per-measurement bloom filter of LocalIds    │   │
-│  │  Series:    LocalId → SeriesMetadata                    │   │
-│  └──────────────────────┬──────────────────────────────────┘   │
-│                         │ flush on rollover                     │
-│  ┌──────────────────────▼──────────────────────────────────┐   │
-│  │              Immutable Segments (on disk)                 │   │
+│  │  MemTable:   active writes (std::map, synchronous get)  │   │
+│  │  SSTables:   immutable, fully cached in RAM             │   │
+│  │  IndexWAL:   DMA-based durability                       │   │
+│  │  Compaction: async coroutines (no external threads)     │   │
 │  │                                                         │   │
-│  │  Postings:  (meas, tagK, tagV) → roaring bitmap         │   │
-│  │  Time-scoped: (day, meas, tagK, tagV) → roaring bitmap  │   │
-│  │  Series:    LocalId → SeriesMetadata                    │   │
-│  │  Stored in LevelDB (or future: custom segment files)    │   │
+│  │  Stores: TAG_INDEX, SERIES_METADATA, MEASUREMENT_SERIES │   │
+│  │          TIME_SCOPED_POSTINGS, ID_MAP                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Postings Acceleration (in-memory)           │   │
+│  │                                                         │   │
+│  │  Mutable:  (meas, tagK, tagV) → sorted vec<LocalId>    │   │
+│  │  Cached:   (meas, tagK, tagV) → roaring bitmap          │   │
+│  │  Bloom:    per-measurement bloom filter                  │   │
+│  │  HLL:      per-measurement cardinality sketches          │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
@@ -76,7 +116,7 @@ Shard 3:
 
 LocalIds are auto-incrementing per shard. With uint32, each shard supports up to 4 billion series — far more than any single core would hold. Sequential IDs compress extremely well in roaring bitmaps (runs of consecutive integers stored as ranges, not individual bits).
 
-**Bidirectional mapping** stored in LevelDB:
+**Bidirectional mapping** stored in NativeIndex:
 ```
 [0x10] + LocalId(4 bytes)            → SeriesId128(16 bytes)    // resolve results
 [0x11] + SeriesId128(16 bytes)       → LocalId(4 bytes)         // write path lookup
@@ -93,13 +133,13 @@ The TAG_INDEX maps `(measurement, tagKey, tagValue)` → set of LocalIds. Two re
 tsl::robin_map<PostingsKey, std::vector<uint32_t>> mutablePostings_;
 ```
 
-**Immutable segments (on disk)**: Roaring bitmaps serialized into LevelDB. Created when the mutable layer is flushed (e.g., on MemoryStore rollover).
+**Immutable segments (NativeIndex SSTables)**: Roaring bitmaps serialized into NativeIndex's SSTable files. Created when the mutable postings layer is flushed (aligned with NativeIndex's MemTable flush / SSTable compaction cycle). Since NativeIndex caches all SSTables in RAM, reading immutable bitmaps is a synchronous in-memory lookup — zero I/O.
 
 ```
 [0x06] + measurement + \0 + tagKey + \0 + tagValue → roaring_bitmap(LocalIds)
 ```
 
-**Query** merges results from the mutable layer and all immutable segments. Immutable segment bitmaps are intersected/unioned using CRoaring's native operations. Mutable layer vectors are converted to temporary bitmaps for intersection if large enough, or intersected directly if small.
+**Query** merges results from the mutable layer and immutable segments (both in memory). Immutable segment bitmaps are intersected/unioned using CRoaring's native operations. Mutable layer vectors are converted to temporary bitmaps for intersection if large enough, or intersected directly if small.
 
 ### Time-Scoped Postings (from VictoriaMetrics)
 
@@ -119,7 +159,7 @@ Alongside global postings, maintain **per-day postings** that record which serie
 
 This prunes series that exist globally but had no data during the query range. For a database with 90-day retention queried for "last 1 hour", this eliminates series that were only active days or weeks ago.
 
-**Storage overhead**: One bitmap per (day, measurement, tagKey, tagValue) combination. With 90-day retention and 100 unique tag combinations, this is ~9K additional LevelDB entries per shard — small relative to the query time saved.
+**Storage overhead**: One bitmap per (day, measurement, tagKey, tagValue) combination. With 90-day retention and 100 unique tag combinations, this is ~9K additional NativeIndex entries per shard — small relative to the query time saved.
 
 **Pre-population** (from VictoriaMetrics): During the last hour of each day, progressively pre-populate the next day's entries for currently-active series. This prevents a write spike at midnight.
 
@@ -129,7 +169,7 @@ This prunes series that exist globally but had no data during the query range. F
 [0x05] + LocalId(4 bytes) → SeriesMetadata(measurement, tags, field)
 ```
 
-Stored in the shard-local LevelDB. No cross-shard lookup needed — the shard that owns a series also owns its metadata.
+Stored in the shard-local NativeIndex. No cross-shard lookup needed — the shard that owns a series also owns its metadata.
 
 ### Bloom Filters (from M3DB)
 
@@ -194,7 +234,7 @@ Schema broadcasts occur only on **first occurrence** of a new field/tag/value. I
 HTTP Write → parse JSON → route data to shard X by hash
   Shard X: WAL + MemoryStore (local)
   Shard X: invoke_on(0, indexMetadataSync(metaOps))     ← CROSS-SHARD RPC
-    Shard 0: indexMetadataBatch() → LevelDB WriteBatch
+    Shard 0: indexMetadataBatch() → NativeIndex kvWriteBatch
     Shard 0: invalidateDiscoveryCache(measurement)
   Shard X: return HTTP 200
 ```
@@ -210,7 +250,7 @@ HTTP Write → parse JSON → route data to shard X by hash
     4. Add LocalId to time-scoped postings for today      ← local, O(1) amortized
     5. Update bloom filter with LocalId                   ← local, O(1)
     6. Update HLL sketch for measurement                  ← local, O(1)
-    7. If new series: write SeriesMetadata to LevelDB     ← local
+    7. If new series: write SeriesMetadata to NativeIndex  ← local
     8. If new schema: broadcast to all shards             ← rare
   Shard X: return HTTP 200
 ```
@@ -258,7 +298,7 @@ HTTP Query → parse → invoke_on_all(localDiscoverAndQuery)
     b. Sort postings lists by estimated cardinality (HLL, smallest first)
     c. Intersect bitmaps: result = activeSeries ∩ tag1 ∩ tag2 ∩ ...
     d. Apply field filter if specified
-    e. Resolve LocalIds → SeriesMetadata (local LevelDB)
+    e. Resolve LocalIds → SeriesMetadata (local NativeIndex, sync)
 
   Stage 3 — EXECUTE
     a. For each matched series:
@@ -395,19 +435,19 @@ No cross-shard RPCs. Each shard sweeps independently. Retention policies are in 
 
 ### Current
 
-`setRetentionPolicy` / `getRetentionPolicy` / `deleteRetentionPolicy` are routed to shard 0's LevelDB via `invoke_on(0, ...)`.
+`setRetentionPolicy` / `getRetentionPolicy` / `deleteRetentionPolicy` are routed to shard 0's NativeIndex via `invoke_on(0, ...)`.
 
 ### Proposed
 
 Retention policies are part of the schema registry (replicated). CRUD operations:
 
 ```
-PUT  /retention → write to local LevelDB + invoke_on_all(applySchemaUpdate)
+PUT  /retention → write to local NativeIndex + invoke_on_all(applySchemaUpdate)
 GET  /retention → read from local schema registry cache (any shard)
-DELETE /retention → delete from local LevelDB + invoke_on_all(removeRetentionPolicy)
+DELETE /retention → delete from local NativeIndex + invoke_on_all(removeRetentionPolicy)
 ```
 
-Writes go to the local shard's LevelDB for persistence, then broadcast to all shards. Reads are served from the local in-memory cache. Same pattern as field/tag schema updates.
+Writes go to the local shard's NativeIndex for persistence, then broadcast to all shards. Reads are served from the local in-memory cache. Same pattern as field/tag schema updates.
 
 ## Metadata API
 
@@ -466,7 +506,7 @@ Data layer:   SeriesId128 → TSM files, MemoryStore, WAL  (unchanged)
               seriesKey → QueryRunner::runQuery()         (unchanged)
 ```
 
-No changes needed to QueryRunner, TSMFileManager, WALFileManager, MemoryStore, or any data-path code. The LocalId mapping is encapsulated within LevelDBIndex.
+No changes needed to QueryRunner, TSMFileManager, WALFileManager, MemoryStore, or any data-path code. The LocalId mapping is encapsulated within NativeIndex (aliased as `LevelDBIndex`).
 
 ## Write Path `knownSeriesCache` Compatibility
 
@@ -480,7 +520,7 @@ The cache is keyed by `SeriesId128`, which is deterministic. A cache hit means t
 
 ## `getSeriesType` Compatibility
 
-`getSeriesType()` determines a field's data type (float/bool/string/int) by checking TSM file headers and MemoryStore variants. It does NOT use the LevelDB index — it's purely data-local:
+`getSeriesType()` determines a field's data type (float/bool/string/int) by checking TSM file headers and MemoryStore variants. It does NOT use the metadata index — it's purely data-local:
 
 ```
 TSMFileManager::getSeriesType(seriesId)
@@ -770,7 +810,7 @@ When the cluster topology changes (server added, removed, or failed), virtual sh
 
 3. MIGRATE: Stream data + index from old server to new server
    - TSM files: bulk copy via network (largest volume, but sequential I/O)
-   - LevelDB index: snapshot + stream (consistent point-in-time copy)
+   - NativeIndex: snapshot SSTables + stream (immutable files, consistent)
    - WAL: replay entries for affected vshards
    - LocalId counters: transfer max counter value for each vshard
 
@@ -786,7 +826,7 @@ When the cluster topology changes (server added, removed, or failed), virtual sh
 
 6. CLEANUP: Old server deletes migrated data after a grace period (e.g., 1 hour)
    - Grace period allows in-flight queries to complete
-   - After grace period: delete TSM files, LevelDB entries, WAL segments
+   - After grace period: delete TSM files, NativeIndex SSTables, WAL segments
 ```
 
 **Failure during migration:**
@@ -801,14 +841,14 @@ When the cluster topology changes (server added, removed, or failed), virtual sh
 
 ### Mutable Postings Durability
 
-In-memory mutable postings are lost on server crash. After restart, the server must rebuild them by scanning local SERIES_METADATA in LevelDB. During rebuild:
+In-memory mutable postings are lost on server crash. After restart, the server must rebuild them by scanning local SERIES_METADATA via NativeIndex's `kvPrefixScan()` (synchronous once SSTables are loaded). During rebuild:
 
 - The server is marked as "warming up" in etcd
 - Queries that hit a warming server receive a header: `X-TimeStar-Warming: true`
 - The coordinator can optionally skip warming servers and return partial results, or wait for rebuild to complete
-- Rebuild time: proportional to series count. For 1M series per shard × 16 shards: ~10-30 seconds (LevelDB sequential scan)
+- Rebuild time: proportional to series count. For 1M series per shard × 16 shards: ~5-15 seconds (NativeIndex `kvPrefixScan()` — all in RAM, no I/O)
 
-For faster recovery, postings can be persisted alongside LevelDB in a future optimization — write a postings snapshot on each MemoryStore rollover. On restart, load the snapshot instead of scanning SERIES_METADATA.
+For faster recovery, postings can be persisted as a dedicated SSTable on each MemoryStore rollover. On restart, load the postings SSTable directly instead of scanning all SERIES_METADATA entries.
 
 ### Network Protocol
 
@@ -837,9 +877,9 @@ Inter-server communication uses Seastar's built-in RPC framework (`seastar::rpc:
 | Metric | Current | Proposed | Improvement |
 |--------|---------|----------|-------------|
 | Cross-shard RPCs per write batch | 1 (indexMetadataSync) | 0 (local write) | **Eliminated** |
-| LevelDB write contention | All shards compete for shard 0 | Each shard writes to own LevelDB | **No contention** |
+| NativeIndex write contention | All shards compete for shard 0 | Each shard writes to own NativeIndex | **No contention** |
 | Shard 0 reactor utilization | Handles all metadata from all shards | Handles only its own 1/N share | **N× less load** |
-| Index update cost per insert | LevelDB WriteBatch (multi-key) | In-memory postings append + bloom update | **~10× faster (memory vs disk)** |
+| Index update cost per insert | NativeIndex kvWriteBatch (multi-key) | In-memory postings append + bloom update | **~10× faster (memory vs WAL)** |
 
 ### Query Path
 
@@ -856,41 +896,40 @@ Inter-server communication uses Seastar's built-in RPC framework (`seastar::rpc:
 
 | Resource | Current | Proposed |
 |----------|---------|----------|
-| LevelDB instances | 1 (shard 0) | N (one per shard) |
-| Total LevelDB disk | X | ~1.3X (time-scoped entries add ~30%) |
-| LevelDB memory (block cache) | Concentrated on shard 0 | Distributed evenly across shards |
+| NativeIndex instances | 1 (shard 0) | N (one per shard) |
+| Total index disk | X | ~1.3X (time-scoped entries add ~30%) |
+| NativeIndex memory (SSTable cache) | Concentrated on shard 0 | Distributed evenly across shards (~same total) |
 | In-memory postings | None | ~50-100 bytes per series per shard (mutable layer) |
 | Bloom filters | None for index | ~10 bits per series per shard |
 | HLL sketches | None | ~16KB per measurement per shard |
 | Schema memory | Shard 0 only | Replicated N× (small: typically <1MB total) |
 
-## LevelDB Compaction Thread Contention
+## Compaction in Distributed NativeIndex
 
-LevelDB runs background compaction in threads outside Seastar's control. With N LevelDB instances (one per shard), there are N potential compaction threads competing for CPU.
+Unlike LevelDB (which runs compaction in external threads outside Seastar's control), NativeIndex compaction runs as **Seastar async coroutines on the reactor thread**. This eliminates the thread contention concern entirely:
 
-**Why this is manageable:**
-- Each instance is 1/N the size of the current centralized instance → compaction runs are shorter and less frequent per instance
-- LevelDB compacts lazily — only when L0 files exceed a threshold (default 4 files)
-- With `write_buffer_size` scaled down by N (e.g., 16MB/N = 1MB per shard), each flush is small
-- Compaction threads yield to the OS scheduler; Seastar's reactor thread has higher effective priority (it runs continuously)
+- No external threads — compaction is cooperative, yields to other coroutines
+- No mutex contention — single-threaded per shard
+- No reactor stalls from thread scheduling — compaction I/O is DMA-based
 
-**Mitigation if reactor stalls are observed:**
-1. Reduce `max_file_size` and `write_buffer_size` proportionally to 1/N
-2. Set LevelDB's `max_background_compactions = 1` (default) — only 1 compaction thread per instance
-3. Monitor reactor stall metrics (`seastar::metrics::reactor_utilization`)
-4. If compaction remains problematic: migrate to RocksDB, which supports a shared thread pool across all instances via `Env::SetBackgroundThreads()`
+With N NativeIndex instances (one per shard), each instance is 1/N the size → compaction runs are shorter and less frequent per instance. Total compaction work across all shards is approximately the same as a single centralized instance, but spread across N reactor threads running independently.
+
+**Tuning per-shard**: Scale `write_buffer_size` by 1/N to keep total MemTable memory constant. Each shard flushes smaller MemTables more frequently, producing smaller SSTables. The L0→L1 compaction threshold (default 4 files) applies independently per shard.
 
 ## Existing Infrastructure
 
 The codebase already has scaffolding for this design:
 
-- **Per-shard LevelDBIndex**: `Engine::index` member, constructed with `shardId` (`engine.cpp:22`)
-- **Per-shard index directory**: `shard_N/index/` path already computed
+- **Per-shard NativeIndex**: `Engine::index` member (type alias `LevelDBIndex = NativeIndex`), constructed with `shardId` (`engine.cpp:22`). Each shard already has an instance — only shard 0's is opened.
+- **Per-shard index directory**: `shard_N/native_index/` path already computed in NativeIndex constructor
+- **Seastar-native LSM tree**: NativeIndex provides `kvGet()` (sync), `kvPut()` (async), `kvPrefixScan()` (sync), `kvWriteBatch()` (async) — all Seastar-native, no thread-pool crossings
+- **SSTable caching**: All SSTables cached in RAM after `open()`. Reads are pure in-memory lookups. Per-shard instances would each cache ~1/N of total data — same total memory.
 - **In-memory schema caches**: `fieldsCache`, `tagsCache`, `tagValuesCache` — just need replication
-- **SIMD bloom filters**: Highway-accelerated, already in `lib/storage/` — extend to index
+- **SIMD bloom filters**: Highway-accelerated, already in `lib/storage/` — extend to index. NativeIndex also has its own per-SSTable bloom filters.
 - **Partial aggregation**: `PartialAggregationResult` and `AggregationState` already exist and support cross-shard merging via `mergePartialAggregationsGrouped()`
 - **Sorted intersection**: `findSeries()` already does two-pointer sorted-merge intersection — extend with cardinality-based ordering
 - **SeriesId128**: Deterministic hash-based IDs — no centralized counter needed
+- **Batch writes**: NativeIndex `kvWriteBatch()` applies multiple keys atomically in a single WAL record — already used by `getOrCreateSeriesId()` for 5+ entries per new series
 
 ## Implementation Phases
 
@@ -899,11 +938,11 @@ The codebase already has scaffolding for this design:
 The single highest-impact change. Enables all subsequent phases.
 
 **Index distribution:**
-1. Remove the `if (shardId != 0) return` gate in `LevelDBIndex::open()`. Each shard opens its own LevelDB.
-2. On insert, write TAG_INDEX + SERIES_METADATA + MEASUREMENT_SERIES entries to the **local** shard's LevelDB (same key formats as today, just on a different shard).
+1. Remove the `if (shardId != 0) return` gate in `NativeIndex::open()`. Each shard opens its own NativeIndex at `shard_N/native_index/`.
+2. On insert, write TAG_INDEX + SERIES_METADATA + MEASUREMENT_SERIES entries to the **local** shard's NativeIndex (same key formats as today, just on a different shard). Use `kvWriteBatch()` for atomic multi-key writes.
 3. Add schema broadcast via `invoke_on_all` for new fields/tags/values.
 4. Add first-writer-wins field type conflict detection in `applySchemaUpdate()`.
-5. Scale LevelDB config per shard: `write_buffer_size /= N`, `max_open_files /= N`.
+5. Scale NativeIndex config per shard: `write_buffer_size /= N`.
 
 **Write path:**
 6. Remove `indexMetadataSync` cross-shard RPC from write path. Index locally instead.
@@ -918,7 +957,7 @@ The single highest-impact change. Enables all subsequent phases.
 11. Change `deleteRangeBySeries()`: compute target shard from hash, send delete directly to that shard. No shard 0 lookup.
 
 **Retention:**
-12. Change retention policy CRUD: write to local LevelDB + broadcast via `invoke_on_all`.
+12. Change retention policy CRUD: write to local NativeIndex + broadcast via `invoke_on_all`.
 13. Change `sweepExpiredFiles()`: each shard sweeps independently using its local index. No cross-shard series discovery.
 
 **Metadata API:**
@@ -932,12 +971,12 @@ The single highest-impact change. Enables all subsequent phases.
 
 ### Phase 2: Shard-Local IDs + In-Memory Postings
 
-Replace LevelDB-scanned TAG_INDEX with in-memory postings for the mutable (recent) data.
+Add in-memory postings acceleration on top of NativeIndex's kvPrefixScan-based TAG_INDEX.
 
 1. Add shard-local uint32 ID assignment: `LocalIdMap` with bidirectional SeriesId128 ↔ LocalId mapping.
 2. On insert, append LocalId to in-memory `mutablePostings_` sorted vectors.
-3. On MemoryStore rollover, flush mutable postings to LevelDB as serialized roaring bitmaps.
-4. On query, merge mutable (sorted vectors) + immutable (roaring bitmaps from LevelDB).
+3. On MemoryStore rollover, flush mutable postings to NativeIndex as serialized roaring bitmaps (via `kvWriteBatch()`).
+4. On query, merge mutable (sorted vectors) + immutable (roaring bitmaps from NativeIndex's in-memory SSTable cache — synchronous, zero I/O).
 5. Integrate CRoaring library for bitmap operations.
 
 **Complexity**: Medium. New LocalId mapping layer + CRoaring integration.
@@ -950,7 +989,7 @@ Add VictoriaMetrics-style per-day index entries.
 1. On insert, mark series as active on the current day in time-scoped postings.
 2. On query, build `activeSeries` bitmap from days in query range before tag intersection.
 3. Add midnight pre-population: progressively populate next-day entries during last hour.
-4. Add cleanup in retention sweep: each shard removes time-scoped entries with `day < now - retention_period` from its local LevelDB during the periodic sweep (Phase 1, step 13). This piggybacks on the existing 15-minute sweep timer.
+4. Add cleanup in retention sweep: each shard removes time-scoped entries with `day < now - retention_period` from its local NativeIndex (via `kvDelete()`) during the periodic sweep (Phase 1, step 13). This piggybacks on the existing 15-minute sweep timer.
 
 **Complexity**: Low-Medium. Additional postings entries with day prefix.
 **Impact**: 10-100× faster queries for narrow time ranges over long-retention data.
@@ -971,7 +1010,7 @@ Introduce the virtual shard indirection layer **on a single server** first. This
 1. Allocate V=4096 virtual shards. Build default placement: round-robin across N local cores.
 2. Replace all `SeriesId128::Hash{}(id) % smp::count` routing with `placement[hash % V]` lookup.
 3. Each core manages multiple virtual shards (4096/N per core). LocalId counters are per-virtual-shard (not per-core) so they transfer cleanly during rebalancing.
-4. Persist placement table to disk (simple JSON file). On startup, load placement and open LevelDB/data directories per virtual shard.
+4. Persist placement table to disk (simple JSON file). On startup, load placement and open NativeIndex/data directories per virtual shard.
 5. Update `deleteRangeBySeries` routing to use placement lookup.
 
 **Complexity**: Medium. Routing refactor, no new networking.
@@ -990,7 +1029,7 @@ Add inter-server communication. Single-server deployment still works (all virtua
 7. **Deterministic field type resolution**: Implement lexicographic conflict resolution in `applySchemaUpdate()` so all servers converge regardless of message ordering.
 8. **Time-scoped postings**: Use data timestamp (not wall clock) for day bucket assignment. Eliminates clock skew issues.
 9. **Delete scatter-gather**: Extend `deleteByPattern` to fan out to all servers. Extend `deleteRangeBySeries` to forward to the correct server via placement.
-10. **Mutable postings recovery**: On startup, mark server as "warming" in etcd. Rebuild mutable postings from LevelDB scan. Remove "warming" flag when ready. Coordinator can skip or wait for warming servers.
+10. **Mutable postings recovery**: On startup, mark server as "warming" in etcd. Rebuild mutable postings from NativeIndex `kvPrefixScan()` (synchronous, all in RAM after `open()`). Remove "warming" flag when ready. Coordinator can skip or wait for warming servers.
 
 **Complexity**: High. New networking layer, failure handling, gossip protocol.
 **Impact**: Horizontal scaling beyond single server. Replication factor 1 (each series on exactly one server).
@@ -1002,7 +1041,7 @@ Add data replication for durability beyond single-server failure.
 1. **Replication factor R**: Each virtual shard assigned to R servers in the placement table. Default R=1 (unchanged), configurable up to R=3.
 2. **Quorum writes**: Write to all R replicas. Ack to client after W = ceil(R/2)+1 replicas succeed. (R=3, W=2: tolerate 1 server failure without write unavailability.)
 3. **Read-any**: Queries served by any replica. Use adaptive replica selection (route to fastest based on response time history).
-4. **Anti-entropy repair**: Background sweep compares TSM file manifests and LevelDB snapshots between replicas. Copies missing data to repair divergence.
+4. **Anti-entropy repair**: Background sweep compares TSM file manifests and NativeIndex SSTable snapshots between replicas. Copies missing data to repair divergence.
 5. **Failure detection and failover**: When a server fails (detected via etcd lease expiry or heartbeat timeout), its virtual shards' remaining replicas continue serving reads and writes. No placement change needed — the remaining replicas are already authoritative.
 6. **Server replacement**: New server joins, receives virtual shard assignments. Data streams from existing replicas. No freeze needed — existing replicas continue serving during streaming.
 
@@ -1012,7 +1051,7 @@ Add data replication for durability beyond single-server failure.
 ### Phase 8: Advanced (Future)
 
 - **Index garbage collection**: Background sweep that removes TAG_INDEX, SERIES_METADATA, and MEASUREMENT_SERIES entries for series with no remaining data in any TSM file. Runs per-shard, checks each indexed series against local TSM file manifests. Not required for correctness (queries find the series but read zero points due to tombstones), but reclaims disk space and reduces index scan times.
-- **FST-based term dictionary**: Replace LevelDB prefix scan for tag values with FST (M3DB/Elasticsearch approach). Only needed at extreme cardinality (millions of unique tag values).
+- **FST-based term dictionary**: Replace NativeIndex prefix scan for tag values with FST (M3DB/Elasticsearch approach). Only needed at extreme cardinality (millions of unique tag values).
 - **Custom routing**: Allow users to route writes by a tag value so queries filtering on that tag hit fewer shards (Elasticsearch routing).
 - **Index compaction**: Merge multiple immutable postings segments into one (InfluxDB L0→L1→L2 compaction).
 - **Gossip protocol upgrade**: Move from K-peer epidemic broadcast to SWIM protocol with suspicion mechanism for more accurate failure detection at scale.

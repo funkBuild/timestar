@@ -1,6 +1,7 @@
 #include "../../../lib/encoding/float_encoder.hpp"
 #include "../../../lib/encoding/integer_encoder.hpp"
 #include "../../../lib/encoding/simple8b.hpp"
+#include "../../../lib/core/placement_table.hpp"
 
 #include <gtest/gtest.h>
 
@@ -89,5 +90,10 @@ TEST(IntegerTest, BasicAssertions) {
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     seastar::app_template app;
-    return app.run(argc, argv, [&] { return seastar::async([&] { return ::RUN_ALL_TESTS(); }); });
+    return app.run(argc, argv, [&] {
+        return seastar::async([&] {
+            timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(seastar::smp::count));
+            return ::RUN_ALL_TESTS();
+        });
+    });
 }

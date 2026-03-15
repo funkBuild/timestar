@@ -38,8 +38,7 @@ QueryRequest QueryParser::parseQueryString(const std::string& queryString) {
         throw QueryParseException("Query needs to specify an aggregation method");
     }
 
-    std::string aggMethod = queryString.substr(pos, colonPos - pos);
-    request.aggregation = parseAggregation(trim(aggMethod));
+    request.aggregation = parseAggregation(queryString.substr(pos, colonPos - pos));
     pos = colonPos + 1;
 
     // Parse measurement (before '(' or '{' or end)
@@ -122,32 +121,31 @@ uint64_t QueryParser::parseTime(const std::string& timeStr) {
     return static_cast<uint64_t>(time) * 1000000000ULL;
 }
 
-AggregationMethod QueryParser::parseAggregation(const std::string& method) {
-    std::string lower = method;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+// Case-insensitive comparison without allocating a lowercase copy.
+static bool ciEqual(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a[i]))) !=
+            static_cast<unsigned char>(b[i]))
+            return false;
+    }
+    return true;
+}
 
-    if (lower == "avg")
-        return AggregationMethod::AVG;
-    if (lower == "min")
-        return AggregationMethod::MIN;
-    if (lower == "max")
-        return AggregationMethod::MAX;
-    if (lower == "sum")
-        return AggregationMethod::SUM;
-    if (lower == "latest")
-        return AggregationMethod::LATEST;
-    if (lower == "count")
-        return AggregationMethod::COUNT;
-    if (lower == "first")
-        return AggregationMethod::FIRST;
-    if (lower == "median")
-        return AggregationMethod::MEDIAN;
-    if (lower == "stddev")
-        return AggregationMethod::STDDEV;
-    if (lower == "stdvar")
-        return AggregationMethod::STDVAR;
-    if (lower == "spread")
-        return AggregationMethod::SPREAD;
+AggregationMethod QueryParser::parseAggregation(const std::string& method) {
+    std::string_view sv = trimView(method);
+
+    if (ciEqual(sv, "avg"))    return AggregationMethod::AVG;
+    if (ciEqual(sv, "min"))    return AggregationMethod::MIN;
+    if (ciEqual(sv, "max"))    return AggregationMethod::MAX;
+    if (ciEqual(sv, "sum"))    return AggregationMethod::SUM;
+    if (ciEqual(sv, "latest")) return AggregationMethod::LATEST;
+    if (ciEqual(sv, "count"))  return AggregationMethod::COUNT;
+    if (ciEqual(sv, "first"))  return AggregationMethod::FIRST;
+    if (ciEqual(sv, "median")) return AggregationMethod::MEDIAN;
+    if (ciEqual(sv, "stddev")) return AggregationMethod::STDDEV;
+    if (ciEqual(sv, "stdvar")) return AggregationMethod::STDVAR;
+    if (ciEqual(sv, "spread")) return AggregationMethod::SPREAD;
 
     throw QueryParseException(
         "Must be one of 'avg', 'min', 'max', 'sum', 'latest', 'count', 'first', 'median', 'stddev', 'stdvar', "
@@ -176,7 +174,9 @@ std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos)
         pos++;
     }
 
-    return trim(query.substr(start, pos - start));
+    // Trim trailing whitespace without extra allocation
+    std::string_view sv = trimView(std::string_view(query).substr(start, pos - start));
+    return std::string(sv);
 }
 
 std::vector<std::string> QueryParser::parseFields(const std::string& query, size_t& pos) {
@@ -192,22 +192,24 @@ std::vector<std::string> QueryParser::parseFields(const std::string& query, size
         throw QueryParseException("Query missing close bracket on fields");
     }
 
-    std::string fieldsStr = query.substr(pos, closePos - pos);
-    pos = closePos + 1;  // Move past ')'
+    std::string_view fieldsView = trimView(std::string_view(query).substr(pos, closePos - pos));
+    pos = closePos + 1;
 
-    // Empty parentheses means all fields
-    fieldsStr = trim(fieldsStr);
-    if (fieldsStr.empty()) {
-        return fields;  // Return empty vector for "all fields"
+    if (fieldsView.empty()) {
+        return fields;
     }
 
-    // Split by comma
-    fields = split(fieldsStr, ',');
-    for (auto& field : fields) {
-        field = trim(field);
-        if (field.empty()) {
+    // Split by comma using string_view to avoid intermediate string allocations
+    size_t start = 0;
+    while (start < fieldsView.size()) {
+        size_t end = fieldsView.find(',', start);
+        if (end == std::string_view::npos) end = fieldsView.size();
+        std::string_view token = trimView(fieldsView.substr(start, end - start));
+        if (token.empty()) {
             throw QueryParseException("Empty field name in field list");
         }
+        fields.emplace_back(token);
+        start = end + 1;
     }
 
     return fields;
@@ -226,31 +228,34 @@ std::map<std::string, std::string> QueryParser::parseScopes(const std::string& q
         throw QueryParseException("Query missing closing brace on scopes");
     }
 
-    std::string scopesStr = query.substr(pos, closePos - pos);
-    pos = closePos + 1;  // Move past '}'
+    std::string_view scopesView = trimView(std::string_view(query).substr(pos, closePos - pos));
+    pos = closePos + 1;
 
-    // Empty braces means no filters
-    scopesStr = trim(scopesStr);
-    if (scopesStr.empty()) {
+    if (scopesView.empty()) {
         return scopes;
     }
 
-    // Split by comma
-    std::vector<std::string> scopePairs = split(scopesStr, ',');
-    for (const auto& pair : scopePairs) {
-        size_t colonPos = pair.find(':');
-        if (colonPos == std::string::npos) {
-            throw QueryParseException("Invalid scope format. Expected 'key:value', got: " + pair);
+    // Parse comma-separated key:value pairs using string_view
+    size_t start = 0;
+    while (start < scopesView.size()) {
+        size_t end = scopesView.find(',', start);
+        if (end == std::string_view::npos) end = scopesView.size();
+        std::string_view pair = trimView(scopesView.substr(start, end - start));
+
+        size_t colonP = pair.find(':');
+        if (colonP == std::string_view::npos) {
+            throw QueryParseException("Invalid scope format. Expected 'key:value', got: " + std::string(pair));
         }
 
-        std::string key = trim(pair.substr(0, colonPos));
-        std::string value = trim(pair.substr(colonPos + 1));
+        std::string_view key = trimView(pair.substr(0, colonP));
+        std::string_view value = trimView(pair.substr(colonP + 1));
 
         if (key.empty() || value.empty()) {
-            throw QueryParseException("Empty key or value in scope: " + pair);
+            throw QueryParseException("Empty key or value in scope: " + std::string(pair));
         }
 
-        scopes[key] = value;
+        scopes[std::string(key)] = std::string(value);
+        start = end + 1;
     }
 
     return scopes;
@@ -269,31 +274,37 @@ std::vector<std::string> QueryParser::parseGroupBy(const std::string& query, siz
         throw QueryParseException("Query missing closing brace on aggregation group");
     }
 
-    std::string tagsStr = query.substr(pos, closePos - pos);
-    pos = closePos + 1;  // Move past '}'
+    std::string_view tagsView = trimView(std::string_view(query).substr(pos, closePos - pos));
+    pos = closePos + 1;
 
-    tagsStr = trim(tagsStr);
-    if (tagsStr.empty()) {
+    if (tagsView.empty()) {
         throw QueryParseException("Empty group by clause");
     }
 
-    // Split by comma
-    tags = split(tagsStr, ',');
-    for (auto& tag : tags) {
-        tag = trim(tag);
-        if (tag.empty()) {
+    size_t start = 0;
+    while (start < tagsView.size()) {
+        size_t end = tagsView.find(',', start);
+        if (end == std::string_view::npos) end = tagsView.size();
+        std::string_view token = trimView(tagsView.substr(start, end - start));
+        if (token.empty()) {
             throw QueryParseException("Empty tag name in group by list");
         }
+        tags.emplace_back(token);
+        start = end + 1;
     }
 
     return tags;
 }
 
 std::string QueryParser::trim(const std::string& str) {
-    size_t first = str.find_first_not_of(" \t\n\r");
-    if (first == std::string::npos)
-        return "";
+    std::string_view sv = trimView(str);
+    return std::string(sv);
+}
 
+std::string_view QueryParser::trimView(std::string_view str) {
+    size_t first = str.find_first_not_of(" \t\n\r");
+    if (first == std::string_view::npos)
+        return {};
     size_t last = str.find_last_not_of(" \t\n\r");
     return str.substr(first, last - first + 1);
 }

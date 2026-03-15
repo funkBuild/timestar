@@ -3,8 +3,13 @@
 
 #include "../index_backend.hpp"
 #include "../key_encoding.hpp"
+#include "../schema_update.hpp"
+#include "block_cache.hpp"
+#include "bloom_filter.hpp"
 #include "compaction.hpp"
+#include "hyperloglog.hpp"
 #include "index_wal.hpp"
+#include "local_id_map.hpp"
 #include "manifest.hpp"
 #include "memtable.hpp"
 #include "merge_iterator.hpp"
@@ -15,9 +20,13 @@
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
 
+#include <roaring.hh>
+
+#include <map>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/smp.hh>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -142,6 +151,28 @@ public:
     template <class T>
     seastar::future<SeriesId128> indexInsert(const TimeStarInsert<T>& insert);
 
+    // Phase 4: Cardinality estimation
+    double estimateMeasurementCardinality(const std::string& measurement);
+    double estimateTagCardinality(const std::string& measurement,
+                                   const std::string& tagKey, const std::string& tagValue);
+
+    // Phase 3: Time-scoped discovery — prunes inactive series using per-day bitmaps
+    seastar::future<std::expected<std::vector<SeriesWithMetadata>, SeriesLimitExceeded>>
+    findSeriesWithMetadataTimeScoped(const std::string& measurement,
+                                      const std::map<std::string, std::string>& tagFilters,
+                                      const std::unordered_set<std::string>& fieldFilter,
+                                      uint64_t startTimeNs, uint64_t endTimeNs,
+                                      size_t maxSeries = 0);
+
+    // Phase 3: Remove day bitmaps for days before cutoffDay (retention cleanup)
+    seastar::future<> removeExpiredDayBitmaps(const std::string& measurement, uint32_t cutoffDay);
+
+    // Schema broadcast: index metadata and return schema changes for broadcast
+    seastar::future<SchemaUpdate> indexMetadataBatchWithSchema(const std::vector<MetadataOp>& ops);
+
+    // Apply schema updates from other shards into local caches
+    void applySchemaUpdate(const SchemaUpdate& update);
+
     // Backward compatibility aliases for code that used LevelDBIndex::FieldStats
     using FieldStats = IndexFieldStats;
 
@@ -160,11 +191,16 @@ private:
     std::unique_ptr<IndexWAL> wal_;
     std::unique_ptr<Manifest> manifest_;
     std::unique_ptr<CompactionEngine> compaction_;
-    std::vector<std::unique_ptr<SSTableReader>> sstableReaders_;
+    // Step 4: Map-keyed SSTable readers for incremental refresh
+    std::map<uint64_t, std::unique_ptr<SSTableReader>> sstableReaders_;
+    // Step 2: Shared block cache for decompressed SSTable data blocks
+    BlockCache blockCache_;
 
     // --- Low-level KV operations ---
     // kvGet is synchronous — all data is in memory (MemTable + cached SSTables).
     std::optional<std::string> kvGet(std::string_view key);
+    // Step 8: Existence check without copying the value.
+    bool kvExists(std::string_view key);
     seastar::future<> kvPut(const std::string& key, const std::string& value);
     seastar::future<> kvDelete(const std::string& key);
     seastar::future<> kvWriteBatch(const IndexWriteBatch& batch);
@@ -184,7 +220,7 @@ private:
     seastar::future<> doFlushImmutableMemTable();  // Background flush work
     seastar::future<> waitForFlush();  // Wait for any in-flight flush to complete
 
-    // Reopen SSTable readers after flush or compaction.
+    // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
     seastar::future<> refreshSSTables();
     std::string sstFilename(uint64_t fileNumber);
 
@@ -200,12 +236,88 @@ private:
 
     std::unordered_map<std::string, std::set<std::string>> fieldsCache_;
     std::unordered_map<std::string, std::set<std::string>> tagsCache_;
+    // Bounded tag values cache: cleared when exceeding limit (repopulated on miss from KV).
     std::unordered_map<std::string, std::set<std::string>> tagValuesCache_;
+    static constexpr size_t MAX_TAG_VALUES_CACHE_ENTRIES = 256;
     std::unordered_set<std::string> knownFieldTypes_;
-    std::unordered_map<std::string, std::vector<SeriesId128>> measurementSeriesCache_;
+    std::unordered_map<std::string, std::string> fieldTypeValues_;  // "meas\0field" → type (from local + broadcast)
+    // Bounded schema caches: clear when exceeding limit (repopulated on miss from KV)
+    static constexpr size_t MAX_SCHEMA_CACHE_ENTRIES = 2000;
+    void trimSchemaCaches();
+    SchemaUpdate pendingSchemaUpdate_;  // Accumulates schema changes during indexMetadataBatchWithSchema
+    // Step 5: measurementSeriesCache_ REMOVED — getAllSeriesForMeasurement() uses prefix scan directly
 
     timestar::LRUCache<SeriesId128, SeriesMetadata, SeriesId128::Hash> seriesMetadataCache_;
     timestar::LRUCache<std::string, std::shared_ptr<const std::vector<SeriesWithMetadata>>> discoveryCache_;
+    std::unordered_map<std::string, uint64_t> discoveryCacheGen_;  // Per-measurement generation counter
+    uint64_t nextDiscoveryCacheGen_ = 1;
+
+    // --- Phase 2: Roaring bitmap postings ---
+    LocalIdMap localIdMap_;
+    uint32_t lastFlushedLocalId_ = 0;  // LOCAL_ID_FORWARD entries flushed up to (exclusive)
+
+    // Cached bitmap entry: tracks whether modified since last flush.
+    struct BitmapEntry {
+        roaring::Roaring bitmap;
+        bool dirty = false;  // true if modified since last flushDirtyBitmaps()
+    };
+    // In-memory bitmap cache. Key: "measurement\0tagKey\0tagValue"
+    // Populated lazily on first access (insert or query), flushed before memtable swap.
+    tsl::robin_map<std::string, BitmapEntry> bitmapCache_;
+
+    // Get or load a bitmap (read-only). Returns nullptr if not found anywhere.
+    // Uses pre-built cache key to avoid double string construction.
+    const roaring::Roaring* getPostingsBitmapByKey(const std::string& cacheKey);
+    // Get or load a bitmap for insert (mutable). Marks entry dirty.
+    // cacheKey is consumed on cache miss (moved into map).
+    roaring::Roaring& getOrLoadBitmapForInsert(std::string& cacheKey);
+    // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
+    void flushDirtyBitmaps(IndexWriteBatch& batch);
+    // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
+    void migrateToLocalIds(IndexWriteBatch& batch);
+    // Build a bitmap cache key: "measurement\0tagKey\0tagValue"
+    static void buildBitmapCacheKey(std::string& out, const std::string& measurement,
+                                     const std::string& tagKey, const std::string& tagValue);
+
+    // --- Phase 4: Cardinality estimation ---
+    // HLL caches. Key: "measurement\0" (per-measurement) or "measurement\0tagKey\0tagValue" (per-tag-value)
+    tsl::robin_map<std::string, HyperLogLog> hllCache_;
+    std::unordered_set<std::string> hllCacheDirty_;  // Keys modified since last flush
+    // Per-measurement bloom filter of all LocalIds (for short-circuiting non-existent tag lookups)
+    tsl::robin_map<std::string, BloomFilter> measurementBloomCache_;
+    std::unordered_set<std::string> dirtyMeasurementBlooms_;
+    std::unordered_set<std::string> bloomFullyBuilt_;  // Measurements where bloom KV scan already done
+    static constexpr size_t MAX_BLOOM_CACHE_ENTRIES = 5000;  // ~40MB at 8KB per bloom
+    void trimMeasurementBloomCache();
+
+    void updateHLL(const std::string& measurement, uint32_t localId);
+    void updateTagHLL(const std::string& measurement, const std::string& tagKey,
+                      const std::string& tagValue, uint32_t localId);
+    void flushDirtyHLLs(IndexWriteBatch& batch);
+    void flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
+    // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
+    void trimHllCache();
+    static constexpr size_t MAX_HLL_CACHE_ENTRIES = 1000;
+
+    // --- Phase 3: Time-scoped per-day bitmaps ---
+    tsl::robin_map<std::string, BitmapEntry> dayBitmapCache_;
+
+    static void buildDayBitmapCacheKey(std::string& out, const std::string& measurement, uint32_t day);
+    roaring::Roaring& getOrLoadDayBitmapForInsert(std::string& cacheKey);
+    const roaring::Roaring* getDayBitmapByKey(const std::string& cacheKey);
+    void flushDirtyDayBitmaps(IndexWriteBatch& batch);
+    roaring::Roaring buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay, uint32_t endDay);
+
+    // Step 7: Cache eviction — bounded by both entry count and byte budget.
+    // Byte budget prevents high-cardinality bitmaps from consuming excessive memory.
+    static constexpr size_t MAX_BITMAP_CACHE_ENTRIES = 100000;
+    static constexpr size_t MAX_BITMAP_CACHE_BYTES = 128 * 1024 * 1024;  // 128MB per shard
+    static constexpr size_t MAX_DAY_BITMAP_CACHE_ENTRIES = 50000;
+    static constexpr size_t MAX_DAY_BITMAP_CACHE_BYTES = 64 * 1024 * 1024;  // 64MB per shard
+    void trimBitmapCache();
+    void trimDayBitmapCache();
+    // Step 6: Evict oldest tag values cache entries when over limit
+    void trimTagValuesCache();
 };
 
 }  // namespace timestar::index

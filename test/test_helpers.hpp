@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine.hpp"
+#include "placement_table.hpp"
 #include "series_id.hpp"
 
 #include <exception>
@@ -23,7 +24,7 @@ inline void shardedInsert(seastar::sharded<Engine>& eng, TimeStarInsert<T> inser
     // Calculate target shard from series key hash (same as HTTP write handler)
     std::string seriesKey = insert.seriesKey();
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-    unsigned shard = SeriesId128::Hash{}(seriesId) % seastar::smp::count;
+    unsigned shard = timestar::routeToCore(seriesId);
 
     // Index metadata on shard 0 first
     eng.invoke_on(0, [insert](Engine& engine) mutable { return engine.indexMetadata(insert); }).get();

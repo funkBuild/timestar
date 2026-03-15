@@ -1,6 +1,6 @@
 #include "string_encoder.hpp"
 
-#include <snappy.h>
+#include <zstd.h>
 
 #include <cstring>
 #include <limits>
@@ -45,7 +45,7 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
     return value;
 }
 
-AlignedBuffer StringEncoder::encode(std::span<const std::string> values) {
+AlignedBuffer StringEncoder::encode(std::span<const std::string> values, int compressionLevel) {
     AlignedBuffer result;
 
     // Validate count fits in uint32_t header field
@@ -100,13 +100,16 @@ AlignedBuffer StringEncoder::encode(std::span<const std::string> values) {
     }
     uncompressed.data.resize(writePos);
 
-    // Compress with Snappy
-    size_t compressedMaxSize = snappy::MaxCompressedLength(uncompressed.data.size());
+    // Compress with zstd (level varies: 1=fast for fresh writes, higher for compacted data)
+    size_t compressedMaxSize = ZSTD_compressBound(uncompressed.data.size());
     std::vector<char> compressed(compressedMaxSize);
-    size_t compressedSize;
-
-    snappy::RawCompress(reinterpret_cast<const char*>(uncompressed.data.data()), uncompressed.data.size(),
-                        compressed.data(), &compressedSize);
+    size_t compressedSize = ZSTD_compress(compressed.data(), compressedMaxSize,
+                                           reinterpret_cast<const char*>(uncompressed.data.data()),
+                                           uncompressed.data.size(), compressionLevel);
+    if (ZSTD_isError(compressedSize)) {
+        throw std::runtime_error(std::string("String encoder: zstd compression failed: ") +
+                                 ZSTD_getErrorName(compressedSize));
+    }
 
     // Validate compressed size fits in uint32_t header field
     if (compressedSize > std::numeric_limits<uint32_t>::max()) {
@@ -135,7 +138,8 @@ AlignedBuffer StringEncoder::encode(std::span<const std::string> values) {
     return result;
 }
 
-size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuffer& target) {
+size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuffer& target,
+                                  int compressionLevel) {
     const size_t startPos = target.size();
 
     if (values.empty()) [[unlikely]] {
@@ -191,16 +195,16 @@ size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuf
     }
     uncompressed.data.resize(writePos);
 
-    // Compress with Snappy into a temporary buffer.
-    // We still need one temporary for Snappy's output since it requires a
-    // contiguous writable region and we don't know the exact compressed size
-    // upfront. This eliminates the 'result' AlignedBuffer copy from encode().
-    size_t compressedMaxSize = snappy::MaxCompressedLength(uncompressed.data.size());
+    // Compress with zstd into a temporary buffer.
+    size_t compressedMaxSize = ZSTD_compressBound(uncompressed.data.size());
     std::vector<char> compressed(compressedMaxSize);
-    size_t compressedSize;
-
-    snappy::RawCompress(reinterpret_cast<const char*>(uncompressed.data.data()), uncompressed.data.size(),
-                        compressed.data(), &compressedSize);
+    size_t compressedSize = ZSTD_compress(compressed.data(), compressedMaxSize,
+                                           reinterpret_cast<const char*>(uncompressed.data.data()),
+                                           uncompressed.data.size(), compressionLevel);
+    if (ZSTD_isError(compressedSize)) {
+        throw std::runtime_error(std::string("String encoder: zstd compression failed: ") +
+                                 ZSTD_getErrorName(compressedSize));
+    }
 
     if (compressedSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("String encoder: compressed size " + std::to_string(compressedSize) +
@@ -257,9 +261,12 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
     }
     std::vector<uint8_t> uncompressed(uncompressedSize);
 
-    if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize,
-                               reinterpret_cast<char*>(uncompressed.data()))) {
-        throw std::runtime_error("Failed to decompress string data");
+    {
+        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                      reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
+        if (ZSTD_isError(ret)) {
+            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
+        }
     }
 
     // Decode strings
@@ -320,9 +327,12 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
     }
     std::vector<uint8_t> uncompressed(uncompressedSize);
 
-    if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize,
-                               reinterpret_cast<char*>(uncompressed.data()))) {
-        throw std::runtime_error("Failed to decompress string data");
+    {
+        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                      reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
+        if (ZSTD_isError(ret)) {
+            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
+        }
     }
     encoded.offset += compressedSize;
 
@@ -369,16 +379,19 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
 
-    // Decompress (Snappy doesn't support random access, so we must decompress the full block)
+    // Decompress (zstd doesn't support random access, so we must decompress the full block)
     if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
                                  ") exceeds limit");
     }
     std::vector<uint8_t> uncompressed(uncompressedSize);
 
-    if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize,
-                               reinterpret_cast<char*>(uncompressed.data()))) {
-        throw std::runtime_error("Failed to decompress string data");
+    {
+        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                      reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
+        if (ZSTD_isError(ret)) {
+            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
+        }
     }
 
     // Decode strings with skip/limit: skip the first skipCount strings without allocating,
@@ -439,16 +452,19 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
 
-    // Decompress (Snappy doesn't support random access, so we must decompress the full block)
+    // Decompress (zstd doesn't support random access, so we must decompress the full block)
     if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
                                  ") exceeds limit");
     }
     std::vector<uint8_t> uncompressed(uncompressedSize);
 
-    if (!snappy::RawUncompress(reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize,
-                               reinterpret_cast<char*>(uncompressed.data()))) {
-        throw std::runtime_error("Failed to decompress string data");
+    {
+        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                      reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
+        if (ZSTD_isError(ret)) {
+            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
+        }
     }
     encoded.offset += compressedSize;
 

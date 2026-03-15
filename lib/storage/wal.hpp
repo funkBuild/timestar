@@ -48,7 +48,7 @@ struct CompressionStats {
     double timestampRatio = 0.25;  // Timestamps: typically ~15-20% of raw
     double floatRatio = 0.30;      // Floats (ALP/Gorilla): typically ~20-25%
     double boolRatio = 0.05;       // Bools (bit-packing): typically ~1.6%
-    double stringRatio = 0.40;     // Strings (Snappy): typically ~10-30%
+    double stringRatio = 0.40;     // Strings (zstd): typically ~10-30%
     double integerRatio = 0.25;    // Integers (ZigZag + FFOR): typically ~15-25%
     size_t sampleCount = 0;        // Number of encodes observed
 

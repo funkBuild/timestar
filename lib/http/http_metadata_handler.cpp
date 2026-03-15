@@ -1,5 +1,7 @@
 #include "http_metadata_handler.hpp"
 
+#include "native_index.hpp"
+
 #include <glaze/glaze.hpp>
 
 #include <algorithm>
@@ -34,6 +36,12 @@ struct TagValuesResponse {
 struct TagsResponse {
     std::string measurement;
     std::unordered_map<std::string, std::vector<std::string>> tags;
+};
+
+struct CardinalityResponse {
+    std::string measurement;
+    double estimated_series_count;
+    std::unordered_map<std::string, double> tag_cardinalities;
 };
 
 struct FieldInfo {
@@ -114,7 +122,14 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
         "json");
     r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/fields"), fieldsHandler);
 
-    timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields");
+    // /cardinality endpoint
+    auto cardinalityHandler = new seastar::httpd::function_handler(
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleCardinality(std::move(req)); },
+        "json");
+    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/cardinality"), cardinalityHandler);
+
+    timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields, /cardinality");
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleMeasurements(
@@ -124,11 +139,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
     try {
         timestar::http_log.debug("Processing /measurements request");
 
-        // Metadata is centralized on shard 0, so query only shard 0
-        auto measurements =
-            co_await engineSharded->invoke_on(0, [](Engine& engine) -> seastar::future<std::vector<std::string>> {
-                co_return co_await engine.getAllMeasurements();
-            });
+        // Schema caches are populated on all shards via broadcast, so query locally
+        auto measurements = co_await engineSharded->local().getAllMeasurements();
 
         // Apply filters if specified
         std::string prefix = req->get_query_param("prefix");
@@ -216,34 +228,28 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         timestar::http_log.debug("Processing /tags request for measurement: {}, tag: {}", measurement,
                                  specificTag.empty() ? "all" : specificTag);
 
-        // Metadata is centralized on shard 0, so query only shard 0
-        std::unordered_map<std::string, std::set<std::string>> allTagsResults = co_await engineSharded->invoke_on(
-            0,
-            [measurement,
-             specificTag](Engine& engine) -> seastar::future<std::unordered_map<std::string, std::set<std::string>>> {
-                std::unordered_map<std::string, std::set<std::string>> tagsResults;
+        // Schema caches are populated on all shards via broadcast, so query locally
+        std::unordered_map<std::string, std::set<std::string>> allTagsResults;
+        auto& localEngine = engineSharded->local();
 
-                if (specificTag.empty()) {
-                    // Get all tags for measurement, then fetch values in parallel
-                    auto tagKeys = co_await engine.getMeasurementTags(measurement);
-                    std::vector<seastar::future<std::set<std::string>>> futures;
-                    futures.reserve(tagKeys.size());
-                    std::vector<std::string> keyVec(tagKeys.begin(), tagKeys.end());
-                    for (const auto& tagKey : keyVec) {
-                        futures.push_back(engine.getTagValues(measurement, tagKey));
-                    }
-                    auto allValues = co_await seastar::when_all_succeed(futures.begin(), futures.end());
-                    for (size_t i = 0; i < keyVec.size(); ++i) {
-                        tagsResults[keyVec[i]] = std::move(allValues[i]);
-                    }
-                } else {
-                    // Get values for specific tag
-                    auto tagValues = co_await engine.getTagValues(measurement, specificTag);
-                    tagsResults[specificTag] = tagValues;
-                }
-
-                co_return tagsResults;
-            });
+        if (specificTag.empty()) {
+            // Get all tags for measurement, then fetch values in parallel
+            auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
+            std::vector<seastar::future<std::set<std::string>>> futures;
+            futures.reserve(tagKeys.size());
+            std::vector<std::string> keyVec(tagKeys.begin(), tagKeys.end());
+            for (const auto& tagKey : keyVec) {
+                futures.push_back(localEngine.getTagValues(measurement, tagKey));
+            }
+            auto allValues = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+            for (size_t i = 0; i < keyVec.size(); ++i) {
+                allTagsResults[keyVec[i]] = std::move(allValues[i]);
+            }
+        } else {
+            // Get values for specific tag
+            auto tagValues = co_await localEngine.getTagValues(measurement, specificTag);
+            allTagsResults[specificTag] = tagValues;
+        }
 
         // Convert sets to vectors for response formatting
         std::unordered_map<std::string, std::vector<std::string>> tagsResult;
@@ -323,24 +329,15 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             }
         }
 
-        // Metadata is centralized on shard 0, so query only shard 0
-        auto allFields = co_await engineSharded->invoke_on(
-            0, [measurement](Engine& engine) -> seastar::future<std::set<std::string>> {
-                co_return co_await engine.getMeasurementFields(measurement);
-            });
+        // Schema caches are populated on all shards via broadcast, so query locally
+        auto& localEngine = engineSharded->local();
+        auto allFields = co_await localEngine.getMeasurementFields(measurement);
 
-        // Look up all field types in a single RPC to shard 0
-        auto fieldsWithTypes = co_await engineSharded->invoke_on(
-            0,
-            [measurement, fields = std::vector<std::string>(allFields.begin(), allFields.end())](
-                Engine& engine) -> seastar::future<std::unordered_map<std::string, std::string>> {
-                std::unordered_map<std::string, std::string> result;
-                for (const auto& field : fields) {
-                    auto fieldType = co_await engine.getIndex().getFieldType(measurement, field);
-                    result[field] = fieldType.empty() ? "float" : fieldType;
-                }
-                co_return result;
-            });
+        std::unordered_map<std::string, std::string> fieldsWithTypes;
+        for (const auto& field : allFields) {
+            auto fieldType = co_await localEngine.getIndex().getFieldType(measurement, field);
+            fieldsWithTypes[field] = fieldType.empty() ? "float" : fieldType;
+        }
 
         rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = formatFieldsResponse(measurement, fieldsWithTypes, tagFilters);
@@ -350,6 +347,121 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
 
     } catch (const std::exception& e) {
         timestar::http_log.error("Error processing /fields: {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
+        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        rep->add_header("Content-Type", "application/json");
+    }
+
+    co_return rep;
+}
+
+seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleCardinality(
+    std::unique_ptr<seastar::http::request> req) {
+    auto rep = std::make_unique<seastar::http::reply>();
+
+    try {
+        std::string measurement = req->get_query_param("measurement");
+        if (measurement.empty()) {
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
+            rep->add_header("Content-Type", "application/json");
+            co_return rep;
+        }
+
+        {
+            auto err = validateQueryParam(measurement, "Measurement name");
+            if (!err.empty()) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                rep->add_header("Content-Type", "application/json");
+                co_return rep;
+            }
+        }
+
+        std::string tagKey = req->get_query_param("tag_key");
+        std::string tagValue = req->get_query_param("tag_value");
+
+        timestar::http_log.debug("Processing /cardinality request for measurement: {}", measurement);
+
+        // Scatter-gather: collect HLL sketches from all shards and merge
+        using HLL = timestar::index::HyperLogLog;
+        auto numShards = seastar::smp::count;
+
+        if (!tagKey.empty() && !tagValue.empty()) {
+            // Specific tag combination cardinality
+            std::vector<seastar::future<double>> futures;
+            futures.reserve(numShards);
+            for (unsigned s = 0; s < numShards; ++s) {
+                futures.push_back(engineSharded->invoke_on(s, [&measurement, &tagKey, &tagValue](Engine& engine) {
+                    auto& idx = static_cast<timestar::index::NativeIndex&>(engine.getIndex());
+                    return idx.estimateTagCardinality(measurement, tagKey, tagValue);
+                }));
+            }
+            auto results = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+
+            // Merge HLLs from each shard — for simplicity, sum since HLLs on different shards
+            // track different LocalIds (per-shard local IDs don't overlap conceptually in terms of
+            // the series they represent, but the estimates can be summed for cross-shard total)
+            double total = 0.0;
+            for (double est : results) {
+                total += est;
+            }
+
+            CardinalityResponse response;
+            response.measurement = measurement;
+            response.estimated_series_count = total;
+            response.tag_cardinalities[tagKey + ":" + tagValue] = total;
+
+            std::string buffer;
+            (void)glz::write_json(response, buffer);
+            rep->set_status(seastar::http::reply::status_type::ok);
+            rep->_content = std::move(buffer);
+            rep->add_header("Content-Type", "application/json");
+        } else {
+            // Measurement-level cardinality plus per-tag-key cardinalities
+            std::vector<seastar::future<double>> futures;
+            futures.reserve(numShards);
+            for (unsigned s = 0; s < numShards; ++s) {
+                futures.push_back(engineSharded->invoke_on(s, [&measurement](Engine& engine) {
+                    auto& idx = static_cast<timestar::index::NativeIndex&>(engine.getIndex());
+                    return idx.estimateMeasurementCardinality(measurement);
+                }));
+            }
+            auto results = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+
+            double totalEstimate = 0.0;
+            for (double est : results) {
+                totalEstimate += est;
+            }
+
+            // Get tag keys from local schema cache, then estimate per-tag-key cardinality
+            auto& localEngine = engineSharded->local();
+            auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
+
+            std::unordered_map<std::string, double> tagCardinalities;
+            for (const auto& tk : tagKeys) {
+                auto tagValues = co_await localEngine.getTagValues(measurement, tk);
+                // For each tag key, the total distinct series is bounded by measurement cardinality.
+                // Report the number of distinct tag values as a proxy for tag-key cardinality.
+                tagCardinalities[tk] = static_cast<double>(tagValues.size());
+            }
+
+            CardinalityResponse response;
+            response.measurement = measurement;
+            response.estimated_series_count = totalEstimate;
+            response.tag_cardinalities = std::move(tagCardinalities);
+
+            std::string buffer;
+            (void)glz::write_json(response, buffer);
+            rep->set_status(seastar::http::reply::status_type::ok);
+            rep->_content = std::move(buffer);
+            rep->add_header("Content-Type", "application/json");
+        }
+
+        timestar::http_log.debug("Returning cardinality for measurement: {}", measurement);
+
+    } catch (const std::exception& e) {
+        timestar::http_log.error("Error processing /cardinality: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
         rep->add_header("Content-Type", "application/json");

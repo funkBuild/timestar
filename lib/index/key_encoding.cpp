@@ -291,4 +291,135 @@ std::set<std::string> decodeStringSet(std::string_view encoded) {
     return result;
 }
 
+// ============================================================================
+// Phase 2: Local ID / Postings bitmap key encoding
+// ============================================================================
+
+std::string encodeLocalId(uint32_t localId) {
+    std::string result(4, '\0');
+    std::memcpy(result.data(), &localId, 4);  // Little-endian on x86
+    return result;
+}
+
+uint32_t decodeLocalId(std::string_view encoded) {
+    if (encoded.size() < 4) {
+        throw std::runtime_error("Invalid local ID encoding: too short");
+    }
+    uint32_t localId;
+    std::memcpy(&localId, encoded.data(), 4);
+    return localId;
+}
+
+std::string encodeLocalIdForwardKey(uint32_t localId) {
+    std::string key;
+    key.reserve(5);
+    key.push_back(static_cast<char>(LOCAL_ID_FORWARD));
+    key.append(encodeLocalId(localId));
+    return key;
+}
+
+std::string encodeLocalIdCounterKey() {
+    return std::string(1, static_cast<char>(LOCAL_ID_COUNTER));
+}
+
+std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
+                                     const std::string& tagValue) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
+    key.push_back(static_cast<char>(POSTINGS_BITMAP));
+    key += measurement;
+    key.push_back('\0');
+    key += tagKey;
+    key.push_back('\0');
+    key += tagValue;
+    return key;
+}
+
+std::string encodePostingsBitmapPrefix(const std::string& measurement, const std::string& tagKey) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1);
+    key.push_back(static_cast<char>(POSTINGS_BITMAP));
+    key += measurement;
+    key.push_back('\0');
+    key += tagKey;
+    key.push_back('\0');
+    return key;
+}
+
+// ============================================================================
+// Phase 3: Time-scoped day bitmap key encoding
+// ============================================================================
+
+std::string encodeDayBitmapKey(const std::string& measurement, uint32_t day) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1 + 4);
+    key.push_back(static_cast<char>(TIME_SERIES_DAY));
+    key += measurement;
+    key.push_back('\0');
+    key.append(reinterpret_cast<const char*>(&day), 4);  // Little-endian on x86
+    return key;
+}
+
+std::string encodeDayBitmapPrefix(const std::string& measurement) {
+    std::string prefix;
+    prefix.reserve(1 + measurement.size() + 1);
+    prefix.push_back(static_cast<char>(TIME_SERIES_DAY));
+    prefix += measurement;
+    prefix.push_back('\0');
+    return prefix;
+}
+
+uint32_t decodeDayFromDayBitmapKey(std::string_view key) {
+    if (key.size() < 4) {
+        throw std::runtime_error("Invalid day bitmap key: too short");
+    }
+    uint32_t day;
+    std::memcpy(&day, key.data() + key.size() - 4, 4);
+    return day;
+}
+
+// ============================================================================
+// Phase 4: Cardinality HLL + measurement bloom key encoding
+// ============================================================================
+
+std::string encodeCardinalityHLLKey(const std::string& measurement) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1);
+    key.push_back(static_cast<char>(CARDINALITY_HLL));
+    key += measurement;
+    key.push_back('\0');
+    return key;
+}
+
+std::string encodeCardinalityHLLKey(const std::string& measurement, const std::string& tagKey,
+                                     const std::string& tagValue) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
+    key.push_back(static_cast<char>(CARDINALITY_HLL));
+    key += measurement;
+    key.push_back('\0');
+    key += tagKey;
+    key.push_back('\0');
+    key += tagValue;
+    return key;
+}
+
+std::string encodeCardinalityHLLPrefix(const std::string& measurement) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1);
+    key.push_back(static_cast<char>(CARDINALITY_HLL));
+    key += measurement;
+    key.push_back('\0');
+    return key;
+}
+
+std::string encodeMeasurementBloomKey(const std::string& measurement) {
+    std::string key;
+    key.reserve(1 + measurement.size() + 1);
+    key.push_back(static_cast<char>(MEASUREMENT_BLOOM));
+    key += measurement;
+    key.push_back('\0');
+    return key;
+}
+
 }  // namespace timestar::index::keys

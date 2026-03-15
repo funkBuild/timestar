@@ -1,5 +1,6 @@
 #include "query_planner.hpp"
 
+#include "placement_table.hpp"
 #include "series_key.hpp"
 
 #include <algorithm>
@@ -96,44 +97,50 @@ QueryPlan QueryPlanner::createPlanSync(const QueryRequest& request, LevelDBIndex
 
 seastar::future<std::vector<std::vector<SeriesId128>>> QueryPlanner::findMatchingSeriesIds(
     const QueryRequest& request, seastar::sharded<LevelDBIndex>* indexSharded) {
-    // Metadata is centralized on shard 0; query only shard 0 for series discovery,
-    // then distribute results to the appropriate data shards by SeriesId128 hash.
-    auto allSeriesIds = co_await indexSharded->invoke_on(
-        0, [request](LevelDBIndex& index) -> seastar::future<std::vector<SeriesId128>> {
-            std::unordered_set<std::string> fieldFilter;
-            if (!request.requestsAllFields()) {
-                fieldFilter.insert(request.fields.begin(), request.fields.end());
-            }
-
-            auto findResult = co_await index.findSeriesWithMetadata(request.measurement, request.scopes, fieldFilter);
-
-            // If limit was exceeded, throw so the caller can report the error
-            if (!findResult.has_value()) {
-                throw std::runtime_error("Query matches too many series for measurement '" + request.measurement +
-                                         "'. Narrow your query with more specific tag filters.");
-            }
-
-            auto& seriesWithMeta = findResult.value();
-            std::vector<SeriesId128> seriesIds;
-            seriesIds.reserve(seriesWithMeta.size());
-            for (const auto& swm : seriesWithMeta) {
-                seriesIds.push_back(swm.seriesId);
-            }
-
-            co_return seriesIds;
-        });
-
-    // Distribute series to their data shards by SeriesId128 hash
-    unsigned shardCount = seastar::smp::count;
+    // Phase 1+: Scatter-gather across all shards — each shard discovers its own local series.
+    unsigned shardCount = timestar::placement().coreCount();
     if (shardCount == 0)
         shardCount = 1;  // Handle test environment
 
     std::vector<std::vector<SeriesId128>> shardBuckets(shardCount);
 
-    for (const auto& seriesId : allSeriesIds) {
-        size_t hash = SeriesId128::Hash{}(seriesId);
-        unsigned shardId = hash % shardCount;
-        shardBuckets[shardId].push_back(seriesId);
+    std::vector<seastar::future<std::pair<unsigned, std::vector<SeriesId128>>>> futures;
+    futures.reserve(shardCount);
+
+    for (unsigned s = 0; s < shardCount; ++s) {
+        auto f = indexSharded->invoke_on(
+            s, [request](LevelDBIndex& index) -> seastar::future<std::vector<SeriesId128>> {
+                std::unordered_set<std::string> fieldFilter;
+                if (!request.requestsAllFields()) {
+                    fieldFilter.insert(request.fields.begin(), request.fields.end());
+                }
+
+                auto findResult = co_await index.findSeriesWithMetadata(
+                    request.measurement, request.scopes, fieldFilter);
+
+                if (!findResult.has_value()) {
+                    throw std::runtime_error("Query matches too many series for measurement '" +
+                                             request.measurement +
+                                             "'. Narrow your query with more specific tag filters.");
+                }
+
+                auto& seriesWithMeta = findResult.value();
+                std::vector<SeriesId128> seriesIds;
+                seriesIds.reserve(seriesWithMeta.size());
+                for (const auto& swm : seriesWithMeta) {
+                    seriesIds.push_back(swm.seriesId);
+                }
+
+                co_return seriesIds;
+            }).then([s](std::vector<SeriesId128> ids) {
+                return std::make_pair(s, std::move(ids));
+            });
+        futures.push_back(std::move(f));
+    }
+
+    auto results = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+    for (auto& [s, ids] : results) {
+        shardBuckets[s] = std::move(ids);
     }
 
     co_return shardBuckets;
@@ -141,7 +148,7 @@ seastar::future<std::vector<std::vector<SeriesId128>>> QueryPlanner::findMatchin
 
 std::vector<std::vector<SeriesId128>> QueryPlanner::findMatchingSeriesIdsSync(const QueryRequest& request,
                                                                               LevelDBIndex* index) {
-    unsigned shardCount = seastar::smp::count;
+    unsigned shardCount = timestar::placement().coreCount();
     if (shardCount == 0)
         shardCount = 1;  // Handle test environment
 
@@ -182,7 +189,7 @@ std::vector<std::vector<SeriesId128>> QueryPlanner::mapSeriesToShards(const std:
                                                                       const std::string& measurement,
                                                                       const std::map<std::string, std::string>& tags,
                                                                       const std::vector<std::string>& fields) {
-    unsigned shardCount = seastar::smp::count;
+    unsigned shardCount = timestar::placement().coreCount();
     if (shardCount == 0)
         shardCount = 1;  // Handle test environment
 
@@ -190,9 +197,7 @@ std::vector<std::vector<SeriesId128>> QueryPlanner::mapSeriesToShards(const std:
 
     // For each series ID, determine its shard
     for (const SeriesId128& seriesId : seriesIds) {
-        // Use the hash function from SeriesId128 for distribution
-        size_t hash = std::hash<SeriesId128>{}(seriesId);
-        unsigned shardId = hash % shardCount;
+        unsigned shardId = timestar::routeToCore(seriesId);
         shardBuckets[shardId].push_back(seriesId);
     }
 
@@ -205,13 +210,8 @@ unsigned QueryPlanner::calculateShardForSeries(const std::string& measurement,
     // Build the series key and hash it to determine shard using SeriesId128
     std::string seriesKey = buildSeriesKeyForSharding(measurement, tags, field);
 
-    unsigned shardCount = seastar::smp::count;
-    if (shardCount == 0)
-        shardCount = 1;  // Handle test environment
-
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-    size_t hash = SeriesId128::Hash{}(seriesId);
-    return hash % shardCount;
+    return timestar::routeToCore(seriesId);
 }
 
 std::string QueryPlanner::buildSeriesKeyForSharding(const std::string& measurement,

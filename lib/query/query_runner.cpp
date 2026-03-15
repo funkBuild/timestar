@@ -630,11 +630,59 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
                 aggregator.setFoldToSingleState(false);
             }
 
-            // Aggregate TSM data first.
+            // Aggregate TSM data first, then memory stores.
             std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqSnap(
                 fileManager->getSequencedTsmFiles().begin(), fileManager->getSequencedTsmFiles().end());
-            for (const auto& [rank, tsmFile] : seqSnap) {
-                co_await tsmFile->aggregateSeries(seriesId, startTime, endTime, aggregator);
+
+            if (isLatest || isFirst) {
+                // LATEST/FIRST: only need 1 point from TSM (the newest/oldest).
+                // Sort files by series time bounds and use sparse index for zero-I/O.
+                std::sort(seqSnap.begin(), seqSnap.end(),
+                          [&](const auto& a, const auto& b) {
+                              return isLatest ? a.second->getSeriesMaxTime(seriesId) > b.second->getSeriesMaxTime(seriesId)
+                                              : a.second->getSeriesMinTime(seriesId) < b.second->getSeriesMinTime(seriesId);
+                          });
+
+                bool tsmResolved = false;
+                for (const auto& [rank, tsmFile] : seqSnap) {
+                    if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime)) continue;
+                    if (tsmFile->hasTombstones()) { tsmResolved = false; break; }
+                    auto pt = isLatest ? tsmFile->getLatestFromSparse(seriesId)
+                                       : tsmFile->getFirstFromSparse(seriesId);
+                    if (pt.has_value() && pt->timestamp >= startTime && pt->timestamp <= endTime) {
+                        aggregator.addPoint(pt->timestamp, pt->value);
+                        tsmResolved = true;
+                        break;
+                    }
+                    if (pt.has_value()) break;
+                }
+
+                if (!tsmResolved) {
+                    for (const auto& [rank, tsmFile] : seqSnap) {
+                        if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime)) continue;
+                        size_t pts = co_await tsmFile->aggregateSeriesSelective(
+                            seriesId, startTime, endTime, aggregator, isLatest, 1);
+                        if (pts > 0) break;
+                    }
+                }
+            } else {
+                // Prefetch index entries for all files in parallel, then aggregate.
+                // This overlaps DMA reads instead of serializing them per file.
+                {
+                    std::vector<seastar::shared_ptr<TSM>> toFetch;
+                    for (const auto& [rank, tsmFile] : seqSnap) {
+                        if (tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime))
+                            toFetch.push_back(tsmFile);
+                    }
+                    if (toFetch.size() > 1) {
+                        co_await seastar::parallel_for_each(toFetch, [&seriesId](seastar::shared_ptr<TSM>& f) {
+                            return f->getFullIndexEntry(seriesId).discard_result();
+                        });
+                    }
+                }
+                for (const auto& [rank, tsmFile] : seqSnap) {
+                    co_await tsmFile->aggregateSeries(seriesId, startTime, endTime, aggregator);
+                }
             }
 
             // Then fold in MemoryStore data.
@@ -693,19 +741,20 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             co_return std::nullopt;
         }
 
-        // Sort by seqNum: monotonically increasing proxy for data recency.
-        // LATEST: newest first (descending seqNum).
-        // FIRST: oldest first (ascending seqNum).
+        // Sort by sparse index time bounds: use the series-level maxTime/minTime
+        // from the sparse index to order files by actual data recency.
+        // LATEST: files with newest data first (descending maxTime).
+        // FIRST: files with oldest data first (ascending minTime).
         const bool reverse = isLatest;
         if (reverse) {
             std::sort(candidateFiles.begin(), candidateFiles.end(),
-                      [](const seastar::shared_ptr<TSM>& a, const seastar::shared_ptr<TSM>& b) {
-                          return a->seqNum > b->seqNum;
+                      [&seriesId](const seastar::shared_ptr<TSM>& a, const seastar::shared_ptr<TSM>& b) {
+                          return a->getSeriesMaxTime(seriesId) > b->getSeriesMaxTime(seriesId);
                       });
         } else {
             std::sort(candidateFiles.begin(), candidateFiles.end(),
-                      [](const seastar::shared_ptr<TSM>& a, const seastar::shared_ptr<TSM>& b) {
-                          return a->seqNum < b->seqNum;
+                      [&seriesId](const seastar::shared_ptr<TSM>& a, const seastar::shared_ptr<TSM>& b) {
+                          return a->getSeriesMinTime(seriesId) < b->getSeriesMinTime(seriesId);
                       });
         }
 
@@ -717,7 +766,43 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             aggregator.setFoldToSingleState(false);
         }
 
-        if (aggregationInterval == 0) {
+        // Zero-I/O fast path: for LATEST/FIRST needing only 1 point, use the
+        // v3 block stats cached in the sparse index. Files are already sorted
+        // by time bounds, so the first candidate has the best point. No DMA
+        // reads required — pure in-memory lookup.
+        bool needsSinglePoint = (aggregationInterval == 0);
+        if (!needsSinglePoint && aggregationInterval > 0) {
+            uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
+            uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
+            needsSinglePoint = (firstBucket == lastBucket);
+        }
+
+        if (needsSinglePoint && !candidateFiles.empty()) {
+            // Try sparse index stats first (zero I/O).
+            // Skip files with tombstones — sparse stats don't reflect deletions.
+            bool resolved = false;
+            for (auto& file : candidateFiles) {
+                if (file->hasTombstones()) break;  // Tombstones invalidate sparse stats
+                auto pt = reverse ? file->getLatestFromSparse(seriesId)
+                                  : file->getFirstFromSparse(seriesId);
+                if (pt.has_value() && pt->timestamp >= startTime && pt->timestamp <= tsmEndTime) {
+                    aggregator.addPoint(pt->timestamp, pt->value);
+                    resolved = true;
+                    break;
+                }
+                // Sparse stats timestamp outside query range — need block-level scan
+                if (pt.has_value()) break;
+            }
+
+            if (!resolved) {
+                // Fallback: DMA-based selective read for the single point
+                for (auto& file : candidateFiles) {
+                    size_t pts = co_await file->aggregateSeriesSelective(
+                        seriesId, startTime, tsmEndTime, aggregator, reverse, 1);
+                    if (pts > 0) break;
+                }
+            }
+        } else if (aggregationInterval == 0) {
             // Non-bucketed: need only 1 point total from TSM.
             for (auto& file : candidateFiles) {
                 size_t pts =
@@ -734,16 +819,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             size_t totalBuckets = static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1);
 
             if (totalBuckets == 1) {
-                // Single-bucket LATEST/FIRST: only need 1 point from the
-                // preferred end.  Use the selective path (reads 1 block) instead
-                // of aggregateSeriesBucketed (reads all blocks).
-                for (auto& file : candidateFiles) {
-                    size_t pts = co_await file->aggregateSeriesSelective(seriesId, startTime, tsmEndTime, aggregator,
-                                                                         reverse, 1);
-                    if (pts > 0) {
-                        break;
-                    }
-                }
+                // Handled above in needsSinglePoint path
+                (void)totalBuckets;
             } else {
                 std::unordered_set<uint64_t> filledBuckets;
                 filledBuckets.reserve(totalBuckets);
@@ -797,14 +874,22 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(fileManager->getSequencedTsmFiles().begin(),
                                                                             fileManager->getSequencedTsmFiles().end());
 
-    // Pre-filter: skip files whose sparse time bounds don't overlap the query
-    // range. This avoids loading full index entries (DMA reads) for files that
-    // cannot contribute data — critical for narrow-range queries with many files.
-    bool hasNonFloat = false;
+    // Pre-filter using sparse index (in-memory), then prefetch full index entries
+    // in parallel for all candidate files. This overlaps DMA reads instead of
+    // serializing them.
+    std::vector<seastar::shared_ptr<TSM>> gate2Candidates;
     for (const auto& [rank, tsmFile] : seqFilesSnap) {
-        if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, tsmEndTime))
-            continue;
+        if (tsmFile->seriesMayOverlapTime(seriesId, startTime, tsmEndTime))
+            gate2Candidates.push_back(tsmFile);
+    }
+    if (gate2Candidates.size() > 1) {
+        co_await seastar::parallel_for_each(gate2Candidates, [&seriesId](seastar::shared_ptr<TSM>& f) {
+            return f->getFullIndexEntry(seriesId).discard_result();
+        });
+    }
 
+    bool hasNonFloat = false;
+    for (auto& tsmFile : gate2Candidates) {
         auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);
         if (!indexEntry)
             continue;

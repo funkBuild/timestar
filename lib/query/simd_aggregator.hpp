@@ -47,6 +47,12 @@ public:
     // SIMD-optimized dot product (useful for weighted aggregations)
     static double dotProduct(const double* a, const double* b, size_t count);
 
+    // Element-wise SIMD operations: dst[i] op= src[i] for each i.
+    // Used by the aligned-timestamp fold in the aggregator merge path.
+    static void addArrays(double* dst, const double* src, size_t count);
+    static void minArrays(double* dst, const double* src, size_t count);
+    static void maxArrays(double* dst, const double* src, size_t count);
+
     // Fast histogram computation for percentile calculations
     static void computeHistogram(const double* values, size_t count, double min_val, double max_val, size_t num_bins,
                                  uint32_t* histogram);

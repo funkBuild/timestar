@@ -12,6 +12,7 @@
 #include <cinttypes>
 #include <filesystem>
 #include <limits>
+#include <unordered_set>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
@@ -33,9 +34,17 @@ std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqN
 }
 
 std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar::shared_ptr<TSM>>& files) {
-    std::set<SeriesId128> uniqueIds;
+    // Use unordered_set for O(1) average insert instead of O(log n) with std::set.
+    // At 100K series this is ~6x faster (see B6 benchmark).
+    std::unordered_set<SeriesId128, SeriesId128::Hash> uniqueIds;
 
-    // Collect all unique series IDs from all files
+    // Pre-size for expected cardinality to avoid rehashing
+    size_t totalEstimate = 0;
+    for (const auto& file : files) {
+        totalEstimate += file->getSeriesIds().size();
+    }
+    uniqueIds.reserve(totalEstimate);
+
     for (const auto& file : files) {
         auto ids = file->getSeriesIds();
         for (const auto& id : ids) {
@@ -43,7 +52,6 @@ std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar
         }
     }
 
-    // Convert set to vector for iteration
     return std::vector<SeriesId128>(uniqueIds.begin(), uniqueIds.end());
 }
 
@@ -996,6 +1004,10 @@ seastar::future<std::string> TSMCompactor::compact(
     // Create temporary file for writing
     std::string tempPath = outputPath + ".tmp";
     TSMWriter writer(tempPath);
+    // Use higher zstd compression for deeper tiers (better ratio, acceptable speed)
+    if (targetTier >= 1) {
+        writer.setCompressionLevel(3);
+    }
 
     CompactionStats stats;
     stats.filesCompacted = files.size();

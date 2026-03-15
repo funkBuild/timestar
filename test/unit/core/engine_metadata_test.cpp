@@ -138,8 +138,7 @@ TEST_F(EngineMetadataTest, NoShardedRefNoCrash) {
 }
 
 // ===========================================================================
-// 4. With shardedRef, non-zero shard insert DOES index metadata
-//    (this is the core fix being tested)
+// 4. With distributed index, insert on any shard indexes metadata locally
 // ===========================================================================
 
 TEST_F(EngineMetadataTest, NonZeroShardInsertIndexesMetadataWithRef) {
@@ -163,19 +162,19 @@ TEST_F(EngineMetadataTest, NonZeroShardInsertIndexesMetadataWithRef) {
         insert.addTag("host", "h1");
         insert.addValue(1000, 50.0);
 
-        // Insert directly on shard 1 (non-zero)
+        // Insert directly on shard 1 — metadata is indexed locally on shard 1
         eng.eng.invoke_on(1, [insert](Engine& engine) mutable { return engine.insert(std::move(insert)); }).get();
 
-        // Metadata SHOULD now be indexed on shard 0 via cross-shard forwarding
-        auto fields = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementFields("cpu"); }).get();
+        // Metadata should be indexed on shard 1 (where the insert happened)
+        auto fields = eng.eng.invoke_on(1, [](Engine& engine) { return engine.getMeasurementFields("cpu"); }).get();
         EXPECT_TRUE(fields.count("usage") > 0)
-            << "With shardedRef, non-zero shard insert should forward metadata to shard 0";
+            << "With distributed index, insert should index metadata locally on the inserting shard";
 
-        auto tags = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementTags("cpu"); }).get();
-        EXPECT_TRUE(tags.count("host") > 0) << "Tags should be forwarded to shard 0";
+        auto tags = eng.eng.invoke_on(1, [](Engine& engine) { return engine.getMeasurementTags("cpu"); }).get();
+        EXPECT_TRUE(tags.count("host") > 0) << "Tags should be indexed locally";
 
-        auto hosts = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getTagValues("cpu", "host"); }).get();
-        EXPECT_TRUE(hosts.count("h1") > 0) << "Tag values should be forwarded to shard 0";
+        auto hosts = eng.eng.invoke_on(1, [](Engine& engine) { return engine.getTagValues("cpu", "host"); }).get();
+        EXPECT_TRUE(hosts.count("h1") > 0) << "Tag values should be indexed locally";
     })
         .join()
         .get();
@@ -217,12 +216,12 @@ TEST_F(EngineMetadataTest, NonZeroShardBoolAndStringInsertIndexMetadata) {
             eng.eng.invoke_on(1, [insert](Engine& engine) mutable { return engine.insert(std::move(insert)); }).get();
         }
 
-        // Verify both fields are indexed on shard 0
-        auto fields = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementFields("sensor"); }).get();
-        EXPECT_TRUE(fields.count("active") > 0) << "Bool field should be indexed via cross-shard forwarding";
-        EXPECT_TRUE(fields.count("status") > 0) << "String field should be indexed via cross-shard forwarding";
+        // Verify both fields are indexed on shard 1 (where inserts happened)
+        auto fields = eng.eng.invoke_on(1, [](Engine& engine) { return engine.getMeasurementFields("sensor"); }).get();
+        EXPECT_TRUE(fields.count("active") > 0) << "Bool field should be indexed locally";
+        EXPECT_TRUE(fields.count("status") > 0) << "String field should be indexed locally";
 
-        auto tags = eng.eng.invoke_on(0, [](Engine& engine) { return engine.getMeasurementTags("sensor"); }).get();
+        auto tags = eng.eng.invoke_on(1, [](Engine& engine) { return engine.getMeasurementTags("sensor"); }).get();
         EXPECT_TRUE(tags.count("zone") > 0);
     })
         .join()

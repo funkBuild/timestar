@@ -10,6 +10,8 @@
 #include "tsm.hpp"
 #include "zigzag.hpp"
 
+#include <seastar/core/thread.hh>
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -110,7 +112,7 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         std::vector<bool> boolVec(values.begin(), values.end());
         BoolEncoderRLE::encodeInto(boolVec, buffer);
     } else if constexpr (std::is_same_v<T, std::string>) {
-        AlignedBuffer encodedStrings = StringEncoder::encode(values);
+        AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
         buffer.write(encodedStrings);
     } else if constexpr (std::is_same_v<T, int64_t>) {
         // Use thread-local scratch buffer to avoid per-block heap allocation
@@ -187,7 +189,7 @@ void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128& ser
     } else if constexpr (std::is_same_v<T, bool>) {
         BoolEncoderRLE::encodeInto(values, buffer);
     } else if constexpr (std::is_same_v<T, std::string>) {
-        AlignedBuffer encodedStrings = StringEncoder::encode(values);
+        AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
         buffer.write(encodedStrings);
     } else if constexpr (std::is_same_v<T, int64_t>) {
         static thread_local std::vector<uint64_t> zigzagScratch;

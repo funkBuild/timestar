@@ -84,14 +84,16 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
 
     int outputLevel = job.inputLevel + 1;
 
-    // Open all input SSTables and create iterator sources
+    // Open all input SSTables and create iterator sources.
+    // Lower priority = newer = wins. Assign decreasing priority so the LAST file
+    // (newest, highest file number) gets priority 0 and wins duplicate key resolution.
     std::vector<std::unique_ptr<IteratorSource>> sources;
-    int priority = 0;
+    int priority = static_cast<int>(job.inputFiles.size()) - 1;
     for (const auto& fileMeta : job.inputFiles) {
         auto reader = co_await SSTableReader::open(sstFilename(fileMeta.fileNumber));
         auto iter = reader->newIterator();
         sources.push_back(
-            std::make_unique<SSTableIteratorSource>(std::move(reader), std::move(iter), priority++));
+            std::make_unique<SSTableIteratorSource>(std::move(reader), std::move(iter), priority--));
     }
 
     // Create merge iterator
@@ -106,15 +108,23 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
         co_return;
     }
 
-    // Write merged output to a new SSTable
+    // Write merged output to a new SSTable.
+    // Use higher zstd compression level for compacted output (L1+) — better ratio, acceptable speed.
     uint64_t outputFileNum = manifest_.nextFileNumber();
     auto outputPath = sstFilename(outputFileNum);
-    auto writer = co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey);
+    int compressionLevel = (outputLevel >= 1) ? 3 : 1;
+    auto writer = co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey,
+                                                  compressionLevel);
 
+    size_t addCount = 0;
     while (merger.valid()) {
         writer.add(merger.key(), merger.value());
+        if (++addCount % 1024 == 0) {
+            co_await writer.flushPending();
+        }
         co_await merger.next();
     }
+    co_await writer.flushPending();
 
     auto outputMeta = co_await writer.finish();
     outputMeta.fileNumber = outputFileNum;

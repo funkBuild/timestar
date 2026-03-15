@@ -218,20 +218,35 @@ SEASTAR_TEST_F(NativeIndexTest, RetentionPolicy) {
     co_await index.close();
 }
 
-SEASTAR_TEST_F(NativeIndexTest, NonZeroShardNoOps) {
-    NativeIndex index(1);  // Non-zero shard
+SEASTAR_TEST_F(NativeIndexTest, NonZeroShardCanIndexAndQuery) {
+    // Clean up shard 1 directory
+    std::filesystem::remove_all("shard_1/native_index");
+
+    NativeIndex index(1);  // Non-zero shard — should now be fully operational
     co_await index.open();
 
-    auto id = co_await index.getSeriesId("weather", {{"loc", "us"}}, "temp");
-    EXPECT_FALSE(id.has_value());
+    // Can create series
+    auto id = co_await index.getOrCreateSeriesId("weather", {{"loc", "us"}}, "temp");
+    EXPECT_NE(id, SeriesId128{});
 
-    auto meta = co_await index.getSeriesMetadata(SeriesId128{});
-    EXPECT_FALSE(meta.has_value());
+    // Can look up series
+    auto foundId = co_await index.getSeriesId("weather", {{"loc", "us"}}, "temp");
+    EXPECT_TRUE(foundId.has_value());
+    EXPECT_EQ(*foundId, id);
 
+    // Can get metadata
+    auto meta = co_await index.getSeriesMetadata(id);
+    EXPECT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->measurement, "weather");
+    EXPECT_EQ(meta->field, "temp");
+
+    // Can query measurements
     auto measurements = co_await index.getAllMeasurements();
-    EXPECT_TRUE(measurements.empty());
+    EXPECT_EQ(measurements.size(), 1u);
+    EXPECT_TRUE(measurements.count("weather"));
 
     co_await index.close();
+    std::filesystem::remove_all("shard_1/native_index");
 }
 
 SEASTAR_TEST_F(NativeIndexTest, ManySeries) {

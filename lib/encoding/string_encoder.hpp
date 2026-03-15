@@ -20,19 +20,21 @@ private:
 public:
     StringEncoder() = default;
 
-    // Encode strings with Snappy compression.
+    // Encode strings with zstd compression.
     // Accepts std::span for zero-copy sub-range encoding; std::vector
     // converts implicitly.
     // Format: [header][compressed_data]
     // Header: magic_number(4) | uncompressed_size(4) | compressed_size(4) | count(4)
     // Data (before compression): [length_prefix][string_data] for each string
-    static AlignedBuffer encode(std::span<const std::string> values);
+    // compressionLevel: zstd level (1=fast for fresh writes, 3=better ratio for compacted data).
+    static AlignedBuffer encode(std::span<const std::string> values, int compressionLevel = 1);
 
     // Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
     // Writes the same format as encode() but directly into the target buffer,
     // eliminating the final result-buffer allocation and copy.
     // Returns the number of bytes written to the target buffer.
-    static size_t encodeInto(std::span<const std::string> values, AlignedBuffer& target);
+    static size_t encodeInto(std::span<const std::string> values, AlignedBuffer& target,
+                              int compressionLevel = 1);
 
     // Decode strings from compressed buffer
     static void decode(AlignedBuffer& encoded, size_t count, std::vector<std::string>& out);
@@ -41,7 +43,7 @@ public:
     static void decode(Slice& encoded, size_t count, std::vector<std::string>& out);
 
     // Decode with skip/count support - avoids allocating strings outside the [skipCount, skipCount+limitCount) range.
-    // Snappy decompression still happens on the full block (no random access), but individual string
+    // zstd decompression still happens on the full block (no random access), but individual string
     // copies are skipped for the first skipCount entries.
     static void decode(AlignedBuffer& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                        std::vector<std::string>& out);

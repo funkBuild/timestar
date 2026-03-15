@@ -1,10 +1,12 @@
 #include "http_delete_handler.hpp"
 
 #include "logger.hpp"
+#include "placement_table.hpp"
 #include "series_key.hpp"
 
 #include <chrono>
 #include <seastar/core/smp.hh>
+#include <seastar/core/when_all.hh>
 
 using namespace seastar;
 using namespace httpd;
@@ -235,112 +237,25 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 "[DELETE_HANDLER] Delete request: measurement={}, tags={}, fields={}, startTime={}, endTime={}",
                 delReq.measurement, delReq.tags.size(), delReq.fields.size(), delReq.startTime, delReq.endTime);
             if (delReq.isPattern) {
-                // Pattern-based deletion
-                std::vector<Engine::DeleteResult> shardResults;
+                // Pattern-based deletion — scatter-gather to all shards.
+                // Each shard discovers matching series from its local index and deletes locally.
+                Engine::DeleteRequest engineReq;
+                engineReq.measurement = delReq.measurement;
+                engineReq.tags = delReq.tags;
+                engineReq.fields = delReq.fields;
+                engineReq.startTime = delReq.startTime;
+                engineReq.endTime = delReq.endTime;
 
-                // Always query shard 0 first for metadata to find matching series,
-                // regardless of whether we have specific tags/fields.
-                // This ensures we use the centralized metadata.
-                {
-                    auto matchingSeries = co_await engineSharded->invoke_on(
-                        0,
-                        [measurement = delReq.measurement, tags = delReq.tags, fields = delReq.fields](
-                            Engine& engine) -> seastar::future<std::vector<std::pair<std::string, size_t>>> {
-                            auto& index = engine.getIndex();
-                            std::vector<std::pair<std::string, size_t>> seriesWithShards;
-
-                            // Find all series IDs that match the pattern
-                            // Delete operations don't enforce a series limit (0 = unlimited)
-                            std::vector<SeriesId128> seriesIds;
-                            if (tags.empty()) {
-                                auto findResult = co_await index.getAllSeriesForMeasurement(measurement);
-                                if (findResult.has_value()) {
-                                    seriesIds = std::move(findResult.value());
-                                }
-                            } else {
-                                auto findResult = co_await index.findSeries(measurement, tags);
-                                if (findResult.has_value()) {
-                                    seriesIds = std::move(findResult.value());
-                                }
-                            }
-
-                            // Guard against unbounded series expansion
-                            static constexpr size_t MAX_DELETE_SERIES = 100000;
-                            if (seriesIds.size() > MAX_DELETE_SERIES) {
-                                throw std::runtime_error(
-                                    "Delete matches too many series (" + std::to_string(seriesIds.size()) +
-                                    "). Narrow with tag filters (limit: " + std::to_string(MAX_DELETE_SERIES) + ").");
-                            }
-
-                            // Get metadata for each series to check field filters and determine shard
-                            for (const SeriesId128& seriesId : seriesIds) {
-                                auto metadata = co_await index.getSeriesMetadata(seriesId);
-                                if (!metadata.has_value()) {
-                                    continue;
-                                }
-
-                                // Check if field matches (if field filter is specified)
-                                if (!fields.empty()) {
-                                    bool fieldMatches = false;
-                                    for (const auto& field : fields) {
-                                        if (metadata->field == field) {
-                                            fieldMatches = true;
-                                            break;
-                                        }
-                                    }
-                                    if (!fieldMatches) {
-                                        continue;
-                                    }
-                                }
-
-                                // Build series key directly without constructing a temporary
-                                // TimeStarInsert<double> object
-                                std::string seriesKey =
-                                    buildSeriesKey(metadata->measurement, metadata->tags, metadata->field);
-
-                                // Calculate target shard for this series using SeriesId128
-                                SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(seriesKey);
-                                size_t shard = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;
-                                seriesWithShards.push_back({seriesKey, shard});
-                            }
-
-                            co_return seriesWithShards;
-                        });
-
-                    // Group series by shard
-                    std::map<size_t, std::vector<std::string>> seriesByShard;
-                    for (const auto& [seriesKey, shard] : matchingSeries) {
-                        seriesByShard[shard].push_back(seriesKey);
-                    }
-
-                    // Execute targeted deletes on each shard that has matching series
-                    for (const auto& [shard, seriesKeys] : seriesByShard) {
-                        auto result = co_await engineSharded->invoke_on(
-                            shard,
-                            [seriesKeys, startTime = delReq.startTime,
-                             endTime = delReq.endTime](Engine& engine) -> seastar::future<Engine::DeleteResult> {
-                                Engine::DeleteResult result;
-
-                                for (const auto& seriesKey : seriesKeys) {
-                                    bool deleted = co_await engine.deleteRange(seriesKey, startTime, endTime);
-                                    if (deleted) {
-                                        result.seriesDeleted++;
-                                        result.deletedSeries.push_back(seriesKey);
-                                        result.pointsDeleted++;  // Placeholder
-                                    }
-                                }
-
-                                co_return result;
-                            });
-
-                        if (result.seriesDeleted > 0) {
-                            shardResults.push_back(result);
-                        }
-                    }
+                std::vector<seastar::future<Engine::DeleteResult>> deleteFutures;
+                for (unsigned s = 0; s < seastar::smp::count; ++s) {
+                    deleteFutures.push_back(engineSharded->invoke_on(
+                        s, [engineReq](Engine& engine) -> seastar::future<Engine::DeleteResult> {
+                            co_return co_await engine.deleteByPattern(engineReq);
+                        }));
                 }
 
-                // Aggregate results from all shards
-                for (const auto& result : shardResults) {
+                auto shardResults = co_await seastar::when_all_succeed(deleteFutures.begin(), deleteFutures.end());
+                for (auto& result : shardResults) {
                     totalSeriesDeleted += result.seriesDeleted;
                     totalPointsDeleted += result.pointsDeleted;
                     allDeletedSeries.insert(allDeletedSeries.end(), result.deletedSeries.begin(),
@@ -352,7 +267,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
 
                 // Hash the full series key to determine shard using SeriesId128
                 SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(fullSeriesKey);
-                unsigned targetShard = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;
+                unsigned targetShard = timestar::routeToCore(seriesIdForSharding);
 
                 // Execute delete on the target shard
                 bool deleted = co_await engineSharded->invoke_on(targetShard, [delReq](Engine& engine) {
@@ -367,7 +282,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             } else if (!delReq.isStructured) {
                 // Series key delete - determine shard using SeriesId128
                 SeriesId128 seriesIdForSharding = SeriesId128::fromSeriesKey(delReq.seriesKey);
-                unsigned targetShard = SeriesId128::Hash{}(seriesIdForSharding) % seastar::smp::count;
+                unsigned targetShard = timestar::routeToCore(seriesIdForSharding);
 
                 // Execute delete on the target shard
                 bool deleted = co_await engineSharded->invoke_on(targetShard, [delReq](Engine& engine) {

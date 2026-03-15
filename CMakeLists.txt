@@ -144,12 +144,33 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+  roaring
+  GIT_REPOSITORY https://github.com/RoaringBitmap/CRoaring.git
+  GIT_TAG v4.1.7
+  GIT_SHALLOW TRUE
+)
+
+FetchContent_Declare(
+  zstd
+  GIT_REPOSITORY https://github.com/facebook/zstd.git
+  GIT_TAG v1.5.6
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR build/cmake
+)
+
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ROARING_BUILD_LTO OFF CACHE BOOL "" FORCE)
+set(ENABLE_ROARING_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(glaze googlebenchmark robin-map highway)
+FetchContent_MakeAvailable(glaze googlebenchmark robin-map highway roaring zstd)
 
 # ─────────────────────────────── sub‑directories ─────────────────────────────
 

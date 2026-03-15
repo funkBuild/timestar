@@ -44,6 +44,36 @@ std::set<std::string> decodeStringSet(std::string_view encoded);
 
 std::string escapeKeyComponent(const std::string& input);
 
+// --- Phase 2: Local ID / Postings bitmap key encoding ---
+
+std::string encodeLocalIdForwardKey(uint32_t localId);
+std::string encodeLocalIdCounterKey();
+std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
+                                     const std::string& tagValue);
+std::string encodePostingsBitmapPrefix(const std::string& measurement, const std::string& tagKey);
+std::string encodeLocalId(uint32_t localId);
+uint32_t decodeLocalId(std::string_view encoded);
+
+// --- Phase 3: Time-scoped day bitmap key encoding ---
+
+constexpr uint64_t NS_PER_DAY = 86400ULL * 1'000'000'000ULL;
+
+inline uint32_t dayBucketFromNs(uint64_t timestampNs) {
+    return static_cast<uint32_t>(timestampNs / NS_PER_DAY);
+}
+
+std::string encodeDayBitmapKey(const std::string& measurement, uint32_t day);
+std::string encodeDayBitmapPrefix(const std::string& measurement);
+uint32_t decodeDayFromDayBitmapKey(std::string_view key);
+
+// --- Phase 4: Cardinality HLL + measurement bloom key encoding ---
+
+std::string encodeCardinalityHLLKey(const std::string& measurement);
+std::string encodeCardinalityHLLKey(const std::string& measurement, const std::string& tagKey,
+                                     const std::string& tagValue);
+std::string encodeCardinalityHLLPrefix(const std::string& measurement);
+std::string encodeMeasurementBloomKey(const std::string& measurement);
+
 }  // namespace timestar::index::keys
 
 #endif  // KEY_ENCODING_H_INCLUDED

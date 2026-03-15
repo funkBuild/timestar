@@ -77,18 +77,21 @@ static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& p
         std::vector<double> values;
 
         if (!partial.bucketStates.empty()) {
-            // Bucketed: extract getValue() per bucket, sort by timestamp
-            std::vector<std::pair<uint64_t, AggregationState*>> buckets;
-            buckets.reserve(partial.bucketStates.size());
+            // Bucketed: extract values directly into a sortable structure.
+            // Use vector<pair<ts,value>> — avoids the indirection through state pointers
+            // and getValue() is called during extraction, not during the sort.
+            size_t n = partial.bucketStates.size();
+            std::vector<std::pair<uint64_t, double>> tvPairs;
+            tvPairs.reserve(n);
             for (auto& [ts, state] : partial.bucketStates) {
-                buckets.emplace_back(ts, &state);
+                tvPairs.emplace_back(ts, state.getValue(method));
             }
-            std::sort(buckets.begin(), buckets.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-            timestamps.reserve(buckets.size());
-            values.reserve(buckets.size());
-            for (auto& [ts, state] : buckets) {
+            std::sort(tvPairs.begin(), tvPairs.end());
+            timestamps.reserve(n);
+            values.reserve(n);
+            for (auto& [ts, val] : tvPairs) {
                 timestamps.push_back(ts);
-                values.push_back(state->getValue(method));
+                values.push_back(val);
             }
         } else if (partial.collapsedState.has_value()) {
             // Non-bucketed streaming pushdown — single collapsed AggregationState
@@ -406,8 +409,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             std::map<std::string, std::string> tags;
         };
 
-        // Result type for the shard 0 series discovery lambda.
-        // Wraps either the shard-grouped contexts or a series-limit-exceeded error.
+        // Result type for per-shard discovery.
         struct SeriesDiscoveryResult {
             std::vector<std::vector<SeriesQueryContext>> seriesByShard;
             bool limitExceeded = false;
@@ -415,59 +417,76 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             size_t limit = 0;
         };
 
-        // Query shard 0 for all series metadata (centralized metadata).
-        // Build SeriesQueryContext objects directly, grouped by owning shard,
-        // eliminating the intermediate SeriesMetadataWithShard struct + conversion loop.
-        // Pass maxSeriesCount() into findSeriesWithMetadata to bail out early.
+        // Scatter-gather: each shard discovers its own series from its local index,
+        // then we combine the results. No centralized shard-0 bottleneck.
         auto findSeriesStart = std::chrono::high_resolution_clock::now();
-        auto discoveryResult = co_await engineSharded->invoke_on(
-            0,
-            [measurement = request.measurement, scopes = request.scopes, fields = request.fields,
-             maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<SeriesDiscoveryResult> {
-                auto& index = engine.getIndex();
 
-                std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
-                auto findResult =
-                    co_await index.findSeriesWithMetadataCached(measurement, scopes, fieldFilter, maxSeries);
+        // Per-shard discovery result
+        struct PerShardDiscovery {
+            std::vector<SeriesQueryContext> contexts;
+            bool limitExceeded = false;
+            size_t discovered = 0;
+            size_t limit = 0;
+        };
 
-                // Check if series limit was exceeded (early bailout from index layer)
-                if (!findResult.has_value()) {
-                    SeriesDiscoveryResult result;
-                    result.limitExceeded = true;
-                    result.discovered = findResult.error().discovered;
-                    result.limit = findResult.error().limit;
+        unsigned shardCount = seastar::smp::count;
+        if (shardCount == 0) shardCount = 1;
+
+        // Fan out discovery to all shards in parallel
+        std::vector<seastar::future<std::pair<unsigned, PerShardDiscovery>>> discoveryFutures;
+        discoveryFutures.reserve(shardCount);
+        for (unsigned s = 0; s < shardCount; ++s) {
+            auto f = engineSharded->invoke_on(
+                s,
+                [measurement = request.measurement, scopes = request.scopes, fields = request.fields,
+                 startTime = request.startTime, endTime = request.endTime,
+                 maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<PerShardDiscovery> {
+                    auto& index = engine.getIndex();
+                    std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
+                    auto findResult =
+                        co_await index.findSeriesWithMetadataTimeScoped(
+                            measurement, scopes, fieldFilter, startTime, endTime, maxSeries);
+
+                    PerShardDiscovery result;
+                    if (!findResult.has_value()) {
+                        result.limitExceeded = true;
+                        result.discovered = findResult.error().discovered;
+                        result.limit = findResult.error().limit;
+                        co_return result;
+                    }
+
+                    const auto& seriesWithMeta = findResult.value();
+                    result.contexts.reserve(seriesWithMeta.size());
+
+                    for (const auto& swm : seriesWithMeta) {
+                        SeriesQueryContext ctx;
+                        ctx.seriesKey = buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
+                        ctx.seriesId = swm.seriesId;
+                        ctx.field = swm.metadata.field;
+                        ctx.tags = swm.metadata.tags;
+                        result.contexts.push_back(std::move(ctx));
+                    }
+
                     co_return result;
-                }
+                }).then([s](PerShardDiscovery result) { return std::make_pair(s, std::move(result)); });
+            discoveryFutures.push_back(std::move(f));
+        }
 
-                const auto& seriesWithMeta = *findResult.value();
+        auto discoveryResults = co_await seastar::when_all_succeed(discoveryFutures.begin(), discoveryFutures.end());
 
-                LOG_QUERY_PATH(timestar::http_log, info,
-                               "[QUERY] Shard 0 (metadata) found {} series for measurement '{}' with {} scopes",
-                               seriesWithMeta.size(), measurement, scopes.size());
+        // Combine discovery results into seriesByShard
+        SeriesDiscoveryResult discoveryResult;
+        discoveryResult.seriesByShard.resize(shardCount);
 
-                SeriesDiscoveryResult result;
-                unsigned shardCount = seastar::smp::count;
-                if (shardCount == 0)
-                    shardCount = 1;
-                result.seriesByShard.resize(shardCount);
-
-                for (const auto& swm : seriesWithMeta) {
-                    std::string seriesKey =
-                        buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
-
-                    SeriesId128 dataSeriesId = SeriesId128::fromSeriesKey(seriesKey);
-                    unsigned shardId = SeriesId128::Hash{}(dataSeriesId) % shardCount;
-
-                    SeriesQueryContext ctx;
-                    ctx.seriesKey = std::move(seriesKey);
-                    ctx.seriesId = dataSeriesId;
-                    ctx.field = swm.metadata.field;
-                    ctx.tags = swm.metadata.tags;
-                    result.seriesByShard[shardId].push_back(std::move(ctx));
-                }
-
-                co_return result;
-            });
+        for (auto& [s, perShard] : discoveryResults) {
+            if (perShard.limitExceeded) {
+                discoveryResult.limitExceeded = true;
+                discoveryResult.discovered = perShard.discovered;
+                discoveryResult.limit = perShard.limit;
+                break;
+            }
+            discoveryResult.seriesByShard[s] = std::move(perShard.contexts);
+        }
 
         auto findSeriesEnd = std::chrono::high_resolution_clock::now();
         timing.findSeriesMs = std::chrono::duration<double, std::milli>(findSeriesEnd - findSeriesStart).count();

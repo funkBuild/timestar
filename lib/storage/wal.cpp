@@ -106,7 +106,7 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     // explicitly (default 65536 is fine, it's a multiple of 4096).
     seastar::file_output_stream_options opts;
     opts.buffer_size = 262144;  // 256 KiB — larger buffer reduces flush frequency under high write load
-    opts.write_behind = 2;      // Allow 2 buffers in-flight concurrently to overlap I/O
+    opts.write_behind = 4;      // Allow 4 buffers in-flight concurrently to overlap I/O
     opts.preallocation_size = 16 * 1024 * 1024;  // Pre-allocate 16 MiB (WAL max size) to reduce fragmentation
     auto s = co_await seastar::make_file_output_stream(walFile, opts);
     out.emplace(std::move(s));
@@ -342,7 +342,7 @@ size_t WAL::estimateInsertSize(TimeStarInsert<T>& insertRequest) {
         }
         size_t estimatedValSize =
             static_cast<size_t>(static_cast<double>(rawStringSize) * _compressionStats.stringRatio);
-        // Floor: at least count bytes (minimum Snappy overhead)
+        // Floor: at least count bytes (minimum zstd overhead)
         estimatedValSize = std::max(estimatedValSize, count);
         estimatedSize += estimatedValSize;
     } else if constexpr (std::is_same_v<T, int64_t>) {

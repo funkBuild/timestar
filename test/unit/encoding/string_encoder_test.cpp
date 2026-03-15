@@ -3,7 +3,7 @@
 #include "../../../lib/storage/compressed_buffer.hpp"
 
 #include <gtest/gtest.h>
-#include <snappy.h>
+#include <zstd.h>
 
 #include <chrono>
 #include <random>
@@ -334,12 +334,13 @@ TEST_F(StringEncoderTest, StringEncoder_Decode_InvalidLengthThrows) {
     };
     const uint32_t uncompSize = static_cast<uint32_t>(uncompressed.size());  // 7
 
-    // Snappy-compress the malformed payload.
-    size_t maxCompLen = snappy::MaxCompressedLength(uncompressed.size());
+    // Zstd-compress the malformed payload.
+    size_t maxCompLen = ZSTD_compressBound(uncompressed.size());
     std::vector<char> compressed(maxCompLen);
-    size_t compSize = 0;
-    snappy::RawCompress(reinterpret_cast<const char*>(uncompressed.data()), uncompressed.size(), compressed.data(),
-                        &compSize);
+    size_t compSize = ZSTD_compress(compressed.data(), maxCompLen,
+                                     reinterpret_cast<const char*>(uncompressed.data()),
+                                     uncompressed.size(), 1);
+    ASSERT_FALSE(ZSTD_isError(compSize));
 
     // Assemble the full encoded buffer with the standard 16-byte header.
     AlignedBuffer buf;
@@ -376,11 +377,12 @@ TEST_F(StringEncoderTest, StringEncoder_Decode_VarIntTooLargeThrows) {
     };
     const uint32_t uncompSize = static_cast<uint32_t>(uncompressed.size());
 
-    size_t maxCompLen = snappy::MaxCompressedLength(uncompressed.size());
+    size_t maxCompLen = ZSTD_compressBound(uncompressed.size());
     std::vector<char> compressed(maxCompLen);
-    size_t compSize = 0;
-    snappy::RawCompress(reinterpret_cast<const char*>(uncompressed.data()), uncompressed.size(), compressed.data(),
-                        &compSize);
+    size_t compSize = ZSTD_compress(compressed.data(), maxCompLen,
+                                     reinterpret_cast<const char*>(uncompressed.data()),
+                                     uncompressed.size(), 1);
+    ASSERT_FALSE(ZSTD_isError(compSize));
 
     // Build the 16-byte header + compressed payload.
     AlignedBuffer buf;

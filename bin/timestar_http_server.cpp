@@ -1,5 +1,6 @@
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
+#include "core/placement_table.hpp"
 #include "http/http_delete_handler.hpp"
 #include "http/http_derived_query_handler.hpp"
 #include "http/http_metadata_handler.hpp"
@@ -223,6 +224,11 @@ int main(int argc, char** argv) {
                     timestar::ShardRebalancer::writeShardCountMeta(".", seastar::smp::count);
                 }
             }
+
+            // Initialize virtual shard placement table (Phase 5)
+            auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
+            timestar::setGlobalPlacement(std::move(pt));
+            timestar::savePlacement("placement.json");
 
             // STEP 1: Initialize the Engine on all shards
             timestar::http_log.info("Initializing Engine on all shards...");

@@ -2,6 +2,7 @@
 
 #include "logger.hpp"
 #include "memory_store.hpp"
+#include "placement_table.hpp"
 #include "series_id.hpp"
 #include "tsm.hpp"
 #include "tsm_writer.hpp"
@@ -162,7 +163,7 @@ bool ShardRebalancer::isRebalanceNeeded(unsigned newShardCount) {
 void ShardRebalancer::createStagingDirs(unsigned newShardCount) {
     for (unsigned s = 0; s < newShardCount; ++s) {
         fs::create_directories(shardDirNew(s) + "/tsm");
-        fs::create_directories(shardDirNew(s) + "/index");
+        fs::create_directories(shardDirNew(s) + "/native_index");
     }
 }
 
@@ -201,7 +202,7 @@ seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount, unsig
             std::unordered_map<unsigned, seastar::shared_ptr<::MemoryStore>> perShardStores;
 
             for (auto& [seriesId, variantSeries] : tempStore->series) {
-                unsigned targetShard = ::SeriesId128::Hash{}(seriesId) % newShardCount;
+                unsigned targetShard = timestar::routeToCore(seriesId);
 
                 auto it = perShardStores.find(targetShard);
                 if (it == perShardStores.end()) {
@@ -267,7 +268,7 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsig
             // Determine target shards for all series
             std::unordered_map<unsigned, std::vector<::SeriesId128>> shardGroups;
             for (const auto& id : seriesIds) {
-                unsigned target = ::SeriesId128::Hash{}(id) % newShardCount;
+                unsigned target = timestar::routeToCore(id);
                 shardGroups[target].push_back(id);
             }
 
@@ -381,28 +382,36 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsig
 }
 
 // ---------------------------------------------------------------------------
-// Phase D: Move LevelDB index
+// Phase D: Copy per-shard NativeIndex directories
 // ---------------------------------------------------------------------------
 
 void ShardRebalancer::moveLevelDBIndex() {
-    // LevelDB index lives only on shard 0
-    std::string srcIndex = shardDir(0) + "/index";
-    std::string dstIndex = shardDirNew(0) + "/index";
+    // Since Phase 1, each shard has its own native_index/ directory.
+    // Copy each old shard's index to the corresponding new shard.
+    unsigned oldCount = _oldShardCount > 0 ? _oldShardCount : detectShardCountFromDirs();
+    for (unsigned s = 0; s < oldCount; ++s) {
+        // Try native_index/ first (Phase 1+), fall back to index/ (legacy)
+        std::string srcIndex = shardDir(s) + "/native_index";
+        if (!fs::exists(srcIndex)) {
+            srcIndex = shardDir(s) + "/index";
+        }
+        if (!fs::exists(srcIndex))
+            continue;
 
-    if (!fs::exists(srcIndex))
-        return;
+        std::string dstIndex = shardDirNew(s) + "/native_index";
 
-    // Remove the empty index dir we created in staging
-    std::error_code ec;
-    fs::remove_all(dstIndex, ec);
+        // Remove the empty dir we created in staging (if any)
+        std::error_code ec;
+        fs::remove_all(dstIndex, ec);
 
-    // Copy the index (can't hard-link a directory tree portably)
-    fs::copy(srcIndex, dstIndex, fs::copy_options::recursive, ec);
-    if (ec) {
-        throw std::runtime_error("Failed to copy LevelDB index: " + ec.message());
+        // Copy the index (can't hard-link a directory tree portably)
+        fs::copy(srcIndex, dstIndex, fs::copy_options::recursive, ec);
+        if (ec) {
+            throw std::runtime_error("Failed to copy NativeIndex for shard " + std::to_string(s) + ": " + ec.message());
+        }
+
+        engine_log.info("[REBALANCE] Copied NativeIndex for shard {}", s);
     }
-
-    engine_log.info("[REBALANCE] Copied LevelDB index to new shard 0");
 }
 
 // ---------------------------------------------------------------------------
@@ -577,8 +586,8 @@ seastar::future<> ShardRebalancer::execute(unsigned newShardCount) {
     engine_log.info("[REBALANCE] Phase B+C: Processing TSM files...");
     co_await processTSMFiles(oldShardCount, newShardCount);
 
-    // Phase D: Move LevelDB index
-    engine_log.info("[REBALANCE] Phase D: Moving LevelDB index...");
+    // Phase D: Copy per-shard NativeIndex directories
+    engine_log.info("[REBALANCE] Phase D: Copying per-shard NativeIndex directories...");
     co_await seastar::async([this] { moveLevelDBIndex(); });
 
     // Phase E: Atomic cutover

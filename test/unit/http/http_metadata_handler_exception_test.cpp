@@ -108,15 +108,14 @@ TEST_F(MetadataHandlerExceptionSafetyTest, HandleMeasurementsTryCatchBeforeCoAwa
 }
 
 // ---------------------------------------------------------------------------
-// handleTags: the co_await engineSharded->invoke_on() call must be inside
-// a try block.
+// handleTags: the co_await calls must be inside a try block.
 // ---------------------------------------------------------------------------
 TEST_F(MetadataHandlerExceptionSafetyTest, HandleTagsTryCatchBeforeCoAwait) {
     std::string body = extractFunctionBody("HttpMetadataHandler::handleTags");
     ASSERT_FALSE(body.empty()) << "Could not locate HttpMetadataHandler::handleTags in http_metadata_handler.cpp";
 
-    auto coAwaitPos = body.find("co_await engineSharded");
-    ASSERT_NE(coAwaitPos, std::string::npos) << "handleTags does not contain 'co_await engineSharded'. "
+    auto coAwaitPos = body.find("co_await");
+    ASSERT_NE(coAwaitPos, std::string::npos) << "handleTags does not contain any 'co_await'. "
                                              << "If the engine call was removed, update this test.";
 
     auto tryPos = body.find("try {");
@@ -124,9 +123,8 @@ TEST_F(MetadataHandlerExceptionSafetyTest, HandleTagsTryCatchBeforeCoAwait) {
                                          << "Engine exceptions would propagate as unhandled coroutine exceptions "
                                          << "instead of being returned as HTTP 500 responses.";
 
-    EXPECT_LT(tryPos, coAwaitPos) << "In handleTags, 'try {' must appear before 'co_await engineSharded'. "
-                                  << "Without this, an engine I/O error (e.g. LevelDB read failure) "
-                                  << "escapes the coroutine unhandled.";
+    EXPECT_LT(tryPos, coAwaitPos) << "In handleTags, 'try {' must appear before 'co_await'. "
+                                  << "Without this, an engine I/O error escapes the coroutine unhandled.";
 
     EXPECT_NE(body.find("catch (const std::exception&"), std::string::npos)
         << "handleTags is missing 'catch (const std::exception&'. "
@@ -134,15 +132,14 @@ TEST_F(MetadataHandlerExceptionSafetyTest, HandleTagsTryCatchBeforeCoAwait) {
 }
 
 // ---------------------------------------------------------------------------
-// handleFields: there are two co_await engineSharded->invoke_on() calls
-// (getMeasurementFields and getFieldType). Both must be covered by a try block.
+// handleFields: the co_await calls must be covered by a try block.
 // ---------------------------------------------------------------------------
 TEST_F(MetadataHandlerExceptionSafetyTest, HandleFieldsTryCatchBeforeCoAwait) {
     std::string body = extractFunctionBody("HttpMetadataHandler::handleFields");
     ASSERT_FALSE(body.empty()) << "Could not locate HttpMetadataHandler::handleFields in http_metadata_handler.cpp";
 
-    auto coAwaitPos = body.find("co_await engineSharded");
-    ASSERT_NE(coAwaitPos, std::string::npos) << "handleFields does not contain 'co_await engineSharded'. "
+    auto coAwaitPos = body.find("co_await");
+    ASSERT_NE(coAwaitPos, std::string::npos) << "handleFields does not contain any 'co_await'. "
                                              << "If the engine call was removed, update this test.";
 
     auto tryPos = body.find("try {");
@@ -150,22 +147,18 @@ TEST_F(MetadataHandlerExceptionSafetyTest, HandleFieldsTryCatchBeforeCoAwait) {
                                          << "Engine exceptions would propagate as unhandled coroutine exceptions "
                                          << "instead of being returned as HTTP 500 responses.";
 
-    EXPECT_LT(tryPos, coAwaitPos) << "In handleFields, 'try {' must appear before 'co_await engineSharded'. "
-                                  << "Without this, an engine I/O error (e.g. LevelDB read failure during "
-                                  << "getMeasurementFields or getFieldType) escapes unhandled.";
+    EXPECT_LT(tryPos, coAwaitPos) << "In handleFields, 'try {' must appear before 'co_await'. "
+                                  << "Without this, an engine I/O error escapes unhandled.";
 
     EXPECT_NE(body.find("catch (const std::exception&"), std::string::npos)
         << "handleFields is missing 'catch (const std::exception&'. "
         << "The try block must have a catch that converts exceptions to HTTP 500.";
 
-    // handleFields calls engineSharded->invoke_on() twice (getMeasurementFields
-    // and getFieldType in the per-field loop).  Both are inside the same outer
-    // try block, so a single 'try {' before the first call is sufficient.
-    // Verify the second call exists as well.
-    auto secondCoAwaitPos = body.find("co_await engineSharded", coAwaitPos + 1);
+    // handleFields has multiple co_await calls (getMeasurementFields and
+    // getFieldType in the per-field loop). All should be inside the try block.
+    auto secondCoAwaitPos = body.find("co_await", coAwaitPos + 1);
     EXPECT_NE(secondCoAwaitPos, std::string::npos)
-        << "handleFields is expected to have two co_await engineSharded calls "
-        << "(getMeasurementFields and getFieldType). "
+        << "handleFields is expected to have multiple co_await calls. "
         << "If the implementation changed, update this test accordingly.";
 }
 

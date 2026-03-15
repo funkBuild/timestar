@@ -14,7 +14,6 @@ file(GLOB_RECURSE SRC_FILES
 # Exclude deprecated LevelDB implementation files
 list(FILTER SRC_FILES EXCLUDE REGEX ".*/deprecated/.*")
 
-find_package (Snappy REQUIRED)
 find_package (Threads REQUIRED)
 # Seastar is added via add_subdirectory in the top-level CMakeLists.txt,
 # so find_package is only needed when building against a system-installed Seastar.
@@ -37,7 +36,7 @@ message(STATUS "Found xxHash: ${XXHASH_LIBRARY}")
 # compilation internally.
 
 add_library(libtimestar STATIC ${SRC_FILES})
-target_link_libraries(libtimestar Threads::Threads Seastar::seastar Snappy::snappy glaze::glaze ${XXHASH_LIBRARY} hwy)
+target_link_libraries(libtimestar Threads::Threads Seastar::seastar libzstd_static glaze::glaze ${XXHASH_LIBRARY} hwy roaring)
 
 # Include both the lib directory and all subdirectories for header resolution
 target_include_directories(libtimestar PUBLIC

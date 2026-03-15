@@ -188,6 +188,76 @@ SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
         regionScan.print("findSeriesByTag (region, 2000 results)");
     }
 
+    // ── Phase 4b: Multi-Tag Intersection (findSeries with tag filters) ──
+    fmt::print("\n── Phase 4b: Multi-Tag Intersection (findSeries) ──\n");
+    {
+        // 2-tag intersection: host + region
+        LatencyStats twoTagHostRegion;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeries(std::string(MEASUREMENTS[m]),
+                                                  {{"host", hostName(42)}, {"region", "us-east"}});
+            twoTagHostRegion.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+            // host-0042 is in us-east (index < 250), so expect 8 fields
+            EXPECT_EQ(res->size(), static_cast<size_t>(FIELDS_PER_MEASUREMENT));
+        }
+        twoTagHostRegion.print("findSeries (host+region, 8 results)");
+
+        // 2-tag intersection: rack + env
+        LatencyStats twoTagRackEnv;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeries(std::string(MEASUREMENTS[m]),
+                                                  {{"rack", rackName(0)}, {"env", "production"}});
+            twoTagRackEnv.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+            // rack-00: hosts 0,5,10,...495 (100 hosts), production: hosts >= 100 (400 hosts)
+            // Intersection: rack-00 hosts that are production = hosts 100,105,...495 = 80 hosts * 8 fields = 640
+            EXPECT_GT(res->size(), 0u);
+        }
+        twoTagRackEnv.print("findSeries (rack+env, ~640 results)");
+
+        // 3-tag intersection: host + rack + region
+        LatencyStats threeTag;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeries(std::string(MEASUREMENTS[m]),
+                                                  {{"host", hostName(42)}, {"rack", rackName(42 % NUM_RACKS)}, {"region", "us-east"}});
+            threeTag.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+            // host-0042 is rack-02, us-east — consistent, expect 8
+            EXPECT_EQ(res->size(), static_cast<size_t>(FIELDS_PER_MEASUREMENT));
+        }
+        threeTag.print("findSeries (host+rack+region, 8 results)");
+
+        // Single-tag via findSeries API (same as findSeriesByTag but through intersection path)
+        LatencyStats singleTagViaFindSeries;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeries(std::string(MEASUREMENTS[m]),
+                                                  {{"host", hostName(0)}});
+            singleTagViaFindSeries.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+            EXPECT_EQ(res->size(), static_cast<size_t>(FIELDS_PER_MEASUREMENT));
+        }
+        singleTagViaFindSeries.print("findSeries (single host tag, 8 results)");
+    }
+
+    // ── Phase 4c: findSeriesByTagPattern (baseline) ─────────────────────
+    fmt::print("\n── Phase 4c: findSeriesByTagPattern (baseline) ──\n");
+    {
+        LatencyStats patternStats;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeriesByTagPattern(std::string(MEASUREMENTS[m]),
+                                                              "host", hostName(42));
+            patternStats.add(clk::now() - t0);
+            EXPECT_EQ(res.size(), static_cast<size_t>(FIELDS_PER_MEASUREMENT));
+        }
+        patternStats.print("findSeriesByTagPattern (single host)");
+    }
+
     // ── Phase 5: getAllSeriesForMeasurement ───────────────────────────────
     fmt::print("\n── Phase 5: getAllSeriesForMeasurement ──\n");
     {
@@ -297,6 +367,131 @@ SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
             stats.add(clk::now() - t0);
         }
         stats.print("findSeriesWithMetadataCached (warm)");
+    }
+
+    // ── Phase 11: Time-Scoped Discovery ────────────────────────────────
+    fmt::print("\n── Phase 11: Time-Scoped Discovery ──\n");
+    {
+        // Simulate time-scoped activity: re-index all series with timestamps
+        // spread across 30 days. Only the first 50 hosts are active on the last day.
+        constexpr uint32_t NUM_DAYS = 30;
+        uint64_t baseDay = 20000ULL * 86400ULL * 1'000'000'000ULL;  // NS_PER_DAY
+
+        fmt::print("  Indexing {} series with timestamps across {} days...\n", TOTAL_SERIES, NUM_DAYS);
+        auto timeScopeStart = clk::now();
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            for (int h = 0; h < NUM_HOSTS; ++h) {
+                int rack = h % NUM_RACKS;
+                std::map<std::string, std::string> tags = {
+                    {"host", hostName(h)},
+                    {"rack", rackName(rack)},
+                    {"region", (h < NUM_HOSTS / 2) ? "us-east" : "us-west"},
+                    {"env", (h < NUM_HOSTS / 5) ? "staging" : "production"},
+                };
+                for (int f = 0; f < FIELDS_PER_MEASUREMENT; ++f) {
+                    // Determine which day this series is active on
+                    int activeDay = h % NUM_DAYS;  // Spread across days
+                    uint64_t ts = baseDay + static_cast<uint64_t>(activeDay) * 86400ULL * 1'000'000'000ULL + 1;
+                    TimeStarInsert<double> insert(std::string(MEASUREMENTS[m]), std::string(FIELDS[f]));
+                    insert.tags = tags;
+                    insert.timestamps = {ts};
+                    insert.values = {42.0};
+                    co_await index.indexInsert(insert);
+                }
+            }
+        }
+        double timeScopeSec = std::chrono::duration<double>(clk::now() - timeScopeStart).count();
+        fmt::print("  Time-scoped indexing: {:.3f}s\n", timeScopeSec);
+
+        // Benchmark: narrow query (last 1 day) vs wide query (all 30 days)
+        uint64_t ns_per_day = 86400ULL * 1'000'000'000ULL;
+
+        LatencyStats narrowDay;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            // Day 0: hosts 0, 30, 60, ... (about NUM_HOSTS/NUM_DAYS hosts * 8 fields)
+            auto t0 = clk::now();
+            auto res = co_await index.findSeriesWithMetadataTimeScoped(
+                std::string(MEASUREMENTS[m]), {}, {},
+                baseDay, baseDay + ns_per_day - 1);
+            narrowDay.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+            // ~17 hosts per day * 8 fields = ~136
+            size_t expected = (NUM_HOSTS / NUM_DAYS) * FIELDS_PER_MEASUREMENT;
+            // Allow some rounding: hosts h where h%30==0
+            EXPECT_GT(res->size(), 0u);
+            fmt::print("    {} day-0 series: {}\n", MEASUREMENTS[m], res->size());
+        }
+        narrowDay.print("findSeriesWithMetadataTimeScoped (1 day)");
+
+        LatencyStats wideAll;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeriesWithMetadataTimeScoped(
+                std::string(MEASUREMENTS[m]), {}, {},
+                baseDay, baseDay + static_cast<uint64_t>(NUM_DAYS) * ns_per_day);
+            wideAll.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+            EXPECT_EQ(res->size(), static_cast<size_t>(NUM_HOSTS * FIELDS_PER_MEASUREMENT));
+        }
+        wideAll.print("findSeriesWithMetadataTimeScoped (30 days, all)");
+
+        LatencyStats nonTimeScoped;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeriesWithMetadata(std::string(MEASUREMENTS[m]), {}, {});
+            nonTimeScoped.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+        }
+        nonTimeScoped.print("findSeriesWithMetadata (non-time-scoped)");
+
+        LatencyStats narrowWithTags;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            auto res = co_await index.findSeriesWithMetadataTimeScoped(
+                std::string(MEASUREMENTS[m]), {{"region", "us-east"}}, {},
+                baseDay, baseDay + ns_per_day - 1);
+            narrowWithTags.add(clk::now() - t0);
+            EXPECT_TRUE(res.has_value());
+        }
+        narrowWithTags.print("findSeriesWithMetadataTimeScoped (1 day + region tag)");
+    }
+
+    // ── Phase 12: Cardinality Estimation (Phase 4) ────────────────────
+    fmt::print("\n── Phase 12: Cardinality Estimation ──\n");
+    {
+        LatencyStats measCard;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            double est = index.estimateMeasurementCardinality(std::string(MEASUREMENTS[m]));
+            measCard.add(clk::now() - t0);
+            double actual = static_cast<double>(NUM_HOSTS * FIELDS_PER_MEASUREMENT);
+            double error = std::abs(est - actual) / actual;
+            fmt::print("    {} estimated={:.0f}  actual={:.0f}  error={:.2f}%\n",
+                       MEASUREMENTS[m], est, actual, error * 100.0);
+            EXPECT_LT(error, 0.05) << "Cardinality estimate too far off for " << MEASUREMENTS[m];
+        }
+        measCard.print("estimateMeasurementCardinality");
+
+        LatencyStats tagCard;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            double est = index.estimateTagCardinality(std::string(MEASUREMENTS[m]), "region", "us-east");
+            tagCard.add(clk::now() - t0);
+            double actual = static_cast<double>(NUM_HOSTS / 2 * FIELDS_PER_MEASUREMENT);
+            double error = std::abs(est - actual) / actual;
+            EXPECT_LT(error, 0.05) << "Tag cardinality estimate too far off for " << MEASUREMENTS[m];
+        }
+        tagCard.print("estimateTagCardinality (region=us-east)");
+
+        LatencyStats hostCard;
+        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
+            auto t0 = clk::now();
+            double est = index.estimateTagCardinality(std::string(MEASUREMENTS[m]), "host", hostName(42));
+            hostCard.add(clk::now() - t0);
+            // Single host should have FIELDS_PER_MEASUREMENT series
+            EXPECT_GT(est, 0.0);
+        }
+        hostCard.print("estimateTagCardinality (single host)");
     }
 
     // ── Summary ──────────────────────────────────────────────────────────

@@ -241,31 +241,48 @@ seastar::future<> TSM::readSparseIndex() {
         // Calculate size of this entry
         uint32_t entrySize = 16 + 1 + 2 + static_cast<uint32_t>(blockBytes);
 
-        // Peek at first block's minTime and last block's maxTime for sparse
-        // time bounds (blocks start with minTime:u64, maxTime:u64).
-        // These enable skipping entire files for narrow-range queries without
-        // loading the full index entry.
+        // Peek at first/last block metadata from the index for sparse lookups.
+        // v3 Float blocks: 80 bytes each (28 base + 28 v2 stats + 24 v3 extended).
+        // Layout per block: minTime(8) maxTime(8) offset(8) size(4)
+        //   v2+: blockSum(8) blockMin(8) blockMax(8) blockCount(4)
+        //   v3+: blockM2(8) blockFirstValue(8) blockLatestValue(8)
         uint64_t seriesMinTime = 0;
         uint64_t seriesMaxTime = 0;
+        double firstValue = 0.0;
+        double latestValue = 0.0;
+        bool hasExtStats = false;
+
         if (blockCount > 0) {
             size_t blockStart = indexSlice.offset;
-            // First block's minTime (offset 0 within block data)
-            std::memcpy(&seriesMinTime, indexSlice.data + blockStart, sizeof(uint64_t));
-            // Last block's maxTime (offset 8 within last block)
             size_t lastBlockStart = blockStart + (blockCount - 1) * perBlockBytes;
+
+            // First block: minTime at offset 0
+            std::memcpy(&seriesMinTime, indexSlice.data + blockStart, sizeof(uint64_t));
+            // Last block: maxTime at offset 8
             std::memcpy(&seriesMaxTime, indexSlice.data + lastBlockStart + 8, sizeof(uint64_t));
+
+            // v3 Float: extract firstValue from first block, latestValue from last block
+            if (isFloat && fileVersion >= TSM_VERSION_EXTENDED_STATS) {
+                // blockFirstValue at offset 64 within block, blockLatestValue at offset 72
+                std::memcpy(&firstValue, indexSlice.data + blockStart + 64, sizeof(double));
+                std::memcpy(&latestValue, indexSlice.data + lastBlockStart + 72, sizeof(double));
+                hasExtStats = true;
+            }
         }
 
         // Skip over the blocks (don't parse them yet)
         indexSlice.offset += blockBytes;
 
-        // Store sparse entry (including type and time bounds for fast lookups)
+        // Store sparse entry with time bounds + v3 first/latest values
         SparseIndexEntry sparseEntry{.seriesId = seriesId,
                                      .fileOffset = entryStartOffset,
                                      .entrySize = entrySize,
                                      .seriesType = static_cast<TSMValueType>(type),
                                      .minTime = seriesMinTime,
-                                     .maxTime = seriesMaxTime};
+                                     .maxTime = seriesMaxTime,
+                                     .firstValue = firstValue,
+                                     .latestValue = latestValue,
+                                     .hasExtendedStats = hasExtStats};
         sparseIndex.insert({seriesId, sparseEntry});
 
         // Collect series ID for bloom filter
@@ -382,43 +399,157 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         }
     }
 
-    if (fullIndexCache.size() >= maxCacheEntries()) {
-        // Evict least recently used entry (back of list)
+    size_t entryBytes = estimateEntryBytes(fullEntry);
+    // Evict LRU entries until under byte budget
+    while (!lruList.empty() && fullIndexCacheBytes + entryBytes > maxCacheBytes()) {
         auto& lruEntry = lruList.back();
+        fullIndexCacheBytes -= estimateEntryBytes(lruEntry.second);
         fullIndexCache.erase(lruEntry.first);
         lruList.pop_back();
     }
     // Insert at front of LRU list (most recently used)
     lruList.emplace_front(seriesId, std::move(fullEntry));
     fullIndexCache[seriesId] = lruList.begin();
+    fullIndexCacheBytes += entryBytes;
 
     timestar::tsm_log.trace("Loaded full index entry for series {} ({} blocks)", seriesId.toHex(), blockCount);
 
     co_return &lruList.front().second;
 }
 
-// Bulk prefetch: identify cache misses and issue all DMA reads in parallel.
-// Warms the full index cache so subsequent getFullIndexEntry() calls are cache hits.
+// Bulk prefetch: identify cache misses and issue coalesced DMA reads.
+// Sorts entries by file offset and merges adjacent reads into larger chunks
+// to reduce syscall count. A 256KB coalesce window typically merges 10-50
+// individual reads into 1-2 DMA operations.
 seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& seriesIds) {
-    // Filter to only series that (a) pass bloom filter, (b) exist in sparse index,
-    // and (c) are not already cached. This avoids unnecessary I/O.
-    std::vector<SeriesId128> toFetch;
+    // Collect entries that need fetching, with their file offsets for sorting
+    struct FetchEntry {
+        SeriesId128 id;
+        uint64_t offset;
+        uint32_t size;
+    };
+    std::vector<FetchEntry> toFetch;
+    toFetch.reserve(seriesIds.size());
+
     for (const auto& seriesId : seriesIds) {
         if (fullIndexCache.find(seriesId) != fullIndexCache.end())
             continue;
         if (!seriesBloomFilter.contains(seriesId.getRawData()))
             continue;
-        if (sparseIndex.find(seriesId) == sparseIndex.end())
+        auto sparseIt = sparseIndex.find(seriesId);
+        if (sparseIt == sparseIndex.end())
             continue;
-        toFetch.push_back(seriesId);
+        toFetch.push_back({seriesId, sparseIt->second.fileOffset, sparseIt->second.entrySize});
     }
 
     if (toFetch.empty())
         co_return;
 
-    // Issue all DMA reads in parallel via getFullIndexEntry (handles parse + caching)
-    co_await seastar::parallel_for_each(
-        toFetch, [this](const SeriesId128& seriesId) { return getFullIndexEntry(seriesId).discard_result(); });
+    // Sort by file offset to enable coalescing
+    std::sort(toFetch.begin(), toFetch.end(),
+              [](const FetchEntry& a, const FetchEntry& b) { return a.offset < b.offset; });
+
+    // Coalesce adjacent entries into read groups.
+    // A gap <= COALESCE_GAP between entries gets included in a single read.
+    static constexpr uint64_t COALESCE_GAP = 64 * 1024;  // 64KB gap threshold
+
+    struct ReadGroup {
+        uint64_t startOffset;
+        uint64_t endOffset;  // exclusive
+        std::vector<const FetchEntry*> entries;
+    };
+
+    std::vector<ReadGroup> groups;
+    groups.push_back({toFetch[0].offset, toFetch[0].offset + toFetch[0].size, {&toFetch[0]}});
+
+    for (size_t i = 1; i < toFetch.size(); ++i) {
+        auto& cur = groups.back();
+        uint64_t entryEnd = toFetch[i].offset + toFetch[i].size;
+        if (toFetch[i].offset <= cur.endOffset + COALESCE_GAP) {
+            // Coalesce: extend the current group
+            cur.endOffset = std::max(cur.endOffset, entryEnd);
+            cur.entries.push_back(&toFetch[i]);
+        } else {
+            // New group
+            groups.push_back({toFetch[i].offset, entryEnd, {&toFetch[i]}});
+        }
+    }
+
+    // Read each group with a single DMA read and parse all entries from the buffer
+    bool isFloat, hasStats, hasExtended;
+    for (auto& group : groups) {
+        uint64_t readSize = group.endOffset - group.startOffset;
+        seastar::temporary_buffer<char> buf;
+        bool readFailed = false;
+        try {
+            buf = co_await tsmFile.dma_read_exactly<char>(group.startOffset, readSize);
+        } catch (...) {
+            readFailed = true;
+        }
+        if (readFailed) {
+            // Fallback: read entries individually
+            for (const auto* entry : group.entries) {
+                co_await getFullIndexEntry(entry->id).discard_result();
+            }
+            continue;
+        }
+
+        for (const auto* entry : group.entries) {
+            // Skip if another coroutine cached it while we were reading
+            if (fullIndexCache.find(entry->id) != fullIndexCache.end())
+                continue;
+
+            uint64_t localOffset = entry->offset - group.startOffset;
+            if (localOffset + entry->size > buf.size())
+                continue;
+
+            Slice entrySlice(reinterpret_cast<const uint8_t*>(buf.get() + localOffset), entry->size);
+
+            TSMIndexEntry fullEntry;
+            std::string seriesIdBytes = entrySlice.readString(16);
+            fullEntry.seriesId = SeriesId128::fromBytes(seriesIdBytes);
+            fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
+            uint16_t blockCount = entrySlice.read<uint16_t>();
+
+            isFloat = (fullEntry.seriesType == TSMValueType::Float);
+            hasStats = (fileVersion >= TSM_VERSION_STATS) && isFloat;
+            hasExtended = (fileVersion >= TSM_VERSION_EXTENDED_STATS) && isFloat;
+            fullEntry.indexBlocks.reserve(blockCount);
+
+            for (uint16_t b = 0; b < blockCount; ++b) {
+                TSMIndexBlock block;
+                block.minTime = entrySlice.read<uint64_t>();
+                block.maxTime = entrySlice.read<uint64_t>();
+                block.offset = entrySlice.read<uint64_t>();
+                block.size = entrySlice.read<uint32_t>();
+                if (hasStats) {
+                    block.blockSum = entrySlice.read<double>();
+                    block.blockMin = entrySlice.read<double>();
+                    block.blockMax = entrySlice.read<double>();
+                    block.blockCount = entrySlice.read<uint32_t>();
+                }
+                if (hasExtended) {
+                    block.blockM2 = entrySlice.read<double>();
+                    block.blockFirstValue = entrySlice.read<double>();
+                    block.blockLatestValue = entrySlice.read<double>();
+                    block.hasExtendedStats = true;
+                }
+                fullEntry.indexBlocks.push_back(block);
+            }
+
+            // Cache the entry
+            size_t entryBytes = estimateEntryBytes(fullEntry);
+            while (!lruList.empty() && fullIndexCacheBytes + entryBytes > maxCacheBytes()) {
+                auto& lruEntry = lruList.back();
+                fullIndexCacheBytes -= estimateEntryBytes(lruEntry.second);
+                fullIndexCache.erase(lruEntry.first);
+                lruList.pop_back();
+            }
+            lruList.emplace_front(entry->id, std::move(fullEntry));
+            fullIndexCache[entry->id] = lruList.begin();
+            fullIndexCacheBytes += entryBytes;
+        }
+    }
 }
 
 template <class T>
@@ -953,6 +1084,40 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     }
     if (blocksToScan.empty()) {
         co_return 0;
+    }
+
+    // Fast path: for LATEST/FIRST with maxPoints=1 and v3 extended stats,
+    // use the block-level latestValue/firstValue directly from the index entry.
+    // This avoids reading any data blocks from disk — pure metadata lookup.
+    // Only valid when the block's extreme timestamp falls within the query range.
+    if (maxPoints == 1 && !hasTombstones()) {
+        if (reverse) {
+            // LATEST: find the block with the highest maxTime that's within range
+            const TSMIndexBlock* bestBlock = nullptr;
+            for (const auto& block : blocksToScan) {
+                if (!bestBlock || block.maxTime > bestBlock->maxTime) {
+                    bestBlock = &block;
+                }
+            }
+            // Only use stats shortcut if the block's maxTime is within the query range.
+            // If maxTime > endTime, the actual latest point within range requires reading the block.
+            if (bestBlock && bestBlock->hasExtendedStats && bestBlock->maxTime <= endTime) {
+                aggregator.addPoint(bestBlock->maxTime, bestBlock->blockLatestValue);
+                co_return 1;
+            }
+        } else {
+            // FIRST: find the block with the lowest minTime that's within range
+            const TSMIndexBlock* bestBlock = nullptr;
+            for (const auto& block : blocksToScan) {
+                if (!bestBlock || block.minTime < bestBlock->minTime) {
+                    bestBlock = &block;
+                }
+            }
+            if (bestBlock && bestBlock->hasExtendedStats && bestBlock->minTime >= startTime) {
+                aggregator.addPoint(bestBlock->minTime, bestBlock->blockFirstValue);
+                co_return 1;
+            }
+        }
     }
 
     // Pre-fetch tombstone ranges once

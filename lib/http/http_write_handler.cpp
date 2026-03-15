@@ -2,6 +2,7 @@
 
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "placement_table.hpp"
 #include "series_key.hpp"
 
 #include <boost/iterator/counting_iterator.hpp>
@@ -143,18 +144,19 @@ void HttpWriteHandler::validateWritePointNames(const std::string& measurement,
         throw std::invalid_argument(err);
 
     for (const auto& [key, value] : tags) {
-        err = validateName(key, "Tag key '" + key + "'");
-        if (!err.empty())
-            throw std::invalid_argument(err);
-        err = validateTagValue(value, "Tag value for '" + key + "'");
-        if (!err.empty())
-            throw std::invalid_argument(err);
+        // Validate first with cheap static context; only build dynamic context on error
+        err = validateName(key, "Tag key");
+        if (!err.empty()) [[unlikely]]
+            throw std::invalid_argument(err + " '" + key + "'");
+        err = validateTagValue(value, "Tag value");
+        if (!err.empty()) [[unlikely]]
+            throw std::invalid_argument(err + " for '" + key + "'");
     }
 
     for (const auto& [fieldName, fieldValue] : fields) {
-        err = validateName(fieldName, "Field name '" + fieldName + "'");
-        if (!err.empty())
-            throw std::invalid_argument(err);
+        err = validateName(fieldName, "Field name");
+        if (!err.empty()) [[unlikely]]
+            throw std::invalid_argument(err + " '" + fieldName + "'");
     }
 }
 
@@ -172,21 +174,21 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
 
     // Validate tags
     for (const auto& [key, value] : glazePoint.tags) {
-        err = validateName(key, "Tag key '" + key + "'");
-        if (!err.empty())
-            throw std::invalid_argument(err);
-        err = validateTagValue(value, "Tag value for '" + key + "'");
-        if (!err.empty())
-            throw std::invalid_argument(err);
+        err = validateName(key, "Tag key");
+        if (!err.empty()) [[unlikely]]
+            throw std::invalid_argument(err + " '" + key + "'");
+        err = validateTagValue(value, "Tag value");
+        if (!err.empty()) [[unlikely]]
+            throw std::invalid_argument(err + " for '" + key + "'");
     }
 
     // Validate field names
     if (glazePoint.fields.is_object()) {
         auto& fields_obj = glazePoint.fields.get<json_value_t::object_t>();
         for (const auto& [fieldName, fieldValue] : fields_obj) {
-            err = validateName(fieldName, "Field name '" + fieldName + "'");
-            if (!err.empty())
-                throw std::invalid_argument(err);
+            err = validateName(fieldName, "Field name");
+            if (!err.empty()) [[unlikely]]
+                throw std::invalid_argument(err + " '" + fieldName + "'");
         }
     }
 }
@@ -409,8 +411,10 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
 
         // Generate timestamps 1ms apart from the pre-computed default
         mwp.timestamps.reserve(numPoints);
+        uint64_t ts = defaultTimestampNs;
         for (size_t i = 0; i < numPoints; i++) {
-            mwp.timestamps.push_back(defaultTimestampNs + i * 1000000);
+            mwp.timestamps.push_back(ts);
+            ts += 1000000;
         }
     }
 
@@ -459,8 +463,10 @@ bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t 
         mwp.timestamps.resize(numPoints, *fwp.timestamp);
     } else {
         mwp.timestamps.reserve(numPoints);
+        uint64_t ts = defaultTimestampNs;
         for (size_t i = 0; i < numPoints; i++) {
-            mwp.timestamps.push_back(defaultTimestampNs + i * 1000000);
+            mwp.timestamps.push_back(ts);
+            ts += 1000000;
         }
     }
 
@@ -726,23 +732,25 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                         throw std::invalid_argument("Unsupported field array type: " + fieldName);
                     }
 
-                    // Resolve timestamps for this array: use the timestamps array if it
-                    // matches, or replicate a single timestamp, or generate sequential ones
-                    std::vector<uint64_t> fieldTimestamps;
+                    // Resolve timestamps for this array: reference the original when sizes
+                    // match (avoids copying 10K+ element vector per field), or build a new one.
+                    std::vector<uint64_t> fieldTimestampsOwned;
+                    const std::vector<uint64_t>* fieldTimestampsPtr = nullptr;
                     if (timestamps.size() == arr.size()) {
-                        fieldTimestamps = timestamps;
+                        fieldTimestampsPtr = &timestamps;  // Zero-copy: share existing vector
                     } else if (timestamps.size() == 1) {
-                        // Single timestamp with array fields - replicate for each element
-                        fieldTimestamps.resize(arr.size(), timestamps[0]);
+                        fieldTimestampsOwned.resize(arr.size(), timestamps[0]);
+                        fieldTimestampsPtr = &fieldTimestampsOwned;
                     } else {
-                        // Generate timestamps 1ms apart from the first available,
-                        // falling back to the batch-level default if none exist
-                        uint64_t baseTs = timestamps.empty() ? defaultTimestampNs : timestamps[0];
-                        fieldTimestamps.reserve(arr.size());
+                        uint64_t ts = timestamps.empty() ? defaultTimestampNs : timestamps[0];
+                        fieldTimestampsOwned.reserve(arr.size());
                         for (size_t i = 0; i < arr.size(); i++) {
-                            fieldTimestamps.push_back(baseTs + i * 1000000);
+                            fieldTimestampsOwned.push_back(ts);
+                            ts += 1000000;
                         }
+                        fieldTimestampsPtr = &fieldTimestampsOwned;
                     }
+                    const auto& fieldTimestamps = *fieldTimestampsPtr;
 
                     CoalesceCandidate& candidate = findOrCreateCandidate(seriesKey, measurement, sharedTags, fieldName,
                                                                          valueType, arr.size(), seriesKeyPrefix);
@@ -1075,7 +1083,7 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
         // Compute SeriesId128 ONCE per field for shard routing.
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-        size_t shard = SeriesId128::Hash{}(seriesId) % seastar::smp::count;
+        size_t shard = timestar::routeToCore(seriesId);
 
         // Create ONE TimeStarInsert with ALL values for this field.
         // Move values from the MWP's FieldArrays directly into the TimeStarInsert
@@ -1526,7 +1534,7 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
 
         // Compute SeriesId128 ONCE per field for shard routing.
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-        size_t shard = SeriesId128::Hash{}(seriesId) % seastar::smp::count;
+        size_t shard = timestar::routeToCore(seriesId);
 
         // Handle each variant type explicitly, accumulating into per-shard vectors
         if (std::holds_alternative<double>(fieldValue)) {

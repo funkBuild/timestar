@@ -28,6 +28,7 @@ private:
     // std::map is optimal for this use case (small dataset, maintains sorted order)
     std::map<SeriesId128, TSMIndexEntry> indexEntries;
     std::string filename;
+    int compressionLevel_ = 1;  // zstd level: 1=fast (fresh writes), 3=better ratio (compacted)
 
     void writeHeader();
 
@@ -36,6 +37,10 @@ private:
 
 public:
     TSMWriter(std::string _filename);
+
+    // Set zstd compression level for string blocks (higher = better ratio, slower).
+    // Call before writing any series. Default is 1 (fast).
+    void setCompressionLevel(int level) { compressionLevel_ = level; }
 
     template <class T>
     void writeSeries(TSMValueType seriesType, const SeriesId128& seriesId, const std::vector<uint64_t>& timestamps,

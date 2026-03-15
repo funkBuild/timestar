@@ -66,6 +66,11 @@ struct SparseIndexEntry {
     // full index entry — critical for narrow-range queries with many TSM files.
     uint64_t minTime = 0;
     uint64_t maxTime = 0;
+    // v3 block-level stats cached from first/last block for zero-I/O LATEST/FIRST.
+    // Populated during readSparseIndex() for Float series in v3 files.
+    double firstValue = 0.0;   // blockFirstValue from the first block
+    double latestValue = 0.0;  // blockLatestValue from the last block
+    bool hasExtendedStats = false;
 };
 
 typedef struct TSMIndexEntry {
@@ -92,15 +97,25 @@ private:
     tsl::robin_map<SeriesId128, SparseIndexEntry, SeriesId128::Hash> sparseIndex;
     bloom_filter seriesBloomFilter;
 
-    // Full index cache with LRU eviction for hot series
-    // LRU list: front = most recently used, back = least recently used
+    // Full index cache with byte-budgeted LRU eviction for hot series.
+    // Budget limits total memory instead of entry count, preventing large series
+    // (many blocks) from consuming disproportionate memory.
     using LRUList = std::list<std::pair<SeriesId128, TSMIndexEntry>>;
     mutable LRUList lruList;
     mutable std::unordered_map<SeriesId128, LRUList::iterator, SeriesId128::Hash> fullIndexCache;
+    mutable size_t fullIndexCacheBytes = 0;
+
+    static size_t estimateEntryBytes(const TSMIndexEntry& entry) {
+        return sizeof(TSMIndexEntry) + entry.indexBlocks.size() * sizeof(TSMIndexBlock)
+               + sizeof(std::pair<SeriesId128, TSMIndexEntry>);  // list node overhead
+    }
 
     // Configuration for bloom filter and cache (read from TOML config)
     static double bloomFpr() { return timestar::config().storage.tsm_bloom_fpr; }
-    static size_t maxCacheEntries() { return timestar::config().storage.tsm_cache_entries; }
+    // Byte budget per TSM file (default: 4096 entries * ~200 bytes ≈ 800KB)
+    static size_t maxCacheBytes() {
+        return timestar::config().storage.tsm_cache_entries * 200;
+    }
 
     // Tombstone support
     std::unique_ptr<timestar::TSMTombstone> tombstones;
@@ -147,6 +162,31 @@ public:
         if (it == sparseIndex.end())
             return false;
         return it->second.minTime <= endTime && startTime <= it->second.maxTime;
+    }
+
+    // Sparse index time bound accessors (no I/O — used for LATEST/FIRST file ordering)
+    uint64_t getSeriesMaxTime(const SeriesId128& seriesId) const {
+        auto it = sparseIndex.find(seriesId);
+        return (it != sparseIndex.end()) ? it->second.maxTime : 0;
+    }
+    uint64_t getSeriesMinTime(const SeriesId128& seriesId) const {
+        auto it = sparseIndex.find(seriesId);
+        return (it != sparseIndex.end()) ? it->second.minTime : std::numeric_limits<uint64_t>::max();
+    }
+
+    // Zero-I/O LATEST/FIRST from sparse index v3 stats.
+    // Returns the latest or first (timestamp, value) for a series without any disk reads.
+    // Returns nullopt if series not found or stats unavailable.
+    struct PointResult { uint64_t timestamp; double value; };
+    std::optional<PointResult> getLatestFromSparse(const SeriesId128& seriesId) const {
+        auto it = sparseIndex.find(seriesId);
+        if (it == sparseIndex.end() || !it->second.hasExtendedStats) return std::nullopt;
+        return PointResult{it->second.maxTime, it->second.latestValue};
+    }
+    std::optional<PointResult> getFirstFromSparse(const SeriesId128& seriesId) const {
+        auto it = sparseIndex.find(seriesId);
+        if (it == sparseIndex.end() || !it->second.hasExtendedStats) return std::nullopt;
+        return PointResult{it->second.minTime, it->second.firstValue};
     }
 
     // Block batching utilities

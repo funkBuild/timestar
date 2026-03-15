@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace timestar::index {
 
@@ -112,15 +114,17 @@ seastar::future<> Manifest::appendRecord(const std::string& record) {
 
     auto path = manifestPath_;
     co_await seastar::async([path, frame = std::move(frame)] {
-        std::ofstream ofs(path, std::ios::binary | std::ios::app);
-        if (!ofs.is_open()) {
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
             throw std::runtime_error("Failed to open manifest for append: " + path);
         }
-        ofs.write(frame.data(), static_cast<std::streamsize>(frame.size()));
-        if (!ofs.good()) {
+        ssize_t written = ::write(fd, frame.data(), frame.size());
+        if (written < 0 || static_cast<size_t>(written) != frame.size()) {
+            ::close(fd);
             throw std::runtime_error("Failed to write to manifest: " + path);
         }
-        ofs.flush();
+        ::fsync(fd);
+        ::close(fd);
     });
 }
 
@@ -133,10 +137,31 @@ seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
 }
 
 seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers) {
+    if (fileNumbers.empty()) co_return;
+
+    // Batch all removal records into a single write+fsync to avoid O(N) fsyncs.
+    std::string batchFrame;
     for (uint64_t fn : fileNumbers) {
-        co_await appendRecord(serializeRemoveFile(fn));
+        std::string record = serializeRemoveFile(fn);
+        encodeFixed32(batchFrame, static_cast<uint32_t>(record.size()));
+        batchFrame.append(record);
         std::erase_if(files_, [fn](const SSTableMetadata& f) { return f.fileNumber == fn; });
     }
+
+    auto path = manifestPath_;
+    co_await seastar::async([path, batchFrame = std::move(batchFrame)] {
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
+            throw std::runtime_error("Failed to open manifest for append: " + path);
+        }
+        ssize_t written = ::write(fd, batchFrame.data(), batchFrame.size());
+        if (written < 0 || static_cast<size_t>(written) != batchFrame.size()) {
+            ::close(fd);
+            throw std::runtime_error("Failed to write to manifest: " + path);
+        }
+        ::fsync(fd);
+        ::close(fd);
+    });
 }
 
 seastar::future<> Manifest::writeSnapshot() {
@@ -147,14 +172,29 @@ seastar::future<> Manifest::writeSnapshot() {
 
     auto path = manifestPath_;
     co_await seastar::async([path, frame = std::move(frame)] {
-        // Write atomically: write to temp, then rename
+        // Write atomically: write to temp, fsync, then rename
         auto tmpPath = path + ".tmp";
         {
-            std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
-            ofs.write(frame.data(), static_cast<std::streamsize>(frame.size()));
-            ofs.flush();
+            int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                throw std::runtime_error("Failed to open manifest temp: " + tmpPath);
+            }
+            ssize_t written = ::write(fd, frame.data(), frame.size());
+            if (written < 0 || static_cast<size_t>(written) != frame.size()) {
+                ::close(fd);
+                throw std::runtime_error("Failed to write manifest snapshot: " + tmpPath);
+            }
+            ::fsync(fd);
+            ::close(fd);
         }
         std::filesystem::rename(tmpPath, path);
+        // fsync parent directory so rename is durable
+        auto dir = std::filesystem::path(path).parent_path().string();
+        int dirfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dirfd >= 0) {
+            ::fsync(dirfd);
+            ::close(dirfd);
+        }
     });
 }
 

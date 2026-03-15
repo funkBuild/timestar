@@ -2,11 +2,13 @@
 #define NATIVE_INDEX_SSTABLE_H_INCLUDED
 
 #include "block.hpp"
+#include "block_cache.hpp"
 #include "bloom_filter.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <string>
 #include <string_view>
@@ -49,15 +51,23 @@ struct IndexEntry {
 };
 
 // Writes a sorted sequence of key-value pairs to an SSTable file.
+// Step 3: Streaming writes — opens file at create(), flushes blocks to disk
+// as the write buffer fills, bounding memory to ~256KB instead of unbounded.
 class SSTableWriter {
 public:
-    // Create a writer for a new SSTable file.
+    // Create a writer for a new SSTable file. Opens the file handle.
+    // compressionLevel: zstd level (1=fast for L0 flushes, 3=better ratio for compacted L1+).
     static seastar::future<SSTableWriter> create(std::string filename, int blockSize = 16384,
-                                                  int bloomBitsPerKey = 15);
+                                                  int bloomBitsPerKey = 15, int compressionLevel = 1);
 
     // Add a key-value pair. Keys MUST be added in sorted order.
-    // Buffers data in memory — no I/O until finish().
+    // Synchronous — buffers data in memory. Call flushPending() periodically
+    // to stream accumulated data to disk when the buffer exceeds the threshold.
     void add(std::string_view key, std::string_view value);
+
+    // Stream-flush pending data to disk if the write buffer exceeds the threshold.
+    // Call periodically between add() calls to bound memory usage.
+    seastar::future<> flushPending();
 
     // Finalize the SSTable: flush remaining block, write bloom filter,
     // index block, and footer. Returns metadata about the written file.
@@ -72,35 +82,51 @@ private:
     SSTableWriter() = default;
 
     void flushBlock();
+    seastar::future<> maybeStreamFlush();
+    seastar::future<> streamFlush();
 
     std::string filename_;
     BlockBuilder currentBlock_;
     BloomFilter bloom_;
     std::vector<IndexEntry> index_;
-    std::string pendingData_;  // All block data buffered here until finish()
-    uint64_t fileOffset_ = 0;
+    std::string pendingData_;  // Bounded write buffer (~256KB)
+    uint64_t fileOffset_ = 0;       // Logical data offset (for index entries)
+    uint64_t diskOffset_ = 0;       // Physical write position on disk
     size_t entryCount_ = 0;
     int blockSize_;
+    int compressionLevel_;
     std::string firstKey_;
     std::string lastKey_;
     std::string currentBlockFirstKey_;
+
+    // Step 3: Streaming I/O
+    seastar::file file_;
+    bool fileOpen_ = false;
+    size_t dmaAlign_ = 0;
+    static constexpr size_t STREAM_FLUSH_THRESHOLD = 256 * 1024;
 };
 
 // Reads an SSTable file and provides point lookups and range iteration.
-// After open(), the entire file is cached in memory and the file handle is
-// released. All subsequent operations are synchronous memory accesses.
+// Step 1: Lazy block loading — only footer, index, and bloom filter are parsed
+// at open(). Data blocks are decompressed on demand.
+// Step 2: Optional shared block cache avoids repeated decompression of hot blocks.
 class SSTableReader {
 public:
     // Open an existing SSTable file. Reads entire file into memory,
-    // decompresses all blocks eagerly, then closes the file handle.
-    static seastar::future<std::unique_ptr<SSTableReader>> open(std::string filename);
+    // parses footer/index/bloom, but does NOT decompress data blocks.
+    static seastar::future<std::unique_ptr<SSTableReader>> open(std::string filename,
+                                                                 BlockCache* cache = nullptr);
 
     // Point lookup: returns the value for a key, or nullopt if not found.
     // Uses bloom filter to skip unnecessary block reads.
-    // Synchronous — all data is in memory after open().
+    // Reads compressed block from disk on demand (cached if block cache provided).
     std::optional<std::string> get(std::string_view key);
 
-    // Range iteration — all operations are synchronous after open().
+    // Step 8: Existence check without copying the value.
+    // Returns true if the key exists, false otherwise.
+    bool contains(std::string_view key);
+
+    // Range iteration.
     class Iterator {
     public:
         void seek(std::string_view target);
@@ -119,6 +145,7 @@ public:
         SSTableReader* reader_;
         bool valid_ = false;
         size_t blockIndex_ = 0;  // Current index entry
+        std::string blockData_;  // Step 1: owned decompressed block data
         std::unique_ptr<BlockReader> blockReader_;
         BlockReader::Iterator blockIter_;
         std::string key_;
@@ -133,21 +160,42 @@ public:
     const SSTableMetadata& metadata() const { return metadata_; }
     const std::string& filename() const { return filename_; }
 
-    // No-op: file handle released after open().
-    seastar::future<> close() { return seastar::make_ready_future<>(); }
+    // Step 1: close() releases raw file data.
+    // Step 2: Proactively evicts blocks from the shared cache.
+    seastar::future<> close();
+
+    // Decompress a single block from the raw file data. Returns the
+    // decompressed block content. Does NOT consult the block cache.
+    std::string decompressBlock(size_t blockIndex) const;
+
+    size_t blockCount() const { return index_.size(); }
+    uint64_t cacheId() const { return cacheId_; }
 
 private:
     SSTableReader() = default;
 
-    // Returns a reference to the cached decompressed block data.
-    const std::string& readBlock(size_t blockIndex);
+    // Find the block index for a key via binary search on the index.
+    size_t findBlock(std::string_view key) const;
+
+    // Get decompressed block data, checking cache first.
+    // |fallback| is populated on cache miss without a block cache.
+    // Returns a reference valid until the next cache mutation on this shard.
+    const std::string& getDecompressedBlock(size_t idx, std::string& fallback) const;
 
     std::string filename_;
     SSTableMetadata metadata_;
     BloomFilter bloom_;
     std::vector<IndexEntry> index_;
-    std::string fileData_;                        // Entire file cached in memory
-    std::vector<std::string> decompressedBlocks_; // Eagerly decompressed blocks
+
+    // On-disk streaming: keep a POSIX fd open for synchronous pread() of data blocks.
+    // Only metadata (bloom + index) is held in memory — data blocks are read on demand
+    // and cached via the block cache. This bounds per-SSTable memory to O(bloom + index)
+    // instead of O(file_size).
+    int readFd_ = -1;
+
+    // Step 2: Block cache (optional, shared across SSTables on this shard)
+    BlockCache* blockCache_ = nullptr;
+    uint64_t cacheId_ = 0;
 };
 
 }  // namespace timestar::index

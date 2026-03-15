@@ -37,7 +37,20 @@ enum IndexKeyType : uint8_t {
     FIELD_TYPE = 0x09,               // measurement+field -> field type (float, bool, string, integer)
     MEASUREMENT_SERIES = 0x0A,       // measurement+\0+series_id -> (empty) for fast measurement->series lookup
     RETENTION_POLICY = 0x0B,         // measurement -> JSON retention policy
-    MEASUREMENT_FIELD_SERIES = 0x0C  // measurement+\0+field+\0+series_id -> (empty) for single-field lookup
+    MEASUREMENT_FIELD_SERIES = 0x0C, // measurement+\0+field+\0+series_id -> (empty) for single-field lookup
+
+    // Phase 2: Roaring bitmap postings
+    LOCAL_ID_FORWARD  = 0x10,        // localId (4B LE) -> SeriesId128 (16B)
+    LOCAL_ID_REVERSE  = 0x11,        // SeriesId128 (16B) -> localId (4B LE)
+    LOCAL_ID_COUNTER  = 0x12,        // singleton -> next localId counter (4B LE)
+    POSTINGS_BITMAP   = 0x13,        // measurement\0tagKey\0tagValue -> serialized roaring bitmap
+
+    // Phase 3: Time-scoped postings
+    TIME_SERIES_DAY   = 0x0D,        // measurement\0day(4B LE) -> roaring bitmap of active LocalIds
+
+    // Phase 4: Cardinality estimation
+    CARDINALITY_HLL   = 0x14,        // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
+    MEASUREMENT_BLOOM = 0x15         // measurement\0 -> serialized bloom filter of all LocalIds
 };
 
 // Metadata for a time series

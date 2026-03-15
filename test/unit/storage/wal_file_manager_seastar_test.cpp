@@ -1022,7 +1022,7 @@ TEST_F(WALFileManagerSeastarTest, ShardedWALFileManagerOperatesIndependently) {
             tmp.addTag("shard_hint", std::to_string(i));
             std::string seriesKey = tmp.seriesKey();
             SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
-            unsigned shard = SeriesId128::Hash{}(sid) % seastar::smp::count;
+            unsigned shard = timestar::routeToCore(sid);
 
             auto resultOpt =
                 eng.eng.invoke_on(shard, [seriesKey](Engine& engine) { return engine.query(seriesKey, 0, UINT64_MAX); })

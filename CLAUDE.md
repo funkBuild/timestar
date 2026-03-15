@@ -53,7 +53,7 @@ Test coverage includes:
 - Encoding algorithms (Float, Boolean, String, Integer)
 - Query system (Parser, Planner, Aggregator, Runner)
 - HTTP handlers (Write, Query, Metadata)
-- Index system (LevelDB metadata index)
+- Index system (distributed NativeIndex, per-shard metadata)
 - End-to-end integration tests
 
 ### API Integration Tests
@@ -95,7 +95,7 @@ Test files include:
 ### Expected Test Results
 
 When all tests pass, you should see:
-- **C++ Tests**: ~2740 tests across 150+ test suites, all passing
+- **C++ Tests**: ~2836 tests across 190+ test suites, all passing
 - **Jest Tests**: 46 tests from 3 test suites, all passing
 - **Standalone Tests**: 8 tests, all passing
 
@@ -126,7 +126,7 @@ The codebase is organized around these key abstractions:
    - Indexed by series ID with min/max time bounds
    - Supports Float, Boolean, and String value types
    - Files ranked by tier number and sequence number for compaction
-   - String values compressed using Snappy compression with variable-length prefixes
+   - String values compressed using zstd compression with variable-length prefixes
 
 3. **WAL** (`lib/storage/wal.hpp/cpp`) - Write-Ahead Log for durability
    - Ensures data persistence before acknowledgment
@@ -142,7 +142,7 @@ The codebase is organized around these key abstractions:
    - `integer_encoder` - Integer compression using Simple8b
    - `float_encoder` - Float compression using ALP (Adaptive Lossless floating-Point)
    - `bool_encoder` - Boolean value compression
-   - `string_encoder` - String compression using Snappy with variable-length prefixes
+   - `string_encoder` - String compression using zstd with variable-length prefixes
    - `tsxor_encoder` - Timestamp compression using XOR
 
 6. **Query Runner** (`lib/query/query_runner.hpp/cpp`) - Executes queries across TSM files and memory stores
@@ -175,8 +175,8 @@ The build system automatically selects the appropriate compiler:
 - Seastar (included as submodule in `external/seastar`)
 - Google Test (fetched automatically for tests)
 - Glaze (fetched automatically for JSON parsing)
-- Snappy compression library
-- LevelDB (install with `sudo apt install libleveldb-dev` on Ubuntu/Debian)
+- CRoaring (fetched automatically for roaring bitmap postings)
+- Zstd (fetched automatically for compression)
 - Threads library
 
 ## Data Storage
@@ -184,7 +184,7 @@ The build system automatically selects the appropriate compiler:
 The database creates shard directories (`shard_0`, `shard_1`, etc.) in the build directory, each containing:
 - `wal/` - Write-ahead log files
 - `tsm/` - TSM data files
-- `index/` - LevelDB index files for metadata and series lookup
+- `native_index/` - NativeIndex files (SSTable + WAL) for metadata and series lookup
 
 ## String Type Implementation
 
@@ -192,7 +192,7 @@ The TimeStar includes full support for string time series data with the followin
 
 ### String Encoder (`lib/encoding/string_encoder.hpp/cpp`)
 
-- **Compression**: Uses Snappy compression for efficient string storage
+- **Compression**: Uses zstd compression for efficient string storage
 - **Encoding Format**: Variable-length prefixes followed by compressed string data
 - **API**: 
   - `encode(values, buffer)` - Encodes vector of strings into compressed buffer
@@ -204,7 +204,7 @@ The TimeStar includes full support for string time series data with the followin
 - **Template Support**: TSM read/write operations fully templated for `std::string`
 - **Query Integration**: String queries supported through `TSMResult<std::string>`
 - **Memory Store**: In-memory string data before TSM flush
-- **File Format**: String blocks stored with Snappy compression in TSM files
+- **File Format**: String blocks stored with zstd compression in TSM files
 
 ### Testing Framework
 
@@ -216,7 +216,7 @@ Due to Seastar's architecture limitation (single `app_template` per process), st
 
 ### Features Verified
 
-- ✅ String encoding/decoding with Snappy compression
+- ✅ String encoding/decoding with zstd compression
 - ✅ TSM file read/write operations  
 - ✅ Memory store integration
 - ✅ Mixed data type support (float, bool, string)
@@ -225,13 +225,16 @@ Due to Seastar's architecture limitation (single `app_template` per process), st
 - ✅ Special character support (UTF-8, JSON, paths)
 - ✅ Multi-block data spanning
 
-## LevelDB Index System
+## Distributed Index System
 
-The TimeStar includes a LevelDB-based indexing system for efficient metadata queries and series discovery:
+The TimeStar uses a Seastar-native NativeIndex (LSM-tree based) for metadata, with each shard maintaining its own index co-located with its data. Schema metadata (measurements, fields, tags) is broadcast to all shards via `invoke_on_all` for local cache reads.
 
-### Index Architecture (`lib/index/leveldb_index.hpp/cpp`)
+### Index Architecture (`lib/index/native/native_index.hpp/cpp`)
 
-- **Per-Shard Storage**: Each shard maintains its own LevelDB index in `shard_N/index/`
+- **Per-Shard Storage**: Each shard maintains its own NativeIndex in `shard_N/native_index/`
+- **Co-located Metadata**: Series metadata lives on the same shard as the series data
+- **Schema Broadcast**: Field/tag/type metadata is broadcast to all shards for local reads
+- **No Shard-0 Bottleneck**: All index operations are local — no cross-shard RPCs for metadata
 - **Key Encoding**: Different index types use prefixed keys for separation:
   - `0x01`: Series mapping (`measurement+tags+field → series_id`)
   - `0x02`: Measurement fields (`measurement → [field1, field2, ...]`)
@@ -244,20 +247,23 @@ The TimeStar includes a LevelDB-based indexing system for efficient metadata que
   - `0x09`: Field type (`measurement+field → field type`)
   - `0x0A`: Measurement series (`measurement+\0+series_id → empty, for fast lookup`)
   - `0x0B`: Retention policy (`measurement → JSON retention policy`)
+  - `0x0D`: Time-series day bitmap (`measurement+\0+day(4B LE) → roaring bitmap of active local IDs`)
 
 ### Features
 
 - **Series ID Generation**: Automatic numeric series ID assignment for efficient storage
 - **Metadata Indexing**: Fast lookup of measurements, fields, and tag key/values
 - **Batch Operations**: Efficient bulk indexing during data ingestion
-- **Snappy Compression**: Built-in LevelDB compression for space efficiency
+- **Zstd Compression**: Built-in LevelDB compression for space efficiency
 - **Bloom Filters**: Optimized point lookups with configurable bloom filter
 
 ### Engine Integration
 
-- **Automatic Indexing**: All inserts are indexed transparently via `Engine::insert()`
-- **Query Support**: New query methods like `queryBySeries()` for structured queries
-- **Metadata APIs**: Methods to discover measurement fields, tags, and tag values
+- **Local Indexing**: Each shard indexes its own metadata via `Engine::insert()` — no cross-shard forwarding
+- **Schema Broadcast**: `indexMetadataSync()` dispatches metadata to owning shards, then broadcasts schema changes to all shards via `broadcastSchemaUpdate()`
+- **Scatter-Gather Queries**: Query handler discovers series on each shard locally, then merges results
+- **Local Metadata API**: `/measurements`, `/tags`, `/fields` endpoints read from local schema caches — no shard-0 bottleneck
+- **Query Support**: `queryBySeries()` and structured queries work with local index
 - **Backwards Compatibility**: Existing string-based series keys still supported
 
 ### API Examples

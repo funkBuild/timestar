@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <fmt/core.h>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -98,18 +99,19 @@ std::string IndexWAL::walFileName(const std::string& dir, uint64_t generation) {
 }
 
 IndexWAL::~IndexWAL() {
-    // If there's unflushed data, write it directly via POSIX I/O.
-    // Can't use async operations in destructors, so bypass Seastar.
+    // Safety net: flush unflushed data via non-blocking POSIX write.
+    // close() should be called before destruction in normal shutdown.
+    // Avoiding ::fsync() here — it can block for seconds and stall the reactor.
+    // The data is durable enough via write() + OS page cache; WAL replay will
+    // handle any incomplete records on next startup.
     if ((!buffer_.empty() || !tailBuf_.empty()) && !currentPath_.empty()) {
         int fd = ::open(currentPath_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
-            if (!tailBuf_.empty()) ::write(fd, tailBuf_.data(), tailBuf_.size());
-            if (!buffer_.empty()) ::write(fd, buffer_.data(), buffer_.size());
-            ::fsync(fd);
+            if (!tailBuf_.empty()) { auto r = ::write(fd, tailBuf_.data(), tailBuf_.size()); (void)r; }
+            if (!buffer_.empty()) { auto r = ::write(fd, buffer_.data(), buffer_.size()); (void)r; }
             ::close(fd);
         }
     }
-    // Close the Seastar file handle
     if (walFile_) {
         walFile_->close().handle_exception([](auto) {});
         walFile_.reset();

@@ -5,6 +5,7 @@
 #include "http_query_handler.hpp"
 #include "leveldb_index.hpp"
 #include "query_parser.hpp"
+#include "schema_update.hpp"
 #include "query_planner.hpp"
 #include "query_result.hpp"
 #include "retention_policy.hpp"
@@ -82,10 +83,13 @@ public:
     seastar::future<SeriesId128> indexMetadata(TimeStarInsert<T> insertRequest);
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops);
 
-    // Synchronous metadata indexing: dispatches metaOps to shard 0's LevelDB index
-    // and awaits completion before returning. Guarantees metadata is queryable by the
-    // time the write response is sent. Can be called from any shard.
+    // Synchronous metadata indexing: dispatches metaOps to each owning shard's index
+    // and broadcasts schema changes to all shards. Guarantees metadata is queryable
+    // by the time the write response is sent. Can be called from any shard.
     seastar::future<> indexMetadataSync(std::vector<MetadataOp> metaOps);
+
+    // Broadcast a SchemaUpdate to all shards' NativeIndex caches.
+    seastar::future<> broadcastSchemaUpdate(timestar::index::SchemaUpdate update);
 
     seastar::future<> rolloverMemoryStore();
     // Returns std::nullopt if series doesn't exist (rather than throwing)

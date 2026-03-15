@@ -144,22 +144,16 @@ TEST_F(EngineDeletePhantomTest, ConstructsSeriesKeyForDeleteRange) {
            "to deleteRange().";
 }
 
-// Verify the existence check routes to shard 0 for metadata lookup.
-// Since metadata lives only on shard 0's LevelDB, the getSeriesId call
-// (which checks getSeriesMetadata) must be invoked on shard 0 to work
-// correctly when deleteRangeBySeries is called on a non-zero shard.
+// Verify the existence check uses local index lookup.
+// With the distributed index, each shard has its own NativeIndex containing
+// metadata for its series. The getSeriesId call uses the local index directly.
 TEST_F(EngineDeletePhantomTest, RoutesMetadataCheckToShard0) {
     std::string funcBody = extractDeleteRangeBySeriesFunction();
     ASSERT_FALSE(funcBody.empty());
 
-    // The function should use shardedRef or invoke_on(0,...) for cross-shard
-    // metadata lookup, or at minimum check the shard and handle accordingly
-    bool routesToShard0 = funcBody.find("invoke_on(0") != std::string::npos ||
-                          funcBody.find("invoke_on( 0") != std::string::npos ||
-                          funcBody.find("shardedRef") != std::string::npos;
+    // With distributed index, deleteRangeBySeries uses local index.getSeriesId()
+    bool usesLocalIndex = funcBody.find("index.getSeriesId") != std::string::npos;
 
-    EXPECT_TRUE(routesToShard0) << "deleteRangeBySeries() must route the getSeriesId() metadata "
-                                   "lookup to shard 0 (via shardedRef->invoke_on(0, ...)) because "
-                                   "metadata is only stored in shard 0's LevelDB. Without this, "
-                                   "the lookup will always return nullopt on non-zero shards.";
+    EXPECT_TRUE(usesLocalIndex) << "deleteRangeBySeries() must use the local index.getSeriesId() "
+                                   "for metadata lookup in the distributed index model.";
 }
