@@ -177,10 +177,13 @@ FetchContent_MakeAvailable(glaze googlebenchmark robin-map highway roaring zstd)
 
 # ─────────────────────────────── sub‑directories ─────────────────────────────
 
-enable_testing()
-
 add_subdirectory(lib)
 add_subdirectory(bin)
-add_subdirectory(test)
+
+option(TIMESTAR_BUILD_TESTS "Build test executables" ON)
+if(TIMESTAR_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(test)
+endif()
 
 # End of CMakeLists.txt

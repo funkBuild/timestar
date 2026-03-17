@@ -3,14 +3,18 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #  Build:  docker build -t timestar .
 #  Run:    docker run --rm -p 8086:8086 timestar
+#
+#  Stages:
+#    deps    — build tools and system libraries (cached aggressively in CI)
+#    builder — compiles the TimeStar server binary
+#    runtime — minimal production image
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ---------------------------------------------------------------------------
-#  Stage 1 — build
+#  Stage 1 — deps: build tools and system libraries
+#  CI caches this layer via buildx GHA cache; rebuilds only when packages change.
 # ---------------------------------------------------------------------------
-FROM ubuntu:24.04 AS builder
-
-ARG ENABLE_LTO=OFF
+FROM ubuntu:24.04 AS deps
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -28,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     meson \
     stow \
     libtool \
+    ccache \
     # Seastar deps
     libboost-all-dev \
     libc-ares-dev \
@@ -54,11 +59,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Use GCC 14
 ENV CC=gcc-14 CXX=g++-14
 
+# ---------------------------------------------------------------------------
+#  Stage 2 — builder: compile the TimeStar server
+# ---------------------------------------------------------------------------
+FROM deps AS builder
+
+ARG ENABLE_LTO=OFF
+
 WORKDIR /src
 COPY . .
 
-# Initialise the seastar submodule (stripped from context by .dockerignore's .git/ exclusion,
-# so we need the full source tree — see note below)
 # NOTE: .dockerignore excludes .git/ for speed. If you use this Dockerfile,
 # either: (a) remove ".git/" from .dockerignore, or (b) ensure external/seastar
 # is already populated (e.g. via `git submodule update --init` before `docker build`).
@@ -72,13 +82,14 @@ RUN mkdir -p build && cd build && \
       -DCMAKE_CXX_COMPILER=g++-14 \
       -DTIMESTAR_ENABLE_LTO=${ENABLE_LTO} \
       -DTIMESTAR_NATIVE_ARCH=OFF \
-    && ninja timestar_http_server timestar_unit_test timestar_test
+      -DTIMESTAR_BUILD_TESTS=OFF \
+    && ninja -j$(nproc) timestar_http_server
 
 # Strip debug symbols — shrinks binary from ~500 MB to ~20 MB
 RUN strip --strip-all build/bin/timestar_http_server
 
 # ---------------------------------------------------------------------------
-#  Stage 2 — minimal runtime image
+#  Stage 3 — minimal runtime image
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
 
