@@ -296,30 +296,12 @@ std::vector<std::string> QueryParser::parseGroupBy(const std::string& query, siz
     return tags;
 }
 
-std::string QueryParser::trim(const std::string& str) {
-    std::string_view sv = trimView(str);
-    return std::string(sv);
-}
-
 std::string_view QueryParser::trimView(std::string_view str) {
     size_t first = str.find_first_not_of(" \t\n\r");
     if (first == std::string_view::npos)
         return {};
     size_t last = str.find_last_not_of(" \t\n\r");
     return str.substr(first, last - first + 1);
-}
-
-std::vector<std::string> QueryParser::split(const std::string& str, char delimiter) {
-    std::vector<std::string> result;
-    size_t start = 0;
-    size_t end = str.find(delimiter);
-    while (end != std::string::npos) {
-        result.push_back(str.substr(start, end - start));
-        start = end + 1;
-        end = str.find(delimiter, start);
-    }
-    result.push_back(str.substr(start));
-    return result;
 }
 
 void QueryParser::skipWhitespace(const std::string& str, size_t& pos) {

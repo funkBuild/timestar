@@ -1,5 +1,4 @@
-#ifndef SERIES_KEY_HPP_INCLUDED
-#define SERIES_KEY_HPP_INCLUDED
+#pragma once
 
 #include <map>
 #include <string>
@@ -31,5 +30,3 @@ inline std::string buildSeriesKey(const std::string& measurement, const std::map
 }
 
 }  // namespace timestar
-
-#endif  // SERIES_KEY_HPP_INCLUDED

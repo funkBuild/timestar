@@ -70,8 +70,8 @@ TEST_F(EngineSeastarTest, InitWithBackgroundTasks) {
         .get();
 }
 
-// NativeIndex does not use file-level locking like LevelDB, so double-init
-// is silently accepted (no-op on second open). This test was LevelDB-specific.
+// NativeIndex does not use file-level locking, so double-init
+// is silently accepted (no-op on second open).
 // TEST_F(EngineSeastarTest, DoubleInitThrowsDueToLock) { ... }
 
 // ===========================================================================
@@ -872,7 +872,7 @@ TEST_F(EngineSeastarTest, CrossShardQueryAllShards) {
 
 TEST_F(EngineSeastarTest, ExecuteLocalQueryWithSeriesIds) {
     // executeLocalQuery calls index.getSeriesMetadata() which requires
-    // the LevelDB index.  The index is only open on shard 0, so this
+    // the NativeIndex.  The index is only open on shard 0, so this
     // test uses a single-shard ScopedEngine where shard 0 holds both
     // the index and the data.
     seastar::thread([] {

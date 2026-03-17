@@ -1,5 +1,4 @@
-#ifndef TRANSFORM_FUNCTIONS_SIMD_H_INCLUDED
-#define TRANSFORM_FUNCTIONS_SIMD_H_INCLUDED
+#pragma once
 
 /**
  * SIMD-Optimized Transform Functions
@@ -168,5 +167,3 @@ void multiply_inplace(std::vector<double>& values, double factor);
 }  // namespace simd
 }  // namespace transform
 }  // namespace timestar
-
-#endif  // TRANSFORM_FUNCTIONS_SIMD_H_INCLUDED

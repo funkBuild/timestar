@@ -1,5 +1,4 @@
-#ifndef RESPONSE_FORMATTER_H_INCLUDED
-#define RESPONSE_FORMATTER_H_INCLUDED
+#pragma once
 
 #include "http_query_handler.hpp"
 
@@ -28,5 +27,3 @@ public:
 };
 
 }  // namespace timestar
-
-#endif  // RESPONSE_FORMATTER_H_INCLUDED

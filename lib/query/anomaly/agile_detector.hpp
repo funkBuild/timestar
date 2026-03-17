@@ -1,5 +1,4 @@
-#ifndef AGILE_DETECTOR_H_INCLUDED
-#define AGILE_DETECTOR_H_INCLUDED
+#pragma once
 
 #include "anomaly_detector.hpp"
 #include "simd_anomaly.hpp"
@@ -46,5 +45,3 @@ private:
 
 }  // namespace anomaly
 }  // namespace timestar
-
-#endif  // AGILE_DETECTOR_H_INCLUDED

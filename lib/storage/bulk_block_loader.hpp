@@ -1,5 +1,4 @@
-#ifndef BULK_BLOCK_LOADER_H_INCLUDED
-#define BULK_BLOCK_LOADER_H_INCLUDED
+#pragma once
 
 #include "series_id.hpp"
 #include "tsm.hpp"
@@ -459,5 +458,3 @@ struct MergeSegment {
 
     size_t blockCount() const { return endIdx - startIdx + 1; }
 };
-
-#endif  // BULK_BLOCK_LOADER_H_INCLUDED

@@ -1,5 +1,4 @@
-#ifndef TSM_RESULT_H_INCLUDED
-#define TSM_RESULT_H_INCLUDED
+#pragma once
 
 #include "util.hpp"
 
@@ -40,7 +39,6 @@ public:
 
 template <class T>
 class TSMResult {
-private:
 public:
     uint64_t rank;
     std::vector<std::unique_ptr<TSMBlock<T>>> blocks;
@@ -54,11 +52,24 @@ public:
         return blocks[idx].get();
     }
 
-    bool empty() { return blocks.size() == 0; }
+    bool empty() const { return blocks.empty(); }
 
-    void appendBlock(std::unique_ptr<TSMBlock<T>>& block) { blocks.push_back(std::move(block)); }
+    void appendBlock(std::unique_ptr<TSMBlock<T>>&& block) { blocks.push_back(std::move(block)); }
 
     void sort() {
+        if (blocks.size() <= 1)
+            return;
+        // Check if already sorted (common case: single-batch read or in-order completion).
+        // TSM files store blocks in order, so this saves O(n log n) work in the typical path.
+        bool sorted = true;
+        for (size_t i = 1; i < blocks.size(); ++i) {
+            if (blocks[i]->startTime() < blocks[i - 1]->startTime()) {
+                sorted = false;
+                break;
+            }
+        }
+        if (sorted)
+            return;
         std::sort(blocks.begin(), blocks.end(),
                   [](const auto& lhs, const auto& rhs) { return lhs->startTime() < rhs->startTime(); });
     }
@@ -86,5 +97,3 @@ public:
         return {allTimestamps, allValues};
     }
 };
-
-#endif

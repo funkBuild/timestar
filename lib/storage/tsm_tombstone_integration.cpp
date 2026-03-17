@@ -220,7 +220,7 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(const SeriesId128& series
     // Replace blocks with filtered result
     result.blocks.clear();
     if (!outTimestamps.empty()) {
-        result.appendBlock(filteredBlock);
+        result.appendBlock(std::move(filteredBlock));
     }
 
     co_return result;

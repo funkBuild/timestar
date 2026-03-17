@@ -1,5 +1,4 @@
-#ifndef SERIES_ALIGNER_H_INCLUDED
-#define SERIES_ALIGNER_H_INCLUDED
+#pragma once
 
 #include "derived_query.hpp"
 #include "expression_evaluator.hpp"
@@ -144,5 +143,3 @@ inline std::vector<uint64_t> generateTimestamps(uint64_t start, uint64_t end, ui
 }
 
 }  // namespace timestar
-
-#endif  // SERIES_ALIGNER_H_INCLUDED

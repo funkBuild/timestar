@@ -7,7 +7,7 @@
 
 namespace timestar::functions {
 
-FunctionPipelineExecutor::FunctionPipelineExecutor(seastar::sharded<Engine>* engine, void* index) : engine_(engine) {}
+FunctionPipelineExecutor::FunctionPipelineExecutor(seastar::sharded<Engine>* engine) : engine_(engine) {}
 
 seastar::future<void> FunctionPipelineExecutor::executeFunction(
     const std::string& functionName,

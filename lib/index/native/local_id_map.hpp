@@ -1,5 +1,4 @@
-#ifndef LOCAL_ID_MAP_H_INCLUDED
-#define LOCAL_ID_MAP_H_INCLUDED
+#pragma once
 
 #include "series_id.hpp"
 
@@ -82,5 +81,3 @@ private:
 };
 
 }  // namespace timestar::index
-
-#endif  // LOCAL_ID_MAP_H_INCLUDED

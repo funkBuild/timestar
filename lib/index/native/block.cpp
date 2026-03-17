@@ -21,7 +21,7 @@ void BlockBuilder::appendVarint32(std::string& buf, uint32_t value) {
 
 BlockBuilder::BlockBuilder(int restart_interval) : restartInterval_(restart_interval) {
     assert(restart_interval >= 1);
-    restartOffsets_.push_back(0);  // First entry is always a restart point
+    restartOffsets_.push_back(0);
 }
 
 void BlockBuilder::add(std::string_view key, std::string_view value) {
@@ -32,11 +32,10 @@ void BlockBuilder::add(std::string_view key, std::string_view value) {
         // Restart point: store full key
         restartOffsets_.push_back(static_cast<uint32_t>(buffer_.size()));
     } else {
-        // Compute shared prefix with previous key
-        size_t minLen = std::min(key.size(), lastKey_.size());
-        while (shared < minLen && key[shared] == lastKey_[shared]) {
-            ++shared;
-        }
+        // Compute shared prefix with previous key using std::mismatch (SIMD-friendly)
+        auto [it1, it2] = std::mismatch(key.begin(), key.begin() + std::min(key.size(), lastKey_.size()),
+                                         lastKey_.begin());
+        shared = static_cast<uint32_t>(std::distance(key.begin(), it1));
     }
 
     uint32_t unshared = static_cast<uint32_t>(key.size()) - shared;
@@ -54,17 +53,7 @@ void BlockBuilder::add(std::string_view key, std::string_view value) {
 }
 
 std::string BlockBuilder::finish() {
-    // Remove the initial dummy restart offset (0) if we have real entries
-    // Actually the first restart is always at offset 0, which is correct.
-    // But we added 0 in constructor AND added 0 again for first entry.
-    // Fix: the constructor pushes 0, and the first add() also pushes buffer_.size()=0.
-    // So we have a duplicate. Let's deduplicate.
-    // Actually let's just not push in constructor and handle it properly:
-    // Re-examine: constructor pushes 0, first add sees entryCount_==0, so entryCount_ % interval == 0,
-    // and pushes buffer_.size() which is also 0. So we get [0, 0, ...].
-    // Fix this by removing the constructor push and letting add() handle it.
-
-    // Remove duplicate first restart if present
+    // Remove duplicate first restart if present (constructor + first add both push 0)
     if (restartOffsets_.size() >= 2 && restartOffsets_[0] == 0 && restartOffsets_[1] == 0) {
         restartOffsets_.erase(restartOffsets_.begin());
     }

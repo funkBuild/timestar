@@ -32,12 +32,12 @@ TEST_F(QueryResultRankTest, HigherRankPreferredForSameTimestamp) {
     // Result A: rank=1 (lower priority)
     tsmResults.emplace_back(1);
     auto blockA = makeRankTestBlock({100, 200, 300}, {1.0, 2.0, 3.0});
-    tsmResults[0].appendBlock(blockA);
+    tsmResults[0].appendBlock(std::move(blockA));
 
     // Result B: rank=5 (higher priority)
     tsmResults.emplace_back(5);
     auto blockB = makeRankTestBlock({200, 300, 400}, {20.0, 30.0, 40.0});
-    tsmResults[1].appendBlock(blockB);
+    tsmResults[1].appendBlock(std::move(blockB));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -63,17 +63,17 @@ TEST_F(QueryResultRankTest, RankPriorityWithMultipleOverlaps) {
     // Result A: rank=3
     tsmResults.emplace_back(3);
     auto blockA = makeRankTestBlock({100, 200}, {1.0, 2.0});
-    tsmResults[0].appendBlock(blockA);
+    tsmResults[0].appendBlock(std::move(blockA));
 
     // Result B: rank=7 (highest)
     tsmResults.emplace_back(7);
     auto blockB = makeRankTestBlock({200, 300}, {20.0, 30.0});
-    tsmResults[1].appendBlock(blockB);
+    tsmResults[1].appendBlock(std::move(blockB));
 
     // Result C: rank=5
     tsmResults.emplace_back(5);
     auto blockC = makeRankTestBlock({200, 400}, {200.0, 400.0});
-    tsmResults[2].appendBlock(blockC);
+    tsmResults[2].appendBlock(std::move(blockC));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -98,12 +98,12 @@ TEST_F(QueryResultRankTest, NoOverlapRankIrrelevant) {
     // Result A: rank=1
     tsmResults.emplace_back(1);
     auto blockA = makeRankTestBlock({100, 200}, {1.0, 2.0});
-    tsmResults[0].appendBlock(blockA);
+    tsmResults[0].appendBlock(std::move(blockA));
 
     // Result B: rank=5
     tsmResults.emplace_back(5);
     auto blockB = makeRankTestBlock({300, 400}, {3.0, 4.0});
-    tsmResults[1].appendBlock(blockB);
+    tsmResults[1].appendBlock(std::move(blockB));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -128,12 +128,12 @@ TEST_F(QueryResultRankTest, SameRankFirstWins) {
     // Result A: rank=3
     tsmResults.emplace_back(3);
     auto blockA = makeRankTestBlock({100, 200, 300}, {1.0, 2.0, 3.0});
-    tsmResults[0].appendBlock(blockA);
+    tsmResults[0].appendBlock(std::move(blockA));
 
     // Result B: rank=3 (same rank)
     tsmResults.emplace_back(3);
     auto blockB = makeRankTestBlock({200, 300, 400}, {20.0, 30.0, 40.0});
-    tsmResults[1].appendBlock(blockB);
+    tsmResults[1].appendBlock(std::move(blockB));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 

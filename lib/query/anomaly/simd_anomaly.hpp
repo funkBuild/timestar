@@ -1,5 +1,4 @@
-#ifndef SIMD_ANOMALY_H_INCLUDED
-#define SIMD_ANOMALY_H_INCLUDED
+#pragma once
 
 #include <cmath>
 #include <cstddef>
@@ -135,5 +134,3 @@ LinearFit weightedLinearRegression(const double* x, const double* y, const doubl
 }  // namespace simd
 }  // namespace anomaly
 }  // namespace timestar
-
-#endif  // SIMD_ANOMALY_H_INCLUDED

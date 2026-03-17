@@ -1,5 +1,4 @@
-#ifndef WAL_FILE_MANAGER_H_INCLUDED
-#define WAL_FILE_MANAGER_H_INCLUDED
+#pragma once
 
 #include "memory_store.hpp"
 #include "tsm_file_manager.hpp"
@@ -149,6 +148,10 @@ public:
         return results;
     }
 
+    // Access the underlying memory stores (for batch operations that iterate
+    // all stores once instead of per-series lookups).
+    const std::vector<seastar::shared_ptr<MemoryStore>>& getMemoryStores() const { return memoryStores; }
+
     // Check if ANY memory store has data for this series within [startTime, endTime].
     // Returns on first match without allocating a vector.  Used by pushdown
     // aggregation to decide whether to fall back to the full query path.
@@ -192,5 +195,3 @@ public:
     // Delete data from memory stores and write to WAL
     seastar::future<> deleteFromMemoryStores(const std::string& seriesKey, uint64_t startTime, uint64_t endTime);
 };
-
-#endif

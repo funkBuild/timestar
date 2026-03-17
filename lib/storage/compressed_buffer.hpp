@@ -1,5 +1,4 @@
-#ifndef COMPRESSED_BUFFER_H_INCLUDED
-#define COMPRESSED_BUFFER_H_INCLUDED
+#pragma once
 
 #include <algorithm>
 #include <cstdint>
@@ -71,5 +70,3 @@ public:
         }
     }
 };
-
-#endif

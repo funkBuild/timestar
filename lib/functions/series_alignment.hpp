@@ -1,5 +1,4 @@
-#ifndef SERIES_ALIGNMENT_H_INCLUDED
-#define SERIES_ALIGNMENT_H_INCLUDED
+#pragma once
 
 #include "function_types.hpp"
 
@@ -37,5 +36,3 @@ public:
 };
 
 }  // namespace timestar::functions
-
-#endif  // SERIES_ALIGNMENT_H_INCLUDED

@@ -1,5 +1,4 @@
-#ifndef EXPRESSION_PARSER_H_INCLUDED
-#define EXPRESSION_PARSER_H_INCLUDED
+#pragma once
 
 #include "expression_ast.hpp"
 
@@ -123,5 +122,3 @@ private:
 };
 
 }  // namespace timestar
-
-#endif  // EXPRESSION_PARSER_H_INCLUDED

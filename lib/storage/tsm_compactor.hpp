@@ -1,5 +1,4 @@
-#ifndef TSM_COMPACTOR_H_INCLUDED
-#define TSM_COMPACTOR_H_INCLUDED
+#pragma once
 
 #include "query_parser.hpp"  // AggregationMethod enum
 #include "retention_policy.hpp"
@@ -422,5 +421,3 @@ public:
         return std::min(sourceTier + 1, 3UL);
     }
 };
-
-#endif  // TSM_COMPACTOR_H_INCLUDED

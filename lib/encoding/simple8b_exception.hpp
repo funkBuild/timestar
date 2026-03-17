@@ -1,5 +1,4 @@
-#ifndef SIMPLE8B_EXCEPTION_H_INCLUDED
-#define SIMPLE8B_EXCEPTION_H_INCLUDED
+#pragma once
 
 #include <cstdint>
 #include <stdexcept>
@@ -30,5 +29,3 @@ private:
                " exceeds maximum encodable value of " + std::to_string(MAX_ENCODABLE_VALUE) + " (60-bit limit)";
     }
 };
-
-#endif

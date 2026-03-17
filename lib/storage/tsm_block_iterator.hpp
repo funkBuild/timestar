@@ -1,5 +1,4 @@
-#ifndef TSM_BLOCK_ITERATOR_H_INCLUDED
-#define TSM_BLOCK_ITERATOR_H_INCLUDED
+#pragma once
 
 #include "tsm.hpp"
 #include "tsm_result.hpp"
@@ -97,5 +96,3 @@ public:
     // Get file rank (for merge priority)
     uint64_t getFileRank() const { return file->rankAsInteger(); }
 };
-
-#endif  // TSM_BLOCK_ITERATOR_H_INCLUDED

@@ -1,5 +1,4 @@
-#ifndef NATIVE_INDEX_H_INCLUDED
-#define NATIVE_INDEX_H_INCLUDED
+#pragma once
 
 #include "../index_backend.hpp"
 #include "../key_encoding.hpp"
@@ -32,17 +31,51 @@
 
 namespace timestar {
 
-// CacheSizeEstimator specializations needed for LRU caches in NativeIndex.
-// SeriesId128 and SeriesMetadata estimators are already defined in leveldb_index.hpp.
-// We need the SeriesWithMetadata vector estimator for the discovery cache.
+// CacheSizeEstimator specializations for LRU cache value types
+// (used by NativeIndex's internal LRU caches)
+
+template <>
+struct CacheSizeEstimator<SeriesId128> {
+    static size_t estimate(const SeriesId128&) { return sizeof(SeriesId128); }
+};
+
+template <>
+struct CacheSizeEstimator<SeriesMetadata> {
+    static size_t estimate(const SeriesMetadata& m) {
+        size_t sz = sizeof(SeriesMetadata);
+        sz += m.measurement.capacity();
+        sz += m.field.capacity();
+        for (const auto& [k, v] : m.tags) {
+            sz += 48 + k.capacity() + v.capacity();
+        }
+        return sz;
+    }
+};
+
+template <>
+struct CacheSizeEstimator<std::shared_ptr<const std::vector<SeriesWithMetadata>>> {
+    static size_t estimate(const std::shared_ptr<const std::vector<SeriesWithMetadata>>& ptr) {
+        if (!ptr)
+            return sizeof(std::shared_ptr<const std::vector<SeriesWithMetadata>>);
+        size_t sz = 32 + sizeof(std::vector<SeriesWithMetadata>);
+        sz += ptr->capacity() * sizeof(SeriesWithMetadata);
+        for (const auto& swm : *ptr) {
+            sz += swm.metadata.measurement.capacity();
+            sz += swm.metadata.field.capacity();
+            for (const auto& [k, v] : swm.metadata.tags) {
+                sz += 48 + k.capacity() + v.capacity();
+            }
+        }
+        return sz;
+    }
+};
 
 }  // namespace timestar
 
 namespace timestar::index {
 
 // Seastar-native LSM-tree based index backend.
-// Replaces LevelDB with DMA I/O, no thread-pool crossings.
-// Uses the same key schema and wire format as LevelDBIndex for compatibility.
+// Uses DMA I/O with no thread-pool crossings.
 class NativeIndex : public IndexBackend {
 public:
     explicit NativeIndex(int shardId);
@@ -147,7 +180,7 @@ public:
     seastar::future<size_t> getSeriesCount() override;
     seastar::future<> compact() override;
 
-    // Non-virtual: insert indexing (template, like LevelDBIndex::indexInsert)
+    // Non-virtual: insert indexing (template)
     template <class T>
     seastar::future<SeriesId128> indexInsert(const TimeStarInsert<T>& insert);
 
@@ -173,7 +206,7 @@ public:
     // Apply schema updates from other shards into local caches
     void applySchemaUpdate(const SchemaUpdate& update);
 
-    // Backward compatibility aliases for code that used LevelDBIndex::FieldStats
+    // Backward compatibility alias for code that used FieldStats
     using FieldStats = IndexFieldStats;
 
     // Static string set encoding helpers (backward compatibility)
@@ -211,10 +244,10 @@ private:
     using ScanCallback = std::function<bool(std::string_view key, std::string_view value)>;
     void kvPrefixScan(const std::string& prefix, ScanCallback fn);
 
-    // Non-blocking memtable flush (double-buffered, like LevelDB).
+    // Non-blocking memtable flush (double-buffered).
     // maybeFlushMemTable swaps the active memtable to immutable and returns immediately.
     // The actual SSTable write happens asynchronously. If a second flush triggers
-    // while the first is still in progress, we wait for it (like LevelDB's imm_ check).
+    // while the first is still in progress, we wait for it.
     seastar::future<> maybeFlushMemTable();
     seastar::future<> flushMemTable();
     seastar::future<> doFlushImmutableMemTable();  // Background flush work
@@ -321,5 +354,3 @@ private:
 };
 
 }  // namespace timestar::index
-
-#endif  // NATIVE_INDEX_H_INCLUDED

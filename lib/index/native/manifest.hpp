@@ -1,5 +1,4 @@
-#ifndef NATIVE_INDEX_MANIFEST_H_INCLUDED
-#define NATIVE_INDEX_MANIFEST_H_INCLUDED
+#pragma once
 
 #include "sstable.hpp"
 
@@ -65,5 +64,3 @@ private:
 };
 
 }  // namespace timestar::index
-
-#endif  // NATIVE_INDEX_MANIFEST_H_INCLUDED

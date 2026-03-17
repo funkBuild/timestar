@@ -1,5 +1,4 @@
-#ifndef COMPACTION_PIPELINE_H_INCLUDED
-#define COMPACTION_PIPELINE_H_INCLUDED
+#pragma once
 
 #include "tsm_compactor.hpp"
 
@@ -105,5 +104,3 @@ private:
         prefetchQueue.push(std::move(future));
     }
 };
-
-#endif  // COMPACTION_PIPELINE_H_INCLUDED

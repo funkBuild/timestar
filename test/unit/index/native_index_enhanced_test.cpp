@@ -1,11 +1,11 @@
 /*
- * Tests for enhanced LevelDB index functionality
+ * Tests for enhanced NativeIndex functionality
  * Tests group-by support, field statistics, and improved series discovery
  */
 
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
@@ -14,7 +14,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 
-class LevelDBIndexEnhancedTest : public ::testing::Test {
+class NativeIndexEnhancedTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // Clean up any existing test index
@@ -29,8 +29,8 @@ protected:
     }
 };
 
-SEASTAR_TEST_F(LevelDBIndexEnhancedTest, FindSeriesByTag) {
-    LevelDBIndex index(0);
+SEASTAR_TEST_F(NativeIndexEnhancedTest, FindSeriesByTag) {
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -67,8 +67,8 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, FindSeriesByTag) {
     co_return;
 }
 
-SEASTAR_TEST_F(LevelDBIndexEnhancedTest, GetSeriesGroupedByTag) {
-    LevelDBIndex index(0);
+SEASTAR_TEST_F(NativeIndexEnhancedTest, GetSeriesGroupedByTag) {
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -108,8 +108,8 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, GetSeriesGroupedByTag) {
     co_return;
 }
 
-SEASTAR_TEST_F(LevelDBIndexEnhancedTest, FieldStatistics) {
-    LevelDBIndex index(0);
+SEASTAR_TEST_F(NativeIndexEnhancedTest, FieldStatistics) {
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -119,7 +119,7 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, FieldStatistics) {
     SeriesId128 seriesId = co_await index.getOrCreateSeriesId(measurement, tags, "value");
 
     // Update field statistics
-    LevelDBIndex::FieldStats stats;
+    timestar::index::NativeIndex::FieldStats stats;
     stats.dataType = "float";
     stats.minTime = 1000000000;
     stats.maxTime = 2000000000;
@@ -154,8 +154,8 @@ SEASTAR_TEST_F(LevelDBIndexEnhancedTest, FieldStatistics) {
     co_return;
 }
 
-SEASTAR_TEST_F(LevelDBIndexEnhancedTest, ComplexTagQueries) {
-    LevelDBIndex index(0);
+SEASTAR_TEST_F(NativeIndexEnhancedTest, ComplexTagQueries) {
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 

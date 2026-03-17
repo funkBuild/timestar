@@ -97,7 +97,7 @@ HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const Gla
         throw std::runtime_error("Either 'series' or 'measurement' is required");
     }
 
-    // Validate strings for null bytes (would corrupt LevelDB keys)
+    // Validate strings for null bytes (would corrupt index keys)
     auto hasNullByte = [](const std::string& s) { return s.find('\0') != std::string::npos; };
     if (hasNullByte(req.measurement) || hasNullByte(req.seriesKey) || hasNullByte(req.field)) {
         throw std::runtime_error("Measurement, series, and field names must not contain null bytes");

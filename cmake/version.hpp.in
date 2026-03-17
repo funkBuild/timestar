@@ -1,18 +1,13 @@
-#ifndef TSDB_VERSION_HPP
-#define TSDB_VERSION_HPP
+#pragma once
 
-#define TSDB_VERSION_MAJOR @TSDB_VERSION_MAJOR@
-#define TSDB_VERSION_MINOR @TSDB_VERSION_MINOR@
-#define TSDB_VERSION_PATCH @TSDB_VERSION_PATCH@
-#define TSDB_VERSION "@TSDB_VERSION@"
+namespace timestar {
 
-namespace tsdb {
+constexpr int VERSION_MAJOR = @TIMESTAR_VERSION_MAJOR@;
+constexpr int VERSION_MINOR = @TIMESTAR_VERSION_MINOR@;
+constexpr int VERSION_PATCH = @TIMESTAR_VERSION_PATCH@;
+constexpr const char* VERSION = "@TIMESTAR_VERSION@";
+constexpr const char* GIT_COMMIT = "@TIMESTAR_GIT_COMMIT@";
+constexpr const char* BUILD_TIME = "@TIMESTAR_BUILD_TIME@";
+constexpr const char* COMPILER = "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@";
 
-constexpr int VERSION_MAJOR = @TSDB_VERSION_MAJOR@;
-constexpr int VERSION_MINOR = @TSDB_VERSION_MINOR@;
-constexpr int VERSION_PATCH = @TSDB_VERSION_PATCH@;
-constexpr const char* VERSION = "@TSDB_VERSION@";
-
-} // namespace tsdb
-
-#endif // TSDB_VERSION_HPP
+}  // namespace timestar

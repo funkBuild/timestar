@@ -111,7 +111,7 @@ seastar::future<> MergeIterator::findNext() {
         }
 
         // Tombstone: skip all sources at this key
-        std::string tombstoneKey(winner->key());
+        std::string_view tombstoneKey = winner->key();
         while (!heap_.empty() && sources_[heap_[0].sourceIndex]->key() == tombstoneKey) {
             auto& src = sources_[heap_[0].sourceIndex];
             co_await src->next();
@@ -181,7 +181,7 @@ void MergeIterator::findNextSync() {
         }
 
         // Tombstone: skip all sources at this key
-        std::string tombstoneKey(winner->key());
+        std::string_view tombstoneKey = winner->key();
         while (!heap_.empty() && sources_[heap_[0].sourceIndex]->key() == tombstoneKey) {
             auto& src = sources_[heap_[0].sourceIndex];
             src->nextSync();

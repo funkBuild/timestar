@@ -5,7 +5,7 @@
 #include "../../../lib/retention/retention_policy.hpp"
 
 #include "../../../lib/http/http_query_handler.hpp"
-#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
@@ -23,7 +23,7 @@ protected:
 
 // Test basic policy CRUD operations
 SEASTAR_TEST_F(RetentionPolicyTest, SetAndGetPolicy) {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     RetentionPolicy policy;
@@ -43,7 +43,7 @@ SEASTAR_TEST_F(RetentionPolicyTest, SetAndGetPolicy) {
 }
 
 SEASTAR_TEST_F(RetentionPolicyTest, GetNonExistentPolicy) {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     auto retrieved = co_await index.getRetentionPolicy("nonexistent");
@@ -53,7 +53,7 @@ SEASTAR_TEST_F(RetentionPolicyTest, GetNonExistentPolicy) {
 }
 
 SEASTAR_TEST_F(RetentionPolicyTest, DeletePolicy) {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     RetentionPolicy policy;
@@ -78,7 +78,7 @@ SEASTAR_TEST_F(RetentionPolicyTest, DeletePolicy) {
 }
 
 SEASTAR_TEST_F(RetentionPolicyTest, GetAllPolicies) {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     // Set multiple policies
@@ -116,7 +116,7 @@ SEASTAR_TEST_F(RetentionPolicyTest, GetAllPolicies) {
 }
 
 SEASTAR_TEST_F(RetentionPolicyTest, UpsertPolicy) {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     // Set initial policy
@@ -146,7 +146,7 @@ SEASTAR_TEST_F(RetentionPolicyTest, UpsertPolicy) {
 }
 
 SEASTAR_TEST_F(RetentionPolicyTest, PolicyWithDownsample) {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     RetentionPolicy policy;

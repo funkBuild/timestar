@@ -31,7 +31,7 @@ TEST_F(QueryResultMergeTest, NullBlocksSkippedWithoutOOB) {
     // Result 1: has data
     tsmResults.emplace_back(1);
     auto block1 = makeBlock({100, 200, 300}, {1.0, 2.0, 3.0});
-    tsmResults[1].appendBlock(block1);
+    tsmResults[1].appendBlock(std::move(block1));
 
     // Result 2: also empty
     tsmResults.emplace_back(2);
@@ -39,7 +39,7 @@ TEST_F(QueryResultMergeTest, NullBlocksSkippedWithoutOOB) {
     // Result 3: has data
     tsmResults.emplace_back(3);
     auto block3 = makeBlock({150, 250}, {4.0, 5.0});
-    tsmResults[3].appendBlock(block3);
+    tsmResults[3].appendBlock(std::move(block3));
 
     // Result 4: empty
     tsmResults.emplace_back(4);
@@ -74,7 +74,7 @@ TEST_F(QueryResultMergeTest, DuplicateTimestampsDeduplicated) {
     // Result 1: timestamps 100, 200, 300
     tsmResults.emplace_back(1);
     auto block1 = makeBlock({100, 200, 300}, {10.0, 20.0, 30.0});
-    tsmResults[1].appendBlock(block1);
+    tsmResults[1].appendBlock(std::move(block1));
 
     // Result 2: empty
     tsmResults.emplace_back(2);
@@ -82,7 +82,7 @@ TEST_F(QueryResultMergeTest, DuplicateTimestampsDeduplicated) {
     // Result 3: timestamps 200, 300, 400 (overlaps with result 1)
     tsmResults.emplace_back(3);
     auto block3 = makeBlock({200, 300, 400}, {21.0, 31.0, 41.0});
-    tsmResults[3].appendBlock(block3);
+    tsmResults[3].appendBlock(std::move(block3));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -110,8 +110,8 @@ TEST_F(QueryResultMergeTest, ValidResultNotFirst) {
     tsmResults.emplace_back(3);
     auto blockA = makeBlock({100, 200}, {1.0, 2.0});
     auto blockB = makeBlock({300, 400}, {3.0, 4.0});
-    tsmResults[3].appendBlock(blockA);
-    tsmResults[3].appendBlock(blockB);
+    tsmResults[3].appendBlock(std::move(blockA));
+    tsmResults[3].appendBlock(std::move(blockB));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -141,8 +141,8 @@ TEST_F(QueryResultMergeTest, MultipleValidResultsMultipleBlocks) {
     tsmResults.emplace_back(1);
     auto b1a = makeBlock({100, 300}, {1.0, 3.0});
     auto b1b = makeBlock({500, 700}, {5.0, 7.0});
-    tsmResults[1].appendBlock(b1a);
-    tsmResults[1].appendBlock(b1b);
+    tsmResults[1].appendBlock(std::move(b1a));
+    tsmResults[1].appendBlock(std::move(b1b));
 
     // Result 2: empty
     tsmResults.emplace_back(2);
@@ -151,8 +151,8 @@ TEST_F(QueryResultMergeTest, MultipleValidResultsMultipleBlocks) {
     tsmResults.emplace_back(3);
     auto b3a = makeBlock({200, 400}, {2.0, 4.0});
     auto b3b = makeBlock({600, 800}, {6.0, 8.0});
-    tsmResults[3].appendBlock(b3a);
-    tsmResults[3].appendBlock(b3b);
+    tsmResults[3].appendBlock(std::move(b3a));
+    tsmResults[3].appendBlock(std::move(b3b));
 
     // Result 4: empty
     tsmResults.emplace_back(4);
@@ -195,7 +195,7 @@ TEST_F(QueryResultMergeTest, SingleValidResult) {
     std::vector<TSMResult<double>> tsmResults;
     tsmResults.emplace_back(0);
     auto block = makeBlock({10, 20, 30}, {1.5, 2.5, 3.5});
-    tsmResults[0].appendBlock(block);
+    tsmResults[0].appendBlock(std::move(block));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 

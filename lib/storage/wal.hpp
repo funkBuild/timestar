@@ -1,5 +1,4 @@
-#ifndef WAL_H_INCLUDED
-#define WAL_H_INCLUDED
+#pragma once
 
 #include "memory_store.hpp"
 #include "series_id.hpp"
@@ -218,5 +217,3 @@ public:
     WALReader(std::string filename);
     seastar::future<> readAll(MemoryStore* store);
 };
-
-#endif  // WAL_H_INCLUDED

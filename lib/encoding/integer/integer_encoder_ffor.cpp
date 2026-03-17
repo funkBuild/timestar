@@ -203,7 +203,8 @@ void encodeBlock(const uint64_t* values, size_t count, AlignedBuffer& buf, uint6
     std::array<uint32_t, 65> bw_hist{};
     for (size_t i = 0; i < count; ++i) {
         uint64_t delta = values[i] - min_val;
-        uint8_t vbw = (delta == 0) ? 0 : static_cast<uint8_t>(64 - __builtin_clzll(delta));
+        // std::countl_zero is defined for 0 (returns 64), avoiding a branch.
+        uint8_t vbw = static_cast<uint8_t>(std::bit_width(delta));
         bw_hist[vbw]++;
     }
 

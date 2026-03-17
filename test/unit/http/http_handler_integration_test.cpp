@@ -85,7 +85,7 @@ protected:
     // More robust cleanup that tolerates partially-cleaned directories.
     // Uses the non-throwing overload of fs::remove_all and retries
     // if the first attempt fails (e.g., due to race with Engine shutdown
-    // releasing LevelDB file locks on other shards).
+    // releasing index file locks on other shards).
     static void robustCleanShardDirectories(int maxShards = 64) {
         std::error_code ec;
         for (int pass = 0; pass < 3; ++pass) {
@@ -140,10 +140,10 @@ protected:
                                                                        const std::string& tag = "") {
         auto req = std::make_unique<seastar::http::request>();
         if (!measurement.empty()) {
-            req->set_query_param("measurement", measurement);
+            req->query_parameters["measurement"] = measurement;
         }
         if (!tag.empty()) {
-            req->set_query_param("tag", tag);
+            req->query_parameters["tag"] = tag;
         }
         return req;
     }

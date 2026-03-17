@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 
@@ -199,18 +200,29 @@ seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shar
 }
 
 seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
-    // Check each tier for compaction needs
     for (uint64_t tier = 0; tier < MAX_TIERS - 1; tier++) {
         if (shouldCompactTier(tier)) {
             timestar::compactor_log.info("Tier {} needs compaction ({} files)", tier, getFileCountInTier(tier));
 
-            // Plan and execute compaction
             auto plan = compactor->planCompaction(tier);
             if (plan.isValid()) {
                 try {
-                    auto stats = co_await compactor->executeCompaction(plan);
+                    CompactionStats stats;
+                    if (_compactionGroupSet) {
+                        // Run compaction under the low-priority scheduling group so
+                        // query I/O gets preferential disk bandwidth. Pass plan as
+                        // an argument (not capture) to avoid dangling references.
+                        stats = co_await seastar::with_scheduling_group(
+                            _compactionGroup,
+                            [this](CompactionPlan p) {
+                                return compactor->executeCompaction(p);
+                            },
+                            std::move(plan));
+                    } else {
+                        stats = co_await compactor->executeCompaction(plan);
+                    }
                     timestar::compactor_log.info("Compacted {} files from tier {} to tier {} in {}ms",
-                                                 stats.filesCompacted, tier, plan.targetTier, stats.duration.count());
+                                                 stats.filesCompacted, tier, tier + 1, stats.duration.count());
                 } catch (const std::exception& e) {
                     timestar::compactor_log.error("Compaction failed for tier {}: {}. Will retry later.", tier,
                                                   e.what());
@@ -218,7 +230,6 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
             }
         }
     }
-
     co_return;
 }
 

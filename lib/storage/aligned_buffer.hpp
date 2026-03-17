@@ -1,5 +1,4 @@
-#ifndef ALIGNED_BUFFER_H_INCLUDED
-#define ALIGNED_BUFFER_H_INCLUDED
+#pragma once
 
 #include "compressed_buffer.hpp"
 
@@ -106,11 +105,18 @@ public:
     // Bulk write raw bytes (for compressed data, etc.)
     void write_bytes(const char* bytes, size_t count);
 
-    // New optimized bulk write for arrays
+    // Bulk write for arrays
     template <typename T>
     void write_array(const T* values, size_t count) {
+        // Guard against overflow: sizeof(T) * count and the subsequent add
+        if (count > 0 && count > SIZE_MAX / sizeof(T)) [[unlikely]] {
+            throw std::runtime_error("AlignedBuffer::write_array overflow");
+        }
         const size_t bytesToAdd = sizeof(T) * count;
         const size_t new_size = current_size + bytesToAdd;
+        if (new_size < current_size) [[unlikely]] {
+            throw std::runtime_error("AlignedBuffer::write_array overflow");
+        }
 
         ensure_capacity(new_size);
 
@@ -178,5 +184,3 @@ public:
 };
 
 std::ofstream& operator<<(std::ofstream& os, const AlignedBuffer& buf);
-
-#endif

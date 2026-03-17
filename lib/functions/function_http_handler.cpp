@@ -3,6 +3,7 @@
 #include "../core/engine.hpp"
 #include "../http/http_query_handler.hpp"
 #include "../query/query_parser.hpp"
+#include "../utils/json_escape.hpp"
 #include "function_security.hpp"
 
 #include <glaze/glaze.hpp>
@@ -53,42 +54,7 @@ struct glz::meta<GlazeFunctionQueryRequest> {
 
 namespace timestar::functions {
 
-// Escape a string for safe embedding in a JSON string value.
-// Prevents JSON injection when user-supplied or exception-derived strings
-// are interpolated into hand-built JSON responses.
-static std::string jsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 4);
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"':
-                out += "\\\"";
-                break;
-            case '\\':
-                out += "\\\\";
-                break;
-            case '\n':
-                out += "\\n";
-                break;
-            case '\r':
-                out += "\\r";
-                break;
-            case '\t':
-                out += "\\t";
-                break;
-            default:
-                if (c < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += static_cast<char>(c);
-                }
-                break;
-        }
-    }
-    return out;
-}
+using timestar::jsonEscape;
 
 // Per-shard instance (one per Seastar shard, no mutex needed)
 thread_local PerformanceTracker FunctionHttpHandler::performanceTracker_;

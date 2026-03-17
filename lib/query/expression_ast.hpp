@@ -1,5 +1,4 @@
-#ifndef EXPRESSION_AST_H_INCLUDED
-#define EXPRESSION_AST_H_INCLUDED
+#pragma once
 
 #include <memory>
 #include <optional>
@@ -461,5 +460,3 @@ inline const char* functionToString(FunctionType func) {
 }
 
 }  // namespace timestar
-
-#endif  // EXPRESSION_AST_H_INCLUDED

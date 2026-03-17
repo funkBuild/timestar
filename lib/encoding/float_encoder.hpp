@@ -1,5 +1,4 @@
-#ifndef FLOAT_ENCODER_MAIN_H_INCLUDED
-#define FLOAT_ENCODER_MAIN_H_INCLUDED
+#pragma once
 
 #include "../storage/compressed_buffer.hpp"
 #include "../storage/slice_buffer.hpp"
@@ -117,5 +116,3 @@ private:
     static Implementation selectBestImplementation();
     static thread_local Implementation s_forced_impl;
 };
-
-#endif  // FLOAT_ENCODER_MAIN_H_INCLUDED

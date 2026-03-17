@@ -1,5 +1,4 @@
-#ifndef VECTORIZED_SERIES_H_INCLUDED
-#define VECTORIZED_SERIES_H_INCLUDED
+#pragma once
 
 #include "function_types.hpp"
 
@@ -58,5 +57,3 @@ public:
 };
 
 }  // namespace timestar::functions
-
-#endif  // VECTORIZED_SERIES_H_INCLUDED

@@ -2,9 +2,12 @@
 
 #include "../../seastar_gtest.hpp"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <seastar/core/coroutine.hh>
+#include <unistd.h>
 
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -258,6 +261,327 @@ SEASTAR_TEST_F(SSTableTest, PrefixScan) {
         it->next();
     }
     EXPECT_EQ(count, 10);
+
+    co_await reader->close();
+}
+
+// ============================================================================
+// SSTable metadata v2 tests — write timestamp in extended footer
+// ============================================================================
+
+SEASTAR_TEST_F(SSTableTest, WriteTimestampRecorded) {
+    auto path = self->sstPath("ts_recorded.sst");
+    auto writer = co_await SSTableWriter::create(path);
+    writer.add("key1", "val1");
+    writer.add("key2", "val2");
+    auto meta = co_await writer.finish();
+
+    EXPECT_GT(meta.writeTimestamp, 0u);
+
+    auto reader = co_await SSTableReader::open(path);
+    EXPECT_GT(reader->metadata().writeTimestamp, 0u);
+    EXPECT_EQ(reader->metadata().writeTimestamp, meta.writeTimestamp);
+
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, WriteTimestampReasonable) {
+    auto beforeNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    auto path = self->sstPath("ts_reasonable.sst");
+    auto writer = co_await SSTableWriter::create(path);
+    writer.add("key1", "val1");
+    auto meta = co_await writer.finish();
+
+    auto afterNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    // writeTimestamp should be between before and after (within 10 seconds for safety)
+    EXPECT_GE(meta.writeTimestamp, beforeNs);
+    EXPECT_LE(meta.writeTimestamp, afterNs);
+
+    // Verify through reader as well
+    auto reader = co_await SSTableReader::open(path);
+    EXPECT_GE(reader->metadata().writeTimestamp, beforeNs);
+    EXPECT_LE(reader->metadata().writeTimestamp, afterNs);
+
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, ExtendedFooterRoundTrip) {
+    auto path = self->sstPath("footer_roundtrip.sst");
+    auto writer = co_await SSTableWriter::create(path, 512);
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+    }
+    auto meta = co_await writer.finish();
+
+    EXPECT_EQ(meta.entryCount, static_cast<uint64_t>(N));
+    EXPECT_EQ(meta.minKey, "key:0000");
+    EXPECT_EQ(meta.maxKey, std::format("key:{:04d}", N - 1));
+    EXPECT_GT(meta.writeTimestamp, 0u);
+
+    // Re-open and verify all metadata fields survived the round trip
+    auto reader = co_await SSTableReader::open(path);
+    const auto& rmeta = reader->metadata();
+    EXPECT_EQ(rmeta.entryCount, static_cast<uint64_t>(N));
+    EXPECT_EQ(rmeta.writeTimestamp, meta.writeTimestamp);
+    EXPECT_EQ(rmeta.minKey, "key:0000");
+
+    // Verify data is still readable
+    auto val = reader->get("key:0050");
+    EXPECT_TRUE(val.has_value());
+    EXPECT_EQ(*val, "val:0050");
+
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, EntryCountCorrectInMetadata) {
+    auto path = self->sstPath("entry_count.sst");
+    auto writer = co_await SSTableWriter::create(path);
+
+    const int N = 42;
+    for (int i = 0; i < N; ++i) {
+        writer.add(std::format("k:{:03d}", i), "v");
+    }
+    auto meta = co_await writer.finish();
+
+    EXPECT_EQ(meta.entryCount, static_cast<uint64_t>(N));
+
+    auto reader = co_await SSTableReader::open(path);
+    EXPECT_EQ(reader->metadata().entryCount, static_cast<uint64_t>(N));
+
+    // Verify by iterating
+    auto it = reader->newIterator();
+    it->seekToFirst();
+    int count = 0;
+    while (it->valid()) {
+        ++count;
+        it->next();
+    }
+    EXPECT_EQ(count, N);
+
+    co_await reader->close();
+}
+
+// ============================================================================
+// CRC32 checksum tests
+// ============================================================================
+
+SEASTAR_TEST_F(SSTableTest, CRC32ChecksumRoundTrip) {
+    auto path = self->sstPath("crc_roundtrip.sst");
+    auto writer = co_await SSTableWriter::create(path, 512);  // Small blocks to force multiple
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+    }
+    auto meta = co_await writer.finish();
+
+    EXPECT_EQ(meta.entryCount, static_cast<uint64_t>(N));
+
+    // Open and read back — CRC32 checksums are validated implicitly on every block read
+    auto reader = co_await SSTableReader::open(path);
+
+    // Point lookups (each triggers block decompression with CRC validation)
+    for (int i = 0; i < N; ++i) {
+        auto val = reader->get(std::format("key:{:04d}", i));
+        EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
+        if (val.has_value()) {
+            EXPECT_EQ(*val, std::format("val:{:04d}", i));
+        }
+    }
+
+    // Full iteration (validates CRC on every block boundary)
+    auto it = reader->newIterator();
+    it->seekToFirst();
+    int count = 0;
+    while (it->valid()) {
+        EXPECT_EQ(it->key(), std::format("key:{:04d}", count));
+        EXPECT_EQ(it->value(), std::format("val:{:04d}", count));
+        ++count;
+        it->next();
+    }
+    EXPECT_EQ(count, N);
+
+    co_await reader->close();
+}
+
+// ============================================================================
+// Two-level summary index tests
+// ============================================================================
+
+SEASTAR_TEST_F(SSTableTest, SummaryIndexLargeFile) {
+    // Write 10,000 entries with small blocks (128 bytes) to force many blocks,
+    // triggering summary index construction. Verify all entries found via get().
+    auto path = self->sstPath("summary_large.sst");
+    auto writer = co_await SSTableWriter::create(path, 128);  // Very small blocks
+    const int N = 10000;
+    for (int i = 0; i < N; ++i) {
+        writer.add(std::format("key:{:06d}", i), std::format("val:{:06d}", i));
+    }
+    auto meta = co_await writer.finish();
+    EXPECT_EQ(meta.entryCount, static_cast<uint64_t>(N));
+
+    auto reader = co_await SSTableReader::open(path);
+
+    // The file should have many blocks — enough to trigger summary construction
+    EXPECT_GT(reader->blockCount(), 128u) << "Expected enough blocks for summary index";
+
+    // Verify every entry is findable via point lookup (uses summary-accelerated findBlock)
+    for (int i = 0; i < N; ++i) {
+        auto val = reader->get(std::format("key:{:06d}", i));
+        EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
+        if (val.has_value()) {
+            EXPECT_EQ(*val, std::format("val:{:06d}", i));
+        }
+    }
+
+    // Verify non-existent keys return nullopt
+    EXPECT_FALSE(reader->get("key:999999").has_value());
+    EXPECT_FALSE(reader->get("aaa").has_value());
+    EXPECT_FALSE(reader->get("zzz").has_value());
+
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, SummaryIndexCorrectness) {
+    // Write entries with known keys, verify findBlock returns correct block
+    // for various key patterns: before first, after last, exact match, between blocks.
+    auto path = self->sstPath("summary_correct.sst");
+    auto writer = co_await SSTableWriter::create(path, 128);  // Small blocks
+    const int N = 5000;
+    for (int i = 0; i < N; ++i) {
+        // Use wide spacing in key values to test "between" lookups
+        writer.add(std::format("k:{:08d}", i * 10), std::format("v:{:08d}", i * 10));
+    }
+    auto meta = co_await writer.finish();
+    EXPECT_EQ(meta.entryCount, static_cast<uint64_t>(N));
+
+    auto reader = co_await SSTableReader::open(path);
+    EXPECT_GT(reader->blockCount(), 128u) << "Expected enough blocks for summary index";
+
+    // Test 1: Exact match lookups at various positions
+    for (int i = 0; i < N; i += 100) {
+        auto val = reader->get(std::format("k:{:08d}", i * 10));
+        EXPECT_TRUE(val.has_value()) << "Missing key at i=" << i;
+        if (val.has_value()) {
+            EXPECT_EQ(*val, std::format("v:{:08d}", i * 10));
+        }
+    }
+
+    // Test 2: Keys between existing entries should return nullopt
+    // (key:00000005 doesn't exist — only multiples of 10)
+    EXPECT_FALSE(reader->get("k:00000005").has_value());
+    EXPECT_FALSE(reader->get("k:00000015").has_value());
+    EXPECT_FALSE(reader->get("k:00025005").has_value());
+
+    // Test 3: Key before first entry
+    EXPECT_FALSE(reader->get("a:00000000").has_value());
+
+    // Test 4: Key after last entry
+    EXPECT_FALSE(reader->get("z:99999999").has_value());
+
+    // Test 5: Iterator seek still works with summary index
+    auto it = reader->newIterator();
+    it->seek("k:00005000");
+    EXPECT_TRUE(it->valid());
+    EXPECT_EQ(it->key(), "k:00005000");
+
+    // Seek between keys — should land on next key
+    it->seek("k:00005001");
+    EXPECT_TRUE(it->valid());
+    EXPECT_EQ(it->key(), "k:00005010");
+
+    // Test 6: Full iteration correctness with summary index
+    it->seekToFirst();
+    int count = 0;
+    while (it->valid()) {
+        EXPECT_EQ(it->key(), std::format("k:{:08d}", count * 10));
+        ++count;
+        it->next();
+    }
+    EXPECT_EQ(count, N);
+
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, SummaryIndexNotBuiltForSmallFiles) {
+    // Verify that summary is not built for small files (< SUMMARY_INTERVAL * 2 blocks)
+    auto path = self->sstPath("summary_small.sst");
+    auto writer = co_await SSTableWriter::create(path, 16384);  // Large blocks = fewer blocks
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+    }
+    co_await writer.finish();
+
+    auto reader = co_await SSTableReader::open(path);
+
+    // With large block size and only 100 entries, we should have very few blocks
+    // Summary should NOT be built (fewer than SUMMARY_INTERVAL * 2 blocks)
+    // But lookups should still work correctly
+    for (int i = 0; i < N; ++i) {
+        auto val = reader->get(std::format("key:{:04d}", i));
+        EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
+        if (val.has_value()) {
+            EXPECT_EQ(*val, std::format("val:{:04d}", i));
+        }
+    }
+
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, SummaryIndexContainsCheck) {
+    // Verify contains() works correctly with summary index
+    auto path = self->sstPath("summary_contains.sst");
+    auto writer = co_await SSTableWriter::create(path, 128);
+    const int N = 8000;
+    for (int i = 0; i < N; ++i) {
+        writer.add(std::format("c:{:06d}", i), "x");
+    }
+    co_await writer.finish();
+
+    auto reader = co_await SSTableReader::open(path);
+    EXPECT_GT(reader->blockCount(), 128u);
+
+    // contains() uses findBlock() internally, so this tests summary acceleration
+    for (int i = 0; i < N; i += 200) {
+        EXPECT_TRUE(reader->contains(std::format("c:{:06d}", i))) << "Missing at i=" << i;
+    }
+    EXPECT_FALSE(reader->contains("c:999999"));
+    EXPECT_FALSE(reader->contains("aaa"));
+
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, CRC32CorruptionDetected) {
+    auto path = self->sstPath("crc_corrupt.sst");
+    auto writer = co_await SSTableWriter::create(path, 512);
+    for (int i = 0; i < 50; ++i) {
+        writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+    }
+    co_await writer.finish();
+
+    // Corrupt one byte in the middle of the first data block.
+    // Data blocks start at offset 0, so corrupting byte 10 is safely inside
+    // the compressed data region (past the 4-byte size prefix).
+    {
+        int fd = ::open(path.c_str(), O_RDWR);
+        EXPECT_GE(fd, 0) << "Failed to open SSTable for corruption";
+        if (fd < 0) co_return;
+        char bad = 0xFF;
+        ssize_t wr = ::pwrite(fd, &bad, 1, 10);  // offset 10: inside compressed data
+        EXPECT_EQ(wr, 1);
+        ::close(fd);
+    }
+
+    // Re-open and attempt to read — should detect CRC mismatch
+    auto reader = co_await SSTableReader::open(path);
+    EXPECT_THROW(reader->get("key:0000"), std::runtime_error);
 
     co_await reader->close();
 }

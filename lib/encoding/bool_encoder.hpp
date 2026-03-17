@@ -1,5 +1,4 @@
-#ifndef BOOL_ENCODER_H_INCLUDED
-#define BOOL_ENCODER_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -22,5 +21,3 @@ public:
 
     static void decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out);
 };
-
-#endif

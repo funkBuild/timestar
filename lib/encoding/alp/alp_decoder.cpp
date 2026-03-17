@@ -94,54 +94,50 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             // Fast path: if this entire sub-block is in the skip range,
             // advance the stream past the packed data and exceptions without unpacking.
             if (global_pos + block_count <= nToSkip) {
-                // Skip FFOR packed words
-                for (size_t w = 0; w < packed_words; ++w) {
-                    encoded.readFixed<uint64_t, 64>();
-                }
-                // Skip exception data
+                // Skip FFOR packed words + exception data in bulk
+                size_t skip_words = packed_words;
                 if (exception_count > 0) [[unlikely]] {
-                    const size_t pos_words = (exception_count * 2 + 7) / 8;
-                    for (size_t w = 0; w < pos_words; ++w) {
-                        encoded.readFixed<uint64_t, 64>();
-                    }
-                    for (size_t i = 0; i < exception_count; ++i) {
-                        encoded.readFixed<uint64_t, 64>();
-                    }
+                    skip_words += (exception_count * 2 + 7) / 8;  // position words
+                    skip_words += exception_count;                  // value words
                 }
+                encoded.skipWords(skip_words);
                 global_pos += block_count;
                 continue;
             }
 
-            // Reuse scratch buffers (resize preserves capacity, no alloc after warmup)
-            scratch.packed_data.resize(packed_words);
-            for (size_t w = 0; w < packed_words; ++w) {
-                scratch.packed_data[w] = encoded.readFixed<uint64_t, 64>();
-            }
+            // Bulk read FFOR packed data into stack buffer, bypassing the per-word
+            // readFixed state machine (~6 ops/word → single memcpy).
+            // Max packed_words = ceil(1024 * 64 / 64) = 1024 (8KB stack).
+            alignas(8) uint64_t packed_stack[1024];
+            encoded.readAlignedWords(packed_stack, packed_words);
 
-            // Unpack integers
-            scratch.decoded_ints.resize(block_count);
-            alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw, scratch.decoded_ints.data());
+            // Unpack integers into stack buffer (L1-hot, no heap allocation)
+            alignas(8) int64_t decoded_stack[1024];
+            alp::ffor_unpack(packed_stack, block_count, for_base, bw, decoded_stack);
 
             // === Read Exceptions ===
+            // Use stack-allocated arrays (max 1024 exceptions, 8KB + 2KB)
+            alignas(8) uint16_t exc_positions_stack[1024];
+            alignas(8) uint64_t exc_values_stack[1024];
             if (exception_count > 0) [[unlikely]] {
-                // Read exception positions
+                // Bulk read exception position words
                 const size_t pos_words = (exception_count * 2 + 7) / 8;
-                scratch.exc_positions.resize(exception_count);
+                alignas(8) uint64_t pos_word_buf[256];  // max 256 words for 1024 exceptions
+                encoded.readAlignedWords(pos_word_buf, pos_words);
+
+                // Unpack positions from words
                 for (size_t w = 0; w < pos_words; ++w) {
-                    uint64_t word = encoded.readFixed<uint64_t, 64>();
-                    for (size_t j = 0; j < 4; ++j) {
-                        size_t idx = w * 4 + j;
-                        if (idx < exception_count) {
-                            scratch.exc_positions[idx] = static_cast<uint16_t>((word >> (j * 16)) & 0xFFFF);
-                        }
+                    uint64_t word = pos_word_buf[w];
+                    const size_t base_idx = w * 4;
+                    const size_t remaining = exception_count - base_idx;
+                    const size_t count = remaining < 4 ? remaining : 4;
+                    for (size_t j = 0; j < count; ++j) {
+                        exc_positions_stack[base_idx + j] = static_cast<uint16_t>((word >> (j * 16)) & 0xFFFF);
                     }
                 }
 
-                // Read exception values
-                scratch.exc_values.resize(exception_count);
-                for (size_t i = 0; i < exception_count; ++i) {
-                    scratch.exc_values[i] = encoded.readFixed<uint64_t, 64>();
-                }
+                // Bulk read exception values
+                encoded.readAlignedWords(exc_values_stack, exception_count);
             }
 
             // === Prefix-Sum Reconstruction (SCHEME_ALP_DELTA only) ===
@@ -151,19 +147,19 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 bool is_first = true;
 
                 for (size_t i = 0; i < block_count; ++i) {
-                    if (exc_scan < exception_count && scratch.exc_positions[exc_scan] == i) [[unlikely]] {
+                    if (exc_scan < exception_count && exc_positions_stack[exc_scan] == i) [[unlikely]] {
                         exc_scan++;
                         continue;
                     }
                     if (is_first) [[unlikely]] {
-                        scratch.decoded_ints[i] = first_value;
+                        decoded_stack[i] = first_value;
                         running = first_value;
                         is_first = false;
                     } else {
-                        uint64_t zz = static_cast<uint64_t>(scratch.decoded_ints[i]);
+                        uint64_t zz = static_cast<uint64_t>(decoded_stack[i]);
                         int64_t delta = static_cast<int64_t>((zz >> 1) ^ -(zz & 1));
                         running += delta;
-                        scratch.decoded_ints[i] = running;
+                        decoded_stack[i] = running;
                     }
                 }
             }
@@ -175,7 +171,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             if (exception_count == 0) [[likely]] {
                 // Fast path: no exceptions -- tight loop, no exception checking
-                const int64_t* __restrict__ decoded = scratch.decoded_ints.data();
+                const int64_t* __restrict__ decoded = decoded_stack;
 
                 // Skip values before nToSkip
                 size_t i = 0;
@@ -200,11 +196,11 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                     double value;
 
                     // Check if this position is an exception
-                    if (exc_idx < exception_count && scratch.exc_positions[exc_idx] == i) [[unlikely]] {
-                        value = std::bit_cast<double>(scratch.exc_values[exc_idx]);
+                    if (exc_idx < exception_count && exc_positions_stack[exc_idx] == i) [[unlikely]] {
+                        value = std::bit_cast<double>(exc_values_stack[exc_idx]);
                         exc_idx++;
                     } else {
-                        value = static_cast<double>(scratch.decoded_ints[i]) * frac_val / fact_val;
+                        value = static_cast<double>(decoded_stack[i]) * frac_val / fact_val;
                     }
 
                     if (global_pos >= nToSkip) [[likely]] {
@@ -240,76 +236,58 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             // Fast path: if this entire sub-block is in the skip range,
             // advance the stream past the packed data and exceptions without unpacking.
             if (global_pos + block_count <= nToSkip) {
-                // Skip left indices FFOR data
-                if (left_bw > 0) {
-                    size_t left_packed_words = alp::ffor_packed_words(block_count, left_bw);
-                    for (size_t w = 0; w < left_packed_words; ++w) {
-                        encoded.readFixed<uint64_t, 64>();
-                    }
-                }
-                // Skip right FFOR data
-                if (right_bw > 0) {
-                    size_t right_packed_words = alp::ffor_packed_words(block_count, right_bw);
-                    for (size_t w = 0; w < right_packed_words; ++w) {
-                        encoded.readFixed<uint64_t, 64>();
-                    }
-                }
-                // Skip exception data
+                size_t skip_words = 0;
+                if (left_bw > 0)
+                    skip_words += alp::ffor_packed_words(block_count, left_bw);
+                if (right_bw > 0)
+                    skip_words += alp::ffor_packed_words(block_count, right_bw);
                 if (exception_count > 0) [[unlikely]] {
-                    size_t pos_words = (exception_count * 2 + 7) / 8;
-                    for (size_t w = 0; w < pos_words; ++w) {
-                        encoded.readFixed<uint64_t, 64>();
-                    }
-                    for (size_t i = 0; i < exception_count; ++i) {
-                        encoded.readFixed<uint64_t, 64>();
-                    }
+                    skip_words += (exception_count * 2 + 7) / 8;
+                    skip_words += exception_count;
                 }
+                encoded.skipWords(skip_words);
                 global_pos += block_count;
                 continue;
             }
 
             // === Read Left Indices (FFOR packed) ===
-            // assign(n, val) reuses capacity when n <= capacity(), no reallocation
-            scratch.left_indices_i64.assign(block_count, 0);
+            alignas(8) int64_t left_indices_stack[1024];
+            std::fill_n(left_indices_stack, block_count, int64_t{0});
             if (left_bw > 0) {
                 size_t left_packed_words = alp::ffor_packed_words(block_count, left_bw);
-                scratch.left_packed.resize(left_packed_words);
-                for (size_t w = 0; w < left_packed_words; ++w) {
-                    scratch.left_packed[w] = encoded.readFixed<uint64_t, 64>();
-                }
-                alp::ffor_unpack(scratch.left_packed.data(), block_count, 0, left_bw, scratch.left_indices_i64.data());
+                alignas(8) uint64_t left_packed_stack[1024];
+                encoded.readAlignedWords(left_packed_stack, left_packed_words);
+                alp::ffor_unpack(left_packed_stack, block_count, 0, left_bw, left_indices_stack);
             }
 
             // === Read Right FFOR Data ===
-            // Initialize all to right_for_base (used when right_bw == 0)
-            scratch.right_parts.assign(block_count, right_for_base);
+            alignas(8) uint64_t right_parts_stack[1024];
+            std::fill_n(right_parts_stack, block_count, right_for_base);
             if (right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, right_bw);
-                scratch.right_packed.resize(right_packed_words);
-                for (size_t w = 0; w < right_packed_words; ++w) {
-                    scratch.right_packed[w] = encoded.readFixed<uint64_t, 64>();
-                }
-                alp::ffor_unpack_u64(scratch.right_packed.data(), block_count, right_for_base, right_bw,
-                                     scratch.right_parts.data());
+                alignas(8) uint64_t right_packed_stack[1024];
+                encoded.readAlignedWords(right_packed_stack, right_packed_words);
+                alp::ffor_unpack_u64(right_packed_stack, block_count, right_for_base, right_bw,
+                                     right_parts_stack);
             }
 
             // === Read Exceptions ===
+            alignas(8) uint16_t rd_exc_positions_stack[1024];
+            alignas(8) uint64_t rd_exc_values_stack[1024];
             if (exception_count > 0) [[unlikely]] {
                 size_t pos_words = (exception_count * 2 + 7) / 8;
-                scratch.exc_positions.resize(exception_count);
+                alignas(8) uint64_t pos_word_buf[256];
+                encoded.readAlignedWords(pos_word_buf, pos_words);
                 for (size_t w = 0; w < pos_words; ++w) {
-                    uint64_t word = encoded.readFixed<uint64_t, 64>();
-                    for (size_t j = 0; j < 4; ++j) {
-                        size_t idx = w * 4 + j;
-                        if (idx < exception_count) {
-                            scratch.exc_positions[idx] = static_cast<uint16_t>((word >> (j * 16)) & 0xFFFF);
-                        }
+                    uint64_t word = pos_word_buf[w];
+                    const size_t base_idx = w * 4;
+                    const size_t remaining = exception_count - base_idx;
+                    const size_t cnt = remaining < 4 ? remaining : 4;
+                    for (size_t j = 0; j < cnt; ++j) {
+                        rd_exc_positions_stack[base_idx + j] = static_cast<uint16_t>((word >> (j * 16)) & 0xFFFF);
                     }
                 }
-                scratch.exc_values.resize(exception_count);
-                for (size_t i = 0; i < exception_count; ++i) {
-                    scratch.exc_values[i] = encoded.readFixed<uint64_t, 64>();
-                }
+                encoded.readAlignedWords(rd_exc_values_stack, exception_count);
             }
 
             // === Reconstruct doubles ===
@@ -319,8 +297,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             if (exception_count == 0) [[likely]] {
                 // Fast path: no exceptions -- tight reconstruction loop
-                const int64_t* __restrict__ left_idx = scratch.left_indices_i64.data();
-                const uint64_t* __restrict__ right = scratch.right_parts.data();
+                const int64_t* __restrict__ left_idx = left_indices_stack;
+                const uint64_t* __restrict__ right = right_parts_stack;
                 const uint64_t* __restrict__ dict = scratch.dictionary.data();
 
                 // Skip values before nToSkip
@@ -345,12 +323,12 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 for (size_t i = 0; i < block_count; ++i) {
                     double value;
 
-                    if (exc_idx < exception_count && scratch.exc_positions[exc_idx] == i) [[unlikely]] {
-                        value = std::bit_cast<double>(scratch.exc_values[exc_idx]);
+                    if (exc_idx < exception_count && rd_exc_positions_stack[exc_idx] == i) [[unlikely]] {
+                        value = std::bit_cast<double>(rd_exc_values_stack[exc_idx]);
                         exc_idx++;
                     } else {
-                        uint64_t left = scratch.dictionary[static_cast<uint8_t>(scratch.left_indices_i64[i])];
-                        uint64_t right = scratch.right_parts[i] & right_mask;
+                        uint64_t left = scratch.dictionary[static_cast<uint8_t>(left_indices_stack[i])];
+                        uint64_t right = right_parts_stack[i] & right_mask;
                         uint64_t combined = (left << right_bit_count) | right;
                         value = std::bit_cast<double>(combined);
                     }

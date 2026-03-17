@@ -38,6 +38,7 @@ public:
 
 private:
     unsigned coreCount_ = 0;
+    unsigned coreMask_ = 0;  // (coreCount_ - 1) when power-of-2, else 0
     std::array<VShardMapping, VIRTUAL_SHARD_COUNT> table_{};
 };
 

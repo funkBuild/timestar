@@ -1,5 +1,4 @@
-#ifndef ANOMALY_RESULT_H_INCLUDED
-#define ANOMALY_RESULT_H_INCLUDED
+#pragma once
 
 #include <cstdint>
 #include <map>
@@ -197,5 +196,3 @@ struct SARIMAParams {
 
 }  // namespace anomaly
 }  // namespace timestar
-
-#endif  // ANOMALY_RESULT_H_INCLUDED

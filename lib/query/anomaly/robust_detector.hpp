@@ -1,5 +1,4 @@
-#ifndef ROBUST_DETECTOR_H_INCLUDED
-#define ROBUST_DETECTOR_H_INCLUDED
+#pragma once
 
 #include "anomaly_detector.hpp"
 #include "stl_decomposition.hpp"
@@ -29,5 +28,3 @@ private:
 
 }  // namespace anomaly
 }  // namespace timestar
-
-#endif  // ROBUST_DETECTOR_H_INCLUDED

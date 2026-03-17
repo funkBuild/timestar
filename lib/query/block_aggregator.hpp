@@ -1,7 +1,7 @@
-#ifndef BLOCK_AGGREGATOR_H_INCLUDED
-#define BLOCK_AGGREGATOR_H_INCLUDED
+#pragma once
 
 #include "aggregator.hpp"
+#include "simd_aggregator.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -122,14 +122,22 @@ public:
         blockState.latest = latestValue;
         blockState.first = firstValue;
 
+        auto doMerge = [&](AggregationState& target) {
+            if (methodAware_) {
+                target.mergeForMethod(blockState, method_);
+            } else {
+                target.merge(blockState);
+            }
+        };
+
         if (singleBucketState_) {
-            singleBucketState_->merge(blockState);
+            doMerge(*singleBucketState_);
         } else if (interval_ == 0 && foldToSingleState_) {
-            singleState_.merge(blockState);
+            doMerge(singleState_);
         } else {
             // Multi-bucket: block fits in a single bucket (verified by canUseBlockStats)
             uint64_t bucket = (minTime / interval_) * interval_;
-            bucketStates_[bucket].merge(blockState);
+            doMerge(bucketStates_[bucket]);
         }
     }
 
@@ -186,15 +194,20 @@ public:
 
     // Add a batch of decoded points (contiguous arrays).
     void addPoints(const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
-        pointCount_ += timestamps.size();
+        const size_t n = timestamps.size();
+        pointCount_ += n;
         if (interval_ == 0) {
             if (foldToSingleState_) {
-                for (size_t i = 0; i < timestamps.size(); ++i) {
-                    addToState(singleState_, values[i], timestamps[i]);
+                if (methodAware_ && n >= 4) {
+                    addPointsSIMDFold(timestamps, values);
+                } else {
+                    for (size_t i = 0; i < n; ++i) {
+                        addToState(singleState_, values[i], timestamps[i]);
+                    }
                 }
                 return;
             }
-            if (timestamps_.size() + timestamps.size() > MAX_UNBUCKETED_STATES) [[unlikely]] {
+            if (timestamps_.size() + n > MAX_UNBUCKETED_STATES) [[unlikely]] {
                 throw std::runtime_error("Non-bucketed aggregation exceeded " + std::to_string(MAX_UNBUCKETED_STATES) +
                                          " states; use an aggregationInterval to reduce cardinality");
             }
@@ -204,14 +217,35 @@ public:
             rawValues_.insert(rawValues_.end(), values.begin(), values.end());
         } else if (singleBucketState_) {
             // Single-bucket fast path: skip division + hash lookup per point.
-            auto* state = singleBucketState_;
-            for (size_t i = 0; i < timestamps.size(); ++i) {
-                addToState(*state, values[i], timestamps[i]);
+            if (methodAware_ && n >= 4) {
+                addPointsSIMDFold(timestamps, values, singleBucketState_);
+            } else {
+                auto* state = singleBucketState_;
+                for (size_t i = 0; i < n; ++i) {
+                    addToState(*state, values[i], timestamps[i]);
+                }
             }
         } else {
-            for (size_t i = 0; i < timestamps.size(); ++i) {
+            // Multi-bucket: batch consecutive timestamps in the same bucket.
+            // Timestamps are monotonic within a block, so we compute the next
+            // bucket boundary once and compare directly — avoids division per point.
+            size_t i = 0;
+            while (i < n) {
                 uint64_t bucket = (timestamps[i] / interval_) * interval_;
-                addToState(bucketStates_[bucket], values[i], timestamps[i]);
+                uint64_t nextBucket = bucket + interval_;
+                size_t j = i + 1;
+                while (j < n && timestamps[j] < nextBucket) {
+                    ++j;
+                }
+                auto& state = bucketStates_[bucket];
+                if (methodAware_ && (j - i) >= 4) {
+                    addPointsSIMDFoldRange(timestamps, values, i, j, state);
+                } else {
+                    for (size_t k = i; k < j; ++k) {
+                        addToState(state, values[k], timestamps[k]);
+                    }
+                }
+                i = j;
             }
         }
     }
@@ -265,6 +299,72 @@ private:
         }
     }
 
+    // SIMD batch fold: process an entire batch using vectorised reductions
+    // for methods that support it (SUM/AVG/MIN/MAX/COUNT/SPREAD).
+    // Falls back to scalar for LATEST/FIRST/STDDEV/MEDIAN.
+    void addPointsSIMDFold(const std::vector<uint64_t>& timestamps,
+                           const std::vector<double>& values,
+                           AggregationState* state = nullptr) {
+        addPointsSIMDFoldRange(timestamps, values, 0, timestamps.size(),
+                               state ? *state : singleState_);
+    }
+
+    void addPointsSIMDFoldRange(const std::vector<uint64_t>& timestamps,
+                                const std::vector<double>& values,
+                                size_t begin, size_t end,
+                                AggregationState& state) {
+        const size_t n = end - begin;
+        const double* vdata = values.data() + begin;
+        const uint64_t* tdata = timestamps.data() + begin;
+
+        switch (method_) {
+            case AggregationMethod::AVG:
+            case AggregationMethod::SUM:
+                state.sum += simd::SimdAggregator::calculateSum(vdata, n);
+                state.count += n;
+                break;
+            case AggregationMethod::COUNT:
+                state.count += n;
+                break;
+            case AggregationMethod::MIN:
+                state.min = std::min(state.min, simd::SimdAggregator::calculateMin(vdata, n));
+                state.count += n;
+                break;
+            case AggregationMethod::MAX:
+                state.max = std::max(state.max, simd::SimdAggregator::calculateMax(vdata, n));
+                state.count += n;
+                break;
+            case AggregationMethod::SPREAD:
+                state.min = std::min(state.min, simd::SimdAggregator::calculateMin(vdata, n));
+                state.max = std::max(state.max, simd::SimdAggregator::calculateMax(vdata, n));
+                state.count += n;
+                break;
+            case AggregationMethod::LATEST:
+                // Timestamps are monotonically increasing within a TSM block,
+                // so the last element is always the latest.
+                if (n > 0 && tdata[n - 1] >= state.latestTimestamp) {
+                    state.latest = vdata[n - 1];
+                    state.latestTimestamp = tdata[n - 1];
+                }
+                state.count += n;
+                break;
+            case AggregationMethod::FIRST:
+                // Monotonic timestamps: first element is the earliest.
+                if (n > 0 && tdata[0] <= state.firstTimestamp) {
+                    state.first = vdata[0];
+                    state.firstTimestamp = tdata[0];
+                }
+                state.count += n;
+                break;
+            default:
+                // STDDEV, MEDIAN, etc. — fall back to scalar per-value
+                for (size_t i = begin; i < end; ++i) {
+                    addToState(state, values[i], timestamps[i]);
+                }
+                break;
+        }
+    }
+
     uint64_t interval_;
     AggregationMethod method_;
     bool methodAware_;
@@ -297,5 +397,3 @@ struct PushdownResult {
 };
 
 }  // namespace timestar
-
-#endif  // BLOCK_AGGREGATOR_H_INCLUDED

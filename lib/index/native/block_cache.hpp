@@ -1,5 +1,4 @@
-#ifndef NATIVE_INDEX_BLOCK_CACHE_H_INCLUDED
-#define NATIVE_INDEX_BLOCK_CACHE_H_INCLUDED
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -29,7 +28,7 @@ public:
     // May evict LRU entries to stay under budget.
     const std::string& put(uint64_t cacheId, size_t blockIndex, std::string data) {
         CacheKey key{cacheId, blockIndex};
-        size_t entrySize = sizeof(Entry) + data.capacity() + 64;
+        size_t entrySize = sizeof(Entry) + data.size() + 64;
 
         auto it = map_.find(key);
         if (it != map_.end()) {
@@ -111,5 +110,3 @@ private:
 };
 
 }  // namespace timestar::index
-
-#endif  // NATIVE_INDEX_BLOCK_CACHE_H_INCLUDED

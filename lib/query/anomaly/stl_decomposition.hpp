@@ -1,5 +1,4 @@
-#ifndef STL_DECOMPOSITION_H_INCLUDED
-#define STL_DECOMPOSITION_H_INCLUDED
+#pragma once
 
 #include "anomaly_result.hpp"
 #include "simd_anomaly.hpp"
@@ -60,5 +59,3 @@ private:
 
 }  // namespace anomaly
 }  // namespace timestar
-
-#endif  // STL_DECOMPOSITION_H_INCLUDED

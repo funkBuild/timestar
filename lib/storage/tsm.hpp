@@ -1,5 +1,4 @@
-#ifndef TSM_H_INCLUDED
-#define TSM_H_INCLUDED
+#pragma once
 
 #include "block_aggregator.hpp"
 #include "bloom_filter.hpp"
@@ -29,7 +28,7 @@ class Slice;
 
 enum class TSMValueType { Float = 0, Boolean, String, Integer };
 
-typedef struct TSMIndexBlock {
+struct TSMIndexBlock {
     uint64_t minTime;
     uint64_t maxTime;
     uint64_t offset;
@@ -44,7 +43,7 @@ typedef struct TSMIndexBlock {
     double blockFirstValue = 0.0;   // Value at earliest timestamp (for FIRST)
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
     bool hasExtendedStats = false;  // true when M2/first/latest are populated
-} TSMIndexBlock;
+};
 
 // Batch of contiguous blocks for optimized I/O
 struct BlockBatch {
@@ -73,11 +72,11 @@ struct SparseIndexEntry {
     bool hasExtendedStats = false;
 };
 
-typedef struct TSMIndexEntry {
+struct TSMIndexEntry {
     SeriesId128 seriesId;
     TSMValueType seriesType;
     std::vector<TSMIndexBlock> indexBlocks;
-} TSMIndexEntry;
+};
 
 // TSM file format versions:
 //   v1: original format (28 bytes per index block)
@@ -287,5 +286,3 @@ public:
     // Delete tombstone file after compaction
     seastar::future<> deleteTombstoneFile();
 };
-
-#endif

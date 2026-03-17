@@ -1,7 +1,6 @@
-#ifndef QUERY_PLANNER_H_INCLUDED
-#define QUERY_PLANNER_H_INCLUDED
+#pragma once
 
-#include "leveldb_index.hpp"
+#include "native_index.hpp"
 #include "query_parser.hpp"
 #include "series_id.hpp"
 #include "series_matcher.hpp"
@@ -42,10 +41,10 @@ class QueryPlanner {
 public:
     // Create execution plan from query request
     // This will use the index to find matching series and map them to shards
-    seastar::future<QueryPlan> createPlan(const QueryRequest& request, seastar::sharded<LevelDBIndex>* indexSharded);
+    seastar::future<QueryPlan> createPlan(const QueryRequest& request, seastar::sharded<index::NativeIndex>* indexSharded);
 
     // Synchronous version for testing
-    QueryPlan createPlanSync(const QueryRequest& request, LevelDBIndex* index);
+    QueryPlan createPlanSync(const QueryRequest& request, index::NativeIndex* index);
 
     // Public for testing
     bool requiresAllShards(const QueryRequest& request);
@@ -56,10 +55,10 @@ public:
 private:
     // Find all series IDs matching the query filters
     seastar::future<std::vector<std::vector<SeriesId128>>> findMatchingSeriesIds(
-        const QueryRequest& request, seastar::sharded<LevelDBIndex>* indexSharded);
+        const QueryRequest& request, seastar::sharded<index::NativeIndex>* indexSharded);
 
     // Synchronous version for testing
-    std::vector<std::vector<SeriesId128>> findMatchingSeriesIdsSync(const QueryRequest& request, LevelDBIndex* index);
+    std::vector<std::vector<SeriesId128>> findMatchingSeriesIdsSync(const QueryRequest& request, index::NativeIndex* index);
 
     // Map series IDs to their respective shards
     std::vector<std::vector<SeriesId128>> mapSeriesToShards(const std::vector<SeriesId128>& seriesIds,
@@ -73,5 +72,3 @@ private:
 };
 
 }  // namespace timestar
-
-#endif  // QUERY_PLANNER_H_INCLUDED

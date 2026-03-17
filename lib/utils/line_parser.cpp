@@ -1,5 +1,7 @@
 #include "line_parser.hpp"
 
+#include <stdexcept>
+
 SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey) {
     const size_t length = seriesKey.length();
 
@@ -58,10 +60,7 @@ SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey) {
                         break;
                     }
                     case State::field: {
-                        // TODO: Should be throw here for invalid seriesKeys?
-                        field = seriesKey.substr(startIndex, i - startIndex);
-
-                        break;
+                        throw std::runtime_error("Malformed series key: unexpected space in field");
                     }
                 }
 

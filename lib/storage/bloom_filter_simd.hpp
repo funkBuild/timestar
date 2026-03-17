@@ -1,5 +1,4 @@
-#ifndef BLOOM_FILTER_SIMD_HPP_INCLUDED
-#define BLOOM_FILTER_SIMD_HPP_INCLUDED
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -24,5 +23,3 @@ void bitwiseXorInplace(uint8_t* dst, const uint8_t* src, size_t count);
 }  // namespace simd
 }  // namespace bloom
 }  // namespace timestar
-
-#endif  // BLOOM_FILTER_SIMD_HPP_INCLUDED

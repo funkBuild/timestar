@@ -1,7 +1,8 @@
 #include "native_index.hpp"
 
 #include "../key_encoding.hpp"
-#include "tsm.hpp"  // for TSMValueType definition
+#include "tsm.hpp"         // for TSMValueType definition
+#include "series_key.hpp"  // for buildSeriesKey
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <glaze/glaze.hpp>
 
 // Use short namespace alias for key encoding
@@ -133,6 +135,7 @@ seastar::future<> NativeIndex::open() {
     CompactionConfig compCfg;
     compCfg.blockSize = timestar::config().index.block_size;
     compCfg.bloomBitsPerKey = timestar::config().index.bloom_filter_bits;
+    compCfg.rateLimitMBps = timestar::config().index.compaction_rate_limit_mbps;
     compaction_ = std::make_unique<CompactionEngine>(indexPath_, *manifest_, compCfg);
 
     // Phase 2: Load or migrate LocalIdMap for roaring bitmap postings
@@ -204,9 +207,7 @@ seastar::future<> NativeIndex::close() {
 // ============================================================================
 
 std::string NativeIndex::sstFilename(uint64_t fileNumber) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "idx_%06lu.sst", fileNumber);
-    return indexPath_ + "/" + buf;
+    return std::format("{}/idx_{:06}.sst", indexPath_, fileNumber);
 }
 
 // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
@@ -428,7 +429,7 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
         trimMeasurementBloomCache();
     }
 
-    // If a previous flush is still in progress, wait for it (like LevelDB's imm_ check)
+    // If a previous flush is still in progress, wait for it
     co_await waitForFlush();
 
     // Swap: active memtable becomes immutable, create fresh active
@@ -549,7 +550,7 @@ seastar::future<> NativeIndex::doFlushImmutableMemTable() {
 }
 
 // ============================================================================
-// Series cache (same two-generation design as LevelDBIndex)
+// Series cache (two-generation design)
 // ============================================================================
 
 bool NativeIndex::seriesCacheContains(const SeriesId128& id) const {
@@ -583,9 +584,11 @@ void NativeIndex::seriesCacheEvictIncremental() {
 seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measurement,
                                                                 std::map<std::string, std::string> tags,
                                                                 std::string field) {
-    // Compute SeriesId128 directly from components — no encoded string needed.
-    // This avoids 2+2M temporary string allocations from escapeKeyComponent().
-    SeriesId128 seriesId = SeriesId128::fromComponents(measurement, tags, field);
+    // Compute SeriesId128 from the canonical series key string.
+    // This produces the same ID used by the data plane (TSM, WAL, MemoryStore),
+    // ensuring index metadata lookups match data lookups without recomputation.
+    std::string seriesKey = timestar::buildSeriesKey(measurement, tags, field);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     // Fast path: already indexed (no string allocation needed)
     if (seriesCacheContains(seriesId)) {
@@ -696,8 +699,8 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
 
 seastar::future<std::optional<SeriesId128>> NativeIndex::getSeriesId(
     const std::string& measurement, const std::map<std::string, std::string>& tags, const std::string& field) {
-    std::string seriesKeyStr = ke::encodeSeriesKey(measurement, tags, field);
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKeyStr);
+    std::string seriesKey = timestar::buildSeriesKey(measurement, tags, field);
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     // Step 8: Existence check without copying the value
     auto metaKey = ke::encodeSeriesMetadataKey(seriesId);
@@ -833,7 +836,11 @@ seastar::future<> NativeIndex::addFieldsAndTags(const std::string& measurement, 
 
 seastar::future<> NativeIndex::setFieldType(const std::string& measurement, const std::string& field,
                                               const std::string& type) {
-    std::string cacheKey = measurement + std::string(1, '\0') + field;
+    std::string cacheKey;
+    cacheKey.reserve(measurement.size() + 1 + field.size());
+    cacheKey = measurement;
+    cacheKey.push_back('\0');
+    cacheKey += field;
     // Step 8: Check cache first, then use kvExists (no value copy needed)
     if (knownFieldTypes_.count(cacheKey)) co_return;
 
@@ -845,7 +852,11 @@ seastar::future<> NativeIndex::setFieldType(const std::string& measurement, cons
 
 seastar::future<std::string> NativeIndex::getFieldType(const std::string& measurement, const std::string& field) {
     // Check in-memory cache first (populated by local indexing and schema broadcast)
-    std::string cacheKey = measurement + std::string(1, '\0') + field;
+    std::string cacheKey;
+    cacheKey.reserve(measurement.size() + 1 + field.size());
+    cacheKey = measurement;
+    cacheKey.push_back('\0');
+    cacheKey += field;
     auto it = fieldTypeValues_.find(cacheKey);
     if (it != fieldTypeValues_.end()) {
         co_return it->second;
@@ -899,7 +910,11 @@ seastar::future<std::set<std::string>> NativeIndex::getTags(const std::string& m
 
 seastar::future<std::set<std::string>> NativeIndex::getTagValues(const std::string& measurement,
                                                                    const std::string& tagKey) {
-    std::string tvCacheKey = measurement + std::string(1, '\0') + tagKey;
+    std::string tvCacheKey;
+    tvCacheKey.reserve(measurement.size() + 1 + tagKey.size());
+    tvCacheKey = measurement;
+    tvCacheKey.push_back('\0');
+    tvCacheKey += tagKey;
     auto& cached = tagValuesCache_[tvCacheKey];
     if (!cached.empty()) co_return cached;
 
@@ -1781,12 +1796,16 @@ void NativeIndex::trimHllCache() {
     }
 }
 
-// Step 6: Evict oldest tag values cache entries when over limit.
+// Step 6: Evict tag values cache entries when over limit.
 void NativeIndex::trimTagValuesCache() {
     if (tagValuesCache_.size() <= MAX_TAG_VALUES_CACHE_ENTRIES) return;
-    // Clear entirely — entries are repopulated on demand from KV store.
-    // This avoids the old FIFO eviction which could discard hot entries.
-    tagValuesCache_.clear();
+    // Evict half the entries (iteration order ≈ random in unordered_map).
+    // This preserves ~50% of hot entries vs clearing everything.
+    size_t toEvict = tagValuesCache_.size() / 2;
+    for (auto it = tagValuesCache_.begin(); it != tagValuesCache_.end() && toEvict > 0;) {
+        it = tagValuesCache_.erase(it);
+        --toEvict;
+    }
 }
 
 void NativeIndex::trimSchemaCaches() {
@@ -1883,6 +1902,14 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
                                                size_t maxSeries) {
     uint32_t startDay = ke::dayBucketFromNs(startTimeNs);
     uint32_t endDay = ke::dayBucketFromNs(endTimeNs);
+
+    // Wide range optimisation: when the day span exceeds the threshold,
+    // fall back to non-time-scoped discovery to avoid O(days) bitmap
+    // lookups (e.g. 7000+ KV gets for 19 years of data).
+    static constexpr uint32_t MAX_DAY_SCAN = 365;
+    if (endDay - startDay > MAX_DAY_SCAN) {
+        co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
+    }
 
     roaring::Roaring activeSeries = buildActiveSeriesBitmap(measurement, startDay, endDay);
 
@@ -2202,7 +2229,11 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
         }
     }
 
-    std::string fieldTypeCacheKey = insert.measurement + std::string(1, '\0') + insert.field;
+    std::string fieldTypeCacheKey;
+    fieldTypeCacheKey.reserve(insert.measurement.size() + 1 + insert.field.size());
+    fieldTypeCacheKey = insert.measurement;
+    fieldTypeCacheKey.push_back('\0');
+    fieldTypeCacheKey += insert.field;
     if (knownFieldTypes_.find(fieldTypeCacheKey) == knownFieldTypes_.end()) {
         std::string typeStr;
         if constexpr (std::is_same_v<T, double>) {

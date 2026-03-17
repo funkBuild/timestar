@@ -1,5 +1,4 @@
-#ifndef EXPRESSION_EVALUATOR_H_INCLUDED
-#define EXPRESSION_EVALUATOR_H_INCLUDED
+#pragma once
 
 #include "derived_query.hpp"
 #include "expression_ast.hpp"
@@ -176,5 +175,3 @@ private:
 };
 
 }  // namespace timestar
-
-#endif  // EXPRESSION_EVALUATOR_H_INCLUDED

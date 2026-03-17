@@ -10,7 +10,7 @@
 // TimeStar Core
 #include "core/engine.hpp"
 #include "core/timestar_value.hpp"
-#include "index/leveldb_index.hpp"
+#include "index/native/native_index.hpp"
 #include "query/query_result.hpp"
 #include "storage/memory_store.hpp"
 #include "storage/wal_file_manager.hpp"
@@ -55,7 +55,7 @@ protected:
 
         // Initialize function executor with engine
         // Note: In real implementation, this would be a sharded engine
-        functionExecutor = new FunctionPipelineExecutor(nullptr, &engine->getIndex());
+        functionExecutor = new FunctionPipelineExecutor(nullptr);
 
         // Generate test data sets
         generateTestData();

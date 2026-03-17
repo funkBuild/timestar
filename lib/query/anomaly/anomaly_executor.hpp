@@ -1,5 +1,4 @@
-#ifndef ANOMALY_EXECUTOR_H_INCLUDED
-#define ANOMALY_EXECUTOR_H_INCLUDED
+#pragma once
 
 #include "anomaly_detector.hpp"
 #include "anomaly_result.hpp"
@@ -38,5 +37,3 @@ private:
 
 }  // namespace anomaly
 }  // namespace timestar
-
-#endif  // ANOMALY_EXECUTOR_H_INCLUDED

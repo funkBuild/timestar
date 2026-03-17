@@ -1,5 +1,4 @@
-#ifndef FUNCTION_MONITORING_H_INCLUDED
-#define FUNCTION_MONITORING_H_INCLUDED
+#pragma once
 
 #include <atomic>
 #include <chrono>
@@ -36,22 +35,22 @@ struct FunctionMetricsSnapshot {
 
     // Calculate derived metrics
     double getSuccessRate() const {
-        return total_executions > 0 ? (double)successful_executions / total_executions : 0.0;
+        return total_executions > 0 ? static_cast<double>(successful_executions) / total_executions : 0.0;
     }
 
-    double getFailureRate() const { return total_executions > 0 ? (double)failed_executions / total_executions : 0.0; }
+    double getFailureRate() const { return total_executions > 0 ? static_cast<double>(failed_executions) / total_executions : 0.0; }
 
     double getAverageExecutionTimeMs() const {
-        return successful_executions > 0 ? (double)total_execution_time_us / successful_executions / 1000.0 : 0.0;
+        return successful_executions > 0 ? static_cast<double>(total_execution_time_us) / successful_executions / 1000.0 : 0.0;
     }
 
     double getCacheHitRate() const {
         uint64_t total = cache_hits + cache_misses;
-        return total > 0 ? (double)cache_hits / total : 0.0;
+        return total > 0 ? static_cast<double>(cache_hits) / total : 0.0;
     }
 
     double getAverageMemoryUsageMB() const {
-        return successful_executions > 0 ? (double)total_memory_allocated / successful_executions / 1024 / 1024 : 0.0;
+        return successful_executions > 0 ? static_cast<double>(total_memory_allocated) / successful_executions / 1024 / 1024 : 0.0;
     }
 };
 
@@ -92,27 +91,27 @@ struct FunctionMetrics {
     // thread -- no cross-thread visibility concern.
     double getSuccessRate() const {
         uint64_t total = total_executions.load();
-        return total > 0 ? (double)successful_executions.load() / total : 0.0;
+        return total > 0 ? static_cast<double>(successful_executions.load()) / total : 0.0;
     }
 
     double getFailureRate() const {
         uint64_t total = total_executions.load();
-        return total > 0 ? (double)failed_executions.load() / total : 0.0;
+        return total > 0 ? static_cast<double>(failed_executions.load()) / total : 0.0;
     }
 
     double getAverageExecutionTimeMs() const {
         uint64_t executions = successful_executions.load();
-        return executions > 0 ? (double)total_execution_time_us.load() / executions / 1000.0 : 0.0;
+        return executions > 0 ? static_cast<double>(total_execution_time_us.load()) / executions / 1000.0 : 0.0;
     }
 
     double getCacheHitRate() const {
         uint64_t total = cache_hits.load() + cache_misses.load();
-        return total > 0 ? (double)cache_hits.load() / total : 0.0;
+        return total > 0 ? static_cast<double>(cache_hits.load()) / total : 0.0;
     }
 
     double getAverageMemoryUsageMB() const {
         uint64_t executions = successful_executions.load();
-        return executions > 0 ? (double)total_memory_allocated.load() / executions / 1024 / 1024 : 0.0;
+        return executions > 0 ? static_cast<double>(total_memory_allocated.load()) / executions / 1024 / 1024 : 0.0;
     }
 };
 
@@ -131,16 +130,16 @@ struct SystemMetricsSnapshot {
     uint64_t http_response_time_us{0};
 
     double getRegistryCacheHitRate() const {
-        return total_registry_lookups > 0 ? (double)registry_cache_hits / total_registry_lookups : 0.0;
+        return total_registry_lookups > 0 ? static_cast<double>(registry_cache_hits) / total_registry_lookups : 0.0;
     }
 
     double getHttpSuccessRate() const {
-        return http_requests_total > 0 ? (double)(http_requests_total - http_requests_failed) / http_requests_total
+        return http_requests_total > 0 ? static_cast<double>(http_requests_total - http_requests_failed) / http_requests_total
                                        : 0.0;
     }
 
     double getAverageHttpResponseTimeMs() const {
-        return http_requests_total > 0 ? (double)http_response_time_us / http_requests_total / 1000.0 : 0.0;
+        return http_requests_total > 0 ? static_cast<double>(http_response_time_us) / http_requests_total / 1000.0 : 0.0;
     }
 };
 
@@ -164,17 +163,17 @@ struct SystemMetrics {
 
     double getRegistryCacheHitRate() const {
         uint64_t total = total_registry_lookups.load();
-        return total > 0 ? (double)registry_cache_hits.load() / total : 0.0;
+        return total > 0 ? static_cast<double>(registry_cache_hits.load()) / total : 0.0;
     }
 
     double getHttpSuccessRate() const {
         uint64_t total = http_requests_total.load();
-        return total > 0 ? (double)(total - http_requests_failed.load()) / total : 0.0;
+        return total > 0 ? static_cast<double>(total - http_requests_failed.load()) / total : 0.0;
     }
 
     double getAverageHttpResponseTimeMs() const {
         uint64_t requests = http_requests_total.load();
-        return requests > 0 ? (double)http_response_time_us.load() / requests / 1000.0 : 0.0;
+        return requests > 0 ? static_cast<double>(http_response_time_us.load()) / requests / 1000.0 : 0.0;
     }
 };
 
@@ -352,5 +351,3 @@ public:
 #define FUNCTION_MONITOR_CACHE_MISS() ts_fn_tracker_.recordCacheMiss()
 
 }  // namespace timestar::functions
-
-#endif  // FUNCTION_MONITORING_H_INCLUDED

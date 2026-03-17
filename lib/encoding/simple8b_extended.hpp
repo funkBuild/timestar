@@ -1,5 +1,4 @@
-#ifndef SIMPLE8B_EXTENDED_H_INCLUDED
-#define SIMPLE8B_EXTENDED_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -61,5 +60,3 @@ private:
                          uint64_t bits);
     static void unpack(uint64_t packedValue, std::vector<uint64_t>& out, uint64_t n, uint64_t bits);
 };
-
-#endif

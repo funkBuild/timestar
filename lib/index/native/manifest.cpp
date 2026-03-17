@@ -81,6 +81,7 @@ std::string Manifest::serializeSnapshot() const {
         record.append(f.minKey);
         encodeFixed32(record, static_cast<uint32_t>(f.maxKey.size()));
         record.append(f.maxKey);
+        encodeFixed64(record, f.writeTimestamp);
     }
 
     return record;
@@ -97,6 +98,7 @@ std::string Manifest::serializeAddFile(const SSTableMetadata& info) const {
     record.append(info.minKey);
     encodeFixed32(record, static_cast<uint32_t>(info.maxKey.size()));
     record.append(info.maxKey);
+    encodeFixed64(record, info.writeTimestamp);
     return record;
 }
 
@@ -260,6 +262,12 @@ seastar::future<> Manifest::recover() {
                 f.maxKey.assign(rp, maxKeyLen);
                 rp += maxKeyLen;
 
+                // writeTimestamp (v2 extension, optional for backward compat)
+                if (rp + 8 <= rend) {
+                    f.writeTimestamp = decodeFixed64(rp);
+                    rp += 8;
+                }
+
                 files_.push_back(std::move(f));
             }
         } else if (type == RecordType::AddFile) {
@@ -287,6 +295,12 @@ seastar::future<> Manifest::recover() {
             if (rp + maxKeyLen > rend) continue;
             f.maxKey.assign(rp, maxKeyLen);
             rp += maxKeyLen;
+
+            // writeTimestamp (v2 extension, optional for backward compat)
+            if (rp + 8 <= rend) {
+                f.writeTimestamp = decodeFixed64(rp);
+                rp += 8;
+            }
 
             files_.push_back(std::move(f));
             if (f.fileNumber >= nextFileNumber_) nextFileNumber_ = f.fileNumber + 1;

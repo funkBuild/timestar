@@ -1,5 +1,4 @@
-#ifndef FLOAT_ENCODER_SIMD_H_INCLUDED
-#define FLOAT_ENCODER_SIMD_H_INCLUDED
+#pragma once
 
 #include "../../storage/compressed_buffer.hpp"
 #include "float_encoder.hpp"
@@ -24,5 +23,3 @@ public:
     // Fallback to regular encoder if needed (kept for API compatibility)
     static CompressedBuffer encodeSafe(std::span<const double> values);
 };
-
-#endif  // FLOAT_ENCODER_SIMD_H_INCLUDED

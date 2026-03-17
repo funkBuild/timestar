@@ -86,8 +86,8 @@ private:
     // Phase B+C: Analyze and process TSM files (move or split)
     seastar::future<> processTSMFiles(unsigned oldShardCount, unsigned newShardCount);
 
-    // Phase D: Move LevelDB index from old shard 0 to new shard 0
-    void moveLevelDBIndex();
+    // Phase D: Copy NativeIndex directories from old shards to new shards
+    void moveNativeIndex();
 
     // Phase E: Atomic directory cutover
     void performCutover(unsigned oldShardCount, unsigned newShardCount);

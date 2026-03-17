@@ -1,5 +1,4 @@
-#ifndef TSM_READER_H_INCLUDED
-#define TSM_READER_H_INCLUDED
+#pragma once
 
 #include "tsm.hpp"
 
@@ -56,5 +55,3 @@ public:
 inline TSMReader makeTSMReader(seastar::shared_ptr<TSM> file) {
     return TSMReader(file);
 }
-
-#endif  // TSM_READER_H_INCLUDED

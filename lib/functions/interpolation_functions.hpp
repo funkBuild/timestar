@@ -1,5 +1,4 @@
-#ifndef INTERPOLATION_FUNCTIONS_H_INCLUDED
-#define INTERPOLATION_FUNCTIONS_H_INCLUDED
+#pragma once
 
 #include "function_types.hpp"
 
@@ -33,5 +32,3 @@ public:
 };
 
 }  // namespace timestar::functions
-
-#endif  // INTERPOLATION_FUNCTIONS_H_INCLUDED

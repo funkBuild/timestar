@@ -7,7 +7,7 @@
 // Source inspection tests: verify that every co_await engineSharded->invoke_on()
 // call in HttpMetadataHandler is enclosed in a try/catch block.
 //
-// Without the fix, an engine exception (e.g. LevelDB I/O error) would propagate
+// Without the fix, an engine exception (e.g. index I/O error) would propagate
 // out of the coroutine as an unhandled exception rather than being caught and
 // turned into an HTTP 500 response.
 //

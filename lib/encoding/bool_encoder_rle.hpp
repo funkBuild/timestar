@@ -1,5 +1,4 @@
-#ifndef BOOL_ENCODER_RLE_H_INCLUDED
-#define BOOL_ENCODER_RLE_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -17,5 +16,3 @@ private:
     static void writeVarint(AlignedBuffer& buf, uint64_t value);
     static uint64_t readVarint(Slice& slice);
 };
-
-#endif

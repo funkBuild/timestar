@@ -1,5 +1,4 @@
-#ifndef SERIES_COMPACTION_DATA_H_INCLUDED
-#define SERIES_COMPACTION_DATA_H_INCLUDED
+#pragma once
 
 #include "series_id.hpp"
 #include "tsm.hpp"
@@ -50,5 +49,3 @@ struct SeriesCompactionData {
     SeriesCompactionData(const SeriesCompactionData&) = delete;
     SeriesCompactionData& operator=(const SeriesCompactionData&) = delete;
 };
-
-#endif  // SERIES_COMPACTION_DATA_H_INCLUDED

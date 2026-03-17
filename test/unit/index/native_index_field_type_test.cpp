@@ -1,18 +1,18 @@
 #include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 
 #include <gtest/gtest.h>
 
 #include <filesystem>
 
 // =============================================================================
-// LevelDB Index Field Type Integration Tests
+// NativeIndex Field Type Integration Tests
 //
 // Verifies that indexInsert() automatically stores field types via setFieldType()
 // and that getFieldType() returns the correct type for each template parameter.
 // =============================================================================
 
-class LevelDBIndexFieldTypeTest : public ::testing::Test {
+class NativeIndexFieldTypeTest : public ::testing::Test {
 protected:
     void SetUp() override { std::filesystem::remove_all("shard_0"); }
 
@@ -21,7 +21,7 @@ protected:
 
 // Test that indexInsert<double> stores field type as "float"
 seastar::future<> testIndexInsertStoresFloatType() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     TimeStarInsert<double> insert("temperature", "value");
@@ -36,13 +36,13 @@ seastar::future<> testIndexInsertStoresFloatType() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexFieldTypeTest, IndexInsertStoresFloatType) {
+TEST_F(NativeIndexFieldTypeTest, IndexInsertStoresFloatType) {
     testIndexInsertStoresFloatType().get();
 }
 
 // Test that indexInsert<bool> stores field type as "boolean"
 seastar::future<> testIndexInsertStoresBooleanType() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     TimeStarInsert<bool> insert("sensor", "is_active");
@@ -57,13 +57,13 @@ seastar::future<> testIndexInsertStoresBooleanType() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexFieldTypeTest, IndexInsertStoresBooleanType) {
+TEST_F(NativeIndexFieldTypeTest, IndexInsertStoresBooleanType) {
     testIndexInsertStoresBooleanType().get();
 }
 
 // Test that indexInsert<std::string> stores field type as "string"
 seastar::future<> testIndexInsertStoresStringType() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     TimeStarInsert<std::string> insert("logs", "message");
@@ -78,13 +78,13 @@ seastar::future<> testIndexInsertStoresStringType() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexFieldTypeTest, IndexInsertStoresStringType) {
+TEST_F(NativeIndexFieldTypeTest, IndexInsertStoresStringType) {
     testIndexInsertStoresStringType().get();
 }
 
 // Test that multiple fields on the same measurement each get correct types
 seastar::future<> testMultipleFieldTypesSameMeasurement() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     // Insert a float field
@@ -118,13 +118,13 @@ seastar::future<> testMultipleFieldTypesSameMeasurement() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexFieldTypeTest, MultipleFieldTypesSameMeasurement) {
+TEST_F(NativeIndexFieldTypeTest, MultipleFieldTypesSameMeasurement) {
     testMultipleFieldTypesSameMeasurement().get();
 }
 
 // Test that calling indexInsert multiple times for the same field doesn't change the type
 seastar::future<> testIdempotentFieldType() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     // Insert same field multiple times
@@ -141,7 +141,7 @@ seastar::future<> testIdempotentFieldType() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexFieldTypeTest, IdempotentFieldType) {
+TEST_F(NativeIndexFieldTypeTest, IdempotentFieldType) {
     testIdempotentFieldType().get();
 }
 
@@ -149,7 +149,7 @@ TEST_F(LevelDBIndexFieldTypeTest, IdempotentFieldType) {
 seastar::future<> testFieldTypePersistence() {
     // First session: insert and set types
     {
-        LevelDBIndex index(0);
+        timestar::index::NativeIndex index(0);
         co_await index.open();
 
         TimeStarInsert<double> floatInsert("persistent_test", "value");
@@ -167,7 +167,7 @@ seastar::future<> testFieldTypePersistence() {
 
     // Second session: reopen and verify types persisted
     {
-        LevelDBIndex index(0);
+        timestar::index::NativeIndex index(0);
         co_await index.open();
 
         auto valueType = co_await index.getFieldType("persistent_test", "value");
@@ -180,13 +180,13 @@ seastar::future<> testFieldTypePersistence() {
     }
 }
 
-TEST_F(LevelDBIndexFieldTypeTest, FieldTypePersistence) {
+TEST_F(NativeIndexFieldTypeTest, FieldTypePersistence) {
     testFieldTypePersistence().get();
 }
 
 // Test that a field with no stored type returns empty string (default behavior)
 seastar::future<> testUnknownFieldTypeReturnsEmpty() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
     co_await index.open();
 
     // Manually create a series without going through indexInsert
@@ -202,6 +202,6 @@ seastar::future<> testUnknownFieldTypeReturnsEmpty() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexFieldTypeTest, UnknownFieldTypeReturnsEmpty) {
+TEST_F(NativeIndexFieldTypeTest, UnknownFieldTypeReturnsEmpty) {
     testUnknownFieldTypeReturnsEmpty().get();
 }

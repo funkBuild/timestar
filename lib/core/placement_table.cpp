@@ -35,6 +35,9 @@ void savePlacement(const std::string& path) {
 PlacementTable PlacementTable::buildLocal(unsigned coreCount) {
     PlacementTable pt;
     pt.coreCount_ = coreCount;
+    // Cache power-of-2 mask for fast routing (bitwise AND vs modulo)
+    pt.coreMask_ = (coreCount > 1 && (coreCount & (coreCount - 1)) == 0)
+        ? (coreCount - 1) : 0;
     for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
         pt.table_[i].serverId = 0;
         pt.table_[i].coreId = coreCount > 0
@@ -45,7 +48,10 @@ PlacementTable PlacementTable::buildLocal(unsigned coreCount) {
 }
 
 unsigned PlacementTable::coreForHash(size_t hash) const {
-    return coreCount_ <= 1 ? 0 : static_cast<unsigned>(hash % coreCount_);
+    if (coreCount_ <= 1) return 0;
+    // Fast path: power-of-2 core counts use bitwise AND (1 cycle vs ~20 for modulo)
+    if (coreMask_) return static_cast<unsigned>(hash & coreMask_);
+    return static_cast<unsigned>(hash % coreCount_);
 }
 
 }  // namespace timestar
@@ -96,6 +102,9 @@ PlacementTable PlacementTable::fromJson(const std::string& data) {
 
     PlacementTable pt;
     pt.coreCount_ = pj.coreCount;
+    pt.coreMask_ = (pj.coreCount > 1 && (pj.coreCount & (pj.coreCount - 1)) == 0)
+        ? (pj.coreCount - 1) : 0;
+    pt.table_.fill(VShardMapping{});
     size_t count = std::min<size_t>(pj.serverIds.size(), VIRTUAL_SHARD_COUNT);
     for (size_t i = 0; i < count; ++i) {
         pt.table_[i].serverId = pj.serverIds[i];

@@ -1,7 +1,7 @@
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
-#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 #include "../../../lib/query/query_runner.hpp"
 #include "../test_helpers.hpp"
 

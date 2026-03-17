@@ -1,5 +1,4 @@
-#ifndef SMOOTHING_FUNCTIONS_H_INCLUDED
-#define SMOOTHING_FUNCTIONS_H_INCLUDED
+#pragma once
 
 #include "function_types.hpp"
 
@@ -65,5 +64,3 @@ std::vector<double> simpleMovingAverage(const std::vector<double>& values, int w
 std::vector<double> exponentialMovingAverage(const std::vector<double>& values, double alpha);
 
 }  // namespace timestar::functions
-
-#endif  // SMOOTHING_FUNCTIONS_H_INCLUDED

@@ -1,5 +1,4 @@
-#ifndef FUNCTION_TYPES_H_INCLUDED
-#define FUNCTION_TYPES_H_INCLUDED
+#pragma once
 
 #include <cassert>
 #include <chrono>
@@ -489,5 +488,3 @@ public:
 };
 
 }  // namespace timestar::functions
-
-#endif  // FUNCTION_TYPES_H_INCLUDED

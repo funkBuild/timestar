@@ -1,5 +1,4 @@
-#ifndef HTTP_DERIVED_QUERY_HANDLER_H_INCLUDED
-#define HTTP_DERIVED_QUERY_HANDLER_H_INCLUDED
+#pragma once
 
 #include "derived_query_executor.hpp"
 
@@ -20,7 +19,7 @@ public:
     // Security limits to prevent DoS attacks
     static constexpr size_t MAX_DERIVED_QUERY_BODY_SIZE = 1 * 1024 * 1024;  // 1MB
 
-    HttpDerivedQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<LevelDBIndex>* index = nullptr,
+    HttpDerivedQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<index::NativeIndex>* index = nullptr,
                             DerivedQueryConfig config = {});
 
     // Register routes with the HTTP server
@@ -28,7 +27,7 @@ public:
 
 private:
     seastar::sharded<Engine>* engine_;
-    seastar::sharded<LevelDBIndex>* index_;
+    seastar::sharded<index::NativeIndex>* index_;
     DerivedQueryConfig config_;
 
     // Handle POST /derived request
@@ -37,5 +36,3 @@ private:
 };
 
 }  // namespace timestar
-
-#endif  // HTTP_DERIVED_QUERY_HANDLER_H_INCLUDED

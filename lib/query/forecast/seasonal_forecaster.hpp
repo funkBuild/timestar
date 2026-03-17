@@ -1,5 +1,4 @@
-#ifndef SEASONAL_FORECASTER_H_INCLUDED
-#define SEASONAL_FORECASTER_H_INCLUDED
+#pragma once
 
 #include "forecast_result.hpp"
 #include "periodicity_detector.hpp"
@@ -110,5 +109,3 @@ public:
 
 }  // namespace forecast
 }  // namespace timestar
-
-#endif  // SEASONAL_FORECASTER_H_INCLUDED

@@ -39,19 +39,10 @@ AlignedBuffer IntegerEncoder::encode(std::span<const uint64_t> values) {
 size_t IntegerEncoder::encodeInto(std::span<const uint64_t> values, AlignedBuffer& target) {
     Implementation impl = (s_forced_impl == AUTO) ? selectBestImplementation() : s_forced_impl;
 
-    switch (impl) {
-        case FFOR:
-            return IntegerEncoderFFOR::encodeInto(values, target);
-
-        // SIMD and AVX512 do not have encodeInto(); fall through to BASIC
-        // which shares the same Simple16 wire format.
-        case AVX512:
-        case SIMD:
-        case BASIC:
-        case AUTO:
-        default:
-            return IntegerEncoderBasic::encodeInto(values, target);
+    if (impl == FFOR) {
+        return IntegerEncoderFFOR::encodeInto(values, target);
     }
+    return IntegerEncoderBasic::encodeInto(values, target);
 }
 
 std::pair<size_t, size_t> IntegerEncoder::decode(Slice& encoded, unsigned int timestampSize,

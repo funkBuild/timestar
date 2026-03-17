@@ -7,6 +7,7 @@
 #include "streaming_aggregator.hpp"
 #include "streaming_derived_evaluator.hpp"
 #include "timestar_config.hpp"
+#include "../utils/json_escape.hpp"
 
 #include <glaze/glaze.hpp>
 
@@ -142,48 +143,9 @@ std::vector<StreamingBatch> HttpStreamHandler::queryResponseToBatches(const std:
     return batches;
 }
 
-// --- JSON string escaping ---
-
-// Append-to-buffer variant: avoids allocation by writing directly into an
-// existing string.  Hot-path callers use this exclusively.
-static void jsonEscapeAppend(const std::string& s, std::string& out) {
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"':
-                out += "\\\"";
-                break;
-            case '\\':
-                out += "\\\\";
-                break;
-            case '\n':
-                out += "\\n";
-                break;
-            case '\r':
-                out += "\\r";
-                break;
-            case '\t':
-                out += "\\t";
-                break;
-            default:
-                if (c < 0x20) [[unlikely]] {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += static_cast<char>(c);
-                }
-                break;
-        }
-    }
-}
-
-// Convenience wrapper that returns a new string (used only in cold error paths).
-static std::string jsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 4);
-    jsonEscapeAppend(s, out);
-    return out;
-}
+// --- JSON string escaping (from shared lib/utils/json_escape.hpp) ---
+using timestar::jsonEscape;
+using timestar::jsonEscapeAppend;
 
 // Append a uint64_t as decimal text via std::to_chars (stack buffer, no heap).
 static inline void appendUint64(std::string& out, uint64_t v) {

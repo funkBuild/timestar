@@ -1,5 +1,4 @@
-#ifndef HTTP_METADATA_HANDLER_H_INCLUDED
-#define HTTP_METADATA_HANDLER_H_INCLUDED
+#pragma once
 
 #include "engine.hpp"
 #include "logger.hpp"
@@ -50,7 +49,7 @@ public:
     // or if `str` contains trailing non-numeric characters (e.g. "3.14", "10abc").
     static size_t parsePaginationParam(const std::string& str, const std::string& paramName, size_t defaultValue);
 
-    // Validate a URL query-parameter value that will be used as a LevelDB key
+    // Validate a URL query-parameter value that will be used as an index key
     // (measurement name, tag key, etc.).  Rejects empty strings and any string
     // containing a null byte (\x00) or ASCII control character (< 0x20).
     //
@@ -58,5 +57,3 @@ public:
     // human-readable error description suitable for an HTTP 400 response body.
     static std::string validateQueryParam(const std::string& name, const std::string& context);
 };
-
-#endif

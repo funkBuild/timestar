@@ -1,5 +1,4 @@
-#ifndef INTEGER_ENCODER_H_INCLUDED
-#define INTEGER_ENCODER_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -63,5 +62,3 @@ private:
     static Implementation selectBestImplementation();
     static thread_local Implementation s_forced_impl;
 };
-
-#endif  // INTEGER_ENCODER_H_INCLUDED

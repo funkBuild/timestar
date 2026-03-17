@@ -2,6 +2,7 @@
 
 #include <regex>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 
 namespace timestar {
@@ -87,6 +88,12 @@ bool SeriesMatcher::matchesTag(const std::string& tagValue, const std::string& s
     return tagValue == scopeValue;
 }
 
+// Maximum cached compiled regex patterns per thread. Prevents unbounded memory
+// growth on long-running servers with diverse query patterns.  When the cache
+// is full, it is cleared entirely (simple eviction; typical deployments use
+// far fewer than 1024 unique patterns).
+static constexpr size_t MAX_REGEX_CACHE_SIZE = 1024;
+
 bool SeriesMatcher::matchesWildcard(const std::string& value, const std::string& pattern) {
     // Cache compiled regex per pattern to avoid ~10-100us recompilation per call.
     // Thread-local is safe under Seastar's one-thread-per-shard model.
@@ -94,6 +101,9 @@ bool SeriesMatcher::matchesWildcard(const std::string& value, const std::string&
 
     auto it = cache.find(pattern);
     if (it == cache.end()) {
+        if (cache.size() >= MAX_REGEX_CACHE_SIZE) {
+            cache.clear();
+        }
         std::string regexPattern = wildcardToRegex(pattern);
         try {
             auto [ins, _] = cache.emplace(pattern, std::regex(regexPattern));
@@ -166,6 +176,9 @@ bool SeriesMatcher::matchesRegex(const std::string& value, const std::string& pa
 
     auto it = cache.find(pattern);
     if (it == cache.end()) {
+        if (cache.size() >= MAX_REGEX_CACHE_SIZE) {
+            cache.clear();
+        }
         try {
             auto [ins, _] = cache.emplace(pattern, std::regex(pattern, std::regex::optimize));
             it = ins;
@@ -262,12 +275,12 @@ std::string SeriesMatcher::toRegexPattern(const std::string& pattern) {
             // needsRegexMatch() first.  Return an anchored literal anyway so
             // a caller that ignores this can still get correct behaviour.
             // Escape regex metacharacters so "foo.bar" matches literally.
-            static const std::string metacharacters = R"(\.^$|()[]{}*+?)";
+            constexpr std::string_view metacharacters = R"(\.^$|()[]{}*+?)";
             std::string escaped;
             escaped.reserve(pattern.size() + 4);
             escaped += '^';
             for (char c : pattern) {
-                if (metacharacters.find(c) != std::string::npos) {
+                if (metacharacters.find(c) != std::string_view::npos) {
                     escaped += '\\';
                 }
                 escaped += c;

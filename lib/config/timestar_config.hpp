@@ -1,5 +1,4 @@
-#ifndef TIMESTAR_CONFIG_H_INCLUDED
-#define TIMESTAR_CONFIG_H_INCLUDED
+#pragma once
 
 #include <glaze/glaze.hpp>
 
@@ -14,6 +13,7 @@ struct ServerConfig {
     uint16_t port = 8086;
     std::string log_level = "info";
     std::string data_dir = ".";
+    uint32_t shutdown_timeout_seconds = 30;  // 0 = wait forever
 };
 
 struct CompactionConfig {
@@ -39,6 +39,7 @@ struct HttpConfig {
     uint32_t max_series_count = 10000;
     uint64_t max_total_points = 10000000;
     uint32_t query_timeout_seconds = 30;
+    uint32_t slow_query_threshold_ms = 500;  // Log queries slower than this (0 = disabled)
 };
 
 struct IndexConfig {
@@ -51,6 +52,7 @@ struct IndexConfig {
     uint64_t metadata_cache_bytes = 48 * 1024 * 1024;   // 48MB for series metadata LRU cache
     uint64_t discovery_cache_bytes = 16 * 1024 * 1024;  // 16MB for discovery result LRU cache
     uint64_t block_cache_bytes = 8 * 1024 * 1024;       // 8MB per shard for SSTable block cache
+    uint32_t compaction_rate_limit_mbps = 0;             // Max compaction write MB/s (0 = unlimited)
 };
 
 struct StreamingConfig {
@@ -59,12 +61,22 @@ struct StreamingConfig {
     uint32_t heartbeat_interval_seconds = 15;
 };
 
+// I/O scheduling shares for Seastar's fair queue. Higher shares = more disk
+// bandwidth under contention. When only one class has pending I/O, it gets
+// full bandwidth regardless of share count.
+struct IOPriorityConfig {
+    float query_shares = 100.0f;       // TSM/index reads during queries
+    float write_shares = 50.0f;        // WAL writes, memtable flushes
+    float compaction_shares = 10.0f;   // Background TSM/SSTable compaction
+};
+
 struct EngineConfig {
     uint32_t metadata_retry_interval_seconds = 5;
     uint32_t max_metadata_retry_ops = 10000;
     uint32_t retention_sweep_interval_minutes = 15;
     double tombstone_dead_fraction_threshold = 0.10;
     uint32_t max_tombstone_rewrites_per_sweep = 2;
+    IOPriorityConfig io_priority;
 };
 
 // Seastar settings parsed from [seastar] TOML section.
@@ -124,7 +136,8 @@ const TimestarConfig& config();
 template <>
 struct glz::meta<timestar::ServerConfig> {
     using T = timestar::ServerConfig;
-    static constexpr auto value = object("port", &T::port, "log_level", &T::log_level, "data_dir", &T::data_dir);
+    static constexpr auto value = object("port", &T::port, "log_level", &T::log_level, "data_dir", &T::data_dir,
+                                         "shutdown_timeout_seconds", &T::shutdown_timeout_seconds);
 };
 
 template <>
@@ -150,7 +163,8 @@ struct glz::meta<timestar::HttpConfig> {
     static constexpr auto value =
         object("max_write_body_size", &T::max_write_body_size, "max_query_body_size", &T::max_query_body_size,
                "max_series_count", &T::max_series_count, "max_total_points", &T::max_total_points,
-               "query_timeout_seconds", &T::query_timeout_seconds);
+               "query_timeout_seconds", &T::query_timeout_seconds,
+               "slow_query_threshold_ms", &T::slow_query_threshold_ms);
 };
 
 template <>
@@ -160,7 +174,16 @@ struct glz::meta<timestar::IndexConfig> {
         object("bloom_filter_bits", &T::bloom_filter_bits, "block_size", &T::block_size, "write_buffer_size",
                &T::write_buffer_size, "max_open_files", &T::max_open_files, "max_file_size", &T::max_file_size,
                "series_cache_size", &T::series_cache_size, "metadata_cache_bytes", &T::metadata_cache_bytes,
-               "discovery_cache_bytes", &T::discovery_cache_bytes, "block_cache_bytes", &T::block_cache_bytes);
+               "discovery_cache_bytes", &T::discovery_cache_bytes, "block_cache_bytes", &T::block_cache_bytes,
+               "compaction_rate_limit_mbps", &T::compaction_rate_limit_mbps);
+};
+
+template <>
+struct glz::meta<timestar::IOPriorityConfig> {
+    using T = timestar::IOPriorityConfig;
+    static constexpr auto value =
+        object("query_shares", &T::query_shares, "write_shares", &T::write_shares,
+               "compaction_shares", &T::compaction_shares);
 };
 
 template <>
@@ -170,7 +193,8 @@ struct glz::meta<timestar::EngineConfig> {
         object("metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds, "max_metadata_retry_ops",
                &T::max_metadata_retry_ops, "retention_sweep_interval_minutes", &T::retention_sweep_interval_minutes,
                "tombstone_dead_fraction_threshold", &T::tombstone_dead_fraction_threshold,
-               "max_tombstone_rewrites_per_sweep", &T::max_tombstone_rewrites_per_sweep);
+               "max_tombstone_rewrites_per_sweep", &T::max_tombstone_rewrites_per_sweep,
+               "io_priority", &T::io_priority);
 };
 
 template <>
@@ -187,5 +211,3 @@ struct glz::meta<timestar::TimestarConfigParseable> {
     static constexpr auto value = object("server", &T::server, "storage", &T::storage, "http", &T::http, "index",
                                          &T::index, "engine", &T::engine, "streaming", &T::streaming);
 };
-
-#endif  // TIMESTAR_CONFIG_H_INCLUDED

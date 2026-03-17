@@ -1,5 +1,4 @@
-#ifndef TSM_TOMBSTONE_H_INCLUDED
-#define TSM_TOMBSTONE_H_INCLUDED
+#pragma once
 
 #include "series_id.hpp"
 
@@ -183,5 +182,3 @@ std::pair<std::vector<uint64_t>, std::vector<T>> TSMTombstone::filterTombstoned(
 }
 
 }  // namespace timestar
-
-#endif  // TSM_TOMBSTONE_H_INCLUDED

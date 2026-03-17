@@ -17,7 +17,7 @@ A high-performance time series database built with C++23 and the Seastar framewo
 - Float, integer, boolean, and string value types
 - ALP + Gorilla XOR float compression (~44% better than XOR alone)
 - Simple8b integer compression
-- Snappy string compression
+- zstd string compression
 - XOR delta-of-delta timestamp compression
 
 **Query System**
@@ -40,7 +40,7 @@ A high-performance time series database built with C++23 and the Seastar framewo
 
 **Infrastructure**
 - Shard-per-core via Seastar (lock-free, linear scaling)
-- LevelDB metadata indexing
+- Per-shard NativeIndex metadata (custom LSM-tree, co-located with data)
 - TOML configuration with Seastar tuning passthrough
 - React dashboard frontend
 
@@ -50,7 +50,7 @@ A high-performance time series database built with C++23 and the Seastar framewo
 
 ```bash
 # Install dependencies (Ubuntu/Debian)
-sudo apt install cmake g++-14 libleveldb-dev libsnappy-dev libssl-dev \
+sudo apt install cmake g++-14 libssl-dev \
   libboost-all-dev liblz4-dev libgnutls28-dev libsctp-dev libhwloc-dev \
   libnuma-dev libpciaccess-dev libcrypto++-dev libxml2-dev xfslibs-dev \
   systemtap-sdt-dev libyaml-cpp-dev libxxhash-dev ragel
@@ -163,7 +163,7 @@ timestar/
 │   │   ├── forecast/      Forecasting and STL decomposition
 │   │   └── transform/     SIMD-optimized transform functions
 │   ├── http/              HTTP API handlers
-│   ├── index/             LevelDB metadata index
+│   ├── index/             Per-shard NativeIndex (custom LSM-tree metadata)
 │   ├── functions/         Arithmetic, interpolation, smoothing functions
 │   ├── config/            TOML configuration
 │   ├── retention/         Retention policy enforcement
@@ -183,7 +183,7 @@ timestar/
 ```bash
 cd build
 
-# All tests (~2740 tests across 150+ suites)
+# All tests (~2865+ tests across 194+ suites)
 ./test/timestar_unit_test
 
 # Specific suite

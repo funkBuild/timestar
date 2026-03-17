@@ -1,5 +1,4 @@
-#ifndef NATIVE_INDEX_BLOOM_FILTER_H_INCLUDED
-#define NATIVE_INDEX_BLOOM_FILTER_H_INCLUDED
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +35,7 @@ public:
     size_t keyCount() const { return numKeys_; }
 
     // Size of the filter in bytes (after build).
-    size_t filterSize() const { return filter_.size(); }
+    size_t filterSize() const { return filterBytes_; }
 
     // Serialization: writes the filter to a string buffer.
     // Format: [k (1 byte)] [filter_size (4 bytes LE)] [filter_data]
@@ -55,7 +54,8 @@ private:
     int bitsPerKey_;
     int k_;  // Number of hash functions
     size_t numKeys_ = 0;
-    std::vector<uint8_t> filter_;
+    std::vector<uint64_t> filter_;  // Word-based for faster bit ops
+    size_t filterBytes_ = 0;        // Actual byte count (for serialization)
     std::vector<uint64_t> hashes_;  // Stored during build phase
     bool built_ = false;
     bool isNull_ = false;
@@ -64,10 +64,8 @@ private:
     static std::pair<uint32_t, uint32_t> hashKey(std::string_view key);
 
     // Probe positions using double hashing: h(i) = (h1 + i * h2) % numBits
-    void setBit(size_t pos) { filter_[pos / 8] |= (1 << (pos % 8)); }
-    bool getBit(size_t pos) const { return (filter_[pos / 8] & (1 << (pos % 8))) != 0; }
+    void setBit(size_t pos) { filter_[pos / 64] |= (1ULL << (pos % 64)); }
+    bool getBit(size_t pos) const { return (filter_[pos / 64] & (1ULL << (pos % 64))) != 0; }
 };
 
 }  // namespace timestar::index
-
-#endif  // NATIVE_INDEX_BLOOM_FILTER_H_INCLUDED

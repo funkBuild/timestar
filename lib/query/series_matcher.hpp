@@ -1,5 +1,4 @@
-#ifndef SERIES_MATCHER_H_INCLUDED
-#define SERIES_MATCHER_H_INCLUDED
+#pragma once
 
 #include <map>
 #include <regex>
@@ -59,5 +58,3 @@ private:
 };
 
 }  // namespace timestar
-
-#endif  // SERIES_MATCHER_H_INCLUDED

@@ -2,7 +2,7 @@
 // Each test inserts representative data, flushes to TSM, then benchmarks
 // the specific query path that was identified as a bottleneck.
 //
-// RC2: Batch metadata fetch (sequential LevelDB Gets)
+// RC2: Batch metadata fetch (sequential NativeIndex Gets)
 // RC3: queryAggregated pushdown vs full materialization
 // RC4: prefetchSeriesIndices TSM index warming
 // RC5: latest aggregation full materialization

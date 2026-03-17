@@ -1,5 +1,4 @@
-#ifndef INTEGER_ENCODER_AVX512_H_INCLUDED
-#define INTEGER_ENCODER_AVX512_H_INCLUDED
+#pragma once
 
 #include "../../storage/aligned_buffer.hpp"
 #include "../../storage/slice_buffer.hpp"
@@ -24,5 +23,3 @@ public:
 
     static bool isAvailable();
 };
-
-#endif  // INTEGER_ENCODER_AVX512_H_INCLUDED

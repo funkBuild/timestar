@@ -1,5 +1,4 @@
-#ifndef ALP_RD_HPP_INCLUDED
-#define ALP_RD_HPP_INCLUDED
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -46,5 +45,3 @@ public:
 };
 
 }  // namespace alp
-
-#endif  // ALP_RD_HPP_INCLUDED

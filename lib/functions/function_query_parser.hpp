@@ -1,5 +1,4 @@
-#ifndef FUNCTION_QUERY_PARSER_H_INCLUDED
-#define FUNCTION_QUERY_PARSER_H_INCLUDED
+#pragma once
 
 #include <string>
 #include <vector>
@@ -20,5 +19,3 @@ private:
 };
 
 }  // namespace timestar::functions
-
-#endif  // FUNCTION_QUERY_PARSER_H_INCLUDED

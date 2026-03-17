@@ -77,6 +77,9 @@ external/robin-map/
 /tsdb
 /tsdb_test
 
+# Benchmark result artifacts
+benchmark/*.json
+
 # Data files (but keep test data)
 *.tsm
 *.wal

@@ -35,13 +35,14 @@ void BloomFilter::build() {
         return;
     }
 
-    // Total bits = numKeys * bitsPerKey, rounded up to whole bytes, minimum 64 bits
+    // Total bits = numKeys * bitsPerKey, rounded up to 64-bit words, minimum 64 bits
     size_t numBits = std::max(static_cast<size_t>(64), numKeys_ * bitsPerKey_);
-    // Round up to next byte boundary
-    size_t numBytes = (numBits + 7) / 8;
-    numBits = numBytes * 8;
+    // Round up to next 64-bit word boundary for word-based storage
+    size_t numWords = (numBits + 63) / 64;
+    numBits = numWords * 64;
+    filterBytes_ = numWords * 8;  // Serialize all uint64_t words as bytes
 
-    filter_.assign(numBytes, 0);
+    filter_.assign(numWords, 0);
 
     for (uint64_t h : hashes_) {
         uint32_t h1 = static_cast<uint32_t>(h);
@@ -62,7 +63,7 @@ bool BloomFilter::mayContain(std::string_view key) const {
     if (isNull_) return true;
     if (filter_.empty()) return false;
 
-    size_t numBits = filter_.size() * 8;
+    size_t numBits = filter_.size() * 64;
 
     uint64_t h = XXH3_64bits(key.data(), key.size());
     uint32_t h1 = static_cast<uint32_t>(h);
@@ -84,15 +85,16 @@ std::pair<uint32_t, uint32_t> BloomFilter::hashKey(std::string_view key) {
 
 void BloomFilter::serializeTo(std::string& output) const {
     // Format: [k (1 byte)] [filter_size (4 bytes LE)] [filter_data]
+    // Serialize as bytes for on-disk compatibility even though internal storage is uint64_t
     output.push_back(static_cast<char>(k_));
 
-    uint32_t size = static_cast<uint32_t>(filter_.size());
+    uint32_t size = static_cast<uint32_t>(filterBytes_);
     output.push_back(static_cast<char>(size & 0xff));
     output.push_back(static_cast<char>((size >> 8) & 0xff));
     output.push_back(static_cast<char>((size >> 16) & 0xff));
     output.push_back(static_cast<char>((size >> 24) & 0xff));
 
-    output.append(reinterpret_cast<const char*>(filter_.data()), filter_.size());
+    output.append(reinterpret_cast<const char*>(filter_.data()), filterBytes_);
 }
 
 BloomFilter BloomFilter::deserializeFrom(std::string_view data) {
@@ -113,8 +115,11 @@ BloomFilter BloomFilter::deserializeFrom(std::string_view data) {
 
     BloomFilter bf;
     bf.k_ = k;
-    bf.filter_.assign(reinterpret_cast<const uint8_t*>(data.data() + 5),
-                      reinterpret_cast<const uint8_t*>(data.data() + 5 + size));
+    bf.filterBytes_ = size;
+    // Load bytes into word-based storage (round up to whole uint64_t)
+    size_t numWords = (size + 7) / 8;
+    bf.filter_.assign(numWords, 0);
+    std::memcpy(bf.filter_.data(), data.data() + 5, size);
     bf.built_ = true;
     return bf;
 }

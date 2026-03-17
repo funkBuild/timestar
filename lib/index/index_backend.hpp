@@ -1,5 +1,4 @@
-#ifndef INDEX_BACKEND_H_INCLUDED
-#define INDEX_BACKEND_H_INCLUDED
+#pragma once
 
 #include "retention_policy.hpp"
 #include "series_id.hpp"
@@ -85,7 +84,7 @@ struct IndexFieldStats {
 };
 
 // Abstract interface for the metadata index backend.
-// Implementations: LevelDBIndex (current), NativeIndex (future).
+// Implementation: NativeIndex (lib/index/native/native_index.hpp).
 class IndexBackend {
 public:
     virtual ~IndexBackend() = default;
@@ -204,5 +203,3 @@ public:
     virtual seastar::future<size_t> getSeriesCount() = 0;
     virtual seastar::future<> compact() = 0;
 };
-
-#endif  // INDEX_BACKEND_H_INCLUDED

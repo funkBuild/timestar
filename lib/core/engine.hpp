@@ -1,9 +1,9 @@
-#ifndef ENGINE_H_INCLUDED
-#define ENGINE_H_INCLUDED
+#pragma once
 
 #include "block_aggregator.hpp"
+#include "engine_metrics.hpp"
 #include "http_query_handler.hpp"
-#include "leveldb_index.hpp"
+#include "native_index.hpp"
 #include "query_parser.hpp"
 #include "schema_update.hpp"
 #include "query_planner.hpp"
@@ -22,6 +22,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/scheduling.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <vector>
@@ -30,7 +31,8 @@ class Engine {
 private:
     TSMFileManager tsmFileManager;
     WALFileManager walFileManager;
-    LevelDBIndex index;
+    timestar::index::NativeIndex index;
+    timestar::EngineMetrics _metrics;
     // TSM conversion runs as background futures per rollover, tracked by WALFileManager's gate
 
     // Gate to block new inserts during shutdown. Closed early in stop() so
@@ -40,7 +42,7 @@ private:
     int shardId;
 
     // Back-reference to the sharded<Engine> container for cross-shard communication.
-    // Used by insert() on non-zero shards to forward metadata indexing to shard 0.
+    // Used for schema broadcasts and cross-shard operations; metadata is indexed locally per-shard.
     seastar::sharded<Engine>* shardedRef = nullptr;
 
     // --- Retention policy cache (all shards) ---
@@ -56,6 +58,15 @@ private:
     // Closed during stop() to ensure no delivery lambda runs against a
     // partially-destroyed Engine after shutdown has begun.
     seastar::gate _streamingGate;
+
+    // --- I/O scheduling groups for fair queue prioritization ---
+    // Created once in init(), used by TSM/index readers (query), WAL (write),
+    // and compaction (background). When only one class has pending I/O it gets
+    // full bandwidth; shares only matter under contention.
+    seastar::scheduling_group _queryGroup;
+    seastar::scheduling_group _writeGroup;
+    seastar::scheduling_group _compactionGroup;
+    bool _schedulingGroupsCreated = false;
 
     // --- TTL background sweep infrastructure (shard 0 only) ---
     seastar::gate _retentionGate;
@@ -121,6 +132,19 @@ public:
         const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
         uint64_t aggregationInterval, timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 
+    // Batch LATEST/FIRST: resolve latest (or first) value for multiple series
+    // in a single pass over TSM files and memory stores.  Avoids per-series
+    // file snapshot, sort, and coroutine overhead.
+    struct BatchLatestEntry {
+        SeriesId128 seriesId;
+        uint64_t timestamp = 0;
+        double value = 0.0;
+        bool resolved = false;
+    };
+    seastar::future<> batchLatest(std::vector<BatchLatestEntry>& entries,
+                                  uint64_t startTime, uint64_t endTime,
+                                  bool wantFirst = false);
+
     // --- Retention policy management ---
     // Update a single policy in this shard's cache (called via invoke_on_all)
     void updateRetentionPolicyCache(const RetentionPolicy& policy);
@@ -132,7 +156,7 @@ public:
     std::optional<RetentionPolicy> getRetentionPolicy(const std::string& measurement) const;
     // Get all retention policies (local cache)
     const std::unordered_map<std::string, RetentionPolicy>& getRetentionPolicies() const { return _retentionPolicies; }
-    // Load policies from LevelDB on shard 0 and broadcast to all shards
+    // Load policies from NativeIndex on shard 0 and broadcast to all shards
     seastar::future<> loadAndBroadcastRetentionPolicies();
     // TTL background sweep (dispatched to all shards from shard 0 timer)
     seastar::future<> sweepExpiredFiles();
@@ -143,7 +167,34 @@ public:
     seastar::future<> sweepTombstoneRewrites();
 
     // Get reference to the index for this shard
-    LevelDBIndex& getIndex() { return index; }
+    timestar::index::NativeIndex& getIndex() { return index; }
+
+    // Per-shard Prometheus metrics counters
+    timestar::EngineMetrics& metrics() { return _metrics; }
+
+    // Gauge accessors for metrics
+    size_t getTSMFileCount() const { return tsmFileManager.getSequencedTsmFiles().size(); }
+
+    // I/O scheduling groups — use with seastar::with_scheduling_group() to
+    // prioritize query I/O over background compaction.
+    // Returns default_scheduling_group() if groups haven't been set (e.g., tests).
+    seastar::scheduling_group queryGroup() const {
+        return _schedulingGroupsCreated ? _queryGroup : seastar::default_scheduling_group();
+    }
+    seastar::scheduling_group compactionGroup() const {
+        return _schedulingGroupsCreated ? _compactionGroup : seastar::default_scheduling_group();
+    }
+
+    // Set I/O scheduling groups (called from main after create_scheduling_group).
+    // create_scheduling_group is a global operation, so groups must be created
+    // once from any shard and then distributed via invoke_on_all.
+    void setIOSchedulingGroups(seastar::scheduling_group query, seastar::scheduling_group write,
+                               seastar::scheduling_group compaction) {
+        _queryGroup = query;
+        _writeGroup = write;
+        _compactionGroup = compaction;
+        _schedulingGroupsCreated = true;
+    }
 
     // Get reference to the subscription manager for this shard
     timestar::SubscriptionManager& getSubscriptionManager() { return _subscriptionManager; }
@@ -173,5 +224,3 @@ public:
 
     std::string basePath();
 };
-
-#endif

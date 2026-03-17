@@ -37,7 +37,7 @@ protected:
     // NOTE: Engine::insert() does NOT index metadata (indexing is handled at
     // the HTTP handler level). For tests that rely on deleteByPattern() or
     // other index-based lookups, we must explicitly call indexMetadata() after
-    // each insert to populate the LevelDB index.
+    // each insert to populate the NativeIndex.
     seastar::future<> insertTestData() {
         // Insert data for multiple series with different tags and fields
 

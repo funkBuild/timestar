@@ -1,5 +1,4 @@
-#ifndef KEY_ENCODING_SIMD_HPP_INCLUDED
-#define KEY_ENCODING_SIMD_HPP_INCLUDED
+#pragma once
 
 #include <cstddef>
 
@@ -14,5 +13,3 @@ inline constexpr size_t kSimdThreshold = 16;
 size_t findFirstEscapeChar(const char* data, size_t len);
 
 }  // namespace timestar::index::simd
-
-#endif  // KEY_ENCODING_SIMD_HPP_INCLUDED

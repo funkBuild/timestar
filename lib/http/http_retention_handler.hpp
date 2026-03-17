@@ -1,5 +1,4 @@
-#ifndef HTTP_RETENTION_HANDLER_H_INCLUDED
-#define HTTP_RETENTION_HANDLER_H_INCLUDED
+#pragma once
 
 #include "engine.hpp"
 #include "retention_policy.hpp"
@@ -39,5 +38,3 @@ public:
 
     void registerRoutes(seastar::httpd::routes& r);
 };
-
-#endif  // HTTP_RETENTION_HANDLER_H_INCLUDED

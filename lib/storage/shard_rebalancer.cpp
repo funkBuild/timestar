@@ -385,7 +385,7 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsig
 // Phase D: Copy per-shard NativeIndex directories
 // ---------------------------------------------------------------------------
 
-void ShardRebalancer::moveLevelDBIndex() {
+void ShardRebalancer::moveNativeIndex() {
     // Since Phase 1, each shard has its own native_index/ directory.
     // Copy each old shard's index to the corresponding new shard.
     unsigned oldCount = _oldShardCount > 0 ? _oldShardCount : detectShardCountFromDirs();
@@ -588,7 +588,7 @@ seastar::future<> ShardRebalancer::execute(unsigned newShardCount) {
 
     // Phase D: Copy per-shard NativeIndex directories
     engine_log.info("[REBALANCE] Phase D: Copying per-shard NativeIndex directories...");
-    co_await seastar::async([this] { moveLevelDBIndex(); });
+    co_await seastar::async([this] { moveNativeIndex(); });
 
     // Phase E: Atomic cutover
     engine_log.info("[REBALANCE] Phase E: Performing directory cutover...");

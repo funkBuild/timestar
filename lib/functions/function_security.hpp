@@ -1,5 +1,4 @@
-#ifndef FUNCTION_SECURITY_H_INCLUDED
-#define FUNCTION_SECURITY_H_INCLUDED
+#pragma once
 
 #include <algorithm>
 #include <cctype>
@@ -83,5 +82,3 @@ private:
 };
 
 }  // namespace timestar::functions
-
-#endif  // FUNCTION_SECURITY_H_INCLUDED

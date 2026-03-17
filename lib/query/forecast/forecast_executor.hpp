@@ -1,5 +1,4 @@
-#ifndef FORECAST_EXECUTOR_H_INCLUDED
-#define FORECAST_EXECUTOR_H_INCLUDED
+#pragma once
 
 #include "forecast_result.hpp"
 #include "linear_forecaster.hpp"
@@ -75,5 +74,3 @@ private:
 
 }  // namespace forecast
 }  // namespace timestar
-
-#endif  // FORECAST_EXECUTOR_H_INCLUDED

@@ -1,5 +1,4 @@
-#ifndef MEMORY_STORE_H_INCLUDED
-#define MEMORY_STORE_H_INCLUDED
+#pragma once
 
 #include "logger.hpp"
 #include "series_id.hpp"
@@ -119,5 +118,3 @@ public:
     // Delete data in a time range for a series
     void deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
 };
-
-#endif

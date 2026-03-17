@@ -1,5 +1,4 @@
-#ifndef SCHEMA_UPDATE_H_INCLUDED
-#define SCHEMA_UPDATE_H_INCLUDED
+#pragma once
 
 #include <set>
 #include <string>
@@ -39,5 +38,3 @@ struct SchemaUpdate {
 };
 
 }  // namespace timestar::index
-
-#endif  // SCHEMA_UPDATE_H_INCLUDED

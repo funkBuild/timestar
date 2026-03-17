@@ -264,6 +264,10 @@ TEST_F(EngineShutdownTest, InsertCompletesBeforeStopDrainsGate) {
         // returning.  If it returned early, data on disk would be incomplete.
         eng->stop().get();
 
+        // Destroy the first engine so its Seastar metrics are deregistered
+        // before the second engine registers the same metric names.
+        eng.engine.reset();
+
         // Re-open the engine (reads TSM files flushed during stop).
         Engine eng2;
         eng2.init().get();
@@ -275,7 +279,6 @@ TEST_F(EngineShutdownTest, InsertCompletesBeforeStopDrainsGate) {
             << "stop() must drain the WAL gate so all data is flushed to TSM";
 
         eng2.stop().get();
-        eng.engine.reset();
     })
         .join()
         .get();
@@ -333,7 +336,7 @@ TEST_F(EngineShutdownTest, ShardedEngineStopIsSafe) {
 //   2. _streamingGate.close() — delivery futures finish
 //   3. _metadataGate.close() — background metadata ops drain (shard 0)
 //   4. walFileManager.close() — flush MemoryStores to TSM
-//   5. index.close()          — close LevelDB
+//   5. index.close()          — close NativeIndex
 //
 // If _insertGate were closed AFTER walFileManager.close(), a concurrent
 // insert could write to a destroyed WAL.  This test reads the source file

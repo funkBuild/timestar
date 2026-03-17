@@ -252,29 +252,34 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
 
-    // Compute block-level statistics for Float series
+    // Compute block-level statistics for Float series.
+    // Two-pass approach: first pass computes sum/min/max (vectorizable),
+    // second pass computes M2 using the known mean (no per-element division).
+    // This replaces Welford's online algorithm which requires a division per
+    // element — ~20 cycles each on modern x86, dominating the stats loop.
+    const size_t n = values.size();
     double sum = 0.0;
     double bmin = std::numeric_limits<double>::max();
     double bmax = std::numeric_limits<double>::lowest();
-    double m2 = 0.0;
-    double mean = 0.0;
-    for (size_t i = 0; i < values.size(); ++i) {
+    for (size_t i = 0; i < n; ++i) {
         double v = values[i];
         sum += v;
-        if (v < bmin)
-            bmin = v;
-        if (v > bmax)
-            bmax = v;
-        // Welford's online algorithm for M2
-        double delta = v - mean;
-        mean += delta / static_cast<double>(i + 1);
-        double delta2 = v - mean;
-        m2 += delta * delta2;
+        if (v < bmin) bmin = v;
+        if (v > bmax) bmax = v;
+    }
+    // Second pass: M2 = Σ(xi - mean)² — single division for mean, no per-element division.
+    double m2 = 0.0;
+    if (n > 0) {
+        double mean = sum / static_cast<double>(n);
+        for (size_t i = 0; i < n; ++i) {
+            double delta = values[i] - mean;
+            m2 += delta * delta;
+        }
     }
     indexBlock.blockSum = sum;
     indexBlock.blockMin = bmin;
     indexBlock.blockMax = bmax;
-    indexBlock.blockCount = static_cast<uint32_t>(values.size());
+    indexBlock.blockCount = static_cast<uint32_t>(n);
     indexBlock.blockM2 = m2;
     // firstValue/latestValue: values at min/max timestamp positions
     size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());

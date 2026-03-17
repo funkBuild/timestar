@@ -1,5 +1,4 @@
-#ifndef FLOAT_DECODER_SIMD_H_INCLUDED
-#define FLOAT_DECODER_SIMD_H_INCLUDED
+#pragma once
 
 #include "../../storage/slice_buffer.hpp"
 
@@ -25,5 +24,3 @@ public:
     // Safe variant (identical to decode since isAvailable() is always true).
     static void decodeSafe(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 };
-
-#endif  // FLOAT_DECODER_SIMD_H_INCLUDED

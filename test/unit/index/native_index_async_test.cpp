@@ -1,7 +1,7 @@
 /*
- * Google Test + Seastar integration for LevelDBIndex tests
+ * Google Test + Seastar integration for NativeIndex tests
  *
- * This test file uses SEASTAR_TEST_F macro to test async LevelDB index operations
+ * This test file uses SEASTAR_TEST_F macro to test async NativeIndex operations
  */
 
 #include "../../seastar_gtest.hpp"
@@ -15,9 +15,9 @@
 // Need to include these after filesystem to avoid conflicts
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 
-class LevelDBIndexAsyncTest : public ::testing::Test {
+class NativeIndexAsyncTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // Clean up any existing test index
@@ -32,8 +32,8 @@ protected:
     }
 };
 
-SEASTAR_TEST_F(LevelDBIndexAsyncTest, BasicIndexOperations) {
-    LevelDBIndex index(0);  // Use shard 999 for testing
+SEASTAR_TEST_F(NativeIndexAsyncTest, BasicIndexOperations) {
+    timestar::index::NativeIndex index(0);  // Use shard 999 for testing
 
     co_await index.open();
 
@@ -79,8 +79,8 @@ SEASTAR_TEST_F(LevelDBIndexAsyncTest, BasicIndexOperations) {
     co_return;
 }
 
-SEASTAR_TEST_F(LevelDBIndexAsyncTest, SeriesIdGeneration) {
-    LevelDBIndex index(0);  // Use shard 998 for this test
+SEASTAR_TEST_F(NativeIndexAsyncTest, SeriesIdGeneration) {
+    timestar::index::NativeIndex index(0);  // Use shard 998 for this test
 
     co_await index.open();
 
@@ -112,7 +112,7 @@ SEASTAR_TEST_F(LevelDBIndexAsyncTest, SeriesIdGeneration) {
     co_return;
 }
 
-SEASTAR_TEST_F(LevelDBIndexAsyncTest, Persistence) {
+SEASTAR_TEST_F(NativeIndexAsyncTest, Persistence) {
     std::string measurement = "test_measurement";
     std::map<std::string, std::string> tags = {{"host", "test-host"}};
     std::string field = "test_field";
@@ -120,7 +120,7 @@ SEASTAR_TEST_F(LevelDBIndexAsyncTest, Persistence) {
 
     // Phase 1: Create series and close
     {
-        auto index = std::make_unique<LevelDBIndex>(0);
+        auto index = std::make_unique<timestar::index::NativeIndex>(0);
         co_await index->open();
         originalId = co_await index->getOrCreateSeriesId(measurement, tags, field);
         EXPECT_FALSE(originalId.isZero());
@@ -129,7 +129,7 @@ SEASTAR_TEST_F(LevelDBIndexAsyncTest, Persistence) {
 
     // Phase 2: Reopen and verify
     {
-        auto index = std::make_unique<LevelDBIndex>(0);
+        auto index = std::make_unique<timestar::index::NativeIndex>(0);
         co_await index->open();
         SeriesId128 newId = co_await index->getOrCreateSeriesId(measurement, tags, field);
         EXPECT_EQ(originalId, newId);

@@ -1,5 +1,4 @@
-#ifndef NATIVE_INDEX_COMPACTION_H_INCLUDED
-#define NATIVE_INDEX_COMPACTION_H_INCLUDED
+#pragma once
 
 #include "manifest.hpp"
 #include "sstable.hpp"
@@ -16,6 +15,8 @@ struct CompactionConfig {
     uint32_t level0Threshold = 4;  // Trigger L0 compaction when this many L0 files exist
     int blockSize = 16384;
     int bloomBitsPerKey = 15;
+    uint32_t rateLimitMBps = 0;    // Max compaction write throughput (MB/s). 0 = unlimited.
+    uint64_t tombstoneGracePeriodMs = 10ULL * 24 * 3600 * 1000;  // Drop tombstones older than this (default 10 days). 0 = keep forever.
 };
 
 // Compaction engine: merges multiple SSTables into fewer, larger SSTables.
@@ -52,5 +53,3 @@ private:
 };
 
 }  // namespace timestar::index
-
-#endif  // NATIVE_INDEX_COMPACTION_H_INCLUDED

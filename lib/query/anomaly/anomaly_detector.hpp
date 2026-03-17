@@ -1,5 +1,4 @@
-#ifndef ANOMALY_DETECTOR_H_INCLUDED
-#define ANOMALY_DETECTOR_H_INCLUDED
+#pragma once
 
 #include "anomaly_result.hpp"
 
@@ -94,5 +93,3 @@ std::unique_ptr<AnomalyDetector> createDetector(Algorithm algorithm);
 
 }  // namespace anomaly
 }  // namespace timestar
-
-#endif  // ANOMALY_DETECTOR_H_INCLUDED

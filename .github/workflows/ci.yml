@@ -39,6 +39,47 @@ jobs:
           name: test-results
           path: test-results/test-results.xml
 
+  benchmarks:
+    name: Benchmark Regression Check
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+    # Advisory — does not block PRs until confidence builds
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize submodules
+        run: git submodule update --init
+
+      - name: Build Docker image (builder stage)
+        run: docker build --target builder -t timestar-builder .
+
+      - name: Run benchmarks inside Docker
+        run: |
+          mkdir -p benchmark-results
+          docker run --rm \
+            -v ${{ github.workspace }}/benchmark-results:/benchmark-results \
+            timestar-builder \
+            bash -c "cd /src && ./benchmark/run_ci_benchmarks.sh build && cp benchmark/ci_results.json /benchmark-results/"
+
+      - name: Compare against baseline
+        run: |
+          python3 benchmark/compare_benchmarks.py \
+            benchmark/ci_baseline.json \
+            benchmark-results/ci_results.json \
+            --threshold 15
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-results/ci_results.json
+            benchmark/benchmark_report.md
+
   lint:
     name: Code Formatting
     runs-on: ubuntu-24.04

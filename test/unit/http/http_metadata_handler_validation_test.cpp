@@ -10,7 +10,7 @@
 //
 // The metadata endpoints (/tags, /fields) accept measurement names and tag
 // names as URL query parameters.  If those parameters contain null bytes or
-// other control characters they could corrupt LevelDB key lookups.
+// other control characters they could corrupt index key lookups.
 //
 // Fix (Task #59): HttpMetadataHandler::validateQueryParam() must reject any
 // name that contains a null byte (\x00) or ASCII control character (< 0x20).
@@ -156,7 +156,7 @@ TEST_F(MetadataHandlerNullByteSourceTest, HandleTagsCallsValidateQueryParam) {
     EXPECT_NE(body.find("validateQueryParam"), std::string::npos)
         << "handleTags must call validateQueryParam() to reject null bytes in "
         << "the 'measurement' (and optionally 'tag') query parameters before "
-        << "passing them to the LevelDB engine.";
+        << "passing them to the index engine.";
 }
 
 TEST_F(MetadataHandlerNullByteSourceTest, HandleFieldsCallsValidateQueryParam) {
@@ -182,6 +182,6 @@ TEST_F(MetadataHandlerNullByteSourceTest, HandleFieldsCallsValidateQueryParam) {
 
     EXPECT_NE(body.find("validateQueryParam"), std::string::npos)
         << "handleFields must call validateQueryParam() to reject null bytes in "
-        << "the 'measurement' query parameter before passing it to the LevelDB "
+        << "the 'measurement' query parameter before passing it to the index "
         << "engine.";
 }

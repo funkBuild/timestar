@@ -480,8 +480,10 @@ void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequ
 template <class T>
 seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
     // --- Encoding phase (no lock needed) ---
-    // Pre-allocate the buffer using the size estimate to avoid reallocations.
-    AlignedBuffer buffer;
+    // Reuse thread-local buffer: capacity persists across inserts, eliminating
+    // per-insert heap allocation. clear() resets size but preserves capacity.
+    static thread_local AlignedBuffer buffer;
+    buffer.clear();
     buffer.reserve(estimateInsertSize(insertRequest));
 
     encodeInsertEntry(buffer, insertRequest);
@@ -553,7 +555,10 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
         estimatedTotal += estimateInsertSize(req);
     }
 
-    AlignedBuffer buffer;
+    // Reuse thread-local buffer (same one as insert() — safe because the
+    // semaphore guarantees only one WAL write runs at a time per shard).
+    static thread_local AlignedBuffer buffer;
+    buffer.clear();
     buffer.reserve(estimatedTotal);
 
     // Second pass: encode each insert directly into the shared buffer
@@ -852,7 +857,7 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
             }
             // If entryLength < 8, it's too small for new format; treat as old format
 
-            Slice entrySlice(const_cast<uint8_t*>(payloadPtr), payloadSize);
+            Slice entrySlice(payloadPtr, payloadSize);
             uint8_t type = entrySlice.read<uint8_t>();
 
             switch (static_cast<WALType>(type)) {

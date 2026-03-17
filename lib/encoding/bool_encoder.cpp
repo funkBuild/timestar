@@ -52,27 +52,68 @@ size_t BoolEncoder::encodeInto(const std::vector<bool>& values, AlignedBuffer& t
 }
 
 void BoolEncoder::decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out) {
-    size_t totalBits = nToSkip + length;
-    size_t bytesNeeded = (totalBits + 7) / 8;
+    if (length == 0) return;
+    out.reserve(out.size() + length);
 
-    for (size_t byteIdx = 0; byteIdx < bytesNeeded; byteIdx++) {
-        uint8_t byte = encoded.read<uint8_t>();
+    // Phase 1: Skip bits — advance pointer directly (no per-byte read call)
+    size_t skipBytes = nToSkip / 8;
+    size_t skipBitsRem = nToSkip % 8;
+    encoded.offset += skipBytes;
 
-        for (int i = 0; i < 8; i++) {
-            if (nToSkip > 0) {
-                nToSkip--;
-            } else if (length > 0) {
-                bool value = ((byte >> i) & 0x1) != 0;
-                out.push_back(value);
-                length--;
-            }
+    size_t remaining = length;
 
-            if (nToSkip == 0 && length == 0)
-                break;
+    // Phase 2: Partial first byte after skip
+    if (skipBitsRem > 0) {
+        uint8_t byte = encoded.data[encoded.offset++];
+        for (size_t i = skipBitsRem; i < 8 && remaining > 0; ++i) {
+            out.push_back(((byte >> i) & 0x1) != 0);
+            --remaining;
         }
+    }
 
-        if (length == 0)
-            break;
+    // Phase 3: Bulk decode — read raw bytes directly from data pointer,
+    // bypassing Slice::read<uint8_t>() per-byte bounds checks.
+    const uint8_t* __restrict__ src = encoded.data + encoded.offset;
+
+    // Process 8 bytes (64 values) at a time
+    while (remaining >= 64) {
+        for (int b = 0; b < 8; ++b) {
+            uint8_t byte = src[b];
+            out.push_back((byte & 0x01) != 0);
+            out.push_back((byte & 0x02) != 0);
+            out.push_back((byte & 0x04) != 0);
+            out.push_back((byte & 0x08) != 0);
+            out.push_back((byte & 0x10) != 0);
+            out.push_back((byte & 0x20) != 0);
+            out.push_back((byte & 0x40) != 0);
+            out.push_back((byte & 0x80) != 0);
+        }
+        src += 8;
+        remaining -= 64;
+    }
+
+    // Remaining full bytes
+    while (remaining >= 8) {
+        uint8_t byte = *src++;
+        out.push_back((byte & 0x01) != 0);
+        out.push_back((byte & 0x02) != 0);
+        out.push_back((byte & 0x04) != 0);
+        out.push_back((byte & 0x08) != 0);
+        out.push_back((byte & 0x10) != 0);
+        out.push_back((byte & 0x20) != 0);
+        out.push_back((byte & 0x40) != 0);
+        out.push_back((byte & 0x80) != 0);
+        remaining -= 8;
+    }
+
+    encoded.offset += (src - (encoded.data + encoded.offset));
+
+    // Phase 4: Tail — final partial byte
+    if (remaining > 0) {
+        uint8_t byte = encoded.data[encoded.offset++];
+        for (size_t i = 0; i < remaining; ++i) {
+            out.push_back(((byte >> i) & 0x1) != 0);
+        }
     }
 }
 

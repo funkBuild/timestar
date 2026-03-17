@@ -41,27 +41,6 @@ struct glz::meta<GlazeQueryRequest> {
 
 namespace timestar {
 
-// Helper to build a merge key from measurement + sorted tags with pre-reserved capacity.
-// Avoids repeated reallocations from naive string concatenation in loops.
-static std::string buildMergeKey(const std::string& measurement, const std::map<std::string, std::string>& tags) {
-    // Pre-calculate total size: measurement + (NUL + key + '=' + value) for each tag
-    size_t totalSize = measurement.size();
-    for (const auto& [k, v] : tags) {
-        totalSize += 1 + k.size() + 1 + v.size();  // '\0' + key + '=' + value
-    }
-
-    std::string key;
-    key.reserve(totalSize);
-    key.append(measurement);
-    for (const auto& [k, v] : tags) {
-        key += '\0';
-        key.append(k);
-        key += '=';
-        key.append(v);
-    }
-    return key;
-}
-
 // Finalize partial aggregation results from a single shard directly into the query response,
 // bypassing the mergePartialAggregationsGrouped() → GroupedAggregationResult pipeline.
 // Precondition: each partial must have a unique groupKey (i.e. no two partials share the
@@ -374,7 +353,21 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
     return request;
 }
 
-seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest& request) {
+seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest& request_in) {
+    QueryRequest request = request_in;
+
+    // Interval collapse for LATEST/FIRST: when the aggregation interval covers
+    // the entire query range, drop it so the non-bucketed fast path is used
+    // (sparse index zero-I/O lookup instead of bucketed block reads).
+    if (request.aggregationInterval > 0 && request.endTime > request.startTime &&
+        (request.aggregation == AggregationMethod::LATEST ||
+         request.aggregation == AggregationMethod::FIRST)) {
+        uint64_t range = request.endTime - request.startTime;
+        if (request.aggregationInterval >= range) {
+            request.aggregationInterval = 0;
+        }
+    }
+
     LOG_QUERY_PATH(timestar::http_log, info,
                    "[QUERY] Executing query - Measurement: {}, Fields: {}, Scopes: {}, Start: {}, End: {}",
                    request.measurement, request.fields.size(), request.scopes.size(), request.startTime,
@@ -388,9 +381,14 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
     QueryTimingInfo timing;
     timing.startTime = std::chrono::high_resolution_clock::now();
 
+    // Increment query counter on the local shard
+    if (engineSharded) {
+        ++engineSharded->local().metrics().queries_total;
+    }
+
     try {
         LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Checking pointers - engineSharded: {}, indexSharded: {}",
-                       (void*)engineSharded, (void*)indexSharded);
+                       static_cast<const void*>(engineSharded), static_cast<const void*>(indexSharded));
 
         if (!engineSharded) {
             LOG_QUERY_PATH(timestar::http_log, error, "[QUERY] engineSharded is NULL!");
@@ -443,22 +441,45 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                  maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<PerShardDiscovery> {
                     auto& index = engine.getIndex();
                     std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
-                    auto findResult =
-                        co_await index.findSeriesWithMetadataTimeScoped(
-                            measurement, scopes, fieldFilter, startTime, endTime, maxSeries);
+                    // Wide-range optimisation: use discovery cache for ranges > 365 days.
+                    static constexpr uint64_t NS_PER_DAY = 86400ULL * 1'000'000'000ULL;
+                    static constexpr uint64_t WIDE_RANGE_THRESHOLD = 365ULL * NS_PER_DAY;
+                    const bool wideRange = (endTime > startTime) &&
+                                           (endTime - startTime) > WIDE_RANGE_THRESHOLD;
+
+                    const std::vector<IndexBackend::SeriesWithMetadata>* swmPtr = nullptr;
+                    std::vector<IndexBackend::SeriesWithMetadata> ownedVec;
+                    std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>> cachedPtr;
 
                     PerShardDiscovery result;
-                    if (!findResult.has_value()) {
-                        result.limitExceeded = true;
-                        result.discovered = findResult.error().discovered;
-                        result.limit = findResult.error().limit;
-                        co_return result;
+
+                    if (wideRange) {
+                        auto cr = co_await index.findSeriesWithMetadataCached(
+                            measurement, scopes, fieldFilter, maxSeries);
+                        if (!cr.has_value()) {
+                            result.limitExceeded = true;
+                            result.discovered = cr.error().discovered;
+                            result.limit = cr.error().limit;
+                            co_return result;
+                        }
+                        cachedPtr = std::move(*cr);
+                        swmPtr = cachedPtr.get();
+                    } else {
+                        auto findResult = co_await index.findSeriesWithMetadataTimeScoped(
+                            measurement, scopes, fieldFilter, startTime, endTime, maxSeries);
+                        if (!findResult.has_value()) {
+                            result.limitExceeded = true;
+                            result.discovered = findResult.error().discovered;
+                            result.limit = findResult.error().limit;
+                            co_return result;
+                        }
+                        ownedVec = std::move(*findResult);
+                        swmPtr = &ownedVec;
                     }
 
-                    const auto& seriesWithMeta = findResult.value();
-                    result.contexts.reserve(seriesWithMeta.size());
+                    result.contexts.reserve(swmPtr->size());
 
-                    for (const auto& swm : seriesWithMeta) {
+                    for (const auto& swm : *swmPtr) {
                         SeriesQueryContext ctx;
                         ctx.seriesKey = buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
                         ctx.seriesId = swm.seriesId;
@@ -561,6 +582,56 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                             std::vector<timestar::SeriesResult> fallbackResults;
                             fallbackResults.reserve(contexts.size());
 
+                            const bool isLatestOrFirst =
+                                (aggregation == AggregationMethod::LATEST || aggregation == AggregationMethod::FIRST);
+
+                            // ---- BATCH LATEST/FIRST FAST PATH ----
+                            // For non-bucketed LATEST/FIRST, resolve all series in a single
+                            // pass over TSM sparse indices and memory stores.  This avoids
+                            // per-series: file snapshot, sort, coroutine overhead, and
+                            // intermediate PushdownResult/BlockAggregator allocations.
+                            if (isLatestOrFirst && aggregationInterval == 0) {
+                                const bool wantFirst = (aggregation == AggregationMethod::FIRST);
+
+                                // Build batch entries
+                                std::vector<Engine::BatchLatestEntry> batchEntries;
+                                batchEntries.resize(contexts.size());
+                                for (size_t i = 0; i < contexts.size(); ++i) {
+                                    batchEntries[i].seriesId = contexts[i].seriesId;
+                                }
+
+                                co_await engine.batchLatest(batchEntries, startTime, endTime, wantFirst);
+
+                                // Convert resolved entries to PartialAggregationResults
+                                pushdownPartials.reserve(batchEntries.size());
+                                for (size_t i = 0; i < batchEntries.size(); ++i) {
+                                    if (!batchEntries[i].resolved) continue;
+
+                                    PartialAggregationResult partial;
+                                    partial.measurement = measurement;
+                                    partial.fieldName = contexts[i].field;
+                                    partial.totalPoints = 1;
+
+                                    auto gkr = timestar::buildGroupKeyDirect(
+                                        measurement, contexts[i].field, contexts[i].tags, groupByTags);
+                                    partial.groupKey = std::move(gkr.key);
+                                    partial.groupKeyHash = gkr.hash;
+                                    partial.cachedTags = std::move(gkr.tags);
+
+                                    AggregationState state;
+                                    state.count = 1;
+                                    state.latest = batchEntries[i].value;
+                                    state.latestTimestamp = batchEntries[i].timestamp;
+                                    state.first = batchEntries[i].value;
+                                    state.firstTimestamp = batchEntries[i].timestamp;
+                                    partial.collapsedState = std::move(state);
+
+                                    pushdownPartials.push_back(std::move(partial));
+                                }
+
+                            } else {
+                            // ---- STANDARD PER-SERIES PATH ----
+
                             // Prefetch TSM index entries for all series on this shard.
                             // Warms the full-index cache in parallel so that per-series
                             // queries hit cache instead of issuing individual DMA reads.
@@ -576,6 +647,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                             // Use max_concurrent_for_each to avoid creating thousands of
                             // concurrent futures at once. Bounded concurrency reduces memory
                             // pressure and context thrashing.
+                            {
                             static constexpr size_t MAX_CONCURRENT_SERIES_QUERIES = 64;
 
                             co_await seastar::max_concurrent_for_each(
@@ -635,11 +707,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                                 ctx.seriesKey, shardId, e.what());
                                         }
                                         co_return;
-                                    } catch (...) {
+                                    } catch (const std::exception& e) {
                                         LOG_QUERY_PATH(
                                             timestar::http_log, warn,
-                                            "[QUERY] Unknown error querying series '{}' on shard {} - skipping",
-                                            ctx.seriesKey, shardId);
+                                            "[QUERY] Unexpected error querying series '{}' on shard {}: {} - skipping",
+                                            ctx.seriesKey, shardId, e.what());
                                         co_return;
                                     }
 
@@ -690,6 +762,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                         fallbackResults.push_back(std::move(seriesResult));
                                     }
                                 });
+                            } // end of non-batch per-series loop
+                            } // end of batch-vs-standard if/else
 
                             // Separate non-numeric (string/bool) fallback results from numeric.
                             // String and boolean data bypass aggregation and are returned as-is.
@@ -1072,6 +1146,29 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
         // Print timing information
         LOG_QUERY_PATH(timestar::http_log, info, "{}", timing.toString());
+
+        // Slow query detection (always compiled in, runtime configurable)
+        const auto slowThresholdMs = timestar::config().http.slow_query_threshold_ms;
+        if (slowThresholdMs > 0 && timing.totalMs > static_cast<double>(slowThresholdMs)) {
+            if (engineSharded) ++engineSharded->local().metrics().slow_queries_total;
+            timestar::query_log.warn(
+                "[SLOW_QUERY] {:.1f}ms (threshold {}ms) | "
+                "measurement={} series={} points={} shards={} | "
+                "discovery={:.1f}ms shard_queries={:.1f}ms aggregation={:.1f}ms format={:.1f}ms",
+                timing.totalMs, slowThresholdMs,
+                request.measurement, timing.seriesFound, timing.finalPointsReturned,
+                timing.shardsQueried,
+                timing.findSeriesMs, timing.shardQueriesMs, timing.aggregationMs,
+                timing.responseFormattingMs);
+
+            // Per-shard breakdown for slow queries (only log shards that took >50% of threshold)
+            const double shardWarnMs = static_cast<double>(slowThresholdMs) / 2.0;
+            for (const auto& [shardId, ms] : timing.perShardQueryMs) {
+                if (ms > shardWarnMs) {
+                    timestar::query_log.warn("[SLOW_QUERY]   shard {} took {:.1f}ms", shardId, ms);
+                }
+            }
+        }
 
     } catch (const std::exception& e) {
         response.success = false;

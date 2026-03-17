@@ -1,6 +1,6 @@
 # Distributed Index Implementation Plan
 
-**Status**: Planning
+**Status**: Phases 1-5 Complete, Phase 6+ Planned
 **Branch**: TBD (off `feature/seastar-native-index`)
 **Proposal**: [distributed_index_proposal.md](distributed_index_proposal.md)
 **Research**: [distributed_index_research.md](distributed_index_research.md)
@@ -9,106 +9,106 @@
 
 ## Phase 1: Co-locate Index (eliminates shard-0 bottleneck)
 
-**Status**: Not Started
+**Status**: COMPLETE
 **Estimated Complexity**: Medium-High
 
 ### Index Distribution
-- [ ] Remove `if (shardId != 0) return` gate in `NativeIndex::open()` — each shard opens its own NativeIndex at `shard_N/native_index/`
-- [ ] On insert, write TAG_INDEX + SERIES_METADATA + MEASUREMENT_SERIES to local shard's NativeIndex via `kvWriteBatch()`
-- [ ] Add `SchemaUpdate` struct and `Engine::applySchemaUpdate()` (idempotent set merge)
-- [ ] Add schema broadcast via `invoke_on_all` for new fields/tags/values
-- [ ] Add first-writer-wins field type conflict detection in `applySchemaUpdate()`
-- [ ] Scale NativeIndex config per shard: `write_buffer_size /= N`
+- [x] Remove `if (shardId != 0) return` gate in `NativeIndex::open()` — each shard opens its own NativeIndex at `shard_N/native_index/`
+- [x] On insert, write TAG_INDEX + SERIES_METADATA + MEASUREMENT_SERIES to local shard's NativeIndex via `kvWriteBatch()`
+- [x] Add `SchemaUpdate` struct and `Engine::applySchemaUpdate()` (idempotent set merge)
+- [x] Add schema broadcast via `invoke_on_all` for new fields/tags/values
+- [x] Add first-writer-wins field type conflict detection in `applySchemaUpdate()`
+- [x] Scale NativeIndex config per shard: `write_buffer_size /= N`
 
 ### Write Path
-- [ ] Remove `indexMetadataSync` cross-shard RPC from `http_write_handler.cpp` — index locally instead
-- [ ] Verify `knownSeriesCache` (thread_local in HTTP handler) carries over correctly
+- [x] Remove `indexMetadataSync` cross-shard RPC from `http_write_handler.cpp` — index locally instead
+- [x] Verify `knownSeriesCache` (thread_local in HTTP handler) carries over correctly
 
 ### Query Path
-- [ ] Add `discoverAndQueryLocal()` method to Engine — discovers matching series from local index, queries local data, returns `PartialAggregationResult`
-- [ ] Change `http_query_handler.cpp`: fan out `discoverAndQueryLocal()` to all shards via `invoke_on_all` instead of single RPC to shard 0
-- [ ] Remove `getSeriesMetadataBatch` re-fetch from `executeLocalQuery` — metadata already local
-- [ ] Merge partial aggregations from all shards on coordinator (reuse existing `mergePartialAggregationsGrouped()`)
+- [x] Add `discoverAndQueryLocal()` method to Engine — discovers matching series from local index, queries local data, returns `PartialAggregationResult`
+- [x] Change `http_query_handler.cpp`: fan out `discoverAndQueryLocal()` to all shards via `invoke_on_all` instead of single RPC to shard 0
+- [x] Remove `getSeriesMetadataBatch` re-fetch from `executeLocalQuery` — metadata already local
+- [x] Merge partial aggregations from all shards on coordinator (reuse existing `mergePartialAggregationsGrouped()`)
 
 ### Delete Path
-- [ ] Add `localDeleteByPattern()` method to Engine — discovers + tombstones locally
-- [ ] Change `deleteByPattern()`: scatter-gather to all shards, each shard discovers and deletes locally
-- [ ] Change `deleteRangeBySeries()`: compute target shard from hash, send delete directly to that shard
+- [x] Add `localDeleteByPattern()` method to Engine — discovers + tombstones locally
+- [x] Change `deleteByPattern()`: scatter-gather to all shards, each shard discovers and deletes locally
+- [x] Change `deleteRangeBySeries()`: compute target shard from hash, send delete directly to that shard
 
 ### Retention
-- [ ] Change retention policy CRUD: write to local NativeIndex + broadcast via `invoke_on_all`
-- [ ] Change `sweepExpiredFiles()`: each shard sweeps independently using local index
-- [ ] Update `loadAndBroadcastRetentionPolicies()`: each shard loads from local index
+- [x] Change retention policy CRUD: write to local NativeIndex + broadcast via `invoke_on_all`
+- [x] Change `sweepExpiredFiles()`: each shard sweeps independently using local index
+- [x] Update `loadAndBroadcastRetentionPolicies()`: each shard loads from local index
 
 ### Metadata API
-- [ ] Change `/measurements` handler: read from local schema registry cache
-- [ ] Change `/tags` handler: read from local schema registry cache
-- [ ] Change `/fields` handler: read from local schema registry cache
+- [x] Change `/measurements` handler: read from local schema registry cache
+- [x] Change `/tags` handler: read from local schema registry cache
+- [x] Change `/fields` handler: read from local schema registry cache
 
 ### Validation
-- [ ] Dual-write to shard 0 during transition
-- [ ] Run both old and new query paths, compare results
-- [ ] Run full test suite (2802+ tests)
-- [ ] Benchmark: insert throughput, query latency, discovery scan time
+- [x] Dual-write to shard 0 during transition
+- [x] Run both old and new query paths, compare results
+- [x] Run full test suite (2802+ tests)
+- [x] Benchmark: insert throughput, query latency, discovery scan time
 
 ---
 
 ## Phase 2: Shard-Local IDs + In-Memory Postings
 
-**Status**: Not Started
+**Status**: COMPLETE
 **Estimated Complexity**: Medium
 
-- [ ] Define `LocalIdMap` class: bidirectional `SeriesId128 ↔ uint32` mapping
-- [ ] Add NativeIndex key prefixes `0x10` (LocalId → SeriesId128) and `0x11` (SeriesId128 → LocalId)
-- [ ] Persist LocalId counter per shard in NativeIndex
-- [ ] Add `mutablePostings_`: `robin_map<PostingsKey, vector<uint32_t>>` per shard
-- [ ] On insert, append LocalId to mutable postings sorted vectors
-- [ ] On MemoryStore rollover, flush mutable postings to NativeIndex as serialized roaring bitmaps via `kvWriteBatch()`
-- [ ] Integrate CRoaring library (add to CMake, vendor or fetch)
-- [ ] On query, merge mutable (sorted vectors) + immutable (roaring bitmaps from NativeIndex SSTable cache)
-- [ ] Benchmark multi-tag intersection: roaring bitmap vs current sorted-merge
+- [x] Define `LocalIdMap` class: bidirectional `SeriesId128 ↔ uint32` mapping
+- [x] Add NativeIndex key prefixes `0x10` (LocalId → SeriesId128) and `0x11` (SeriesId128 → LocalId)
+- [x] Persist LocalId counter per shard in NativeIndex
+- [x] Add `mutablePostings_`: `robin_map<PostingsKey, vector<uint32_t>>` per shard
+- [x] On insert, append LocalId to mutable postings sorted vectors
+- [x] On MemoryStore rollover, flush mutable postings to NativeIndex as serialized roaring bitmaps via `kvWriteBatch()`
+- [x] Integrate CRoaring library (add to CMake, vendor or fetch)
+- [x] On query, merge mutable (sorted vectors) + immutable (roaring bitmaps from NativeIndex SSTable cache)
+- [x] Benchmark multi-tag intersection: roaring bitmap vs current sorted-merge
 
 ---
 
 ## Phase 3: Time-Scoped Postings
 
-**Status**: Not Started
+**Status**: COMPLETE
 **Estimated Complexity**: Low-Medium
 
-- [ ] Add NativeIndex key prefixes `0x0D` (day + tag → bitmap) and `0x0E` (day + measurement → bitmap)
-- [ ] On insert, mark series as active on current day (using data timestamp, not wall clock)
-- [ ] On query, build `activeSeries` bitmap from days in query range before tag intersection
-- [ ] Add midnight pre-population: progressively populate next-day entries during last hour
-- [ ] Add cleanup in retention sweep: remove time-scoped entries older than retention period
-- [ ] Benchmark: narrow time range query (5min) over 90-day retention data
+- [x] Add NativeIndex key prefixes `0x0D` (day + tag → bitmap) and `0x0E` (day + measurement → bitmap)
+- [x] On insert, mark series as active on current day (using data timestamp, not wall clock)
+- [x] On query, build `activeSeries` bitmap from days in query range before tag intersection
+- [x] Add midnight pre-population: progressively populate next-day entries during last hour
+- [x] Add cleanup in retention sweep: remove time-scoped entries older than retention period
+- [x] Benchmark: narrow time range query (5min) over 90-day retention data
 
 ---
 
 ## Phase 4: Query Optimizations
 
-**Status**: Not Started
+**Status**: COMPLETE
 **Estimated Complexity**: Low
 
-- [ ] **Smallest-first intersection**: Retrieve postings sizes (HLL or bitmap cardinality), sort, intersect smallest first
-- [ ] **Bloom filter pruning**: Add per-measurement bloom filter of active series, check before TAG_INDEX scan
-- [ ] **HLL sketches**: Add per-measurement and per-tag-key HLL for cardinality estimation
-- [ ] Add cardinality estimation API endpoint
-- [ ] Benchmark: multi-tag query with selective vs broad filters
+- [x] **Smallest-first intersection**: Retrieve postings sizes (HLL or bitmap cardinality), sort, intersect smallest first
+- [x] **Bloom filter pruning**: Add per-measurement bloom filter of active series, check before TAG_INDEX scan
+- [x] **HLL sketches**: Add per-measurement and per-tag-key HLL for cardinality estimation
+- [x] Add cardinality estimation API endpoint
+- [x] Benchmark: multi-tag query with selective vs broad filters
 
 ---
 
 ## Phase 5: Virtual Shard Abstraction
 
-**Status**: Not Started
+**Status**: COMPLETE
 **Estimated Complexity**: Medium
 
-- [ ] Allocate V=4096 virtual shards, build default placement (round-robin across N local cores)
-- [ ] Add `PlacementTable` class: maps virtual shard → (server, core)
-- [ ] Replace all `SeriesId128::Hash{}(id) % smp::count` routing with `placement[hash % V]` lookup
-- [ ] Make LocalId counters per-virtual-shard (not per-core) for clean rebalancing
-- [ ] Persist placement table to disk (JSON)
-- [ ] Update `deleteRangeBySeries` routing to use placement lookup
-- [ ] Verify single-server behavior is identical (all virtual shards map to local cores)
+- [x] Allocate V=4096 virtual shards, build default placement (round-robin across N local cores)
+- [x] Add `PlacementTable` class: maps virtual shard → (server, core)
+- [x] Replace all `SeriesId128::Hash{}(id) % smp::count` routing with `placement[hash % V]` lookup
+- [x] Make LocalId counters per-virtual-shard (not per-core) for clean rebalancing
+- [x] Persist placement table to disk (JSON)
+- [x] Update `deleteRangeBySeries` routing to use placement lookup
+- [x] Verify single-server behavior is identical (all virtual shards map to local cores)
 
 ---
 

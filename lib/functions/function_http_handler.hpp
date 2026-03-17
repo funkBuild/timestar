@@ -1,5 +1,4 @@
-#ifndef FUNCTION_HTTP_HANDLER_H_INCLUDED
-#define FUNCTION_HTTP_HANDLER_H_INCLUDED
+#pragma once
 
 #include <algorithm>
 #include <chrono>
@@ -140,5 +139,3 @@ private:
 };
 
 }  // namespace timestar::functions
-
-#endif  // FUNCTION_HTTP_HANDLER_H_INCLUDED

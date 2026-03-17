@@ -1,5 +1,4 @@
-#ifndef NATIVE_INDEX_HYPERLOGLOG_H_INCLUDED
-#define NATIVE_INDEX_HYPERLOGLOG_H_INCLUDED
+#pragma once
 
 #include <xxhash.h>
 
@@ -102,5 +101,3 @@ private:
 };
 
 }  // namespace timestar::index
-
-#endif  // NATIVE_INDEX_HYPERLOGLOG_H_INCLUDED

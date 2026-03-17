@@ -1,5 +1,4 @@
-#ifndef AGGREGATOR_H_INCLUDED
-#define AGGREGATOR_H_INCLUDED
+#pragma once
 
 #include "query_parser.hpp"
 
@@ -426,5 +425,3 @@ public:
 };
 
 }  // namespace timestar
-
-#endif  // AGGREGATOR_H_INCLUDED

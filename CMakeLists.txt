@@ -36,6 +36,9 @@ endif()
 
 project(timestar LANGUAGES C CXX ASM)
 
+# ──────────────────────────── version stamping ───────────────────────────────
+include(cmake/version.cmake)
+
 # ─────────────────────── sanity check on the chosen compiler ─────────────────
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")

@@ -1,5 +1,4 @@
-#ifndef ARITHMETIC_FUNCTIONS_H_INCLUDED
-#define ARITHMETIC_FUNCTIONS_H_INCLUDED
+#pragma once
 
 #include "function_types.hpp"
 
@@ -86,5 +85,3 @@ std::vector<double> scale(const std::vector<double>& values, double factor);
 std::vector<double> offset(const std::vector<double>& values, double offset_value);
 
 }  // namespace timestar::functions
-
-#endif  // ARITHMETIC_FUNCTIONS_H_INCLUDED

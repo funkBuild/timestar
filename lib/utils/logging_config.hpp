@@ -1,5 +1,4 @@
-#ifndef LOGGING_CONFIG_HPP
-#define LOGGING_CONFIG_HPP
+#pragma once
 
 // Compile-time logging configuration for TimeStar
 // These defines control verbose logging in performance-critical paths
@@ -29,5 +28,3 @@
 #else
     #define LOG_QUERY_PATH(logger, level, ...) ((void)0)
 #endif
-
-#endif  // LOGGING_CONFIG_HPP

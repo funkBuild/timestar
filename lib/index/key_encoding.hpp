@@ -1,5 +1,4 @@
-#ifndef KEY_ENCODING_H_INCLUDED
-#define KEY_ENCODING_H_INCLUDED
+#pragma once
 
 #include "index_backend.hpp"
 #include "series_id.hpp"
@@ -12,8 +11,7 @@
 namespace timestar::index::keys {
 
 // --- Key encoding functions ---
-// These produce the same binary keys as LevelDBIndex's private methods.
-// Used by both LevelDBIndex and NativeIndex.
+// These produce the binary keys used by NativeIndex.
 
 std::string encodeSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
                              const std::string& field);
@@ -75,5 +73,3 @@ std::string encodeCardinalityHLLPrefix(const std::string& measurement);
 std::string encodeMeasurementBloomKey(const std::string& measurement);
 
 }  // namespace timestar::index::keys
-
-#endif  // KEY_ENCODING_H_INCLUDED

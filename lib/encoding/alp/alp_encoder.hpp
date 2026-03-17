@@ -1,5 +1,4 @@
-#ifndef ALP_ENCODER_HPP_INCLUDED
-#define ALP_ENCODER_HPP_INCLUDED
+#pragma once
 
 #include "../../storage/compressed_buffer.hpp"
 
@@ -21,5 +20,3 @@ public:
     // Returns the number of bytes written.
     static size_t encodeInto(std::span<const double> values, AlignedBuffer& target);
 };
-
-#endif  // ALP_ENCODER_HPP_INCLUDED

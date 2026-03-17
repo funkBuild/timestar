@@ -1,5 +1,4 @@
-#ifndef SIMPLE8B_H_INCLUDED
-#define SIMPLE8B_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -21,5 +20,3 @@ public:
     template <uint64_t n, uint64_t bits>
     static inline void unpack(uint64_t value, std::vector<uint64_t>& out);
 };
-
-#endif

@@ -1,7 +1,6 @@
-#ifndef HTTP_QUERY_HANDLER_H_INCLUDED
-#define HTTP_QUERY_HANDLER_H_INCLUDED
+#pragma once
 
-#include "leveldb_index.hpp"
+#include "native_index.hpp"
 #include "query_parser.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
@@ -58,7 +57,7 @@ struct QueryResponse {
 class HttpQueryHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
-    seastar::sharded<LevelDBIndex>* indexSharded;
+    seastar::sharded<timestar::index::NativeIndex>* indexSharded;
 
 public:
     // Security limits to prevent DoS attacks
@@ -73,7 +72,7 @@ public:
         return std::chrono::seconds(timestar::config().http.query_timeout_seconds);
     }
 
-    explicit HttpQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<LevelDBIndex>* index = nullptr)
+    explicit HttpQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<timestar::index::NativeIndex>* index = nullptr)
         : engineSharded(engine), indexSharded(index) {}
 
     // Validate request body size and content type (public for testing).
@@ -118,5 +117,3 @@ private:
 };
 
 }  // namespace timestar
-
-#endif  // HTTP_QUERY_HANDLER_H_INCLUDED

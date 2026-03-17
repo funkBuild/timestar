@@ -1,5 +1,4 @@
-#ifndef TSM_FILE_MANAGER_H_INCLUDED
-#define TSM_FILE_MANAGER_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "memory_store.hpp"
@@ -11,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <vector>
 
@@ -34,6 +34,11 @@ private:
     // Compactor (unique ownership, destructor defined in .cpp where TSMCompactor is complete)
     std::unique_ptr<TSMCompactor> compactor;
     std::optional<seastar::future<>> compactionTask;
+
+    // I/O scheduling group for compaction (lower priority than queries).
+    // Set by Engine via setCompactionGroup() after scheduling groups are created.
+    seastar::scheduling_group _compactionGroup;
+    bool _compactionGroupSet = false;
 
     seastar::future<> openTsmFile(std::string path);
     std::string basePath();
@@ -69,9 +74,10 @@ public:
     // Get the compactor (for tombstone rewrites)
     TSMCompactor* getCompactor() { return compactor.get(); }
 
+    // Set the I/O scheduling group for background compaction.
+    void setCompactionGroup(seastar::scheduling_group sg) { _compactionGroup = sg; _compactionGroupSet = true; }
+
     // Start background compaction
     seastar::future<> startCompactionLoop();
     seastar::future<> stopCompactionLoop();
 };
-
-#endif

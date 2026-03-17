@@ -283,6 +283,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU16("TIMESTAR_PORT", cfg.server.port);
     envString("TIMESTAR_LOG_LEVEL", cfg.server.log_level);
     envString("TIMESTAR_DATA_DIR", cfg.server.data_dir);
+    envU32("TIMESTAR_SHUTDOWN_TIMEOUT_SECONDS", cfg.server.shutdown_timeout_seconds);
 
     // Storage
     envU64("TIMESTAR_WAL_SIZE_THRESHOLD", cfg.storage.wal_size_threshold);
@@ -301,6 +302,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU32("TIMESTAR_HTTP_MAX_SERIES_COUNT", cfg.http.max_series_count);
     envU64("TIMESTAR_HTTP_MAX_TOTAL_POINTS", cfg.http.max_total_points);
     envU32("TIMESTAR_HTTP_QUERY_TIMEOUT_SECONDS", cfg.http.query_timeout_seconds);
+    envU32("TIMESTAR_HTTP_SLOW_QUERY_THRESHOLD_MS", cfg.http.slow_query_threshold_ms);
 
     // Index
     envU32("TIMESTAR_INDEX_BLOOM_FILTER_BITS", cfg.index.bloom_filter_bits);

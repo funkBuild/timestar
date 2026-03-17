@@ -1,5 +1,4 @@
-#ifndef FORECAST_RESULT_H_INCLUDED
-#define FORECAST_RESULT_H_INCLUDED
+#pragma once
 
 #include "../anomaly/anomaly_result.hpp"  // Reuse Seasonality enum
 
@@ -384,5 +383,3 @@ struct SARIMAState {
 
 }  // namespace forecast
 }  // namespace timestar
-
-#endif  // FORECAST_RESULT_H_INCLUDED

@@ -1,5 +1,4 @@
-#ifndef FLOAT_DECODER_H_INCLUDED
-#define FLOAT_DECODER_H_INCLUDED
+#pragma once
 
 #include "../../storage/compressed_buffer.hpp"
 #include "../../storage/slice_buffer.hpp"
@@ -21,5 +20,3 @@ class FloatDecoderBasic {
 public:
     static void decode(CompressedSlice& values, size_t nToSkip, size_t length, std::vector<double>& out);
 };
-
-#endif  // FLOAT_DECODER_H_INCLUDED

@@ -15,8 +15,7 @@
  *********************************************************************
  */
 
-#ifndef INCLUDE_BLOOM_FILTER_HPP
-    #define INCLUDE_BLOOM_FILTER_HPP
+#pragma once
 
     #include "bloom_filter_simd.hpp"
 
@@ -148,9 +147,9 @@ public:
 
 class bloom_filter {
 protected:
-    typedef unsigned int bloom_type;
-    typedef unsigned char cell_type;
-    typedef std::vector<unsigned char> table_type;
+    using bloom_type = unsigned int;
+    using cell_type = unsigned char;
+    using table_type = std::vector<unsigned char>;
 
 public:
     bloom_filter()
@@ -555,7 +554,7 @@ public:
 
         std::copy(bit_table_.begin(), bit_table_.begin() + new_tbl_raw_size, tmp.begin());
 
-        typedef table_type::iterator itr_t;
+        using itr_t = table_type::iterator;
 
         itr_t itr = bit_table_.begin() + (new_table_size / bits_per_char);
         itr_t end = bit_table_.begin() + (original_table_size / bits_per_char);
@@ -586,7 +585,6 @@ private:
     std::vector<unsigned long long int> size_list;
 };
 
-#endif
 
 /*
   Note 1:

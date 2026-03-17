@@ -1,5 +1,4 @@
-#ifndef ZIGZAG_H_INCLUDED
-#define ZIGZAG_H_INCLUDED
+#pragma once
 
 #include <algorithm>
 #include <cstdint>
@@ -49,5 +48,3 @@ public:
         }
     }
 };
-
-#endif

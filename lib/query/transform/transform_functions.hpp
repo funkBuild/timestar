@@ -1,5 +1,7 @@
-#ifndef TRANSFORM_FUNCTIONS_H_INCLUDED
-#define TRANSFORM_FUNCTIONS_H_INCLUDED
+#pragma once
+
+// Single-includer header: only transform_functions_test.cpp includes this file.
+// Splitting into .hpp/.cpp would add complexity for no compile-time benefit.
 
 #include <algorithm>
 #include <cmath>
@@ -1544,5 +1546,3 @@ inline std::vector<std::vector<bool>> outliers_mask(const std::vector<std::vecto
 
 }  // namespace transform
 }  // namespace timestar
-
-#endif  // TRANSFORM_FUNCTIONS_H_INCLUDED

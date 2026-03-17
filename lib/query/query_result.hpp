@@ -1,5 +1,4 @@
-#ifndef QUERY_RESULT_H_INCLUDED
-#define QUERY_RESULT_H_INCLUDED
+#pragma once
 
 #include "tsm_result.hpp"
 #include "util.hpp"
@@ -54,6 +53,24 @@ public:
     static QueryResult fromTsmResults(std::vector<TSMResult<T>>& tsmResults) {
         QueryResult<T> results;
         results.mergeTsmResults(tsmResults);
+        return results;
+    }
+
+    // Single-source fast path: concatenate blocks from one TSMResult directly.
+    static QueryResult fromTsmResults(TSMResult<T>& singleResult) {
+        QueryResult<T> results;
+        size_t totalPoints = 0;
+        for (const auto& block : singleResult.blocks) {
+            totalPoints += block->size();
+        }
+        results.timestamps.reserve(totalPoints);
+        results.values.reserve(totalPoints);
+        for (auto& block : singleResult.blocks) {
+            results.timestamps.insert(results.timestamps.end(),
+                                      block->timestamps.begin(), block->timestamps.end());
+            results.values.insert(results.values.end(),
+                                  block->values.begin(), block->values.end());
+        }
         return results;
     }
 
@@ -191,8 +208,8 @@ public:
         // Pre-calculate total points for efficient reservation
         size_t totalPoints = 0;
         for (size_t i = 0; i < tsmResultSize; i++) {
-            for (size_t b = 0; tsmResults[i].getBlock(b) != nullptr; ++b) {
-                totalPoints += tsmResults[i].getBlock(b)->size();
+            for (const auto& block : tsmResults[i].blocks) {
+                totalPoints += block->size();
             }
         }
         timestamps.reserve(totalPoints);
@@ -294,5 +311,3 @@ public:
 
 using VariantQueryResult =
     std::variant<QueryResult<double>, QueryResult<bool>, QueryResult<std::string>, QueryResult<int64_t>>;
-
-#endif

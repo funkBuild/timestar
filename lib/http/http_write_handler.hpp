@@ -1,5 +1,4 @@
-#ifndef HTTP_WRITE_HANDLER_H_INCLUDED
-#define HTTP_WRITE_HANDLER_H_INCLUDED
+#pragma once
 
 #include "engine.hpp"
 #include "series_id.hpp"
@@ -191,7 +190,7 @@ private:
     };
 
     // Helper struct for metadata operations (deduplication across batch).
-    // Aliases MetadataOp from leveldb_index.hpp for batch indexing compatibility.
+    // Aliases MetadataOp from index_backend.hpp for batch indexing compatibility.
     using MetaOp = MetadataOp;
 
     // Parse a single write point from JSON string.
@@ -281,5 +280,3 @@ public:
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
     }
 };
-
-#endif  // HTTP_WRITE_HANDLER_H_INCLUDED

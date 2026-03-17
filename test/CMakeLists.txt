@@ -58,16 +58,13 @@ target_include_directories(timestar_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Pass source file paths for source-inspection tests
 target_compile_definitions(timestar_test PRIVATE
-    TSXOR_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/tsxor_encoder.cpp"
     TSM_COMPACTOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_compactor.cpp"
     QUERY_RUNNER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/query_runner.cpp"
     WAL_FILE_MANAGER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.hpp"
     QUERY_RESULT_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/query_result.hpp"
-    LEVELDB_INDEX_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/leveldb_index.cpp"
     ENGINE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/core/engine.cpp"
     WAL_FILE_MANAGER_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.cpp"
     ENGINE_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/core/engine.cpp"
-    LEVELDB_INDEX_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/leveldb_index.cpp"
     TSM_TOMBSTONE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_tombstone.cpp"
     TSM_FILE_MANAGER_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_file_manager.cpp"
     TSM_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm.hpp"
@@ -104,16 +101,13 @@ add_executable(timestar_unit_test ${UNIT_TEST_SRCS})
 target_link_libraries(timestar_unit_test libtimestar gtest_main)
 target_include_directories(timestar_unit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_unit_test PRIVATE
-    TSXOR_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/tsxor_encoder.cpp"
     TSM_COMPACTOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_compactor.cpp"
     QUERY_RUNNER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/query_runner.cpp"
     WAL_FILE_MANAGER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.hpp"
     QUERY_RESULT_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/query_result.hpp"
-    LEVELDB_INDEX_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/leveldb_index.cpp"
     ENGINE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/core/engine.cpp"
     WAL_FILE_MANAGER_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.cpp"
     ENGINE_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/core/engine.cpp"
-    LEVELDB_INDEX_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/leveldb_index.cpp"
     TSM_TOMBSTONE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_tombstone.cpp"
     TSM_FILE_MANAGER_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_file_manager.cpp"
     TSM_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm.hpp"

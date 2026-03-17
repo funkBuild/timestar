@@ -65,7 +65,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             co_return reply;
         }
 
-        // Validate measurement name (no control characters or LevelDB key separators)
+        // Validate measurement name (no control characters or index key separators)
         for (char c : policyReq.measurement) {
             if (c < 0x20 || c == '\x7f') {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
@@ -147,7 +147,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             }
         }
 
-        // Write to LevelDB on shard 0
+        // Write to NativeIndex on shard 0
         co_await engineSharded->invoke_on(0, [policy](Engine& engine) -> seastar::future<> {
             co_await engine.getIndex().setRetentionPolicy(policy);
         });

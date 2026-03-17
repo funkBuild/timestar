@@ -1,10 +1,11 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
 This is a Time Series Database (TimeStar) implementation built with C++23 and the Seastar framework. The database uses TSM (Time-Structured Merge) files for storage and WAL (Write-Ahead Log) for durability.
+
+This project must be developed inline with the below requirements -
+- SIMD is used whenever possible using Google Highway
+- All data structures and code emphasizes efficiency and compute/memory optimal solutions
+- The database must be able to store more data than system memory allows, focusing on efficient cache usage over holding raw data in memory
 
 ## Build Commands
 
@@ -95,7 +96,7 @@ Test files include:
 ### Expected Test Results
 
 When all tests pass, you should see:
-- **C++ Tests**: ~2836 tests across 190+ test suites, all passing
+- **C++ Tests**: 2858+ tests across 194+ test suites, all passing
 - **Jest Tests**: 46 tests from 3 test suites, all passing
 - **Standalone Tests**: 8 tests, all passing
 
@@ -254,7 +255,7 @@ The TimeStar uses a Seastar-native NativeIndex (LSM-tree based) for metadata, wi
 - **Series ID Generation**: Automatic numeric series ID assignment for efficient storage
 - **Metadata Indexing**: Fast lookup of measurements, fields, and tag key/values
 - **Batch Operations**: Efficient bulk indexing during data ingestion
-- **Zstd Compression**: Built-in LevelDB compression for space efficiency
+- **Zstd Compression**: Built-in zstd compression for space efficiency
 - **Bloom Filters**: Optimized point lookups with configurable bloom filter
 
 ### Engine Integration
@@ -612,7 +613,7 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
 - **Parallel execution**: Each shard processes queries independently
 - **Result aggregation**: Results merged and aggregated from all shards
 - **Time filtering**: Efficient time-based data retrieval using TSM indexes
-- **Tag filtering**: Fast lookups using LevelDB index for series discovery
+- **Tag filtering**: Fast lookups using NativeIndex for series discovery
 
 ### Performance Considerations
 

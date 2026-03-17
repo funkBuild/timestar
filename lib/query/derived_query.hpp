@@ -1,5 +1,4 @@
-#ifndef DERIVED_QUERY_H_INCLUDED
-#define DERIVED_QUERY_H_INCLUDED
+#pragma once
 
 #include "expression_ast.hpp"
 #include "expression_parser.hpp"
@@ -185,5 +184,3 @@ private:
 };
 
 }  // namespace timestar
-
-#endif  // DERIVED_QUERY_H_INCLUDED

@@ -1,5 +1,4 @@
-#ifndef ALP_FFOR_HPP_INCLUDED
-#define ALP_FFOR_HPP_INCLUDED
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -350,5 +349,3 @@ inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uin
 }
 
 }  // namespace alp
-
-#endif  // ALP_FFOR_HPP_INCLUDED

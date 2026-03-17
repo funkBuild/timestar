@@ -178,7 +178,7 @@ seastar::future<> MemoryStore::initWAL() {
 seastar::future<> MemoryStore::removeWAL() {
     if (wal) {
         co_await wal->remove();
-        wal.reset(nullptr);
+        wal.reset();
     }
 };
 

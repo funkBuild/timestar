@@ -1,5 +1,4 @@
-#ifndef TSM_MERGE_SPECIALIZED_H_INCLUDED
-#define TSM_MERGE_SPECIALIZED_H_INCLUDED
+#pragma once
 
 #include "series_id.hpp"
 #include "tsm.hpp"
@@ -272,5 +271,3 @@ public:
         co_return batch;
     }
 };
-
-#endif  // TSM_MERGE_SPECIALIZED_H_INCLUDED

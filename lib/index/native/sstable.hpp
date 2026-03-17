@@ -1,5 +1,4 @@
-#ifndef NATIVE_INDEX_SSTABLE_H_INCLUDED
-#define NATIVE_INDEX_SSTABLE_H_INCLUDED
+#pragma once
 
 #include "block.hpp"
 #include "block_cache.hpp"
@@ -18,22 +17,25 @@ namespace timestar::index {
 
 // SSTable file format:
 //   [Data Block 0] [Data Block 1] ... [Data Block N]
+//     Each block: [uncompressed_size(4)] [compressed_data(N)] [crc32(4)]
 //   [Bloom Filter Block]
 //   [Index Block]
-//   [Footer (48 bytes)]
+//   [Footer (64 bytes)]
 //
-// Footer layout (48 bytes):
-//   bloom_offset   (uint64_t)
-//   bloom_size     (uint64_t)
-//   index_offset   (uint64_t)
-//   index_size     (uint64_t)
-//   entry_count    (uint64_t)
-//   magic          (uint32_t)  0x54534958 = "TSIX"
-//   version        (uint32_t)  1
+// Footer layout (64 bytes):
+//   bloom_offset       (uint64_t)  offset 0
+//   bloom_size         (uint64_t)  offset 8
+//   index_offset       (uint64_t)  offset 16
+//   index_size         (uint64_t)  offset 24
+//   entry_count        (uint64_t)  offset 32
+//   write_timestamp_ns (uint64_t)  offset 40  — wall-clock ns when SSTable was created
+//   reserved           (uint64_t)  offset 48  — for future use
+//   magic              (uint32_t)  offset 56  0x54534958 = "TSIX"
+//   version            (uint32_t)  offset 60  1
 
 static constexpr uint32_t SSTABLE_MAGIC = 0x54534958;  // "TSIX"
 static constexpr uint32_t SSTABLE_VERSION = 1;
-static constexpr size_t SSTABLE_FOOTER_SIZE = 48;
+static constexpr size_t SSTABLE_FOOTER_SIZE = 64;
 
 struct SSTableMetadata {
     uint64_t fileNumber = 0;
@@ -42,6 +44,7 @@ struct SSTableMetadata {
     std::string minKey;
     std::string maxKey;
     int level = 0;
+    uint64_t writeTimestamp = 0;  // Wall-clock nanoseconds when SSTable was created
 };
 
 struct IndexEntry {
@@ -90,6 +93,7 @@ private:
     BloomFilter bloom_;
     std::vector<IndexEntry> index_;
     std::string pendingData_;  // Bounded write buffer (~256KB)
+    size_t pendingOffset_ = 0;      // Offset into pendingData_ (avoids erase(0,N) copies)
     uint64_t fileOffset_ = 0;       // Logical data offset (for index entries)
     uint64_t diskOffset_ = 0;       // Physical write position on disk
     size_t entryCount_ = 0;
@@ -98,6 +102,7 @@ private:
     std::string firstKey_;
     std::string lastKey_;
     std::string currentBlockFirstKey_;
+    uint64_t writeTimestampNs_ = 0;  // Captured at create() time
 
     // Step 3: Streaming I/O
     seastar::file file_;
@@ -112,6 +117,14 @@ private:
 // Step 2: Optional shared block cache avoids repeated decompression of hot blocks.
 class SSTableReader {
 public:
+    ~SSTableReader();
+
+    // Non-copyable, non-movable (fd ownership)
+    SSTableReader(const SSTableReader&) = delete;
+    SSTableReader& operator=(const SSTableReader&) = delete;
+    SSTableReader(SSTableReader&&) = delete;
+    SSTableReader& operator=(SSTableReader&&) = delete;
+
     // Open an existing SSTable file. Reads entire file into memory,
     // parses footer/index/bloom, but does NOT decompress data blocks.
     static seastar::future<std::unique_ptr<SSTableReader>> open(std::string filename,
@@ -175,7 +188,13 @@ private:
     SSTableReader() = default;
 
     // Find the block index for a key via binary search on the index.
+    // Uses two-phase lookup when summary index is available:
+    //   Phase 1: Binary search compact summary_ (~N/64 entries) to narrow range
+    //   Phase 2: Binary search within the narrowed range of index_ (~64 entries)
     size_t findBlock(std::string_view key) const;
+
+    // Build the summary index from index_ entries. Called once during open().
+    void buildSummary();
 
     // Get decompressed block data, checking cache first.
     // |fallback| is populated on cache miss without a block cache.
@@ -186,6 +205,18 @@ private:
     SSTableMetadata metadata_;
     BloomFilter bloom_;
     std::vector<IndexEntry> index_;
+
+    // Two-level summary index for faster block lookups at high cardinality.
+    // Samples every SUMMARY_INTERVAL-th entry from index_ to narrow binary search.
+    // SummaryEntry::key is a string_view into index_[i].firstKey — safe because
+    // index_ is immutable after open() and outlives summary_.
+    static constexpr size_t SUMMARY_INTERVAL = 64;
+
+    struct SummaryEntry {
+        std::string_view key;   // Points into index_[indexPos].firstKey
+        size_t indexPos;        // Position in index_ array
+    };
+    std::vector<SummaryEntry> summary_;
 
     // On-disk streaming: keep a POSIX fd open for synchronous pread() of data blocks.
     // Only metadata (bloom + index) is held in memory — data blocks are read on demand
@@ -199,5 +230,3 @@ private:
 };
 
 }  // namespace timestar::index
-
-#endif  // NATIVE_INDEX_SSTABLE_H_INCLUDED

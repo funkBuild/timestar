@@ -1,5 +1,4 @@
-#ifndef TSM_WRITER_H_INCLUDED
-#define TSM_WRITER_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "memory_store.hpp"
@@ -88,5 +87,3 @@ public:
     // Async run: builds TSM file in memory, writes via Seastar DMA I/O (for production)
     static seastar::future<> runAsync(seastar::shared_ptr<MemoryStore> store, std::string filename);
 };
-
-#endif

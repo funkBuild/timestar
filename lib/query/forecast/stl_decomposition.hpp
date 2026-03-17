@@ -1,5 +1,4 @@
-#ifndef STL_DECOMPOSITION_H_INCLUDED
-#define STL_DECOMPOSITION_H_INCLUDED
+#pragma once
 
 #include <cstddef>
 #include <vector>
@@ -133,5 +132,3 @@ private:
 
 }  // namespace forecast
 }  // namespace timestar
-
-#endif

@@ -1,5 +1,4 @@
-#ifndef QUERY_RUNNER_H_INCLUDED
-#define QUERY_RUNNER_H_INCLUDED
+#pragma once
 
 #include "block_aggregator.hpp"
 #include "query_parser.hpp"
@@ -38,5 +37,3 @@ public:
         std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
         timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 };
-
-#endif

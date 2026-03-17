@@ -18,7 +18,7 @@
  * at speeds >10x faster than the previous SHA1 implementation.
  *
  * Note: Changing the hash function invalidates all previously-persisted
- * SeriesId128 values (WAL files, LevelDB index entries, TSM file series
+ * SeriesId128 values (WAL files, NativeIndex entries, TSM file series
  * indexes).  A full data re-ingestion or migration is required after this
  * change.
  */
@@ -33,21 +33,17 @@ public:
     // Explicit constructor from SeriesKey string
     explicit SeriesId128(const std::string& seriesKey) { *this = fromSeriesKey(seriesKey); }
 
-    // Generate SeriesId128 from SeriesKey using XXH3_128bits hash
+    // Generate SeriesId128 from SeriesKey using XXH3_128bits hash.
+    // This is the single canonical way to produce a SeriesId128.
+    // The series key format is: "measurement,tag1=val1,tag2=val2 field"
+    // (produced by timestar::buildSeriesKey).
     static SeriesId128 fromSeriesKey(const std::string& seriesKey);
 
-    // Generate SeriesId128 directly from components (measurement, tags, field)
-    // without building the intermediate encoded series key string.
-    // Produces the same hash as fromSeriesKey(encodeSeriesKey(m, tags, f)).
-    static SeriesId128 fromComponents(const std::string& measurement,
-                                       const std::map<std::string, std::string>& tags,
-                                       const std::string& field);
-
-    // Comparison operators (required for LevelDB keys and std::map)
+    // Comparison operators (required for index keys and std::map)
     auto operator<=>(const SeriesId128& other) const = default;
     bool operator==(const SeriesId128& other) const = default;
 
-    // Serialization for LevelDB storage
+    // Serialization for index storage
     std::string toBytes() const { return std::string(reinterpret_cast<const char*>(data.data()), data.size()); }
 
     // Zero-copy append: write the 16-byte ID directly into an existing string,

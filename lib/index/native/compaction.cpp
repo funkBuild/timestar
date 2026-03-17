@@ -5,9 +5,12 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <format>
 #include <memory>
 
 namespace timestar::index {
@@ -48,9 +51,7 @@ CompactionEngine::CompactionEngine(std::string dataDir, Manifest& manifest, Comp
     : dataDir_(std::move(dataDir)), manifest_(manifest), config_(config) {}
 
 std::string CompactionEngine::sstFilename(uint64_t fileNumber) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "idx_%06lu.sst", fileNumber);
-    return dataDir_ + "/" + buf;
+    return std::format("{}/idx_{:06}.sst", dataDir_, fileNumber);
 }
 
 std::optional<CompactionEngine::CompactionJob> CompactionEngine::pickCompaction() {
@@ -98,7 +99,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
 
     // Create merge iterator
     MergeIterator merger(std::move(sources));
-    co_await merger.seekToFirst();
+    merger.seekToFirstSync();  // SSTable iterators are synchronous
 
     if (!merger.valid()) {
         // All inputs were empty — just remove the files
@@ -116,13 +117,61 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     auto writer = co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey,
                                                   compressionLevel);
 
+    // Tombstone GC: determine if tombstones from these input files can be dropped.
+    // A tombstone (empty value) is safe to drop if ALL input SSTables were written
+    // more than tombstoneGracePeriodMs ago — no newer data can shadow it.
+    bool canDropTombstones = false;
+    size_t tombstonesDropped = 0;
+    if (config_.tombstoneGracePeriodMs > 0) {
+        auto nowNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        uint64_t cutoffNs = nowNs - config_.tombstoneGracePeriodMs * 1'000'000;
+        canDropTombstones = true;
+        for (const auto& f : job.inputFiles) {
+            if (f.writeTimestamp == 0 || f.writeTimestamp > cutoffNs) {
+                canDropTombstones = false;
+                break;
+            }
+        }
+    }
+
     size_t addCount = 0;
+    size_t bytesWritten = 0;
+    auto rateStart = std::chrono::steady_clock::now();
+    const size_t rateLimitBytesPerSec = static_cast<size_t>(config_.rateLimitMBps) * 1024 * 1024;
+
     while (merger.valid()) {
+        // Drop expired tombstones (empty values from deleted keys)
+        if (canDropTombstones && merger.value().empty()) {
+            ++tombstonesDropped;
+            merger.nextSync();  // SSTable iterators are synchronous — avoid coroutine frame
+            continue;
+        }
+
+        bytesWritten += merger.key().size() + merger.value().size();
         writer.add(merger.key(), merger.value());
         if (++addCount % 1024 == 0) {
             co_await writer.flushPending();
+
+            // Rate limiter: if throughput exceeds budget, sleep to throttle
+            if (rateLimitBytesPerSec > 0) {
+                auto elapsed = std::chrono::steady_clock::now() - rateStart;
+                auto elapsedSec = std::chrono::duration<double>(elapsed).count();
+                if (elapsedSec > 0) {
+                    double currentRate = static_cast<double>(bytesWritten) / elapsedSec;
+                    if (currentRate > static_cast<double>(rateLimitBytesPerSec)) {
+                        double targetSec = static_cast<double>(bytesWritten) / static_cast<double>(rateLimitBytesPerSec);
+                        double sleepSec = targetSec - elapsedSec;
+                        if (sleepSec > 0.001) {
+                            co_await seastar::sleep(std::chrono::microseconds(
+                                static_cast<int64_t>(sleepSec * 1'000'000)));
+                        }
+                    }
+                }
+            }
         }
-        co_await merger.next();
+        merger.nextSync();  // SSTable iterators are synchronous — avoid coroutine frame
     }
     co_await writer.flushPending();
 

@@ -11,7 +11,7 @@ file(GLOB_RECURSE SRC_FILES
     config/*.cpp
     functions/*.cpp
 )
-# Exclude deprecated LevelDB implementation files
+# Exclude deprecated implementation files
 list(FILTER SRC_FILES EXCLUDE REGEX ".*/deprecated/.*")
 
 find_package (Threads REQUIRED)
@@ -40,6 +40,7 @@ target_link_libraries(libtimestar Threads::Threads Seastar::seastar libzstd_stat
 
 # Include both the lib directory and all subdirectories for header resolution
 target_include_directories(libtimestar PUBLIC
+    ${CMAKE_BINARY_DIR}/generated
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/storage

@@ -15,7 +15,7 @@
 #include <seastar/core/distributed.hh>
 #include <unordered_set>
 
-typedef std::chrono::high_resolution_clock Clock;
+using Clock = std::chrono::high_resolution_clock;
 
 // ---------------------------------------------------------------------------
 // Multi-way merge of K+1 sorted sequences (TSM + K memory stores)
@@ -83,13 +83,15 @@ static void mergeTwoSpans(SortedSpan<T>& a, SortedSpan<T>& b, std::vector<uint64
         const size_t remaining = s->len - s->pos;
         if (remaining == 0)
             continue;
-        // Bulk insert timestamps (contiguous memory).
         outTs.insert(outTs.end(), s->tsPtr + s->pos, s->tsPtr + s->len);
-        // Index-based copy for values (required for vector<bool> compatibility).
         const auto& vals = *s->valVec;
         const size_t base = s->baseIdx + s->pos;
-        for (size_t i = 0; i < remaining; ++i) {
-            outVal.push_back(vals[base + i]);
+        if constexpr (std::is_same_v<T, bool>) {
+            for (size_t i = 0; i < remaining; ++i) {
+                outVal.push_back(vals[base + i]);
+            }
+        } else {
+            outVal.insert(outVal.end(), vals.begin() + base, vals.begin() + base + remaining);
         }
         s->pos = s->len;
     }
@@ -121,8 +123,12 @@ static void mergeSmallNSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint
                 outTs.insert(outTs.end(), s.tsPtr + s.pos, s.tsPtr + s.len);
                 const auto& vals = *s.valVec;
                 const size_t base = s.baseIdx + s.pos;
-                for (size_t j = 0; j < remaining; ++j) {
-                    outVal.push_back(vals[base + j]);
+                if constexpr (std::is_same_v<T, bool>) {
+                    for (size_t j = 0; j < remaining; ++j) {
+                        outVal.push_back(vals[base + j]);
+                    }
+                } else {
+                    outVal.insert(outVal.end(), vals.begin() + base, vals.begin() + base + remaining);
                 }
                 s.pos = s.len;
                 break;
@@ -199,8 +205,12 @@ static void mergeHeapSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint64
             outTs.insert(outTs.end(), s.tsPtr + s.pos, s.tsPtr + s.len);
             const auto& vals = *s.valVec;
             const size_t base = s.baseIdx + s.pos;
-            for (size_t i = 0; i < remaining; ++i) {
-                outVal.push_back(vals[base + i]);
+            if constexpr (std::is_same_v<T, bool>) {
+                for (size_t i = 0; i < remaining; ++i) {
+                    outVal.push_back(vals[base + i]);
+                }
+            } else {
+                outVal.insert(outVal.end(), vals.begin() + base, vals.begin() + base + remaining);
             }
             break;
         }
@@ -243,25 +253,30 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
                    "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime,
                    endTime);
 
-    // Pre-allocate indexed slots to avoid concurrent push_back on a shared vector.
-    // Each coroutine writes to its own slot, eliminating the race condition where
-    // parallel_for_each coroutines could push_back concurrently after co_await points.
     // Snapshot the TSM file map so that compaction cannot mutate it
     // mid-iteration across co_await suspension points.
-    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFiles(fileManager->getSequencedTsmFiles().begin(),
-                                                                        fileManager->getSequencedTsmFiles().end());
-    std::vector<std::optional<TSMResult<T>>> tsmSlots(seqFiles.size());
+    // Pre-filter using sparse index time bounds (in-memory, no I/O) to skip
+    // files whose series data is entirely outside [startTime, endTime].
+    // This avoids DMA reads for full index entries in irrelevant files.
+    std::vector<seastar::shared_ptr<TSM>> candidateFiles;
+    for (const auto& [seq, tsmFile] : fileManager->getSequencedTsmFiles()) {
+        if (tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime)) {
+            candidateFiles.push_back(tsmFile);
+        }
+    }
 
-    // First query TSM files
+    // Pre-allocate indexed slots to avoid concurrent push_back on a shared vector.
+    std::vector<std::optional<TSMResult<T>>> tsmSlots(candidateFiles.size());
+
+    // Query only candidate TSM files
     size_t slotIdx = 0;
     co_await seastar::parallel_for_each(
-        seqFiles.begin(), seqFiles.end(),
+        candidateFiles.begin(), candidateFiles.end(),
         [&tsmSlots, &seriesId, startTime, endTime,
-         &slotIdx](const std::pair<unsigned int, seastar::shared_ptr<TSM>>& tsmTuple) -> seastar::future<> {
+         &slotIdx](const seastar::shared_ptr<TSM>& tsmFile) -> seastar::future<> {
             // Assign index before any suspension point - safe in cooperative scheduling
             // because parallel_for_each invokes the lambda sequentially before yielding
             size_t myIdx = slotIdx++;
-            const auto& [tsmRank, tsmFile] = tsmTuple;
 
             // Use queryWithTombstones to automatically filter out deleted data
             // SeriesId128 pre-computed by caller — no redundant hash here
@@ -275,21 +290,91 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
             tsmSlots[myIdx] = std::move(results);
         });
 
-    // Collect non-empty results from the slots
-    std::vector<TSMResult<T>> tsmResults;
+    // Collect non-empty results from the slots, paired with sparse time bounds.
+    struct TimeBoundedResult {
+        TSMResult<T> result;
+        uint64_t minTime;  // Earliest block start time in this result
+        uint64_t maxTime;  // Latest block end time in this result
+    };
+    std::vector<TimeBoundedResult> tsmResults;
     tsmResults.reserve(tsmSlots.size());
-    for (auto& slot : tsmSlots) {
-        if (slot.has_value()) {
-            tsmResults.push_back(std::move(*slot));
+    for (size_t i = 0; i < tsmSlots.size(); ++i) {
+        if (!tsmSlots[i].has_value())
+            continue;
+        auto& res = *tsmSlots[i];
+        // Compute time bounds from actual decoded blocks (accurate after time filtering)
+        uint64_t rmin = UINT64_MAX, rmax = 0;
+        for (const auto& block : res.blocks) {
+            if (!block->timestamps.empty()) {
+                rmin = std::min(rmin, block->timestamps.front());
+                rmax = std::max(rmax, block->timestamps.back());
+            }
         }
+        tsmResults.push_back({std::move(res), rmin, rmax});
     }
 
-    // Sort by rank in descending order
-    std::sort(tsmResults.begin(), tsmResults.end(),
-              [](const auto& lhs, const auto& rhs) { return lhs.rank > rhs.rank; });
+    QueryResult<T> result;
 
-    // Produce sorted, deduped TSM result via the existing heap-based merge.
-    QueryResult<T> result = QueryResult<T>::fromTsmResults(tsmResults);
+    if (tsmResults.empty()) {
+        // No TSM data — result stays empty
+    } else if (tsmResults.size() == 1) {
+        // Single source: direct concatenation, no merge needed.
+        result = QueryResult<T>::fromTsmResults(tsmResults[0].result);
+    } else {
+        // Sort by minTime ascending for the non-overlap check.
+        std::sort(tsmResults.begin(), tsmResults.end(),
+                  [](const auto& a, const auto& b) { return a.minTime < b.minTime; });
+
+        // Check for non-overlapping time ranges across files.
+        // If each file's minTime > previous file's maxTime, there's no overlap
+        // and we can concatenate in order instead of doing an N-way merge.
+        bool nonOverlapping = true;
+        for (size_t i = 1; i < tsmResults.size(); ++i) {
+            if (tsmResults[i].minTime <= tsmResults[i - 1].maxTime) {
+                nonOverlapping = false;
+                break;
+            }
+        }
+
+        if (nonOverlapping) {
+            // Fast path: concatenate blocks from each file in time order.
+            // No per-point comparison needed — just bulk append.
+            size_t totalPoints = 0;
+            for (const auto& tbr : tsmResults) {
+                for (const auto& block : tbr.result.blocks) {
+                    totalPoints += block->size();
+                }
+            }
+            result.timestamps.reserve(totalPoints);
+            result.values.reserve(totalPoints);
+
+            for (auto& tbr : tsmResults) {
+                for (auto& block : tbr.result.blocks) {
+                    result.timestamps.insert(result.timestamps.end(),
+                                             block->timestamps.begin(), block->timestamps.end());
+                    if constexpr (std::is_same_v<T, bool>) {
+                        for (size_t j = 0; j < block->values.size(); ++j) {
+                            result.values.push_back(block->values[j]);
+                        }
+                    } else {
+                        result.values.insert(result.values.end(),
+                                             block->values.begin(), block->values.end());
+                    }
+                }
+            }
+        } else {
+            // Overlapping: fall back to the full N-way merge with dedup.
+            // Extract TSMResults and sort by rank descending for dedup priority.
+            std::vector<TSMResult<T>> mergeInputs;
+            mergeInputs.reserve(tsmResults.size());
+            for (auto& tbr : tsmResults) {
+                mergeInputs.push_back(std::move(tbr.result));
+            }
+            std::sort(mergeInputs.begin(), mergeInputs.end(),
+                      [](const auto& a, const auto& b) { return a.rank > b.rank; });
+            result = QueryResult<T>::fromTsmResults(mergeInputs);
+        }
+    }
 
     // Query memory stores from WAL.
     // With background TSM conversion, multiple memory stores may hold data
@@ -820,7 +905,6 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
             if (totalBuckets == 1) {
                 // Handled above in needsSinglePoint path
-                (void)totalBuckets;
             } else {
                 std::unordered_set<uint64_t> filledBuckets;
                 filledBuckets.reserve(totalBuckets);
@@ -894,7 +978,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         if (!indexEntry)
             continue;
 
-        // If any file reports a non-Float type, pushdown is inapplicable.
+        // Only float series support pushdown aggregation.
         if (indexEntry->seriesType != TSMValueType::Float) {
             hasNonFloat = true;
             break;

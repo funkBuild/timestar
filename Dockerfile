@@ -48,8 +48,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     valgrind \
     xfslibs-dev \
     # TimeStar deps
-    libsnappy-dev \
-    libleveldb-dev \
     libxxhash-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -98,8 +96,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libprotobuf32t64 \
     libyaml-cpp0.8 \
     libhwloc15 \
-    libsnappy1v5 \
-    libleveldb1d \
     libxxhash0 \
     libnuma1 \
     liburing2 \

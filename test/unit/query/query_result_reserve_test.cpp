@@ -34,7 +34,7 @@ TEST_F(QueryResultReserveTest, SmallMergeDoesNotOverReserve) {
 
     tsmResults.emplace_back(0);
     auto block = makeReserveTestBlock({100, 200, 300}, {1.0, 2.0, 3.0});
-    tsmResults[0].appendBlock(block);
+    tsmResults[0].appendBlock(std::move(block));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -66,7 +66,7 @@ TEST_F(QueryResultReserveTest, LargeMergeDataCorrectness) {
     }
 
     auto block = makeReserveTestBlock(timestamps, values);
-    tsmResults[0].appendBlock(block);
+    tsmResults[0].appendBlock(std::move(block));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -89,11 +89,11 @@ TEST_F(QueryResultReserveTest, FromTsmResultsReservesCorrectly) {
     // Two results with different block sizes
     tsmResults.emplace_back(0);
     auto block1 = makeReserveTestBlock({100, 200}, {1.0, 2.0});
-    tsmResults[0].appendBlock(block1);
+    tsmResults[0].appendBlock(std::move(block1));
 
     tsmResults.emplace_back(1);
     auto block2 = makeReserveTestBlock({150, 250, 350}, {3.0, 4.0, 5.0});
-    tsmResults[1].appendBlock(block2);
+    tsmResults[1].appendBlock(std::move(block2));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 
@@ -116,9 +116,9 @@ TEST_F(QueryResultReserveTest, MultiBlockCapacityGrowsAsNeeded) {
     auto block1 = makeReserveTestBlock({100, 200}, {1.0, 2.0});
     auto block2 = makeReserveTestBlock({300, 400}, {3.0, 4.0});
     auto block3 = makeReserveTestBlock({500, 600}, {5.0, 6.0});
-    tsmResults[0].appendBlock(block1);
-    tsmResults[0].appendBlock(block2);
-    tsmResults[0].appendBlock(block3);
+    tsmResults[0].appendBlock(std::move(block1));
+    tsmResults[0].appendBlock(std::move(block2));
+    tsmResults[0].appendBlock(std::move(block3));
 
     auto qr = QueryResult<double>::fromTsmResults(tsmResults);
 

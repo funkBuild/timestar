@@ -1,5 +1,4 @@
-#ifndef SIMD_AGGREGATOR_H_INCLUDED
-#define SIMD_AGGREGATOR_H_INCLUDED
+#pragma once
 
 #include <cstdint>
 #include <limits>
@@ -74,5 +73,3 @@ double calculateVariance(const double* values, size_t count, double mean);
 
 }  // namespace simd
 }  // namespace timestar
-
-#endif  // SIMD_AGGREGATOR_H_INCLUDED

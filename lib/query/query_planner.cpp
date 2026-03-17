@@ -13,7 +13,7 @@
 namespace timestar {
 
 seastar::future<QueryPlan> QueryPlanner::createPlan(const QueryRequest& request,
-                                                    seastar::sharded<LevelDBIndex>* indexSharded) {
+                                                    seastar::sharded<index::NativeIndex>* indexSharded) {
     QueryPlan plan;
     plan.aggregation = request.aggregation;
     plan.aggregationInterval = request.aggregationInterval;
@@ -51,7 +51,7 @@ seastar::future<QueryPlan> QueryPlanner::createPlan(const QueryRequest& request,
     co_return plan;
 }
 
-QueryPlan QueryPlanner::createPlanSync(const QueryRequest& request, LevelDBIndex* index) {
+QueryPlan QueryPlanner::createPlanSync(const QueryRequest& request, index::NativeIndex* index) {
     QueryPlan plan;
     plan.aggregation = request.aggregation;
     plan.aggregationInterval = request.aggregationInterval;
@@ -96,7 +96,7 @@ QueryPlan QueryPlanner::createPlanSync(const QueryRequest& request, LevelDBIndex
 }
 
 seastar::future<std::vector<std::vector<SeriesId128>>> QueryPlanner::findMatchingSeriesIds(
-    const QueryRequest& request, seastar::sharded<LevelDBIndex>* indexSharded) {
+    const QueryRequest& request, seastar::sharded<index::NativeIndex>* indexSharded) {
     // Phase 1+: Scatter-gather across all shards — each shard discovers its own local series.
     unsigned shardCount = timestar::placement().coreCount();
     if (shardCount == 0)
@@ -109,7 +109,7 @@ seastar::future<std::vector<std::vector<SeriesId128>>> QueryPlanner::findMatchin
 
     for (unsigned s = 0; s < shardCount; ++s) {
         auto f = indexSharded->invoke_on(
-            s, [request](LevelDBIndex& index) -> seastar::future<std::vector<SeriesId128>> {
+            s, [request](index::NativeIndex& index) -> seastar::future<std::vector<SeriesId128>> {
                 std::unordered_set<std::string> fieldFilter;
                 if (!request.requestsAllFields()) {
                     fieldFilter.insert(request.fields.begin(), request.fields.end());
@@ -147,7 +147,7 @@ seastar::future<std::vector<std::vector<SeriesId128>>> QueryPlanner::findMatchin
 }
 
 std::vector<std::vector<SeriesId128>> QueryPlanner::findMatchingSeriesIdsSync(const QueryRequest& request,
-                                                                              LevelDBIndex* index) {
+                                                                              index::NativeIndex* index) {
     unsigned shardCount = timestar::placement().coreCount();
     if (shardCount == 0)
         shardCount = 1;  // Handle test environment
@@ -156,8 +156,8 @@ std::vector<std::vector<SeriesId128>> QueryPlanner::findMatchingSeriesIdsSync(co
 
     // This synchronous version is only used by unit tests (createPlanSync).
     // Production code uses the async findMatchingSeriesIds() which queries
-    // the real LevelDB index via invoke_on(0).  The index parameter is
-    // accepted but unused because LevelDB requires async I/O.
+    // each shard's NativeIndex via invoke_on().  The index parameter is
+    // accepted but unused because the index requires async I/O.
     (void)index;
 
     if (!request.measurement.empty()) {

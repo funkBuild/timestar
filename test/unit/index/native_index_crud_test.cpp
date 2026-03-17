@@ -1,4 +1,4 @@
-#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 
 #include "../../../lib/core/timestar_value.hpp"
 
@@ -7,7 +7,7 @@
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 
-class LevelDBIndexTest : public ::testing::Test {
+class NativeIndexCrudTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // Clean up any existing test index
@@ -21,7 +21,7 @@ protected:
 };
 
 seastar::future<> runIndexTest() {
-    LevelDBIndex index(0);  // Use shard 0 for testing
+    timestar::index::NativeIndex index(0);  // Use shard 0 for testing
 
     co_await index.open();
 
@@ -76,13 +76,13 @@ seastar::future<> runIndexTest() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, BasicIndexOperations) {
+TEST_F(NativeIndexCrudTest, BasicIndexOperations) {
     runIndexTest().get();
 }
 
 // Additional integration tests for series ID generation
 seastar::future<> testSeriesIdGeneration() {
-    LevelDBIndex index(0);  // Use shard 0 for this test
+    timestar::index::NativeIndex index(0);  // Use shard 0 for this test
 
     co_await index.open();
 
@@ -118,7 +118,7 @@ seastar::future<> testSeriesIdGeneration() {
     co_await index.close();
 
     // Test 4: Persistence - reopen and verify IDs are consistent
-    LevelDBIndex index2(0);
+    timestar::index::NativeIndex index2(0);
     co_await index2.open();
 
     SeriesId128 id1_check = co_await index2.getOrCreateSeriesId(measurement, tags1, "idle");
@@ -130,13 +130,13 @@ seastar::future<> testSeriesIdGeneration() {
     co_await index2.close();
 }
 
-TEST_F(LevelDBIndexTest, SeriesIdGeneration) {
+TEST_F(NativeIndexCrudTest, SeriesIdGeneration) {
     testSeriesIdGeneration().get();
 }
 
 // Test metadata indexing
 seastar::future<> testMetadataIndexing() {
-    LevelDBIndex index(0);  // Use shard 0 for this test
+    timestar::index::NativeIndex index(0);  // Use shard 0 for this test
 
     co_await index.open();
 
@@ -189,13 +189,13 @@ seastar::future<> testMetadataIndexing() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, MetadataIndexing) {
+TEST_F(NativeIndexCrudTest, MetadataIndexing) {
     testMetadataIndexing().get();
 }
 
 // Test series discovery methods
 seastar::future<> testFindSeries() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -230,13 +230,13 @@ seastar::future<> testFindSeries() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, FindSeries) {
+TEST_F(NativeIndexCrudTest, FindSeries) {
     testFindSeries().get();
 }
 
 // Test optimized single-tag lookup
 seastar::future<> testFindSeriesByTag() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -266,13 +266,13 @@ seastar::future<> testFindSeriesByTag() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, FindSeriesByTag) {
+TEST_F(NativeIndexCrudTest, FindSeriesByTag) {
     testFindSeriesByTag().get();
 }
 
 // Test grouping series by tag values
 seastar::future<> testGetSeriesGroupedByTag() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -307,13 +307,13 @@ seastar::future<> testGetSeriesGroupedByTag() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, GetSeriesGroupedByTag) {
+TEST_F(NativeIndexCrudTest, GetSeriesGroupedByTag) {
     testGetSeriesGroupedByTag().get();
 }
 
 // Test field type management
 seastar::future<> testFieldTypes() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -343,13 +343,13 @@ seastar::future<> testFieldTypes() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, FieldTypes) {
+TEST_F(NativeIndexCrudTest, FieldTypes) {
     testFieldTypes().get();
 }
 
 // Test field statistics tracking
 seastar::future<> testFieldStatistics() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -358,7 +358,7 @@ seastar::future<> testFieldStatistics() {
     auto seriesId2 = co_await index.getOrCreateSeriesId("temperature", {{"location", "us-east"}}, "value");
 
     // Update field stats for first series
-    LevelDBIndex::FieldStats stats1{
+    timestar::index::NativeIndex::FieldStats stats1{
         "float",     // dataType
         1000000000,  // minTime
         2000000000,  // maxTime
@@ -367,7 +367,7 @@ seastar::future<> testFieldStatistics() {
     co_await index.updateFieldStats(seriesId1, "value", stats1);
 
     // Update field stats for second series
-    LevelDBIndex::FieldStats stats2{
+    timestar::index::NativeIndex::FieldStats stats2{
         "float",     // dataType
         1500000000,  // minTime
         2500000000,  // maxTime
@@ -399,13 +399,13 @@ seastar::future<> testFieldStatistics() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, FieldStatistics) {
+TEST_F(NativeIndexCrudTest, FieldStatistics) {
     testFieldStatistics().get();
 }
 
 // Test series metadata retrieval
 seastar::future<> testSeriesMetadata() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -449,13 +449,13 @@ seastar::future<> testSeriesMetadata() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, SeriesMetadata) {
+TEST_F(NativeIndexCrudTest, SeriesMetadata) {
     testSeriesMetadata().get();
 }
 
 // Test getAllMeasurements
 seastar::future<> testGetAllMeasurements() {
-    LevelDBIndex index(0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -479,7 +479,7 @@ seastar::future<> testGetAllMeasurements() {
     co_await index.close();
 }
 
-TEST_F(LevelDBIndexTest, GetAllMeasurements) {
+TEST_F(NativeIndexCrudTest, GetAllMeasurements) {
     testGetAllMeasurements().get();
 }
 
@@ -487,7 +487,7 @@ TEST_F(LevelDBIndexTest, GetAllMeasurements) {
 seastar::future<> testOpenCloseLifecycle() {
     // Cycle 1: open, use, close
     {
-        LevelDBIndex index(0);
+        timestar::index::NativeIndex index(0);
         co_await index.open();
 
         auto id = co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value1"}}, "field1");
@@ -498,7 +498,7 @@ seastar::future<> testOpenCloseLifecycle() {
 
     // Cycle 2: reopen same path, use, close
     {
-        LevelDBIndex index(0);
+        timestar::index::NativeIndex index(0);
         co_await index.open();
 
         // Previously created series should still exist
@@ -513,7 +513,7 @@ seastar::future<> testOpenCloseLifecycle() {
 
     // Cycle 3: open and let destructor handle cleanup (no explicit close)
     {
-        LevelDBIndex index(0);
+        timestar::index::NativeIndex index(0);
         co_await index.open();
 
         co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value2"}}, "field2");
@@ -523,7 +523,7 @@ seastar::future<> testOpenCloseLifecycle() {
 
     // Cycle 4: reopen after destructor-based cleanup to verify integrity
     {
-        LevelDBIndex index(0);
+        timestar::index::NativeIndex index(0);
         co_await index.open();
 
         auto fields = co_await index.getFields("lifecycle_test");
@@ -535,6 +535,6 @@ seastar::future<> testOpenCloseLifecycle() {
     }
 }
 
-TEST_F(LevelDBIndexTest, OpenCloseLifecycle) {
+TEST_F(NativeIndexCrudTest, OpenCloseLifecycle) {
     testOpenCloseLifecycle().get();
 }

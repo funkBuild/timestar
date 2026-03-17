@@ -1,10 +1,10 @@
 /*
- * Minimal test to debug LevelDB index segfault
+ * Minimal test for NativeIndex open/close lifecycle
  */
 
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
-#include "../../../lib/index/leveldb_index.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
@@ -13,15 +13,15 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 
-class LevelDBIndexMinimalTest : public ::testing::Test {
+class NativeIndexMinimalTest : public ::testing::Test {
 protected:
     void SetUp() override { std::filesystem::remove_all("shard_0"); }
 
     void TearDown() override { std::filesystem::remove_all("shard_0"); }
 };
 
-SEASTAR_TEST_F(LevelDBIndexMinimalTest, OpenAndClose) {
-    LevelDBIndex index(0);
+SEASTAR_TEST_F(NativeIndexMinimalTest, OpenAndClose) {
+    timestar::index::NativeIndex index(0);
 
     std::cerr << "About to open index..." << std::endl;
     co_await index.open();
@@ -33,8 +33,8 @@ SEASTAR_TEST_F(LevelDBIndexMinimalTest, OpenAndClose) {
     co_return;
 }
 
-SEASTAR_TEST_F(LevelDBIndexMinimalTest, CreateSimpleSeries) {
-    LevelDBIndex index(0);
+SEASTAR_TEST_F(NativeIndexMinimalTest, CreateSimpleSeries) {
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
     std::cerr << "Index opened" << std::endl;
@@ -53,8 +53,8 @@ SEASTAR_TEST_F(LevelDBIndexMinimalTest, CreateSimpleSeries) {
     co_return;
 }
 
-SEASTAR_TEST_F(LevelDBIndexMinimalTest, CreateSeriesWithTags) {
-    LevelDBIndex index(0);
+SEASTAR_TEST_F(NativeIndexMinimalTest, CreateSeriesWithTags) {
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
     std::cerr << "Index opened" << std::endl;

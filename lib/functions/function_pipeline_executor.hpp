@@ -1,5 +1,4 @@
-#ifndef FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED
-#define FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED
+#pragma once
 
 #include <map>
 #include <seastar/core/future.hh>
@@ -18,7 +17,7 @@ private:
     seastar::sharded<Engine>* engine_;
 
 public:
-    FunctionPipelineExecutor(seastar::sharded<Engine>* engine, void* index = nullptr);
+    FunctionPipelineExecutor(seastar::sharded<Engine>* engine);
 
     seastar::future<void> executeFunction(
         const std::string& functionName,
@@ -26,5 +25,3 @@ public:
 };
 
 }  // namespace timestar::functions
-
-#endif  // FUNCTION_PIPELINE_EXECUTOR_H_INCLUDED

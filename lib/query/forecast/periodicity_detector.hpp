@@ -1,5 +1,4 @@
-#ifndef PERIODICITY_DETECTOR_H_INCLUDED
-#define PERIODICITY_DETECTOR_H_INCLUDED
+#pragma once
 
 #include <algorithm>
 #include <cmath>
@@ -102,5 +101,3 @@ private:
 
 }  // namespace forecast
 }  // namespace timestar
-
-#endif

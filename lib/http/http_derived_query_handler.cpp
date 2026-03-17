@@ -3,6 +3,7 @@
 #include "anomaly/anomaly_result.hpp"
 #include "forecast/forecast_result.hpp"
 #include "logger.hpp"
+#include "timestar_config.hpp"
 
 #include <seastar/core/future.hh>
 #include <seastar/http/reply.hh>
@@ -11,7 +12,7 @@
 namespace timestar {
 
 HttpDerivedQueryHandler::HttpDerivedQueryHandler(seastar::sharded<Engine>* engine,
-                                                 seastar::sharded<LevelDBIndex>* index, DerivedQueryConfig config)
+                                                 seastar::sharded<index::NativeIndex>* index, DerivedQueryConfig config)
     : engine_(engine), index_(index), config_(config) {
     if (!engine_)
         throw std::invalid_argument("engine must not be null");
@@ -76,20 +77,35 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
             rep->_content = executor.formatResponseVariant(result);
             rep->done("application/json");
 
-            // Log execution stats
+            // Log execution stats + slow query detection
+            const auto slowMs = timestar::config().http.slow_query_threshold_ms;
             if (std::holds_alternative<DerivedQueryResult>(result)) {
                 const auto& r = std::get<DerivedQueryResult>(result);
                 http_log.debug("Derived query completed: {} points, {:.2f}ms", r.stats.pointCount,
                                r.stats.executionTimeMs);
+                if (slowMs > 0 && r.stats.executionTimeMs > static_cast<double>(slowMs)) {
+                    query_log.warn("[SLOW_QUERY] derived {:.1f}ms (threshold {}ms) points={}",
+                                   r.stats.executionTimeMs, slowMs, r.stats.pointCount);
+                }
             } else if (std::holds_alternative<anomaly::AnomalyQueryResult>(result)) {
                 const auto& r = std::get<anomaly::AnomalyQueryResult>(result);
                 http_log.debug("Anomaly query completed: {} points, {} anomalies, {:.2f}ms", r.statistics.totalPoints,
                                r.statistics.anomalyCount, r.statistics.executionTimeMs);
+                if (slowMs > 0 && r.statistics.executionTimeMs > static_cast<double>(slowMs)) {
+                    query_log.warn("[SLOW_QUERY] anomaly {:.1f}ms (threshold {}ms) points={} anomalies={}",
+                                   r.statistics.executionTimeMs, slowMs,
+                                   r.statistics.totalPoints, r.statistics.anomalyCount);
+                }
             } else if (std::holds_alternative<forecast::ForecastQueryResult>(result)) {
                 const auto& r = std::get<forecast::ForecastQueryResult>(result);
                 http_log.debug("Forecast query completed: {} historical + {} forecast points, {:.2f}ms",
                                r.statistics.historicalPoints, r.statistics.forecastPoints,
                                r.statistics.executionTimeMs);
+                if (slowMs > 0 && r.statistics.executionTimeMs > static_cast<double>(slowMs)) {
+                    query_log.warn("[SLOW_QUERY] forecast {:.1f}ms (threshold {}ms) points={}+{}",
+                                   r.statistics.executionTimeMs, slowMs,
+                                   r.statistics.historicalPoints, r.statistics.forecastPoints);
+                }
             }
 
         } catch (const DerivedQueryException& e) {

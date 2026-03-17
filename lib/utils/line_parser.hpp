@@ -1,5 +1,4 @@
-#ifndef LINE_PARSER_H_INCLUDED
-#define LINE_PARSER_H_INCLUDED
+#pragma once
 
 #include <map>
 #include <string>
@@ -16,5 +15,3 @@ public:
     SeriesKeyParser(std::string_view seriesKey);
     void parseKeypair(std::string_view keypair, std::map<std::string_view, std::string_view>& map);
 };
-
-#endif

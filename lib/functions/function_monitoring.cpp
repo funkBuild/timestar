@@ -7,8 +7,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <iostream>
 #include <sstream>
+
+#include <seastar/util/log.hh>
+
+static seastar::logger monitoring_log("timestar.monitoring");
 
 namespace timestar::functions {
 
@@ -43,7 +46,7 @@ void ProductionMonitor::start() {
     monitoring_thread_ = std::thread(&ProductionMonitor::monitoringLoop, this);
 
     if (detailed_logging_) {
-        std::cout << "[ProductionMonitor] Started background monitoring thread\n";
+        monitoring_log.info("[ProductionMonitor] Started background monitoring thread");
     }
 }
 
@@ -69,7 +72,7 @@ void ProductionMonitor::stop() {
     }
 
     if (detailed_logging_) {
-        std::cout << "[ProductionMonitor] Stopped background monitoring thread\n";
+        monitoring_log.info("[ProductionMonitor] Stopped background monitoring thread");
     }
 }
 
@@ -79,7 +82,7 @@ void ProductionMonitor::registerFunction(const std::string& function_name) {
         function_metrics_[function_name] = std::make_shared<FunctionMetrics>();
 
         if (detailed_logging_) {
-            std::cout << "[ProductionMonitor] Registered function: " << function_name << "\n";
+            monitoring_log.info("[ProductionMonitor] Registered function: {}", function_name);
         }
     }
 }
@@ -96,7 +99,7 @@ std::shared_ptr<FunctionMetrics> ProductionMonitor::getFunctionMetrics(const std
     function_metrics_[function_name] = metrics;
 
     if (detailed_logging_) {
-        std::cout << "[ProductionMonitor] Auto-registered function: " << function_name << "\n";
+        monitoring_log.info("[ProductionMonitor] Auto-registered function: {}", function_name);
     }
 
     return metrics;
@@ -109,7 +112,7 @@ void ProductionMonitor::setAlertThresholds(const AlertThresholds& thresholds) {
     thresholds_ = thresholds;
 
     if (detailed_logging_) {
-        std::cout << "[ProductionMonitor] Updated alert thresholds\n";
+        monitoring_log.info("[ProductionMonitor] Updated alert thresholds");
     }
 }
 
@@ -142,7 +145,7 @@ void ProductionMonitor::acknowledgeAlert(size_t alert_id) {
         active_alerts_.erase(active_alerts_.begin() + alert_id);
 
         if (detailed_logging_) {
-            std::cout << "[ProductionMonitor] Acknowledged alert ID: " << alert_id << "\n";
+            monitoring_log.info("[ProductionMonitor] Acknowledged alert ID: {}", alert_id);
         }
     }
 }
@@ -154,7 +157,7 @@ void ProductionMonitor::clearAlertsForTesting() {
     alert_history_.clear();
 
     if (detailed_logging_) {
-        std::cout << "[ProductionMonitor] Cleared all alerts and history for testing\n";
+        monitoring_log.info("[ProductionMonitor] Cleared all alerts and history for testing");
     }
 }
 
@@ -360,7 +363,7 @@ void ProductionMonitor::setCollectionInterval(std::chrono::seconds interval) {
     monitoring_cv_.notify_one();
 
     if (detailed_logging_) {
-        std::cout << "[ProductionMonitor] Updated collection interval to " << interval.count() << "s\n";
+        monitoring_log.info("[ProductionMonitor] Updated collection interval to {}s", interval.count());
     }
 }
 
@@ -368,7 +371,7 @@ void ProductionMonitor::enableDetailedLogging(bool enabled) {
     detailed_logging_ = enabled;
 
     if (enabled) {
-        std::cout << "[ProductionMonitor] Detailed logging enabled\n";
+        monitoring_log.info("[ProductionMonitor] Detailed logging enabled");
     }
 }
 
@@ -386,14 +389,15 @@ void ProductionMonitor::monitoringLoop() {
 
             if (detailed_logging_) {
                 auto system_snapshot = getSystemMetricsSnapshot();
-                std::cout << "[ProductionMonitor] Active calls: " << system_snapshot.active_function_calls
-                          << ", Queued: " << system_snapshot.queued_function_calls
-                          << ", Memory: " << system_snapshot.system_memory_bytes / 1024 / 1024 << "MB\n";
+                monitoring_log.debug("[ProductionMonitor] Active calls: {}, Queued: {}, Memory: {}MB",
+                                     system_snapshot.active_function_calls,
+                                     system_snapshot.queued_function_calls,
+                                     system_snapshot.system_memory_bytes / 1024 / 1024);
             }
 
         } catch (const std::exception& e) {
             if (detailed_logging_) {
-                std::cout << "[ProductionMonitor] Error in monitoring loop: " << e.what() << "\n";
+                monitoring_log.error("[ProductionMonitor] Error in monitoring loop: {}", e.what());
             }
         }
 
@@ -499,7 +503,7 @@ void ProductionMonitor::checkAlertConditions() {
             alert.function_name = "system";
             alert.message = "High concurrency: " + std::to_string(active_calls) + " active calls";
             alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, (double)active_calls / thresholds_.max_concurrent_calls);
+            alert.severity = std::min(1.0, static_cast<double>(active_calls) / thresholds_.max_concurrent_calls);
             alert.metrics["active_calls"] = active_calls;
             pendingAlerts.push_back(std::move(alert));
         }
@@ -511,7 +515,7 @@ void ProductionMonitor::checkAlertConditions() {
             alert.function_name = "system";
             alert.message = "Queue overload: " + std::to_string(queued_calls) + " queued calls";
             alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, (double)queued_calls / thresholds_.max_queue_size);
+            alert.severity = std::min(1.0, static_cast<double>(queued_calls) / thresholds_.max_queue_size);
             alert.metrics["queued_calls"] = queued_calls;
             pendingAlerts.push_back(std::move(alert));
         }
@@ -542,7 +546,7 @@ void ProductionMonitor::processAlert(const Alert& alert) {
     alert_history_.push_back(alert);
 
     if (detailed_logging_) {
-        std::cout << "[ProductionMonitor] ALERT: " << alert.message << " (severity: " << alert.severity << ")\n";
+        monitoring_log.info("[ProductionMonitor] ALERT: {} (severity: {})", alert.message, alert.severity);
     }
 }
 

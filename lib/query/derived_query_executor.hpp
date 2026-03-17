@@ -1,5 +1,4 @@
-#ifndef DERIVED_QUERY_EXECUTOR_H_INCLUDED
-#define DERIVED_QUERY_EXECUTOR_H_INCLUDED
+#pragma once
 
 #include "anomaly/anomaly_executor.hpp"
 #include "anomaly/anomaly_result.hpp"
@@ -53,7 +52,7 @@ class DerivedQueryExecutor {
     friend class ::DerivedQueryMultiSeriesTest;
 
 public:
-    DerivedQueryExecutor(seastar::sharded<Engine>* engine, seastar::sharded<LevelDBIndex>* index = nullptr,
+    DerivedQueryExecutor(seastar::sharded<Engine>* engine, seastar::sharded<index::NativeIndex>* index = nullptr,
                          DerivedQueryConfig config = {});
 
     // Execute a derived query
@@ -91,7 +90,7 @@ public:
 
 private:
     seastar::sharded<Engine>* engine_;
-    seastar::sharded<LevelDBIndex>* index_;
+    seastar::sharded<index::NativeIndex>* index_;
     DerivedQueryConfig config_;
     const ExpressionNode* cachedAst_ = nullptr;  // Avoids re-parsing in executeWithAnomaly→execute
 
@@ -205,5 +204,3 @@ struct GlazeForecastResponse {
 };
 
 }  // namespace timestar
-
-#endif  // DERIVED_QUERY_EXECUTOR_H_INCLUDED

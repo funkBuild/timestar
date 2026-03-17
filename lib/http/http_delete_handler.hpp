@@ -1,5 +1,4 @@
-#ifndef HTTP_DELETE_HANDLER_H_INCLUDED
-#define HTTP_DELETE_HANDLER_H_INCLUDED
+#pragma once
 
 #include "engine.hpp"
 #include "series_id.hpp"
@@ -99,5 +98,3 @@ public:
 
     void registerRoutes(seastar::httpd::routes& r);
 };
-
-#endif

@@ -1,5 +1,4 @@
-#ifndef STRING_ENCODER_H_INCLUDED
-#define STRING_ENCODER_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -16,6 +15,15 @@ private:
 
     // Read variable-length integer
     static uint32_t readVarInt(Slice& slice);
+
+    // Shared encode implementation: validates, builds varint-prefixed buffer, compresses.
+    struct CompressedPayload {
+        std::vector<char> data;
+        uint32_t uncompressedSize;
+        uint32_t compressedSize;
+        uint32_t count;
+    };
+    static CompressedPayload compressStrings(std::span<const std::string> values, int compressionLevel);
 
 public:
     StringEncoder() = default;
@@ -50,5 +58,3 @@ public:
     static void decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                        std::vector<std::string>& out);
 };
-
-#endif  // STRING_ENCODER_H_INCLUDED

@@ -12,7 +12,7 @@ Focused tests for individual components with minimal dependencies.
 - **`unit/storage/`** - Storage layer tests (TSM, WAL, Memory Store, Compactor)
 - **`unit/encoding/`** - Encoding/compression algorithm tests (Simple8b, Simple16, String encoding)
 - **`unit/query/`** - Query system tests (Parser, Planner, Aggregator, Series Matcher)
-- **`unit/index/`** - Index system tests (LevelDB index, Metadata index)
+- **`unit/index/`** - Index system tests (NativeIndex, key encoding, postings)
 - **`unit/http/`** - HTTP handler tests (Query handler, Write handler)
 
 ### Integration Tests (`integration/`)
@@ -86,7 +86,7 @@ The build system creates multiple test executables:
 Some tests require the Seastar framework and are compiled separately due to special compilation requirements. These tests use coroutines and async I/O:
 
 - Storage: `tsm_compactor_test`, `tsm_tombstone_test`, `tsm_string_test`
-- Index: `leveldb_index_*_test`, `metadata_index_gtest_seastar`
+- Index: `native_index_*_test`
 - Integration: Most integration tests
 - E2E: `delete_e2e_test`, `flexible_delete_test`
 - Performance: All performance tests

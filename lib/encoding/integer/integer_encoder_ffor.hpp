@@ -1,5 +1,4 @@
-#ifndef INTEGER_ENCODER_FFOR_H_INCLUDED
-#define INTEGER_ENCODER_FFOR_H_INCLUDED
+#pragma once
 
 #include "../../storage/aligned_buffer.hpp"
 #include "../../storage/slice_buffer.hpp"
@@ -40,5 +39,3 @@ public:
 
     static bool isAvailable() { return true; }
 };
-
-#endif  // INTEGER_ENCODER_FFOR_H_INCLUDED

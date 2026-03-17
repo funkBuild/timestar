@@ -11,6 +11,23 @@
 // Prevents OOM from a crafted payload that claims a multi-GB uncompressed size.
 static constexpr uint32_t MAX_UNCOMPRESSED_SIZE = 256 * 1024 * 1024;
 
+// Thread-local zstd contexts — eliminates ~200KB alloc per compress and ~130KB
+// per decompress.  Seastar's shard-per-core model means one thread per shard,
+// so thread_local is safe with no synchronization overhead.
+// RAII wrappers ensure cleanup at thread exit.
+struct ZstdCCtxDeleter { void operator()(ZSTD_CCtx* p) const { ZSTD_freeCCtx(p); } };
+struct ZstdDCtxDeleter { void operator()(ZSTD_DCtx* p) const { ZSTD_freeDCtx(p); } };
+
+static ZSTD_CCtx* getThreadCCtx() {
+    static thread_local std::unique_ptr<ZSTD_CCtx, ZstdCCtxDeleter> ctx(ZSTD_createCCtx());
+    return ctx.get();
+}
+
+static ZSTD_DCtx* getThreadDCtx() {
+    static thread_local std::unique_ptr<ZSTD_DCtx, ZstdDCtxDeleter> ctx(ZSTD_createDCtx());
+    return ctx.get();
+}
+
 void StringEncoder::writeVarInt(AlignedBuffer& buffer, uint32_t value) {
     while (value >= 0x80) {
         buffer.write(static_cast<uint8_t>((value & 0x7F) | 0x80));
@@ -45,96 +62,87 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
     return value;
 }
 
-AlignedBuffer StringEncoder::encode(std::span<const std::string> values, int compressionLevel) {
-    AlignedBuffer result;
-
-    // Validate count fits in uint32_t header field
+// Shared encode implementation: validates input, builds varint-prefixed
+// uncompressed buffer, compresses with zstd, and returns the compressed
+// payload with metadata. Both encode() and encodeInto() delegate here.
+StringEncoder::CompressedPayload StringEncoder::compressStrings(
+    std::span<const std::string> values, int compressionLevel) {
     if (values.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("String encoder: count " + std::to_string(values.size()) +
                                   " exceeds uint32_t maximum");
     }
 
-    // Calculate uncompressed size and validate individual string lengths
-    size_t uncompressedSize = 0;
+    // Calculate uncompressed size with varint length prefixes
+    size_t uncompSize = 0;
     for (const auto& str : values) {
         if (str.size() > std::numeric_limits<uint32_t>::max()) {
             throw std::overflow_error("String encoder: individual string length " + std::to_string(str.size()) +
                                       " exceeds uint32_t maximum");
         }
-        // Calculate varint size for length
         uint32_t len = static_cast<uint32_t>(str.size());
         size_t varintSize = 1;
-        while (len >= 0x80) {
-            varintSize++;
-            len >>= 7;
-        }
-        uncompressedSize += varintSize + str.size();
+        while (len >= 0x80) { varintSize++; len >>= 7; }
+        uncompSize += varintSize + str.size();
     }
 
-    // Validate total uncompressed size fits in uint32_t header field
-    if (uncompressedSize > std::numeric_limits<uint32_t>::max()) {
-        throw std::overflow_error("String encoder: total uncompressed size " + std::to_string(uncompressedSize) +
+    if (uncompSize > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("String encoder: total uncompressed size " + std::to_string(uncompSize) +
                                   " exceeds uint32_t maximum");
     }
 
-    // Create uncompressed buffer with string data
-    AlignedBuffer uncompressed(uncompressedSize);
+    // Build uncompressed buffer (varint-prefixed strings)
+    AlignedBuffer uncompressed(uncompSize);
     size_t writePos = 0;
-
     for (const auto& str : values) {
-        if (str.size() > std::numeric_limits<uint32_t>::max()) {
-            throw std::overflow_error("String encoder: individual string size " + std::to_string(str.size()) +
-                                      " exceeds uint32_t maximum");
-        }
-        // Write varint length prefix
         uint32_t len = static_cast<uint32_t>(str.size());
         while (len >= 0x80) {
             uncompressed.data[writePos++] = static_cast<uint8_t>((len & 0x7F) | 0x80);
             len >>= 7;
         }
         uncompressed.data[writePos++] = static_cast<uint8_t>(len & 0x7F);
-
-        // Write string data
         std::memcpy(uncompressed.data.data() + writePos, str.data(), str.size());
         writePos += str.size();
     }
     uncompressed.data.resize(writePos);
 
-    // Compress with zstd (level varies: 1=fast for fresh writes, higher for compacted data)
+    // Compress with zstd — reuse thread-local buffer to avoid per-call allocation
     size_t compressedMaxSize = ZSTD_compressBound(uncompressed.data.size());
-    std::vector<char> compressed(compressedMaxSize);
-    size_t compressedSize = ZSTD_compress(compressed.data(), compressedMaxSize,
-                                           reinterpret_cast<const char*>(uncompressed.data.data()),
-                                           uncompressed.data.size(), compressionLevel);
+    static thread_local std::vector<char> tlCompBuf;
+    tlCompBuf.resize(compressedMaxSize);
+    auto& compressed = tlCompBuf;
+    size_t compressedSize = ZSTD_compressCCtx(getThreadCCtx(), compressed.data(), compressedMaxSize,
+                                               reinterpret_cast<const char*>(uncompressed.data.data()),
+                                               uncompressed.data.size(), compressionLevel);
     if (ZSTD_isError(compressedSize)) {
         throw std::runtime_error(std::string("String encoder: zstd compression failed: ") +
                                  ZSTD_getErrorName(compressedSize));
     }
-
-    // Validate compressed size fits in uint32_t header field
     if (compressedSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("String encoder: compressed size " + std::to_string(compressedSize) +
                                   " exceeds uint32_t maximum");
     }
 
-    // Write header: magic_number(4) | uncompressed_size(4) | compressed_size(4) | count(4)
+    compressed.resize(compressedSize);
+    return {std::move(compressed),
+            static_cast<uint32_t>(uncompressed.data.size()),
+            static_cast<uint32_t>(compressedSize),
+            static_cast<uint32_t>(values.size())};
+}
 
-    // Magic number for string encoding
-    uint32_t magic = 0x53545247;  // "STRG"
-    result.write(magic);
+// Write the standard STRG header into an AlignedBuffer.
+static void writeStringHeader(AlignedBuffer& buf, uint32_t uncompSize, uint32_t compSize, uint32_t count) {
+    static constexpr uint32_t STRG_MAGIC = 0x53545247;
+    buf.write(STRG_MAGIC);
+    buf.write(uncompSize);
+    buf.write(compSize);
+    buf.write(count);
+}
 
-    uint32_t uncompSize = static_cast<uint32_t>(uncompressed.data.size());
-    result.write(uncompSize);
-
-    uint32_t compSize = static_cast<uint32_t>(compressedSize);
-    result.write(compSize);
-
-    uint32_t count = static_cast<uint32_t>(values.size());
-    result.write(count);
-
-    // Write compressed data
-    result.write_bytes(compressed.data(), compressedSize);
-
+AlignedBuffer StringEncoder::encode(std::span<const std::string> values, int compressionLevel) {
+    AlignedBuffer result;
+    auto payload = compressStrings(values, compressionLevel);
+    writeStringHeader(result, payload.uncompressedSize, payload.compressedSize, payload.count);
+    result.write_bytes(payload.data.data(), payload.data.size());
     return result;
 }
 
@@ -143,84 +151,13 @@ size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuf
     const size_t startPos = target.size();
 
     if (values.empty()) [[unlikely]] {
-        // Write a valid empty header so decoders don't choke
-        uint32_t magic = 0x53545247;  // "STRG"
-        target.write(magic);
-        target.write(static_cast<uint32_t>(0));  // uncompressed_size
-        target.write(static_cast<uint32_t>(0));  // compressed_size
-        target.write(static_cast<uint32_t>(0));  // count
+        writeStringHeader(target, 0, 0, 0);
         return target.size() - startPos;
     }
 
-    // Validate count fits in uint32_t header field
-    if (values.size() > std::numeric_limits<uint32_t>::max()) {
-        throw std::overflow_error("String encoder: count " + std::to_string(values.size()) +
-                                  " exceeds uint32_t maximum");
-    }
-
-    // Calculate uncompressed size and validate individual string lengths
-    size_t uncompressedSize = 0;
-    for (const auto& str : values) {
-        if (str.size() > std::numeric_limits<uint32_t>::max()) {
-            throw std::overflow_error("String encoder: individual string length " + std::to_string(str.size()) +
-                                      " exceeds uint32_t maximum");
-        }
-        uint32_t len = static_cast<uint32_t>(str.size());
-        size_t varintSize = 1;
-        while (len >= 0x80) {
-            varintSize++;
-            len >>= 7;
-        }
-        uncompressedSize += varintSize + str.size();
-    }
-
-    if (uncompressedSize > std::numeric_limits<uint32_t>::max()) {
-        throw std::overflow_error("String encoder: total uncompressed size " + std::to_string(uncompressedSize) +
-                                  " exceeds uint32_t maximum");
-    }
-
-    // Build the uncompressed buffer (varint-prefixed strings)
-    AlignedBuffer uncompressed(uncompressedSize);
-    size_t writePos = 0;
-
-    for (const auto& str : values) {
-        uint32_t len = static_cast<uint32_t>(str.size());
-        while (len >= 0x80) {
-            uncompressed.data[writePos++] = static_cast<uint8_t>((len & 0x7F) | 0x80);
-            len >>= 7;
-        }
-        uncompressed.data[writePos++] = static_cast<uint8_t>(len & 0x7F);
-        std::memcpy(uncompressed.data.data() + writePos, str.data(), str.size());
-        writePos += str.size();
-    }
-    uncompressed.data.resize(writePos);
-
-    // Compress with zstd into a temporary buffer.
-    size_t compressedMaxSize = ZSTD_compressBound(uncompressed.data.size());
-    std::vector<char> compressed(compressedMaxSize);
-    size_t compressedSize = ZSTD_compress(compressed.data(), compressedMaxSize,
-                                           reinterpret_cast<const char*>(uncompressed.data.data()),
-                                           uncompressed.data.size(), compressionLevel);
-    if (ZSTD_isError(compressedSize)) {
-        throw std::runtime_error(std::string("String encoder: zstd compression failed: ") +
-                                 ZSTD_getErrorName(compressedSize));
-    }
-
-    if (compressedSize > std::numeric_limits<uint32_t>::max()) {
-        throw std::overflow_error("String encoder: compressed size " + std::to_string(compressedSize) +
-                                  " exceeds uint32_t maximum");
-    }
-
-    // Write header directly into the target buffer
-    uint32_t magic = 0x53545247;  // "STRG"
-    target.write(magic);
-    target.write(static_cast<uint32_t>(uncompressed.data.size()));
-    target.write(static_cast<uint32_t>(compressedSize));
-    target.write(static_cast<uint32_t>(values.size()));
-
-    // Write compressed data directly into the target buffer
-    target.write_bytes(compressed.data(), compressedSize);
-
+    auto payload = compressStrings(values, compressionLevel);
+    writeStringHeader(target, payload.uncompressedSize, payload.compressedSize, payload.count);
+    target.write_bytes(payload.data.data(), payload.data.size());
     return target.size() - startPos;
 }
 
@@ -259,10 +196,13 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
                                  ") exceeds limit");
     }
-    std::vector<uint8_t> uncompressed(uncompressedSize);
+    // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
+    static thread_local std::vector<uint8_t> tlDecompBuf;
+    tlDecompBuf.resize(uncompressedSize);
+    auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                       reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
@@ -325,10 +265,13 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
                                  ") exceeds limit");
     }
-    std::vector<uint8_t> uncompressed(uncompressedSize);
+    // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
+    static thread_local std::vector<uint8_t> tlDecompBuf;
+    tlDecompBuf.resize(uncompressedSize);
+    auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                       reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
@@ -384,10 +327,13 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
                                  ") exceeds limit");
     }
-    std::vector<uint8_t> uncompressed(uncompressedSize);
+    // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
+    static thread_local std::vector<uint8_t> tlDecompBuf;
+    tlDecompBuf.resize(uncompressedSize);
+    auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                       reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
@@ -457,10 +403,13 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
                                  ") exceeds limit");
     }
-    std::vector<uint8_t> uncompressed(uncompressedSize);
+    // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
+    static thread_local std::vector<uint8_t> tlDecompBuf;
+    tlDecompBuf.resize(uncompressedSize);
+    auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompress(reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                       reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));

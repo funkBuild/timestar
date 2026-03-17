@@ -1,5 +1,4 @@
-#ifndef SIMPLE16_H_INCLUDED
-#define SIMPLE16_H_INCLUDED
+#pragma once
 
 #include "aligned_buffer.hpp"
 #include "slice_buffer.hpp"
@@ -43,5 +42,3 @@ public:
     // Returns the number of bytes written.
     static size_t encodeInto(std::vector<uint64_t>& values, AlignedBuffer& target);
 };
-
-#endif

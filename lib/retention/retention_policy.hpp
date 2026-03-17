@@ -1,5 +1,4 @@
-#ifndef RETENTION_POLICY_H_INCLUDED
-#define RETENTION_POLICY_H_INCLUDED
+#pragma once
 
 #include <glaze/glaze.hpp>
 
@@ -47,5 +46,3 @@ struct glz::meta<RetentionPolicyRequest> {
     using T = RetentionPolicyRequest;
     static constexpr auto value = object("measurement", &T::measurement, "ttl", &T::ttl, "downsample", &T::downsample);
 };
-
-#endif  // RETENTION_POLICY_H_INCLUDED
