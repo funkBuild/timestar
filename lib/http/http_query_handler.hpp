@@ -72,7 +72,8 @@ public:
         return std::chrono::seconds(timestar::config().http.query_timeout_seconds);
     }
 
-    explicit HttpQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<timestar::index::NativeIndex>* index = nullptr)
+    explicit HttpQueryHandler(seastar::sharded<Engine>* engine,
+                              seastar::sharded<timestar::index::NativeIndex>* index = nullptr)
         : engineSharded(engine), indexSharded(index) {}
 
     // Validate request body size and content type (public for testing).

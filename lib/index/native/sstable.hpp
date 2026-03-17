@@ -60,8 +60,8 @@ class SSTableWriter {
 public:
     // Create a writer for a new SSTable file. Opens the file handle.
     // compressionLevel: zstd level (1=fast for L0 flushes, 3=better ratio for compacted L1+).
-    static seastar::future<SSTableWriter> create(std::string filename, int blockSize = 16384,
-                                                  int bloomBitsPerKey = 15, int compressionLevel = 1);
+    static seastar::future<SSTableWriter> create(std::string filename, int blockSize = 16384, int bloomBitsPerKey = 15,
+                                                 int compressionLevel = 1);
 
     // Add a key-value pair. Keys MUST be added in sorted order.
     // Synchronous — buffers data in memory. Call flushPending() periodically
@@ -92,10 +92,10 @@ private:
     BlockBuilder currentBlock_;
     BloomFilter bloom_;
     std::vector<IndexEntry> index_;
-    std::string pendingData_;  // Bounded write buffer (~256KB)
-    size_t pendingOffset_ = 0;      // Offset into pendingData_ (avoids erase(0,N) copies)
-    uint64_t fileOffset_ = 0;       // Logical data offset (for index entries)
-    uint64_t diskOffset_ = 0;       // Physical write position on disk
+    std::string pendingData_;   // Bounded write buffer (~256KB)
+    size_t pendingOffset_ = 0;  // Offset into pendingData_ (avoids erase(0,N) copies)
+    uint64_t fileOffset_ = 0;   // Logical data offset (for index entries)
+    uint64_t diskOffset_ = 0;   // Physical write position on disk
     size_t entryCount_ = 0;
     int blockSize_;
     int compressionLevel_;
@@ -127,8 +127,7 @@ public:
 
     // Open an existing SSTable file. Reads entire file into memory,
     // parses footer/index/bloom, but does NOT decompress data blocks.
-    static seastar::future<std::unique_ptr<SSTableReader>> open(std::string filename,
-                                                                 BlockCache* cache = nullptr);
+    static seastar::future<std::unique_ptr<SSTableReader>> open(std::string filename, BlockCache* cache = nullptr);
 
     // Point lookup: returns the value for a key, or nullopt if not found.
     // Uses bloom filter to skip unnecessary block reads.
@@ -154,7 +153,6 @@ public:
         explicit Iterator(SSTableReader* reader);
 
     private:
-
         SSTableReader* reader_;
         bool valid_ = false;
         size_t blockIndex_ = 0;  // Current index entry
@@ -213,8 +211,8 @@ private:
     static constexpr size_t SUMMARY_INTERVAL = 64;
 
     struct SummaryEntry {
-        std::string_view key;   // Points into index_[indexPos].firstKey
-        size_t indexPos;        // Position in index_ array
+        std::string_view key;  // Points into index_[indexPos].firstKey
+        size_t indexPos;       // Position in index_ array
     };
     std::vector<SummaryEntry> summary_;
 

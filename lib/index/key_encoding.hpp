@@ -14,7 +14,7 @@ namespace timestar::index::keys {
 // These produce the binary keys used by NativeIndex.
 
 std::string encodeSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
-                             const std::string& field);
+                            const std::string& field);
 
 std::string encodeMeasurementFieldsKey(const std::string& measurement);
 std::string encodeMeasurementTagsKey(const std::string& measurement);
@@ -24,7 +24,7 @@ std::string encodeFieldTypeKey(const std::string& measurement, const std::string
 std::string encodeMeasurementSeriesKey(const std::string& measurement, const SeriesId128& seriesId);
 std::string encodeMeasurementSeriesPrefix(const std::string& measurement);
 std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, const std::string& field,
-                                             const SeriesId128& seriesId);
+                                            const SeriesId128& seriesId);
 std::string encodeRetentionPolicyKey(const std::string& measurement);
 
 // --- Value encoding/decoding ---
@@ -47,7 +47,7 @@ std::string escapeKeyComponent(const std::string& input);
 std::string encodeLocalIdForwardKey(uint32_t localId);
 std::string encodeLocalIdCounterKey();
 std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
-                                     const std::string& tagValue);
+                                    const std::string& tagValue);
 std::string encodePostingsBitmapPrefix(const std::string& measurement, const std::string& tagKey);
 std::string encodeLocalId(uint32_t localId);
 uint32_t decodeLocalId(std::string_view encoded);
@@ -68,7 +68,7 @@ uint32_t decodeDayFromDayBitmapKey(std::string_view key);
 
 std::string encodeCardinalityHLLKey(const std::string& measurement);
 std::string encodeCardinalityHLLKey(const std::string& measurement, const std::string& tagKey,
-                                     const std::string& tagValue);
+                                    const std::string& tagValue);
 std::string encodeCardinalityHLLPrefix(const std::string& measurement);
 std::string encodeMeasurementBloomKey(const std::string& measurement);
 

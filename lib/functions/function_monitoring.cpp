@@ -7,9 +7,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <sstream>
-
 #include <seastar/util/log.hh>
+#include <sstream>
 
 static seastar::logger monitoring_log("timestar.monitoring");
 
@@ -390,8 +389,7 @@ void ProductionMonitor::monitoringLoop() {
             if (detailed_logging_) {
                 auto system_snapshot = getSystemMetricsSnapshot();
                 monitoring_log.debug("[ProductionMonitor] Active calls: {}, Queued: {}, Memory: {}MB",
-                                     system_snapshot.active_function_calls,
-                                     system_snapshot.queued_function_calls,
+                                     system_snapshot.active_function_calls, system_snapshot.queued_function_calls,
                                      system_snapshot.system_memory_bytes / 1024 / 1024);
             }
 

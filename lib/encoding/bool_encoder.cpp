@@ -52,7 +52,8 @@ size_t BoolEncoder::encodeInto(const std::vector<bool>& values, AlignedBuffer& t
 }
 
 void BoolEncoder::decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out) {
-    if (length == 0) return;
+    if (length == 0)
+        return;
     out.reserve(out.size() + length);
 
     // Phase 1: Skip bits — advance pointer directly (no per-byte read call)

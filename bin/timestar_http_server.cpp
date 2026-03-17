@@ -76,9 +76,8 @@ void set_routes(routes& r) {
     r.add(operation_type::GET, url("/health"), health);
 
     auto* version = emplaceHandler(new function_handler([](const_req req) {
-        return sstring(fmt::format(
-            R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
-            timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER));
+        return sstring(fmt::format(R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
+                                   timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER));
     }));
     r.add(operation_type::GET, url("/version"), version);
 
@@ -124,10 +123,8 @@ int main(int argc, char** argv) {
     bool dumpConfig = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
-            std::cout << "TimeStar " << timestar::VERSION
-                      << " (" << timestar::GIT_COMMIT << ")"
-                      << "\nBuilt: " << timestar::BUILD_TIME
-                      << "\nCompiler: " << timestar::COMPILER << std::endl;
+            std::cout << "TimeStar " << timestar::VERSION << " (" << timestar::GIT_COMMIT << ")"
+                      << "\nBuilt: " << timestar::BUILD_TIME << "\nCompiler: " << timestar::COMPILER << std::endl;
             return 0;
         } else if (std::strcmp(argv[i], "--dump-config") == 0) {
             dumpConfig = true;
@@ -230,9 +227,8 @@ int main(int argc, char** argv) {
 
             // Initialize logging
             timestar::init_logging(log_level);
-            timestar::http_log.info("Starting TimeStar {} ({}) built {} with {}",
-                                   timestar::VERSION, timestar::GIT_COMMIT,
-                                   timestar::BUILD_TIME, timestar::COMPILER);
+            timestar::http_log.info("Starting TimeStar {} ({}) built {} with {}", timestar::VERSION,
+                                    timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER);
 
             // STEP 0: Check for shard rebalancing (CPU count change)
             {
@@ -336,9 +332,9 @@ int main(int argc, char** argv) {
                 // from oversized payloads. Seastar enforces this at the connection
                 // layer before buffering the full body.
                 static constexpr size_t MAX_CONTENT_LENGTH = 64 * 1024 * 1024;
-                server->server().invoke_on_all([](httpd::http_server& s) {
-                    s.set_content_length_limit(MAX_CONTENT_LENGTH);
-                }).get();
+                server->server()
+                    .invoke_on_all([](httpd::http_server& s) { s.set_content_length_limit(MAX_CONTENT_LENGTH); })
+                    .get();
 
                 server->set_routes(set_routes).get();
 
@@ -384,7 +380,8 @@ int main(int argc, char** argv) {
             auto doShutdown = [&]() -> seastar::future<> {
                 co_await server->stop();
                 co_await seastar::smp::invoke_on_all([] {
-                    if (g_streamHandler) return g_streamHandler->stop();
+                    if (g_streamHandler)
+                        return g_streamHandler->stop();
                     return seastar::make_ready_future<>();
                 });
                 co_await g_engine.invoke_on_all([](Engine& engine) { return engine.stop(); });

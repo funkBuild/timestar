@@ -251,17 +251,22 @@ static void mergeSortedStatesInto(std::vector<uint64_t>& baseTs, std::vector<Agg
 // Check whether all K partials share identical timestamp vectors.
 // If so, we can use element-wise SIMD combine instead of a merge.
 static bool allTimestampsIdentical(const std::vector<PartialAggregationResult*>& partials) {
-    if (partials.size() <= 1) return true;
+    if (partials.size() <= 1)
+        return true;
     const auto& ref = partials[0]->sortedTimestamps;
     for (size_t i = 1; i < partials.size(); ++i) {
         const auto& ts = partials[i]->sortedTimestamps;
-        if (ts.size() != ref.size()) return false;
+        if (ts.size() != ref.size())
+            return false;
         // Only check endpoints + midpoint for speed — false negatives go to merge path
         if (!ts.empty()) {
-            if (ts.front() != ref.front()) return false;
-            if (ts.back() != ref.back()) return false;
+            if (ts.front() != ref.front())
+                return false;
+            if (ts.back() != ref.back())
+                return false;
             size_t mid = ts.size() / 2;
-            if (ts[mid] != ref[mid]) return false;
+            if (ts[mid] != ref[mid])
+                return false;
         }
     }
     return true;
@@ -270,11 +275,9 @@ static bool allTimestampsIdentical(const std::vector<PartialAggregationResult*>&
 // SIMD element-wise fold for aligned-timestamp raw-value partials.
 // Combines K value arrays into one using the aggregation method.
 // Outputs merged (timestamps, values, counts). O(N) time, zero merge overhead.
-static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& partials,
-                                  AggregationMethod method,
-                                  std::vector<uint64_t>& outTs,
-                                  std::vector<double>& outVals,
-                                  std::vector<size_t>& outCounts) {
+static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
+                                 std::vector<uint64_t>& outTs, std::vector<double>& outVals,
+                                 std::vector<size_t>& outCounts) {
     const size_t N = partials[0]->sortedTimestamps.size();
     const size_t K = partials.size();
 
@@ -293,19 +296,23 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
             case AggregationMethod::AVG:
             case AggregationMethod::SUM:
             case AggregationMethod::COUNT:
-                for (size_t i = 0; i < N; ++i) dst[i] += src[i];
+                for (size_t i = 0; i < N; ++i)
+                    dst[i] += src[i];
                 break;
             case AggregationMethod::MIN:
-                for (size_t i = 0; i < N; ++i) dst[i] = std::min(dst[i], src[i]);
+                for (size_t i = 0; i < N; ++i)
+                    dst[i] = std::min(dst[i], src[i]);
                 break;
             case AggregationMethod::MAX:
             case AggregationMethod::LATEST:
-                for (size_t i = 0; i < N; ++i) dst[i] = std::max(dst[i], src[i]);
+                for (size_t i = 0; i < N; ++i)
+                    dst[i] = std::max(dst[i], src[i]);
                 break;
             case AggregationMethod::FIRST:
                 break;
             default:
-                for (size_t i = 0; i < N; ++i) dst[i] += src[i];
+                for (size_t i = 0; i < N; ++i)
+                    dst[i] += src[i];
                 break;
         }
     }
@@ -313,16 +320,15 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
 
 // N-way heap merge for raw-value partials with mismatched timestamps.
 // O(K*N * log K) time, O(K*N) space (single output allocation).
-static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
-                                AggregationMethod method,
-                                std::vector<uint64_t>& outTs,
-                                std::vector<double>& outVals,
-                                std::vector<size_t>& outCounts) {
+static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
+                               std::vector<uint64_t>& outTs, std::vector<double>& outVals,
+                               std::vector<size_t>& outCounts) {
     const size_t K = partials.size();
 
     // Pre-calculate total output size for single allocation
     size_t totalSize = 0;
-    for (const auto* p : partials) totalSize += p->sortedTimestamps.size();
+    for (const auto* p : partials)
+        totalSize += p->sortedTimestamps.size();
 
     outTs.reserve(totalSize);
     outVals.reserve(totalSize);
@@ -338,8 +344,8 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
 
     std::vector<HeapEntry> heapVec;
     heapVec.reserve(K);
-    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap(
-        std::greater<HeapEntry>{}, std::move(heapVec));
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap(std::greater<HeapEntry>{},
+                                                                                         std::move(heapVec));
 
     // Seed heap with first element from each partial
     for (size_t i = 0; i < K; ++i) {
@@ -392,14 +398,14 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
 
 // N-way heap merge for AggregationState partials.
 // O(K*N * log K) time, single pass.
-static void nWayMergeStates(std::vector<PartialAggregationResult*>& partials,
-                             std::vector<uint64_t>& outTs,
-                             std::vector<AggregationState>& outStates,
-                             AggregationMethod method = AggregationMethod::AVG) {
+static void nWayMergeStates(std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
+                            std::vector<AggregationState>& outStates,
+                            AggregationMethod method = AggregationMethod::AVG) {
     const size_t K = partials.size();
 
     size_t totalSize = 0;
-    for (const auto* p : partials) totalSize += p->sortedTimestamps.size();
+    for (const auto* p : partials)
+        totalSize += p->sortedTimestamps.size();
 
     outTs.reserve(totalSize);
     outStates.reserve(totalSize);
@@ -660,7 +666,8 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     merged.mergeForMethod(*p->collapsedState, method);
                 }
                 if (merged.count > 0) {
-                    groupedResult.points.push_back({merged.getTimestamp(method), merged.getValue(method), merged.count});
+                    groupedResult.points.push_back(
+                        {merged.getTimestamp(method), merged.getValue(method), merged.count});
                 }
             } else {
                 // Not all collapsed: convert any collapsed partials to

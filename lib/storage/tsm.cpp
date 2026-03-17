@@ -209,8 +209,8 @@ seastar::future<> TSM::readSparseIndex() {
         uint64_t entryStartOffset = indexOffset + indexSlice.offset;
 
         // Read series ID (16 bytes) — zero-copy from index buffer
-        SeriesId128 seriesId = SeriesId128::fromBytes(
-            reinterpret_cast<const char*>(indexSlice.data + indexSlice.offset), 16);
+        SeriesId128 seriesId =
+            SeriesId128::fromBytes(reinterpret_cast<const char*>(indexSlice.data + indexSlice.offset), 16);
         indexSlice.offset += 16;
 
         // Read type (1 byte) and block count (2 bytes)
@@ -343,8 +343,7 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     TSMIndexEntry fullEntry;
 
     // Parse series ID (verify) — zero-copy from entry buffer
-    fullEntry.seriesId = SeriesId128::fromBytes(
-        reinterpret_cast<const char*>(entrySlice.data + entrySlice.offset), 16);
+    fullEntry.seriesId = SeriesId128::fromBytes(reinterpret_cast<const char*>(entrySlice.data + entrySlice.offset), 16);
     entrySlice.offset += 16;
 
     // Parse type and block count
@@ -509,8 +508,8 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
 
             TSMIndexEntry fullEntry;
             // Zero-copy series ID from entry buffer
-            fullEntry.seriesId = SeriesId128::fromBytes(
-                reinterpret_cast<const char*>(entrySlice.data + entrySlice.offset), 16);
+            fullEntry.seriesId =
+                SeriesId128::fromBytes(reinterpret_cast<const char*>(entrySlice.data + entrySlice.offset), 16);
             entrySlice.offset += 16;
             fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
             uint16_t blockCount = entrySlice.read<uint16_t>();
@@ -852,7 +851,7 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
 // Returns the number of points decoded.
 template <class T>
 static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
-                               std::vector<uint64_t>& outTimestamps, std::vector<T>& outValues) {
+                              std::vector<uint64_t>& outTimestamps, std::vector<T>& outValues) {
     if (blockSize < BLOCK_HEADER_SIZE)
         return 0;
 
@@ -915,8 +914,8 @@ seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTim
 
     uint32_t bufferOffset = 0;
     for (const auto& block : batch.blocks) {
-        decodeBlockFlat<T>(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
-                           flatBlock->timestamps, flatBlock->values);
+        decodeBlockFlat<T>(batchBuf.get() + bufferOffset, block.size, startTime, endTime, flatBlock->timestamps,
+                           flatBlock->values);
         bufferOffset += block.size;
     }
 

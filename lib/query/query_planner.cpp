@@ -108,33 +108,33 @@ seastar::future<std::vector<std::vector<SeriesId128>>> QueryPlanner::findMatchin
     futures.reserve(shardCount);
 
     for (unsigned s = 0; s < shardCount; ++s) {
-        auto f = indexSharded->invoke_on(
-            s, [request](index::NativeIndex& index) -> seastar::future<std::vector<SeriesId128>> {
-                std::unordered_set<std::string> fieldFilter;
-                if (!request.requestsAllFields()) {
-                    fieldFilter.insert(request.fields.begin(), request.fields.end());
-                }
+        auto f = indexSharded
+                     ->invoke_on(s,
+                                 [request](index::NativeIndex& index) -> seastar::future<std::vector<SeriesId128>> {
+                                     std::unordered_set<std::string> fieldFilter;
+                                     if (!request.requestsAllFields()) {
+                                         fieldFilter.insert(request.fields.begin(), request.fields.end());
+                                     }
 
-                auto findResult = co_await index.findSeriesWithMetadata(
-                    request.measurement, request.scopes, fieldFilter);
+                                     auto findResult = co_await index.findSeriesWithMetadata(
+                                         request.measurement, request.scopes, fieldFilter);
 
-                if (!findResult.has_value()) {
-                    throw std::runtime_error("Query matches too many series for measurement '" +
-                                             request.measurement +
+                                     if (!findResult.has_value()) {
+                                         throw std::runtime_error(
+                                             "Query matches too many series for measurement '" + request.measurement +
                                              "'. Narrow your query with more specific tag filters.");
-                }
+                                     }
 
-                auto& seriesWithMeta = findResult.value();
-                std::vector<SeriesId128> seriesIds;
-                seriesIds.reserve(seriesWithMeta.size());
-                for (const auto& swm : seriesWithMeta) {
-                    seriesIds.push_back(swm.seriesId);
-                }
+                                     auto& seriesWithMeta = findResult.value();
+                                     std::vector<SeriesId128> seriesIds;
+                                     seriesIds.reserve(seriesWithMeta.size());
+                                     for (const auto& swm : seriesWithMeta) {
+                                         seriesIds.push_back(swm.seriesId);
+                                     }
 
-                co_return seriesIds;
-            }).then([s](std::vector<SeriesId128> ids) {
-                return std::make_pair(s, std::move(ids));
-            });
+                                     co_return seriesIds;
+                                 })
+                     .then([s](std::vector<SeriesId128> ids) { return std::make_pair(s, std::move(ids)); });
         futures.push_back(std::move(f));
     }
 

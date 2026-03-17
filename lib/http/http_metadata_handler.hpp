@@ -32,7 +32,8 @@ public:
 
     seastar::future<std::unique_ptr<seastar::http::reply>> handleFields(std::unique_ptr<seastar::http::request> req);
 
-    seastar::future<std::unique_ptr<seastar::http::reply>> handleCardinality(std::unique_ptr<seastar::http::request> req);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleCardinality(
+        std::unique_ptr<seastar::http::request> req);
 
     std::string createErrorResponse(const std::string& code, const std::string& message);
     std::string formatMeasurementsResponse(const std::vector<std::string>& measurements, size_t total = 0);

@@ -10,8 +10,6 @@
 #include "tsm.hpp"
 #include "zigzag.hpp"
 
-#include <seastar/core/thread.hh>
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -264,8 +262,10 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     for (size_t i = 0; i < n; ++i) {
         double v = values[i];
         sum += v;
-        if (v < bmin) bmin = v;
-        if (v > bmax) bmax = v;
+        if (v < bmin)
+            bmin = v;
+        if (v > bmax)
+            bmax = v;
     }
     // Second pass: M2 = Σ(xi - mean)² — single division for mean, no per-element division.
     double m2 = 0.0;

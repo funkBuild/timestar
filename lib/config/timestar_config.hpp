@@ -52,7 +52,7 @@ struct IndexConfig {
     uint64_t metadata_cache_bytes = 48 * 1024 * 1024;   // 48MB for series metadata LRU cache
     uint64_t discovery_cache_bytes = 16 * 1024 * 1024;  // 16MB for discovery result LRU cache
     uint64_t block_cache_bytes = 8 * 1024 * 1024;       // 8MB per shard for SSTable block cache
-    uint32_t compaction_rate_limit_mbps = 0;             // Max compaction write MB/s (0 = unlimited)
+    uint32_t compaction_rate_limit_mbps = 0;            // Max compaction write MB/s (0 = unlimited)
 };
 
 struct StreamingConfig {
@@ -65,9 +65,9 @@ struct StreamingConfig {
 // bandwidth under contention. When only one class has pending I/O, it gets
 // full bandwidth regardless of share count.
 struct IOPriorityConfig {
-    float query_shares = 100.0f;       // TSM/index reads during queries
-    float write_shares = 50.0f;        // WAL writes, memtable flushes
-    float compaction_shares = 10.0f;   // Background TSM/SSTable compaction
+    float query_shares = 100.0f;      // TSM/index reads during queries
+    float write_shares = 50.0f;       // WAL writes, memtable flushes
+    float compaction_shares = 10.0f;  // Background TSM/SSTable compaction
 };
 
 struct EngineConfig {
@@ -160,11 +160,10 @@ struct glz::meta<timestar::StorageConfig> {
 template <>
 struct glz::meta<timestar::HttpConfig> {
     using T = timestar::HttpConfig;
-    static constexpr auto value =
-        object("max_write_body_size", &T::max_write_body_size, "max_query_body_size", &T::max_query_body_size,
-               "max_series_count", &T::max_series_count, "max_total_points", &T::max_total_points,
-               "query_timeout_seconds", &T::query_timeout_seconds,
-               "slow_query_threshold_ms", &T::slow_query_threshold_ms);
+    static constexpr auto value = object(
+        "max_write_body_size", &T::max_write_body_size, "max_query_body_size", &T::max_query_body_size,
+        "max_series_count", &T::max_series_count, "max_total_points", &T::max_total_points, "query_timeout_seconds",
+        &T::query_timeout_seconds, "slow_query_threshold_ms", &T::slow_query_threshold_ms);
 };
 
 template <>
@@ -181,20 +180,18 @@ struct glz::meta<timestar::IndexConfig> {
 template <>
 struct glz::meta<timestar::IOPriorityConfig> {
     using T = timestar::IOPriorityConfig;
-    static constexpr auto value =
-        object("query_shares", &T::query_shares, "write_shares", &T::write_shares,
-               "compaction_shares", &T::compaction_shares);
+    static constexpr auto value = object("query_shares", &T::query_shares, "write_shares", &T::write_shares,
+                                         "compaction_shares", &T::compaction_shares);
 };
 
 template <>
 struct glz::meta<timestar::EngineConfig> {
     using T = timestar::EngineConfig;
-    static constexpr auto value =
-        object("metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds, "max_metadata_retry_ops",
-               &T::max_metadata_retry_ops, "retention_sweep_interval_minutes", &T::retention_sweep_interval_minutes,
-               "tombstone_dead_fraction_threshold", &T::tombstone_dead_fraction_threshold,
-               "max_tombstone_rewrites_per_sweep", &T::max_tombstone_rewrites_per_sweep,
-               "io_priority", &T::io_priority);
+    static constexpr auto value = object(
+        "metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds, "max_metadata_retry_ops",
+        &T::max_metadata_retry_ops, "retention_sweep_interval_minutes", &T::retention_sweep_interval_minutes,
+        "tombstone_dead_fraction_threshold", &T::tombstone_dead_fraction_threshold, "max_tombstone_rewrites_per_sweep",
+        &T::max_tombstone_rewrites_per_sweep, "io_priority", &T::io_priority);
 };
 
 template <>

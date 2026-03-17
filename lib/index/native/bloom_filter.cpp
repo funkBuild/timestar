@@ -60,8 +60,10 @@ void BloomFilter::build() {
 }
 
 bool BloomFilter::mayContain(std::string_view key) const {
-    if (isNull_) return true;
-    if (filter_.empty()) return false;
+    if (isNull_)
+        return true;
+    if (filter_.empty())
+        return false;
 
     size_t numBits = filter_.size() * 64;
 

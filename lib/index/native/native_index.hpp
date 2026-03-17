@@ -9,20 +9,18 @@
 #include "hyperloglog.hpp"
 #include "index_wal.hpp"
 #include "local_id_map.hpp"
+#include "lru_cache.hpp"
 #include "manifest.hpp"
 #include "memtable.hpp"
 #include "merge_iterator.hpp"
 #include "sstable.hpp"
-#include "write_batch.hpp"
-
-#include "lru_cache.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
-
-#include <roaring.hh>
+#include "write_batch.hpp"
 
 #include <map>
 #include <memory>
+#include <roaring.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/smp.hh>
@@ -87,11 +85,11 @@ public:
 
     // --- Series indexing ---
     seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement, std::map<std::string, std::string> tags,
-                                                      std::string field) override;
+                                                     std::string field) override;
 
     seastar::future<std::optional<SeriesId128>> getSeriesId(const std::string& measurement,
-                                                             const std::map<std::string, std::string>& tags,
-                                                             const std::string& field) override;
+                                                            const std::map<std::string, std::string>& tags,
+                                                            const std::string& field) override;
 
     seastar::future<std::optional<SeriesMetadata>> getSeriesMetadata(const SeriesId128& seriesId) override;
 
@@ -101,19 +99,19 @@ public:
     // --- Measurement metadata ---
     seastar::future<> addField(const std::string& measurement, const std::string& field) override;
     seastar::future<> addTag(const std::string& measurement, const std::string& tagKey,
-                              const std::string& tagValue) override;
+                             const std::string& tagValue) override;
     seastar::future<> addFieldsAndTags(const std::string& measurement, const std::string& field,
-                                        const std::map<std::string, std::string>& tags) override;
+                                       const std::map<std::string, std::string>& tags) override;
 
     seastar::future<> setFieldType(const std::string& measurement, const std::string& field,
-                                    const std::string& type) override;
+                                   const std::string& type) override;
     seastar::future<std::string> getFieldType(const std::string& measurement, const std::string& field) override;
 
     seastar::future<std::set<std::string>> getAllMeasurements() override;
     seastar::future<std::set<std::string>> getFields(const std::string& measurement) override;
     seastar::future<std::set<std::string>> getTags(const std::string& measurement) override;
     seastar::future<std::set<std::string>> getTagValues(const std::string& measurement,
-                                                         const std::string& tagKey) override;
+                                                        const std::string& tagKey) override;
 
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops) override;
 
@@ -155,9 +153,9 @@ public:
 
     // --- Field stats ---
     seastar::future<> updateFieldStats(const SeriesId128& seriesId, const std::string& field,
-                                        const IndexFieldStats& stats) override;
+                                       const IndexFieldStats& stats) override;
     seastar::future<std::optional<IndexFieldStats>> getFieldStats(const SeriesId128& seriesId,
-                                                                   const std::string& field) override;
+                                                                  const std::string& field) override;
 
     // --- Measurement series ---
     seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> getAllSeriesForMeasurement(
@@ -186,16 +184,15 @@ public:
 
     // Phase 4: Cardinality estimation
     double estimateMeasurementCardinality(const std::string& measurement);
-    double estimateTagCardinality(const std::string& measurement,
-                                   const std::string& tagKey, const std::string& tagValue);
+    double estimateTagCardinality(const std::string& measurement, const std::string& tagKey,
+                                  const std::string& tagValue);
 
     // Phase 3: Time-scoped discovery — prunes inactive series using per-day bitmaps
     seastar::future<std::expected<std::vector<SeriesWithMetadata>, SeriesLimitExceeded>>
     findSeriesWithMetadataTimeScoped(const std::string& measurement,
-                                      const std::map<std::string, std::string>& tagFilters,
-                                      const std::unordered_set<std::string>& fieldFilter,
-                                      uint64_t startTimeNs, uint64_t endTimeNs,
-                                      size_t maxSeries = 0);
+                                     const std::map<std::string, std::string>& tagFilters,
+                                     const std::unordered_set<std::string>& fieldFilter, uint64_t startTimeNs,
+                                     uint64_t endTimeNs, size_t maxSeries = 0);
 
     // Phase 3: Remove day bitmaps for days before cutoffDay (retention cleanup)
     seastar::future<> removeExpiredDayBitmaps(const std::string& measurement, uint32_t cutoffDay);
@@ -219,7 +216,7 @@ private:
 
     // --- LSM storage ---
     std::unique_ptr<MemTable> memtable_;
-    std::unique_ptr<MemTable> immutableMemtable_;  // Being flushed to SSTable in background
+    std::unique_ptr<MemTable> immutableMemtable_;   // Being flushed to SSTable in background
     std::optional<seastar::future<>> flushFuture_;  // Tracks background flush
     std::unique_ptr<IndexWAL> wal_;
     std::unique_ptr<Manifest> manifest_;
@@ -251,7 +248,7 @@ private:
     seastar::future<> maybeFlushMemTable();
     seastar::future<> flushMemTable();
     seastar::future<> doFlushImmutableMemTable();  // Background flush work
-    seastar::future<> waitForFlush();  // Wait for any in-flight flush to complete
+    seastar::future<> waitForFlush();              // Wait for any in-flight flush to complete
 
     // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
     seastar::future<> refreshSSTables();
@@ -309,8 +306,8 @@ private:
     // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
     void migrateToLocalIds(IndexWriteBatch& batch);
     // Build a bitmap cache key: "measurement\0tagKey\0tagValue"
-    static void buildBitmapCacheKey(std::string& out, const std::string& measurement,
-                                     const std::string& tagKey, const std::string& tagValue);
+    static void buildBitmapCacheKey(std::string& out, const std::string& measurement, const std::string& tagKey,
+                                    const std::string& tagValue);
 
     // --- Phase 4: Cardinality estimation ---
     // HLL caches. Key: "measurement\0" (per-measurement) or "measurement\0tagKey\0tagValue" (per-tag-value)
@@ -319,13 +316,13 @@ private:
     // Per-measurement bloom filter of all LocalIds (for short-circuiting non-existent tag lookups)
     tsl::robin_map<std::string, BloomFilter> measurementBloomCache_;
     std::unordered_set<std::string> dirtyMeasurementBlooms_;
-    std::unordered_set<std::string> bloomFullyBuilt_;  // Measurements where bloom KV scan already done
+    std::unordered_set<std::string> bloomFullyBuilt_;        // Measurements where bloom KV scan already done
     static constexpr size_t MAX_BLOOM_CACHE_ENTRIES = 5000;  // ~40MB at 8KB per bloom
     void trimMeasurementBloomCache();
 
     void updateHLL(const std::string& measurement, uint32_t localId);
-    void updateTagHLL(const std::string& measurement, const std::string& tagKey,
-                      const std::string& tagValue, uint32_t localId);
+    void updateTagHLL(const std::string& measurement, const std::string& tagKey, const std::string& tagValue,
+                      uint32_t localId);
     void flushDirtyHLLs(IndexWriteBatch& batch);
     void flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large

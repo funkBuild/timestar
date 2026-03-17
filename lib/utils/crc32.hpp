@@ -78,14 +78,9 @@ public:
             std::memcpy(&b, data + 4, sizeof(uint32_t));
             a ^= crc;
 
-            crc = TABLES[7][(a      ) & 0xFF]
-                ^ TABLES[6][(a >>  8) & 0xFF]
-                ^ TABLES[5][(a >> 16) & 0xFF]
-                ^ TABLES[4][(a >> 24) & 0xFF]
-                ^ TABLES[3][(b      ) & 0xFF]
-                ^ TABLES[2][(b >>  8) & 0xFF]
-                ^ TABLES[1][(b >> 16) & 0xFF]
-                ^ TABLES[0][(b >> 24) & 0xFF];
+            crc = TABLES[7][(a) & 0xFF] ^ TABLES[6][(a >> 8) & 0xFF] ^ TABLES[5][(a >> 16) & 0xFF] ^
+                  TABLES[4][(a >> 24) & 0xFF] ^ TABLES[3][(b) & 0xFF] ^ TABLES[2][(b >> 8) & 0xFF] ^
+                  TABLES[1][(b >> 16) & 0xFF] ^ TABLES[0][(b >> 24) & 0xFF];
             data += 8;
         }
 

@@ -208,7 +208,8 @@ void AddArrays(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src, size_t 
         auto s_vec = hn::LoadU(d, &src[i]);
         hn::StoreU(hn::Add(d_vec, s_vec), d, &dst[i]);
     }
-    for (; i < count; ++i) dst[i] += src[i];
+    for (; i < count; ++i)
+        dst[i] += src[i];
 }
 
 // Element-wise minimum: dst[i] = min(dst[i], src[i])
@@ -221,7 +222,8 @@ void MinArrays(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src, size_t 
         auto s_vec = hn::LoadU(d, &src[i]);
         hn::StoreU(hn::Min(d_vec, s_vec), d, &dst[i]);
     }
-    for (; i < count; ++i) dst[i] = std::min(dst[i], src[i]);
+    for (; i < count; ++i)
+        dst[i] = std::min(dst[i], src[i]);
 }
 
 // Element-wise maximum: dst[i] = max(dst[i], src[i])
@@ -234,7 +236,8 @@ void MaxArrays(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src, size_t 
         auto s_vec = hn::LoadU(d, &src[i]);
         hn::StoreU(hn::Max(d_vec, s_vec), d, &dst[i]);
     }
-    for (; i < count; ++i) dst[i] = std::max(dst[i], src[i]);
+    for (; i < count; ++i)
+        dst[i] = std::max(dst[i], src[i]);
 }
 
 }  // namespace HWY_NAMESPACE

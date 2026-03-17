@@ -3,15 +3,14 @@
 #include "merge_iterator.hpp"
 #include "sstable.hpp"
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/seastar.hh>
-#include <seastar/core/sleep.hh>
-
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 
 namespace timestar::index {
 
@@ -72,7 +71,8 @@ seastar::future<> CompactionEngine::maybeCompact() {
 seastar::future<> CompactionEngine::compactAll() {
     // Merge all files into a single L1 file
     auto allFiles = manifest_.files();
-    if (allFiles.size() <= 1) co_return;
+    if (allFiles.size() <= 1)
+        co_return;
 
     CompactionJob job;
     job.inputLevel = 0;
@@ -81,7 +81,8 @@ seastar::future<> CompactionEngine::compactAll() {
 }
 
 seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
-    if (job.inputFiles.empty()) co_return;
+    if (job.inputFiles.empty())
+        co_return;
 
     int outputLevel = job.inputLevel + 1;
 
@@ -93,8 +94,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     for (const auto& fileMeta : job.inputFiles) {
         auto reader = co_await SSTableReader::open(sstFilename(fileMeta.fileNumber));
         auto iter = reader->newIterator();
-        sources.push_back(
-            std::make_unique<SSTableIteratorSource>(std::move(reader), std::move(iter), priority--));
+        sources.push_back(std::make_unique<SSTableIteratorSource>(std::move(reader), std::move(iter), priority--));
     }
 
     // Create merge iterator
@@ -104,7 +104,8 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     if (!merger.valid()) {
         // All inputs were empty — just remove the files
         std::vector<uint64_t> toRemove;
-        for (const auto& f : job.inputFiles) toRemove.push_back(f.fileNumber);
+        for (const auto& f : job.inputFiles)
+            toRemove.push_back(f.fileNumber);
         co_await manifest_.removeFiles(toRemove);
         co_return;
     }
@@ -114,8 +115,8 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     uint64_t outputFileNum = manifest_.nextFileNumber();
     auto outputPath = sstFilename(outputFileNum);
     int compressionLevel = (outputLevel >= 1) ? 3 : 1;
-    auto writer = co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey,
-                                                  compressionLevel);
+    auto writer =
+        co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey, compressionLevel);
 
     // Tombstone GC: determine if tombstones from these input files can be dropped.
     // A tombstone (empty value) is safe to drop if ALL input SSTables were written
@@ -124,8 +125,8 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     size_t tombstonesDropped = 0;
     if (config_.tombstoneGracePeriodMs > 0) {
         auto nowNs = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count());
         uint64_t cutoffNs = nowNs - config_.tombstoneGracePeriodMs * 1'000'000;
         canDropTombstones = true;
         for (const auto& f : job.inputFiles) {
@@ -161,11 +162,12 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
                 if (elapsedSec > 0) {
                     double currentRate = static_cast<double>(bytesWritten) / elapsedSec;
                     if (currentRate > static_cast<double>(rateLimitBytesPerSec)) {
-                        double targetSec = static_cast<double>(bytesWritten) / static_cast<double>(rateLimitBytesPerSec);
+                        double targetSec =
+                            static_cast<double>(bytesWritten) / static_cast<double>(rateLimitBytesPerSec);
                         double sleepSec = targetSec - elapsedSec;
                         if (sleepSec > 0.001) {
-                            co_await seastar::sleep(std::chrono::microseconds(
-                                static_cast<int64_t>(sleepSec * 1'000'000)));
+                            co_await seastar::sleep(
+                                std::chrono::microseconds(static_cast<int64_t>(sleepSec * 1'000'000)));
                         }
                     }
                 }

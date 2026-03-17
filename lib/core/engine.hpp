@@ -5,10 +5,10 @@
 #include "http_query_handler.hpp"
 #include "native_index.hpp"
 #include "query_parser.hpp"
-#include "schema_update.hpp"
 #include "query_planner.hpp"
 #include "query_result.hpp"
 #include "retention_policy.hpp"
+#include "schema_update.hpp"
 #include "series_id.hpp"
 #include "subscription_manager.hpp"
 #include "timestar_config.hpp"
@@ -141,8 +141,7 @@ public:
         double value = 0.0;
         bool resolved = false;
     };
-    seastar::future<> batchLatest(std::vector<BatchLatestEntry>& entries,
-                                  uint64_t startTime, uint64_t endTime,
+    seastar::future<> batchLatest(std::vector<BatchLatestEntry>& entries, uint64_t startTime, uint64_t endTime,
                                   bool wantFirst = false);
 
     // --- Retention policy management ---

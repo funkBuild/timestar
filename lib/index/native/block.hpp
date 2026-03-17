@@ -107,10 +107,10 @@ public:
     Iterator newIterator() const;
 
 private:
-    std::string_view data_;         // Raw block bytes (entries region only)
+    std::string_view data_;               // Raw block bytes (entries region only)
     const uint32_t* restarts_ = nullptr;  // Pointer into data_ for restart offsets
     uint32_t restartCount_ = 0;
-    size_t dataSize_ = 0;          // Size of entries region (before restarts)
+    size_t dataSize_ = 0;  // Size of entries region (before restarts)
     bool valid_ = false;
 
     static uint32_t decodeFixed32(const char* p);

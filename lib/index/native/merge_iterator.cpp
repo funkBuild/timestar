@@ -1,20 +1,19 @@
 #include "merge_iterator.hpp"
 
-#include <seastar/core/coroutine.hh>
-
 #include <algorithm>
+#include <seastar/core/coroutine.hh>
 
 namespace timestar::index {
 
-MergeIterator::MergeIterator(std::vector<std::unique_ptr<IteratorSource>> sources)
-    : sources_(std::move(sources)) {}
+MergeIterator::MergeIterator(std::vector<std::unique_ptr<IteratorSource>> sources) : sources_(std::move(sources)) {}
 
 bool MergeIterator::heapLess(size_t a, size_t b) const {
     auto& sa = sources_[heap_[a].sourceIndex];
     auto& sb = sources_[heap_[b].sourceIndex];
     // Sort by key first, then by priority (lower = newer = preferred)
     int cmp = sa->key().compare(sb->key());
-    if (cmp != 0) return cmp < 0;
+    if (cmp != 0)
+        return cmp < 0;
     return sa->priority() < sb->priority();
 }
 
@@ -24,9 +23,12 @@ void MergeIterator::siftDown(size_t i) {
         size_t smallest = i;
         size_t left = 2 * i + 1;
         size_t right = 2 * i + 2;
-        if (left < n && heapLess(left, smallest)) smallest = left;
-        if (right < n && heapLess(right, smallest)) smallest = right;
-        if (smallest == i) break;
+        if (left < n && heapLess(left, smallest))
+            smallest = left;
+        if (right < n && heapLess(right, smallest))
+            smallest = right;
+        if (smallest == i)
+            break;
         std::swap(heap_[i], heap_[smallest]);
         i = smallest;
     }
@@ -74,13 +76,15 @@ seastar::future<> MergeIterator::seek(std::string_view target) {
 }
 
 seastar::future<> MergeIterator::next() {
-    if (!valid_) co_return;
+    if (!valid_)
+        co_return;
 
     // Advance all sources that are positioned at the current key
     // (skip duplicates from lower-priority sources)
     while (!heap_.empty()) {
         auto& top = sources_[heap_[0].sourceIndex];
-        if (top->key() != currentKey_) break;
+        if (top->key() != currentKey_)
+            break;
 
         // Advance this source
         co_await top->next();
@@ -90,7 +94,8 @@ seastar::future<> MergeIterator::next() {
             // Remove from heap: swap with last, pop, sift down
             heap_[0] = heap_.back();
             heap_.pop_back();
-            if (!heap_.empty()) siftDown(0);
+            if (!heap_.empty())
+                siftDown(0);
         }
     }
 
@@ -120,7 +125,8 @@ seastar::future<> MergeIterator::findNext() {
             } else {
                 heap_[0] = heap_.back();
                 heap_.pop_back();
-                if (!heap_.empty()) siftDown(0);
+                if (!heap_.empty())
+                    siftDown(0);
             }
         }
     }
@@ -150,12 +156,14 @@ void MergeIterator::seekSync(std::string_view target) {
 }
 
 void MergeIterator::nextSync() {
-    if (!valid_) return;
+    if (!valid_)
+        return;
 
     // Advance all sources positioned at the current key
     while (!heap_.empty()) {
         auto& top = sources_[heap_[0].sourceIndex];
-        if (top->key() != currentKey_) break;
+        if (top->key() != currentKey_)
+            break;
 
         top->nextSync();
         if (top->valid()) {
@@ -163,7 +171,8 @@ void MergeIterator::nextSync() {
         } else {
             heap_[0] = heap_.back();
             heap_.pop_back();
-            if (!heap_.empty()) siftDown(0);
+            if (!heap_.empty())
+                siftDown(0);
         }
     }
 
@@ -190,7 +199,8 @@ void MergeIterator::findNextSync() {
             } else {
                 heap_[0] = heap_.back();
                 heap_.pop_back();
-                if (!heap_.empty()) siftDown(0);
+                if (!heap_.empty())
+                    siftDown(0);
             }
         }
     }

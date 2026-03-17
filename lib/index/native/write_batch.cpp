@@ -48,11 +48,11 @@ static uint32_t readFixed32(const char* p) {
 
 void IndexWriteBatch::serializeTo(std::string& output) const {
     // Pre-compute total size to avoid reallocations
-    size_t totalSize = 4; // op count
+    size_t totalSize = 4;  // op count
     for (const auto& op : ops_) {
-        totalSize += 1 + 4 + op.key.size(); // type + key_len + key
+        totalSize += 1 + 4 + op.key.size();  // type + key_len + key
         if (op.type == OpType::Put) {
-            totalSize += 4 + op.value.size(); // value_len + value
+            totalSize += 4 + op.value.size();  // value_len + value
         }
     }
     output.reserve(output.size() + totalSize);
@@ -83,24 +83,29 @@ IndexWriteBatch IndexWriteBatch::deserializeFrom(std::string_view data) {
     p += 4;
 
     for (uint32_t i = 0; i < count; ++i) {
-        if (p >= end) throw std::runtime_error("WriteBatch: truncated at op type");
+        if (p >= end)
+            throw std::runtime_error("WriteBatch: truncated at op type");
 
         auto type = static_cast<IndexWriteBatch::OpType>(*p);
         ++p;
 
-        if (p + 4 > end) throw std::runtime_error("WriteBatch: truncated at key length");
+        if (p + 4 > end)
+            throw std::runtime_error("WriteBatch: truncated at key length");
         uint32_t keyLen = readFixed32(p);
         p += 4;
 
-        if (p + keyLen > end) throw std::runtime_error("WriteBatch: truncated at key data");
+        if (p + keyLen > end)
+            throw std::runtime_error("WriteBatch: truncated at key data");
         std::string key(p, keyLen);
         p += keyLen;
 
         if (type == OpType::Put) {
-            if (p + 4 > end) throw std::runtime_error("WriteBatch: truncated at value length");
+            if (p + 4 > end)
+                throw std::runtime_error("WriteBatch: truncated at value length");
             uint32_t valLen = readFixed32(p);
             p += 4;
-            if (p + valLen > end) throw std::runtime_error("WriteBatch: truncated at value data");
+            if (p + valLen > end)
+                throw std::runtime_error("WriteBatch: truncated at value data");
             batch.put(key, std::string_view(p, valLen));
             p += valLen;
         } else {

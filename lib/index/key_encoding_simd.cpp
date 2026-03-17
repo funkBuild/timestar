@@ -39,9 +39,8 @@ size_t FindFirstEscapeCharKernel(const char* HWY_RESTRICT data, size_t len) {
         auto v = hn::LoadU(d, p + i);
 
         // Check all four escape characters with OR
-        auto match = hn::Or(
-            hn::Or(hn::Eq(v, v_backslash), hn::Eq(v, v_comma)),
-            hn::Or(hn::Eq(v, v_equals), hn::Eq(v, v_space)));
+        auto match =
+            hn::Or(hn::Or(hn::Eq(v, v_backslash), hn::Eq(v, v_comma)), hn::Or(hn::Eq(v, v_equals), hn::Eq(v, v_space)));
 
         if (!hn::AllFalse(d, match)) {
             // Find exact position of first match

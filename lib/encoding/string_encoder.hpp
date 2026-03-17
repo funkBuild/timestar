@@ -41,8 +41,7 @@ public:
     // Writes the same format as encode() but directly into the target buffer,
     // eliminating the final result-buffer allocation and copy.
     // Returns the number of bytes written to the target buffer.
-    static size_t encodeInto(std::span<const std::string> values, AlignedBuffer& target,
-                              int compressionLevel = 1);
+    static size_t encodeInto(std::span<const std::string> values, AlignedBuffer& target, int compressionLevel = 1);
 
     // Decode strings from compressed buffer
     static void decode(AlignedBuffer& encoded, size_t count, std::vector<std::string>& out);

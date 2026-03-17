@@ -15,8 +15,12 @@ static constexpr uint32_t MAX_UNCOMPRESSED_SIZE = 256 * 1024 * 1024;
 // per decompress.  Seastar's shard-per-core model means one thread per shard,
 // so thread_local is safe with no synchronization overhead.
 // RAII wrappers ensure cleanup at thread exit.
-struct ZstdCCtxDeleter { void operator()(ZSTD_CCtx* p) const { ZSTD_freeCCtx(p); } };
-struct ZstdDCtxDeleter { void operator()(ZSTD_DCtx* p) const { ZSTD_freeDCtx(p); } };
+struct ZstdCCtxDeleter {
+    void operator()(ZSTD_CCtx* p) const { ZSTD_freeCCtx(p); }
+};
+struct ZstdDCtxDeleter {
+    void operator()(ZSTD_DCtx* p) const { ZSTD_freeDCtx(p); }
+};
 
 static ZSTD_CCtx* getThreadCCtx() {
     static thread_local std::unique_ptr<ZSTD_CCtx, ZstdCCtxDeleter> ctx(ZSTD_createCCtx());
@@ -65,8 +69,8 @@ uint32_t StringEncoder::readVarInt(Slice& slice) {
 // Shared encode implementation: validates input, builds varint-prefixed
 // uncompressed buffer, compresses with zstd, and returns the compressed
 // payload with metadata. Both encode() and encodeInto() delegate here.
-StringEncoder::CompressedPayload StringEncoder::compressStrings(
-    std::span<const std::string> values, int compressionLevel) {
+StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const std::string> values,
+                                                                int compressionLevel) {
     if (values.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("String encoder: count " + std::to_string(values.size()) +
                                   " exceeds uint32_t maximum");
@@ -81,7 +85,10 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(
         }
         uint32_t len = static_cast<uint32_t>(str.size());
         size_t varintSize = 1;
-        while (len >= 0x80) { varintSize++; len >>= 7; }
+        while (len >= 0x80) {
+            varintSize++;
+            len >>= 7;
+        }
         uncompSize += varintSize + str.size();
     }
 
@@ -111,8 +118,8 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(
     tlCompBuf.resize(compressedMaxSize);
     auto& compressed = tlCompBuf;
     size_t compressedSize = ZSTD_compressCCtx(getThreadCCtx(), compressed.data(), compressedMaxSize,
-                                               reinterpret_cast<const char*>(uncompressed.data.data()),
-                                               uncompressed.data.size(), compressionLevel);
+                                              reinterpret_cast<const char*>(uncompressed.data.data()),
+                                              uncompressed.data.size(), compressionLevel);
     if (ZSTD_isError(compressedSize)) {
         throw std::runtime_error(std::string("String encoder: zstd compression failed: ") +
                                  ZSTD_getErrorName(compressedSize));
@@ -123,10 +130,8 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(
     }
 
     compressed.resize(compressedSize);
-    return {std::move(compressed),
-            static_cast<uint32_t>(uncompressed.data.size()),
-            static_cast<uint32_t>(compressedSize),
-            static_cast<uint32_t>(values.size())};
+    return {std::move(compressed), static_cast<uint32_t>(uncompressed.data.size()),
+            static_cast<uint32_t>(compressedSize), static_cast<uint32_t>(values.size())};
 }
 
 // Write the standard STRG header into an AlignedBuffer.
@@ -146,8 +151,7 @@ AlignedBuffer StringEncoder::encode(std::span<const std::string> values, int com
     return result;
 }
 
-size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuffer& target,
-                                  int compressionLevel) {
+size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuffer& target, int compressionLevel) {
     const size_t startPos = target.size();
 
     if (values.empty()) [[unlikely]] {
@@ -202,8 +206,9 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
     auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
-                                      reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
+        size_t ret =
+            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
         }
@@ -271,8 +276,9 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
     auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
-                                      reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
+        size_t ret =
+            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
         }
@@ -333,8 +339,9 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
     auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
-                                      reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
+        size_t ret =
+            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
         }
@@ -409,8 +416,9 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
     auto& uncompressed = tlDecompBuf;
 
     {
-        size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
-                                      reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
+        size_t ret =
+            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
+                                reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
         if (ZSTD_isError(ret)) {
             throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
         }

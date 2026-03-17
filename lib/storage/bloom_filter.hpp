@@ -17,17 +17,17 @@
 
 #pragma once
 
-    #include "bloom_filter_simd.hpp"
+#include "bloom_filter_simd.hpp"
 
-    #include <algorithm>
-    #include <cmath>
-    #include <cstddef>
-    #include <cstdlib>
-    #include <cstring>
-    #include <iterator>
-    #include <limits>
-    #include <string>
-    #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
+#include <limits>
+#include <string>
+#include <vector>
 
 static const std::size_t bits_per_char = 0x08;  // 8 bits in 1 char(unsigned)
 
@@ -584,7 +584,6 @@ private:
 
     std::vector<unsigned long long int> size_list;
 };
-
 
 /*
   Note 1:

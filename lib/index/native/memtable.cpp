@@ -79,7 +79,8 @@ void MemTable::Iterator::seek(std::string_view target) {
 }
 
 void MemTable::Iterator::next() {
-    if (!valid_) return;
+    if (!valid_)
+        return;
     ++it_;
     valid_ = (it_ != table_->entries_.end());
 }

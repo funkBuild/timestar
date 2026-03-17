@@ -25,9 +25,7 @@ public:
     unsigned coreCount() const { return coreCount_; }
 
     // Virtual shard number (for serialization / Phase 6)
-    static uint16_t vshardForHash(size_t hash) {
-        return static_cast<uint16_t>(hash & VIRTUAL_SHARD_MASK);
-    }
+    static uint16_t vshardForHash(size_t hash) { return static_cast<uint16_t>(hash & VIRTUAL_SHARD_MASK); }
 
     // Access the mapping table
     const VShardMapping& mapping(uint16_t vshard) const { return table_[vshard]; }

@@ -3,10 +3,10 @@
 #include "aggregator.hpp"
 #include "key_encoding.hpp"
 #include "logger.hpp"
-#include "placement_table.hpp"
-#include "series_key.hpp"
 #include "logging_config.hpp"
+#include "placement_table.hpp"
 #include "query_runner.hpp"
+#include "series_key.hpp"
 #include "tsm_compactor.hpp"
 #include "tsm_writer.hpp"
 #include "util.hpp"
@@ -65,8 +65,8 @@ std::string Engine::basePath() {
 seastar::future<> Engine::stop() {
     auto stopStart = std::chrono::steady_clock::now();
     auto elapsedMs = [&]() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - stopStart).count();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stopStart)
+            .count();
     };
 
     timestar::engine_log.info("[ENGINE_STOP] Starting shutdown on shard {}", shardId);
@@ -275,9 +275,11 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
     std::vector<seastar::future<timestar::index::SchemaUpdate>> futures;
     futures.reserve(shardCount);
     for (unsigned s = 0; s < shardCount; ++s) {
-        if (opsByShard[s].empty()) continue;
+        if (opsByShard[s].empty())
+            continue;
         futures.push_back(shardedRef->invoke_on(
-            s, [ops = std::move(opsByShard[s])](Engine& engine) mutable -> seastar::future<timestar::index::SchemaUpdate> {
+            s,
+            [ops = std::move(opsByShard[s])](Engine& engine) mutable -> seastar::future<timestar::index::SchemaUpdate> {
                 co_return co_await engine.index.indexMetadataBatchWithSchema(ops);
             }));
     }
@@ -298,7 +300,8 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
 }
 
 seastar::future<> Engine::broadcastSchemaUpdate(timestar::index::SchemaUpdate update) {
-    if (!shardedRef || update.empty()) co_return;
+    if (!shardedRef || update.empty())
+        co_return;
     co_await shardedRef->invoke_on_all([update = std::move(update)](Engine& e) {
         e.getIndex().applySchemaUpdate(update);
         return seastar::make_ready_future<>();
@@ -337,10 +340,10 @@ seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated
                                                  aggregationInterval, method);
 }
 
-seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries,
-                                      uint64_t startTime, uint64_t endTime,
+seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, uint64_t startTime, uint64_t endTime,
                                       bool wantFirst) {
-    if (entries.empty()) co_return;
+    if (entries.empty())
+        co_return;
 
     // --- Phase 1: TSM sparse index scan (zero I/O) ---
     // Snapshot TSM files once.  getSequencedTsmFiles() is ordered by (tier, seqNum);
@@ -358,24 +361,28 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries,
     size_t unresolvedCount = entries.size();
 
     for (const auto& tsmFile : tsmFiles) {
-        if (unresolvedCount == 0) break;
-        if (tsmFile->hasTombstones()) continue;
+        if (unresolvedCount == 0)
+            break;
+        if (tsmFile->hasTombstones())
+            continue;
 
         for (auto& entry : entries) {
-            if (entry.resolved) continue;
+            if (entry.resolved)
+                continue;
 
-            auto pt = wantFirst ? tsmFile->getFirstFromSparse(entry.seriesId)
-                                : tsmFile->getLatestFromSparse(entry.seriesId);
-            if (!pt.has_value()) continue;
-            if (pt->timestamp < startTime || pt->timestamp > endTime) continue;
+            auto pt =
+                wantFirst ? tsmFile->getFirstFromSparse(entry.seriesId) : tsmFile->getLatestFromSparse(entry.seriesId);
+            if (!pt.has_value())
+                continue;
+            if (pt->timestamp < startTime || pt->timestamp > endTime)
+                continue;
 
             if (!entry.resolved) {
                 entry.timestamp = pt->timestamp;
                 entry.value = pt->value;
                 entry.resolved = true;
                 --unresolvedCount;
-            } else if (wantFirst ? (pt->timestamp < entry.timestamp)
-                                 : (pt->timestamp > entry.timestamp)) {
+            } else if (wantFirst ? (pt->timestamp < entry.timestamp) : (pt->timestamp > entry.timestamp)) {
                 entry.timestamp = pt->timestamp;
                 entry.value = pt->value;
             }
@@ -386,16 +393,20 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries,
     // fall back to selective DMA reads for unresolved series. ---
     if (unresolvedCount > 0) {
         for (const auto& tsmFile : tsmFiles) {
-            if (unresolvedCount == 0) break;
+            if (unresolvedCount == 0)
+                break;
             for (auto& entry : entries) {
-                if (entry.resolved) continue;
-                if (!tsmFile->seriesMayOverlapTime(entry.seriesId, startTime, endTime)) continue;
+                if (entry.resolved)
+                    continue;
+                if (!tsmFile->seriesMayOverlapTime(entry.seriesId, startTime, endTime))
+                    continue;
 
-                timestar::BlockAggregator agg(0, startTime, endTime,
+                timestar::BlockAggregator agg(
+                    0, startTime, endTime,
                     wantFirst ? timestar::AggregationMethod::FIRST : timestar::AggregationMethod::LATEST, true);
                 agg.setFoldToSingleState(false);
-                size_t pts = co_await tsmFile->aggregateSeriesSelective(
-                    entry.seriesId, startTime, endTime, agg, !wantFirst, 1);
+                size_t pts =
+                    co_await tsmFile->aggregateSeriesSelective(entry.seriesId, startTime, endTime, agg, !wantFirst, 1);
                 if (pts > 0) {
                     auto state = agg.takeSingleState();
                     if (wantFirst) {
@@ -418,15 +429,17 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries,
     for (const auto& memStore : walFileManager.getMemoryStores()) {
         for (auto& entry : entries) {
             auto* series = memStore->querySeries<double>(entry.seriesId);
-            if (!series || series->timestamps.empty()) continue;
+            if (!series || series->timestamps.empty())
+                continue;
 
             if (!wantFirst) {
                 // LATEST: check last element (timestamps are sorted ascending)
-                auto it = std::upper_bound(series->timestamps.begin(),
-                                           series->timestamps.end(), endTime);
-                if (it == series->timestamps.begin()) continue;
+                auto it = std::upper_bound(series->timestamps.begin(), series->timestamps.end(), endTime);
+                if (it == series->timestamps.begin())
+                    continue;
                 --it;
-                if (*it < startTime) continue;
+                if (*it < startTime)
+                    continue;
                 size_t idx = static_cast<size_t>(it - series->timestamps.begin());
                 if (!entry.resolved || series->timestamps[idx] > entry.timestamp) {
                     entry.timestamp = series->timestamps[idx];
@@ -435,9 +448,9 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries,
                 }
             } else {
                 // FIRST: check first element in range
-                auto it = std::lower_bound(series->timestamps.begin(),
-                                           series->timestamps.end(), startTime);
-                if (it == series->timestamps.end() || *it > endTime) continue;
+                auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
+                if (it == series->timestamps.end() || *it > endTime)
+                    continue;
                 size_t idx = static_cast<size_t>(it - series->timestamps.begin());
                 if (!entry.resolved || series->timestamps[idx] < entry.timestamp) {
                     entry.timestamp = series->timestamps[idx];
@@ -447,7 +460,6 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries,
             }
         }
     }
-
 }
 
 seastar::future<> Engine::prefetchSeriesIndices(const std::vector<SeriesId128>& seriesIds) {
@@ -713,9 +725,8 @@ seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteReques
     // Convert fields to unordered_set for O(1) lookup (vs O(n) linear search)
     std::unordered_set<std::string> fieldFilter(request.fields.begin(), request.fields.end());
 
-    auto filterAndBuild = [&fieldFilter](
-                              const std::vector<SeriesId128>& ids,
-                              timestar::index::NativeIndex& idx) -> seastar::future<std::vector<std::pair<SeriesId128, std::string>>> {
+    auto filterAndBuild = [&fieldFilter](const std::vector<SeriesId128>& ids, timestar::index::NativeIndex& idx)
+        -> seastar::future<std::vector<std::pair<SeriesId128, std::string>>> {
         std::vector<std::pair<SeriesId128, std::string>> result;
         for (const auto& seriesId : ids) {
             auto metadata = co_await idx.getSeriesMetadata(seriesId);

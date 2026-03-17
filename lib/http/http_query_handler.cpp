@@ -360,8 +360,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
     // the entire query range, drop it so the non-bucketed fast path is used
     // (sparse index zero-I/O lookup instead of bucketed block reads).
     if (request.aggregationInterval > 0 && request.endTime > request.startTime &&
-        (request.aggregation == AggregationMethod::LATEST ||
-         request.aggregation == AggregationMethod::FIRST)) {
+        (request.aggregation == AggregationMethod::LATEST || request.aggregation == AggregationMethod::FIRST)) {
         uint64_t range = request.endTime - request.startTime;
         if (request.aggregationInterval >= range) {
             request.aggregationInterval = 0;
@@ -428,68 +427,72 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         };
 
         unsigned shardCount = seastar::smp::count;
-        if (shardCount == 0) shardCount = 1;
+        if (shardCount == 0)
+            shardCount = 1;
 
         // Fan out discovery to all shards in parallel
         std::vector<seastar::future<std::pair<unsigned, PerShardDiscovery>>> discoveryFutures;
         discoveryFutures.reserve(shardCount);
         for (unsigned s = 0; s < shardCount; ++s) {
-            auto f = engineSharded->invoke_on(
-                s,
-                [measurement = request.measurement, scopes = request.scopes, fields = request.fields,
-                 startTime = request.startTime, endTime = request.endTime,
-                 maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<PerShardDiscovery> {
-                    auto& index = engine.getIndex();
-                    std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
-                    // Wide-range optimisation: use discovery cache for ranges > 365 days.
-                    static constexpr uint64_t NS_PER_DAY = 86400ULL * 1'000'000'000ULL;
-                    static constexpr uint64_t WIDE_RANGE_THRESHOLD = 365ULL * NS_PER_DAY;
-                    const bool wideRange = (endTime > startTime) &&
-                                           (endTime - startTime) > WIDE_RANGE_THRESHOLD;
+            auto f =
+                engineSharded
+                    ->invoke_on(s,
+                                [measurement = request.measurement, scopes = request.scopes, fields = request.fields,
+                                 startTime = request.startTime, endTime = request.endTime,
+                                 maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<PerShardDiscovery> {
+                                    auto& index = engine.getIndex();
+                                    std::unordered_set<std::string> fieldFilter(fields.begin(), fields.end());
+                                    // Wide-range optimisation: use discovery cache for ranges > 365 days.
+                                    static constexpr uint64_t NS_PER_DAY = 86400ULL * 1'000'000'000ULL;
+                                    static constexpr uint64_t WIDE_RANGE_THRESHOLD = 365ULL * NS_PER_DAY;
+                                    const bool wideRange =
+                                        (endTime > startTime) && (endTime - startTime) > WIDE_RANGE_THRESHOLD;
 
-                    const std::vector<IndexBackend::SeriesWithMetadata>* swmPtr = nullptr;
-                    std::vector<IndexBackend::SeriesWithMetadata> ownedVec;
-                    std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>> cachedPtr;
+                                    const std::vector<IndexBackend::SeriesWithMetadata>* swmPtr = nullptr;
+                                    std::vector<IndexBackend::SeriesWithMetadata> ownedVec;
+                                    std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>> cachedPtr;
 
-                    PerShardDiscovery result;
+                                    PerShardDiscovery result;
 
-                    if (wideRange) {
-                        auto cr = co_await index.findSeriesWithMetadataCached(
-                            measurement, scopes, fieldFilter, maxSeries);
-                        if (!cr.has_value()) {
-                            result.limitExceeded = true;
-                            result.discovered = cr.error().discovered;
-                            result.limit = cr.error().limit;
-                            co_return result;
-                        }
-                        cachedPtr = std::move(*cr);
-                        swmPtr = cachedPtr.get();
-                    } else {
-                        auto findResult = co_await index.findSeriesWithMetadataTimeScoped(
-                            measurement, scopes, fieldFilter, startTime, endTime, maxSeries);
-                        if (!findResult.has_value()) {
-                            result.limitExceeded = true;
-                            result.discovered = findResult.error().discovered;
-                            result.limit = findResult.error().limit;
-                            co_return result;
-                        }
-                        ownedVec = std::move(*findResult);
-                        swmPtr = &ownedVec;
-                    }
+                                    if (wideRange) {
+                                        auto cr = co_await index.findSeriesWithMetadataCached(measurement, scopes,
+                                                                                              fieldFilter, maxSeries);
+                                        if (!cr.has_value()) {
+                                            result.limitExceeded = true;
+                                            result.discovered = cr.error().discovered;
+                                            result.limit = cr.error().limit;
+                                            co_return result;
+                                        }
+                                        cachedPtr = std::move(*cr);
+                                        swmPtr = cachedPtr.get();
+                                    } else {
+                                        auto findResult = co_await index.findSeriesWithMetadataTimeScoped(
+                                            measurement, scopes, fieldFilter, startTime, endTime, maxSeries);
+                                        if (!findResult.has_value()) {
+                                            result.limitExceeded = true;
+                                            result.discovered = findResult.error().discovered;
+                                            result.limit = findResult.error().limit;
+                                            co_return result;
+                                        }
+                                        ownedVec = std::move(*findResult);
+                                        swmPtr = &ownedVec;
+                                    }
 
-                    result.contexts.reserve(swmPtr->size());
+                                    result.contexts.reserve(swmPtr->size());
 
-                    for (const auto& swm : *swmPtr) {
-                        SeriesQueryContext ctx;
-                        ctx.seriesKey = buildSeriesKey(swm.metadata.measurement, swm.metadata.tags, swm.metadata.field);
-                        ctx.seriesId = swm.seriesId;
-                        ctx.field = swm.metadata.field;
-                        ctx.tags = swm.metadata.tags;
-                        result.contexts.push_back(std::move(ctx));
-                    }
+                                    for (const auto& swm : *swmPtr) {
+                                        SeriesQueryContext ctx;
+                                        ctx.seriesKey = buildSeriesKey(swm.metadata.measurement, swm.metadata.tags,
+                                                                       swm.metadata.field);
+                                        ctx.seriesId = swm.seriesId;
+                                        ctx.field = swm.metadata.field;
+                                        ctx.tags = swm.metadata.tags;
+                                        result.contexts.push_back(std::move(ctx));
+                                    }
 
-                    co_return result;
-                }).then([s](PerShardDiscovery result) { return std::make_pair(s, std::move(result)); });
+                                    co_return result;
+                                })
+                    .then([s](PerShardDiscovery result) { return std::make_pair(s, std::move(result)); });
             discoveryFutures.push_back(std::move(f));
         }
 
@@ -605,15 +608,16 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                 // Convert resolved entries to PartialAggregationResults
                                 pushdownPartials.reserve(batchEntries.size());
                                 for (size_t i = 0; i < batchEntries.size(); ++i) {
-                                    if (!batchEntries[i].resolved) continue;
+                                    if (!batchEntries[i].resolved)
+                                        continue;
 
                                     PartialAggregationResult partial;
                                     partial.measurement = measurement;
                                     partial.fieldName = contexts[i].field;
                                     partial.totalPoints = 1;
 
-                                    auto gkr = timestar::buildGroupKeyDirect(
-                                        measurement, contexts[i].field, contexts[i].tags, groupByTags);
+                                    auto gkr = timestar::buildGroupKeyDirect(measurement, contexts[i].field,
+                                                                             contexts[i].tags, groupByTags);
                                     partial.groupKey = std::move(gkr.key);
                                     partial.groupKeyHash = gkr.hash;
                                     partial.cachedTags = std::move(gkr.tags);
@@ -630,140 +634,143 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                 }
 
                             } else {
-                            // ---- STANDARD PER-SERIES PATH ----
+                                // ---- STANDARD PER-SERIES PATH ----
 
-                            // Prefetch TSM index entries for all series on this shard.
-                            // Warms the full-index cache in parallel so that per-series
-                            // queries hit cache instead of issuing individual DMA reads.
-                            {
-                                std::vector<SeriesId128> prefetchIds;
-                                prefetchIds.reserve(contexts.size());
-                                for (const auto& ctx : contexts) {
-                                    prefetchIds.push_back(ctx.seriesId);
+                                // Prefetch TSM index entries for all series on this shard.
+                                // Warms the full-index cache in parallel so that per-series
+                                // queries hit cache instead of issuing individual DMA reads.
+                                {
+                                    std::vector<SeriesId128> prefetchIds;
+                                    prefetchIds.reserve(contexts.size());
+                                    for (const auto& ctx : contexts) {
+                                        prefetchIds.push_back(ctx.seriesId);
+                                    }
+                                    co_await engine.prefetchSeriesIndices(prefetchIds);
                                 }
-                                co_await engine.prefetchSeriesIndices(prefetchIds);
-                            }
 
-                            // Use max_concurrent_for_each to avoid creating thousands of
-                            // concurrent futures at once. Bounded concurrency reduces memory
-                            // pressure and context thrashing.
-                            {
-                            static constexpr size_t MAX_CONCURRENT_SERIES_QUERIES = 64;
+                                // Use max_concurrent_for_each to avoid creating thousands of
+                                // concurrent futures at once. Bounded concurrency reduces memory
+                                // pressure and context thrashing.
+                                {
+                                    static constexpr size_t MAX_CONCURRENT_SERIES_QUERIES = 64;
 
-                            co_await seastar::max_concurrent_for_each(
-                                contexts, MAX_CONCURRENT_SERIES_QUERIES,
-                                [&engine, &pushdownPartials, &fallbackResults, &measurement, startTime, endTime,
-                                 shardId, aggregationInterval, aggregation,
-                                 &groupByTags](SeriesQueryContext& ctx) -> seastar::future<> {
-                                    // ---- PUSHDOWN PATH ----
-                                    // Try aggregating directly from TSM blocks, skipping the
-                                    // full TSMResult → QueryResult → SeriesResult pipeline.
-                                    auto pushdownResult =
-                                        co_await engine.queryAggregated(ctx.seriesKey, ctx.seriesId, startTime, endTime,
-                                                                        aggregationInterval, aggregation);
+                                    co_await seastar::max_concurrent_for_each(
+                                        contexts, MAX_CONCURRENT_SERIES_QUERIES,
+                                        [&engine, &pushdownPartials, &fallbackResults, &measurement, startTime, endTime,
+                                         shardId, aggregationInterval, aggregation,
+                                         &groupByTags](SeriesQueryContext& ctx) -> seastar::future<> {
+                                            // ---- PUSHDOWN PATH ----
+                                            // Try aggregating directly from TSM blocks, skipping the
+                                            // full TSMResult → QueryResult → SeriesResult pipeline.
+                                            auto pushdownResult = co_await engine.queryAggregated(
+                                                ctx.seriesKey, ctx.seriesId, startTime, endTime, aggregationInterval,
+                                                aggregation);
 
-                                    if (pushdownResult.has_value()) {
-                                        // Build PartialAggregationResult directly from PushdownResult
-                                        PartialAggregationResult partial;
-                                        partial.measurement = measurement;
-                                        partial.fieldName = ctx.field;
-                                        partial.totalPoints = pushdownResult->totalPoints;
+                                            if (pushdownResult.has_value()) {
+                                                // Build PartialAggregationResult directly from PushdownResult
+                                                PartialAggregationResult partial;
+                                                partial.measurement = measurement;
+                                                partial.fieldName = ctx.field;
+                                                partial.totalPoints = pushdownResult->totalPoints;
 
-                                        // Build composite groupKey (same format as createPartialAggregations)
-                                        auto gkr = timestar::buildGroupKeyDirect(measurement, ctx.field, ctx.tags,
-                                                                                 groupByTags);
-                                        partial.groupKey = std::move(gkr.key);
-                                        partial.groupKeyHash = gkr.hash;
-                                        partial.cachedTags = std::move(gkr.tags);
+                                                // Build composite groupKey (same format as createPartialAggregations)
+                                                auto gkr = timestar::buildGroupKeyDirect(measurement, ctx.field,
+                                                                                         ctx.tags, groupByTags);
+                                                partial.groupKey = std::move(gkr.key);
+                                                partial.groupKeyHash = gkr.hash;
+                                                partial.cachedTags = std::move(gkr.tags);
 
-                                        if (aggregationInterval > 0) {
-                                            partial.bucketStates = std::move(pushdownResult->bucketStates);
-                                        } else if (pushdownResult->aggregatedState.has_value()) {
-                                            partial.collapsedState = std::move(pushdownResult->aggregatedState);
-                                        } else {
-                                            partial.sortedTimestamps = std::move(pushdownResult->sortedTimestamps);
-                                            partial.sortedValues = std::move(pushdownResult->sortedValues);
-                                        }
-
-                                        pushdownPartials.push_back(std::move(partial));
-                                        co_return;
-                                    }
-
-                                    // ---- FALLBACK PATH ----
-                                    // Pushdown not applicable (non-float, memory data, overlap).
-                                    std::optional<VariantQueryResult> optResult;
-                                    try {
-                                        optResult =
-                                            co_await engine.query(ctx.seriesKey, ctx.seriesId, startTime, endTime);
-                                    } catch (const std::runtime_error& e) {
-                                        if (std::string(e.what()).find("Series not found") != std::string::npos) {
-                                            LOG_QUERY_PATH(timestar::http_log, info,
-                                                           "[QUERY] Series '{}' not found on shard {} - skipping",
-                                                           ctx.seriesKey, shardId);
-                                        } else {
-                                            LOG_QUERY_PATH(
-                                                timestar::http_log, warn,
-                                                "[QUERY] Error querying series '{}' on shard {}: {} - skipping",
-                                                ctx.seriesKey, shardId, e.what());
-                                        }
-                                        co_return;
-                                    } catch (const std::exception& e) {
-                                        LOG_QUERY_PATH(
-                                            timestar::http_log, warn,
-                                            "[QUERY] Unexpected error querying series '{}' on shard {}: {} - skipping",
-                                            ctx.seriesKey, shardId, e.what());
-                                        co_return;
-                                    }
-
-                                    if (!optResult.has_value()) {
-                                        co_return;
-                                    }
-
-                                    auto variantResult = std::move(optResult.value());
-
-                                    timestar::SeriesResult seriesResult;
-                                    seriesResult.measurement = measurement;
-                                    seriesResult.tags = std::move(ctx.tags);
-
-                                    std::visit(
-                                        [&seriesResult, &ctx](auto&& result) {
-                                            using T = std::decay_t<decltype(result)>;
-                                            if constexpr (std::is_same_v<T, QueryResult<double>>) {
-                                                if (!result.timestamps.empty()) {
-                                                    seriesResult.fields[ctx.field] =
-                                                        std::make_pair(std::move(result.timestamps),
-                                                                       FieldValues(std::move(result.values)));
+                                                if (aggregationInterval > 0) {
+                                                    partial.bucketStates = std::move(pushdownResult->bucketStates);
+                                                } else if (pushdownResult->aggregatedState.has_value()) {
+                                                    partial.collapsedState = std::move(pushdownResult->aggregatedState);
+                                                } else {
+                                                    partial.sortedTimestamps =
+                                                        std::move(pushdownResult->sortedTimestamps);
+                                                    partial.sortedValues = std::move(pushdownResult->sortedValues);
                                                 }
-                                            } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
-                                                if (!result.timestamps.empty()) {
-                                                    std::vector<bool> boolValues(result.values.begin(),
-                                                                                 result.values.end());
-                                                    seriesResult.fields[ctx.field] =
-                                                        std::make_pair(std::move(result.timestamps),
-                                                                       FieldValues(std::move(boolValues)));
-                                                }
-                                            } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
-                                                if (!result.timestamps.empty()) {
-                                                    seriesResult.fields[ctx.field] =
-                                                        std::make_pair(std::move(result.timestamps),
-                                                                       FieldValues(std::move(result.values)));
-                                                }
-                                            } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
-                                                if (!result.timestamps.empty()) {
-                                                    seriesResult.fields[ctx.field] =
-                                                        std::make_pair(std::move(result.timestamps),
-                                                                       FieldValues(std::move(result.values)));
-                                                }
+
+                                                pushdownPartials.push_back(std::move(partial));
+                                                co_return;
                                             }
-                                        },
-                                        variantResult);
 
-                                    if (!seriesResult.fields.empty()) {
-                                        fallbackResults.push_back(std::move(seriesResult));
-                                    }
-                                });
-                            } // end of non-batch per-series loop
-                            } // end of batch-vs-standard if/else
+                                            // ---- FALLBACK PATH ----
+                                            // Pushdown not applicable (non-float, memory data, overlap).
+                                            std::optional<VariantQueryResult> optResult;
+                                            try {
+                                                optResult = co_await engine.query(ctx.seriesKey, ctx.seriesId,
+                                                                                  startTime, endTime);
+                                            } catch (const std::runtime_error& e) {
+                                                if (std::string(e.what()).find("Series not found") !=
+                                                    std::string::npos) {
+                                                    LOG_QUERY_PATH(
+                                                        timestar::http_log, info,
+                                                        "[QUERY] Series '{}' not found on shard {} - skipping",
+                                                        ctx.seriesKey, shardId);
+                                                } else {
+                                                    LOG_QUERY_PATH(
+                                                        timestar::http_log, warn,
+                                                        "[QUERY] Error querying series '{}' on shard {}: {} - skipping",
+                                                        ctx.seriesKey, shardId, e.what());
+                                                }
+                                                co_return;
+                                            } catch (const std::exception& e) {
+                                                LOG_QUERY_PATH(timestar::http_log, warn,
+                                                               "[QUERY] Unexpected error querying series '{}' on shard "
+                                                               "{}: {} - skipping",
+                                                               ctx.seriesKey, shardId, e.what());
+                                                co_return;
+                                            }
+
+                                            if (!optResult.has_value()) {
+                                                co_return;
+                                            }
+
+                                            auto variantResult = std::move(optResult.value());
+
+                                            timestar::SeriesResult seriesResult;
+                                            seriesResult.measurement = measurement;
+                                            seriesResult.tags = std::move(ctx.tags);
+
+                                            std::visit(
+                                                [&seriesResult, &ctx](auto&& result) {
+                                                    using T = std::decay_t<decltype(result)>;
+                                                    if constexpr (std::is_same_v<T, QueryResult<double>>) {
+                                                        if (!result.timestamps.empty()) {
+                                                            seriesResult.fields[ctx.field] =
+                                                                std::make_pair(std::move(result.timestamps),
+                                                                               FieldValues(std::move(result.values)));
+                                                        }
+                                                    } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
+                                                        if (!result.timestamps.empty()) {
+                                                            std::vector<bool> boolValues(result.values.begin(),
+                                                                                         result.values.end());
+                                                            seriesResult.fields[ctx.field] =
+                                                                std::make_pair(std::move(result.timestamps),
+                                                                               FieldValues(std::move(boolValues)));
+                                                        }
+                                                    } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
+                                                        if (!result.timestamps.empty()) {
+                                                            seriesResult.fields[ctx.field] =
+                                                                std::make_pair(std::move(result.timestamps),
+                                                                               FieldValues(std::move(result.values)));
+                                                        }
+                                                    } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
+                                                        if (!result.timestamps.empty()) {
+                                                            seriesResult.fields[ctx.field] =
+                                                                std::make_pair(std::move(result.timestamps),
+                                                                               FieldValues(std::move(result.values)));
+                                                        }
+                                                    }
+                                                },
+                                                variantResult);
+
+                                            if (!seriesResult.fields.empty()) {
+                                                fallbackResults.push_back(std::move(seriesResult));
+                                            }
+                                        });
+                                }  // end of non-batch per-series loop
+                            }  // end of batch-vs-standard if/else
 
                             // Separate non-numeric (string/bool) fallback results from numeric.
                             // String and boolean data bypass aggregation and are returned as-is.
@@ -1150,15 +1157,14 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         // Slow query detection (always compiled in, runtime configurable)
         const auto slowThresholdMs = timestar::config().http.slow_query_threshold_ms;
         if (slowThresholdMs > 0 && timing.totalMs > static_cast<double>(slowThresholdMs)) {
-            if (engineSharded) ++engineSharded->local().metrics().slow_queries_total;
+            if (engineSharded)
+                ++engineSharded->local().metrics().slow_queries_total;
             timestar::query_log.warn(
                 "[SLOW_QUERY] {:.1f}ms (threshold {}ms) | "
                 "measurement={} series={} points={} shards={} | "
                 "discovery={:.1f}ms shard_queries={:.1f}ms aggregation={:.1f}ms format={:.1f}ms",
-                timing.totalMs, slowThresholdMs,
-                request.measurement, timing.seriesFound, timing.finalPointsReturned,
-                timing.shardsQueried,
-                timing.findSeriesMs, timing.shardQueriesMs, timing.aggregationMs,
+                timing.totalMs, slowThresholdMs, request.measurement, timing.seriesFound, timing.finalPointsReturned,
+                timing.shardsQueried, timing.findSeriesMs, timing.shardQueriesMs, timing.aggregationMs,
                 timing.responseFormattingMs);
 
             // Per-shard breakdown for slow queries (only log shards that took >50% of threshold)

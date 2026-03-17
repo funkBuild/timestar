@@ -75,7 +75,10 @@ public:
     TSMCompactor* getCompactor() { return compactor.get(); }
 
     // Set the I/O scheduling group for background compaction.
-    void setCompactionGroup(seastar::scheduling_group sg) { _compactionGroup = sg; _compactionGroupSet = true; }
+    void setCompactionGroup(seastar::scheduling_group sg) {
+        _compactionGroup = sg;
+        _compactionGroupSet = true;
+    }
 
     // Start background compaction
     seastar::future<> startCompactionLoop();

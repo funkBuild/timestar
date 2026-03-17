@@ -25,31 +25,31 @@ struct MetadataOp {
 };
 
 enum IndexKeyType : uint8_t {
-    SERIES_INDEX = 0x01,             // series_key -> series_id
-    MEASUREMENT_FIELDS = 0x02,       // measurement -> fields set
-    MEASUREMENT_TAGS = 0x03,         // measurement -> tag keys set
-    TAG_VALUES = 0x04,               // measurement+tag_key -> values set
-    SERIES_METADATA = 0x05,          // series_id -> metadata
-    TAG_INDEX = 0x06,                // measurement+tag_key+tag_value -> series_ids
-    GROUP_BY_INDEX = 0x07,           // measurement+tag_key+tag_value -> series_ids (for group-by)
-    FIELD_STATS = 0x08,              // series_id+field -> stats
-    FIELD_TYPE = 0x09,               // measurement+field -> field type (float, bool, string, integer)
-    MEASUREMENT_SERIES = 0x0A,       // measurement+\0+series_id -> (empty) for fast measurement->series lookup
-    RETENTION_POLICY = 0x0B,         // measurement -> JSON retention policy
-    MEASUREMENT_FIELD_SERIES = 0x0C, // measurement+\0+field+\0+series_id -> (empty) for single-field lookup
+    SERIES_INDEX = 0x01,              // series_key -> series_id
+    MEASUREMENT_FIELDS = 0x02,        // measurement -> fields set
+    MEASUREMENT_TAGS = 0x03,          // measurement -> tag keys set
+    TAG_VALUES = 0x04,                // measurement+tag_key -> values set
+    SERIES_METADATA = 0x05,           // series_id -> metadata
+    TAG_INDEX = 0x06,                 // measurement+tag_key+tag_value -> series_ids
+    GROUP_BY_INDEX = 0x07,            // measurement+tag_key+tag_value -> series_ids (for group-by)
+    FIELD_STATS = 0x08,               // series_id+field -> stats
+    FIELD_TYPE = 0x09,                // measurement+field -> field type (float, bool, string, integer)
+    MEASUREMENT_SERIES = 0x0A,        // measurement+\0+series_id -> (empty) for fast measurement->series lookup
+    RETENTION_POLICY = 0x0B,          // measurement -> JSON retention policy
+    MEASUREMENT_FIELD_SERIES = 0x0C,  // measurement+\0+field+\0+series_id -> (empty) for single-field lookup
 
     // Phase 2: Roaring bitmap postings
-    LOCAL_ID_FORWARD  = 0x10,        // localId (4B LE) -> SeriesId128 (16B)
-    LOCAL_ID_REVERSE  = 0x11,        // SeriesId128 (16B) -> localId (4B LE)
-    LOCAL_ID_COUNTER  = 0x12,        // singleton -> next localId counter (4B LE)
-    POSTINGS_BITMAP   = 0x13,        // measurement\0tagKey\0tagValue -> serialized roaring bitmap
+    LOCAL_ID_FORWARD = 0x10,  // localId (4B LE) -> SeriesId128 (16B)
+    LOCAL_ID_REVERSE = 0x11,  // SeriesId128 (16B) -> localId (4B LE)
+    LOCAL_ID_COUNTER = 0x12,  // singleton -> next localId counter (4B LE)
+    POSTINGS_BITMAP = 0x13,   // measurement\0tagKey\0tagValue -> serialized roaring bitmap
 
     // Phase 3: Time-scoped postings
-    TIME_SERIES_DAY   = 0x0D,        // measurement\0day(4B LE) -> roaring bitmap of active LocalIds
+    TIME_SERIES_DAY = 0x0D,  // measurement\0day(4B LE) -> roaring bitmap of active LocalIds
 
     // Phase 4: Cardinality estimation
-    CARDINALITY_HLL   = 0x14,        // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
-    MEASUREMENT_BLOOM = 0x15         // measurement\0 -> serialized bloom filter of all LocalIds
+    CARDINALITY_HLL = 0x14,   // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
+    MEASUREMENT_BLOOM = 0x15  // measurement\0 -> serialized bloom filter of all LocalIds
 };
 
 // Metadata for a time series
@@ -95,12 +95,12 @@ public:
 
     // Series indexing - core functionality.
     virtual seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement,
-                                                              std::map<std::string, std::string> tags,
-                                                              std::string field) = 0;
+                                                             std::map<std::string, std::string> tags,
+                                                             std::string field) = 0;
 
     virtual seastar::future<std::optional<SeriesId128>> getSeriesId(const std::string& measurement,
-                                                                     const std::map<std::string, std::string>& tags,
-                                                                     const std::string& field) = 0;
+                                                                    const std::map<std::string, std::string>& tags,
+                                                                    const std::string& field) = 0;
 
     // Get metadata for a series by ID
     virtual seastar::future<std::optional<SeriesMetadata>> getSeriesMetadata(const SeriesId128& seriesId) = 0;
@@ -112,15 +112,15 @@ public:
     // Measurement metadata indexing
     virtual seastar::future<> addField(const std::string& measurement, const std::string& field) = 0;
     virtual seastar::future<> addTag(const std::string& measurement, const std::string& tagKey,
-                                      const std::string& tagValue) = 0;
+                                     const std::string& tagValue) = 0;
 
     // Batched metadata indexing
     virtual seastar::future<> addFieldsAndTags(const std::string& measurement, const std::string& field,
-                                                const std::map<std::string, std::string>& tags) = 0;
+                                               const std::map<std::string, std::string>& tags) = 0;
 
     // Field type management
     virtual seastar::future<> setFieldType(const std::string& measurement, const std::string& field,
-                                            const std::string& type) = 0;
+                                           const std::string& type) = 0;
     virtual seastar::future<std::string> getFieldType(const std::string& measurement, const std::string& field) = 0;
 
     // Query support - get metadata for measurements
@@ -128,7 +128,7 @@ public:
     virtual seastar::future<std::set<std::string>> getFields(const std::string& measurement) = 0;
     virtual seastar::future<std::set<std::string>> getTags(const std::string& measurement) = 0;
     virtual seastar::future<std::set<std::string>> getTagValues(const std::string& measurement,
-                                                                 const std::string& tagKey) = 0;
+                                                                const std::string& tagKey) = 0;
 
     // Batch metadata indexing
     virtual seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops) = 0;
@@ -176,7 +176,7 @@ public:
 
     // Field statistics
     virtual seastar::future<> updateFieldStats(const SeriesId128& seriesId, const std::string& field,
-                                                const IndexFieldStats& stats) = 0;
+                                               const IndexFieldStats& stats) = 0;
 
     virtual seastar::future<std::optional<IndexFieldStats>> getFieldStats(const SeriesId128& seriesId,
                                                                           const std::string& field) = 0;

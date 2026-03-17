@@ -2,22 +2,26 @@
 
 #include "crc32.hpp"
 
-#include <seastar/core/fstream.hh>
-#include <seastar/core/seastar.hh>
-#include <seastar/core/temporary_buffer.hh>
+#include <fcntl.h>
+#include <unistd.h>
 #include <zstd.h>
 
 #include <chrono>
 #include <cstring>
-#include <fcntl.h>
 #include <memory>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <stdexcept>
-#include <unistd.h>
 
 // Thread-local zstd contexts for SSTable block compress/decompress.
 namespace {
-struct ZstdCCtxDeleter { void operator()(ZSTD_CCtx* p) const { ZSTD_freeCCtx(p); } };
-struct ZstdDCtxDeleter { void operator()(ZSTD_DCtx* p) const { ZSTD_freeDCtx(p); } };
+struct ZstdCCtxDeleter {
+    void operator()(ZSTD_CCtx* p) const { ZSTD_freeCCtx(p); }
+};
+struct ZstdDCtxDeleter {
+    void operator()(ZSTD_DCtx* p) const { ZSTD_freeDCtx(p); }
+};
 
 static ZSTD_CCtx* getSstCCtx() {
     static thread_local std::unique_ptr<ZSTD_CCtx, ZstdCCtxDeleter> ctx(ZSTD_createCCtx());
@@ -73,7 +77,7 @@ static uint64_t decodeFixed64(const char* p) {
 // --- SSTableWriter (Step 3: streaming writes) ---
 
 seastar::future<SSTableWriter> SSTableWriter::create(std::string filename, int blockSize, int bloomBitsPerKey,
-                                                       int compressionLevel) {
+                                                     int compressionLevel) {
     SSTableWriter writer;
     writer.filename_ = filename;
     writer.blockSize_ = blockSize;
@@ -81,8 +85,8 @@ seastar::future<SSTableWriter> SSTableWriter::create(std::string filename, int b
     writer.bloom_ = BloomFilter(bloomBitsPerKey);
     writer.currentBlock_ = BlockBuilder(16);
     writer.writeTimestampNs_ = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
 
     // Step 3: Open file at creation time for streaming writes
     std::string_view filenameView{filename};
@@ -120,15 +124,16 @@ seastar::future<> SSTableWriter::flushPending() {
 }
 
 void SSTableWriter::flushBlock() {
-    if (currentBlock_.empty()) return;
+    if (currentBlock_.empty())
+        return;
 
     auto rawBlock = currentBlock_.finish();
 
     // Compress with zstd (level configured at create time: 1=fast for L0, 3=better for L1+)
     size_t maxCompressed = ZSTD_compressBound(rawBlock.size());
     std::string compressed(maxCompressed, '\0');
-    size_t compressedSize = ZSTD_compressCCtx(getSstCCtx(), compressed.data(), maxCompressed,
-                                               rawBlock.data(), rawBlock.size(), compressionLevel_);
+    size_t compressedSize = ZSTD_compressCCtx(getSstCCtx(), compressed.data(), maxCompressed, rawBlock.data(),
+                                              rawBlock.size(), compressionLevel_);
     if (ZSTD_isError(compressedSize)) {
         throw std::runtime_error(std::string("SSTable zstd compression failed: ") + ZSTD_getErrorName(compressedSize));
     }
@@ -168,12 +173,14 @@ seastar::future<> SSTableWriter::maybeStreamFlush() {
 
 seastar::future<> SSTableWriter::streamFlush() {
     size_t available = pendingData_.size() - pendingOffset_;
-    if (available == 0 || !fileOpen_) co_return;
+    if (available == 0 || !fileOpen_)
+        co_return;
 
     // Round down to DMA alignment boundary — write only complete aligned chunks.
     // Remaining bytes stay in pendingData_ for the next flush or finish().
     size_t chunkSize = available & ~(dmaAlign_ - 1);
-    if (chunkSize == 0) co_return;
+    if (chunkSize == 0)
+        co_return;
 
     auto buf = seastar::temporary_buffer<char>::aligned(dmaAlign_, chunkSize);
     std::memcpy(buf.get_write(), pendingData_.data() + pendingOffset_, chunkSize);
@@ -181,7 +188,8 @@ seastar::future<> SSTableWriter::streamFlush() {
     size_t written = 0;
     while (written < chunkSize) {
         auto n = co_await file_.dma_write(diskOffset_ + written, buf.get() + written, chunkSize - written);
-        if (n == 0) throw std::runtime_error("SSTable dma_write returned 0");
+        if (n == 0)
+            throw std::runtime_error("SSTable dma_write returned 0");
         written += n;
     }
 
@@ -275,7 +283,8 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
         size_t written = 0;
         while (written < writeSize) {
             auto n = co_await file_.dma_write(diskOffset_ + written, buf.get() + written, writeSize - written);
-            if (n == 0) throw std::runtime_error("SSTable dma_write returned 0");
+            if (n == 0)
+                throw std::runtime_error("SSTable dma_write returned 0");
             written += n;
         }
 
@@ -289,7 +298,8 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
 
     co_await file_.close();
     fileOpen_ = false;
-    if (err) std::rethrow_exception(err);
+    if (err)
+        std::rethrow_exception(err);
 
     // Free the buffer
     pendingData_.clear();
@@ -337,10 +347,10 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     auto footerBuf = seastar::temporary_buffer<char>::aligned(dmaAlign, footerReadSize);
     size_t footerRead = 0;
     while (footerRead < footerReadSize) {
-        auto n = co_await file.dma_read(alignedFooterOffset + footerRead,
-                                                   footerBuf.get_write() + footerRead,
-                                                   footerReadSize - footerRead);
-        if (n == 0) break;
+        auto n = co_await file.dma_read(alignedFooterOffset + footerRead, footerBuf.get_write() + footerRead,
+                                        footerReadSize - footerRead);
+        if (n == 0)
+            break;
         footerRead += n;
     }
 
@@ -378,10 +388,10 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
         auto metaBuf = seastar::temporary_buffer<char>::aligned(dmaAlign, alignedMetaSize);
         size_t metaRead = 0;
         while (metaRead < alignedMetaSize) {
-            auto n = co_await file.dma_read(alignedMetaOffset + metaRead,
-                                                       metaBuf.get_write() + metaRead,
-                                                       alignedMetaSize - metaRead);
-            if (n == 0) break;
+            auto n = co_await file.dma_read(alignedMetaOffset + metaRead, metaBuf.get_write() + metaRead,
+                                            alignedMetaSize - metaRead);
+            if (n == 0)
+                break;
             metaRead += n;
         }
 
@@ -389,8 +399,8 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
 
         // Parse bloom filter
         if (bloomSize > 0 && bloomOffset >= metaStart && bloomOffset + bloomSize <= metaEnd) {
-            reader->bloom_ = BloomFilter::deserializeFrom(
-                std::string_view(metaBase + (bloomOffset - metaStart), bloomSize));
+            reader->bloom_ =
+                BloomFilter::deserializeFrom(std::string_view(metaBase + (bloomOffset - metaStart), bloomSize));
         } else {
             reader->bloom_ = BloomFilter::createNull();
         }
@@ -400,21 +410,25 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
             const char* ip = metaBase + (indexOffset - metaStart);
             const char* iend = ip + indexSize;
 
-            if (ip + 4 > iend) throw std::runtime_error("SSTable index truncated");
+            if (ip + 4 > iend)
+                throw std::runtime_error("SSTable index truncated");
             uint32_t numEntries = decodeFixed32(ip);
             ip += 4;
 
             reader->index_.reserve(numEntries);
             for (uint32_t i = 0; i < numEntries; ++i) {
-                if (ip + 4 > iend) throw std::runtime_error("SSTable index entry truncated");
+                if (ip + 4 > iend)
+                    throw std::runtime_error("SSTable index entry truncated");
                 uint32_t keyLen = decodeFixed32(ip);
                 ip += 4;
 
-                if (ip + keyLen > iend) throw std::runtime_error("SSTable index key truncated");
+                if (ip + keyLen > iend)
+                    throw std::runtime_error("SSTable index key truncated");
                 std::string firstKey(ip, keyLen);
                 ip += keyLen;
 
-                if (ip + 12 > iend) throw std::runtime_error("SSTable index offset truncated");
+                if (ip + 12 > iend)
+                    throw std::runtime_error("SSTable index offset truncated");
                 uint64_t offset = decodeFixed64(ip);
                 ip += 8;
                 uint32_t size = decodeFixed32(ip);
@@ -463,23 +477,22 @@ std::string SSTableReader::decompressBlock(size_t blockIndex) const {
     std::string compressedBuf(entry.size, '\0');
     ssize_t bytesRead = ::pread(readFd_, compressedBuf.data(), entry.size, static_cast<off_t>(entry.offset));
     if (bytesRead < 0 || static_cast<size_t>(bytesRead) < entry.size) {
-        throw std::runtime_error("SSTable pread failed for block " + std::to_string(blockIndex) +
-                                 " in " + filename_);
+        throw std::runtime_error("SSTable pread failed for block " + std::to_string(blockIndex) + " in " + filename_);
     }
 
     // Verify CRC32 (covers size prefix + compressed data, excludes trailing CRC itself)
     uint32_t storedCrc = decodeFixed32(compressedBuf.data() + entry.size - 4);
     uint32_t computedCrc = CRC32::compute(compressedBuf.data(), entry.size - 4);
     if (storedCrc != computedCrc) {
-        throw std::runtime_error("SSTable block CRC32 mismatch in " + filename_ +
-                                 " block " + std::to_string(blockIndex));
+        throw std::runtime_error("SSTable block CRC32 mismatch in " + filename_ + " block " +
+                                 std::to_string(blockIndex));
     }
 
     // Decompress (skip size prefix, exclude CRC)
     uint32_t uncompressedSize = decodeFixed32(compressedBuf.data());
     std::string result(uncompressedSize, '\0');
-    size_t decompSize = ZSTD_decompressDCtx(getSstDCtx(), result.data(), uncompressedSize,
-                                             compressedBuf.data() + 4, entry.size - 4 - 4);
+    size_t decompSize = ZSTD_decompressDCtx(getSstDCtx(), result.data(), uncompressedSize, compressedBuf.data() + 4,
+                                            entry.size - 4 - 4);
     if (ZSTD_isError(decompSize)) {
         throw std::runtime_error(std::string("SSTable zstd decompression failed: ") + ZSTD_getErrorName(decompSize));
     }
@@ -536,7 +549,8 @@ size_t SSTableReader::findBlock(std::string_view key) const {
 const std::string& SSTableReader::getDecompressedBlock(size_t idx, std::string& fallback) const {
     if (blockCache_) {
         auto* cached = blockCache_->get(cacheId_, idx);
-        if (cached) return *cached;
+        if (cached)
+            return *cached;
         fallback = decompressBlock(idx);
         return blockCache_->put(cacheId_, idx, fallback);
     }
@@ -696,7 +710,8 @@ void SSTableReader::Iterator::seek(std::string_view target) {
 }
 
 void SSTableReader::Iterator::next() {
-    if (!valid_) return;
+    if (!valid_)
+        return;
 
     blockIter_.next();
     updateFromBlockIter();

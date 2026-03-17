@@ -19,7 +19,8 @@ public:
     // next put/evict call), or nullptr on miss. Promotes entry to MRU on hit.
     const std::string* get(uint64_t cacheId, size_t blockIndex) {
         auto it = map_.find({cacheId, blockIndex});
-        if (it == map_.end()) return nullptr;
+        if (it == map_.end())
+            return nullptr;
         list_.splice(list_.begin(), list_, it->second);
         return &it->second->data;
     }
@@ -101,7 +102,8 @@ private:
     size_t currentBytes_ = 0;
 
     void evictOne() {
-        if (list_.empty()) return;
+        if (list_.empty())
+            return;
         auto& back = list_.back();
         currentBytes_ -= back.entrySize;
         map_.erase(back.key);

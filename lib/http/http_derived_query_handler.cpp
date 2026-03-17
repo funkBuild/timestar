@@ -84,8 +84,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                 http_log.debug("Derived query completed: {} points, {:.2f}ms", r.stats.pointCount,
                                r.stats.executionTimeMs);
                 if (slowMs > 0 && r.stats.executionTimeMs > static_cast<double>(slowMs)) {
-                    query_log.warn("[SLOW_QUERY] derived {:.1f}ms (threshold {}ms) points={}",
-                                   r.stats.executionTimeMs, slowMs, r.stats.pointCount);
+                    query_log.warn("[SLOW_QUERY] derived {:.1f}ms (threshold {}ms) points={}", r.stats.executionTimeMs,
+                                   slowMs, r.stats.pointCount);
                 }
             } else if (std::holds_alternative<anomaly::AnomalyQueryResult>(result)) {
                 const auto& r = std::get<anomaly::AnomalyQueryResult>(result);
@@ -93,8 +93,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                                r.statistics.anomalyCount, r.statistics.executionTimeMs);
                 if (slowMs > 0 && r.statistics.executionTimeMs > static_cast<double>(slowMs)) {
                     query_log.warn("[SLOW_QUERY] anomaly {:.1f}ms (threshold {}ms) points={} anomalies={}",
-                                   r.statistics.executionTimeMs, slowMs,
-                                   r.statistics.totalPoints, r.statistics.anomalyCount);
+                                   r.statistics.executionTimeMs, slowMs, r.statistics.totalPoints,
+                                   r.statistics.anomalyCount);
                 }
             } else if (std::holds_alternative<forecast::ForecastQueryResult>(result)) {
                 const auto& r = std::get<forecast::ForecastQueryResult>(result);
@@ -103,8 +103,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
                                r.statistics.executionTimeMs);
                 if (slowMs > 0 && r.statistics.executionTimeMs > static_cast<double>(slowMs)) {
                     query_log.warn("[SLOW_QUERY] forecast {:.1f}ms (threshold {}ms) points={}+{}",
-                                   r.statistics.executionTimeMs, slowMs,
-                                   r.statistics.historicalPoints, r.statistics.forecastPoints);
+                                   r.statistics.executionTimeMs, slowMs, r.statistics.historicalPoints,
+                                   r.statistics.forecastPoints);
                 }
             }
 

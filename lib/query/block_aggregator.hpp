@@ -302,17 +302,13 @@ private:
     // SIMD batch fold: process an entire batch using vectorised reductions
     // for methods that support it (SUM/AVG/MIN/MAX/COUNT/SPREAD).
     // Falls back to scalar for LATEST/FIRST/STDDEV/MEDIAN.
-    void addPointsSIMDFold(const std::vector<uint64_t>& timestamps,
-                           const std::vector<double>& values,
+    void addPointsSIMDFold(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
                            AggregationState* state = nullptr) {
-        addPointsSIMDFoldRange(timestamps, values, 0, timestamps.size(),
-                               state ? *state : singleState_);
+        addPointsSIMDFoldRange(timestamps, values, 0, timestamps.size(), state ? *state : singleState_);
     }
 
-    void addPointsSIMDFoldRange(const std::vector<uint64_t>& timestamps,
-                                const std::vector<double>& values,
-                                size_t begin, size_t end,
-                                AggregationState& state) {
+    void addPointsSIMDFoldRange(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
+                                size_t begin, size_t end, AggregationState& state) {
         const size_t n = end - begin;
         const double* vdata = values.data() + begin;
         const uint64_t* tdata = timestamps.data() + begin;

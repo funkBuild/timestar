@@ -33,8 +33,8 @@ void BlockBuilder::add(std::string_view key, std::string_view value) {
         restartOffsets_.push_back(static_cast<uint32_t>(buffer_.size()));
     } else {
         // Compute shared prefix with previous key using std::mismatch (SIMD-friendly)
-        auto [it1, it2] = std::mismatch(key.begin(), key.begin() + std::min(key.size(), lastKey_.size()),
-                                         lastKey_.begin());
+        auto [it1, it2] =
+            std::mismatch(key.begin(), key.begin() + std::min(key.size(), lastKey_.size()), lastKey_.begin());
         shared = static_cast<uint32_t>(std::distance(key.begin(), it1));
     }
 
@@ -203,7 +203,8 @@ void BlockReader::Iterator::seekToFirst() {
 }
 
 void BlockReader::Iterator::next() {
-    if (!valid_) return;
+    if (!valid_)
+        return;
     decodeEntry();
 }
 
@@ -221,8 +222,7 @@ void BlockReader::Iterator::seek(std::string_view target) {
     while (lo + 1 < hi) {
         size_t mid = lo + (hi - lo) / 2;
         // Decode the key at restart point mid
-        uint32_t restartOffset =
-            BlockReader::decodeFixed32(reinterpret_cast<const char*>(&reader_->restarts_[mid]));
+        uint32_t restartOffset = BlockReader::decodeFixed32(reinterpret_cast<const char*>(&reader_->restarts_[mid]));
         const char* p = reader_->data_.data() + restartOffset;
         const char* limit = reader_->data_.data() + reader_->dataSize_;
 

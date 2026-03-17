@@ -1,16 +1,16 @@
 #include "manifest.hpp"
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/seastar.hh>
-#include <seastar/core/thread.hh>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/thread.hh>
 #include <stdexcept>
-#include <unistd.h>
 
 namespace timestar::index {
 
@@ -25,7 +25,8 @@ static void encodeFixed32(std::string& out, uint32_t v) {
 
 static void encodeFixed64(std::string& out, uint64_t v) {
     char buf[8];
-    for (int i = 0; i < 8; ++i) buf[i] = static_cast<char>((v >> (i * 8)) & 0xff);
+    for (int i = 0; i < 8; ++i)
+        buf[i] = static_cast<char>((v >> (i * 8)) & 0xff);
     out.append(buf, 8);
 }
 
@@ -38,7 +39,8 @@ static uint32_t decodeFixed32(const char* p) {
 
 static uint64_t decodeFixed64(const char* p) {
     uint64_t r = 0;
-    for (int i = 0; i < 8; ++i) r |= static_cast<uint64_t>(static_cast<uint8_t>(p[i])) << (i * 8);
+    for (int i = 0; i < 8; ++i)
+        r |= static_cast<uint64_t>(static_cast<uint8_t>(p[i])) << (i * 8);
     return r;
 }
 
@@ -61,7 +63,8 @@ seastar::future<Manifest> Manifest::open(std::string directory) {
 std::vector<SSTableMetadata> Manifest::filesAtLevel(int level) const {
     std::vector<SSTableMetadata> result;
     for (const auto& f : files_) {
-        if (f.level == level) result.push_back(f);
+        if (f.level == level)
+            result.push_back(f);
     }
     return result;
 }
@@ -139,7 +142,8 @@ seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
 }
 
 seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers) {
-    if (fileNumbers.empty()) co_return;
+    if (fileNumbers.empty())
+        co_return;
 
     // Batch all removal records into a single write+fsync to avoid O(N) fsyncs.
     std::string batchFrame;
@@ -203,7 +207,8 @@ seastar::future<> Manifest::writeSnapshot() {
 seastar::future<> Manifest::recover() {
     files_.clear();
     auto fileSize = std::filesystem::file_size(manifestPath_);
-    if (fileSize == 0) co_return;
+    if (fileSize == 0)
+        co_return;
 
     std::string data;
     co_await seastar::async([this, &data, fileSize] {
@@ -218,26 +223,30 @@ seastar::future<> Manifest::recover() {
     while (p + 4 <= end) {
         uint32_t recordLen = decodeFixed32(p);
         p += 4;
-        if (p + recordLen > end) break;
+        if (p + recordLen > end)
+            break;
 
         const char* rp = p;
         const char* rend = p + recordLen;
         p += recordLen;
 
-        if (rp >= rend) continue;
+        if (rp >= rend)
+            continue;
         auto type = static_cast<RecordType>(*rp);
         ++rp;
 
         if (type == RecordType::Snapshot) {
             files_.clear();
-            if (rp + 12 > rend) continue;
+            if (rp + 12 > rend)
+                continue;
             nextFileNumber_ = decodeFixed64(rp);
             rp += 8;
             uint32_t fileCount = decodeFixed32(rp);
             rp += 4;
 
             for (uint32_t i = 0; i < fileCount; ++i) {
-                if (rp + 28 > rend) break;
+                if (rp + 28 > rend)
+                    break;
                 SSTableMetadata f;
                 f.fileNumber = decodeFixed64(rp);
                 rp += 8;
@@ -248,17 +257,21 @@ seastar::future<> Manifest::recover() {
                 f.entryCount = decodeFixed64(rp);
                 rp += 8;
 
-                if (rp + 4 > rend) break;
+                if (rp + 4 > rend)
+                    break;
                 uint32_t minKeyLen = decodeFixed32(rp);
                 rp += 4;
-                if (rp + minKeyLen > rend) break;
+                if (rp + minKeyLen > rend)
+                    break;
                 f.minKey.assign(rp, minKeyLen);
                 rp += minKeyLen;
 
-                if (rp + 4 > rend) break;
+                if (rp + 4 > rend)
+                    break;
                 uint32_t maxKeyLen = decodeFixed32(rp);
                 rp += 4;
-                if (rp + maxKeyLen > rend) break;
+                if (rp + maxKeyLen > rend)
+                    break;
                 f.maxKey.assign(rp, maxKeyLen);
                 rp += maxKeyLen;
 
@@ -271,7 +284,8 @@ seastar::future<> Manifest::recover() {
                 files_.push_back(std::move(f));
             }
         } else if (type == RecordType::AddFile) {
-            if (rp + 28 > rend) continue;
+            if (rp + 28 > rend)
+                continue;
             SSTableMetadata f;
             f.fileNumber = decodeFixed64(rp);
             rp += 8;
@@ -282,17 +296,21 @@ seastar::future<> Manifest::recover() {
             f.entryCount = decodeFixed64(rp);
             rp += 8;
 
-            if (rp + 4 > rend) continue;
+            if (rp + 4 > rend)
+                continue;
             uint32_t minKeyLen = decodeFixed32(rp);
             rp += 4;
-            if (rp + minKeyLen > rend) continue;
+            if (rp + minKeyLen > rend)
+                continue;
             f.minKey.assign(rp, minKeyLen);
             rp += minKeyLen;
 
-            if (rp + 4 > rend) continue;
+            if (rp + 4 > rend)
+                continue;
             uint32_t maxKeyLen = decodeFixed32(rp);
             rp += 4;
-            if (rp + maxKeyLen > rend) continue;
+            if (rp + maxKeyLen > rend)
+                continue;
             f.maxKey.assign(rp, maxKeyLen);
             rp += maxKeyLen;
 
@@ -303,9 +321,11 @@ seastar::future<> Manifest::recover() {
             }
 
             files_.push_back(std::move(f));
-            if (f.fileNumber >= nextFileNumber_) nextFileNumber_ = f.fileNumber + 1;
+            if (f.fileNumber >= nextFileNumber_)
+                nextFileNumber_ = f.fileNumber + 1;
         } else if (type == RecordType::RemoveFile) {
-            if (rp + 8 > rend) continue;
+            if (rp + 8 > rend)
+                continue;
             uint64_t fn = decodeFixed64(rp);
             std::erase_if(files_, [fn](const SSTableMetadata& ff) { return ff.fileNumber == fn; });
         }

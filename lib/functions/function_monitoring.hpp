@@ -38,10 +38,13 @@ struct FunctionMetricsSnapshot {
         return total_executions > 0 ? static_cast<double>(successful_executions) / total_executions : 0.0;
     }
 
-    double getFailureRate() const { return total_executions > 0 ? static_cast<double>(failed_executions) / total_executions : 0.0; }
+    double getFailureRate() const {
+        return total_executions > 0 ? static_cast<double>(failed_executions) / total_executions : 0.0;
+    }
 
     double getAverageExecutionTimeMs() const {
-        return successful_executions > 0 ? static_cast<double>(total_execution_time_us) / successful_executions / 1000.0 : 0.0;
+        return successful_executions > 0 ? static_cast<double>(total_execution_time_us) / successful_executions / 1000.0
+                                         : 0.0;
     }
 
     double getCacheHitRate() const {
@@ -50,7 +53,9 @@ struct FunctionMetricsSnapshot {
     }
 
     double getAverageMemoryUsageMB() const {
-        return successful_executions > 0 ? static_cast<double>(total_memory_allocated) / successful_executions / 1024 / 1024 : 0.0;
+        return successful_executions > 0
+                   ? static_cast<double>(total_memory_allocated) / successful_executions / 1024 / 1024
+                   : 0.0;
     }
 };
 
@@ -134,12 +139,14 @@ struct SystemMetricsSnapshot {
     }
 
     double getHttpSuccessRate() const {
-        return http_requests_total > 0 ? static_cast<double>(http_requests_total - http_requests_failed) / http_requests_total
-                                       : 0.0;
+        return http_requests_total > 0
+                   ? static_cast<double>(http_requests_total - http_requests_failed) / http_requests_total
+                   : 0.0;
     }
 
     double getAverageHttpResponseTimeMs() const {
-        return http_requests_total > 0 ? static_cast<double>(http_response_time_us) / http_requests_total / 1000.0 : 0.0;
+        return http_requests_total > 0 ? static_cast<double>(http_response_time_us) / http_requests_total / 1000.0
+                                       : 0.0;
     }
 };
 

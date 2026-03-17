@@ -105,16 +105,14 @@ private:
     mutable size_t fullIndexCacheBytes = 0;
 
     static size_t estimateEntryBytes(const TSMIndexEntry& entry) {
-        return sizeof(TSMIndexEntry) + entry.indexBlocks.size() * sizeof(TSMIndexBlock)
-               + sizeof(std::pair<SeriesId128, TSMIndexEntry>);  // list node overhead
+        return sizeof(TSMIndexEntry) + entry.indexBlocks.size() * sizeof(TSMIndexBlock) +
+               sizeof(std::pair<SeriesId128, TSMIndexEntry>);  // list node overhead
     }
 
     // Configuration for bloom filter and cache (read from TOML config)
     static double bloomFpr() { return timestar::config().storage.tsm_bloom_fpr; }
     // Byte budget per TSM file (default: 4096 entries * ~200 bytes ≈ 800KB)
-    static size_t maxCacheBytes() {
-        return timestar::config().storage.tsm_cache_entries * 200;
-    }
+    static size_t maxCacheBytes() { return timestar::config().storage.tsm_cache_entries * 200; }
 
     // Tombstone support
     std::unique_ptr<timestar::TSMTombstone> tombstones;
@@ -176,15 +174,20 @@ public:
     // Zero-I/O LATEST/FIRST from sparse index v3 stats.
     // Returns the latest or first (timestamp, value) for a series without any disk reads.
     // Returns nullopt if series not found or stats unavailable.
-    struct PointResult { uint64_t timestamp; double value; };
+    struct PointResult {
+        uint64_t timestamp;
+        double value;
+    };
     std::optional<PointResult> getLatestFromSparse(const SeriesId128& seriesId) const {
         auto it = sparseIndex.find(seriesId);
-        if (it == sparseIndex.end() || !it->second.hasExtendedStats) return std::nullopt;
+        if (it == sparseIndex.end() || !it->second.hasExtendedStats)
+            return std::nullopt;
         return PointResult{it->second.maxTime, it->second.latestValue};
     }
     std::optional<PointResult> getFirstFromSparse(const SeriesId128& seriesId) const {
         auto it = sparseIndex.find(seriesId);
-        if (it == sparseIndex.end() || !it->second.hasExtendedStats) return std::nullopt;
+        if (it == sparseIndex.end() || !it->second.hasExtendedStats)
+            return std::nullopt;
         return PointResult{it->second.minTime, it->second.firstValue};
     }
 

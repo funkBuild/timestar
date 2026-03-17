@@ -123,7 +123,8 @@ uint64_t QueryParser::parseTime(const std::string& timeStr) {
 
 // Case-insensitive comparison without allocating a lowercase copy.
 static bool ciEqual(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) return false;
+    if (a.size() != b.size())
+        return false;
     for (size_t i = 0; i < a.size(); ++i) {
         if (static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a[i]))) !=
             static_cast<unsigned char>(b[i]))
@@ -135,17 +136,28 @@ static bool ciEqual(std::string_view a, std::string_view b) {
 AggregationMethod QueryParser::parseAggregation(const std::string& method) {
     std::string_view sv = trimView(method);
 
-    if (ciEqual(sv, "avg"))    return AggregationMethod::AVG;
-    if (ciEqual(sv, "min"))    return AggregationMethod::MIN;
-    if (ciEqual(sv, "max"))    return AggregationMethod::MAX;
-    if (ciEqual(sv, "sum"))    return AggregationMethod::SUM;
-    if (ciEqual(sv, "latest")) return AggregationMethod::LATEST;
-    if (ciEqual(sv, "count"))  return AggregationMethod::COUNT;
-    if (ciEqual(sv, "first"))  return AggregationMethod::FIRST;
-    if (ciEqual(sv, "median")) return AggregationMethod::MEDIAN;
-    if (ciEqual(sv, "stddev")) return AggregationMethod::STDDEV;
-    if (ciEqual(sv, "stdvar")) return AggregationMethod::STDVAR;
-    if (ciEqual(sv, "spread")) return AggregationMethod::SPREAD;
+    if (ciEqual(sv, "avg"))
+        return AggregationMethod::AVG;
+    if (ciEqual(sv, "min"))
+        return AggregationMethod::MIN;
+    if (ciEqual(sv, "max"))
+        return AggregationMethod::MAX;
+    if (ciEqual(sv, "sum"))
+        return AggregationMethod::SUM;
+    if (ciEqual(sv, "latest"))
+        return AggregationMethod::LATEST;
+    if (ciEqual(sv, "count"))
+        return AggregationMethod::COUNT;
+    if (ciEqual(sv, "first"))
+        return AggregationMethod::FIRST;
+    if (ciEqual(sv, "median"))
+        return AggregationMethod::MEDIAN;
+    if (ciEqual(sv, "stddev"))
+        return AggregationMethod::STDDEV;
+    if (ciEqual(sv, "stdvar"))
+        return AggregationMethod::STDVAR;
+    if (ciEqual(sv, "spread"))
+        return AggregationMethod::SPREAD;
 
     throw QueryParseException(
         "Must be one of 'avg', 'min', 'max', 'sum', 'latest', 'count', 'first', 'median', 'stddev', 'stdvar', "
@@ -203,7 +215,8 @@ std::vector<std::string> QueryParser::parseFields(const std::string& query, size
     size_t start = 0;
     while (start < fieldsView.size()) {
         size_t end = fieldsView.find(',', start);
-        if (end == std::string_view::npos) end = fieldsView.size();
+        if (end == std::string_view::npos)
+            end = fieldsView.size();
         std::string_view token = trimView(fieldsView.substr(start, end - start));
         if (token.empty()) {
             throw QueryParseException("Empty field name in field list");
@@ -239,7 +252,8 @@ std::map<std::string, std::string> QueryParser::parseScopes(const std::string& q
     size_t start = 0;
     while (start < scopesView.size()) {
         size_t end = scopesView.find(',', start);
-        if (end == std::string_view::npos) end = scopesView.size();
+        if (end == std::string_view::npos)
+            end = scopesView.size();
         std::string_view pair = trimView(scopesView.substr(start, end - start));
 
         size_t colonP = pair.find(':');
@@ -284,7 +298,8 @@ std::vector<std::string> QueryParser::parseGroupBy(const std::string& query, siz
     size_t start = 0;
     while (start < tagsView.size()) {
         size_t end = tagsView.find(',', start);
-        if (end == std::string_view::npos) end = tagsView.size();
+        if (end == std::string_view::npos)
+            end = tagsView.size();
         std::string_view token = trimView(tagsView.substr(start, end - start));
         if (token.empty()) {
             throw QueryParseException("Empty tag name in group by list");

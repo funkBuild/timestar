@@ -41,7 +41,8 @@ class QueryPlanner {
 public:
     // Create execution plan from query request
     // This will use the index to find matching series and map them to shards
-    seastar::future<QueryPlan> createPlan(const QueryRequest& request, seastar::sharded<index::NativeIndex>* indexSharded);
+    seastar::future<QueryPlan> createPlan(const QueryRequest& request,
+                                          seastar::sharded<index::NativeIndex>* indexSharded);
 
     // Synchronous version for testing
     QueryPlan createPlanSync(const QueryRequest& request, index::NativeIndex* index);
@@ -58,7 +59,8 @@ private:
         const QueryRequest& request, seastar::sharded<index::NativeIndex>* indexSharded);
 
     // Synchronous version for testing
-    std::vector<std::vector<SeriesId128>> findMatchingSeriesIdsSync(const QueryRequest& request, index::NativeIndex* index);
+    std::vector<std::vector<SeriesId128>> findMatchingSeriesIdsSync(const QueryRequest& request,
+                                                                    index::NativeIndex* index);
 
     // Map series IDs to their respective shards
     std::vector<std::vector<SeriesId128>> mapSeriesToShards(const std::vector<SeriesId128>& seriesIds,

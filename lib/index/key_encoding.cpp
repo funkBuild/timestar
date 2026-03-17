@@ -1,4 +1,5 @@
 #include "key_encoding.hpp"
+
 #include "key_encoding_simd.hpp"
 
 #include <charconv>
@@ -11,15 +12,15 @@ namespace timestar::index::keys {
 // Uses SIMD to scan for escape characters in 16-32 byte chunks.
 static void appendEscaped(std::string& out, const std::string& s) {
     // SIMD scan for first escape character
-    size_t firstEscape = (s.size() >= simd::kSimdThreshold)
-        ? simd::findFirstEscapeChar(s.data(), s.size())
-        : [&]() -> size_t {
-            for (size_t i = 0; i < s.size(); ++i) {
-                char c = s[i];
-                if (c == '\\' || c == ',' || c == '=' || c == ' ') return i;
-            }
-            return s.size();
-        }();
+    size_t firstEscape =
+        (s.size() >= simd::kSimdThreshold) ? simd::findFirstEscapeChar(s.data(), s.size()) : [&]() -> size_t {
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (c == '\\' || c == ',' || c == '=' || c == ' ')
+                return i;
+        }
+        return s.size();
+    }();
 
     if (firstEscape == s.size()) {
         // No escaping needed — fast append
@@ -33,11 +34,21 @@ static void appendEscaped(std::string& out, const std::string& s) {
     // Escape the rest
     for (size_t i = firstEscape; i < s.size(); ++i) {
         switch (s[i]) {
-            case '\\': out.append("\\\\", 2); break;
-            case ',': out.append("\\,", 2); break;
-            case '=': out.append("\\=", 2); break;
-            case ' ': out.append("\\ ", 2); break;
-            default: out.push_back(s[i]); break;
+            case '\\':
+                out.append("\\\\", 2);
+                break;
+            case ',':
+                out.append("\\,", 2);
+                break;
+            case '=':
+                out.append("\\=", 2);
+                break;
+            case ' ':
+                out.append("\\ ", 2);
+                break;
+            default:
+                out.push_back(s[i]);
+                break;
         }
     }
 }
@@ -49,7 +60,7 @@ std::string escapeKeyComponent(const std::string& s) {
 }
 
 std::string encodeSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
-                             const std::string& field) {
+                            const std::string& field) {
     size_t estimatedSize = 1 + measurement.size() + field.size() + 1;
     for (const auto& [k, v] : tags) {
         estimatedSize += 1 + k.size() + 1 + v.size();
@@ -139,7 +150,7 @@ std::string encodeMeasurementSeriesPrefix(const std::string& measurement) {
 }
 
 std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, const std::string& field,
-                                             const SeriesId128& seriesId) {
+                                            const SeriesId128& seriesId) {
     std::string key;
     key.reserve(1 + measurement.size() + 1 + field.size() + 1 + 16);
     key.push_back(static_cast<char>(MEASUREMENT_FIELD_SERIES));
@@ -222,7 +233,8 @@ SeriesMetadata decodeSeriesMetadata(const char* rawData, size_t rawLen) {
 
     // Fast null-byte scanner using memchr
     auto nextField = [&]() -> std::string_view {
-        if (p >= end) return {};
+        if (p >= end)
+            return {};
         const char* nul = static_cast<const char*>(std::memchr(p, '\0', static_cast<size_t>(end - p)));
         if (!nul) {
             std::string_view field(p, static_cast<size_t>(end - p));
@@ -238,7 +250,8 @@ SeriesMetadata decodeSeriesMetadata(const char* rawData, size_t rawLen) {
     metadata.field = std::string(nextField());
 
     std::string_view sizeStr = nextField();
-    if (sizeStr.empty()) return metadata;
+    if (sizeStr.empty())
+        return metadata;
 
     size_t tagCount = 0;
     auto [ptr, ec] = std::from_chars(sizeStr.data(), sizeStr.data() + sizeStr.size(), tagCount);
@@ -282,7 +295,8 @@ std::set<std::string> decodeStringSet(std::string_view encoded) {
         std::memcpy(&len, data + offset, sizeof(len));
         offset += sizeof(uint32_t);
 
-        if (offset + len > size) break;
+        if (offset + len > size)
+            break;
 
         result.emplace(data + offset, len);
         offset += len;
@@ -323,7 +337,7 @@ std::string encodeLocalIdCounterKey() {
 }
 
 std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
-                                     const std::string& tagValue) {
+                                    const std::string& tagValue) {
     std::string key;
     key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key.push_back(static_cast<char>(POSTINGS_BITMAP));
@@ -392,7 +406,7 @@ std::string encodeCardinalityHLLKey(const std::string& measurement) {
 }
 
 std::string encodeCardinalityHLLKey(const std::string& measurement, const std::string& tagKey,
-                                     const std::string& tagValue) {
+                                    const std::string& tagValue) {
     std::string key;
     key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key.push_back(static_cast<char>(CARDINALITY_HLL));

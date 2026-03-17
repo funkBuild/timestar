@@ -270,25 +270,25 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
 
     // Query only candidate TSM files
     size_t slotIdx = 0;
-    co_await seastar::parallel_for_each(
-        candidateFiles.begin(), candidateFiles.end(),
-        [&tsmSlots, &seriesId, startTime, endTime,
-         &slotIdx](const seastar::shared_ptr<TSM>& tsmFile) -> seastar::future<> {
-            // Assign index before any suspension point - safe in cooperative scheduling
-            // because parallel_for_each invokes the lambda sequentially before yielding
-            size_t myIdx = slotIdx++;
+    co_await seastar::parallel_for_each(candidateFiles.begin(), candidateFiles.end(),
+                                        [&tsmSlots, &seriesId, startTime, endTime,
+                                         &slotIdx](const seastar::shared_ptr<TSM>& tsmFile) -> seastar::future<> {
+                                            // Assign index before any suspension point - safe in cooperative scheduling
+                                            // because parallel_for_each invokes the lambda sequentially before yielding
+                                            size_t myIdx = slotIdx++;
 
-            // Use queryWithTombstones to automatically filter out deleted data
-            // SeriesId128 pre-computed by caller — no redundant hash here
-            TSMResult<T> results = co_await tsmFile.get()->queryWithTombstones<T>(seriesId, startTime, endTime);
+                                            // Use queryWithTombstones to automatically filter out deleted data
+                                            // SeriesId128 pre-computed by caller — no redundant hash here
+                                            TSMResult<T> results = co_await tsmFile.get()->queryWithTombstones<T>(
+                                                seriesId, startTime, endTime);
 
-            if (results.empty())
-                co_return;
+                                            if (results.empty())
+                                                co_return;
 
-            // readSeriesBatched() already sorts blocks by start time after
-            // parallel_for_each (tsm.cpp:707), so no redundant sort needed here.
-            tsmSlots[myIdx] = std::move(results);
-        });
+                                            // readSeriesBatched() already sorts blocks by start time after
+                                            // parallel_for_each (tsm.cpp:707), so no redundant sort needed here.
+                                            tsmSlots[myIdx] = std::move(results);
+                                        });
 
     // Collect non-empty results from the slots, paired with sparse time bounds.
     struct TimeBoundedResult {
@@ -350,15 +350,14 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
 
             for (auto& tbr : tsmResults) {
                 for (auto& block : tbr.result.blocks) {
-                    result.timestamps.insert(result.timestamps.end(),
-                                             block->timestamps.begin(), block->timestamps.end());
+                    result.timestamps.insert(result.timestamps.end(), block->timestamps.begin(),
+                                             block->timestamps.end());
                     if constexpr (std::is_same_v<T, bool>) {
                         for (size_t j = 0; j < block->values.size(); ++j) {
                             result.values.push_back(block->values[j]);
                         }
                     } else {
-                        result.values.insert(result.values.end(),
-                                             block->values.begin(), block->values.end());
+                        result.values.insert(result.values.end(), block->values.begin(), block->values.end());
                     }
                 }
             }
@@ -722,32 +721,37 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             if (isLatest || isFirst) {
                 // LATEST/FIRST: only need 1 point from TSM (the newest/oldest).
                 // Sort files by series time bounds and use sparse index for zero-I/O.
-                std::sort(seqSnap.begin(), seqSnap.end(),
-                          [&](const auto& a, const auto& b) {
-                              return isLatest ? a.second->getSeriesMaxTime(seriesId) > b.second->getSeriesMaxTime(seriesId)
-                                              : a.second->getSeriesMinTime(seriesId) < b.second->getSeriesMinTime(seriesId);
-                          });
+                std::sort(seqSnap.begin(), seqSnap.end(), [&](const auto& a, const auto& b) {
+                    return isLatest ? a.second->getSeriesMaxTime(seriesId) > b.second->getSeriesMaxTime(seriesId)
+                                    : a.second->getSeriesMinTime(seriesId) < b.second->getSeriesMinTime(seriesId);
+                });
 
                 bool tsmResolved = false;
                 for (const auto& [rank, tsmFile] : seqSnap) {
-                    if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime)) continue;
-                    if (tsmFile->hasTombstones()) { tsmResolved = false; break; }
-                    auto pt = isLatest ? tsmFile->getLatestFromSparse(seriesId)
-                                       : tsmFile->getFirstFromSparse(seriesId);
+                    if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime))
+                        continue;
+                    if (tsmFile->hasTombstones()) {
+                        tsmResolved = false;
+                        break;
+                    }
+                    auto pt = isLatest ? tsmFile->getLatestFromSparse(seriesId) : tsmFile->getFirstFromSparse(seriesId);
                     if (pt.has_value() && pt->timestamp >= startTime && pt->timestamp <= endTime) {
                         aggregator.addPoint(pt->timestamp, pt->value);
                         tsmResolved = true;
                         break;
                     }
-                    if (pt.has_value()) break;
+                    if (pt.has_value())
+                        break;
                 }
 
                 if (!tsmResolved) {
                     for (const auto& [rank, tsmFile] : seqSnap) {
-                        if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime)) continue;
-                        size_t pts = co_await tsmFile->aggregateSeriesSelective(
-                            seriesId, startTime, endTime, aggregator, isLatest, 1);
-                        if (pts > 0) break;
+                        if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime))
+                            continue;
+                        size_t pts = co_await tsmFile->aggregateSeriesSelective(seriesId, startTime, endTime,
+                                                                                aggregator, isLatest, 1);
+                        if (pts > 0)
+                            break;
                     }
                 }
             } else {
@@ -867,24 +871,26 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             // Skip files with tombstones — sparse stats don't reflect deletions.
             bool resolved = false;
             for (auto& file : candidateFiles) {
-                if (file->hasTombstones()) break;  // Tombstones invalidate sparse stats
-                auto pt = reverse ? file->getLatestFromSparse(seriesId)
-                                  : file->getFirstFromSparse(seriesId);
+                if (file->hasTombstones())
+                    break;  // Tombstones invalidate sparse stats
+                auto pt = reverse ? file->getLatestFromSparse(seriesId) : file->getFirstFromSparse(seriesId);
                 if (pt.has_value() && pt->timestamp >= startTime && pt->timestamp <= tsmEndTime) {
                     aggregator.addPoint(pt->timestamp, pt->value);
                     resolved = true;
                     break;
                 }
                 // Sparse stats timestamp outside query range — need block-level scan
-                if (pt.has_value()) break;
+                if (pt.has_value())
+                    break;
             }
 
             if (!resolved) {
                 // Fallback: DMA-based selective read for the single point
                 for (auto& file : candidateFiles) {
-                    size_t pts = co_await file->aggregateSeriesSelective(
-                        seriesId, startTime, tsmEndTime, aggregator, reverse, 1);
-                    if (pts > 0) break;
+                    size_t pts = co_await file->aggregateSeriesSelective(seriesId, startTime, tsmEndTime, aggregator,
+                                                                         reverse, 1);
+                    if (pts > 0)
+                        break;
                 }
             }
         } else if (aggregationInterval == 0) {

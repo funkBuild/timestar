@@ -1,5 +1,6 @@
 #include "http_stream_handler.hpp"
 
+#include "../utils/json_escape.hpp"
 #include "engine.hpp"
 #include "expression_evaluator.hpp"
 #include "expression_parser.hpp"
@@ -7,7 +8,6 @@
 #include "streaming_aggregator.hpp"
 #include "streaming_derived_evaluator.hpp"
 #include "timestar_config.hpp"
-#include "../utils/json_escape.hpp"
 
 #include <glaze/glaze.hpp>
 

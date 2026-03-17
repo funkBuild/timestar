@@ -230,13 +230,13 @@ private:
     }
 
 public:
-
     // Extract final aggregated value based on method
     // Return the representative timestamp for a collapsed state.
     // LATEST uses latestTimestamp; FIRST uses firstTimestamp; others use firstTimestamp
     // as a sensible default (earliest data point in the state).
     uint64_t getTimestamp(AggregationMethod method) const {
-        if (method == AggregationMethod::LATEST) return latestTimestamp;
+        if (method == AggregationMethod::LATEST)
+            return latestTimestamp;
         return firstTimestamp;
     }
 

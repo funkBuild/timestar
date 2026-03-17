@@ -43,7 +43,8 @@ public:
         int zeros = 0;
         for (size_t i = 0; i < NUM_REGISTERS; ++i) {
             sum += 1.0 / static_cast<double>(1ULL << registers_[i]);
-            if (registers_[i] == 0) ++zeros;
+            if (registers_[i] == 0)
+                ++zeros;
         }
 
         // alpha_m constant for m = 16384
@@ -52,7 +53,8 @@ public:
 
         // Small range correction (linear counting)
         if (raw <= 2.5 * static_cast<double>(NUM_REGISTERS) && zeros > 0) {
-            return static_cast<double>(NUM_REGISTERS) * std::log(static_cast<double>(NUM_REGISTERS) / static_cast<double>(zeros));
+            return static_cast<double>(NUM_REGISTERS) *
+                   std::log(static_cast<double>(NUM_REGISTERS) / static_cast<double>(zeros));
         }
 
         return raw;
@@ -82,7 +84,8 @@ public:
     // True if all registers are zero (no data added).
     bool empty() const {
         for (size_t i = 0; i < NUM_REGISTERS; ++i) {
-            if (registers_[i] != 0) return false;
+            if (registers_[i] != 0)
+                return false;
         }
         return true;
     }

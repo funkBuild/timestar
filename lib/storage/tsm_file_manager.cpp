@@ -8,9 +8,9 @@
 
 #include <filesystem>
 #include <seastar/core/reactor.hh>
-#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/with_scheduling_group.hh>
 
 namespace fs = std::filesystem;
 
@@ -213,10 +213,7 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
                         // query I/O gets preferential disk bandwidth. Pass plan as
                         // an argument (not capture) to avoid dangling references.
                         stats = co_await seastar::with_scheduling_group(
-                            _compactionGroup,
-                            [this](CompactionPlan p) {
-                                return compactor->executeCompaction(p);
-                            },
+                            _compactionGroup, [this](CompactionPlan p) { return compactor->executeCompaction(p); },
                             std::move(plan));
                     } else {
                         stats = co_await compactor->executeCompaction(plan);

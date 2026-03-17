@@ -63,8 +63,8 @@ private:
 
     // Seastar DMA file handle and write positions
     std::optional<seastar::file> walFile_;
-    uint64_t writePos_ = 0;       // Logical bytes written (for truncate)
-    uint64_t dmaWritePos_ = 0;    // Physical DMA-aligned write offset
+    uint64_t writePos_ = 0;     // Logical bytes written (for truncate)
+    uint64_t dmaWritePos_ = 0;  // Physical DMA-aligned write offset
     size_t dmaAlignment_ = 4096;
 
     // Write buffer — accumulates records, flushed on rotate()/close() or when full.

@@ -98,7 +98,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 size_t skip_words = packed_words;
                 if (exception_count > 0) [[unlikely]] {
                     skip_words += (exception_count * 2 + 7) / 8;  // position words
-                    skip_words += exception_count;                  // value words
+                    skip_words += exception_count;                // value words
                 }
                 encoded.skipWords(skip_words);
                 global_pos += block_count;
@@ -267,8 +267,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 size_t right_packed_words = alp::ffor_packed_words(block_count, right_bw);
                 alignas(8) uint64_t right_packed_stack[1024];
                 encoded.readAlignedWords(right_packed_stack, right_packed_words);
-                alp::ffor_unpack_u64(right_packed_stack, block_count, right_for_base, right_bw,
-                                     right_parts_stack);
+                alp::ffor_unpack_u64(right_packed_stack, block_count, right_for_base, right_bw, right_parts_stack);
             }
 
             // === Read Exceptions ===

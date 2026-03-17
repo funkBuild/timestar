@@ -1,7 +1,8 @@
 #include "placement_table.hpp"
 
-#include <fstream>
 #include <glaze/glaze.hpp>
+
+#include <fstream>
 
 namespace timestar {
 
@@ -36,21 +37,20 @@ PlacementTable PlacementTable::buildLocal(unsigned coreCount) {
     PlacementTable pt;
     pt.coreCount_ = coreCount;
     // Cache power-of-2 mask for fast routing (bitwise AND vs modulo)
-    pt.coreMask_ = (coreCount > 1 && (coreCount & (coreCount - 1)) == 0)
-        ? (coreCount - 1) : 0;
+    pt.coreMask_ = (coreCount > 1 && (coreCount & (coreCount - 1)) == 0) ? (coreCount - 1) : 0;
     for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
         pt.table_[i].serverId = 0;
-        pt.table_[i].coreId = coreCount > 0
-            ? static_cast<uint16_t>(i % coreCount)
-            : 0;
+        pt.table_[i].coreId = coreCount > 0 ? static_cast<uint16_t>(i % coreCount) : 0;
     }
     return pt;
 }
 
 unsigned PlacementTable::coreForHash(size_t hash) const {
-    if (coreCount_ <= 1) return 0;
+    if (coreCount_ <= 1)
+        return 0;
     // Fast path: power-of-2 core counts use bitwise AND (1 cycle vs ~20 for modulo)
-    if (coreMask_) return static_cast<unsigned>(hash & coreMask_);
+    if (coreMask_)
+        return static_cast<unsigned>(hash & coreMask_);
     return static_cast<unsigned>(hash % coreCount_);
 }
 
@@ -70,12 +70,8 @@ struct PlacementJson {
 template <>
 struct glz::meta<PlacementJson> {
     using T = PlacementJson;
-    static constexpr auto value = object(
-        "coreCount", &T::coreCount,
-        "virtualShardCount", &T::virtualShardCount,
-        "serverIds", &T::serverIds,
-        "coreIds", &T::coreIds
-    );
+    static constexpr auto value = object("coreCount", &T::coreCount, "virtualShardCount", &T::virtualShardCount,
+                                         "serverIds", &T::serverIds, "coreIds", &T::coreIds);
 };
 
 namespace timestar {
@@ -102,8 +98,7 @@ PlacementTable PlacementTable::fromJson(const std::string& data) {
 
     PlacementTable pt;
     pt.coreCount_ = pj.coreCount;
-    pt.coreMask_ = (pj.coreCount > 1 && (pj.coreCount & (pj.coreCount - 1)) == 0)
-        ? (pj.coreCount - 1) : 0;
+    pt.coreMask_ = (pj.coreCount > 1 && (pj.coreCount & (pj.coreCount - 1)) == 0) ? (pj.coreCount - 1) : 0;
     pt.table_.fill(VShardMapping{});
     size_t count = std::min<size_t>(pj.serverIds.size(), VIRTUAL_SHARD_COUNT);
     for (size_t i = 0; i < count; ++i) {

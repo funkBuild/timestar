@@ -66,10 +66,8 @@ public:
         results.timestamps.reserve(totalPoints);
         results.values.reserve(totalPoints);
         for (auto& block : singleResult.blocks) {
-            results.timestamps.insert(results.timestamps.end(),
-                                      block->timestamps.begin(), block->timestamps.end());
-            results.values.insert(results.values.end(),
-                                  block->values.begin(), block->values.end());
+            results.timestamps.insert(results.timestamps.end(), block->timestamps.begin(), block->timestamps.end());
+            results.values.insert(results.values.end(), block->values.begin(), block->values.end());
         }
         return results;
     }

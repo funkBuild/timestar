@@ -1,19 +1,19 @@
 #include "native_index.hpp"
 
 #include "../key_encoding.hpp"
-#include "tsm.hpp"         // for TSMValueType definition
 #include "series_key.hpp"  // for buildSeriesKey
+#include "tsm.hpp"         // for TSMValueType definition
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/seastar.hh>
-#include <seastar/core/smp.hh>
-#include <seastar/util/log.hh>
+#include <glaze/glaze.hpp>
 
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <format>
-#include <glaze/glaze.hpp>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/util/log.hh>
 
 // Use short namespace alias for key encoding
 namespace ke = timestar::index::keys;
@@ -172,8 +172,8 @@ seastar::future<> NativeIndex::open() {
     // This avoids scanning all HLL/bloom KV entries at startup, which can stall for
     // 10K+ measurements.
 
-    ::native_index_log.info("NativeIndex opened at: {} ({} SSTables, {} MemTable entries, {} local IDs)",
-                          indexPath_, manifest_->files().size(), memtable_->size(), localIdMap_.size());
+    ::native_index_log.info("NativeIndex opened at: {} ({} SSTables, {} MemTable entries, {} local IDs)", indexPath_,
+                            manifest_->files().size(), memtable_->size(), localIdMap_.size());
 }
 
 seastar::future<> NativeIndex::close() {
@@ -193,7 +193,8 @@ seastar::future<> NativeIndex::close() {
     }
     sstableReaders_.clear();
 
-    if (wal_) co_await wal_->close();
+    if (wal_)
+        co_await wal_->close();
     if (manifest_) {
         co_await manifest_->writeSnapshot();
         co_await manifest_->close();
@@ -281,19 +282,24 @@ std::optional<std::string> NativeIndex::kvGet(std::string_view key) {
 bool NativeIndex::kvExists(std::string_view key) {
     // 1. Check active MemTable first (newest)
     auto memResult = memtable_->get(key);
-    if (memResult.has_value()) return true;
-    if (memtable_->isTombstone(key)) return false;
+    if (memResult.has_value())
+        return true;
+    if (memtable_->isTombstone(key))
+        return false;
 
     // 2. Check immutable MemTable (being flushed)
     if (immutableMemtable_) {
         auto immResult = immutableMemtable_->get(key);
-        if (immResult.has_value()) return true;
-        if (immutableMemtable_->isTombstone(key)) return false;
+        if (immResult.has_value())
+            return true;
+        if (immutableMemtable_->isTombstone(key))
+            return false;
     }
 
     // 3. Check SSTables (newest to oldest)
     for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
-        if (it->second->contains(key)) return true;
+        if (it->second->contains(key))
+            return true;
     }
 
     return false;
@@ -335,11 +341,11 @@ void NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallback fn) {
         iter->seek(prefix);
         while (iter->valid()) {
             auto key = iter->key();
-            if (key.size() < prefix.size() ||
-                std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+            if (key.size() < prefix.size() || std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
                 break;
             }
-            if (!fn(key, iter->value())) break;
+            if (!fn(key, iter->value()))
+                break;
             iter->next();
         }
         return;
@@ -351,13 +357,13 @@ void NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallback fn) {
         iter.seek(prefix);
         while (iter.valid()) {
             auto key = iter.key();
-            if (key.size() < prefix.size() ||
-                std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+            if (key.size() < prefix.size() || std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
                 break;
             }
             // Skip tombstones in single-source scan
             if (!iter.isTombstone()) {
-                if (!fn(key, iter.value())) break;
+                if (!fn(key, iter.value()))
+                    break;
             }
             iter.next();
         }
@@ -386,11 +392,11 @@ void NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallback fn) {
 
     while (merger.valid()) {
         auto key = merger.key();
-        if (key.size() < prefix.size() ||
-            std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
+        if (key.size() < prefix.size() || std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
             break;
         }
-        if (!fn(key, merger.value())) break;
+        if (!fn(key, merger.value()))
+            break;
         merger.nextSync();
     }
 }
@@ -405,12 +411,14 @@ seastar::future<> NativeIndex::waitForFlush() {
 seastar::future<> NativeIndex::maybeFlushMemTable() {
     auto usage = memtable_->approximateMemoryUsage();
     auto threshold = timestar::config().index.write_buffer_size;
-    if (usage < threshold) co_return;
+    if (usage < threshold)
+        co_return;
 
     ::native_index_log.info("Flushing MemTable: {} bytes >= {} threshold", usage, threshold);
 
     // Phase 2+3+4: Flush dirty bitmaps, day bitmaps, HLLs, and blooms before memtable swap
-    if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() || !dirtyMeasurementBlooms_.empty()) {
+    if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() ||
+        !dirtyMeasurementBlooms_.empty()) {
         IndexWriteBatch postingsBatch;
         flushDirtyBitmaps(postingsBatch);
         flushDirtyDayBitmaps(postingsBatch);
@@ -423,8 +431,8 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
         // Evict non-dirty cache entries to bound memory growth
         trimBitmapCache();
         trimDayBitmapCache();
-        trimHllCache();           // Step 7
-        trimTagValuesCache();     // Step 6
+        trimHllCache();        // Step 7
+        trimTagValuesCache();  // Step 6
         trimSchemaCaches();
         trimMeasurementBloomCache();
     }
@@ -453,7 +461,8 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
 // Blocking flush — used by close() and compact() where we need synchronous completion.
 seastar::future<> NativeIndex::flushMemTable() {
     // Phase 2+3+4: Flush dirty bitmaps, day bitmaps, HLLs, and blooms before checking empty
-    if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() || !dirtyMeasurementBlooms_.empty()) {
+    if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() ||
+        !dirtyMeasurementBlooms_.empty()) {
         IndexWriteBatch postingsBatch;
         flushDirtyBitmaps(postingsBatch);
         flushDirtyDayBitmaps(postingsBatch);
@@ -465,8 +474,8 @@ seastar::future<> NativeIndex::flushMemTable() {
         }
         trimBitmapCache();
         trimDayBitmapCache();
-        trimHllCache();           // Step 7
-        trimTagValuesCache();     // Step 6
+        trimHllCache();        // Step 7
+        trimTagValuesCache();  // Step 6
         trimSchemaCaches();
         trimMeasurementBloomCache();
     }
@@ -496,10 +505,11 @@ seastar::future<> NativeIndex::flushMemTable() {
 
 // Writes the immutable memtable to an SSTable. Does NOT touch active memtable.
 seastar::future<> NativeIndex::doFlushImmutableMemTable() {
-    if (!immutableMemtable_ || immutableMemtable_->empty()) co_return;
+    if (!immutableMemtable_ || immutableMemtable_->empty())
+        co_return;
 
-    ::native_index_log.info("Flushing immutable MemTable: {} entries, {} approx bytes",
-                            immutableMemtable_->size(), immutableMemtable_->approximateMemoryUsage());
+    ::native_index_log.info("Flushing immutable MemTable: {} entries, {} approx bytes", immutableMemtable_->size(),
+                            immutableMemtable_->approximateMemoryUsage());
 
     // Count live (non-tombstone) entries
     size_t liveCount = 0;
@@ -507,7 +517,8 @@ seastar::future<> NativeIndex::doFlushImmutableMemTable() {
         auto countIt = immutableMemtable_->newIterator();
         countIt.seekToFirst();
         while (countIt.valid()) {
-            if (!countIt.isTombstone()) ++liveCount;
+            if (!countIt.isTombstone())
+                ++liveCount;
             countIt.next();
         }
     }
@@ -521,7 +532,7 @@ seastar::future<> NativeIndex::doFlushImmutableMemTable() {
     uint64_t fileNum = manifest_->nextFileNumber();
     auto path = sstFilename(fileNum);
     auto writer = co_await SSTableWriter::create(path, timestar::config().index.block_size,
-                                                  timestar::config().index.bloom_filter_bits);
+                                                 timestar::config().index.bloom_filter_bits);
 
     auto it = immutableMemtable_->newIterator();
     it.seekToFirst();
@@ -582,8 +593,8 @@ void NativeIndex::seriesCacheEvictIncremental() {
 // Stage 4: Coalesced insert — all metadata (series, fields, tags) written
 // in a single WAL batch instead of 2-6 separate writes.
 seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measurement,
-                                                                std::map<std::string, std::string> tags,
-                                                                std::string field) {
+                                                              std::map<std::string, std::string> tags,
+                                                              std::string field) {
     // Compute SeriesId128 from the canonical series key string.
     // This produces the same ID used by the data plane (TSM, WAL, MemoryStore),
     // ensuring index metadata lookups match data lookups without recomputation.
@@ -642,7 +653,8 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
     auto& fieldCache = fieldsCache_[measurement];
     if (fieldCache.empty()) {
         auto val = kvGet(ke::encodeMeasurementFieldsKey(measurement));
-        if (val.has_value()) fieldCache = ke::decodeStringSet(*val);
+        if (val.has_value())
+            fieldCache = ke::decodeStringSet(*val);
     }
     if (fieldCache.insert(field).second) {
         batch.put(ke::encodeMeasurementFieldsKey(measurement), ke::encodeStringSet(fieldCache));
@@ -653,7 +665,8 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
     auto& tagKeysCache = tagsCache_[measurement];
     if (tagKeysCache.empty()) {
         auto val = kvGet(ke::encodeMeasurementTagsKey(measurement));
-        if (val.has_value()) tagKeysCache = ke::decodeStringSet(*val);
+        if (val.has_value())
+            tagKeysCache = ke::decodeStringSet(*val);
     }
     // Reusable buffer for tag-values cache key
     std::string tvCacheKey;
@@ -673,7 +686,8 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
         std::string tagValuesKvKey = ke::encodeTagValuesKey(measurement, tagKey);
         if (tagVals.empty()) {
             auto val = kvGet(tagValuesKvKey);
-            if (val.has_value()) tagVals = ke::decodeStringSet(*val);
+            if (val.has_value())
+                tagVals = ke::decodeStringSet(*val);
         }
         if (tagVals.insert(tagValue).second) {
             batch.put(std::move(tagValuesKvKey), ke::encodeStringSet(tagVals));
@@ -697,8 +711,9 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
     co_return seriesId;
 }
 
-seastar::future<std::optional<SeriesId128>> NativeIndex::getSeriesId(
-    const std::string& measurement, const std::map<std::string, std::string>& tags, const std::string& field) {
+seastar::future<std::optional<SeriesId128>> NativeIndex::getSeriesId(const std::string& measurement,
+                                                                     const std::map<std::string, std::string>& tags,
+                                                                     const std::string& field) {
     std::string seriesKey = timestar::buildSeriesKey(measurement, tags, field);
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
@@ -713,11 +728,13 @@ seastar::future<std::optional<SeriesId128>> NativeIndex::getSeriesId(
 seastar::future<std::optional<SeriesMetadata>> NativeIndex::getSeriesMetadata(const SeriesId128& seriesId) {
     // Check metadata cache
     auto cached = seriesMetadataCache_.get(seriesId);
-    if (cached) co_return *cached;
+    if (cached)
+        co_return *cached;
 
     auto key = ke::encodeSeriesMetadataKey(seriesId);
     auto val = kvGet(key);
-    if (!val.has_value()) co_return std::nullopt;
+    if (!val.has_value())
+        co_return std::nullopt;
 
     auto metadata = ke::decodeSeriesMetadata(*val);
     seriesMetadataCache_.put(seriesId, metadata);
@@ -767,7 +784,8 @@ seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>
 
 seastar::future<> NativeIndex::addField(const std::string& measurement, const std::string& field) {
     auto& cached = fieldsCache_[measurement];
-    if (cached.count(field)) co_return;
+    if (cached.count(field))
+        co_return;
 
     // Load from storage if cache is empty
     if (cached.empty()) {
@@ -784,7 +802,7 @@ seastar::future<> NativeIndex::addField(const std::string& measurement, const st
 }
 
 seastar::future<> NativeIndex::addTag(const std::string& measurement, const std::string& tagKey,
-                                       const std::string& tagValue) {
+                                      const std::string& tagValue) {
     // Add tag key
     auto& tagKeys = tagsCache_[measurement];
     if (tagKeys.empty()) {
@@ -827,7 +845,7 @@ seastar::future<> NativeIndex::addTag(const std::string& measurement, const std:
 }
 
 seastar::future<> NativeIndex::addFieldsAndTags(const std::string& measurement, const std::string& field,
-                                                  const std::map<std::string, std::string>& tags) {
+                                                const std::map<std::string, std::string>& tags) {
     co_await addField(measurement, field);
     for (const auto& [tagKey, tagValue] : tags) {
         co_await addTag(measurement, tagKey, tagValue);
@@ -835,14 +853,15 @@ seastar::future<> NativeIndex::addFieldsAndTags(const std::string& measurement, 
 }
 
 seastar::future<> NativeIndex::setFieldType(const std::string& measurement, const std::string& field,
-                                              const std::string& type) {
+                                            const std::string& type) {
     std::string cacheKey;
     cacheKey.reserve(measurement.size() + 1 + field.size());
     cacheKey = measurement;
     cacheKey.push_back('\0');
     cacheKey += field;
     // Step 8: Check cache first, then use kvExists (no value copy needed)
-    if (knownFieldTypes_.count(cacheKey)) co_return;
+    if (knownFieldTypes_.count(cacheKey))
+        co_return;
 
     co_await kvPut(ke::encodeFieldTypeKey(measurement, field), type);
     knownFieldTypes_.insert(cacheKey);
@@ -888,7 +907,8 @@ seastar::future<std::set<std::string>> NativeIndex::getAllMeasurements() {
 
 seastar::future<std::set<std::string>> NativeIndex::getFields(const std::string& measurement) {
     auto& cached = fieldsCache_[measurement];
-    if (!cached.empty()) co_return cached;
+    if (!cached.empty())
+        co_return cached;
 
     auto val = kvGet(ke::encodeMeasurementFieldsKey(measurement));
     if (val.has_value()) {
@@ -899,7 +919,8 @@ seastar::future<std::set<std::string>> NativeIndex::getFields(const std::string&
 
 seastar::future<std::set<std::string>> NativeIndex::getTags(const std::string& measurement) {
     auto& cached = tagsCache_[measurement];
-    if (!cached.empty()) co_return cached;
+    if (!cached.empty())
+        co_return cached;
 
     auto val = kvGet(ke::encodeMeasurementTagsKey(measurement));
     if (val.has_value()) {
@@ -909,14 +930,15 @@ seastar::future<std::set<std::string>> NativeIndex::getTags(const std::string& m
 }
 
 seastar::future<std::set<std::string>> NativeIndex::getTagValues(const std::string& measurement,
-                                                                   const std::string& tagKey) {
+                                                                 const std::string& tagKey) {
     std::string tvCacheKey;
     tvCacheKey.reserve(measurement.size() + 1 + tagKey.size());
     tvCacheKey = measurement;
     tvCacheKey.push_back('\0');
     tvCacheKey += tagKey;
     auto& cached = tagValuesCache_[tvCacheKey];
-    if (!cached.empty()) co_return cached;
+    if (!cached.empty())
+        co_return cached;
 
     auto val = kvGet(ke::encodeTagValuesKey(measurement, tagKey));
     if (val.has_value()) {
@@ -926,16 +948,26 @@ seastar::future<std::set<std::string>> NativeIndex::getTagValues(const std::stri
 }
 
 seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>& ops) {
-    if (ops.empty()) co_return;
+    if (ops.empty())
+        co_return;
 
     for (const auto& op : ops) {
         std::string typeStr;
         switch (op.valueType) {
-            case TSMValueType::Float: typeStr = "float"; break;
-            case TSMValueType::Boolean: typeStr = "boolean"; break;
-            case TSMValueType::String: typeStr = "string"; break;
-            case TSMValueType::Integer: typeStr = "integer"; break;
-            default: break;
+            case TSMValueType::Float:
+                typeStr = "float";
+                break;
+            case TSMValueType::Boolean:
+                typeStr = "boolean";
+                break;
+            case TSMValueType::String:
+                typeStr = "string";
+                break;
+            case TSMValueType::Integer:
+                typeStr = "integer";
+                break;
+            default:
+                break;
         }
 
         co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
@@ -976,7 +1008,8 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
     for (const auto& [tagKey, tagValue] : tagFilters) {
         buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
         auto* bitmap = getPostingsBitmapByKey(cacheKey);
-        if (!bitmap) co_return std::vector<SeriesId128>{};
+        if (!bitmap)
+            co_return std::vector<SeriesId128>{};
         bitmaps.push_back({bitmap});
     }
 
@@ -1012,8 +1045,8 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
 // in a single pass — avoids materializing an intermediate vector<SeriesId128>.
 seastar::future<std::expected<std::vector<IndexBackend::SeriesWithMetadata>, SeriesLimitExceeded>>
 NativeIndex::findSeriesWithMetadata(const std::string& measurement,
-                                     const std::map<std::string, std::string>& tagFilters,
-                                     const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
+                                    const std::map<std::string, std::string>& tagFilters,
+                                    const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
     // For no-tag queries, fall through to the vector-based path
     if (tagFilters.empty()) {
         auto findResult = co_await getAllSeriesForMeasurement(measurement, maxSeries);
@@ -1042,10 +1075,14 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
                     meta = &*decoded;
                 }
             }
-            if (!meta) continue;
-            if (!fieldFilter.empty() && !fieldFilter.count(meta->field)) continue;
-            if (decoded) results.push_back({id, std::move(*decoded)});
-            else results.push_back({id, *meta});
+            if (!meta)
+                continue;
+            if (!fieldFilter.empty() && !fieldFilter.count(meta->field))
+                continue;
+            if (decoded)
+                results.push_back({id, std::move(*decoded)});
+            else
+                results.push_back({id, *meta});
         }
         co_return results;
     }
@@ -1061,16 +1098,20 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
         auto& [tagKey, tagValue] = *tagFilters.begin();
         buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
         singleBitmap = getPostingsBitmapByKey(cacheKey);
-        if (!singleBitmap) co_return std::vector<SeriesWithMetadata>{};
+        if (!singleBitmap)
+            co_return std::vector<SeriesWithMetadata>{};
     } else {
         // Multi-tag — build intersection (smallest-first)
-        struct TagBitmap { const roaring::Roaring* bmp; };
+        struct TagBitmap {
+            const roaring::Roaring* bmp;
+        };
         std::vector<TagBitmap> bitmaps;
         bitmaps.reserve(tagFilters.size());
         for (const auto& [tagKey, tagValue] : tagFilters) {
             buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
             auto* bmp = getPostingsBitmapByKey(cacheKey);
-            if (!bmp) co_return std::vector<SeriesWithMetadata>{};
+            if (!bmp)
+                co_return std::vector<SeriesWithMetadata>{};
             bitmaps.push_back({bmp});
         }
         std::sort(bitmaps.begin(), bitmaps.end(),
@@ -1095,7 +1136,8 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
 
     for (auto it = bitmap.begin(); it != bitmap.end(); ++it) {
         uint32_t localId = *it;
-        if (localId >= localIdMap_.nextId()) continue;
+        if (localId >= localIdMap_.nextId())
+            continue;
         const SeriesId128& id = localIdMap_.getGlobalId(localId);
 
         auto cached = seriesMetadataCache_.get(id);
@@ -1115,19 +1157,24 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
                 meta = &*decoded;
             }
         }
-        if (!meta) continue;
-        if (!fieldFilter.empty() && !fieldFilter.count(meta->field)) continue;
-        if (decoded) results.push_back({id, std::move(*decoded)});
-        else results.push_back({id, *meta});
+        if (!meta)
+            continue;
+        if (!fieldFilter.empty() && !fieldFilter.count(meta->field))
+            continue;
+        if (decoded)
+            results.push_back({id, std::move(*decoded)});
+        else
+            results.push_back({id, *meta});
     }
 
     co_return results;
 }
 
-seastar::future<std::expected<std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>>, SeriesLimitExceeded>>
+seastar::future<
+    std::expected<std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>>, SeriesLimitExceeded>>
 NativeIndex::findSeriesWithMetadataCached(const std::string& measurement,
-                                           const std::map<std::string, std::string>& tagFilters,
-                                           const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
+                                          const std::map<std::string, std::string>& tagFilters,
+                                          const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
     // Build cache key with generation counter to avoid O(N) prefix scan on invalidation
     uint64_t gen = discoveryCacheGen_[measurement];
     std::string cacheKey = measurement;
@@ -1147,7 +1194,8 @@ NativeIndex::findSeriesWithMetadataCached(const std::string& measurement,
     }
 
     auto cached = discoveryCache_.get(cacheKey);
-    if (cached) co_return *cached;
+    if (cached)
+        co_return *cached;
 
     auto result = co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
     if (!result.has_value()) {
@@ -1164,24 +1212,32 @@ void NativeIndex::invalidateDiscoveryCache(const std::string& measurement) {
     discoveryCacheGen_[measurement] = nextDiscoveryCacheGen_++;
 }
 
-size_t NativeIndex::getMetadataCacheSize() const { return seriesMetadataCache_.size(); }
-size_t NativeIndex::getMetadataCacheBytes() const { return seriesMetadataCache_.currentBytes(); }
-size_t NativeIndex::getDiscoveryCacheSize() const { return discoveryCache_.size(); }
-size_t NativeIndex::getDiscoveryCacheBytes() const { return discoveryCache_.currentBytes(); }
+size_t NativeIndex::getMetadataCacheSize() const {
+    return seriesMetadataCache_.size();
+}
+size_t NativeIndex::getMetadataCacheBytes() const {
+    return seriesMetadataCache_.currentBytes();
+}
+size_t NativeIndex::getDiscoveryCacheSize() const {
+    return discoveryCache_.size();
+}
+size_t NativeIndex::getDiscoveryCacheBytes() const {
+    return discoveryCache_.currentBytes();
+}
 
 // ============================================================================
 // Tag queries
 // ============================================================================
 
 seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTag(const std::string& measurement,
-                                                                        const std::string& tagKey,
-                                                                        const std::string& tagValue,
-                                                                        size_t maxSeries) {
+                                                                       const std::string& tagKey,
+                                                                       const std::string& tagValue, size_t maxSeries) {
     // Phase 2: Load roaring bitmap (const ref, no copy) and reverse-lookup to global IDs
     std::string cacheKey;
     buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
     auto* bitmap = getPostingsBitmapByKey(cacheKey);
-    if (!bitmap) co_return std::vector<SeriesId128>{};
+    if (!bitmap)
+        co_return std::vector<SeriesId128>{};
 
     std::vector<SeriesId128> result;
     result.reserve(bitmap->cardinality());
@@ -1190,16 +1246,17 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTag(const std
         if (localId < localIdMap_.nextId()) {
             result.push_back(localIdMap_.getGlobalId(localId));
         }
-        if (maxSeries > 0 && result.size() > maxSeries) break;
+        if (maxSeries > 0 && result.size() > maxSeries)
+            break;
     }
 
     co_return result;
 }
 
 seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTagPattern(const std::string& measurement,
-                                                                               const std::string& tagKey,
-                                                                               const std::string& scopeValue,
-                                                                               size_t maxSeries) {
+                                                                              const std::string& tagKey,
+                                                                              const std::string& scopeValue,
+                                                                              size_t maxSeries) {
     // For simplicity, treat patterns as exact match for now.
     // Full wildcard/regex support can be added later.
     co_return co_await findSeriesByTag(measurement, tagKey, scopeValue, maxSeries);
@@ -1225,7 +1282,8 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
     // For each, check if cache has a dirty override; if so, use the cache version.
     kvPrefixScan(bitmapPrefix, [&](std::string_view key, std::string_view value) {
         auto tagValue = key.substr(bitmapPrefix.size());
-        if (tagValue.empty() || value.empty()) return true;
+        if (tagValue.empty() || value.empty())
+            return true;
         std::string fullCacheKey = cachePrefix + std::string(tagValue);
         auto cacheIt = bitmapCache_.find(fullCacheKey);
         if (cacheIt != bitmapCache_.end()) {
@@ -1244,10 +1302,10 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
     // Second: add any dirty cache entries that don't have a KV counterpart
     // (new tag values inserted since last flush). Only scan dirty entries.
     for (auto cacheIt = bitmapCache_.begin(); cacheIt != bitmapCache_.end(); ++cacheIt) {
-        if (!cacheIt->second.dirty) continue;
+        if (!cacheIt->second.dirty)
+            continue;
         auto& postingsKey = cacheIt->first;
-        if (postingsKey.size() > cachePrefix.size() &&
-            postingsKey.compare(0, cachePrefix.size(), cachePrefix) == 0) {
+        if (postingsKey.size() > cachePrefix.size() && postingsKey.compare(0, cachePrefix.size(), cachePrefix) == 0) {
             std::string tagValue = postingsKey.substr(cachePrefix.size());
             if (bitmapsByValue.find(tagValue) == bitmapsByValue.end()) {
                 bitmapsByValue[tagValue] = &cacheIt->second.bitmap;
@@ -1258,7 +1316,8 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
     // Reverse-lookup to global IDs
     std::map<std::string, std::vector<SeriesId128>> result;
     for (auto& [tagValue, bitmapPtr] : bitmapsByValue) {
-        if (!bitmapPtr || bitmapPtr->isEmpty()) continue;
+        if (!bitmapPtr || bitmapPtr->isEmpty())
+            continue;
         auto& vec = result[tagValue];
         vec.reserve(bitmapPtr->cardinality());
         for (auto it = bitmapPtr->begin(); it != bitmapPtr->end(); ++it) {
@@ -1277,7 +1336,7 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
 // ============================================================================
 
 seastar::future<> NativeIndex::updateFieldStats(const SeriesId128& seriesId, const std::string& field,
-                                                  const IndexFieldStats& stats) {
+                                                const IndexFieldStats& stats) {
     std::string key;
     key.push_back(FIELD_STATS);
     seriesId.appendTo(key);
@@ -1297,7 +1356,7 @@ seastar::future<> NativeIndex::updateFieldStats(const SeriesId128& seriesId, con
 }
 
 seastar::future<std::optional<IndexFieldStats>> NativeIndex::getFieldStats(const SeriesId128& seriesId,
-                                                                            const std::string& field) {
+                                                                           const std::string& field) {
     std::string key;
     key.push_back(FIELD_STATS);
     seriesId.appendTo(key);
@@ -1305,14 +1364,16 @@ seastar::future<std::optional<IndexFieldStats>> NativeIndex::getFieldStats(const
     key += field;
 
     auto val = kvGet(key);
-    if (!val.has_value()) co_return std::nullopt;
+    if (!val.has_value())
+        co_return std::nullopt;
 
     IndexFieldStats stats;
     std::string_view data(*val);
     size_t pos = 0;
 
     auto nextField = [&]() -> std::string_view {
-        if (pos >= data.size()) return {};
+        if (pos >= data.size())
+            return {};
         auto end = data.find('\0', pos);
         if (end == std::string_view::npos) {
             auto f = data.substr(pos);
@@ -1352,7 +1413,8 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
         if (key.size() >= prefix.size() + 16) {
             result.push_back(SeriesId128::fromBytes(key.data() + prefix.size(), 16));
         }
-        if (result.size() > effectiveMax) return false;
+        if (result.size() > effectiveMax)
+            return false;
         return true;
     });
 
@@ -1367,9 +1429,15 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
 // Cache management
 // ============================================================================
 
-void NativeIndex::setMaxSeriesCacheSize(size_t maxSize) { maxSeriesCacheSize_ = maxSize; }
-size_t NativeIndex::getMaxSeriesCacheSize() const { return maxSeriesCacheSize_; }
-size_t NativeIndex::getSeriesCacheSize() const { return indexedSeriesCache_.size(); }
+void NativeIndex::setMaxSeriesCacheSize(size_t maxSize) {
+    maxSeriesCacheSize_ = maxSize;
+}
+size_t NativeIndex::getMaxSeriesCacheSize() const {
+    return maxSeriesCacheSize_;
+}
+size_t NativeIndex::getSeriesCacheSize() const {
+    return indexedSeriesCache_.size();
+}
 
 seastar::future<> NativeIndex::rebuildMeasurementSeriesIndex() {
     // No-op for NativeIndex — the MEASUREMENT_SERIES index is always maintained.
@@ -1393,11 +1461,13 @@ seastar::future<> NativeIndex::setRetentionPolicy(const RetentionPolicy& policy)
 seastar::future<std::optional<RetentionPolicy>> NativeIndex::getRetentionPolicy(const std::string& measurement) {
     auto key = ke::encodeRetentionPolicyKey(measurement);
     auto val = kvGet(key);
-    if (!val.has_value()) co_return std::nullopt;
+    if (!val.has_value())
+        co_return std::nullopt;
 
     RetentionPolicy policy;
     auto ec = glz::read_json(policy, *val);
-    if (ec) co_return std::nullopt;
+    if (ec)
+        co_return std::nullopt;
     co_return policy;
 }
 
@@ -1421,7 +1491,8 @@ seastar::future<std::vector<RetentionPolicy>> NativeIndex::getAllRetentionPolici
 seastar::future<bool> NativeIndex::deleteRetentionPolicy(const std::string& measurement) {
     auto key = ke::encodeRetentionPolicyKey(measurement);
     auto existing = kvGet(key);
-    if (!existing.has_value()) co_return false;
+    if (!existing.has_value())
+        co_return false;
 
     co_await kvDelete(key);
     co_return true;
@@ -1464,8 +1535,8 @@ seastar::future<> NativeIndex::compact() {
 // Phase 2: Roaring bitmap postings
 // ============================================================================
 
-void NativeIndex::buildBitmapCacheKey(std::string& out, const std::string& measurement,
-                                       const std::string& tagKey, const std::string& tagValue) {
+void NativeIndex::buildBitmapCacheKey(std::string& out, const std::string& measurement, const std::string& tagKey,
+                                      const std::string& tagValue) {
     out.clear();
     out.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     out += measurement;
@@ -1491,10 +1562,12 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
     std::string bitmapKey;
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
         auto& entry = it.value();
-        if (!entry.dirty) continue;
+        if (!entry.dirty)
+            continue;
 
         auto& bitmap = entry.bitmap;
-        if (bitmap.isEmpty()) continue;
+        if (bitmap.isEmpty())
+            continue;
 
         bitmap.runOptimize();
         bitmap.shrinkToFit();
@@ -1585,7 +1658,8 @@ void NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
         return true;
     });
 
-    if (localIdMap_.size() == 0) return;
+    if (localIdMap_.size() == 0)
+        return;
 
     // Persist the counter
     batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localIdMap_.nextId()));
@@ -1594,14 +1668,17 @@ void NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
     // Populate bitmapCache_ directly so they're immediately available for queries.
     std::string tagPrefix(1, static_cast<char>(TAG_INDEX));
     kvPrefixScan(tagPrefix, [&](std::string_view key, std::string_view value) {
-        if (value.size() < 16) return true;
+        if (value.size() < 16)
+            return true;
         SeriesId128 globalId = SeriesId128::fromBytes(value.data(), 16);
         auto localOpt = localIdMap_.getLocalId(globalId);
-        if (!localOpt.has_value()) return true;
+        if (!localOpt.has_value())
+            return true;
 
         // Extract measurement\0tagKey\0tagValue from key (skip prefix byte, strip trailing \0+seriesId)
         auto afterPrefix = key.substr(1);
-        if (afterPrefix.size() < 17) return true;
+        if (afterPrefix.size() < 17)
+            return true;
         auto mtvPart = afterPrefix.substr(0, afterPrefix.size() - 16);
         if (!mtvPart.empty() && mtvPart.back() == '\0') {
             mtvPart = mtvPart.substr(0, mtvPart.size() - 1);
@@ -1618,7 +1695,8 @@ void NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
     size_t bitmapCount = 0;
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
         auto& entry = it.value();
-        if (!entry.dirty) continue;
+        if (!entry.dirty)
+            continue;
         entry.bitmap.runOptimize();
         entry.bitmap.shrinkToFit();
         entry.dirty = false;
@@ -1633,8 +1711,8 @@ void NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
         ++bitmapCount;
     }
 
-    ::native_index_log.info("Migration: assigned {} local IDs, built {} postings bitmaps",
-                          localIdMap_.size(), bitmapCount);
+    ::native_index_log.info("Migration: assigned {} local IDs, built {} postings bitmaps", localIdMap_.size(),
+                            bitmapCount);
 }
 
 // ============================================================================
@@ -1698,10 +1776,12 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
     std::string kvKey;
     for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
         auto& entry = it.value();
-        if (!entry.dirty) continue;
+        if (!entry.dirty)
+            continue;
 
         auto& bitmap = entry.bitmap;
-        if (bitmap.isEmpty()) continue;
+        if (bitmap.isEmpty())
+            continue;
 
         bitmap.runOptimize();
         bitmap.shrinkToFit();
@@ -1732,11 +1812,13 @@ void NativeIndex::trimBitmapCache() {
             }
         }
     }
-    if (!overEntries && !overBytes) return;
+    if (!overEntries && !overBytes)
+        return;
 
     // Evict non-dirty entries until under both limits
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end();) {
-        if (bitmapCache_.size() <= MAX_BITMAP_CACHE_ENTRIES / 2) break;  // Evict to 50% to avoid thrashing
+        if (bitmapCache_.size() <= MAX_BITMAP_CACHE_ENTRIES / 2)
+            break;  // Evict to 50% to avoid thrashing
         if (!it->second.dirty) {
             it = bitmapCache_.erase(it);
         } else {
@@ -1758,10 +1840,12 @@ void NativeIndex::trimDayBitmapCache() {
             }
         }
     }
-    if (!overEntries && !overBytes) return;
+    if (!overEntries && !overBytes)
+        return;
 
     for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end();) {
-        if (dayBitmapCache_.size() <= MAX_DAY_BITMAP_CACHE_ENTRIES / 2) break;
+        if (dayBitmapCache_.size() <= MAX_DAY_BITMAP_CACHE_ENTRIES / 2)
+            break;
         if (!it->second.dirty) {
             it = dayBitmapCache_.erase(it);
         } else {
@@ -1774,7 +1858,8 @@ void NativeIndex::trimDayBitmapCache() {
 // Per-measurement HLLs (key = "measurement\0") stay warm; per-tag-value HLLs
 // (key = "measurement\0tagKey\0tagValue") are numerous and rarely queried.
 void NativeIndex::trimHllCache() {
-    if (hllCache_.size() <= MAX_HLL_CACHE_ENTRIES) return;
+    if (hllCache_.size() <= MAX_HLL_CACHE_ENTRIES)
+        return;
 
     size_t toEvict = hllCache_.size() - MAX_HLL_CACHE_ENTRIES;
     for (auto it = hllCache_.begin(); it != hllCache_.end() && toEvict > 0;) {
@@ -1798,7 +1883,8 @@ void NativeIndex::trimHllCache() {
 
 // Step 6: Evict tag values cache entries when over limit.
 void NativeIndex::trimTagValuesCache() {
-    if (tagValuesCache_.size() <= MAX_TAG_VALUES_CACHE_ENTRIES) return;
+    if (tagValuesCache_.size() <= MAX_TAG_VALUES_CACHE_ENTRIES)
+        return;
     // Evict half the entries (iteration order ≈ random in unordered_map).
     // This preserves ~50% of hot entries vs clearing everything.
     size_t toEvict = tagValuesCache_.size() / 2;
@@ -1830,10 +1916,12 @@ void NativeIndex::trimSchemaCaches() {
 }
 
 void NativeIndex::trimMeasurementBloomCache() {
-    if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES) return;
+    if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES)
+        return;
     // Evict non-dirty entries first. If still over limit, evict all non-dirty.
     for (auto it = measurementBloomCache_.begin(); it != measurementBloomCache_.end();) {
-        if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES) break;
+        if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES)
+            break;
         if (dirtyMeasurementBlooms_.count(it->first) == 0) {
             bloomFullyBuilt_.erase(it->first);
             it = measurementBloomCache_.erase(it);
@@ -1843,8 +1931,8 @@ void NativeIndex::trimMeasurementBloomCache() {
     }
 }
 
-roaring::Roaring NativeIndex::buildActiveSeriesBitmap(const std::string& measurement,
-                                                       uint32_t startDay, uint32_t endDay) {
+roaring::Roaring NativeIndex::buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay,
+                                                      uint32_t endDay) {
     roaring::Roaring result;
     std::string cacheKey;
     for (uint32_t day = startDay; day <= endDay; ++day) {
@@ -1875,8 +1963,7 @@ seastar::future<> NativeIndex::removeExpiredDayBitmaps(const std::string& measur
     for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
         auto& k = it->first;
         // Cache key format: "measurement\0day(4B)"
-        if (k.size() >= measurement.size() + 1 + 4 &&
-            k.compare(0, measurement.size(), measurement) == 0 &&
+        if (k.size() >= measurement.size() + 1 + 4 && k.compare(0, measurement.size(), measurement) == 0 &&
             k[measurement.size()] == '\0') {
             uint32_t day;
             std::memcpy(&day, k.data() + k.size() - 4, 4);
@@ -1896,10 +1983,9 @@ seastar::future<> NativeIndex::removeExpiredDayBitmaps(const std::string& measur
 
 seastar::future<std::expected<std::vector<IndexBackend::SeriesWithMetadata>, SeriesLimitExceeded>>
 NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
-                                               const std::map<std::string, std::string>& tagFilters,
-                                               const std::unordered_set<std::string>& fieldFilter,
-                                               uint64_t startTimeNs, uint64_t endTimeNs,
-                                               size_t maxSeries) {
+                                              const std::map<std::string, std::string>& tagFilters,
+                                              const std::unordered_set<std::string>& fieldFilter, uint64_t startTimeNs,
+                                              uint64_t endTimeNs, size_t maxSeries) {
     uint32_t startDay = ke::dayBucketFromNs(startTimeNs);
     uint32_t endDay = ke::dayBucketFromNs(endTimeNs);
 
@@ -1926,8 +2012,7 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
             std::string measPrefix = measurement;
             measPrefix.push_back('\0');
             for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
-                if (it->first.size() >= measPrefix.size() &&
-                    it->first.compare(0, measPrefix.size(), measPrefix) == 0 &&
+                if (it->first.size() >= measPrefix.size() && it->first.compare(0, measPrefix.size(), measPrefix) == 0 &&
                     !it->second.bitmap.isEmpty()) {
                     hasDayBitmaps = true;
                     break;
@@ -1949,21 +2034,26 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
             auto& [tagKey, tagValue] = *tagFilters.begin();
             buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
             auto* tagBitmap = getPostingsBitmapByKey(cacheKey);
-            if (!tagBitmap) co_return std::vector<SeriesWithMetadata>{};
+            if (!tagBitmap)
+                co_return std::vector<SeriesWithMetadata>{};
             activeSeries &= *tagBitmap;
         } else {
             // Multi-tag intersection (smallest-first)
-            struct TagBitmap { const roaring::Roaring* bmp; };
+            struct TagBitmap {
+                const roaring::Roaring* bmp;
+            };
             std::vector<TagBitmap> bitmaps;
             bitmaps.reserve(tagFilters.size());
             for (const auto& [tagKey, tagValue] : tagFilters) {
                 buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
                 auto* bmp = getPostingsBitmapByKey(cacheKey);
-                if (!bmp) co_return std::vector<SeriesWithMetadata>{};
+                if (!bmp)
+                    co_return std::vector<SeriesWithMetadata>{};
                 bitmaps.push_back({bmp});
             }
-            std::sort(bitmaps.begin(), bitmaps.end(),
-                      [](const TagBitmap& a, const TagBitmap& b) { return a.bmp->cardinality() < b.bmp->cardinality(); });
+            std::sort(bitmaps.begin(), bitmaps.end(), [](const TagBitmap& a, const TagBitmap& b) {
+                return a.bmp->cardinality() < b.bmp->cardinality();
+            });
             roaring::Roaring tagIntersection = *bitmaps[0].bmp;
             for (size_t i = 1; i < bitmaps.size() && !tagIntersection.isEmpty(); ++i) {
                 tagIntersection &= *bitmaps[i].bmp;
@@ -1988,7 +2078,8 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
 
     for (auto it = activeSeries.begin(); it != activeSeries.end(); ++it) {
         uint32_t localId = *it;
-        if (localId >= localIdMap_.nextId()) continue;
+        if (localId >= localIdMap_.nextId())
+            continue;
         const SeriesId128& id = localIdMap_.getGlobalId(localId);
 
         auto cached = seriesMetadataCache_.get(id);
@@ -2008,10 +2099,14 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
                 meta = &*decoded;
             }
         }
-        if (!meta) continue;
-        if (!fieldFilter.empty() && !fieldFilter.count(meta->field)) continue;
-        if (decoded) results.push_back({id, std::move(*decoded)});
-        else results.push_back({id, *meta});
+        if (!meta)
+            continue;
+        if (!fieldFilter.empty() && !fieldFilter.count(meta->field))
+            continue;
+        if (decoded)
+            results.push_back({id, std::move(*decoded)});
+        else
+            results.push_back({id, *meta});
     }
 
     co_return results;
@@ -2043,8 +2138,8 @@ void NativeIndex::updateHLL(const std::string& measurement, uint32_t localId) {
     hllCacheDirty_.insert(key);
 }
 
-void NativeIndex::updateTagHLL(const std::string& measurement, const std::string& tagKey,
-                                const std::string& tagValue, uint32_t localId) {
+void NativeIndex::updateTagHLL(const std::string& measurement, const std::string& tagKey, const std::string& tagValue,
+                               uint32_t localId) {
     std::string key;
     key.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key += measurement;
@@ -2072,7 +2167,8 @@ void NativeIndex::updateTagHLL(const std::string& measurement, const std::string
 void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
     for (const auto& cacheKey : hllCacheDirty_) {
         auto it = hllCache_.find(cacheKey);
-        if (it == hllCache_.end() || it->second.empty()) continue;
+        if (it == hllCache_.end() || it->second.empty())
+            continue;
 
         std::string kvKey;
         kvKey.reserve(1 + cacheKey.size());
@@ -2100,8 +2196,7 @@ void NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batch) {
         for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
             auto& key = it->first;
             // Cache key format: "measurement\0tagKey\0tagValue"
-            if (key.size() >= measPrefix.size() &&
-                key.compare(0, measPrefix.size(), measPrefix) == 0 &&
+            if (key.size() >= measPrefix.size() && key.compare(0, measPrefix.size(), measPrefix) == 0 &&
                 !it->second.bitmap.isEmpty()) {
                 bitmapKvKey.clear();
                 bitmapKvKey.push_back(static_cast<char>(POSTINGS_BITMAP));
@@ -2169,8 +2264,8 @@ double NativeIndex::estimateMeasurementCardinality(const std::string& measuremen
     return static_cast<double>(count);
 }
 
-double NativeIndex::estimateTagCardinality(const std::string& measurement,
-                                            const std::string& tagKey, const std::string& tagValue) {
+double NativeIndex::estimateTagCardinality(const std::string& measurement, const std::string& tagKey,
+                                           const std::string& tagValue) {
     std::string key;
     key.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key += measurement;
