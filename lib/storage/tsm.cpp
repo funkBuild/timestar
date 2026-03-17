@@ -22,6 +22,38 @@ using Clock = std::chrono::high_resolution_clock;
 // Block header: uint8_t type + uint32_t timestampSize + uint32_t timestampBytes
 static constexpr size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t);  // 9 bytes
 
+// Phase 3: Thread-local string dictionary for use during block decode.
+// Set by readSeriesBatched/readSingleBlock before decoding string blocks,
+// consumed by decodeBlock. Avoids threading dictionary through template params.
+static thread_local const std::vector<std::string>* tlStringDict = nullptr;
+
+// Phase 0: Check whether a block's time range overlaps any tombstone range.
+// tombstoneRanges must be sorted by start time (as returned by getTombstoneRanges).
+// Uses binary search: O(log T) per block instead of scanning all tombstones.
+static bool blockOverlapsTombstones(uint64_t blockMin, uint64_t blockMax,
+                                    const std::vector<std::pair<uint64_t, uint64_t>>& tombstoneRanges) {
+    if (tombstoneRanges.empty())
+        return false;
+    // Find first tombstone range whose start > blockMax — all earlier ranges potentially overlap.
+    // Then check backwards: any range whose end >= blockMin overlaps the block.
+    auto it = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
+                               std::make_pair(blockMax, std::numeric_limits<uint64_t>::max()));
+    // Check all ranges before 'it' — the one just before could overlap
+    if (it != tombstoneRanges.begin()) {
+        --it;
+        // Walk backwards checking for overlap: range overlaps block if range.end >= blockMin && range.start <= blockMax
+        // Since ranges are sorted by start, once range.start > blockMax we're past the block.
+        // We go backwards until range.end < blockMin.
+        for (auto rit = it;; --rit) {
+            if (rit->second >= blockMin && rit->first <= blockMax)
+                return true;
+            if (rit == tombstoneRanges.begin())
+                break;
+        }
+    }
+    return false;
+}
+
 // Decode a float block directly into thread-local scratch buffers and fold into
 // a BlockAggregator, avoiding per-block unique_ptr<TSMBlock> heap allocation.
 // Returns number of decoded points (0 on error or empty block).
@@ -59,6 +91,106 @@ static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
 
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
     FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, valScratch);
+
+    aggregator.addPoints(tsScratch, valScratch);
+    return tsScratch.size();
+}
+
+// Decode an Integer block directly into thread-local scratch buffers and fold into
+// a BlockAggregator (as double), avoiding per-block unique_ptr<TSMBlock> heap allocation.
+// Returns number of decoded points (0 on error or empty block).
+static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime,
+                                               uint64_t endTime, timestar::BlockAggregator& aggregator) {
+    if (blockSize < BLOCK_HEADER_SIZE)
+        return 0;
+
+    Slice blockSlice(data, blockSize);
+    auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
+    [[maybe_unused]] uint8_t blockType = headerSlice.read<uint8_t>();
+    uint32_t timestampSize = headerSlice.read<uint32_t>();
+    uint32_t timestampBytes = headerSlice.read<uint32_t>();
+
+    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
+        return 0;
+
+    static thread_local std::vector<uint64_t> tsScratch;
+    static thread_local std::vector<double> valScratch;
+    tsScratch.clear();
+    valScratch.clear();
+    tsScratch.reserve(timestampSize);
+
+    auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+    auto [nSkipped, nTimestamps] =
+        IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
+
+    if (nTimestamps == 0)
+        return 0;
+
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
+    if (valueByteSize > blockSize)
+        return 0;
+
+    // Decode zigzag-encoded integers
+    static thread_local std::vector<uint64_t> zigzagScratch;
+    zigzagScratch.clear();
+    zigzagScratch.reserve(nSkipped + nTimestamps);
+
+    auto valuesSlice = blockSlice.getSlice(valueByteSize);
+    IntegerEncoder::decode(valuesSlice, nSkipped + nTimestamps, zigzagScratch);
+
+    // Convert zigzag int64 to double for the aggregator
+    valScratch.reserve(nTimestamps);
+    for (size_t i = nSkipped; i < zigzagScratch.size(); ++i) {
+        valScratch.push_back(static_cast<double>(ZigZag::zigzagDecode(zigzagScratch[i])));
+    }
+
+    aggregator.addPoints(tsScratch, valScratch);
+    return tsScratch.size();
+}
+
+// Decode a Boolean block directly into thread-local scratch buffers and fold into
+// a BlockAggregator (true=1.0, false=0.0).
+static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime,
+                                            uint64_t endTime, timestar::BlockAggregator& aggregator) {
+    if (blockSize < BLOCK_HEADER_SIZE)
+        return 0;
+
+    Slice blockSlice(data, blockSize);
+    auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
+    [[maybe_unused]] uint8_t blockType = headerSlice.read<uint8_t>();
+    uint32_t timestampSize = headerSlice.read<uint32_t>();
+    uint32_t timestampBytes = headerSlice.read<uint32_t>();
+
+    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
+        return 0;
+
+    static thread_local std::vector<uint64_t> tsScratch;
+    static thread_local std::vector<double> valScratch;
+    tsScratch.clear();
+    valScratch.clear();
+    tsScratch.reserve(timestampSize);
+
+    auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+    auto [nSkipped, nTimestamps] =
+        IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
+
+    if (nTimestamps == 0)
+        return 0;
+
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
+    if (valueByteSize > blockSize)
+        return 0;
+
+    // Decode RLE-encoded booleans
+    auto valuesSlice = blockSlice.getSlice(valueByteSize);
+    std::vector<bool> boolValues;
+    BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, boolValues);
+
+    // Convert bools to double (1.0/0.0)
+    valScratch.reserve(nTimestamps);
+    for (size_t i = 0; i < boolValues.size(); ++i) {
+        valScratch.push_back(boolValues[i] ? 1.0 : 0.0);
+    }
 
     aggregator.addPoints(tsScratch, valScratch);
     return tsScratch.size();
@@ -140,9 +272,10 @@ seastar::future<> TSM::open() {
         if (length >= 5) {
             auto hdrBuf = co_await tsmFile.dma_read_exactly<uint8_t>(0, 5);
             fileVersion = hdrBuf.get()[4];
-            if (fileVersion != TSM_VERSION) {
+            if (fileVersion < TSM_VERSION_MIN || fileVersion > TSM_VERSION) {
                 throw std::runtime_error("Unsupported TSM file version " + std::to_string(fileVersion) +
-                                         " (expected " + std::to_string(TSM_VERSION) + "): " + filePath);
+                                         " (supported: " + std::to_string(TSM_VERSION_MIN) + "-" +
+                                         std::to_string(TSM_VERSION) + "): " + filePath);
             }
         }
 
@@ -221,9 +354,9 @@ seastar::future<> TSM::readSparseIndex() {
         uint8_t type = indexSlice.read<uint8_t>();
         uint16_t blockCount = indexSlice.read<uint16_t>();
 
-        // Float blocks: 80 bytes (28 base + 52 stats), others: 28 bytes
-        bool isFloat = static_cast<TSMValueType>(type) == TSMValueType::Float;
-        size_t perBlockBytes = isFloat ? 80 : 28;
+        // Block size depends on type and file version
+        auto seriesType = static_cast<TSMValueType>(type);
+        size_t perBlockBytes = indexBlockBytes(seriesType, fileVersion);
 
         // Validate blockCount against remaining index data to prevent
         // reads past the end of the index on malformed files.
@@ -234,19 +367,14 @@ seastar::future<> TSM::readSparseIndex() {
                                      std::to_string(indexSlice.bytesLeft()) + " remain");
         }
 
-        // Calculate size of this entry
-        uint32_t entrySize = 16 + 1 + 2 + static_cast<uint32_t>(blockBytes);
-
         // Peek at first/last block metadata from the index for sparse lookups.
-        // Float blocks: 80 bytes each (28 base + 52 stats).
-        // Layout per block: minTime(8) maxTime(8) offset(8) size(4)
-        //   blockSum(8) blockMin(8) blockMax(8) blockCount(4)
-        //   blockM2(8) blockFirstValue(8) blockLatestValue(8)
         uint64_t seriesMinTime = 0;
         uint64_t seriesMaxTime = 0;
         double firstValue = 0.0;
         double latestValue = 0.0;
         bool hasExtStats = false;
+        bool boolFirst = false;
+        bool boolLatest = false;
 
         if (blockCount > 0) {
             size_t blockStart = indexSlice.offset;
@@ -257,11 +385,27 @@ seastar::future<> TSM::readSparseIndex() {
             // Last block: maxTime at offset 8
             std::memcpy(&seriesMaxTime, indexSlice.data + lastBlockStart + 8, sizeof(uint64_t));
 
-            // Float: extract firstValue from first block, latestValue from last block
-            if (isFloat) {
-                // blockFirstValue at offset 64 within block, blockLatestValue at offset 72
+            // Float: blockFirstValue at offset 64, blockLatestValue at offset 72
+            if (seriesType == TSMValueType::Float) {
                 std::memcpy(&firstValue, indexSlice.data + blockStart + 64, sizeof(double));
                 std::memcpy(&latestValue, indexSlice.data + lastBlockStart + 72, sizeof(double));
+                hasExtStats = true;
+            }
+            // Integer (V2): first/latest as int64 at offset 52 and 60 within block
+            else if (seriesType == TSMValueType::Integer && fileVersion >= 2) {
+                int64_t intFirst, intLatest;
+                std::memcpy(&intFirst, indexSlice.data + blockStart + 52, sizeof(int64_t));
+                std::memcpy(&intLatest, indexSlice.data + lastBlockStart + 60, sizeof(int64_t));
+                firstValue = static_cast<double>(intFirst);
+                latestValue = static_cast<double>(intLatest);
+                hasExtStats = true;
+            }
+            // Boolean (V2): first/latest as uint8 at offset 36 and 37
+            else if (seriesType == TSMValueType::Boolean && fileVersion >= 2) {
+                boolFirst = (indexSlice.data[blockStart + 36] != 0);
+                boolLatest = (indexSlice.data[lastBlockStart + 37] != 0);
+                firstValue = boolFirst ? 1.0 : 0.0;
+                latestValue = boolLatest ? 1.0 : 0.0;
                 hasExtStats = true;
             }
         }
@@ -269,16 +413,33 @@ seastar::future<> TSM::readSparseIndex() {
         // Skip over the blocks (don't parse them yet)
         indexSlice.offset += blockBytes;
 
-        // Store sparse entry with time bounds + v3 first/latest values
+        // Phase 3: Skip over string dictionary if present (V2 String series)
+        uint32_t dictBytes = 0;
+        if (seriesType == TSMValueType::String && fileVersion >= 2) {
+            if (indexSlice.offset + 4 <= indexSlice.length_) {
+                std::memcpy(&dictBytes, indexSlice.data + indexSlice.offset, 4);
+                indexSlice.offset += 4 + dictBytes;
+            }
+        }
+
+        // Calculate total entry size (header + blocks + optional dictionary)
+        uint32_t entrySize = 16 + 1 + 2 + static_cast<uint32_t>(blockBytes);
+        if (seriesType == TSMValueType::String && fileVersion >= 2) {
+            entrySize += 4 + dictBytes;
+        }
+
+        // Store sparse entry with time bounds + first/latest values
         SparseIndexEntry sparseEntry{.seriesId = seriesId,
                                      .fileOffset = entryStartOffset,
                                      .entrySize = entrySize,
-                                     .seriesType = static_cast<TSMValueType>(type),
+                                     .seriesType = seriesType,
                                      .minTime = seriesMinTime,
                                      .maxTime = seriesMaxTime,
                                      .firstValue = firstValue,
                                      .latestValue = latestValue,
-                                     .hasExtendedStats = hasExtStats};
+                                     .hasExtendedStats = hasExtStats,
+                                     .boolFirstValue = boolFirst,
+                                     .boolLatestValue = boolLatest};
         sparseIndex.insert({seriesId, sparseEntry});
 
         // Collect series ID for bloom filter
@@ -317,7 +478,12 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     if (cacheIt != fullIndexCache.end()) {
         // Move to front of LRU list (most recently used)
         lruList.splice(lruList.begin(), lruList, cacheIt->second);
-        co_return &cacheIt->second->second;
+        auto& entry = cacheIt->second->second;
+        // Phase 3: Set thread-local dictionary for string block decoding
+        if (entry.seriesType == TSMValueType::String) {
+            tlStringDict = entry.stringDictionary.empty() ? nullptr : &entry.stringDictionary;
+        }
+        co_return &entry;
     }
 
     // Step 3: Sparse index lookup
@@ -345,8 +511,7 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
     uint16_t blockCount = entrySlice.read<uint16_t>();
 
-    // Parse all blocks
-    bool isFloat = (fullEntry.seriesType == TSMValueType::Float);
+    // Parse all blocks — per-type stats depend on file version
     fullEntry.indexBlocks.reserve(blockCount);
     for (uint16_t i = 0; i < blockCount; i++) {
         TSMIndexBlock block;
@@ -354,7 +519,7 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         block.maxTime = entrySlice.read<uint64_t>();
         block.offset = entrySlice.read<uint64_t>();
         block.size = entrySlice.read<uint32_t>();
-        if (isFloat) {
+        if (fullEntry.seriesType == TSMValueType::Float) {
             block.blockSum = entrySlice.read<double>();
             block.blockMin = entrySlice.read<double>();
             block.blockMax = entrySlice.read<double>();
@@ -363,8 +528,55 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
             block.blockFirstValue = entrySlice.read<double>();
             block.blockLatestValue = entrySlice.read<double>();
             block.hasExtendedStats = true;
+        } else if (fileVersion >= 2) {
+            // V2: all non-Float types have at least blockCount
+            if (fullEntry.seriesType == TSMValueType::Integer) {
+                // 72 bytes: 28 base + count(4) + sum(8) + min(8) + max(8) + first(8) + latest(8)
+                block.blockCount = entrySlice.read<uint32_t>();
+                int64_t intSum = entrySlice.read<int64_t>();
+                int64_t intMin = entrySlice.read<int64_t>();
+                int64_t intMax = entrySlice.read<int64_t>();
+                int64_t intFirst = entrySlice.read<int64_t>();
+                int64_t intLatest = entrySlice.read<int64_t>();
+                block.blockSum = static_cast<double>(intSum);
+                block.blockMin = static_cast<double>(intMin);
+                block.blockMax = static_cast<double>(intMax);
+                block.blockFirstValue = static_cast<double>(intFirst);
+                block.blockLatestValue = static_cast<double>(intLatest);
+                block.hasExtendedStats = true;
+            } else if (fullEntry.seriesType == TSMValueType::Boolean) {
+                // 40 bytes: 28 base + count(4) + trueCount(4) + firstValue(1) + latestValue(1) + pad(2)
+                block.blockCount = entrySlice.read<uint32_t>();
+                block.boolTrueCount = entrySlice.read<uint32_t>();
+                block.boolFirstValue = (entrySlice.read<uint8_t>() != 0);
+                block.boolLatestValue = (entrySlice.read<uint8_t>() != 0);
+                entrySlice.offset += 2;  // skip padding
+                // Convert for aggregator compatibility
+                block.blockSum = static_cast<double>(block.boolTrueCount);
+                block.blockMin = (block.boolTrueCount < block.blockCount) ? 0.0 : 1.0;
+                block.blockMax = (block.boolTrueCount > 0) ? 1.0 : 0.0;
+                block.blockFirstValue = block.boolFirstValue ? 1.0 : 0.0;
+                block.blockLatestValue = block.boolLatestValue ? 1.0 : 0.0;
+                block.hasExtendedStats = true;
+            } else if (fullEntry.seriesType == TSMValueType::String) {
+                // 32 bytes: 28 base + count(4)
+                block.blockCount = entrySlice.read<uint32_t>();
+                // No value stats for strings — blockCount enables COUNT pushdown
+            }
         }
         fullEntry.indexBlocks.push_back(block);
+    }
+
+    // Phase 3: Parse string dictionary if present
+    if (fullEntry.seriesType == TSMValueType::String && fileVersion >= 2 &&
+        entrySlice.offset + 4 <= entrySlice.length_) {
+        uint32_t dictSize = entrySlice.read<uint32_t>();
+        if (dictSize > 0 && entrySlice.offset + dictSize <= entrySlice.length_) {
+            auto dict = StringEncoder::deserializeDictionary(entrySlice, dictSize);
+            if (dict.valid) {
+                fullEntry.stringDictionary = std::move(dict.entries);
+            }
+        }
     }
 
     // Step 6: Cache it with LRU eviction.
@@ -406,7 +618,13 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
 
     timestar::tsm_log.trace("Loaded full index entry for series {} ({} blocks)", seriesId.toHex(), blockCount);
 
-    co_return &lruList.front().second;
+    // Phase 3: Set thread-local dictionary for string block decoding
+    auto& cachedEntry = lruList.front().second;
+    if (cachedEntry.seriesType == TSMValueType::String) {
+        tlStringDict = cachedEntry.stringDictionary.empty() ? nullptr : &cachedEntry.stringDictionary;
+    }
+
+    co_return &cachedEntry;
 }
 
 // Bulk prefetch: identify cache misses and issue coalesced DMA reads.
@@ -468,7 +686,6 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
     }
 
     // Read each group with a single DMA read and parse all entries from the buffer
-    bool isFloat;
     for (auto& group : groups) {
         uint64_t readSize = group.endOffset - group.startOffset;
         seastar::temporary_buffer<char> buf;
@@ -505,7 +722,6 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
             fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
             uint16_t blockCount = entrySlice.read<uint16_t>();
 
-            isFloat = (fullEntry.seriesType == TSMValueType::Float);
             fullEntry.indexBlocks.reserve(blockCount);
 
             for (uint16_t b = 0; b < blockCount; ++b) {
@@ -514,7 +730,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
                 block.maxTime = entrySlice.read<uint64_t>();
                 block.offset = entrySlice.read<uint64_t>();
                 block.size = entrySlice.read<uint32_t>();
-                if (isFloat) {
+                if (fullEntry.seriesType == TSMValueType::Float) {
                     block.blockSum = entrySlice.read<double>();
                     block.blockMin = entrySlice.read<double>();
                     block.blockMax = entrySlice.read<double>();
@@ -523,8 +739,49 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
                     block.blockFirstValue = entrySlice.read<double>();
                     block.blockLatestValue = entrySlice.read<double>();
                     block.hasExtendedStats = true;
+                } else if (fileVersion >= 2) {
+                    if (fullEntry.seriesType == TSMValueType::Integer) {
+                        block.blockCount = entrySlice.read<uint32_t>();
+                        int64_t intSum = entrySlice.read<int64_t>();
+                        int64_t intMin = entrySlice.read<int64_t>();
+                        int64_t intMax = entrySlice.read<int64_t>();
+                        int64_t intFirst = entrySlice.read<int64_t>();
+                        int64_t intLatest = entrySlice.read<int64_t>();
+                        block.blockSum = static_cast<double>(intSum);
+                        block.blockMin = static_cast<double>(intMin);
+                        block.blockMax = static_cast<double>(intMax);
+                        block.blockFirstValue = static_cast<double>(intFirst);
+                        block.blockLatestValue = static_cast<double>(intLatest);
+                        block.hasExtendedStats = true;
+                    } else if (fullEntry.seriesType == TSMValueType::Boolean) {
+                        block.blockCount = entrySlice.read<uint32_t>();
+                        block.boolTrueCount = entrySlice.read<uint32_t>();
+                        block.boolFirstValue = (entrySlice.read<uint8_t>() != 0);
+                        block.boolLatestValue = (entrySlice.read<uint8_t>() != 0);
+                        entrySlice.offset += 2;
+                        block.blockSum = static_cast<double>(block.boolTrueCount);
+                        block.blockMin = (block.boolTrueCount < block.blockCount) ? 0.0 : 1.0;
+                        block.blockMax = (block.boolTrueCount > 0) ? 1.0 : 0.0;
+                        block.blockFirstValue = block.boolFirstValue ? 1.0 : 0.0;
+                        block.blockLatestValue = block.boolLatestValue ? 1.0 : 0.0;
+                        block.hasExtendedStats = true;
+                    } else if (fullEntry.seriesType == TSMValueType::String) {
+                        block.blockCount = entrySlice.read<uint32_t>();
+                    }
                 }
                 fullEntry.indexBlocks.push_back(block);
+            }
+
+            // Phase 3: Parse string dictionary
+            if (fullEntry.seriesType == TSMValueType::String && fileVersion >= 2 &&
+                entrySlice.offset + 4 <= entrySlice.length_) {
+                uint32_t dictSize = entrySlice.read<uint32_t>();
+                if (dictSize > 0 && entrySlice.offset + dictSize <= entrySlice.length_) {
+                    auto dict = StringEncoder::deserializeDictionary(entrySlice, dictSize);
+                    if (dict.valid) {
+                        fullEntry.stringDictionary = std::move(dict.entries);
+                    }
+                }
             }
 
             // Cache the entry
@@ -550,6 +807,11 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
 
     if (!indexEntry) {
         co_return;  // Series not in this file
+    }
+
+    // Phase 3: Set thread-local dictionary for string block decoding
+    if constexpr (std::is_same_v<T, std::string>) {
+        tlStringDict = indexEntry->stringDictionary.empty() ? nullptr : &indexEntry->stringDictionary;
     }
 
     // Filter blocks by time range
@@ -657,7 +919,16 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+        // Phase 3: Check if dictionary-encoded (STR2 magic)
+        if (StringEncoder::isDictionaryEncoded(valuesSlice) && tlStringDict && !tlStringDict->empty()) {
+            StringEncoder::Dictionary dict;
+            dict.entries = *tlStringDict;
+            dict.valid = true;
+            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict,
+                                            blockResults->values);
+        } else {
+            StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+        }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         // Reuse thread-local scratch buffer to avoid per-block heap allocation
@@ -817,7 +1088,15 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
         BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+        if (StringEncoder::isDictionaryEncoded(valuesSlice) && tlStringDict && !tlStringDict->empty()) {
+            StringEncoder::Dictionary dict;
+            dict.entries = *tlStringDict;
+            dict.valid = true;
+            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict,
+                                            blockResults->values);
+        } else {
+            StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+        }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         // Reuse thread-local scratch buffer to avoid per-block heap allocation
@@ -870,7 +1149,14 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, outValues);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
+        if (StringEncoder::isDictionaryEncoded(valuesSlice) && tlStringDict && !tlStringDict->empty()) {
+            StringEncoder::Dictionary dict;
+            dict.entries = *tlStringDict;
+            dict.valid = true;
+            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict, outValues);
+        } else {
+            StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
+        }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         static thread_local std::vector<uint64_t> rawUintScratch;
@@ -921,6 +1207,11 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry) {
         co_return;  // Series not in this file
+    }
+
+    // Phase 3: Set thread-local dictionary for string block decoding
+    if constexpr (std::is_same_v<T, std::string>) {
+        tlStringDict = indexEntry->stringDictionary.empty() ? nullptr : &indexEntry->stringDictionary;
     }
 
     // Step 1: Filter blocks by time range
@@ -991,10 +1282,12 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
         co_return 0;
     }
 
-    // Only float series can be pushdown-aggregated
-    if (indexEntry->seriesType != TSMValueType::Float) {
+    // Float, Integer, and Boolean support pushdown aggregation; String does not
+    if (indexEntry->seriesType == TSMValueType::String) {
         co_return 0;
     }
+
+    const auto seriesType = indexEntry->seriesType;
 
     // Filter blocks by time range
     std::vector<TSMIndexBlock> blocksToScan;
@@ -1045,7 +1338,9 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
         for (size_t bi = 0; bi < blockCount; ++bi) {
             const auto& block = batch.blocks[bi];
             bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
-            bool canSkip = !hasTombstoneRanges && blockFullyContained && block.blockCount > 0 &&
+            // Phase 0: per-block tombstone check instead of global hasTombstoneRanges gate
+            bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
+            bool canSkip = !blockHasTombstones && blockFullyContained && block.blockCount > 0 &&
                            aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
             skippedFlags[bi] = canSkip;
             if (canSkip) {
@@ -1073,38 +1368,90 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                 continue;
             }
 
-            if (!hasTombstoneRanges) {
-                // Fast path: no tombstones — decode into scratch buffers and fold
+            // Phase 0: per-block tombstone check instead of global gate
+            bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
+            if (!blockHasTombstones) {
+                // Fast path: no tombstones for this block — decode into scratch buffers and fold
                 size_t n;
                 if (countOnly) {
-                    // COUNT optimization: decode timestamps only, skip value decompression
                     n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, startTime, endTime, aggregator);
-                } else {
+                } else if (seriesType == TSMValueType::Float) {
                     n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
                                                   aggregator);
+                } else if (seriesType == TSMValueType::Integer) {
+                    n = decodeIntegerBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
+                                                         aggregator);
+                } else {
+                    // Boolean
+                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
+                                                      aggregator);
                 }
                 totalPoints += n;
             } else {
                 // Tombstone path: need per-point filtering, use full decode.
                 Slice blockSlice(batchBuf.get() + bufferOffset, block.size);
-                auto blockResult = decodeBlock<double>(blockSlice, block.size, startTime, endTime);
-                if (blockResult && !blockResult->timestamps.empty()) {
-                    const auto& ts = blockResult->timestamps;
-                    const auto& vals = blockResult->values;
-                    for (size_t i = 0; i < ts.size(); ++i) {
-                        uint64_t t = ts[i];
-                        auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                        std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                        bool isTombstoned = false;
-                        if (rangeIt != tombstoneRanges.begin()) {
-                            --rangeIt;
-                            if (t >= rangeIt->first && t <= rangeIt->second) {
-                                isTombstoned = true;
+                if (seriesType == TSMValueType::Float) {
+                    auto blockResult = decodeBlock<double>(blockSlice, block.size, startTime, endTime);
+                    if (blockResult && !blockResult->timestamps.empty()) {
+                        const auto& ts = blockResult->timestamps;
+                        const auto& vals = blockResult->values;
+                        for (size_t i = 0; i < ts.size(); ++i) {
+                            uint64_t t = ts[i];
+                            auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
+                                                            std::make_pair(t, std::numeric_limits<uint64_t>::max()));
+                            bool isTombstoned = false;
+                            if (rangeIt != tombstoneRanges.begin()) {
+                                --rangeIt;
+                                if (t >= rangeIt->first && t <= rangeIt->second)
+                                    isTombstoned = true;
+                            }
+                            if (!isTombstoned) {
+                                aggregator.addPoint(t, vals[i]);
+                                totalPoints++;
                             }
                         }
-                        if (!isTombstoned) {
-                            aggregator.addPoint(t, vals[i]);
-                            totalPoints++;
+                    }
+                } else if (seriesType == TSMValueType::Integer) {
+                    auto blockResult = decodeBlock<int64_t>(blockSlice, block.size, startTime, endTime);
+                    if (blockResult && !blockResult->timestamps.empty()) {
+                        const auto& ts = blockResult->timestamps;
+                        const auto& vals = blockResult->values;
+                        for (size_t i = 0; i < ts.size(); ++i) {
+                            uint64_t t = ts[i];
+                            auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
+                                                            std::make_pair(t, std::numeric_limits<uint64_t>::max()));
+                            bool isTombstoned = false;
+                            if (rangeIt != tombstoneRanges.begin()) {
+                                --rangeIt;
+                                if (t >= rangeIt->first && t <= rangeIt->second)
+                                    isTombstoned = true;
+                            }
+                            if (!isTombstoned) {
+                                aggregator.addPoint(t, static_cast<double>(vals[i]));
+                                totalPoints++;
+                            }
+                        }
+                    }
+                } else {
+                    // Boolean
+                    auto blockResult = decodeBlock<bool>(blockSlice, block.size, startTime, endTime);
+                    if (blockResult && !blockResult->timestamps.empty()) {
+                        const auto& ts = blockResult->timestamps;
+                        const auto& vals = blockResult->values;
+                        for (size_t i = 0; i < ts.size(); ++i) {
+                            uint64_t t = ts[i];
+                            auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
+                                                            std::make_pair(t, std::numeric_limits<uint64_t>::max()));
+                            bool isTombstoned = false;
+                            if (rangeIt != tombstoneRanges.begin()) {
+                                --rangeIt;
+                                if (t >= rangeIt->first && t <= rangeIt->second)
+                                    isTombstoned = true;
+                            }
+                            if (!isTombstoned) {
+                                aggregator.addPoint(t, vals[i] ? 1.0 : 0.0);
+                                totalPoints++;
+                            }
                         }
                     }
                 }
@@ -1121,9 +1468,11 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
                                                       timestar::BlockAggregator& aggregator, bool reverse,
                                                       size_t maxPoints) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
-    if (!indexEntry || indexEntry->seriesType != TSMValueType::Float) {
+    if (!indexEntry || indexEntry->seriesType == TSMValueType::String) {
         co_return 0;
     }
+
+    const auto seriesType = indexEntry->seriesType;
 
     // Filter blocks by time range
     std::vector<TSMIndexBlock> blocksToScan;
@@ -1180,70 +1529,47 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     size_t totalPoints = 0;
     size_t count = blocksToScan.size();
 
+    // Helper lambda: iterate decoded points, optionally filtering tombstones, in fwd/rev order.
+    auto processPoints = [&](const std::vector<uint64_t>& ts, const auto& vals, auto toDouble) {
+        size_t pointCount = ts.size();
+        for (size_t pi = 0; pi < pointCount && totalPoints < maxPoints; ++pi) {
+            size_t j = reverse ? (pointCount - 1 - pi) : pi;
+            uint64_t t = ts[j];
+            if (hasTombstoneRanges) {
+                auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
+                                                std::make_pair(t, std::numeric_limits<uint64_t>::max()));
+                if (rangeIt != tombstoneRanges.begin()) {
+                    --rangeIt;
+                    if (t >= rangeIt->first && t <= rangeIt->second)
+                        continue;
+                }
+            }
+            aggregator.addPoint(t, toDouble(vals[j]));
+            totalPoints++;
+        }
+    };
+
     for (size_t i = 0; i < count && totalPoints < maxPoints; ++i) {
         size_t idx = reverse ? (count - 1 - i) : i;
         const auto& block = blocksToScan[idx];
 
-        auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);
-        if (!blockResult || blockResult->timestamps.empty()) {
-            continue;
-        }
-
-        const auto& ts = blockResult->timestamps;
-        const auto& vals = blockResult->values;
-
-        if (!hasTombstoneRanges) {
-            // No tombstones: take points from the appropriate end
-            if (reverse) {
-                // Take from the end (latest points first)
-                for (size_t j = ts.size(); j > 0 && totalPoints < maxPoints; --j) {
-                    aggregator.addPoint(ts[j - 1], vals[j - 1]);
-                    totalPoints++;
-                }
-            } else {
-                // Take from the beginning (earliest points first)
-                for (size_t j = 0; j < ts.size() && totalPoints < maxPoints; ++j) {
-                    aggregator.addPoint(ts[j], vals[j]);
-                    totalPoints++;
-                }
-            }
+        if (seriesType == TSMValueType::Float) {
+            auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);
+            if (!blockResult || blockResult->timestamps.empty())
+                continue;
+            processPoints(blockResult->timestamps, blockResult->values, [](double v) { return v; });
+        } else if (seriesType == TSMValueType::Integer) {
+            auto blockResult = co_await readSingleBlock<int64_t>(block, startTime, endTime);
+            if (!blockResult || blockResult->timestamps.empty())
+                continue;
+            processPoints(blockResult->timestamps, blockResult->values,
+                          [](int64_t v) { return static_cast<double>(v); });
         } else {
-            // Filter tombstoned points
-            if (reverse) {
-                for (size_t j = ts.size(); j > 0 && totalPoints < maxPoints; --j) {
-                    uint64_t t = ts[j - 1];
-                    auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                    std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                    bool isTombstoned = false;
-                    if (rangeIt != tombstoneRanges.begin()) {
-                        --rangeIt;
-                        if (t >= rangeIt->first && t <= rangeIt->second) {
-                            isTombstoned = true;
-                        }
-                    }
-                    if (!isTombstoned) {
-                        aggregator.addPoint(t, vals[j - 1]);
-                        totalPoints++;
-                    }
-                }
-            } else {
-                for (size_t j = 0; j < ts.size() && totalPoints < maxPoints; ++j) {
-                    uint64_t t = ts[j];
-                    auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                    std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                    bool isTombstoned = false;
-                    if (rangeIt != tombstoneRanges.begin()) {
-                        --rangeIt;
-                        if (t >= rangeIt->first && t <= rangeIt->second) {
-                            isTombstoned = true;
-                        }
-                    }
-                    if (!isTombstoned) {
-                        aggregator.addPoint(t, vals[j]);
-                        totalPoints++;
-                    }
-                }
-            }
+            // Boolean
+            auto blockResult = co_await readSingleBlock<bool>(block, startTime, endTime);
+            if (!blockResult || blockResult->timestamps.empty())
+                continue;
+            processPoints(blockResult->timestamps, blockResult->values, [](bool v) { return v ? 1.0 : 0.0; });
         }
     }
 
@@ -1255,9 +1581,11 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
                                                      uint64_t interval, std::unordered_set<uint64_t>& filledBuckets,
                                                      size_t totalBuckets) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
-    if (!indexEntry || indexEntry->seriesType != TSMValueType::Float) {
+    if (!indexEntry || indexEntry->seriesType == TSMValueType::String) {
         co_return 0;
     }
+
+    const auto seriesType = indexEntry->seriesType;
 
     // Filter blocks by time range
     std::vector<TSMIndexBlock> blocksToScan;
@@ -1310,8 +1638,10 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
         // Extended-stats shortcut: when block has extended stats and fits in one
         // bucket, extract the first/latest endpoint directly without DMA
         // read + decode.  This preserves 1-point-per-bucket semantics.
+        // Phase 0: per-block tombstone check instead of global gate
         bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
-        if (!hasTombstoneRanges && blockFullyContained && block.hasExtendedStats) {
+        bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
+        if (!blockHasTombstones && blockFullyContained && block.hasExtendedStats) {
             uint64_t bFirst = (block.minTime / interval) * interval;
             uint64_t bLast = (block.maxTime / interval) * interval;
             if (bFirst == bLast) {
@@ -1329,44 +1659,49 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
             }
         }
 
-        auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);
-        if (!blockResult || blockResult->timestamps.empty()) {
-            continue;
-        }
-
-        const auto& ts = blockResult->timestamps;
-        const auto& vals = blockResult->values;
-
-        // For LATEST, iterate points in reverse so the first point added per
-        // bucket is the actual latest within this block. For FIRST, iterate
-        // forward so the first point is the earliest.
-        size_t pointCount = ts.size();
-        for (size_t pi = 0; pi < pointCount; ++pi) {
-            size_t j = reverse ? (pointCount - 1 - pi) : pi;
-            uint64_t t = ts[j];
-
-            if (hasTombstoneRanges) {
-                auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                if (rangeIt != tombstoneRanges.begin()) {
-                    --rangeIt;
-                    if (t >= rangeIt->first && t <= rangeIt->second) {
-                        continue;  // Tombstoned
+        // Helper lambda for bucketed point processing with tombstone filtering
+        auto processBucketedPoints = [&](const std::vector<uint64_t>& ts, auto toDouble) {
+            size_t pointCount = ts.size();
+            for (size_t pi = 0; pi < pointCount; ++pi) {
+                size_t j = reverse ? (pointCount - 1 - pi) : pi;
+                uint64_t t = ts[j];
+                if (hasTombstoneRanges) {
+                    auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
+                                                    std::make_pair(t, std::numeric_limits<uint64_t>::max()));
+                    if (rangeIt != tombstoneRanges.begin()) {
+                        --rangeIt;
+                        if (t >= rangeIt->first && t <= rangeIt->second)
+                            continue;
                     }
                 }
+                uint64_t bucketKey = (t / interval) * interval;
+                if (filledBuckets.find(bucketKey) != filledBuckets.end())
+                    continue;
+                aggregator.addPoint(t, toDouble(j));
+                filledBuckets.insert(bucketKey);
+                totalPoints++;
             }
+        };
 
-            // Match BlockAggregator's bucket key formula: (t / interval) * interval
-            uint64_t bucketKey = (t / interval) * interval;
-            // For LATEST/FIRST, once a bucket has a point from the preferred direction,
-            // skip further points for that bucket
-            if (filledBuckets.find(bucketKey) != filledBuckets.end()) {
+        if (seriesType == TSMValueType::Float) {
+            auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);
+            if (!blockResult || blockResult->timestamps.empty())
                 continue;
-            }
-
-            aggregator.addPoint(t, vals[j]);
-            filledBuckets.insert(bucketKey);
-            totalPoints++;
+            const auto& vals = blockResult->values;
+            processBucketedPoints(blockResult->timestamps, [&vals](size_t j) { return vals[j]; });
+        } else if (seriesType == TSMValueType::Integer) {
+            auto blockResult = co_await readSingleBlock<int64_t>(block, startTime, endTime);
+            if (!blockResult || blockResult->timestamps.empty())
+                continue;
+            const auto& vals = blockResult->values;
+            processBucketedPoints(blockResult->timestamps, [&vals](size_t j) { return static_cast<double>(vals[j]); });
+        } else {
+            // Boolean
+            auto blockResult = co_await readSingleBlock<bool>(block, startTime, endTime);
+            if (!blockResult || blockResult->timestamps.empty())
+                continue;
+            const auto& vals = blockResult->values;
+            processBucketedPoints(blockResult->timestamps, [&vals](size_t j) { return vals[j] ? 1.0 : 0.0; });
         }
     }
 

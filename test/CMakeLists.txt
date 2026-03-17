@@ -69,7 +69,7 @@ target_compile_definitions(timestar_test PRIVATE
     TSM_FILE_MANAGER_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_file_manager.cpp"
     TSM_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm.hpp"
     BLOOM_FILTER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/bloom_filter.hpp"
-    INTEGER_ENCODER_BASIC_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/integer/integer_encoder.cpp"
+
     HTTP_SERVER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../bin/timestar_http_server.cpp"
     HTTP_STREAM_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_stream_handler.cpp"
     HTTP_METADATA_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_metadata_handler.cpp"
@@ -112,7 +112,7 @@ target_compile_definitions(timestar_unit_test PRIVATE
     TSM_FILE_MANAGER_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_file_manager.cpp"
     TSM_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm.hpp"
     BLOOM_FILTER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/bloom_filter.hpp"
-    INTEGER_ENCODER_BASIC_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/integer/integer_encoder.cpp"
+
     HTTP_SERVER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../bin/timestar_http_server.cpp"
     HTTP_STREAM_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_stream_handler.cpp"
     HTTP_METADATA_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_metadata_handler.cpp"

@@ -6,6 +6,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 
 // Maximum decompressed size we'll allocate for string decoding (256MB).
 // Prevents OOM from a crafted payload that claims a multi-GB uncompressed size.
@@ -373,6 +375,259 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
             break;
         }
     }
+}
+
+// ==================== Dictionary Encoding (Phase 3) ====================
+
+static constexpr uint32_t STR2_MAGIC = 0x53545232;  // "STR2"
+
+StringEncoder::Dictionary StringEncoder::buildDictionary(std::span<const std::string> values) {
+    Dictionary dict;
+    // Use an ordered map to assign stable IDs (insertion order)
+    std::unordered_map<std::string_view, uint32_t> seen;
+    seen.reserve(std::min(values.size(), MAX_DICT_ENTRIES + 1));
+
+    size_t totalBytes = 4;  // count(4)
+    for (const auto& s : values) {
+        if (seen.find(s) != seen.end())
+            continue;
+        if (seen.size() >= MAX_DICT_ENTRIES) {
+            return dict;  // valid=false
+        }
+        // varint size of string length + string data
+        size_t varintSize = 1;
+        uint32_t len = static_cast<uint32_t>(s.size());
+        while (len >= 0x80) {
+            varintSize++;
+            len >>= 7;
+        }
+        totalBytes += varintSize + s.size();
+        if (totalBytes > MAX_DICT_BYTES) {
+            return dict;  // valid=false
+        }
+        seen[s] = static_cast<uint32_t>(dict.entries.size());
+        dict.entries.push_back(s);
+    }
+    dict.totalBytes = totalBytes;
+    dict.valid = true;
+    return dict;
+}
+
+AlignedBuffer StringEncoder::serializeDictionary(const Dictionary& dict) {
+    AlignedBuffer buf;
+    buf.write(static_cast<uint32_t>(dict.entries.size()));
+    for (const auto& s : dict.entries) {
+        writeVarInt(buf, static_cast<uint32_t>(s.size()));
+        buf.write_bytes(s.data(), s.size());
+    }
+    return buf;
+}
+
+StringEncoder::Dictionary StringEncoder::deserializeDictionary(Slice& encoded, size_t dictSize) {
+    Dictionary dict;
+    if (dictSize < 4)
+        return dict;
+
+    size_t startOffset = encoded.offset;
+    uint32_t count;
+    std::memcpy(&count, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    dict.entries.reserve(count);
+    for (uint32_t i = 0; i < count && encoded.offset < startOffset + dictSize; ++i) {
+        uint32_t strLen = readVarInt(encoded);
+        if (strLen > encoded.length_ - encoded.offset) {
+            throw std::runtime_error("Invalid string length in dictionary");
+        }
+        dict.entries.emplace_back(reinterpret_cast<const char*>(encoded.data + encoded.offset), strLen);
+        encoded.offset += strLen;
+    }
+    dict.totalBytes = dictSize;
+    dict.valid = true;
+    return dict;
+}
+
+AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> values, const Dictionary& dict,
+                                              int compressionLevel) {
+    // Build string -> ID map from dictionary
+    std::unordered_map<std::string_view, uint32_t> idMap;
+    idMap.reserve(dict.entries.size());
+    for (uint32_t i = 0; i < dict.entries.size(); ++i) {
+        idMap[dict.entries[i]] = i;
+    }
+
+    // Encode values as varint IDs into an uncompressed buffer
+    // Estimate: each ID is 1-3 bytes (varint), so values.size() * 3 is a safe upper bound
+    AlignedBuffer uncompressed(values.size() * 3);
+    size_t writePos = 0;
+    for (const auto& s : values) {
+        auto it = idMap.find(s);
+        if (it == idMap.end()) {
+            throw std::runtime_error("String not found in dictionary during encoding");
+        }
+        uint32_t id = it->second;
+        // Inline varint write for speed
+        while (id >= 0x80) {
+            uncompressed.data[writePos++] = static_cast<uint8_t>((id & 0x7F) | 0x80);
+            id >>= 7;
+        }
+        uncompressed.data[writePos++] = static_cast<uint8_t>(id & 0x7F);
+    }
+    uncompressed.data.resize(writePos);
+
+    // Compress the ID stream with zstd
+    size_t compressedMaxSize = ZSTD_compressBound(writePos);
+    static thread_local std::vector<char> tlCompBuf;
+    tlCompBuf.resize(compressedMaxSize);
+    size_t compressedSize =
+        ZSTD_compressCCtx(getThreadCCtx(), tlCompBuf.data(), compressedMaxSize,
+                          reinterpret_cast<const char*>(uncompressed.data.data()), writePos, compressionLevel);
+    if (ZSTD_isError(compressedSize)) {
+        throw std::runtime_error(std::string("String dict encoder: zstd compression failed: ") +
+                                 ZSTD_getErrorName(compressedSize));
+    }
+
+    // Write header + compressed data
+    AlignedBuffer result;
+    result.write(STR2_MAGIC);                             // magic
+    result.write(static_cast<uint32_t>(writePos));        // uncompressed size
+    result.write(static_cast<uint32_t>(compressedSize));  // compressed size
+    result.write(static_cast<uint32_t>(values.size()));   // count
+    result.write_bytes(tlCompBuf.data(), compressedSize);
+    return result;
+}
+
+void StringEncoder::decodeDictionary(Slice& encoded, size_t count, const Dictionary& dict,
+                                     std::vector<std::string>& out) {
+    if (encoded.length_ - encoded.offset < 16) {
+        throw std::runtime_error("Invalid dictionary-encoded string buffer: too small for header");
+    }
+
+    uint32_t magic;
+    std::memcpy(&magic, encoded.data + encoded.offset, 4);
+    if (magic != STR2_MAGIC) {
+        throw std::runtime_error("Invalid magic in dictionary-encoded string block");
+    }
+    encoded.offset += 4;
+
+    uint32_t uncompressedSize;
+    std::memcpy(&uncompressedSize, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    uint32_t compressedSize;
+    std::memcpy(&compressedSize, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    uint32_t storedCount;
+    std::memcpy(&storedCount, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    if (encoded.length_ - encoded.offset < compressedSize) {
+        throw std::runtime_error("Dictionary-encoded string buffer: size mismatch");
+    }
+    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
+        throw std::runtime_error("Dictionary-encoded block uncompressedSize exceeds limit");
+    }
+
+    // Decompress ID stream
+    static thread_local std::vector<uint8_t> tlDecompBuf;
+    tlDecompBuf.resize(uncompressedSize);
+    size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()), uncompressedSize,
+                                     reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
+    if (ZSTD_isError(ret)) {
+        throw std::runtime_error(std::string("Failed to decompress dictionary IDs: ") + ZSTD_getErrorName(ret));
+    }
+    encoded.offset += compressedSize;
+
+    // Decode varint IDs and look up dictionary
+    Slice idSlice(tlDecompBuf.data(), uncompressedSize);
+    out.clear();
+    out.reserve(count);
+    for (size_t i = 0; i < count && idSlice.offset < idSlice.length_; ++i) {
+        uint32_t id = readVarInt(idSlice);
+        if (id >= dict.entries.size()) {
+            throw std::runtime_error("Dictionary ID " + std::to_string(id) + " out of range (dict size " +
+                                     std::to_string(dict.entries.size()) + ")");
+        }
+        out.push_back(dict.entries[id]);
+    }
+}
+
+void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                                     const Dictionary& dict, std::vector<std::string>& out) {
+    if (encoded.length_ - encoded.offset < 16) {
+        throw std::runtime_error("Invalid dictionary-encoded string buffer: too small for header");
+    }
+
+    uint32_t magic;
+    std::memcpy(&magic, encoded.data + encoded.offset, 4);
+    if (magic != STR2_MAGIC) {
+        throw std::runtime_error("Invalid magic in dictionary-encoded string block");
+    }
+    encoded.offset += 4;
+
+    uint32_t uncompressedSize;
+    std::memcpy(&uncompressedSize, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    uint32_t compressedSize;
+    std::memcpy(&compressedSize, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    uint32_t storedCount;
+    std::memcpy(&storedCount, encoded.data + encoded.offset, 4);
+    encoded.offset += 4;
+
+    if (encoded.length_ - encoded.offset < compressedSize) {
+        throw std::runtime_error("Dictionary-encoded string buffer: size mismatch");
+    }
+    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
+        throw std::runtime_error("Dictionary-encoded block uncompressedSize exceeds limit");
+    }
+
+    static thread_local std::vector<uint8_t> tlDecompBuf;
+    tlDecompBuf.resize(uncompressedSize);
+    size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()), uncompressedSize,
+                                     reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
+    if (ZSTD_isError(ret)) {
+        throw std::runtime_error(std::string("Failed to decompress dictionary IDs: ") + ZSTD_getErrorName(ret));
+    }
+    encoded.offset += compressedSize;
+
+    Slice idSlice(tlDecompBuf.data(), uncompressedSize);
+    out.clear();
+    out.reserve(limitCount);
+    size_t produced = 0;
+    for (size_t i = 0; i < totalCount && idSlice.offset < idSlice.length_; ++i) {
+        uint32_t id = readVarInt(idSlice);
+        if (id >= dict.entries.size()) {
+            throw std::runtime_error("Dictionary ID out of range");
+        }
+        if (i < skipCount)
+            continue;
+        if (produced < limitCount) {
+            out.push_back(dict.entries[id]);
+            produced++;
+        } else {
+            break;
+        }
+    }
+}
+
+bool StringEncoder::isDictionaryEncoded(const uint8_t* data, size_t size) {
+    if (size < 4)
+        return false;
+    uint32_t magic;
+    std::memcpy(&magic, data, 4);
+    return magic == STR2_MAGIC;
+}
+
+bool StringEncoder::isDictionaryEncoded(Slice& slice) {
+    if (slice.length_ - slice.offset < 4)
+        return false;
+    uint32_t magic;
+    std::memcpy(&magic, slice.data + slice.offset, 4);
+    return magic == STR2_MAGIC;
 }
 
 void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,

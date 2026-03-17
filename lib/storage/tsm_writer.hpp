@@ -72,6 +72,10 @@ public:
     void writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEntry& indexEntry, size_t blockStartOffset);
     void writeIndexBlock(std::span<const uint64_t> timestamps, std::span<const double> values,
                          TSMIndexEntry& indexEntry, size_t blockStartOffset);
+    void writeIndexBlock(std::span<const uint64_t> timestamps, std::span<const int64_t> values,
+                         TSMIndexEntry& indexEntry, size_t blockStartOffset);
+    void writeIndexBlock(std::span<const uint64_t> timestamps, const std::vector<bool>& values, size_t valOffset,
+                         size_t valCount, TSMIndexEntry& indexEntry, size_t blockStartOffset);
 
     // Blocking close using POSIX I/O (for use in tests or seastar::async contexts)
     void close();

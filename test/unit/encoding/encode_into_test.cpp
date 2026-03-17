@@ -1,6 +1,5 @@
 // Tests for the encodeInto() variants of FloatEncoder, IntegerEncoder, and
-// StringEncoder.  BoolEncoder::encodeInto() is already covered by
-// BoolEncoderTest.EncodeIntoEdgeSizes in bool_encoder_test.cpp.
+// StringEncoder.
 //
 // encodeInto() is the WAL write-path variant that writes directly into a
 // caller-supplied AlignedBuffer instead of allocating and returning a new

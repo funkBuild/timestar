@@ -134,12 +134,11 @@ int main() {
     std::cout << "║              Testing the new optimized implementation         ║\n";
     std::cout << "╚══════════════════════════════════════════════════════════════╝\n" << RESET;
 
-    std::cout << BOLD << "\nNote: This encoder now includes the following optimizations:\n" << RESET;
-    std::cout << "  • Loop unrolling (4x) in delta-of-delta encoding\n";
-    std::cout << "  • Optimized memory allocation with pre-reservation\n";
-    std::cout << "  • Loop unrolling (4x) in delta reconstruction\n";
-    std::cout << "  • SIMD-aware batch processing when AVX2 is available\n";
-    std::cout << "  • Reduced branch mispredictions\n";
+    std::cout << BOLD << "\nEncoder: FFOR (Frame-of-Reference) with Google Highway SIMD\n" << RESET;
+    std::cout << "  • Block-based FFOR bit-packing (1024 values/block)\n";
+    std::cout << "  • Delta-of-delta + ZigZag preprocessing\n";
+    std::cout << "  • Exception mechanism for outlier handling\n";
+    std::cout << "  • Vectorized via Google Highway (auto-selects best ISA)\n";
 
     // Test different datasets
     benchmarkDataset("Monotonic Timestamps (10K)", generateMonotonicTimestamps(10000));
