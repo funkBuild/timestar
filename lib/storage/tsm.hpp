@@ -33,12 +33,12 @@ struct TSMIndexBlock {
     uint64_t maxTime;
     uint64_t offset;
     uint32_t size;
-    // Block-level statistics (populated in v2+ files for Float series)
+    // Block-level statistics (Float series only)
     double blockSum = 0.0;
     double blockMin = std::numeric_limits<double>::max();
     double blockMax = std::numeric_limits<double>::lowest();
     uint32_t blockCount = 0;  // 0 means stats not available
-    // Extended statistics (populated in v3+ files for Float series)
+    // Extended statistics (Float series only)
     double blockM2 = 0.0;           // Welford's M2 accumulator for STDDEV/STDVAR
     double blockFirstValue = 0.0;   // Value at earliest timestamp (for FIRST)
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
@@ -65,8 +65,8 @@ struct SparseIndexEntry {
     // full index entry — critical for narrow-range queries with many TSM files.
     uint64_t minTime = 0;
     uint64_t maxTime = 0;
-    // v3 block-level stats cached from first/last block for zero-I/O LATEST/FIRST.
-    // Populated during readSparseIndex() for Float series in v3 files.
+    // Block-level stats cached from first/last block for zero-I/O LATEST/FIRST.
+    // Populated during readSparseIndex() for Float series.
     double firstValue = 0.0;   // blockFirstValue from the first block
     double latestValue = 0.0;  // blockLatestValue from the last block
     bool hasExtendedStats = false;
@@ -78,12 +78,9 @@ struct TSMIndexEntry {
     std::vector<TSMIndexBlock> indexBlocks;
 };
 
-// TSM file format versions:
-//   v1: original format (28 bytes per index block)
-//   v2: adds block-level statistics for Float series (56 bytes per Float block, 28 for others)
-//   v3: adds extended statistics (M2, firstValue, latestValue) for Float series (80 bytes per Float block)
-static constexpr uint8_t TSM_VERSION_STATS = 2;
-static constexpr uint8_t TSM_VERSION_EXTENDED_STATS = 3;
+// TSM file format version.
+// Index blocks are 80 bytes for Float series (base + stats + extended stats), 28 bytes for others.
+static constexpr uint8_t TSM_VERSION = 1;
 
 class TSM {
 private:
@@ -171,7 +168,7 @@ public:
         return (it != sparseIndex.end()) ? it->second.minTime : std::numeric_limits<uint64_t>::max();
     }
 
-    // Zero-I/O LATEST/FIRST from sparse index v3 stats.
+    // Zero-I/O LATEST/FIRST from sparse index stats.
     // Returns the latest or first (timestamp, value) for a series without any disk reads.
     // Returns nullopt if series not found or stats unavailable.
     struct PointResult {

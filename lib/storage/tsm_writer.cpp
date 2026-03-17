@@ -34,7 +34,7 @@ TSMWriter::TSMWriter(std::string _filename) {
 void TSMWriter::writeHeader() {
     std::string magic("TASM");
     buffer.write(magic);
-    buffer.write(TSM_VERSION_EXTENDED_STATS);  // Version 3: includes extended block statistics
+    buffer.write(TSM_VERSION);  // Version 1: block stats + extended stats for Float series
 }
 
 template <class T>
@@ -388,13 +388,12 @@ void TSMWriter::writeIndex() {
             buffer.write(block.maxTime);  // maxTime
             buffer.write(block.offset);   // byte offset from start of file
             buffer.write(block.size);     // block size
-            // v2+: block-level statistics for Float series
+            // Block-level statistics for Float series (80 bytes per block)
             if (indexEntry.seriesType == TSMValueType::Float) {
                 buffer.write(block.blockSum);
                 buffer.write(block.blockMin);
                 buffer.write(block.blockMax);
                 buffer.write(block.blockCount);
-                // v3: extended statistics
                 buffer.write(block.blockM2);
                 buffer.write(block.blockFirstValue);
                 buffer.write(block.blockLatestValue);

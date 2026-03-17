@@ -73,7 +73,7 @@ public:
     // Returns true when all points in the block would go to the same
     // aggregation target (single bucket, fold mode, or block fits in one bucket)
     // AND the aggregation method doesn't require per-point computation.
-    // hasExtendedStats: true when block has M2/firstValue/latestValue (v3+ files).
+    // hasExtendedStats: true when block has M2/firstValue/latestValue (Float series).
     bool canUseBlockStats(uint64_t blockMinTime, uint64_t blockMaxTime, bool hasExtendedStats = false) const {
         if (methodAware_) {
             switch (method_) {
@@ -83,7 +83,7 @@ public:
                 case AggregationMethod::MEDIAN:
                     return false;
                 // STDDEV/STDVAR need Welford M2; LATEST/FIRST need actual values.
-                // These can use block stats only when extended stats (v3+) are available.
+                // These can use block stats only when extended stats are available.
                 case AggregationMethod::STDDEV:
                 case AggregationMethod::STDVAR:
                 case AggregationMethod::LATEST:

@@ -136,10 +136,14 @@ seastar::future<> TSM::open() {
     try {
         length = co_await tsmFile.size();
 
-        // Read file header to determine version (magic "TASM" + 1-byte version)
+        // Read and validate file header (magic "TASM" + 1-byte version)
         if (length >= 5) {
             auto hdrBuf = co_await tsmFile.dma_read_exactly<uint8_t>(0, 5);
             fileVersion = hdrBuf.get()[4];
+            if (fileVersion != TSM_VERSION) {
+                throw std::runtime_error("Unsupported TSM file version " + std::to_string(fileVersion) +
+                                         " (expected " + std::to_string(TSM_VERSION) + "): " + filePath);
+            }
         }
 
         // Use lazy loading: read sparse index + bloom filter (not full index)
@@ -217,18 +221,9 @@ seastar::future<> TSM::readSparseIndex() {
         uint8_t type = indexSlice.read<uint8_t>();
         uint16_t blockCount = indexSlice.read<uint16_t>();
 
-        // v1: 28 bytes per block (minTime+maxTime+offset+size)
-        // v2: Float blocks get 28 extra bytes (sum+min+max+count = 8+8+8+4)
-        // v3: Float blocks get 52 extra bytes (v2 stats + m2+firstValue+latestValue = 8+8+8)
+        // Float blocks: 80 bytes (28 base + 52 stats), others: 28 bytes
         bool isFloat = static_cast<TSMValueType>(type) == TSMValueType::Float;
-        size_t extraBytes = 0;
-        if (isFloat) {
-            if (fileVersion >= TSM_VERSION_EXTENDED_STATS)
-                extraBytes = 52;  // sum+min+max+count + m2+firstValue+latestValue
-            else if (fileVersion >= TSM_VERSION_STATS)
-                extraBytes = 28;  // sum+min+max+count
-        }
-        size_t perBlockBytes = 28 + extraBytes;
+        size_t perBlockBytes = isFloat ? 80 : 28;
 
         // Validate blockCount against remaining index data to prevent
         // reads past the end of the index on malformed files.
@@ -243,10 +238,10 @@ seastar::future<> TSM::readSparseIndex() {
         uint32_t entrySize = 16 + 1 + 2 + static_cast<uint32_t>(blockBytes);
 
         // Peek at first/last block metadata from the index for sparse lookups.
-        // v3 Float blocks: 80 bytes each (28 base + 28 v2 stats + 24 v3 extended).
+        // Float blocks: 80 bytes each (28 base + 52 stats).
         // Layout per block: minTime(8) maxTime(8) offset(8) size(4)
-        //   v2+: blockSum(8) blockMin(8) blockMax(8) blockCount(4)
-        //   v3+: blockM2(8) blockFirstValue(8) blockLatestValue(8)
+        //   blockSum(8) blockMin(8) blockMax(8) blockCount(4)
+        //   blockM2(8) blockFirstValue(8) blockLatestValue(8)
         uint64_t seriesMinTime = 0;
         uint64_t seriesMaxTime = 0;
         double firstValue = 0.0;
@@ -262,8 +257,8 @@ seastar::future<> TSM::readSparseIndex() {
             // Last block: maxTime at offset 8
             std::memcpy(&seriesMaxTime, indexSlice.data + lastBlockStart + 8, sizeof(uint64_t));
 
-            // v3 Float: extract firstValue from first block, latestValue from last block
-            if (isFloat && fileVersion >= TSM_VERSION_EXTENDED_STATS) {
+            // Float: extract firstValue from first block, latestValue from last block
+            if (isFloat) {
                 // blockFirstValue at offset 64 within block, blockLatestValue at offset 72
                 std::memcpy(&firstValue, indexSlice.data + blockStart + 64, sizeof(double));
                 std::memcpy(&latestValue, indexSlice.data + lastBlockStart + 72, sizeof(double));
@@ -352,8 +347,6 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
 
     // Parse all blocks
     bool isFloat = (fullEntry.seriesType == TSMValueType::Float);
-    bool hasStats = (fileVersion >= TSM_VERSION_STATS) && isFloat;
-    bool hasExtended = (fileVersion >= TSM_VERSION_EXTENDED_STATS) && isFloat;
     fullEntry.indexBlocks.reserve(blockCount);
     for (uint16_t i = 0; i < blockCount; i++) {
         TSMIndexBlock block;
@@ -361,13 +354,11 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         block.maxTime = entrySlice.read<uint64_t>();
         block.offset = entrySlice.read<uint64_t>();
         block.size = entrySlice.read<uint32_t>();
-        if (hasStats) {
+        if (isFloat) {
             block.blockSum = entrySlice.read<double>();
             block.blockMin = entrySlice.read<double>();
             block.blockMax = entrySlice.read<double>();
             block.blockCount = entrySlice.read<uint32_t>();
-        }
-        if (hasExtended) {
             block.blockM2 = entrySlice.read<double>();
             block.blockFirstValue = entrySlice.read<double>();
             block.blockLatestValue = entrySlice.read<double>();
@@ -477,7 +468,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
     }
 
     // Read each group with a single DMA read and parse all entries from the buffer
-    bool isFloat, hasStats, hasExtended;
+    bool isFloat;
     for (auto& group : groups) {
         uint64_t readSize = group.endOffset - group.startOffset;
         seastar::temporary_buffer<char> buf;
@@ -515,8 +506,6 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
             uint16_t blockCount = entrySlice.read<uint16_t>();
 
             isFloat = (fullEntry.seriesType == TSMValueType::Float);
-            hasStats = (fileVersion >= TSM_VERSION_STATS) && isFloat;
-            hasExtended = (fileVersion >= TSM_VERSION_EXTENDED_STATS) && isFloat;
             fullEntry.indexBlocks.reserve(blockCount);
 
             for (uint16_t b = 0; b < blockCount; ++b) {
@@ -525,13 +514,11 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
                 block.maxTime = entrySlice.read<uint64_t>();
                 block.offset = entrySlice.read<uint64_t>();
                 block.size = entrySlice.read<uint32_t>();
-                if (hasStats) {
+                if (isFloat) {
                     block.blockSum = entrySlice.read<double>();
                     block.blockMin = entrySlice.read<double>();
                     block.blockMax = entrySlice.read<double>();
                     block.blockCount = entrySlice.read<uint32_t>();
-                }
-                if (hasExtended) {
                     block.blockM2 = entrySlice.read<double>();
                     block.blockFirstValue = entrySlice.read<double>();
                     block.blockLatestValue = entrySlice.read<double>();
@@ -1149,7 +1136,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
         co_return 0;
     }
 
-    // Fast path: for LATEST/FIRST with maxPoints=1 and v3 extended stats,
+    // Fast path: for LATEST/FIRST with maxPoints=1 and extended stats,
     // use the block-level latestValue/firstValue directly from the index entry.
     // This avoids reading any data blocks from disk — pure metadata lookup.
     // Only valid when the block's extreme timestamp falls within the query range.
@@ -1320,7 +1307,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
             continue;  // Skip this block entirely
         }
 
-        // Extended-stats shortcut: when block has v3 stats and fits in one
+        // Extended-stats shortcut: when block has extended stats and fits in one
         // bucket, extract the first/latest endpoint directly without DMA
         // read + decode.  This preserves 1-point-per-bucket semantics.
         bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
