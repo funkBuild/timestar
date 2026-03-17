@@ -25,25 +25,10 @@ timestar_add_benchmark(bit_operations_benchmark bit_operations_benchmark.cpp
     EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/utils
     EXTRA_FLAGS -mavx2 -msse4.2)
 
-timestar_add_benchmark(float_decoder_ultimate_benchmark float_decoder_ultimate_benchmark.cpp
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/encoding/float
-    EXTRA_FLAGS -mavx2 -mavx512f -mavx512dq)
-
-timestar_add_benchmark(float_encoder_ultimate_benchmark float_encoder_ultimate_benchmark.cpp
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/encoding/float
-    EXTRA_FLAGS -mavx2 -mavx512f -mavx512dq)
-
-timestar_add_benchmark(float_decoder_buffer_optimization_test float_decoder_buffer_optimization_test.cpp
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/encoding/float)
-
 timestar_add_benchmark(integer_encoder_benchmark integer_encoder_benchmark.cpp)
 
 timestar_add_benchmark(integer_encoder_comparison integer_encoder_comparison.cpp
     EXTRA_FLAGS -mavx2)
-
-timestar_add_benchmark(integer_encoder_variants_benchmark integer_encoder_variants_benchmark.cpp
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/encoding/integer
-    EXTRA_FLAGS -mavx2 -mavx512f -mavx512dq)
 
 # --- Query / aggregator benchmarks ---
 
@@ -76,31 +61,3 @@ add_custom_target(run-batch-read-bench
 
 # --- Comparison benchmarks ---
 
-timestar_add_benchmark(alp_gorilla_comparison_benchmark alp_gorilla_comparison_benchmark.cpp
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/encoding/float)
-
-add_custom_target(run-alp-bench
-    COMMAND alp_gorilla_comparison_benchmark
-    DEPENDS alp_gorilla_comparison_benchmark
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running ALP vs Gorilla comparison benchmark"
-)
-
-timestar_add_benchmark(integer_ffor_vs_simple16_benchmark integer_ffor_vs_simple16_benchmark.cpp
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/encoding/integer)
-
-add_custom_target(run-ffor-bench
-    COMMAND integer_ffor_vs_simple16_benchmark
-    DEPENDS integer_ffor_vs_simple16_benchmark
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running FFOR vs Simple16 integer encoder comparison benchmark"
-)
-
-timestar_add_benchmark(bool_encoder_benchmark bool_encoder_benchmark.cpp)
-
-add_custom_target(run-bool-bench
-    COMMAND bool_encoder_benchmark
-    DEPENDS bool_encoder_benchmark
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running BitPack vs RLE boolean encoder comparison benchmark"
-)

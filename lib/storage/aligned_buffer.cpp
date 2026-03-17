@@ -94,4 +94,5 @@ template void AlignedBuffer::write<uint8_t>(uint8_t value);
 template void AlignedBuffer::write<uint16_t>(uint16_t value);
 template void AlignedBuffer::write<uint32_t>(uint32_t value);
 template void AlignedBuffer::write<uint64_t>(uint64_t value);
+template void AlignedBuffer::write<int64_t>(int64_t value);
 template void AlignedBuffer::write<double>(double value);

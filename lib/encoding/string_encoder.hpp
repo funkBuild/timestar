@@ -56,4 +56,48 @@ public:
                        std::vector<std::string>& out);
     static void decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                        std::vector<std::string>& out);
+
+    // ==================== Dictionary Encoding (Phase 3) ====================
+    // For low-cardinality string series, dictionary encoding stores varint IDs
+    // instead of raw strings, then compresses the IDs with zstd.
+    // Magic: "STR2" (0x53545232) distinguishes from raw "STRG" (0x53545247).
+
+    // Dictionary limits — fall back to raw encoding if exceeded.
+    // Benchmarking showed dictionary encoding is only beneficial for cardinality <= ~50.
+    // Above that, the dictionary overhead exceeds zstd's native compression of repeated strings.
+    static constexpr size_t MAX_DICT_BYTES = 4 * 1024;  // 4KB max dictionary size
+    static constexpr size_t MAX_DICT_ENTRIES = 50;      // 50 max unique strings
+
+    // Build a dictionary from a set of string values.
+    // Returns the dictionary (ordered vector of unique strings) and total byte size.
+    // Returns empty dictionary if limits are exceeded.
+    struct Dictionary {
+        std::vector<std::string> entries;  // index -> string
+        size_t totalBytes = 0;             // total serialized size
+        bool valid = false;                // true if within limits
+    };
+    static Dictionary buildDictionary(std::span<const std::string> values);
+
+    // Serialize a dictionary to bytes: count(4) + [varint_len + string_data]...
+    static AlignedBuffer serializeDictionary(const Dictionary& dict);
+
+    // Deserialize a dictionary from bytes.
+    static Dictionary deserializeDictionary(Slice& encoded, size_t dictSize);
+
+    // Encode strings using dictionary: replaces strings with varint IDs, then zstd-compresses.
+    // Header: magic("STR2") + uncompressedSize(4) + compressedSize(4) + count(4)
+    // Data: zstd-compressed varint IDs
+    static AlignedBuffer encodeDictionary(std::span<const std::string> values, const Dictionary& dict,
+                                          int compressionLevel = 1);
+
+    // Decode dictionary-encoded block: decompress IDs, look up dictionary.
+    static void decodeDictionary(Slice& encoded, size_t count, const Dictionary& dict, std::vector<std::string>& out);
+
+    // Decode dictionary-encoded block with skip/limit support.
+    static void decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                                 const Dictionary& dict, std::vector<std::string>& out);
+
+    // Check if a block is dictionary-encoded by peeking at the magic bytes.
+    static bool isDictionaryEncoded(const uint8_t* data, size_t size);
+    static bool isDictionaryEncoded(Slice& slice);
 };

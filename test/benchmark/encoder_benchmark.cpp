@@ -1,5 +1,5 @@
 #include "aligned_buffer.hpp"
-#include "bool_encoder.hpp"
+#include "bool_encoder_rle.hpp"
 #include "compressed_buffer.hpp"
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
@@ -315,16 +315,16 @@ BenchmarkResult benchmarkBoolEncoder(const std::vector<bool>& data) {
 
     // Warmup
     for (size_t i = 0; i < WARMUP_ITERATIONS; ++i) {
-        encodeBuffer = BoolEncoder::encode(data);
+        encodeBuffer = BoolEncoderRLE::encode(data);
         decoded.clear();
         Slice slice(encodeBuffer.data.data(), encodeBuffer.data.size());
-        BoolEncoder::decode(slice, 0, data.size(), decoded);
+        BoolEncoderRLE::decode(slice, 0, data.size(), decoded);
     }
 
     // Benchmark encoding
     auto encode_start = high_resolution_clock::now();
     for (size_t i = 0; i < BENCHMARK_ITERATIONS; ++i) {
-        encodeBuffer = BoolEncoder::encode(data);
+        encodeBuffer = BoolEncoderRLE::encode(data);
     }
     auto encode_end = high_resolution_clock::now();
 
@@ -335,7 +335,7 @@ BenchmarkResult benchmarkBoolEncoder(const std::vector<bool>& data) {
     for (size_t i = 0; i < BENCHMARK_ITERATIONS; ++i) {
         decoded.clear();
         Slice slice(encodeBuffer.data.data(), encodeBuffer.data.size());
-        BoolEncoder::decode(slice, 0, data.size(), decoded);
+        BoolEncoderRLE::decode(slice, 0, data.size(), decoded);
     }
     auto decode_end = high_resolution_clock::now();
 

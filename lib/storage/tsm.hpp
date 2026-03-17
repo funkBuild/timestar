@@ -33,16 +33,24 @@ struct TSMIndexBlock {
     uint64_t maxTime;
     uint64_t offset;
     uint32_t size;
-    // Block-level statistics (Float series only)
+    // Block-level statistics (all types in V2; Float-only in V1)
+    // For Float: native double values.
+    // For Integer: int64 values stored as double (lossless up to 2^53).
+    // For Boolean: blockSum = trueCount, blockMin/blockMax = 0.0/1.0 or unused.
+    // For String: only blockCount is meaningful.
     double blockSum = 0.0;
     double blockMin = std::numeric_limits<double>::max();
     double blockMax = std::numeric_limits<double>::lowest();
     uint32_t blockCount = 0;  // 0 means stats not available
-    // Extended statistics (Float series only)
-    double blockM2 = 0.0;           // Welford's M2 accumulator for STDDEV/STDVAR
+    // Extended statistics (Float/Integer in V2)
+    double blockM2 = 0.0;           // Welford's M2 accumulator for STDDEV/STDVAR (Float only)
     double blockFirstValue = 0.0;   // Value at earliest timestamp (for FIRST)
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
-    bool hasExtendedStats = false;  // true when M2/first/latest are populated
+    bool hasExtendedStats = false;  // true when first/latest are populated
+    // Boolean-specific stats (V2)
+    uint32_t boolTrueCount = 0;    // Number of true values in block
+    bool boolFirstValue = false;   // Value at earliest timestamp
+    bool boolLatestValue = false;  // Value at latest timestamp
 };
 
 // Batch of contiguous blocks for optimized I/O
@@ -66,21 +74,55 @@ struct SparseIndexEntry {
     uint64_t minTime = 0;
     uint64_t maxTime = 0;
     // Block-level stats cached from first/last block for zero-I/O LATEST/FIRST.
-    // Populated during readSparseIndex() for Float series.
+    // Populated during readSparseIndex() for Float and Integer series (V2).
     double firstValue = 0.0;   // blockFirstValue from the first block
     double latestValue = 0.0;  // blockLatestValue from the last block
     bool hasExtendedStats = false;
+    // Boolean sparse stats for zero-I/O LATEST/FIRST
+    bool boolFirstValue = false;
+    bool boolLatestValue = false;
 };
 
 struct TSMIndexEntry {
     SeriesId128 seriesId;
     TSMValueType seriesType;
     std::vector<TSMIndexBlock> indexBlocks;
+    // String dictionary (Phase 3): populated for dictionary-encoded String series.
+    // When non-empty, string blocks use varint IDs referencing this dictionary.
+    std::vector<std::string> stringDictionary;
 };
 
 // TSM file format version.
-// Index blocks are 80 bytes for Float series (base + stats + extended stats), 28 bytes for others.
-static constexpr uint8_t TSM_VERSION = 1;
+// V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
+// V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
+static constexpr uint8_t TSM_VERSION = 2;
+static constexpr uint8_t TSM_VERSION_MIN = 1;  // oldest version we can read
+
+// Per-type index block byte size for V2 files.
+// V1 files: Float=80, all others=28 (no stats).
+// V2 files: Float=80, Integer=72, Boolean=40, String=32.
+inline size_t indexBlockBytesV2(TSMValueType type) {
+    switch (type) {
+        case TSMValueType::Float:
+            return 80;  // 28 base + 52 stats
+        case TSMValueType::Integer:
+            return 72;  // 28 base + 4 count + 40 (sum/min/max/first/latest as int64)
+        case TSMValueType::Boolean:
+            return 40;  // 28 base + 4 count + 4 trueCount + 1 first + 1 latest + 2 pad
+        case TSMValueType::String:
+            return 32;  // 28 base + 4 count
+        default:
+            return 28;
+    }
+}
+
+inline size_t indexBlockBytes(TSMValueType type, uint8_t version) {
+    if (version < 2) {
+        // V1: only Float has stats
+        return (type == TSMValueType::Float) ? 80 : 28;
+    }
+    return indexBlockBytesV2(type);
+}
 
 class TSM {
 private:
@@ -257,7 +299,7 @@ public:
 
     // Pushdown aggregation: decode blocks and fold directly into BlockAggregator
     // instead of materialising TSMResult. Returns the number of points aggregated.
-    // Only works for Float series; returns 0 for other types.
+    // Works for Float, Integer, and Boolean series; returns 0 for String.
     seastar::future<size_t> aggregateSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                             timestar::BlockAggregator& aggregator);
 

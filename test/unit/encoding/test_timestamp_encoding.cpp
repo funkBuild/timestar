@@ -1,5 +1,4 @@
 #include "../../../lib/encoding/integer_encoder.hpp"
-#include "../../../lib/encoding/simple16.hpp"
 
 #include <gtest/gtest.h>
 
@@ -13,14 +12,16 @@ TEST(TimestampEncodingTest, MaxUint64Value) {
     std::cout << "Testing UINT64_MAX: " << max_val << std::endl;
     std::cout << "In hex: 0x" << std::hex << max_val << std::dec << std::endl;
 
-    // Test 1: Direct Simple16 encoding
+    // Test 1: Single UINT64_MAX value
     {
         std::vector<uint64_t> values = {max_val};
-        AlignedBuffer encoded = Simple16::encode(values);
+        AlignedBuffer encoded = IntegerEncoder::encode(values);
 
         Slice slice(encoded.data.data(), encoded.size());
-        std::vector<uint64_t> decoded = Simple16::decode(slice, 1);
+        std::vector<uint64_t> decoded;
+        auto [skipped, added] = IntegerEncoder::decode(slice, 1, decoded, 0, UINT64_MAX);
 
+        ASSERT_EQ(added, 1);
         ASSERT_EQ(decoded.size(), 1);
         EXPECT_EQ(decoded[0], max_val);
     }

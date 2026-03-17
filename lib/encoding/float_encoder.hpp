@@ -4,12 +4,6 @@
 #include "../storage/slice_buffer.hpp"
 #include "alp/alp_decoder.hpp"
 #include "alp/alp_encoder.hpp"
-#include "float/float_decoder.hpp"  // Contains FloatDecoderBasic
-#include "float/float_decoder_avx512.hpp"
-#include "float/float_decoder_simd.hpp"
-#include "float/float_encoder.hpp"  // Contains FloatEncoderBasic
-#include "float/float_encoder_avx512.hpp"
-#include "float/float_encoder_simd.hpp"
 
 #include <span>
 #include <string>
@@ -18,23 +12,15 @@
 class AlignedBuffer;
 
 /**
- * Compile-time selection of float compression algorithm.
- * Change this constexpr to switch the entire storage layer between algorithms.
- *   GORILLA - Gorilla XOR-delta encoding (original, with AVX-512/AVX2 acceleration)
- *   ALP     - Adaptive Lossless floating-Point compression (SIGMOD 2024)
- */
-enum class FloatCompression { GORILLA, ALP };
-
-static constexpr FloatCompression FLOAT_COMPRESSION = FloatCompression::ALP;
-
-/**
- * Main FloatEncoder class that automatically selects the best implementation
- * based on CPU capabilities.
+ * FloatEncoder - ALP (Adaptive Lossless floating-Point) compression.
+ *
+ * Uses the ALP algorithm (SIGMOD 2024) for efficient lossless compression
+ * of double-precision floating-point values.
  */
 class FloatEncoder {
 public:
     /**
-     * Encode doubles using the best available implementation.
+     * Encode doubles using ALP compression.
      * Accepts std::span for zero-copy sub-range encoding; std::vector
      * converts implicitly.
      */
@@ -42,77 +28,28 @@ public:
 
     /**
      * Encode directly into an existing AlignedBuffer (zero-copy for WAL path).
-     * The CompressedBuffer is still used internally for bit-packing, but the
-     * result is written directly into the target, eliminating one full copy.
      * Returns the number of bytes written to the target buffer.
      */
     static size_t encodeInto(std::span<const double> values, AlignedBuffer& target);
 
     /**
-     * Get the name of the encoder implementation being used
+     * Get the name of the encoder implementation being used.
      */
     static std::string getImplementationName();
-
-    /**
-     * Check which implementations are available
-     */
-    static bool hasAVX512();
-    static bool hasAVX2();
-
-    /**
-     * Force a specific implementation (for testing)
-     */
-    enum Implementation {
-        AUTO,   // Automatically select best
-        BASIC,  // Force basic implementation
-        SIMD,   // Force SIMD AVX2
-        AVX512  // Force AVX-512
-    };
-
-    static void setImplementation(Implementation impl);
-
-private:
-    static Implementation selectBestImplementation();
-    static thread_local Implementation s_forced_impl;
 };
 
 /**
- * Main FloatDecoder class that automatically selects the best implementation
- * based on CPU capabilities.
- *
- * All decoder implementations are compatible with all encoder outputs.
+ * FloatDecoder - ALP (Adaptive Lossless floating-Point) decompression.
  */
 class FloatDecoder {
 public:
     /**
-     * Decode compressed data back to doubles using the best available implementation
+     * Decode compressed data back to doubles.
      */
     static void decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 
     /**
-     * Get the name of the decoder implementation being used
+     * Get the name of the decoder implementation being used.
      */
     static std::string getImplementationName();
-
-    /**
-     * Check which implementations are available
-     */
-    static bool hasAVX512();
-    static bool hasAVX2();
-
-    /**
-     * Force a specific implementation (for testing)
-     */
-    enum Implementation {
-        AUTO,   // Automatically select best
-        BASIC,  // Force basic implementation
-        SIMD,   // Force SIMD AVX2
-        AVX512  // Force AVX-512
-    };
-
-    static void setImplementation(Implementation impl);
-
-private:
-    static Implementation selectBestImplementation();
-    static thread_local Implementation s_forced_impl;
 };

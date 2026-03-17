@@ -10,12 +10,11 @@
 /**
  * IntegerEncoderFFOR - FFOR (Frame-of-Reference) based integer encoder
  *
- * Uses delta-of-delta encoding followed by ZigZag (same as the Basic encoder),
- * then replaces Simple16 variable-width packing with block-based FFOR
- * bit-packing and an exception mechanism for outliers.
+ * Uses delta-of-delta encoding followed by ZigZag, then block-based FFOR
+ * bit-packing with an exception mechanism for outliers.
  *
- * Key advantages over Simple16:
- * - Constant-interval timestamps compress to ~0 bits/value (vs 2+ bits/value)
+ * Key properties:
+ * - Constant-interval timestamps compress to ~0 bits/value
  * - Branchless, auto-vectorizable packing/unpacking loops
  * - Per-block exception mechanism handles outliers without inflating all values
  *

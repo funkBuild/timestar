@@ -10,7 +10,7 @@ Tests are organized into the following categories:
 Focused tests for individual components with minimal dependencies.
 
 - **`unit/storage/`** - Storage layer tests (TSM, WAL, Memory Store, Compactor)
-- **`unit/encoding/`** - Encoding/compression algorithm tests (Simple8b, Simple16, String encoding)
+- **`unit/encoding/`** - Encoding/compression algorithm tests (FFOR integer, Float, String encoding)
 - **`unit/query/`** - Query system tests (Parser, Planner, Aggregator, Series Matcher)
 - **`unit/index/`** - Index system tests (NativeIndex, key encoding, postings)
 - **`unit/http/`** - HTTP handler tests (Query handler, Write handler)

@@ -34,7 +34,7 @@ TSMWriter::TSMWriter(std::string _filename) {
 void TSMWriter::writeHeader() {
     std::string magic("TASM");
     buffer.write(magic);
-    buffer.write(TSM_VERSION);  // Version 1: block stats + extended stats for Float series
+    buffer.write(TSM_VERSION);  // Version 2: universal block stats for all types
 }
 
 template <class T>
@@ -45,6 +45,16 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
     TSMIndexEntry indexEntry;
     indexEntry.seriesId = seriesId;
     indexEntry.seriesType = seriesType;
+
+    // Phase 3: For String series, try building a dictionary from all values.
+    // If valid, blocks will use dictionary encoding (varint IDs instead of raw strings).
+    StringEncoder::Dictionary stringDict;
+    if constexpr (std::is_same_v<T, std::string>) {
+        stringDict = StringEncoder::buildDictionary(values);
+        if (stringDict.valid) {
+            indexEntry.stringDictionary = stringDict.entries;
+        }
+    }
 
     size_t offset = 0;
     size_t blockCount = 0;
@@ -76,7 +86,8 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
             buffer.write((uint32_t)encodedTimestamps.size());
             buffer.write(encodedTimestamps);
             BoolEncoderRLE::encodeInto(blockValues, buffer);
-            writeIndexBlock(tsSpan, indexEntry, blockStartOffset);
+
+            writeIndexBlock(tsSpan, values, offset, blockSize, indexEntry, blockStartOffset);
         } else {
             std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
             std::span<const T> valSpan(values.data() + offset, blockSize);
@@ -110,8 +121,17 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         std::vector<bool> boolVec(values.begin(), values.end());
         BoolEncoderRLE::encodeInto(boolVec, buffer);
     } else if constexpr (std::is_same_v<T, std::string>) {
-        AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
-        buffer.write(encodedStrings);
+        // Phase 3: Use dictionary encoding if dictionary is available on the index entry
+        if (!indexEntry.stringDictionary.empty()) {
+            StringEncoder::Dictionary dict;
+            dict.entries = indexEntry.stringDictionary;
+            dict.valid = true;
+            AlignedBuffer encodedStrings = StringEncoder::encodeDictionary(values, dict, compressionLevel_);
+            buffer.write(encodedStrings);
+        } else {
+            AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
+            buffer.write(encodedStrings);
+        }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         // Use thread-local scratch buffer to avoid per-block heap allocation
         static thread_local std::vector<uint64_t> zigzagScratch;
@@ -123,10 +143,13 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         static_assert(sizeof(T) == 0, "Unsupported TSM value type");
     }
 
-    // For Float series, pass values to compute block-level stats
+    // Compute block-level stats per type
     if constexpr (std::is_same_v<T, double>) {
         writeIndexBlock(timestamps, values, indexEntry, blockStartOffset);
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+        writeIndexBlock(timestamps, values, indexEntry, blockStartOffset);
     } else {
+        // String: base index block only (blockCount set in writeIndex serialization via separate overload)
         writeIndexBlock(timestamps, indexEntry, blockStartOffset);
     }
 }
@@ -187,8 +210,16 @@ void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128& ser
     } else if constexpr (std::is_same_v<T, bool>) {
         BoolEncoderRLE::encodeInto(values, buffer);
     } else if constexpr (std::is_same_v<T, std::string>) {
-        AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
-        buffer.write(encodedStrings);
+        if (!indexEntry.stringDictionary.empty()) {
+            StringEncoder::Dictionary dict;
+            dict.entries = indexEntry.stringDictionary;
+            dict.valid = true;
+            AlignedBuffer encodedStrings = StringEncoder::encodeDictionary(values, dict, compressionLevel_);
+            buffer.write(encodedStrings);
+        } else {
+            AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
+            buffer.write(encodedStrings);
+        }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         static thread_local std::vector<uint64_t> zigzagScratch;
         zigzagScratch.resize(values.size());
@@ -202,6 +233,10 @@ void TSMWriter::writeBlockDirect(TSMValueType seriesType, const SeriesId128& ser
     // Write index block (timestamps still valid as lvalue)
     if constexpr (std::is_same_v<T, double>) {
         writeIndexBlock(timestamps, values, indexEntry, blockStartOffset);
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+        writeIndexBlock(timestamps, values, indexEntry, blockStartOffset);
+    } else if constexpr (std::is_same_v<T, bool>) {
+        writeIndexBlock(timestamps, values, 0, values.size(), indexEntry, blockStartOffset);
     } else {
         writeIndexBlock(timestamps, indexEntry, blockStartOffset);
     }
@@ -226,6 +261,8 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     indexBlock.maxTime = *maxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
+    // V2: set blockCount for all types (enables COUNT pushdown for String)
+    indexBlock.blockCount = static_cast<uint32_t>(timestamps.size());
 
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
@@ -291,6 +328,90 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
 
+// Integer-specific writeIndexBlock: compute sum/min/max/first/latest as int64, store in TSMIndexBlock
+void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<const int64_t> values,
+                                TSMIndexEntry& indexEntry, size_t blockStartOffset) {
+    if (timestamps.empty())
+        return;
+    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    size_t blockSize = buffer.size() - blockStartOffset;
+    if (blockSize > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("TSM block size exceeds uint32_t maximum");
+    }
+
+    TSMIndexBlock indexBlock;
+    indexBlock.minTime = *minTime;
+    indexBlock.maxTime = *maxTime;
+    indexBlock.offset = blockStartOffset;
+    indexBlock.size = static_cast<uint32_t>(blockSize);
+
+    const size_t n = values.size();
+    int64_t sum = 0;
+    int64_t bmin = std::numeric_limits<int64_t>::max();
+    int64_t bmax = std::numeric_limits<int64_t>::min();
+    for (size_t i = 0; i < n; ++i) {
+        int64_t v = values[i];
+        sum += v;
+        if (v < bmin)
+            bmin = v;
+        if (v > bmax)
+            bmax = v;
+    }
+    indexBlock.blockSum = static_cast<double>(sum);
+    indexBlock.blockMin = static_cast<double>(bmin);
+    indexBlock.blockMax = static_cast<double>(bmax);
+    indexBlock.blockCount = static_cast<uint32_t>(n);
+
+    // first/latest at min/max timestamp positions
+    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
+    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    indexBlock.blockFirstValue = static_cast<double>(values[firstIdx]);
+    indexBlock.blockLatestValue = static_cast<double>(values[latestIdx]);
+    indexBlock.hasExtendedStats = true;
+
+    indexEntry.indexBlocks.push_back(std::move(indexBlock));
+}
+
+// Boolean-specific writeIndexBlock: compute trueCount, first/latest values
+void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std::vector<bool>& values, size_t valOffset,
+                                size_t valCount, TSMIndexEntry& indexEntry, size_t blockStartOffset) {
+    if (timestamps.empty())
+        return;
+    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    size_t blockSize = buffer.size() - blockStartOffset;
+    if (blockSize > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("TSM block size exceeds uint32_t maximum");
+    }
+
+    TSMIndexBlock indexBlock;
+    indexBlock.minTime = *minTime;
+    indexBlock.maxTime = *maxTime;
+    indexBlock.offset = blockStartOffset;
+    indexBlock.size = static_cast<uint32_t>(blockSize);
+    indexBlock.blockCount = static_cast<uint32_t>(valCount);
+
+    uint32_t trueCount = 0;
+    for (size_t i = 0; i < valCount; ++i) {
+        if (values[valOffset + i])
+            trueCount++;
+    }
+    indexBlock.boolTrueCount = trueCount;
+    indexBlock.blockSum = static_cast<double>(trueCount);
+    indexBlock.blockMin = (trueCount < indexBlock.blockCount) ? 0.0 : 1.0;
+    indexBlock.blockMax = (trueCount > 0) ? 1.0 : 0.0;
+
+    // first/latest at min/max timestamp positions
+    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
+    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    indexBlock.boolFirstValue = values[valOffset + firstIdx];
+    indexBlock.boolLatestValue = values[valOffset + latestIdx];
+    indexBlock.blockFirstValue = indexBlock.boolFirstValue ? 1.0 : 0.0;
+    indexBlock.blockLatestValue = indexBlock.boolLatestValue ? 1.0 : 0.0;
+    indexBlock.hasExtendedStats = true;
+
+    indexEntry.indexBlocks.push_back(std::move(indexBlock));
+}
+
 // Phase 2: Write compressed block bytes directly (zero-copy transfer)
 void TSMWriter::writeCompressedBlock(TSMValueType seriesType, const SeriesId128& seriesId,
                                      seastar::temporary_buffer<uint8_t>&& compressedData, uint64_t minTime,
@@ -347,7 +468,7 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
     indexBlock.maxTime = srcBlock.maxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(compressedData.size());
-    // Carry forward block stats from source file
+    // Carry forward block stats from source file (all types)
     indexBlock.blockSum = srcBlock.blockSum;
     indexBlock.blockMin = srcBlock.blockMin;
     indexBlock.blockMax = srcBlock.blockMax;
@@ -356,6 +477,10 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
     indexBlock.blockFirstValue = srcBlock.blockFirstValue;
     indexBlock.blockLatestValue = srcBlock.blockLatestValue;
     indexBlock.hasExtendedStats = srcBlock.hasExtendedStats;
+    // Boolean-specific
+    indexBlock.boolTrueCount = srcBlock.boolTrueCount;
+    indexBlock.boolFirstValue = srcBlock.boolFirstValue;
+    indexBlock.boolLatestValue = srcBlock.boolLatestValue;
 
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
@@ -382,14 +507,14 @@ void TSMWriter::writeIndex() {
         }
         buffer.write(static_cast<uint16_t>(indexEntry.indexBlocks.size()));
 
-        // for each block
+        // for each block — per-type stats (V2 format)
         for (auto const& block : indexEntry.indexBlocks) {
             buffer.write(block.minTime);  // minTime
             buffer.write(block.maxTime);  // maxTime
             buffer.write(block.offset);   // byte offset from start of file
             buffer.write(block.size);     // block size
-            // Block-level statistics for Float series (80 bytes per block)
             if (indexEntry.seriesType == TSMValueType::Float) {
+                // Float: 80 bytes (28 base + 52 stats)
                 buffer.write(block.blockSum);
                 buffer.write(block.blockMin);
                 buffer.write(block.blockMax);
@@ -397,6 +522,40 @@ void TSMWriter::writeIndex() {
                 buffer.write(block.blockM2);
                 buffer.write(block.blockFirstValue);
                 buffer.write(block.blockLatestValue);
+            } else if (indexEntry.seriesType == TSMValueType::Integer) {
+                // Integer: 72 bytes (28 base + count(4) + sum/min/max/first/latest as int64)
+                buffer.write(block.blockCount);
+                buffer.write(static_cast<int64_t>(block.blockSum));
+                buffer.write(static_cast<int64_t>(block.blockMin));
+                buffer.write(static_cast<int64_t>(block.blockMax));
+                buffer.write(static_cast<int64_t>(block.blockFirstValue));
+                buffer.write(static_cast<int64_t>(block.blockLatestValue));
+            } else if (indexEntry.seriesType == TSMValueType::Boolean) {
+                // Boolean: 40 bytes (28 base + count(4) + trueCount(4) + first(1) + latest(1) + pad(2))
+                buffer.write(block.blockCount);
+                buffer.write(block.boolTrueCount);
+                buffer.write(static_cast<uint8_t>(block.boolFirstValue ? 1 : 0));
+                buffer.write(static_cast<uint8_t>(block.boolLatestValue ? 1 : 0));
+                buffer.write(static_cast<uint16_t>(0));  // padding
+            } else if (indexEntry.seriesType == TSMValueType::String) {
+                // String: 32 bytes (28 base + count(4))
+                buffer.write(block.blockCount);
+            }
+        }
+
+        // Phase 3: Write string dictionary after block metadata for String series.
+        // Format: dictSize(4) + dictData(dictSize bytes)
+        // dictSize == 0 means no dictionary (raw encoding used).
+        if (indexEntry.seriesType == TSMValueType::String) {
+            if (!indexEntry.stringDictionary.empty()) {
+                StringEncoder::Dictionary dict;
+                dict.entries = indexEntry.stringDictionary;
+                dict.valid = true;
+                AlignedBuffer serialized = StringEncoder::serializeDictionary(dict);
+                buffer.write(static_cast<uint32_t>(serialized.size()));
+                buffer.write(serialized);
+            } else {
+                buffer.write(static_cast<uint32_t>(0));  // no dictionary
             }
         }
     }

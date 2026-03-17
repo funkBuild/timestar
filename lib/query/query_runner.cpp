@@ -819,8 +819,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             auto type = tsmFile->getSeriesType(seriesId);
             if (!type.has_value())
                 continue;
-            // Only float series support pushdown aggregation.
-            if (*type != TSMValueType::Float) {
+            // Float, Integer, and Boolean support pushdown aggregation; String does not.
+            if (*type == TSMValueType::String) {
                 co_return std::nullopt;
             }
             candidateFiles.push_back(tsmFile);
@@ -984,8 +984,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         if (!indexEntry)
             continue;
 
-        // Only float series support pushdown aggregation.
-        if (indexEntry->seriesType != TSMValueType::Float) {
+        // Float, Integer, and Boolean support pushdown; String does not.
+        if (indexEntry->seriesType == TSMValueType::String) {
             hasNonFloat = true;
             break;
         }
