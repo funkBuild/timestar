@@ -449,27 +449,22 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
     // Actually remove data from memory based on variant type
     std::visit(
         [&](auto& inMemorySeries) {
-            using T = typename std::decay_t<decltype(inMemorySeries.values)>::value_type;
-
             auto& timestamps = inMemorySeries.timestamps;
             auto& values = inMemorySeries.values;
 
-            // Reserve with original size as upper bound to avoid reallocations
-            std::vector<uint64_t> newTimestamps;
-            std::vector<T> newValues;
-            newTimestamps.reserve(timestamps.size());
-            newValues.reserve(values.size());
+            // Binary search for the deletion range on sorted timestamps
+            auto startIt = std::lower_bound(timestamps.begin(), timestamps.end(), startTime);
+            auto endIt = std::upper_bound(timestamps.begin(), timestamps.end(), endTime);
 
-            for (size_t i = 0; i < timestamps.size(); ++i) {
-                // Keep data that's outside the deletion range
-                if (timestamps[i] < startTime || timestamps[i] > endTime) [[likely]] {
-                    newTimestamps.push_back(timestamps[i]);
-                    newValues.push_back(values[i]);
-                }
+            if (startIt == endIt) {
+                return;  // Nothing to delete
             }
 
-            timestamps = std::move(newTimestamps);
-            values = std::move(newValues);
+            size_t startIdx = static_cast<size_t>(startIt - timestamps.begin());
+            size_t endIdx = static_cast<size_t>(endIt - timestamps.begin());
+
+            timestamps.erase(timestamps.begin() + startIdx, timestamps.begin() + endIdx);
+            values.erase(values.begin() + startIdx, values.begin() + endIdx);
         },
         variantSeries);
 

@@ -165,16 +165,21 @@ static SeastarConfig parseSeastarSection(const std::string& tomlContent) {
         trimWs(key);
         trimWs(value);
 
-        // Remove quotes from string values
-        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
-            value = value.substr(1, value.size() - 2);
-        }
-
-        // Strip inline comments (after the value)
+        // Strip inline comments BEFORE removing quotes (comments can't appear inside quotes)
         auto commentPos = value.find('#');
         if (commentPos != std::string::npos) {
-            value = value.substr(0, commentPos);
-            trimWs(value);
+            // Only strip if the # is not inside quotes
+            size_t quoteStart = value.find('"');
+            size_t quoteEnd = value.rfind('"');
+            if (quoteStart == std::string::npos || commentPos > quoteEnd || commentPos < quoteStart) {
+                value = value.substr(0, commentPos);
+                trimWs(value);
+            }
+        }
+
+        // Then remove quotes
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+            value = value.substr(1, value.size() - 2);
         }
 
         if (!key.empty() && !value.empty()) {

@@ -1835,6 +1835,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 
                 if (obj.contains("writes")) {
                     auto& writes = obj["writes"];
+                    if (!writes.is_array()) {
+                        throw std::invalid_argument("'writes' field must be a JSON array");
+                    }
                     if (writes.is_array()) {
                         auto& writes_array = writes.get<json_value_t::array_t>();
 
@@ -1937,6 +1940,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                     "[METADATA] Single write: indexed {} unique series synchronously", metaOpsCount);
 #endif
                 }
+            } else {
+                throw std::invalid_argument("Request body must be a JSON object");
             }
         }
 

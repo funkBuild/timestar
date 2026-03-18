@@ -509,6 +509,11 @@ seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
     // Hold the gate BEFORE the semaphore so that WAL::close() (which calls
     // _io_gate.close()) will wait for coroutines queued on _io_sem rather
     // than racing past them and closing the stream while they're pending.
+    //
+    // Safety invariant: the thread-local buffer is populated above before the
+    // co_await on _io_sem. Seastar's output_stream::write() copies data
+    // synchronously into its internal buffer before any suspension point, so
+    // the buffer contents are consumed before any other coroutine can reuse it.
     auto gate_holder = _io_gate.hold();
     auto units = co_await seastar::get_units(_io_sem, 1);
 
@@ -585,6 +590,10 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
 
     // --- I/O phase (under lock) ---
     // Hold the gate BEFORE the semaphore (see insert() for rationale).
+    // Safety invariant: the thread-local buffer is populated above before the
+    // co_await on _io_sem. Seastar's output_stream::write() copies data
+    // synchronously into its internal buffer before any suspension point, so
+    // the buffer contents are consumed before any other coroutine can reuse it.
     auto gate_holder = _io_gate.hold();
     auto units = co_await seastar::get_units(_io_sem, 1);
 

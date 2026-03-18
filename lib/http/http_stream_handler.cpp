@@ -112,6 +112,8 @@ std::vector<StreamingBatch> HttpStreamHandler::queryResponseToBatches(const std:
 
             std::visit(
                 [&](const auto& vals) {
+                    // NOTE: StreamingDataPoint copies measurement/field/tags per point. For high-throughput
+                    // streaming, consider refactoring to hold shared data at the batch level.
                     for (size_t i = 0; i < timestamps.size() && i < vals.size(); ++i) {
                         StreamingDataPoint pt;
                         pt.measurement = sr.measurement;

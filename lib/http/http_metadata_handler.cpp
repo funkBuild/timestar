@@ -176,7 +176,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
 
         if (offset < measurements.size()) {
             auto startIt = measurements.begin() + offset;
-            auto endIt = measurements.begin() + std::min(offset + limit, measurements.size());
+            size_t end = (limit > measurements.size() - offset) ? measurements.size() : offset + limit;
+            auto endIt = measurements.begin() + end;
             measurements = std::vector<std::string>(startIt, endIt);
         } else {
             measurements.clear();
@@ -307,6 +308,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
 
         timestar::http_log.debug("Processing /fields request for measurement: {}", measurement);
 
+        // TODO: tagFilters are parsed but not yet applied to field discovery.
+        // The "filtered_by" response field shows the parsed filters for API transparency.
+        // Implementing tag-based field filtering requires cross-referencing the index.
         // Parse optional tags parameter for filtering
         std::string tagsParam = req->get_query_param("tags");
         std::unordered_map<std::string, std::string> tagFilters;

@@ -933,13 +933,10 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 }
 
                 if (!requestedFieldSet.empty()) {
-                    std::erase_if(response.series, [&](const SeriesResult& s) {
-                        for (const auto& [fn, _] : s.fields) {
-                            if (!requestedFieldSet.contains(fn))
-                                return true;
-                        }
-                        return s.fields.empty();
-                    });
+                    for (auto& s : response.series) {
+                        std::erase_if(s.fields, [&](const auto& kv) { return !requestedFieldSet.contains(kv.first); });
+                    }
+                    std::erase_if(response.series, [](const SeriesResult& s) { return s.fields.empty(); });
                 }
             }
 
@@ -1090,15 +1087,12 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                     response.series.push_back(std::move(series));
                 }
 
-                // Filter fields: remove series whose single field doesn't match the request.
+                // Filter fields: remove non-requested fields from each series, then remove empty series.
                 if (!requestedFieldSet.empty()) {
-                    std::erase_if(response.series, [&](const SeriesResult& s) {
-                        for (const auto& [fn, _] : s.fields) {
-                            if (!requestedFieldSet.contains(fn))
-                                return true;
-                        }
-                        return s.fields.empty();
-                    });
+                    for (auto& s : response.series) {
+                        std::erase_if(s.fields, [&](const auto& kv) { return !requestedFieldSet.contains(kv.first); });
+                    }
+                    std::erase_if(response.series, [](const SeriesResult& s) { return s.fields.empty(); });
                 }
             }
             // Add string results that bypassed aggregation directly to response
@@ -1292,7 +1286,12 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
         }
         return static_cast<uint64_t>(result);
     } else {
-        uint64_t value = std::stoull(valueStr);
+        uint64_t value;
+        try {
+            value = std::stoull(valueStr);
+        } catch (const std::out_of_range&) {
+            throw QueryParseException("Interval value overflow: " + interval);
+        }
         // Clamp to UINT64_MAX on overflow (same rationale as decimal path).
         if (multiplier > 1 && value > std::numeric_limits<uint64_t>::max() / multiplier) {
             return std::numeric_limits<uint64_t>::max();

@@ -70,12 +70,21 @@ void set_routes(routes& r) {
           new function_handler([](const_req req) { return "Hello from TimeStar HTTP Server!"; }));
 
     r.add(operation_type::GET, url("/health"),
-          new function_handler([](const_req req) {
-              if (g_ready.load(std::memory_order_relaxed)) {
-                  return sstring("{\"status\":\"healthy\"}");
-              }
-              return sstring("{\"status\":\"starting\"}");
-          }));
+          new function_handler(
+              [](std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply> rep)
+                  -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  if (g_ready.load(std::memory_order_relaxed)) {
+                      rep->set_status(seastar::http::reply::status_type::ok);
+                      rep->_content = "{\"status\":\"healthy\"}";
+                  } else {
+                      rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                      rep->_content = "{\"status\":\"starting\"}";
+                  }
+                  rep->add_header("Content-Type", "application/json");
+                  rep->done();
+                  return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+              },
+              "json"));
 
     r.add(operation_type::GET, url("/version"),
           new function_handler([](const_req req) {

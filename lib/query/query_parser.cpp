@@ -117,6 +117,13 @@ uint64_t QueryParser::parseTime(const std::string& timeStr) {
         throw QueryParseException("Failed to convert time: " + timeStr);
     }
 
+    // Post-validation: timegm normalizes invalid dates (e.g., Feb 30 -> Mar 2).
+    // Detect this by checking that the fields were not modified.
+    if (tm.tm_mday != day || tm.tm_mon != (month - 1) || (tm.tm_year + 1900) != year) {
+        throw QueryParseException("Invalid date: day " + std::to_string(day) +
+            " is out of range for month " + std::to_string(month));
+    }
+
     // Convert to nanoseconds
     return static_cast<uint64_t>(time) * 1000000000ULL;
 }
@@ -236,6 +243,9 @@ std::map<std::string, std::string> QueryParser::parseScopes(const std::string& q
     }
     pos++;  // Skip '{'
 
+    // NOTE: Regex scope values containing '}' (e.g., {host:/server-[0-9]{2,4}/})
+    // are not supported. The parser finds the first '}' as the closing brace.
+    // Workaround: use ~ prefix syntax instead: {host:~server-[0-9]\{2,4\}}
     size_t closePos = query.find('}', pos);
     if (closePos == std::string::npos) {
         throw QueryParseException("Query missing closing brace on scopes");

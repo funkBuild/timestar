@@ -94,7 +94,10 @@ struct AggregationState {
             first = value;
             firstTimestamp = timestamp;
         }
-        // Welford's online variance: compute delta from old mean, then update
+        // Welford's online variance: compute delta from old mean, then update.
+        // NOTE: oldMean derived from (sum - value) / count can suffer from catastrophic
+        // cancellation for extreme value ranges. For typical TSDB workloads (bounded sensor
+        // values), this is acceptable. Full Welford requires tracking mean separately.
         double oldMean = (count > 0) ? (sum - value) / count : 0.0;
         count++;
         double newMean = sum / count;

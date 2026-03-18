@@ -131,7 +131,7 @@ BlockReader::BlockReader(std::string_view data) : data_(data) {
     }
 
     dataSize_ = data.size() - restartFooterSize;
-    restarts_ = reinterpret_cast<const uint32_t*>(data.data() + dataSize_);
+    restartsBase_ = data.data() + dataSize_;
     valid_ = true;
 }
 
@@ -187,7 +187,7 @@ void BlockReader::Iterator::seekToRestartPoint(size_t restartIndex) {
         valid_ = false;
         return;
     }
-    offset_ = BlockReader::decodeFixed32(reinterpret_cast<const char*>(&reader_->restarts_[restartIndex]));
+    offset_ = BlockReader::decodeFixed32(reader_->restartsBase_ + restartIndex * 4);
     key_.clear();  // Restart points always store the full key (shared=0)
     decodeEntry();
 }
@@ -222,7 +222,7 @@ void BlockReader::Iterator::seek(std::string_view target) {
     while (lo + 1 < hi) {
         size_t mid = lo + (hi - lo) / 2;
         // Decode the key at restart point mid
-        uint32_t restartOffset = BlockReader::decodeFixed32(reinterpret_cast<const char*>(&reader_->restarts_[mid]));
+        uint32_t restartOffset = BlockReader::decodeFixed32(reader_->restartsBase_ + mid * 4);
         const char* p = reader_->data_.data() + restartOffset;
         const char* limit = reader_->data_.data() + reader_->dataSize_;
 

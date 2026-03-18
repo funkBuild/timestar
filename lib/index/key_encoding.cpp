@@ -121,6 +121,9 @@ std::string encodeSeriesMetadataKey(const SeriesId128& seriesId) {
 }
 
 std::string encodeFieldTypeKey(const std::string& measurement, const std::string& field) {
+    if (measurement.find('\0') != std::string::npos || field.find('\0') != std::string::npos) {
+        throw std::invalid_argument("Key component must not contain null bytes");
+    }
     std::string key;
     key.reserve(1 + measurement.size() + 1 + field.size());
     key.push_back(static_cast<char>(FIELD_TYPE));
@@ -131,6 +134,9 @@ std::string encodeFieldTypeKey(const std::string& measurement, const std::string
 }
 
 std::string encodeMeasurementSeriesKey(const std::string& measurement, const SeriesId128& seriesId) {
+    if (measurement.find('\0') != std::string::npos) {
+        throw std::invalid_argument("Key component must not contain null bytes");
+    }
     std::string key;
     key.reserve(1 + measurement.size() + 1 + 16);
     key.push_back(static_cast<char>(MEASUREMENT_SERIES));
@@ -151,6 +157,9 @@ std::string encodeMeasurementSeriesPrefix(const std::string& measurement) {
 
 std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, const std::string& field,
                                             const SeriesId128& seriesId) {
+    if (measurement.find('\0') != std::string::npos || field.find('\0') != std::string::npos) {
+        throw std::invalid_argument("Key component must not contain null bytes");
+    }
     std::string key;
     key.reserve(1 + measurement.size() + 1 + field.size() + 1 + 16);
     key.push_back(static_cast<char>(MEASUREMENT_FIELD_SERIES));

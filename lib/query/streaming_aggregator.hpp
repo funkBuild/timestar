@@ -69,8 +69,9 @@ struct BucketState {
             case AggregationMethod::MEDIAN:
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR:
-                // MEDIAN/STDDEV/STDVAR require rawValues which BucketState doesn't track.
-                // Return NaN to signal unsupported rather than silently returning AVG.
+                // These methods require full rawValues which streaming aggregation
+                // does not track (unbounded memory). Callers should validate the
+                // aggregation method at subscription creation time.
                 return std::numeric_limits<double>::quiet_NaN();
             default:
                 return sum / static_cast<double>(count);  // fallback to AVG

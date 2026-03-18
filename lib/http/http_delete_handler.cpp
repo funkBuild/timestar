@@ -14,6 +14,8 @@ using namespace httpd;
 using timestar::buildSeriesKey;
 
 // Glaze-compatible structures for JSON parsing
+// NOTE: GlazeDeleteRequest is also defined in test/unit/http/http_delete_handler_test.cpp.
+// Both must be kept in sync. Consider moving to a shared header if the struct grows.
 struct GlazeDeleteRequest {
     // For series key format
     std::optional<std::string> series;
@@ -96,6 +98,11 @@ HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const Gla
         }
     } else {
         throw std::runtime_error("Either 'series' or 'measurement' is required");
+    }
+
+    // Validate structured delete requires a non-empty field
+    if (req.isStructured && req.field.empty() && !req.isPattern) {
+        throw std::invalid_argument("Structured delete requires a non-empty 'field'");
     }
 
     // Validate strings for null bytes (would corrupt index keys)

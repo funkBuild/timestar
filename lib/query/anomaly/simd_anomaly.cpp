@@ -488,7 +488,8 @@ void computeMovingAverage(const double* values, size_t count, size_t windowSize,
     double windowSum = 0.0;
     size_t windowCount = 0;
 
-    // Initialize first window [0, halfWindow] inclusive
+    // Initialize first window [0, halfWindow] inclusive — the right half of the
+    // centered window around position 0 (the left half is clamped to 0).
     size_t initEnd = std::min(halfWindow + 1, count);
     for (size_t i = 0; i < initEnd; ++i) {
         if (!std::isnan(values[i])) {

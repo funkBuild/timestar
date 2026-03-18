@@ -97,14 +97,11 @@ seastar::future<FunctionResult<double>> SMAFunction::execute(const DoubleSeriesV
         result.timestamps[0] = input.timestampAt(window - 1);
 
         for (size_t i = 1; i < outputCount; ++i) {
-            double yOut = -input.valueAt(i - 1) - comp;
-            double tOut = sum + yOut;
-            comp = (tOut - sum) - yOut;
-            sum = tOut;
-            double yIn = input.valueAt(i + window - 1) - comp;
-            double tIn = sum + yIn;
-            comp = (tIn - sum) - yIn;
-            sum = tIn;
+            double delta = input.valueAt(i + window - 1) - input.valueAt(i - 1);
+            double y = delta - comp;
+            double t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
             result.values[i] = sum / window;
             result.timestamps[i] = input.timestampAt(i + window - 1);
         }

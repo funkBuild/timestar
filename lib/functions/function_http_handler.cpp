@@ -246,7 +246,7 @@ std::string FunctionHttpHandler::handleFunctionListSync() {
            "{\"name\":\"add\",\"category\":\"arithmetic\",\"description\":\"Add constant "
            "value\",\"parameters\":[{\"name\":\"value\",\"type\":\"float\",\"required\":true}]},"
            "{\"name\":\"multiply\",\"category\":\"arithmetic\",\"description\":\"Multiply by "
-           "constant\",\"parameters\":[{\"name\":\"value\",\"type\":\"float\",\"required\":true}]},"
+           "constant\",\"parameters\":[{\"name\":\"factor\",\"type\":\"float\",\"required\":true}]},"
            "{\"name\":\"scale\",\"category\":\"arithmetic\",\"description\":\"Scale by "
            "factor\",\"parameters\":[{\"name\":\"factor\",\"type\":\"float\",\"required\":true}]},"
            "{\"name\":\"offset\",\"category\":\"arithmetic\",\"description\":\"Offset by "
@@ -331,8 +331,8 @@ std::string FunctionHttpHandler::handleFunctionInfoSync(const seastar::http::req
     } else if (functionName == "multiply") {
         return "{\"status\":\"success\",\"function\":{\"name\":\"multiply\",\"category\":\"arithmetic\","
                "\"description\":\"Multiply by "
-               "constant\",\"parameters\":{\"value\":{\"type\":\"float\",\"required\":true,\"description\":\"Value to "
-               "multiply by\"}},\"examples\":[\"multiply(value:2.5)\",\"multiply(value:0.5)\"]}}";
+               "constant\",\"parameters\":{\"factor\":{\"type\":\"float\",\"required\":true,\"description\":\"Factor to "
+               "multiply by\"}},\"examples\":[\"multiply(factor:2.5)\",\"multiply(factor:0.5)\"]}}";
     } else if (functionName == "scale") {
         return "{\"status\":\"success\",\"function\":{\"name\":\"scale\",\"category\":\"arithmetic\",\"description\":"
                "\"Scale by "

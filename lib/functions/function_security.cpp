@@ -40,6 +40,10 @@ const std::unordered_set<std::string> FunctionSecurity::dangerousFunctionNames_ 
 
 // Lazily initialized on first call. Function-local static avoids global
 // constructor ordering issues and safely contains any regex_error.
+// NOTE: ~30 regex patterns are evaluated per request. For production use, consider
+// replacing simple string patterns with std::string::find() and reserving regex
+// for genuinely complex patterns. The ProductionMonitor's std::mutex should be
+// replaced with lock-free atomics or Seastar timers to avoid blocking the reactor.
 const std::vector<std::regex>& FunctionSecurity::getDangerousPatterns() {
     static const std::vector<std::regex> patterns = [] {
         std::vector<std::regex> p;

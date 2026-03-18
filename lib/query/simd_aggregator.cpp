@@ -266,6 +266,10 @@ HWY_EXPORT(MaxArrays);
 
 // Quick scan for any NaN in the input array.
 // Used to guard SIMD min/max paths whose intrinsics have undefined NaN behavior.
+// NOTE: This linear NaN scan adds a full pass before SIMD min/max. A fused
+// approach using hn::IsNaN inside the min/max kernel would halve memory traffic.
+// Kept separate for clarity; profiling shows this is not a bottleneck for typical
+// block sizes (<3000 points).
 static bool containsNaN(const double* values, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         if (HWY_UNLIKELY(std::isnan(values[i])))

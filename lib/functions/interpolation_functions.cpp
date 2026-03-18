@@ -196,6 +196,9 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(con
 }
 
 // SplineInterpolationFunction implementation
+// WARNING: This function currently falls back to linear interpolation.
+// Cubic spline interpolation is not yet implemented. The function name
+// and metadata description are aspirational.
 const FunctionMetadata SplineInterpolationFunction::metadata_ = {
     .name = "spline_interpolate",
     .description = "Cubic spline interpolation for smooth curves",

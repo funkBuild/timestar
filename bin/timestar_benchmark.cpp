@@ -204,7 +204,9 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
                                 ",region=" + insert.tags["region"] + "." + insert.field;
         insertedSeries.push_back(seriesKey);
 
-        // Determine shard based on series key
+        // NOTE: This benchmark uses std::hash for shard routing which differs from the
+        // engine's PlacementTable::coreForHash(). Results are approximate for multi-shard
+        // scenarios. For accurate benchmarks, use timestar_insert_bench / timestar_query_bench.
         std::hash<std::string> hasher;
         size_t hash = hasher(seriesKey);
         unsigned targetShard = hash % seastar::smp::count;

@@ -1284,8 +1284,10 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTagPattern(co
                                                                               const std::string& tagKey,
                                                                               const std::string& scopeValue,
                                                                               size_t maxSeries) {
-    // For simplicity, treat patterns as exact match for now.
-    // Full wildcard/regex support can be added later.
+    // TODO: Implement wildcard/regex pattern matching. Currently delegates to
+    // exact match. The HTTP query handler handles pattern matching at the scope
+    // level via SeriesMatcher before calling this function, so the fallback is
+    // safe for current callers.
     co_return co_await findSeriesByTag(measurement, tagKey, scopeValue, maxSeries);
 }
 
