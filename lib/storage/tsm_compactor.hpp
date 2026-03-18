@@ -35,6 +35,12 @@ struct CompactionStats {
     std::chrono::milliseconds duration{0};
 };
 
+// Result from compact(): output path and stats, avoiding shared mutable state.
+struct CompactionResult {
+    std::string outputPath;
+    CompactionStats stats;
+};
+
 // Represents a plan for compacting a set of TSM files
 struct CompactionPlan {
     std::vector<seastar::shared_ptr<TSM>> sourceFiles;
@@ -212,7 +218,7 @@ private:
 
     TSMFileManager* fileManager;
     std::unique_ptr<CompactionStrategy> strategy;
-    CompactionStats lastCompactStats;           // Stats from the most recent compact() call
+    // lastCompactStats removed — compact() now returns stats via CompactionResult
     seastar::semaphore compactionSemaphore{2};  // Re-initialized in constructor from config
     bool compactionEnabled{true};
 
@@ -287,10 +293,10 @@ public:
     // Set custom compaction strategy
     void setStrategy(std::unique_ptr<CompactionStrategy> newStrategy) { strategy = std::move(newStrategy); }
 
-    // Main compaction method - merges files and returns path to new file.
+    // Main compaction method - merges files and returns result with path + stats.
     // retentionPolicies: per-measurement policies for TTL/downsampling (empty = no retention).
     // seriesMetadataMap: SeriesId128 -> measurement name, pre-built by caller for efficiency.
-    seastar::future<std::string> compact(
+    seastar::future<CompactionResult> compact(
         const std::vector<seastar::shared_ptr<TSM>>& files,
         const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies = {},
         const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap = {});

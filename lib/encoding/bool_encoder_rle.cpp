@@ -25,7 +25,7 @@ void BoolEncoderRLE::writeVarint(AlignedBuffer& buf, uint64_t value) {
 
 uint64_t BoolEncoderRLE::readVarint(Slice& slice) {
     if (slice.bytesLeft() == 0) [[unlikely]] {
-        return 0;
+        throw std::runtime_error("BoolEncoderRLE: unexpected end of data in varint");
     }
     // Fast path: single-byte varint (value < 128) — the common case.
     const uint8_t* ptr = slice.data + slice.offset;

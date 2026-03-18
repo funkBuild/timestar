@@ -161,6 +161,8 @@ public:
     // (the caller must fill them).
     uint8_t* grow_uninit(size_t extra_bytes) {
         const size_t new_size = current_size + extra_bytes;
+        if (extra_bytes > 0 && new_size < current_size) [[unlikely]]
+            throw std::overflow_error("AlignedBuffer::grow_uninit overflow");
         ensure_capacity(new_size);
         uint8_t* ptr = data.data() + current_size;
         current_size = new_size;

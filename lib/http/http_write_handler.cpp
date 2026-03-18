@@ -1,5 +1,6 @@
 #include "http_write_handler.hpp"
 
+#include "http_auth.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "placement_table.hpp"
@@ -641,6 +642,14 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 timestamps.push_back(singleTimestampIt->second.as<uint64_t>());
             } else {
                 // No timestamp provided - use the batch-level default
+                timestamps.push_back(defaultTimestampNs);
+            }
+
+            // Bug #11 fix: Guard against empty timestamps vector.
+            // The "timestamps" JSON key may exist as an array of all non-numeric
+            // elements, leaving timestamps empty after parsing. Accessing
+            // timestamps[0] below would be undefined behavior.
+            if (timestamps.empty()) {
                 timestamps.push_back(defaultTimestampNs);
             }
 
@@ -1957,13 +1966,15 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     co_return rep;
 }
 
-void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r) {
+void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleWrite(std::move(req)); },
+        timestar::wrapWithAuth(authToken,
+            [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleWrite(std::move(req)); }),
         "json");
 
     r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/write"), handler);
 
-    timestar::http_log.info("Registered HTTP write endpoint at /write");
+    timestar::http_log.info("Registered HTTP write endpoint at /write{}",
+                            authToken.empty() ? "" : " (auth required)");
 }

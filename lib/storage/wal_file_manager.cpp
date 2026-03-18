@@ -102,8 +102,10 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
             conversionSucceeded = true;  // Empty WAL, safe to remove
         }
 
-        // Only remove WAL file if conversion succeeded or store was empty
-        if (conversionSucceeded) {
+        // Only remove WAL file if conversion succeeded or store was empty.
+        // Guard with file_exists to avoid double-removal if convertWalToTsm
+        // already removed it internally via store->removeWAL().
+        if (conversionSucceeded && co_await seastar::file_exists(walFilename)) {
             co_await seastar::remove_file(walFilename);
         }
 

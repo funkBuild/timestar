@@ -126,6 +126,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
 
     const size_t total_values = values.size();
     const size_t num_blocks = (total_values + alp::ALP_VECTOR_SIZE - 1) / alp::ALP_VECTOR_SIZE;
+    if (num_blocks > UINT16_MAX) throw std::overflow_error("ALP: too many blocks for 16-bit header field");
     const size_t tail_count = total_values % alp::ALP_VECTOR_SIZE;
 
     // Determine scheme: try ALP first, fall back to ALP_RD
@@ -449,6 +450,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
 
     const size_t total_values = values.size();
     const size_t num_blocks = (total_values + alp::ALP_VECTOR_SIZE - 1) / alp::ALP_VECTOR_SIZE;
+    if (num_blocks > UINT16_MAX) throw std::overflow_error("ALP: too many blocks for 16-bit header field");
     const size_t tail_count = total_values % alp::ALP_VECTOR_SIZE;
 
     // Determine scheme: try ALP first, fall back to ALP_RD

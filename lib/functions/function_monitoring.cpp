@@ -1,5 +1,7 @@
 #include "function_monitoring.hpp"
 
+#include "../utils/json_escape.hpp"
+
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -236,7 +238,7 @@ std::string ProductionMonitor::exportMetricsAsJson() const {
                 json << ",\n";
             first = false;
 
-            json << "    \"" << name << "\": {\n";
+            json << "    \"" << timestar::jsonEscape(name) << "\": {\n";
             json << "      \"total_executions\": " << metrics->total_executions.load() << ",\n";
             json << "      \"successful_executions\": " << metrics->successful_executions.load() << ",\n";
             json << "      \"failed_executions\": " << metrics->failed_executions.load() << ",\n";
@@ -297,8 +299,8 @@ std::string ProductionMonitor::exportAlertsAsJson() const {
             json << "    {\n";
             json << "      \"id\": " << i << ",\n";
             json << "      \"type\": " << static_cast<int>(alert.type) << ",\n";
-            json << "      \"function_name\": \"" << alert.function_name << "\",\n";
-            json << "      \"message\": \"" << alert.message << "\",\n";
+            json << "      \"function_name\": \"" << timestar::jsonEscape(alert.function_name) << "\",\n";
+            json << "      \"message\": \"" << timestar::jsonEscape(alert.message) << "\",\n";
             json << "      \"severity\": " << std::fixed << std::setprecision(2) << alert.severity << ",\n";
             json << "      \"timestamp\": "
                  << std::chrono::duration_cast<std::chrono::seconds>(alert.timestamp.time_since_epoch()).count()

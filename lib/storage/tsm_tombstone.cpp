@@ -116,7 +116,10 @@ void TSMTombstone::sortAndMergeEntries() {
     for (size_t i = 1; i < entries.size(); ++i) {
         const auto& entry = entries[i];
 
-        if (entry.seriesId == current.seriesId && entry.startTime <= current.endTime + 1) {
+        // Bug #21 fix: Overflow-safe adjacency check — current.endTime + 1
+        // wraps to 0 when endTime == UINT64_MAX.
+        if (entry.seriesId == current.seriesId &&
+            (entry.startTime <= current.endTime || current.endTime == UINT64_MAX || entry.startTime == current.endTime + 1)) {
             // Overlapping or adjacent range, merge
             current.endTime = std::max(current.endTime, entry.endTime);
         } else {
@@ -136,6 +139,8 @@ void TSMTombstone::sortAndMergeEntries() {
 }
 
 seastar::future<> TSMTombstone::load() {
+    std::exception_ptr loadError;
+
     try {
         auto exists = co_await seastar::file_exists(tombstonePath);
         if (!exists) {
@@ -153,7 +158,6 @@ seastar::future<> TSMTombstone::load() {
 
         if (fileSize < TombstoneHeader::SIZE) {
             // File too small to contain valid header
-            co_await close();
             throw std::runtime_error("Tombstone file too small for header");
         }
 
@@ -167,13 +171,11 @@ seastar::future<> TSMTombstone::load() {
 
         // Verify magic number and version
         if (header.magic != TOMBSTONE_MAGIC) {
-            co_await close();
             throw std::runtime_error("Invalid tombstone file magic number");
         }
 
         bool isV1 = (header.version == TOMBSTONE_VERSION_V1);
         if (header.version != TOMBSTONE_VERSION && !isV1) {
-            co_await close();
             throw std::runtime_error("Unsupported tombstone file version");
         }
 
@@ -183,7 +185,6 @@ seastar::future<> TSMTombstone::load() {
         uint32_t actualChecksum = calculateHeaderChecksum(header);
 
         if (expectedChecksum != actualChecksum) {
-            co_await close();
             throw std::runtime_error("Tombstone header checksum mismatch");
         }
 
@@ -193,7 +194,6 @@ seastar::future<> TSMTombstone::load() {
             TombstoneHeader::SIZE + (header.entryCount * entrySize) + sizeof(uint64_t);  // Footer checksum
 
         if (static_cast<size_t>(fileSize) != expectedSize) {
-            co_await close();
             throw std::runtime_error("Tombstone file corrupt: file size mismatch");
         }
 
@@ -240,7 +240,6 @@ seastar::future<> TSMTombstone::load() {
                 entry.checksum = expectedEntryChecksum;
 
                 if (expectedEntryChecksum != actualEntryChecksum) {
-                    co_await close();
                     throw std::runtime_error("Tombstone entry checksum mismatch at index " + std::to_string(i));
                 }
             }
@@ -258,7 +257,6 @@ seastar::future<> TSMTombstone::load() {
         if (!isV1) {
             uint64_t actualFileChecksum = calculateFileChecksum();
             if (fileChecksum != actualFileChecksum) {
-                co_await close();
                 throw std::runtime_error("Tombstone file checksum mismatch");
             }
         }
@@ -266,13 +264,22 @@ seastar::future<> TSMTombstone::load() {
         // Rebuild index for fast lookups
         rebuildIndex();
 
-        co_await close();
         isDirty = false;
 
-    } catch (const std::exception& e) {
-        // Can't use co_await in catch block - flag for cleanup
-        // Will close outside catch block
-        throw std::runtime_error("Failed to load tombstone file: " + std::string(e.what()));
+    } catch (...) {
+        // Bug #20 fix: Capture exception so we can close the fd before rethrowing.
+        // The old code used catch(const std::exception&) and re-threw without closing
+        // the file descriptor, causing a leak on I/O errors.
+        loadError = std::current_exception();
+    }
+
+    // Clean up file handle regardless of success/failure
+    if (isOpen) {
+        try { co_await close(); } catch (...) {}
+    }
+
+    if (loadError) {
+        std::rethrow_exception(loadError);
     }
 }
 
@@ -399,7 +406,9 @@ seastar::future<bool> TSMTombstone::addTombstone(const SeriesId128& seriesId, ui
     // and keeps the code simple.
     size_t writeIdx = 0;
     for (size_t i = 0; i < ranges.size(); ++i) {
-        if (ranges[i].first <= mergedEnd + 1 && ranges[i].second + 1 >= mergedStart) {
+        // Bug #21 fix: Overflow-safe adjacency check for UINT64_MAX boundaries
+        if ((ranges[i].first <= mergedEnd || mergedEnd == UINT64_MAX || ranges[i].first == mergedEnd + 1) &&
+            (ranges[i].second >= mergedStart || (ranges[i].second != UINT64_MAX && ranges[i].second + 1 >= mergedStart))) {
             // Overlapping or adjacent — absorb into merged range
             mergedStart = std::min(mergedStart, ranges[i].first);
             mergedEnd = std::max(mergedEnd, ranges[i].second);
@@ -439,7 +448,17 @@ bool TSMTombstone::isDeleted(const SeriesId128& seriesId, uint64_t timestamp) co
 
     const auto& ranges = it->second;
 
-    // Binary search for applicable range
+    // Binary search for applicable range.
+    // Bug #21 fix: When timestamp == UINT64_MAX, timestamp + 1 overflows to 0.
+    // Handle this by searching for the end of the range vector directly.
+    if (timestamp == UINT64_MAX) {
+        // Check the last range — if it covers UINT64_MAX, it must be the last or only range
+        if (!ranges.empty() && ranges.back().second == UINT64_MAX && timestamp >= ranges.back().first) {
+            return true;
+        }
+        return false;
+    }
+
     auto rangeIt = std::lower_bound(ranges.begin(), ranges.end(), std::make_pair(timestamp + 1, uint64_t(0)));
 
     if (rangeIt != ranges.begin()) {

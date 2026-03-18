@@ -33,6 +33,11 @@ public:
     seastar::future<> addFile(const SSTableMetadata& info);
     seastar::future<> removeFiles(const std::vector<uint64_t>& fileNumbers);
 
+    // Atomic add+remove: writes both records in a single append+fsync.
+    // Prevents crash-window where both old and new data exist in the manifest.
+    seastar::future<> atomicReplaceFiles(const SSTableMetadata& newFile,
+                                         const std::vector<uint64_t>& removeFileNums);
+
     // Write a full snapshot (compacts the manifest file)
     seastar::future<> writeSnapshot();
 

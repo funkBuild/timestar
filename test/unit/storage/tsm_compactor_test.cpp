@@ -118,7 +118,8 @@ SEASTAR_TEST_F(TSMCompactorTest, BasicCompaction) {
     }
 
     // Compact the files
-    auto compactedFile = co_await self->compactor->compact(files);
+    auto compactedResult = co_await self->compactor->compact(files);
+    auto compactedFile = compactedResult.outputPath;
 
     EXPECT_FALSE(compactedFile.empty());
     EXPECT_TRUE(fs::exists(compactedFile));
@@ -162,7 +163,8 @@ SEASTAR_TEST_F(TSMCompactorTest, DeduplicationDuringCompaction) {
     }
 
     // Compact should keep only latest values (from file 2)
-    auto compactedFile = co_await self->compactor->compact(files);
+    auto compactedResult = co_await self->compactor->compact(files);
+    auto compactedFile = compactedResult.outputPath;
 
     EXPECT_FALSE(compactedFile.empty());
     EXPECT_TRUE(fs::exists(compactedFile));
@@ -280,7 +282,8 @@ SEASTAR_TEST_F(TSMCompactorTest, NewerValuesOverwriteOlderDuringCompaction) {
     }
 
     // Compact the files
-    auto compactedFile = co_await self->compactor->compact(files);
+    auto compactedResult = co_await self->compactor->compact(files);
+    auto compactedFile = compactedResult.outputPath;
 
     EXPECT_FALSE(compactedFile.empty());
     EXPECT_TRUE(fs::exists(compactedFile));
@@ -420,7 +423,8 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
     }
 
     // Step 2: Compact level 0 files to level 1
-    auto level1File = co_await self->compactor->compact(level0Files);
+    auto level1Result = co_await self->compactor->compact(level0Files);
+    auto level1File = level1Result.outputPath;
     EXPECT_FALSE(level1File.empty());
 
     auto level1TSM = seastar::make_shared<TSM>(level1File);
@@ -479,7 +483,8 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
     }
 
     // Step 4: Compact level 1 files to level 2
-    auto level2File = co_await self->compactor->compact(level1Files);
+    auto level2Result = co_await self->compactor->compact(level1Files);
+    auto level2File = level2Result.outputPath;
     EXPECT_FALSE(level2File.empty());
 
     auto level2TSM = seastar::make_shared<TSM>(level2File);
@@ -600,7 +605,7 @@ SEASTAR_TEST_F(TSMCompactorTest, ConcurrentReadsDuringCompaction) {
     auto compactionTask = seastar::async([&]() {
         auto result = self->compactor->compact(files).get();
         compactionDone = true;
-        EXPECT_FALSE(result.empty());
+        EXPECT_FALSE(result.outputPath.empty());
     });
 
     // Give compaction time to start
@@ -788,7 +793,8 @@ SEASTAR_TEST_F(TSMCompactorTest, MixedDataTypeCompaction) {
     }
 
     // Compact files with mixed types
-    auto compactedFile = co_await self->compactor->compact(files);
+    auto compactedResult = co_await self->compactor->compact(files);
+    auto compactedFile = compactedResult.outputPath;
 
     EXPECT_FALSE(compactedFile.empty());
     EXPECT_TRUE(fs::exists(compactedFile));
@@ -815,7 +821,7 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionErrorHandling) {
     // Test with empty file list
     std::vector<seastar::shared_ptr<TSM>> emptyFiles;
     auto result = co_await self->compactor->compact(emptyFiles);
-    EXPECT_TRUE(result.empty());
+    EXPECT_TRUE(result.outputPath.empty());
 
     // Test with invalid plan
     CompactionPlan invalidPlan;

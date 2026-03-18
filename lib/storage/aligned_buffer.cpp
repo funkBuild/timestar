@@ -62,6 +62,8 @@ void AlignedBuffer::write(std::_Bit_reference value) {
 // Bulk write raw bytes
 void AlignedBuffer::write_bytes(const char* bytes, size_t count) {
     const size_t new_size = current_size + count;
+    if (count > 0 && new_size < current_size) [[unlikely]]
+        throw std::overflow_error("AlignedBuffer::write_bytes overflow");
 
     ensure_capacity(new_size);
 

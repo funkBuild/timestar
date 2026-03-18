@@ -23,7 +23,7 @@ public:
                             DerivedQueryConfig config = {});
 
     // Register routes with the HTTP server
-    void registerRoutes(seastar::httpd::routes& r);
+    void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
 private:
     seastar::sharded<Engine>* engine_;

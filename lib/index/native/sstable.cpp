@@ -516,11 +516,20 @@ std::string SSTableReader::decompressBlock(size_t blockIndex) const {
 
     // Decompress (skip size prefix, exclude CRC)
     uint32_t uncompressedSize = decodeFixed32(compressedBuf.data());
+    static constexpr uint32_t MAX_BLOCK_SIZE = 64 * 1024 * 1024;  // 64MB sanity limit
+    if (uncompressedSize > MAX_BLOCK_SIZE) {
+        throw std::runtime_error("SSTable block uncompressed size too large: " +
+            std::to_string(uncompressedSize) + " bytes (max " + std::to_string(MAX_BLOCK_SIZE) + ")");
+    }
     std::string result(uncompressedSize, '\0');
     size_t decompSize = ZSTD_decompressDCtx(getSstDCtx(), result.data(), uncompressedSize, compressedBuf.data() + 4,
                                             entry.size - 4 - 4);
     if (ZSTD_isError(decompSize)) {
         throw std::runtime_error(std::string("SSTable zstd decompression failed: ") + ZSTD_getErrorName(decompSize));
+    }
+    if (decompSize != uncompressedSize) {
+        throw std::runtime_error("SSTable block decompressed size mismatch: expected " +
+            std::to_string(uncompressedSize) + ", got " + std::to_string(decompSize));
     }
     return result;
 }

@@ -37,7 +37,9 @@ public:
     bool valid() const override { return iter_->valid(); }
     std::string_view key() const override { return iter_->key(); }
     std::string_view value() const override { return iter_->value(); }
-    bool isTombstone() const override { return false; }  // SSTables don't store tombstones directly
+    // Return false so tombstones pass through to the compaction writer.
+    // Compaction handles tombstone GC directly via sentinel value check.
+    bool isTombstone() const override { return false; }
     int priority() const override { return priority_; }
 
 private:
@@ -143,8 +145,9 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     const size_t rateLimitBytesPerSec = static_cast<size_t>(config_.rateLimitMBps) * 1024 * 1024;
 
     while (merger.valid()) {
-        // Drop expired tombstones (empty values from deleted keys)
-        if (canDropTombstones && merger.value().empty()) {
+        // Drop expired tombstones (single null byte sentinel from deleted keys)
+        auto mergedVal = merger.value();
+        if (canDropTombstones && mergedVal.size() == 1 && mergedVal[0] == '\0') {
             ++tombstonesDropped;
             merger.nextSync();  // SSTable iterators are synchronous — avoid coroutine frame
             continue;
@@ -181,14 +184,13 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     outputMeta.fileNumber = outputFileNum;
     outputMeta.level = outputLevel;
 
-    // Update manifest: add output, remove inputs
-    co_await manifest_.addFile(outputMeta);
-
+    // Update manifest atomically: add output and remove inputs in a single fsync.
+    // This prevents a crash-window where both old and new data exist.
     std::vector<uint64_t> toRemove;
     for (const auto& f : job.inputFiles) {
         toRemove.push_back(f.fileNumber);
     }
-    co_await manifest_.removeFiles(toRemove);
+    co_await manifest_.atomicReplaceFiles(outputMeta, toRemove);
 
     // Delete old SSTable files from disk
     for (const auto& f : job.inputFiles) {

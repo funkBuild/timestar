@@ -18,6 +18,16 @@
 // Use short namespace alias for key encoding
 namespace ke = timestar::index::keys;
 
+// Tombstone sentinel: a single null byte distinguishes SSTable tombstones from
+// legitimate empty-value marker entries (MEASUREMENT_SERIES, MEASUREMENT_FIELD_SERIES).
+// Tombstone sentinel: a single null byte distinguishes SSTable tombstones from
+// legitimate empty-value marker entries (MEASUREMENT_SERIES, MEASUREMENT_FIELD_SERIES).
+static constexpr std::string_view SSTABLE_TOMBSTONE{"\0", 1};
+
+static bool isSstableTombstone(std::string_view value) {
+    return value.size() == 1 && value[0] == '\0';
+}
+
 static seastar::logger native_index_log("timestar.native_index");
 
 namespace timestar::index {
@@ -89,7 +99,7 @@ public:
     bool valid() const override { return iter_->valid(); }
     std::string_view key() const override { return iter_->key(); }
     std::string_view value() const override { return iter_->value(); }
-    bool isTombstone() const override { return false; }  // SSTables don't store tombstones
+    bool isTombstone() const override { return isSstableTombstone(value()); }
     int priority() const override { return priority_; }
 
 private:
@@ -271,6 +281,8 @@ std::optional<std::string> NativeIndex::kvGet(std::string_view key) {
     for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
         auto result = it->second->get(key);
         if (result.has_value()) {
+            if (isSstableTombstone(*result))
+                return std::nullopt;
             return result;
         }
     }
@@ -298,8 +310,9 @@ bool NativeIndex::kvExists(std::string_view key) {
 
     // 3. Check SSTables (newest to oldest)
     for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
-        if (it->second->contains(key))
-            return true;
+        auto result = it->second->get(key);
+        if (result.has_value())
+            return !isSstableTombstone(*result);
     }
 
     return false;
@@ -344,8 +357,12 @@ void NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallback fn) {
             if (key.size() < prefix.size() || std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
                 break;
             }
-            if (!fn(key, iter->value()))
-                break;
+            // Skip tombstones in single-source scan
+            auto val = iter->value();
+            if (!isSstableTombstone(val)) {
+                if (!fn(key, val))
+                    break;
+            }
             iter->next();
         }
         return;
@@ -511,20 +528,23 @@ seastar::future<> NativeIndex::doFlushImmutableMemTable() {
     ::native_index_log.info("Flushing immutable MemTable: {} entries, {} approx bytes", immutableMemtable_->size(),
                             immutableMemtable_->approximateMemoryUsage());
 
-    // Count live (non-tombstone) entries
+    // Count entries (tombstones are written as empty values to suppress older SSTable entries)
     size_t liveCount = 0;
+    size_t tombstoneCount = 0;
     {
         auto countIt = immutableMemtable_->newIterator();
         countIt.seekToFirst();
         while (countIt.valid()) {
-            if (!countIt.isTombstone())
+            if (countIt.isTombstone())
+                ++tombstoneCount;
+            else
                 ++liveCount;
             countIt.next();
         }
     }
-    ::native_index_log.info("Immutable MemTable has {} live entries (excluding tombstones)", liveCount);
-    if (liveCount == 0) {
-        ::native_index_log.info("Skipping SSTable flush — no live entries");
+    ::native_index_log.info("Immutable MemTable has {} live + {} tombstone entries", liveCount, tombstoneCount);
+    if (liveCount == 0 && tombstoneCount == 0) {
+        ::native_index_log.info("Skipping SSTable flush — empty MemTable");
         co_return;
     }
 
@@ -538,12 +558,15 @@ seastar::future<> NativeIndex::doFlushImmutableMemTable() {
     it.seekToFirst();
     size_t addCount = 0;
     while (it.valid()) {
-        if (!it.isTombstone()) {
+        // Tombstones are written with a sentinel value to suppress older
+        // values in lower-level SSTables until compaction GC.
+        if (it.isTombstone()) {
+            writer.add(it.key(), SSTABLE_TOMBSTONE);
+        } else {
             writer.add(it.key(), it.value());
-            // Periodically flush to disk to bound memory (every 1024 entries)
-            if (++addCount % 1024 == 0) {
-                co_await writer.flushPending();
-            }
+        }
+        if (++addCount % 1024 == 0) {
+            co_await writer.flushPending();
         }
         it.next();
     }

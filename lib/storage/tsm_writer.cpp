@@ -346,18 +346,18 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.size = static_cast<uint32_t>(blockSize);
 
     const size_t n = values.size();
-    int64_t sum = 0;
+    double sum = 0.0;
     int64_t bmin = std::numeric_limits<int64_t>::max();
     int64_t bmax = std::numeric_limits<int64_t>::min();
     for (size_t i = 0; i < n; ++i) {
         int64_t v = values[i];
-        sum += v;
+        sum += static_cast<double>(v);
         if (v < bmin)
             bmin = v;
         if (v > bmax)
             bmax = v;
     }
-    indexBlock.blockSum = static_cast<double>(sum);
+    indexBlock.blockSum = sum;
     indexBlock.blockMin = static_cast<double>(bmin);
     indexBlock.blockMax = static_cast<double>(bmax);
     indexBlock.blockCount = static_cast<uint32_t>(n);

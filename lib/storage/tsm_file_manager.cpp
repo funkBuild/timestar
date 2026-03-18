@@ -102,10 +102,12 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
     std::string filename =
         "shard_" + std::to_string(shardId) + "/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
-    // TSMWriter::runAsync() uses Seastar DMA I/O for non-blocking writes.
-    // All in-memory buffer construction is synchronous (CPU-bound, fast),
-    // and only the final file write is async via open_file_dma + dma_write.
-    co_await TSMWriter::runAsync(memStore, filename);
+    // Write to a .tmp file first, then rename atomically on success.
+    // If TSMWriter::runAsync() throws, the orphaned .tmp file will be
+    // cleaned up on the next startup by init() (which removes all .tmp files).
+    auto tmpFilename = filename + ".tmp";
+    co_await TSMWriter::runAsync(memStore, tmpFilename);
+    co_await seastar::rename_file(tmpFilename, filename);
     co_await openTsmFile(filename);
 
     co_await checkAndTriggerCompaction();

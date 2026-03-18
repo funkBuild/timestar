@@ -17,6 +17,7 @@ list(FILTER UNIT_INDEX_TESTS EXCLUDE REGEX ".*/deprecated/.*")
 file(GLOB_RECURSE UNIT_HTTP_TESTS unit/http/*.cpp)
 file(GLOB_RECURSE UNIT_CORE_TESTS unit/core/*.cpp)
 file(GLOB_RECURSE UNIT_RETENTION_TESTS unit/retention/*.cpp)
+file(GLOB_RECURSE UNIT_FUNCTIONS_TESTS unit/functions/*.cpp)
 file(GLOB_RECURSE INTEGRATION_TESTS integration/*.cpp)
 file(GLOB_RECURSE E2E_TESTS e2e/*.cpp)
 file(GLOB_RECURSE PERFORMANCE_TESTS performance/*.cpp)
@@ -46,6 +47,7 @@ set(TEST_SRCS
     ${UNIT_HTTP_TESTS}
     ${UNIT_CORE_TESTS}
     ${UNIT_RETENTION_TESTS}
+    ${UNIT_FUNCTIONS_TESTS}
     ${INTEGRATION_TESTS}
     ${E2E_TESTS}
     ${PERFORMANCE_TESTS}
@@ -78,6 +80,23 @@ target_compile_definitions(timestar_test PRIVATE
     WAL_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal.cpp"
     HTTP_WRITE_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_write_handler.cpp"
     TSM_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm.cpp"
+    ALP_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/alp/alp_encoder.cpp"
+    ALP_DECODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/alp/alp_decoder.cpp"
+    MANIFEST_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/manifest.cpp"
+    TSM_WRITER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_writer.cpp"
+    SSTABLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/sstable.cpp"
+    BOOL_ENCODER_RLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/bool_encoder_rle.cpp"
+    FUNCTION_MONITORING_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_monitoring.cpp"
+    FUNCTION_HTTP_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_http_handler.cpp"
+    INTERPOLATION_FUNCTIONS_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/interpolation_functions.cpp"
+    FUNCTION_TYPES_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_types.hpp"
+    SIMD_AGGREGATOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/simd_aggregator.cpp"
+    TSM_COMPACTOR_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_compactor.hpp"
+    STRING_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/string_encoder.cpp"
+    COMPACTION_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/compaction.cpp"
+    MANIFEST_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/manifest.hpp"
+    LINE_PARSER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/utils/line_parser.hpp"
+    WAL_FILE_MANAGER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.hpp"
 )
 
 # Discover tests for CTest
@@ -96,6 +115,7 @@ set(UNIT_TEST_SRCS
     ${UNIT_HTTP_TESTS}
     ${UNIT_CORE_TESTS}
     ${UNIT_RETENTION_TESTS}
+    ${UNIT_FUNCTIONS_TESTS}
 )
 add_executable(timestar_unit_test ${UNIT_TEST_SRCS})
 target_link_libraries(timestar_unit_test libtimestar gtest_main)
@@ -121,6 +141,23 @@ target_compile_definitions(timestar_unit_test PRIVATE
     WAL_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal.cpp"
     HTTP_WRITE_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_write_handler.cpp"
     TSM_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm.cpp"
+    ALP_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/alp/alp_encoder.cpp"
+    ALP_DECODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/alp/alp_decoder.cpp"
+    MANIFEST_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/manifest.cpp"
+    TSM_WRITER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_writer.cpp"
+    SSTABLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/sstable.cpp"
+    BOOL_ENCODER_RLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/bool_encoder_rle.cpp"
+    FUNCTION_MONITORING_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_monitoring.cpp"
+    FUNCTION_HTTP_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_http_handler.cpp"
+    INTERPOLATION_FUNCTIONS_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/interpolation_functions.cpp"
+    FUNCTION_TYPES_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_types.hpp"
+    SIMD_AGGREGATOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/simd_aggregator.cpp"
+    TSM_COMPACTOR_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_compactor.hpp"
+    STRING_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/string_encoder.cpp"
+    COMPACTION_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/compaction.cpp"
+    MANIFEST_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/manifest.hpp"
+    LINE_PARSER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/utils/line_parser.hpp"
+    WAL_FILE_MANAGER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.hpp"
 )
 
 # Integration tests only

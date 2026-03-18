@@ -180,6 +180,53 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
     files_.erase(it, files_.end());
 }
 
+seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
+                                                const std::vector<uint64_t>& removeFileNums) {
+    // Build a single buffer containing the AddFile record followed by all
+    // RemoveFile records.  One write+fsync ensures crash atomicity: either
+    // all records are persisted or none are.
+    std::string combinedFrame;
+
+    // AddFile record
+    std::string addRecord = serializeAddFile(newFile);
+    encodeFixed32(combinedFrame, static_cast<uint32_t>(addRecord.size()));
+    combinedFrame.append(addRecord);
+
+    // RemoveFile records
+    for (uint64_t fn : removeFileNums) {
+        std::string rmRecord = serializeRemoveFile(fn);
+        encodeFixed32(combinedFrame, static_cast<uint32_t>(rmRecord.size()));
+        combinedFrame.append(rmRecord);
+    }
+
+    // Single write+fsync
+    auto path = manifestPath_;
+    co_await seastar::async([path, combinedFrame = std::move(combinedFrame)] {
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
+            throw std::runtime_error("Failed to open manifest for atomic replace: " + path);
+        }
+        ssize_t written = ::write(fd, combinedFrame.data(), combinedFrame.size());
+        if (written < 0 || static_cast<size_t>(written) != combinedFrame.size()) {
+            ::close(fd);
+            throw std::runtime_error("Failed to write atomic replace to manifest: " + path);
+        }
+        ::fsync(fd);
+        ::close(fd);
+    });
+
+    // Update in-memory state AFTER successful persist
+    files_.push_back(newFile);
+    if (newFile.fileNumber >= nextFileNumber_) {
+        nextFileNumber_ = newFile.fileNumber + 1;
+    }
+
+    std::unordered_set<uint64_t> toRemove(removeFileNums.begin(), removeFileNums.end());
+    auto it = std::remove_if(files_.begin(), files_.end(),
+                             [&toRemove](const SSTableMetadata& f) { return toRemove.contains(f.fileNumber); });
+    files_.erase(it, files_.end());
+}
+
 seastar::future<> Manifest::writeSnapshot() {
     auto snapshot = serializeSnapshot();
     std::string frame;
@@ -330,9 +377,10 @@ seastar::future<> Manifest::recover() {
                 rp += 8;
             }
 
+            uint64_t fn = f.fileNumber;
             files_.push_back(std::move(f));
-            if (f.fileNumber >= nextFileNumber_)
-                nextFileNumber_ = f.fileNumber + 1;
+            if (fn >= nextFileNumber_)
+                nextFileNumber_ = fn + 1;
         } else if (type == RecordType::RemoveFile) {
             if (rp + 8 > rend)
                 continue;

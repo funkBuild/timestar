@@ -127,7 +127,7 @@ std::string PerformanceTracker::getPerformanceStats() const {
             json << ",";
         first = false;
 
-        json << "\"" << pair.first << "\":{";
+        json << "\"" << jsonEscape(pair.first) << "\":{";
         json << "\"executions\":" << pair.second.executions << ",";
         json << "\"avgTime\":" << pair.second.getAverageTime() << ",";
         json << "\"cacheHitRate\":" << pair.second.getCacheHitRate();
@@ -934,7 +934,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> FunctionHttpHandler::crea
     const std::string& error, seastar::http::reply::status_type status) {
     auto rep = std::make_unique<seastar::http::reply>();
     rep->set_status(status);
-    rep->_content = R"({"success":false,"error":")" + error + R"("})";
+    rep->_content = R"({"success":false,"error":")" + jsonEscape(error) + R"("})";
     rep->done("application/json");
     return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
@@ -959,7 +959,11 @@ void FunctionHttpHandler::updatePerformanceMetrics(const std::string& functionNa
 
 std::unique_ptr<seastar::http::reply> FunctionHttpHandler::createErrorResponse(
     const std::string& error, seastar::http::reply::status_type status) const {
-    return nullptr;
+    auto rep = std::make_unique<seastar::http::reply>();
+    rep->set_status(status);
+    rep->add_header("Content-Type", "application/json");
+    rep->_content = "{\"success\":false,\"error\":\"" + jsonEscape(error) + "\"}";
+    return rep;
 }
 
 }  // namespace timestar::functions

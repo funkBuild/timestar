@@ -1,4 +1,5 @@
 #include "http_retention_handler.hpp"
+#include "http_auth.hpp"
 
 #include "http_query_handler.hpp"
 #include "logger.hpp"
@@ -273,30 +274,34 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     co_return reply;
 }
 
-void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r) {
-    // Capture shared_ptr so the handler object is kept alive as long as the
-    // function_handler lambdas exist (i.e., until routes is destroyed).  This
-    // prevents a use-after-free if the caller does not hold onto the raw pointer
-    // after calling registerRoutes().
+void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto self = shared_from_this();
+    auto wrap = [&](auto fn) { return timestar::wrapWithAuth(authToken, std::move(fn)); };
 
-    auto* putHandler = new seastar::httpd::function_handler(
-        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handlePut(std::move(req)); },
-        "json");
-    r.add(seastar::httpd::operation_type::PUT, seastar::httpd::url("/retention"), putHandler);
+    r.add(seastar::httpd::operation_type::PUT, seastar::httpd::url("/retention"),
+          new seastar::httpd::function_handler(
+              wrap([self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  return self->handlePut(std::move(req));
+              }),
+              "json"));
 
-    auto* getHandler = new seastar::httpd::function_handler(
-        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handleGet(std::move(req)); },
-        "json");
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/retention"), getHandler);
+    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/retention"),
+          new seastar::httpd::function_handler(
+              wrap([self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  return self->handleGet(std::move(req));
+              }),
+              "json"));
 
-    auto* deleteHandler = new seastar::httpd::function_handler(
-        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handleDelete(std::move(req)); },
-        "json");
-    r.add(seastar::httpd::operation_type::DELETE, seastar::httpd::url("/retention"), deleteHandler);
+    r.add(seastar::httpd::operation_type::DELETE, seastar::httpd::url("/retention"),
+          new seastar::httpd::function_handler(
+              wrap([self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  return self->handleDelete(std::move(req));
+              }),
+              "json"));
 
-    timestar::http_log.info("Registered retention endpoints at /retention (PUT/GET/DELETE)");
+    timestar::http_log.info("Registered retention endpoints at /retention (PUT/GET/DELETE){}",
+                            authToken.empty() ? "" : " (auth required)");
 }

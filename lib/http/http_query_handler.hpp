@@ -84,7 +84,7 @@ public:
     seastar::future<std::unique_ptr<seastar::http::reply>> handleQuery(std::unique_ptr<seastar::http::request> req);
 
     // Register routes with HTTP server
-    void registerRoutes(seastar::httpd::routes& r);
+    void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
     // Execute query across shards
     seastar::future<QueryResponse> executeQuery(const QueryRequest& request);

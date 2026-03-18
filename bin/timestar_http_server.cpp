@@ -48,10 +48,9 @@ static thread_local timestar::HttpStreamHandler* g_streamHandler = nullptr;
 // Used by /health for Kubernetes readiness probes.
 static std::atomic<bool> g_ready{false};
 
-// TODO(H-H1): Add authentication/authorization middleware.  Currently all
-// endpoints are unauthenticated.  When deploying to a network accessible to
-// untrusted clients, place a reverse proxy (nginx, envoy) in front or
-// implement bearer-token / mTLS auth here.
+// Auth token — set once before server start, read by all shards via set_routes().
+// Empty string means auth is disabled (all requests pass through).
+static std::string g_authToken;
 
 void set_routes(routes& r) {
     // Per-shard handler instances. Each handler's registerRoutes() captures
@@ -84,32 +83,31 @@ void set_routes(routes& r) {
                                          timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER));
           }));
 
+    // Protected endpoints — when g_authToken is non-empty, each handler wraps
+    // its routes with Bearer token authentication via wrapWithAuth().
     auto* writeHandler = emplaceHandler(new HttpWriteHandler(&g_engine));
-    writeHandler->registerRoutes(r);
+    writeHandler->registerRoutes(r, g_authToken);
 
     auto* queryHandler = emplaceHandler(new timestar::HttpQueryHandler(&g_engine, nullptr));
-    queryHandler->registerRoutes(r);
+    queryHandler->registerRoutes(r, g_authToken);
 
     auto* deleteHandler = emplaceHandler(new HttpDeleteHandler(&g_engine));
-    deleteHandler->registerRoutes(r);
+    deleteHandler->registerRoutes(r, g_authToken);
 
     auto* metadataHandler = emplaceHandler(new HttpMetadataHandler(&g_engine));
-    metadataHandler->registerRoutes(r);
+    metadataHandler->registerRoutes(r, g_authToken);
 
-    // HttpRetentionHandler uses enable_shared_from_this, so it must be
-    // constructed as a shared_ptr. Store the shared_ptr in the handlers
-    // vector to ensure it outlives the route lambdas.
     auto retentionHandlerPtr = std::make_shared<HttpRetentionHandler>(&g_engine);
-    retentionHandlerPtr->registerRoutes(r);
+    retentionHandlerPtr->registerRoutes(r, g_authToken);
     handlers.emplace_back(new std::shared_ptr<HttpRetentionHandler>(retentionHandlerPtr),
                           [](void* p) { delete static_cast<std::shared_ptr<HttpRetentionHandler>*>(p); });
 
     auto* streamHandler = emplaceHandler(new timestar::HttpStreamHandler(&g_engine));
-    streamHandler->registerRoutes(r);
-    g_streamHandler = streamHandler;  // Save for shutdown
+    streamHandler->registerRoutes(r, g_authToken);
+    g_streamHandler = streamHandler;
 
     auto* derivedQueryHandler = emplaceHandler(new timestar::HttpDerivedQueryHandler(&g_engine));
-    derivedQueryHandler->registerRoutes(r);
+    derivedQueryHandler->registerRoutes(r, g_authToken);
 
     r.add(operation_type::GET, url("/"),
           new function_handler([](const_req req) {
@@ -338,6 +336,19 @@ int main(int argc, char** argv) {
             // allocated on its own heap.
             seastar_apps_lib::stop_signal stop_signal;
 
+            // Initialize auth token if auth is enabled
+            if (timestar::config().server.auth_enabled) {
+                g_authToken = timestar::config().server.auth_token;
+                if (g_authToken.empty()) {
+                    g_authToken = timestar::generateToken(32);
+                    timestar::http_log.info("Auth enabled — generated token: {}", timestar::maskToken(g_authToken));
+                } else {
+                    timestar::http_log.info("Auth enabled — using configured token: {}", timestar::maskToken(g_authToken));
+                }
+            } else {
+                timestar::http_log.info("Auth disabled — all endpoints are unauthenticated");
+            }
+
             auto server = std::make_unique<http_server_control>();
 
             // Start the HTTP server
@@ -413,7 +424,15 @@ int main(int argc, char** argv) {
                 }
                 timestar::http_log.info("Shutdown complete");
             } catch (const seastar::timed_out_error&) {
+                // with_timeout does NOT cancel the doShutdown() coroutine — it
+                // continues running in the background holding references to
+                // stack locals (server, g_engine). Returning normally would
+                // destroy those objects while the coroutine is still live,
+                // causing use-after-free. Use _exit() to terminate immediately;
+                // the OS reclaims all resources and WAL recovery handles
+                // unflushed data on restart.
                 timestar::http_log.error("Shutdown timed out after {}s — forcing exit", timeoutSec);
+                std::_Exit(1);
             }
 
             return 0;

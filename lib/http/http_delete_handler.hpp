@@ -96,5 +96,5 @@ public:
 
     seastar::future<std::unique_ptr<seastar::http::reply>> handleDelete(std::unique_ptr<seastar::http::request> req);
 
-    void registerRoutes(seastar::httpd::routes& r);
+    void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 };

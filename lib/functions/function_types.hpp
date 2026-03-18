@@ -455,9 +455,11 @@ public:
         result.timestamps = targetTimestamps;
         result.values.reserve(targetTimestamps.size());
 
+        // Bug #23 fix: Hoist search position before the outer loop so it
+        // persists across iterations, giving O(n+m) instead of O(n*m).
+        size_t i = 0;
         for (uint64_t targetTime : targetTimestamps) {
             // Find surrounding points for interpolation
-            size_t i = 0;
             while (i + 1 < input.size() && input.timestampAt(i + 1) < targetTime) {
                 ++i;
             }

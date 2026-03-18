@@ -23,7 +23,7 @@ public:
 
     HttpMetadataHandler(seastar::sharded<Engine>* _engineSharded);
 
-    void registerRoutes(seastar::httpd::routes& r);
+    void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
     seastar::future<std::unique_ptr<seastar::http::reply>> handleMeasurements(
         std::unique_ptr<seastar::http::request> req);

@@ -1,4 +1,5 @@
 #include "http_stream_handler.hpp"
+#include "http_auth.hpp"
 
 #include "../utils/json_escape.hpp"
 #include "engine.hpp"
@@ -427,13 +428,25 @@ public:
     }
 };
 
-void HttpStreamHandler::registerRoutes(seastar::httpd::routes& r) {
+void HttpStreamHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     // seastar::httpd::routes takes ownership of raw handler pointers and
     // deletes them in its destructor — raw new is the required Seastar API.
-    r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/subscribe"), new sse_handler(this));
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/subscriptions"), new subscriptions_handler(this));
+    if (authToken.empty()) {
+        r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/subscribe"), new sse_handler(this));
+        r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/subscriptions"),
+              new subscriptions_handler(this));
+    } else {
+        std::string token(authToken);
+        r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/subscribe"),
+              new timestar::AuthHandlerWrapper(
+                  std::make_unique<sse_handler>(this), token));
+        r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/subscriptions"),
+              new timestar::AuthHandlerWrapper(
+                  std::make_unique<subscriptions_handler>(this), token));
+    }
 
-    timestar::http_log.info("Registered HTTP streaming endpoints at /subscribe, /subscriptions");
+    timestar::http_log.info("Registered HTTP streaming endpoints at /subscribe, /subscriptions{}",
+                            authToken.empty() ? "" : " (auth required)");
 }
 
 // --- Main subscribe handler ---

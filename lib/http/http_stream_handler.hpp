@@ -21,7 +21,7 @@ class HttpStreamHandler {
 public:
     explicit HttpStreamHandler(seastar::sharded<Engine>* engine) : _engineSharded(engine) {}
 
-    void registerRoutes(seastar::httpd::routes& r);
+    void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
     // Wait for all active streaming connections to finish (for graceful shutdown).
     seastar::future<> stop() { return _connectionGate.close(); }

@@ -576,13 +576,13 @@ seastar::future<> TSMCompactor::mergeSeriesBulk(const SeriesId128& seriesId,
                 readFutures.push_back(meta.sourceFile->readCompressedBlock(meta.indexBlock));
             }
 
-            // Wait for all reads to complete at once
-            auto compressedBlocks = co_await seastar::when_all(readFutures.begin(), readFutures.end());
+            // Wait for all reads to complete at once (fail-fast on first error)
+            auto compressedBlocks = co_await seastar::when_all_succeed(readFutures.begin(), readFutures.end());
 
             // Write all compressed blocks to destination
             for (size_t i = 0; i < blockMeta.size(); i++) {
                 const auto& meta = blockMeta[i];
-                auto compressedData = std::move(compressedBlocks[i].get());
+                auto compressedData = std::move(compressedBlocks[i]);
 
                 writer.writeCompressedBlockWithStats(TSM::getValueType<T>(), seriesId, std::move(compressedData),
                                                      meta.indexBlock);
@@ -771,11 +771,11 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             readFutures.push_back(meta.sourceFile->readCompressedBlock(meta.indexBlock));
         }
 
-        auto compressedData = co_await seastar::when_all(readFutures.begin(), readFutures.end());
+        auto compressedData = co_await seastar::when_all_succeed(readFutures.begin(), readFutures.end());
 
         for (size_t i = 0; i < blockMeta.size(); i++) {
             typename SeriesCompactionData<T>::CompressedBlock block;
-            block.data = std::move(compressedData[i].get());
+            block.data = std::move(compressedData[i]);
             block.minTime = blockMeta[i].minTime;
             block.maxTime = blockMeta[i].maxTime;
             block.blockSum = blockMeta[i].indexBlock.blockSum;
@@ -981,12 +981,12 @@ void TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, SeriesCompaction
     stats.duplicatesRemoved += data.duplicatesRemoved;
 }
 
-seastar::future<std::string> TSMCompactor::compact(
+seastar::future<CompactionResult> TSMCompactor::compact(
     const std::vector<seastar::shared_ptr<TSM>>& files,
     const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies,
     const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
     if (files.empty()) {
-        co_return std::string();
+        co_return CompactionResult{};
     }
 
     // Determine output tier and filename
@@ -1003,6 +1003,14 @@ seastar::future<std::string> TSMCompactor::compact(
 
     // Create temporary file for writing
     std::string tempPath = outputPath + ".tmp";
+    // Track whether we successfully renamed — if not, clean up the temp file.
+    bool tempRenamed = false;
+    // Scope guard: clean up the temp file on any exception before the rename succeeds.
+    struct TempCleanup {
+        const std::string& path;
+        bool& renamed;
+        ~TempCleanup() { if (!renamed) { try { fs::remove(path); } catch (...) {} } }
+    } tempCleanup{tempPath, tempRenamed};
     TSMWriter writer(tempPath);
     // Use higher zstd compression for deeper tiers (better ratio, acceptable speed)
     if (targetTier >= 1) {
@@ -1162,11 +1170,9 @@ seastar::future<std::string> TSMCompactor::compact(
     stats.filesCompacted = files.size();
     stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-    // Store stats so executeCompaction can retrieve them
-    lastCompactStats = stats;
-
     // Atomic rename from temp to final (async to avoid blocking the reactor)
     co_await seastar::rename_file(tempPath, outputPath);
+    tempRenamed = true;  // Rename succeeded — don't delete the output file
 
     // Fsync the parent directory to ensure the rename (directory entry update)
     // is durable.  Without this, a crash could lose the rename even though
@@ -1182,7 +1188,7 @@ seastar::future<std::string> TSMCompactor::compact(
         timestar::compactor_log.warn("Failed to fsync parent directory after compaction rename: {}", dir);
     }
 
-    co_return outputPath;
+    co_return CompactionResult{outputPath, stats};
 }
 
 CompactionPlan TSMCompactor::planCompaction(uint64_t tier) {
@@ -1229,11 +1235,11 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
     activeCompactions.push_back(active);
 
     // Perform compaction (passing pending retention context if any)
-    std::string newFile = co_await compact(plan.sourceFiles, _pendingRetentionPolicies, _pendingSeriesMeasurementMap);
+    auto compactionResult = co_await compact(plan.sourceFiles, _pendingRetentionPolicies, _pendingSeriesMeasurementMap);
 
-    if (!newFile.empty()) {
+    if (!compactionResult.outputPath.empty()) {
         // Open the new file
-        auto newTSM = seastar::make_shared<TSM>(newFile);
+        auto newTSM = seastar::make_shared<TSM>(compactionResult.outputPath);
         co_await newTSM->open();
 
         // Add to file manager
@@ -1245,7 +1251,7 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
     }
 
     // Propagate stats from the compact() call and add timing
-    active.stats = lastCompactStats;
+    active.stats = compactionResult.stats;
     auto endTime = std::chrono::steady_clock::now();
     active.stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - active.startTime);
 

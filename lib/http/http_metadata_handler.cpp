@@ -1,4 +1,5 @@
 #include "http_metadata_handler.hpp"
+#include "http_auth.hpp"
 
 #include "native_index.hpp"
 
@@ -100,36 +101,43 @@ HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharde
     timestar::http_log.info("HttpMetadataHandler initialized");
 }
 
-void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r) {
-    // /measurements endpoint
-    auto measurementsHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleMeasurements(std::move(req)); },
-        "json");
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/measurements"), measurementsHandler);
+void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
+    auto wrap = [&](auto fn) { return timestar::wrapWithAuth(authToken, std::move(fn)); };
 
-    // /tags endpoint
-    auto tagsHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleTags(std::move(req)); },
-        "json");
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/tags"), tagsHandler);
+    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/measurements"),
+          new seastar::httpd::function_handler(
+              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  return handleMeasurements(std::move(req));
+              }),
+              "json"));
 
-    // /fields endpoint
-    auto fieldsHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleFields(std::move(req)); },
-        "json");
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/fields"), fieldsHandler);
+    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/tags"),
+          new seastar::httpd::function_handler(
+              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  return handleTags(std::move(req));
+              }),
+              "json"));
 
-    // /cardinality endpoint
-    auto cardinalityHandler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleCardinality(std::move(req)); },
-        "json");
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/cardinality"), cardinalityHandler);
+    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/fields"),
+          new seastar::httpd::function_handler(
+              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  return handleFields(std::move(req));
+              }),
+              "json"));
 
-    timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields, /cardinality");
+    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/cardinality"),
+          new seastar::httpd::function_handler(
+              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  return handleCardinality(std::move(req));
+              }),
+              "json"));
+
+    timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields, /cardinality{}",
+                            authToken.empty() ? "" : " (auth required)");
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleMeasurements(
@@ -402,8 +410,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
 
         timestar::http_log.debug("Processing /cardinality request for measurement: {}", measurement);
 
-        // Scatter-gather: collect HLL sketches from all shards and merge
-        using HLL = timestar::index::HyperLogLog;
+        // Scatter-gather: collect estimates from all shards and sum
         auto numShards = seastar::smp::count;
 
         if (!tagKey.empty() && !tagValue.empty()) {
@@ -411,7 +418,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             std::vector<seastar::future<double>> futures;
             futures.reserve(numShards);
             for (unsigned s = 0; s < numShards; ++s) {
-                futures.push_back(engineSharded->invoke_on(s, [&measurement, &tagKey, &tagValue](Engine& engine) {
+                futures.push_back(engineSharded->invoke_on(s, [measurement, tagKey, tagValue](Engine& engine) {
                     auto& idx = static_cast<timestar::index::NativeIndex&>(engine.getIndex());
                     return idx.estimateTagCardinality(measurement, tagKey, tagValue);
                 }));
@@ -441,7 +448,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             std::vector<seastar::future<double>> futures;
             futures.reserve(numShards);
             for (unsigned s = 0; s < numShards; ++s) {
-                futures.push_back(engineSharded->invoke_on(s, [&measurement](Engine& engine) {
+                futures.push_back(engineSharded->invoke_on(s, [measurement](Engine& engine) {
                     auto& idx = static_cast<timestar::index::NativeIndex&>(engine.getIndex());
                     return idx.estimateMeasurementCardinality(measurement);
                 }));

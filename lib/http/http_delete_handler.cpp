@@ -1,4 +1,5 @@
 #include "http_delete_handler.hpp"
+#include "http_auth.hpp"
 
 #include "logger.hpp"
 #include "placement_table.hpp"
@@ -323,16 +324,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     co_return reply;
 }
 
-void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r) {
+void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req,
-               std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            // We don't use the provided reply, create our own
-            return handleDelete(std::move(req));
-        },
+        timestar::wrapWithAuth(authToken,
+            [this](std::unique_ptr<seastar::http::request> req,
+                   std::unique_ptr<seastar::http::reply>) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                return handleDelete(std::move(req));
+            }),
         "json");
 
     r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/delete"), handler);
 
-    timestar::http_log.info("Registered DELETE endpoint at /delete");
+    timestar::http_log.info("Registered DELETE endpoint at /delete{}",
+                            authToken.empty() ? "" : " (auth required)");
 }

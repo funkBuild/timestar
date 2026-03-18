@@ -279,7 +279,12 @@ seastar::future<> TSM::open() {
             }
         }
 
-        // Use lazy loading: read sparse index + bloom filter (not full index)
+        // Use lazy loading: read sparse index + bloom filter (not full index).
+        // Minimum valid file: 5-byte header + 8-byte index offset footer = 13 bytes.
+        if (length < 13) {
+            throw std::runtime_error("TSM file too small (" + std::to_string(length) +
+                                     " bytes, minimum 13): " + filePath);
+        }
         co_await readSparseIndex();
 
         // Load tombstones if they exist
@@ -391,11 +396,13 @@ seastar::future<> TSM::readSparseIndex() {
                 std::memcpy(&latestValue, indexSlice.data + lastBlockStart + 72, sizeof(double));
                 hasExtStats = true;
             }
-            // Integer (V2): first/latest as int64 at offset 52 and 60 within block
+            // Integer (V2): first/latest as int64 at offset 56 and 64 within block
+            // Layout: minTime(8) maxTime(8) offset(8) size(4) count(4) sum(8) min(8) max(8) first(8) latest(8)
+            //         0         8          16        24      28       32      40      48      56       64
             else if (seriesType == TSMValueType::Integer && fileVersion >= 2) {
                 int64_t intFirst, intLatest;
-                std::memcpy(&intFirst, indexSlice.data + blockStart + 52, sizeof(int64_t));
-                std::memcpy(&intLatest, indexSlice.data + lastBlockStart + 60, sizeof(int64_t));
+                std::memcpy(&intFirst, indexSlice.data + blockStart + 56, sizeof(int64_t));
+                std::memcpy(&intLatest, indexSlice.data + lastBlockStart + 64, sizeof(int64_t));
                 firstValue = static_cast<double>(intFirst);
                 latestValue = static_cast<double>(intLatest);
                 hasExtStats = true;
@@ -890,6 +897,10 @@ std::vector<TSMIndexBlock> TSM::getSeriesBlocks(const SeriesId128& seriesId) con
 template <class T>
 seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
                                                                    uint64_t endTime) {
+    // Bug #8 fix: Capture tlStringDict BEFORE co_await — another coroutine
+    // on this thread could overwrite the thread-local during DMA suspension.
+    const std::vector<std::string>* localDict = tlStringDict;
+
     auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
@@ -920,9 +931,10 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         // Phase 3: Check if dictionary-encoded (STR2 magic)
-        if (StringEncoder::isDictionaryEncoded(valuesSlice) && tlStringDict && !tlStringDict->empty()) {
+        // Bug #8 fix: Use localDict (captured before co_await) instead of tlStringDict
+        if (StringEncoder::isDictionaryEncoded(valuesSlice) && localDict && !localDict->empty()) {
             StringEncoder::Dictionary dict;
-            dict.entries = *tlStringDict;
+            dict.entries = *localDict;
             dict.valid = true;
             StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict,
                                             blockResults->values);

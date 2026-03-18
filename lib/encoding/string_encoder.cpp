@@ -131,8 +131,10 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
                                   " exceeds uint32_t maximum");
     }
 
-    compressed.resize(compressedSize);
-    return {std::move(compressed), static_cast<uint32_t>(uncompressed.data.size()),
+    // Copy instead of move — `compressed` is a reference to thread-local `tlCompBuf`,
+    // and moving it would leave the thread-local empty, defeating its reuse purpose.
+    return {std::vector<char>(compressed.begin(), compressed.begin() + compressedSize),
+            static_cast<uint32_t>(uncompressed.data.size()),
             static_cast<uint32_t>(compressedSize), static_cast<uint32_t>(values.size())};
 }
 

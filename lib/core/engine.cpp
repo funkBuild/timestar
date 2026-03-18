@@ -169,6 +169,12 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
         co_return WALTimingInfo{};  // No work to do
     }
 
+    // Update Prometheus metrics for batch inserts
+    ++_metrics.inserts_total;
+    for (const auto& req : insertRequests) {
+        _metrics.insert_points_total += req.timestamps.size();
+    }
+
     // Metadata indexing is now handled at the HTTP handler level on shard 0
     // This Engine method now only handles data storage (WAL + MemoryStore)
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Processing batch data storage for {} requests",
@@ -315,11 +321,11 @@ seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string ser
     co_return co_await query(std::move(series), seriesId, startTime, endTime);
 }
 
-seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string series, const SeriesId128& /* seriesId */,
+seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string series, const SeriesId128& seriesId,
                                                                  uint64_t startTime, uint64_t endTime) {
     QueryRunner runner(&tsmFileManager, &walFileManager);
     try {
-        co_return co_await runner.runQuery(series, startTime, endTime);
+        co_return co_await runner.runQuery(series, seriesId, startTime, endTime);
     } catch (const std::runtime_error& e) {
         std::string_view msg(e.what());
         if (msg.find("Series not found") != std::string_view::npos ||

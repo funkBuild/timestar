@@ -1,4 +1,5 @@
 #include "http_query_handler.hpp"
+#include "http_auth.hpp"
 
 #include "aggregator.hpp"
 #include "engine.hpp"
@@ -279,15 +280,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
     co_return rep;
 }
 
-void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r) {
+void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleQuery(std::move(req)); },
+        timestar::wrapWithAuth(authToken,
+            [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleQuery(std::move(req)); }),
         "json");
 
     r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/query"), handler);
 
-    timestar::http_log.info("Registered HTTP query endpoint at /query");
+    timestar::http_log.info("Registered HTTP query endpoint at /query{}",
+                            authToken.empty() ? "" : " (auth required)");
 }
 
 QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeReq) {

@@ -199,7 +199,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionUnderActiveWrites) {
     self->fileManager->setSequencedTsmFile(100, newTsm);
 
     // Phase 4: wait for compaction to finish
-    auto compactedFile = co_await std::move(compactionFuture);
+    auto compactedResult = co_await std::move(compactionFuture);
+    auto compactedFile = compactedResult.outputPath;
 
     EXPECT_FALSE(compactedFile.empty());
     EXPECT_TRUE(fs::exists(compactedFile));
@@ -287,14 +288,15 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ErrorRecoveryDuringCompaction) {
     // 4b: compacting an empty vector returns an empty path
     std::vector<seastar::shared_ptr<TSM>> noFiles;
     auto result = co_await self->compactor->compact(noFiles);
-    EXPECT_TRUE(result.empty());
+    EXPECT_TRUE(result.outputPath.empty());
 
     // 4c: compacting a single valid file still works (no merge needed)
     auto tsm = self->createTestTSMFile(0, 1, "err.", 1, 20);
     co_await tsm->open();
     co_await tsm->readSparseIndex();
 
-    auto singleResult = co_await self->compactor->compact({tsm});
+    auto singleCompactResult = co_await self->compactor->compact({tsm});
+    auto singleResult = singleCompactResult.outputPath;
     EXPECT_FALSE(singleResult.empty());
     EXPECT_TRUE(fs::exists(singleResult));
 
@@ -349,7 +351,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneIntegrationDuringCompaction) {
     }
 
     // Compact -- tombstoned points should be filtered out
-    auto compactedPath = co_await self->compactor->compact(files);
+    auto compactedResult = co_await self->compactor->compact(files);
+    auto compactedPath = compactedResult.outputPath;
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
 
@@ -402,19 +405,19 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ConcurrentCompactionRequests) {
     auto resultA = co_await std::move(futA);
     auto resultB = co_await std::move(futB);
 
-    EXPECT_FALSE(resultA.empty());
-    EXPECT_FALSE(resultB.empty());
-    EXPECT_TRUE(fs::exists(resultA));
-    EXPECT_TRUE(fs::exists(resultB));
+    EXPECT_FALSE(resultA.outputPath.empty());
+    EXPECT_FALSE(resultB.outputPath.empty());
+    EXPECT_TRUE(fs::exists(resultA.outputPath));
+    EXPECT_TRUE(fs::exists(resultB.outputPath));
 
     // Verify both output files contain the correct data
-    auto tsmA = seastar::make_shared<TSM>(resultA);
+    auto tsmA = seastar::make_shared<TSM>(resultA.outputPath);
     co_await tsmA->open();
     co_await tsmA->readSparseIndex();
     auto idsA = tsmA->getSeriesIds();
     EXPECT_GE(idsA.size(), 2);
 
-    auto tsmB = seastar::make_shared<TSM>(resultB);
+    auto tsmB = seastar::make_shared<TSM>(resultB.outputPath);
     co_await tsmB->open();
     co_await tsmB->readSparseIndex();
     auto idsB = tsmB->getSeriesIds();
@@ -482,7 +485,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, DataIntegrityAfterCompaction) {
         files.push_back(tsm);
     }
 
-    auto compactedPath = co_await self->compactor->compact(files);
+    auto compactedPathResult = co_await self->compactor->compact(files);
+    auto compactedPath = compactedPathResult.outputPath;
     EXPECT_FALSE(compactedPath.empty());
 
     auto compacted = seastar::make_shared<TSM>(compactedPath);
@@ -591,7 +595,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
         files.push_back(tsm);
     }
 
-    auto compactedPath = co_await self->compactor->compact(files);
+    auto compactedPathResult = co_await self->compactor->compact(files);
+    auto compactedPath = compactedPathResult.outputPath;
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
 
@@ -708,7 +713,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneMultipleFilesCompaction) {
         files.push_back(tsm);
     }
 
-    auto compactedPath = co_await self->compactor->compact(files);
+    auto compactedPathResult = co_await self->compactor->compact(files);
+    auto compactedPath = compactedPathResult.outputPath;
     EXPECT_FALSE(compactedPath.empty());
 
     auto compacted = seastar::make_shared<TSM>(compactedPath);
@@ -751,7 +757,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ConcurrentReadsDuringCompaction) {
     auto compactionFuture = seastar::async([&]() {
         auto result = self->compactor->compact(files).get();
         compactionDone = true;
-        EXPECT_FALSE(result.empty());
+        EXPECT_FALSE(result.outputPath.empty());
     });
 
     // Give compaction a small head start
@@ -800,7 +806,8 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, LargeScaleCompactionIntegrity) {
         files.push_back(tsm);
     }
 
-    auto compactedPath = co_await self->compactor->compact(files);
+    auto compactedPathResult = co_await self->compactor->compact(files);
+    auto compactedPath = compactedPathResult.outputPath;
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
 

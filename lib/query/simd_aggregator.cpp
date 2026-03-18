@@ -166,8 +166,10 @@ void ComputeHistogram(const double* values, size_t count, double min_val, double
     auto zero_vec = hn::Zero(d);
     auto max_bin_vec = hn::Set(d, static_cast<double>(num_bins - 1));
 
-    // Scratch buffer for storing computed bin values (max 8 lanes for AVX-512)
-    alignas(64) double bins[8];
+    // Scratch buffer for storing computed bin values.
+    // Use HWY_MAX_LANES_D to support variable-width SIMD (including ARM SVE).
+    static constexpr size_t kMaxLanes = HWY_MAX_LANES_D(hn::ScalableTag<double>);
+    alignas(64) double bins[kMaxLanes];
 
     size_t i = 0;
 

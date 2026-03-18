@@ -146,8 +146,10 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(con
                 if (input.count >= 2) {
                     double slope = (input.valueAt(1) - input.valueAt(0)) /
                                    static_cast<double>(input.timestampAt(1) - input.timestampAt(0));
+                    // Bug #22 fix: Cast both operands to double before subtraction
+                    // to prevent unsigned underflow when targetTime < timestampAt(0)
                     double extrapolated =
-                        input.valueAt(0) + slope * static_cast<double>(targetTime - input.timestampAt(0));
+                        input.valueAt(0) + slope * (static_cast<double>(targetTime) - static_cast<double>(input.timestampAt(0)));
                     result.values.push_back(extrapolated);
                 } else {
                     result.values.push_back(input.valueAt(0));

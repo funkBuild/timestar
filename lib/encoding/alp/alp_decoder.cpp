@@ -80,6 +80,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             const uint8_t bw = static_cast<uint8_t>((bh0 >> 16) & 0x7F);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
             const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
+            if (exception_count > block_count) throw std::runtime_error("ALP: exception_count exceeds block_count");
             const int64_t for_base = std::bit_cast<int64_t>(bh1);
 
             // Read first_value for delta scheme (part of block header)
@@ -224,6 +225,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             const uint8_t dict_size = static_cast<uint8_t>((bh0 >> 16) & 0xFF);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
             const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
+            if (exception_count > block_count) throw std::runtime_error("ALP: exception_count exceeds block_count");
             const uint64_t right_for_base = bh1;
 
             // === Read Dictionary ===

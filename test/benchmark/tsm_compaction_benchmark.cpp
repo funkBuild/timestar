@@ -184,7 +184,7 @@ seastar::future<CompactionStats> runCompactionBenchmark() {
     std::cout << "\nExecuting compaction..." << std::endl;
     std::string outputFile;
     try {
-        outputFile = co_await compactor.compact(benchState.loadedFiles);
+        outputFile = (co_await compactor.compact(benchState.loadedFiles)).outputPath;
         std::cout << "Compaction completed successfully" << std::endl;
         std::cout << "Output file: " << outputFile << std::endl;
     } catch (const std::exception& e) {

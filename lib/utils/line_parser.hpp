@@ -10,8 +10,8 @@ private:
 public:
     std::string measurement;
     std::string field;
-    std::map<std::string_view, std::string_view> tags;
+    std::map<std::string, std::string> tags;
 
     SeriesKeyParser(std::string_view seriesKey);
-    void parseKeypair(std::string_view keypair, std::map<std::string_view, std::string_view>& map);
+    void parseKeypair(std::string_view keypair, std::map<std::string, std::string>& map);
 };

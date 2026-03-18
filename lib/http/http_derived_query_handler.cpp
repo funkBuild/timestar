@@ -1,4 +1,5 @@
 #include "http_derived_query_handler.hpp"
+#include "http_auth.hpp"
 
 #include "anomaly/anomaly_result.hpp"
 #include "forecast/forecast_result.hpp"
@@ -18,18 +19,19 @@ HttpDerivedQueryHandler::HttpDerivedQueryHandler(seastar::sharded<Engine>* engin
         throw std::invalid_argument("engine must not be null");
 }
 
-void HttpDerivedQueryHandler::registerRoutes(seastar::httpd::routes& r) {
-    // POST /derived - Execute derived metric query
+void HttpDerivedQueryHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto* handler = new seastar::httpd::function_handler(
-        [this](std::unique_ptr<seastar::http::request> req,
-               std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            return handleDerivedQuery(std::move(req), std::move(rep));
-        },
+        timestar::wrapWithAuth(authToken,
+            [this](std::unique_ptr<seastar::http::request> req,
+                   std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                return handleDerivedQuery(std::move(req), std::move(rep));
+            }),
         "json");
 
     r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/derived"), handler);
 
-    http_log.info("Registered HTTP derived query endpoint at /derived");
+    http_log.info("Registered HTTP derived query endpoint at /derived{}",
+                  authToken.empty() ? "" : " (auth required)");
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::handleDerivedQuery(

@@ -153,7 +153,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, OldDataDroppedAfterCompaction) {
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap;
     seriesMap[sid] = measurement;
 
-    auto compactedPath = co_await self->compactor->compact({file0, file1}, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact({file0, file1}, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
@@ -213,7 +213,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, RecentDataPreservedAfterCompaction) {
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap;
     seriesMap[sid] = measurement;
 
-    auto compactedPath = co_await self->compactor->compact({file0, file1}, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact({file0, file1}, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
@@ -268,7 +268,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, MixedAgeDataPartialRetention) {
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap;
     seriesMap[sid] = measurement;
 
-    auto compactedPath = co_await self->compactor->compact({file0, file1}, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact({file0, file1}, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
@@ -328,7 +328,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, CompactedOutputHasFewerFiles) {
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap;
     seriesMap[sid] = measurement;
 
-    auto compactedPath = co_await self->compactor->compact(files, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact(files, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
@@ -367,7 +367,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, NoRetentionPolicyPreservesAllData) {
     co_await file1->readSparseIndex();
 
     // No retention policies at all.
-    auto compactedPath = co_await self->compactor->compact({file0, file1});
+    auto compactedPath = (co_await self->compactor->compact({file0, file1})).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
 
@@ -443,7 +443,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, RetentionAppliedOnlyToTargetMeasurement)
     seriesMap[sid_a] = measA;
     seriesMap[sid_b] = measB;  // B is in the map but has no matching policy
 
-    auto compactedPath = co_await self->compactor->compact({f0, f1}, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact({f0, f1}, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
@@ -502,7 +502,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, QueryAfterCompactionReturnsOnlyInRetenti
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap;
     seriesMap[sid] = measurement;
 
-    auto compactedPath = co_await self->compactor->compact({f0, f1, f2}, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact({f0, f1, f2}, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
     EXPECT_TRUE(fs::exists(compactedPath));
@@ -576,7 +576,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, ShortRetentionWindowDropsMostData) {
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap;
     seriesMap[sid] = measurement;
 
-    auto compactedPath = co_await self->compactor->compact({file0, file1}, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact({file0, file1}, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
 
@@ -631,7 +631,7 @@ SEASTAR_TEST_F(CompactionRetentionTest, SetRetentionContextAppliedOnCompact) {
 
     // Pass the same policies explicitly to the compact() call so retention
     // is applied via both the pre-loaded context and the direct argument.
-    auto compactedPath = co_await self->compactor->compact({file0, file1}, policies, seriesMap);
+    auto compactedPath = (co_await self->compactor->compact({file0, file1}, policies, seriesMap)).outputPath;
 
     EXPECT_FALSE(compactedPath.empty());
 

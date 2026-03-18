@@ -44,25 +44,26 @@ __attribute__((target("sse4.2"))) uint32_t IndexWAL::computeCrc32(const char* da
 }
 
 #else
-// Software fallback: CRC32 with zlib polynomial
-static constexpr auto makeCrc32Table() {
+// Software fallback: CRC32C with Castagnoli polynomial (0x82F63B78 reflected)
+// Must match the x86 hardware intrinsics (_mm_crc32) for WAL portability.
+static constexpr auto makeCrc32cTable() {
     std::array<uint32_t, 256> table{};
     for (uint32_t i = 0; i < 256; ++i) {
         uint32_t c = i;
         for (int j = 0; j < 8; ++j) {
-            c = (c >> 1) ^ (0xEDB88320 & (-(c & 1)));
+            c = (c >> 1) ^ (0x82F63B78 & (-(c & 1)));
         }
         table[i] = c;
     }
     return table;
 }
 
-static constexpr auto crc32_table = makeCrc32Table();
+static constexpr auto crc32c_table = makeCrc32cTable();
 
 uint32_t IndexWAL::computeCrc32(const char* data, size_t len) {
     uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < len; ++i) {
-        crc = crc32_table[(crc ^ static_cast<uint8_t>(data[i])) & 0xFF] ^ (crc >> 8);
+        crc = crc32c_table[(crc ^ static_cast<uint8_t>(data[i])) & 0xFF] ^ (crc >> 8);
     }
     return crc ^ 0xFFFFFFFF;
 }

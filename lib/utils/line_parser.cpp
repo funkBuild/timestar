@@ -72,12 +72,13 @@ SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey) {
     field = seriesKey.substr(startIndex, length - startIndex);
 }
 
-void SeriesKeyParser::parseKeypair(std::string_view keypair, std::map<std::string_view, std::string_view>& map) {
+void SeriesKeyParser::parseKeypair(std::string_view keypair, std::map<std::string, std::string>& map) {
     auto delim = keypair.find('=');
     if (delim == std::string_view::npos)
         return;  // skip malformed keypairs
-    std::string_view key = keypair.substr(0, delim);
-    std::string_view value = keypair.substr(delim + 1);
+    // Copy into owning std::string to avoid dangling string_view references
+    std::string key(keypair.substr(0, delim));
+    std::string value(keypair.substr(delim + 1));
 
-    map.insert({key, value});
+    map.insert({std::move(key), std::move(value)});
 }
