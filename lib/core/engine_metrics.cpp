@@ -22,8 +22,10 @@ void EngineMetrics::setup(Engine& engine) {
                              sm::description("Total queries exceeding slow_query_threshold_ms")),
             sm::make_counter("deletes_total", deletes_total, sm::description("Total delete operations")),
             sm::make_counter("wal_rollovers_total", wal_rollovers_total, sm::description("Total WAL rollovers to TSM")),
-            sm::make_counter("compactions_total", compactions_total,
-                             sm::description("Total compaction operations completed")),
+            sm::make_gauge(
+                "compactions_total",
+                [&engine] { return static_cast<int64_t>(engine.getCompletedCompactions()); },
+                sm::description("Total compaction operations completed")),
 
             // Gauges (live state via lambda, read at scrape time)
             sm::make_gauge(

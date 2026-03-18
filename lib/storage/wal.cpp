@@ -909,6 +909,10 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                                 TimeStarInsert<int64_t> insertReq = readSeries<int64_t>(entrySlice, seriesKey);
                                 store->insertMemory(std::move(insertReq));
                             } break;
+                            default:
+                                timestar::wal_log.warn("WAL recovery: unknown value type {} in entry, skipping", valueType);
+                                partialEntries++;
+                                continue;
                         }
                         entriesRead++;
                     } catch (const std::exception& e) {

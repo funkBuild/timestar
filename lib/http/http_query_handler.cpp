@@ -271,6 +271,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
                        response.statistics.executionTimeMs);
 
     } catch (const std::exception& e) {
+        if (engineSharded) {
+            ++engineSharded->local().metrics().query_errors_total;
+        }
         timestar::http_log.error("[QUERY] Error handling query request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal query error");

@@ -71,8 +71,6 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
         seastar::shared_ptr<TSM> tsmFile = seastar::make_shared<TSM>(path);
         co_await tsmFile->open();
 
-        tsmFiles.push_back(tsmFile);
-
         // Add to tier tracking
         uint64_t tier = tsmFile->tierNum;
         if (tier < MAX_TIERS) {
@@ -90,7 +88,7 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
         if (tsmFile->seqNum >= nextSequenceId) {
             nextSequenceId = tsmFile->seqNum + 1;
         }
-    } catch (const std::runtime_error& e) {
+    } catch (const std::exception& e) {
         timestar::tsm_log.error("Failed to open TSM file {}: {}", path, e.what());
         co_return;
     }
@@ -157,8 +155,6 @@ bool TSMFileManager::shouldCompactTier(uint64_t tier) const {
 }
 
 seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
-    tsmFiles.push_back(file);
-
     uint64_t tier = file->tierNum;
     if (tier < MAX_TIERS) {
         tiers[tier].push_back(file);
@@ -180,9 +176,6 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
 
 seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shared_ptr<TSM>>& files) {
     for (const auto& file : files) {
-        // Remove from main list
-        tsmFiles.erase(std::remove(tsmFiles.begin(), tsmFiles.end(), file), tsmFiles.end());
-
         // Remove from tier tracking
         uint64_t tier = file->tierNum;
         if (tier < MAX_TIERS) {
@@ -220,6 +213,7 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
                     } else {
                         stats = co_await compactor->executeCompaction(plan);
                     }
+                    ++completedCompactions_;
                     timestar::compactor_log.info("Compacted {} files from tier {} to tier {} in {}ms",
                                                  stats.filesCompacted, tier, tier + 1, stats.duration.count());
                 } catch (const std::exception& e) {

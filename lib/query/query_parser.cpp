@@ -174,12 +174,12 @@ std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos)
         if (c == '(' || c == '{') {
             break;
         }
-        if (std::isspace(c)) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
             // Check if followed by 'by' keyword
             size_t tempPos = pos;
             skipWhitespace(query, tempPos);
             if (tempPos + 1 < query.length() && query[tempPos] == 'b' && query[tempPos + 1] == 'y' &&
-                (tempPos + 2 == query.length() || std::isspace(query[tempPos + 2]) || query[tempPos + 2] == '{')) {
+                (tempPos + 2 == query.length() || std::isspace(static_cast<unsigned char>(query[tempPos + 2])) || query[tempPos + 2] == '{')) {
                 break;
             }
         }
@@ -320,7 +320,7 @@ std::string_view QueryParser::trimView(std::string_view str) {
 }
 
 void QueryParser::skipWhitespace(const std::string& str, size_t& pos) {
-    while (pos < str.length() && std::isspace(str[pos])) {
+    while (pos < str.length() && std::isspace(static_cast<unsigned char>(str[pos]))) {
         pos++;
     }
 }

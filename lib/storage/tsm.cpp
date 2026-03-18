@@ -271,6 +271,11 @@ seastar::future<> TSM::open() {
         // Read and validate file header (magic "TASM" + 1-byte version)
         if (length >= 5) {
             auto hdrBuf = co_await tsmFile.dma_read_exactly<uint8_t>(0, 5);
+            // Validate magic bytes "TASM"
+            if (hdrBuf.get()[0] != 'T' || hdrBuf.get()[1] != 'A' ||
+                hdrBuf.get()[2] != 'S' || hdrBuf.get()[3] != 'M') {
+                throw std::runtime_error("Not a TSM file (bad magic): " + filePath);
+            }
             fileVersion = hdrBuf.get()[4];
             if (fileVersion < TSM_VERSION_MIN || fileVersion > TSM_VERSION) {
                 throw std::runtime_error("Unsupported TSM file version " + std::to_string(fileVersion) +
@@ -904,10 +909,18 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
     auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
+    if (indexBlock.size < BLOCK_HEADER_SIZE) {
+        throw std::runtime_error("TSM block too small: " + std::to_string(indexBlock.size));
+    }
+
     auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
     uint8_t blockType = headerSlice.read<uint8_t>();
     uint32_t timestampSize = headerSlice.read<uint32_t>();
     uint32_t timestampBytes = headerSlice.read<uint32_t>();
+
+    if (timestampBytes > indexBlock.size - BLOCK_HEADER_SIZE) {
+        throw std::runtime_error("TSM block timestampBytes exceeds block size");
+    }
 
     // Validate that the block's stored type matches the template parameter
     TSMValueType expectedType = getValueType<T>();

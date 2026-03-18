@@ -26,13 +26,14 @@ private:
     // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
     // only accessed from a single thread.
     uint64_t nextSequenceId = 0;
-    std::vector<seastar::shared_ptr<TSM>> tsmFiles;
-
     // Track files by tier for compaction
     std::vector<seastar::shared_ptr<TSM>> tiers[MAX_TIERS];
 
     // Compactor (unique ownership, destructor defined in .cpp where TSMCompactor is complete)
     std::unique_ptr<TSMCompactor> compactor;
+
+    // Counter for completed compactions (read by Engine to update Prometheus metrics)
+    uint64_t completedCompactions_ = 0;
     std::optional<seastar::future<>> compactionTask;
 
     // I/O scheduling group for compaction (lower priority than queries).
@@ -73,6 +74,9 @@ public:
 
     // Get the compactor (for tombstone rewrites)
     TSMCompactor* getCompactor() { return compactor.get(); }
+
+    // Number of compactions completed since startup (for Prometheus metrics)
+    uint64_t getCompletedCompactions() const { return completedCompactions_; }
 
     // Set the I/O scheduling group for background compaction.
     void setCompactionGroup(seastar::scheduling_group sg) {

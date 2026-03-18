@@ -1947,16 +1947,19 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     } catch (const seastar::gate_closed_exception&) {
         // Insert gate closed — server is shutting down. Return 503 so clients
         // know to retry against another node or after restart.
+        ++engineSharded->local().metrics().insert_errors_total;
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
         rep->_content = createErrorResponse("Server is shutting down");
         rep->add_header("Content-Type", "application/json");
     } catch (const std::invalid_argument& e) {
         // Client input validation error — 400 Bad Request
+        ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.debug("Write validation error: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->_content = createErrorResponse(e.what());
         rep->add_header("Content-Type", "application/json");
     } catch (const std::exception& e) {
+        ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.error("Error handling write request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("Internal server error");

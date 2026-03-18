@@ -342,18 +342,19 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
         co_return true;
     }
 
-    estimatedAccumulatedSize += batchEstimate;
-
 #if TIMESTAR_LOG_INSERT_PATH
     auto start_wal_insert = std::chrono::high_resolution_clock::now();
 #endif
     if (wal) {
         auto walResult = co_await wal->insertBatch(insertRequests);
         if (walResult == WALInsertResult::RolloverNeeded) [[unlikely]] {
-            estimatedAccumulatedSize -= batchEstimate;
             co_return true;
         }
     }
+
+    // Increment AFTER the WAL insert succeeds — if the WAL throws, we must not
+    // leak the estimate (there is no corresponding decrement on the exception path).
+    estimatedAccumulatedSize += batchEstimate;
 
 #if TIMESTAR_LOG_INSERT_PATH
     auto start_memory_insert = std::chrono::high_resolution_clock::now();

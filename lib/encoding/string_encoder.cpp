@@ -26,11 +26,15 @@ struct ZstdDCtxDeleter {
 
 static ZSTD_CCtx* getThreadCCtx() {
     static thread_local std::unique_ptr<ZSTD_CCtx, ZstdCCtxDeleter> ctx(ZSTD_createCCtx());
+    if (!ctx) [[unlikely]]
+        throw std::runtime_error("Failed to allocate ZSTD compression context");
     return ctx.get();
 }
 
 static ZSTD_DCtx* getThreadDCtx() {
     static thread_local std::unique_ptr<ZSTD_DCtx, ZstdDCtxDeleter> ctx(ZSTD_createDCtx());
+    if (!ctx) [[unlikely]]
+        throw std::runtime_error("Failed to allocate ZSTD decompression context");
     return ctx.get();
 }
 

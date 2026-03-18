@@ -93,6 +93,9 @@ seastar::future<> Engine::stop() {
         }
     }
 
+    co_await tsmFileManager.stopCompactionLoop();
+    timestar::engine_log.info("[ENGINE_STOP] Compaction loop stopped ({}ms) on shard {}", elapsedMs(), shardId);
+
     co_await walFileManager.close();
     timestar::engine_log.info("[ENGINE_STOP] WAL closed ({}ms) on shard {}", elapsedMs(), shardId);
 
@@ -301,7 +304,12 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
     // Broadcast schema changes — fire-and-forget (don't block write response).
     // Schema caches are eventually consistent; queries will see updates on next read.
     if (!combined.empty()) {
-        (void)broadcastSchemaUpdate(std::move(combined));
+        (void)broadcastSchemaUpdate(std::move(combined)).handle_exception([](std::exception_ptr ep) {
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception& e) {
+                timestar::engine_log.warn("[METADATA] Schema broadcast failed: {}", e.what());
+            }
+        });
     }
 }
 
@@ -635,6 +643,7 @@ seastar::future<std::vector<timestar::SeriesResult>> Engine::executeLocalQuery(c
 
 seastar::future<bool> Engine::deleteRange(std::string seriesKey, uint64_t startTime, uint64_t endTime) {
     auto gate_holder = _insertGate.hold();
+    ++_metrics.deletes_total;
     co_return co_await deleteRangeImpl(std::move(seriesKey), startTime, endTime);
 }
 
@@ -690,6 +699,7 @@ seastar::future<bool> Engine::deleteRangeImpl(std::string seriesKey, uint64_t st
 seastar::future<bool> Engine::deleteRangeBySeries(std::string measurement, std::map<std::string, std::string> tags,
                                                   std::string field, uint64_t startTime, uint64_t endTime) {
     auto gate_holder = _insertGate.hold();
+    ++_metrics.deletes_total;
     // Look up series ID without creating it — deleting a non-existent series is a no-op.
     // Each shard has its own index now — look up locally.
     auto seriesIdOpt = co_await index.getSeriesId(measurement, tags, field);
@@ -709,6 +719,7 @@ seastar::future<bool> Engine::deleteRangeBySeries(std::string measurement, std::
 
 seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteRequest& request) {
     auto gate_holder = _insertGate.hold();
+    ++_metrics.deletes_total;
     DeleteResult result;
 
     // Debug logging disabled - uncomment for troubleshooting
@@ -775,6 +786,7 @@ seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteReques
 
 seastar::future<> Engine::rolloverMemoryStore() {
     auto gate_holder = _insertGate.hold();
+    ++_metrics.wal_rollovers_total;
     timestar::engine_log.debug("[ENGINE] Rolling over memory store on shard {}", shardId);
     co_return co_await walFileManager.rolloverMemoryStore();
 }

@@ -15,6 +15,20 @@
 
 namespace fs = std::filesystem;
 
+// Parse the WAL sequence number from a file path like "shard_0/42.wal".
+// Returns 0 for malformed filenames so they sort first (and get harmlessly
+// replayed/skipped before any valid WAL).
+static int parseWalSeqNum(const std::string& path) {
+    auto dotPos = path.find_last_of('.');
+    auto slashPos = path.find_last_of('/');
+    size_t start = (slashPos == std::string::npos) ? 0 : slashPos + 1;
+    try {
+        return std::stoi(path.substr(start, dotPos - start));
+    } catch (...) {
+        return 0;
+    }
+}
+
 WALFileManager::WALFileManager() {
     shardId = seastar::this_shard_id();
 }
@@ -47,12 +61,7 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
     // sorting, a DeleteRange in sequence 5 could replay before its Write in
     // sequence 4, causing data loss.
     std::sort(walFiles.begin(), walFiles.end(), [](const std::string& a, const std::string& b) {
-        auto parseSeq = [](const std::string& path) -> int {
-            size_t dotPos = path.find_last_of('.');
-            size_t slashPos = path.find_last_of('/') + 1;
-            return std::stoi(path.substr(slashPos, dotPos - slashPos));
-        };
-        return parseSeq(a) < parseSeq(b);
+        return parseWalSeqNum(a) < parseWalSeqNum(b);
     });
 
     if (!walFiles.empty()) {
@@ -63,10 +72,7 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
 
     // Convert them to TSM's if they exist and are closed
     for (const auto& walFilename : walFiles) {
-        size_t filenameEndIndex = walFilename.find_last_of(".");
-        size_t filenameStartIndex = walFilename.find_last_of("/") + 1;
-
-        int seqNum = std::stoi(walFilename.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex));
+        int seqNum = parseWalSeqNum(walFilename);
 
         if (seqNum > currentWalSequenceNumber)
             currentWalSequenceNumber = seqNum;

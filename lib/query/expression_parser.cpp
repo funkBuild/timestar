@@ -86,7 +86,7 @@ std::string ExpressionNode::toString() const {
 ExpressionLexer::ExpressionLexer(std::string_view input) : input_(input) {}
 
 void ExpressionLexer::skipWhitespace() {
-    while (!isAtEnd() && std::isspace(peek())) {
+    while (!isAtEnd() && std::isspace(static_cast<unsigned char>(peek()))) {
         advance();
     }
 }
@@ -110,14 +110,14 @@ Token ExpressionLexer::readNumber() {
     size_t startPos = pos_;
 
     // Integer part
-    while (!isAtEnd() && std::isdigit(peek())) {
+    while (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
         advance();
     }
 
     // Decimal part
-    if (!isAtEnd() && peek() == '.' && pos_ + 1 < input_.size() && std::isdigit(input_[pos_ + 1])) {
+    if (!isAtEnd() && peek() == '.' && pos_ + 1 < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_ + 1]))) {
         advance();  // consume '.'
-        while (!isAtEnd() && std::isdigit(peek())) {
+        while (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
             advance();
         }
     }
@@ -129,8 +129,8 @@ Token ExpressionLexer::readNumber() {
         if (!isAtEnd() && (peek() == '+' || peek() == '-')) {
             advance();
         }
-        if (!isAtEnd() && std::isdigit(peek())) {
-            while (!isAtEnd() && std::isdigit(peek())) {
+        if (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
+            while (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
                 advance();
             }
         } else {
@@ -150,7 +150,7 @@ Token ExpressionLexer::readIdentifier() {
     advance();
 
     // Continue with alphanumeric or underscore
-    while (!isAtEnd() && (std::isalnum(peek()) || peek() == '_')) {
+    while (!isAtEnd() && (std::isalnum(static_cast<unsigned char>(peek())) || peek() == '_')) {
         advance();
     }
 
@@ -231,7 +231,7 @@ Token ExpressionLexer::nextToken() {
     }
 
     // Numbers
-    if (std::isdigit(c)) {
+    if (std::isdigit(static_cast<unsigned char>(c))) {
         return readNumber();
     }
 
@@ -241,7 +241,7 @@ Token ExpressionLexer::nextToken() {
     }
 
     // Identifiers (query refs and function names)
-    if (std::isalpha(c) || c == '_') {
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
         return readIdentifier();
     }
 

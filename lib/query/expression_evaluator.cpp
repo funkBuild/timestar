@@ -217,7 +217,8 @@ AlignedSeries AlignedSeries::clamp(const AlignedSeries& val, const AlignedSeries
     checkSameSize(val, maxVal, "clamp");
     std::vector<double> result(val.values.size());
     for (size_t i = 0; i < val.values.size(); ++i) {
-        result[i] = std::clamp(val.values[i], minVal.values[i], maxVal.values[i]);
+        double lo = minVal.values[i], hi = maxVal.values[i];
+        result[i] = (lo > hi) ? std::numeric_limits<double>::quiet_NaN() : std::clamp(val.values[i], lo, hi);
     }
     return AlignedSeries(val.timestamps, std::move(result));
 }

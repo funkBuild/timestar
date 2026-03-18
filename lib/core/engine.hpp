@@ -173,6 +173,7 @@ public:
 
     // Gauge accessors for metrics
     size_t getTSMFileCount() const { return tsmFileManager.getSequencedTsmFiles().size(); }
+    uint64_t getCompletedCompactions() const { return tsmFileManager.getCompletedCompactions(); }
 
     // I/O scheduling groups — use with seastar::with_scheduling_group() to
     // prioritize query I/O over background compaction.

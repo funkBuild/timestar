@@ -331,6 +331,7 @@ seastar::future<> NativeIndex::kvDelete(const std::string& key) {
     batch.remove(key);
     co_await wal_->append(batch);
     memtable_->remove(key);
+    co_await maybeFlushMemTable();
 }
 
 seastar::future<> NativeIndex::kvWriteBatch(const IndexWriteBatch& batch) {
@@ -1412,9 +1413,13 @@ seastar::future<std::optional<IndexFieldStats>> NativeIndex::getFieldStats(const
     };
 
     stats.dataType = std::string(nextField());
-    stats.minTime = std::stoll(std::string(nextField()));
-    stats.maxTime = std::stoll(std::string(nextField()));
-    stats.pointCount = std::stoull(std::string(nextField()));
+    try {
+        stats.minTime = std::stoll(std::string(nextField()));
+        stats.maxTime = std::stoll(std::string(nextField()));
+        stats.pointCount = std::stoull(std::string(nextField()));
+    } catch (const std::exception&) {
+        co_return std::nullopt;
+    }
 
     co_return stats;
 }
