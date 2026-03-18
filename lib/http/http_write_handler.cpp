@@ -1657,6 +1657,7 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     }
 
     // Wait for all shard inserts to complete in parallel
+    size_t numShards = shardFutures.size();
     co_await seastar::when_all_succeed(std::move(shardFutures));
 
     // Synchronous metadata indexing: await completion so metadata is queryable
@@ -1669,7 +1670,7 @@ seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
     auto end_total = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
     LOG_INSERT_PATH(timestar::http_log, info, "[PERF] [HTTP] processWritePoint: {}us ({} fields, {} shards)",
-                    total_duration.count(), point.fields.size(), shardFutures.size());
+                    total_duration.count(), point.fields.size(), numShards);
 #endif
 
     co_return;

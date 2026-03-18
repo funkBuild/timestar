@@ -347,7 +347,9 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
                         return seastar::get_units(_conversionSemaphore, 1).then([this, store, sid, seqNum](auto units) {
                             timestar::wal_log.info("[BG_CONVERT] Retrying TSM conversion for store {} on shard {}",
                                                    seqNum, sid);
-                            return convertWalToTsm(store).finally([units = std::move(units)] {});
+                            return store->close().then([this, store, units = std::move(units)]() mutable {
+                                return convertWalToTsm(store).finally([units = std::move(units)] {});
+                            });
                         });
                     });
                 }).handle_exception([sid, seqNum](auto ep2) {

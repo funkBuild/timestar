@@ -105,8 +105,8 @@ TEST_F(SeriesMatcherTest, TagMatchingWithRegex) {
     EXPECT_TRUE(SeriesMatcher::matchesTag("server-123", "/server-[0-9]+/"));
     EXPECT_FALSE(SeriesMatcher::matchesTag("server-abc", "/server-[0-9]+/"));
 
-    // Invalid regex format (no closing /)
-    EXPECT_FALSE(SeriesMatcher::matchesTag("server-01", "/server-[0-9]+"));
+    // Invalid regex format (no closing /) - should throw
+    EXPECT_THROW(SeriesMatcher::matchesTag("server-01", "/server-[0-9]+"), std::invalid_argument);
 }
 
 // Test complete series matching with wildcards

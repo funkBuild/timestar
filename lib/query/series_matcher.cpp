@@ -73,10 +73,11 @@ bool SeriesMatcher::matchesTag(const std::string& tagValue, const std::string& s
     // Check for regex pattern (starts with /)
     if (!scopeValue.empty() && scopeValue[0] == '/') {
         size_t endPos = scopeValue.rfind('/');
-        if (endPos > 0) {
-            std::string pattern = scopeValue.substr(1, endPos - 1);
-            return matchesRegex(tagValue, pattern);
+        if (endPos == 0) {
+            throw std::invalid_argument("Malformed /regex/ pattern: missing closing '/'");
         }
+        std::string pattern = scopeValue.substr(1, endPos - 1);
+        return matchesRegex(tagValue, pattern);
     }
 
     // Check for wildcard pattern (contains * or ?)

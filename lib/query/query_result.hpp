@@ -88,6 +88,10 @@ public:
                     return false;
 
                 state.blockSize = state.block->size();
+                if (state.blockSize == 0) {
+                    state.block = nullptr;
+                    return false;
+                }
             }
 
             state.currentTimestamp = state.block->timestampAt(state.blockOffset);

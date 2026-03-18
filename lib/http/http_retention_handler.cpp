@@ -33,6 +33,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
 
+    if (!engineSharded) {
+        reply->set_status(seastar::http::reply::status_type::internal_server_error);
+        reply->_content = R"({"status":"error","error":"Retention handler not initialized"})";
+        co_return reply;
+    }
+
     // Body size limit to prevent DoS via large payloads
     if (req->content.size() > timestar::config().http.max_query_body_size) {
         reply->set_status(seastar::http::reply::status_type::payload_too_large);
@@ -178,6 +184,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
 
+    if (!engineSharded) {
+        reply->set_status(seastar::http::reply::status_type::internal_server_error);
+        reply->_content = R"({"status":"error","error":"Retention handler not initialized"})";
+        co_return reply;
+    }
+
     try {
         // Check for ?measurement= query parameter
         std::string measurement = req->get_query_param("measurement");
@@ -227,6 +239,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
     reply->add_header("Content-Type", "application/json");
+
+    if (!engineSharded) {
+        reply->set_status(seastar::http::reply::status_type::internal_server_error);
+        reply->_content = R"({"status":"error","error":"Retention handler not initialized"})";
+        co_return reply;
+    }
 
     try {
         std::string measurement = req->get_query_param("measurement");

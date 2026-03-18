@@ -140,8 +140,8 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
         const size_t sample_count = std::min(total_values, alp::ALP_VECTOR_SIZE);
         int64_t abs_min = std::numeric_limits<int64_t>::max();
         int64_t abs_max = std::numeric_limits<int64_t>::min();
-        int64_t zz_min = std::numeric_limits<int64_t>::max();
-        int64_t zz_max = std::numeric_limits<int64_t>::min();
+        uint64_t zz_min = UINT64_MAX;
+        uint64_t zz_max = 0;
         int64_t prev = 0;
         bool first_valid = true;
 
@@ -161,18 +161,23 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
             if (!first_valid) {
                 int64_t delta = result.encoded - prev;
                 uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
-                auto zz_signed = static_cast<int64_t>(zz);
-                if (zz_signed < zz_min)
-                    zz_min = zz_signed;
-                if (zz_signed > zz_max)
-                    zz_max = zz_signed;
+                if (zz < zz_min)
+                    zz_min = zz;
+                if (zz > zz_max)
+                    zz_max = zz;
             }
             first_valid = false;
             prev = result.encoded;
         }
 
         uint8_t abs_bw = requiredBitWidth(abs_min, abs_max);
-        uint8_t delta_bw = (zz_min <= zz_max) ? requiredBitWidth(zz_min, zz_max) : abs_bw;
+        uint8_t delta_bw;
+        if (zz_min <= zz_max) {
+            uint64_t zz_range = zz_max - zz_min;
+            delta_bw = (zz_range == 0) ? 0 : static_cast<uint8_t>(64 - __builtin_clzll(zz_range));
+        } else {
+            delta_bw = abs_bw;
+        }
         if (delta_bw < abs_bw) {
             scheme = alp::SCHEME_ALP_DELTA;
         }
@@ -464,8 +469,8 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         const size_t sample_count = std::min(total_values, alp::ALP_VECTOR_SIZE);
         int64_t abs_min = std::numeric_limits<int64_t>::max();
         int64_t abs_max = std::numeric_limits<int64_t>::min();
-        int64_t zz_min = std::numeric_limits<int64_t>::max();
-        int64_t zz_max = std::numeric_limits<int64_t>::min();
+        uint64_t zz_min = UINT64_MAX;
+        uint64_t zz_max = 0;
         int64_t prev = 0;
         bool first_valid = true;
 
@@ -485,18 +490,23 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             if (!first_valid) {
                 int64_t delta = result.encoded - prev;
                 uint64_t zz = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
-                auto zz_signed = static_cast<int64_t>(zz);
-                if (zz_signed < zz_min)
-                    zz_min = zz_signed;
-                if (zz_signed > zz_max)
-                    zz_max = zz_signed;
+                if (zz < zz_min)
+                    zz_min = zz;
+                if (zz > zz_max)
+                    zz_max = zz;
             }
             first_valid = false;
             prev = result.encoded;
         }
 
         uint8_t abs_bw = requiredBitWidth(abs_min, abs_max);
-        uint8_t delta_bw = (zz_min <= zz_max) ? requiredBitWidth(zz_min, zz_max) : abs_bw;
+        uint8_t delta_bw;
+        if (zz_min <= zz_max) {
+            uint64_t zz_range = zz_max - zz_min;
+            delta_bw = (zz_range == 0) ? 0 : static_cast<uint8_t>(64 - __builtin_clzll(zz_range));
+        } else {
+            delta_bw = abs_bw;
+        }
         if (delta_bw < abs_bw) {
             scheme = alp::SCHEME_ALP_DELTA;
         }

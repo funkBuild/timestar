@@ -151,7 +151,7 @@ inline uint64_t parseDurationToNs(const std::string& duration) {
     }
 
     // Find the position where unit starts (first non-digit/non-decimal from the left)
-    size_t unitPos = 0;
+    size_t unitPos = duration.size();
     for (size_t i = 0; i < duration.size(); ++i) {
         if (!std::isdigit(duration[i]) && duration[i] != '.') {
             unitPos = i;
@@ -160,10 +160,10 @@ inline uint64_t parseDurationToNs(const std::string& duration) {
     }
 
     if (unitPos == 0) {
-        throw std::invalid_argument("Duration missing value: " + duration);
+        throw std::invalid_argument("Duration missing numeric value: " + duration);
     }
     if (unitPos == duration.size()) {
-        throw std::invalid_argument("Duration missing unit: " + duration);
+        throw std::invalid_argument("Duration missing unit suffix: " + duration);
     }
 
     // Parse the numeric part

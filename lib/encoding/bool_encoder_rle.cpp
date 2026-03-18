@@ -260,4 +260,9 @@ void BoolEncoderRLE::decode(Slice& encoded, size_t nToSkip, size_t length, std::
         length -= toEmit;
         currentValue = !currentValue;
     }
+
+    if (writePos != out.size()) {
+        throw std::runtime_error("BoolEncoderRLE::decode: emitted " +
+            std::to_string(writePos - basePos) + " values, expected " + std::to_string(out.size() - basePos));
+    }
 }

@@ -339,6 +339,8 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
         // Trim series values by same offset
         if (trimCount > 0 && seriesValues[s].size() > trimCount) {
             input.values.assign(seriesValues[s].begin() + static_cast<ptrdiff_t>(trimCount), seriesValues[s].end());
+        } else if (trimCount > 0 && seriesValues[s].size() <= trimCount) {
+            continue;  // Not enough data after trimming
         } else {
             input.values = seriesValues[s];
         }

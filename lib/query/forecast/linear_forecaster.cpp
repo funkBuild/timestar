@@ -117,9 +117,10 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
 
     // Scalar fallback
     for (size_t i = 0; i < n; ++i) {
+        double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
         double predicted = fit.slope * px[i] + fit.intercept;
         double residual = py[i] - predicted;
-        sse += pw[i] * residual * residual;
+        sse += w * residual * residual;
     }
 
     if (n > 2) {

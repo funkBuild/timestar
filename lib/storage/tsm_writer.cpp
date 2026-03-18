@@ -177,6 +177,15 @@ void TSMWriter::writeSeriesDirect(TSMValueType seriesType, const SeriesId128& se
     indexEntry.seriesId = seriesId;
     indexEntry.seriesType = seriesType;
 
+    // Phase 3: For String series, try building a dictionary from all values.
+    // Must be done before writeBlockDirect which moves the values vector.
+    if constexpr (std::is_same_v<T, std::string>) {
+        auto dict = StringEncoder::buildDictionary(std::span(values));
+        if (dict.valid) {
+            indexEntry.stringDictionary = std::move(dict.entries);
+        }
+    }
+
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Zero-copy write for series '{}' ({} points)", seriesId.toHex(),
                     timestamps.size());
 

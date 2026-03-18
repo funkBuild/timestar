@@ -809,7 +809,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             co_return result;
         }
         // Split: pushdown [startTime, memMinTime-1], fallback [memMinTime, endTime]
-        tsmEndTime = memMinTime - 1;
+        tsmEndTime = (memMinTime > 0) ? memMinTime - 1 : 0;
         fallbackStartTime = memMinTime;
         needsFallback = true;
     }
@@ -1005,14 +1005,16 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         }
 
         FileRef ref{tsmFile};
+        bool hasBlocks = false;
         for (const auto& block : indexEntry->indexBlocks) {
             if (block.minTime <= tsmEndTime && startTime <= block.maxTime) {
                 allBlockRanges.push_back({block.minTime, block.maxTime});
                 ref.maxBlockTime = std::max(ref.maxBlockTime, block.maxTime);
                 ref.minBlockTime = std::min(ref.minBlockTime, block.minTime);
+                hasBlocks = true;
             }
         }
-        if (ref.maxBlockTime > 0) {
+        if (hasBlocks) {
             filesWithData.push_back(std::move(ref));
         }
     }

@@ -79,7 +79,7 @@ private:
             return currentBlock->timestamps[pointIndex];
         }
 
-        T currentValue() const { return currentBlock->values[pointIndex]; }
+        decltype(auto) currentValue() const { return currentBlock->values[pointIndex]; }
 
         // Phase 1.3: Async advance that loads blocks on-demand
         seastar::future<> advance() {
