@@ -1188,7 +1188,10 @@ NativeIndex::findSeriesWithMetadataCached(const std::string& measurement,
         cacheKey += '\0';
     }
     cacheKey += "F:";
-    for (const auto& f : fieldFilter) {
+    // Sort field names for deterministic cache key (unordered_set iteration is non-deterministic)
+    std::vector<std::string> sortedFields(fieldFilter.begin(), fieldFilter.end());
+    std::sort(sortedFields.begin(), sortedFields.end());
+    for (const auto& f : sortedFields) {
         cacheKey += f;
         cacheKey += ',';
     }
@@ -2372,8 +2375,8 @@ void NativeIndex::applySchemaUpdate(const SchemaUpdate& update) {
     for (const auto& [cacheKey, type] : update.newFieldTypes) {
         knownFieldTypes_.insert(cacheKey);
         // Store the actual type value so getFieldType() can return it
-        auto it = fieldTypeValues_.find(cacheKey);
-        if (it == fieldTypeValues_.end() || type < it->second) {
+        // First-write-wins: don't overwrite existing field types
+        if (!fieldTypeValues_.contains(cacheKey)) {
             fieldTypeValues_[cacheKey] = type;
         }
     }

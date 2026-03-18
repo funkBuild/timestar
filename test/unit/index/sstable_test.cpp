@@ -585,3 +585,113 @@ SEASTAR_TEST_F(SSTableTest, CRC32CorruptionDetected) {
 
     co_await reader->close();
 }
+
+// ============================================================================
+// Bug fix tests: abort() cleanup and truncated file detection
+// ============================================================================
+
+SEASTAR_TEST_F(SSTableTest, AbortDeletesPartialFile) {
+    auto path = self->sstPath("abort_cleanup.sst");
+
+    // Create a writer, add some data, then abort without finishing
+    auto writer = co_await SSTableWriter::create(path);
+    writer.add("key1", "val1");
+    writer.add("key2", "val2");
+
+    // The file should exist after create()
+    EXPECT_TRUE(std::filesystem::exists(path));
+
+    co_await writer.abort();
+
+    // After abort(), the partial file must be removed
+    EXPECT_FALSE(std::filesystem::exists(path));
+}
+
+SEASTAR_TEST_F(SSTableTest, AbortEmptyWriterDeletesFile) {
+    auto path = self->sstPath("abort_empty.sst");
+
+    // Create a writer but add nothing — abort immediately
+    auto writer = co_await SSTableWriter::create(path);
+    EXPECT_TRUE(std::filesystem::exists(path));
+
+    co_await writer.abort();
+
+    EXPECT_FALSE(std::filesystem::exists(path));
+}
+
+SEASTAR_TEST_F(SSTableTest, TruncatedFileThrowsOnOpen) {
+    auto path = self->sstPath("truncated.sst");
+
+    // Write a valid SSTable first to get a realistic file
+    {
+        auto writer = co_await SSTableWriter::create(path);
+        for (int i = 0; i < 50; ++i) {
+            writer.add(std::format("key:{:04d}", i), std::format("val:{:04d}", i));
+        }
+        co_await writer.finish();
+    }
+
+    // Truncate the file to just a few bytes (less than the 64-byte footer)
+    {
+        int fd = ::open(path.c_str(), O_WRONLY | O_TRUNC);
+        EXPECT_GE(fd, 0) << "Failed to open file for truncation";
+        if (fd < 0) co_return;
+        // Write 10 garbage bytes — too small for a valid SSTable
+        const char garbage[] = "TRUNCATED!";
+        [[maybe_unused]] auto n = ::write(fd, garbage, 10);
+        ::close(fd);
+    }
+
+    // Opening a truncated file must throw (file too small for footer)
+    EXPECT_THROW(co_await SSTableReader::open(path), std::runtime_error);
+}
+
+SEASTAR_TEST_F(SSTableTest, TruncatedMetadataThrowsOnOpen) {
+    // Craft a file with a valid footer that references an index region
+    // containing data that claims more entries than actually fit.
+    // This exercises the index parser's bounds checks.
+    auto path = self->sstPath("truncated_meta.sst");
+
+    auto encodeFixed64 = [](char* buf, uint64_t v) {
+        for (int i = 0; i < 8; ++i)
+            buf[i] = static_cast<char>((v >> (i * 8)) & 0xff);
+    };
+    auto encodeFixed32 = [](char* buf, uint32_t v) {
+        buf[0] = static_cast<char>(v & 0xff);
+        buf[1] = static_cast<char>((v >> 8) & 0xff);
+        buf[2] = static_cast<char>((v >> 16) & 0xff);
+        buf[3] = static_cast<char>((v >> 24) & 0xff);
+    };
+
+    // Build a 16-byte "index" region: numEntries=5, then only 12 bytes of
+    // data (not enough for even one full entry: 4+key+12 minimum).
+    char indexData[16];
+    std::memset(indexData, 0, 16);
+    encodeFixed32(indexData, 5);  // Claim 5 entries, but only 12 bytes follow
+
+    // Build the footer referencing this index region
+    char footer[64];
+    std::memset(footer, 0, 64);
+    encodeFixed64(footer + 0, 0);             // bloomOffset (no bloom)
+    encodeFixed64(footer + 8, 0);             // bloomSize = 0
+    encodeFixed64(footer + 16, 0);            // indexOffset = 0 (start of file)
+    encodeFixed64(footer + 24, 16);           // indexSize = 16
+    encodeFixed64(footer + 32, 5);            // entryCount
+    encodeFixed64(footer + 40, 0);            // writeTimestamp
+    encodeFixed32(footer + 56, 0x54534958);   // SSTABLE_MAGIC
+    encodeFixed32(footer + 60, 1);            // SSTABLE_VERSION
+
+    // Write: 16 bytes index data + 64 bytes footer = 80 bytes total
+    {
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        EXPECT_GE(fd, 0);
+        if (fd < 0) co_return;
+        [[maybe_unused]] auto n1 = ::write(fd, indexData, 16);
+        [[maybe_unused]] auto n2 = ::write(fd, footer, 64);
+        ::close(fd);
+    }
+
+    // The index parser will see numEntries=5 but run out of data after
+    // the first partial entry, throwing "SSTable index entry truncated"
+    EXPECT_THROW(co_await SSTableReader::open(path), std::runtime_error);
+}

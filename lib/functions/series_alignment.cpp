@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace timestar::functions {
 
@@ -37,7 +38,9 @@ SeriesAlignment::SeriesAlignment() = default;
 
 std::vector<double> SeriesAlignment::alignSeries(const std::vector<double>& values,
                                                  const std::vector<uint64_t>& timestamps, uint64_t targetInterval) {
-    // Degenerate cases: return original values unchanged
+    if (values.size() != timestamps.size()) {
+        throw std::invalid_argument("alignSeries: values/timestamps size mismatch");
+    }
     if (timestamps.empty() || values.empty()) {
         return {};
     }

@@ -153,6 +153,9 @@ public:
     AlignedSeries evaluate(const ExpressionNode& expr, const QueryResultMap& queryResults);
 
 private:
+    static constexpr int MAX_EVAL_DEPTH = 100;
+    int evalDepth_ = 0;
+
     AlignedSeries evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults);
 
     const AlignedSeries& evaluateQueryRef(const QueryRef& ref, const QueryResultMap& queryResults);

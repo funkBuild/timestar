@@ -370,11 +370,11 @@ double vectorVariance(const double* values, size_t count, double mean) {
 // ==================== Incremental Rolling Stats ====================
 
 IncrementalRollingStats::IncrementalRollingStats(size_t windowSize)
-    : windowSize_(windowSize),
+    : windowSize_(std::max(windowSize, size_t(1))),
       count_(0),
       mean_(0.0),
       m2_(0.0),
-      buffer_(windowSize, 0.0),
+      buffer_(windowSize_, std::numeric_limits<double>::quiet_NaN()),
       head_(0),
       bufferFull_(false),
       updatesSinceRecompute_(0) {}
@@ -384,12 +384,20 @@ void IncrementalRollingStats::update(double value) {
         return;
 
     if (bufferFull_) {
-        // Remove oldest value from statistics (inverse Welford)
         double oldValue = buffer_[head_];
-        double oldMean = mean_;
-        mean_ = mean_ + (value - oldValue) / static_cast<double>(count_);
-        // Update M2: add new contribution, remove old contribution
-        m2_ = m2_ + (value - mean_) * (value - oldMean) - (oldValue - mean_) * (oldValue - oldMean);
+        if (std::isnan(oldValue)) {
+            // Old slot was NaN (unused). Add value using Welford (no removal).
+            ++count_;
+            double delta = value - mean_;
+            mean_ += delta / static_cast<double>(count_);
+            double delta2 = value - mean_;
+            m2_ += delta * delta2;
+        } else {
+            // Remove oldest value, add new (inverse Welford)
+            double oldMean = mean_;
+            mean_ = mean_ + (value - oldValue) / static_cast<double>(count_);
+            m2_ = m2_ + (value - mean_) * (value - oldMean) - (oldValue - mean_) * (oldValue - oldMean);
+        }
     } else {
         // Welford's online algorithm
         ++count_;
@@ -429,22 +437,29 @@ double IncrementalRollingStats::stddev() const {
 }
 
 void IncrementalRollingStats::recomputeFromBuffer() {
-    if (count_ == 0)
-        return;
-
-    // Recompute mean using Kahan summation for precision
+    // Iterate the full buffer, skip NaN slots (gaps from init or removed values).
+    // This correctly handles the circular buffer regardless of head_ position.
     double sum = 0.0, c = 0.0;
-    for (size_t i = 0; i < count_; ++i) {
+    size_t validCount = 0;
+    for (size_t i = 0; i < windowSize_; ++i) {
+        if (std::isnan(buffer_[i])) continue;
         double y = buffer_[i] - c;
         double t = sum + y;
         c = (t - sum) - y;
         sum = t;
+        ++validCount;
+    }
+    count_ = validCount;
+    if (count_ == 0) {
+        mean_ = 0.0;
+        m2_ = 0.0;
+        return;
     }
     mean_ = sum / static_cast<double>(count_);
 
-    // Recompute M2 (sum of squared differences from mean)
     m2_ = 0.0;
-    for (size_t i = 0; i < count_; ++i) {
+    for (size_t i = 0; i < windowSize_; ++i) {
+        if (std::isnan(buffer_[i])) continue;
         double diff = buffer_[i] - mean_;
         m2_ += diff * diff;
     }
@@ -457,7 +472,7 @@ void IncrementalRollingStats::reset() {
     head_ = 0;
     bufferFull_ = false;
     updatesSinceRecompute_ = 0;
-    std::fill(buffer_.begin(), buffer_.end(), 0.0);
+    std::fill(buffer_.begin(), buffer_.end(), std::numeric_limits<double>::quiet_NaN());
 }
 
 // ==================== Moving Average ====================

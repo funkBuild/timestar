@@ -167,9 +167,9 @@ static void mergeSortedRawValuesInto(std::vector<uint64_t>& baseTs, std::vector<
                     v = std::min(baseVals[i], newVals[j]);
                     break;
                 case AggregationMethod::MAX:
-                case AggregationMethod::LATEST:
                     v = std::max(baseVals[i], newVals[j]);
                     break;
+                case AggregationMethod::LATEST:
                 case AggregationMethod::FIRST:
                     v = baseVals[i];
                     break;
@@ -255,19 +255,8 @@ static bool allTimestampsIdentical(const std::vector<PartialAggregationResult*>&
         return true;
     const auto& ref = partials[0]->sortedTimestamps;
     for (size_t i = 1; i < partials.size(); ++i) {
-        const auto& ts = partials[i]->sortedTimestamps;
-        if (ts.size() != ref.size())
+        if (partials[i]->sortedTimestamps != ref)
             return false;
-        // Only check endpoints + midpoint for speed — false negatives go to merge path
-        if (!ts.empty()) {
-            if (ts.front() != ref.front())
-                return false;
-            if (ts.back() != ref.back())
-                return false;
-            size_t mid = ts.size() / 2;
-            if (ts[mid] != ref[mid])
-                return false;
-        }
     }
     return true;
 }
@@ -304,9 +293,11 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
                     dst[i] = std::min(dst[i], src[i]);
                 break;
             case AggregationMethod::MAX:
-            case AggregationMethod::LATEST:
                 for (size_t i = 0; i < N; ++i)
                     dst[i] = std::max(dst[i], src[i]);
+                break;
+            case AggregationMethod::LATEST:
+                // Keep existing value (both partials have same timestamp)
                 break;
             case AggregationMethod::FIRST:
                 break;
@@ -363,8 +354,8 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
             case AggregationMethod::MIN:
                 return std::min(existing, incoming);
             case AggregationMethod::MAX:
-            case AggregationMethod::LATEST:
                 return std::max(existing, incoming);
+            case AggregationMethod::LATEST:
             case AggregationMethod::FIRST:
                 return existing;
             default:

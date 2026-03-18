@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <unordered_set>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/thread.hh>
@@ -134,11 +135,12 @@ seastar::future<> Manifest::appendRecord(const std::string& record) {
 }
 
 seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
+    // Persist to disk FIRST, then update in-memory state.
+    co_await appendRecord(serializeAddFile(info));
     files_.push_back(info);
     if (info.fileNumber >= nextFileNumber_) {
         nextFileNumber_ = info.fileNumber + 1;
     }
-    co_await appendRecord(serializeAddFile(info));
 }
 
 seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers) {
@@ -151,9 +153,9 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
         std::string record = serializeRemoveFile(fn);
         encodeFixed32(batchFrame, static_cast<uint32_t>(record.size()));
         batchFrame.append(record);
-        std::erase_if(files_, [fn](const SSTableMetadata& f) { return f.fileNumber == fn; });
     }
 
+    // Persist to disk FIRST, then update in-memory state.
     auto path = manifestPath_;
     co_await seastar::async([path, batchFrame = std::move(batchFrame)] {
         int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -168,6 +170,14 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
         ::fsync(fd);
         ::close(fd);
     });
+
+    // Update in-memory state AFTER successful persist
+    std::unordered_set<uint64_t> toRemove(fileNumbers.begin(), fileNumbers.end());
+    // Use explicit loop instead of std::erase_if with lambda to avoid
+    // GCC 14 coroutine frame + std::reference_wrapper interaction bug.
+    auto it = std::remove_if(files_.begin(), files_.end(),
+                             [&toRemove](const SSTableMetadata& f) { return toRemove.contains(f.fileNumber); });
+    files_.erase(it, files_.end());
 }
 
 seastar::future<> Manifest::writeSnapshot() {

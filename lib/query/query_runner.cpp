@@ -615,9 +615,11 @@ static bool isStreamableMethod(timestar::AggregationMethod method) {
 // BlockAggregator without materialising intermediate QueryResult vectors.
 // Returns the number of points aggregated.
 // ---------------------------------------------------------------------------
-static size_t aggregateMemoryStores(WALFileManager* walFileManager, const SeriesId128& seriesId, uint64_t startTime,
-                                    uint64_t endTime, timestar::BlockAggregator& aggregator) {
-    auto memoryMatches = walFileManager->queryAllMemoryStores<double>(seriesId);
+// Helper: fold typed memory store matches into aggregator, converting to double.
+template <typename T>
+static size_t aggregateMemoryStoresTyped(WALFileManager* walFileManager, const SeriesId128& seriesId,
+                                         uint64_t startTime, uint64_t endTime, timestar::BlockAggregator& aggregator) {
+    auto memoryMatches = walFileManager->queryAllMemoryStores<T>(seriesId);
     size_t totalPoints = 0;
     for (const auto& match : memoryMatches) {
         const auto& storeData = *match.series;
@@ -630,14 +632,21 @@ static size_t aggregateMemoryStores(WALFileManager* walFileManager, const Series
         size_t count = endIdx - startIdx;
         if (count == 0)
             continue;
-
-        // Feed points directly into the aggregator — no vector copy.
         for (size_t i = startIdx; i < endIdx; ++i) {
-            aggregator.addPoint(storeData.timestamps[i], storeData.values[i]);
+            aggregator.addPoint(storeData.timestamps[i], static_cast<double>(storeData.values[i]));
         }
         totalPoints += count;
     }
     return totalPoints;
+}
+
+static size_t aggregateMemoryStores(WALFileManager* walFileManager, const SeriesId128& seriesId, uint64_t startTime,
+                                    uint64_t endTime, timestar::BlockAggregator& aggregator) {
+    // Query all numeric types — int64_t and bool memory data was previously ignored.
+    size_t pts = aggregateMemoryStoresTyped<double>(walFileManager, seriesId, startTime, endTime, aggregator);
+    pts += aggregateMemoryStoresTyped<int64_t>(walFileManager, seriesId, startTime, endTime, aggregator);
+    pts += aggregateMemoryStoresTyped<bool>(walFileManager, seriesId, startTime, endTime, aggregator);
+    return pts;
 }
 
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
@@ -693,7 +702,12 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // Gate 1 (split logic): Instead of rejecting entirely when memory data
     // exists, determine the split point so the TSM-only portion can still
     // benefit from pushdown aggregation.
+    // Check all numeric types for earliest memory timestamp
     auto memMinTimeOpt = walFileManager->getEarliestMemoryTimestamp<double>(seriesId, startTime, endTime);
+    auto memMinInt = walFileManager->getEarliestMemoryTimestamp<int64_t>(seriesId, startTime, endTime);
+    auto memMinBool = walFileManager->getEarliestMemoryTimestamp<bool>(seriesId, startTime, endTime);
+    if (memMinInt && (!memMinTimeOpt || *memMinInt < *memMinTimeOpt)) memMinTimeOpt = memMinInt;
+    if (memMinBool && (!memMinTimeOpt || *memMinBool < *memMinTimeOpt)) memMinTimeOpt = memMinBool;
 
     // tsmEndTime: the upper bound for the TSM-only pushdown range.
     // fallbackStartTime: the lower bound for the fallback (TSM+memory) range.

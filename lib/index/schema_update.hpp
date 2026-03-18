@@ -28,11 +28,8 @@ struct SchemaUpdate {
             newTagValues[k].insert(v.begin(), v.end());
         }
         for (const auto& [k, v] : other.newFieldTypes) {
-            // Deterministic conflict resolution: lexicographically smaller type wins
-            auto it = newFieldTypes.find(k);
-            if (it == newFieldTypes.end() || v < it->second) {
-                newFieldTypes[k] = v;
-            }
+            // First-write-wins: don't overwrite existing field types
+            newFieldTypes.try_emplace(k, v);
         }
     }
 };

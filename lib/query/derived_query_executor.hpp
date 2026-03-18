@@ -89,6 +89,8 @@ public:
     static bool isForecastFormula(const std::string& formula);
 
 private:
+    friend class DerivedQueryCachedAstSafetyTest;  // Test access to cachedAst_
+
     seastar::sharded<Engine>* engine_;
     seastar::sharded<index::NativeIndex>* index_;
     DerivedQueryConfig config_;

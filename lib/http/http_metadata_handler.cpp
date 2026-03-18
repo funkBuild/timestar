@@ -381,6 +381,25 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         std::string tagKey = req->get_query_param("tag_key");
         std::string tagValue = req->get_query_param("tag_value");
 
+        if (!tagKey.empty()) {
+            auto err = validateQueryParam(tagKey, "Tag key");
+            if (!err.empty()) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                rep->add_header("Content-Type", "application/json");
+                co_return rep;
+            }
+        }
+        if (!tagValue.empty()) {
+            auto err = validateQueryParam(tagValue, "Tag value");
+            if (!err.empty()) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                rep->add_header("Content-Type", "application/json");
+                co_return rep;
+            }
+        }
+
         timestar::http_log.debug("Processing /cardinality request for measurement: {}", measurement);
 
         // Scatter-gather: collect HLL sketches from all shards and merge

@@ -3,6 +3,7 @@
 #include <glaze/toml.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -37,7 +38,8 @@ std::vector<std::string> TimestarConfig::validate() const {
     if (storage.max_points_per_block == 0) {
         errors.emplace_back("storage.max_points_per_block must be > 0");
     }
-    if (storage.tsm_bloom_fpr <= 0.0 || storage.tsm_bloom_fpr >= 1.0) {
+    if (std::isnan(storage.tsm_bloom_fpr) || std::isinf(storage.tsm_bloom_fpr) ||
+        storage.tsm_bloom_fpr <= 0.0 || storage.tsm_bloom_fpr >= 1.0) {
         errors.emplace_back("storage.tsm_bloom_fpr must be in (0, 1)");
     }
 
@@ -68,7 +70,8 @@ std::vector<std::string> TimestarConfig::validate() const {
         errors.emplace_back("index.write_buffer_size must be > 0");
     }
 
-    if (engine.tombstone_dead_fraction_threshold <= 0.0 || engine.tombstone_dead_fraction_threshold >= 1.0) {
+    if (std::isnan(engine.tombstone_dead_fraction_threshold) || std::isinf(engine.tombstone_dead_fraction_threshold) ||
+        engine.tombstone_dead_fraction_threshold <= 0.0 || engine.tombstone_dead_fraction_threshold >= 1.0) {
         errors.emplace_back("engine.tombstone_dead_fraction_threshold must be in (0, 1)");
     }
     if (engine.retention_sweep_interval_minutes == 0) {
@@ -259,20 +262,36 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     auto envStr = [](const char* name) -> const char* { return std::getenv(name); };
 
     auto envU16 = [&](const char* name, uint16_t& field) {
-        if (auto v = envStr(name))
-            field = static_cast<uint16_t>(std::stoul(v));
+        if (auto v = envStr(name)) {
+            try { field = static_cast<uint16_t>(std::stoul(v)); }
+            catch (const std::exception&) {
+                throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");
+            }
+        }
     };
     auto envU32 = [&](const char* name, uint32_t& field) {
-        if (auto v = envStr(name))
-            field = static_cast<uint32_t>(std::stoul(v));
+        if (auto v = envStr(name)) {
+            try { field = static_cast<uint32_t>(std::stoul(v)); }
+            catch (const std::exception&) {
+                throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");
+            }
+        }
     };
     auto envU64 = [&](const char* name, uint64_t& field) {
-        if (auto v = envStr(name))
-            field = std::stoull(v);
+        if (auto v = envStr(name)) {
+            try { field = std::stoull(v); }
+            catch (const std::exception&) {
+                throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");
+            }
+        }
     };
     auto envDbl = [&](const char* name, double& field) {
-        if (auto v = envStr(name))
-            field = std::stod(v);
+        if (auto v = envStr(name)) {
+            try { field = std::stod(v); }
+            catch (const std::exception&) {
+                throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");
+            }
+        }
     };
     auto envString = [&](const char* name, std::string& field) {
         if (auto v = envStr(name))

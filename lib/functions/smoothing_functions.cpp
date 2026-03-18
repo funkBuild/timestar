@@ -84,16 +84,27 @@ seastar::future<FunctionResult<double>> SMAFunction::execute(const DoubleSeriesV
         result.values.resize(outputCount);
         result.timestamps.resize(outputCount);
 
+        // Kahan-compensated sliding window to prevent drift over long series
         double sum = 0.0;
+        double comp = 0.0;
         for (int64_t j = 0; j < window; ++j) {
-            sum += input.valueAt(j);
+            double y = input.valueAt(j) - comp;
+            double t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
         }
         result.values[0] = sum / window;
         result.timestamps[0] = input.timestampAt(window - 1);
 
         for (size_t i = 1; i < outputCount; ++i) {
-            sum -= input.valueAt(i - 1);
-            sum += input.valueAt(i + window - 1);
+            double yOut = -input.valueAt(i - 1) - comp;
+            double tOut = sum + yOut;
+            comp = (tOut - sum) - yOut;
+            sum = tOut;
+            double yIn = input.valueAt(i + window - 1) - comp;
+            double tIn = sum + yIn;
+            comp = (tIn - sum) - yIn;
+            sum = tIn;
             result.values[i] = sum / window;
             result.timestamps[i] = input.timestampAt(i + window - 1);
         }

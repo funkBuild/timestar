@@ -275,20 +275,31 @@ std::string ResponseFormatter::format(QueryResponse& response) {
             if (!firstTag)
                 pos = appendChar(buf, pos, ',');
             firstTag = false;
-            // Write "key=value" directly — tag keys/values never need escaping
-            size_t need = key.size() + value.size() + 4;
-            if (pos + need > buf.size()) {
-                buf.resize(std::max(buf.size() * 2, pos + need));
+            // Write "key=value" as a JSON string with proper escaping
+            if (!needsEscaping(key) && !needsEscaping(value)) [[likely]] {
+                // Fast path: no escaping needed
+                size_t need = key.size() + value.size() + 4;
+                if (pos + need > buf.size()) {
+                    buf.resize(std::max(buf.size() * 2, pos + need));
+                }
+                char* p = buf.data() + pos;
+                *p++ = '"';
+                std::memcpy(p, key.data(), key.size());
+                p += key.size();
+                *p++ = '=';
+                std::memcpy(p, value.data(), value.size());
+                p += value.size();
+                *p++ = '"';
+                pos = static_cast<size_t>(p - buf.data());
+            } else {
+                // Slow path: escape key and/or value
+                std::string kv;
+                kv.reserve(key.size() + 1 + value.size());
+                kv.append(key);
+                kv.push_back('=');
+                kv.append(value);
+                pos = appendJsonString(buf, pos, kv);
             }
-            char* p = buf.data() + pos;
-            *p++ = '"';
-            std::memcpy(p, key.data(), key.size());
-            p += key.size();
-            *p++ = '=';
-            std::memcpy(p, value.data(), value.size());
-            p += value.size();
-            *p++ = '"';
-            pos = static_cast<size_t>(p - buf.data());
         }
         pos = appendChar(buf, pos, ']');
 

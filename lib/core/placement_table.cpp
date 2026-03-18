@@ -100,7 +100,7 @@ PlacementTable PlacementTable::fromJson(const std::string& data) {
     pt.coreCount_ = pj.coreCount;
     pt.coreMask_ = (pj.coreCount > 1 && (pj.coreCount & (pj.coreCount - 1)) == 0) ? (pj.coreCount - 1) : 0;
     pt.table_.fill(VShardMapping{});
-    size_t count = std::min<size_t>(pj.serverIds.size(), VIRTUAL_SHARD_COUNT);
+    size_t count = std::min({pj.serverIds.size(), pj.coreIds.size(), static_cast<size_t>(VIRTUAL_SHARD_COUNT)});
     for (size_t i = 0; i < count; ++i) {
         pt.table_[i].serverId = pj.serverIds[i];
         pt.table_[i].coreId = pj.coreIds[i];

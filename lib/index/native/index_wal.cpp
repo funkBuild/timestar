@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cinttypes>
 #include <cstring>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
@@ -95,7 +96,7 @@ static uint64_t decodeFixed64(const char* p) {
 
 std::string IndexWAL::walFileName(const std::string& dir, uint64_t generation) {
     char buf[32];
-    snprintf(buf, sizeof(buf), "idx_%06lu.wal", generation);
+    snprintf(buf, sizeof(buf), "idx_%06" PRIu64 ".wal", generation);
     return dir + "/" + buf;
 }
 

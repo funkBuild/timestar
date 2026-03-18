@@ -50,21 +50,21 @@ std::vector<double> SeasonalForecaster::inverseSeasonalDifference(const std::vec
 
     // To invert seasonal differencing, we need: y[t] = y'[t] + y[t-s]
     // For forecasting, we need to use the last seasonal cycle from original data
-    for (size_t i = 0; i < forecastCount; ++i) {
-        // Get the corresponding seasonal lag value
-        // Use signed arithmetic to avoid unsigned underflow when
-        // original.size() < seasonalPeriod
+    size_t safeCount = std::min(forecastCount, diffed.size());
+    for (size_t i = 0; i < safeCount; ++i) {
         ptrdiff_t baseIdx = static_cast<ptrdiff_t>(original.size()) - static_cast<ptrdiff_t>(seasonalPeriod) +
                             static_cast<ptrdiff_t>(i % seasonalPeriod);
         if (baseIdx >= 0 && static_cast<size_t>(baseIdx) < original.size()) {
             result[i] = diffed[i] + original[static_cast<size_t>(baseIdx)];
         } else if (i >= seasonalPeriod) {
-            // Fallback: use the forecast we just made
             result[i] = diffed[i] + result[i - seasonalPeriod];
         } else {
-            // Not enough data for seasonal reference: use last available value
             result[i] = diffed[i] + original.back();
         }
+    }
+    // Fill remaining if forecastCount > diffed.size()
+    for (size_t i = safeCount; i < forecastCount; ++i) {
+        result[i] = i > 0 ? result[i - 1] : (original.empty() ? 0.0 : original.back());
     }
 
     return result;

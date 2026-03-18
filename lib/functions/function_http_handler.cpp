@@ -922,14 +922,21 @@ std::string FunctionHttpHandler::handleCacheStatsSync() {
     return R"({"status":"error","error":"Cache statistics endpoint not yet implemented"})";
 }
 
-// Stub implementations for compatibility
 seastar::future<std::unique_ptr<seastar::http::reply>> FunctionHttpHandler::createJsonReply(const std::string& json) {
-    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(nullptr);
+    auto rep = std::make_unique<seastar::http::reply>();
+    rep->set_status(seastar::http::reply::status_type::ok);
+    rep->_content = json;
+    rep->done("application/json");
+    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> FunctionHttpHandler::createErrorReply(
     const std::string& error, seastar::http::reply::status_type status) {
-    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(nullptr);
+    auto rep = std::make_unique<seastar::http::reply>();
+    rep->set_status(status);
+    rep->_content = R"({"success":false,"error":")" + error + R"("})";
+    rep->done("application/json");
+    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
 seastar::future<FunctionQueryResponse> FunctionHttpHandler::executeFunctionQuery(const FunctionQueryRequest& request) {

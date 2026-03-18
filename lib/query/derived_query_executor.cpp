@@ -383,10 +383,14 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeWithAnom
             auto forecastResult = co_await executeForecast(request, *ast);
             co_return DerivedQueryResultVariant{std::move(forecastResult)};
         } else {
-            // Execute regular derived query, reusing the already-parsed AST
+            // Execute regular derived query, reusing the already-parsed AST.
+            // RAII guard ensures cachedAst_ is reset even if execute() throws.
+            struct CachedAstGuard {
+                const ExpressionNode*& ref;
+                ~CachedAstGuard() { ref = nullptr; }
+            } guard{cachedAst_};
             cachedAst_ = ast.get();
             auto result = co_await execute(request);
-            cachedAst_ = nullptr;
             co_return DerivedQueryResultVariant{std::move(result)};
         }
     } catch (const std::exception& e) {

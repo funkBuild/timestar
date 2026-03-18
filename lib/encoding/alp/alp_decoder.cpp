@@ -309,7 +309,10 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 // Emit values until block ends or output is full
                 const size_t emit_end = std::min(static_cast<size_t>(block_count), i + output_remaining);
                 for (; i < emit_end; ++i) {
-                    uint64_t left = dict[static_cast<uint8_t>(left_idx[i])];
+                    auto lidx = static_cast<uint8_t>(left_idx[i]);
+                    if (lidx >= dict_size) [[unlikely]]
+                        throw std::runtime_error("ALP_RD decoder: dictionary index out of range");
+                    uint64_t left = dict[lidx];
                     uint64_t r = right[i] & right_mask;
                     uint64_t combined = (left << right_bit_count) | r;
                     *output_ptr++ = std::bit_cast<double>(combined);
@@ -326,7 +329,10 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                         value = std::bit_cast<double>(rd_exc_values_stack[exc_idx]);
                         exc_idx++;
                     } else {
-                        uint64_t left = scratch.dictionary[static_cast<uint8_t>(left_indices_stack[i])];
+                        auto lidx = static_cast<uint8_t>(left_indices_stack[i]);
+                        if (lidx >= dict_size) [[unlikely]]
+                            throw std::runtime_error("ALP_RD decoder: dictionary index out of range");
+                        uint64_t left = scratch.dictionary[lidx];
                         uint64_t right = right_parts_stack[i] & right_mask;
                         uint64_t combined = (left << right_bit_count) | right;
                         value = std::bit_cast<double>(combined);

@@ -239,7 +239,11 @@ private:
     std::string createErrorResponse(const std::string& error);
 
     // Create success response JSON
-    std::string createSuccessResponse(int pointsWritten);
+    std::string createSuccessResponse(int64_t pointsWritten);
+
+    // Create partial failure response JSON (some writes in a batch failed)
+    std::string createPartialFailureResponse(int64_t pointsWritten, int64_t failedWrites,
+                                             const std::vector<std::string>& errors);
 
 public:
     HttpWriteHandler(seastar::sharded<Engine>* _engineSharded);

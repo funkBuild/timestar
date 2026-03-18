@@ -1018,6 +1018,11 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     // cross-shard metadata RPC entirely, eliminating the biggest bottleneck
     // for non-shard-0 shards. The cache persists for the lifetime of the shard.
     static thread_local tsl::robin_set<SeriesId128, SeriesId128::Hash> knownSeriesCache;
+    // Cap cache to prevent unbounded memory growth with high-cardinality workloads
+    static constexpr size_t MAX_KNOWN_SERIES_CACHE = 500'000;
+    if (knownSeriesCache.size() > MAX_KNOWN_SERIES_CACHE) [[unlikely]] {
+        knownSeriesCache.clear();
+    }
 
     // Local metadata tracking — each coroutine gets its own copies so there
     // is no shared mutable state when multiple coroutines run concurrently.
@@ -1673,7 +1678,7 @@ std::string HttpWriteHandler::createErrorResponse(const std::string& error) {
     return buffer;
 }
 
-std::string HttpWriteHandler::createSuccessResponse(int pointsWritten) {
+std::string HttpWriteHandler::createSuccessResponse(int64_t pointsWritten) {
     // Create JSON object directly
     auto response = glz::obj{"status", "success", "points_written", pointsWritten};
 
@@ -1681,6 +1686,19 @@ std::string HttpWriteHandler::createSuccessResponse(int pointsWritten) {
     auto ec = glz::write_json(response, buffer);
     if (ec) {
         return R"({"status":"error","message":"Failed to serialize success response"})";
+    }
+    return buffer;
+}
+
+std::string HttpWriteHandler::createPartialFailureResponse(int64_t pointsWritten, int64_t failedWrites,
+                                                           const std::vector<std::string>& errors) {
+    auto response = glz::obj{"status", "partial", "points_written", pointsWritten, "failed_writes", failedWrites,
+                             "errors", errors};
+
+    std::string buffer;
+    auto ec = glz::write_json(response, buffer);
+    if (ec) {
+        return R"({"status":"error","message":"Failed to serialize partial failure response"})";
     }
     return buffer;
 }
@@ -1736,7 +1754,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 
         LOG_INSERT_PATH(timestar::http_log, debug, "Received write request: {} bytes", body.size());
 
-        int pointsWritten = 0;
+        int64_t pointsWritten = 0;
 #if TIMESTAR_LOG_INSERT_PATH
         auto batchStartTime = std::chrono::steady_clock::now();
 #endif
@@ -1753,9 +1771,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // allocations and roughly halves the JSON parsing cost.
         bool fastPathHandled = false;
         if (body.size() > 256) {
-            // Quick check: skip fast path for batch writes (have "writes" key)
+            // Quick check: skip fast path for batch writes (have "writes" key).
+            // We must search the entire body, not just the first N bytes,
+            // because the "writes" key can appear at any position depending
+            // on JSON key ordering.
             auto writesPos = body.find("\"writes\"");
-            if (writesPos == std::string::npos || writesPos > 64) {
+            if (writesPos == std::string::npos) {
                 FastDoubleWritePoint fwp;
                 auto fast_err = glz::read_json(fwp, body);
                 if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
@@ -1769,7 +1790,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                             throw std::invalid_argument(error);
                         }
 
-                        pointsWritten = mwp.timestamps.size() * mwp.fields.size();
+                        pointsWritten = static_cast<int64_t>(mwp.timestamps.size()) *
+                                        static_cast<int64_t>(mwp.fields.size());
 
                         auto writeResult = co_await processMultiWritePoint(mwp);
 
@@ -1822,8 +1844,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                         writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
 #endif
 
+                        // Pre-compute per-MWP point counts so we can subtract on failure.
+                        std::vector<int64_t> perMwpPoints;
+                        perMwpPoints.reserve(coalescedWrites.size());
                         for (const auto& mwp : coalescedWrites) {
-                            pointsWritten += mwp.timestamps.size() * mwp.fields.size();
+                            auto pts = static_cast<int64_t>(mwp.timestamps.size()) *
+                                       static_cast<int64_t>(mwp.fields.size());
+                            pointsWritten += pts;
+                            perMwpPoints.push_back(pts);
                             std::string error;
                             if (!validateArraySizes(mwp, error)) {
                                 throw std::invalid_argument(error);
@@ -1840,13 +1868,20 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 
                         std::vector<MetaOp> metaOps;
                         metaOps.reserve(coalescedWrites.size() * 2);
-                        for (auto& result : mwpResults) {
+                        int64_t failedWrites = 0;
+                        std::vector<std::string> writeErrors;
+                        for (size_t i = 0; i < mwpResults.size(); ++i) {
                             try {
-                                auto writeResult = result.get();
+                                auto writeResult = mwpResults[i].get();
                                 metaOps.insert(metaOps.end(), std::make_move_iterator(writeResult.metaOps.begin()),
                                                std::make_move_iterator(writeResult.metaOps.end()));
                             } catch (const std::exception& e) {
                                 timestar::http_log.error("Error processing write: {}", e.what());
+                                pointsWritten -= perMwpPoints[i];
+                                ++failedWrites;
+                                if (writeErrors.size() < 10) {
+                                    writeErrors.emplace_back(e.what());
+                                }
                             }
                         }
 
@@ -1860,6 +1895,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                         LOG_INSERT_PATH(timestar::http_log, info,
                                         "[METADATA] Batch: indexed {} unique series synchronously", metaOpsCount);
 #endif
+
+                        // Report partial failure if some writes failed
+                        if (failedWrites > 0) {
+                            rep->set_status(seastar::http::reply::status_type::ok);
+                            rep->_content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
+                            rep->add_header("Content-Type", "application/json");
+                            co_return rep;
+                        }
                     }
                 } else {
                     MultiWritePoint mwp = parseMultiWritePoint(doc, defaultTimestampNs);
@@ -1868,7 +1911,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                         throw std::invalid_argument(error);
                     }
 
-                    pointsWritten = mwp.timestamps.size() * mwp.fields.size();
+                    pointsWritten = static_cast<int64_t>(mwp.timestamps.size()) *
+                                    static_cast<int64_t>(mwp.fields.size());
 
                     auto writeResult = co_await processMultiWritePoint(mwp);
 

@@ -14,6 +14,8 @@ struct ServerConfig {
     std::string log_level = "info";
     std::string data_dir = ".";
     uint32_t shutdown_timeout_seconds = 30;  // 0 = wait forever
+    bool auth_enabled = false;
+    std::string auth_token;  // Empty = auto-generate on startup when auth_enabled
 };
 
 struct CompactionConfig {

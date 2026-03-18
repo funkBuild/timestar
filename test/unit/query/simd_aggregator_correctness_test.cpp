@@ -397,7 +397,7 @@ TEST_F(SimdAggregatorCorrectnessTest, BucketSums_BasicCase) {
     std::vector<size_t> bucket_indices = {0, 4, 8};
     std::vector<double> bucket_sums(3, 0.0);
 
-    SimdAggregator::calculateBucketSums(values.data(), bucket_indices.data(), 3, 4, bucket_sums.data());
+    SimdAggregator::calculateBucketSums(values.data(), values.size(), bucket_indices.data(), 3, 4, bucket_sums.data());
 
     EXPECT_DOUBLE_EQ(bucket_sums[0], 10.0);    // 1+2+3+4
     EXPECT_DOUBLE_EQ(bucket_sums[1], 100.0);   // 10+20+30+40
@@ -409,7 +409,7 @@ TEST_F(SimdAggregatorCorrectnessTest, BucketSums_UnevenBuckets) {
     std::vector<size_t> bucket_indices = {0, 5};
     std::vector<double> bucket_sums(2, 0.0);
 
-    SimdAggregator::calculateBucketSums(values.data(), bucket_indices.data(), 2, 3, bucket_sums.data());
+    SimdAggregator::calculateBucketSums(values.data(), values.size(), bucket_indices.data(), 2, 3, bucket_sums.data());
 
     EXPECT_DOUBLE_EQ(bucket_sums[0], 15.0);  // 1+2+3+4+5
     EXPECT_DOUBLE_EQ(bucket_sums[1], 60.0);  // 10+20+30

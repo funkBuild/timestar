@@ -3,6 +3,7 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 
@@ -16,7 +17,7 @@ BloomFilter::BloomFilter(int bits_per_key) : bitsPerKey_(bits_per_key) {
 }
 
 void BloomFilter::addKey(std::string_view key) {
-    // Store the 64-bit hash for later use in build()
+    assert(!built_ && "addKey() called after build() — filter is immutable");
     uint64_t h = XXH3_64bits(key.data(), key.size());
     hashes_.push_back(h);
     ++numKeys_;

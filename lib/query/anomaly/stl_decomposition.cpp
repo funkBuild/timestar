@@ -248,8 +248,9 @@ STLComponents STLDecomposition::decompose(const std::vector<double>& values, con
         return components;
     }
 
-    // Set window sizes
-    size_t seasonalWindow = config.seasonalWindow;
+    // Set window sizes. Minimum 3 for meaningful LOESS smoothing and to prevent
+    // trendWindow formula from producing negative values (UB on cast to size_t).
+    size_t seasonalWindow = std::max(config.seasonalWindow, size_t(3));
     if (seasonalWindow % 2 == 0)
         seasonalWindow++;  // Must be odd
 

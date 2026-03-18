@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace timestar {
 
@@ -170,6 +171,9 @@ std::vector<double> SeriesAligner::interpolateSeries(const std::vector<uint64_t>
     std::vector<double> result;
     result.reserve(targetTimestamps.size());
 
+    if (srcTimestamps.size() != srcValues.size()) {
+        throw std::invalid_argument("interpolateSeries: srcTimestamps/srcValues size mismatch");
+    }
     if (srcTimestamps.empty() || srcValues.empty()) {
         // Fill with NaN if source is empty
         result.resize(targetTimestamps.size(), std::numeric_limits<double>::quiet_NaN());

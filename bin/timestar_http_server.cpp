@@ -1,6 +1,7 @@
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
 #include "core/placement_table.hpp"
+#include "http/http_auth.hpp"
 #include "http/http_delete_handler.hpp"
 #include "http/http_derived_query_handler.hpp"
 #include "http/http_metadata_handler.hpp"
@@ -27,6 +28,7 @@
 #include <seastar/http/httpd.hh>
 #include <seastar/net/api.hh>
 #include <seastar/util/backtrace.hh>
+#include <seastar/util/defer.hh>
 #include <sstream>
 #include <vector>
 
@@ -63,23 +65,24 @@ void set_routes(routes& r) {
         return ptr;
     };
 
-    // Simple test endpoints
-    auto* test = emplaceHandler(new function_handler([](const_req req) { return "Hello from TimeStar HTTP Server!"; }));
-    r.add(operation_type::GET, url("/test"), test);
+    // Simple test endpoints — passed directly to r.add() which takes exclusive
+    // ownership.  Must NOT also go through emplaceHandler() (double-free).
+    r.add(operation_type::GET, url("/test"),
+          new function_handler([](const_req req) { return "Hello from TimeStar HTTP Server!"; }));
 
-    auto* health = emplaceHandler(new function_handler([](const_req req) {
-        if (g_ready.load(std::memory_order_relaxed)) {
-            return sstring("{\"status\":\"healthy\"}");
-        }
-        return sstring("{\"status\":\"starting\"}");
-    }));
-    r.add(operation_type::GET, url("/health"), health);
+    r.add(operation_type::GET, url("/health"),
+          new function_handler([](const_req req) {
+              if (g_ready.load(std::memory_order_relaxed)) {
+                  return sstring("{\"status\":\"healthy\"}");
+              }
+              return sstring("{\"status\":\"starting\"}");
+          }));
 
-    auto* version = emplaceHandler(new function_handler([](const_req req) {
-        return sstring(fmt::format(R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
-                                   timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER));
-    }));
-    r.add(operation_type::GET, url("/version"), version);
+    r.add(operation_type::GET, url("/version"),
+          new function_handler([](const_req req) {
+              return sstring(fmt::format(R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
+                                         timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER));
+          }));
 
     auto* writeHandler = emplaceHandler(new HttpWriteHandler(&g_engine));
     writeHandler->registerRoutes(r);
@@ -108,12 +111,12 @@ void set_routes(routes& r) {
     auto* derivedQueryHandler = emplaceHandler(new timestar::HttpDerivedQueryHandler(&g_engine));
     derivedQueryHandler->registerRoutes(r);
 
-    auto* root = emplaceHandler(new function_handler([](const_req req) {
-        return "{\"message\":\"TimeStar HTTP "
-               "Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/"
-               "tags\",\"/fields\",\"/retention\",\"/subscribe\",\"/subscriptions\"]}";
-    }));
-    r.add(operation_type::GET, url("/"), root);
+    r.add(operation_type::GET, url("/"),
+          new function_handler([](const_req req) {
+              return "{\"message\":\"TimeStar HTTP "
+                     "Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/"
+                     "tags\",\"/fields\",\"/retention\",\"/subscribe\",\"/subscriptions\"]}";
+          }));
 }
 
 int main(int argc, char** argv) {
@@ -256,6 +259,15 @@ int main(int argc, char** argv) {
             timestar::http_log.info("Initializing Engine on all shards...");
             g_engine.start().get();
 
+            // Scope guard: Seastar's sharded<> asserts in its destructor if
+            // stop() was not called after a successful start().  If any step
+            // below throws, we must stop the engine before the exception
+            // propagates.  The guard is disarmed once startup succeeds.
+            auto engineGuard = seastar::defer([&] {
+                g_engine.invoke_on_all([](Engine& engine) { return engine.stop(); }).get();
+                g_engine.stop().get();
+            });
+
             try {
                 g_engine.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
 
@@ -308,6 +320,10 @@ int main(int argc, char** argv) {
                 timestar::http_log.error("Backtrace:\n{}", current_backtrace());
                 throw;
             }
+
+            // Engine init succeeded -- disarm the scope guard so normal shutdown
+            // handles cleanup (the doShutdown lambda below).
+            engineGuard.cancel();
 
             // Start background tasks on all shards for WAL->TSM conversion
             timestar::http_log.info("Starting background tasks on all shards...");

@@ -128,46 +128,49 @@ bool SeriesMatcher::matchesRegex(const std::string& value, const std::string& pa
     }
 
     // Detect patterns that cause exponential backtracking:
-    // 1. Nested quantifiers: (a+)+, (a*)+, (a+)*, etc.
-    // 2. Quantified alternation: (a|aa)+, (x|xy)*, etc. — overlapping
-    //    alternatives with a quantifier cause the same combinatorial explosion.
-    size_t depth = 0;
-    bool hasQuantifierInGroup = false;
-    bool hasAlternationInGroup = false;
+    // 1. Nested quantifiers: (a+)+, (a*)+, (a+)*, ((a+))+ etc.
+    // 2. Quantified alternation: (a|aa)+, (x|xy)*, etc.
+    // Uses a stack to track per-depth state so nested groups are detected correctly.
+    struct GroupState {
+        bool hasQuantifier = false;
+        bool hasAlternation = false;
+    };
+    std::vector<GroupState> groupStack;
     for (size_t i = 0; i < pattern.size(); ++i) {
         char c = pattern[i];
         if (c == '\\' && i + 1 < pattern.size()) {
-            ++i;  // skip escaped character
+            ++i;
             continue;
         }
         if (c == '(') {
-            depth++;
-            hasQuantifierInGroup = false;
-            hasAlternationInGroup = false;
+            groupStack.push_back({});
         } else if (c == '+' || c == '*') {
-            if (depth > 0) {
-                hasQuantifierInGroup = true;
+            if (!groupStack.empty()) {
+                groupStack.back().hasQuantifier = true;
             }
         } else if (c == '|') {
-            if (depth > 0) {
-                hasAlternationInGroup = true;
+            if (!groupStack.empty()) {
+                groupStack.back().hasAlternation = true;
             }
         } else if (c == ')') {
-            if (depth > 0)
-                depth--;
-            // Check if a quantifier follows the closing paren of a group
-            // that itself contains a quantifier or alternation
-            if ((hasQuantifierInGroup || hasAlternationInGroup) && i + 1 < pattern.size()) {
-                char next = pattern[i + 1];
-                if (next == '+' || next == '*' || next == '{') {
-                    throw std::invalid_argument(
-                        "regex pattern rejected: quantified group with "
-                        "nested quantifiers or alternation can cause "
-                        "catastrophic backtracking");
+            if (!groupStack.empty()) {
+                auto state = groupStack.back();
+                groupStack.pop_back();
+                // Check if a quantifier follows this group
+                if ((state.hasQuantifier || state.hasAlternation) && i + 1 < pattern.size()) {
+                    char next = pattern[i + 1];
+                    if (next == '+' || next == '*' || next == '{') {
+                        throw std::invalid_argument(
+                            "regex pattern rejected: quantified group with "
+                            "nested quantifiers or alternation can cause "
+                            "catastrophic backtracking");
+                    }
+                }
+                // Propagate: if child had a quantifier, parent does too
+                if (!groupStack.empty() && state.hasQuantifier) {
+                    groupStack.back().hasQuantifier = true;
                 }
             }
-            hasQuantifierInGroup = false;
-            hasAlternationInGroup = false;
         }
     }
 

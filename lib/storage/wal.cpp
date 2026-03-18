@@ -151,6 +151,21 @@ seastar::future<> WAL::close() {
     co_await _io_gate.close();
     timestar::wal_log.debug("WAL seq={} all operations completed", sequenceNumber);
 
+    // Flush any buffered data to disk before closing the stream.
+    // Without this, data may sit in the output_stream buffer or OS page cache
+    // and never reach durable storage, violating WAL durability guarantees.
+    if (out) {
+        timestar::wal_log.debug("WAL seq={} performing final flush before close", sequenceNumber);
+        try {
+            co_await padToAlignment();
+            co_await out->flush();
+            _unflushed_bytes = 0;
+            timestar::wal_log.debug("WAL seq={} final flush completed before close", sequenceNumber);
+        } catch (const std::exception& e) {
+            timestar::wal_log.error("WAL seq={} final flush error during close: {}", sequenceNumber, e.what());
+        }
+    }
+
     // Close the output stream before destroying it
     // Note: closing the stream also closes the underlying file
     if (out) {

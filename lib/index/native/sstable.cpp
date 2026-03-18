@@ -319,6 +319,14 @@ seastar::future<> SSTableWriter::abort() {
         co_await file_.close();
         fileOpen_ = false;
     }
+    // Remove the partial file to avoid orphaned SSTables accumulating on disk.
+    if (!filename_.empty()) {
+        try {
+            co_await seastar::remove_file(filename_);
+        } catch (...) {
+            // Best-effort removal — file may not exist if create() partially failed.
+        }
+    }
 }
 
 // --- SSTableReader (Step 1: lazy block loading, Step 2: block cache) ---
@@ -352,6 +360,15 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
         if (n == 0)
             break;
         footerRead += n;
+    }
+    // Validate we read enough bytes to cover the actual footer data.
+    // footerReadSize is DMA-aligned and may extend past EOF, so check against
+    // the real byte count needed: from alignedFooterOffset to end of file.
+    const size_t footerBytesNeeded = fileSize - alignedFooterOffset;
+    if (footerRead < footerBytesNeeded) {
+        co_await file.close();
+        throw std::runtime_error("SSTable truncated footer read (" + std::to_string(footerRead) + " of " +
+                                 std::to_string(footerBytesNeeded) + " bytes): " + filename);
     }
 
     const char* fp = footerBuf.get() + (footerReadOffset - alignedFooterOffset);
@@ -393,6 +410,15 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
             if (n == 0)
                 break;
             metaRead += n;
+        }
+        // Validate we read enough bytes to cover the actual metadata region.
+        // alignedMetaSize is DMA-aligned and may extend past EOF, so check
+        // against the real byte count: from alignedMetaOffset to metaEnd.
+        const size_t metaBytesNeeded = metaEnd - alignedMetaOffset;
+        if (metaRead < metaBytesNeeded) {
+            co_await file.close();
+            throw std::runtime_error("SSTable truncated metadata read (" + std::to_string(metaRead) + " of " +
+                                     std::to_string(metaBytesNeeded) + " bytes): " + filename);
         }
 
         const char* metaBase = metaBuf.get() + (metaStart - alignedMetaOffset);

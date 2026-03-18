@@ -664,10 +664,14 @@ seastar::future<bool> Engine::deleteRangeImpl(std::string seriesKey, uint64_t st
         anyDeleted = true;
     }
 
-    // Iterate through all TSM files and add tombstones where necessary
-    // Convert series key to SeriesId128 for TSM operations
+    // Snapshot TSM file pointers to avoid iterator invalidation across co_await
+    // (background compaction can mutate getSequencedTsmFiles() during suspension)
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+    std::vector<seastar::shared_ptr<TSM>> tsmSnapshot;
     for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+        tsmSnapshot.push_back(tsmFile);
+    }
+    for (const auto& tsmFile : tsmSnapshot) {
         bool deleted = co_await tsmFile->deleteRange(seriesId, startTime, endTime);
         if (deleted) {
             anyDeleted = true;

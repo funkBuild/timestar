@@ -40,8 +40,8 @@ public:
 
     // Batch operations for time-bucketed aggregation
     // Process multiple buckets in parallel
-    static void calculateBucketSums(const double* values, const size_t* bucket_indices, size_t num_buckets,
-                                    size_t values_per_bucket, double* bucket_sums);
+    static void calculateBucketSums(const double* values, size_t total_values, const size_t* bucket_indices,
+                                    size_t num_buckets, size_t values_per_bucket, double* bucket_sums);
 
     // SIMD-optimized dot product (useful for weighted aggregations)
     static double dotProduct(const double* a, const double* b, size_t count);

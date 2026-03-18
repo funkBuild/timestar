@@ -189,7 +189,7 @@ AlignedSeries AlignedSeries::min(const AlignedSeries& a, const AlignedSeries& b)
     checkSameSize(a, b, "min");
     std::vector<double> result(a.values.size());
     for (size_t i = 0; i < a.values.size(); ++i) {
-        result[i] = std::min(a.values[i], b.values[i]);
+        result[i] = std::fmin(a.values[i], b.values[i]);  // NaN-safe: returns non-NaN arg
     }
     return AlignedSeries(a.timestamps, std::move(result));
 }
@@ -198,7 +198,7 @@ AlignedSeries AlignedSeries::max(const AlignedSeries& a, const AlignedSeries& b)
     checkSameSize(a, b, "max");
     std::vector<double> result(a.values.size());
     for (size_t i = 0; i < a.values.size(); ++i) {
-        result[i] = std::max(a.values[i], b.values[i]);
+        result[i] = std::fmax(a.values[i], b.values[i]);  // NaN-safe: returns non-NaN arg
     }
     return AlignedSeries(a.timestamps, std::move(result));
 }
@@ -606,23 +606,30 @@ AlignedSeries AlignedSeries::rolling_avg(int N) const {
         return AlignedSeries(timestamps, std::move(result));
     }
 
+    // Kahan-compensated sliding window to prevent floating-point drift
     double running_sum = 0.0;
-    int valid_count = 0;  // Track non-NaN values in the window
+    double comp = 0.0;  // Kahan compensation term
+    int valid_count = 0;
     for (size_t i = 0; i < values.size(); ++i) {
         if (!std::isnan(values[i])) {
-            running_sum += values[i];
+            double y = values[i] - comp;
+            double t = running_sum + y;
+            comp = (t - running_sum) - y;
+            running_sum = t;
             valid_count++;
         }
         if (i >= static_cast<size_t>(N)) {
             if (!std::isnan(values[i - N])) {
-                running_sum -= values[i - N];
+                double y = -values[i - N] - comp;
+                double t = running_sum + y;
+                comp = (t - running_sum) - y;
+                running_sum = t;
                 valid_count--;
             }
         }
         if (i + 1 >= static_cast<size_t>(N)) {
             result[i] = (valid_count > 0) ? running_sum / valid_count : nan;
         }
-        // else remains NaN (window not yet full)
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -1030,6 +1037,16 @@ AlignedSeries ExpressionEvaluator::evaluate(const ExpressionNode& expr, const Qu
 }
 
 AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults) {
+    if (++evalDepth_ > MAX_EVAL_DEPTH) {
+        --evalDepth_;
+        throw EvaluationException("Expression evaluation depth exceeded limit of " +
+                                  std::to_string(MAX_EVAL_DEPTH));
+    }
+    struct DepthGuard {
+        int& d;
+        ~DepthGuard() { --d; }
+    } guard{evalDepth_};
+
     switch (node.type) {
         case ExprNodeType::QUERY_REF:
             return evaluateQueryRef(node.asQueryRef(), queryResults);

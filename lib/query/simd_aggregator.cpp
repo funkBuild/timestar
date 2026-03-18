@@ -318,12 +318,13 @@ double SimdAggregator::calculateVariance(const double* values, size_t count, dou
     return HWY_DYNAMIC_DISPATCH(CalculateVariance)(values, count, mean);
 }
 
-void SimdAggregator::calculateBucketSums(const double* values, const size_t* bucket_indices, size_t num_buckets,
-                                         size_t values_per_bucket, double* bucket_sums) {
+void SimdAggregator::calculateBucketSums(const double* values, size_t total_values, const size_t* bucket_indices,
+                                         size_t num_buckets, size_t values_per_bucket, double* bucket_sums) {
     for (size_t b = 0; b < num_buckets; ++b) {
         size_t start = bucket_indices[b];
         size_t end = (b + 1 < num_buckets) ? bucket_indices[b + 1] : start + values_per_bucket;
-        size_t count = end - start;
+        end = std::min(end, total_values);
+        size_t count = (end > start) ? end - start : 0;
 
         if (count > 0) {
             bucket_sums[b] = calculateSum(&values[start], count);

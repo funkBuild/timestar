@@ -42,6 +42,19 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
         return files;
     });
 
+    // Sort WAL files by sequence number to ensure deterministic replay order.
+    // directory_iterator returns entries in filesystem-dependent order; without
+    // sorting, a DeleteRange in sequence 5 could replay before its Write in
+    // sequence 4, causing data loss.
+    std::sort(walFiles.begin(), walFiles.end(), [](const std::string& a, const std::string& b) {
+        auto parseSeq = [](const std::string& path) -> int {
+            size_t dotPos = path.find_last_of('.');
+            size_t slashPos = path.find_last_of('/') + 1;
+            return std::stoi(path.substr(slashPos, dotPos - slashPos));
+        };
+        return parseSeq(a) < parseSeq(b);
+    });
+
     if (!walFiles.empty()) {
         timestar::wal_log.info("Found {} existing WAL files on shard {} - converting to TSM", walFiles.size(), shardId);
 

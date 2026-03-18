@@ -38,13 +38,21 @@ seastar::future<void> FunctionPipelineExecutor::executeFunction(
         }
         co_return;
     } else if (functionName == "ema") {
-        int64_t window = 3;
-        auto it = parameters.find("window");
-        if (it != parameters.end() && std::holds_alternative<int64_t>(it->second)) {
-            window = std::get<int64_t>(it->second);
+        // Accept both "alpha" (direct smoothing factor) and "window" (span-based)
+        double alpha = 0.0;
+        auto alphaIt = parameters.find("alpha");
+        if (alphaIt != parameters.end() && std::holds_alternative<double>(alphaIt->second)) {
+            alpha = std::get<double>(alphaIt->second);
         }
-        if (window > 0 && !data.empty()) {
-            double alpha = 2.0 / (static_cast<double>(window) + 1.0);
+        if (alpha <= 0.0 || alpha > 1.0) {
+            int64_t window = 3;
+            auto it = parameters.find("window");
+            if (it != parameters.end() && std::holds_alternative<int64_t>(it->second)) {
+                window = std::get<int64_t>(it->second);
+            }
+            alpha = 2.0 / (static_cast<double>(std::max(int64_t(1), window)) + 1.0);
+        }
+        if (alpha > 0.0 && !data.empty()) {
             double ema = data[0];
             data[0] = ema;
             for (size_t i = 1; i < data.size(); ++i) {
