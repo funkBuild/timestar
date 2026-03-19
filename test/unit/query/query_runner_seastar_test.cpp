@@ -762,6 +762,109 @@ SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryTSMAfterDeletion) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: Two memory stores with no TSM data (rollover without TSM conversion)
+//
+// Regression test for C1 critical bug: after a memory store rollover but
+// before the background TSM conversion completes, two memory stores exist.
+// A query at this moment must return data from BOTH stores, not just the
+// newer one. This scenario is the normal steady-state during heavy writes:
+//   1. Insert data -> goes to memory store 0
+//   2. Rollover -> old data moves to memory store 1, new empty store at 0
+//   3. Insert more data -> goes to new memory store 0
+//   4. Query -> must merge data from BOTH memory stores (0 and 1)
+// ---------------------------------------------------------------------------
+seastar::future<> testQueryWithTwoMemoryStoresNoTSM() {
+    WITH_ENGINE(engine, {
+        // Phase 1: Insert data into the first memory store (timestamps 1000-3000)
+        TimeStarInsert<double> insert1("pressure", "value");
+        insert1.addTag("sensor", "main");
+        insert1.addValue(1000, 101.0);
+        insert1.addValue(2000, 102.0);
+        insert1.addValue(3000, 103.0);
+
+        co_await engine.insert(std::move(insert1));
+
+        // Phase 2: Trigger rollover. This creates a new memory store at index 0
+        // and pushes the old store (with timestamps 1000-3000) to index 1.
+        // The background TSM conversion is launched asynchronously but has NOT
+        // completed yet — Seastar is cooperative, so no conversion work runs
+        // until we yield to the reactor (which we won't do before querying).
+        co_await engine.rolloverMemoryStore();
+
+        // Phase 3: Insert more data into the NEW memory store (timestamps 4000-6000)
+        TimeStarInsert<double> insert2("pressure", "value");
+        insert2.addTag("sensor", "main");
+        insert2.addValue(4000, 104.0);
+        insert2.addValue(5000, 105.0);
+        insert2.addValue(6000, 106.0);
+
+        co_await engine.insert(std::move(insert2));
+
+        // Verify: no TSM files should exist yet. The background conversion has
+        // not had a chance to run because we haven't yielded to the reactor
+        // between the rollover and this point (inserts are inline).
+        EXPECT_EQ(engine.getTSMFileCount(), 0u)
+            << "Expected zero TSM files — background conversion should not have completed yet";
+
+        // Phase 4: Query the full time range. The query runner must discover and
+        // merge data from BOTH memory stores (the active one at index 0 with
+        // timestamps 4000-6000, and the read-only one at index 1 with 1000-3000).
+        auto resultOpt = co_await engine.query("pressure,sensor=main value", 0, UINT64_MAX);
+        EXPECT_TRUE(resultOpt.has_value()) << "Query should return data from memory stores";
+
+        if (resultOpt.has_value()) {
+            auto& result = std::get<QueryResult<double>>(resultOpt.value());
+
+            // Must have ALL 6 points from both memory stores
+            EXPECT_EQ(result.timestamps.size(), 6u)
+                << "Expected 6 points from two memory stores, got " << result.timestamps.size();
+            EXPECT_EQ(result.values.size(), 6u);
+
+            // Verify sorted timestamp order (merged from both stores)
+            for (size_t i = 1; i < result.timestamps.size(); ++i) {
+                EXPECT_LT(result.timestamps[i - 1], result.timestamps[i])
+                    << "Timestamps should be in ascending order at index " << i;
+            }
+
+            // Verify all timestamps are present
+            EXPECT_EQ(result.timestamps[0], 1000u);
+            EXPECT_EQ(result.timestamps[1], 2000u);
+            EXPECT_EQ(result.timestamps[2], 3000u);
+            EXPECT_EQ(result.timestamps[3], 4000u);
+            EXPECT_EQ(result.timestamps[4], 5000u);
+            EXPECT_EQ(result.timestamps[5], 6000u);
+
+            // Verify all values are present and correct
+            EXPECT_DOUBLE_EQ(result.values[0], 101.0);
+            EXPECT_DOUBLE_EQ(result.values[1], 102.0);
+            EXPECT_DOUBLE_EQ(result.values[2], 103.0);
+            EXPECT_DOUBLE_EQ(result.values[3], 104.0);
+            EXPECT_DOUBLE_EQ(result.values[4], 105.0);
+            EXPECT_DOUBLE_EQ(result.values[5], 106.0);
+        }
+
+        // Also verify a sub-range query spanning both stores works correctly
+        auto subResult = co_await engine.query("pressure,sensor=main value", 2000, 5000);
+        EXPECT_TRUE(subResult.has_value());
+
+        if (subResult.has_value()) {
+            auto& result = std::get<QueryResult<double>>(subResult.value());
+            EXPECT_EQ(result.timestamps.size(), 4u)
+                << "Sub-range query should return 4 points spanning both stores";
+            EXPECT_EQ(result.timestamps[0], 2000u);
+            EXPECT_EQ(result.timestamps[1], 3000u);
+            EXPECT_EQ(result.timestamps[2], 4000u);
+            EXPECT_EQ(result.timestamps[3], 5000u);
+        }
+    });
+    co_return;
+}
+
+SEASTAR_TEST_F(QueryRunnerSeastarTest, QueryWithTwoMemoryStoresNoTSM) {
+    co_await testQueryWithTwoMemoryStoresNoTSM();
+}
+
+// ---------------------------------------------------------------------------
 // Test: Multiple independent series do not interfere with each other
 // ---------------------------------------------------------------------------
 seastar::future<> testMultipleIndependentSeries() {

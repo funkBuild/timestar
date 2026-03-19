@@ -1,7 +1,6 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
-#include "../../../lib/query/query_planner.hpp"
 #include "../../../lib/query/query_runner.hpp"
 #include "../../../lib/query/series_matcher.hpp"
 #include "../../../lib/storage/memory_store.hpp"
@@ -437,26 +436,3 @@ TEST_F(QueryRealIntegrationTest, PerformanceWithRealisticData) {
     EXPECT_LT(aggDuration.count(), 500) << "Aggregation too slow: " << aggDuration.count() << "ms";
 }
 
-// Test QueryPlanner with real series IDs (simulated)
-TEST_F(QueryRealIntegrationTest, QueryPlannerWithRealData) {
-    // Create a query request
-    QueryRequest request;
-    request.measurement = "temperature";
-    request.fields = {"value", "humidity"};
-    request.scopes = {{"location", "us-west"}, {"sensor", "outdoor"}};
-    request.startTime = startTime;
-    request.endTime = endTime;
-    request.aggregation = AggregationMethod::MAX;
-    request.aggregationInterval = 5 * 60 * 1000000000ULL;  // 5 minutes
-
-    // Test the planner's logic (without actual index)
-    QueryPlanner planner;
-
-    // Test shard calculation
-    std::string seriesKey = planner.buildSeriesKeyForSharding(request.measurement, request.scopes, "value");
-
-    EXPECT_FALSE(seriesKey.empty());
-    EXPECT_TRUE(seriesKey.find("temperature") != std::string::npos);
-    EXPECT_TRUE(seriesKey.find("us-west") != std::string::npos);
-
-}

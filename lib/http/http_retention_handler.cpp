@@ -73,7 +73,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
         // Validate measurement name (no control characters or index key separators)
         for (char c : policyReq.measurement) {
-            if (c < 0x20 || c == '\x7f') {
+            if (static_cast<unsigned char>(c) < 0x20 || c == '\x7f') {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Measurement name contains control characters");
                 co_return reply;
@@ -194,7 +194,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
         // Validate measurement name if provided
         for (char c : measurement) {
-            if (c < 0x20 || c == '\x7f') {
+            if (static_cast<unsigned char>(c) < 0x20 || c == '\x7f') {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Measurement name contains control characters");
                 co_return reply;
@@ -254,7 +254,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
         // Validate measurement name
         for (char c : measurement) {
-            if (c < 0x20 || c == '\x7f') {
+            if (static_cast<unsigned char>(c) < 0x20 || c == '\x7f') {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Measurement name contains control characters");
                 co_return reply;

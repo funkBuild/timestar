@@ -117,7 +117,7 @@ bool SeriesMatcher::matchesWildcard(const std::string& value, const std::string&
     return std::regex_match(value, it->second);
 }
 
-bool SeriesMatcher::matchesRegex(const std::string& value, const std::string& pattern) {
+void SeriesMatcher::validateRegexSafety(const std::string& pattern) {
     // Guard against ReDoS: limit pattern length and reject patterns with
     // nested quantifiers that cause catastrophic backtracking in std::regex
     // (which has no timeout mechanism). Since Seastar is single-threaded
@@ -174,6 +174,10 @@ bool SeriesMatcher::matchesRegex(const std::string& value, const std::string& pa
             }
         }
     }
+}
+
+bool SeriesMatcher::matchesRegex(const std::string& value, const std::string& pattern) {
+    validateRegexSafety(pattern);
 
     // Cache compiled regex per pattern to avoid recompilation on each call.
     static thread_local std::unordered_map<std::string, std::regex> cache;
@@ -259,20 +263,26 @@ std::string SeriesMatcher::toRegexPattern(const std::string& pattern) {
         case ScopeMatchType::WILDCARD:
             // Convert * / ? wildcards to their regex equivalents.
             return wildcardToRegex(pattern);
-        case ScopeMatchType::REGEX:
+        case ScopeMatchType::REGEX: {
+            std::string raw;
             if (!pattern.empty() && pattern[0] == '~') {
                 // ~regex — strip the leading ~
-                return pattern.substr(1);
-            }
-            // /regex/ — strip surrounding slashes
-            {
+                raw = pattern.substr(1);
+            } else {
+                // /regex/ — strip surrounding slashes
                 size_t endPos = pattern.rfind('/');
                 if (endPos > 0) {
-                    return pattern.substr(1, endPos - 1);
+                    raw = pattern.substr(1, endPos - 1);
+                } else {
+                    // Malformed /regex pattern — treat the whole thing as the pattern
+                    raw = pattern;
                 }
-                // Malformed /regex pattern — treat the whole thing as the pattern
-                return pattern;
             }
+            // Apply the same ReDoS validation that matchesRegex() uses,
+            // so pre-compiled subscription regexes cannot bypass the guards.
+            validateRegexSafety(raw);
+            return raw;
+        }
         case ScopeMatchType::EXACT:
         default: {
             // Exact patterns don't need regex; caller should have checked

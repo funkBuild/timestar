@@ -48,7 +48,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
 
     // Scalar fallback (skip NaN values by zeroing their weight)
     for (size_t i = 0; i < n; ++i) {
-        double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
+        double w = (!std::isfinite(px[i]) || !std::isfinite(py[i])) ? 0.0 : pw[i];
         sumWeights += w;
         weightedSumX += w * px[i];
         weightedSumY += w * py[i];
@@ -80,7 +80,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
 
     // Scalar fallback (skip NaN values)
     for (size_t i = 0; i < n; ++i) {
-        double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
+        double w = (!std::isfinite(px[i]) || !std::isfinite(py[i])) ? 0.0 : pw[i];
         double dx = px[i] - fit.meanX;
         double dy = py[i] - meanY;
         sumXY += w * dx * dy;
@@ -117,7 +117,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
 
     // Scalar fallback
     for (size_t i = 0; i < n; ++i) {
-        double w = (std::isnan(px[i]) || std::isnan(py[i])) ? 0.0 : pw[i];
+        double w = (!std::isfinite(px[i]) || !std::isfinite(py[i])) ? 0.0 : pw[i];
         double predicted = fit.slope * px[i] + fit.intercept;
         double residual = py[i] - predicted;
         sse += w * residual * residual;

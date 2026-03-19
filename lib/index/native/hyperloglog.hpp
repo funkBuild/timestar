@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hyperloglog_simd.hpp"
+
 #include <xxhash.h>
 
 #include <algorithm>
@@ -41,11 +43,7 @@ public:
         // Harmonic mean of 2^(-register[j])
         double sum = 0.0;
         int zeros = 0;
-        for (size_t i = 0; i < NUM_REGISTERS; ++i) {
-            sum += 1.0 / static_cast<double>(1ULL << registers_[i]);
-            if (registers_[i] == 0)
-                ++zeros;
-        }
+        simd::hllEstimateSum(registers_.data(), NUM_REGISTERS, &sum, &zeros);
 
         // alpha_m constant for m = 16384
         constexpr double alpha = 0.7213 / (1.0 + 1.079 / static_cast<double>(NUM_REGISTERS));
@@ -61,10 +59,9 @@ public:
     }
 
     // Merge another HLL sketch (union = max of registers).
+    // Uses SIMD-accelerated element-wise max over 16KB of uint8_t registers.
     void merge(const HyperLogLog& other) {
-        for (size_t i = 0; i < NUM_REGISTERS; ++i) {
-            registers_[i] = std::max(registers_[i], other.registers_[i]);
-        }
+        simd::hllMergeRegisters(registers_.data(), other.registers_.data(), NUM_REGISTERS);
     }
 
     // Serialize: append 16KB register array to output.
@@ -77,6 +74,10 @@ public:
         HyperLogLog hll;
         if (data.size() >= SERIALIZED_SIZE) {
             std::memcpy(hll.registers_.data(), data.data(), SERIALIZED_SIZE);
+            // Clamp registers to max valid rank (51 for 14-bit precision + 64-bit hash)
+            // to prevent UB from `1ULL << registers_[i]` in estimate() when value >= 64.
+            // Uses SIMD-accelerated min across 16KB register array.
+            simd::hllClampRegisters(hll.registers_.data(), SERIALIZED_SIZE, 51);
         }
         return hll;
     }

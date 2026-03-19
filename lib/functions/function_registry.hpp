@@ -37,6 +37,7 @@ public:
     }
 
     bool hasFunction(const std::string& name) const;
+    const FunctionMetadata* getMetadata(const std::string& name) const;
     std::vector<std::string> getAllFunctionNames() const;
     std::vector<std::string> getFunctionsByCategory(FunctionCategory category) const;
     std::vector<std::string> searchFunctions(const std::string& pattern) const;

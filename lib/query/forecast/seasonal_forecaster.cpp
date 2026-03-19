@@ -384,6 +384,27 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
 
     // Working copy of data
     std::vector<double> y = input.values;
+
+    // Sanitize NaN/Inf values: replace with mean of finite values so that
+    // vectorMean (and downstream AR coefficients) don't propagate NaN.
+    {
+        double finiteSum = 0.0;
+        size_t finiteCount = 0;
+        for (size_t i = 0; i < y.size(); ++i) {
+            if (std::isfinite(y[i])) {
+                finiteSum += y[i];
+                ++finiteCount;
+            }
+        }
+        // finiteCount > 0 guaranteed by the all-NaN guard above
+        double finiteMean = (finiteCount > 0) ? (finiteSum / static_cast<double>(finiteCount)) : 0.0;
+        for (size_t i = 0; i < y.size(); ++i) {
+            if (!std::isfinite(y[i])) {
+                y[i] = finiteMean;
+            }
+        }
+    }
+
     double mean = anomaly::simd::vectorMean(y.data(), y.size());
 
     // Store last values for inverse differencing

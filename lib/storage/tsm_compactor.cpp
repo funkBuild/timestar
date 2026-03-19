@@ -409,34 +409,31 @@ void TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, SeriesCompaction
 
 seastar::future<CompactionResult> TSMCompactor::compact(
     const std::vector<seastar::shared_ptr<TSM>>& files,
+    uint64_t targetTier,
+    uint64_t targetSeq,
     const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies,
     const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
     if (files.empty()) {
         co_return CompactionResult{};
     }
 
-    // Determine output tier and filename
-    uint64_t maxTier = 0;
-    uint64_t maxSeq = 0;
-    for (const auto& file : files) {
-        maxTier = std::max(maxTier, file->tierNum);
-        maxSeq = std::max(maxSeq, file->seqNum);
+    // When called without a pre-allocated plan (targetSeq == 0), compute the
+    // target tier from the input files and allocate a fresh sequence ID.
+    // This preserves backward compatibility for direct callers (e.g. tests).
+    if (targetSeq == 0) {
+        uint64_t maxTier = 0;
+        for (const auto& file : files) {
+            maxTier = std::max(maxTier, file->tierNum);
+        }
+        targetTier = strategy->getTargetTier(maxTier, files.size());
+        targetSeq = fileManager->allocateSequenceId();
     }
 
-    uint64_t targetTier = strategy->getTargetTier(maxTier, files.size());
-    uint64_t targetSeq = fileManager->allocateSequenceId();
     std::string outputPath = generateCompactedFilename(targetTier, targetSeq);
 
     // Create temporary file for writing
     std::string tempPath = outputPath + ".tmp";
-    // Track whether we successfully renamed — if not, clean up the temp file.
-    bool tempRenamed = false;
-    // Scope guard: clean up the temp file on any exception before the rename succeeds.
-    struct TempCleanup {
-        const std::string& path;
-        bool& renamed;
-        ~TempCleanup() { if (!renamed) { try { fs::remove(path); } catch (...) {} } }
-    } tempCleanup{tempPath, tempRenamed};
+    try {
     TSMWriter writer(tempPath);
     // Use higher zstd compression for deeper tiers (better ratio, acceptable speed)
     if (targetTier >= 1) {
@@ -598,7 +595,6 @@ seastar::future<CompactionResult> TSMCompactor::compact(
 
     // Atomic rename from temp to final (async to avoid blocking the reactor)
     co_await seastar::rename_file(tempPath, outputPath);
-    tempRenamed = true;  // Rename succeeded — don't delete the output file
 
     // Fsync the parent directory to ensure the rename (directory entry update)
     // is durable.  Without this, a crash could lose the rename even though
@@ -615,6 +611,13 @@ seastar::future<CompactionResult> TSMCompactor::compact(
     }
 
     co_return CompactionResult{outputPath, stats};
+    } catch (...) {
+        // Clean up temp file — use blocking remove since we cannot co_await
+        // inside a catch handler in C++. This is the exception path only.
+        std::error_code ec;
+        std::filesystem::remove(tempPath, ec);
+        throw;
+    }
 }
 
 CompactionPlan TSMCompactor::planCompaction(uint64_t tier) {
@@ -668,8 +671,15 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
                       [&](const ActiveCompaction& a) { return a.plan.targetPath == plan.targetPath; });
     });
 
-    // Perform compaction (passing pending retention context if any)
-    auto compactionResult = co_await compact(plan.sourceFiles, _pendingRetentionPolicies, _pendingSeriesMeasurementMap);
+    // Perform compaction (passing pending retention context if any).
+    // Use the plan's pre-allocated targetTier and targetSeqNum so the output
+    // file path matches plan.targetPath (avoids wasting sequence IDs).
+    auto compactionResult = co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum,
+                                             _pendingRetentionPolicies, _pendingSeriesMeasurementMap);
+
+    // Clear pending retention context so subsequent compactions don't apply stale policies.
+    _pendingRetentionPolicies.clear();
+    _pendingSeriesMeasurementMap.clear();
 
     if (!compactionResult.outputPath.empty()) {
         // Open the new file
@@ -684,13 +694,21 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
         co_await fileManager->removeTSMFiles(plan.sourceFiles);
     }
 
-    // Propagate stats from the compact() call and add timing
-    active.stats = compactionResult.stats;
+    // Propagate stats from the compact() call and add timing.
+    // Update the vector element (not the local copy) so getActiveCompactionStats() sees real stats.
+    CompactionStats finalStats = compactionResult.stats;
     auto endTime = std::chrono::steady_clock::now();
-    active.stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - active.startTime);
+    finalStats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - active.startTime);
+
+    for (auto& ac : activeCompactions) {
+        if (ac.plan.targetPath == plan.targetPath) {
+            ac.stats = finalStats;
+            break;
+        }
+    }
 
     // removeActive fires here via scope guard
-    co_return active.stats;
+    co_return finalStats;
 }
 
 bool TSMCompactor::shouldCompact(uint64_t tier) const {
@@ -736,7 +754,7 @@ seastar::future<> TSMCompactor::forceFullCompaction() {
     timestar::compactor_log.info("Starting forced full compaction...");
 
     // Compact each tier from bottom up
-    for (uint64_t tier = 0; tier < 3; tier++) {
+    for (uint64_t tier = 0; tier < 4; tier++) {
         // Get all files in this tier, excluding any in active compaction
         std::vector<seastar::shared_ptr<TSM>> tierFiles;
         for (const auto& [seq, file] : fileManager->getSequencedTsmFiles()) {
@@ -750,7 +768,7 @@ seastar::future<> TSMCompactor::forceFullCompaction() {
 
             CompactionPlan plan;
             plan.sourceFiles = tierFiles;
-            plan.targetTier = tier + 1;
+            plan.targetTier = std::min(tier + 1, uint64_t{3});
             plan.targetSeqNum = fileManager->allocateSequenceId();
             plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
 

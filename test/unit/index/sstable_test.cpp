@@ -46,11 +46,11 @@ SEASTAR_TEST_F(SSTableTest, WriteAndReadSingle) {
     EXPECT_EQ(meta.maxKey, "hello");
 
     auto reader = co_await SSTableReader::open(path);
-    auto val = reader->get("hello");
+    auto val = co_await reader->get("hello");
     EXPECT_TRUE(val.has_value());
     EXPECT_EQ(*val, "world");
 
-    auto missing = reader->get("nothere");
+    auto missing = co_await reader->get("nothere");
     EXPECT_FALSE(missing.has_value());
 
     co_await reader->close();
@@ -73,13 +73,13 @@ SEASTAR_TEST_F(SSTableTest, WriteAndReadMany) {
 
     // Point lookups
     for (int i = 0; i < N; i += 50) {
-        auto val = reader->get(std::format("key:{:04d}", i));
+        auto val = co_await reader->get(std::format("key:{:04d}", i));
         EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
         EXPECT_EQ(*val, std::format("val:{:04d}", i));
     }
 
     // Non-existent keys
-    auto missing = reader->get("key:9999");
+    auto missing = co_await reader->get("key:9999");
     EXPECT_FALSE(missing.has_value());
 
     co_await reader->close();
@@ -96,14 +96,14 @@ SEASTAR_TEST_F(SSTableTest, IteratorFullScan) {
 
     auto reader = co_await SSTableReader::open(path);
     auto it = reader->newIterator();
-    it->seekToFirst();
+    co_await it->seekToFirst();
 
     int count = 0;
     while (it->valid()) {
         EXPECT_EQ(it->key(), std::format("k:{:04d}", count));
         EXPECT_EQ(it->value(), std::format("v:{:04d}", count));
         ++count;
-        it->next();
+        co_await it->next();
     }
     EXPECT_EQ(count, N);
 
@@ -123,22 +123,22 @@ SEASTAR_TEST_F(SSTableTest, IteratorSeek) {
     auto it = reader->newIterator();
 
     // Seek to exact key
-    it->seek("key:0050");
+    co_await it->seek("key:0050");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "key:0050");
 
     // Seek between keys
-    it->seek("key:0050a");
+    co_await it->seek("key:0050a");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "key:0051");
 
     // Seek before first
-    it->seek("aaa");
+    co_await it->seek("aaa");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "key:0000");
 
     // Seek past last
-    it->seek("zzz");
+    co_await it->seek("zzz");
     EXPECT_FALSE(it->valid());
 
     co_await reader->close();
@@ -155,11 +155,11 @@ SEASTAR_TEST_F(SSTableTest, IteratorSeekAndIterate) {
     auto reader = co_await SSTableReader::open(path);
     auto it = reader->newIterator();
 
-    it->seek("key:0095");
+    co_await it->seek("key:0095");
     int count = 0;
     while (it->valid()) {
         ++count;
-        it->next();
+        co_await it->next();
     }
     EXPECT_EQ(count, 5);  // keys 95-99
 
@@ -181,11 +181,11 @@ SEASTAR_TEST_F(SSTableTest, BinaryKeysAndValues) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto v1 = reader->get(key1);
+    auto v1 = co_await reader->get(key1);
     EXPECT_TRUE(v1.has_value());
     EXPECT_EQ(*v1, val1);
 
-    auto v2 = reader->get(key2);
+    auto v2 = co_await reader->get(key2);
     EXPECT_TRUE(v2.has_value());
     EXPECT_EQ(*v2, val2);
 
@@ -201,11 +201,11 @@ SEASTAR_TEST_F(SSTableTest, EmptyValues) {
     co_await writer.finish();
 
     auto reader = co_await SSTableReader::open(path);
-    auto v1 = reader->get("key1");
+    auto v1 = co_await reader->get("key1");
     EXPECT_TRUE(v1.has_value());
     EXPECT_EQ(*v1, "");
 
-    auto v3 = reader->get("key3");
+    auto v3 = co_await reader->get("key3");
     EXPECT_TRUE(v3.has_value());
     EXPECT_EQ(*v3, "value3");
 
@@ -226,7 +226,7 @@ SEASTAR_TEST_F(SSTableTest, BloomFilterRejects) {
     // (no disk read needed). We can't directly observe this, but we can
     // verify correctness.
     for (int i = 0; i < 100; ++i) {
-        auto val = reader->get(std::format("noexist:{:04d}", i));
+        auto val = co_await reader->get(std::format("noexist:{:04d}", i));
         EXPECT_FALSE(val.has_value());
     }
 
@@ -254,11 +254,11 @@ SEASTAR_TEST_F(SSTableTest, PrefixScan) {
 
     // Scan prefix \x05meas1
     std::string prefix = "\x05meas1";
-    it->seek(prefix);
+    co_await it->seek(prefix);
     int count = 0;
     while (it->valid() && it->key().substr(0, prefix.size()) == prefix) {
         ++count;
-        it->next();
+        co_await it->next();
     }
     EXPECT_EQ(count, 10);
 
@@ -333,7 +333,7 @@ SEASTAR_TEST_F(SSTableTest, ExtendedFooterRoundTrip) {
     EXPECT_EQ(rmeta.minKey, "key:0000");
 
     // Verify data is still readable
-    auto val = reader->get("key:0050");
+    auto val = co_await reader->get("key:0050");
     EXPECT_TRUE(val.has_value());
     EXPECT_EQ(*val, "val:0050");
 
@@ -357,11 +357,11 @@ SEASTAR_TEST_F(SSTableTest, EntryCountCorrectInMetadata) {
 
     // Verify by iterating
     auto it = reader->newIterator();
-    it->seekToFirst();
+    co_await it->seekToFirst();
     int count = 0;
     while (it->valid()) {
         ++count;
-        it->next();
+        co_await it->next();
     }
     EXPECT_EQ(count, N);
 
@@ -388,7 +388,7 @@ SEASTAR_TEST_F(SSTableTest, CRC32ChecksumRoundTrip) {
 
     // Point lookups (each triggers block decompression with CRC validation)
     for (int i = 0; i < N; ++i) {
-        auto val = reader->get(std::format("key:{:04d}", i));
+        auto val = co_await reader->get(std::format("key:{:04d}", i));
         EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
         if (val.has_value()) {
             EXPECT_EQ(*val, std::format("val:{:04d}", i));
@@ -397,13 +397,13 @@ SEASTAR_TEST_F(SSTableTest, CRC32ChecksumRoundTrip) {
 
     // Full iteration (validates CRC on every block boundary)
     auto it = reader->newIterator();
-    it->seekToFirst();
+    co_await it->seekToFirst();
     int count = 0;
     while (it->valid()) {
         EXPECT_EQ(it->key(), std::format("key:{:04d}", count));
         EXPECT_EQ(it->value(), std::format("val:{:04d}", count));
         ++count;
-        it->next();
+        co_await it->next();
     }
     EXPECT_EQ(count, N);
 
@@ -433,7 +433,7 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexLargeFile) {
 
     // Verify every entry is findable via point lookup (uses summary-accelerated findBlock)
     for (int i = 0; i < N; ++i) {
-        auto val = reader->get(std::format("key:{:06d}", i));
+        auto val = co_await reader->get(std::format("key:{:06d}", i));
         EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
         if (val.has_value()) {
             EXPECT_EQ(*val, std::format("val:{:06d}", i));
@@ -441,9 +441,9 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexLargeFile) {
     }
 
     // Verify non-existent keys return nullopt
-    EXPECT_FALSE(reader->get("key:999999").has_value());
-    EXPECT_FALSE(reader->get("aaa").has_value());
-    EXPECT_FALSE(reader->get("zzz").has_value());
+    EXPECT_FALSE((co_await reader->get("key:999999")).has_value());
+    EXPECT_FALSE((co_await reader->get("aaa")).has_value());
+    EXPECT_FALSE((co_await reader->get("zzz")).has_value());
 
     co_await reader->close();
 }
@@ -466,7 +466,7 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexCorrectness) {
 
     // Test 1: Exact match lookups at various positions
     for (int i = 0; i < N; i += 100) {
-        auto val = reader->get(std::format("k:{:08d}", i * 10));
+        auto val = co_await reader->get(std::format("k:{:08d}", i * 10));
         EXPECT_TRUE(val.has_value()) << "Missing key at i=" << i;
         if (val.has_value()) {
             EXPECT_EQ(*val, std::format("v:{:08d}", i * 10));
@@ -475,34 +475,34 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexCorrectness) {
 
     // Test 2: Keys between existing entries should return nullopt
     // (key:00000005 doesn't exist — only multiples of 10)
-    EXPECT_FALSE(reader->get("k:00000005").has_value());
-    EXPECT_FALSE(reader->get("k:00000015").has_value());
-    EXPECT_FALSE(reader->get("k:00025005").has_value());
+    EXPECT_FALSE((co_await reader->get("k:00000005")).has_value());
+    EXPECT_FALSE((co_await reader->get("k:00000015")).has_value());
+    EXPECT_FALSE((co_await reader->get("k:00025005")).has_value());
 
     // Test 3: Key before first entry
-    EXPECT_FALSE(reader->get("a:00000000").has_value());
+    EXPECT_FALSE((co_await reader->get("a:00000000")).has_value());
 
     // Test 4: Key after last entry
-    EXPECT_FALSE(reader->get("z:99999999").has_value());
+    EXPECT_FALSE((co_await reader->get("z:99999999")).has_value());
 
     // Test 5: Iterator seek still works with summary index
     auto it = reader->newIterator();
-    it->seek("k:00005000");
+    co_await it->seek("k:00005000");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "k:00005000");
 
     // Seek between keys — should land on next key
-    it->seek("k:00005001");
+    co_await it->seek("k:00005001");
     EXPECT_TRUE(it->valid());
     EXPECT_EQ(it->key(), "k:00005010");
 
     // Test 6: Full iteration correctness with summary index
-    it->seekToFirst();
+    co_await it->seekToFirst();
     int count = 0;
     while (it->valid()) {
         EXPECT_EQ(it->key(), std::format("k:{:08d}", count * 10));
         ++count;
-        it->next();
+        co_await it->next();
     }
     EXPECT_EQ(count, N);
 
@@ -525,7 +525,7 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexNotBuiltForSmallFiles) {
     // Summary should NOT be built (fewer than SUMMARY_INTERVAL * 2 blocks)
     // But lookups should still work correctly
     for (int i = 0; i < N; ++i) {
-        auto val = reader->get(std::format("key:{:04d}", i));
+        auto val = co_await reader->get(std::format("key:{:04d}", i));
         EXPECT_TRUE(val.has_value()) << "Missing key:" << i;
         if (val.has_value()) {
             EXPECT_EQ(*val, std::format("val:{:04d}", i));
@@ -550,10 +550,10 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexContainsCheck) {
 
     // contains() uses findBlock() internally, so this tests summary acceleration
     for (int i = 0; i < N; i += 200) {
-        EXPECT_TRUE(reader->contains(std::format("c:{:06d}", i))) << "Missing at i=" << i;
+        EXPECT_TRUE(co_await reader->contains(std::format("c:{:06d}", i))) << "Missing at i=" << i;
     }
-    EXPECT_FALSE(reader->contains("c:999999"));
-    EXPECT_FALSE(reader->contains("aaa"));
+    EXPECT_FALSE(co_await reader->contains("c:999999"));
+    EXPECT_FALSE(co_await reader->contains("aaa"));
 
     co_await reader->close();
 }
@@ -581,7 +581,7 @@ SEASTAR_TEST_F(SSTableTest, CRC32CorruptionDetected) {
 
     // Re-open and attempt to read — should detect CRC mismatch
     auto reader = co_await SSTableReader::open(path);
-    EXPECT_THROW(reader->get("key:0000"), std::runtime_error);
+    EXPECT_THROW(co_await reader->get("key:0000"), std::runtime_error);
 
     co_await reader->close();
 }

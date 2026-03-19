@@ -89,6 +89,9 @@ IndexWriteBatch IndexWriteBatch::deserializeFrom(std::string_view data) {
         auto type = static_cast<IndexWriteBatch::OpType>(*p);
         ++p;
 
+        if (type != OpType::Put && type != OpType::Delete)
+            throw std::runtime_error("WriteBatch: invalid op type");
+
         if (p + 4 > end)
             throw std::runtime_error("WriteBatch: truncated at key length");
         uint32_t keyLen = readFixed32(p);

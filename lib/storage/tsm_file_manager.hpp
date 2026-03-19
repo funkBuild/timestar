@@ -58,6 +58,7 @@ public:
     ~TSMFileManager();  // Defined in .cpp where TSMCompactor is complete
 
     seastar::future<> init();
+    seastar::future<> stop();
     seastar::future<> writeMemstore(seastar::shared_ptr<MemoryStore> memStore, uint64_t tier = 0);
     std::optional<TSMValueType> getSeriesType(const std::string& seriesKey);
     std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);

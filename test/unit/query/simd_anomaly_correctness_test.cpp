@@ -152,13 +152,7 @@ void computeMovingAverage(const double* values, size_t count, size_t windowSize,
 
 class SimdAnomalyCorrectnessTest : public ::testing::Test {
 protected:
-    bool avx2Available_ = false;
-    bool avx512Available_ = false;
-
-    void SetUp() override {
-        avx2Available_ = simd_ns::isAvx2Available();
-        avx512Available_ = simd_ns::isAvx512Available();
-    }
+    void SetUp() override {}
 };
 
 // ==================== Vector Operations ====================

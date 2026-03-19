@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -79,9 +80,9 @@ void ProductionMonitor::onTimerTick() {
                                  system_snapshot.system_memory_bytes / 1024 / 1024);
         }
     } catch (const std::exception& e) {
-        if (detailed_logging_) {
-            monitoring_log.error("[ProductionMonitor] Error in monitoring tick: {}", e.what());
-        }
+        monitoring_log.error("Monitoring tick error: {}", e.what());
+    } catch (...) {
+        monitoring_log.error("Unknown monitoring tick error");
     }
 }
 
@@ -535,7 +536,12 @@ uint64_t ProductionMonitor::getCurrentMemoryUsage() {
             std::istringstream iss(line);
             std::string label, size_str, unit;
             iss >> label >> size_str >> unit;
-            return std::stoull(size_str) * 1024;  // Convert KB to bytes
+            uint64_t kb = 0;
+            auto [ptr, ec] = std::from_chars(size_str.data(), size_str.data() + size_str.size(), kb);
+            if (ec != std::errc()) {
+                return 0;
+            }
+            return kb * 1024;  // Convert KB to bytes
         }
     }
     return 0;

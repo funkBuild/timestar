@@ -9,6 +9,8 @@
 #include <optional>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -111,6 +113,22 @@ private:
     static constexpr size_t STREAM_FLUSH_THRESHOLD = 256 * 1024;
 };
 
+// Move-only container for a raw (compressed) block read from disk.
+// Holds the DMA temporary_buffer and the on-disk block size.
+struct RawBlock {
+    seastar::temporary_buffer<char> data;
+    uint32_t size;
+
+    RawBlock() = default;
+    RawBlock(seastar::temporary_buffer<char> d, uint32_t s) : data(std::move(d)), size(s) {}
+
+    // Move-only (temporary_buffer is move-only)
+    RawBlock(const RawBlock&) = delete;
+    RawBlock& operator=(const RawBlock&) = delete;
+    RawBlock(RawBlock&&) noexcept = default;
+    RawBlock& operator=(RawBlock&&) noexcept = default;
+};
+
 // Reads an SSTable file and provides point lookups and range iteration.
 // Step 1: Lazy block loading — only footer, index, and bloom filter are parsed
 // at open(). Data blocks are decompressed on demand.
@@ -132,18 +150,18 @@ public:
     // Point lookup: returns the value for a key, or nullopt if not found.
     // Uses bloom filter to skip unnecessary block reads.
     // Reads compressed block from disk on demand (cached if block cache provided).
-    std::optional<std::string> get(std::string_view key);
+    seastar::future<std::optional<std::string>> get(std::string_view key);
 
     // Step 8: Existence check without copying the value.
     // Returns true if the key exists, false otherwise.
-    bool contains(std::string_view key);
+    seastar::future<bool> contains(std::string_view key);
 
     // Range iteration.
     class Iterator {
     public:
-        void seek(std::string_view target);
-        void seekToFirst();
-        void next();
+        seastar::future<> seek(std::string_view target);
+        seastar::future<> seekToFirst();
+        seastar::future<> next();
 
         bool valid() const { return valid_; }
         std::string_view key() const { return key_; }
@@ -162,7 +180,7 @@ public:
         std::string key_;
         std::string_view value_;
 
-        void loadBlock(size_t idx);
+        seastar::future<> loadBlock(size_t idx);
         void updateFromBlockIter();
     };
 
@@ -177,13 +195,24 @@ public:
 
     // Decompress a single block from the raw file data. Returns the
     // decompressed block content. Does NOT consult the block cache.
-    std::string decompressBlock(size_t blockIndex) const;
+    seastar::future<std::string> decompressBlock(size_t blockIndex);
 
     size_t blockCount() const { return index_.size(); }
     uint64_t cacheId() const { return cacheId_; }
 
+    // Concurrency semaphore: limits concurrent cache-miss block reads per shard.
+    // Set by NativeIndex::open() — pointer is per-shard (thread-local in Seastar).
+    static seastar::semaphore* blockReadSemaphore_;
+    static void setBlockReadSemaphore(seastar::semaphore* sem);
+
 private:
     SSTableReader() = default;
+
+    // I/O-only: read the raw (compressed) block from disk via DMA.
+    seastar::future<RawBlock> readRawBlock(size_t blockIndex);
+
+    // CPU-only: verify CRC and decompress a raw block. Pure function, no I/O.
+    static std::string decompressRawBlock(const RawBlock& raw, std::string_view filename, size_t blockIndex);
 
     // Find the block index for a key via binary search on the index.
     // Uses two-phase lookup when summary index is available:
@@ -195,9 +224,9 @@ private:
     void buildSummary();
 
     // Get decompressed block data, checking cache first.
-    // |fallback| is populated on cache miss without a block cache.
-    // Returns a reference valid until the next cache mutation on this shard.
-    const std::string& getDecompressedBlock(size_t idx, std::string& fallback) const;
+    // On cache hit, returns the cached block string (no I/O).
+    // On cache miss, reads and decompresses from disk asynchronously.
+    seastar::future<std::string> getDecompressedBlock(size_t idx);
 
     std::string filename_;
     SSTableMetadata metadata_;
@@ -216,11 +245,12 @@ private:
     };
     std::vector<SummaryEntry> summary_;
 
-    // On-disk streaming: keep a POSIX fd open for synchronous pread() of data blocks.
+    // On-disk streaming: keep a Seastar DMA file open for async reads of data blocks.
     // Only metadata (bloom + index) is held in memory — data blocks are read on demand
     // and cached via the block cache. This bounds per-SSTable memory to O(bloom + index)
     // instead of O(file_size).
-    int readFd_ = -1;
+    seastar::file readFile_;
+    bool readFileOpen_ = false;
 
     // Step 2: Block cache (optional, shared across SSTables on this shard)
     BlockCache* blockCache_ = nullptr;

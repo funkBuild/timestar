@@ -24,45 +24,28 @@ double Aggregator::calculateAvg(const std::vector<double>& values) {
     if (values.empty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
-    // Use SIMD when available for better performance
-    if (simd::SimdAggregator::isAvx2Available()) {
-        return simd::SimdAggregator::calculateAvg(values.data(), values.size());
-    }
-    double sum = std::accumulate(values.begin(), values.end(), 0.0);
-    return sum / values.size();
+    return simd::SimdAggregator::calculateAvg(values.data(), values.size());
 }
 
 double Aggregator::calculateMin(const std::vector<double>& values) {
     if (values.empty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
-    // Use SIMD when available for better performance
-    if (simd::SimdAggregator::isAvx2Available()) {
-        return simd::SimdAggregator::calculateMin(values.data(), values.size());
-    }
-    return *std::min_element(values.begin(), values.end());
+    return simd::SimdAggregator::calculateMin(values.data(), values.size());
 }
 
 double Aggregator::calculateMax(const std::vector<double>& values) {
     if (values.empty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
-    // Use SIMD when available for better performance
-    if (simd::SimdAggregator::isAvx2Available()) {
-        return simd::SimdAggregator::calculateMax(values.data(), values.size());
-    }
-    return *std::max_element(values.begin(), values.end());
+    return simd::SimdAggregator::calculateMax(values.data(), values.size());
 }
 
 double Aggregator::calculateSum(const std::vector<double>& values) {
     if (values.empty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
-    // Use SIMD when available for better performance
-    if (simd::SimdAggregator::isAvx2Available()) {
-        return simd::SimdAggregator::calculateSum(values.data(), values.size());
-    }
-    return std::accumulate(values.begin(), values.end(), 0.0);
+    return simd::SimdAggregator::calculateSum(values.data(), values.size());
 }
 
 // ============================================================================
@@ -223,9 +206,13 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
                 break;
             case AggregationMethod::FIRST:
                 break;
+            // These methods require full AggregationState; should not reach here.
+            case AggregationMethod::SPREAD:
+            case AggregationMethod::STDDEV:
+            case AggregationMethod::STDVAR:
+            case AggregationMethod::MEDIAN:
+                break;
             default:
-                for (size_t i = 0; i < N; ++i)
-                    dst[i] += src[i];
                 break;
         }
     }
@@ -280,8 +267,14 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
             case AggregationMethod::LATEST:
             case AggregationMethod::FIRST:
                 return existing;
+            // These methods require full AggregationState; should not reach here.
+            case AggregationMethod::SPREAD:
+            case AggregationMethod::STDDEV:
+            case AggregationMethod::STDVAR:
+            case AggregationMethod::MEDIAN:
+                return existing;
             default:
-                return existing + incoming;
+                return existing;
         }
     };
 
@@ -606,7 +599,14 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     }
                 }
 
-                if (allRaw && !groupPartials.empty()) {
+                // SPREAD/STDDEV/STDVAR/MEDIAN need full AggregationState;
+                // they cannot be folded from raw values alone.
+                bool methodCanFoldRaw = method != AggregationMethod::SPREAD &&
+                                        method != AggregationMethod::STDDEV &&
+                                        method != AggregationMethod::STDVAR &&
+                                        method != AggregationMethod::MEDIAN;
+
+                if (allRaw && methodCanFoldRaw && !groupPartials.empty()) {
                     // Fast path: merge raw (timestamp, value) vectors directly.
                     auto* first = groupPartials[0];
 
@@ -651,11 +651,13 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     // Fallback: some partials have AggregationStates (from the
                     // createPartialAggregations path). Convert any raw-value
                     // partials to states, then merge normally.
+                    const bool needsRaw = (method == AggregationMethod::MEDIAN);
                     for (auto* p : groupPartials) {
                         if (!p->sortedValues.empty() && p->sortedStates.empty()) {
                             p->sortedStates.reserve(p->sortedTimestamps.size());
                             for (size_t i = 0; i < p->sortedTimestamps.size(); ++i) {
                                 AggregationState s;
+                                s.collectRaw = needsRaw;
                                 s.addValue(p->sortedValues[i], p->sortedTimestamps[i]);
                                 p->sortedStates.push_back(s);
                             }
@@ -705,12 +707,16 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
         return {};
     }
 
+    const bool needsRaw = (method == AggregationMethod::MEDIAN);
+
     if (interval > 0) {
         // Bucketed aggregation
         std::unordered_map<uint64_t, AggregationState> buckets;
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
             uint64_t bucketTime = (timestamps[i] / interval) * interval;
-            buckets[bucketTime].addValue(values[i], timestamps[i]);
+            auto& state = buckets[bucketTime];
+            if (needsRaw) state.collectRaw = true;
+            state.addValue(values[i], timestamps[i]);
         }
 
         std::vector<AggregatedPoint> result;
@@ -725,7 +731,9 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
         // No bucketing - one point per timestamp
         std::unordered_map<uint64_t, AggregationState> states;
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
-            states[timestamps[i]].addValue(values[i], timestamps[i]);
+            auto& state = states[timestamps[i]];
+            if (needsRaw) state.collectRaw = true;
+            state.addValue(values[i], timestamps[i]);
         }
 
         std::vector<AggregatedPoint> result;
@@ -747,12 +755,15 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
     }
 
     // Merge all series into one set of timestamp states
+    const bool needsRaw = (method == AggregationMethod::MEDIAN);
     std::unordered_map<uint64_t, AggregationState> mergedStates;
 
     for (const auto& [timestamps, values] : groupData) {
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
             uint64_t key = interval > 0 ? (timestamps[i] / interval) * interval : timestamps[i];
-            mergedStates[key].addValue(values[i], timestamps[i]);
+            auto& state = mergedStates[key];
+            if (needsRaw) state.collectRaw = true;
+            state.addValue(values[i], timestamps[i]);
         }
     }
 

@@ -2,6 +2,7 @@
 
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 
 namespace timestar::functions {
 
@@ -343,11 +344,162 @@ std::string FunctionSecurity::sanitizeInput(const std::string& input, size_t max
 }
 
 bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
-    for (const auto& pattern : getDangerousPatterns()) {
-        if (std::regex_search(input, pattern)) {
-            return true;
+    // Pre-lowercase once (all patterns are case-insensitive)
+    std::string lower;
+    lower.resize(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(input[i])));
+    }
+
+    // Shell metacharacters
+    if (lower.find_first_of(";&|`$") != std::string::npos) return true;
+
+    // Code injection: keyword + optional whitespace + '('
+    static constexpr std::string_view parenKw[] = {"__import__", "exec", "eval", "system", "shell_exec"};
+    for (auto kw : parenKw) {
+        size_t pos = 0;
+        while ((pos = lower.find(kw, pos)) != std::string::npos) {
+            size_t p = pos + kw.size();
+            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) ++p;
+            if (p < lower.size() && lower[p] == '(') return true;
+            ++pos;
         }
     }
+
+    // Command injection: keyword + at least one whitespace
+    static constexpr std::string_view cmdKw[] = {"rm", "sudo", "chmod", "kill", "ps", "ls", "cat", "curl", "wget", "nc"};
+    for (auto kw : cmdKw) {
+        size_t pos = 0;
+        while ((pos = lower.find(kw, pos)) != std::string::npos) {
+            size_t p = pos + kw.size();
+            if (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) return true;
+            ++pos;
+        }
+    }
+
+    // Path traversal
+    if (lower.find("../") != std::string::npos || lower.find("..\\") != std::string::npos) return true;
+    if (lower.find("%2e%2e%2f") != std::string::npos || lower.find("%2e%2e%5c") != std::string::npos) return true;
+    if (lower.find("\\.\\.\\" ) != std::string::npos || lower.find("\\.\\./" ) != std::string::npos) return true;
+
+    // SQL injection: ' or '
+    {
+        size_t pos = 0;
+        while ((pos = lower.find('\'', pos)) != std::string::npos) {
+            size_t p = pos + 1;
+            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
+            if (p + 2 <= lower.size() && lower[p] == 'o' && lower[p + 1] == 'r') {
+                size_t q = p + 2;
+                while (q < lower.size() && (lower[q] == ' ' || lower[q] == '\t')) ++q;
+                if (q < lower.size() && lower[q] == '\'') return true;
+            }
+            ++pos;
+        }
+    }
+    // ' union select
+    {
+        size_t pos = 0;
+        while ((pos = lower.find('\'', pos)) != std::string::npos) {
+            size_t p = pos + 1;
+            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
+            if (lower.compare(p, 5, "union") == 0) {
+                size_t q = p + 5;
+                while (q < lower.size() && (lower[q] == ' ' || lower[q] == '\t')) ++q;
+                if (lower.compare(q, 6, "select") == 0) return true;
+            }
+            ++pos;
+        }
+    }
+    // Two-word SQL: drop table, delete from, insert into
+    static constexpr struct { std::string_view kw1; std::string_view kw2; } sqlPairs[] = {
+        {"drop", "table"}, {"delete", "from"}, {"insert", "into"}
+    };
+    for (const auto& [kw1, kw2] : sqlPairs) {
+        size_t pos = 0;
+        while ((pos = lower.find(kw1, pos)) != std::string::npos) {
+            size_t p = pos + kw1.size();
+            if (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) {
+                while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) ++p;
+                if (lower.compare(p, kw2.size(), kw2) == 0) return true;
+            }
+            ++pos;
+        }
+    }
+
+    // XSS: <script...>
+    {
+        size_t pos = 0;
+        while ((pos = lower.find("<script", pos)) != std::string::npos) {
+            size_t p = pos + 7;
+            while (p < lower.size() && lower[p] != '>') ++p;
+            if (p < lower.size()) return true;
+            ++pos;
+        }
+    }
+    // javascript:
+    {
+        size_t pos = 0;
+        while ((pos = lower.find("javascript", pos)) != std::string::npos) {
+            size_t p = pos + 10;
+            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
+            if (p < lower.size() && lower[p] == ':') return true;
+            ++pos;
+        }
+    }
+    // on\w{1,30}\s*= (event handler attributes)
+    {
+        size_t pos = 0;
+        while ((pos = lower.find("on", pos)) != std::string::npos) {
+            size_t p = pos + 2;
+            size_t wc = 0;
+            while (p < lower.size() && (std::isalnum(static_cast<unsigned char>(lower[p])) || lower[p] == '_')) { ++p; ++wc; if (wc > 30) break; }
+            if (wc >= 1 && wc <= 30) {
+                while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
+                if (p < lower.size() && lower[p] == '=') return true;
+            }
+            ++pos;
+        }
+    }
+
+    // Hex escape: \x followed by 2 hex digits
+    {
+        size_t pos = 0;
+        while ((pos = lower.find("\\x", pos)) != std::string::npos) {
+            if (pos + 3 < lower.size() &&
+                std::isxdigit(static_cast<unsigned char>(lower[pos + 2])) &&
+                std::isxdigit(static_cast<unsigned char>(lower[pos + 3]))) return true;
+            ++pos;
+        }
+    }
+
+    // Format string: %n or %<2+ digits><s|d|x|n>
+    {
+        size_t pos = 0;
+        while ((pos = lower.find('%', pos)) != std::string::npos) {
+            if (pos + 1 < lower.size() && lower[pos + 1] == 'n') return true;
+            size_t p = pos + 1;
+            size_t dc = 0;
+            while (p < lower.size() && lower[p] >= '0' && lower[p] <= '9') { ++p; ++dc; }
+            if (dc >= 2 && p < lower.size() && (lower[p] == 's' || lower[p] == 'd' || lower[p] == 'x' || lower[p] == 'n')) return true;
+            ++pos;
+        }
+    }
+
+    // LDAP injection: *)([\w=*]+)(|
+    {
+        size_t pos = 0;
+        while ((pos = lower.find("*)(", pos)) != std::string::npos) {
+            size_t p = pos + 3;
+            size_t cc = 0;
+            while (p < lower.size() && (std::isalnum(static_cast<unsigned char>(lower[p])) || lower[p] == '_' || lower[p] == '=' || lower[p] == '*')) { ++p; ++cc; }
+            if (cc > 0 && p + 2 < lower.size() && lower[p] == ')' && lower[p+1] == '(' && lower[p+2] == '|') return true;
+            ++pos;
+        }
+    }
+
+    // Protocol injection
+    if (lower.find("file://") != std::string::npos || lower.find("ftp://") != std::string::npos || lower.find("ldap://") != std::string::npos) return true;
+
     return false;
 }
 

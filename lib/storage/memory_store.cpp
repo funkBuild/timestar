@@ -360,7 +360,12 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
     auto start_memory_insert = std::chrono::high_resolution_clock::now();
 #endif
     for (auto& insertRequest : insertRequests) {
-        insertMemory(std::move(insertRequest));
+        try {
+            insertMemory(std::move(insertRequest));
+        } catch (const std::exception& e) {
+            timestar::memory_log.warn("insertMemory failed for series {}: {} — data is in WAL and will be recovered on restart",
+                                      insertRequest.seriesKey(), e.what());
+        }
     }
 #if TIMESTAR_LOG_INSERT_PATH
     auto end_memory_batch = std::chrono::high_resolution_clock::now();

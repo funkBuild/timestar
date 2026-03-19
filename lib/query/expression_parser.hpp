@@ -74,9 +74,11 @@ private:
     ExpressionLexer lexer_;
     Token currentToken_;
     std::set<std::string> queryRefs_;
+    size_t inputLength_ = 0;
     int depth_ = 0;
     static constexpr int MAX_DEPTH = 100;
     static constexpr size_t MAX_ARGS = 1000;
+    static constexpr size_t MAX_EXPRESSION_LENGTH = 10240;
 
     // Operator precedence levels
     static constexpr int PREC_NONE = 0;

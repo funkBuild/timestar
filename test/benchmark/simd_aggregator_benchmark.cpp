@@ -46,9 +46,8 @@ int main() {
     std::cout << "=== SIMD Aggregator Performance Benchmark ===" << std::endl;
     std::cout << std::endl;
 
-    // Check AVX2 availability
-    bool avx2_available = timestar::simd::SimdAggregator::isAvx2Available();
-    std::cout << "AVX2 Support: " << (avx2_available ? "✓ Available" : "✗ Not Available") << std::endl;
+    // Highway handles ISA dispatch automatically at runtime
+    std::cout << "SIMD Support: Highway runtime dispatch (best available ISA)" << std::endl;
     std::cout << std::endl;
 
     // Test different data sizes
@@ -71,15 +70,12 @@ int main() {
             return sum;
         });
 
-        double simd_sum_time = 0.0;
-        if (avx2_available) {
-            simd_sum_time = benchmark("  SIMD Sum (AVX2)", [&]() {
-                return timestar::simd::SimdAggregator::calculateSum(data.data(), data.size());
-            });
+        double simd_sum_time = benchmark("  SIMD Sum", [&]() {
+            return timestar::simd::SimdAggregator::calculateSum(data.data(), data.size());
+        });
 
-            double speedup = scalar_sum_time / simd_sum_time;
-            std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x" << std::endl;
-        }
+        double speedup_sum = scalar_sum_time / simd_sum_time;
+        std::cout << "  Speedup: " << std::setprecision(2) << speedup_sum << "x" << std::endl;
 
         // Benchmark MIN
         std::cout << "\nMIN Operation:" << std::endl;
@@ -93,15 +89,12 @@ int main() {
             return min_val;
         });
 
-        double simd_min_time = 0.0;
-        if (avx2_available) {
-            simd_min_time = benchmark("  SIMD Min (AVX2)", [&]() {
-                return timestar::simd::SimdAggregator::calculateMin(data.data(), data.size());
-            });
+        double simd_min_time = benchmark("  SIMD Min", [&]() {
+            return timestar::simd::SimdAggregator::calculateMin(data.data(), data.size());
+        });
 
-            double speedup = scalar_min_time / simd_min_time;
-            std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x" << std::endl;
-        }
+        double speedup_min = scalar_min_time / simd_min_time;
+        std::cout << "  Speedup: " << std::setprecision(2) << speedup_min << "x" << std::endl;
 
         // Benchmark MAX
         std::cout << "\nMAX Operation:" << std::endl;
@@ -115,15 +108,12 @@ int main() {
             return max_val;
         });
 
-        double simd_max_time = 0.0;
-        if (avx2_available) {
-            simd_max_time = benchmark("  SIMD Max (AVX2)", [&]() {
-                return timestar::simd::SimdAggregator::calculateMax(data.data(), data.size());
-            });
+        double simd_max_time = benchmark("  SIMD Max", [&]() {
+            return timestar::simd::SimdAggregator::calculateMax(data.data(), data.size());
+        });
 
-            double speedup = scalar_max_time / simd_max_time;
-            std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x" << std::endl;
-        }
+        double speedup_max = scalar_max_time / simd_max_time;
+        std::cout << "  Speedup: " << std::setprecision(2) << speedup_max << "x" << std::endl;
 
         // Benchmark AVERAGE
         std::cout << "\nAVERAGE Operation:" << std::endl;
@@ -136,15 +126,12 @@ int main() {
             return sum / data.size();
         });
 
-        double simd_avg_time = 0.0;
-        if (avx2_available) {
-            simd_avg_time = benchmark("  SIMD Avg (AVX2)", [&]() {
-                return timestar::simd::SimdAggregator::calculateAvg(data.data(), data.size());
-            });
+        double simd_avg_time = benchmark("  SIMD Avg", [&]() {
+            return timestar::simd::SimdAggregator::calculateAvg(data.data(), data.size());
+        });
 
-            double speedup = scalar_avg_time / simd_avg_time;
-            std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x" << std::endl;
-        }
+        double speedup_avg = scalar_avg_time / simd_avg_time;
+        std::cout << "  Speedup: " << std::setprecision(2) << speedup_avg << "x" << std::endl;
 
         // Benchmark DOT PRODUCT (useful for weighted aggregations)
         std::cout << "\nDOT PRODUCT Operation:" << std::endl;
@@ -159,28 +146,20 @@ int main() {
             return dot;
         });
 
-        double simd_dot_time = 0.0;
-        if (avx2_available) {
-            simd_dot_time = benchmark("  SIMD Dot Product (AVX2)", [&]() {
-                return timestar::simd::SimdAggregator::dotProduct(data.data(), weights.data(), data.size());
-            });
+        double simd_dot_time = benchmark("  SIMD Dot Product", [&]() {
+            return timestar::simd::SimdAggregator::dotProduct(data.data(), weights.data(), data.size());
+        });
 
-            double speedup = scalar_dot_time / simd_dot_time;
-            std::cout << "  Speedup: " << std::setprecision(2) << speedup << "x" << std::endl;
-        }
+        double speedup_dot = scalar_dot_time / simd_dot_time;
+        std::cout << "  Speedup: " << std::setprecision(2) << speedup_dot << "x" << std::endl;
 
         std::cout << std::endl;
     }
 
     // Summary
     std::cout << "=== Summary ===" << std::endl;
-    if (avx2_available) {
-        std::cout << "SIMD optimizations are providing significant speedups for large datasets." << std::endl;
-        std::cout << "Typical speedup: 2-4x for aggregation operations on arrays > 1000 elements." << std::endl;
-    } else {
-        std::cout << "AVX2 is not available on this CPU. Using scalar fallback implementations." << std::endl;
-        std::cout << "Consider running on a modern Intel/AMD processor for SIMD benefits." << std::endl;
-    }
+    std::cout << "SIMD optimizations are providing significant speedups for large datasets." << std::endl;
+    std::cout << "Typical speedup: 2-4x for aggregation operations on arrays > 1000 elements." << std::endl;
 
     return 0;
 }

@@ -87,7 +87,12 @@ class SubscriptionManager {
 public:
     SubscriptionManager() = default;
 
+    // Set the configurable maximum number of local subscriptions per shard.
+    // Must match the streaming config's max_subscriptions_per_shard value.
+    void setMaxLocalSubscriptions(size_t limit) { _maxLocalSubscriptions = limit; }
+
     // Register a subscription on this shard.
+    // Throws std::runtime_error if the local subscription limit is exceeded.
     void addSubscription(const Subscription& sub);
 
     // Register a local output queue for a subscription (handler shard only).
@@ -139,7 +144,8 @@ private:
     tsl::robin_map<uint64_t, uint64_t> _sequenceCounters;
     tsl::robin_map<uint64_t, uint64_t> _droppedCounters;
 
-    static constexpr size_t MAX_LOCAL_SUBSCRIPTIONS = 10'000;
+    static constexpr size_t DEFAULT_MAX_LOCAL_SUBSCRIPTIONS = 10'000;
+    size_t _maxLocalSubscriptions = DEFAULT_MAX_LOCAL_SUBSCRIPTIONS;
     uint64_t _nextSubscriptionId = 0;
     size_t _localSubscriptionCount = 0;
 

@@ -32,16 +32,17 @@ static bool isWholeWord(const std::string& query, size_t pos, size_t len) {
     return true;
 }
 
-// Returns true if the function name `name` appears as a whole word anywhere in `query`.
-static bool containsWholeWord(const std::string& query, const std::string& name) {
+// Returns the position of the first whole-word occurrence of `name` in `query`,
+// or std::string::npos if no whole-word match exists.
+static size_t findWholeWord(const std::string& query, const std::string& name) {
     size_t pos = 0;
     while ((pos = query.find(name, pos)) != std::string::npos) {
         if (isWholeWord(query, pos, name.size())) {
-            return true;
+            return pos;
         }
         pos += 1;
     }
-    return false;
+    return std::string::npos;
 }
 
 std::vector<std::string> FunctionQueryParser::parse(const std::string& query) {
@@ -50,8 +51,8 @@ std::vector<std::string> FunctionQueryParser::parse(const std::string& query) {
     std::vector<std::pair<size_t, std::string>> matches;
 
     auto findAndCollect = [&](const std::string& name) {
-        size_t pos = query.find(name);
-        if (pos != std::string::npos && containsWholeWord(query, name)) {
+        size_t pos = findWholeWord(query, name);
+        if (pos != std::string::npos) {
             matches.emplace_back(pos, name);
         }
     };

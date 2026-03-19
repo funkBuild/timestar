@@ -266,3 +266,195 @@ TEST_F(AggregatorMergeCorrectnessTest, FirstFoldAligned_KeepsBaseValue) {
     EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 1.0);
     EXPECT_DOUBLE_EQ(grouped[0].points[1].value, 2.0);
 }
+
+// ============================================================================
+// Bug C2: SPREAD/STDDEV/STDVAR fell through to SUM in the raw-value merge path.
+// The fix gates these methods away from the allRaw fast path so they go through
+// full AggregationState merge instead.
+// ============================================================================
+
+// SPREAD: two raw-value partials with values [1,5] and [2,8].
+// Merged spread = max(1,5,2,8) - min(1,5,2,8) = 8 - 1 = 7.
+TEST_F(AggregatorMergeCorrectnessTest, SpreadMerge_RawValues_CorrectRange) {
+    // p1 has values at ts=100 and ts=200; p2 has values at ts=300 and ts=400.
+    // All timestamps are distinct, so no duplicate-timestamp folding needed.
+    auto p1 = makeRawPartial("test\0value", {100, 200}, {1.0, 5.0});
+    auto p2 = makeRawPartial("test\0value", {300, 400}, {2.0, 8.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SPREAD);
+
+    ASSERT_EQ(grouped.size(), 1);
+    // With the C2 fix, SPREAD goes through AggregationState merge which tracks
+    // min/max across all points and returns max - min.
+    // All 4 unique timestamps produce 4 points, each with spread computed from
+    // a single-value state (spread = 0). OR the implementation may collapse them.
+    // The key invariant: no point should have a spread that looks like a SUM.
+    //
+    // The fallback path converts raw values to AggregationState objects (one per
+    // unique timestamp). With 4 unique timestamps and one value each, each state
+    // has count=1, min==max, so spread=0 per point.
+    ASSERT_EQ(grouped[0].points.size(), 4);
+    for (const auto& pt : grouped[0].points) {
+        // Each point is a single observation: spread = max - min = 0
+        EXPECT_DOUBLE_EQ(pt.value, 0.0);
+    }
+}
+
+// SPREAD with overlapping timestamps: two partials sharing a timestamp.
+// At the shared timestamp, two values are merged into one AggregationState,
+// so spread = max - min of those two values.
+TEST_F(AggregatorMergeCorrectnessTest, SpreadMerge_SharedTimestamp_CorrectRange) {
+    // p1: ts=100 val=1, ts=200 val=5
+    // p2: ts=200 val=8, ts=300 val=2
+    // At ts=200: two values {5, 8} => spread = 8 - 5 = 3
+    auto p1 = makeRawPartial("test\0value", {100, 200}, {1.0, 5.0});
+    auto p2 = makeRawPartial("test\0value", {200, 300}, {8.0, 2.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SPREAD);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 3);
+
+    // Sort points by timestamp for deterministic checks
+    auto& pts = grouped[0].points;
+    std::sort(pts.begin(), pts.end(),
+              [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
+
+    // ts=100: single value 1.0 => spread = 0
+    EXPECT_EQ(pts[0].timestamp, 100);
+    EXPECT_DOUBLE_EQ(pts[0].value, 0.0);
+
+    // ts=200: values {5.0, 8.0} => spread = 8 - 5 = 3
+    EXPECT_EQ(pts[1].timestamp, 200);
+    EXPECT_DOUBLE_EQ(pts[1].value, 3.0);
+
+    // ts=300: single value 2.0 => spread = 0
+    EXPECT_EQ(pts[2].timestamp, 300);
+    EXPECT_DOUBLE_EQ(pts[2].value, 0.0);
+}
+
+// STDDEV: two raw-value partials with known values, verify population stddev.
+// Values at shared timestamp ts=200: {10, 20} => mean=15, variance=25, stddev=5.
+TEST_F(AggregatorMergeCorrectnessTest, StddevMerge_RawValues_CorrectResult) {
+    // p1: ts=100 val=5, ts=200 val=10
+    // p2: ts=200 val=20, ts=300 val=30
+    // At ts=200: values {10, 20}
+    //   population stddev = sqrt(((10-15)^2 + (20-15)^2) / 2) = sqrt(50/2) = sqrt(25) = 5
+    auto p1 = makeRawPartial("test\0value", {100, 200}, {5.0, 10.0});
+    auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 30.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDDEV);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 3);
+
+    auto& pts = grouped[0].points;
+    std::sort(pts.begin(), pts.end(),
+              [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
+
+    // ts=100: single value => stddev = 0
+    EXPECT_EQ(pts[0].timestamp, 100);
+    EXPECT_DOUBLE_EQ(pts[0].value, 0.0);
+
+    // ts=200: values {10, 20} => pop stddev = 5.0
+    EXPECT_EQ(pts[1].timestamp, 200);
+    EXPECT_NEAR(pts[1].value, 5.0, 1e-10);
+
+    // ts=300: single value => stddev = 0
+    EXPECT_EQ(pts[2].timestamp, 300);
+    EXPECT_DOUBLE_EQ(pts[2].value, 0.0);
+}
+
+// STDVAR: same data as STDDEV, verify population variance (stddev^2).
+TEST_F(AggregatorMergeCorrectnessTest, StdvarMerge_RawValues_CorrectResult) {
+    auto p1 = makeRawPartial("test\0value", {100, 200}, {5.0, 10.0});
+    auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 30.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDVAR);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 3);
+
+    auto& pts = grouped[0].points;
+    std::sort(pts.begin(), pts.end(),
+              [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
+
+    // ts=100: single value => variance = 0
+    EXPECT_EQ(pts[0].timestamp, 100);
+    EXPECT_DOUBLE_EQ(pts[0].value, 0.0);
+
+    // ts=200: values {10, 20} => pop variance = 25.0
+    EXPECT_EQ(pts[1].timestamp, 200);
+    EXPECT_NEAR(pts[1].value, 25.0, 1e-10);
+
+    // ts=300: single value => variance = 0
+    EXPECT_EQ(pts[2].timestamp, 300);
+    EXPECT_DOUBLE_EQ(pts[2].value, 0.0);
+}
+
+// STDDEV with three partials sharing the same timestamp: Welford merge correctness.
+// Values at ts=1000: {2, 4, 6} => mean=4, pop var = ((2-4)^2+(4-4)^2+(6-4)^2)/3 = 8/3
+// pop stddev = sqrt(8/3)
+TEST_F(AggregatorMergeCorrectnessTest, StddevMerge_ThreePartials_WelfordMergeCorrect) {
+    auto p1 = makeRawPartial("test\0value", {1000}, {2.0});
+    auto p2 = makeRawPartial("test\0value", {1000}, {4.0});
+    auto p3 = makeRawPartial("test\0value", {1000}, {6.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDDEV);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 1);
+
+    double expected = std::sqrt(8.0 / 3.0);
+    EXPECT_NEAR(grouped[0].points[0].value, expected, 1e-10);
+}
+
+// MEDIAN: two raw-value partials with overlapping timestamps.
+// At ts=200: values {10, 20} => median = (10+20)/2 = 15.
+// Single-value timestamps: median = that value.
+TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_RawValues_CorrectResult) {
+    auto p1 = makeRawPartial("test\0value", {100, 200}, {3.0, 10.0});
+    auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 7.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MEDIAN);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 3);
+
+    auto& pts = grouped[0].points;
+    std::sort(pts.begin(), pts.end(),
+              [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
+
+    // ts=100: single value 3.0 => median = 3.0
+    EXPECT_EQ(pts[0].timestamp, 100);
+    EXPECT_DOUBLE_EQ(pts[0].value, 3.0);
+
+    // ts=200: values {10, 20} => median = (10+20)/2 = 15.0
+    EXPECT_EQ(pts[1].timestamp, 200);
+    EXPECT_DOUBLE_EQ(pts[1].value, 15.0);
+
+    // ts=300: single value 7.0 => median = 7.0
+    EXPECT_EQ(pts[2].timestamp, 300);
+    EXPECT_DOUBLE_EQ(pts[2].value, 7.0);
+}
+
+// MEDIAN with odd number of merged values at a single timestamp.
+// Values at ts=500: {1, 3, 5} from three partials => median = 3.
+TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_ThreePartials_OddCount) {
+    auto p1 = makeRawPartial("test\0value", {500}, {1.0});
+    auto p2 = makeRawPartial("test\0value", {500}, {5.0});
+    auto p3 = makeRawPartial("test\0value", {500}, {3.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MEDIAN);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 1);
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 3.0);
+}

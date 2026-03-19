@@ -111,12 +111,12 @@ public:
     std::string handleFunctionInfoSync(const seastar::http::request& req);
     std::string handleFunctionValidationSync(const seastar::http::request& req);
     std::string handleQueryParsingSync(const seastar::http::request& req);
-    std::string handleFunctionQuerySync(const seastar::http::request& req);
+    std::pair<bool, std::string> handleFunctionQuerySync(const seastar::http::request& req);
     std::string handlePerformanceStatsSync();
     std::string handleCacheStatsSync();
 
     // Multi-series operation handler
-    std::string handleMultiSeriesOperation(const std::string& functionQuery, uint64_t startTimeVal, uint64_t endTimeVal,
+    std::pair<bool, std::string> handleMultiSeriesOperation(const std::string& functionQuery, uint64_t startTimeVal, uint64_t endTimeVal,
                                            const std::chrono::high_resolution_clock::time_point& startTime);
 
 private:

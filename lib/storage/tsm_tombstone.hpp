@@ -162,13 +162,21 @@ std::pair<std::vector<uint64_t>, std::vector<T>> TSMTombstone::filterTombstoned(
         bool isTombstoned = false;
         uint64_t ts = timestamps[i];
 
-        // Binary search for applicable tombstone range
-        auto rangeIt = std::lower_bound(ranges.begin(), ranges.end(), std::make_pair(ts + 1, uint64_t(0)));
-
-        if (rangeIt != ranges.begin()) {
-            --rangeIt;
-            if (ts >= rangeIt->first && ts <= rangeIt->second) {
+        // Binary search for applicable tombstone range.
+        // Bug M9 fix: When ts == UINT64_MAX, ts + 1 overflows to 0.
+        // Handle this by checking the last range directly, matching isDeleted().
+        if (ts == UINT64_MAX) {
+            if (!ranges.empty() && ranges.back().second == UINT64_MAX && ts >= ranges.back().first) {
                 isTombstoned = true;
+            }
+        } else {
+            auto rangeIt = std::lower_bound(ranges.begin(), ranges.end(), std::make_pair(ts + 1, uint64_t(0)));
+
+            if (rangeIt != ranges.begin()) {
+                --rangeIt;
+                if (ts >= rangeIt->first && ts <= rangeIt->second) {
+                    isTombstoned = true;
+                }
             }
         }
 

@@ -48,8 +48,8 @@ namespace timestar {
 // same measurement+field+tags combination). When multiple series produce partials with the
 // same groupKey (e.g. non-group-by queries with multiple matching series), callers must use
 // the merge fallback path instead.
-static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials, AggregationMethod method,
-                                        QueryResponse& response) {
+void HttpQueryHandler::finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials,
+                                                   AggregationMethod method, QueryResponse& response) {
     response.series.reserve(partials.size());
 
     for (auto& partial : partials) {
@@ -502,7 +502,21 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             discoveryFutures.push_back(std::move(f));
         }
 
-        auto discoveryResults = co_await seastar::when_all_succeed(discoveryFutures.begin(), discoveryFutures.end());
+        // Wait for all shards to complete discovery, with timeout to prevent indefinite hangs
+        auto discoveryDeadline = seastar::lowres_clock::now() + defaultQueryTimeout();
+        std::vector<std::pair<unsigned, PerShardDiscovery>> discoveryResults;
+        try {
+            discoveryResults = co_await seastar::with_timeout(
+                discoveryDeadline,
+                seastar::when_all_succeed(discoveryFutures.begin(), discoveryFutures.end()));
+        } catch (seastar::timed_out_error&) {
+            QueryResponse timeoutResponse;
+            timeoutResponse.success = false;
+            timeoutResponse.errorCode = "QUERY_TIMEOUT";
+            timeoutResponse.errorMessage =
+                "Discovery phase timed out after " + std::to_string(defaultQueryTimeout().count()) + " seconds";
+            co_return timeoutResponse;
+        }
 
         // Combine discovery results into seriesByShard
         SeriesDiscoveryResult discoveryResult;
@@ -1179,8 +1193,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
     } catch (const std::exception& e) {
         response.success = false;
         response.errorCode = "QUERY_EXECUTION_ERROR";
-        response.errorMessage = e.what();
-        LOG_QUERY_PATH(timestar::http_log, error, "[QUERY] Query execution failed: {}", e.what());
+        response.errorMessage = "Query execution failed";
+        timestar::http_log.error("Query execution failed: {}", e.what());
     }
 
     co_return response;

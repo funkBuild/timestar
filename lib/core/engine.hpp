@@ -5,7 +5,7 @@
 #include "http_query_handler.hpp"
 #include "native_index.hpp"
 #include "query_parser.hpp"
-#include "query_planner.hpp"
+#include "shard_query.hpp"
 #include "query_result.hpp"
 #include "retention_policy.hpp"
 #include "schema_update.hpp"

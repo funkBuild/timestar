@@ -18,13 +18,7 @@ namespace scalar = timestar::simd::scalar;
 
 class SimdAggregatorCorrectnessTest : public ::testing::Test {
 protected:
-    bool avx2Available_ = false;
-    bool avx512Available_ = false;
-
-    void SetUp() override {
-        avx2Available_ = SimdAggregator::isAvx2Available();
-        avx512Available_ = SimdAggregator::isAvx512Available();
-    }
+    void SetUp() override {}
 };
 
 // ==================== Sum ====================

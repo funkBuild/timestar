@@ -66,8 +66,10 @@ public:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle(
         const seastar::sstring& path, std::unique_ptr<seastar::http::request> req,
         std::unique_ptr<seastar::http::reply> rep) override {
-        if (auto deny = checkAuth(*req, token_))
+        if (auto deny = checkAuth(*req, token_)) {
+            deny->done("json");
             co_return std::move(deny);
+        }
         co_return co_await inner_->handle(path, std::move(req), std::move(rep));
     }
 };

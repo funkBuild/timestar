@@ -58,14 +58,14 @@ StreamingBatch StreamingAggregator::closeBuckets(uint64_t nowNs) {
         // Skip the in-progress bucket (the one that hasn't completed yet).
         // A bucket [start, start+interval) is complete when start+interval <= now.
         // nowNs==0 means "close all" (used in tests or final flush).
-        if (nowNs != 0 && it->first + _intervalNs > nowNs) {
+        if (nowNs != 0 && (nowNs < it->first || nowNs - it->first < _intervalNs)) {
             break;
         }
 
         for (auto& [key, state] : it->second) {
             if (state.count == 0)
                 continue;
-            if (state.isStringOnly)
+            if (state.isStringOnly && _method != AggregationMethod::COUNT)
                 continue;
 
             StreamingDataPoint pt;

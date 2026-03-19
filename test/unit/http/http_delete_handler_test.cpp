@@ -1,34 +1,8 @@
+#include "../../../lib/http/http_delete_handler.hpp"
+
 #include <glaze/glaze.hpp>
 
 #include <gtest/gtest.h>
-
-// Define GlazeDeleteRequest before including the handler header.
-// The header forward-declares this struct, and parseDeleteRequest takes it by const ref.
-// This definition must match the one in http_delete_handler.cpp exactly (ODR-compliant).
-struct GlazeDeleteRequest {
-    // For series key format
-    std::optional<std::string> series;
-
-    // For structured format
-    std::optional<std::string> measurement;
-    std::optional<std::map<std::string, std::string>> tags;
-    std::optional<std::string> field;
-    std::optional<std::vector<std::string>> fields;
-
-    // Time range (optional - defaults to all time)
-    std::optional<uint64_t> startTime;
-    std::optional<uint64_t> endTime;
-};
-
-template <>
-struct glz::meta<GlazeDeleteRequest> {
-    using T = GlazeDeleteRequest;
-    static constexpr auto value =
-        object("series", &T::series, "measurement", &T::measurement, "tags", &T::tags, "field", &T::field, "fields",
-               &T::fields, "startTime", &T::startTime, "endTime", &T::endTime);
-};
-
-#include "../../../lib/http/http_delete_handler.hpp"
 
 // =============================================================================
 // HttpDeleteHandler Tests

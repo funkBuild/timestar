@@ -311,8 +311,20 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             size_t pos = 0;
             while (pos < tagsParam.length()) {
                 size_t colonPos = tagsParam.find(':', pos);
-                if (colonPos == std::string::npos)
-                    break;
+                if (colonPos == std::string::npos) {
+                    // Malformed segment: no colon found. Return 400 so the
+                    // caller knows their input is wrong rather than silently
+                    // dropping this and all subsequent segments.
+                    size_t endPos = tagsParam.find(',', pos);
+                    if (endPos == std::string::npos)
+                        endPos = tagsParam.length();
+                    std::string badSegment = tagsParam.substr(pos, endPos - pos);
+                    rep->set_status(seastar::http::reply::status_type::bad_request);
+                    rep->_content = createErrorResponse("INVALID_PARAMETER",
+                        "Malformed tag filter segment '" + badSegment +
+                        "': expected 'key:value' format");
+                    co_return rep;
+                }
 
                 std::string key = tagsParam.substr(pos, colonPos - pos);
 
@@ -435,15 +447,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
                 total += est;
             }
 
-            CardinalityResponse response;
-            response.measurement = measurement;
-            response.estimated_series_count = total;
-            response.tag_cardinalities[tagKey + ":" + tagValue] = total;
+            std::unordered_map<std::string, double> tagCard;
+            tagCard[tagKey + ":" + tagValue] = total;
 
-            std::string buffer;
-            (void)glz::write_json(response, buffer);
             rep->set_status(seastar::http::reply::status_type::ok);
-            rep->_content = std::move(buffer);
+            rep->_content = formatCardinalityResponse(measurement, total, tagCard);
         } else {
             // Measurement-level cardinality plus per-tag-key cardinalities
             std::vector<seastar::future<double>> futures;
@@ -473,15 +481,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
                 tagCardinalities[tk] = static_cast<double>(tagValues.size());
             }
 
-            CardinalityResponse response;
-            response.measurement = measurement;
-            response.estimated_series_count = totalEstimate;
-            response.tag_cardinalities = std::move(tagCardinalities);
-
-            std::string buffer;
-            (void)glz::write_json(response, buffer);
             rep->set_status(seastar::http::reply::status_type::ok);
-            rep->_content = std::move(buffer);
+            rep->_content = formatCardinalityResponse(measurement, totalEstimate, tagCardinalities);
         }
 
         timestar::http_log.debug("Returning cardinality for measurement: {}", measurement);
@@ -557,6 +558,19 @@ std::string HttpMetadataHandler::formatFieldsResponse(const std::string& measure
     if (!tagFilters.empty()) {
         response.filtered_by = tagFilters;
     }
+
+    std::string buffer;
+    (void)glz::write_json(response, buffer);
+    return buffer;
+}
+
+std::string HttpMetadataHandler::formatCardinalityResponse(
+    const std::string& measurement, double estimatedSeriesCount,
+    const std::unordered_map<std::string, double>& tagCardinalities) {
+    CardinalityResponse response;
+    response.measurement = measurement;
+    response.estimated_series_count = estimatedSeriesCount;
+    response.tag_cardinalities = tagCardinalities;
 
     std::string buffer;
     (void)glz::write_json(response, buffer);

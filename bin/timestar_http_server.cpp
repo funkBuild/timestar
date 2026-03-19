@@ -240,6 +240,12 @@ int main(int argc, char** argv) {
             timestar::http_log.info("Starting TimeStar {} ({}) built {} with {}", timestar::VERSION,
                                     timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER);
 
+            // Initialize virtual shard placement table (Phase 5)
+            // Must be done BEFORE the rebalancer, which uses routeToCore().
+            auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
+            timestar::setGlobalPlacement(std::move(pt));
+            timestar::savePlacement("placement.json");
+
             // STEP 0: Check for shard rebalancing (CPU count change)
             {
                 timestar::ShardRebalancer rebalancer(".");
@@ -256,11 +262,6 @@ int main(int argc, char** argv) {
                     timestar::ShardRebalancer::writeShardCountMeta(".", seastar::smp::count);
                 }
             }
-
-            // Initialize virtual shard placement table (Phase 5)
-            auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
-            timestar::setGlobalPlacement(std::move(pt));
-            timestar::savePlacement("placement.json");
 
             // STEP 1: Initialize the Engine on all shards
             timestar::http_log.info("Initializing Engine on all shards...");

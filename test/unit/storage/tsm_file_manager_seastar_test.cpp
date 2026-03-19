@@ -699,3 +699,285 @@ seastar::future<> testFMPersistenceAcrossManagerLifecycle() {
 TEST_F(TSMFileManagerSeastarTest, PersistenceAcrossManagerLifecycle) {
     testFMPersistenceAcrossManagerLifecycle().get();
 }
+
+// ---------------------------------------------------------------------------
+// Test: Init cleans up orphaned .tmp files from previous crashes
+// ---------------------------------------------------------------------------
+seastar::future<> testFMInitCleansUpOrphanedTmpFiles(TSMFileManagerSeastarTest* self) {
+    // Create a valid TSM file
+    self->createTestTSMFile("0_1.tsm", "valid.series", {1000, 2000}, {1.0, 2.0});
+
+    // Create orphaned .tmp files (simulating crash during compaction/writeMemstore)
+    {
+        std::ofstream f(self->tsmDir + "/0_5.tsm.tmp");
+        f << "partial write data from crash";
+    }
+    {
+        std::ofstream f(self->tsmDir + "/1_10.tsm.tmp");
+        f << "another orphaned temp file";
+    }
+
+    // Verify .tmp files exist before init
+    EXPECT_TRUE(fs::exists(self->tsmDir + "/0_5.tsm.tmp"));
+    EXPECT_TRUE(fs::exists(self->tsmDir + "/1_10.tsm.tmp"));
+
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    // .tmp files should have been removed during init
+    EXPECT_FALSE(fs::exists(self->tsmDir + "/0_5.tsm.tmp"));
+    EXPECT_FALSE(fs::exists(self->tsmDir + "/1_10.tsm.tmp"));
+
+    // Valid .tsm file should still be loaded
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
+    EXPECT_EQ(mgr.getFileCountInTier(0), 1);
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitCleansUpOrphanedTmpFiles) {
+    testFMInitCleansUpOrphanedTmpFiles(this).get();
+}
+
+// ---------------------------------------------------------------------------
+// Test: Init cleans up .tmp files while leaving non-.tsm files alone
+// ---------------------------------------------------------------------------
+seastar::future<> testFMInitTmpCleanupPreservesOtherFiles(TSMFileManagerSeastarTest* self) {
+    // Create a valid TSM file
+    self->createTestTSMFile("0_1.tsm", "series.a", {1000}, {1.0});
+
+    // Create an orphaned .tmp file
+    {
+        std::ofstream f(self->tsmDir + "/0_2.tsm.tmp");
+        f << "orphaned temp";
+    }
+
+    // Create a non-TSM, non-tmp file (should be left alone)
+    {
+        std::ofstream f(self->tsmDir + "/notes.txt");
+        f << "some notes";
+    }
+
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    // .tmp file should be cleaned up
+    EXPECT_FALSE(fs::exists(self->tsmDir + "/0_2.tsm.tmp"));
+
+    // notes.txt should still exist (init only removes .tmp files, ignores others)
+    EXPECT_TRUE(fs::exists(self->tsmDir + "/notes.txt"));
+
+    // Only the valid .tsm file should be loaded
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitTmpCleanupPreservesOtherFiles) {
+    testFMInitTmpCleanupPreservesOtherFiles(this).get();
+}
+
+// ---------------------------------------------------------------------------
+// Test: stop() clears all TSM file tracking structures
+// ---------------------------------------------------------------------------
+seastar::future<> testFMStopClearsFiles(TSMFileManagerSeastarTest* self) {
+    self->createTestTSMFile("0_1.tsm", "series.a", {1000, 2000}, {1.0, 2.0});
+    self->createTestTSMFile("0_2.tsm", "series.b", {1000, 2000}, {3.0, 4.0});
+    self->createTestTSMFile("1_3.tsm", "series.c", {1000, 2000}, {5.0, 6.0});
+
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    // Verify files are tracked before stop
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 3);
+    EXPECT_EQ(mgr.getFileCountInTier(0), 2);
+    EXPECT_EQ(mgr.getFileCountInTier(1), 1);
+
+    co_await mgr.stop();
+
+    // After stop, all tracking structures should be empty
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
+    EXPECT_EQ(mgr.getFileCountInTier(0), 0);
+    EXPECT_EQ(mgr.getFileCountInTier(1), 0);
+    EXPECT_TRUE(mgr.getFilesInTier(0).empty());
+    EXPECT_TRUE(mgr.getFilesInTier(1).empty());
+}
+
+TEST_F(TSMFileManagerSeastarTest, StopClearsFiles) {
+    testFMStopClearsFiles(this).get();
+}
+
+// ---------------------------------------------------------------------------
+// Test: stop() followed by re-init rediscovers files
+// ---------------------------------------------------------------------------
+seastar::future<> testFMStopThenReinit(TSMFileManagerSeastarTest* self) {
+    self->createTestTSMFile("0_1.tsm", "series.a", {1000, 2000}, {1.0, 2.0});
+
+    TSMFileManager mgr;
+    co_await mgr.init();
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
+
+    co_await mgr.stop();
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
+
+    // Re-init should rediscover files from disk
+    co_await mgr.init();
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1);
+    EXPECT_EQ(mgr.getFileCountInTier(0), 1);
+}
+
+TEST_F(TSMFileManagerSeastarTest, StopThenReinit) {
+    testFMStopThenReinit(this).get();
+}
+
+// ---------------------------------------------------------------------------
+// Test: stop() on an empty manager (no files) succeeds without error
+// ---------------------------------------------------------------------------
+seastar::future<> testFMStopEmpty() {
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
+
+    // stop() on empty manager should not throw
+    co_await mgr.stop();
+
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 0);
+}
+
+TEST_F(TSMFileManagerSeastarTest, StopEmpty) {
+    testFMStopEmpty().get();
+}
+
+// ---------------------------------------------------------------------------
+// Test: getSeriesType returns correct type for float, bool, and string series
+//       written via writeMemstore (across a single TSM file with mixed types)
+// ---------------------------------------------------------------------------
+seastar::future<> testFMGetSeriesTypeMultipleTypes() {
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    // Create a memory store with float, bool, and string data
+    auto store = seastar::make_shared<MemoryStore>(0);
+
+    TimeStarInsert<double> floatInsert("weather", "temperature");
+    floatInsert.addValue(1000, 72.5);
+    floatInsert.addValue(2000, 73.1);
+    store->insertMemory(std::move(floatInsert));
+
+    TimeStarInsert<bool> boolInsert("system", "healthy");
+    boolInsert.addValue(1000, true);
+    boolInsert.addValue(2000, false);
+    store->insertMemory(std::move(boolInsert));
+
+    TimeStarInsert<std::string> strInsert("app", "status");
+    strInsert.addValue(1000, std::string("running"));
+    strInsert.addValue(2000, std::string("stopped"));
+    store->insertMemory(std::move(strInsert));
+
+    co_await mgr.writeMemstore(store, 0);
+
+    // Verify each series has the correct type
+    // Series key format: "measurement field"
+    auto floatType = mgr.getSeriesType("weather temperature");
+    EXPECT_TRUE(floatType.has_value());
+    EXPECT_EQ(floatType.value(), TSMValueType::Float);
+
+    auto boolType = mgr.getSeriesType("system healthy");
+    EXPECT_TRUE(boolType.has_value());
+    EXPECT_EQ(boolType.value(), TSMValueType::Boolean);
+
+    auto strType = mgr.getSeriesType("app status");
+    EXPECT_TRUE(strType.has_value());
+    EXPECT_EQ(strType.value(), TSMValueType::String);
+}
+
+TEST_F(TSMFileManagerSeastarTest, GetSeriesTypeMultipleTypes) {
+    testFMGetSeriesTypeMultipleTypes().get();
+}
+
+// ---------------------------------------------------------------------------
+// Test: getSeriesType returns correct type when series span multiple TSM files
+// ---------------------------------------------------------------------------
+seastar::future<> testFMGetSeriesTypeAcrossMultipleFiles() {
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    // Write float series in first TSM file
+    {
+        auto store = seastar::make_shared<MemoryStore>(0);
+        TimeStarInsert<double> insert("cpu", "usage");
+        insert.addValue(1000, 45.2);
+        insert.addValue(2000, 50.1);
+        store->insertMemory(std::move(insert));
+        co_await mgr.writeMemstore(store, 0);
+    }
+
+    // Write bool series in second TSM file
+    {
+        auto store = seastar::make_shared<MemoryStore>(0);
+        TimeStarInsert<bool> insert("door", "open");
+        insert.addValue(3000, true);
+        insert.addValue(4000, false);
+        store->insertMemory(std::move(insert));
+        co_await mgr.writeMemstore(store, 0);
+    }
+
+    // Write string series in third TSM file
+    {
+        auto store = seastar::make_shared<MemoryStore>(0);
+        TimeStarInsert<std::string> insert("service", "state");
+        insert.addValue(5000, std::string("active"));
+        insert.addValue(6000, std::string("idle"));
+        store->insertMemory(std::move(insert));
+        co_await mgr.writeMemstore(store, 0);
+    }
+
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 3);
+
+    // Each series should resolve to the correct type across different files
+    auto floatType = mgr.getSeriesType("cpu usage");
+    EXPECT_TRUE(floatType.has_value());
+    EXPECT_EQ(floatType.value(), TSMValueType::Float);
+
+    auto boolType = mgr.getSeriesType("door open");
+    EXPECT_TRUE(boolType.has_value());
+    EXPECT_EQ(boolType.value(), TSMValueType::Boolean);
+
+    auto strType = mgr.getSeriesType("service state");
+    EXPECT_TRUE(strType.has_value());
+    EXPECT_EQ(strType.value(), TSMValueType::String);
+
+    // Non-existent series should return empty
+    auto missingType = mgr.getSeriesType("nonexistent series");
+    EXPECT_FALSE(missingType.has_value());
+}
+
+TEST_F(TSMFileManagerSeastarTest, GetSeriesTypeAcrossMultipleFiles) {
+    testFMGetSeriesTypeAcrossMultipleFiles().get();
+}
+
+// ---------------------------------------------------------------------------
+// Test: getSeriesType with SeriesId128 overload (direct ID lookup)
+// ---------------------------------------------------------------------------
+seastar::future<> testFMGetSeriesTypeBySeriesId128() {
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    auto store = seastar::make_shared<MemoryStore>(0);
+    TimeStarInsert<double> insert("metric", "value");
+    insert.addValue(1000, 99.9);
+    store->insertMemory(std::move(insert));
+    co_await mgr.writeMemstore(store, 0);
+
+    // Look up by SeriesId128 directly
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("metric value");
+    auto seriesType = mgr.getSeriesType(seriesId);
+    EXPECT_TRUE(seriesType.has_value());
+    EXPECT_EQ(seriesType.value(), TSMValueType::Float);
+
+    // Non-existent SeriesId128 should return empty
+    SeriesId128 missingId = SeriesId128::fromSeriesKey("does_not exist");
+    auto missingType = mgr.getSeriesType(missingId);
+    EXPECT_FALSE(missingType.has_value());
+}
+
+TEST_F(TSMFileManagerSeastarTest, GetSeriesTypeBySeriesId128) {
+    testFMGetSeriesTypeBySeriesId128().get();
+}

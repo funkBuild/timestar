@@ -33,6 +33,7 @@ add_executable(function_tests
     test_edge_cases.cpp
     test_performance_regression.cpp
     test_production_monitoring.cpp
+    test_pipeline_executor.cpp
 )
 target_link_libraries(function_tests PRIVATE gtest_main gmock libtimestar pthread)
 target_compile_features(function_tests PRIVATE cxx_std_23)
@@ -57,3 +58,4 @@ timestar_add_function_test(test_function_security_only           test_function_s
 timestar_add_function_test(test_function_query_parser_only       test_function_query_parser.cpp)
 timestar_add_function_test(test_performance_regression_only      test_performance_regression.cpp)
 timestar_add_function_test(test_production_monitoring_only       test_production_monitoring.cpp)
+timestar_add_function_test(test_pipeline_executor_only          test_pipeline_executor.cpp)

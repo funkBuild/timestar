@@ -2,13 +2,12 @@
 
 #include "crc32.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
 #include <zstd.h>
 
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -35,14 +34,18 @@ static ZSTD_DCtx* getSstDCtx() {
 
 namespace timestar::index {
 
-// --- SSTableReader destructor (RAII for POSIX fd) ---
+// --- SSTableReader static members ---
+seastar::semaphore* SSTableReader::blockReadSemaphore_ = nullptr;
 
-SSTableReader::~SSTableReader() {
-    if (readFd_ >= 0) {
-        ::close(readFd_);
-        readFd_ = -1;
-    }
+void SSTableReader::setBlockReadSemaphore(seastar::semaphore* sem) {
+    blockReadSemaphore_ = sem;
 }
+
+// --- SSTableReader destructor ---
+// The seastar::file is ref-counted; no explicit close needed here.
+// Block cache eviction is handled by close() — NOT here, because with
+// shared_ptr the reader can outlive the NativeIndex that owns the BlockCache.
+SSTableReader::~SSTableReader() = default;
 
 // --- Helper: encode/decode fixed integers ---
 
@@ -481,22 +484,14 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     // Build two-level summary index for faster block lookups
     reader->buildSummary();
 
-    // Close the Seastar DMA file handle (metadata reading is done).
-    // Open a plain POSIX fd for synchronous pread() of data blocks on cache miss.
-    co_await file.close();
-
-    reader->readFd_ = ::open(filename.c_str(), O_RDONLY);
-    if (reader->readFd_ < 0) {
-        throw std::runtime_error("SSTable failed to open POSIX fd: " + filename);
-    }
-    // Hint to kernel: random access pattern (block reads are scattered by key hash).
-    // This disables overly aggressive readahead that wastes I/O bandwidth.
-    ::posix_fadvise(reader->readFd_, 0, 0, POSIX_FADV_RANDOM);
+    // Keep the Seastar DMA file handle open for async block reads on cache miss.
+    reader->readFile_ = std::move(file);
+    reader->readFileOpen_ = true;
 
     co_return std::move(reader);
 }
 
-std::string SSTableReader::decompressBlock(size_t blockIndex) const {
+seastar::future<RawBlock> SSTableReader::readRawBlock(size_t blockIndex) {
     if (blockIndex >= index_.size()) {
         throw std::runtime_error("SSTable block index out of range");
     }
@@ -505,32 +500,44 @@ std::string SSTableReader::decompressBlock(size_t blockIndex) const {
         throw std::runtime_error("SSTable block too small");
     }
 
-    // Read the full block including CRC from disk using pread() (synchronous).
-    // The block cache ensures this path is only hit on cache misses.
-    std::string compressedBuf(entry.size, '\0');
-    ssize_t bytesRead = ::pread(readFd_, compressedBuf.data(), entry.size, static_cast<off_t>(entry.offset));
-    if (bytesRead < 0 || static_cast<size_t>(bytesRead) < entry.size) {
-        throw std::runtime_error("SSTable pread failed for block " + std::to_string(blockIndex) + " in " + filename_);
+    // Acquire concurrency semaphore if configured (limits concurrent DMA reads per shard).
+    std::optional<seastar::semaphore_units<>> units;
+    if (blockReadSemaphore_) {
+        units.emplace(co_await seastar::get_units(*blockReadSemaphore_, 1));
     }
 
+    // Read the full block including CRC from disk using async DMA read.
+    // dma_read<char> handles DMA alignment internally — reads the enclosing
+    // aligned region and returns only the requested bytes.
+    auto buf = co_await readFile_.dma_read<char>(entry.offset, entry.size);
+    if (buf.size() < entry.size) {
+        throw std::runtime_error("SSTable dma_read short for block " + std::to_string(blockIndex) + " in " + filename_);
+    }
+
+    co_return RawBlock{std::move(buf), entry.size};
+}
+
+std::string SSTableReader::decompressRawBlock(const RawBlock& raw, std::string_view filename, size_t blockIndex) {
+    const char* data = raw.data.get();
+
     // Verify CRC32 (covers size prefix + compressed data, excludes trailing CRC itself)
-    uint32_t storedCrc = decodeFixed32(compressedBuf.data() + entry.size - 4);
-    uint32_t computedCrc = CRC32::compute(compressedBuf.data(), entry.size - 4);
+    uint32_t storedCrc = decodeFixed32(data + raw.size - 4);
+    uint32_t computedCrc = CRC32::compute(data, raw.size - 4);
     if (storedCrc != computedCrc) {
-        throw std::runtime_error("SSTable block CRC32 mismatch in " + filename_ + " block " +
+        throw std::runtime_error(std::string("SSTable block CRC32 mismatch in ") + std::string(filename) + " block " +
                                  std::to_string(blockIndex));
     }
 
     // Decompress (skip size prefix, exclude CRC)
-    uint32_t uncompressedSize = decodeFixed32(compressedBuf.data());
+    uint32_t uncompressedSize = decodeFixed32(data);
     static constexpr uint32_t MAX_BLOCK_SIZE = 64 * 1024 * 1024;  // 64MB sanity limit
     if (uncompressedSize > MAX_BLOCK_SIZE) {
         throw std::runtime_error("SSTable block uncompressed size too large: " +
             std::to_string(uncompressedSize) + " bytes (max " + std::to_string(MAX_BLOCK_SIZE) + ")");
     }
     std::string result(uncompressedSize, '\0');
-    size_t decompSize = ZSTD_decompressDCtx(getSstDCtx(), result.data(), uncompressedSize, compressedBuf.data() + 4,
-                                            entry.size - 4 - 4);
+    size_t decompSize = ZSTD_decompressDCtx(getSstDCtx(), result.data(), uncompressedSize, data + 4,
+                                            raw.size - 4 - 4);
     if (ZSTD_isError(decompSize)) {
         throw std::runtime_error(std::string("SSTable zstd decompression failed: ") + ZSTD_getErrorName(decompSize));
     }
@@ -539,6 +546,11 @@ std::string SSTableReader::decompressBlock(size_t blockIndex) const {
             std::to_string(uncompressedSize) + ", got " + std::to_string(decompSize));
     }
     return result;
+}
+
+seastar::future<std::string> SSTableReader::decompressBlock(size_t blockIndex) {
+    auto raw = co_await readRawBlock(blockIndex);
+    co_return decompressRawBlock(raw, filename_, blockIndex);
 }
 
 void SSTableReader::buildSummary() {
@@ -588,70 +600,68 @@ size_t SSTableReader::findBlock(std::string_view key) const {
     return lo;
 }
 
-const std::string& SSTableReader::getDecompressedBlock(size_t idx, std::string& fallback) const {
+seastar::future<std::string> SSTableReader::getDecompressedBlock(size_t idx) {
     if (blockCache_) {
         auto* cached = blockCache_->get(cacheId_, idx);
         if (cached)
-            return *cached;
-        fallback = decompressBlock(idx);
-        return blockCache_->put(cacheId_, idx, fallback);
+            co_return std::string(*cached);
+        auto block = co_await decompressBlock(idx);
+        blockCache_->put(cacheId_, idx, block);
+        co_return block;
     }
-    fallback = decompressBlock(idx);
-    return fallback;
+    co_return co_await decompressBlock(idx);
 }
 
-std::optional<std::string> SSTableReader::get(std::string_view key) {
+seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view key) {
     // Bloom filter check
     if (!bloom_.mayContain(key)) {
-        return std::nullopt;
+        co_return std::nullopt;
     }
 
     if (index_.empty()) {
-        return std::nullopt;
+        co_return std::nullopt;
     }
 
     // Binary search index to find the right data block.
     size_t lo = findBlock(key);
 
     // Step 1: Decompress block on demand (Step 2: via block cache if available)
-    std::string localBlock;
-    const auto& blockData = getDecompressedBlock(lo, localBlock);
+    auto blockData = co_await getDecompressedBlock(lo);
     BlockReader blockReader(blockData);
     if (!blockReader.valid()) {
-        return std::nullopt;
+        co_return std::nullopt;
     }
 
     auto it = blockReader.newIterator();
     it.seek(key);
     if (it.valid() && it.key() == key) {
-        return std::string(it.value());
+        co_return std::string(it.value());
     }
 
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
-bool SSTableReader::contains(std::string_view key) {
+seastar::future<bool> SSTableReader::contains(std::string_view key) {
     // Bloom filter check
     if (!bloom_.mayContain(key)) {
-        return false;
+        co_return false;
     }
 
     if (index_.empty()) {
-        return false;
+        co_return false;
     }
 
     size_t lo = findBlock(key);
 
-    std::string localBlock;
-    const auto& blockData = getDecompressedBlock(lo, localBlock);
+    auto blockData = co_await getDecompressedBlock(lo);
     BlockReader blockReader(blockData);
     if (!blockReader.valid()) {
-        return false;
+        co_return false;
     }
 
     auto it = blockReader.newIterator();
     it.seek(key);
-    return it.valid() && it.key() == key;
+    co_return it.valid() && it.key() == key;
 }
 
 seastar::future<> SSTableReader::close() {
@@ -659,45 +669,28 @@ seastar::future<> SSTableReader::close() {
     if (blockCache_ && cacheId_ != 0) {
         blockCache_->evict(cacheId_);
     }
-    // Close the POSIX fd used for synchronous block reads
-    if (readFd_ >= 0) {
-        ::close(readFd_);
-        readFd_ = -1;
+    // Close the Seastar DMA file used for async block reads
+    if (readFileOpen_) {
+        co_await readFile_.close();
+        readFileOpen_ = false;
     }
-    return seastar::make_ready_future<>();
 }
 
 // --- SSTableReader::Iterator ---
 
 SSTableReader::Iterator::Iterator(SSTableReader* reader) : reader_(reader) {}
 
-void SSTableReader::Iterator::loadBlock(size_t idx) {
+seastar::future<> SSTableReader::Iterator::loadBlock(size_t idx) {
     if (idx >= reader_->index_.size()) {
         valid_ = false;
-        return;
+        co_return;
     }
     blockIndex_ = idx;
-    // Decompress block on demand into owned blockData_.
-    // BlockReader holds a string_view, so it must point to stable memory.
-    // Always use the owned blockData_ member — never a cache reference that
-    // could be evicted by a subsequent put().
-    if (reader_->blockCache_) {
-        auto* cached = reader_->blockCache_->get(reader_->cacheId_, idx);
-        if (cached) {
-            // Cache hit — copy into owned storage for stable lifetime
-            blockData_ = *cached;
-        } else {
-            // Cache miss — decompress and populate cache
-            blockData_ = reader_->decompressBlock(idx);
-            reader_->blockCache_->put(reader_->cacheId_, idx, blockData_);
-        }
-    } else {
-        blockData_ = reader_->decompressBlock(idx);
-    }
+    blockData_ = co_await reader_->getDecompressedBlock(idx);
     blockReader_ = std::make_unique<BlockReader>(blockData_);
     if (!blockReader_->valid()) {
         valid_ = false;
-        return;
+        co_return;
     }
     blockIter_ = blockReader_->newIterator();
 }
@@ -712,38 +705,38 @@ void SSTableReader::Iterator::updateFromBlockIter() {
     }
 }
 
-void SSTableReader::Iterator::seekToFirst() {
+seastar::future<> SSTableReader::Iterator::seekToFirst() {
     if (reader_->index_.empty()) {
         valid_ = false;
-        return;
+        co_return;
     }
-    loadBlock(0);
+    co_await loadBlock(0);
     if (blockReader_ && blockReader_->valid()) {
         blockIter_.seekToFirst();
         updateFromBlockIter();
     }
 }
 
-void SSTableReader::Iterator::seek(std::string_view target) {
+seastar::future<> SSTableReader::Iterator::seek(std::string_view target) {
     if (reader_->index_.empty()) {
         valid_ = false;
-        return;
+        co_return;
     }
 
     // Binary search for the right block
     size_t lo = reader_->findBlock(target);
 
-    loadBlock(lo);
+    co_await loadBlock(lo);
     if (!blockReader_ || !blockReader_->valid()) {
         valid_ = false;
-        return;
+        co_return;
     }
     blockIter_.seek(target);
     updateFromBlockIter();
 
     // If not found in this block, try the next block
     if (!valid_ && lo + 1 < reader_->index_.size()) {
-        loadBlock(lo + 1);
+        co_await loadBlock(lo + 1);
         if (blockReader_ && blockReader_->valid()) {
             blockIter_.seekToFirst();
             updateFromBlockIter();
@@ -751,16 +744,16 @@ void SSTableReader::Iterator::seek(std::string_view target) {
     }
 }
 
-void SSTableReader::Iterator::next() {
+seastar::future<> SSTableReader::Iterator::next() {
     if (!valid_)
-        return;
+        co_return;
 
     blockIter_.next();
     updateFromBlockIter();
 
     // If current block exhausted, move to next block
     if (!valid_ && blockIndex_ + 1 < reader_->index_.size()) {
-        loadBlock(blockIndex_ + 1);
+        co_await loadBlock(blockIndex_ + 1);
         if (blockReader_ && blockReader_->valid()) {
             blockIter_.seekToFirst();
             updateFromBlockIter();

@@ -1,7 +1,7 @@
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
-#include "../../../lib/query/query_planner.hpp"
+#include "../../../lib/query/shard_query.hpp"
 #include "../../../lib/query/series_matcher.hpp"
 #include "../test_helpers/aggregator_test_helper.hpp"
 

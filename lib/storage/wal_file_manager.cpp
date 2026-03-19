@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
@@ -16,16 +17,20 @@
 namespace fs = std::filesystem;
 
 // Parse the WAL sequence number from a file path like "shard_0/42.wal".
-// Returns 0 for malformed filenames so they sort first (and get harmlessly
-// replayed/skipped before any valid WAL).
-static int parseWalSeqNum(const std::string& path) {
+// Returns std::nullopt for malformed filenames so callers can skip them.
+static std::optional<unsigned int> parseWalSeqNum(const std::string& path) {
     auto dotPos = path.find_last_of('.');
     auto slashPos = path.find_last_of('/');
     size_t start = (slashPos == std::string::npos) ? 0 : slashPos + 1;
+    if (dotPos == std::string::npos || dotPos <= start)
+        return std::nullopt;
     try {
-        return std::stoi(path.substr(start, dotPos - start));
+        int val = std::stoi(path.substr(start, dotPos - start));
+        if (val < 0)
+            return std::nullopt;
+        return static_cast<unsigned int>(val);
     } catch (...) {
-        return 0;
+        return std::nullopt;
     }
 }
 
@@ -56,12 +61,22 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
         return files;
     });
 
+    // Remove WAL files with malformed filenames (unparseable sequence number).
+    std::erase_if(walFiles, [](const std::string& f) {
+        auto seq = parseWalSeqNum(f);
+        if (!seq.has_value()) {
+            timestar::wal_log.warn("Skipping malformed WAL filename: {}", f);
+            return true;
+        }
+        return false;
+    });
+
     // Sort WAL files by sequence number to ensure deterministic replay order.
     // directory_iterator returns entries in filesystem-dependent order; without
     // sorting, a DeleteRange in sequence 5 could replay before its Write in
     // sequence 4, causing data loss.
     std::sort(walFiles.begin(), walFiles.end(), [](const std::string& a, const std::string& b) {
-        return parseWalSeqNum(a) < parseWalSeqNum(b);
+        return *parseWalSeqNum(a) < *parseWalSeqNum(b);
     });
 
     if (!walFiles.empty()) {
@@ -72,10 +87,13 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
 
     // Convert them to TSM's if they exist and are closed
     for (const auto& walFilename : walFiles) {
-        int seqNum = parseWalSeqNum(walFilename);
+        // Safe to dereference: malformed filenames were filtered out above.
+        unsigned int seqNum = *parseWalSeqNum(walFilename);
 
-        if (seqNum > currentWalSequenceNumber)
+        if (!walSequenceInitialized_ || seqNum > currentWalSequenceNumber) {
             currentWalSequenceNumber = seqNum;
+            walSequenceInitialized_ = true;
+        }
 
         timestar::wal_log.debug("Creating recovery store for WAL sequence {} on shard {}", seqNum, shardId);
         seastar::shared_ptr store = seastar::make_shared<MemoryStore>(seqNum);
@@ -120,7 +138,14 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
     }
 
     if (memoryStores.size() == 0) {
-        seastar::shared_ptr store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);
+        // If WAL files were found during recovery, advance past the highest
+        // sequence number.  Otherwise start at 0.
+        if (walSequenceInitialized_)
+            ++currentWalSequenceNumber;
+        // Either way, the sequence is now valid.
+        walSequenceInitialized_ = true;
+
+        seastar::shared_ptr store = seastar::make_shared<MemoryStore>(currentWalSequenceNumber);
         co_await store->initWAL();
         memoryStores.push_back(store);
     }

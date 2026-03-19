@@ -1408,21 +1408,6 @@ TEST_F(TransformFunctionsTest, SimdConsistencyScalarVsSimd) {
     }
 }
 
-TEST_F(TransformFunctionsTest, SimdCpuDetection) {
-    // Verify CPU detection functions work (don't crash)
-    bool avx2 = simd::isAvx2Available();
-    bool avx512 = simd::isAvx512Available();
-
-    // Just verify the functions return consistent results
-    EXPECT_EQ(avx2, simd::isAvx2Available());
-    EXPECT_EQ(avx512, simd::isAvx512Available());
-
-    // AVX512 implies AVX2 support
-    if (avx512) {
-        EXPECT_TRUE(avx2);
-    }
-}
-
 // ============================================================================
 // DBSCAN 1D Tests
 // ============================================================================

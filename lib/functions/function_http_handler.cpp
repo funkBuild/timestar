@@ -4,6 +4,7 @@
 #include "../http/http_query_handler.hpp"
 #include "../query/query_parser.hpp"
 #include "../utils/json_escape.hpp"
+#include "function_registry.hpp"
 #include "function_security.hpp"
 
 #include <glaze/glaze.hpp>
@@ -220,16 +221,10 @@ void FunctionHttpHandler::registerRoutes(seastar::httpd::routes& routes) {
     auto* functionQuery = new function_handler(
         [this](std::unique_ptr<http::request> req,
                std::unique_ptr<http::reply> rep) -> seastar::future<std::unique_ptr<http::reply>> {
-            std::string response = handleFunctionQuerySync(*req);
+            auto [success, response] = handleFunctionQuerySync(*req);
 
-            // Check if response indicates an error and set appropriate HTTP status
-            if (response.find("\"success\": false") != std::string::npos) {
-                rep->set_status(http::reply::status_type::bad_request);
-            } else {
-                rep->set_status(http::reply::status_type::ok);
-            }
-
-            rep->_content = response;
+            rep->set_status(success ? http::reply::status_type::ok : http::reply::status_type::bad_request);
+            rep->_content = std::move(response);
             rep->add_header("Content-Type", "application/json");
             return seastar::make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
         },
@@ -238,22 +233,39 @@ void FunctionHttpHandler::registerRoutes(seastar::httpd::routes& routes) {
 }
 
 std::string FunctionHttpHandler::handleFunctionListSync() {
-    return "{\"status\":\"success\",\"functions\":["
-           "{\"name\":\"sma\",\"category\":\"smoothing\",\"description\":\"Simple Moving "
-           "Average\",\"parameters\":[{\"name\":\"window\",\"type\":\"int\",\"required\":true}]},"
-           "{\"name\":\"ema\",\"category\":\"smoothing\",\"description\":\"Exponential Moving "
-           "Average\",\"parameters\":[{\"name\":\"alpha\",\"type\":\"float\",\"required\":true}]},"
-           "{\"name\":\"add\",\"category\":\"arithmetic\",\"description\":\"Add constant "
-           "value\",\"parameters\":[{\"name\":\"value\",\"type\":\"float\",\"required\":true}]},"
-           "{\"name\":\"multiply\",\"category\":\"arithmetic\",\"description\":\"Multiply by "
-           "constant\",\"parameters\":[{\"name\":\"factor\",\"type\":\"float\",\"required\":true}]},"
-           "{\"name\":\"scale\",\"category\":\"arithmetic\",\"description\":\"Scale by "
-           "factor\",\"parameters\":[{\"name\":\"factor\",\"type\":\"float\",\"required\":true}]},"
-           "{\"name\":\"offset\",\"category\":\"arithmetic\",\"description\":\"Offset by "
-           "constant\",\"parameters\":[{\"name\":\"offset\",\"type\":\"float\",\"required\":true}]},"
-           "{\"name\":\"interpolate\",\"category\":\"interpolation\",\"description\":\"Linear "
-           "interpolation\",\"parameters\":[]}"
-           "]}";
+    auto& registry = FunctionRegistry::getInstance();
+    auto names = registry.getAllFunctionNames();
+
+    std::ostringstream json;
+    json << "{\"status\":\"success\",\"functions\":[";
+
+    bool first = true;
+    for (const auto& name : names) {
+        const auto* meta = registry.getMetadata(name);
+        if (!meta) continue;
+
+        if (!first) json << ",";
+        first = false;
+
+        json << "{\"name\":\"" << jsonEscape(meta->name)
+             << "\",\"category\":\"" << jsonEscape(categoryToString(meta->category))
+             << "\",\"description\":\"" << jsonEscape(meta->description)
+             << "\",\"parameters\":[";
+
+        for (size_t i = 0; i < meta->parameters.size(); ++i) {
+            if (i > 0) json << ",";
+            const auto& param = meta->parameters[i];
+            json << "{\"name\":\"" << jsonEscape(param.name)
+                 << "\",\"type\":\"" << jsonEscape(param.type)
+                 << "\",\"required\":" << (param.required ? "true" : "false")
+                 << "}";
+        }
+
+        json << "]}";
+    }
+
+    json << "]}";
+    return json.str();
 }
 
 std::string FunctionHttpHandler::handleFunctionInfoSync(const seastar::http::request& req) {
@@ -313,49 +325,39 @@ std::string FunctionHttpHandler::handleFunctionInfoSync(const seastar::http::req
     // Use sanitized function name
     functionName = validation.sanitizedInput;
 
-    if (functionName == "sma") {
-        return "{\"status\":\"success\",\"function\":{\"name\":\"sma\",\"category\":\"smoothing\",\"description\":"
-               "\"Simple Moving "
-               "Average\",\"parameters\":{\"window\":{\"type\":\"int\",\"required\":true,\"description\":\"Size of the "
-               "moving window\"}},\"examples\":[\"sma(window:10)\",\"sma(window:5)\"]}}";
-    } else if (functionName == "ema") {
-        return "{\"status\":\"success\",\"function\":{\"name\":\"ema\",\"category\":\"smoothing\",\"description\":"
-               "\"Exponential Moving "
-               "Average\",\"parameters\":{\"alpha\":{\"type\":\"float\",\"required\":true,\"description\":\"Smoothing "
-               "factor between 0 and 1\"}},\"examples\":[\"ema(alpha:0.3)\",\"ema(alpha:0.1)\"]}}";
-    } else if (functionName == "add") {
-        return "{\"status\":\"success\",\"function\":{\"name\":\"add\",\"category\":\"arithmetic\",\"description\":"
-               "\"Add constant "
-               "value\",\"parameters\":{\"value\":{\"type\":\"float\",\"required\":true,\"description\":\"Value to "
-               "add\"}},\"examples\":[\"add(value:10)\",\"add(value:-5.5)\"]}}";
-    } else if (functionName == "multiply") {
-        return "{\"status\":\"success\",\"function\":{\"name\":\"multiply\",\"category\":\"arithmetic\","
-               "\"description\":\"Multiply by "
-               "constant\",\"parameters\":{\"factor\":{\"type\":\"float\",\"required\":true,\"description\":\"Factor to "
-               "multiply by\"}},\"examples\":[\"multiply(factor:2.5)\",\"multiply(factor:0.5)\"]}}";
-    } else if (functionName == "scale") {
-        return "{\"status\":\"success\",\"function\":{\"name\":\"scale\",\"category\":\"arithmetic\",\"description\":"
-               "\"Scale by "
-               "factor\",\"parameters\":{\"factor\":{\"type\":\"float\",\"required\":true,\"description\":\"Scaling "
-               "factor\"}},\"examples\":[\"scale(factor:1.8)\",\"scale(factor:0.5)\"]}}";
-    } else if (functionName == "offset") {
-        return "{\"status\":\"success\",\"function\":{\"name\":\"offset\",\"category\":\"arithmetic\",\"description\":"
-               "\"Offset by "
-               "constant\",\"parameters\":{\"value\":{\"type\":\"float\",\"required\":true,\"description\":\"Offset "
-               "value to add\"}},\"examples\":[\"offset(value:32)\",\"offset(value:-10)\"]}}";
-    } else if (functionName == "interpolate") {
-        return "{\"status\":\"success\",\"function\":{\"name\":\"interpolate\",\"category\":\"interpolation\","
-               "\"description\":\"Linear "
-               "interpolation\",\"parameters\":{\"method\":{\"type\":\"string\",\"required\":false,\"description\":"
-               "\"Interpolation "
-               "method\",\"default\":\"linear\"},\"target_interval\":{\"type\":\"int\",\"required\":false,"
-               "\"description\":\"Target interval in "
-               "nanoseconds\"}},\"examples\":[\"interpolate(method:linear)\",\"interpolate(method:linear,target_"
-               "interval:60000000000)\"]}}";
+    auto& registry = FunctionRegistry::getInstance();
+    const auto* meta = registry.getMetadata(functionName);
+    if (!meta) {
+        return "{\"status\":\"error\",\"error\":{\"code\":\"FUNCTION_NOT_FOUND\",\"message\":\"Function not found: " +
+               jsonEscape(functionName) + "\"}}";
     }
 
-    return "{\"status\":\"error\",\"error\":{\"code\":\"FUNCTION_NOT_FOUND\",\"message\":\"Function not found: " +
-           jsonEscape(functionName) + "\"}}";
+    std::ostringstream json;
+    json << "{\"status\":\"success\",\"function\":{\"name\":\"" << jsonEscape(meta->name)
+         << "\",\"category\":\"" << jsonEscape(categoryToString(meta->category))
+         << "\",\"description\":\"" << jsonEscape(meta->description)
+         << "\",\"parameters\":{";
+
+    for (size_t i = 0; i < meta->parameters.size(); ++i) {
+        if (i > 0) json << ",";
+        const auto& param = meta->parameters[i];
+        json << "\"" << jsonEscape(param.name) << "\":{\"type\":\"" << jsonEscape(param.type)
+             << "\",\"required\":" << (param.required ? "true" : "false")
+             << ",\"description\":\"" << jsonEscape(param.description) << "\"";
+        if (!param.defaultValue.empty()) {
+            json << ",\"default\":\"" << jsonEscape(param.defaultValue) << "\"";
+        }
+        json << "}";
+    }
+
+    json << "},\"examples\":[";
+    for (size_t i = 0; i < meta->examples.size(); ++i) {
+        if (i > 0) json << ",";
+        json << "\"" << jsonEscape(meta->examples[i]) << "\"";
+    }
+    json << "]}}";
+
+    return json.str();
 }
 
 std::string FunctionHttpHandler::handleFunctionValidationSync(const seastar::http::request& req) {
@@ -400,95 +402,25 @@ std::string FunctionHttpHandler::handleFunctionValidationSync(const seastar::htt
         // Use sanitized function name
         functionName = nameValidation.sanitizedInput;
 
-        // Validate based on function type
-        if (functionName == "sma") {
-            // Check for window parameter
-            if (parameters.find("\"window\"") == std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: window\"}";
-            }
+        // Look up function in the registry
+        auto& registry = FunctionRegistry::getInstance();
+        const auto* meta = registry.getMetadata(functionName);
+        if (!meta) {
+            return "{\"status\":\"success\",\"valid\":false,\"error\":\"Unknown function: " + jsonEscape(functionName) + "\"}";
+        }
 
-            // Check for negative window
-            if (parameters.find("\"window\":-") != std::string::npos ||
-                parameters.find("\"window\": -") != std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Parameter 'window' must be positive\"}";
-            }
-
-            // Check for invalid window value (non-numeric)
-            size_t windowPos = parameters.find("\"window\":");
-            if (windowPos != std::string::npos) {
-                size_t valueStart = parameters.find(":", windowPos) + 1;
-                while (valueStart < parameters.length() && std::isspace(parameters[valueStart])) {
-                    valueStart++;
-                }
-
-                // Check if value starts with a quote (string value instead of number)
-                if (valueStart < parameters.length() && parameters[valueStart] == '"') {
-                    return "{\"status\":\"success\",\"valid\":false,\"error\":\"Parameter 'window' must be a number\"}";
-                }
-
-                // Check for other non-numeric patterns like "invalid"
-                if (parameters.find("\"invalid\"", valueStart) != std::string::npos ||
-                    parameters.find("'invalid'", valueStart) != std::string::npos) {
-                    return "{\"status\":\"success\",\"valid\":false,\"error\":\"Parameter 'window' must be a number\"}";
+        // Check that all required parameters are present
+        for (const auto& param : meta->parameters) {
+            if (param.required) {
+                std::string paramKey = "\"" + param.name + "\"";
+                if (parameters.find(paramKey) == std::string::npos) {
+                    return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: " +
+                           jsonEscape(param.name) + "\"}";
                 }
             }
-
-            return "{\"status\":\"success\",\"valid\":true}";
         }
 
-        else if (functionName == "ema") {
-            // Check for alpha parameter
-            if (parameters.find("\"alpha\"") == std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: alpha\"}";
-            }
-
-            return "{\"status\":\"success\",\"valid\":true}";
-        }
-
-        else if (functionName == "scale") {
-            // Check for factor parameter
-            if (parameters.find("\"factor\"") == std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: factor\"}";
-            }
-
-            return "{\"status\":\"success\",\"valid\":true}";
-        }
-
-        else if (functionName == "offset") {
-            // Check for value parameter
-            if (parameters.find("\"value\"") == std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: value\"}";
-            }
-
-            return "{\"status\":\"success\",\"valid\":true}";
-        }
-
-        else if (functionName == "multiply") {
-            // Check for factor parameter
-            if (parameters.find("\"factor\"") == std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: factor\"}";
-            }
-
-            return "{\"status\":\"success\",\"valid\":true}";
-        }
-
-        else if (functionName == "add") {
-            // Check for operand parameter
-            if (parameters.find("\"operand\"") == std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: operand\"}";
-            }
-
-            return "{\"status\":\"success\",\"valid\":true}";
-        }
-
-        else if (functionName == "interpolate") {
-            // Interpolate function has optional parameters, so it's always valid
-            return "{\"status\":\"success\",\"valid\":true}";
-        }
-
-        else {
-            return "{\"status\":\"success\",\"valid\":false,\"error\":\"Unknown function: " + functionName + "\"}";
-        }
+        return "{\"status\":\"success\",\"valid\":true}";
 
     } catch (const std::exception& e) {
         return "{\"status\":\"success\",\"valid\":false,\"error\":\"Failed to parse request: " + jsonEscape(e.what()) +
@@ -590,14 +522,12 @@ std::string FunctionHttpHandler::handleQueryParsingSync(const seastar::http::req
         }
     }
 
-    // Known valid functions for validation
-    std::set<std::string> knownFunctions = {"sma", "ema", "add", "multiply", "scale", "offset", "interpolate"};
-
-    // Check if all functions are valid
+    // Check if all functions are valid using the registry
+    auto& registry = FunctionRegistry::getInstance();
     bool valid = true;
     std::string invalidFunction = "";
     for (const auto& func : functionNames) {
-        if (knownFunctions.find(func) == knownFunctions.end()) {
+        if (!registry.hasFunction(func)) {
             valid = false;
             invalidFunction = func;
             break;
@@ -627,7 +557,7 @@ std::string FunctionHttpHandler::handleQueryParsingSync(const seastar::http::req
     return response;
 }
 
-std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::request& req) {
+std::pair<bool, std::string> FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::request& req) {
     auto startTime = std::chrono::high_resolution_clock::now();
 
     try {
@@ -637,7 +567,7 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
         // SECURITY VALIDATION: Validate JSON input
         auto jsonValidation = FunctionSecurity::validateJsonInput(body);
         if (!jsonValidation.isValid) {
-            return "{\"success\": false, \"error\": \"" + jsonValidation.errorMessage + "\"}";
+            return {false, "{\"success\":false,\"error\":\"" + jsonEscape(jsonValidation.errorMessage) + "\"}"};
         }
         body = jsonValidation.sanitizedInput;
 
@@ -645,11 +575,11 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
         GlazeFunctionQueryRequest parsedReq;
         auto parseErr = glz::read_json(parsedReq, body);
         if (parseErr) {
-            return "{\"success\": false, \"error\": \"Invalid request format\"}";
+            return {false, R"({"success":false,"error":"Invalid request format"})"};
         }
 
         if (parsedReq.query.empty() || parsedReq.startTime == 0 || parsedReq.endTime == 0) {
-            return "{\"success\": false, \"error\": \"Invalid request format\"}";
+            return {false, R"({"success":false,"error":"Invalid request format"})"};
         }
 
         std::string functionQuery = parsedReq.query;
@@ -659,13 +589,13 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
         // SECURITY VALIDATION: Validate function query
         auto queryValidation = FunctionSecurity::validateFunctionQuery(functionQuery);
         if (!queryValidation.isValid) {
-            return "{\"success\": false, \"error\": \"" + queryValidation.errorMessage + "\"}";
+            return {false, "{\"success\":false,\"error\":\"" + jsonEscape(queryValidation.errorMessage) + "\"}"};
         }
         functionQuery = queryValidation.sanitizedInput;
 
         // Check if this is a multi-series operation (e.g., add(query1, query2))
         if (functionQuery.find("add(") == 0) {
-            return handleMultiSeriesOperation(functionQuery, startTimeVal, endTimeVal, startTime);
+            return handleMultiSeriesOperation(functionQuery, startTimeVal, endTimeVal, startTime);  // already returns pair
         }
 
         // Handle single-series operation with chained functions
@@ -675,13 +605,13 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
         // Find where the functions start (after closing parenthesis of fields or braces of tags)
         size_t functionStart = functionQuery.find('(');
         if (functionStart == std::string::npos) {
-            return "{\"success\": false, \"error\": \"Invalid query format - missing field specification\"}";
+            return {false, R"({"success":false,"error":"Invalid query format - missing field specification"})"};
         }
 
         // Find closing parenthesis of fields
         size_t functionEnd = functionQuery.find(')', functionStart);
         if (functionEnd == std::string::npos) {
-            return "{\"success\": false, \"error\": \"Invalid query format - missing closing parenthesis for fields\"}";
+            return {false, R"({"success":false,"error":"Invalid query format - missing closing parenthesis for fields"})"};
         }
 
         // Extract field name from the query
@@ -745,7 +675,7 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
             }
 
             if (parenCount != 0) {
-                return "{\"success\": false, \"error\": \"Mismatched parentheses in function: " + funcName + "\"}";
+                return {false, "{\"success\":false,\"error\":\"Mismatched parentheses in function: " + jsonEscape(funcName) + "\"}"};
             }
 
             std::string funcParams = functionQuery.substr(paramStart, paramEnd - paramStart - 1);
@@ -756,20 +686,20 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
 
         // TODO: Query actual data from the engine instead of returning an error.
         // The function query endpoint does not yet integrate with the storage engine.
-        return R"({"success": false, "error": "Function query endpoint not yet connected to storage engine"})";
+        return {false, R"({"success":false,"error":"Function query endpoint not yet connected to storage engine"})"};
 
     } catch (const std::exception& e) {
-        return "{\"success\": false, \"error\": \"" + jsonEscape(e.what()) + "\"}";
+        return {false, "{\"success\":false,\"error\":\"" + jsonEscape(e.what()) + "\"}"};
     }
 }
 
-std::string FunctionHttpHandler::handleMultiSeriesOperation(
+std::pair<bool, std::string> FunctionHttpHandler::handleMultiSeriesOperation(
     const std::string& functionQuery, [[maybe_unused]] uint64_t startTimeVal, [[maybe_unused]] uint64_t endTimeVal,
     [[maybe_unused]] const std::chrono::high_resolution_clock::time_point& startTime) {
     // Multi-series function query endpoint is not yet connected to the storage engine.
     // Return an explicit error rather than fabricated data.
     (void)functionQuery;
-    return R"({"success": false, "error": "Multi-series function query endpoint not yet connected to storage engine"})";
+    return {false, R"({"success":false,"error":"Multi-series function query endpoint not yet connected to storage engine"})"};
 
 #if 0  // Original mock implementation — kept for reference during engine integration
     try {

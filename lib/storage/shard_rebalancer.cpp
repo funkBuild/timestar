@@ -57,17 +57,28 @@ std::string ShardRebalancer::stateFilePath() const {
 
 void ShardRebalancer::writeShardCountMeta(const std::string& dataDir, unsigned shardCount) {
     std::string path = (dataDir.empty() ? "." : dataDir) + "/shard_count.meta";
-    std::ofstream ofs(path, std::ios::trunc);
+    std::string tmpPath = path + ".tmp";
+    std::ofstream ofs(tmpPath, std::ios::trunc);
     if (!ofs) {
-        throw std::runtime_error("Failed to write shard_count.meta: " + path);
+        throw std::runtime_error("Failed to write shard_count.meta.tmp: " + tmpPath);
     }
     ofs << shardCount << "\n";
     ofs.flush();
-    // fsync to ensure data reaches disk for crash safety
-    int fd = ::open(path.c_str(), O_RDONLY);
+    ofs.close();
+    // fsync the temp file to ensure data reaches disk before rename
+    int fd = ::open(tmpPath.c_str(), O_RDONLY);
     if (fd >= 0) {
         ::fsync(fd);
         ::close(fd);
+    }
+    // Atomic rename replaces old file — no window where truncation loses data
+    fs::rename(tmpPath, path);
+    // fsync parent directory to persist the rename
+    std::string dir = fs::path(path).parent_path().string();
+    int dirfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0) {
+        ::fsync(dirfd);
+        ::close(dirfd);
     }
 }
 
@@ -86,20 +97,31 @@ unsigned ShardRebalancer::readShardCountMeta(const std::string& dataDir) {
 // ---------------------------------------------------------------------------
 
 void ShardRebalancer::writeState(const RebalanceState& state) {
-    std::ofstream ofs(stateFilePath(), std::ios::trunc);
+    auto path = stateFilePath();
+    std::string tmpPath = path + ".tmp";
+    std::ofstream ofs(tmpPath, std::ios::trunc);
     if (!ofs) {
-        throw std::runtime_error("Failed to write rebalance.state");
+        throw std::runtime_error("Failed to write rebalance.state.tmp");
     }
     // Simple text format: phase oldCount newCount
     int phaseInt = static_cast<int>(state.phase);
     ofs << phaseInt << " " << state.oldShardCount << " " << state.newShardCount << "\n";
     ofs.flush();
-    // fsync to ensure data reaches disk for crash safety
-    auto path = stateFilePath();
-    int fd = ::open(path.c_str(), O_RDONLY);
+    ofs.close();
+    // fsync the temp file to ensure data reaches disk before rename
+    int fd = ::open(tmpPath.c_str(), O_RDONLY);
     if (fd >= 0) {
         ::fsync(fd);
         ::close(fd);
+    }
+    // Atomic rename replaces old file — no window where truncation loses data
+    fs::rename(tmpPath, path);
+    // fsync parent directory to persist the rename
+    std::string dir = fs::path(path).parent_path().string();
+    int dirfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0) {
+        ::fsync(dirfd);
+        ::close(dirfd);
     }
 }
 
@@ -453,6 +475,14 @@ void ShardRebalancer::performCutover(unsigned oldShardCount, unsigned newShardCo
         if (fs::exists(src)) {
             fs::rename(src, dst);
         }
+    }
+
+    // fsync the data directory to persist all renames — without this,
+    // power loss can silently lose the directory entry updates
+    int dirfd = ::open(_dataDir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0) {
+        ::fsync(dirfd);
+        ::close(dirfd);
     }
 
     writeState({RebalancePhase::Complete, oldShardCount, newShardCount});

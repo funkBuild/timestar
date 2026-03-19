@@ -2,6 +2,7 @@
 
 #include "alp_constants.hpp"
 #include "alp_ffor.hpp"
+#include "alp_simd.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -27,8 +28,16 @@ struct ALPScratchBuffers {
     std::vector<uint64_t> exc_values{1024};
     std::vector<uint64_t> pos_word_buf{256};
 
-    // ALP_RD scheme buffers
+    // ALP_RD scheme buffers — moved from stack (~44KB) to thread-local
+    // to avoid overflow on Seastar's 128KB fiber stacks.
     std::vector<uint64_t> dictionary;
+    std::vector<int64_t> rd_left_indices{1024};
+    std::vector<uint64_t> rd_left_packed{1024};
+    std::vector<uint64_t> rd_right_parts{1024};
+    std::vector<uint64_t> rd_right_packed{1024};
+    std::vector<uint16_t> rd_exc_positions{1024};
+    std::vector<uint64_t> rd_exc_values{1024};
+    std::vector<uint64_t> rd_pos_word_buf{256};
 };
 
 static ALPScratchBuffers& getScratch() {
@@ -189,11 +198,14 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
                 // Emit values until block ends or output is full
                 const size_t emit_end = std::min(static_cast<size_t>(block_count), i + output_remaining);
-                for (; i < emit_end; ++i) {
-                    // Must preserve original evaluation order: (int * frac) / fact
-                    // to maintain bit-exact round-trip with the encoder
-                    *output_ptr++ = static_cast<double>(decoded[i]) * frac_val / fact_val;
-                }
+                const size_t emit_count = emit_end - i;
+
+                // SIMD-accelerated reconstruction: int64 -> double via (val * frac / fact).
+                // Highway vectorizes the int64->double conversion + mul + div, which GCC
+                // cannot auto-vectorize (the int64->double cast is the bottleneck).
+                alp::simd::alpReconstruct(&decoded[i], emit_count, frac_val, fact_val, output_ptr);
+                output_ptr += emit_count;
+
                 output_remaining = length - static_cast<size_t>(output_ptr - (out.data() + current_size));
                 global_pos += block_count;
             } else {
@@ -264,42 +276,44 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             }
 
             // === Read Left Indices (FFOR packed) ===
-            alignas(8) int64_t left_indices_stack[1024];
-            std::fill_n(left_indices_stack, block_count, int64_t{0});
+            // Use thread-local scratch buffers instead of stack arrays to avoid
+            // overflow on Seastar's 128KB fiber stacks (~44KB saved).
+            scratch.rd_left_indices.resize(block_count);
+            std::fill_n(scratch.rd_left_indices.data(), block_count, int64_t{0});
             if (left_bw > 0) {
                 size_t left_packed_words = alp::ffor_packed_words(block_count, left_bw);
-                alignas(8) uint64_t left_packed_stack[1024];
-                encoded.readAlignedWords(left_packed_stack, left_packed_words);
-                alp::ffor_unpack(left_packed_stack, block_count, 0, left_bw, left_indices_stack);
+                scratch.rd_left_packed.resize(left_packed_words);
+                encoded.readAlignedWords(scratch.rd_left_packed.data(), left_packed_words);
+                alp::ffor_unpack(scratch.rd_left_packed.data(), block_count, 0, left_bw, scratch.rd_left_indices.data());
             }
 
             // === Read Right FFOR Data ===
-            alignas(8) uint64_t right_parts_stack[1024];
-            std::fill_n(right_parts_stack, block_count, right_for_base);
+            scratch.rd_right_parts.resize(block_count);
+            std::fill_n(scratch.rd_right_parts.data(), block_count, right_for_base);
             if (right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, right_bw);
-                alignas(8) uint64_t right_packed_stack[1024];
-                encoded.readAlignedWords(right_packed_stack, right_packed_words);
-                alp::ffor_unpack_u64(right_packed_stack, block_count, right_for_base, right_bw, right_parts_stack);
+                scratch.rd_right_packed.resize(right_packed_words);
+                encoded.readAlignedWords(scratch.rd_right_packed.data(), right_packed_words);
+                alp::ffor_unpack_u64(scratch.rd_right_packed.data(), block_count, right_for_base, right_bw, scratch.rd_right_parts.data());
             }
 
             // === Read Exceptions ===
-            alignas(8) uint16_t rd_exc_positions_stack[1024];
-            alignas(8) uint64_t rd_exc_values_stack[1024];
+            scratch.rd_exc_positions.resize(exception_count);
+            scratch.rd_exc_values.resize(exception_count);
             if (exception_count > 0) [[unlikely]] {
                 size_t pos_words = (exception_count * 2 + 7) / 8;
-                alignas(8) uint64_t pos_word_buf[256];
-                encoded.readAlignedWords(pos_word_buf, pos_words);
+                scratch.rd_pos_word_buf.resize(pos_words);
+                encoded.readAlignedWords(scratch.rd_pos_word_buf.data(), pos_words);
                 for (size_t w = 0; w < pos_words; ++w) {
-                    uint64_t word = pos_word_buf[w];
+                    uint64_t word = scratch.rd_pos_word_buf[w];
                     const size_t base_idx = w * 4;
                     const size_t remaining = exception_count - base_idx;
                     const size_t cnt = remaining < 4 ? remaining : 4;
                     for (size_t j = 0; j < cnt; ++j) {
-                        rd_exc_positions_stack[base_idx + j] = static_cast<uint16_t>((word >> (j * 16)) & 0xFFFF);
+                        scratch.rd_exc_positions[base_idx + j] = static_cast<uint16_t>((word >> (j * 16)) & 0xFFFF);
                     }
                 }
-                encoded.readAlignedWords(rd_exc_values_stack, exception_count);
+                encoded.readAlignedWords(scratch.rd_exc_values.data(), exception_count);
             }
 
             // === Reconstruct doubles ===
@@ -309,8 +323,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             if (exception_count == 0) [[likely]] {
                 // Fast path: no exceptions -- tight reconstruction loop
-                const int64_t* __restrict__ left_idx = left_indices_stack;
-                const uint64_t* __restrict__ right = right_parts_stack;
+                const int64_t* __restrict__ left_idx = scratch.rd_left_indices.data();
+                const uint64_t* __restrict__ right = scratch.rd_right_parts.data();
                 const uint64_t* __restrict__ dict = scratch.dictionary.data();
 
                 // Skip values before nToSkip
@@ -338,15 +352,15 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 for (size_t i = 0; i < block_count; ++i) {
                     double value;
 
-                    if (exc_idx < exception_count && rd_exc_positions_stack[exc_idx] == i) [[unlikely]] {
-                        value = std::bit_cast<double>(rd_exc_values_stack[exc_idx]);
+                    if (exc_idx < exception_count && scratch.rd_exc_positions[exc_idx] == i) [[unlikely]] {
+                        value = std::bit_cast<double>(scratch.rd_exc_values[exc_idx]);
                         exc_idx++;
                     } else {
-                        auto lidx = static_cast<uint8_t>(left_indices_stack[i]);
+                        auto lidx = static_cast<uint8_t>(scratch.rd_left_indices[i]);
                         if (lidx >= dict_size) [[unlikely]]
                             throw std::runtime_error("ALP_RD decoder: dictionary index out of range");
                         uint64_t left = scratch.dictionary[lidx];
-                        uint64_t right = right_parts_stack[i] & right_mask;
+                        uint64_t right = scratch.rd_right_parts[i] & right_mask;
                         uint64_t combined = (left << right_bit_count) | right;
                         value = std::bit_cast<double>(combined);
                     }

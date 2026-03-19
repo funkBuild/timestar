@@ -237,8 +237,11 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
     }
 
     std::unordered_set<uint64_t> toRemove(removeFileNums.begin(), removeFileNums.end());
+    auto newFn = newFile.fileNumber;
     auto it = std::remove_if(files_.begin(), files_.end(),
-                             [&toRemove](const SSTableMetadata& f) { return toRemove.contains(f.fileNumber); });
+                             [&toRemove, newFn](const SSTableMetadata& f) {
+                                 return f.fileNumber != newFn && toRemove.contains(f.fileNumber);
+                             });
     files_.erase(it, files_.end());
 }
 

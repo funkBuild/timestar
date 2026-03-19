@@ -277,12 +277,48 @@ std::map<std::string, std::string> QueryParser::parseScopes(const std::string& q
         return scopes;
     }
 
-    // Parse comma-separated key:value pairs using string_view
+    // Parse comma-separated key:value pairs using string_view.
+    // We must not split on commas that appear inside regex patterns:
+    //   ~prefix regex:  e.g. host:~server-[a,b]+   — commas inside [...] are literal
+    //   /regex/ style:  e.g. host:/server,[0-9]+/   — commas between /.../ are literal
+    // Strategy: scan character by character, tracking whether we're inside a
+    // /.../ regex or a [...] bracket expression. Only split on top-level commas.
     size_t start = 0;
     while (start < scopesView.size()) {
-        size_t end = scopesView.find(',', start);
-        if (end == std::string_view::npos)
-            end = scopesView.size();
+        size_t end = start;
+        bool inSlashRegex = false;  // between /  .../
+        int bracketDepth = 0;       // inside [...]
+        bool seenColon = false;     // past the key: separator
+        while (end < scopesView.size()) {
+            char c = scopesView[end];
+            if (!seenColon) {
+                // Before the colon — just looking for the key:value separator
+                if (c == ':') {
+                    seenColon = true;
+                    // Peek: does the value start with '/'?
+                    if (end + 1 < scopesView.size() && scopesView[end + 1] == '/') {
+                        inSlashRegex = true;
+                        end += 2;  // skip ':' and opening '/'
+                        continue;
+                    }
+                }
+            } else if (inSlashRegex) {
+                // Inside /regex/ — skip to closing unescaped '/'
+                if (c == '/' && (end == 0 || scopesView[end - 1] != '\\')) {
+                    inSlashRegex = false;
+                }
+            } else {
+                // In the value portion (plain or ~regex)
+                if (c == '[') {
+                    bracketDepth++;
+                } else if (c == ']' && bracketDepth > 0) {
+                    bracketDepth--;
+                } else if (c == ',' && bracketDepth == 0) {
+                    break;  // top-level comma — this is a real delimiter
+                }
+            }
+            end++;
+        }
         std::string_view pair = trimView(scopesView.substr(start, end - start));
 
         size_t colonP = pair.find(':');
@@ -297,6 +333,9 @@ std::map<std::string, std::string> QueryParser::parseScopes(const std::string& q
             throw QueryParseException("Empty key or value in scope: " + std::string(pair));
         }
 
+        if (scopes.count(std::string(key))) {
+            throw QueryParseException("Duplicate scope key: '" + std::string(key) + "'");
+        }
         scopes[std::string(key)] = std::string(value);
         start = end + 1;
     }

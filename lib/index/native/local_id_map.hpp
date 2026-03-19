@@ -40,9 +40,20 @@ public:
     }
 
     // Reverse lookup: local ID → global ID. The caller must ensure localId < nextId().
+    // After restore, some slots may contain zero SeriesId128 if local IDs were lost
+    // (e.g., partial WAL truncation). Callers should check isValid() or handle zero IDs.
     const SeriesId128& getGlobalId(uint32_t localId) const {
         assert(localId < localToGlobal_.size());
+        // Defense: a zero SeriesId128 indicates a hole from incomplete restore
+        // (e.g., partial WAL truncation). Callers must handle this gracefully.
+        assert(!localToGlobal_[localId].isZero() && "getGlobalId: zero ID hole detected — local ID was never restored");
         return localToGlobal_[localId];
+    }
+
+    // Check whether a local ID is validly mapped (in bounds and not a zero hole).
+    // Use this before getGlobalId() when processing restored data that may have gaps.
+    bool isValid(uint32_t localId) const {
+        return localId < localToGlobal_.size() && !localToGlobal_[localId].isZero();
     }
 
     // The next local ID that will be assigned.
@@ -52,6 +63,9 @@ public:
     uint32_t size() const { return nextId_; }
 
     // Prepare for bulk restore: pre-allocate for expectedCount entries.
+    // WARNING: resize(nextId) default-constructs zero SeriesId128 entries for ALL slots.
+    // If any local IDs are missing from persisted data (e.g., partial WAL truncation),
+    // those slots will remain zero, creating "holes". Use isValid() to detect them.
     void restoreBegin(uint32_t nextId, uint32_t expectedCount) {
         nextId_ = nextId;
         localToGlobal_.resize(nextId);

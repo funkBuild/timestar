@@ -13,31 +13,7 @@ using namespace seastar;
 using namespace httpd;
 using timestar::buildSeriesKey;
 
-// Glaze-compatible structures for JSON parsing
-// NOTE: GlazeDeleteRequest is also defined in test/unit/http/http_delete_handler_test.cpp.
-// Both must be kept in sync. Consider moving to a shared header if the struct grows.
-struct GlazeDeleteRequest {
-    // For series key format
-    std::optional<std::string> series;
-
-    // For structured format
-    std::optional<std::string> measurement;
-    std::optional<std::map<std::string, std::string>> tags;
-    std::optional<std::string> field;
-    std::optional<std::vector<std::string>> fields;
-
-    // Time range (optional - defaults to all time)
-    std::optional<uint64_t> startTime;
-    std::optional<uint64_t> endTime;
-};
-
-template <>
-struct glz::meta<GlazeDeleteRequest> {
-    using T = GlazeDeleteRequest;
-    static constexpr auto value =
-        object("series", &T::series, "measurement", &T::measurement, "tags", &T::tags, "field", &T::field, "fields",
-               &T::fields, "startTime", &T::startTime, "endTime", &T::endTime);
-};
+// GlazeDeleteRequest is defined in http_delete_handler.hpp
 
 struct GlazeBatchDelete {
     std::vector<GlazeDeleteRequest> deletes;
@@ -117,6 +93,8 @@ HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const Gla
         throw std::runtime_error("Measurement, series, and field names must not contain null bytes");
     }
     for (const auto& f : req.fields) {
+        if (f.empty())
+            throw std::invalid_argument("'fields' must not contain empty strings");
         if (hasNullByte(f))
             throw std::runtime_error("Field names must not contain null bytes");
     }

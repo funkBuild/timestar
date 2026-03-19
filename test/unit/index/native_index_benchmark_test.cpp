@@ -462,7 +462,7 @@ SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
         LatencyStats measCard;
         for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
             auto t0 = clk::now();
-            double est = index.estimateMeasurementCardinality(std::string(MEASUREMENTS[m]));
+            double est = co_await index.estimateMeasurementCardinality(std::string(MEASUREMENTS[m]));
             measCard.add(clk::now() - t0);
             double actual = static_cast<double>(NUM_HOSTS * FIELDS_PER_MEASUREMENT);
             double error = std::abs(est - actual) / actual;
@@ -475,7 +475,7 @@ SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
         LatencyStats tagCard;
         for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
             auto t0 = clk::now();
-            double est = index.estimateTagCardinality(std::string(MEASUREMENTS[m]), "region", "us-east");
+            double est = co_await index.estimateTagCardinality(std::string(MEASUREMENTS[m]), "region", "us-east");
             tagCard.add(clk::now() - t0);
             double actual = static_cast<double>(NUM_HOSTS / 2 * FIELDS_PER_MEASUREMENT);
             double error = std::abs(est - actual) / actual;
@@ -486,7 +486,7 @@ SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
         LatencyStats hostCard;
         for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
             auto t0 = clk::now();
-            double est = index.estimateTagCardinality(std::string(MEASUREMENTS[m]), "host", hostName(42));
+            double est = co_await index.estimateTagCardinality(std::string(MEASUREMENTS[m]), "host", hostName(42));
             hostCard.add(clk::now() - t0);
             // Single host should have FIELDS_PER_MEASUREMENT series
             EXPECT_GT(est, 0.0);

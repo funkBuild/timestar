@@ -1843,6 +1843,16 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     if (writes.is_array()) {
                         auto& writes_array = writes.get<json_value_t::array_t>();
 
+                        constexpr size_t MAX_BATCH_WRITES = 100000;
+                        if (writes_array.size() > MAX_BATCH_WRITES) {
+                            rep->set_status(seastar::http::reply::status_type::bad_request);
+                            rep->_content = createErrorResponse(
+                                "Batch too large: " + std::to_string(writes_array.size()) +
+                                " writes exceeds maximum of " + std::to_string(MAX_BATCH_WRITES));
+                            rep->add_header("Content-Type", "application/json");
+                            co_return rep;
+                        }
+
                         LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Processing batch with {} writes",
                                         writes_array.size());
 

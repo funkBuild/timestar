@@ -22,17 +22,20 @@ public:
         : reader_(std::move(reader)), iter_(std::move(iter)), priority_(priority) {}
 
     seastar::future<> seek(std::string_view target) override {
-        iter_->seek(target);
-        return seastar::make_ready_future<>();
+        co_await iter_->seek(target);
     }
     seastar::future<> seekToFirst() override {
-        iter_->seekToFirst();
-        return seastar::make_ready_future<>();
+        co_await iter_->seekToFirst();
     }
     seastar::future<> next() override {
-        iter_->next();
-        return seastar::make_ready_future<>();
+        co_await iter_->next();
     }
+
+    // Synchronous fast path — calls .get() on async futures.
+    // Safe when futures are ready (cache hit) or inside seastar::async().
+    void seekSync(std::string_view target) override { iter_->seek(target).get(); }
+    void seekToFirstSync() override { iter_->seekToFirst().get(); }
+    void nextSync() override { iter_->next().get(); }
 
     bool valid() const override { return iter_->valid(); }
     std::string_view key() const override { return iter_->key(); }
@@ -101,7 +104,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
 
     // Create merge iterator
     MergeIterator merger(std::move(sources));
-    merger.seekToFirstSync();  // SSTable iterators are synchronous
+    co_await merger.seekToFirst();  // SSTable iterators are async (DMA I/O)
 
     if (!merger.valid()) {
         // All inputs were empty — remove from manifest and delete physical files
@@ -158,7 +161,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
             auto mergedVal = merger.value();
             if (canDropTombstones && mergedVal.size() == 1 && mergedVal[0] == '\0') {
                 ++tombstonesDropped;
-                merger.nextSync();
+                co_await merger.next();
                 continue;
             }
 
@@ -184,7 +187,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
                     }
                 }
             }
-            merger.nextSync();
+            co_await merger.next();
         }
         co_await writer.flushPending();
 

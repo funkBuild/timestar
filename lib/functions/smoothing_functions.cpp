@@ -304,24 +304,23 @@ std::unique_ptr<IFunction> GaussianSmoothFunction::clone() const {
 
 seastar::future<bool> GaussianSmoothFunction::validateParameters(const FunctionContext& context) const {
     try {
-        bool hasSigma = context.hasParameter("sigma");
-        bool hasWindow = context.hasParameter("window");
-
-        // Only one parameter should be provided at a time
-        if (hasSigma && hasWindow) {
-            return seastar::make_ready_future<bool>(false);
-        }
-
-        if (hasSigma) {
+        // Both sigma and window may be provided independently:
+        // sigma controls the Gaussian kernel width, window controls the kernel array size.
+        if (context.hasParameter("sigma")) {
             double sigma = context.getParameter<double>("sigma");
-            return seastar::make_ready_future<bool>(sigma > 0.0);
-        } else if (hasWindow) {
-            int64_t window = context.getParameter<int64_t>("window");
-            return seastar::make_ready_future<bool>(window > 0 && window % 2 == 1);  // Window should be odd
-        } else {
-            // Default sigma is valid
-            return seastar::make_ready_future<bool>(true);
+            if (sigma <= 0.0) {
+                return seastar::make_ready_future<bool>(false);
+            }
         }
+
+        if (context.hasParameter("window")) {
+            int64_t window = context.getParameter<int64_t>("window");
+            if (window <= 0 || window % 2 == 0) {  // Window should be positive and odd
+                return seastar::make_ready_future<bool>(false);
+            }
+        }
+
+        return seastar::make_ready_future<bool>(true);
     } catch (...) {
         return seastar::make_ready_future<bool>(false);
     }
@@ -339,8 +338,23 @@ seastar::future<FunctionResult<double>> GaussianSmoothFunction::execute(const Do
         throw InsufficientDataException("Gaussian smoothing requires at least 3 data points");
     }
 
-    if (!validateParameters(context).get()) {
-        throw std::invalid_argument("GaussianSmoothFunction: invalid parameters");
+    // Inline parameter validation (avoids calling .get() on a future, which
+    // would block the Seastar reactor thread and risk deadlock).
+    // Both sigma and window may be provided: sigma controls kernel width,
+    // window controls kernel array size.
+    {
+        if (context.hasParameter("sigma")) {
+            double s = context.getParameter<double>("sigma");
+            if (s <= 0.0) {
+                throw std::invalid_argument("GaussianSmoothFunction: sigma must be positive");
+            }
+        }
+        if (context.hasParameter("window")) {
+            int64_t w = context.getParameter<int64_t>("window");
+            if (w <= 0 || w % 2 == 0) {
+                throw std::invalid_argument("GaussianSmoothFunction: window must be a positive odd integer");
+            }
+        }
     }
 
     // Calculate sigma based on the provided parameter

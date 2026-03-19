@@ -119,6 +119,7 @@ public:
         blockState.latestTimestamp = maxTime;
         blockState.firstTimestamp = minTime;
         blockState.m2 = m2;
+        blockState.mean = (count > 0) ? sum / count : 0.0;
         blockState.latest = latestValue;
         blockState.first = firstValue;
 
@@ -313,28 +314,73 @@ private:
         const double* vdata = values.data() + begin;
         const uint64_t* tdata = timestamps.data() + begin;
 
+        // INVARIANT: Decoded TSM block data is NaN-free (NaN filtered during write).
+        // Defense-in-depth: if the first element is NaN (e.g. corrupt data), bail to
+        // the scalar path which correctly skips NaN via addValueForMethod().
+        if (n > 0 && std::isnan(vdata[0])) [[unlikely]] {
+            for (size_t i = begin; i < end; ++i) {
+                addToState(state, values[i], timestamps[i]);
+            }
+            return;
+        }
+
         switch (method_) {
             case AggregationMethod::AVG:
-            case AggregationMethod::SUM:
-                state.sum += simd::SimdAggregator::calculateSum(vdata, n);
-                state.count += n;
+            case AggregationMethod::SUM: {
+                double simdSum = simd::SimdAggregator::calculateSum(vdata, n);
+                // Defense-in-depth: if SIMD sum is NaN (interior NaN values),
+                // fall back to scalar which skips NaN correctly.
+                if (std::isnan(simdSum)) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                } else {
+                    state.sum += simdSum;
+                    state.count += n;
+                }
                 break;
+            }
             case AggregationMethod::COUNT:
                 state.count += n;
                 break;
-            case AggregationMethod::MIN:
-                state.min = std::min(state.min, simd::SimdAggregator::calculateMin(vdata, n));
-                state.count += n;
+            case AggregationMethod::MIN: {
+                double simdMin = simd::SimdAggregator::calculateMin(vdata, n);
+                if (std::isnan(simdMin)) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                } else {
+                    state.min = std::min(state.min, simdMin);
+                    state.count += n;
+                }
                 break;
-            case AggregationMethod::MAX:
-                state.max = std::max(state.max, simd::SimdAggregator::calculateMax(vdata, n));
-                state.count += n;
+            }
+            case AggregationMethod::MAX: {
+                double simdMax = simd::SimdAggregator::calculateMax(vdata, n);
+                if (std::isnan(simdMax)) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                } else {
+                    state.max = std::max(state.max, simdMax);
+                    state.count += n;
+                }
                 break;
-            case AggregationMethod::SPREAD:
-                state.min = std::min(state.min, simd::SimdAggregator::calculateMin(vdata, n));
-                state.max = std::max(state.max, simd::SimdAggregator::calculateMax(vdata, n));
-                state.count += n;
+            }
+            case AggregationMethod::SPREAD: {
+                double simdMin = simd::SimdAggregator::calculateMin(vdata, n);
+                double simdMax = simd::SimdAggregator::calculateMax(vdata, n);
+                if (std::isnan(simdMin) || std::isnan(simdMax)) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                } else {
+                    state.min = std::min(state.min, simdMin);
+                    state.max = std::max(state.max, simdMax);
+                    state.count += n;
+                }
                 break;
+            }
             case AggregationMethod::LATEST:
                 // Timestamps are monotonically increasing within a TSM block,
                 // so the last element is always the latest.

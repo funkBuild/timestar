@@ -15,16 +15,17 @@ void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<d
     lower.resize(n);
 
     // Compute residual statistics (using robust estimators)
-    std::vector<double> absResiduals;
-    absResiduals.reserve(n);
+    // MAD = median(|x_i - median(x)|), NOT median(|x_i|)
+    std::vector<double> residuals;
+    residuals.reserve(n);
 
     for (size_t i = 0; i < n; ++i) {
         if (!std::isnan(stl.residual[i])) {
-            absResiduals.push_back(std::abs(stl.residual[i]));
+            residuals.push_back(stl.residual[i]);
         }
     }
 
-    if (absResiduals.empty()) {
+    if (residuals.empty()) {
         // No valid residuals - use infinite bounds (never flag anomalies)
         for (size_t i = 0; i < n; ++i) {
             upper[i] = std::numeric_limits<double>::infinity();
@@ -33,20 +34,35 @@ void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<d
         return;
     }
 
-    // Use MAD (Median Absolute Deviation) for robust scale estimation
-    // nth_element is O(N) vs O(N log N) for full sort
-    size_t sz = absResiduals.size();
+    // Step 1: Compute median of raw residuals
+    size_t sz = residuals.size();
     size_t medianIdx = sz / 2;
-    std::nth_element(absResiduals.begin(), absResiduals.begin() + static_cast<ptrdiff_t>(medianIdx),
-                     absResiduals.end());
+    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx),
+                     residuals.end());
+    double residualMedian;
+    if (sz % 2 == 0 && sz >= 2) {
+        double upperMedian = residuals[medianIdx];
+        auto lowerIt = std::max_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx));
+        residualMedian = (*lowerIt + upperMedian) / 2.0;
+    } else {
+        residualMedian = residuals[medianIdx];
+    }
+
+    // Step 2: Compute |x_i - median(x)|, reusing the residuals vector in-place
+    for (size_t i = 0; i < sz; ++i) {
+        residuals[i] = std::abs(residuals[i] - residualMedian);
+    }
+
+    // Step 3: MAD = median of the absolute deviations
+    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx),
+                     residuals.end());
     double mad;
     if (sz % 2 == 0 && sz >= 2) {
-        // For even-length: true median is average of elements at [n/2-1] and [n/2]
-        double upperMedian = absResiduals[medianIdx];
-        auto lowerIt = std::max_element(absResiduals.begin(), absResiduals.begin() + static_cast<ptrdiff_t>(medianIdx));
+        double upperMedian = residuals[medianIdx];
+        auto lowerIt = std::max_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx));
         mad = (*lowerIt + upperMedian) / 2.0;
     } else {
-        mad = absResiduals[medianIdx];
+        mad = residuals[medianIdx];
     }
 
     // Convert MAD to standard deviation equivalent

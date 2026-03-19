@@ -165,6 +165,10 @@ TEST_F(QueryParserTest, ErrorOnInvalidScopeFormat) {
     EXPECT_THROW(QueryParser::parseQueryString("avg:temperature(){invalid_format}"), QueryParseException);
 }
 
+TEST_F(QueryParserTest, ErrorOnDuplicateScopeKey) {
+    EXPECT_THROW(QueryParser::parseQueryString("avg:temperature(){host:a,host:b}"), QueryParseException);
+}
+
 TEST_F(QueryParserTest, ErrorOnEmptyGroupBy) {
     EXPECT_THROW(QueryParser::parseQueryString("avg:temperature() by {}"), QueryParseException);
 }
@@ -271,4 +275,41 @@ TEST_F(QueryParserTest, MixedExactAndPatternScopes) {
     EXPECT_EQ(request.scopes.at("host"), "server-*");
     EXPECT_EQ(request.scopes.at("dc"), "dc1");
     EXPECT_TRUE(request.hasPatternFilters());
+}
+
+// ~regex scope with commas inside bracket expression
+TEST_F(QueryParserTest, TildeRegexWithCommaInBrackets) {
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:~server-[a,b]+,dc:dc1}");
+
+    EXPECT_EQ(request.scopes.size(), 2);
+    EXPECT_EQ(request.scopes.at("host"), "~server-[a,b]+");
+    EXPECT_EQ(request.scopes.at("dc"), "dc1");
+}
+
+// /regex/ scope with commas inside the pattern
+TEST_F(QueryParserTest, SlashRegexWithCommas) {
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:/server,prod/,dc:dc1}");
+
+    EXPECT_EQ(request.scopes.size(), 2);
+    EXPECT_EQ(request.scopes.at("host"), "/server,prod/");
+    EXPECT_EQ(request.scopes.at("dc"), "dc1");
+}
+
+// /regex/ scope with commas inside bracket expressions
+TEST_F(QueryParserTest, SlashRegexWithCommaInBrackets) {
+    QueryRequest request = QueryParser::parseQueryString("avg:cpu(usage){host:/server-[a,b]+/,dc:dc2}");
+
+    EXPECT_EQ(request.scopes.size(), 2);
+    EXPECT_EQ(request.scopes.at("host"), "/server-[a,b]+/");
+    EXPECT_EQ(request.scopes.at("dc"), "dc2");
+}
+
+// Multiple regex scopes with commas
+TEST_F(QueryParserTest, MultipleRegexScopesWithCommas) {
+    QueryRequest request = QueryParser::parseQueryString(
+        "avg:cpu(usage){host:~server-[a,b],region:/us-[east,west]/}");
+
+    EXPECT_EQ(request.scopes.size(), 2);
+    EXPECT_EQ(request.scopes.at("host"), "~server-[a,b]");
+    EXPECT_EQ(request.scopes.at("region"), "/us-[east,west]/");
 }

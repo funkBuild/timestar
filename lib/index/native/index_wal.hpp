@@ -8,6 +8,7 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
 #include <string>
+#include <vector>
 
 namespace timestar::index {
 
@@ -58,6 +59,7 @@ private:
 
     std::string directory_;
     std::string currentPath_;
+    std::vector<std::string> oldWalPaths_;  // Older WAL generations found on open(), replayed before current
     uint64_t sequence_ = 0;
     uint64_t walGeneration_ = 0;
 
@@ -76,6 +78,9 @@ private:
 
     seastar::future<> flushBuffer();
     seastar::future<> flushTail();  // Write remaining partial DMA block before close/rotate
+
+    // Replay a single WAL file into the target MemTable. Returns records replayed.
+    seastar::future<uint64_t> replayOneFile(const std::string& path, MemTable& target);
 
     static uint32_t computeCrc32(const char* data, size_t len);
     static std::string walFileName(const std::string& dir, uint64_t generation);

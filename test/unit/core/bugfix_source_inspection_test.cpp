@@ -184,13 +184,9 @@ TEST_F(BugfixSourceInspectionTest, Bug9_TempFileCleanupGuard) {
     std::string src = readFile(TSM_COMPACTOR_SOURCE_PATH);
     ASSERT_FALSE(src.empty()) << "Could not read tsm_compactor.cpp";
 
-    // The compact() function should have a scope guard for temp file cleanup
-    EXPECT_NE(src.find("TempCleanup"), std::string::npos)
-        << "compact() must use a scope guard (TempCleanup) to clean up temp files on failure";
-
-    // And the renamed flag should be set after successful rename
-    EXPECT_NE(src.find("tempRenamed = true"), std::string::npos)
-        << "Must mark temp as renamed after successful rename to prevent cleanup";
+    // The compact() function must clean up temp files on failure via catch block
+    EXPECT_NE(src.find("std::filesystem::remove(tempPath"), std::string::npos)
+        << "compact() must clean up temp files on failure in the catch block";
 }
 
 // ---------------------------------------------------------------------------

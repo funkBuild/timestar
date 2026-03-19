@@ -474,7 +474,9 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, Series
     // Fast path: single memory store with all timestamps > TSM max.
     // This is the common case (recent writes only in memory).  Check if the
     // TSM span and memory span are already non-overlapping and ordered.
-    if (spans.size() == 2 && !spans[0].exhausted() && !spans[1].exhausted()) {
+    // Guard: only take fast path when spans[0] is the TSM span backed by result
+    // (when no TSM files exist, spans[0] is a memory store and result is empty).
+    if (spans.size() == 2 && spans[0].valVec == &result.values && !spans[0].exhausted() && !spans[1].exhausted()) {
         uint64_t tsmMaxTs = spans[0].tsPtr[spans[0].len - 1];
         uint64_t memMinTs = spans[1].tsPtr[0];
         if (memMinTs > tsmMaxTs) {
@@ -722,94 +724,16 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     if (memMinTimeOpt.has_value()) {
         uint64_t memMinTime = *memMinTimeOpt;
         if (memMinTime <= startTime || memMinTime == 0) {
-            // Entire requested range overlaps with memory — aggregate both
-            // TSM and memory data directly instead of falling back to full
-            // materialisation with intermediate QueryResult vectors.
-            const bool foldLatestFirst = (aggregationInterval == 0) && (isLatest || isFirst);
-            timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
-            if (foldLatestFirst) {
-                aggregator.setFoldToSingleState(false);
-            }
-
-            // Aggregate TSM data first, then memory stores.
-            std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqSnap(
-                fileManager->getSequencedTsmFiles().begin(), fileManager->getSequencedTsmFiles().end());
-
-            if (isLatest || isFirst) {
-                // LATEST/FIRST: only need 1 point from TSM (the newest/oldest).
-                // Sort files by series time bounds and use sparse index for zero-I/O.
-                std::sort(seqSnap.begin(), seqSnap.end(), [&](const auto& a, const auto& b) {
-                    return isLatest ? a.second->getSeriesMaxTime(seriesId) > b.second->getSeriesMaxTime(seriesId)
-                                    : a.second->getSeriesMinTime(seriesId) < b.second->getSeriesMinTime(seriesId);
-                });
-
-                bool tsmResolved = false;
-                for (const auto& [rank, tsmFile] : seqSnap) {
-                    if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime))
-                        continue;
-                    if (tsmFile->hasTombstones()) {
-                        tsmResolved = false;
-                        break;
-                    }
-                    auto pt = isLatest ? tsmFile->getLatestFromSparse(seriesId) : tsmFile->getFirstFromSparse(seriesId);
-                    if (pt.has_value() && pt->timestamp >= startTime && pt->timestamp <= endTime) {
-                        aggregator.addPoint(pt->timestamp, pt->value);
-                        tsmResolved = true;
-                        break;
-                    }
-                    if (pt.has_value())
-                        break;
-                }
-
-                if (!tsmResolved) {
-                    for (const auto& [rank, tsmFile] : seqSnap) {
-                        if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime))
-                            continue;
-                        size_t pts = co_await tsmFile->aggregateSeriesSelective(seriesId, startTime, endTime,
-                                                                                aggregator, isLatest, 1);
-                        if (pts > 0)
-                            break;
-                    }
-                }
-            } else {
-                // Prefetch index entries for all files in parallel, then aggregate.
-                // This overlaps DMA reads instead of serializing them per file.
-                {
-                    std::vector<seastar::shared_ptr<TSM>> toFetch;
-                    for (const auto& [rank, tsmFile] : seqSnap) {
-                        if (tsmFile->seriesMayOverlapTime(seriesId, startTime, endTime))
-                            toFetch.push_back(tsmFile);
-                    }
-                    if (toFetch.size() > 1) {
-                        co_await seastar::parallel_for_each(toFetch, [&seriesId](seastar::shared_ptr<TSM>& f) {
-                            return f->getFullIndexEntry(seriesId).discard_result();
-                        });
-                    }
-                }
-                for (const auto& [rank, tsmFile] : seqSnap) {
-                    co_await tsmFile->aggregateSeries(seriesId, startTime, endTime, aggregator);
-                }
-            }
-
-            // Then fold in MemoryStore data.
-            aggregateMemoryStores(walFileManager, seriesId, startTime, endTime, aggregator);
-
-            if (aggregator.pointCount() == 0) {
-                co_return std::nullopt;
-            }
-
-            timestar::PushdownResult result;
-            result.totalPoints = aggregator.pointCount();
-            if (aggregationInterval > 0) {
-                result.bucketStates = aggregator.takeBucketStates();
-            } else if (foldLatestFirst) {
-                result.aggregatedState = aggregator.takeSingleState();
-            } else {
-                aggregator.sortTimestamps();
-                result.sortedTimestamps = aggregator.takeTimestamps();
-                result.sortedValues = aggregator.takeValues();
-            }
-            co_return result;
+            // Entire requested range overlaps with memory data.  During
+            // rollover the same points can exist in both TSM files (from a
+            // just-flushed frozen memory store) and the still-queryable
+            // memory stores.  Aggregating both sources without dedup would
+            // double-count data for SUM/COUNT/AVG/STDDEV/etc.
+            //
+            // Fall back to the standard merge-based query path which
+            // performs proper multi-way merge with dedup (TSM wins on equal
+            // timestamps).
+            co_return std::nullopt;
         }
         // Split: pushdown [startTime, memMinTime-1], fallback [memMinTime, endTime]
         tsmEndTime = (memMinTime > 0) ? memMinTime - 1 : 0;

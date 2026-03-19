@@ -827,10 +827,9 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
             // entryLength includes the CRC, so payload = entryLength - 4
             // Old format: [WALType byte][payload...] (no CRC)
             //
-            // Detection: if entryLength >= 8, first check for old format by looking
-            // at byte positions: old format has WALType at byte 0 (not byte 4),
-            // while new format has CRC at bytes 0-3 and WALType at byte 4.
-            // If old format is ruled out, verify CRC; mismatch -> corruption.
+            // Format detection: new format has 4-byte CRC prefix + WALType at byte 4;
+            // old format has WALType at byte 0 with no CRC. Try CRC first (definitive
+            // if it matches), fall back to old-format detection if CRC fails.
             const uint8_t* rawEntry = reinterpret_cast<const uint8_t*>(entry.data());
             const uint8_t* payloadPtr = rawEntry;
             size_t payloadSize = entryLength;
@@ -843,35 +842,41 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                 size_t crcPayloadSize = entryLength - 4;
                 uint32_t computedCrc = CRC32::compute(crcPayload, crcPayloadSize);
 
-                // Check if the first byte looks like an old-format entry (valid WALType
-                // at position 0 with no CRC prefix). In old format the WALType is the
-                // very first byte; in new format the first 4 bytes are the CRC and the
-                // WALType sits at byte 4.  We detect old format when byte 0 is a valid
-                // WALType AND byte 4 is NOT a valid WALType (byte 4 would be SeriesId128
-                // data in old format, not a WALType).
-                uint8_t firstByte = rawEntry[0];
-                bool byte0IsType = firstByte <= static_cast<uint8_t>(WALType::Close);
-                bool byte4IsType = (entryLength > 4) && (rawEntry[4] <= static_cast<uint8_t>(WALType::Close));
-
-                if (byte0IsType && !byte4IsType) {
-                    // Old format entry (no CRC prefix) - skip CRC verification
-                    timestar::wal_log.debug("WAL recovery: old format entry detected (no CRC), type={}", firstByte);
-                    // payloadPtr and payloadSize already point to full entry
-                } else if (storedCrc == computedCrc) {
+                // Try new format first: new-format entries have a 4-byte CRC prefix
+                // followed by WALType at byte 4. If CRC matches, it's definitively
+                // a new-format entry.
+                //
+                // If CRC doesn't match, try old format: old-format entries have
+                // WALType at byte 0 with no CRC prefix. We accept the entry as
+                // old-format if byte 0 is a valid WALType.
+                //
+                // Previous heuristic checked byte0IsType && !byte4IsType first,
+                // which failed when byte 4 of SeriesId128 happened to be <= 3
+                // (a valid WALType value), causing old entries to be silently
+                // discarded as corrupt.
+                if (storedCrc == computedCrc) {
                     // New format with valid CRC - use payload after CRC
                     payloadPtr = crcPayload;
                     payloadSize = crcPayloadSize;
                     timestar::wal_log.trace("WAL recovery: CRC32 verified for entry");
                 } else {
-                    // New-format entry with CRC mismatch: reject as corrupted.
-                    // Do NOT fall through to old-format parsing, which would silently
-                    // accept corrupted data.
-                    timestar::wal_log.warn(
-                        "WAL recovery: CRC32 mismatch (stored=0x{:08X}, computed=0x{:08X}), "
-                        "discarding corrupt entry",
-                        storedCrc, computedCrc);
-                    partialEntries++;
-                    continue;
+                    uint8_t firstByte = rawEntry[0];
+                    bool byte0IsType = firstByte <= static_cast<uint8_t>(WALType::Close);
+                    if (byte0IsType) {
+                        // Old format entry (no CRC prefix) - skip CRC verification
+                        timestar::wal_log.debug("WAL recovery: old format entry detected (no CRC), type={}", firstByte);
+                        // payloadPtr and payloadSize already point to full entry
+                    } else {
+                        // Neither valid new-format CRC nor old-format WALType:
+                        // entry is corrupt.
+                        timestar::wal_log.warn(
+                            "WAL recovery: CRC32 mismatch (stored=0x{:08X}, computed=0x{:08X}) "
+                            "and byte 0 (0x{:02X}) is not a valid WALType, "
+                            "discarding corrupt entry",
+                            storedCrc, computedCrc, firstByte);
+                        partialEntries++;
+                        continue;
+                    }
                 }
             }
             // If entryLength < 8, it's too small for new format; treat as old format
@@ -932,16 +937,23 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                 } break;
 
                 case WALType::DeleteRange: {
-                    // Read fixed 16-byte SeriesId128
-                    std::string seriesIdBytes = entrySlice.readString(16);
-                    SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
+                    try {
+                        // Read fixed 16-byte SeriesId128
+                        std::string seriesIdBytes = entrySlice.readString(16);
+                        SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
 
-                    uint64_t startTime = entrySlice.read<uint64_t>();
-                    uint64_t endTime = entrySlice.read<uint64_t>();
-                    timestar::wal_log.debug("WAL recovery: DeleteRange for series={}, startTime={}, endTime={}",
-                                            seriesId.toHex(), startTime, endTime);
-                    store->deleteRange(seriesId, startTime, endTime);
-                    entriesRead++;
+                        uint64_t startTime = entrySlice.read<uint64_t>();
+                        uint64_t endTime = entrySlice.read<uint64_t>();
+                        timestar::wal_log.debug("WAL recovery: DeleteRange for series={}, startTime={}, endTime={}",
+                                                seriesId.toHex(), startTime, endTime);
+                        store->deleteRange(seriesId, startTime, endTime);
+                        entriesRead++;
+                    } catch (const std::exception& e) {
+                        timestar::wal_log.error("WAL recovery: Failed to read DeleteRange entry: {}", e.what());
+                        partialEntries++;
+                    } catch (...) {
+                        partialEntries++;
+                    }
                 } break;
 
                 default:

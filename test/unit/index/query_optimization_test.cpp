@@ -175,7 +175,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, MeasurementHLLUpdatedOnInsert) {
             {{"host", "server-" + std::to_string(i)}}, "usage");
     }
 
-    double est = index.estimateMeasurementCardinality("cpu");
+    double est = co_await index.estimateMeasurementCardinality("cpu");
     EXPECT_GT(est, 80.0) << "Should estimate close to 100 series";
     EXPECT_LT(est, 120.0) << "Should estimate close to 100 series";
 
@@ -197,11 +197,11 @@ SEASTAR_TEST_F(QueryOptimizationTest, TagHLLUpdatedOnInsert) {
             {{"host", "server-" + std::to_string(i)}, {"region", "us-east"}}, "usage");
     }
 
-    double westEst = index.estimateTagCardinality("cpu", "region", "us-west");
+    double westEst = co_await index.estimateTagCardinality("cpu", "region", "us-west");
     EXPECT_GT(westEst, 40.0) << "us-west should estimate ~50";
     EXPECT_LT(westEst, 65.0);
 
-    double eastEst = index.estimateTagCardinality("cpu", "region", "us-east");
+    double eastEst = co_await index.estimateTagCardinality("cpu", "region", "us-east");
     EXPECT_GT(eastEst, 22.0) << "us-east should estimate ~30";
     EXPECT_LT(eastEst, 40.0);
 
@@ -229,7 +229,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, HLLPersistsAcrossFlushCompactReopen) {
         NativeIndex index(0);
         co_await index.open();
 
-        double est = index.estimateMeasurementCardinality("temperature");
+        double est = co_await index.estimateMeasurementCardinality("temperature");
         EXPECT_GT(est, 160.0) << "HLL should persist: estimated " << est << " (expected ~200)";
         EXPECT_LT(est, 240.0);
 
@@ -241,10 +241,10 @@ SEASTAR_TEST_F(QueryOptimizationTest, NonExistentMeasurementReturnsZero) {
     NativeIndex index(0);
     co_await index.open();
 
-    double est = index.estimateMeasurementCardinality("nonexistent");
+    double est = co_await index.estimateMeasurementCardinality("nonexistent");
     EXPECT_DOUBLE_EQ(est, 0.0);
 
-    double tagEst = index.estimateTagCardinality("nonexistent", "host", "server-1");
+    double tagEst = co_await index.estimateTagCardinality("nonexistent", "host", "server-1");
     EXPECT_DOUBLE_EQ(tagEst, 0.0);
 
     co_await index.close();
@@ -263,8 +263,8 @@ SEASTAR_TEST_F(QueryOptimizationTest, MultipleMeasurementsIndependent) {
             {{"host", "h-" + std::to_string(i)}}, "used");
     }
 
-    double cpuEst = index.estimateMeasurementCardinality("cpu");
-    double memEst = index.estimateMeasurementCardinality("memory");
+    double cpuEst = co_await index.estimateMeasurementCardinality("cpu");
+    double memEst = co_await index.estimateMeasurementCardinality("memory");
 
     EXPECT_GT(cpuEst, 80.0);
     EXPECT_LT(cpuEst, 120.0);
@@ -331,9 +331,9 @@ SEASTAR_TEST_F(QueryOptimizationTest, CardinalityAfterMixedInserts) {
             {{"host", "h-" + std::to_string(i)}, {"mount", "/data"}}, "free");
     }
 
-    double cpuEst = index.estimateMeasurementCardinality("cpu");
-    double memEst = index.estimateMeasurementCardinality("memory");
-    double diskEst = index.estimateMeasurementCardinality("disk");
+    double cpuEst = co_await index.estimateMeasurementCardinality("cpu");
+    double memEst = co_await index.estimateMeasurementCardinality("memory");
+    double diskEst = co_await index.estimateMeasurementCardinality("disk");
 
     // CPU and memory should both be ~100
     EXPECT_GT(cpuEst, 80.0);
@@ -345,7 +345,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, CardinalityAfterMixedInserts) {
     EXPECT_LT(diskEst, 40.0);
 
     // Tag cardinality for region=east (cpu) should be ~50
-    double eastEst = index.estimateTagCardinality("cpu", "region", "east");
+    double eastEst = co_await index.estimateTagCardinality("cpu", "region", "east");
     EXPECT_GT(eastEst, 38.0);
     EXPECT_LT(eastEst, 65.0);
 

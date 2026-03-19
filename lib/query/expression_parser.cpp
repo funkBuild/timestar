@@ -251,7 +251,7 @@ Token ExpressionLexer::nextToken() {
 
 // ==================== ExpressionParser ====================
 
-ExpressionParser::ExpressionParser(std::string_view input) : lexer_(input), currentToken_(TokenType::END, "", 0) {
+ExpressionParser::ExpressionParser(std::string_view input) : lexer_(input), currentToken_(TokenType::END, "", 0), inputLength_(input.size()) {
     advance();  // Load first token
 }
 
@@ -475,6 +475,10 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
 }
 
 std::unique_ptr<ExpressionNode> ExpressionParser::parse() {
+    if (inputLength_ > MAX_EXPRESSION_LENGTH) {
+        throw std::runtime_error("Expression too long (max " + std::to_string(MAX_EXPRESSION_LENGTH) + " characters)");
+    }
+
     auto expr = parseExpression();
 
     if (!check(TokenType::END)) {

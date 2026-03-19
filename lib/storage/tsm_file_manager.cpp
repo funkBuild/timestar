@@ -64,6 +64,23 @@ seastar::future<> TSMFileManager::init() {
     }
 }
 
+seastar::future<> TSMFileManager::stop() {
+    // Close all open TSM file handles to prevent resource leaks.
+    // Seastar asserts on leaked file handles in debug builds.
+    for (auto& [seqNum, tsmFile] : sequencedTsmFiles) {
+        try {
+            co_await tsmFile->close();
+        } catch (const std::exception& e) {
+            timestar::tsm_log.warn("Failed to close TSM file (seq={}): {}", seqNum, e.what());
+        }
+    }
+    sequencedTsmFiles.clear();
+    for (size_t i = 0; i < MAX_TIERS; ++i) {
+        tiers[i].clear();
+    }
+    timestar::tsm_log.info("TSMFileManager stopped on shard {}", shardId);
+}
+
 seastar::future<> TSMFileManager::openTsmFile(std::string path) {
     timestar::tsm_log.debug("Opening TSM file: {}", path);
 
@@ -84,6 +101,7 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
         if (!inserted) {
             timestar::tsm_log.warn("Duplicate sequence number {} for TSM file: {}, existing file takes precedence",
                                    tsmSeqNum, path);
+            co_await tsmFile->close();
         } else {
             uint64_t tier = tsmFile->tierNum;
             if (tier < MAX_TIERS) {
@@ -108,6 +126,20 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
     auto tmpFilename = filename + ".tmp";
     co_await TSMWriter::runAsync(memStore, tmpFilename);
     co_await seastar::rename_file(tmpFilename, filename);
+
+    // Fsync the parent directory to ensure the rename (directory entry update)
+    // is durable.  Without this, a crash could lose the rename even though
+    // the file data is already on disk.
+    auto slash = filename.rfind('/');
+    std::string parentDir = (slash != std::string::npos) ? filename.substr(0, slash) : ".";
+    try {
+        auto dirFile = co_await seastar::open_directory(parentDir);
+        co_await dirFile.flush();
+        co_await dirFile.close();
+    } catch (...) {
+        timestar::tsm_log.warn("Failed to fsync parent directory after memstore write rename: {}", parentDir);
+    }
+
     co_await openTsmFile(filename);
 
     co_await checkAndTriggerCompaction();
@@ -162,6 +194,7 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
     if (!inserted) {
         timestar::tsm_log.warn("Duplicate sequence number {} when adding TSM file, existing file takes precedence",
                                tsmSeqNum);
+        co_await file->close();
     } else {
         uint64_t tier = file->tierNum;
         if (tier < MAX_TIERS) {

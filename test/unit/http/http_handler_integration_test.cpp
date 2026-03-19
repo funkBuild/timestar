@@ -34,25 +34,6 @@
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
 
-// Delete handler requires GlazeDeleteRequest to be defined before the header
-struct GlazeDeleteRequest {
-    std::optional<std::string> series;
-    std::optional<std::string> measurement;
-    std::optional<std::map<std::string, std::string>> tags;
-    std::optional<std::string> field;
-    std::optional<std::vector<std::string>> fields;
-    std::optional<uint64_t> startTime;
-    std::optional<uint64_t> endTime;
-};
-
-template <>
-struct glz::meta<GlazeDeleteRequest> {
-    using T = GlazeDeleteRequest;
-    static constexpr auto value =
-        object("series", &T::series, "measurement", &T::measurement, "tags", &T::tags, "field", &T::field, "fields",
-               &T::fields, "startTime", &T::startTime, "endTime", &T::endTime);
-};
-
 #include "../../../lib/http/http_delete_handler.hpp"
 
 using namespace timestar;

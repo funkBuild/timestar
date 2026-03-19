@@ -96,6 +96,7 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(con
 
         for (uint64_t t = startTime; t <= endTime; t += uinterval) {
             targetTimestamps.push_back(t);
+            if (t > UINT64_MAX - uinterval) break;
         }
     } else {
         std::string timestampStr = context.getParameter<std::string>("target_timestamps");
@@ -278,6 +279,7 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(con
 
         for (uint64_t t = startTime; t <= endTime; t += uinterval) {
             targetTimestamps.push_back(t);
+            if (t > UINT64_MAX - uinterval) break;
         }
     } else {
         std::string timestampStr = context.getParameter<std::string>("target_timestamps");

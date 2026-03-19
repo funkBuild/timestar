@@ -329,6 +329,12 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& nam
         // Extract values (must be numeric for derived metrics)
         if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
             subResult.values = std::get<std::vector<double>>(fieldData.second);
+        } else if (std::holds_alternative<std::vector<bool>>(fieldData.second)) {
+            const auto& boolVals = std::get<std::vector<bool>>(fieldData.second);
+            subResult.values.reserve(boolVals.size());
+            for (bool v : boolVals) {
+                subResult.values.push_back(v ? 1.0 : 0.0);
+            }
         } else if (std::holds_alternative<std::vector<int64_t>>(fieldData.second)) {
             const auto& intVals = std::get<std::vector<int64_t>>(fieldData.second);
             subResult.values.reserve(intVals.size());
@@ -340,6 +346,10 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& nam
         }
 
         break;  // Take first matching field
+    }
+
+    if (subResult.field.empty() && !fieldName.empty() && !series.fields.empty()) {
+        throw DerivedQueryException("Sub-query '" + name + "' field '" + fieldName + "' not found in results");
     }
 
     return subResult;

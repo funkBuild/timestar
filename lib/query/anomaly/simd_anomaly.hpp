@@ -8,14 +8,6 @@ namespace timestar {
 namespace anomaly {
 namespace simd {
 
-// SIMD is always available via Highway runtime dispatch.
-inline bool isAvx2Available() {
-    return true;
-}
-inline bool isAvx512Available() {
-    return true;
-}
-
 // ==================== Vector Operations ====================
 
 // Element-wise vector subtraction: result[i] = a[i] - b[i]
@@ -115,6 +107,9 @@ void computeBounds(const double* predictions,
 
 // Compute anomaly scores in one pass
 // score[i] = max(0, (value - upper)) + max(0, (lower - value))
+// NOTE: NaN values in input produce NaN scores. As defense-in-depth, this
+// function clamps any NaN scores to 0 before returning. Callers may also
+// post-process NaN scores if additional handling is needed.
 void computeAnomalyScores(const double* values, const double* upper, const double* lower, double* scores, size_t count);
 
 // ==================== LOESS Helpers ====================

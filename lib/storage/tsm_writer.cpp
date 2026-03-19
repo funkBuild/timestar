@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <seastar/core/coroutine.hh>
@@ -303,25 +304,39 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     // Compute block-level statistics for Float series.
     // Two-pass approach: first pass computes sum/min/max (vectorizable),
     // second pass computes M2 using the known mean (no per-element division).
-    // This replaces Welford's online algorithm which requires a division per
-    // element — ~20 cycles each on modern x86, dominating the stats loop.
+    // NaN values are skipped for stats (sum/min/max/mean/m2) but blockCount
+    // still reflects the total number of values (including NaN) since the
+    // decoder needs the full count.
     const size_t n = values.size();
     double sum = 0.0;
     double bmin = std::numeric_limits<double>::max();
     double bmax = std::numeric_limits<double>::lowest();
+    size_t validCount = 0;
     for (size_t i = 0; i < n; ++i) {
         double v = values[i];
+        if (std::isnan(v))
+            continue;
+        ++validCount;
         sum += v;
         if (v < bmin)
             bmin = v;
         if (v > bmax)
             bmax = v;
     }
+    // If all values are NaN, use sentinel values indicating no valid stats.
+    if (validCount == 0) {
+        sum = 0.0;
+        bmin = std::numeric_limits<double>::quiet_NaN();
+        bmax = std::numeric_limits<double>::quiet_NaN();
+    }
     // Second pass: M2 = Σ(xi - mean)² — single division for mean, no per-element division.
+    // Only computed over non-NaN values.
     double m2 = 0.0;
-    if (n > 0) {
-        double mean = sum / static_cast<double>(n);
+    if (validCount > 0) {
+        double mean = sum / static_cast<double>(validCount);
         for (size_t i = 0; i < n; ++i) {
+            if (std::isnan(values[i]))
+                continue;
             double delta = values[i] - mean;
             m2 += delta * delta;
         }
@@ -537,12 +552,21 @@ void TSMWriter::writeIndex() {
                 buffer.write(block.blockLatestValue);
             } else if (indexEntry.seriesType == TSMValueType::Integer) {
                 // Integer: 72 bytes (28 base + count(4) + sum/min/max/first/latest as int64)
+                // Clamp double→int64 to avoid undefined behavior when values exceed INT64 range
+                // (blockSum of large int64 values can exceed 2^63, and values >= 2^53 lose precision)
+                auto safeToInt64 = [](double v) -> int64_t {
+                    constexpr double maxSafe = static_cast<double>(std::numeric_limits<int64_t>::max());
+                    constexpr double minSafe = static_cast<double>(std::numeric_limits<int64_t>::min());
+                    if (v >= maxSafe) return std::numeric_limits<int64_t>::max();
+                    if (v <= minSafe) return std::numeric_limits<int64_t>::min();
+                    return static_cast<int64_t>(v);
+                };
                 buffer.write(block.blockCount);
-                buffer.write(static_cast<int64_t>(block.blockSum));
-                buffer.write(static_cast<int64_t>(block.blockMin));
-                buffer.write(static_cast<int64_t>(block.blockMax));
-                buffer.write(static_cast<int64_t>(block.blockFirstValue));
-                buffer.write(static_cast<int64_t>(block.blockLatestValue));
+                buffer.write(safeToInt64(block.blockSum));
+                buffer.write(safeToInt64(block.blockMin));
+                buffer.write(safeToInt64(block.blockMax));
+                buffer.write(safeToInt64(block.blockFirstValue));
+                buffer.write(safeToInt64(block.blockLatestValue));
             } else if (indexEntry.seriesType == TSMValueType::Boolean) {
                 // Boolean: 40 bytes (28 base + count(4) + trueCount(4) + first(1) + latest(1) + pad(2))
                 buffer.write(block.blockCount);

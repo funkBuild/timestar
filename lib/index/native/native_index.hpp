@@ -23,6 +23,7 @@
 #include <roaring.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/smp.hh>
 #include <unordered_map>
 #include <unordered_set>
@@ -186,9 +187,9 @@ public:
     seastar::future<SeriesId128> indexInsert(const TimeStarInsert<T>& insert);
 
     // Phase 4: Cardinality estimation
-    double estimateMeasurementCardinality(const std::string& measurement);
-    double estimateTagCardinality(const std::string& measurement, const std::string& tagKey,
-                                  const std::string& tagValue);
+    seastar::future<double> estimateMeasurementCardinality(const std::string& measurement);
+    seastar::future<double> estimateTagCardinality(const std::string& measurement, const std::string& tagKey,
+                                                   const std::string& tagValue);
 
     // Phase 3: Time-scoped discovery — prunes inactive series using per-day bitmaps
     seastar::future<std::expected<std::vector<SeriesWithMetadata>, SeriesLimitExceeded>>
@@ -224,25 +225,28 @@ private:
     std::unique_ptr<IndexWAL> wal_;
     std::unique_ptr<Manifest> manifest_;
     std::unique_ptr<CompactionEngine> compaction_;
-    // Step 4: Map-keyed SSTable readers for incremental refresh
-    std::map<uint64_t, std::unique_ptr<SSTableReader>> sstableReaders_;
+    // Step 4: Map-keyed SSTable readers for incremental refresh.
+    // shared_ptr for lifetime safety across co_await in kvGet/kvExists/kvPrefixScan.
+    std::map<uint64_t, std::shared_ptr<SSTableReader>> sstableReaders_;
     // Step 2: Shared block cache for decompressed SSTable data blocks
     BlockCache blockCache_;
+    // Concurrency limiter for SSTable cache-miss block reads (DMA I/O).
+    seastar::semaphore blockReadSemaphore_{16};
 
     // --- Low-level KV operations ---
-    // kvGet is synchronous — all data is in memory (MemTable + cached SSTables).
-    std::optional<std::string> kvGet(std::string_view key);
+    // kvGet checks MemTable (sync) then SSTables (async DMA on cache miss).
+    seastar::future<std::optional<std::string>> kvGet(std::string_view key);
     // Step 8: Existence check without copying the value.
-    bool kvExists(std::string_view key);
+    seastar::future<bool> kvExists(std::string_view key);
     seastar::future<> kvPut(const std::string& key, const std::string& value);
     seastar::future<> kvDelete(const std::string& key);
     seastar::future<> kvWriteBatch(const IndexWriteBatch& batch);
 
     // Prefix scan: iterate all keys with the given prefix, calling fn for each.
     // fn receives (key, value) and returns true to continue, false to stop.
-    // Synchronous — all data is in memory (MemTable + cached SSTables).
+    // Async — SSTable block reads may require DMA I/O on cache miss.
     using ScanCallback = std::function<bool(std::string_view key, std::string_view value)>;
-    void kvPrefixScan(const std::string& prefix, ScanCallback fn);
+    seastar::future<> kvPrefixScan(const std::string& prefix, ScanCallback fn);
 
     // Non-blocking memtable flush (double-buffered).
     // maybeFlushMemTable swaps the active memtable to immutable and returns immediately.
@@ -300,14 +304,14 @@ private:
 
     // Get or load a bitmap (read-only). Returns nullptr if not found anywhere.
     // Uses pre-built cache key to avoid double string construction.
-    const roaring::Roaring* getPostingsBitmapByKey(const std::string& cacheKey);
+    seastar::future<const roaring::Roaring*> getPostingsBitmapByKey(const std::string& cacheKey);
     // Get or load a bitmap for insert (mutable). Marks entry dirty.
     // cacheKey is consumed on cache miss (moved into map).
-    roaring::Roaring& getOrLoadBitmapForInsert(std::string& cacheKey);
+    seastar::future<roaring::Roaring*> getOrLoadBitmapForInsert(std::string& cacheKey);
     // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
     void flushDirtyBitmaps(IndexWriteBatch& batch);
     // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
-    void migrateToLocalIds(IndexWriteBatch& batch);
+    seastar::future<> migrateToLocalIds(IndexWriteBatch& batch);
     // Build a bitmap cache key: "measurement\0tagKey\0tagValue"
     static void buildBitmapCacheKey(std::string& out, const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue);
@@ -323,11 +327,11 @@ private:
     static constexpr size_t MAX_BLOOM_CACHE_ENTRIES = 5000;  // ~40MB at 8KB per bloom
     void trimMeasurementBloomCache();
 
-    void updateHLL(const std::string& measurement, uint32_t localId);
-    void updateTagHLL(const std::string& measurement, const std::string& tagKey, const std::string& tagValue,
-                      uint32_t localId);
+    seastar::future<> updateHLL(const std::string& measurement, uint32_t localId);
+    seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey, const std::string& tagValue,
+                                   uint32_t localId);
     void flushDirtyHLLs(IndexWriteBatch& batch);
-    void flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
+    seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
     void trimHllCache();
     static constexpr size_t MAX_HLL_CACHE_ENTRIES = 1000;
@@ -336,10 +340,10 @@ private:
     tsl::robin_map<std::string, BitmapEntry> dayBitmapCache_;
 
     static void buildDayBitmapCacheKey(std::string& out, const std::string& measurement, uint32_t day);
-    roaring::Roaring& getOrLoadDayBitmapForInsert(std::string& cacheKey);
-    const roaring::Roaring* getDayBitmapByKey(const std::string& cacheKey);
+    seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
+    seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
     void flushDirtyDayBitmaps(IndexWriteBatch& batch);
-    roaring::Roaring buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay, uint32_t endDay);
+    seastar::future<roaring::Roaring> buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay, uint32_t endDay);
 
     // Step 7: Cache eviction — bounded by both entry count and byte budget.
     // Byte budget prevents high-cardinality bitmaps from consuming excessive memory.

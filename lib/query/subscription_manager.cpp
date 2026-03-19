@@ -50,9 +50,9 @@ void SubscriptionManager::addSubscription(const Subscription& sub) {
         return;
 
     bool isLocal = (sub.handlerShard == seastar::this_shard_id());
-    if (isLocal && _localSubscriptionCount >= MAX_LOCAL_SUBSCRIPTIONS) {
+    if (isLocal && _localSubscriptionCount >= _maxLocalSubscriptions) {
         throw std::runtime_error("Maximum local subscription limit reached (" +
-                                 std::to_string(MAX_LOCAL_SUBSCRIPTIONS) + ")");
+                                 std::to_string(_maxLocalSubscriptions) + ")");
     }
 
     // Pre-compile any wildcard/regex scope patterns so that Subscription::matches()

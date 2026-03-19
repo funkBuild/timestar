@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "core/placement_table.hpp"
 #include "logger.hpp"
 #include "query_result.hpp"
 #include "timestar_value.hpp"
@@ -371,6 +372,10 @@ int main(int argc, char** argv) {
     seastar::app_template app;
 
     return app.run(argc, argv, []() -> seastar::future<> {
+        // Initialize virtual shard placement table before engine start
+        auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
+        timestar::setGlobalPlacement(std::move(pt));
+
         seastar::sharded<Engine> engine;
 
         // Initialize engine on all shards

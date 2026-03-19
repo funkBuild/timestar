@@ -45,6 +45,11 @@ public:
     // /regex/ patterns the surrounding sigils are stripped.
     static std::string toRegexPattern(const std::string& pattern);
 
+    // Validate that a regex pattern is safe from catastrophic backtracking
+    // (ReDoS). Throws std::invalid_argument if the pattern exceeds the length
+    // limit or contains nested quantifiers / quantified alternation.
+    static void validateRegexSafety(const std::string& pattern);
+
     // Extract the longest literal prefix before the first metacharacter.
     // For wildcards: "server-*" -> "server-", "server-0?" -> "server-0"
     // For ~regex: "~server-[0-9]+" -> "server-", "~[a-z]+" -> ""

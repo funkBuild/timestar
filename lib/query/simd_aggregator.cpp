@@ -192,10 +192,13 @@ void ComputeHistogram(const double* values, size_t count, double min_val, double
         }
     }
 
-    // Scalar tail
+    // Scalar tail — clamp the double BEFORE casting to int to avoid UB.
+    // (A double outside [INT_MIN, INT_MAX] has undefined behavior on int cast.)
+    const double max_bin_d = static_cast<double>(num_bins - 1);
     for (; i < count; ++i) {
-        int bin = static_cast<int>((values[i] - min_val) * scale);
-        bin = std::max(0, std::min(static_cast<int>(num_bins - 1), bin));
+        double bin_d = (values[i] - min_val) * scale;
+        bin_d = std::max(0.0, std::min(max_bin_d, bin_d));
+        int bin = static_cast<int>(bin_d);
         histogram[bin]++;
     }
 }
@@ -311,7 +314,7 @@ void SimdAggregator::computeHistogram(const double* values, size_t count, double
 
     double range = max_val - min_val;
     if (range <= 0) {
-        histogram[0] = count;
+        histogram[0] = static_cast<uint32_t>(std::min(count, static_cast<size_t>(UINT32_MAX)));
         return;
     }
 

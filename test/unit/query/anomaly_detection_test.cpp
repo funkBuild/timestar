@@ -684,24 +684,3 @@ TEST_F(AnomalyDetectionTest, BasicDetectorAccurateOnLongSeriesWithKnownAnomalies
     }
 }
 
-// ==================== CPUID Caching Test ====================
-
-TEST_F(AnomalyDetectionTest, CpuidCachingReturnsConsistentResults) {
-    // Verify that isAvx2Available() and isAvx512Available() return the
-    // same result on repeated calls. This validates that the static
-    // caching works correctly and the functions are idempotent.
-
-    bool avx2_first = simd::isAvx2Available();
-    bool avx2_second = simd::isAvx2Available();
-    EXPECT_EQ(avx2_first, avx2_second) << "isAvx2Available() returned inconsistent results";
-
-    bool avx512_first = simd::isAvx512Available();
-    bool avx512_second = simd::isAvx512Available();
-    EXPECT_EQ(avx512_first, avx512_second) << "isAvx512Available() returned inconsistent results";
-
-    // Call many more times to be thorough
-    for (int i = 0; i < 100; ++i) {
-        EXPECT_EQ(simd::isAvx2Available(), avx2_first);
-        EXPECT_EQ(simd::isAvx512Available(), avx512_first);
-    }
-}

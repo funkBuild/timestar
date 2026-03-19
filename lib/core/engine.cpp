@@ -96,6 +96,9 @@ seastar::future<> Engine::stop() {
     co_await tsmFileManager.stopCompactionLoop();
     timestar::engine_log.info("[ENGINE_STOP] Compaction loop stopped ({}ms) on shard {}", elapsedMs(), shardId);
 
+    co_await tsmFileManager.stop();
+    timestar::engine_log.info("[ENGINE_STOP] TSM files closed ({}ms) on shard {}", elapsedMs(), shardId);
+
     co_await walFileManager.close();
     timestar::engine_log.info("[ENGINE_STOP] WAL closed ({}ms) on shard {}", elapsedMs(), shardId);
 
@@ -304,8 +307,13 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
     // Broadcast schema changes — fire-and-forget (don't block write response).
     // Schema caches are eventually consistent; queries will see updates on next read.
     if (!combined.empty()) {
-        (void)broadcastSchemaUpdate(std::move(combined)).handle_exception([](std::exception_ptr ep) {
+        (void)seastar::try_with_gate(_insertGate, [this, combined = std::move(combined)]() mutable {
+            return broadcastSchemaUpdate(std::move(combined));
+        }).handle_exception([](std::exception_ptr ep) {
             try { std::rethrow_exception(ep); }
+            catch (const seastar::gate_closed_exception&) {
+                // Shutting down — safe to discard.
+            }
             catch (const std::exception& e) {
                 timestar::engine_log.warn("[METADATA] Schema broadcast failed: {}", e.what());
             }
@@ -836,6 +844,10 @@ seastar::future<> Engine::loadAndBroadcastRetentionPolicies() {
         co_return;
     }
 
+    if (!shardedRef) {
+        co_return;
+    }
+
     auto policies = co_await index.getAllRetentionPolicies();
     std::unordered_map<std::string, RetentionPolicy> policyMap;
     for (auto& p : policies) {
@@ -922,10 +934,17 @@ seastar::future<> Engine::sweepExpiredFiles() {
         co_return;
     }
 
+    // Snapshot TSM file pointers — background compaction can mutate the live map
+    // between co_await calls above and this iteration.
+    std::vector<seastar::shared_ptr<TSM>> tsmSnapshot;
+    for (auto& [rank, tsm] : tsmFileManager.getSequencedTsmFiles()) {
+        tsmSnapshot.push_back(tsm);
+    }
+
     // Iterate TSM files, check block metadata against TTL cutoffs
     std::vector<seastar::shared_ptr<TSM>> fullyExpiredFiles;
 
-    for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+    for (const auto& tsmFile : tsmSnapshot) {
         bool allExpired = true;
         bool anyExpired = false;
 

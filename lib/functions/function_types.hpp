@@ -12,6 +12,8 @@
 #include <variant>
 #include <vector>
 
+#include "simd_aggregator.hpp"
+
 namespace timestar::functions {
 
 // Parameter value types for function context
@@ -19,6 +21,18 @@ using ParameterValue = std::variant<int64_t, double, std::string, bool>;
 
 // Function categories for organization
 enum class FunctionCategory { ARITHMETIC, SMOOTHING, AGGREGATION, TRANSFORMATION, STATISTICAL, OTHER };
+
+inline const char* categoryToString(FunctionCategory cat) {
+    switch (cat) {
+        case FunctionCategory::ARITHMETIC: return "arithmetic";
+        case FunctionCategory::SMOOTHING: return "smoothing";
+        case FunctionCategory::AGGREGATION: return "aggregation";
+        case FunctionCategory::TRANSFORMATION: return "transformation";
+        case FunctionCategory::STATISTICAL: return "statistical";
+        case FunctionCategory::OTHER: return "other";
+    }
+    return "unknown";
+}
 
 // Forward declarations
 template <typename T>
@@ -325,8 +339,13 @@ public:
         return *this;
     }
 
-    // Aggregation operations (Kahan compensated summation for precision)
+    // Aggregation operations — SIMD-accelerated via Highway for >= 8 elements,
+    // scalar Kahan compensated summation fallback for small arrays.
     double sum() const {
+        if (data_.size() >= 8) {
+            return timestar::simd::SimdAggregator::calculateSum(data_.data(), data_.size());
+        }
+        // Scalar Kahan summation for small arrays (higher precision, no SIMD overhead)
         double result = 0.0;
         double compensation = 0.0;
         for (const auto& val : data_) {
@@ -343,35 +362,15 @@ public:
     double minimum() const {
         if (empty())
             return std::numeric_limits<double>::quiet_NaN();
-        // Find the first non-NaN value to initialize result
-        size_t start = 0;
-        while (start < data_.size() && std::isnan(data_[start]))
-            ++start;
-        if (start == data_.size())
-            return std::numeric_limits<double>::quiet_NaN();
-        double result = data_[start];
-        for (size_t i = start + 1; i < data_.size(); ++i) {
-            if (!std::isnan(data_[i]) && data_[i] < result)
-                result = data_[i];
-        }
-        return result;
+        // SimdAggregator::calculateMin handles NaN (pre-scans, falls back to scalar NaN-skipping)
+        return timestar::simd::SimdAggregator::calculateMin(data_.data(), data_.size());
     }
 
     double maximum() const {
         if (empty())
             return std::numeric_limits<double>::quiet_NaN();
-        // Find the first non-NaN value to initialize result
-        size_t start = 0;
-        while (start < data_.size() && std::isnan(data_[start]))
-            ++start;
-        if (start == data_.size())
-            return std::numeric_limits<double>::quiet_NaN();
-        double result = data_[start];
-        for (size_t i = start + 1; i < data_.size(); ++i) {
-            if (!std::isnan(data_[i]) && data_[i] > result)
-                result = data_[i];
-        }
-        return result;
+        // SimdAggregator::calculateMax handles NaN (pre-scans, falls back to scalar NaN-skipping)
+        return timestar::simd::SimdAggregator::calculateMax(data_.data(), data_.size());
     }
 };
 

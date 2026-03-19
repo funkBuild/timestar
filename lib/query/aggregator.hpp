@@ -1,5 +1,9 @@
 #pragma once
 
+// NaN handling policy: NaN = missing data. All aggregation methods skip NaN
+// values (they are excluded from SUM, AVG, COUNT, MIN, MAX, etc.). See
+// docs/nan_policy.md for the full cross-subsystem policy.
+
 #include "query_parser.hpp"
 
 #include <algorithm>
@@ -69,6 +73,9 @@ struct AggregationState {
     // Welford's online M2 accumulator for STDDEV/STDVAR — O(1) memory, no raw values needed.
     // M2 = sum of squared differences from the running mean: Σ(x_i - mean)^2
     double m2 = 0.0;
+    // Running mean for canonical Welford algorithm — avoids catastrophic cancellation
+    // that occurs when deriving oldMean from (sum - value) / count for extreme value ranges.
+    double mean = 0.0;
     // Raw values for MEDIAN computation only (STDDEV/STDVAR use Welford instead).
     // Populated by addValue() only when collectRaw is true, avoiding per-value
     // vector push_back overhead for the ~95% of queries that don't use MEDIAN.
@@ -94,14 +101,13 @@ struct AggregationState {
             first = value;
             firstTimestamp = timestamp;
         }
-        // Welford's online variance: compute delta from old mean, then update.
-        // NOTE: oldMean derived from (sum - value) / count can suffer from catastrophic
-        // cancellation for extreme value ranges. For typical TSDB workloads (bounded sensor
-        // values), this is acceptable. Full Welford requires tracking mean separately.
-        double oldMean = (count > 0) ? (sum - value) / count : 0.0;
+        // Canonical Welford's online variance: track mean as a dedicated field to
+        // avoid catastrophic cancellation from (sum - value) / count.
         count++;
-        double newMean = sum / count;
-        m2 += (value - oldMean) * (value - newMean);
+        double delta = value - mean;
+        mean += delta / count;
+        double delta2 = value - mean;
+        m2 += delta * delta2;
         if (collectRaw) {
             if (rawValues.size() < RAW_VALUES_HARD_LIMIT) {
                 rawValues.push_back(value);
@@ -155,10 +161,11 @@ struct AggregationState {
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR: {
                 sum += value;
-                double oldMean = (count > 0) ? (sum - value) / count : 0.0;
                 count++;
-                double newMean = sum / count;
-                m2 += (value - oldMean) * (value - newMean);
+                double delta = value - mean;
+                mean += delta / count;
+                double delta2 = value - mean;
+                m2 += delta * delta2;
                 break;
             }
             default:
@@ -172,10 +179,13 @@ struct AggregationState {
     void merge(const AggregationState& other) {
         // Parallel Welford merge BEFORE mergeCore (needs pre-merge counts)
         if (count > 0 && other.count > 0) {
-            double delta = (other.sum / other.count) - (sum / count);
-            m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / (count + other.count);
+            double delta = other.mean - mean;
+            double totalCount = static_cast<double>(count) + other.count;
+            m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / totalCount;
+            mean = (mean * count + other.mean * other.count) / totalCount;
         } else if (other.count > 0) {
             m2 = other.m2;
+            mean = other.mean;
         }
         mergeCore(other);
         mergeRawValues(other);
@@ -187,10 +197,13 @@ struct AggregationState {
         if (method == AggregationMethod::STDDEV || method == AggregationMethod::STDVAR) {
             // Welford parallel merge BEFORE count update
             if (count > 0 && other.count > 0) {
-                double delta = (other.sum / other.count) - (sum / count);
-                m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / (count + other.count);
+                double delta = other.mean - mean;
+                double totalCount = static_cast<double>(count) + other.count;
+                m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / totalCount;
+                mean = (mean * count + other.mean * other.count) / totalCount;
             } else if (other.count > 0) {
                 m2 = other.m2;
+                mean = other.mean;
             }
         }
         mergeCore(other);

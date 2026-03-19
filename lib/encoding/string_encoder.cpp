@@ -221,6 +221,12 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
 
+    // Empty block: nothing to decompress — return immediately.
+    if (uncompressedSize == 0) {
+        out.clear();
+        return;
+    }
+
     // Decompress (guard against crafted payloads claiming excessive uncompressed size)
     if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
@@ -288,6 +294,13 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
 
+    // Empty block: nothing to decompress — advance past compressed data and return.
+    if (uncompressedSize == 0) {
+        encoded.offset += compressedSize;
+        out.clear();
+        return;
+    }
+
     // Decompress (guard against crafted payloads claiming excessive uncompressed size)
     if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
         throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
@@ -346,6 +359,12 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
 
     if (encoded.size() < 16 + compressedSize) {
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
+    }
+
+    // Empty block: nothing to decompress — return immediately.
+    if (uncompressedSize == 0) {
+        out.clear();
+        return;
     }
 
     // Decompress (zstd doesn't support random access, so we must decompress the full block)
@@ -549,6 +568,13 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t count, const Diction
         throw std::runtime_error("Dictionary-encoded block uncompressedSize exceeds limit");
     }
 
+    // Empty block: nothing to decompress — advance past compressed data and return.
+    if (uncompressedSize == 0) {
+        encoded.offset += compressedSize;
+        out.clear();
+        return;
+    }
+
     // Decompress ID stream
     tlDecompBuf.resize(uncompressedSize);
     size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()), uncompressedSize,
@@ -600,6 +626,13 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t s
     }
     if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
         throw std::runtime_error("Dictionary-encoded block uncompressedSize exceeds limit");
+    }
+
+    // Empty block: nothing to decompress — advance past compressed data and return.
+    if (uncompressedSize == 0) {
+        encoded.offset += compressedSize;
+        out.clear();
+        return;
     }
 
     tlDecompBuf.resize(uncompressedSize);
@@ -672,6 +705,13 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
 
     if (encoded.length_ - encoded.offset < compressedSize) {
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
+    }
+
+    // Empty block: nothing to decompress — advance past compressed data and return.
+    if (uncompressedSize == 0) {
+        encoded.offset += compressedSize;
+        out.clear();
+        return;
     }
 
     // Decompress (zstd doesn't support random access, so we must decompress the full block)

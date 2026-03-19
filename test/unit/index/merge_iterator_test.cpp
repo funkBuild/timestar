@@ -186,3 +186,110 @@ TEST(MergeIteratorTest, ThreeSourcesMerge) {
     }
     EXPECT_EQ(count, 30);
 }
+
+// ---------------------------------------------------------------------------
+// Synchronous interface tests — mirrors of the async tests above.
+// These exercise seekToFirstSync(), seekSync(), nextSync() which are the
+// primary production hot path used by kvPrefixScan.
+// ---------------------------------------------------------------------------
+
+TEST(MergeIteratorTest, DuplicateKeysNewestWinsSync) {
+    MemTable newer, older;
+    newer.put("key", "new_value");
+    older.put("key", "old_value");
+
+    std::vector<std::unique_ptr<IteratorSource>> sources;
+    sources.push_back(std::make_unique<MemTableSource>(newer, 0));  // priority 0 = newest
+    sources.push_back(std::make_unique<MemTableSource>(older, 1));  // priority 1 = older
+
+    MergeIterator merger(std::move(sources));
+    merger.seekToFirstSync();
+
+    EXPECT_TRUE(merger.valid());
+    EXPECT_EQ(merger.key(), "key");
+    EXPECT_EQ(merger.value(), "new_value");
+
+    merger.nextSync();
+    EXPECT_FALSE(merger.valid());
+}
+
+TEST(MergeIteratorTest, TombstoneSuppressesSync) {
+    MemTable newer, older;
+    newer.remove("key");                // Tombstone in newer
+    older.put("key", "old_value");      // Live entry in older
+    older.put("other", "still_alive");  // Another key
+
+    std::vector<std::unique_ptr<IteratorSource>> sources;
+    sources.push_back(std::make_unique<MemTableSource>(newer, 0));
+    sources.push_back(std::make_unique<MemTableSource>(older, 1));
+
+    MergeIterator merger(std::move(sources));
+    merger.seekToFirstSync();
+
+    // "key" should be suppressed by tombstone
+    EXPECT_TRUE(merger.valid());
+    EXPECT_EQ(merger.key(), "other");
+    EXPECT_EQ(merger.value(), "still_alive");
+
+    merger.nextSync();
+    EXPECT_FALSE(merger.valid());
+}
+
+TEST(MergeIteratorTest, ThreeSourcesMergeSync) {
+    MemTable mt1, mt2, mt3;
+    // Interleaved keys
+    for (int i = 0; i < 30; ++i) {
+        auto key = std::format("key:{:03d}", i);
+        if (i % 3 == 0) mt1.put(key, "src1");
+        if (i % 3 == 1) mt2.put(key, "src2");
+        if (i % 3 == 2) mt3.put(key, "src3");
+    }
+
+    std::vector<std::unique_ptr<IteratorSource>> sources;
+    sources.push_back(std::make_unique<MemTableSource>(mt1, 0));
+    sources.push_back(std::make_unique<MemTableSource>(mt2, 1));
+    sources.push_back(std::make_unique<MemTableSource>(mt3, 2));
+
+    MergeIterator merger(std::move(sources));
+    merger.seekToFirstSync();
+
+    int count = 0;
+    std::string prev;
+    while (merger.valid()) {
+        EXPECT_GT(std::string(merger.key()), prev);
+        prev = std::string(merger.key());
+        ++count;
+        merger.nextSync();
+    }
+    EXPECT_EQ(count, 30);
+}
+
+TEST(MergeIteratorTest, SeekSync) {
+    MemTable mt1, mt2;
+    mt1.put("aaa", "1");
+    mt1.put("ccc", "3");
+    mt2.put("bbb", "2");
+    mt2.put("ddd", "4");
+
+    std::vector<std::unique_ptr<IteratorSource>> sources;
+    sources.push_back(std::make_unique<MemTableSource>(mt1, 0));
+    sources.push_back(std::make_unique<MemTableSource>(mt2, 1));
+
+    MergeIterator merger(std::move(sources));
+    merger.seekSync("bbb");
+
+    EXPECT_TRUE(merger.valid());
+    EXPECT_EQ(merger.key(), "bbb");
+
+    // Continue iterating to verify remaining keys are in order
+    merger.nextSync();
+    EXPECT_TRUE(merger.valid());
+    EXPECT_EQ(merger.key(), "ccc");
+
+    merger.nextSync();
+    EXPECT_TRUE(merger.valid());
+    EXPECT_EQ(merger.key(), "ddd");
+
+    merger.nextSync();
+    EXPECT_FALSE(merger.valid());
+}

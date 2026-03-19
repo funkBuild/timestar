@@ -26,7 +26,8 @@ struct MemoryStoreMatch {
 class WALFileManager {
 private:
     int shardId;
-    int currentWalSequenceNumber = -1;
+    uint32_t currentWalSequenceNumber = 0;
+    bool walSequenceInitialized_ = false;
     std::vector<seastar::shared_ptr<MemoryStore>> memoryStores;
     TSMFileManager* tsmFileManager;
     seastar::gate _backgroundGate;               // Tracks in-flight background TSM conversions

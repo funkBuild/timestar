@@ -50,8 +50,8 @@ void AlignedBuffer::write(const AlignedBuffer& value) {
     current_size = new_size;
 };
 
-// The data type of std::vector<bool>
-void AlignedBuffer::write(std::_Bit_reference value) {
+// Accepts bool directly; vector<bool> proxy references convert implicitly.
+void AlignedBuffer::write(bool value) {
     const size_t new_size = current_size + 1;
     ensure_capacity(new_size);
     uint8_t byte = value ? 1 : 0;

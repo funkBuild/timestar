@@ -16,6 +16,11 @@ bool FunctionRegistry::hasFunction(const std::string& name) const {
     return prototypes_.find(name) != prototypes_.end();
 }
 
+const FunctionMetadata* FunctionRegistry::getMetadata(const std::string& name) const {
+    auto it = metadata_.find(name);
+    return it != metadata_.end() ? &it->second : nullptr;
+}
+
 std::vector<std::string> FunctionRegistry::getAllFunctionNames() const {
     std::vector<std::string> names;
     for (const auto& pair : prototypes_) {

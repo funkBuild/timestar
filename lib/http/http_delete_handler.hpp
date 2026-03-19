@@ -5,11 +5,36 @@
 
 #include <glaze/glaze.hpp>
 
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
-// Forward declaration for Glaze structure
-struct GlazeDeleteRequest;
+// Glaze-compatible structure for JSON parsing of delete requests.
+// Defined here (not in the .cpp) to avoid ODR violations across translation units.
+struct GlazeDeleteRequest {
+    // For series key format
+    std::optional<std::string> series;
+
+    // For structured format
+    std::optional<std::string> measurement;
+    std::optional<std::map<std::string, std::string>> tags;
+    std::optional<std::string> field;
+    std::optional<std::vector<std::string>> fields;
+
+    // Time range (optional - defaults to all time)
+    std::optional<uint64_t> startTime;
+    std::optional<uint64_t> endTime;
+};
+
+template <>
+struct glz::meta<GlazeDeleteRequest> {
+    using T = GlazeDeleteRequest;
+    static constexpr auto value =
+        object("series", &T::series, "measurement", &T::measurement, "tags", &T::tags, "field", &T::field, "fields",
+               &T::fields, "startTime", &T::startTime, "endTime", &T::endTime);
+};
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>

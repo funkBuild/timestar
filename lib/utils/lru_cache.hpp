@@ -47,6 +47,10 @@ public:
             it->second->entrySize = entrySize;
             currentBytes_ += entrySize;
             list_.splice(list_.begin(), list_, it->second);
+            // Evict LRU entries if updated value grew the cache over budget
+            while (!list_.empty() && currentBytes_ > maxBytes_ && list_.size() > 1) {
+                evictOne();
+            }
         } else {
             // Evict until we have room (but always allow at least 1 entry)
             while (!list_.empty() && currentBytes_ + entrySize > maxBytes_) {

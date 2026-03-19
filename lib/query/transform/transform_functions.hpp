@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
@@ -548,42 +549,110 @@ inline std::vector<double> moving_rollup(const std::vector<double>& values, cons
         throw std::invalid_argument("Unknown rollup method: " + method);
     }
 
-    // Sliding window: start advances monotonically since timestamps are sorted
+    // Method-specific O(n) amortized implementations.
+    // The start pointer advances monotonically since timestamps are sorted,
+    // so total work across all iterations is O(n) for each method.
+    const size_t n = values.size();
     size_t start = 0;
 
-    for (size_t i = 0; i < values.size(); ++i) {
-        uint64_t windowStart = (timestamps[i] > windowNs) ? timestamps[i] - windowNs : 0;
+    if (method == "avg" || method == "sum") {
+        // Incremental sum: add entering values, subtract leaving values.
+        // NaN values are skipped (not added to runningSum, not counted).
+        double runningSum = 0.0;
+        size_t validCount = 0;
 
-        // Advance start pointer to first element within the window
-        while (start <= i && timestamps[start] < windowStart) {
-            ++start;
-        }
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t windowStart = (timestamps[i] > windowNs) ? timestamps[i] - windowNs : 0;
 
-        // Collect non-NaN values in the window [start, i]
-        std::vector<double> windowValues;
-        windowValues.reserve(i - start + 1);
-        for (size_t j = start; j <= i; ++j) {
-            if (!std::isnan(values[j])) {
-                windowValues.push_back(values[j]);
+            // Add the new element
+            if (!std::isnan(values[i])) {
+                runningSum += values[i];
+                ++validCount;
+            }
+
+            // Remove elements that fell out of the window
+            while (start < i && timestamps[start] < windowStart) {
+                if (!std::isnan(values[start])) {
+                    runningSum -= values[start];
+                    --validCount;
+                }
+                ++start;
+            }
+
+            if (validCount == 0) {
+                result[i] = std::nan("");
+            } else if (method == "avg") {
+                result[i] = runningSum / static_cast<double>(validCount);
+            } else {
+                result[i] = runningSum;
             }
         }
+    } else if (method == "count") {
+        // Incremental count of non-NaN values in the window.
+        size_t validCount = 0;
 
-        if (windowValues.empty()) {
-            result[i] = std::nan("");
-            continue;
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t windowStart = (timestamps[i] > windowNs) ? timestamps[i] - windowNs : 0;
+
+            if (!std::isnan(values[i])) {
+                ++validCount;
+            }
+
+            while (start < i && timestamps[start] < windowStart) {
+                if (!std::isnan(values[start])) {
+                    --validCount;
+                }
+                ++start;
+            }
+
+            if (validCount == 0) {
+                result[i] = std::nan("");
+            } else {
+                result[i] = static_cast<double>(validCount);
+            }
         }
+    } else if (method == "min" || method == "max") {
+        // Monotone deque for O(n) amortized min/max.
+        // The deque stores indices of candidate extremes. For min, the front
+        // holds the index of the current minimum; values are kept in
+        // non-decreasing order. For max, non-increasing order.
+        std::deque<size_t> dq;
 
-        if (method == "avg") {
-            double sum = std::accumulate(windowValues.begin(), windowValues.end(), 0.0);
-            result[i] = sum / windowValues.size();
-        } else if (method == "sum") {
-            result[i] = std::accumulate(windowValues.begin(), windowValues.end(), 0.0);
-        } else if (method == "min") {
-            result[i] = *std::min_element(windowValues.begin(), windowValues.end());
-        } else if (method == "max") {
-            result[i] = *std::max_element(windowValues.begin(), windowValues.end());
-        } else if (method == "count") {
-            result[i] = static_cast<double>(windowValues.size());
+        // Lambda to check whether a candidate should be evicted from the back.
+        // For min: evict if back value >= new value (keep strictly increasing).
+        // For max: evict if back value <= new value (keep strictly decreasing).
+        const bool isMin = (method == "min");
+
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t windowStart = (timestamps[i] > windowNs) ? timestamps[i] - windowNs : 0;
+
+            // Remove elements that fell out of the window from the front
+            while (start < i && timestamps[start] < windowStart) {
+                if (!dq.empty() && dq.front() == start) {
+                    dq.pop_front();
+                }
+                ++start;
+            }
+
+            // Only insert non-NaN values into the deque
+            if (!std::isnan(values[i])) {
+                if (isMin) {
+                    while (!dq.empty() && values[dq.back()] >= values[i]) {
+                        dq.pop_back();
+                    }
+                } else {
+                    while (!dq.empty() && values[dq.back()] <= values[i]) {
+                        dq.pop_back();
+                    }
+                }
+                dq.push_back(i);
+            }
+
+            if (dq.empty()) {
+                result[i] = std::nan("");
+            } else {
+                result[i] = values[dq.front()];
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 #include "../../../lib/http/http_query_handler.hpp"
 
+#include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
 
 #include <glaze/glaze.hpp>
@@ -410,4 +411,501 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestBodySizeTakesPrecedenceOverContentTy
 
 TEST_F(HttpQueryHandlerTest, MaxQueryBodySizeIs1MB) {
     EXPECT_EQ(HttpQueryHandler::maxQueryBodySize(), 1 * 1024 * 1024);
+}
+
+// =============================================================================
+// Time Range Validation Tests
+// Tests for startTime/endTime validation in parseQueryRequest
+// =============================================================================
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestStartTimeEqualsEndTimeThrows) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(1000000000);
+    glazeReq.endTime = uint64_t(1000000000);
+
+    EXPECT_THROW(handler.parseQueryRequest(glazeReq), QueryParseException);
+}
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestStartTimeEqualsEndTimeErrorMessage) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(5000000000);
+    glazeReq.endTime = uint64_t(5000000000);
+
+    try {
+        handler.parseQueryRequest(glazeReq);
+        FAIL() << "Expected QueryParseException";
+    } catch (const QueryParseException& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("startTime must be less than endTime"), std::string::npos)
+            << "Error message should mention time ordering, got: " << msg;
+    }
+}
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestStartTimeGreaterThanEndTimeThrows) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(2000000000);
+    glazeReq.endTime = uint64_t(1000000000);
+
+    EXPECT_THROW(handler.parseQueryRequest(glazeReq), QueryParseException);
+}
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestStartTimeGreaterThanEndTimeStringTimestamps) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = std::string("2000000000");
+    glazeReq.endTime = std::string("1000000000");
+
+    EXPECT_THROW(handler.parseQueryRequest(glazeReq), QueryParseException);
+}
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestValidTimeRangeSucceeds) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(1000000000);
+    glazeReq.endTime = uint64_t(2000000000);
+
+    QueryRequest request = handler.parseQueryRequest(glazeReq);
+    EXPECT_EQ(request.startTime, 1000000000ULL);
+    EXPECT_EQ(request.endTime, 2000000000ULL);
+}
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestWithStringInterval) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(1000000000);
+    glazeReq.endTime = uint64_t(2000000000);
+    glazeReq.aggregationInterval = std::string("5m");
+
+    QueryRequest request = handler.parseQueryRequest(glazeReq);
+    EXPECT_EQ(request.aggregationInterval, 5ULL * 60 * 1000000000);
+}
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestWithNumericInterval) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(1000000000);
+    glazeReq.endTime = uint64_t(2000000000);
+    glazeReq.aggregationInterval = uint64_t(300000000000);
+
+    QueryRequest request = handler.parseQueryRequest(glazeReq);
+    EXPECT_EQ(request.aggregationInterval, 300000000000ULL);
+}
+
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestNoInterval) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(1000000000);
+    glazeReq.endTime = uint64_t(2000000000);
+    // No aggregationInterval set
+
+    QueryRequest request = handler.parseQueryRequest(glazeReq);
+    EXPECT_EQ(request.aggregationInterval, 0ULL);
+}
+
+// =============================================================================
+// finalizeSingleShardPartials Tests
+// Tests the 4 code paths for converting partial aggregation results into
+// the final QueryResponse without the full merge pipeline.
+// =============================================================================
+
+// Path 1: Bucketed results (bucketStates populated)
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsBucketed) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "cpu";
+    partial.fieldName = "usage";
+    partial.groupKey = "cpu\0usage";
+    partial.cachedTags = {{"host", "server-01"}};
+
+    // Add 3 buckets with pre-computed states
+    AggregationState state1;
+    state1.sum = 100.0;
+    state1.count = 5;
+    partial.bucketStates[1000] = state1;
+
+    AggregationState state2;
+    state2.sum = 200.0;
+    state2.count = 5;
+    partial.bucketStates[2000] = state2;
+
+    AggregationState state3;
+    state3.sum = 150.0;
+    state3.count = 5;
+    partial.bucketStates[3000] = state3;
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+
+    ASSERT_EQ(response.series.size(), 1);
+    EXPECT_EQ(response.series[0].measurement, "cpu");
+    EXPECT_EQ(response.series[0].tags.at("host"), "server-01");
+
+    auto& field = response.series[0].fields.at("usage");
+    auto& timestamps = field.first;
+    auto& values = std::get<std::vector<double>>(field.second);
+
+    // Buckets should be sorted by timestamp
+    ASSERT_EQ(timestamps.size(), 3);
+    EXPECT_EQ(timestamps[0], 1000);
+    EXPECT_EQ(timestamps[1], 2000);
+    EXPECT_EQ(timestamps[2], 3000);
+
+    // AVG = sum/count
+    EXPECT_DOUBLE_EQ(values[0], 20.0);
+    EXPECT_DOUBLE_EQ(values[1], 40.0);
+    EXPECT_DOUBLE_EQ(values[2], 30.0);
+}
+
+// Path 2: Collapsed state (single pre-folded AggregationState)
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsCollapsedState) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "temperature";
+    partial.fieldName = "value";
+    partial.groupKey = "temperature\0value";
+    partial.cachedTags = {{"location", "us-west"}};
+
+    AggregationState state;
+    state.count = 10;
+    state.latest = 42.5;
+    state.latestTimestamp = 5000;
+    state.first = 38.0;
+    state.firstTimestamp = 1000;
+    partial.collapsedState = state;
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::LATEST, response);
+
+    ASSERT_EQ(response.series.size(), 1);
+    EXPECT_EQ(response.series[0].measurement, "temperature");
+    EXPECT_EQ(response.series[0].tags.at("location"), "us-west");
+
+    auto& field = response.series[0].fields.at("value");
+    auto& timestamps = field.first;
+    auto& values = std::get<std::vector<double>>(field.second);
+
+    ASSERT_EQ(timestamps.size(), 1);
+    EXPECT_EQ(timestamps[0], 5000);  // LATEST uses latestTimestamp
+    EXPECT_DOUBLE_EQ(values[0], 42.5);
+}
+
+// Path 2 variant: Collapsed state with FIRST method
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsCollapsedStateFirst) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "temperature";
+    partial.fieldName = "value";
+    partial.groupKey = "temperature\0value";
+
+    AggregationState state;
+    state.count = 10;
+    state.latest = 42.5;
+    state.latestTimestamp = 5000;
+    state.first = 38.0;
+    state.firstTimestamp = 1000;
+    partial.collapsedState = state;
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::FIRST, response);
+
+    ASSERT_EQ(response.series.size(), 1);
+    auto& field = response.series[0].fields.at("value");
+    auto& timestamps = field.first;
+    auto& values = std::get<std::vector<double>>(field.second);
+
+    ASSERT_EQ(timestamps.size(), 1);
+    EXPECT_EQ(timestamps[0], 1000);  // FIRST uses firstTimestamp
+    EXPECT_DOUBLE_EQ(values[0], 38.0);
+}
+
+// Path 2 edge: Collapsed state with count == 0 produces no series
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsCollapsedStateEmpty) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "temperature";
+    partial.fieldName = "value";
+    partial.groupKey = "temperature\0value";
+
+    AggregationState state;
+    state.count = 0;
+    partial.collapsedState = state;
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+
+    // count == 0 means the collapsed state is empty; should produce no series
+    EXPECT_EQ(response.series.size(), 0);
+}
+
+// Path 3: sortedValues populated (raw values from pushdown)
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSortedValues) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "disk";
+    partial.fieldName = "iops";
+    partial.groupKey = "disk\0iops";
+    partial.cachedTags = {{"device", "sda"}};
+    partial.sortedTimestamps = {100, 200, 300, 400};
+    partial.sortedValues = {10.0, 20.0, 30.0, 40.0};
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+
+    ASSERT_EQ(response.series.size(), 1);
+    EXPECT_EQ(response.series[0].measurement, "disk");
+
+    auto& field = response.series[0].fields.at("iops");
+    auto& timestamps = field.first;
+    auto& values = std::get<std::vector<double>>(field.second);
+
+    ASSERT_EQ(timestamps.size(), 4);
+    EXPECT_EQ(timestamps[0], 100);
+    EXPECT_EQ(timestamps[3], 400);
+    EXPECT_DOUBLE_EQ(values[0], 10.0);
+    EXPECT_DOUBLE_EQ(values[3], 40.0);
+}
+
+// Path 3 with COUNT: raw values replaced with 1.0 per point
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSortedValuesCount) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "requests";
+    partial.fieldName = "count";
+    partial.groupKey = "requests\0count";
+    partial.sortedTimestamps = {100, 200, 300};
+    partial.sortedValues = {5.0, 10.0, 15.0};
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::COUNT, response);
+
+    ASSERT_EQ(response.series.size(), 1);
+    auto& field = response.series[0].fields.at("count");
+    auto& values = std::get<std::vector<double>>(field.second);
+
+    // COUNT replaces all values with 1.0
+    ASSERT_EQ(values.size(), 3);
+    EXPECT_DOUBLE_EQ(values[0], 1.0);
+    EXPECT_DOUBLE_EQ(values[1], 1.0);
+    EXPECT_DOUBLE_EQ(values[2], 1.0);
+}
+
+// Path 4: sortedStates populated (fallback aggregation)
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSortedStates) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "memory";
+    partial.fieldName = "usage_pct";
+    partial.groupKey = "memory\0usage_pct";
+    partial.cachedTags = {{"host", "web-01"}};
+
+    // Build sorted states with known values
+    AggregationState s1;
+    s1.count = 1;
+    s1.sum = 75.0;
+    s1.min = 75.0;
+    s1.max = 75.0;
+
+    AggregationState s2;
+    s2.count = 1;
+    s2.sum = 82.0;
+    s2.min = 82.0;
+    s2.max = 82.0;
+
+    partial.sortedTimestamps = {1000, 2000};
+    partial.sortedStates = {s1, s2};
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::SUM, response);
+
+    ASSERT_EQ(response.series.size(), 1);
+    EXPECT_EQ(response.series[0].measurement, "memory");
+    EXPECT_EQ(response.series[0].tags.at("host"), "web-01");
+
+    auto& field = response.series[0].fields.at("usage_pct");
+    auto& timestamps = field.first;
+    auto& values = std::get<std::vector<double>>(field.second);
+
+    ASSERT_EQ(timestamps.size(), 2);
+    EXPECT_EQ(timestamps[0], 1000);
+    EXPECT_EQ(timestamps[1], 2000);
+    // SUM: getValue returns sum
+    EXPECT_DOUBLE_EQ(values[0], 75.0);
+    EXPECT_DOUBLE_EQ(values[1], 82.0);
+}
+
+// Edge case: Empty partials vector produces no series
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsEmpty) {
+    std::vector<PartialAggregationResult> partials;
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+
+    EXPECT_EQ(response.series.size(), 0);
+}
+
+// Edge case: Partial with no data in any path is skipped
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSkipsEmptyPartial) {
+    std::vector<PartialAggregationResult> partials;
+
+    // First partial: completely empty (no bucketStates, no collapsedState,
+    // no sortedValues, no sortedStates) => should be skipped
+    PartialAggregationResult emptyPartial;
+    emptyPartial.measurement = "empty";
+    emptyPartial.fieldName = "field";
+    emptyPartial.groupKey = "empty\0field";
+    partials.push_back(std::move(emptyPartial));
+
+    // Second partial: has actual data
+    PartialAggregationResult dataPartial;
+    dataPartial.measurement = "cpu";
+    dataPartial.fieldName = "idle";
+    dataPartial.groupKey = "cpu\0idle";
+    dataPartial.sortedTimestamps = {500};
+    dataPartial.sortedValues = {99.5};
+    partials.push_back(std::move(dataPartial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+
+    // Only the data-bearing partial should produce a series
+    ASSERT_EQ(response.series.size(), 1);
+    EXPECT_EQ(response.series[0].measurement, "cpu");
+}
+
+// Multiple partials from different series
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsMultipleSeries) {
+    std::vector<PartialAggregationResult> partials;
+
+    // Series 1: collapsed state
+    PartialAggregationResult p1;
+    p1.measurement = "temp";
+    p1.fieldName = "celsius";
+    p1.groupKey = "temp\0location=east\0celsius";
+    p1.cachedTags = {{"location", "east"}};
+    AggregationState s1;
+    s1.count = 5;
+    s1.max = 35.0;
+    p1.collapsedState = s1;
+    partials.push_back(std::move(p1));
+
+    // Series 2: raw values
+    PartialAggregationResult p2;
+    p2.measurement = "temp";
+    p2.fieldName = "celsius";
+    p2.groupKey = "temp\0location=west\0celsius";
+    p2.cachedTags = {{"location", "west"}};
+    p2.sortedTimestamps = {100, 200};
+    p2.sortedValues = {22.0, 23.0};
+    partials.push_back(std::move(p2));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::MAX, response);
+
+    ASSERT_EQ(response.series.size(), 2);
+
+    // Both series should have the correct measurement
+    EXPECT_EQ(response.series[0].measurement, "temp");
+    EXPECT_EQ(response.series[1].measurement, "temp");
+
+    // Verify different tags distinguish them
+    bool foundEast = false, foundWest = false;
+    for (const auto& s : response.series) {
+        if (s.tags.count("location") && s.tags.at("location") == "east")
+            foundEast = true;
+        if (s.tags.count("location") && s.tags.at("location") == "west")
+            foundWest = true;
+    }
+    EXPECT_TRUE(foundEast);
+    EXPECT_TRUE(foundWest);
+}
+
+// Bucketed results should be sorted by timestamp regardless of insertion order
+TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsBucketsSortedByTimestamp) {
+    std::vector<PartialAggregationResult> partials;
+
+    PartialAggregationResult partial;
+    partial.measurement = "net";
+    partial.fieldName = "bytes";
+    partial.groupKey = "net\0bytes";
+
+    // Insert buckets in reverse order
+    AggregationState s;
+    s.count = 1;
+
+    s.sum = 300.0;
+    partial.bucketStates[3000] = s;
+    s.sum = 100.0;
+    partial.bucketStates[1000] = s;
+    s.sum = 200.0;
+    partial.bucketStates[2000] = s;
+
+    partials.push_back(std::move(partial));
+
+    QueryResponse response;
+    response.success = true;
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::SUM, response);
+
+    ASSERT_EQ(response.series.size(), 1);
+    auto& field = response.series[0].fields.at("bytes");
+    auto& timestamps = field.first;
+    auto& values = std::get<std::vector<double>>(field.second);
+
+    // Must be sorted ascending
+    ASSERT_EQ(timestamps.size(), 3);
+    EXPECT_EQ(timestamps[0], 1000);
+    EXPECT_EQ(timestamps[1], 2000);
+    EXPECT_EQ(timestamps[2], 3000);
+    EXPECT_DOUBLE_EQ(values[0], 100.0);
+    EXPECT_DOUBLE_EQ(values[1], 200.0);
+    EXPECT_DOUBLE_EQ(values[2], 300.0);
 }

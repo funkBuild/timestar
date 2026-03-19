@@ -19,14 +19,6 @@ namespace timestar {
 namespace transform {
 namespace simd {
 
-// Highway handles ISA dispatch automatically — always available.
-inline bool isAvx2Available() {
-    return true;
-}
-inline bool isAvx512Available() {
-    return true;
-}
-
 // ============================================================================
 // Scalar Fallback Implementations
 // ============================================================================

@@ -65,13 +65,13 @@ SEASTAR_TEST_F(CompactionTest, CompactFourL0Files) {
     auto l1Files = manifest.filesAtLevel(1);
     auto reader = co_await SSTableReader::open(self->sstFilename(l1Files[0].fileNumber));
     auto it = reader->newIterator();
-    it->seekToFirst();
+    co_await it->seekToFirst();
 
     int count = 0;
     while (it->valid()) {
         EXPECT_EQ(it->key(), std::format("key:{:04d}", count));
         ++count;
-        it->next();
+        co_await it->next();
     }
     EXPECT_EQ(count, 100);
 

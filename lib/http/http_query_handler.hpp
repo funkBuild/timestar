@@ -24,6 +24,9 @@ struct GlazeQueryRequest;
 
 namespace timestar {
 
+// Forward declaration for finalizeSingleShardPartials
+struct PartialAggregationResult;
+
 // Variant type for field values - can be double, bool, string, or int64
 using FieldValues =
     std::variant<std::vector<double>, std::vector<bool>, std::vector<std::string>, std::vector<int64_t>>;
@@ -94,6 +97,13 @@ public:
 
     // Parse interval string like "5m", "1h", "30s" to nanoseconds
     static uint64_t parseInterval(const std::string& interval);
+
+    // Finalize partial aggregation results from a single shard into the query response.
+    // Each partial must have a unique groupKey; callers with duplicate groupKeys must use
+    // the merge fallback path (mergePartialAggregationsGrouped) instead.
+    // Public static for testability.
+    static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials,
+                                            AggregationMethod method, QueryResponse& response);
 
     // Format response as JSON (public for testing)
     // Note: field filtering is performed in executeQuery(), so by the time this

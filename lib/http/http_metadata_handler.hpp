@@ -44,6 +44,9 @@ public:
                                      const std::unordered_map<std::string, std::string>& fields,
                                      const std::unordered_map<std::string, std::string>& tagFilters = {});
 
+    std::string formatCardinalityResponse(const std::string& measurement, double estimatedSeriesCount,
+                                          const std::unordered_map<std::string, double>& tagCardinalities);
+
     // Parse a single pagination parameter string into a size_t.
     // Returns `defaultValue` when `str` is empty.
     // Throws BadRequestException if `str` is non-empty but not a valid non-negative integer,

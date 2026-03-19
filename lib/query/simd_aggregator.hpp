@@ -13,14 +13,6 @@ namespace simd {
 
 class SimdAggregator {
 public:
-    // Check if AVX2 is available at runtime.
-    // With Highway, dispatch is handled automatically — always returns true.
-    static inline bool isAvx2Available() { return true; }
-
-    // Check if AVX512 is available at runtime.
-    // With Highway, dispatch is handled automatically — always returns true.
-    static inline bool isAvx512Available() { return true; }
-
     // SIMD-optimized sum calculation
     // ~4x faster than scalar for large arrays
     static double calculateSum(const double* values, size_t count);

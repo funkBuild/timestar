@@ -825,9 +825,17 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
         co_return;  // Series not in this file
     }
 
-    // Phase 3: Set thread-local dictionary for string block decoding
+    // Phase 3: Set thread-local dictionary for string block decoding.
+    // Copy the dictionary into a coroutine-frame-local vector so it survives
+    // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
+    [[maybe_unused]] std::vector<std::string> localDictCopy;
     if constexpr (std::is_same_v<T, std::string>) {
-        tlStringDict = indexEntry->stringDictionary.empty() ? nullptr : &indexEntry->stringDictionary;
+        if (!indexEntry->stringDictionary.empty()) {
+            localDictCopy = indexEntry->stringDictionary;
+            tlStringDict = &localDictCopy;
+        } else {
+            tlStringDict = nullptr;
+        }
     }
 
     // Filter blocks by time range
@@ -907,9 +915,14 @@ template <class T>
 seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
                                                                    uint64_t endTime,
                                                                    const std::vector<std::string>* stringDict) {
-    // Use explicitly-passed dictionary if available; otherwise fall back to the
-    // thread-local (kept for backward compatibility with readSeries callers).
-    const std::vector<std::string>* localDict = stringDict ? stringDict : tlStringDict;
+    // Capture the dictionary pointer before co_await.  With the use-after-free
+    // fix applied to all callers (readSeries, readSeriesBatched, bulk_block_loader),
+    // both stringDict and tlStringDict now point to coroutine-frame-local copies
+    // rather than into the LRU cache, so a shallow pointer save is sufficient here.
+    const std::vector<std::string>* localDict = nullptr;
+    if constexpr (std::is_same_v<T, std::string>) {
+        localDict = stringDict ? stringDict : tlStringDict;
+    }
 
     auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
@@ -1206,21 +1219,23 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
 template <class T>
 seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
                                       TSMResult<T>& results) {
-    // Capture tlStringDict BEFORE co_await — another coroutine on this shard
-    // could overwrite the thread-local during DMA suspension.
-    // (Same fix as readSingleBlock Bug #8.)
-    [[maybe_unused]] const std::vector<std::string>* localDict = nullptr;
+    // Copy the dictionary into a coroutine-frame-local vector so it survives
+    // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
+    // The old code saved only a raw pointer which could dangle after eviction.
+    [[maybe_unused]] std::vector<std::string> localDictCopy;
     if constexpr (std::is_same_v<T, std::string>) {
-        localDict = tlStringDict;
+        if (tlStringDict && !tlStringDict->empty()) {
+            localDictCopy = *tlStringDict;
+        }
     }
 
     // Single large DMA read for entire batch
     auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
 
-    // Restore tlStringDict from local capture after co_await, so that
+    // Restore tlStringDict from the local copy after co_await, so that
     // decodeBlockFlat<std::string> sees the correct dictionary.
     if constexpr (std::is_same_v<T, std::string>) {
-        tlStringDict = localDict;
+        tlStringDict = localDictCopy.empty() ? nullptr : &localDictCopy;
     }
 
     // Decode all blocks in this batch into a single flat TSMBlock.
@@ -1252,9 +1267,17 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
         co_return;  // Series not in this file
     }
 
-    // Phase 3: Set thread-local dictionary for string block decoding
+    // Phase 3: Set thread-local dictionary for string block decoding.
+    // Copy the dictionary into a coroutine-frame-local vector so it survives
+    // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
+    [[maybe_unused]] std::vector<std::string> localDictCopy;
     if constexpr (std::is_same_v<T, std::string>) {
-        tlStringDict = indexEntry->stringDictionary.empty() ? nullptr : &indexEntry->stringDictionary;
+        if (!indexEntry->stringDictionary.empty()) {
+            localDictCopy = indexEntry->stringDictionary;
+            tlStringDict = &localDictCopy;
+        } else {
+            tlStringDict = nullptr;
+        }
     }
 
     // Step 1: Filter blocks by time range

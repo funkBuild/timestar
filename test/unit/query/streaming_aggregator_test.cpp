@@ -214,6 +214,65 @@ TEST(StreamingAggregatorTest, CloseBucketsClearsState) {
     EXPECT_DOUBLE_EQ(std::get<double>(batch3.points[0].value), 20.0);
 }
 
+TEST(StreamingAggregatorTest, PartialCloseBuckets) {
+    // Interval = 1000ns, so bucket boundaries are 0, 1000, 2000, ...
+    StreamingAggregator agg(1000, AggregationMethod::AVG);
+
+    // Bucket [0, 999]: points at t=100 and t=500
+    agg.addPoint(makePoint("temp", "value", {}, 100, 10.0));
+    agg.addPoint(makePoint("temp", "value", {}, 500, 30.0));
+
+    // Bucket [1000, 1999]: points at t=1200 and t=1800
+    agg.addPoint(makePoint("temp", "value", {}, 1200, 50.0));
+    agg.addPoint(makePoint("temp", "value", {}, 1800, 70.0));
+
+    // closeBuckets(1500): bucket [0,999] is complete (0 + 1000 <= 1500),
+    // but bucket [1000,1999] is NOT (1000 + 1000 = 2000 > 1500).
+    auto batch1 = agg.closeBuckets(1500);
+    ASSERT_EQ(batch1.points.size(), 1u);
+    EXPECT_EQ(batch1.points[0].timestamp, 0u);                          // bucket start
+    EXPECT_DOUBLE_EQ(std::get<double>(batch1.points[0].value), 20.0);   // avg(10, 30)
+
+    // The aggregator should still have the in-progress bucket [1000,1999].
+    EXPECT_TRUE(agg.hasData());
+
+    // closeBuckets(2500): bucket [1000,1999] is now complete (1000 + 1000 <= 2500).
+    auto batch2 = agg.closeBuckets(2500);
+    ASSERT_EQ(batch2.points.size(), 1u);
+    EXPECT_EQ(batch2.points[0].timestamp, 1000u);                       // bucket start
+    EXPECT_DOUBLE_EQ(std::get<double>(batch2.points[0].value), 60.0);   // avg(50, 70)
+
+    // All buckets closed now.
+    EXPECT_FALSE(agg.hasData());
+}
+
+TEST(StreamingAggregatorTest, PartialCloseRetainsInProgress) {
+    // Interval = 1000ns, bucket [0, 999].
+    StreamingAggregator agg(1000, AggregationMethod::SUM);
+
+    agg.addPoint(makePoint("temp", "value", {}, 100, 5.0));
+    agg.addPoint(makePoint("temp", "value", {}, 400, 15.0));
+
+    // nowNs=500: bucket [0,999] is NOT complete (0 + 1000 = 1000 > 500).
+    auto batch1 = agg.closeBuckets(500);
+    EXPECT_TRUE(batch1.points.empty());
+
+    // Data is still retained.
+    EXPECT_TRUE(agg.hasData());
+
+    // nowNs=999: still not complete (0 + 1000 = 1000 > 999).
+    auto batch2 = agg.closeBuckets(999);
+    EXPECT_TRUE(batch2.points.empty());
+    EXPECT_TRUE(agg.hasData());
+
+    // nowNs=1000: now complete (0 + 1000 <= 1000).
+    auto batch3 = agg.closeBuckets(1000);
+    ASSERT_EQ(batch3.points.size(), 1u);
+    EXPECT_EQ(batch3.points[0].timestamp, 0u);
+    EXPECT_DOUBLE_EQ(std::get<double>(batch3.points[0].value), 20.0);   // sum(5, 15)
+    EXPECT_FALSE(agg.hasData());
+}
+
 // --- SSE Event Formatting Tests ---
 
 TEST(SSEFormatTest, EventIncludesLabelWhenSet) {

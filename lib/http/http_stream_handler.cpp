@@ -496,7 +496,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         co_return rep;
     }
 
+    constexpr size_t MAX_QUERIES_PER_SUBSCRIPTION = 100;
+
     if (!glazeReq.queries.empty()) {
+        // Reject excessively large query lists to prevent resource exhaustion
+        if (glazeReq.queries.size() > MAX_QUERIES_PER_SUBSCRIPTION) {
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->_content =
+                "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_QUERIES\",\"message\":\"Too many queries (max "
+                "100)\"}}";
+            rep->add_header("Content-Type", "application/json");
+            co_return rep;
+        }
         // Multi-query mode
         for (size_t i = 0; i < glazeReq.queries.size(); ++i) {
             const auto& qe = glazeReq.queries[i];
@@ -637,8 +648,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
 
     const auto& streamCfg = timestar::config().streaming;
 
-    // Check subscription limit before accepting (count all queries that will be registered)
+    // Heuristic pre-check: fast-fail if we're clearly over the limit.
+    // The authoritative enforcement is inside addSubscription() which is
+    // race-free on a single Seastar shard (no interleaving between the
+    // check and the insert).
     auto& localMgr = _engineSharded->local().getSubscriptionManager();
+    localMgr.setMaxLocalSubscriptions(streamCfg.max_subscriptions_per_shard);
     if (localMgr.localSubscriptionCount() + queryEntries.size() > streamCfg.max_subscriptions_per_shard) {
         rep->set_status(seastar::http::reply::status_type{429});
         rep->_content =
@@ -671,11 +686,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         allSubIds.push_back(sub.id);
 
         // Register on handler shard with queue.
-        // addSubscription throws std::invalid_argument if any scope pattern is
-        // an invalid regex — return HTTP 400 so the client gets a clear error.
+        // addSubscription throws std::runtime_error if the per-shard limit
+        // is exceeded (authoritative, race-free check), or
+        // std::invalid_argument if any scope pattern is an invalid regex.
         std::string subscriptionError;
+        bool limitExceeded = false;
         try {
             localMgr.addSubscription(sub);
+        } catch (const std::runtime_error& e) {
+            subscriptionError = e.what();
+            limitExceeded = true;
+            allSubIds.pop_back();
         } catch (const std::exception& e) {
             subscriptionError = e.what();
             // Remove the sub ID we just failed to register (wasn't added)
@@ -693,11 +714,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                     engine.getSubscriptionManager().removeSubscription(id);
                 }
             });
-            rep->set_status(seastar::http::reply::status_type{400});
-            rep->_content = std::string(
-                                "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_SCOPE_PATTERN\","
-                                "\"message\":\"") +
-                            jsonEscape(subscriptionError) + "\"}}";
+            if (limitExceeded) {
+                rep->set_status(seastar::http::reply::status_type{429});
+                rep->_content =
+                    "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_SUBSCRIPTIONS\","
+                    "\"message\":\"" + jsonEscape(subscriptionError) + "\"}}";
+            } else {
+                rep->set_status(seastar::http::reply::status_type{400});
+                rep->_content = std::string(
+                                    "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_SCOPE_PATTERN\","
+                                    "\"message\":\"") +
+                                jsonEscape(subscriptionError) + "\"}}";
+            }
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
@@ -716,6 +744,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
 
     // --- Backfill: execute queries for historical data AFTER subscription registration ---
     std::vector<StreamingBatch> backfillBatches;
+    constexpr size_t MAX_BACKFILL_POINTS = 1000000;
 
     if (glazeReq.backfill) {
         uint64_t backfillStart = parseStartTime(glazeReq.startTime);
@@ -724,8 +753,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
 
         HttpQueryHandler backfillHandler(_engineSharded);
 
+        size_t totalBackfillPoints = 0;
         auto backfillTimeoutSeconds = HttpQueryHandler::defaultQueryTimeout();
         for (const auto& entry : queryEntries) {
+            if (totalBackfillPoints >= MAX_BACKFILL_POINTS) {
+                timestar::http_log.warn(
+                    "[SUBSCRIBE] Backfill point limit reached ({} points); "
+                    "skipping remaining queries",
+                    totalBackfillPoints);
+                break;
+            }
+
             QueryRequest backfillReq = entry.queryReq;
             backfillReq.startTime = backfillStart;
             backfillReq.endTime = backfillEnd;
@@ -736,7 +774,15 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 if (response.success && !response.series.empty()) {
                     auto batches = queryResponseToBatches(response.series, entry.label);
                     for (auto& b : batches) {
+                        totalBackfillPoints += b.points.size();
                         backfillBatches.push_back(std::move(b));
+                        if (totalBackfillPoints >= MAX_BACKFILL_POINTS) {
+                            timestar::http_log.warn(
+                                "[SUBSCRIBE] Backfill point limit reached ({} points); "
+                                "truncating results",
+                                totalBackfillPoints);
+                            break;
+                        }
                     }
                 }
             } catch (seastar::timed_out_error&) {

@@ -37,6 +37,15 @@ public:
     // Size of the filter in bytes (after build).
     size_t filterSize() const { return filterBytes_; }
 
+    // SIMD-accelerated popcount: total number of set bits in the filter.
+    // Uses Highway PopulationCount on uint64_t lanes for maximum throughput.
+    uint64_t bitCount() const;
+
+    // Filter density: fraction of bits that are set (0.0 = empty, 1.0 = full).
+    // Useful for diagnostics and estimating false positive rate.
+    // Actual FPR ≈ density^k where k is the number of hash functions.
+    double density() const;
+
     // Serialization: writes the filter to a string buffer.
     // Format: [k (1 byte)] [filter_size (4 bytes LE)] [filter_data]
     void serializeTo(std::string& output) const;

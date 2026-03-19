@@ -225,6 +225,11 @@ void ComputeAnomalyScoresKernel(const double* HWY_RESTRICT values, const double*
         double below = std::max(0.0, lower[i] - values[i]);
         scores[i] = above + below;
     }
+
+    // Fixup: NaN input values produce NaN scores; clamp to 0
+    for (size_t i = 0; i < count; ++i) {
+        if (std::isnan(scores[i])) scores[i] = 0.0;
+    }
 }
 
 // --- LOESS: tricube weights ---

@@ -279,10 +279,29 @@ public:
     // Main compaction method - merges files and returns result with path + stats.
     // retentionPolicies: per-measurement policies for TTL/downsampling (empty = no retention).
     // seriesMetadataMap: SeriesId128 -> measurement name, pre-built by caller for efficiency.
+    // targetTier/targetSeq: pre-allocated from CompactionPlan.  When called
+    // without a plan (e.g. from tests), pass 0 for both and compact() will
+    // compute the tier from input files and allocate a fresh sequence ID.
     seastar::future<CompactionResult> compact(
         const std::vector<seastar::shared_ptr<TSM>>& files,
+        uint64_t targetTier,
+        uint64_t targetSeq,
         const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies = {},
         const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap = {});
+
+    // Convenience overload for callers without a pre-allocated plan (auto-allocates tier/seq).
+    seastar::future<CompactionResult> compact(
+        const std::vector<seastar::shared_ptr<TSM>>& files,
+        const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies,
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
+        return compact(files, 0, 0, retentionPolicies, seriesMeasurementMap);
+    }
+
+    // Convenience overload: compact files with no retention and auto-allocated tier/seq.
+    seastar::future<CompactionResult> compact(
+        const std::vector<seastar::shared_ptr<TSM>>& files) {
+        return compact(files, 0, 0);
+    }
 
     // Create a compaction plan for given tier
     CompactionPlan planCompaction(uint64_t tier);

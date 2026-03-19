@@ -1103,6 +1103,18 @@ AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op, const Qu
     auto left = evaluateNode(*op.left, queryResults);
     auto right = evaluateNode(*op.right, queryResults);
 
+    // Verify timestamp alignment for meaningful element-wise operations.
+    // When timestamps differ (e.g., a - time_shift(a, '7d')), element-wise
+    // arithmetic produces meaningless results since left[i] and right[i]
+    // correspond to completely different time points.
+    if (left.timestamps && right.timestamps && left.timestamps != right.timestamps) {
+        // Different timestamp pointers — check if values actually match
+        if (*left.timestamps != *right.timestamps) {
+            throw EvaluationException("Binary operation requires aligned timestamps. "
+                "Use time_shift with explicit alignment or apply functions separately.");
+        }
+    }
+
     switch (op.op) {
         case BinaryOpType::ADD:
             return left + right;

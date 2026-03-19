@@ -109,8 +109,12 @@ IndexWAL::~IndexWAL() {
     // The data is durable enough via write() + OS page cache; WAL replay will
     // handle any incomplete records on next startup.
     if ((!buffer_.empty() || !tailBuf_.empty()) && !currentPath_.empty()) {
-        int fd = ::open(currentPath_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int fd = ::open(currentPath_.c_str(), O_WRONLY | O_CREAT, 0644);
         if (fd >= 0) {
+            // Seek to dmaWritePos_ so we overwrite any zero-filled region
+            // left by truncate, rather than appending after it (O_APPEND
+            // would write past the zeros, creating a gap that breaks replay).
+            ::lseek(fd, static_cast<off_t>(dmaWritePos_), SEEK_SET);
             if (!tailBuf_.empty()) {
                 auto r = ::write(fd, tailBuf_.data(), tailBuf_.size());
                 (void)r;
@@ -192,35 +196,48 @@ seastar::future<> IndexWAL::flushBuffer() {
     // that were already counted in writePos_ during the previous flush.)
     writePos_ = dmaWritePos_ + tailSize;
 
-    // Truncate + flush to ensure data is on disk
-    co_await walFile_->truncate(writePos_);
+    // Truncate to the actual DMA-written position (not writePos_, which
+    // includes tail bytes still in memory — truncating to writePos_ would
+    // create a zero gap from dmaWritePos_ to writePos_ that breaks replay).
+    co_await walFile_->truncate(dmaWritePos_);
     co_await walFile_->flush();
 }
 
 seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
     // Wrap blocking filesystem calls in seastar::async to avoid reactor stalls.
-    auto [dir, maxGen] = co_await seastar::async([directory] {
+    auto [dir, allGens] = co_await seastar::async([directory] {
         std::filesystem::create_directories(directory);
 
-        uint64_t gen = 0;
+        std::vector<uint64_t> gens;
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
             if (entry.path().extension() == ".wal") {
                 auto name = entry.path().stem().string();
                 if (name.starts_with("idx_")) {
                     try {
                         uint64_t g = std::stoull(name.substr(4));
-                        gen = std::max(gen, g);
+                        gens.push_back(g);
                     } catch (...) {}
                 }
             }
         }
-        return std::make_pair(directory, gen);
+        std::sort(gens.begin(), gens.end());
+        return std::make_pair(directory, std::move(gens));
     });
 
     IndexWAL wal;
     wal.directory_ = dir;
-    wal.walGeneration_ = maxGen;
-    wal.currentPath_ = walFileName(dir, maxGen);
+
+    if (allGens.empty()) {
+        wal.walGeneration_ = 0;
+        wal.currentPath_ = walFileName(dir, 0);
+    } else {
+        wal.walGeneration_ = allGens.back();
+        wal.currentPath_ = walFileName(dir, allGens.back());
+        // All generations except the latest are old WAL files to replay first
+        for (size_t i = 0; i + 1 < allGens.size(); ++i) {
+            wal.oldWalPaths_.push_back(walFileName(dir, allGens[i]));
+        }
+    }
 
     co_return std::move(wal);
 }
@@ -271,18 +288,39 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
         co_await flushTail();
     }
 
-    // Use Seastar async I/O to avoid blocking the reactor
-    if (!co_await seastar::file_exists(currentPath_)) {
+    // Replay older WAL generations first (ascending order) — these are from
+    // pre-crash rotations where deleteFile() never completed.
+    for (const auto& oldPath : oldWalPaths_) {
+        recordsReplayed += co_await replayOneFile(oldPath, target);
+    }
+
+    // Replay the current (latest) generation
+    recordsReplayed += co_await replayOneFile(currentPath_, target);
+
+    // Delete old WAL files only after ALL replays succeed — if we crash here,
+    // the next open() will find them again and replay is idempotent.
+    for (const auto& oldPath : oldWalPaths_) {
+        co_await deleteFile(oldPath);
+    }
+    oldWalPaths_.clear();
+
+    co_return recordsReplayed;
+}
+
+seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTable& target) {
+    uint64_t recordsReplayed = 0;
+
+    if (!co_await seastar::file_exists(path)) {
         co_return 0;
     }
 
-    auto fileSize = co_await seastar::file_size(currentPath_);
+    auto fileSize = co_await seastar::file_size(path);
     if (fileSize == 0) {
         co_return 0;
     }
 
     // Read WAL file using Seastar DMA I/O
-    auto f = co_await seastar::open_file_dma(currentPath_, seastar::open_flags::ro);
+    auto f = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
     auto is = seastar::make_file_input_stream(f);
     auto buf = co_await is.read_exactly(fileSize);
     co_await is.close();

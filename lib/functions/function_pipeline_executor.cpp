@@ -2,6 +2,7 @@
 
 #include "../core/engine.hpp"
 #include "../utils/logger.hpp"
+#include "function_registry.hpp"
 
 #include <seastar/core/coroutine.hh>
 
@@ -9,6 +10,11 @@ namespace timestar::functions {
 
 FunctionPipelineExecutor::FunctionPipelineExecutor(seastar::sharded<Engine>* engine) : engine_(engine) {}
 
+// NOTE: sma, ema, add, and multiply have optimized inline implementations below
+// for pipeline performance. All other registered functions fall through to the
+// FunctionRegistry lookup at the end of the if/else chain.
+// TODO: Consider refactoring inline implementations to delegate to their canonical
+// function classes (SMAFunction, EMAFunction, etc.) to avoid divergence.
 seastar::future<void> FunctionPipelineExecutor::executeFunction(
     const std::string& functionName,
     const std::map<std::string, std::variant<int64_t, double, std::string>>& parameters, std::vector<double>& data) {
@@ -77,6 +83,37 @@ seastar::future<void> FunctionPipelineExecutor::executeFunction(
             for (auto& val : data) {
                 val *= factor;
             }
+        }
+        co_return;
+    }
+
+    // Fall through to FunctionRegistry for any function not handled above.
+    auto& registry = FunctionRegistry::getInstance();
+    if (registry.hasFunction(functionName)) {
+        auto func = registry.createFunction(functionName);
+        auto* unaryFunc = dynamic_cast<IUnaryFunction*>(func.get());
+        if (unaryFunc && !data.empty()) {
+            // Build FunctionContext from pipeline parameters
+            FunctionContext ctx;
+            for (const auto& [key, val] : parameters) {
+                std::visit([&](const auto& v) { ctx.setParameter(key, ParameterValue(v)); }, val);
+            }
+
+            // IUnaryFunction::execute() requires a DoubleSeriesView with timestamps.
+            // Pipeline data has no timestamps, so synthesize sequential indices.
+            std::vector<uint64_t> syntheticTimestamps(data.size());
+            for (size_t i = 0; i < data.size(); ++i)
+                syntheticTimestamps[i] = i;
+
+            DoubleSeriesView view(&syntheticTimestamps, &data);
+            auto result = co_await unaryFunc->execute(view, ctx);
+
+            if (!result.values.empty()) {
+                data = std::move(result.values);
+            }
+        } else if (!unaryFunc) {
+            timestar::query_log.warn(
+                "Pipeline function '{}' found in registry but is not a unary function", functionName);
         }
         co_return;
     }

@@ -76,16 +76,16 @@ public:
             co_return result;  // Series not in this file
         }
 
-        // Capture the string dictionary from the index entry BEFORE any
-        // further co_await. When multiple loadFromFile coroutines run
-        // concurrently, reactor preemption can cause getFullIndexEntry()
-        // for a different file to overwrite the thread-local tlStringDict
-        // before this coroutine's readSingleBlock captures it. Passing
-        // the dictionary pointer explicitly avoids the race entirely.
+        // Copy the string dictionary into a coroutine-frame-local vector so
+        // it survives LRU cache evictions across co_await DMA suspensions
+        // (use-after-free fix). The old code saved only a raw pointer into the
+        // cache entry which could dangle after eviction.
+        [[maybe_unused]] std::vector<std::string> localDictCopy;
         const std::vector<std::string>* stringDict = nullptr;
         if constexpr (std::is_same_v<T, std::string>) {
             if (!indexEntry->stringDictionary.empty()) {
-                stringDict = &indexEntry->stringDictionary;
+                localDictCopy = indexEntry->stringDictionary;
+                stringDict = &localDictCopy;
             }
         }
 

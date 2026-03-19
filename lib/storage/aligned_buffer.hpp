@@ -64,7 +64,7 @@ struct dma_default_init_allocator {
 
     template <typename U, std::size_t A>
     bool operator==(const dma_default_init_allocator<U, A>&) const noexcept {
-        return true;
+        return Alignment == A;
     }
 };
 
@@ -102,7 +102,7 @@ public:
     void write(const std::string& value);
     void write(const CompressedBuffer& value);
     void write(const AlignedBuffer& value);
-    void write(std::_Bit_reference value);
+    void write(bool value);
 
     // Bulk write raw bytes (for compressed data, etc.)
     void write_bytes(const char* bytes, size_t count);

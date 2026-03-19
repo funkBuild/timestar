@@ -332,7 +332,7 @@ SEASTAR_TEST_F(OptimizationBaseline, B2_SSTableReadMemory) {
             for (int i = 0; i < lookups; ++i) {
                 std::string key = fmt::format("key_{:08d}", dist2(rng2));
                 auto t0 = clk::now();
-                auto val = reader->get(key);
+                auto val = co_await reader->get(key);
                 cold.add(clk::now() - t0);
                 EXPECT_TRUE(val.has_value());
             }

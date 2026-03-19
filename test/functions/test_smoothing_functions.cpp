@@ -360,9 +360,9 @@ TEST_F(SmoothingFunctionsTest, ParameterValidation) {
     FunctionContext evenGaussianWindow = createContext({{"window", int64_t(6)}});
     EXPECT_FALSE(gaussianFunc.validateParameters(evenGaussianWindow).get());
 
-    // Multiple Gaussian parameters - should fail
-    FunctionContext multipleGaussianParams = createContext({{"sigma", 1.0}, {"window", int64_t(7)}});
-    EXPECT_FALSE(gaussianFunc.validateParameters(multipleGaussianParams).get());
+    // Both Gaussian parameters - allowed (sigma controls kernel width, window controls kernel size)
+    FunctionContext bothGaussianParams = createContext({{"sigma", 1.0}, {"window", int64_t(7)}});
+    EXPECT_TRUE(gaussianFunc.validateParameters(bothGaussianParams).get());
 }
 
 // Test function metadata
