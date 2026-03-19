@@ -55,16 +55,16 @@ protected:
 };
 
 TEST_F(ALPEncoderOverflowSourceTest, SourceInspection_EncodeGuardExists) {
-    // Find encode() function (not encodeInto)
-    auto pos = sourceCode.find("ALPEncoder::encode(");
-    ASSERT_NE(pos, std::string::npos) << "Could not find ALPEncoder::encode()";
+    // encode() delegates to encodeInto() which contains the overflow guard.
+    // Check that encodeInto has the UINT16_MAX check.
+    auto pos = sourceCode.find("ALPEncoder::encodeInto(");
+    ASSERT_NE(pos, std::string::npos) << "Could not find ALPEncoder::encodeInto()";
 
-    // Extract a region after the encode() signature to check for the guard
     auto region = sourceCode.substr(pos, 500);
     EXPECT_NE(region.find("UINT16_MAX"), std::string::npos)
-        << "encode() must contain a UINT16_MAX overflow check for num_blocks";
+        << "encodeInto() must contain a UINT16_MAX overflow check for num_blocks";
     EXPECT_NE(region.find("overflow_error"), std::string::npos)
-        << "encode() must throw std::overflow_error on num_blocks overflow";
+        << "encodeInto() must throw std::overflow_error on num_blocks overflow";
 }
 
 TEST_F(ALPEncoderOverflowSourceTest, SourceInspection_EncodeIntoGuardExists) {

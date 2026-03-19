@@ -168,7 +168,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         } catch (const BadRequestException& e) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("INVALID_PARAMETER", e.what());
-            rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
 
@@ -186,7 +185,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         // Format response
         rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = formatMeasurementsResponse(measurements, totalCount);
-        rep->add_header("Content-Type", "application/json");
 
         timestar::http_log.debug("Returning {} measurements", measurements.size());
 
@@ -194,7 +192,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         timestar::http_log.error("Error processing /measurements: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
-        rep->add_header("Content-Type", "application/json");
     }
 
     co_return rep;
@@ -209,7 +206,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         if (measurement.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
-            rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
 
@@ -218,7 +214,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = createErrorResponse("INVALID_PARAMETER", err);
-                rep->add_header("Content-Type", "application/json");
                 co_return rep;
             }
         }
@@ -229,7 +224,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = createErrorResponse("INVALID_PARAMETER", err);
-                rep->add_header("Content-Type", "application/json");
                 co_return rep;
             }
         }
@@ -269,7 +263,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
 
         rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = formatTagsResponse(measurement, tagsResult, specificTag);
-        rep->add_header("Content-Type", "application/json");
 
         timestar::http_log.debug("Returning tags for measurement: {}", measurement);
 
@@ -277,7 +270,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         timestar::http_log.error("Error processing /tags: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
-        rep->add_header("Content-Type", "application/json");
     }
 
     co_return rep;
@@ -292,7 +284,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         if (measurement.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
-            rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
 
@@ -301,7 +292,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = createErrorResponse("INVALID_PARAMETER", err);
-                rep->add_header("Content-Type", "application/json");
                 co_return rep;
             }
         }
@@ -346,14 +336,19 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         auto allFields = co_await localEngine.getMeasurementFields(measurement);
 
         std::unordered_map<std::string, std::string> fieldsWithTypes;
-        for (const auto& field : allFields) {
-            auto fieldType = co_await localEngine.getIndex().getFieldType(measurement, field);
-            fieldsWithTypes[field] = fieldType.empty() ? "float" : fieldType;
+        std::vector<std::string> fieldVec(allFields.begin(), allFields.end());
+        std::vector<seastar::future<std::string>> typeFutures;
+        typeFutures.reserve(fieldVec.size());
+        for (const auto& field : fieldVec) {
+            typeFutures.push_back(localEngine.getIndex().getFieldType(measurement, field));
+        }
+        auto allTypes = co_await seastar::when_all_succeed(typeFutures.begin(), typeFutures.end());
+        for (size_t i = 0; i < fieldVec.size(); ++i) {
+            fieldsWithTypes[fieldVec[i]] = allTypes[i].empty() ? "float" : std::move(allTypes[i]);
         }
 
         rep->set_status(seastar::http::reply::status_type::ok);
         rep->_content = formatFieldsResponse(measurement, fieldsWithTypes, tagFilters);
-        rep->add_header("Content-Type", "application/json");
 
         timestar::http_log.debug("Returning {} fields for measurement: {}", allFields.size(), measurement);
 
@@ -361,7 +356,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         timestar::http_log.error("Error processing /fields: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
-        rep->add_header("Content-Type", "application/json");
     }
 
     co_return rep;
@@ -376,7 +370,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         if (measurement.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
-            rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
 
@@ -385,7 +378,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = createErrorResponse("INVALID_PARAMETER", err);
-                rep->add_header("Content-Type", "application/json");
                 co_return rep;
             }
         }
@@ -398,7 +390,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = createErrorResponse("INVALID_PARAMETER", err);
-                rep->add_header("Content-Type", "application/json");
                 co_return rep;
             }
         }
@@ -407,12 +398,19 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = createErrorResponse("INVALID_PARAMETER", err);
-                rep->add_header("Content-Type", "application/json");
                 co_return rep;
             }
         }
 
         timestar::http_log.debug("Processing /cardinality request for measurement: {}", measurement);
+
+        // Validate: both tag_key and tag_value must be provided together
+        if (tagKey.empty() != tagValue.empty()) {
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->_content = createErrorResponse("INVALID_PARAMETER",
+                                                "Both tag_key and tag_value must be provided together");
+            co_return rep;
+        }
 
         // Scatter-gather: collect estimates from all shards and sum
         auto numShards = seastar::smp::count;
@@ -446,7 +444,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             (void)glz::write_json(response, buffer);
             rep->set_status(seastar::http::reply::status_type::ok);
             rep->_content = std::move(buffer);
-            rep->add_header("Content-Type", "application/json");
         } else {
             // Measurement-level cardinality plus per-tag-key cardinalities
             std::vector<seastar::future<double>> futures;
@@ -485,7 +482,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             (void)glz::write_json(response, buffer);
             rep->set_status(seastar::http::reply::status_type::ok);
             rep->_content = std::move(buffer);
-            rep->add_header("Content-Type", "application/json");
         }
 
         timestar::http_log.debug("Returning cardinality for measurement: {}", measurement);
@@ -494,7 +490,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         timestar::http_log.error("Error processing /cardinality: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
-        rep->add_header("Content-Type", "application/json");
     }
 
     co_return rep;

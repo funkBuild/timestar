@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -42,9 +43,15 @@ public:
         : timestamps(ts),
           values(vals),
           startIndex(start),
-          count((!ts || !vals) ? 0
-                               : (cnt == 0 ? (start <= vals->size() ? vals->size() - start : 0)
-                                           : std::min(cnt, start <= vals->size() ? vals->size() - start : 0))) {}
+          count((!ts || !vals)
+                    ? 0
+                    : (cnt == 0
+                           ? (start <= std::min(ts->size(), vals->size())
+                                  ? std::min(ts->size(), vals->size()) - start
+                                  : 0)
+                           : std::min(cnt, start <= std::min(ts->size(), vals->size())
+                                              ? std::min(ts->size(), vals->size()) - start
+                                              : 0))) {}
 
     size_t size() const { return count; }
     bool empty() const { return count == 0 || !timestamps || !values; }
@@ -336,10 +343,16 @@ public:
     double minimum() const {
         if (empty())
             return std::numeric_limits<double>::quiet_NaN();
-        double result = data_[0];
-        for (const auto& val : data_) {
-            if (val < result)
-                result = val;
+        // Find the first non-NaN value to initialize result
+        size_t start = 0;
+        while (start < data_.size() && std::isnan(data_[start]))
+            ++start;
+        if (start == data_.size())
+            return std::numeric_limits<double>::quiet_NaN();
+        double result = data_[start];
+        for (size_t i = start + 1; i < data_.size(); ++i) {
+            if (!std::isnan(data_[i]) && data_[i] < result)
+                result = data_[i];
         }
         return result;
     }
@@ -347,10 +360,16 @@ public:
     double maximum() const {
         if (empty())
             return std::numeric_limits<double>::quiet_NaN();
-        double result = data_[0];
-        for (const auto& val : data_) {
-            if (val > result)
-                result = val;
+        // Find the first non-NaN value to initialize result
+        size_t start = 0;
+        while (start < data_.size() && std::isnan(data_[start]))
+            ++start;
+        if (start == data_.size())
+            return std::numeric_limits<double>::quiet_NaN();
+        double result = data_[start];
+        for (size_t i = start + 1; i < data_.size(); ++i) {
+            if (!std::isnan(data_[i]) && data_[i] > result)
+                result = data_[i];
         }
         return result;
     }
@@ -452,6 +471,10 @@ public:
     static FunctionResult<double> interpolateLinear(const DoubleSeriesView& input,
                                                     const std::vector<uint64_t>& targetTimestamps) {
         FunctionResult<double> result;
+        if (input.empty() || targetTimestamps.empty()) {
+            return result;
+        }
+
         result.timestamps = targetTimestamps;
         result.values.reserve(targetTimestamps.size());
 

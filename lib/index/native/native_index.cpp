@@ -308,8 +308,12 @@ bool NativeIndex::kvExists(std::string_view key) {
             return false;
     }
 
-    // 3. Check SSTables (newest to oldest)
+    // 3. Check SSTables (newest to oldest).
+    // Use contains() for bloom-filter-based early rejection (avoids copying
+    // the value). Only fall back to get() on a hit to check for tombstones.
     for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
+        if (!it->second->contains(key))
+            continue;
         auto result = it->second->get(key);
         if (result.has_value())
             return !isSstableTombstone(*result);
@@ -1273,7 +1277,7 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTag(const std
         if (localId < localIdMap_.nextId()) {
             result.push_back(localIdMap_.getGlobalId(localId));
         }
-        if (maxSeries > 0 && result.size() > maxSeries)
+        if (maxSeries > 0 && result.size() >= maxSeries)
             break;
     }
 
@@ -1536,13 +1540,17 @@ seastar::future<bool> NativeIndex::deleteRetentionPolicy(const std::string& meas
 // ============================================================================
 
 seastar::future<size_t> NativeIndex::getSeriesCount() {
+    co_return getSeriesCountSync();
+}
+
+size_t NativeIndex::getSeriesCountSync() const {
     size_t count = 0;
     std::string prefix(1, static_cast<char>(SERIES_METADATA));
-    kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
+    const_cast<NativeIndex*>(this)->kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
         ++count;
         return true;
     });
-    co_return count;
+    return count;
 }
 
 seastar::future<> NativeIndex::compact() {

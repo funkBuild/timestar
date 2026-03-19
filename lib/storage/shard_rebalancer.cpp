@@ -8,10 +8,12 @@
 #include "tsm_writer.hpp"
 
 #include <algorithm>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <regex>
+#include <unistd.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -61,6 +63,12 @@ void ShardRebalancer::writeShardCountMeta(const std::string& dataDir, unsigned s
     }
     ofs << shardCount << "\n";
     ofs.flush();
+    // fsync to ensure data reaches disk for crash safety
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
 }
 
 unsigned ShardRebalancer::readShardCountMeta(const std::string& dataDir) {
@@ -86,6 +94,13 @@ void ShardRebalancer::writeState(const RebalanceState& state) {
     int phaseInt = static_cast<int>(state.phase);
     ofs << phaseInt << " " << state.oldShardCount << " " << state.newShardCount << "\n";
     ofs.flush();
+    // fsync to ensure data reaches disk for crash safety
+    auto path = stateFilePath();
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
 }
 
 RebalanceState ShardRebalancer::readState() {
@@ -97,6 +112,10 @@ RebalanceState ShardRebalancer::readState() {
     ifs >> phaseInt >> state.oldShardCount >> state.newShardCount;
     if (ifs.fail())
         return {};
+    if (phaseInt < 0 || phaseInt > 3) {
+        engine_log.error("[REBALANCE] Invalid phase {} in state file, ignoring", phaseInt);
+        return {};
+    }
     state.phase = static_cast<RebalancePhase>(phaseInt);
     return state;
 }
@@ -174,16 +193,19 @@ void ShardRebalancer::createStagingDirs(unsigned newShardCount) {
 seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount, unsigned newShardCount) {
     for (unsigned oldShard = 0; oldShard < oldShardCount; ++oldShard) {
         std::string shardPath = shardDir(oldShard);
-        if (!fs::exists(shardPath))
-            continue;
 
-        // Collect WAL files
-        std::vector<std::string> walFiles;
-        for (const auto& entry : fs::directory_iterator(shardPath)) {
-            if (entry.path().extension() == ".wal") {
-                walFiles.push_back(entry.path().string());
+        // Wrap blocking filesystem calls in seastar::async to avoid reactor stalls
+        auto walFiles = co_await seastar::async([&shardPath] {
+            std::vector<std::string> files;
+            if (!fs::exists(shardPath))
+                return files;
+            for (const auto& entry : fs::directory_iterator(shardPath)) {
+                if (entry.path().extension() == ".wal") {
+                    files.push_back(entry.path().string());
+                }
             }
-        }
+            return files;
+        });
 
         if (walFiles.empty())
             continue;
@@ -240,16 +262,22 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsig
 
     for (unsigned oldShard = 0; oldShard < oldShardCount; ++oldShard) {
         std::string tsmDir = shardDir(oldShard) + "/tsm";
-        if (!fs::exists(tsmDir))
-            continue;
 
-        // Collect TSM files
-        std::vector<std::string> tsmFiles;
-        for (const auto& entry : fs::directory_iterator(tsmDir)) {
-            if (entry.path().extension() == ".tsm") {
-                tsmFiles.push_back(fs::canonical(entry.path()).string());
+        // Wrap blocking filesystem calls in seastar::async to avoid reactor stalls
+        auto tsmFiles = co_await seastar::async([&tsmDir] {
+            std::vector<std::string> files;
+            if (!fs::exists(tsmDir))
+                return files;
+            for (const auto& entry : fs::directory_iterator(tsmDir)) {
+                if (entry.path().extension() == ".tsm") {
+                    files.push_back(fs::canonical(entry.path()).string());
+                }
             }
-        }
+            return files;
+        });
+
+        if (tsmFiles.empty())
+            continue;
 
         engine_log.info("[REBALANCE] Analyzing {} TSM files from shard {}", tsmFiles.size(), oldShard);
 
@@ -386,32 +414,19 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsig
 // ---------------------------------------------------------------------------
 
 void ShardRebalancer::moveNativeIndex() {
-    // Since Phase 1, each shard has its own native_index/ directory.
-    // Copy each old shard's index to the corresponding new shard.
+    // After rebalancing, series are rerouted across shards. Copying old shard N's
+    // NativeIndex to new shard N would produce stale metadata: entries for series
+    // that moved away, and missing entries for series that moved in. A stale index
+    // is worse than an empty one (ghost results, missed discoveries).
+    //
+    // Instead, we leave the new shards with empty native_index/ directories
+    // (already created by createStagingDirs). The NativeIndex will be rebuilt
+    // incrementally as data is written/queried. Existing TSM data remains
+    // queryable through direct series key lookups and scatter-gather discovery.
     unsigned oldCount = _oldShardCount > 0 ? _oldShardCount : detectShardCountFromDirs();
-    for (unsigned s = 0; s < oldCount; ++s) {
-        // Try native_index/ first (Phase 1+), fall back to index/ (legacy)
-        std::string srcIndex = shardDir(s) + "/native_index";
-        if (!fs::exists(srcIndex)) {
-            srcIndex = shardDir(s) + "/index";
-        }
-        if (!fs::exists(srcIndex))
-            continue;
-
-        std::string dstIndex = shardDirNew(s) + "/native_index";
-
-        // Remove the empty dir we created in staging (if any)
-        std::error_code ec;
-        fs::remove_all(dstIndex, ec);
-
-        // Copy the index (can't hard-link a directory tree portably)
-        fs::copy(srcIndex, dstIndex, fs::copy_options::recursive, ec);
-        if (ec) {
-            throw std::runtime_error("Failed to copy NativeIndex for shard " + std::to_string(s) + ": " + ec.message());
-        }
-
-        engine_log.info("[REBALANCE] Copied NativeIndex for shard {}", s);
-    }
+    engine_log.info("[REBALANCE] Skipping NativeIndex copy ({} old shards) — "
+                    "index will rebuild incrementally from TSM data",
+                    oldCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -449,11 +464,18 @@ void ShardRebalancer::completeCutover(unsigned oldShardCount, unsigned newShardC
     // Move any remaining old shard dirs to _old
     for (unsigned s = 0; s < oldShardCount; ++s) {
         std::string src = shardDir(s);
+        if (!fs::exists(src))
+            continue;
         std::string oldDst = shardDirOld(s);
-        std::string newSrc = shardDirNew(s);
-        // If shard_N exists and shard_N_new also exists, shard_N is still old
-        if (fs::exists(src) && fs::exists(newSrc)) {
+        if (s >= newShardCount) {
+            // Scale-down: no _new dir exists for this shard. Archive unconditionally
+            // to prevent orphaned directories that break future detectShardCountFromDirs().
             fs::rename(src, oldDst);
+        } else {
+            std::string newSrc = shardDirNew(s);
+            if (fs::exists(newSrc)) {
+                fs::rename(src, oldDst);
+            }
         }
     }
 

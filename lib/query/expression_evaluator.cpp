@@ -453,6 +453,10 @@ AlignedSeries AlignedSeries::integral() const {
     double area = 0.0;
     result[0] = 0.0;
     for (size_t i = 1; i < values.size(); ++i) {
+        if (ts[i] <= ts[i - 1]) {
+            result[i] = area;
+            continue;
+        }
         double delta_s = static_cast<double>(ts[i] - ts[i - 1]) / 1e9;
         if (!std::isnan(values[i]) && !std::isnan(values[i - 1]) && delta_s > 0.0) {
             area += (values[i] + values[i - 1]) / 2.0 * delta_s;
@@ -768,6 +772,10 @@ AlignedSeries AlignedSeries::rolling_stddev(int N) const {
     double Q = 0.0;  // current sum of squared deviations from M
     size_t k = 0;    // current window occupancy (0 <= k <= N)
 
+    // NaN values are substituted with 0 so that the Welford add/remove
+    // symmetry is maintained (matching the zscore() pattern).
+    auto safe = [](double v) { return std::isnan(v) ? 0.0 : v; };
+
     // Phase 1 lambda: k is variable, so we must divide.
     auto welford_add_p1 = [&](double x) {
         ++k;
@@ -778,7 +786,7 @@ AlignedSeries AlignedSeries::rolling_stddev(int N) const {
 
     // Phase 1: fill the window (processes elements 0 .. N-2)
     for (size_t i = 0; i < wsize - 1 && i < values.size(); ++i) {
-        welford_add_p1(values[i]);
+        welford_add_p1(safe(values[i]));
     }
 
     // Phase 2: k == wsize throughout -- precompute loop-invariant reciprocals.
@@ -789,7 +797,7 @@ AlignedSeries AlignedSeries::rolling_stddev(int N) const {
         // Add new right-edge element (k goes wsize-1 -> wsize; use inv_wsize).
         ++k;
         {
-            double x = values[i];
+            double x = safe(values[i]);
             double delta = x - M;
             M += delta * inv_wsize;  // replaces: M += delta / k  (k == wsize)
             Q += delta * (x - M);
@@ -799,7 +807,7 @@ AlignedSeries AlignedSeries::rolling_stddev(int N) const {
 
         if (i + 1 < values.size()) {
             // Remove old left-edge element (k goes wsize -> wsize-1).
-            double x = values[i - wsize + 1];
+            double x = safe(values[i - wsize + 1]);
             double delta = x - M;
             M -= delta * inv_wsize_m1;  // replaces: M -= delta / (k-1)  (k-1 == wsize-1)
             Q -= delta * (x - M);

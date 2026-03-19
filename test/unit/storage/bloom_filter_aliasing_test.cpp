@@ -3,8 +3,6 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
-#include <regex>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -65,32 +63,16 @@ TEST(BloomFilterAliasingTest, NoFalseNegatives) {
 TEST(BloomFilterAliasingTest, UnalignedData) {
     auto bf = make_bloom_filter();
 
-    // Strings of various lengths to exercise all remainder paths in hash_ap:
-    //   len 1 -> 1-byte remainder only
-    //   len 2 -> 2-byte remainder
-    //   len 3 -> 2-byte + 1-byte remainder
-    //   len 4 -> 4-byte remainder
-    //   len 5 -> 4-byte + 1-byte remainder
-    //   len 6 -> 4-byte + 2-byte remainder
-    //   len 7 -> 4-byte + 2-byte + 1-byte remainder
-    //   len 8 -> one full 8-byte iteration, no remainder
-    //   len 9 -> one 8-byte iteration + 1-byte remainder
-    //   len 10 -> one 8-byte iteration + 2-byte remainder
-    //   len 11 -> one 8-byte iteration + 2-byte + 1-byte remainder
-    //   len 12 -> one 8-byte iteration + 4-byte remainder
-    //   len 13 -> one 8-byte iteration + 4-byte + 1-byte remainder
-    //   len 14 -> one 8-byte iteration + 4-byte + 2-byte remainder
-    //   len 15 -> one 8-byte iteration + 4-byte + 2-byte + 1-byte remainder
-
+    // Strings of various lengths to exercise hash function with all input sizes
     std::vector<std::string> keys;
     for (int len = 1; len <= 15; ++len) {
         keys.push_back(std::string(len, 'x'));
     }
 
-    // Also add some varied-content strings of specific remainder lengths
-    keys.push_back("ABCDE");    // 5 bytes: 4-byte + 1-byte remainder
-    keys.push_back("ABCDEF");   // 6 bytes: 4-byte + 2-byte remainder
-    keys.push_back("ABCDEFG");  // 7 bytes: 4-byte + 2-byte + 1-byte remainder
+    // Also add some varied-content strings of specific lengths
+    keys.push_back("ABCDE");
+    keys.push_back("ABCDEF");
+    keys.push_back("ABCDEFG");
 
     for (const auto& key : keys) {
         bf.insert(key);
@@ -145,9 +127,9 @@ TEST(BloomFilterAliasingTest, IntegerTypeInserts) {
 }
 
 // ------------------------------------------------------------------
-// Source-inspection test: No reinterpret_cast in hash_ap()
+// Source-inspection test: Uses xxHash, not custom hash_ap
 // ------------------------------------------------------------------
-TEST(BloomFilterAliasingTest, SourceNoReinterpretCast) {
+TEST(BloomFilterAliasingTest, SourceUsesXxHash) {
 #ifndef BLOOM_FILTER_SOURCE_PATH
     GTEST_SKIP() << "BLOOM_FILTER_SOURCE_PATH not defined";
 #else
@@ -156,42 +138,30 @@ TEST(BloomFilterAliasingTest, SourceNoReinterpretCast) {
 
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-    // Find the hash_ap function definition (not a call site)
-    // The definition has the form: hash_ap(const unsigned char*
-    auto hash_ap_start = content.find("hash_ap(const unsigned char*");
-    ASSERT_NE(hash_ap_start, std::string::npos) << "Could not find hash_ap function definition in source";
+    // Verify xxhash is included
+    EXPECT_NE(content.find("#include <xxhash.h>"), std::string::npos)
+        << "bloom_filter.hpp must include <xxhash.h>";
 
-    // Find the function body (from first { after hash_ap to matching })
-    auto body_start = content.find('{', hash_ap_start);
-    ASSERT_NE(body_start, std::string::npos);
+    // Verify XXH3_128bits is used for hashing
+    EXPECT_NE(content.find("XXH3_128bits"), std::string::npos)
+        << "bloom_filter.hpp must use XXH3_128bits for hashing";
 
-    // Walk to find the matching closing brace
-    int depth = 1;
-    size_t pos = body_start + 1;
-    while (pos < content.size() && depth > 0) {
-        if (content[pos] == '{')
-            ++depth;
-        else if (content[pos] == '}')
-            --depth;
-        ++pos;
-    }
+    // Verify no srand/rand usage (old library used these)
+    EXPECT_EQ(content.find("srand("), std::string::npos)
+        << "bloom_filter.hpp must not use srand()";
+    EXPECT_EQ(content.find("rand()"), std::string::npos)
+        << "bloom_filter.hpp must not use rand()";
 
-    std::string hash_ap_body = content.substr(body_start, pos - body_start);
-
-    // Verify no reinterpret_cast<const unsigned int*> in hash_ap
-    EXPECT_EQ(hash_ap_body.find("reinterpret_cast<const unsigned int*>"), std::string::npos)
-        << "hash_ap() must not use reinterpret_cast<const unsigned int*> (strict aliasing violation)";
-
-    // Verify no reinterpret_cast<const unsigned short*> in hash_ap
-    EXPECT_EQ(hash_ap_body.find("reinterpret_cast<const unsigned short*>"), std::string::npos)
-        << "hash_ap() must not use reinterpret_cast<const unsigned short*> (strict aliasing violation)";
+    // Verify no hash_ap function (replaced by xxHash)
+    EXPECT_EQ(content.find("hash_ap("), std::string::npos)
+        << "bloom_filter.hpp must not contain the old hash_ap function";
 #endif
 }
 
 // ------------------------------------------------------------------
-// Source-inspection test: Uses std::memcpy for type punning
+// Source-inspection test: No strict aliasing violations
 // ------------------------------------------------------------------
-TEST(BloomFilterAliasingTest, SourceUsesMemcpy) {
+TEST(BloomFilterAliasingTest, SourceNoAliasingViolations) {
 #ifndef BLOOM_FILTER_SOURCE_PATH
     GTEST_SKIP() << "BLOOM_FILTER_SOURCE_PATH not defined";
 #else
@@ -200,32 +170,12 @@ TEST(BloomFilterAliasingTest, SourceUsesMemcpy) {
 
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-    // Find the hash_ap function definition (not a call site)
-    // The definition has the form: hash_ap(const unsigned char*
-    auto hash_ap_start = content.find("hash_ap(const unsigned char*");
-    ASSERT_NE(hash_ap_start, std::string::npos) << "Could not find hash_ap function definition in source";
+    // Verify no reinterpret_cast<const unsigned int*> (strict aliasing violation)
+    EXPECT_EQ(content.find("reinterpret_cast<const unsigned int*>"), std::string::npos)
+        << "bloom_filter.hpp must not use reinterpret_cast<const unsigned int*>";
 
-    auto body_start = content.find('{', hash_ap_start);
-    ASSERT_NE(body_start, std::string::npos);
-
-    int depth = 1;
-    size_t pos = body_start + 1;
-    while (pos < content.size() && depth > 0) {
-        if (content[pos] == '{')
-            ++depth;
-        else if (content[pos] == '}')
-            --depth;
-        ++pos;
-    }
-
-    std::string hash_ap_body = content.substr(body_start, pos - body_start);
-
-    // Verify std::memcpy is used in hash_ap
-    EXPECT_NE(hash_ap_body.find("memcpy"), std::string::npos)
-        << "hash_ap() must use std::memcpy for type punning instead of reinterpret_cast";
-
-    // Verify the include for cstring is present in the file
-    EXPECT_NE(content.find("#include <cstring>"), std::string::npos)
-        << "bloom_filter.hpp must include <cstring> for std::memcpy";
+    // Verify no reinterpret_cast<const unsigned short*> (strict aliasing violation)
+    EXPECT_EQ(content.find("reinterpret_cast<const unsigned short*>"), std::string::npos)
+        << "bloom_filter.hpp must not use reinterpret_cast<const unsigned short*>";
 #endif
 }

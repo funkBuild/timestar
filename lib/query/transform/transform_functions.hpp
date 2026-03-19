@@ -225,6 +225,8 @@ inline std::vector<double> integral(const std::vector<double>& values, const std
         return std::vector<double>(values.size(), std::nan(""));
     }
 
+    if (values.empty()) return {};
+
     std::vector<double> result(values.size());
     double area = 0.0;
     result[0] = 0.0;
@@ -1053,6 +1055,10 @@ inline std::vector<double> piecewise_constant(const std::vector<double>& values,
             validValues.push_back(values[i]);
             validIndices.push_back(i);
         }
+    }
+
+    if (validValues.empty()) {
+        return std::vector<double>(values.size(), std::nan(""));
     }
 
     if (validValues.size() < minSegmentSize * 2) {

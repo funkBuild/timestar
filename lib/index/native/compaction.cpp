@@ -104,11 +104,17 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     merger.seekToFirstSync();  // SSTable iterators are synchronous
 
     if (!merger.valid()) {
-        // All inputs were empty — just remove the files
+        // All inputs were empty — remove from manifest and delete physical files
         std::vector<uint64_t> toRemove;
         for (const auto& f : job.inputFiles)
             toRemove.push_back(f.fileNumber);
         co_await manifest_.removeFiles(toRemove);
+        for (const auto& f : job.inputFiles) {
+            auto path = sstFilename(f.fileNumber);
+            if (co_await seastar::file_exists(path)) {
+                co_await seastar::remove_file(path);
+            }
+        }
         co_return;
     }
 
@@ -144,60 +150,70 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     auto rateStart = std::chrono::steady_clock::now();
     const size_t rateLimitBytesPerSec = static_cast<size_t>(config_.rateLimitMBps) * 1024 * 1024;
 
-    while (merger.valid()) {
-        // Drop expired tombstones (single null byte sentinel from deleted keys)
-        auto mergedVal = merger.value();
-        if (canDropTombstones && mergedVal.size() == 1 && mergedVal[0] == '\0') {
-            ++tombstonesDropped;
-            merger.nextSync();  // SSTable iterators are synchronous — avoid coroutine frame
-            continue;
-        }
+    // Wrap the merge/write/manifest section so we can clean up the partial
+    // output file if any step fails (no co_await in catch blocks in C++20).
+    std::exception_ptr compactionError;
+    try {
+        while (merger.valid()) {
+            auto mergedVal = merger.value();
+            if (canDropTombstones && mergedVal.size() == 1 && mergedVal[0] == '\0') {
+                ++tombstonesDropped;
+                merger.nextSync();
+                continue;
+            }
 
-        bytesWritten += merger.key().size() + merger.value().size();
-        writer.add(merger.key(), merger.value());
-        if (++addCount % 1024 == 0) {
-            co_await writer.flushPending();
+            bytesWritten += merger.key().size() + merger.value().size();
+            writer.add(merger.key(), merger.value());
+            if (++addCount % 1024 == 0) {
+                co_await writer.flushPending();
 
-            // Rate limiter: if throughput exceeds budget, sleep to throttle
-            if (rateLimitBytesPerSec > 0) {
-                auto elapsed = std::chrono::steady_clock::now() - rateStart;
-                auto elapsedSec = std::chrono::duration<double>(elapsed).count();
-                if (elapsedSec > 0) {
-                    double currentRate = static_cast<double>(bytesWritten) / elapsedSec;
-                    if (currentRate > static_cast<double>(rateLimitBytesPerSec)) {
-                        double targetSec =
-                            static_cast<double>(bytesWritten) / static_cast<double>(rateLimitBytesPerSec);
-                        double sleepSec = targetSec - elapsedSec;
-                        if (sleepSec > 0.001) {
-                            co_await seastar::sleep(
-                                std::chrono::microseconds(static_cast<int64_t>(sleepSec * 1'000'000)));
+                if (rateLimitBytesPerSec > 0) {
+                    auto elapsed = std::chrono::steady_clock::now() - rateStart;
+                    auto elapsedSec = std::chrono::duration<double>(elapsed).count();
+                    if (elapsedSec > 0) {
+                        double currentRate = static_cast<double>(bytesWritten) / elapsedSec;
+                        if (currentRate > static_cast<double>(rateLimitBytesPerSec)) {
+                            double targetSec =
+                                static_cast<double>(bytesWritten) / static_cast<double>(rateLimitBytesPerSec);
+                            double sleepSec = targetSec - elapsedSec;
+                            if (sleepSec > 0.001) {
+                                co_await seastar::sleep(
+                                    std::chrono::microseconds(static_cast<int64_t>(sleepSec * 1'000'000)));
+                            }
                         }
                     }
                 }
             }
+            merger.nextSync();
         }
-        merger.nextSync();  // SSTable iterators are synchronous — avoid coroutine frame
-    }
-    co_await writer.flushPending();
+        co_await writer.flushPending();
 
-    auto outputMeta = co_await writer.finish();
-    outputMeta.fileNumber = outputFileNum;
-    outputMeta.level = outputLevel;
+        auto outputMeta = co_await writer.finish();
+        outputMeta.fileNumber = outputFileNum;
+        outputMeta.level = outputLevel;
 
-    // Update manifest atomically: add output and remove inputs in a single fsync.
-    // This prevents a crash-window where both old and new data exist.
-    std::vector<uint64_t> toRemove;
-    for (const auto& f : job.inputFiles) {
-        toRemove.push_back(f.fileNumber);
-    }
-    co_await manifest_.atomicReplaceFiles(outputMeta, toRemove);
-
-    // Delete old SSTable files from disk
-    for (const auto& f : job.inputFiles) {
-        auto path = sstFilename(f.fileNumber);
-        if (std::filesystem::exists(path)) {
-            co_await seastar::remove_file(path);
+        std::vector<uint64_t> toRemove;
+        for (const auto& f : job.inputFiles) {
+            toRemove.push_back(f.fileNumber);
         }
+        co_await manifest_.atomicReplaceFiles(outputMeta, toRemove);
+
+        for (const auto& f : job.inputFiles) {
+            auto path = sstFilename(f.fileNumber);
+            if (co_await seastar::file_exists(path)) {
+                co_await seastar::remove_file(path);
+            }
+        }
+    } catch (...) {
+        compactionError = std::current_exception();
+    }
+
+    // Clean up partial output file on failure
+    if (compactionError) {
+        if (co_await seastar::file_exists(outputPath)) {
+            co_await seastar::remove_file(outputPath);
+        }
+        std::rethrow_exception(compactionError);
     }
 }
 

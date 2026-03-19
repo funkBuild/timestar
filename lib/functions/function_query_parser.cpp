@@ -45,24 +45,35 @@ static bool containsWholeWord(const std::string& query, const std::string& name)
 }
 
 std::vector<std::string> FunctionQueryParser::parse(const std::string& query) {
-    std::vector<std::string> functions;
+    // Collect (position, name) pairs and sort by position to preserve
+    // the pipeline execution order from the query string.
+    std::vector<std::pair<size_t, std::string>> matches;
 
-    // Use registry function names when available; fall back to hardcoded set
+    auto findAndCollect = [&](const std::string& name) {
+        size_t pos = query.find(name);
+        if (pos != std::string::npos && containsWholeWord(query, name)) {
+            matches.emplace_back(pos, name);
+        }
+    };
+
     if (registry_) {
         for (const auto& name : registry_->getAllFunctionNames()) {
-            if (containsWholeWord(query, name)) {
-                functions.push_back(name);
-            }
+            findAndCollect(name);
         }
     } else {
         static const std::vector<std::string> builtins = {"sma", "ema", "add", "multiply"};
         for (const auto& name : builtins) {
-            if (containsWholeWord(query, name)) {
-                functions.push_back(name);
-            }
+            findAndCollect(name);
         }
     }
 
+    std::sort(matches.begin(), matches.end());
+
+    std::vector<std::string> functions;
+    functions.reserve(matches.size());
+    for (auto& [pos, name] : matches) {
+        functions.push_back(std::move(name));
+    }
     return functions;
 }
 

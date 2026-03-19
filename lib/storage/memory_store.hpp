@@ -49,7 +49,7 @@ private:
     bool closed = false;
     // Tracks cumulative estimated (worst-case/pre-compression) insert sizes.
     // The actual compressed WAL size grows much slower than estimates due to
-    // XOR float compression and Simple8b timestamp compression.  Using only
+    // XOR float compression and FFOR timestamp compression.  Using only
     // the compressed size for rollover decisions can cause the WAL to never
     // trigger rollover when compression is highly effective.  This counter
     // provides a conservative upper bound for rollover decisions.
@@ -74,8 +74,11 @@ public:
     seastar::future<> close();
     template <class T>
     void insertMemory(TimeStarInsert<T>&& insertRequest);
+    // Insert a single series write. Returns true if WAL needs rollover.
+    // On success (returns false), insertRequest is moved-from and must not be reused.
+    // On rollover (returns true), insertRequest is NOT consumed and can be retried.
     template <class T>
-    seastar::future<bool> insert(TimeStarInsert<T>& insertRequest);  // Returns true if WAL needs rollover
+    seastar::future<bool> insert(TimeStarInsert<T>& insertRequest);
 
     template <class T>
     seastar::future<bool> insertBatch(

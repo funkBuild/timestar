@@ -75,6 +75,11 @@ QueryRequest QueryParser::parseQueryString(const std::string& queryString) {
                 throw QueryParseException("Query missing open brace on aggregation group");
             }
             request.groupByTags = parseGroupBy(queryString, pos);
+
+            skipWhitespace(queryString, pos);
+            if (pos < queryString.length()) {
+                throw QueryParseException("Unexpected characters after group by: " + queryString.substr(pos));
+            }
         } else {
             throw QueryParseException("Unexpected characters after query: " + queryString.substr(pos));
         }
@@ -96,6 +101,12 @@ uint64_t QueryParser::parseTime(const std::string& timeStr) {
 
     if (ss.fail() || dash1 != '-' || dash2 != '-' || colon1 != ':' || colon2 != ':') {
         throw QueryParseException("Invalid time format. Expected: dd-mm-yyyy hh:mm:ss");
+    }
+
+    // Reject trailing characters after the expected format
+    std::string remaining;
+    if (ss >> remaining) {
+        throw QueryParseException("Trailing characters in time string: " + timeStr);
     }
 
     // Validate ranges
@@ -134,7 +145,7 @@ static bool ciEqual(std::string_view a, std::string_view b) {
         return false;
     for (size_t i = 0; i < a.size(); ++i) {
         if (static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a[i]))) !=
-            static_cast<unsigned char>(b[i]))
+            static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(b[i]))))
             return false;
     }
     return true;
@@ -195,6 +206,14 @@ std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos)
 
     // Trim trailing whitespace without extra allocation
     std::string_view sv = trimView(std::string_view(query).substr(start, pos - start));
+
+    if (sv.empty()) {
+        throw QueryParseException("Empty measurement name");
+    }
+    if (sv.find_first_of(" \t\n\r") != std::string_view::npos) {
+        throw QueryParseException("Measurement name cannot contain whitespace: '" + std::string(sv) + "'");
+    }
+
     return std::string(sv);
 }
 

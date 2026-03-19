@@ -21,7 +21,7 @@ struct ShardQuery {
     std::set<std::string> fields;        // Fields to retrieve
     uint64_t startTime;
     uint64_t endTime;
-    bool requiresAllSeries;  // If true, query all matching series on shard
+    // (requiresAllSeries removed — was never read)
 };
 
 // Complete query execution plan
@@ -34,7 +34,6 @@ struct QueryPlan {
 
     // Metadata for optimization
     size_t estimatedSeriesCount = 0;
-    size_t estimatedPointCount = 0;
 };
 
 class QueryPlanner {
@@ -47,9 +46,6 @@ public:
     // Synchronous version for testing
     QueryPlan createPlanSync(const QueryRequest& request, index::NativeIndex* index);
 
-    // Public for testing
-    bool requiresAllShards(const QueryRequest& request);
-
     std::string buildSeriesKeyForSharding(const std::string& measurement,
                                           const std::map<std::string, std::string>& tags, const std::string& field);
 
@@ -61,12 +57,6 @@ private:
     // Synchronous version for testing
     std::vector<std::vector<SeriesId128>> findMatchingSeriesIdsSync(const QueryRequest& request,
                                                                     index::NativeIndex* index);
-
-    // Map series IDs to their respective shards
-    std::vector<std::vector<SeriesId128>> mapSeriesToShards(const std::vector<SeriesId128>& seriesIds,
-                                                            const std::string& measurement,
-                                                            const std::map<std::string, std::string>& tags,
-                                                            const std::vector<std::string>& fields);
 
     // Calculate which shard a series belongs to
     unsigned calculateShardForSeries(const std::string& measurement, const std::map<std::string, std::string>& tags,

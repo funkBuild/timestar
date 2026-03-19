@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace timestar {
@@ -24,10 +25,10 @@ void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<d
     }
 
     if (absResiduals.empty()) {
-        // No valid residuals - use wide bounds
+        // No valid residuals - use infinite bounds (never flag anomalies)
         for (size_t i = 0; i < n; ++i) {
-            upper[i] = values[i] + 1000.0;
-            lower[i] = values[i] - 1000.0;
+            upper[i] = std::numeric_limits<double>::infinity();
+            lower[i] = -std::numeric_limits<double>::infinity();
         }
         return;
     }

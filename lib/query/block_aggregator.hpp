@@ -371,6 +371,11 @@ private:
     std::vector<double> rawValues_;
     // Single-bucket optimisation: cached pointer to the only bucket entry,
     // avoiding per-point integer division and hash map lookup.
+    // INVARIANT: singleBucketState_ points into bucketStates_ (std::unordered_map,
+    // node-stable for existing entries). Only valid while no insertions to
+    // bucketStates_ occur through the multi-bucket path. The single-bucket
+    // optimization (bucketCount==1) ensures this: all inserts go through
+    // singleBucketState_ directly, never through bucketStates_[key].
     AggregationState* singleBucketState_ = nullptr;
     uint64_t singleBucketKey_ = 0;
     // Non-bucketed fold mode: single accumulated state (streaming aggregation)

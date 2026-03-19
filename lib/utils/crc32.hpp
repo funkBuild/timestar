@@ -1,9 +1,12 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+
+static_assert(std::endian::native == std::endian::little, "CRC32 slicing-by-8 requires little-endian");
 
 // CRC32 (ISO 3309 / ITU-T V.42) using slicing-by-8.
 // Polynomial: 0xEDB88320 (reflected representation of 0x04C11DB7).

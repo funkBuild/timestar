@@ -355,3 +355,16 @@ TEST_F(HttpWriteHandlerTest, NumericEdgeCases) {
     EXPECT_TRUE(fields["zero_float"].is_number());
     EXPECT_DOUBLE_EQ(fields["zero_float"].get<double>(), 0.0);
 }
+
+// Regression: after findOrCreateCandidate, the local valueType must be synced
+// with candidate.valueType to handle Integer->Float promotion for array fields.
+TEST_F(HttpWriteHandlerTest, CoalesceArrayIntToFloatPromotionFixPresent) {
+    std::ifstream src("../lib/http/http_write_handler.cpp");
+    ASSERT_TRUE(src.is_open()) << "Could not open http_write_handler.cpp for source inspection";
+    std::string content((std::istreambuf_iterator<char>(src)), std::istreambuf_iterator<char>());
+
+    // The fix: after findOrCreateCandidate returns, local valueType is updated
+    // from candidate.valueType so the reserve/push_back loop uses the promoted type.
+    EXPECT_NE(content.find("valueType = candidate.valueType"), std::string::npos)
+        << "Array coalesce must sync local valueType with candidate.valueType after promotion";
+}

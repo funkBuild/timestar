@@ -65,11 +65,17 @@ HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const Gla
 
     // Check for series key format
     if (glazeReq.series) {
+        if (glazeReq.series->empty()) {
+            throw std::invalid_argument("'series' must not be empty");
+        }
         req.seriesKey = *glazeReq.series;
         req.isStructured = false;
     }
     // Check for structured/pattern format
     else if (glazeReq.measurement) {
+        if (glazeReq.measurement->empty()) {
+            throw std::invalid_argument("'measurement' must not be empty");
+        }
         req.measurement = *glazeReq.measurement;
         req.isStructured = true;
 
@@ -159,7 +165,6 @@ std::string HttpDeleteHandler::createSuccessResponse(uint64_t deletedCount, uint
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handleDelete(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
-    reply->add_header("Content-Type", "application/json");
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);

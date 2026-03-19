@@ -16,12 +16,18 @@
 
 namespace timestar {
 
+using TagMap = std::map<std::string, std::string>;
+
+inline std::shared_ptr<const TagMap> makeTags(TagMap tags) {
+    return std::make_shared<const TagMap>(std::move(tags));
+}
+
 // A single data point notification for streaming to a subscriber.
 struct StreamingDataPoint {
     std::string measurement;
     std::string field;
-    std::map<std::string, std::string> tags;
-    uint64_t timestamp;
+    std::shared_ptr<const TagMap> tags = makeTags({});  // Shared across points in a batch (avoids N copies)
+    uint64_t timestamp = 0;
     std::variant<double, bool, std::string, int64_t> value;
 };
 

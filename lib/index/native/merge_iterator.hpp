@@ -70,7 +70,7 @@ private:
     std::vector<HeapEntry> heap_;
     bool valid_ = false;
     std::string currentKey_;
-    std::string_view currentValue_;
+    std::string currentValue_;  // Owned copy — prevents dangling when sources advance
 
     // Rebuild heap from all valid sources
     void rebuildHeap();

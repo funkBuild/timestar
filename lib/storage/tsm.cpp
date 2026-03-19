@@ -47,6 +47,10 @@ static bool blockOverlapsTombstones(uint64_t blockMin, uint64_t blockMax,
         for (auto rit = it;; --rit) {
             if (rit->second >= blockMin && rit->first <= blockMax)
                 return true;
+            // Ranges are sorted by start and non-overlapping (merged).
+            // Once a range ends before the block starts, all earlier ranges do too.
+            if (rit->second < blockMin)
+                break;
             if (rit == tombstoneRanges.begin())
                 break;
         }
@@ -901,10 +905,11 @@ std::vector<TSMIndexBlock> TSM::getSeriesBlocks(const SeriesId128& seriesId) con
 // Phase 1.1: Read a single block and return it (not appending to results)
 template <class T>
 seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
-                                                                   uint64_t endTime) {
-    // Bug #8 fix: Capture tlStringDict BEFORE co_await — another coroutine
-    // on this thread could overwrite the thread-local during DMA suspension.
-    const std::vector<std::string>* localDict = tlStringDict;
+                                                                   uint64_t endTime,
+                                                                   const std::vector<std::string>* stringDict) {
+    // Use explicitly-passed dictionary if available; otherwise fall back to the
+    // thread-local (kept for backward compatibility with readSeries callers).
+    const std::vector<std::string>* localDict = stringDict ? stringDict : tlStringDict;
 
     auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
@@ -981,14 +986,13 @@ template seastar::future<> TSM::readSeries<int64_t>(const SeriesId128& seriesId,
 
 // Phase 1.1: Template instantiations for readSingleBlock
 template seastar::future<std::unique_ptr<TSMBlock<double>>> TSM::readSingleBlock<double>(
-    const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime);
-template seastar::future<std::unique_ptr<TSMBlock<bool>>> TSM::readSingleBlock<bool>(const TSMIndexBlock& indexBlock,
-                                                                                     uint64_t startTime,
-                                                                                     uint64_t endTime);
+    const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime, const std::vector<std::string>* stringDict);
+template seastar::future<std::unique_ptr<TSMBlock<bool>>> TSM::readSingleBlock<bool>(
+    const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime, const std::vector<std::string>* stringDict);
 template seastar::future<std::unique_ptr<TSMBlock<std::string>>> TSM::readSingleBlock<std::string>(
-    const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime);
+    const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime, const std::vector<std::string>* stringDict);
 template seastar::future<std::unique_ptr<TSMBlock<int64_t>>> TSM::readSingleBlock<int64_t>(
-    const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime);
+    const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime, const std::vector<std::string>* stringDict);
 
 // Phase 2: Read compressed block bytes directly without decompression
 seastar::future<seastar::temporary_buffer<uint8_t>> TSM::readCompressedBlock(const TSMIndexBlock& indexBlock) {
@@ -1202,8 +1206,22 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
 template <class T>
 seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
                                       TSMResult<T>& results) {
+    // Capture tlStringDict BEFORE co_await — another coroutine on this shard
+    // could overwrite the thread-local during DMA suspension.
+    // (Same fix as readSingleBlock Bug #8.)
+    [[maybe_unused]] const std::vector<std::string>* localDict = nullptr;
+    if constexpr (std::is_same_v<T, std::string>) {
+        localDict = tlStringDict;
+    }
+
     // Single large DMA read for entire batch
     auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
+
+    // Restore tlStringDict from local capture after co_await, so that
+    // decodeBlockFlat<std::string> sees the correct dictionary.
+    if constexpr (std::is_same_v<T, std::string>) {
+        tlStringDict = localDict;
+    }
 
     // Decode all blocks in this batch into a single flat TSMBlock.
     // Blocks within a batch are contiguous and sorted by offset (= time order),

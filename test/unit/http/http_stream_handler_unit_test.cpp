@@ -45,7 +45,7 @@ static StreamingBatch makeBatch(const std::string& measurement, const std::map<s
 
     StreamingDataPoint pt;
     pt.measurement = measurement;
-    pt.tags = tags;
+    pt.tags = makeTags(tags);
     pt.field = field;
     pt.timestamp = timestamp;
     pt.value = value;
@@ -513,7 +513,7 @@ TEST_F(SSEPayloadGroupingTest, TwoPointsDifferentSeries) {
 
     StreamingDataPoint pt1;
     pt1.measurement = "temperature";
-    pt1.tags = {{"location", "us-west"}};
+    pt1.tags = makeTags({{"location", "us-west"}});
     pt1.field = "value";
     pt1.timestamp = 1000;
     pt1.value = 23.5;
@@ -521,7 +521,7 @@ TEST_F(SSEPayloadGroupingTest, TwoPointsDifferentSeries) {
 
     StreamingDataPoint pt2;
     pt2.measurement = "temperature";
-    pt2.tags = {{"location", "us-east"}};
+    pt2.tags = makeTags({{"location", "us-east"}});
     pt2.field = "value";
     pt2.timestamp = 2000;
     pt2.value = 25.0;
@@ -548,7 +548,7 @@ TEST_F(SSEPayloadGroupingTest, TwoFieldsSameSeries) {
     for (const char* field : {"temperature", "humidity"}) {
         StreamingDataPoint pt;
         pt.measurement = "weather";
-        pt.tags = {{"station", "s01"}};
+        pt.tags = makeTags({{"station", "s01"}});
         pt.field = field;
         pt.timestamp = 1000;
         pt.value = 20.0;
@@ -635,8 +635,8 @@ TEST_F(QueryResponseToBatchesTest, TagsArePropagatedToPoints) {
     auto batches = HttpStreamHandler::queryResponseToBatches({sr}, "");
     ASSERT_EQ(batches.size(), 1u);
     ASSERT_EQ(batches[0].points.size(), 1u);
-    EXPECT_EQ(batches[0].points[0].tags.at("location"), "us-west");
-    EXPECT_EQ(batches[0].points[0].tags.at("unit"), "celsius");
+    EXPECT_EQ(batches[0].points[0].tags->at("location"), "us-west");
+    EXPECT_EQ(batches[0].points[0].tags->at("unit"), "celsius");
 }
 
 TEST_F(QueryResponseToBatchesTest, BoolValuesConverted) {
@@ -950,7 +950,7 @@ TEST_F(ApplyFormulaTest, MetadataPreservedAfterFormula) {
     batch.label = "test_label";
     StreamingDataPoint pt;
     pt.measurement = "weather";
-    pt.tags = {{"station", "s01"}};
+    pt.tags = makeTags({{"station", "s01"}});
     pt.field = "temperature";
     pt.timestamp = 999000ULL;
     pt.value = 25.0;
@@ -960,7 +960,7 @@ TEST_F(ApplyFormulaTest, MetadataPreservedAfterFormula) {
 
     ASSERT_EQ(result.points.size(), 1u);
     EXPECT_EQ(result.points[0].measurement, "weather");
-    EXPECT_EQ(result.points[0].tags.at("station"), "s01");
+    EXPECT_EQ(result.points[0].tags->at("station"), "s01");
     EXPECT_EQ(result.points[0].field, "temperature");
     EXPECT_EQ(result.points[0].timestamp, 999000ULL);
     EXPECT_EQ(result.label, "test_label");
@@ -1020,7 +1020,7 @@ TEST_F(ApplyFormulaTest, MultipleSeriesEvaluatedIndependently) {
 
     StreamingDataPoint pt1;
     pt1.measurement = "cpu";
-    pt1.tags = {{"host", "srv1"}};
+    pt1.tags = makeTags({{"host", "srv1"}});
     pt1.field = "usage";
     pt1.timestamp = 1000;
     pt1.value = 50.0;
@@ -1028,7 +1028,7 @@ TEST_F(ApplyFormulaTest, MultipleSeriesEvaluatedIndependently) {
 
     StreamingDataPoint pt2;
     pt2.measurement = "cpu";
-    pt2.tags = {{"host", "srv2"}};
+    pt2.tags = makeTags({{"host", "srv2"}});
     pt2.field = "usage";
     pt2.timestamp = 1000;
     pt2.value = 75.0;

@@ -441,6 +441,13 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
             uint32_t numEntries = decodeFixed32(ip);
             ip += 4;
 
+            // Guard against corrupt index claiming more entries than the data can hold.
+            // Each entry needs at minimum 16 bytes (4 keyLen + 8 offset + 4 size).
+            size_t remainingBytes = static_cast<size_t>(iend - ip);
+            if (numEntries > remainingBytes / 16) {
+                throw std::runtime_error("SSTable index claims " + std::to_string(numEntries) +
+                                         " entries but only " + std::to_string(remainingBytes) + " bytes remain");
+            }
             reader->index_.reserve(numEntries);
             for (uint32_t i = 0; i < numEntries; ++i) {
                 if (ip + 4 > iend)

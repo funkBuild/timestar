@@ -94,15 +94,9 @@ TEST_F(QueryParserEdgeCaseTest, GroupByWithoutSpaceBeforeBrace) {
     EXPECT_EQ(result.groupByTags[0], "tag");
 }
 
-// Trailing characters after the group-by clause: the parser does not re-check
-// for remaining input after successfully parsing a group-by clause, so trailing
-// text is silently ignored. Verify the parsed result is correct and the garbage
-// is simply discarded.
+// Trailing characters after the group-by clause should be rejected.
 TEST_F(QueryParserEdgeCaseTest, TrailingGarbageAfterGroupBy) {
-    auto result = QueryParser::parseQueryString("avg:m() by {tag}garbage");
-    EXPECT_EQ(result.measurement, "m");
-    ASSERT_EQ(result.groupByTags.size(), 1u);
-    EXPECT_EQ(result.groupByTags[0], "tag");
+    EXPECT_THROW(QueryParser::parseQueryString("avg:m() by {tag}garbage"), QueryParseException);
 }
 
 // A scope value containing a colon should capture everything after the first

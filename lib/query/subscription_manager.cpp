@@ -219,13 +219,16 @@ std::shared_ptr<const StreamingBatch> SubscriptionManager::buildBatch(
     const std::vector<uint64_t>& timestamps, const std::vector<T>& values, const std::string& label) {
     auto batch = std::make_shared<StreamingBatch>();
     batch->label = label;
-    batch->points.reserve(timestamps.size());
 
-    for (size_t i = 0; i < timestamps.size(); ++i) {
+    const size_t count = std::min(timestamps.size(), values.size());
+    batch->points.reserve(count);
+
+    auto sharedTags = std::make_shared<const TagMap>(tags);
+    for (size_t i = 0; i < count; ++i) {
         StreamingDataPoint pt;
         pt.measurement = measurement;
         pt.field = field;
-        pt.tags = tags;
+        pt.tags = sharedTags;  // O(1) shared_ptr copy
         pt.timestamp = timestamps[i];
         pt.value = toVariant(values[i]);
         batch->points.push_back(std::move(pt));

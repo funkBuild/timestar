@@ -22,8 +22,8 @@ public:
     // The response is consumed (fields may be moved from).
     static std::string format(QueryResponse& response);
 
-    // Format a JSON error response: {"status":"error","message":"...","error":"..."}
-    static std::string formatError(const std::string& message);
+    // Format a JSON error response: {"status":"error","error_code":"...","message":"...","error":"..."}
+    static std::string formatError(const std::string& message, const std::string& code = "");
 };
 
 }  // namespace timestar

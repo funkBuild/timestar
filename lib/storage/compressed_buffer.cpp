@@ -8,6 +8,11 @@ constexpr size_t CompressedBuffer::INITIAL_CAPACITY;
 constexpr size_t CompressedBuffer::GROWTH_FACTOR;
 
 void CompressedBuffer::write(uint64_t value, int bits) {
+    // Mask value to the requested bit width to prevent upper bits from
+    // bleeding into adjacent fields via the OR-write below.
+    if (bits < 64)
+        value &= (1ULL << bits) - 1;
+
     if (!initialized || bitOffset > 63) {
         if (!initialized) {
             initialized = true;
@@ -46,6 +51,9 @@ void CompressedBuffer::write(uint64_t value, int bits) {
 
 template <int bits>
 void CompressedBuffer::write(uint64_t value) {
+    if constexpr (bits < 64)
+        value &= (1ULL << bits) - 1;
+
     if (!initialized || bitOffset > 63) {
         if (!initialized) {
             initialized = true;
@@ -216,8 +224,9 @@ template void CompressedBuffer::writeFixed<0b0, 1>();
 
 template uint8_t CompressedBuffer::read<uint8_t>(int bits);
 template uint64_t CompressedBuffer::read<uint64_t>(int bits);
-template double CompressedBuffer::read<double>(int bits);
 template bool CompressedBuffer::read<bool>(int bits);
+// Note: read<double> intentionally not instantiated — it would perform
+// integer-to-float conversion, not bitcast. Use read<uint64_t> + bit_cast.
 
 template uint64_t CompressedBuffer::readFixed<uint64_t, 64>();
 template uint64_t CompressedBuffer::readFixed<uint64_t, 5>();

@@ -2,15 +2,15 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_set>
 #include <vector>
+
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/timer.hh>
 
 namespace timestar::functions {
 
@@ -216,6 +216,11 @@ struct Alert {
 };
 
 // Production monitoring manager
+//
+// All access (reads and writes) occurs on a single Seastar reactor thread
+// because getInstance() returns a thread_local instance. No mutexes are
+// needed. Periodic metric collection uses seastar::timer instead of a
+// background std::thread, so the callback executes directly on the reactor.
 class ProductionMonitor {
 private:
     std::map<std::string, std::shared_ptr<FunctionMetrics>> function_metrics_;
@@ -224,8 +229,6 @@ private:
 
     static constexpr size_t MAX_ALERT_HISTORY = 1000;
 
-    mutable std::mutex metrics_mutex_;
-    mutable std::mutex alerts_mutex_;
     std::vector<Alert> active_alerts_;
     // O(1) duplicate detection for active alerts keyed by (type, function_name).
     struct AlertKey {
@@ -243,14 +246,10 @@ private:
     std::unordered_set<AlertKey, AlertKeyHash> active_alert_keys_;
     std::deque<Alert> alert_history_;
 
-    // Background monitoring thread
-    std::thread monitoring_thread_;
-    std::atomic<bool> monitoring_active_{false};
-    std::condition_variable monitoring_cv_;
-    std::mutex monitoring_mutex_;
-    // Serializes start()/stop() lifecycle transitions so that concurrent calls
-    // cannot double-start or double-join the monitoring thread.
-    std::mutex lifecycle_mutex_;
+    // Seastar timer for periodic metric collection (replaces std::thread).
+    // Fires on the reactor thread -- no cross-thread synchronization needed.
+    seastar::timer<seastar::lowres_clock> monitoring_timer_;
+    bool monitoring_active_{false};
 
     // Metrics collection interval
     std::chrono::seconds collection_interval_{30};  // 30 seconds
@@ -260,6 +259,9 @@ private:
     void checkAlertConditions();
     void processAlert(const Alert& alert);
     void cleanupOldAlerts();
+
+    // Timer callback: runs one collection cycle.
+    void onTimerTick();
 
 public:
     ProductionMonitor();
@@ -271,7 +273,7 @@ public:
     // Lifecycle management
     void start();
     void stop();
-    bool isRunning() const { return monitoring_active_.load(); }
+    bool isRunning() const { return monitoring_active_; }
 
     // Metrics registration and access
     void registerFunction(const std::string& function_name);
@@ -286,6 +288,9 @@ public:
     void clearAlertsForTesting();                 // Clear all alerts and history for testing
     void addAlertForTesting(const Alert& alert);  // Directly inject an alert for testing
     size_t getAlertHistorySize() const;           // Return raw alert_history_ size for testing
+
+    // Run one collection cycle synchronously (for unit tests without a reactor).
+    void runCollectionCycle();
 
     // Metrics reporting
     std::map<std::string, FunctionMetricsSnapshot> getAllFunctionMetrics() const;
@@ -314,8 +319,6 @@ public:
     uint64_t getOpenFileDescriptors();
 
 private:
-    // Background monitoring loop
-    void monitoringLoop();
     bool detailed_logging_{false};
 };
 

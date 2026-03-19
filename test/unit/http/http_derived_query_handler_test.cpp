@@ -898,8 +898,6 @@ TEST_F(HttpDerivedQueryHandlerTest, DefaultConfigValues) {
     EXPECT_EQ(config.alignmentStrategy, AlignmentStrategy::INNER);
     EXPECT_EQ(config.interpolationMethod, InterpolationMethod::LINEAR);
     EXPECT_EQ(config.maxSubQueries, 10u);
-    EXPECT_EQ(config.maxTotalPoints, 10000000u);
-    EXPECT_EQ(config.timeoutMs, 30000u);
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CustomConfig) {
@@ -907,14 +905,10 @@ TEST_F(HttpDerivedQueryHandlerTest, CustomConfig) {
     config.alignmentStrategy = AlignmentStrategy::OUTER;
     config.interpolationMethod = InterpolationMethod::ZERO;
     config.maxSubQueries = 5;
-    config.maxTotalPoints = 1000;
-    config.timeoutMs = 5000;
 
     EXPECT_EQ(config.alignmentStrategy, AlignmentStrategy::OUTER);
     EXPECT_EQ(config.interpolationMethod, InterpolationMethod::ZERO);
     EXPECT_EQ(config.maxSubQueries, 5u);
-    EXPECT_EQ(config.maxTotalPoints, 1000u);
-    EXPECT_EQ(config.timeoutMs, 5000u);
 }
 
 // =============================================================================
@@ -1082,7 +1076,6 @@ TEST_F(HttpDerivedQueryHandlerTest, ExecutorConstructWithNullEngine) {
 TEST_F(HttpDerivedQueryHandlerTest, ExecutorConstructWithCustomConfig) {
     DerivedQueryConfig config;
     config.maxSubQueries = 20;
-    config.maxTotalPoints = 5000000;
 
     EXPECT_NO_THROW(DerivedQueryExecutor(nullptr, nullptr, config));
 }

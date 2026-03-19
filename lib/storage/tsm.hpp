@@ -144,8 +144,12 @@ private:
     mutable size_t fullIndexCacheBytes = 0;
 
     static size_t estimateEntryBytes(const TSMIndexEntry& entry) {
-        return sizeof(TSMIndexEntry) + entry.indexBlocks.size() * sizeof(TSMIndexBlock) +
-               sizeof(std::pair<SeriesId128, TSMIndexEntry>);  // list node overhead
+        size_t bytes = sizeof(TSMIndexEntry) + entry.indexBlocks.size() * sizeof(TSMIndexBlock) +
+                       sizeof(std::pair<SeriesId128, TSMIndexEntry>);  // list node overhead
+        for (const auto& s : entry.stringDictionary) {
+            bytes += sizeof(std::string) + s.capacity();
+        }
+        return bytes;
     }
 
     // Configuration for bloom filter and cache (read from TOML config)
@@ -241,9 +245,15 @@ public:
     std::vector<TSMIndexBlock> getSeriesBlocks(const SeriesId128& seriesId) const;
 
     // Read a single block and return it (for on-demand loading)
+    // If stringDict is provided (non-null), it will be used for dictionary-encoded
+    // string block decoding instead of the thread-local tlStringDict. This avoids
+    // a race condition when multiple concurrent loadFromFile coroutines set
+    // tlStringDict from different files' getFullIndexEntry() calls — reactor
+    // preemption can cause the wrong dictionary to be visible.
     template <class T>
-    seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
-                                                                  uint64_t endTime);
+    seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlock(
+        const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime,
+        const std::vector<std::string>* stringDict = nullptr);
 
     // Phase 2: Read compressed block bytes directly (zero-copy transfer)
     seastar::future<seastar::temporary_buffer<uint8_t>> readCompressedBlock(const TSMIndexBlock& indexBlock);

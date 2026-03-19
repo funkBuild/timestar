@@ -118,6 +118,40 @@ uint8_t requiredBitWidth(int64_t min_val, int64_t max_val) {
 }  // anonymous namespace
 
 CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
+    // Delegate to encodeInto() to avoid maintaining two near-identical ~300-line
+    // encoding implementations. The AlignedBuffer→CompressedBuffer conversion
+    // copies the raw words, negligible compared to the encoding work.
+    AlignedBuffer aligned;
+    encodeInto(values, aligned);
+
+    CompressedBuffer buffer;
+    const size_t numBytes = aligned.size();
+    if (numBytes > 0) {
+        // Copy AlignedBuffer's raw bytes into CompressedBuffer as 64-bit words.
+        const size_t fullWords = numBytes / 8;
+        const size_t tailBytes = numBytes % 8;
+        buffer.reserve(fullWords + (tailBytes > 0 ? 1 : 0));
+
+        const uint8_t* src = aligned.data.data();
+        for (size_t i = 0; i < fullWords; ++i) {
+            uint64_t word;
+            std::memcpy(&word, src + i * 8, 8);
+            buffer.write<64>(word);
+        }
+        if (tailBytes > 0) {
+            uint64_t word = 0;
+            std::memcpy(&word, src + fullWords * 8, tailBytes);
+            buffer.write(word, static_cast<int>(tailBytes * 8));
+        }
+    }
+    buffer.shrink_to_fit();
+    return buffer;
+}
+
+// Keep the old encode() implementation available as a reference during
+// transition, but #if 0 it out to prevent compilation.
+#if 0
+CompressedBuffer ALPEncoder::encode_legacy(std::span<const double> values) {
     CompressedBuffer buffer;
 
     if (values.empty()) {
@@ -445,6 +479,7 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     buffer.shrink_to_fit();
     return buffer;
 }
+#endif  // legacy encode()
 
 size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& target) {
     if (values.empty()) {

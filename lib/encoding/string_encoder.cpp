@@ -13,6 +13,24 @@
 // Prevents OOM from a crafted payload that claims a multi-GB uncompressed size.
 static constexpr uint32_t MAX_UNCOMPRESSED_SIZE = 256 * 1024 * 1024;
 
+// Single shared thread-local decompression buffer for all decode functions.
+// Previously each function declared its own, consuming 6x memory. Safe because
+// Seastar is single-threaded per shard and no function holds a reference across calls.
+static thread_local std::vector<uint8_t> tlDecompBuf;
+
+// Validate zstd decompression result: check for errors and size mismatch.
+// A truncated or corrupted compressed stream may decompress fewer bytes than
+// the header claims, leaving stale data in the reused thread-local buffer.
+static void validateDecompress(size_t ret, size_t expectedSize) {
+    if (ZSTD_isError(ret)) {
+        throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
+    }
+    if (ret != expectedSize) {
+        throw std::runtime_error("String decoder: decompressed size mismatch (expected " +
+                                 std::to_string(expectedSize) + ", got " + std::to_string(ret) + ")");
+    }
+}
+
 // Thread-local zstd contexts — eliminates ~200KB alloc per compress and ~130KB
 // per decompress.  Seastar's shard-per-core model means one thread per shard,
 // so thread_local is safe with no synchronization overhead.
@@ -209,7 +227,6 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
                                  ") exceeds limit");
     }
     // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
-    static thread_local std::vector<uint8_t> tlDecompBuf;
     tlDecompBuf.resize(uncompressedSize);
     auto& uncompressed = tlDecompBuf;
 
@@ -217,9 +234,7 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
         size_t ret =
             ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                 reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
-        if (ZSTD_isError(ret)) {
-            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
-        }
+        validateDecompress(ret, uncompressedSize);
     }
 
     // Decode strings
@@ -279,7 +294,6 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
                                  ") exceeds limit");
     }
     // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
-    static thread_local std::vector<uint8_t> tlDecompBuf;
     tlDecompBuf.resize(uncompressedSize);
     auto& uncompressed = tlDecompBuf;
 
@@ -287,9 +301,7 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
         size_t ret =
             ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                 reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
-        if (ZSTD_isError(ret)) {
-            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
-        }
+        validateDecompress(ret, uncompressedSize);
     }
     encoded.offset += compressedSize;
 
@@ -342,7 +354,6 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
                                  ") exceeds limit");
     }
     // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
-    static thread_local std::vector<uint8_t> tlDecompBuf;
     tlDecompBuf.resize(uncompressedSize);
     auto& uncompressed = tlDecompBuf;
 
@@ -350,9 +361,7 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t totalCount, size_t ski
         size_t ret =
             ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                 reinterpret_cast<const char*>(encoded.data.data() + 16), compressedSize);
-        if (ZSTD_isError(ret)) {
-            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
-        }
+        validateDecompress(ret, uncompressedSize);
     }
 
     // Decode strings with skip/limit: skip the first skipCount strings without allocating,
@@ -438,6 +447,11 @@ StringEncoder::Dictionary StringEncoder::deserializeDictionary(Slice& encoded, s
     uint32_t count;
     std::memcpy(&count, encoded.data + encoded.offset, 4);
     encoded.offset += 4;
+
+    // Guard against crafted payloads with absurdly large count
+    if (count > MAX_DICT_ENTRIES || count > dictSize) {
+        throw std::runtime_error("Dictionary entry count too large: " + std::to_string(count));
+    }
 
     dict.entries.reserve(count);
     for (uint32_t i = 0; i < count && encoded.offset < startOffset + dictSize; ++i) {
@@ -536,13 +550,10 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t count, const Diction
     }
 
     // Decompress ID stream
-    static thread_local std::vector<uint8_t> tlDecompBuf;
     tlDecompBuf.resize(uncompressedSize);
     size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()), uncompressedSize,
                                      reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
-    if (ZSTD_isError(ret)) {
-        throw std::runtime_error(std::string("Failed to decompress dictionary IDs: ") + ZSTD_getErrorName(ret));
-    }
+    validateDecompress(ret, uncompressedSize);
     encoded.offset += compressedSize;
 
     // Decode varint IDs and look up dictionary
@@ -591,13 +602,10 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t s
         throw std::runtime_error("Dictionary-encoded block uncompressedSize exceeds limit");
     }
 
-    static thread_local std::vector<uint8_t> tlDecompBuf;
     tlDecompBuf.resize(uncompressedSize);
     size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()), uncompressedSize,
                                      reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
-    if (ZSTD_isError(ret)) {
-        throw std::runtime_error(std::string("Failed to decompress dictionary IDs: ") + ZSTD_getErrorName(ret));
-    }
+    validateDecompress(ret, uncompressedSize);
     encoded.offset += compressedSize;
 
     Slice idSlice(tlDecompBuf.data(), uncompressedSize);
@@ -672,7 +680,6 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
                                  ") exceeds limit");
     }
     // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
-    static thread_local std::vector<uint8_t> tlDecompBuf;
     tlDecompBuf.resize(uncompressedSize);
     auto& uncompressed = tlDecompBuf;
 
@@ -680,9 +687,7 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
         size_t ret =
             ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
                                 reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
-        if (ZSTD_isError(ret)) {
-            throw std::runtime_error(std::string("Failed to decompress string data: ") + ZSTD_getErrorName(ret));
-        }
+        validateDecompress(ret, uncompressedSize);
     }
     encoded.offset += compressedSize;
 

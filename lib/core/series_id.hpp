@@ -37,7 +37,7 @@ public:
     // This is the single canonical way to produce a SeriesId128.
     // The series key format is: "measurement,tag1=val1,tag2=val2 field"
     // (produced by timestar::buildSeriesKey).
-    static SeriesId128 fromSeriesKey(const std::string& seriesKey);
+    static SeriesId128 fromSeriesKey(std::string_view seriesKey);
 
     // Comparison operators (required for index keys and std::map)
     auto operator<=>(const SeriesId128& other) const = default;
@@ -50,7 +50,7 @@ public:
     // avoiding a temporary std::string allocation.
     void appendTo(std::string& out) const { out.append(reinterpret_cast<const char*>(data.data()), data.size()); }
 
-    static SeriesId128 fromBytes(const std::string& bytes) {
+    static SeriesId128 fromBytes(std::string_view bytes) {
         SeriesId128 id;
         if (bytes.size() != 16) {
             throw std::runtime_error("Invalid SeriesId128 byte string length: " + std::to_string(bytes.size()));

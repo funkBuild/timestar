@@ -11,6 +11,7 @@
 #include <fstream>
 #include <memory>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/when_all.hh>
 
 namespace fs = std::filesystem;
 
@@ -1032,4 +1033,88 @@ seastar::future<> testUnflushedBytesResetAndReaccumulate() {
 
 TEST_F(WALSeastarTest, UnflushedBytesResetAndReaccumulate) {
     testUnflushedBytesResetAndReaccumulate().get();
+}
+
+// Regression test: concurrent inserts must not lose data.
+// Before the fix, the static thread_local AlignedBuffer was populated before
+// acquiring the I/O semaphore. A coroutine that suspended at the semaphore
+// could have its buffer overwritten by another coroutine, silently losing data.
+seastar::future<> testConcurrentInsertsNoDataLoss() {
+    constexpr unsigned int sequenceNumber = 99;
+    constexpr int NUM_CONCURRENT = 20;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    {
+        WAL wal(sequenceNumber);
+        co_await wal.init(store.get());
+
+        // Launch NUM_CONCURRENT insert coroutines simultaneously.
+        // Each writes a distinct series with unique values.
+        std::vector<seastar::future<WALInsertResult>> futures;
+        futures.reserve(NUM_CONCURRENT);
+
+        for (int i = 0; i < NUM_CONCURRENT; ++i) {
+            std::string seriesKey = "series_" + std::to_string(i);
+            auto f = [&wal, seriesKey, i]() -> seastar::future<WALInsertResult> {
+                TimeStarInsert<double> insert("concurrent_test", seriesKey);
+                // Each series gets 10 points with values derived from its index
+                for (int j = 0; j < 10; ++j) {
+                    insert.addValue(
+                        static_cast<uint64_t>(i * 1000 + j),
+                        static_cast<double>(i * 100 + j));
+                }
+                co_return co_await wal.insert(insert);
+            }();
+            futures.push_back(std::move(f));
+        }
+
+        auto results = co_await seastar::when_all(futures.begin(), futures.end());
+        for (auto& r : results) {
+            EXPECT_EQ(r.get(), WALInsertResult::Success);
+        }
+
+        co_await wal.close();
+    }
+
+    // Recover from the WAL and verify ALL series are present with correct data
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+        WALReader reader(walFile);
+        co_await reader.readAll(recoveredStore.get());
+    }
+
+    // Every concurrent insert must have been persisted
+    EXPECT_EQ(recoveredStore->series.size(), static_cast<size_t>(NUM_CONCURRENT))
+        << "All " << NUM_CONCURRENT << " concurrently-inserted series must survive WAL recovery";
+
+    // Verify each series has correct values
+    for (int i = 0; i < NUM_CONCURRENT; ++i) {
+        std::string seriesKey = "series_" + std::to_string(i);
+        TimeStarInsert<double> lookup("concurrent_test", seriesKey);
+        SeriesId128 sid = lookup.seriesId128();
+
+        auto it = recoveredStore->series.find(sid);
+        EXPECT_NE(it, recoveredStore->series.end())
+            << "Series " << seriesKey << " missing after concurrent WAL recovery";
+        if (it == recoveredStore->series.end())
+            continue;
+
+        auto& seriesData = std::get<InMemorySeries<double>>(it->second);
+        EXPECT_EQ(seriesData.values.size(), 10u)
+            << "Series " << seriesKey << " should have 10 points";
+        if (seriesData.values.size() != 10u)
+            continue;
+
+        for (int j = 0; j < 10; ++j) {
+            EXPECT_DOUBLE_EQ(seriesData.values[j], static_cast<double>(i * 100 + j))
+                << "Series " << seriesKey << " point " << j << " has wrong value";
+        }
+    }
+
+    co_return;
+}
+
+TEST_F(WALSeastarTest, ConcurrentInsertsNoDataLoss) {
+    testConcurrentInsertsNoDataLoss().get();
 }

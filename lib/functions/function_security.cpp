@@ -151,7 +151,8 @@ FunctionSecurity::ValidationResult FunctionSecurity::validateFunctionName(const 
 
     // Convert to lowercase for checking dangerous names
     std::string lowerName = functionName;
-    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
 
     // Check against dangerous function names
     if (dangerousFunctionNames_.find(lowerName) != dangerousFunctionNames_.end()) {
@@ -323,19 +324,19 @@ FunctionSecurity::ValidationResult FunctionSecurity::validateJsonInput(const std
 
     // All checks passed
     result.isValid = true;
-    result.sanitizedInput = sanitizeInput(json);
+    result.sanitizedInput = sanitizeInput(json, MAX_JSON_LENGTH);
     return result;
 }
 
-std::string FunctionSecurity::sanitizeInput(const std::string& input) {
+std::string FunctionSecurity::sanitizeInput(const std::string& input, size_t maxLength) {
     std::string sanitized = removeControlCharacters(input);
 
     // Remove null bytes
     sanitized.erase(std::remove(sanitized.begin(), sanitized.end(), '\0'), sanitized.end());
 
     // Truncate if too long (safety measure)
-    if (sanitized.length() > MAX_QUERY_LENGTH) {
-        sanitized = sanitized.substr(0, MAX_QUERY_LENGTH);
+    if (sanitized.length() > maxLength) {
+        sanitized = sanitized.substr(0, maxLength);
     }
 
     return sanitized;
@@ -363,7 +364,8 @@ bool FunctionSecurity::containsPathTraversal(const std::string& input) {
     // URL-encoded checks must be case-insensitive since hex digits
     // can be upper or lowercase (e.g., %2e vs %2E).
     std::string lower = input;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
     return lower.find("%2e%2e%2f") != std::string::npos || lower.find("%2e%2e%5c") != std::string::npos;
 }
 

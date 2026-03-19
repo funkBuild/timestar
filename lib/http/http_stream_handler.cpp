@@ -107,17 +107,16 @@ std::vector<StreamingBatch> HttpStreamHandler::queryResponseToBatches(const std:
         StreamingBatch batch;
         batch.label = label;
 
+        auto sharedTags = std::make_shared<const TagMap>(sr.tags);
         for (const auto& [fieldName, fieldData] : sr.fields) {
             const auto& [timestamps, values] = fieldData;
 
             std::visit(
                 [&](const auto& vals) {
-                    // NOTE: StreamingDataPoint copies measurement/field/tags per point. For high-throughput
-                    // streaming, consider refactoring to hold shared data at the batch level.
                     for (size_t i = 0; i < timestamps.size() && i < vals.size(); ++i) {
                         StreamingDataPoint pt;
                         pt.measurement = sr.measurement;
-                        pt.tags = sr.tags;
+                        pt.tags = sharedTags;
                         pt.field = fieldName;
                         pt.timestamp = timestamps[i];
 
@@ -209,11 +208,11 @@ static std::string buildSSEJsonPayload(const StreamingBatch& batch) {
 
     struct MeasGroupKey {
         std::string measurement;
-        std::map<std::string, std::string> tags;
+        std::shared_ptr<const TagMap> tags;
         bool operator<(const MeasGroupKey& o) const {
             if (measurement != o.measurement)
                 return measurement < o.measurement;
-            return tags < o.tags;
+            return *tags < *o.tags;
         }
     };
 
@@ -253,7 +252,7 @@ static std::string buildSSEJsonPayload(const StreamingBatch& batch) {
         payload += "\",\"tags\":{";
 
         bool firstTag = true;
-        for (const auto& [k, v] : key.tags) {
+        for (const auto& [k, v] : *key.tags) {
             if (!firstTag)
                 payload += ',';
             firstTag = false;
@@ -677,7 +676,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         std::string subscriptionError;
         try {
             localMgr.addSubscription(sub);
-        } catch (const std::invalid_argument& e) {
+        } catch (const std::exception& e) {
             subscriptionError = e.what();
             // Remove the sub ID we just failed to register (wasn't added)
             allSubIds.pop_back();

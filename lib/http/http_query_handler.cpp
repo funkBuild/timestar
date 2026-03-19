@@ -310,7 +310,7 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
         std::string timeStr = std::get<std::string>(glazeReq.startTime);
         try {
             startTime = std::stoull(timeStr);
-        } catch (...) {
+        } catch (const std::exception&) {
             // Fall back to date string parsing (legacy support)
             startTime = QueryParser::parseTime(timeStr);
         }
@@ -323,7 +323,7 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
         std::string timeStr = std::get<std::string>(glazeReq.endTime);
         try {
             endTime = std::stoull(timeStr);
-        } catch (...) {
+        } catch (const std::exception&) {
             // Fall back to date string parsing (legacy support)
             endTime = QueryParser::parseTime(timeStr);
         }
@@ -1191,7 +1191,7 @@ std::string HttpQueryHandler::formatQueryResponse(QueryResponse& response) {
 }
 
 std::string HttpQueryHandler::createErrorResponse(const std::string& code, const std::string& message) {
-    return ResponseFormatter::formatError(message);
+    return ResponseFormatter::formatError(message, code);
 }
 
 // Test-only utility: production query path iterates shards inline in executeQuery().

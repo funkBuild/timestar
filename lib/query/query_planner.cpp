@@ -31,7 +31,7 @@ seastar::future<QueryPlan> QueryPlanner::createPlan(const QueryRequest& request,
             sq.seriesIds = seriesIds;
             sq.startTime = request.startTime;
             sq.endTime = request.endTime;
-            sq.requiresAllSeries = false;
+
 
             // Set fields to query
             if (request.requestsAllFields()) {
@@ -76,7 +76,7 @@ QueryPlan QueryPlanner::createPlanSync(const QueryRequest& request, index::Nativ
             sq.seriesIds = seriesIds;
             sq.startTime = request.startTime;
             sq.endTime = request.endTime;
-            sq.requiresAllSeries = false;
+
 
             // Set fields to query
             if (request.requestsAllFields()) {
@@ -185,25 +185,6 @@ std::vector<std::vector<SeriesId128>> QueryPlanner::findMatchingSeriesIdsSync(co
     return shardBuckets;
 }
 
-std::vector<std::vector<SeriesId128>> QueryPlanner::mapSeriesToShards(const std::vector<SeriesId128>& seriesIds,
-                                                                      const std::string& measurement,
-                                                                      const std::map<std::string, std::string>& tags,
-                                                                      const std::vector<std::string>& fields) {
-    unsigned shardCount = timestar::placement().coreCount();
-    if (shardCount == 0)
-        shardCount = 1;  // Handle test environment
-
-    std::vector<std::vector<SeriesId128>> shardBuckets(shardCount);
-
-    // For each series ID, determine its shard
-    for (const SeriesId128& seriesId : seriesIds) {
-        unsigned shardId = timestar::routeToCore(seriesId);
-        shardBuckets[shardId].push_back(seriesId);
-    }
-
-    return shardBuckets;
-}
-
 unsigned QueryPlanner::calculateShardForSeries(const std::string& measurement,
                                                const std::map<std::string, std::string>& tags,
                                                const std::string& field) {
@@ -218,25 +199,6 @@ std::string QueryPlanner::buildSeriesKeyForSharding(const std::string& measureme
                                                     const std::map<std::string, std::string>& tags,
                                                     const std::string& field) {
     return buildSeriesKey(measurement, tags, field);
-}
-
-bool QueryPlanner::requiresAllShards(const QueryRequest& request) {
-    // If no specific tags are provided, we need to query all shards
-    // Also if using wildcards or regex, we may need all shards
-
-    if (request.scopes.empty()) {
-        return true;
-    }
-
-    // Check for wildcards or regex in scopes
-    for (const auto& [key, value] : request.scopes) {
-        if (value.find('*') != std::string::npos || value.find('?') != std::string::npos ||
-            (!value.empty() && (value[0] == '/' || value[0] == '~'))) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 }  // namespace timestar

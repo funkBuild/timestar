@@ -276,8 +276,6 @@ TEST_F(DerivedQueryExecutorTest, DefaultConfig) {
     EXPECT_EQ(config.alignmentStrategy, AlignmentStrategy::INNER);
     EXPECT_EQ(config.interpolationMethod, InterpolationMethod::LINEAR);
     EXPECT_EQ(config.maxSubQueries, 10);
-    EXPECT_EQ(config.maxTotalPoints, 10000000);
-    EXPECT_EQ(config.timeoutMs, 30000);
 }
 
 TEST_F(DerivedQueryExecutorTest, CustomConfig) {
@@ -285,8 +283,6 @@ TEST_F(DerivedQueryExecutorTest, CustomConfig) {
     config.alignmentStrategy = AlignmentStrategy::OUTER;
     config.interpolationMethod = InterpolationMethod::ZERO;
     config.maxSubQueries = 20;
-    config.maxTotalPoints = 5000000;
-    config.timeoutMs = 60000;
 
     // Verify construction with custom config does not throw
     EXPECT_NO_THROW({ DerivedQueryExecutor executor(nullptr, nullptr, config); });

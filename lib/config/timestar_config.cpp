@@ -268,16 +268,24 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
 
     auto envU16 = [&](const char* name, uint16_t& field) {
         if (auto v = envStr(name)) {
-            try { field = static_cast<uint16_t>(std::stoul(v)); }
-            catch (const std::exception&) {
+            try {
+                auto val = std::stoul(v);
+                if (val > std::numeric_limits<uint16_t>::max())
+                    throw std::out_of_range("exceeds uint16 range");
+                field = static_cast<uint16_t>(val);
+            } catch (const std::exception&) {
                 throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");
             }
         }
     };
     auto envU32 = [&](const char* name, uint32_t& field) {
         if (auto v = envStr(name)) {
-            try { field = static_cast<uint32_t>(std::stoul(v)); }
-            catch (const std::exception&) {
+            try {
+                auto val = std::stoul(v);
+                if (val > std::numeric_limits<uint32_t>::max())
+                    throw std::out_of_range("exceeds uint32 range");
+                field = static_cast<uint32_t>(val);
+            } catch (const std::exception&) {
                 throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");
             }
         }

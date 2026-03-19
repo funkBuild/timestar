@@ -67,26 +67,28 @@ seastar::future<> TSMFileManager::init() {
 seastar::future<> TSMFileManager::openTsmFile(std::string path) {
     timestar::tsm_log.debug("Opening TSM file: {}", path);
 
+    // Parse sequence number from filename before attempting open, so that
+    // nextSequenceId is updated even if open() fails on a corrupt file.
+    // This prevents sequence number reuse on the next writeMemstore().
+    seastar::shared_ptr<TSM> tsmFile = seastar::make_shared<TSM>(path);
+    if (tsmFile->seqNum >= nextSequenceId) {
+        nextSequenceId = tsmFile->seqNum + 1;
+    }
+
     try {
-        seastar::shared_ptr<TSM> tsmFile = seastar::make_shared<TSM>(path);
         co_await tsmFile->open();
 
-        // Add to tier tracking
-        uint64_t tier = tsmFile->tierNum;
-        if (tier < MAX_TIERS) {
-            tiers[tier].push_back(tsmFile);
-        }
-
-        uint64_t tsmSeqNum = tsmFile.get()->rankAsInteger();
+        uint64_t tsmSeqNum = tsmFile->rankAsInteger();
 
         auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, tsmFile});
         if (!inserted) {
             timestar::tsm_log.warn("Duplicate sequence number {} for TSM file: {}, existing file takes precedence",
                                    tsmSeqNum, path);
-        }
-
-        if (tsmFile->seqNum >= nextSequenceId) {
-            nextSequenceId = tsmFile->seqNum + 1;
+        } else {
+            uint64_t tier = tsmFile->tierNum;
+            if (tier < MAX_TIERS) {
+                tiers[tier].push_back(tsmFile);
+            }
         }
     } catch (const std::exception& e) {
         timestar::tsm_log.error("Failed to open TSM file {}: {}", path, e.what());
@@ -155,16 +157,16 @@ bool TSMFileManager::shouldCompactTier(uint64_t tier) const {
 }
 
 seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
-    uint64_t tier = file->tierNum;
-    if (tier < MAX_TIERS) {
-        tiers[tier].push_back(file);
-    }
-
     uint64_t tsmSeqNum = file->rankAsInteger();
     auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, file});
     if (!inserted) {
         timestar::tsm_log.warn("Duplicate sequence number {} when adding TSM file, existing file takes precedence",
                                tsmSeqNum);
+    } else {
+        uint64_t tier = file->tierNum;
+        if (tier < MAX_TIERS) {
+            tiers[tier].push_back(file);
+        }
     }
 
     if (file->seqNum >= nextSequenceId) {
@@ -227,7 +229,7 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
 }
 
 seastar::future<> TSMFileManager::startCompactionLoop() {
-    if (compactor) {
+    if (compactor && !compactionTask.has_value()) {
         compactionTask = compactor->runCompactionLoop();
     }
     co_return;
@@ -238,6 +240,7 @@ seastar::future<> TSMFileManager::stopCompactionLoop() {
         compactor->stopCompaction();
         if (compactionTask.has_value()) {
             co_await std::move(compactionTask.value());
+            compactionTask.reset();
         }
     }
     co_return;

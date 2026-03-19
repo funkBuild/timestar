@@ -345,13 +345,17 @@ std::string ResponseFormatter::format(QueryResponse& response) {
     return buf;
 }
 
-std::string ResponseFormatter::formatError(const std::string& message) {
-    // {"status":"error","message":"...","error":"..."}
+std::string ResponseFormatter::formatError(const std::string& message, const std::string& code) {
     std::string buf;
-    buf.resize(message.size() * 2 + 64);
+    buf.resize(message.size() * 2 + code.size() + 96);
     size_t pos = 0;
 
-    pos = appendRaw(buf, pos, R"({"status":"error","message":)");
+    pos = appendRaw(buf, pos, R"({"status":"error")");
+    if (!code.empty()) {
+        pos = appendRaw(buf, pos, R"(,"error_code":)");
+        pos = appendJsonString(buf, pos, code);
+    }
+    pos = appendRaw(buf, pos, R"(,"message":)");
     pos = appendJsonString(buf, pos, message);
     pos = appendRaw(buf, pos, R"(,"error":)");
     pos = appendJsonString(buf, pos, message);

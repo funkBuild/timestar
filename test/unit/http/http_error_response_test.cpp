@@ -12,6 +12,7 @@ using namespace timestar;
 // Glaze structure for parsing error responses
 struct ErrorResponseParsed {
     std::string status;
+    std::string error_code;
     std::string message;
     std::string error;
 };
@@ -19,7 +20,8 @@ struct ErrorResponseParsed {
 template <>
 struct glz::meta<ErrorResponseParsed> {
     using T = ErrorResponseParsed;
-    static constexpr auto value = object("status", &T::status, "message", &T::message, "error", &T::error);
+    static constexpr auto value =
+        object("status", &T::status, "error_code", &T::error_code, "message", &T::message, "error", &T::error);
 };
 
 // Glaze structure for parsing success responses (allow unknown keys)

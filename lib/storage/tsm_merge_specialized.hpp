@@ -74,30 +74,33 @@ public:
 
     const SeriesId128& getSeriesId() const { return seriesId; }
 
-    // Phase 5.1: Direct comparison between two sources (no heap)
+    // Direct comparison between two sources (no heap).
+    // On equal timestamps, prefer source 1 (newer file) and advance both
+    // sources to deduplicate.
     seastar::future<std::pair<uint64_t, T>> next() {
         uint64_t ts0 = sources[0].currentTimestamp();
         uint64_t ts1 = sources[1].currentTimestamp();
 
-        // Direct comparison - choose smaller timestamp
-        // On equal timestamps, prefer source 1 (newer file, higher rank)
-        size_t chosenIdx;
+        uint64_t timestamp;
+        T value;
+
         if (ts0 < ts1) {
-            chosenIdx = 0;
+            timestamp = ts0;
+            value = sources[0].currentValue();
+            co_await sources[0].advance();
         } else if (ts1 < ts0) {
-            chosenIdx = 1;
+            timestamp = ts1;
+            value = sources[1].currentValue();
+            co_await sources[1].advance();
         } else {
-            // Equal timestamps - prefer newer file (index 1)
-            chosenIdx = 1;
+            // Equal timestamps — take newer file's value, advance both
+            timestamp = ts1;
+            value = sources[1].currentValue();
+            co_await sources[0].advance();
+            co_await sources[1].advance();
         }
 
-        auto& chosen = sources[chosenIdx];
-        uint64_t timestamp = chosen.currentTimestamp();
-        T value = chosen.currentValue();
-
-        co_await chosen.advance();
-
-        co_return std::make_pair(timestamp, value);
+        co_return std::make_pair(timestamp, std::move(value));
     }
 
     seastar::future<std::vector<std::pair<uint64_t, T>>> nextBatch(size_t maxPoints = 1000) {
@@ -105,32 +108,8 @@ public:
         batch.reserve(maxPoints);
 
         while (hasNext() && batch.size() < maxPoints) {
-            auto [ts, val] = co_await next();
-
-            // Skip duplicates from the other source
-            uint64_t otherTs =
-                sources[0].exhausted
-                    ? UINT64_MAX
-                    : (sources[1].exhausted ? UINT64_MAX
-                                            : (sources[0].currentTimestamp() == ts ? sources[1].currentTimestamp()
-                                                                                   : sources[0].currentTimestamp()));
-
-            while (hasNext() && otherTs == ts) {
-                // Advance the source with same timestamp
-                if (!sources[0].exhausted && sources[0].currentTimestamp() == ts) {
-                    co_await sources[0].advance();
-                }
-                if (!sources[1].exhausted && sources[1].currentTimestamp() == ts) {
-                    co_await sources[1].advance();
-                }
-                otherTs = sources[0].exhausted
-                              ? UINT64_MAX
-                              : (sources[1].exhausted
-                                     ? UINT64_MAX
-                                     : std::min(sources[0].currentTimestamp(), sources[1].currentTimestamp()));
-            }
-
-            batch.push_back({ts, val});
+            auto point = co_await next();
+            batch.push_back(std::move(point));
         }
 
         co_return batch;
@@ -149,7 +128,7 @@ private:
         bool exhausted = false;
         uint64_t rank = 0;  // File rank for tie-breaking
 
-        Source() = default;
+        Source() { exhausted = true; }
         Source(seastar::shared_ptr<TSM> f, const SeriesId128& seriesId) : file(f), rank(f->rankAsInteger()) {
             blockIterator = seastar::make_lw_shared<TSMBlockIterator<T>>(f, seriesId, 0, UINT64_MAX);
         }
@@ -215,16 +194,16 @@ public:
 
     const SeriesId128& getSeriesId() const { return seriesId; }
 
-    // Phase 5.1: Tournament-style 4-way comparison (3 comparisons)
+    // Tournament-style 4-way comparison. On equal timestamps, the source with
+    // the highest rank (newest file) wins and ALL sources at that timestamp
+    // are advanced to deduplicate.
     seastar::future<std::pair<uint64_t, T>> next() {
-        // Tournament tree: compare pairs, then winners
-        // Round 1: (0 vs 1) and (2 vs 3)
         uint64_t ts0 = sources[0].currentTimestamp();
         uint64_t ts1 = sources[1].currentTimestamp();
         uint64_t ts2 = sources[2].currentTimestamp();
         uint64_t ts3 = sources[3].currentTimestamp();
 
-        // Find minimum using 3 comparisons (optimal for 4 elements)
+        // Find minimum using tournament tree (3 comparisons)
         size_t winner01 = (ts0 < ts1) ? 0 : (ts1 < ts0) ? 1 : (sources[1].rank > sources[0].rank ? 1 : 0);
         size_t winner23 = (ts2 < ts3) ? 2 : (ts3 < ts2) ? 3 : (sources[3].rank > sources[2].rank ? 3 : 2);
 
@@ -236,13 +215,17 @@ public:
                                ? winner23
                                : (sources[winner23].rank > sources[winner01].rank ? winner23 : winner01);
 
-        auto& chosen = sources[chosenIdx];
-        uint64_t timestamp = chosen.currentTimestamp();
-        T value = chosen.currentValue();
+        uint64_t timestamp = sources[chosenIdx].currentTimestamp();
+        T value = sources[chosenIdx].currentValue();
 
-        co_await chosen.advance();
+        // Advance ALL sources at this timestamp to deduplicate
+        for (auto& src : sources) {
+            if (!src.exhausted && src.currentTimestamp() == timestamp) {
+                co_await src.advance();
+            }
+        }
 
-        co_return std::make_pair(timestamp, value);
+        co_return std::make_pair(timestamp, std::move(value));
     }
 
     seastar::future<std::vector<std::pair<uint64_t, T>>> nextBatch(size_t maxPoints = 1000) {
@@ -250,22 +233,9 @@ public:
         batch.reserve(maxPoints);
 
         while (hasNext() && batch.size() < maxPoints) {
-            auto [timestamp, value] = co_await next();
-
-            // Dedup: advance all sources at same timestamp
-            while (hasNext()) {
-                bool foundDup = false;
-                for (auto& src : sources) {
-                    if (!src.exhausted && src.currentTimestamp() == timestamp) {
-                        co_await src.advance();
-                        foundDup = true;
-                    }
-                }
-                if (!foundDup)
-                    break;
-            }
-
-            batch.push_back({timestamp, value});
+            // next() already deduplicates equal timestamps
+            auto point = co_await next();
+            batch.push_back(std::move(point));
         }
 
         co_return batch;

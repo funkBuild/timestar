@@ -318,9 +318,12 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(con
             double v1 = input.valueAt(i);
             double v2 = input.valueAt(i + 1);
 
-            double ratio = static_cast<double>(targetTime - t1) / static_cast<double>(t2 - t1);
-            double interpolated = v1 + ratio * (v2 - v1);
-            result.values.push_back(interpolated);
+            if (t1 == t2) {
+                result.values.push_back(v1);
+            } else {
+                double ratio = static_cast<double>(targetTime - t1) / static_cast<double>(t2 - t1);
+                result.values.push_back(v1 + ratio * (v2 - v1));
+            }
         } else {
             result.values.push_back(input.valueAt(input.count - 1));
         }

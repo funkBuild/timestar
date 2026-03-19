@@ -24,6 +24,8 @@ struct BucketState {
     bool isStringOnly = true;  // true until a numeric value is added
 
     void addDouble(double val, uint64_t ts) {
+        if (std::isnan(val)) [[unlikely]]
+            return;
         isStringOnly = false;  // numeric value seen
         sum += val;
         if (val < min)
@@ -82,7 +84,7 @@ struct BucketState {
 // Key for identifying a unique series+field combination in aggregation.
 struct SeriesFieldKey {
     std::string measurement;
-    std::map<std::string, std::string> tags;
+    std::shared_ptr<const TagMap> tags;
     std::string field;
 
     bool operator<(const SeriesFieldKey& other) const {
@@ -90,7 +92,11 @@ struct SeriesFieldKey {
             return measurement < other.measurement;
         if (field != other.field)
             return field < other.field;
-        return tags < other.tags;
+        return *tags < *other.tags;
+    }
+
+    bool operator==(const SeriesFieldKey& other) const {
+        return measurement == other.measurement && field == other.field && *tags == *other.tags;
     }
 };
 
@@ -125,6 +131,12 @@ private:
 
     // bucketStart -> (SeriesFieldKey -> BucketState)
     std::map<uint64_t, std::map<SeriesFieldKey, BucketState>> _buckets;
+
+    // Fast-path cache: avoids per-point string/map copies when consecutive points
+    // target the same series+field+bucket (common in streaming ingest).
+    const SeriesFieldKey* _cachedKey = nullptr;
+    BucketState* _cachedState = nullptr;
+    uint64_t _cachedBucket = ~0ULL;
 
     uint64_t bucketStart(uint64_t timestamp) const { return timestamp - (timestamp % _intervalNs); }
 };

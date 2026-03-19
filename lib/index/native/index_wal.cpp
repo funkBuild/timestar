@@ -13,6 +13,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/thread.hh>
 #include <stdexcept>
 
 namespace timestar::index {
@@ -185,7 +186,11 @@ seastar::future<> IndexWAL::flushBuffer() {
         tailBuf_.assign(combined.data() + alignedSize, tailSize);
     }
 
-    writePos_ += totalSize;
+    // writePos_ is the logical end of all data written so far.
+    // It equals the DMA-written bytes + any pending tail bytes.
+    // (Cannot use += totalSize because totalSize includes tail bytes
+    // that were already counted in writePos_ during the previous flush.)
+    writePos_ = dmaWritePos_ + tailSize;
 
     // Truncate + flush to ensure data is on disk
     co_await walFile_->truncate(writePos_);
@@ -193,30 +198,29 @@ seastar::future<> IndexWAL::flushBuffer() {
 }
 
 seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
-    std::filesystem::create_directories(directory);
+    // Wrap blocking filesystem calls in seastar::async to avoid reactor stalls.
+    auto [dir, maxGen] = co_await seastar::async([directory] {
+        std::filesystem::create_directories(directory);
 
-    IndexWAL wal;
-    wal.directory_ = directory;
-
-    // Find the highest existing WAL generation
-    uint64_t maxGen = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        if (entry.path().extension() == ".wal") {
-            auto name = entry.path().stem().string();
-            if (name.starts_with("idx_")) {
-                try {
-                    uint64_t gen = std::stoull(name.substr(4));
-                    maxGen = std::max(maxGen, gen);
-                } catch (...) {}
+        uint64_t gen = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            if (entry.path().extension() == ".wal") {
+                auto name = entry.path().stem().string();
+                if (name.starts_with("idx_")) {
+                    try {
+                        uint64_t g = std::stoull(name.substr(4));
+                        gen = std::max(gen, g);
+                    } catch (...) {}
+                }
             }
         }
-    }
+        return std::make_pair(directory, gen);
+    });
 
+    IndexWAL wal;
+    wal.directory_ = dir;
     wal.walGeneration_ = maxGen;
-    wal.currentPath_ = walFileName(directory, maxGen);
-
-    // Don't open file yet — replay() needs to read first.
-    // File opened lazily on first append().
+    wal.currentPath_ = walFileName(dir, maxGen);
 
     co_return std::move(wal);
 }
@@ -267,11 +271,12 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
         co_await flushTail();
     }
 
-    if (!std::filesystem::exists(currentPath_)) {
+    // Use Seastar async I/O to avoid blocking the reactor
+    if (!co_await seastar::file_exists(currentPath_)) {
         co_return 0;
     }
 
-    auto fileSize = std::filesystem::file_size(currentPath_);
+    auto fileSize = co_await seastar::file_size(currentPath_);
     if (fileSize == 0) {
         co_return 0;
     }
@@ -343,10 +348,9 @@ seastar::future<std::string> IndexWAL::rotate() {
 }
 
 seastar::future<> IndexWAL::deleteFile(const std::string& path) {
-    if (std::filesystem::exists(path)) {
-        std::filesystem::remove(path);
+    if (co_await seastar::file_exists(path)) {
+        co_await seastar::remove_file(path);
     }
-    co_return;
 }
 
 // Write the remaining tail buffer (partial DMA block) to disk.

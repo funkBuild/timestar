@@ -124,10 +124,15 @@ seastar::future<> Manifest::appendRecord(const std::string& record) {
         if (fd < 0) {
             throw std::runtime_error("Failed to open manifest for append: " + path);
         }
-        ssize_t written = ::write(fd, frame.data(), frame.size());
-        if (written < 0 || static_cast<size_t>(written) != frame.size()) {
-            ::close(fd);
-            throw std::runtime_error("Failed to write to manifest: " + path);
+        size_t total = 0;
+        while (total < frame.size()) {
+            ssize_t w = ::write(fd, frame.data() + total, frame.size() - total);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                throw std::runtime_error("Failed to write to manifest: " + path + ": " + std::string(strerror(errno)));
+            }
+            total += w;
         }
         ::fsync(fd);
         ::close(fd);
@@ -162,10 +167,15 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
         if (fd < 0) {
             throw std::runtime_error("Failed to open manifest for append: " + path);
         }
-        ssize_t written = ::write(fd, batchFrame.data(), batchFrame.size());
-        if (written < 0 || static_cast<size_t>(written) != batchFrame.size()) {
-            ::close(fd);
-            throw std::runtime_error("Failed to write to manifest: " + path);
+        size_t total = 0;
+        while (total < batchFrame.size()) {
+            ssize_t w = ::write(fd, batchFrame.data() + total, batchFrame.size() - total);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                throw std::runtime_error("Failed to write to manifest: " + path + ": " + std::string(strerror(errno)));
+            }
+            total += w;
         }
         ::fsync(fd);
         ::close(fd);
@@ -206,10 +216,15 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
         if (fd < 0) {
             throw std::runtime_error("Failed to open manifest for atomic replace: " + path);
         }
-        ssize_t written = ::write(fd, combinedFrame.data(), combinedFrame.size());
-        if (written < 0 || static_cast<size_t>(written) != combinedFrame.size()) {
-            ::close(fd);
-            throw std::runtime_error("Failed to write atomic replace to manifest: " + path);
+        size_t total = 0;
+        while (total < combinedFrame.size()) {
+            ssize_t w = ::write(fd, combinedFrame.data() + total, combinedFrame.size() - total);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                throw std::runtime_error("Failed to write atomic replace to manifest: " + path + ": " + std::string(strerror(errno)));
+            }
+            total += w;
         }
         ::fsync(fd);
         ::close(fd);
@@ -242,10 +257,15 @@ seastar::future<> Manifest::writeSnapshot() {
             if (fd < 0) {
                 throw std::runtime_error("Failed to open manifest temp: " + tmpPath);
             }
-            ssize_t written = ::write(fd, frame.data(), frame.size());
-            if (written < 0 || static_cast<size_t>(written) != frame.size()) {
-                ::close(fd);
-                throw std::runtime_error("Failed to write manifest snapshot: " + tmpPath);
+            size_t total = 0;
+            while (total < frame.size()) {
+                ssize_t w = ::write(fd, frame.data() + total, frame.size() - total);
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    ::close(fd);
+                    throw std::runtime_error("Failed to write manifest snapshot: " + tmpPath + ": " + std::string(strerror(errno)));
+                }
+                total += w;
             }
             ::fsync(fd);
             ::close(fd);
@@ -271,7 +291,14 @@ seastar::future<> Manifest::recover() {
     co_await seastar::async([this, &data, fileSize] {
         data.resize(fileSize);
         std::ifstream ifs(manifestPath_, std::ios::binary);
+        if (!ifs.is_open()) {
+            throw std::runtime_error("Failed to open manifest for recovery: " + manifestPath_);
+        }
         ifs.read(data.data(), static_cast<std::streamsize>(fileSize));
+        if (static_cast<size_t>(ifs.gcount()) != fileSize) {
+            throw std::runtime_error("Short read from manifest: expected " + std::to_string(fileSize) +
+                                     " bytes, got " + std::to_string(ifs.gcount()));
+        }
     });
 
     const char* p = data.data();
@@ -332,7 +359,7 @@ seastar::future<> Manifest::recover() {
                 f.maxKey.assign(rp, maxKeyLen);
                 rp += maxKeyLen;
 
-                // writeTimestamp (v2 extension, optional for backward compat)
+                // writeTimestamp (present in all snapshots written by this codebase).
                 if (rp + 8 <= rend) {
                     f.writeTimestamp = decodeFixed64(rp);
                     rp += 8;

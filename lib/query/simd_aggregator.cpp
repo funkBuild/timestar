@@ -200,48 +200,6 @@ void ComputeHistogram(const double* values, size_t count, double min_val, double
     }
 }
 
-// Element-wise addition: dst[i] += src[i]
-void AddArrays(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src, size_t count) {
-    const hn::ScalableTag<double> d;
-    const size_t N = hn::Lanes(d);
-    size_t i = 0;
-    for (; i + N <= count; i += N) {
-        auto d_vec = hn::LoadU(d, &dst[i]);
-        auto s_vec = hn::LoadU(d, &src[i]);
-        hn::StoreU(hn::Add(d_vec, s_vec), d, &dst[i]);
-    }
-    for (; i < count; ++i)
-        dst[i] += src[i];
-}
-
-// Element-wise minimum: dst[i] = min(dst[i], src[i])
-void MinArrays(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src, size_t count) {
-    const hn::ScalableTag<double> d;
-    const size_t N = hn::Lanes(d);
-    size_t i = 0;
-    for (; i + N <= count; i += N) {
-        auto d_vec = hn::LoadU(d, &dst[i]);
-        auto s_vec = hn::LoadU(d, &src[i]);
-        hn::StoreU(hn::Min(d_vec, s_vec), d, &dst[i]);
-    }
-    for (; i < count; ++i)
-        dst[i] = std::min(dst[i], src[i]);
-}
-
-// Element-wise maximum: dst[i] = max(dst[i], src[i])
-void MaxArrays(double* HWY_RESTRICT dst, const double* HWY_RESTRICT src, size_t count) {
-    const hn::ScalableTag<double> d;
-    const size_t N = hn::Lanes(d);
-    size_t i = 0;
-    for (; i + N <= count; i += N) {
-        auto d_vec = hn::LoadU(d, &dst[i]);
-        auto s_vec = hn::LoadU(d, &src[i]);
-        hn::StoreU(hn::Max(d_vec, s_vec), d, &dst[i]);
-    }
-    for (; i < count; ++i)
-        dst[i] = std::max(dst[i], src[i]);
-}
-
 }  // namespace HWY_NAMESPACE
 }  // namespace simd
 }  // namespace timestar
@@ -260,9 +218,6 @@ HWY_EXPORT(CalculateMax);
 HWY_EXPORT(CalculateVariance);
 HWY_EXPORT(DotProduct);
 HWY_EXPORT(ComputeHistogram);
-HWY_EXPORT(AddArrays);
-HWY_EXPORT(MinArrays);
-HWY_EXPORT(MaxArrays);
 
 // Quick scan for any NaN in the input array.
 // Used to guard SIMD min/max paths whose intrinsics have undefined NaN behavior.
@@ -363,18 +318,6 @@ void SimdAggregator::computeHistogram(const double* values, size_t count, double
     double scale = (num_bins - 1) / range;
 
     HWY_DYNAMIC_DISPATCH(ComputeHistogram)(values, count, min_val, scale, num_bins, histogram);
-}
-
-void SimdAggregator::addArrays(double* dst, const double* src, size_t count) {
-    HWY_DYNAMIC_DISPATCH(AddArrays)(dst, src, count);
-}
-
-void SimdAggregator::minArrays(double* dst, const double* src, size_t count) {
-    HWY_DYNAMIC_DISPATCH(MinArrays)(dst, src, count);
-}
-
-void SimdAggregator::maxArrays(double* dst, const double* src, size_t count) {
-    HWY_DYNAMIC_DISPATCH(MaxArrays)(dst, src, count);
 }
 
 // --- Scalar fallback implementations ---

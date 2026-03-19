@@ -166,6 +166,8 @@ ForecastOutput ForecastExecutor::execute(const ForecastInput& input, const Forec
 void ForecastExecutor::addSeriesPieces(ForecastQueryResult& result, const ForecastOutput& output,
                                        const std::vector<std::string>& groupTags, size_t queryIndex) {
     size_t nHistorical = output.historicalCount;
+    if (output.past.size() < nHistorical)
+        nHistorical = output.past.size();
     size_t nForecast = output.forecastCount;
     size_t totalPoints = nHistorical + nForecast;
 

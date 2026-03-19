@@ -31,6 +31,24 @@ public:
     TSMBlockIterator(seastar::shared_ptr<TSM> f, const SeriesId128& id, uint64_t start = 0, uint64_t end = UINT64_MAX)
         : file(f), seriesId(id), startTime(start), endTime(end) {}
 
+    ~TSMBlockIterator() {
+        // If a prefetch is outstanding, we must not let Seastar assert on
+        // "future destroyed without being awaited". Detach it with
+        // handle_exception to consume the result silently.
+        if (prefetchFuture.has_value()) {
+            std::move(prefetchFuture.value()).then_wrapped([](auto f) {
+                try { f.get(); } catch (...) {}
+            });
+            prefetchFuture.reset();
+        }
+    }
+
+    // Non-copyable, movable
+    TSMBlockIterator(const TSMBlockIterator&) = delete;
+    TSMBlockIterator& operator=(const TSMBlockIterator&) = delete;
+    TSMBlockIterator(TSMBlockIterator&&) = default;
+    TSMBlockIterator& operator=(TSMBlockIterator&&) = default;
+
     // Phase 1.2: Initialize with just the index metadata (no I/O yet)
     seastar::future<> init() {
         // Get index blocks without reading data

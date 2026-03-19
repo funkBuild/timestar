@@ -763,6 +763,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
                     CoalesceCandidate& candidate = findOrCreateCandidate(seriesKey, measurement, sharedTags, fieldName,
                                                                          valueType, arr.size(), seriesKeyPrefix);
+                    // Apply any Integer->Float promotion from findOrCreateCandidate
+                    valueType = candidate.valueType;
 
                     // Add all array elements to candidate
                     candidate.timestamps.reserve(candidate.timestamps.size() + arr.size());

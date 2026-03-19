@@ -111,26 +111,31 @@ seastar::future<FunctionResult<double>> SMAFunction::execute(const DoubleSeriesV
                                  input.timestamps->begin() + input.startIndex + input.count);
         result.values.resize(input.count);
 
-        for (size_t i = 0; i < input.count; ++i) {
-            double sum = 0.0;
-            int64_t validCount = 0;
+        // O(n) sliding window with Kahan summation.
+        // Initial sum: window copies of values[0] (left-edge padding fills entire window).
+        double sum = static_cast<double>(window) * input.valueAt(0);
+        double comp = 0.0;
+        result.values[0] = sum / window;
 
-            for (int64_t j = 0; j < window; ++j) {
-                int64_t dataIdx = static_cast<int64_t>(i) - j;
+        // Phase 1: Ramp-up -- each step replaces one padding (values[0]) with values[i]
+        size_t rampEnd = std::min(static_cast<size_t>(window), input.count);
+        for (size_t i = 1; i < rampEnd; ++i) {
+            double delta = input.valueAt(i) - input.valueAt(0);
+            double y = delta - comp;
+            double t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
+            result.values[i] = sum / window;
+        }
 
-                if (dataIdx >= 0 && dataIdx < static_cast<int64_t>(input.count)) {
-                    sum += input.valueAt(dataIdx);
-                    validCount++;
-                } else if (dataIdx < 0) {
-                    sum += input.valueAt(0);
-                    validCount++;
-                } else {
-                    sum += input.valueAt(input.count - 1);
-                    validCount++;
-                }
-            }
-
-            result.values[i] = validCount > 0 ? sum / validCount : input.valueAt(i);
+        // Phase 2: Steady-state -- full window, standard slide
+        for (size_t i = rampEnd; i < input.count; ++i) {
+            double delta = input.valueAt(i) - input.valueAt(i - window);
+            double y = delta - comp;
+            double t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
+            result.values[i] = sum / window;
         }
     } else if (edgeHandling == "pad_zeros") {
         // Pad with zeros - return same size as input
@@ -138,20 +143,27 @@ seastar::future<FunctionResult<double>> SMAFunction::execute(const DoubleSeriesV
                                  input.timestamps->begin() + input.startIndex + input.count);
         result.values.resize(input.count);
 
-        for (size_t i = 0; i < input.count; ++i) {
-            double sum = 0.0;
-            int64_t validCount = 0;
+        // O(n) sliding window with Kahan summation.
+        // Phase 1: Ramp-up -- window extends beyond left edge, missing values are 0
+        double sum = 0.0;
+        double comp = 0.0;
+        size_t rampEnd = std::min(static_cast<size_t>(window), input.count);
+        for (size_t i = 0; i < rampEnd; ++i) {
+            double y = input.valueAt(i) - comp;
+            double t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
+            result.values[i] = sum / window;
+        }
 
-            for (int64_t j = 0; j < window; ++j) {
-                int64_t dataIdx = static_cast<int64_t>(i) - j;
-
-                if (dataIdx >= 0 && dataIdx < static_cast<int64_t>(input.count)) {
-                    sum += input.valueAt(dataIdx);
-                    validCount++;
-                }
-            }
-
-            result.values[i] = validCount > 0 ? sum / window : 0.0;
+        // Phase 2: Steady-state -- full window within data bounds
+        for (size_t i = rampEnd; i < input.count; ++i) {
+            double delta = input.valueAt(i) - input.valueAt(i - window);
+            double y = delta - comp;
+            double t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
+            result.values[i] = sum / window;
         }
     }
 
@@ -325,6 +337,10 @@ seastar::future<FunctionResult<double>> GaussianSmoothFunction::execute(const Do
 
     if (input.count < 3) {
         throw InsufficientDataException("Gaussian smoothing requires at least 3 data points");
+    }
+
+    if (!validateParameters(context).get()) {
+        throw std::invalid_argument("GaussianSmoothFunction: invalid parameters");
     }
 
     // Calculate sigma based on the provided parameter

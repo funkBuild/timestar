@@ -31,7 +31,6 @@ std::string HttpRetentionHandler::createErrorResponse(const std::string& error) 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handlePut(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
-    reply->add_header("Content-Type", "application/json");
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -182,7 +181,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleGet(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
-    reply->add_header("Content-Type", "application/json");
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -238,7 +236,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleDelete(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
-    reply->add_header("Content-Type", "application/json");
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);

@@ -30,7 +30,8 @@ struct SeriesBlocks {
     SeriesId128 seriesId;
     std::vector<std::unique_ptr<TSMBlock<T>>> blocks;  // All blocks loaded in memory
     size_t totalPoints = 0;
-    uint64_t fileRank = 0;  // For deduplication (higher rank = newer file)
+    uint64_t fileRank = 0;            // For deduplication (higher rank = newer file)
+    seastar::shared_ptr<TSM> source;  // Source TSM file (for index block lookup during compaction)
 
     SeriesBlocks() = default;
     SeriesBlocks(const SeriesId128& id) : seriesId(id) {}
@@ -64,6 +65,7 @@ public:
                                                          uint64_t startTime = 0, uint64_t endTime = UINT64_MAX) {
         SeriesBlocks<T> result(seriesId);
         result.fileRank = file->rankAsInteger();
+        result.source = file;
 
         // Ensure the full index entry is loaded (lazy-loads from sparse index
         // via DMA read if not already cached). getSeriesBlocks() only checks
@@ -72,6 +74,19 @@ public:
         auto* indexEntry = co_await file->getFullIndexEntry(seriesId);
         if (!indexEntry) {
             co_return result;  // Series not in this file
+        }
+
+        // Capture the string dictionary from the index entry BEFORE any
+        // further co_await. When multiple loadFromFile coroutines run
+        // concurrently, reactor preemption can cause getFullIndexEntry()
+        // for a different file to overwrite the thread-local tlStringDict
+        // before this coroutine's readSingleBlock captures it. Passing
+        // the dictionary pointer explicitly avoids the race entirely.
+        const std::vector<std::string>* stringDict = nullptr;
+        if constexpr (std::is_same_v<T, std::string>) {
+            if (!indexEntry->stringDictionary.empty()) {
+                stringDict = &indexEntry->stringDictionary;
+            }
         }
 
         auto indexBlocks = file->getSeriesBlocks(seriesId);
@@ -98,9 +113,10 @@ public:
         std::vector<seastar::future<std::unique_ptr<TSMBlock<T>>>> blockFutures;
         blockFutures.reserve(relevantBlocks.size());
 
-        // Start all reads in parallel
+        // Start all reads in parallel, passing the string dictionary explicitly
+        // to avoid the thread-local tlStringDict race.
         for (const auto& indexBlock : relevantBlocks) {
-            blockFutures.push_back(file->readSingleBlock<T>(indexBlock, startTime, endTime));
+            blockFutures.push_back(file->readSingleBlock<T>(indexBlock, startTime, endTime, stringDict));
         }
 
         // Wait for all reads to complete at once (single await point!)
@@ -118,16 +134,23 @@ public:
         co_return result;
     }
 
-    // Load all blocks for a series from multiple TSM files
+    // Load all blocks for a series from multiple TSM files (parallel I/O)
     static seastar::future<std::vector<SeriesBlocks<T>>> loadFromFiles(
         const std::vector<seastar::shared_ptr<TSM>>& files, const SeriesId128& seriesId, uint64_t startTime = 0,
         uint64_t endTime = UINT64_MAX) {
+        // Launch all file loads concurrently — each does independent DMA reads
+        std::vector<seastar::future<SeriesBlocks<T>>> futures;
+        futures.reserve(files.size());
+        for (const auto& file : files) {
+            futures.push_back(loadFromFile(file, seriesId, startTime, endTime));
+        }
+
+        auto results = co_await seastar::when_all(futures.begin(), futures.end());
+
         std::vector<SeriesBlocks<T>> allBlocks;
         allBlocks.reserve(files.size());
-
-        // Load from each file
-        for (const auto& file : files) {
-            auto blocks = co_await loadFromFile(file, seriesId, startTime, endTime);
+        for (auto& f : results) {
+            auto blocks = f.get();
             if (!blocks.blocks.empty()) {
                 allBlocks.push_back(std::move(blocks));
             }
@@ -207,7 +230,8 @@ private:
     BulkMergeContext<T> ctx1;
 
 public:
-    explicit BulkMerger2Way(std::vector<SeriesBlocks<T>>& sources) : ctx0(&sources[0]), ctx1(&sources[1]) {
+    explicit BulkMerger2Way(std::vector<SeriesBlocks<T>>& sources)
+        : ctx0(sources.size() >= 1 ? &sources[0] : nullptr), ctx1(sources.size() >= 2 ? &sources[1] : nullptr) {
         if (sources.size() != 2) {
             throw std::invalid_argument("BulkMerger2Way requires exactly 2 sources, got " +
                                         std::to_string(sources.size()));
@@ -265,7 +289,9 @@ private:
 
 public:
     explicit BulkMerger3Way(std::vector<SeriesBlocks<T>>& sources)
-        : ctx0(&sources[0]), ctx1(&sources[1]), ctx2(&sources[2]) {
+        : ctx0(sources.size() >= 1 ? &sources[0] : nullptr),
+          ctx1(sources.size() >= 2 ? &sources[1] : nullptr),
+          ctx2(sources.size() >= 3 ? &sources[2] : nullptr) {
         if (sources.size() != 3) {
             throw std::invalid_argument("BulkMerger3Way requires exactly 3 sources, got " +
                                         std::to_string(sources.size()));

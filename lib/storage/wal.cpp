@@ -29,6 +29,11 @@
 #include <string>
 #include <vector>
 
+static_assert(static_cast<int>(WALValueType::Float) == static_cast<int>(TSMValueType::Float));
+static_assert(static_cast<int>(WALValueType::Boolean) == static_cast<int>(TSMValueType::Boolean));
+static_assert(static_cast<int>(WALValueType::String) == static_cast<int>(TSMValueType::String));
+static_assert(static_cast<int>(WALValueType::Integer) == static_cast<int>(TSMValueType::Integer));
+
 namespace fs = std::filesystem;
 
 // ------------------------ WAL ------------------------
@@ -494,9 +499,17 @@ void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequ
 
 template <class T>
 seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
-    // --- Encoding phase (no lock needed) ---
+    // Hold the gate BEFORE the semaphore so that WAL::close() (which calls
+    // _io_gate.close()) will wait for coroutines queued on _io_sem rather
+    // than racing past them and closing the stream while they're pending.
+    auto gate_holder = _io_gate.hold();
+    auto units = co_await seastar::get_units(_io_sem, 1);
+
+    // --- Encoding phase (under lock) ---
     // Reuse thread-local buffer: capacity persists across inserts, eliminating
     // per-insert heap allocation. clear() resets size but preserves capacity.
+    // Must be under the semaphore to prevent concurrent coroutines from
+    // overwriting the buffer between encoding and the stream write.
     static thread_local AlignedBuffer buffer;
     buffer.clear();
     buffer.reserve(estimateInsertSize(insertRequest));
@@ -504,18 +517,6 @@ seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
     encodeInsertEntry(buffer, insertRequest);
 
     const size_t dataSize = buffer.size();
-
-    // --- I/O phase (under lock) ---
-    // Hold the gate BEFORE the semaphore so that WAL::close() (which calls
-    // _io_gate.close()) will wait for coroutines queued on _io_sem rather
-    // than racing past them and closing the stream while they're pending.
-    //
-    // Safety invariant: the thread-local buffer is populated above before the
-    // co_await on _io_sem. Seastar's output_stream::write() copies data
-    // synchronously into its internal buffer before any suspension point, so
-    // the buffer contents are consumed before any other coroutine can reuse it.
-    auto gate_holder = _io_gate.hold();
-    auto units = co_await seastar::get_units(_io_sem, 1);
 
     LOG_INSERT_PATH(timestar::wal_log, debug, "WAL::insert - dataSize={}, currentSize={}", dataSize, currentSize);
 
@@ -564,10 +565,13 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
         co_return co_await insert(insertRequests[0]);
     }
 
-    // --- Encoding phase (no lock needed) ---
-    // Single pre-allocated buffer: compute estimated total size, allocate once,
-    // encode all entries sequentially into the shared buffer, then write once.
-    // This eliminates N separate allocations, N moves, and N stream writes.
+    // Hold the gate BEFORE the semaphore (see insert() for rationale).
+    auto gate_holder = _io_gate.hold();
+    auto units = co_await seastar::get_units(_io_sem, 1);
+
+    // --- Encoding phase (under lock) ---
+    // Must be under the semaphore to prevent concurrent coroutines from
+    // overwriting the thread-local buffer between encoding and the stream write.
 
     // First pass: compute total estimated size for pre-allocation
     size_t estimatedTotal = 0;
@@ -587,15 +591,6 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
     }
 
     const size_t totalSize = buffer.size();
-
-    // --- I/O phase (under lock) ---
-    // Hold the gate BEFORE the semaphore (see insert() for rationale).
-    // Safety invariant: the thread-local buffer is populated above before the
-    // co_await on _io_sem. Seastar's output_stream::write() copies data
-    // synchronously into its internal buffer before any suspension point, so
-    // the buffer contents are consumed before any other coroutine can reuse it.
-    auto gate_holder = _io_gate.hold();
-    auto units = co_await seastar::get_units(_io_sem, 1);
 
     LOG_INSERT_PATH(timestar::wal_log, debug, "WAL::insertBatch - {} entries, total size={}, currentSize={}",
                     insertRequests.size(), totalSize, currentSize);

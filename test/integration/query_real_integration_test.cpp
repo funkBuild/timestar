@@ -459,15 +459,4 @@ TEST_F(QueryRealIntegrationTest, QueryPlannerWithRealData) {
     EXPECT_TRUE(seriesKey.find("temperature") != std::string::npos);
     EXPECT_TRUE(seriesKey.find("us-west") != std::string::npos);
 
-    // Test requiresAllShards logic
-    QueryRequest wildcardRequest = request;
-    wildcardRequest.scopes["location"] = "us-*";  // Wildcard
-    EXPECT_TRUE(planner.requiresAllShards(wildcardRequest));
-
-    QueryRequest exactRequest = request;
-    EXPECT_FALSE(planner.requiresAllShards(exactRequest));
-
-    QueryRequest emptyRequest;
-    emptyRequest.measurement = "test";
-    EXPECT_TRUE(planner.requiresAllShards(emptyRequest));  // No scopes = all shards
 }

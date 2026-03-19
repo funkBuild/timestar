@@ -345,8 +345,18 @@ std::string encodeLocalIdCounterKey() {
     return std::string(1, static_cast<char>(LOCAL_ID_COUNTER));
 }
 
+// Shared validation for functions that use \0 as separator
+static void validateNoNullBytes(std::initializer_list<std::string_view> components) {
+    for (auto sv : components) {
+        if (sv.find('\0') != std::string_view::npos) {
+            throw std::invalid_argument("Key component must not contain null bytes");
+        }
+    }
+}
+
 std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue) {
+    validateNoNullBytes({measurement, tagKey, tagValue});
     std::string key;
     key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key.push_back(static_cast<char>(POSTINGS_BITMAP));
@@ -359,6 +369,7 @@ std::string encodePostingsBitmapKey(const std::string& measurement, const std::s
 }
 
 std::string encodePostingsBitmapPrefix(const std::string& measurement, const std::string& tagKey) {
+    validateNoNullBytes({measurement, tagKey});
     std::string key;
     key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1);
     key.push_back(static_cast<char>(POSTINGS_BITMAP));
@@ -374,6 +385,7 @@ std::string encodePostingsBitmapPrefix(const std::string& measurement, const std
 // ============================================================================
 
 std::string encodeDayBitmapKey(const std::string& measurement, uint32_t day) {
+    validateNoNullBytes({measurement});
     std::string key;
     key.reserve(1 + measurement.size() + 1 + 4);
     key.push_back(static_cast<char>(TIME_SERIES_DAY));
@@ -384,6 +396,7 @@ std::string encodeDayBitmapKey(const std::string& measurement, uint32_t day) {
 }
 
 std::string encodeDayBitmapPrefix(const std::string& measurement) {
+    validateNoNullBytes({measurement});
     std::string prefix;
     prefix.reserve(1 + measurement.size() + 1);
     prefix.push_back(static_cast<char>(TIME_SERIES_DAY));
@@ -406,6 +419,7 @@ uint32_t decodeDayFromDayBitmapKey(std::string_view key) {
 // ============================================================================
 
 std::string encodeCardinalityHLLKey(const std::string& measurement) {
+    validateNoNullBytes({measurement});
     std::string key;
     key.reserve(1 + measurement.size() + 1);
     key.push_back(static_cast<char>(CARDINALITY_HLL));
@@ -416,6 +430,7 @@ std::string encodeCardinalityHLLKey(const std::string& measurement) {
 
 std::string encodeCardinalityHLLKey(const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue) {
+    validateNoNullBytes({measurement, tagKey, tagValue});
     std::string key;
     key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key.push_back(static_cast<char>(CARDINALITY_HLL));
@@ -428,6 +443,7 @@ std::string encodeCardinalityHLLKey(const std::string& measurement, const std::s
 }
 
 std::string encodeCardinalityHLLPrefix(const std::string& measurement) {
+    validateNoNullBytes({measurement});
     std::string key;
     key.reserve(1 + measurement.size() + 1);
     key.push_back(static_cast<char>(CARDINALITY_HLL));
@@ -437,6 +453,7 @@ std::string encodeCardinalityHLLPrefix(const std::string& measurement) {
 }
 
 std::string encodeMeasurementBloomKey(const std::string& measurement) {
+    validateNoNullBytes({measurement});
     std::string key;
     key.reserve(1 + measurement.size() + 1);
     key.push_back(static_cast<char>(MEASUREMENT_BLOOM));

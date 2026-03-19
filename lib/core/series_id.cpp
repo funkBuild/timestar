@@ -4,7 +4,7 @@
 
 #include <cstring>
 
-SeriesId128 SeriesId128::fromSeriesKey(const std::string& seriesKey) {
+SeriesId128 SeriesId128::fromSeriesKey(std::string_view seriesKey) {
     SeriesId128 id;
 
     // Empty key produces a zero SeriesId128 -- callers can test with isZero().

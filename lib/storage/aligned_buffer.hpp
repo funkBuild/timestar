@@ -37,6 +37,8 @@ struct dma_default_init_allocator {
     dma_default_init_allocator(const dma_default_init_allocator<U, A>&) noexcept {}
 
     T* allocate(std::size_t n) {
+        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T))
+            throw std::bad_alloc();
         const std::size_t bytes = n * sizeof(T);
         // std::aligned_alloc requires size to be a multiple of alignment.
         const std::size_t padded = (bytes + Alignment - 1) & ~(Alignment - 1);

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <seastar/core/reactor.hh>
 #include <seastar/util/log.hh>
 #include <sstream>
 
@@ -30,55 +31,67 @@ ProductionMonitor& ProductionMonitor::getInstance() {
 }
 
 void ProductionMonitor::start() {
-    // Serialize with stop() via lifecycle_mutex_.  This prevents the scenario
-    // where stop() sees monitoring_active_==true and clears the flag while
-    // start() has already passed the CAS but has not yet launched the thread,
-    // which would leave a zombie std::thread object in monitoring_thread_.
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-
-    // Use compare_exchange_strong so that only one thread wins when start() is
-    // called concurrently.  If monitoring_active_ is already true the exchange
-    // fails and we return immediately without touching monitoring_thread_.
-    bool expected = false;
-    if (!monitoring_active_.compare_exchange_strong(expected, true)) {
-        return;  // Already running (or another thread just won the race)
+    if (monitoring_active_) {
+        return;  // Already running
     }
 
-    monitoring_thread_ = std::thread(&ProductionMonitor::monitoringLoop, this);
+    monitoring_active_ = true;
+
+    // The timer requires a running Seastar reactor. In unit-test contexts
+    // where no reactor exists (e.g. plain gtest_main binaries), we skip
+    // arming the timer. Tests can call runCollectionCycle() directly.
+    if (seastar::engine_is_ready()) {
+        monitoring_timer_.set_callback([this] { onTimerTick(); });
+        monitoring_timer_.arm_periodic(collection_interval_);
+    }
 
     if (detailed_logging_) {
-        monitoring_log.info("[ProductionMonitor] Started background monitoring thread");
+        monitoring_log.info("[ProductionMonitor] Started monitoring timer ({}s interval)",
+                            collection_interval_.count());
     }
 }
 
 void ProductionMonitor::stop() {
-    // Serialize start()/stop() lifecycle transitions so that only one thread
-    // performs the join.  Without this:
-    //  - Two concurrent stop() calls can both see monitoring_active_==true,
-    //    both set it to false, and then both try to join the same std::thread
-    //    (undefined behaviour, may deadlock).
-    //  - A concurrent start() can create the thread after stop() has already
-    //    cleared monitoring_active_, leaving an unjoinable thread.
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-
-    if (!monitoring_active_.load()) {
+    if (!monitoring_active_) {
         return;  // Not running
     }
 
-    monitoring_active_.store(false);
-    monitoring_cv_.notify_all();
-
-    if (monitoring_thread_.joinable()) {
-        monitoring_thread_.join();
+    if (seastar::engine_is_ready()) {
+        monitoring_timer_.cancel();
     }
+    monitoring_active_ = false;
 
     if (detailed_logging_) {
-        monitoring_log.info("[ProductionMonitor] Stopped background monitoring thread");
+        monitoring_log.info("[ProductionMonitor] Stopped monitoring timer");
     }
 }
 
+void ProductionMonitor::onTimerTick() {
+    try {
+        collectSystemMetrics();
+        checkAlertConditions();
+        cleanupOldAlerts();
+
+        if (detailed_logging_) {
+            auto system_snapshot = getSystemMetricsSnapshot();
+            monitoring_log.debug("[ProductionMonitor] Active calls: {}, Queued: {}, Memory: {}MB",
+                                 system_snapshot.active_function_calls, system_snapshot.queued_function_calls,
+                                 system_snapshot.system_memory_bytes / 1024 / 1024);
+        }
+    } catch (const std::exception& e) {
+        if (detailed_logging_) {
+            monitoring_log.error("[ProductionMonitor] Error in monitoring tick: {}", e.what());
+        }
+    }
+}
+
+void ProductionMonitor::runCollectionCycle() {
+    collectSystemMetrics();
+    checkAlertConditions();
+    cleanupOldAlerts();
+}
+
 void ProductionMonitor::registerFunction(const std::string& function_name) {
-    std::lock_guard<std::mutex> lock(metrics_mutex_);
     if (function_metrics_.find(function_name) == function_metrics_.end()) {
         function_metrics_[function_name] = std::make_shared<FunctionMetrics>();
 
@@ -89,7 +102,6 @@ void ProductionMonitor::registerFunction(const std::string& function_name) {
 }
 
 std::shared_ptr<FunctionMetrics> ProductionMonitor::getFunctionMetrics(const std::string& function_name) {
-    std::lock_guard<std::mutex> lock(metrics_mutex_);
     auto it = function_metrics_.find(function_name);
     if (it != function_metrics_.end()) {
         return it->second;
@@ -107,9 +119,6 @@ std::shared_ptr<FunctionMetrics> ProductionMonitor::getFunctionMetrics(const std
 }
 
 void ProductionMonitor::setAlertThresholds(const AlertThresholds& thresholds) {
-    // thresholds_ is read by checkAlertConditions() (under metrics_mutex_) and
-    // getHealthStatus(), both of which may run concurrently on other threads.
-    std::lock_guard<std::mutex> lock(metrics_mutex_);
     thresholds_ = thresholds;
 
     if (detailed_logging_) {
@@ -118,12 +127,10 @@ void ProductionMonitor::setAlertThresholds(const AlertThresholds& thresholds) {
 }
 
 std::vector<Alert> ProductionMonitor::getActiveAlerts() const {
-    std::lock_guard<std::mutex> lock(alerts_mutex_);
     return active_alerts_;
 }
 
 std::vector<Alert> ProductionMonitor::getAlertHistory(std::chrono::minutes lookback) const {
-    std::lock_guard<std::mutex> lock(alerts_mutex_);
     std::vector<Alert> recent_alerts;
 
     auto cutoff_time = std::chrono::steady_clock::now() - lookback;
@@ -138,7 +145,6 @@ std::vector<Alert> ProductionMonitor::getAlertHistory(std::chrono::minutes lookb
 }
 
 void ProductionMonitor::acknowledgeAlert(size_t alert_id) {
-    std::lock_guard<std::mutex> lock(alerts_mutex_);
     if (alert_id < active_alerts_.size()) {
         // Remove key from the lookup set before erasing from vector
         const auto& alert = active_alerts_[alert_id];
@@ -152,7 +158,6 @@ void ProductionMonitor::acknowledgeAlert(size_t alert_id) {
 }
 
 void ProductionMonitor::clearAlertsForTesting() {
-    std::lock_guard<std::mutex> lock(alerts_mutex_);
     active_alerts_.clear();
     active_alert_keys_.clear();
     alert_history_.clear();
@@ -167,12 +172,10 @@ void ProductionMonitor::addAlertForTesting(const Alert& alert) {
 }
 
 size_t ProductionMonitor::getAlertHistorySize() const {
-    std::lock_guard<std::mutex> lock(alerts_mutex_);
     return alert_history_.size();
 }
 
 std::map<std::string, FunctionMetricsSnapshot> ProductionMonitor::getAllFunctionMetrics() const {
-    std::lock_guard<std::mutex> lock(metrics_mutex_);
     std::map<std::string, FunctionMetricsSnapshot> snapshot;
 
     for (const auto& [name, metrics] : function_metrics_) {
@@ -231,7 +234,6 @@ std::string ProductionMonitor::exportMetricsAsJson() const {
     // Function metrics
     json << "  \"functions\": {\n";
     {
-        std::lock_guard<std::mutex> lock(metrics_mutex_);
         bool first = true;
         for (const auto& [name, metrics] : function_metrics_) {
             if (!first)
@@ -290,7 +292,6 @@ std::string ProductionMonitor::exportAlertsAsJson() const {
     json << "  \"active_alerts\": [\n";
 
     {
-        std::lock_guard<std::mutex> lock(alerts_mutex_);
         for (size_t i = 0; i < active_alerts_.size(); ++i) {
             const auto& alert = active_alerts_[i];
             if (i > 0)
@@ -320,14 +321,11 @@ ProductionMonitor::HealthStatus ProductionMonitor::getHealthStatus() const {
     status.status = "OK";
 
     // Check active alerts
-    {
-        std::lock_guard<std::mutex> lock(alerts_mutex_);
-        for (const auto& alert : active_alerts_) {
-            status.active_alerts.push_back(alert.message);
-            if (alert.severity > 0.7) {  // High severity alerts affect health
-                status.healthy = false;
-                status.status = "DEGRADED";
-            }
+    for (const auto& alert : active_alerts_) {
+        status.active_alerts.push_back(alert.message);
+        if (alert.severity > 0.7) {  // High severity alerts affect health
+            status.healthy = false;
+            status.status = "DEGRADED";
         }
     }
 
@@ -337,31 +335,28 @@ ProductionMonitor::HealthStatus ProductionMonitor::getHealthStatus() const {
     status.key_metrics["queued_calls"] = system_metrics_->queued_function_calls.load();
     status.key_metrics["http_success_rate"] = system_metrics_->getHttpSuccessRate();
 
-    // Check critical thresholds (thresholds_ guarded by metrics_mutex_)
-    {
-        std::lock_guard<std::mutex> lock(metrics_mutex_);
-        if (system_metrics_->queued_function_calls.load() > thresholds_.max_queue_size) {
-            status.healthy = false;
-            status.status = "CRITICAL";
-        }
+    // Check critical thresholds
+    if (system_metrics_->queued_function_calls.load() > thresholds_.max_queue_size) {
+        status.healthy = false;
+        status.status = "CRITICAL";
+    }
 
-        if (system_metrics_->active_function_calls.load() > thresholds_.max_concurrent_calls) {
-            status.healthy = false;
-            status.status = "OVERLOADED";
-        }
+    if (system_metrics_->active_function_calls.load() > thresholds_.max_concurrent_calls) {
+        status.healthy = false;
+        status.status = "OVERLOADED";
     }
 
     return status;
 }
 
 void ProductionMonitor::setCollectionInterval(std::chrono::seconds interval) {
-    // collection_interval_ is read by monitoringLoop() under monitoring_mutex_.
-    // Wake the loop so it picks up the new interval immediately.
-    {
-        std::lock_guard<std::mutex> lock(monitoring_mutex_);
-        collection_interval_ = interval;
+    collection_interval_ = interval;
+
+    // If the timer is running, re-arm it with the new interval.
+    if (monitoring_active_ && seastar::engine_is_ready()) {
+        monitoring_timer_.cancel();
+        monitoring_timer_.arm_periodic(collection_interval_);
     }
-    monitoring_cv_.notify_one();
 
     if (detailed_logging_) {
         monitoring_log.info("[ProductionMonitor] Updated collection interval to {}s", interval.count());
@@ -373,37 +368,6 @@ void ProductionMonitor::enableDetailedLogging(bool enabled) {
 
     if (enabled) {
         monitoring_log.info("[ProductionMonitor] Detailed logging enabled");
-    }
-}
-
-void ProductionMonitor::monitoringLoop() {
-    while (monitoring_active_.load()) {
-        try {
-            // Collect system metrics
-            collectSystemMetrics();
-
-            // Check alert conditions
-            checkAlertConditions();
-
-            // Cleanup old alerts
-            cleanupOldAlerts();
-
-            if (detailed_logging_) {
-                auto system_snapshot = getSystemMetricsSnapshot();
-                monitoring_log.debug("[ProductionMonitor] Active calls: {}, Queued: {}, Memory: {}MB",
-                                     system_snapshot.active_function_calls, system_snapshot.queued_function_calls,
-                                     system_snapshot.system_memory_bytes / 1024 / 1024);
-            }
-
-        } catch (const std::exception& e) {
-            if (detailed_logging_) {
-                monitoring_log.error("[ProductionMonitor] Error in monitoring loop: {}", e.what());
-            }
-        }
-
-        // Wait for next collection interval or shutdown signal
-        std::unique_lock<std::mutex> lock(monitoring_mutex_);
-        monitoring_cv_.wait_for(lock, collection_interval_, [this] { return !monitoring_active_.load(); });
     }
 }
 
@@ -428,108 +392,99 @@ void ProductionMonitor::collectSystemMetrics() {
 }
 
 void ProductionMonitor::checkAlertConditions() {
-    // Collect alerts while holding metrics_mutex_, then release it before
-    // calling processAlert (which acquires alerts_mutex_). This avoids
-    // nested lock acquisition and eliminates any deadlock risk.
     std::vector<Alert> pendingAlerts;
 
-    {
-        std::lock_guard<std::mutex> lock(metrics_mutex_);
+    for (const auto& [function_name, metrics] : function_metrics_) {
+        if (!metrics)
+            continue;
 
-        for (const auto& [function_name, metrics] : function_metrics_) {
-            if (!metrics)
-                continue;
-
-            // Check failure rate
-            double failure_rate = metrics->getFailureRate();
-            if (failure_rate > thresholds_.max_failure_rate && metrics->total_executions.load() > 10) {
-                Alert alert;
-                alert.type = AlertType::HIGH_FAILURE_RATE;
-                alert.function_name = function_name;
-                alert.message = "High failure rate: " + std::to_string(failure_rate * 100) + "%";
-                alert.timestamp = std::chrono::steady_clock::now();
-                alert.severity = std::min(1.0, failure_rate / thresholds_.max_failure_rate);
-                alert.metrics["failure_rate"] = failure_rate;
-                pendingAlerts.push_back(std::move(alert));
-            }
-
-            // Check response time
-            double avg_time = metrics->getAverageExecutionTimeMs();
-            if (avg_time > thresholds_.max_response_time_ms && metrics->successful_executions.load() > 5) {
-                Alert alert;
-                alert.type = AlertType::SLOW_RESPONSE_TIME;
-                alert.function_name = function_name;
-                alert.message = "Slow response time: " + std::to_string(avg_time) + "ms";
-                alert.timestamp = std::chrono::steady_clock::now();
-                alert.severity = std::min(1.0, avg_time / thresholds_.max_response_time_ms);
-                alert.metrics["avg_response_time_ms"] = avg_time;
-                pendingAlerts.push_back(std::move(alert));
-            }
-
-            // Check cache hit rate
-            double cache_rate = metrics->getCacheHitRate();
-            uint64_t total_cache_ops = metrics->cache_hits.load() + metrics->cache_misses.load();
-            if (cache_rate < thresholds_.min_cache_hit_rate && total_cache_ops > 20) {
-                Alert alert;
-                alert.type = AlertType::LOW_CACHE_HIT_RATE;
-                alert.function_name = function_name;
-                alert.message = "Low cache hit rate: " + std::to_string(cache_rate * 100) + "%";
-                alert.timestamp = std::chrono::steady_clock::now();
-                alert.severity =
-                    std::min(1.0, (thresholds_.min_cache_hit_rate - cache_rate) / thresholds_.min_cache_hit_rate);
-                alert.metrics["cache_hit_rate"] = cache_rate;
-                pendingAlerts.push_back(std::move(alert));
-            }
-
-            // Check memory usage
-            double memory_mb = metrics->getAverageMemoryUsageMB();
-            if (memory_mb > thresholds_.max_memory_usage_mb && metrics->successful_executions.load() > 5) {
-                Alert alert;
-                alert.type = AlertType::HIGH_MEMORY_USAGE;
-                alert.function_name = function_name;
-                alert.message = "High memory usage: " + std::to_string(memory_mb) + "MB";
-                alert.timestamp = std::chrono::steady_clock::now();
-                alert.severity = std::min(1.0, memory_mb / thresholds_.max_memory_usage_mb);
-                alert.metrics["memory_usage_mb"] = memory_mb;
-                pendingAlerts.push_back(std::move(alert));
-            }
-        }
-
-        // System-level alerts
-        uint64_t active_calls = system_metrics_->active_function_calls.load();
-        if (active_calls > thresholds_.max_concurrent_calls) {
+        // Check failure rate
+        double failure_rate = metrics->getFailureRate();
+        if (failure_rate > thresholds_.max_failure_rate && metrics->total_executions.load() > 10) {
             Alert alert;
-            alert.type = AlertType::HIGH_CONCURRENCY;
-            alert.function_name = "system";
-            alert.message = "High concurrency: " + std::to_string(active_calls) + " active calls";
+            alert.type = AlertType::HIGH_FAILURE_RATE;
+            alert.function_name = function_name;
+            alert.message = "High failure rate: " + std::to_string(failure_rate * 100) + "%";
             alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, static_cast<double>(active_calls) / thresholds_.max_concurrent_calls);
-            alert.metrics["active_calls"] = active_calls;
+            alert.severity = std::min(1.0, failure_rate / thresholds_.max_failure_rate);
+            alert.metrics["failure_rate"] = failure_rate;
             pendingAlerts.push_back(std::move(alert));
         }
 
-        uint64_t queued_calls = system_metrics_->queued_function_calls.load();
-        if (queued_calls > thresholds_.max_queue_size) {
+        // Check response time
+        double avg_time = metrics->getAverageExecutionTimeMs();
+        if (avg_time > thresholds_.max_response_time_ms && metrics->successful_executions.load() > 5) {
             Alert alert;
-            alert.type = AlertType::QUEUE_OVERLOAD;
-            alert.function_name = "system";
-            alert.message = "Queue overload: " + std::to_string(queued_calls) + " queued calls";
+            alert.type = AlertType::SLOW_RESPONSE_TIME;
+            alert.function_name = function_name;
+            alert.message = "Slow response time: " + std::to_string(avg_time) + "ms";
             alert.timestamp = std::chrono::steady_clock::now();
-            alert.severity = std::min(1.0, static_cast<double>(queued_calls) / thresholds_.max_queue_size);
-            alert.metrics["queued_calls"] = queued_calls;
+            alert.severity = std::min(1.0, avg_time / thresholds_.max_response_time_ms);
+            alert.metrics["avg_response_time_ms"] = avg_time;
             pendingAlerts.push_back(std::move(alert));
         }
-    }  // metrics_mutex_ released
 
-    // Now process alerts with only alerts_mutex_ held
+        // Check cache hit rate
+        double cache_rate = metrics->getCacheHitRate();
+        uint64_t total_cache_ops = metrics->cache_hits.load() + metrics->cache_misses.load();
+        if (cache_rate < thresholds_.min_cache_hit_rate && total_cache_ops > 20) {
+            Alert alert;
+            alert.type = AlertType::LOW_CACHE_HIT_RATE;
+            alert.function_name = function_name;
+            alert.message = "Low cache hit rate: " + std::to_string(cache_rate * 100) + "%";
+            alert.timestamp = std::chrono::steady_clock::now();
+            alert.severity =
+                std::min(1.0, (thresholds_.min_cache_hit_rate - cache_rate) / thresholds_.min_cache_hit_rate);
+            alert.metrics["cache_hit_rate"] = cache_rate;
+            pendingAlerts.push_back(std::move(alert));
+        }
+
+        // Check memory usage
+        double memory_mb = metrics->getAverageMemoryUsageMB();
+        if (memory_mb > thresholds_.max_memory_usage_mb && metrics->successful_executions.load() > 5) {
+            Alert alert;
+            alert.type = AlertType::HIGH_MEMORY_USAGE;
+            alert.function_name = function_name;
+            alert.message = "High memory usage: " + std::to_string(memory_mb) + "MB";
+            alert.timestamp = std::chrono::steady_clock::now();
+            alert.severity = std::min(1.0, memory_mb / thresholds_.max_memory_usage_mb);
+            alert.metrics["memory_usage_mb"] = memory_mb;
+            pendingAlerts.push_back(std::move(alert));
+        }
+    }
+
+    // System-level alerts
+    uint64_t active_calls = system_metrics_->active_function_calls.load();
+    if (active_calls > thresholds_.max_concurrent_calls) {
+        Alert alert;
+        alert.type = AlertType::HIGH_CONCURRENCY;
+        alert.function_name = "system";
+        alert.message = "High concurrency: " + std::to_string(active_calls) + " active calls";
+        alert.timestamp = std::chrono::steady_clock::now();
+        alert.severity = std::min(1.0, static_cast<double>(active_calls) / thresholds_.max_concurrent_calls);
+        alert.metrics["active_calls"] = active_calls;
+        pendingAlerts.push_back(std::move(alert));
+    }
+
+    uint64_t queued_calls = system_metrics_->queued_function_calls.load();
+    if (queued_calls > thresholds_.max_queue_size) {
+        Alert alert;
+        alert.type = AlertType::QUEUE_OVERLOAD;
+        alert.function_name = "system";
+        alert.message = "Queue overload: " + std::to_string(queued_calls) + " queued calls";
+        alert.timestamp = std::chrono::steady_clock::now();
+        alert.severity = std::min(1.0, static_cast<double>(queued_calls) / thresholds_.max_queue_size);
+        alert.metrics["queued_calls"] = queued_calls;
+        pendingAlerts.push_back(std::move(alert));
+    }
+
+    // Process collected alerts
     for (const auto& alert : pendingAlerts) {
         processAlert(alert);
     }
 }
 
 void ProductionMonitor::processAlert(const Alert& alert) {
-    std::lock_guard<std::mutex> lock(alerts_mutex_);
-
     // O(1) duplicate check using the unordered_set keyed by (type, function_name)
     AlertKey key{alert.type, alert.function_name};
     if (active_alert_keys_.contains(key)) {
@@ -551,8 +506,6 @@ void ProductionMonitor::processAlert(const Alert& alert) {
 }
 
 void ProductionMonitor::cleanupOldAlerts() {
-    std::lock_guard<std::mutex> lock(alerts_mutex_);
-
     auto cutoff_time = std::chrono::steady_clock::now() - std::chrono::hours(24);
 
     // Remove old alerts from history
@@ -632,7 +585,7 @@ FunctionExecutionTracker::FunctionExecutionTracker(const std::string& function_n
     : function_name_(function_name), start_time_(std::chrono::steady_clock::now()), initial_memory_(0) {
     monitor_ = &ProductionMonitor::getInstance();
     metrics_ = monitor_->getFunctionMetrics(function_name_);
-    // Skip blocking /proc read — memory tracking done only in background collection
+    // Skip blocking /proc read -- memory tracking done only in background collection
 
     // Update active calls
     monitor_->getSystemMetrics()->active_function_calls.fetch_add(1);
@@ -648,7 +601,7 @@ FunctionExecutionTracker::~FunctionExecutionTracker() {
     // Update execution time
     metrics_->total_execution_time_us.fetch_add(duration_us);
 
-    // Memory tracking removed from hot path — collected periodically by background monitor
+    // Memory tracking removed from hot path -- collected periodically by background monitor
 
     // Update active calls
     monitor_->getSystemMetrics()->active_function_calls.fetch_sub(1);

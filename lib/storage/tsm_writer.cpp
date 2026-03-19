@@ -27,7 +27,7 @@
 #include <variant>
 
 TSMWriter::TSMWriter(std::string _filename) {
-    filename = _filename;
+    filename = std::move(_filename);
     writeHeader();
 }
 
@@ -40,6 +40,10 @@ void TSMWriter::writeHeader() {
 template <class T>
 void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId,
                             const std::vector<uint64_t>& timestamps, const std::vector<T>& values) {
+    if (timestamps.size() != values.size()) {
+        throw std::invalid_argument("TSMWriter::writeSeries: timestamps (" + std::to_string(timestamps.size()) +
+                                    ") and values (" + std::to_string(values.size()) + ") size mismatch");
+    }
     // serializes a single series into one or more blocks. After each block, append an index entry.
     // Block size is config-driven via storage.max_points_per_block (default 1000).
     TSMIndexEntry indexEntry;
@@ -623,6 +627,7 @@ void TSMWriter::close() {
     while (remaining > 0) {
         ssize_t written = ::write(fd, ptr, remaining);
         if (written < 0) {
+            if (errno == EINTR) continue;
             int err = errno;
             ::close(fd);
             throw std::system_error(err, std::system_category(), "TSMWriter::close: write failed for " + filename);
@@ -633,7 +638,11 @@ void TSMWriter::close() {
 
     // fsync on the same fd to ensure durability before returning.
     // Reusing the write fd avoids an extra open() syscall.
-    if (::fsync(fd) < 0) {
+    int fsync_ret;
+    do {
+        fsync_ret = ::fsync(fd);
+    } while (fsync_ret < 0 && errno == EINTR);
+    if (fsync_ret < 0) {
         int err = errno;
         ::close(fd);
         throw std::system_error(err, std::system_category(), "TSMWriter::close: fsync failed for " + filename);

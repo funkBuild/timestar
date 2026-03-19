@@ -13,7 +13,7 @@ static StreamingDataPoint makePoint(const std::string& measurement, const std::s
     StreamingDataPoint pt;
     pt.measurement = measurement;
     pt.field = field;
-    pt.tags = tags;
+    pt.tags = makeTags(tags);
     pt.timestamp = timestamp;
     pt.value = value;
     return pt;
@@ -114,10 +114,10 @@ TEST(StreamingAggregatorTest, MultipleSeriesIndependent) {
     // Find each series
     bool foundWest = false, foundEast = false;
     for (const auto& pt : batch.points) {
-        if (pt.tags.at("loc") == "west") {
+        if (pt.tags->at("loc") == "west") {
             EXPECT_DOUBLE_EQ(std::get<double>(pt.value), 15.0);
             foundWest = true;
-        } else if (pt.tags.at("loc") == "east") {
+        } else if (pt.tags->at("loc") == "east") {
             EXPECT_DOUBLE_EQ(std::get<double>(pt.value), 100.0);
             foundEast = true;
         }
@@ -365,9 +365,9 @@ TEST(StreamingFormulaTest, MultipleSeriesAppliedIndependently) {
     // Find each series
     for (const auto& pt : result.points) {
         double val = std::get<double>(pt.value);
-        if (pt.tags.at("host") == "a") {
+        if (pt.tags->at("host") == "a") {
             EXPECT_TRUE(val == 100.0 || val == 120.0);
-        } else if (pt.tags.at("host") == "b") {
+        } else if (pt.tags->at("host") == "b") {
             EXPECT_DOUBLE_EQ(val, 140.0);
         }
     }
@@ -389,7 +389,7 @@ TEST(StreamingFormulaTest, PreservesMetadata) {
     EXPECT_EQ(result.sequenceId, 42u);
     EXPECT_EQ(result.points[0].measurement, "temp");
     EXPECT_EQ(result.points[0].field, "celsius");
-    EXPECT_EQ(result.points[0].tags.at("loc"), "west");
+    EXPECT_EQ(result.points[0].tags->at("loc"), "west");
     EXPECT_EQ(result.points[0].timestamp, 5000u);
     EXPECT_DOUBLE_EQ(std::get<double>(result.points[0].value), 26.0);
 }

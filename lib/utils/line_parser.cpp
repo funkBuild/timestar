@@ -31,10 +31,7 @@ SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey) {
                         break;
                     }
                     case State::field: {
-                        // Throw invalid
-                        field = seriesKey.substr(startIndex, i - startIndex);
-
-                        break;
+                        throw std::invalid_argument("Multiple fields not supported in line protocol");
                     }
                 }
             } break;

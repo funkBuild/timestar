@@ -17,20 +17,18 @@ namespace {
 // After the first few decode calls, all buffers reach their maximum needed capacity
 // and subsequent calls are allocation-free.
 struct ALPScratchBuffers {
-    // ALP scheme buffers
-    std::vector<uint64_t> packed_data;
-    std::vector<int64_t> decoded_ints;
+    // Reusable per-block decode buffers. Allocated once per thread, capacity
+    // persists across calls (no per-block heap allocation after warm-up).
+    // Replaces large stack arrays (~28-46KB) that risked overflow on Seastar's
+    // 128KB fiber stacks.
+    std::vector<uint64_t> packed_data{1024};
+    std::vector<int64_t> decoded_ints{1024};
+    std::vector<uint16_t> exc_positions{1024};
+    std::vector<uint64_t> exc_values{1024};
+    std::vector<uint64_t> pos_word_buf{256};
 
     // ALP_RD scheme buffers
     std::vector<uint64_t> dictionary;
-    std::vector<int64_t> left_indices_i64;
-    std::vector<uint64_t> left_packed;
-    std::vector<uint64_t> right_parts;
-    std::vector<uint64_t> right_packed;
-
-    // Shared between both schemes
-    std::vector<uint16_t> exc_positions;
-    std::vector<uint64_t> exc_values;
 };
 
 static ALPScratchBuffers& getScratch() {
@@ -80,6 +78,9 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             const uint8_t bw = static_cast<uint8_t>((bh0 >> 16) & 0x7F);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
             const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
+            if (exp >= 19 || fac >= 19) throw std::runtime_error("ALP: invalid exp/fac");
+            if (bw > 64) throw std::runtime_error("ALP: invalid bit width");
+            if (block_count > 1024) throw std::runtime_error("ALP: block_count exceeds limit");
             if (exception_count > block_count) throw std::runtime_error("ALP: exception_count exceeds block_count");
             const int64_t for_base = std::bit_cast<int64_t>(bh1);
 
@@ -106,29 +107,35 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 continue;
             }
 
-            // Bulk read FFOR packed data into stack buffer, bypassing the per-word
-            // readFixed state machine (~6 ops/word → single memcpy).
-            // Max packed_words = ceil(1024 * 64 / 64) = 1024 (8KB stack).
-            alignas(8) uint64_t packed_stack[1024];
-            encoded.readAlignedWords(packed_stack, packed_words);
+            // Bulk read FFOR packed data into thread-local buffer, bypassing the
+            // per-word readFixed state machine (~6 ops/word → single memcpy).
+            auto& scratch = getScratch();
+            scratch.packed_data.resize(packed_words);
+            encoded.readAlignedWords(scratch.packed_data.data(), packed_words);
 
-            // Unpack integers into stack buffer (L1-hot, no heap allocation)
-            alignas(8) int64_t decoded_stack[1024];
-            alp::ffor_unpack(packed_stack, block_count, for_base, bw, decoded_stack);
+            // Unpack integers into thread-local buffer (capacity persists)
+            scratch.decoded_ints.resize(block_count);
+            alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw, scratch.decoded_ints.data());
+
+            // Convenient aliases for the per-block data
+            auto* decoded_stack = scratch.decoded_ints.data();
+            auto* exc_positions_stack = scratch.exc_positions.data();
+            auto* exc_values_stack = scratch.exc_values.data();
 
             // === Read Exceptions ===
-            // Use stack-allocated arrays (max 1024 exceptions, 8KB + 2KB)
-            alignas(8) uint16_t exc_positions_stack[1024];
-            alignas(8) uint64_t exc_values_stack[1024];
             if (exception_count > 0) [[unlikely]] {
-                // Bulk read exception position words
+                scratch.exc_positions.resize(exception_count);
+                scratch.exc_values.resize(exception_count);
+                exc_positions_stack = scratch.exc_positions.data();
+                exc_values_stack = scratch.exc_values.data();
+
                 const size_t pos_words = (exception_count * 2 + 7) / 8;
-                alignas(8) uint64_t pos_word_buf[256];  // max 256 words for 1024 exceptions
-                encoded.readAlignedWords(pos_word_buf, pos_words);
+                scratch.pos_word_buf.resize(pos_words);
+                encoded.readAlignedWords(scratch.pos_word_buf.data(), pos_words);
 
                 // Unpack positions from words
                 for (size_t w = 0; w < pos_words; ++w) {
-                    uint64_t word = pos_word_buf[w];
+                    uint64_t word = scratch.pos_word_buf[w];
                     const size_t base_idx = w * 4;
                     const size_t remaining = exception_count - base_idx;
                     const size_t count = remaining < 4 ? remaining : 4;
@@ -225,6 +232,10 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             const uint8_t dict_size = static_cast<uint8_t>((bh0 >> 16) & 0xFF);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
             const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
+            if (dict_size > 8) throw std::runtime_error("ALP_RD: dict_size exceeds limit");
+            if (right_bw > 64) throw std::runtime_error("ALP_RD: invalid right bit width");
+            if (left_bw > 64) throw std::runtime_error("ALP_RD: invalid left bit width");
+            if (block_count > 1024) throw std::runtime_error("ALP_RD: block_count exceeds limit");
             if (exception_count > block_count) throw std::runtime_error("ALP: exception_count exceeds block_count");
             const uint64_t right_for_base = bh1;
 

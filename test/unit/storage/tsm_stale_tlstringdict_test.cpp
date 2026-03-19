@@ -68,15 +68,20 @@ TEST_F(TlStringDictStaleTest, LocalDictCapturedBeforeCoAwait) {
     std::string body = extractReadSingleBlock();
     ASSERT_FALSE(body.empty()) << "Could not find readSingleBlock function";
 
-    // Verify localDict is declared before the dma_read co_await
-    auto localDictPos = body.find("localDict = tlStringDict");
+    // Verify localDict is set before the dma_read co_await.
+    // The assignment may use the explicit stringDict parameter (preferred in
+    // the bulk-loading path) or fall back to the thread-local tlStringDict.
+    auto localDictPos = body.find("localDict = stringDict");
+    if (localDictPos == std::string::npos) {
+        localDictPos = body.find("localDict = tlStringDict");
+    }
     auto coAwaitPos = body.find("co_await tsmFile.dma_read_exactly");
     ASSERT_NE(localDictPos, std::string::npos)
-        << "readSingleBlock must capture tlStringDict into localDict before co_await";
+        << "readSingleBlock must set localDict (from stringDict param or tlStringDict) before co_await";
     ASSERT_NE(coAwaitPos, std::string::npos)
         << "readSingleBlock must contain a co_await dma_read_exactly call";
     EXPECT_LT(localDictPos, coAwaitPos)
-        << "localDict must be captured BEFORE the co_await suspension point";
+        << "localDict must be set BEFORE the co_await suspension point";
 }
 
 TEST_F(TlStringDictStaleTest, TlStringDictNotReadAfterCoAwait) {

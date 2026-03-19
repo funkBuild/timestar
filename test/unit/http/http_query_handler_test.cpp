@@ -49,6 +49,7 @@ struct GlazeQueryResponse {
 
 struct GlazeErrorResponse {
     std::string status;
+    std::string error_code;
     std::string message;
     std::string error;
 };
@@ -83,7 +84,8 @@ struct glz::meta<GlazeQueryResponse> {
 template <>
 struct glz::meta<GlazeErrorResponse> {
     using T = GlazeErrorResponse;
-    static constexpr auto value = object("status", &T::status, "message", &T::message, "error", &T::error);
+    static constexpr auto value =
+        object("status", &T::status, "error_code", &T::error_code, "message", &T::message, "error", &T::error);
 };
 
 class HttpQueryHandlerTest : public ::testing::Test {

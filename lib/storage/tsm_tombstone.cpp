@@ -510,7 +510,7 @@ std::vector<std::pair<uint64_t, uint64_t>> TSMTombstone::getTombstoneRanges(cons
 
     for (size_t i = 1; i < ranges.size(); ++i) {
         auto& back = merged.back();
-        if (ranges[i].first <= back.second + 1) {
+        if (ranges[i].first <= back.second + 1 || back.second == UINT64_MAX) {
             // Overlapping or adjacent, merge
             back.second = std::max(back.second, ranges[i].second);
         } else {

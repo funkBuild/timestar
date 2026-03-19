@@ -118,33 +118,6 @@ TEST_F(QueryPlannerTest, CreatePlanMultipleFields) {
     }
 }
 
-// Test requiresAllShards function
-TEST_F(QueryPlannerTest, RequiresAllShards) {
-    QueryPlanner planner;
-
-    // Empty scopes requires all shards
-    QueryRequest request1;
-    request1.measurement = "test";
-    EXPECT_TRUE(planner.requiresAllShards(request1));
-
-    // Exact match doesn't require all shards
-    QueryRequest request2;
-    request2.measurement = "test";
-    request2.scopes = {{"host", "server-01"}};
-    EXPECT_FALSE(planner.requiresAllShards(request2));
-
-    // Wildcard requires all shards
-    QueryRequest request3;
-    request3.measurement = "test";
-    request3.scopes = {{"host", "server-*"}};
-    EXPECT_TRUE(planner.requiresAllShards(request3));
-
-    // Regex requires all shards
-    QueryRequest request4;
-    request4.measurement = "test";
-    request4.scopes = {{"host", "/server-[0-9]+/"}};
-    EXPECT_TRUE(planner.requiresAllShards(request4));
-}
 
 // Test series key building for sharding
 TEST_F(QueryPlannerTest, SeriesKeyBuilding) {

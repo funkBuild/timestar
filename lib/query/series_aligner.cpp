@@ -37,10 +37,13 @@ std::map<std::string, AlignedSeries> SeriesAligner::align(const std::map<std::st
     // Align each series to the output timestamps
     std::map<std::string, AlignedSeries> result;
 
-    for (const auto& [name, subResult] : series) {
-        std::vector<double> alignedValues = interpolateSeries(subResult.timestamps, subResult.values, outputTimestamps);
+    // Share one timestamp vector across all aligned series (avoids N copies)
+    auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(outputTimestamps));
 
-        result[name] = AlignedSeries(outputTimestamps, std::move(alignedValues));
+    for (const auto& [name, subResult] : series) {
+        std::vector<double> alignedValues = interpolateSeries(subResult.timestamps, subResult.values, *sharedTimestamps);
+
+        result[name] = AlignedSeries(sharedTimestamps, std::move(alignedValues));
     }
 
     return result;

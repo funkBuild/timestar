@@ -3,6 +3,7 @@
 #include "retention_policy.hpp"
 #include "series_id.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <map>
 #include <memory>

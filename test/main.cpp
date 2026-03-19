@@ -1,6 +1,5 @@
 #include "../../../lib/encoding/float_encoder.hpp"
 #include "../../../lib/encoding/integer_encoder.hpp"
-#include "../../../lib/encoding/simple8b.hpp"
 #include "../../../lib/core/placement_table.hpp"
 
 #include <gtest/gtest.h>
@@ -38,29 +37,6 @@ TEST(FloatTest, BasicAssertions) {
     for (unsigned int i = 0; i < std::min(decoded.size(), v.size()); i++) {
         // std::cout << i << " -- " << v[i] << " :: " << decoded[i] << std::endl;
         EXPECT_DOUBLE_EQ(v[i], decoded[i]);
-    }
-}
-
-TEST(Simple8Test, BasicAssertions) {
-    const unsigned int test_length = 1000000;
-
-    std::vector<uint64_t> v;
-    uint64_t tmp = 0;
-
-    for (unsigned int i = 0; i < test_length; i++) {
-        tmp += 10;
-        v.push_back(tmp);
-    }
-
-    auto buf = Simple8B::encode(v);
-    Slice slice(buf.data.data(), buf.size());
-    auto decoded = Simple8B::decode(slice, v.size());
-
-    EXPECT_EQ(decoded.size(), v.size());
-
-    for (unsigned int i = 0; i < std::min(decoded.size(), v.size()); i++) {
-        // std::cout << i << " -- " << v[i] << " :: " << decoded[i] << std::endl;
-        EXPECT_EQ(v[i], decoded[i]);
     }
 }
 

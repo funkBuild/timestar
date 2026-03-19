@@ -176,6 +176,9 @@ public:
 
     // --- Debug/maintenance ---
     seastar::future<size_t> getSeriesCount() override;
+    // Synchronous series count — safe to call from Prometheus gauge lambdas
+    // (no coroutine frame, no suspension point).
+    size_t getSeriesCountSync() const;
     seastar::future<> compact() override;
 
     // Non-virtual: insert indexing (template)

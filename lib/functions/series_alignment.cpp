@@ -1,5 +1,7 @@
 #include "series_alignment.hpp"
 
+#include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -44,6 +46,7 @@ std::vector<double> SeriesAlignment::alignSeries(const std::vector<double>& valu
     if (timestamps.empty() || values.empty()) {
         return {};
     }
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
     if (targetInterval == 0) {
         return values;
     }

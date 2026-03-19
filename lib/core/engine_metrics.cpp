@@ -33,7 +33,7 @@ void EngineMetrics::setup(Engine& engine) {
                 sm::description("Number of TSM files on this shard")),
             sm::make_gauge(
                 "index_series_count",
-                [&engine] { return static_cast<int64_t>(engine.getIndex().getSeriesCount().get()); },
+                [&engine] { return static_cast<int64_t>(engine.getIndex().getSeriesCountSync()); },
                 sm::description("Number of indexed series on this shard")),
         });
 }

@@ -47,7 +47,7 @@ public:
     /**
      * Sanitize input string by removing/replacing dangerous characters
      */
-    static std::string sanitizeInput(const std::string& input);
+    static std::string sanitizeInput(const std::string& input, size_t maxLength = MAX_QUERY_LENGTH);
 
     /**
      * Check if input contains dangerous patterns

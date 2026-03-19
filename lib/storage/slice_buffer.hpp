@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -145,6 +146,7 @@ public:
             offset++;
             bitOffset = 0;
         }
+        assert(bitOffset == 0 && "readAlignedWords requires word-aligned state");
         if (offset + count > length_) [[unlikely]] {
             throw std::runtime_error("CompressedSlice::readAlignedWords - read past end of buffer");
         }
@@ -165,6 +167,7 @@ public:
             offset++;
             bitOffset = 0;
         }
+        assert(bitOffset == 0 && "skipWords requires word-aligned state");
         offset += count;
         // bitOffset stays 0 (aligned)
     }
@@ -214,7 +217,7 @@ public:
         return (length_ - offset) / sizeof(T);
     }
 
-    size_t remaining() { return length_ - offset; }
+    size_t remaining() const { return length_ - offset; }
 
     std::string readString(size_t byteLength) {
         if (offset + byteLength > length_) {
@@ -228,7 +231,7 @@ public:
         return thisString;
     }
 
-    size_t bytesLeft() { return length_ - offset; }
+    size_t bytesLeft() const { return length_ - offset; }
 
     Slice getSlice(size_t byteLength) {
         if (offset + byteLength > length_) {

@@ -463,10 +463,19 @@ std::string FunctionHttpHandler::handleFunctionValidationSync(const seastar::htt
             return "{\"status\":\"success\",\"valid\":true}";
         }
 
-        else if (functionName == "add" || functionName == "multiply") {
-            // Check for value parameter
-            if (parameters.find("\"value\"") == std::string::npos) {
-                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: value\"}";
+        else if (functionName == "multiply") {
+            // Check for factor parameter
+            if (parameters.find("\"factor\"") == std::string::npos) {
+                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: factor\"}";
+            }
+
+            return "{\"status\":\"success\",\"valid\":true}";
+        }
+
+        else if (functionName == "add") {
+            // Check for operand parameter
+            if (parameters.find("\"operand\"") == std::string::npos) {
+                return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: operand\"}";
             }
 
             return "{\"status\":\"success\",\"valid\":true}";
@@ -755,8 +764,14 @@ std::string FunctionHttpHandler::handleFunctionQuerySync(const seastar::http::re
 }
 
 std::string FunctionHttpHandler::handleMultiSeriesOperation(
-    const std::string& functionQuery, uint64_t startTimeVal, uint64_t endTimeVal,
-    const std::chrono::high_resolution_clock::time_point& startTime) {
+    const std::string& functionQuery, [[maybe_unused]] uint64_t startTimeVal, [[maybe_unused]] uint64_t endTimeVal,
+    [[maybe_unused]] const std::chrono::high_resolution_clock::time_point& startTime) {
+    // Multi-series function query endpoint is not yet connected to the storage engine.
+    // Return an explicit error rather than fabricated data.
+    (void)functionQuery;
+    return R"({"success": false, "error": "Multi-series function query endpoint not yet connected to storage engine"})";
+
+#if 0  // Original mock implementation — kept for reference during engine integration
     try {
         // Parse multi-series function syntax: add(query1, query2)
         // Extract the function parameters between outer parentheses
@@ -912,6 +927,7 @@ std::string FunctionHttpHandler::handleMultiSeriesOperation(
     } catch (const std::exception& e) {
         return "{\"success\": false, \"error\": \"" + jsonEscape(e.what()) + "\"}";
     }
+#endif  // mock implementation
 }
 
 std::string FunctionHttpHandler::handlePerformanceStatsSync() {

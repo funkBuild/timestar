@@ -246,23 +246,6 @@ private:
     // Generate output filename for compacted file
     std::string generateCompactedFilename(uint64_t tier, uint64_t seqNum);
 
-    // Merge series data from multiple files
-    template <typename T>
-    seastar::future<> mergeSeries(const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-                                  TSMWriter& writer, CompactionStats& stats);
-
-    // Phase 2.2: Merge series using pre-initialized iterator (for pipeline)
-    // Phase 5.2: Templated on iterator type to support specialized merges
-    template <typename T, typename MergeIterator>
-    seastar::future<> mergeSeriesWithIterator(MergeIterator& merger,
-                                              const std::vector<seastar::shared_ptr<TSM>>& sources, TSMWriter& writer,
-                                              CompactionStats& stats);
-
-    // Phase A: Bulk-load merge (no streaming, minimal async overhead)
-    template <typename T>
-    seastar::future<> mergeSeriesBulk(const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-                                      TSMWriter& writer, CompactionStats& stats);
-
     // Phase 3: Process series for compaction without writing (for parallel processing)
     template <typename T>
     seastar::future<SeriesCompactionData<T>> processSeriesForCompaction(

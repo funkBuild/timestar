@@ -35,12 +35,6 @@ struct DerivedQueryConfig {
 
     // Maximum number of sub-queries allowed
     size_t maxSubQueries = 10;
-
-    // Maximum total points across all sub-queries
-    size_t maxTotalPoints = 10000000;
-
-    // Timeout for the entire derived query (milliseconds)
-    uint64_t timeoutMs = 30000;
 };
 
 // Result type that can be regular, anomaly, or forecast result

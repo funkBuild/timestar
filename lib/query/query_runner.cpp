@@ -652,8 +652,11 @@ static size_t aggregateMemoryStores(WALFileManager* walFileManager, const Series
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
     std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
     timestar::AggregationMethod method) {
-    // Gate 0.5: MEDIAN needs all raw values for nth_element — cannot stream.
-    if (aggregationInterval == 0 && method == timestar::AggregationMethod::MEDIAN) {
+    // Gate 0.5: MEDIAN needs all raw values for nth_element — cannot use
+    // pushdown aggregation (neither bucketed nor non-bucketed), because the
+    // BlockAggregator does not set collectRaw=true and rawValues is never
+    // populated, causing getValue(MEDIAN) to return NaN.
+    if (method == timestar::AggregationMethod::MEDIAN) {
         co_return std::nullopt;
     }
 

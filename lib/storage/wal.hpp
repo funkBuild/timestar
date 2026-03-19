@@ -26,7 +26,12 @@
 class AlignedBuffer;
 class MemoryStore;
 
-enum class WALType { Write = 0, Delete, DeleteRange, Close };
+enum class WALType {
+    Write = 0,
+    Delete,       // Reserved for future use (point-level delete); not currently written
+    DeleteRange,
+    Close
+};
 enum class WALValueType { Float = 0, Boolean, String, Integer };
 
 enum class WALInsertResult { Success, RolloverNeeded };

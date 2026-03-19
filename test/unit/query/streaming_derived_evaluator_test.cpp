@@ -11,7 +11,7 @@ static StreamingDataPoint makePoint(const std::string& measurement, const std::s
     StreamingDataPoint pt;
     pt.measurement = measurement;
     pt.field = field;
-    pt.tags = tags;
+    pt.tags = makeTags(tags);
     pt.timestamp = timestamp;
     pt.value = value;
     return pt;

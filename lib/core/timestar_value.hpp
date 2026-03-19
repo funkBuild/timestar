@@ -70,6 +70,7 @@ public:
     void addValue(uint64_t timestamp, T value) {
         timestamps.push_back(timestamp);
         values.push_back(value);
+        _cachedEstimatedSize.reset();  // invalidate stale size estimate
     }
 
     // Set shared tags (refcounted, zero-copy across multi-field inserts).

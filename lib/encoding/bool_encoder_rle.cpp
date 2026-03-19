@@ -42,14 +42,18 @@ uint64_t BoolEncoderRLE::readVarint(Slice& slice) {
     while (pos < remaining) {
         uint8_t byte = ptr[pos++];
         result |= static_cast<uint64_t>(byte & 0x7F) << shift;
-        if ((byte & 0x80) == 0)
-            break;
+        if ((byte & 0x80) == 0) {
+            // Complete varint — advance slice and return
+            slice.offset += pos;
+            return result;
+        }
         shift += 7;
-        if (shift >= 64)
-            break;  // prevent overflow for malformed data
+        if (shift >= 64) {
+            throw std::runtime_error("BoolEncoderRLE: varint overflow (>64 bits)");
+        }
     }
-    slice.offset += pos;
-    return result;
+    // Loop exited because we ran out of data mid-varint (continuation bit set)
+    throw std::runtime_error("BoolEncoderRLE: truncated varint");
 }
 
 AlignedBuffer BoolEncoderRLE::encode(const std::vector<bool>& values) {
