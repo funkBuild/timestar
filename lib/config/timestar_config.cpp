@@ -317,12 +317,37 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
         if (auto v = envStr(name))
             field = v;
     };
+    auto envBool = [&](const char* name, bool& field) {
+        if (auto v = envStr(name)) {
+            std::string s(v);
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            if (s == "true" || s == "1" || s == "yes") {
+                field = true;
+            } else if (s == "false" || s == "0" || s == "no") {
+                field = false;
+            } else {
+                throw std::runtime_error(std::string("Invalid boolean for ") + name + ": \"" + v +
+                                         "\" (expected true/false/1/0/yes/no)");
+            }
+        }
+    };
+    auto envFlt = [&](const char* name, float& field) {
+        if (auto v = envStr(name)) {
+            try {
+                field = std::stof(v);
+            } catch (const std::exception&) {
+                throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");
+            }
+        }
+    };
 
     // Server
     envU16("TIMESTAR_PORT", cfg.server.port);
     envString("TIMESTAR_LOG_LEVEL", cfg.server.log_level);
     envString("TIMESTAR_DATA_DIR", cfg.server.data_dir);
     envU32("TIMESTAR_SHUTDOWN_TIMEOUT_SECONDS", cfg.server.shutdown_timeout_seconds);
+    envBool("TIMESTAR_AUTH_ENABLED", cfg.server.auth_enabled);
+    envString("TIMESTAR_AUTH_TOKEN", cfg.server.auth_token);
 
     // Storage
     envU64("TIMESTAR_WAL_SIZE_THRESHOLD", cfg.storage.wal_size_threshold);
@@ -350,12 +375,20 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU32("TIMESTAR_INDEX_MAX_OPEN_FILES", cfg.index.max_open_files);
     envU64("TIMESTAR_INDEX_MAX_FILE_SIZE", cfg.index.max_file_size);
     envU64("TIMESTAR_INDEX_SERIES_CACHE_SIZE", cfg.index.series_cache_size);
+    envU64("TIMESTAR_INDEX_METADATA_CACHE_BYTES", cfg.index.metadata_cache_bytes);
+    envU64("TIMESTAR_INDEX_DISCOVERY_CACHE_BYTES", cfg.index.discovery_cache_bytes);
+    envU64("TIMESTAR_INDEX_BLOCK_CACHE_BYTES", cfg.index.block_cache_bytes);
+    envU32("TIMESTAR_INDEX_COMPACTION_RATE_LIMIT_MBPS", cfg.index.compaction_rate_limit_mbps);
 
     // Engine
     envU32("TIMESTAR_RETENTION_SWEEP_INTERVAL_MINUTES", cfg.engine.retention_sweep_interval_minutes);
     envU32("TIMESTAR_MAX_METADATA_RETRY_OPS", cfg.engine.max_metadata_retry_ops);
     envDbl("TIMESTAR_TOMBSTONE_DEAD_FRACTION_THRESHOLD", cfg.engine.tombstone_dead_fraction_threshold);
     envU32("TIMESTAR_MAX_TOMBSTONE_REWRITES_PER_SWEEP", cfg.engine.max_tombstone_rewrites_per_sweep);
+    envU32("TIMESTAR_METADATA_RETRY_INTERVAL_SECONDS", cfg.engine.metadata_retry_interval_seconds);
+    envFlt("TIMESTAR_IO_QUERY_SHARES", cfg.engine.io_priority.query_shares);
+    envFlt("TIMESTAR_IO_WRITE_SHARES", cfg.engine.io_priority.write_shares);
+    envFlt("TIMESTAR_IO_COMPACTION_SHARES", cfg.engine.io_priority.compaction_shares);
 
     // Streaming
     envU32("TIMESTAR_STREAMING_MAX_SUBSCRIPTIONS", cfg.streaming.max_subscriptions_per_shard);

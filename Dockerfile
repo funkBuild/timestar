@@ -123,14 +123,18 @@ RUN useradd -r -s /bin/false -d /var/lib/timestar timestar \
 
 COPY --from=builder /src/build/bin/timestar_http_server /usr/local/bin/timestar_http_server
 
-# Persistent data volume
+# Persistent data volume — shard_N directories are created under WORKDIR
 VOLUME /var/lib/timestar
+WORKDIR /var/lib/timestar
 
 EXPOSE 8086
 
-# Container-friendly defaults
-ENV TIMESTAR_DATA_DIR=/var/lib/timestar \
-    TIMESTAR_OVERPROVISIONED=true
+# Container-friendly defaults:
+#   - No auth (zero-config startup)
+#   - overprovisioned=true (Docker typically shares CPUs)
+#   - No SMP/memory set (Seastar auto-detects all CPUs and available RAM)
+# All overridable via TIMESTAR_* env vars (see docs or --dump-config).
+ENV TIMESTAR_OVERPROVISIONED=true
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
     CMD wget -q --spider http://localhost:8086/health || exit 1

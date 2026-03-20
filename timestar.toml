@@ -1,0 +1,31 @@
+# TimeStar Example Configuration
+#
+# This file is NOT required. TimeStar starts with sensible defaults and all
+# settings can be overridden via TIMESTAR_* environment variables.
+#
+# Usage:
+#   timestar_http_server --config /path/to/timestar.toml
+#
+# To see all defaults:
+#   timestar_http_server --dump-config
+
+[server]
+port = 8086
+log_level = "info"
+# auth_enabled = true
+# auth_token = "my-secret-api-key"
+
+[storage]
+# wal_size_threshold = 16777216     # 16 MiB
+# max_points_per_block = 3000
+# tsm_bloom_fpr = 0.01
+
+# [storage.compaction]
+# max_concurrent = 2
+# batch_size = 10000
+
+[seastar]
+# Omit smp and memory to auto-detect all CPUs and available RAM.
+# smp = 4
+# memory = "8G"
+overprovisioned = true
