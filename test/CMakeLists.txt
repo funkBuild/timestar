@@ -18,6 +18,7 @@ file(GLOB_RECURSE UNIT_HTTP_TESTS unit/http/*.cpp)
 file(GLOB_RECURSE UNIT_CORE_TESTS unit/core/*.cpp)
 file(GLOB_RECURSE UNIT_RETENTION_TESTS unit/retention/*.cpp)
 file(GLOB_RECURSE UNIT_FUNCTIONS_TESTS unit/functions/*.cpp)
+file(GLOB_RECURSE UNIT_UTILS_TESTS unit/utils/*.cpp)
 file(GLOB_RECURSE INTEGRATION_TESTS integration/*.cpp)
 file(GLOB_RECURSE E2E_TESTS e2e/*.cpp)
 file(GLOB_RECURSE PERFORMANCE_TESTS performance/*.cpp)
@@ -48,6 +49,7 @@ set(TEST_SRCS
     ${UNIT_CORE_TESTS}
     ${UNIT_RETENTION_TESTS}
     ${UNIT_FUNCTIONS_TESTS}
+    ${UNIT_UTILS_TESTS}
     ${INTEGRATION_TESTS}
     ${E2E_TESTS}
     ${PERFORMANCE_TESTS}

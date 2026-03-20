@@ -1,10 +1,8 @@
 name: Docker Publish
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [main]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -14,7 +12,6 @@ jobs:
   docker:
     name: Build & Push Docker Image
     runs-on: ubuntu-24.04
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: Checkout repository
@@ -24,9 +21,18 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Read version
+      - name: Extract version from release tag
         id: version
-        run: echo "version=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+        run: |
+          # Strip 'v' prefix if present (v1.2.3 -> 1.2.3)
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          # Extract major.minor for short tag (1.2.3 -> 1.2)
+          MAJOR_MINOR="${TAG%.*}"
+          echo "major_minor=${MAJOR_MINOR}" >> "$GITHUB_OUTPUT"
+          # Extract major for short tag (1.2.3 -> 1)
+          MAJOR="${TAG%%.*}"
+          echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -46,18 +52,8 @@ jobs:
             ENABLE_LTO=ON
           tags: |
             funkbuild/timestar:${{ steps.version.outputs.version }}
+            funkbuild/timestar:${{ steps.version.outputs.major_minor }}
+            funkbuild/timestar:${{ steps.version.outputs.major }}
             funkbuild/timestar:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Bump patch version
-        run: |
-          current=$(cat VERSION | tr -d '[:space:]')
-          IFS='.' read -r major minor patch <<< "$current"
-          next="${major}.${minor}.$((patch + 1))"
-          echo "$next" > VERSION
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION
-          git commit -m "Bump version to ${next} [skip ci]"
-          git push

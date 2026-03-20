@@ -11,20 +11,16 @@
 namespace timestar {
 
 bool constantTimeEquals(std::string_view a, std::string_view b) {
-    // Constant-time comparison: always iterate the full length of b to avoid
-    // leaking the expected token's content through timing.  The XOR accumulator
-    // ensures we don't short-circuit on the first differing byte.
+    // Constant-time comparison: always iterate max(a.size(), b.size()) to avoid
+    // leaking either token's length through timing. The XOR accumulator ensures
+    // we don't short-circuit on the first differing byte.
     uint8_t result = static_cast<uint8_t>(a.size() != b.size());
 
-    // Only enter the XOR loop when a is non-empty.  When a is empty and b is
-    // not, result is already 1 (size mismatch), so skipping the loop is safe
-    // and avoids the UB of indexing into an empty string_view.
-    if (!a.empty()) {
-        const size_t len = b.size();
-        const size_t aLen = a.size();
-        for (size_t i = 0; i < len; ++i) {
-            result |= static_cast<uint8_t>(a[i % aLen] ^ b[i]);
-        }
+    const size_t len = std::max(a.size(), b.size());
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t ca = (i < a.size()) ? static_cast<uint8_t>(a[i]) : 0;
+        uint8_t cb = (i < b.size()) ? static_cast<uint8_t>(b[i]) : 0;
+        result |= ca ^ cb;
     }
 
     // Compiler barrier: prevent the optimizer from converting the accumulated
@@ -64,8 +60,7 @@ std::unique_ptr<seastar::http::reply> checkAuth(const seastar::http::request& re
     constexpr std::string_view prefix = "Bearer ";
     // The "Bearer " prefix is public and non-secret; a plain starts_with is
     // fine here.  Constant-time comparison is only needed for the token itself.
-    if (header.size() <= prefix.size() ||
-        !std::string_view(header).starts_with(prefix)) {
+    if (header.size() <= prefix.size() || !std::string_view(header).starts_with(prefix)) {
         return make401Reply("Missing or malformed Authorization header");
     }
 

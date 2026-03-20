@@ -4,10 +4,6 @@
 #include <cstring>
 #include <fstream>
 
-// Static constants for optimization
-constexpr size_t AlignedBuffer::INITIAL_CAPACITY;
-constexpr size_t AlignedBuffer::GROWTH_FACTOR;
-
 template <class T>
 void AlignedBuffer::write(T value) {
     const size_t bytesToAdd = sizeof(T);

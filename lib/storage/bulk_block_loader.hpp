@@ -122,14 +122,25 @@ public:
         // Wait for all reads to complete at once (single await point!)
         auto blockResults = co_await seastar::when_all(blockFutures.begin(), blockFutures.end());
 
-        // Process results (when_all returns vector of futures)
+        // Process results -- consume ALL futures to avoid Seastar assertion
+        // on exceptional futures that are destroyed without being consumed.
+        std::exception_ptr firstError;
         for (auto& future : blockResults) {
-            auto block = std::move(future.get());
-            if (block && !block->timestamps.empty()) {
-                result.totalPoints += block->timestamps.size();
-                result.blocks.push_back(std::move(block));
+            if (future.failed()) {
+                if (!firstError)
+                    firstError = future.get_exception();
+                else
+                    future.ignore_ready_future();
+            } else {
+                auto block = std::move(future.get());
+                if (block && !block->timestamps.empty()) {
+                    result.totalPoints += block->timestamps.size();
+                    result.blocks.push_back(std::move(block));
+                }
             }
         }
+        if (firstError)
+            std::rethrow_exception(firstError);
 
         co_return result;
     }
@@ -149,12 +160,22 @@ public:
 
         std::vector<SeriesBlocks<T>> allBlocks;
         allBlocks.reserve(files.size());
+        std::exception_ptr firstError;
         for (auto& f : results) {
-            auto blocks = f.get();
-            if (!blocks.blocks.empty()) {
-                allBlocks.push_back(std::move(blocks));
+            if (f.failed()) {
+                if (!firstError)
+                    firstError = f.get_exception();
+                else
+                    f.ignore_ready_future();
+            } else {
+                auto blocks = f.get();
+                if (!blocks.blocks.empty()) {
+                    allBlocks.push_back(std::move(blocks));
+                }
             }
         }
+        if (firstError)
+            std::rethrow_exception(firstError);
 
         co_return allBlocks;
     }
@@ -395,7 +416,9 @@ public:
 
     bool hasNext() const { return !minHeap.empty(); }
 
-    // Get next point (NO ASYNC!)
+    // Get next deduplicated point (NO ASYNC!)
+    // For equal timestamps, the heap orders by fileRank descending (newest first),
+    // so the first pop yields the authoritative value. Remaining duplicates are consumed.
     std::pair<uint64_t, T> next() {
         auto item = minHeap.top();
         minHeap.pop();
@@ -410,31 +433,30 @@ public:
             minHeap.push({ctx.currentTimestamp(), item.contextIndex, ctx.getFileRank()});
         }
 
+        // Consume duplicates from other sources at the same timestamp
+        while (!minHeap.empty() && minHeap.top().timestamp == timestamp) {
+            auto dupItem = minHeap.top();
+            minHeap.pop();
+
+            auto& dupCtx = contexts[dupItem.contextIndex];
+            dupCtx.advance();
+
+            if (dupCtx.hasMore()) {
+                minHeap.push({dupCtx.currentTimestamp(), dupItem.contextIndex, dupCtx.getFileRank()});
+            }
+        }
+
         return {timestamp, value};
     }
 
     // Get next batch (NO ASYNC!)
+    // next() already handles dedup, so just collect points.
     std::vector<std::pair<uint64_t, T>> nextBatch(size_t maxPoints = 1000) {
         std::vector<std::pair<uint64_t, T>> batch;
         batch.reserve(maxPoints);
 
         while (hasNext() && batch.size() < maxPoints) {
-            auto [timestamp, value] = next();
-
-            // Skip duplicates from other sources (keep newest file's value)
-            while (hasNext() && !minHeap.empty() && minHeap.top().timestamp == timestamp) {
-                auto dupItem = minHeap.top();
-                minHeap.pop();
-
-                auto& dupCtx = contexts[dupItem.contextIndex];
-                dupCtx.advance();
-
-                if (dupCtx.hasMore()) {
-                    minHeap.push({dupCtx.currentTimestamp(), dupItem.contextIndex, dupCtx.getFileRank()});
-                }
-            }
-
-            batch.push_back({timestamp, value});
+            batch.push_back(next());
         }
 
         return batch;

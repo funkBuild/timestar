@@ -120,7 +120,7 @@ inline size_t appendRaw(std::string& buf, size_t pos, std::string_view sv) {
 
 inline size_t appendChar(std::string& buf, size_t pos, char c) {
     if (pos >= buf.size()) {
-        buf.resize(buf.size() * 2);
+        buf.resize(std::max(buf.size() * 2, pos + 1));
     }
     buf[pos] = c;
     return pos + 1;

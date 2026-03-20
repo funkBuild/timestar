@@ -1331,353 +1331,6 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     co_return WriteResult{std::move(aggregatedTiming), std::move(metaOps)};
 }
 
-HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const std::string& json, uint64_t defaultTimestampNs) {
-    WritePoint wp;
-
-    GlazeWritePoint glazePoint;
-    auto error = glz::read_json(glazePoint, json);
-    if (error) {
-        throw std::invalid_argument("Failed to parse write point: " + std::string(glz::format_error(error)));
-    }
-
-    wp.measurement = glazePoint.measurement;
-    wp.tags = glazePoint.tags;
-
-    // Validate measurement and tag names before any processing
-    {
-        auto err = validateName(wp.measurement, "Measurement name");
-        if (!err.empty())
-            throw std::invalid_argument(err);
-        for (const auto& [key, value] : wp.tags) {
-            err = validateName(key, "Tag key '" + key + "'");
-            if (!err.empty())
-                throw std::invalid_argument(err);
-            err = validateTagValue(value, "Tag value for '" + key + "'");
-            if (!err.empty())
-                throw std::invalid_argument(err);
-        }
-    }
-
-    // Parse fields
-    if (!glazePoint.fields.is_object()) {
-        throw std::invalid_argument("'fields' must be an object");
-    }
-
-    auto& fields_obj = glazePoint.fields.get<json_value_t::object_t>();
-    if (fields_obj.empty()) {
-        throw std::invalid_argument("'fields' object cannot be empty");
-    }
-
-    for (auto& [fieldName, fieldValue] : fields_obj) {
-        // Validate field name (fast path avoids string allocation for valid names)
-        if (!isValidName(fieldName)) {
-            auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-            if (!err.empty())
-                throw std::invalid_argument(err);
-        }
-
-        if (fieldValue.is_number()) {
-            if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
-                wp.fields[fieldName] = fieldValue.as<int64_t>();
-            } else {
-                wp.fields[fieldName] = fieldValue.get<double>();
-            }
-        } else if (fieldValue.is_boolean()) {
-            wp.fields[fieldName] = fieldValue.get<bool>();
-        } else if (fieldValue.is_string()) {
-            auto str_value = fieldValue.get<std::string>();
-            wp.fields[fieldName] = str_value;
-            LOG_INSERT_PATH(timestar::http_log, debug,
-                            "[WRITE] Single write: detected string field '{}' with value: '{}'", fieldName, str_value);
-        } else {
-            throw std::invalid_argument("Unsupported field type for field: " + fieldName);
-        }
-    }
-
-    // Parse timestamp, falling back to the caller-supplied default
-    if (glazePoint.timestamp) {
-        wp.timestamp = *glazePoint.timestamp;
-    } else {
-        wp.timestamp = defaultTimestampNs;
-    }
-
-    return wp;
-}
-
-HttpWriteHandler::WritePoint HttpWriteHandler::parseWritePoint(const json_value_t& doc, uint64_t defaultTimestampNs) {
-    WritePoint wp;
-
-    // Extract fields directly from the already-parsed json_value_t, avoiding
-    // a redundant re-parse of the raw JSON string.
-
-    if (!doc.is_object()) {
-        throw std::invalid_argument("Write point must be a JSON object");
-    }
-    auto& obj = doc.get<json_value_t::object_t>();
-
-    // Extract measurement
-    auto measurementIt = obj.find("measurement");
-    if (measurementIt == obj.end() || !measurementIt->second.is_string()) {
-        throw std::invalid_argument("Missing or invalid 'measurement' field");
-    }
-    wp.measurement = measurementIt->second.get<std::string>();
-
-    // Extract tags
-    auto tagsIt = obj.find("tags");
-    if (tagsIt != obj.end() && tagsIt->second.is_object()) {
-        auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
-        for (const auto& [tagKey, tagValue] : tagsObj) {
-            if (tagValue.is_string()) {
-                wp.tags[tagKey] = tagValue.get<std::string>();
-            }
-        }
-    }
-
-    // Validate measurement and tag names before any processing
-    {
-        auto err = validateName(wp.measurement, "Measurement name");
-        if (!err.empty())
-            throw std::invalid_argument(err);
-        for (const auto& [key, value] : wp.tags) {
-            err = validateName(key, "Tag key '" + key + "'");
-            if (!err.empty())
-                throw std::invalid_argument(err);
-            err = validateTagValue(value, "Tag value for '" + key + "'");
-            if (!err.empty())
-                throw std::invalid_argument(err);
-        }
-    }
-
-    // Parse fields
-    auto fieldsIt = obj.find("fields");
-    if (fieldsIt == obj.end() || !fieldsIt->second.is_object()) {
-        throw std::invalid_argument("'fields' must be an object");
-    }
-
-    auto& fields_obj = fieldsIt->second.get<json_value_t::object_t>();
-    if (fields_obj.empty()) {
-        throw std::invalid_argument("'fields' object cannot be empty");
-    }
-
-    for (auto& [fieldName, fieldValue] : fields_obj) {
-        // Validate field name (fast path avoids string allocation for valid names)
-        if (!isValidName(fieldName)) {
-            auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-            if (!err.empty())
-                throw std::invalid_argument(err);
-        }
-
-        if (fieldValue.is_number()) {
-            if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
-                wp.fields[fieldName] = fieldValue.as<int64_t>();
-            } else {
-                wp.fields[fieldName] = fieldValue.as<double>();
-            }
-        } else if (fieldValue.is_boolean()) {
-            wp.fields[fieldName] = fieldValue.get<bool>();
-        } else if (fieldValue.is_string()) {
-            auto str_value = fieldValue.get<std::string>();
-            wp.fields[fieldName] = str_value;
-            LOG_INSERT_PATH(timestar::http_log, debug,
-                            "[WRITE] Single write: detected string field '{}' with value: '{}'", fieldName, str_value);
-        } else {
-            throw std::invalid_argument("Unsupported field type for field: " + fieldName);
-        }
-    }
-
-    // Parse timestamp, falling back to the caller-supplied default
-    auto timestampIt = obj.find("timestamp");
-    if (timestampIt != obj.end() && timestampIt->second.is_number()) {
-        wp.timestamp = timestampIt->second.as<uint64_t>();
-    } else {
-        wp.timestamp = defaultTimestampNs;
-    }
-
-    return wp;
-}
-
-seastar::future<> HttpWriteHandler::processWritePoint(const WritePoint& point) {
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_total = std::chrono::high_resolution_clock::now();
-#endif
-
-    // Insert data before metadata for crash safety: if data insert succeeds but
-    // metadata indexing fails, the data is still durable and discoverable on retry.
-    // The reverse order (metadata first) would create phantom metadata entries
-    // pointing to nonexistent data if the data insert fails.
-
-    // Group inserts by shard to dispatch all fields in parallel rather than
-    // sequentially. For a point with N fields, this reduces up to 2*N sequential
-    // cross-shard round trips down to one parallel fan-out + one metadata dispatch.
-    // Use pre-sized vectors indexed by shard ID for O(1) access and cache locality,
-    // since shard IDs are dense integers in [0, smp::count).
-    const size_t shardCount = seastar::smp::count;
-    std::vector<std::vector<TimeStarInsert<double>>> shardDoubleInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<bool>>> shardBoolInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<std::string>>> shardStringInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegerInserts(shardCount);
-    std::vector<MetaOp> metaOps;
-
-    // Share tags across all field inserts to avoid N copies for N fields.
-    // For single-point writes this is a minor win, but for multi-field points
-    // it eliminates all tag copies (only shared_ptr refcount increments).
-    auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(point.tags);
-
-    // Pre-build the measurement+tags prefix once for series key construction
-    std::string seriesKeyPrefix;
-    {
-        size_t prefixSize = point.measurement.size();
-        for (const auto& [tagKey, tagValue] : *sharedTags) {
-            prefixSize += 1 + tagKey.size() + 1 + tagValue.size();
-        }
-        seriesKeyPrefix.reserve(prefixSize);
-        seriesKeyPrefix = point.measurement;
-        for (const auto& [tagKey, tagValue] : *sharedTags) {
-            seriesKeyPrefix += ',';
-            seriesKeyPrefix += tagKey;
-            seriesKeyPrefix += '=';
-            seriesKeyPrefix += tagValue;
-        }
-    }
-
-    for (const auto& [fieldName, fieldValue] : point.fields) {
-        // Build the complete series key for sharding (no temporaries)
-        std::string seriesKey;
-        seriesKey.reserve(seriesKeyPrefix.size() + 1 + fieldName.size());
-        seriesKey = seriesKeyPrefix;
-        seriesKey += ' ';
-        seriesKey += fieldName;
-
-        // Compute SeriesId128 ONCE per field for shard routing.
-        SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-        size_t shard = timestar::routeToCore(seriesId);
-
-        // Handle each variant type explicitly, accumulating into per-shard vectors
-        if (std::holds_alternative<double>(fieldValue)) {
-            double value = std::get<double>(fieldValue);
-            TimeStarInsert<double> insert(point.measurement, fieldName);
-            insert.setSharedTags(sharedTags);
-            insert.setCachedSeriesKey(std::move(seriesKey));
-            insert.setCachedSeriesId128(seriesId);
-            insert.addValue(point.timestamp, value);
-            shardDoubleInserts[shard].push_back(std::move(insert));
-            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
-
-        } else if (std::holds_alternative<bool>(fieldValue)) {
-            bool value = std::get<bool>(fieldValue);
-            TimeStarInsert<bool> insert(point.measurement, fieldName);
-            insert.setSharedTags(sharedTags);
-            insert.setCachedSeriesKey(std::move(seriesKey));
-            insert.setCachedSeriesId128(seriesId);
-            insert.addValue(point.timestamp, value);
-            shardBoolInserts[shard].push_back(std::move(insert));
-            metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
-
-        } else if (std::holds_alternative<std::string>(fieldValue)) {
-            const std::string& value = std::get<std::string>(fieldValue);
-            TimeStarInsert<std::string> insert(point.measurement, fieldName);
-            insert.setSharedTags(sharedTags);
-            insert.setCachedSeriesKey(std::move(seriesKey));
-            insert.setCachedSeriesId128(seriesId);
-            insert.addValue(point.timestamp, value);
-
-            LOG_INSERT_PATH(
-                timestar::http_log, debug,
-                "[WRITE] Processing single string insert - field: '{}', value: '{}', timestamp: {}, shard: {}",
-                fieldName, value, point.timestamp, shard);
-            LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] String series key: '{}'", insert.seriesKey());
-
-            shardStringInserts[shard].push_back(std::move(insert));
-            metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
-
-        } else if (std::holds_alternative<int64_t>(fieldValue)) {
-            int64_t value = std::get<int64_t>(fieldValue);
-            TimeStarInsert<int64_t> insert(point.measurement, fieldName);
-            insert.setSharedTags(sharedTags);
-            insert.setCachedSeriesKey(std::move(seriesKey));
-            insert.setCachedSeriesId128(seriesId);
-            insert.addValue(point.timestamp, value);
-            shardIntegerInserts[shard].push_back(std::move(insert));
-            metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
-        }
-    }
-
-    // Dispatch all shards in parallel using insertBatch for efficiency.
-    // Iterate over the pre-sized vectors directly, skipping empty shards.
-    std::vector<seastar::future<>> shardFutures;
-    shardFutures.reserve(shardCount);
-
-    for (size_t shard = 0; shard < shardCount; ++shard) {
-        // Skip shards with no work - O(1) emptiness check on each vector
-        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() && shardStringInserts[shard].empty() &&
-            shardIntegerInserts[shard].empty()) [[likely]] {
-            continue;
-        }
-
-        // Move this shard's inserts directly from the pre-sized vectors
-        auto doubles = std::move(shardDoubleInserts[shard]);
-        auto bools = std::move(shardBoolInserts[shard]);
-        auto strings = std::move(shardStringInserts[shard]);
-        auto integers = std::move(shardIntegerInserts[shard]);
-
-        shardFutures.push_back(engineSharded->invoke_on(
-            shard,
-            [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
-             integers = std::move(integers)](Engine& engine) mutable -> seastar::future<> {
-                // Use insertBatch when multiple inserts target the same shard,
-                // otherwise fall back to single insert for less overhead.
-                // skipMetadataIndexing=true because we index metadata separately below.
-                if (!doubles.empty()) {
-                    if (doubles.size() == 1) {
-                        co_await engine.insert(std::move(doubles[0]), true);
-                    } else {
-                        co_await engine.insertBatch(std::move(doubles));
-                    }
-                }
-                if (!bools.empty()) {
-                    if (bools.size() == 1) {
-                        co_await engine.insert(std::move(bools[0]), true);
-                    } else {
-                        co_await engine.insertBatch(std::move(bools));
-                    }
-                }
-                if (!strings.empty()) {
-                    if (strings.size() == 1) {
-                        co_await engine.insert(std::move(strings[0]), true);
-                    } else {
-                        co_await engine.insertBatch(std::move(strings));
-                    }
-                }
-                if (!integers.empty()) {
-                    if (integers.size() == 1) {
-                        co_await engine.insert(std::move(integers[0]), true);
-                    } else {
-                        co_await engine.insertBatch(std::move(integers));
-                    }
-                }
-            }));
-    }
-
-    // Wait for all shard inserts to complete in parallel
-    size_t numShards = shardFutures.size();
-    co_await seastar::when_all_succeed(std::move(shardFutures));
-
-    // Synchronous metadata indexing: await completion so metadata is queryable
-    // before the write response is returned (no write hole).
-    if (!metaOps.empty()) {
-        co_await engineSharded->local().indexMetadataSync(std::move(metaOps));
-    }
-
-#if TIMESTAR_LOG_INSERT_PATH
-    auto end_total = std::chrono::high_resolution_clock::now();
-    auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
-    LOG_INSERT_PATH(timestar::http_log, info, "[PERF] [HTTP] processWritePoint: {}us ({} fields, {} shards)",
-                    total_duration.count(), point.fields.size(), numShards);
-#endif
-
-    co_return;
-}
-
 std::string HttpWriteHandler::createErrorResponse(const std::string& error) {
     // Create JSON object directly
     auto response = glz::obj{"status", "error", "message", error};
@@ -1704,8 +1357,8 @@ std::string HttpWriteHandler::createSuccessResponse(int64_t pointsWritten) {
 
 std::string HttpWriteHandler::createPartialFailureResponse(int64_t pointsWritten, int64_t failedWrites,
                                                            const std::vector<std::string>& errors) {
-    auto response = glz::obj{"status", "partial", "points_written", pointsWritten, "failed_writes", failedWrites,
-                             "errors", errors};
+    auto response =
+        glz::obj{"status", "partial", "points_written", pointsWritten, "failed_writes", failedWrites, "errors", errors};
 
     std::string buffer;
     auto ec = glz::write_json(response, buffer);
@@ -1802,8 +1455,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                             throw std::invalid_argument(error);
                         }
 
-                        pointsWritten = static_cast<int64_t>(mwp.timestamps.size()) *
-                                        static_cast<int64_t>(mwp.fields.size());
+                        pointsWritten =
+                            static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
 
                         auto writeResult = co_await processMultiWritePoint(mwp);
 
@@ -1846,9 +1499,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                         constexpr size_t MAX_BATCH_WRITES = 100000;
                         if (writes_array.size() > MAX_BATCH_WRITES) {
                             rep->set_status(seastar::http::reply::status_type::bad_request);
-                            rep->_content = createErrorResponse(
-                                "Batch too large: " + std::to_string(writes_array.size()) +
-                                " writes exceeds maximum of " + std::to_string(MAX_BATCH_WRITES));
+                            rep->_content =
+                                createErrorResponse("Batch too large: " + std::to_string(writes_array.size()) +
+                                                    " writes exceeds maximum of " + std::to_string(MAX_BATCH_WRITES));
                             rep->add_header("Content-Type", "application/json");
                             co_return rep;
                         }
@@ -1873,8 +1526,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                         std::vector<int64_t> perMwpPoints;
                         perMwpPoints.reserve(coalescedWrites.size());
                         for (const auto& mwp : coalescedWrites) {
-                            auto pts = static_cast<int64_t>(mwp.timestamps.size()) *
-                                       static_cast<int64_t>(mwp.fields.size());
+                            auto pts =
+                                static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
                             pointsWritten += pts;
                             perMwpPoints.push_back(pts);
                             std::string error;
@@ -1936,8 +1589,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                         throw std::invalid_argument(error);
                     }
 
-                    pointsWritten = static_cast<int64_t>(mwp.timestamps.size()) *
-                                    static_cast<int64_t>(mwp.fields.size());
+                    pointsWritten =
+                        static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
 
                     auto writeResult = co_await processMultiWritePoint(mwp);
 
@@ -1989,13 +1642,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 
 void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto* handler = new seastar::httpd::function_handler(
-        timestar::wrapWithAuth(authToken,
+        timestar::wrapWithAuth(
+            authToken,
             [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
                 -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleWrite(std::move(req)); }),
         "json");
 
     r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/write"), handler);
 
-    timestar::http_log.info("Registered HTTP write endpoint at /write{}",
-                            authToken.empty() ? "" : " (auth required)");
+    timestar::http_log.info("Registered HTTP write endpoint at /write{}", authToken.empty() ? "" : " (auth required)");
 }

@@ -226,7 +226,8 @@ inline std::vector<double> integral(const std::vector<double>& values, const std
         return std::vector<double>(values.size(), std::nan(""));
     }
 
-    if (values.empty()) return {};
+    if (values.empty())
+        return {};
 
     std::vector<double> result(values.size());
     double area = 0.0;
@@ -626,12 +627,15 @@ inline std::vector<double> moving_rollup(const std::vector<double>& values, cons
         for (size_t i = 0; i < n; ++i) {
             uint64_t windowStart = (timestamps[i] > windowNs) ? timestamps[i] - windowNs : 0;
 
-            // Remove elements that fell out of the window from the front
+            // Remove elements that fell out of the window from the front.
+            // Advance `start` past all out-of-window positions, then drain
+            // any deque front entries that are now before the window start
+            // (these may have been skipped if NaN positions were never inserted).
             while (start < i && timestamps[start] < windowStart) {
-                if (!dq.empty() && dq.front() == start) {
-                    dq.pop_front();
-                }
                 ++start;
+            }
+            while (!dq.empty() && dq.front() < start) {
+                dq.pop_front();
             }
 
             // Only insert non-NaN values into the deque
@@ -687,16 +691,6 @@ inline std::vector<uint64_t> timeshift(const std::vector<uint64_t>& timestamps, 
 // ============================================================================
 // Rank Functions - Select top/bottom N series
 // ============================================================================
-
-/**
- * Series data structure for ranking functions
- */
-struct RankedSeries {
-    size_t index;  // Original series index
-    std::vector<double> values;
-    std::vector<std::string> tags;  // Series identifying tags
-    double rankValue;               // Value used for ranking
-};
 
 /**
  * Calculate ranking value for a series using specified method
@@ -1150,13 +1144,6 @@ inline std::vector<double> piecewise_constant(const std::vector<double>& values,
     std::vector<size_t> changePoints;
     changePoints.push_back(0);
 
-    std::vector<double> cusum(validValues.size());
-    cusum[0] = 0;
-
-    for (size_t i = 1; i < validValues.size(); ++i) {
-        cusum[i] = cusum[i - 1] + (validValues[i] - globalMean);
-    }
-
     // Find significant changes
     for (size_t i = minSegmentSize; i < validValues.size() - minSegmentSize; ++i) {
         // Check if this point is a local maximum of |CUSUM|
@@ -1440,7 +1427,7 @@ inline std::vector<OutlierResult> outliers(const std::vector<std::vector<double>
             double dataRange = *std::max_element(valuesAtT.begin(), valuesAtT.end()) -
                                *std::min_element(valuesAtT.begin(), valuesAtT.end());
             double epsilon = dataRange / tolerance;
-            size_t minPoints = std::max(2UL, valuesAtT.size() / 4);
+            size_t minPoints = std::max<size_t>(2, valuesAtT.size() / 4);
 
             auto clusters = dbscan1D(valuesAtT, epsilon, minPoints);
 
@@ -1571,7 +1558,7 @@ inline std::vector<std::vector<bool>> outliers_mask(const std::vector<std::vecto
             double dataRange = *std::max_element(valuesAtT.begin(), valuesAtT.end()) -
                                *std::min_element(valuesAtT.begin(), valuesAtT.end());
             double epsilon = dataRange / tolerance;
-            size_t minPoints = std::max(2UL, valuesAtT.size() / 4);
+            size_t minPoints = std::max<size_t>(2, valuesAtT.size() / 4);
 
             auto clusters = dbscan1D(valuesAtT, epsilon, minPoints);
 

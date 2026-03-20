@@ -47,14 +47,18 @@ protected:
     // Extract function body by name
     std::string extractFunction(const std::string& signature) const {
         auto pos = sourceCode.find(signature);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         auto braceStart = sourceCode.find('{', pos);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
         int depth = 1;
         size_t i = braceStart + 1;
         while (i < sourceCode.size() && depth > 0) {
-            if (sourceCode[i] == '{') depth++;
-            else if (sourceCode[i] == '}') depth--;
+            if (sourceCode[i] == '{')
+                depth++;
+            else if (sourceCode[i] == '}')
+                depth--;
             i++;
         }
         return sourceCode.substr(pos, i - pos);
@@ -129,14 +133,18 @@ protected:
 
     std::string extractFunction(const std::string& signature) const {
         auto pos = sourceCode.find(signature);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         auto braceStart = sourceCode.find('{', pos);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
         int depth = 1;
         size_t i = braceStart + 1;
         while (i < sourceCode.size() && depth > 0) {
-            if (sourceCode[i] == '{') depth++;
-            else if (sourceCode[i] == '}') depth--;
+            if (sourceCode[i] == '{')
+                depth++;
+            else if (sourceCode[i] == '}')
+                depth--;
             i++;
         }
         return sourceCode.substr(pos, i - pos);
@@ -145,15 +153,6 @@ protected:
 
 TEST_F(FunctionHttpHandlerJsonInjectionTest, SourceFileLoaded) {
     ASSERT_FALSE(sourceCode.empty()) << "Could not load function_http_handler.cpp";
-}
-
-TEST_F(FunctionHttpHandlerJsonInjectionTest, GetPerformanceStatsEscapesFunctionNames) {
-    std::string body = extractFunction("getPerformanceStats");
-    ASSERT_FALSE(body.empty()) << "Could not find getPerformanceStats function";
-
-    // pair.first (function name) used as JSON key must be escaped
-    EXPECT_NE(body.find("jsonEscape(pair.first)"), std::string::npos)
-        << "getPerformanceStats must escape function names with jsonEscape()";
 }
 
 TEST_F(FunctionHttpHandlerJsonInjectionTest, CreateErrorReplyEscapesError) {

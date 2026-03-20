@@ -20,8 +20,6 @@ namespace ke = timestar::index::keys;
 
 // Tombstone sentinel: a single null byte distinguishes SSTable tombstones from
 // legitimate empty-value marker entries (MEASUREMENT_SERIES, MEASUREMENT_FIELD_SERIES).
-// Tombstone sentinel: a single null byte distinguishes SSTable tombstones from
-// legitimate empty-value marker entries (MEASUREMENT_SERIES, MEASUREMENT_FIELD_SERIES).
 static constexpr std::string_view SSTABLE_TOMBSTONE{"\0", 1};
 
 static bool isSstableTombstone(std::string_view value) {
@@ -78,15 +76,9 @@ public:
     SSTableBorrowedIteratorSource(SSTableReader* reader, int priority)
         : iter_(reader->newIterator()), priority_(priority) {}
 
-    seastar::future<> seek(std::string_view target) override {
-        co_await iter_->seek(target);
-    }
-    seastar::future<> seekToFirst() override {
-        co_await iter_->seekToFirst();
-    }
-    seastar::future<> next() override {
-        co_await iter_->next();
-    }
+    seastar::future<> seek(std::string_view target) override { co_await iter_->seek(target); }
+    seastar::future<> seekToFirst() override { co_await iter_->seekToFirst(); }
+    seastar::future<> next() override { co_await iter_->next(); }
 
     // Synchronous fast path — calls .get() on async futures.
     // Safe only inside seastar::async() or when futures are ready (cache hit).
@@ -282,15 +274,21 @@ seastar::future<std::optional<std::string>> NativeIndex::kvGet(std::string_view 
     }
 
     // 3. Check SSTables (newest to oldest = reverse map order by file number)
-    // Capture shared_ptr copy before co_await to prevent use-after-free
-    // if refreshSSTables() removes a reader while we're mid-await.
-    for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
-        auto reader = it->second;  // shared_ptr copy
-        auto result = co_await reader->get(key);
-        if (result.has_value()) {
-            if (isSstableTombstone(*result))
-                co_return std::nullopt;
-            co_return result;
+    // Snapshot readers into a local vector to prevent iterator invalidation
+    // if refreshSSTables() modifies sstableReaders_ during co_await.
+    {
+        std::vector<std::shared_ptr<SSTableReader>> readers;
+        readers.reserve(sstableReaders_.size());
+        for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
+            readers.push_back(it->second);
+        }
+        for (auto& reader : readers) {
+            auto result = co_await reader->get(key);
+            if (result.has_value()) {
+                if (isSstableTombstone(*result))
+                    co_return std::nullopt;
+                co_return result;
+            }
         }
     }
 
@@ -316,15 +314,21 @@ seastar::future<bool> NativeIndex::kvExists(std::string_view key) {
     }
 
     // 3. Check SSTables (newest to oldest).
-    // Use contains() for bloom-filter-based early rejection (avoids copying
-    // the value). Only fall back to get() on a hit to check for tombstones.
-    for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
-        auto reader = it->second;  // shared_ptr copy
-        if (!co_await reader->contains(key))
-            continue;
-        auto result = co_await reader->get(key);
-        if (result.has_value())
-            co_return !isSstableTombstone(*result);
+    // Snapshot readers to prevent iterator invalidation across co_await.
+    {
+        std::vector<std::shared_ptr<SSTableReader>> readers;
+        readers.reserve(sstableReaders_.size());
+        for (auto it = sstableReaders_.rbegin(); it != sstableReaders_.rend(); ++it) {
+            readers.push_back(it->second);
+        }
+        for (auto& reader : readers) {
+            // Use get() directly -- contains() would decompress the same block
+            // only to have get() decompress it again. get() returns nullopt on
+            // bloom-filter rejection, so the fast-path is preserved.
+            auto result = co_await reader->get(key);
+            if (result.has_value())
+                co_return !isSstableTombstone(*result);
+        }
     }
 
     co_return false;
@@ -411,9 +415,14 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
         ++nextPriority;
     }
 
-    // Step 4: Iterate map in ascending file number order (oldest first → highest priority)
+    // Step 4: Iterate map in ascending file number order (oldest first → highest priority).
+    // Snapshot shared_ptrs to keep readers alive for the entire scan duration,
+    // preventing use-after-free if refreshSSTables() runs during co_await.
+    std::vector<std::shared_ptr<SSTableReader>> readerSnapshot;
+    readerSnapshot.reserve(sstableReaders_.size());
     int sstPriority = nextPriority + static_cast<int>(sstableReaders_.size());
     for (auto& [fileNum, reader] : sstableReaders_) {
+        readerSnapshot.push_back(reader);
         sources.push_back(std::make_unique<SSTableBorrowedIteratorSource>(reader.get(), sstPriority));
         --sstPriority;
     }
@@ -1559,15 +1568,8 @@ seastar::future<size_t> NativeIndex::getSeriesCount() {
 }
 
 size_t NativeIndex::getSeriesCountSync() const {
-    // Synchronous wrapper — safe only when all SSTable blocks are cached or in MemTable.
-    // Used by Prometheus gauge lambdas where async is not possible.
-    size_t count = 0;
-    std::string prefix(1, static_cast<char>(SERIES_METADATA));
-    const_cast<NativeIndex*>(this)->kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
-        ++count;
-        return true;
-    }).get();
-    return count;
+    // O(1) via LocalIdMap — no disk I/O, no .get() on futures, no reactor stall.
+    return localIdMap_.size();
 }
 
 seastar::future<> NativeIndex::compact() {
@@ -1695,9 +1697,12 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::st
     bitmapKvKey.push_back(static_cast<char>(POSTINGS_BITMAP));
     bitmapKvKey.append(cacheKey);
 
-    auto& entry = bitmapCache_[cacheKey];
-    entry.dirty = true;
+    // Pre-insert before co_await; do NOT hold a reference across the
+    // suspension point — robin_map rehash would invalidate it.
+    bitmapCache_[cacheKey].dirty = true;
     auto existing = co_await kvGet(bitmapKvKey);
+    // Re-find after co_await (rehash may have moved entries)
+    auto& entry = bitmapCache_[cacheKey];
     if (existing.has_value()) {
         entry.bitmap = roaring::Roaring::readSafe(existing->data(), existing->size());
     }
@@ -1798,9 +1803,12 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
     kvKey.push_back(static_cast<char>(TIME_SERIES_DAY));
     kvKey.append(cacheKey);
 
-    auto& entry = dayBitmapCache_[cacheKey];
-    entry.dirty = true;
+    // Pre-insert before co_await; do NOT hold a reference across the
+    // suspension point — robin_map rehash would invalidate it.
+    dayBitmapCache_[cacheKey].dirty = true;
     auto existing = co_await kvGet(kvKey);
+    // Re-find after co_await (rehash may have moved entries)
+    auto& entry = dayBitmapCache_[cacheKey];
     if (existing.has_value()) {
         entry.bitmap = roaring::Roaring::readSafe(existing->data(), existing->size());
     }
@@ -1989,8 +1997,8 @@ void NativeIndex::trimMeasurementBloomCache() {
     }
 }
 
-seastar::future<roaring::Roaring> NativeIndex::buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay,
-                                                                       uint32_t endDay) {
+seastar::future<roaring::Roaring> NativeIndex::buildActiveSeriesBitmap(const std::string& measurement,
+                                                                       uint32_t startDay, uint32_t endDay) {
     roaring::Roaring result;
     std::string cacheKey;
     for (uint32_t day = startDay; day <= endDay; ++day) {
@@ -2196,8 +2204,8 @@ seastar::future<> NativeIndex::updateHLL(const std::string& measurement, uint32_
     hllCacheDirty_.insert(key);
 }
 
-seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, const std::string& tagKey, const std::string& tagValue,
-                                            uint32_t localId) {
+seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, const std::string& tagKey,
+                                            const std::string& tagValue, uint32_t localId) {
     std::string key;
     key.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key += measurement;
@@ -2323,7 +2331,7 @@ seastar::future<double> NativeIndex::estimateMeasurementCardinality(const std::s
 }
 
 seastar::future<double> NativeIndex::estimateTagCardinality(const std::string& measurement, const std::string& tagKey,
-                                                              const std::string& tagValue) {
+                                                            const std::string& tagValue) {
     std::string key;
     key.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key += measurement;

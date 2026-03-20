@@ -29,11 +29,11 @@ TEST_F(BlockCacheTest, PutThenGet) {
     cache.put(id, 0, "hello");
     cache.put(id, 1, "world");
 
-    const std::string* v0 = cache.get(id, 0);
+    auto v0 = cache.get(id, 0);
     ASSERT_NE(v0, nullptr);
     EXPECT_EQ(*v0, "hello");
 
-    const std::string* v1 = cache.get(id, 1);
+    auto v1 = cache.get(id, 1);
     ASSERT_NE(v1, nullptr);
     EXPECT_EQ(*v1, "world");
 
@@ -129,13 +129,15 @@ TEST_F(BlockCacheTest, EvictsMultipleToFitNewEntry) {
     cache.put(id, 99, std::string(largeSize, 'Z'));
 
     // The large entry should exist
-    ASSERT_NE(cache.get(id, 99), nullptr);
-    EXPECT_EQ(*cache.get(id, 99), std::string(largeSize, 'Z'));
+    auto v = cache.get(id, 99);
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(*v, std::string(largeSize, 'Z'));
 
     // Multiple small entries should have been evicted
     size_t surviving = 0;
     for (size_t i = 0; i < 4; ++i) {
-        if (cache.get(id, i) != nullptr) ++surviving;
+        if (cache.get(id, i) != nullptr)
+            ++surviving;
     }
     EXPECT_LT(surviving, 4u);
 }
@@ -154,7 +156,7 @@ TEST_F(BlockCacheTest, UpdateExistingEntryAdjustsSize) {
     EXPECT_EQ(cache.size(), 1u);
 
     // Verify the data was updated
-    const std::string* v = cache.get(id, 0);
+    auto v = cache.get(id, 0);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, std::string(1000, 'B'));
 
@@ -199,10 +201,12 @@ TEST_F(BlockCacheTest, EvictByCacheIdPreservesOthers) {
     EXPECT_EQ(cache.size(), 2u);
     EXPECT_EQ(cache.get(id1, 0), nullptr);
     EXPECT_EQ(cache.get(id1, 1), nullptr);
-    ASSERT_NE(cache.get(id2, 0), nullptr);
-    EXPECT_EQ(*cache.get(id2, 0), "id2-block0");
-    ASSERT_NE(cache.get(id2, 1), nullptr);
-    EXPECT_EQ(*cache.get(id2, 1), "id2-block1");
+    auto v20 = cache.get(id2, 0);
+    ASSERT_NE(v20, nullptr);
+    EXPECT_EQ(*v20, "id2-block0");
+    auto v21 = cache.get(id2, 1);
+    ASSERT_NE(v21, nullptr);
+    EXPECT_EQ(*v21, "id2-block1");
 }
 
 TEST_F(BlockCacheTest, ByteBudgetIsRespected) {
@@ -217,8 +221,7 @@ TEST_F(BlockCacheTest, ByteBudgetIsRespected) {
     for (size_t i = 0; i < 100; ++i) {
         cache.put(id, i, std::string(50, static_cast<char>('a' + (i % 26))));
         // After inserting small entries, budget should be respected
-        EXPECT_LE(cache.currentBytes(), cache.maxBytes() + 500)
-            << "currentBytes exceeded budget at iteration " << i;
+        EXPECT_LE(cache.currentBytes(), cache.maxBytes() + 500) << "currentBytes exceeded budget at iteration " << i;
     }
     EXPECT_EQ(cache.maxBytes(), budget);
 }
@@ -255,8 +258,7 @@ TEST_F(BlockCacheTest, HitRateAfterEviction) {
     // Re-access indices 2, 3, 4 to promote them to MRU.
     // LRU order (tail=LRU): 5, 6, 7, 8, 9, 2, 3, 4
     for (size_t i = 2; i < 5; ++i) {
-        ASSERT_NE(cache.get(id, i), nullptr)
-            << "Entry " << i << " should still be in cache";
+        ASSERT_NE(cache.get(id, i), nullptr) << "Entry " << i << " should still be in cache";
     }
 
     // Insert 5 more entries (indices 10..14) to force evictions.
@@ -269,16 +271,16 @@ TEST_F(BlockCacheTest, HitRateAfterEviction) {
     // The re-accessed entries (2, 3, 4) should have survived
     size_t reaccessed_hits = 0;
     for (size_t i = 2; i < 5; ++i) {
-        if (cache.get(id, i) != nullptr) ++reaccessed_hits;
+        if (cache.get(id, i) != nullptr)
+            ++reaccessed_hits;
     }
-    EXPECT_EQ(reaccessed_hits, 3u)
-        << "Expected all re-accessed entries to survive eviction";
+    EXPECT_EQ(reaccessed_hits, 3u) << "Expected all re-accessed entries to survive eviction";
 
     // The non-re-accessed entries (5..9) should all be gone
     size_t middle_hits = 0;
     for (size_t i = 5; i < 10; ++i) {
-        if (cache.get(id, i) != nullptr) ++middle_hits;
+        if (cache.get(id, i) != nullptr)
+            ++middle_hits;
     }
-    EXPECT_EQ(middle_hits, 0u)
-        << "Expected non-accessed middle entries to be evicted";
+    EXPECT_EQ(middle_hits, 0u) << "Expected non-accessed middle entries to be evicted";
 }

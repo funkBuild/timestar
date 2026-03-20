@@ -115,8 +115,7 @@ size_t BoolEncoderRLE::encodeInto(const std::vector<bool>& values, AlignedBuffer
             mask = ~0UL << bitOff;  // zero out bits [0, bitOff)
         }
 
-        // Build the expected pattern for the current run value.
-        unsigned long expected = currentValue ? mask : 0UL;
+        // XOR the word against the current run value to find transitions.
         unsigned long xorWord = (word ^ (currentValue ? ~0UL : 0UL)) & mask;
 
         if (xorWord == 0) {
@@ -266,7 +265,7 @@ void BoolEncoderRLE::decode(Slice& encoded, size_t nToSkip, size_t length, std::
     }
 
     if (writePos != out.size()) {
-        throw std::runtime_error("BoolEncoderRLE::decode: emitted " +
-            std::to_string(writePos - basePos) + " values, expected " + std::to_string(out.size() - basePos));
+        throw std::runtime_error("BoolEncoderRLE::decode: emitted " + std::to_string(writePos - basePos) +
+                                 " values, expected " + std::to_string(out.size() - basePos));
     }
 }

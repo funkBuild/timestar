@@ -142,26 +142,4 @@ ALPRDBlockResult ALPRD::encodeBlock(const double* values, size_t count, uint8_t 
     return result;
 }
 
-void ALPRD::decodeBlock(const ALPRDBlockResult& block, size_t count, double* out) {
-    const uint64_t right_mask = (block.right_bit_count == 64) ? ~0ULL : ((1ULL << block.right_bit_count) - 1);
-
-    // Build exception lookup
-    std::unordered_map<uint16_t, uint64_t> exc_map;
-    for (size_t i = 0; i < block.exception_positions.size(); ++i) {
-        exc_map[block.exception_positions[i]] = block.exception_values[i];
-    }
-
-    for (size_t i = 0; i < count; ++i) {
-        auto exc_it = exc_map.find(static_cast<uint16_t>(i));
-        if (exc_it != exc_map.end()) {
-            out[i] = std::bit_cast<double>(exc_it->second);
-        } else {
-            uint64_t left = block.dictionary[block.left_indices[i]];
-            uint64_t right = block.right_parts[i];
-            uint64_t combined = (left << block.right_bit_count) | (right & right_mask);
-            out[i] = std::bit_cast<double>(combined);
-        }
-    }
-}
-
 }  // namespace alp

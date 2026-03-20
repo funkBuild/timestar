@@ -31,7 +31,7 @@ const std::unordered_set<std::string> FunctionSecurity::dangerousFunctionNames_ 
     "having", "order",
 
     // Special characters and protocols
-    "javascript", "vbscript", "data", "file", "ftp", "http", "https",
+    "javascript", "vbscript", "data", "https",
 
     // Path-related
     "cd", "chdir", "pwd", "ls", "dir", "find", "locate",
@@ -45,72 +45,6 @@ const std::unordered_set<std::string> FunctionSecurity::dangerousFunctionNames_ 
 // replacing simple string patterns with std::string::find() and reserving regex
 // for genuinely complex patterns. The ProductionMonitor's std::mutex should be
 // replaced with lock-free atomics or Seastar timers to avoid blocking the reactor.
-const std::vector<std::regex>& FunctionSecurity::getDangerousPatterns() {
-    static const std::vector<std::regex> patterns = [] {
-        std::vector<std::regex> p;
-        // Pre-allocate to avoid repeated reallocation
-        p.reserve(30);
-        auto add = [&](const char* pattern) { p.emplace_back(pattern, std::regex_constants::icase); };
-
-        // Code injection patterns
-        add(R"(__import__\s*\()");
-        add(R"(exec\s*\()");
-        add(R"(eval\s*\()");
-        add(R"(system\s*\()");
-        add(R"(shell_exec\s*\()");
-
-        // Command injection patterns — only match shell metacharacters.
-        // Parentheses (), braces {}, and brackets [] are legitimate query
-        // language syntax and must NOT be blocked here.
-        add(R"([;&|`$])");
-        add(R"(\\x[0-9a-f]{2})");
-
-        // Command-like patterns (spaces between command arguments)
-        add(R"(rm\s+)");
-        add(R"(sudo\s+)");
-        add(R"(chmod\s+)");
-        add(R"(kill\s+)");
-        add(R"(ps\s+)");
-        add(R"(ls\s+)");
-        add(R"(cat\s+)");
-        add(R"(curl\s+)");
-        add(R"(wget\s+)");
-        add(R"(nc\s+)");
-
-        // Path traversal patterns
-        add(R"(\.\./|\.\.\\)");
-        add(R"(%2e%2e%2f|%2e%2e%5c)");
-        add(R"(\\\.\\\.\\|\\\.\\\./)");
-
-        // SQL injection patterns
-        add(R"('\s*or\s*')");
-        add(R"('\s*union\s*select)");
-        add(R"(drop\s+table)");
-        add(R"(delete\s+from)");
-        add(R"(insert\s+into)");
-
-        // XSS patterns
-        add(R"(<script[^>]*>)");
-        add(R"(javascript\s*:)");
-        // Bound \w to {1,30} to prevent ReDoS (longest HTML event attr is 23 chars)
-        add(R"(on\w{1,30}\s*=)");
-
-        // Format string attacks — match %n (dangerous write primitive) and multi-digit
-        // width specifiers like %10s, %08x, but NOT bare %Xd or %Xs which collide with
-        // URL-encoded values (%2d = '-', %3d = '=', etc.)
-        add(R"(%[0-9]{2,}[sdxn]|%n)");
-
-        // LDAP injection
-        add(R"(\*\)\([\w=*]+\)\(\|)");
-
-        // Protocol injection
-        add(R"(file:\/\/|ftp:\/\/|ldap:\/\/)");
-
-        return p;
-    }();
-    return patterns;
-}
-
 FunctionSecurity::ValidationResult FunctionSecurity::validateFunctionName(const std::string& functionName) {
     ValidationResult result;
 
@@ -352,46 +286,66 @@ bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
     }
 
     // Shell metacharacters
-    if (lower.find_first_of(";&|`$") != std::string::npos) return true;
+    if (lower.find_first_of(";&|`$") != std::string::npos)
+        return true;
 
-    // Code injection: keyword + optional whitespace + '('
+    // Code injection: keyword at word boundary + optional whitespace + '('
+    // Require word boundary to avoid matching "execute(", "evaluate(", "subsystem("
     static constexpr std::string_view parenKw[] = {"__import__", "exec", "eval", "system", "shell_exec"};
     for (auto kw : parenKw) {
         size_t pos = 0;
         while ((pos = lower.find(kw, pos)) != std::string::npos) {
-            size_t p = pos + kw.size();
-            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) ++p;
-            if (p < lower.size() && lower[p] == '(') return true;
+            bool atWordBoundary = (pos == 0 || !std::isalnum(static_cast<unsigned char>(lower[pos - 1])));
+            if (atWordBoundary) {
+                size_t p = pos + kw.size();
+                while (p < lower.size() &&
+                       (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r'))
+                    ++p;
+                if (p < lower.size() && lower[p] == '(')
+                    return true;
+            }
             ++pos;
         }
     }
 
-    // Command injection: keyword + at least one whitespace
-    static constexpr std::string_view cmdKw[] = {"rm", "sudo", "chmod", "kill", "ps", "ls", "cat", "curl", "wget", "nc"};
+    // Command injection: keyword at word boundary + at least one whitespace.
+    // Require word boundary before the keyword to avoid matching "firmware" for "rm",
+    // "impulse" for "ls", "once" for "nc", etc.
+    static constexpr std::string_view cmdKw[] = {"rm", "sudo", "chmod", "kill", "cat", "curl", "wget"};
     for (auto kw : cmdKw) {
         size_t pos = 0;
         while ((pos = lower.find(kw, pos)) != std::string::npos) {
+            // Check word boundary before keyword (start of string or non-alnum)
+            bool atWordBoundary = (pos == 0 || !std::isalnum(static_cast<unsigned char>(lower[pos - 1])));
             size_t p = pos + kw.size();
-            if (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) return true;
+            if (atWordBoundary && p < lower.size() &&
+                (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r'))
+                return true;
             ++pos;
         }
     }
 
     // Path traversal
-    if (lower.find("../") != std::string::npos || lower.find("..\\") != std::string::npos) return true;
-    if (lower.find("%2e%2e%2f") != std::string::npos || lower.find("%2e%2e%5c") != std::string::npos) return true;
-    if (lower.find("\\.\\.\\" ) != std::string::npos || lower.find("\\.\\./" ) != std::string::npos) return true;
+    if (lower.find("../") != std::string::npos || lower.find("..\\") != std::string::npos)
+        return true;
+    if (lower.find("%2e%2e%2f") != std::string::npos || lower.find("%2e%2e%5c") != std::string::npos)
+        return true;
+    if (lower.find("\\.\\.\\") != std::string::npos || lower.find("\\.\\./") != std::string::npos)
+        return true;
 
     // SQL injection: ' or '
     {
         size_t pos = 0;
         while ((pos = lower.find('\'', pos)) != std::string::npos) {
             size_t p = pos + 1;
-            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
+            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t'))
+                ++p;
             if (p + 2 <= lower.size() && lower[p] == 'o' && lower[p + 1] == 'r') {
                 size_t q = p + 2;
-                while (q < lower.size() && (lower[q] == ' ' || lower[q] == '\t')) ++q;
-                if (q < lower.size() && lower[q] == '\'') return true;
+                while (q < lower.size() && (lower[q] == ' ' || lower[q] == '\t'))
+                    ++q;
+                if (q < lower.size() && lower[q] == '\'')
+                    return true;
             }
             ++pos;
         }
@@ -401,26 +355,35 @@ bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
         size_t pos = 0;
         while ((pos = lower.find('\'', pos)) != std::string::npos) {
             size_t p = pos + 1;
-            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
+            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t'))
+                ++p;
             if (lower.compare(p, 5, "union") == 0) {
                 size_t q = p + 5;
-                while (q < lower.size() && (lower[q] == ' ' || lower[q] == '\t')) ++q;
-                if (lower.compare(q, 6, "select") == 0) return true;
+                while (q < lower.size() && (lower[q] == ' ' || lower[q] == '\t'))
+                    ++q;
+                if (lower.compare(q, 6, "select") == 0)
+                    return true;
             }
             ++pos;
         }
     }
     // Two-word SQL: drop table, delete from, insert into
-    static constexpr struct { std::string_view kw1; std::string_view kw2; } sqlPairs[] = {
-        {"drop", "table"}, {"delete", "from"}, {"insert", "into"}
-    };
+    static constexpr struct {
+        std::string_view kw1;
+        std::string_view kw2;
+    } sqlPairs[] = {{"drop", "table"}, {"delete", "from"}, {"insert", "into"}};
     for (const auto& [kw1, kw2] : sqlPairs) {
         size_t pos = 0;
         while ((pos = lower.find(kw1, pos)) != std::string::npos) {
+            bool atWordBoundary = (pos == 0 || !std::isalnum(static_cast<unsigned char>(lower[pos - 1])));
             size_t p = pos + kw1.size();
-            if (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) {
-                while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) ++p;
-                if (lower.compare(p, kw2.size(), kw2) == 0) return true;
+            if (atWordBoundary && p < lower.size() &&
+                (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r')) {
+                while (p < lower.size() &&
+                       (lower[p] == ' ' || lower[p] == '\t' || lower[p] == '\n' || lower[p] == '\r'))
+                    ++p;
+                if (lower.compare(p, kw2.size(), kw2) == 0)
+                    return true;
             }
             ++pos;
         }
@@ -431,8 +394,10 @@ bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
         size_t pos = 0;
         while ((pos = lower.find("<script", pos)) != std::string::npos) {
             size_t p = pos + 7;
-            while (p < lower.size() && lower[p] != '>') ++p;
-            if (p < lower.size()) return true;
+            while (p < lower.size() && lower[p] != '>')
+                ++p;
+            if (p < lower.size())
+                return true;
             ++pos;
         }
     }
@@ -441,21 +406,34 @@ bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
         size_t pos = 0;
         while ((pos = lower.find("javascript", pos)) != std::string::npos) {
             size_t p = pos + 10;
-            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
-            if (p < lower.size() && lower[p] == ':') return true;
+            while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t'))
+                ++p;
+            if (p < lower.size() && lower[p] == ':')
+                return true;
             ++pos;
         }
     }
-    // on\w{1,30}\s*= (event handler attributes)
+    // on\w{1,30}\s*= (HTML event handler attributes like onclick=, onload=)
+    // Require word boundary before "on" to avoid matching "condition=", "conversion=", etc.
     {
         size_t pos = 0;
         while ((pos = lower.find("on", pos)) != std::string::npos) {
-            size_t p = pos + 2;
-            size_t wc = 0;
-            while (p < lower.size() && (std::isalnum(static_cast<unsigned char>(lower[p])) || lower[p] == '_')) { ++p; ++wc; if (wc > 30) break; }
-            if (wc >= 1 && wc <= 30) {
-                while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t')) ++p;
-                if (p < lower.size() && lower[p] == '=') return true;
+            bool atWordBoundary = (pos == 0 || !std::isalnum(static_cast<unsigned char>(lower[pos - 1])));
+            if (atWordBoundary) {
+                size_t p = pos + 2;
+                size_t wc = 0;
+                while (p < lower.size() && (std::isalnum(static_cast<unsigned char>(lower[p])) || lower[p] == '_')) {
+                    ++p;
+                    ++wc;
+                    if (wc > 30)
+                        break;
+                }
+                if (wc >= 1 && wc <= 30) {
+                    while (p < lower.size() && (lower[p] == ' ' || lower[p] == '\t'))
+                        ++p;
+                    if (p < lower.size() && lower[p] == '=')
+                        return true;
+                }
             }
             ++pos;
         }
@@ -465,22 +443,31 @@ bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
     {
         size_t pos = 0;
         while ((pos = lower.find("\\x", pos)) != std::string::npos) {
-            if (pos + 3 < lower.size() &&
-                std::isxdigit(static_cast<unsigned char>(lower[pos + 2])) &&
-                std::isxdigit(static_cast<unsigned char>(lower[pos + 3]))) return true;
+            if (pos + 3 < lower.size() && std::isxdigit(static_cast<unsigned char>(lower[pos + 2])) &&
+                std::isxdigit(static_cast<unsigned char>(lower[pos + 3])))
+                return true;
             ++pos;
         }
     }
 
-    // Format string: %n or %<2+ digits><s|d|x|n>
+    // Format string: %n (dangerous write primitive) or %<2+ digits><s|d|x|n>
+    // Skip percent-encoded values like %0A, %2F which are legitimate URL encoding.
     {
         size_t pos = 0;
         while ((pos = lower.find('%', pos)) != std::string::npos) {
-            if (pos + 1 < lower.size() && lower[pos + 1] == 'n') return true;
+            // %n is dangerous only when not followed by a hex digit (to skip %0a-style URL encoding)
+            if (pos + 1 < lower.size() && lower[pos + 1] == 'n' &&
+                (pos + 2 >= lower.size() || !std::isalnum(static_cast<unsigned char>(lower[pos + 2]))))
+                return true;
             size_t p = pos + 1;
             size_t dc = 0;
-            while (p < lower.size() && lower[p] >= '0' && lower[p] <= '9') { ++p; ++dc; }
-            if (dc >= 2 && p < lower.size() && (lower[p] == 's' || lower[p] == 'd' || lower[p] == 'x' || lower[p] == 'n')) return true;
+            while (p < lower.size() && lower[p] >= '0' && lower[p] <= '9') {
+                ++p;
+                ++dc;
+            }
+            if (dc >= 2 && p < lower.size() &&
+                (lower[p] == 's' || lower[p] == 'd' || lower[p] == 'x' || lower[p] == 'n'))
+                return true;
             ++pos;
         }
     }
@@ -491,14 +478,21 @@ bool FunctionSecurity::containsDangerousPatterns(const std::string& input) {
         while ((pos = lower.find("*)(", pos)) != std::string::npos) {
             size_t p = pos + 3;
             size_t cc = 0;
-            while (p < lower.size() && (std::isalnum(static_cast<unsigned char>(lower[p])) || lower[p] == '_' || lower[p] == '=' || lower[p] == '*')) { ++p; ++cc; }
-            if (cc > 0 && p + 2 < lower.size() && lower[p] == ')' && lower[p+1] == '(' && lower[p+2] == '|') return true;
+            while (p < lower.size() && (std::isalnum(static_cast<unsigned char>(lower[p])) || lower[p] == '_' ||
+                                        lower[p] == '=' || lower[p] == '*')) {
+                ++p;
+                ++cc;
+            }
+            if (cc > 0 && p + 2 < lower.size() && lower[p] == ')' && lower[p + 1] == '(' && lower[p + 2] == '|')
+                return true;
             ++pos;
         }
     }
 
     // Protocol injection
-    if (lower.find("file://") != std::string::npos || lower.find("ftp://") != std::string::npos || lower.find("ldap://") != std::string::npos) return true;
+    if (lower.find("file://") != std::string::npos || lower.find("ftp://") != std::string::npos ||
+        lower.find("ldap://") != std::string::npos)
+        return true;
 
     return false;
 }
@@ -516,8 +510,7 @@ bool FunctionSecurity::containsPathTraversal(const std::string& input) {
     // URL-encoded checks must be case-insensitive since hex digits
     // can be upper or lowercase (e.g., %2e vs %2E).
     std::string lower = input;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
     return lower.find("%2e%2e%2f") != std::string::npos || lower.find("%2e%2e%5c") != std::string::npos;
 }
 

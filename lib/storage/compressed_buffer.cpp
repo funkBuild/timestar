@@ -3,11 +3,9 @@
 #include <algorithm>
 #include <cstring>
 
-// Define static constants
-constexpr size_t CompressedBuffer::INITIAL_CAPACITY;
-constexpr size_t CompressedBuffer::GROWTH_FACTOR;
-
 void CompressedBuffer::write(uint64_t value, int bits) {
+    if (bits <= 0)
+        return;  // No-op for zero or invalid bit counts
     // Mask value to the requested bit width to prevent upper bits from
     // bleeding into adjacent fields via the OR-write below.
     if (bits < 64)
@@ -138,6 +136,8 @@ void CompressedBuffer::writeFixed() {
 
 template <typename T>
 T CompressedBuffer::read(const int bits) {
+    if (bits <= 0)
+        return static_cast<T>(0);  // No-op for zero or invalid bit counts
     if (bitOffset > 63) {
         offset++;
         bitOffset = 0;

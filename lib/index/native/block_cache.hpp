@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <seastar/core/shared_ptr.hh>
 #include <string>
 #include <unordered_map>
 
@@ -11,25 +12,30 @@ namespace timestar::index {
 // Byte-budgeted LRU cache for decompressed SSTable data blocks.
 // Single-threaded (Seastar shard-local) — no locking needed.
 // Key: (cache_id, block_index) where cache_id is unique per SSTableReader.
+//
+// Stores blocks as seastar::lw_shared_ptr<const std::string> so cache hits
+// return a shared pointer — zero-copy (avoids duplicating ~16KB per lookup).
 class BlockCache {
 public:
     explicit BlockCache(size_t maxBytes) : maxBytes_(maxBytes) {}
 
-    // Look up a cached block. Returns pointer to block data (stable until
-    // next put/evict call), or nullptr on miss. Promotes entry to MRU on hit.
-    const std::string* get(uint64_t cacheId, size_t blockIndex) {
+    // Look up a cached block. Returns shared_ptr to block data on hit (zero-copy),
+    // or nullptr on miss. Promotes entry to MRU on hit.
+    seastar::lw_shared_ptr<const std::string> get(uint64_t cacheId, size_t blockIndex) {
         auto it = map_.find({cacheId, blockIndex});
         if (it == map_.end())
             return nullptr;
         list_.splice(list_.begin(), list_, it->second);
-        return &it->second->data;
+        return it->second->data;
     }
 
-    // Insert a block into the cache. Returns reference to the cached data.
-    // May evict LRU entries to stay under budget.
-    const std::string& put(uint64_t cacheId, size_t blockIndex, std::string data) {
+    // Insert a block into the cache. Takes ownership via shared_ptr.
+    // Returns the cached shared_ptr. May evict LRU entries to stay under budget.
+    seastar::lw_shared_ptr<const std::string> put(uint64_t cacheId, size_t blockIndex,
+                                                  seastar::lw_shared_ptr<const std::string> data) {
         CacheKey key{cacheId, blockIndex};
-        size_t entrySize = sizeof(Entry) + data.size() + 64;
+        size_t dataBytes = data ? data->size() : 0;
+        size_t entrySize = sizeof(Entry) + dataBytes + 64;
 
         auto it = map_.find(key);
         if (it != map_.end()) {
@@ -49,6 +55,12 @@ public:
         map_[key] = list_.begin();
         currentBytes_ += entrySize;
         return list_.front().data;
+    }
+
+    // Convenience overload: wraps a plain string in a shared_ptr and caches it.
+    seastar::lw_shared_ptr<const std::string> put(uint64_t cacheId, size_t blockIndex, std::string data) {
+        auto ptr = seastar::make_lw_shared<const std::string>(std::move(data));
+        return put(cacheId, blockIndex, std::move(ptr));
     }
 
     // Evict all entries for a given cache ID (called when SSTableReader is destroyed).
@@ -91,7 +103,7 @@ private:
 
     struct Entry {
         CacheKey key;
-        std::string data;
+        seastar::lw_shared_ptr<const std::string> data;
         size_t entrySize;
     };
 

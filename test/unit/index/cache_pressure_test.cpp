@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-using timestar::index::BlockCache;
 using timestar::LRUCache;
+using timestar::index::BlockCache;
 
 class CachePressureTest : public ::testing::Test {};
 
@@ -137,7 +137,7 @@ TEST_F(CachePressureTest, BlockCacheStressEviction) {
     // A fresh insert + get should still work correctly
     uint64_t finalId = BlockCache::nextCacheId();
     cache.put(finalId, 0, "final-check");
-    const std::string* v = cache.get(finalId, 0);
+    auto v = cache.get(finalId, 0);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, "final-check");
 }

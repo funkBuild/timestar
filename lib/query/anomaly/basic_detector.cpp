@@ -110,59 +110,5 @@ AnomalyOutput BasicDetector::detectOptimized(const AnomalyInput& input, const An
     return output;
 }
 
-// Legacy implementation kept for reference/validation
-BasicDetector::RollingStats BasicDetector::computeRollingStats(const std::vector<double>& values, size_t endIdx,
-                                                               size_t windowSize) {
-    RollingStats stats{0.0, 0.0, 0.0, 0.0, 0.0};
-
-    if (endIdx == 0 || windowSize == 0) {
-        return stats;
-    }
-
-    size_t start = (endIdx > windowSize) ? endIdx - windowSize : 0;
-
-    // Collect non-NaN values in window
-    std::vector<double> windowValues;
-    windowValues.reserve(endIdx - start);
-
-    for (size_t i = start; i < endIdx; ++i) {
-        if (!std::isnan(values[i])) {
-            windowValues.push_back(values[i]);
-        }
-    }
-
-    if (windowValues.empty()) {
-        return stats;
-    }
-
-    // Use SIMD for mean computation
-    stats.mean = simd::vectorMean(windowValues.data(), windowValues.size());
-
-    // Use SIMD for variance computation
-    if (windowValues.size() > 1) {
-        double variance = simd::vectorVariance(windowValues.data(), windowValues.size(), stats.mean);
-        stats.stddev = std::sqrt(variance);
-    }
-
-    // Sort for percentiles (still needed for median/quartiles)
-    std::sort(windowValues.begin(), windowValues.end());
-    size_t n = windowValues.size();
-
-    // Median
-    if (n % 2 == 0) {
-        stats.median = (windowValues[n / 2 - 1] + windowValues[n / 2]) / 2.0;
-    } else {
-        stats.median = windowValues[n / 2];
-    }
-
-    // Quartiles
-    size_t q1Idx = n / 4;
-    size_t q3Idx = (3 * n) / 4;
-    stats.q1 = windowValues[q1Idx];
-    stats.q3 = windowValues[std::min(q3Idx, n - 1)];
-
-    return stats;
-}
-
 }  // namespace anomaly
 }  // namespace timestar

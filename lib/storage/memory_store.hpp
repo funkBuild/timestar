@@ -93,9 +93,9 @@ public:
     bool wouldExceedThreshold(TimeStarInsert<T>& insertRequest, size_t& outEstimatedSize);
     template <class T>
     bool wouldBatchExceedThreshold(std::vector<TimeStarInsert<T>>& insertRequests);
-    bool isClosed() { return closed; }
-    bool isEmpty() { return series.size() == 0; }
-    std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
+    bool isClosed() const { return closed; }
+    bool isEmpty() const { return series.empty(); }
+    std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId) const;
     WAL* getWAL() { return wal.get(); }
 
     // Query method to get data for a series.

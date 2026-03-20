@@ -10,7 +10,6 @@
 #include <glaze/glaze.hpp>
 
 #include <chrono>
-#include <regex>
 #include <seastar/core/when_all.hh>
 
 // Glaze reflection for JSON parsing - must be outside namespace

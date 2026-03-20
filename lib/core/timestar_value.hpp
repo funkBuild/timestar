@@ -49,7 +49,8 @@ public:
     std::vector<uint64_t> timestamps;
     std::vector<T> values;
 
-    TimeStarInsert(std::string _measurement, std::string _field) : measurement(_measurement), field(_field) {}
+    TimeStarInsert(std::string _measurement, std::string _field)
+        : measurement(std::move(_measurement)), field(std::move(_field)) {}
 
     static TimeStarInsert<T> fromSeriesKey(std::string seriesId) {
         TimeStarInsert<T> insert("", "");
@@ -65,7 +66,12 @@ public:
         return insert;
     }
 
-    void addTag(std::string key, std::string value) { tags.insert({key, value}); }
+    void addTag(std::string key, std::string value) {
+        tags.insert({std::move(key), std::move(value)});
+        _seriesKeyCache = false;
+        _seriesId128Cache = false;
+        _cachedEstimatedSize.reset();
+    }
 
     void addValue(uint64_t timestamp, T value) {
         timestamps.push_back(timestamp);

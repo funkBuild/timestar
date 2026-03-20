@@ -191,6 +191,40 @@ struct AggregationState {
         mergeRawValues(other);
     }
 
+    void merge(AggregationState&& other) {
+        if (count > 0 && other.count > 0) {
+            double delta = other.mean - mean;
+            double totalCount = static_cast<double>(count) + other.count;
+            m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / totalCount;
+            mean = (mean * count + other.mean * other.count) / totalCount;
+        } else if (other.count > 0) {
+            m2 = other.m2;
+            mean = other.mean;
+        }
+        mergeCore(other);
+        // Move raw values instead of copying
+        if (other.rawValuesSaturated) {
+            rawValuesSaturated = true;
+        }
+        if (!rawValuesSaturated && !other.rawValues.empty()) {
+            size_t available = RAW_VALUES_HARD_LIMIT - rawValues.size();
+            if (rawValues.empty()) {
+                rawValues = std::move(other.rawValues);
+                if (rawValues.size() > RAW_VALUES_HARD_LIMIT) {
+                    rawValues.resize(RAW_VALUES_HARD_LIMIT);
+                    rawValuesSaturated = true;
+                }
+            } else {
+                size_t toCopy = std::min(available, other.rawValues.size());
+                rawValues.insert(
+                    rawValues.end(), std::make_move_iterator(other.rawValues.begin()),
+                    std::make_move_iterator(other.rawValues.begin() + static_cast<std::ptrdiff_t>(toCopy)));
+                if (toCopy < other.rawValues.size())
+                    rawValuesSaturated = true;
+            }
+        }
+    }
+
     // Method-aware merge — skips expensive Welford variance computation and raw
     // value copying for methods that don't need them (~90% of queries).
     void mergeForMethod(const AggregationState& other, AggregationMethod method) {

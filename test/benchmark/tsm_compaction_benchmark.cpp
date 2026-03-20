@@ -10,6 +10,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 
 namespace fs = std::filesystem;
 

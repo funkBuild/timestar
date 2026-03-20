@@ -38,9 +38,6 @@ private:
 
     // Update state and predict next value
     double predictAndUpdate(HoltWintersState& state, double actualValue, size_t seasonalIndex, size_t seasonalPeriod);
-
-    // Compute prediction error statistics
-    double computeErrorStdDev(const std::vector<double>& errors, size_t windowSize);
 };
 
 }  // namespace anomaly

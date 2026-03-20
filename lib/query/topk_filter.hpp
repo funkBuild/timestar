@@ -134,16 +134,21 @@ inline std::vector<GroupedSeries> bottomk(int N, std::vector<GroupedSeries> grou
 namespace detail {
 
 // Build the sorted union of all timestamps appearing in any of the groups.
+// Uses iterative set_union on already-sorted per-group timestamps: O(G*N)
+// instead of O(G*N * log(G*N)) from concat+sort.
 inline std::vector<uint64_t> unionTimestamps(const std::vector<GroupedSeries>& groups) {
-    std::vector<uint64_t> all;
-    for (const auto& g : groups) {
-        for (uint64_t t : *g.series.timestamps) {
-            all.push_back(t);
-        }
+    if (groups.empty())
+        return {};
+    std::vector<uint64_t> result = *groups[0].series.timestamps;
+    std::vector<uint64_t> temp;
+    for (size_t i = 1; i < groups.size(); ++i) {
+        const auto& ts = *groups[i].series.timestamps;
+        temp.clear();
+        temp.reserve(result.size() + ts.size());
+        std::set_union(result.begin(), result.end(), ts.begin(), ts.end(), std::back_inserter(temp));
+        std::swap(result, temp);
     }
-    std::sort(all.begin(), all.end());
-    all.erase(std::unique(all.begin(), all.end()), all.end());
-    return all;
+    return result;
 }
 
 // Compute the p-th percentile of a sorted non-empty vector using linear

@@ -1,6 +1,6 @@
 #include "http_metadata_handler.hpp"
-#include "http_auth.hpp"
 
+#include "http_auth.hpp"
 #include "native_index.hpp"
 
 #include <glaze/glaze.hpp>
@@ -112,13 +112,12 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r, std::string_
               }),
               "json"));
 
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/tags"),
-          new seastar::httpd::function_handler(
-              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  return handleTags(std::move(req));
-              }),
-              "json"));
+    r.add(
+        seastar::httpd::operation_type::GET, seastar::httpd::url("/tags"),
+        new seastar::httpd::function_handler(
+            wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                     -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleTags(std::move(req)); }),
+            "json"));
 
     r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/fields"),
           new seastar::httpd::function_handler(
@@ -320,9 +319,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
                         endPos = tagsParam.length();
                     std::string badSegment = tagsParam.substr(pos, endPos - pos);
                     rep->set_status(seastar::http::reply::status_type::bad_request);
-                    rep->_content = createErrorResponse("INVALID_PARAMETER",
-                        "Malformed tag filter segment '" + badSegment +
-                        "': expected 'key:value' format");
+                    rep->_content =
+                        createErrorResponse("INVALID_PARAMETER", "Malformed tag filter segment '" + badSegment +
+                                                                     "': expected 'key:value' format");
                     co_return rep;
                 }
 
@@ -419,8 +418,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         // Validate: both tag_key and tag_value must be provided together
         if (tagKey.empty() != tagValue.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("INVALID_PARAMETER",
-                                                "Both tag_key and tag_value must be provided together");
+            rep->_content =
+                createErrorResponse("INVALID_PARAMETER", "Both tag_key and tag_value must be provided together");
             co_return rep;
         }
 
@@ -473,12 +472,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto& localEngine = engineSharded->local();
             auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
 
+            // Fetch all tag-key cardinalities in parallel (not sequentially)
             std::unordered_map<std::string, double> tagCardinalities;
-            for (const auto& tk : tagKeys) {
-                auto tagValues = co_await localEngine.getTagValues(measurement, tk);
-                // For each tag key, the total distinct series is bounded by measurement cardinality.
-                // Report the number of distinct tag values as a proxy for tag-key cardinality.
-                tagCardinalities[tk] = static_cast<double>(tagValues.size());
+            std::vector<seastar::future<std::set<std::string>>> tagFutures;
+            tagFutures.reserve(tagKeys.size());
+            std::vector<std::string> tagKeysCopy(tagKeys.begin(), tagKeys.end());
+            for (const auto& tk : tagKeysCopy) {
+                tagFutures.push_back(localEngine.getTagValues(measurement, tk));
+            }
+            auto tagResults = co_await seastar::when_all_succeed(tagFutures.begin(), tagFutures.end());
+            for (size_t i = 0; i < tagKeysCopy.size(); ++i) {
+                tagCardinalities[tagKeysCopy[i]] = static_cast<double>(tagResults[i].size());
             }
 
             rep->set_status(seastar::http::reply::status_type::ok);

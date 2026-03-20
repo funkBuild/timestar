@@ -143,6 +143,12 @@ private:
     mutable std::unordered_map<SeriesId128, LRUList::iterator, SeriesId128::Hash> fullIndexCache;
     mutable size_t fullIndexCacheBytes = 0;
 
+    // Shared helper: parse index blocks (and optional string dictionary) from a Slice
+    // into a TSMIndexEntry.  The Slice must be positioned just after the series type
+    // and block-count fields have already been read.  On return the Slice offset is
+    // advanced past all block data and the optional string dictionary.
+    void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint16_t blockCount) const;
+
     static size_t estimateEntryBytes(const TSMIndexEntry& entry) {
         size_t bytes = sizeof(TSMIndexEntry) + entry.indexBlocks.size() * sizeof(TSMIndexBlock) +
                        sizeof(std::pair<SeriesId128, TSMIndexEntry>);  // list node overhead
@@ -251,9 +257,9 @@ public:
     // tlStringDict from different files' getFullIndexEntry() calls — reactor
     // preemption can cause the wrong dictionary to be visible.
     template <class T>
-    seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlock(
-        const TSMIndexBlock& indexBlock, uint64_t startTime, uint64_t endTime,
-        const std::vector<std::string>* stringDict = nullptr);
+    seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
+                                                                  uint64_t endTime,
+                                                                  const std::vector<std::string>* stringDict = nullptr);
 
     // Phase 2: Read compressed block bytes directly (zero-copy transfer)
     seastar::future<seastar::temporary_buffer<uint8_t>> readCompressedBlock(const TSMIndexBlock& indexBlock);

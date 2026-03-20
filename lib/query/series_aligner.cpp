@@ -41,7 +41,8 @@ std::map<std::string, AlignedSeries> SeriesAligner::align(const std::map<std::st
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(outputTimestamps));
 
     for (const auto& [name, subResult] : series) {
-        std::vector<double> alignedValues = interpolateSeries(subResult.timestamps, subResult.values, *sharedTimestamps);
+        std::vector<double> alignedValues =
+            interpolateSeries(subResult.timestamps, subResult.values, *sharedTimestamps);
 
         result[name] = AlignedSeries(sharedTimestamps, std::move(alignedValues));
     }
@@ -276,20 +277,6 @@ double SeriesAligner::linearInterpolate(uint64_t t, uint64_t t1, double v1, uint
 
     double ratio = static_cast<double>(t - t1) / static_cast<double>(t2 - t1);
     return v1 + ratio * (v2 - v1);
-}
-
-size_t SeriesAligner::findLowerBound(const std::vector<uint64_t>& timestamps, uint64_t target) {
-    auto it = std::lower_bound(timestamps.begin(), timestamps.end(), target);
-    if (it == timestamps.end()) {
-        return timestamps.size() - 1;
-    }
-    if (*it == target) {
-        return std::distance(timestamps.begin(), it);
-    }
-    if (it == timestamps.begin()) {
-        return 0;
-    }
-    return std::distance(timestamps.begin(), it) - 1;
 }
 
 }  // namespace timestar

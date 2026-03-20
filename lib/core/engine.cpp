@@ -178,7 +178,7 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
     // Update Prometheus metrics for batch inserts
     ++_metrics.inserts_total;
     for (const auto& req : insertRequests) {
-        _metrics.insert_points_total += req.timestamps.size();
+        _metrics.insert_points_total += req.getTimestamps().size();
     }
 
     // Metadata indexing is now handled at the HTTP handler level on shard 0
@@ -310,11 +310,11 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
         (void)seastar::try_with_gate(_insertGate, [this, combined = std::move(combined)]() mutable {
             return broadcastSchemaUpdate(std::move(combined));
         }).handle_exception([](std::exception_ptr ep) {
-            try { std::rethrow_exception(ep); }
-            catch (const seastar::gate_closed_exception&) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const seastar::gate_closed_exception&) {
                 // Shutting down — safe to discard.
-            }
-            catch (const std::exception& e) {
+            } catch (const std::exception& e) {
                 timestar::engine_log.warn("[METADATA] Schema broadcast failed: {}", e.what());
             }
         });
@@ -589,52 +589,24 @@ seastar::future<std::vector<timestar::SeriesResult>> Engine::executeLocalQuery(c
 
                 if constexpr (std::is_same_v<T, QueryResult<double>>) {
                     if (!result.timestamps.empty()) {
-                        // Convert nanosecond timestamps to expected format
-                        std::vector<uint64_t> timestamps;
-                        std::vector<double> values;
-
-                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                            timestamps.push_back(result.timestamps[i]);
-                            values.push_back(result.values[i]);
-                        }
-
-                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                        seriesResult.fields[meta.field] = std::make_pair(
+                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
                     }
                 } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
                     if (!result.timestamps.empty()) {
-                        std::vector<uint64_t> timestamps;
-                        std::vector<bool> values;
-
-                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                            timestamps.push_back(result.timestamps[i]);
-                            values.push_back(result.values[i]);
-                        }
-
-                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                        // vector<bool> cannot be moved efficiently (it's a bitset), but avoid element-by-element copy
+                        seriesResult.fields[meta.field] = std::make_pair(
+                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
                     }
                 } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
                     if (!result.timestamps.empty()) {
-                        std::vector<uint64_t> timestamps;
-                        std::vector<std::string> values;
-
-                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                            timestamps.push_back(result.timestamps[i]);
-                            values.push_back(result.values[i]);
-                        }
-
-                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                        seriesResult.fields[meta.field] = std::make_pair(
+                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
                     }
                 } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
                     if (!result.timestamps.empty()) {
-                        std::vector<uint64_t> timestamps;
-                        std::vector<int64_t> values;
-
-                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                            timestamps.push_back(result.timestamps[i]);
-                            values.push_back(result.values[i]);
-                        }
-
-                        seriesResult.fields[meta.field] = std::make_pair(timestamps, timestar::FieldValues(values));
+                        seriesResult.fields[meta.field] = std::make_pair(
+                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
                     }
                 }
             },
@@ -642,7 +614,7 @@ seastar::future<std::vector<timestar::SeriesResult>> Engine::executeLocalQuery(c
 
         // Only add if we got data
         if (!seriesResult.fields.empty()) {
-            results.push_back(seriesResult);
+            results.push_back(std::move(seriesResult));
         }
     }
 
@@ -659,26 +631,16 @@ seastar::future<bool> Engine::deleteRangeImpl(std::string seriesKey, uint64_t st
     // Delete from all TSM files that contain this series in the time range
     bool anyDeleted = false;
 
-    // First check if the series exists in memory stores BEFORE deleting
+    // Compute SeriesId128 once for all lookups (avoids redundant XXH3 hashes)
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+
+    // Check if the series exists in memory stores BEFORE deleting
     bool existsInMemory = false;
-    auto memDataDouble = walFileManager.queryMemoryStores<double>(seriesKey);
-    if (memDataDouble.has_value()) {
+    if (walFileManager.queryMemoryStores<double>(seriesId).has_value() ||
+        walFileManager.queryMemoryStores<bool>(seriesId).has_value() ||
+        walFileManager.queryMemoryStores<std::string>(seriesId).has_value() ||
+        walFileManager.queryMemoryStores<int64_t>(seriesId).has_value()) {
         existsInMemory = true;
-    } else {
-        auto memDataBool = walFileManager.queryMemoryStores<bool>(seriesKey);
-        if (memDataBool.has_value()) {
-            existsInMemory = true;
-        } else {
-            auto memDataString = walFileManager.queryMemoryStores<std::string>(seriesKey);
-            if (memDataString.has_value()) {
-                existsInMemory = true;
-            } else {
-                auto memDataInt = walFileManager.queryMemoryStores<int64_t>(seriesKey);
-                if (memDataInt.has_value()) {
-                    existsInMemory = true;
-                }
-            }
-        }
     }
 
     // Delete from memory stores and write to WAL
@@ -689,7 +651,6 @@ seastar::future<bool> Engine::deleteRangeImpl(std::string seriesKey, uint64_t st
 
     // Snapshot TSM file pointers to avoid iterator invalidation across co_await
     // (background compaction can mutate getSequencedTsmFiles() during suspension)
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     std::vector<seastar::shared_ptr<TSM>> tsmSnapshot;
     for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
         tsmSnapshot.push_back(tsmFile);
@@ -946,7 +907,6 @@ seastar::future<> Engine::sweepExpiredFiles() {
 
     for (const auto& tsmFile : tsmSnapshot) {
         bool allExpired = true;
-        bool anyExpired = false;
 
         auto allSeriesIds = tsmFile->getSeriesIds();
         for (const auto& seriesId : allSeriesIds) {
@@ -961,7 +921,7 @@ seastar::future<> Engine::sweepExpiredFiles() {
             auto blocks = tsmFile->getSeriesBlocks(seriesId);
             for (const auto& block : blocks) {
                 if (block.maxTime < cutoff) {
-                    anyExpired = true;
+                    // Block is expired (below cutoff)
                 } else {
                     allExpired = false;
                 }

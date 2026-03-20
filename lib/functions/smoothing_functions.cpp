@@ -423,33 +423,6 @@ seastar::future<FunctionResult<double>> GaussianSmoothFunction::execute(const Do
     return seastar::make_ready_future<FunctionResult<double>>(std::move(result));
 }
 
-// Smoothing utilities implementation
-namespace smoothing_utils {
-std::vector<uint64_t> generateSmoothedTimestamps(const std::vector<uint64_t>& original, size_t window,
-                                                 SmoothingFunction::EdgeHandling edgeHandling) {
-    std::vector<uint64_t> result;
-
-    switch (edgeHandling) {
-        case SmoothingFunction::EdgeHandling::TRUNCATE:
-            if (original.size() >= window) {
-                result.assign(original.begin() + window - 1, original.end());
-            }
-            break;
-
-        case SmoothingFunction::EdgeHandling::PAD_NEAREST:
-            result = original;
-            break;
-
-        case SmoothingFunction::EdgeHandling::PAD_ZEROS:
-        case SmoothingFunction::EdgeHandling::EXTRAPOLATE:
-            result = original;
-            break;
-    }
-
-    return result;
-}
-}  // namespace smoothing_utils
-
 // Legacy functions for backward compatibility
 std::vector<double> simpleMovingAverage(const std::vector<double>& values, int window) {
     std::vector<double> result;

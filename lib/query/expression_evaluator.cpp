@@ -218,7 +218,12 @@ AlignedSeries AlignedSeries::clamp(const AlignedSeries& val, const AlignedSeries
     std::vector<double> result(val.values.size());
     for (size_t i = 0; i < val.values.size(); ++i) {
         double lo = minVal.values[i], hi = maxVal.values[i];
-        result[i] = (lo > hi) ? std::numeric_limits<double>::quiet_NaN() : std::clamp(val.values[i], lo, hi);
+        double v = val.values[i];
+        if (std::isnan(v) || std::isnan(lo) || std::isnan(hi) || lo > hi) {
+            result[i] = std::numeric_limits<double>::quiet_NaN();
+        } else {
+            result[i] = std::clamp(v, lo, hi);
+        }
     }
     return AlignedSeries(val.timestamps, std::move(result));
 }
@@ -407,9 +412,17 @@ AlignedSeries AlignedSeries::fill_linear() const {
         double t1 = static_cast<double>(ts[j]);
         double v1 = result[j];
         double dt = t1 - t0;
-        for (size_t k = i; k < j; ++k) {
-            double fraction = (static_cast<double>(ts[k]) - t0) / dt;
-            result[k] = v0 + fraction * (v1 - v0);
+        if (dt == 0.0) {
+            // Duplicate timestamps — use midpoint of endpoint values
+            double mid = (v0 + v1) * 0.5;
+            for (size_t k = i; k < j; ++k) {
+                result[k] = mid;
+            }
+        } else {
+            for (size_t k = i; k < j; ++k) {
+                double fraction = (static_cast<double>(ts[k]) - t0) / dt;
+                result[k] = v0 + fraction * (v1 - v0);
+            }
         }
         i = j;
     }
@@ -529,7 +542,7 @@ AlignedSeries AlignedSeries::as_percent(const AlignedSeries& series, const Align
 AlignedSeries AlignedSeries::clamp_min(double minVal) const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = std::max(values[i], minVal);
+        result[i] = std::isnan(values[i]) ? values[i] : std::max(values[i], minVal);
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -537,7 +550,7 @@ AlignedSeries AlignedSeries::clamp_min(double minVal) const {
 AlignedSeries AlignedSeries::clamp_max(double maxVal) const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
-        result[i] = std::min(values[i], maxVal);
+        result[i] = std::isnan(values[i]) ? values[i] : std::min(values[i], maxVal);
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -1048,8 +1061,7 @@ AlignedSeries ExpressionEvaluator::evaluate(const ExpressionNode& expr, const Qu
 AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults) {
     if (++evalDepth_ > MAX_EVAL_DEPTH) {
         --evalDepth_;
-        throw EvaluationException("Expression evaluation depth exceeded limit of " +
-                                  std::to_string(MAX_EVAL_DEPTH));
+        throw EvaluationException("Expression evaluation depth exceeded limit of " + std::to_string(MAX_EVAL_DEPTH));
     }
     struct DepthGuard {
         int& d;
@@ -1110,7 +1122,8 @@ AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op, const Qu
     if (left.timestamps && right.timestamps && left.timestamps != right.timestamps) {
         // Different timestamp pointers — check if values actually match
         if (*left.timestamps != *right.timestamps) {
-            throw EvaluationException("Binary operation requires aligned timestamps. "
+            throw EvaluationException(
+                "Binary operation requires aligned timestamps. "
                 "Use time_shift with explicit alignment or apply functions separately.");
         }
     }

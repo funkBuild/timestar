@@ -1,11 +1,10 @@
 #include "http_delete_handler.hpp"
-#include "http_auth.hpp"
 
+#include "http_auth.hpp"
 #include "logger.hpp"
 #include "placement_table.hpp"
 #include "series_key.hpp"
 
-#include <chrono>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 
@@ -218,7 +217,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
 
         // Execute deletes
         uint64_t totalSeriesDeleted = 0;
-        uint64_t totalPointsDeleted = 0;
         std::vector<std::string> allDeletedSeries;
 
         timestar::http_log.info("[DELETE_HANDLER] Processing {} delete requests", deleteRequests.size());
@@ -248,7 +246,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 auto shardResults = co_await seastar::when_all_succeed(deleteFutures.begin(), deleteFutures.end());
                 for (auto& result : shardResults) {
                     totalSeriesDeleted += result.seriesDeleted;
-                    totalPointsDeleted += result.pointsDeleted;
                     allDeletedSeries.insert(allDeletedSeries.end(), result.deletedSeries.begin(),
                                             result.deletedSeries.end());
                 }
@@ -316,15 +313,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
 
 void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto* handler = new seastar::httpd::function_handler(
-        timestar::wrapWithAuth(authToken,
-            [this](std::unique_ptr<seastar::http::request> req,
-                   std::unique_ptr<seastar::http::reply>) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                return handleDelete(std::move(req));
-            }),
+        timestar::wrapWithAuth(
+            authToken,
+            [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+                -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleDelete(std::move(req)); }),
         "json");
 
     r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/delete"), handler);
 
-    timestar::http_log.info("Registered DELETE endpoint at /delete{}",
-                            authToken.empty() ? "" : " (auth required)");
+    timestar::http_log.info("Registered DELETE endpoint at /delete{}", authToken.empty() ? "" : " (auth required)");
 }

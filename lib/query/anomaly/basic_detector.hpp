@@ -25,17 +25,6 @@ private:
     // Optimized detection using incremental rolling stats
     // Complexity: O(N) instead of O(N*W)
     AnomalyOutput detectOptimized(const AnomalyInput& input, const AnomalyConfig& config);
-
-    // Legacy rolling stats computation (kept for fallback/validation)
-    struct RollingStats {
-        double mean;
-        double stddev;
-        double median;
-        double q1;  // 25th percentile
-        double q3;  // 75th percentile
-    };
-
-    RollingStats computeRollingStats(const std::vector<double>& values, size_t endIdx, size_t windowSize);
 };
 
 }  // namespace anomaly

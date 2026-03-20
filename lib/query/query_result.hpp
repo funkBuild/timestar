@@ -80,17 +80,19 @@ public:
             state.blockOffset++;
 
             if (state.blockOffset >= state.blockSize) {
-                state.blockIdx++;
-                state.blockOffset = 0;
-                state.block = tsmResults[state.tsmResultIndex].getBlock(state.blockIdx);
+                // Advance to next non-empty block (skip empty blocks from
+                // time-range filtering or tombstone removal)
+                while (true) {
+                    state.blockIdx++;
+                    state.blockOffset = 0;
+                    state.block = tsmResults[state.tsmResultIndex].getBlock(state.blockIdx);
 
-                if (state.block == nullptr)
-                    return false;
+                    if (state.block == nullptr)
+                        return false;  // No more blocks: source exhausted
 
-                state.blockSize = state.block->size();
-                if (state.blockSize == 0) {
-                    state.block = nullptr;
-                    return false;
+                    state.blockSize = state.block->size();
+                    if (state.blockSize > 0)
+                        break;  // Found a non-empty block
                 }
             }
 

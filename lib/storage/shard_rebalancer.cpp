@@ -7,13 +7,14 @@
 #include "tsm.hpp"
 #include "tsm_writer.hpp"
 
-#include <algorithm>
 #include <fcntl.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <regex>
-#include <unistd.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -154,7 +155,7 @@ void ShardRebalancer::removeState() {
 unsigned ShardRebalancer::detectShardCountFromDirs() const {
     unsigned maxShard = 0;
     bool found = false;
-    std::regex shardPattern("shard_(\\d+)");
+    static const std::regex shardPattern("shard_(\\d+)");
 
     if (!fs::exists(_dataDir))
         return 0;
@@ -304,10 +305,9 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsig
         engine_log.info("[REBALANCE] Analyzing {} TSM files from shard {}", tsmFiles.size(), oldShard);
 
         for (const auto& tsmPath : tsmFiles) {
-            // Open the TSM file and read its sparse index
+            // Open the TSM file (open() reads the sparse index internally)
             auto tsm = seastar::make_shared<::TSM>(tsmPath);
             co_await tsm->open();
-            co_await tsm->readSparseIndex();
 
             auto seriesIds = tsm->getSeriesIds();
             if (seriesIds.empty()) {
@@ -446,9 +446,10 @@ void ShardRebalancer::moveNativeIndex() {
     // incrementally as data is written/queried. Existing TSM data remains
     // queryable through direct series key lookups and scatter-gather discovery.
     unsigned oldCount = _oldShardCount > 0 ? _oldShardCount : detectShardCountFromDirs();
-    engine_log.info("[REBALANCE] Skipping NativeIndex copy ({} old shards) — "
-                    "index will rebuild incrementally from TSM data",
-                    oldCount);
+    engine_log.info(
+        "[REBALANCE] Skipping NativeIndex copy ({} old shards) — "
+        "index will rebuild incrementally from TSM data",
+        oldCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +537,7 @@ void ShardRebalancer::cleanup(unsigned oldShardCount) {
     }
 
     // Also clean up any leftover staging dirs
-    std::regex newPattern("shard_\\d+_new");
+    static const std::regex newPattern("shard_\\d+_new");
     if (fs::exists(_dataDir)) {
         for (const auto& entry : fs::directory_iterator(_dataDir)) {
             if (entry.is_directory() && std::regex_match(entry.path().filename().string(), newPattern)) {

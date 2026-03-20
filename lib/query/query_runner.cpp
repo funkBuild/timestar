@@ -8,14 +8,10 @@
 #include "tsm_result.hpp"
 
 #include <algorithm>
-#include <chrono>
-#include <map>
 #include <optional>
 #include <queue>
 #include <seastar/core/distributed.hh>
 #include <unordered_set>
-
-using Clock = std::chrono::high_resolution_clock;
 
 // ---------------------------------------------------------------------------
 // Multi-way merge of K+1 sorted sequences (TSM + K memory stores)
@@ -247,8 +243,8 @@ static void mergeHeapSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint64
 }
 
 template <class T>
-seastar::future<QueryResult<T>> QueryRunner::queryTsm(std::string series, SeriesId128 seriesId, uint64_t startTime,
-                                                      uint64_t endTime) {
+seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series, SeriesId128 seriesId,
+                                                      uint64_t startTime, uint64_t endTime) {
     LOG_QUERY_PATH(timestar::query_log, debug,
                    "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime,
                    endTime);
@@ -711,8 +707,10 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     auto memMinTimeOpt = walFileManager->getEarliestMemoryTimestamp<double>(seriesId, startTime, endTime);
     auto memMinInt = walFileManager->getEarliestMemoryTimestamp<int64_t>(seriesId, startTime, endTime);
     auto memMinBool = walFileManager->getEarliestMemoryTimestamp<bool>(seriesId, startTime, endTime);
-    if (memMinInt && (!memMinTimeOpt || *memMinInt < *memMinTimeOpt)) memMinTimeOpt = memMinInt;
-    if (memMinBool && (!memMinTimeOpt || *memMinBool < *memMinTimeOpt)) memMinTimeOpt = memMinBool;
+    if (memMinInt && (!memMinTimeOpt || *memMinInt < *memMinTimeOpt))
+        memMinTimeOpt = memMinInt;
+    if (memMinBool && (!memMinTimeOpt || *memMinBool < *memMinTimeOpt))
+        memMinTimeOpt = memMinBool;
 
     // tsmEndTime: the upper bound for the TSM-only pushdown range.
     // fallbackStartTime: the lower bound for the fallback (TSM+memory) range.
@@ -1003,13 +1001,15 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 }
 
 // Template instantiations
-template seastar::future<QueryResult<bool>> QueryRunner::queryTsm<bool>(std::string series, SeriesId128 seriesId,
+template seastar::future<QueryResult<bool>> QueryRunner::queryTsm<bool>(const std::string& series, SeriesId128 seriesId,
                                                                         uint64_t startTime, uint64_t endTime);
-template seastar::future<QueryResult<double>> QueryRunner::queryTsm<double>(std::string series, SeriesId128 seriesId,
-                                                                            uint64_t startTime, uint64_t endTime);
-template seastar::future<QueryResult<std::string>> QueryRunner::queryTsm<std::string>(std::string series,
+template seastar::future<QueryResult<double>> QueryRunner::queryTsm<double>(const std::string& series,
+                                                                            SeriesId128 seriesId, uint64_t startTime,
+                                                                            uint64_t endTime);
+template seastar::future<QueryResult<std::string>> QueryRunner::queryTsm<std::string>(const std::string& series,
                                                                                       SeriesId128 seriesId,
                                                                                       uint64_t startTime,
                                                                                       uint64_t endTime);
-template seastar::future<QueryResult<int64_t>> QueryRunner::queryTsm<int64_t>(std::string series, SeriesId128 seriesId,
-                                                                              uint64_t startTime, uint64_t endTime);
+template seastar::future<QueryResult<int64_t>> QueryRunner::queryTsm<int64_t>(const std::string& series,
+                                                                              SeriesId128 seriesId, uint64_t startTime,
+                                                                              uint64_t endTime);

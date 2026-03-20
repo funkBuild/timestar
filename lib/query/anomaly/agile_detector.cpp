@@ -1,5 +1,7 @@
 #include "agile_detector.hpp"
 
+#include "simd_anomaly.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -76,39 +78,6 @@ double AgileDetector::predictAndUpdate(HoltWintersState& state, double actualVal
     return prediction;
 }
 
-double AgileDetector::computeErrorStdDev(const std::vector<double>& errors, size_t windowSize) {
-    if (errors.empty())
-        return 1.0;
-
-    size_t start = (errors.size() > windowSize) ? errors.size() - windowSize : 0;
-    size_t end = errors.size();
-
-    // Collect finite values from the window (skip NaN entries from missing data)
-    double sum = 0.0;
-    size_t count = 0;
-    for (size_t i = start; i < end; ++i) {
-        if (std::isfinite(errors[i])) {
-            sum += errors[i];
-            ++count;
-        }
-    }
-    if (count < 2)
-        return 1.0;
-
-    double mean = sum / static_cast<double>(count);
-
-    double sumSqDiff = 0.0;
-    for (size_t i = start; i < end; ++i) {
-        if (std::isfinite(errors[i])) {
-            double d = errors[i] - mean;
-            sumSqDiff += d * d;
-        }
-    }
-    double variance = sumSqDiff / static_cast<double>(count - 1);
-
-    return (variance > 0) ? std::sqrt(variance) : 1.0;
-}
-
 AnomalyOutput AgileDetector::detect(const AnomalyInput& input, const AnomalyConfig& config) {
     AnomalyOutput output;
 
@@ -138,12 +107,13 @@ AnomalyOutput AgileDetector::detect(const AnomalyInput& input, const AnomalyConf
     // Initialize Holt-Winters state
     HoltWintersState state = initializeState(input.values, seasonalPeriod);
 
-    // Track prediction errors for adaptive bounds
-    std::vector<double> errors;
-    errors.reserve(n);
-
     // Pre-allocate scale vector for SIMD bounds computation
     std::vector<double> scale(n, 1.0);
+
+    // Incremental rolling stats for O(1) per-step error stddev (replaces O(w) computeErrorStdDev).
+    // IncrementalRollingStats maintains a ring buffer and Welford online variance,
+    // with periodic recomputation to prevent floating-point drift.
+    simd::IncrementalRollingStats errorStats(config.windowSize);
 
     // Minimum data points before reliable bounds.
     // Use at most 1/4 of the seasonal period to avoid suppressing anomaly
@@ -161,9 +131,9 @@ AnomalyOutput AgileDetector::detect(const AnomalyInput& input, const AnomalyConf
         double prediction = predictAndUpdate(state, value, seasonalIdx, seasonalPeriod);
         output.predictions[i] = prediction;
 
-        // Track error (always push to maintain 1:1 alignment with data points;
-        // NaN values produce NaN errors, skipped by computeErrorStdDev)
-        errors.push_back(value - prediction);
+        // Track error incrementally (IncrementalRollingStats skips NaN internally)
+        double error = value - prediction;
+        errorStats.update(error);
 
         // Compute adaptive bounds based on recent error distribution
         if (i < minDataPoints) {
@@ -172,8 +142,8 @@ AnomalyOutput AgileDetector::detect(const AnomalyInput& input, const AnomalyConf
             output.lower[i] = -std::numeric_limits<double>::infinity();
             output.scores[i] = 0.0;
         } else {
-            // Use rolling error statistics for bounds
-            double errorStd = computeErrorStdDev(errors, config.windowSize);
+            // Use rolling error statistics for bounds — O(1) per step
+            double errorStd = errorStats.stddev();
 
             // Ensure minimum bound width
             double minStd = std::abs(prediction) * 0.01;

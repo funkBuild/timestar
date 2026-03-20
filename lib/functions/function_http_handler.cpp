@@ -57,117 +57,11 @@ namespace timestar::functions {
 
 using timestar::jsonEscape;
 
-// Per-shard instance (one per Seastar shard, no mutex needed)
-thread_local PerformanceTracker FunctionHttpHandler::performanceTracker_;
-
-// PerformanceTracker implementation
-void PerformanceTracker::recordExecution(const std::string& functionName, std::chrono::nanoseconds duration) {
-    auto& stats = functionStats_[functionName];
-    stats.executions++;
-    stats.totalTimeNs += duration.count();
-}
-
-void PerformanceTracker::recordCacheHit(const std::string& functionName) {
-    auto& stats = functionStats_[functionName];
-    stats.cacheHits++;
-}
-
-void PerformanceTracker::recordCacheMiss(const std::string& functionName) {
-    auto& stats = functionStats_[functionName];
-    stats.cacheMisses++;
-}
-
-uint64_t PerformanceTracker::getTotalExecutions() const {
-    uint64_t total = 0;
-    for (const auto& pair : functionStats_) {
-        total += pair.second.executions;
-    }
-    return total;
-}
-
-double PerformanceTracker::getAverageExecutionTime() const {
-    uint64_t totalExecs = 0;
-    uint64_t totalTimeNs = 0;
-
-    for (const auto& pair : functionStats_) {
-        totalExecs += pair.second.executions;
-        totalTimeNs += pair.second.totalTimeNs;
-    }
-
-    return totalExecs > 0 ? (totalTimeNs / 1000000.0) / totalExecs : 0.0;
-}
-
-std::string PerformanceTracker::getPerformanceStats() const {
-    // Calculate totals
-    uint64_t totalExecs = 0;
-    uint64_t totalTimeNs = 0;
-    uint64_t totalHits = 0, totalMisses = 0;
-
-    for (const auto& pair : functionStats_) {
-        totalExecs += pair.second.executions;
-        totalTimeNs += pair.second.totalTimeNs;
-        totalHits += pair.second.cacheHits;
-        totalMisses += pair.second.cacheMisses;
-    }
-
-    double avgExecTime = totalExecs > 0 ? (totalTimeNs / 1000000.0) / totalExecs : 0.0;
-    double overallHitRate =
-        (totalHits + totalMisses) > 0 ? static_cast<double>(totalHits) / (totalHits + totalMisses) : 0.0;
-
-    std::ostringstream json;
-    json << "{\"status\":\"success\",\"statistics\":{";
-    json << "\"totalExecutions\":" << totalExecs << ",";
-    json << "\"averageExecutionTime\":" << avgExecTime << ",";
-    json << "\"cacheHitRate\":" << overallHitRate;
-
-    json << "},\"functionStats\":{";
-
-    bool first = true;
-    for (const auto& pair : functionStats_) {
-        if (!first)
-            json << ",";
-        first = false;
-
-        json << "\"" << jsonEscape(pair.first) << "\":{";
-        json << "\"executions\":" << pair.second.executions << ",";
-        json << "\"avgTime\":" << pair.second.getAverageTime() << ",";
-        json << "\"cacheHitRate\":" << pair.second.getCacheHitRate();
-        json << "}";
-    }
-
-    json << "}}";
-    return json.str();
-}
-
 FunctionHttpHandler::FunctionHttpHandler(seastar::sharded<Engine>& engine) : engine_(engine) {}
 
 void FunctionHttpHandler::registerRoutes(seastar::httpd::routes& routes) {
     using namespace seastar;
     using namespace httpd;
-
-    // Performance stats endpoint - GET /functions/performance (must be before wildcard /functions/{name})
-    auto* performanceStats = new function_handler(
-        [this](std::unique_ptr<http::request> req,
-               std::unique_ptr<http::reply> rep) -> seastar::future<std::unique_ptr<http::reply>> {
-            rep->set_status(http::reply::status_type::ok);
-            rep->_content = handlePerformanceStatsSync();
-            rep->add_header("Content-Type", "application/json");
-            return seastar::make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
-        },
-        "json");
-    routes.add(operation_type::GET, url("/functions/performance"), performanceStats);
-
-    // Cache stats endpoint - GET /functions/cache (must be before wildcard /functions/{name})
-    auto* cacheStats = new function_handler(
-        [this](std::unique_ptr<http::request> req,
-               std::unique_ptr<http::reply> rep) -> seastar::future<std::unique_ptr<http::reply>> {
-            rep->set_status(http::reply::status_type::ok);
-            rep->_content = handleCacheStatsSync();
-            rep->add_header("Content-Type", "application/json");
-            return seastar::make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
-        },
-        "json");
-    routes.add(operation_type::GET, url("/functions/cache"), cacheStats);
 
     // Function validation endpoint - POST /functions/validate (must be before wildcard /functions/{name})
     auto* validateFunction = new function_handler(
@@ -242,23 +136,23 @@ std::string FunctionHttpHandler::handleFunctionListSync() {
     bool first = true;
     for (const auto& name : names) {
         const auto* meta = registry.getMetadata(name);
-        if (!meta) continue;
+        if (!meta)
+            continue;
 
-        if (!first) json << ",";
+        if (!first)
+            json << ",";
         first = false;
 
-        json << "{\"name\":\"" << jsonEscape(meta->name)
-             << "\",\"category\":\"" << jsonEscape(categoryToString(meta->category))
-             << "\",\"description\":\"" << jsonEscape(meta->description)
+        json << "{\"name\":\"" << jsonEscape(meta->name) << "\",\"category\":\""
+             << jsonEscape(categoryToString(meta->category)) << "\",\"description\":\"" << jsonEscape(meta->description)
              << "\",\"parameters\":[";
 
         for (size_t i = 0; i < meta->parameters.size(); ++i) {
-            if (i > 0) json << ",";
+            if (i > 0)
+                json << ",";
             const auto& param = meta->parameters[i];
-            json << "{\"name\":\"" << jsonEscape(param.name)
-                 << "\",\"type\":\"" << jsonEscape(param.type)
-                 << "\",\"required\":" << (param.required ? "true" : "false")
-                 << "}";
+            json << "{\"name\":\"" << jsonEscape(param.name) << "\",\"type\":\"" << jsonEscape(param.type)
+                 << "\",\"required\":" << (param.required ? "true" : "false") << "}";
         }
 
         json << "]}";
@@ -333,17 +227,17 @@ std::string FunctionHttpHandler::handleFunctionInfoSync(const seastar::http::req
     }
 
     std::ostringstream json;
-    json << "{\"status\":\"success\",\"function\":{\"name\":\"" << jsonEscape(meta->name)
-         << "\",\"category\":\"" << jsonEscape(categoryToString(meta->category))
-         << "\",\"description\":\"" << jsonEscape(meta->description)
+    json << "{\"status\":\"success\",\"function\":{\"name\":\"" << jsonEscape(meta->name) << "\",\"category\":\""
+         << jsonEscape(categoryToString(meta->category)) << "\",\"description\":\"" << jsonEscape(meta->description)
          << "\",\"parameters\":{";
 
     for (size_t i = 0; i < meta->parameters.size(); ++i) {
-        if (i > 0) json << ",";
+        if (i > 0)
+            json << ",";
         const auto& param = meta->parameters[i];
         json << "\"" << jsonEscape(param.name) << "\":{\"type\":\"" << jsonEscape(param.type)
-             << "\",\"required\":" << (param.required ? "true" : "false")
-             << ",\"description\":\"" << jsonEscape(param.description) << "\"";
+             << "\",\"required\":" << (param.required ? "true" : "false") << ",\"description\":\""
+             << jsonEscape(param.description) << "\"";
         if (!param.defaultValue.empty()) {
             json << ",\"default\":\"" << jsonEscape(param.defaultValue) << "\"";
         }
@@ -352,7 +246,8 @@ std::string FunctionHttpHandler::handleFunctionInfoSync(const seastar::http::req
 
     json << "},\"examples\":[";
     for (size_t i = 0; i < meta->examples.size(); ++i) {
-        if (i > 0) json << ",";
+        if (i > 0)
+            json << ",";
         json << "\"" << jsonEscape(meta->examples[i]) << "\"";
     }
     json << "]}}";
@@ -406,16 +301,20 @@ std::string FunctionHttpHandler::handleFunctionValidationSync(const seastar::htt
         auto& registry = FunctionRegistry::getInstance();
         const auto* meta = registry.getMetadata(functionName);
         if (!meta) {
-            return "{\"status\":\"success\",\"valid\":false,\"error\":\"Unknown function: " + jsonEscape(functionName) + "\"}";
+            return "{\"status\":\"success\",\"valid\":false,\"error\":\"Unknown function: " + jsonEscape(functionName) +
+                   "\"}";
         }
 
-        // Check that all required parameters are present
-        for (const auto& param : meta->parameters) {
-            if (param.required) {
-                std::string paramKey = "\"" + param.name + "\"";
-                if (parameters.find(paramKey) == std::string::npos) {
-                    return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: " +
-                           jsonEscape(param.name) + "\"}";
+        // Check that all required parameters are present by parsing the JSON
+        if (!parameters.empty()) {
+            std::map<std::string, glz::json_t> parsedParams;
+            auto parseErr = glz::read_json(parsedParams, parameters);
+            if (!parseErr) {
+                for (const auto& param : meta->parameters) {
+                    if (param.required && parsedParams.find(param.name) == parsedParams.end()) {
+                        return "{\"status\":\"success\",\"valid\":false,\"error\":\"Missing required parameter: " +
+                               jsonEscape(param.name) + "\"}";
+                    }
                 }
             }
         }
@@ -595,7 +494,8 @@ std::pair<bool, std::string> FunctionHttpHandler::handleFunctionQuerySync(const 
 
         // Check if this is a multi-series operation (e.g., add(query1, query2))
         if (functionQuery.find("add(") == 0) {
-            return handleMultiSeriesOperation(functionQuery, startTimeVal, endTimeVal, startTime);  // already returns pair
+            return handleMultiSeriesOperation(functionQuery, startTimeVal, endTimeVal,
+                                              startTime);  // already returns pair
         }
 
         // Handle single-series operation with chained functions
@@ -611,7 +511,8 @@ std::pair<bool, std::string> FunctionHttpHandler::handleFunctionQuerySync(const 
         // Find closing parenthesis of fields
         size_t functionEnd = functionQuery.find(')', functionStart);
         if (functionEnd == std::string::npos) {
-            return {false, R"({"success":false,"error":"Invalid query format - missing closing parenthesis for fields"})"};
+            return {false,
+                    R"({"success":false,"error":"Invalid query format - missing closing parenthesis for fields"})"};
         }
 
         // Extract field name from the query
@@ -675,7 +576,8 @@ std::pair<bool, std::string> FunctionHttpHandler::handleFunctionQuerySync(const 
             }
 
             if (parenCount != 0) {
-                return {false, "{\"success\":false,\"error\":\"Mismatched parentheses in function: " + jsonEscape(funcName) + "\"}"};
+                return {false, "{\"success\":false,\"error\":\"Mismatched parentheses in function: " +
+                                   jsonEscape(funcName) + "\"}"};
             }
 
             std::string funcParams = functionQuery.substr(paramStart, paramEnd - paramStart - 1);
@@ -699,9 +601,10 @@ std::pair<bool, std::string> FunctionHttpHandler::handleMultiSeriesOperation(
     // Multi-series function query endpoint is not yet connected to the storage engine.
     // Return an explicit error rather than fabricated data.
     (void)functionQuery;
-    return {false, R"({"success":false,"error":"Multi-series function query endpoint not yet connected to storage engine"})"};
+    return {false,
+            R"({"success":false,"error":"Multi-series function query endpoint not yet connected to storage engine"})"};
 
-#if 0  // Original mock implementation — kept for reference during engine integration
+#if 0   // Original mock implementation — kept for reference during engine integration
     try {
         // Parse multi-series function syntax: add(query1, query2)
         // Extract the function parameters between outer parentheses
@@ -860,22 +763,6 @@ std::pair<bool, std::string> FunctionHttpHandler::handleMultiSeriesOperation(
 #endif  // mock implementation
 }
 
-std::string FunctionHttpHandler::handlePerformanceStatsSync() {
-    return R"({"status":"error","error":"Performance statistics endpoint not yet implemented"})";
-}
-
-std::string FunctionHttpHandler::handleCacheStatsSync() {
-    return R"({"status":"error","error":"Cache statistics endpoint not yet implemented"})";
-}
-
-seastar::future<std::unique_ptr<seastar::http::reply>> FunctionHttpHandler::createJsonReply(const std::string& json) {
-    auto rep = std::make_unique<seastar::http::reply>();
-    rep->set_status(seastar::http::reply::status_type::ok);
-    rep->_content = json;
-    rep->done("application/json");
-    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
-}
-
 seastar::future<std::unique_ptr<seastar::http::reply>> FunctionHttpHandler::createErrorReply(
     const std::string& error, seastar::http::reply::status_type status) {
     auto rep = std::make_unique<seastar::http::reply>();
@@ -884,24 +771,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> FunctionHttpHandler::crea
     rep->done("application/json");
     return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
-
-seastar::future<FunctionQueryResponse> FunctionHttpHandler::executeFunctionQuery(const FunctionQueryRequest& request) {
-    return seastar::make_ready_future<FunctionQueryResponse>(FunctionQueryResponse{});
-}
-
-FunctionRegistryResponse FunctionHttpHandler::buildFunctionRegistryResponse() const {
-    return FunctionRegistryResponse{};
-}
-
-FunctionPerformanceResponse FunctionHttpHandler::buildPerformanceResponse() const {
-    return FunctionPerformanceResponse{};
-}
-
-QueryParseResponse FunctionHttpHandler::parseAndValidateQuery(const std::string& query) const {
-    return QueryParseResponse{};
-}
-
-void FunctionHttpHandler::updatePerformanceMetrics(const std::string& functionName, double executionTimeMs) const {}
 
 std::unique_ptr<seastar::http::reply> FunctionHttpHandler::createErrorResponse(
     const std::string& error, seastar::http::reply::status_type status) const {

@@ -4,8 +4,6 @@
 #include "http_query_handler.hpp"  // For SeriesResult
 #include "simd_aggregator.hpp"
 
-#include <fmt/format.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -601,10 +599,8 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
 
                 // SPREAD/STDDEV/STDVAR/MEDIAN need full AggregationState;
                 // they cannot be folded from raw values alone.
-                bool methodCanFoldRaw = method != AggregationMethod::SPREAD &&
-                                        method != AggregationMethod::STDDEV &&
-                                        method != AggregationMethod::STDVAR &&
-                                        method != AggregationMethod::MEDIAN;
+                bool methodCanFoldRaw = method != AggregationMethod::SPREAD && method != AggregationMethod::STDDEV &&
+                                        method != AggregationMethod::STDVAR && method != AggregationMethod::MEDIAN;
 
                 if (allRaw && methodCanFoldRaw && !groupPartials.empty()) {
                     // Fast path: merge raw (timestamp, value) vectors directly.
@@ -715,7 +711,8 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
             uint64_t bucketTime = (timestamps[i] / interval) * interval;
             auto& state = buckets[bucketTime];
-            if (needsRaw) state.collectRaw = true;
+            if (needsRaw)
+                state.collectRaw = true;
             state.addValue(values[i], timestamps[i]);
         }
 
@@ -732,7 +729,8 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
         std::unordered_map<uint64_t, AggregationState> states;
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
             auto& state = states[timestamps[i]];
-            if (needsRaw) state.collectRaw = true;
+            if (needsRaw)
+                state.collectRaw = true;
             state.addValue(values[i], timestamps[i]);
         }
 
@@ -762,7 +760,8 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
         for (size_t i = 0; i < timestamps.size() && i < values.size(); ++i) {
             uint64_t key = interval > 0 ? (timestamps[i] / interval) * interval : timestamps[i];
             auto& state = mergedStates[key];
-            if (needsRaw) state.collectRaw = true;
+            if (needsRaw)
+                state.collectRaw = true;
             state.addValue(values[i], timestamps[i]);
         }
     }

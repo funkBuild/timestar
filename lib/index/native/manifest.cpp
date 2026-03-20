@@ -1,17 +1,12 @@
 #include "manifest.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <unordered_set>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
-#include <seastar/core/thread.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace timestar::index {
 
@@ -45,16 +40,38 @@ static uint64_t decodeFixed64(const char* p) {
     return r;
 }
 
+seastar::future<> Manifest::openFileForAppend() {
+    if (fileOpen_) {
+        co_await file_.flush();
+        co_await file_.close();
+        fileOpen_ = false;
+    }
+
+    file_ = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::rw | seastar::open_flags::create);
+    dmaAlign_ = file_.disk_write_dma_alignment();
+    fileOpen_ = true;
+
+    // Determine the current file size so we append at the right offset
+    writeOffset_ = co_await file_.size();
+}
+
 seastar::future<Manifest> Manifest::open(std::string directory) {
-    std::filesystem::create_directories(directory);
+    co_await seastar::recursive_touch_directory(directory);
 
     Manifest m;
     m.directory_ = directory;
     m.manifestPath_ = directory + "/MANIFEST";
 
-    if (std::filesystem::exists(m.manifestPath_)) {
+    bool exists = co_await seastar::file_exists(m.manifestPath_);
+    if (exists) {
         co_await m.recover();
-    } else {
+    }
+
+    // Open the file handle for subsequent appends (rw mode for read-modify-write).
+    // If the file didn't exist, open_flags::create will create it.
+    co_await m.openFileForAppend();
+
+    if (!exists) {
         co_await m.writeSnapshot();
     }
 
@@ -113,35 +130,61 @@ std::string Manifest::serializeRemoveFile(uint64_t fileNumber) const {
     return record;
 }
 
-seastar::future<> Manifest::appendRecord(const std::string& record) {
+seastar::future<> Manifest::appendFrame(const std::string& frame) {
+    if (!fileOpen_) {
+        co_await openFileForAppend();
+    }
+
+    // writeOffset_ is the logical end of data. It may not be DMA-aligned.
+    // DMA writes require aligned offset, aligned buffer, and aligned size.
+    // Strategy: read-modify-write the partial tail block if writeOffset_ is unaligned,
+    // then append the new data, pad to alignment, and write the combined block.
+
+    const uint64_t alignedStart = writeOffset_ & ~(static_cast<uint64_t>(dmaAlign_) - 1);
+    const size_t tailBytes = static_cast<size_t>(writeOffset_ - alignedStart);
+    const size_t totalBytes = tailBytes + frame.size();
+    const size_t paddedSize = (totalBytes + dmaAlign_ - 1) & ~(dmaAlign_ - 1);
+
+    auto buf = seastar::temporary_buffer<char>::aligned(dmaAlign_, paddedSize);
+    std::memset(buf.get_write(), 0, paddedSize);
+
+    // If there's a partial tail from a previous write, read it back
+    if (tailBytes > 0) {
+        auto tailBuf = co_await file_.dma_read<char>(alignedStart, dmaAlign_);
+        std::memcpy(buf.get_write(), tailBuf.get(), tailBytes);
+    }
+
+    // Append the new frame data after the tail
+    std::memcpy(buf.get_write() + tailBytes, frame.data(), frame.size());
+
+    // DMA write the combined block
+    size_t written = 0;
+    while (written < paddedSize) {
+        auto n = co_await file_.dma_write(alignedStart + written, buf.get() + written, paddedSize - written);
+        if (n == 0)
+            throw std::runtime_error("Manifest dma_write returned 0: " + manifestPath_);
+        written += n;
+    }
+
+    // Advance logical offset by the actual data written (not padding)
+    writeOffset_ += frame.size();
+
+    // Truncate to the exact logical size so recovery doesn't see zero-pad bytes
+    // as spurious records. truncate() does not require DMA alignment.
+    co_await file_.truncate(writeOffset_);
+
+    // Flush to ensure data reaches stable storage (equivalent to fsync)
+    co_await file_.flush();
+}
+
+seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
+    std::string record = serializeAddFile(info);
     std::string frame;
     encodeFixed32(frame, static_cast<uint32_t>(record.size()));
     frame.append(record);
 
-    auto path = manifestPath_;
-    co_await seastar::async([path, frame = std::move(frame)] {
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd < 0) {
-            throw std::runtime_error("Failed to open manifest for append: " + path);
-        }
-        size_t total = 0;
-        while (total < frame.size()) {
-            ssize_t w = ::write(fd, frame.data() + total, frame.size() - total);
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                ::close(fd);
-                throw std::runtime_error("Failed to write to manifest: " + path + ": " + std::string(strerror(errno)));
-            }
-            total += w;
-        }
-        ::fsync(fd);
-        ::close(fd);
-    });
-}
-
-seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
     // Persist to disk FIRST, then update in-memory state.
-    co_await appendRecord(serializeAddFile(info));
+    co_await appendFrame(frame);
     files_.push_back(info);
     if (info.fileNumber >= nextFileNumber_) {
         nextFileNumber_ = info.fileNumber + 1;
@@ -152,7 +195,7 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
     if (fileNumbers.empty())
         co_return;
 
-    // Batch all removal records into a single write+fsync to avoid O(N) fsyncs.
+    // Batch all removal records into a single write+fsync
     std::string batchFrame;
     for (uint64_t fn : fileNumbers) {
         std::string record = serializeRemoveFile(fn);
@@ -161,25 +204,7 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
     }
 
     // Persist to disk FIRST, then update in-memory state.
-    auto path = manifestPath_;
-    co_await seastar::async([path, batchFrame = std::move(batchFrame)] {
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd < 0) {
-            throw std::runtime_error("Failed to open manifest for append: " + path);
-        }
-        size_t total = 0;
-        while (total < batchFrame.size()) {
-            ssize_t w = ::write(fd, batchFrame.data() + total, batchFrame.size() - total);
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                ::close(fd);
-                throw std::runtime_error("Failed to write to manifest: " + path + ": " + std::string(strerror(errno)));
-            }
-            total += w;
-        }
-        ::fsync(fd);
-        ::close(fd);
-    });
+    co_await appendFrame(batchFrame);
 
     // Update in-memory state AFTER successful persist
     std::unordered_set<uint64_t> toRemove(fileNumbers.begin(), fileNumbers.end());
@@ -191,9 +216,9 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
 }
 
 seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
-                                                const std::vector<uint64_t>& removeFileNums) {
+                                               const std::vector<uint64_t>& removeFileNums) {
     // Build a single buffer containing the AddFile record followed by all
-    // RemoveFile records.  One write+fsync ensures crash atomicity: either
+    // RemoveFile records. One write+fsync ensures crash atomicity: either
     // all records are persisted or none are.
     std::string combinedFrame;
 
@@ -210,25 +235,7 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
     }
 
     // Single write+fsync
-    auto path = manifestPath_;
-    co_await seastar::async([path, combinedFrame = std::move(combinedFrame)] {
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd < 0) {
-            throw std::runtime_error("Failed to open manifest for atomic replace: " + path);
-        }
-        size_t total = 0;
-        while (total < combinedFrame.size()) {
-            ssize_t w = ::write(fd, combinedFrame.data() + total, combinedFrame.size() - total);
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                ::close(fd);
-                throw std::runtime_error("Failed to write atomic replace to manifest: " + path + ": " + std::string(strerror(errno)));
-            }
-            total += w;
-        }
-        ::fsync(fd);
-        ::close(fd);
-    });
+    co_await appendFrame(combinedFrame);
 
     // Update in-memory state AFTER successful persist
     files_.push_back(newFile);
@@ -238,10 +245,9 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
 
     std::unordered_set<uint64_t> toRemove(removeFileNums.begin(), removeFileNums.end());
     auto newFn = newFile.fileNumber;
-    auto it = std::remove_if(files_.begin(), files_.end(),
-                             [&toRemove, newFn](const SSTableMetadata& f) {
-                                 return f.fileNumber != newFn && toRemove.contains(f.fileNumber);
-                             });
+    auto it = std::remove_if(files_.begin(), files_.end(), [&toRemove, newFn](const SSTableMetadata& f) {
+        return f.fileNumber != newFn && toRemove.contains(f.fileNumber);
+    });
     files_.erase(it, files_.end());
 }
 
@@ -251,61 +257,73 @@ seastar::future<> Manifest::writeSnapshot() {
     encodeFixed32(frame, static_cast<uint32_t>(snapshot.size()));
     frame.append(snapshot);
 
-    auto path = manifestPath_;
-    co_await seastar::async([path, frame = std::move(frame)] {
-        // Write atomically: write to temp, fsync, then rename
-        auto tmpPath = path + ".tmp";
-        {
-            int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) {
-                throw std::runtime_error("Failed to open manifest temp: " + tmpPath);
-            }
-            size_t total = 0;
-            while (total < frame.size()) {
-                ssize_t w = ::write(fd, frame.data() + total, frame.size() - total);
-                if (w < 0) {
-                    if (errno == EINTR) continue;
-                    ::close(fd);
-                    throw std::runtime_error("Failed to write manifest snapshot: " + tmpPath + ": " + std::string(strerror(errno)));
-                }
-                total += w;
-            }
-            ::fsync(fd);
-            ::close(fd);
+    // Write atomically: write to temp file via DMA, fsync, then rename.
+    auto tmpPath = manifestPath_ + ".tmp";
+    auto tmpFile = co_await seastar::open_file_dma(
+        tmpPath, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+    auto tmpAlign = tmpFile.disk_write_dma_alignment();
+
+    std::exception_ptr err;
+    try {
+        const size_t dataSize = frame.size();
+        const size_t paddedSize = (dataSize + tmpAlign - 1) & ~(tmpAlign - 1);
+
+        auto buf = seastar::temporary_buffer<char>::aligned(tmpAlign, paddedSize);
+        std::memset(buf.get_write(), 0, paddedSize);
+        std::memcpy(buf.get_write(), frame.data(), dataSize);
+
+        size_t written = 0;
+        while (written < paddedSize) {
+            auto n = co_await tmpFile.dma_write(written, buf.get() + written, paddedSize - written);
+            if (n == 0)
+                throw std::runtime_error("Manifest snapshot dma_write returned 0: " + tmpPath);
+            written += n;
         }
-        std::filesystem::rename(tmpPath, path);
-        // fsync parent directory so rename is durable
-        auto dir = std::filesystem::path(path).parent_path().string();
-        int dirfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-        if (dirfd >= 0) {
-            ::fsync(dirfd);
-            ::close(dirfd);
+
+        // Truncate to actual data size (remove DMA padding zeros)
+        if (paddedSize != dataSize) {
+            co_await tmpFile.truncate(dataSize);
         }
-    });
+        co_await tmpFile.flush();
+    } catch (...) {
+        err = std::current_exception();
+    }
+
+    co_await tmpFile.close();
+    if (err)
+        std::rethrow_exception(err);
+
+    // Atomic rename: temp -> manifest
+    co_await seastar::rename_file(tmpPath, manifestPath_);
+
+    // fsync parent directory so rename is durable
+    co_await seastar::sync_directory(directory_);
+
+    // Reopen the file handle since the old handle pointed to the pre-rename inode
+    if (fileOpen_) {
+        co_await file_.close();
+        fileOpen_ = false;
+    }
+    co_await openFileForAppend();
 }
 
 seastar::future<> Manifest::recover() {
     files_.clear();
-    auto fileSize = std::filesystem::file_size(manifestPath_);
-    if (fileSize == 0)
+
+    auto readFile = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::ro);
+    auto fileSize = co_await readFile.size();
+    if (fileSize == 0) {
+        co_await readFile.close();
         co_return;
+    }
 
-    std::string data;
-    co_await seastar::async([this, &data, fileSize] {
-        data.resize(fileSize);
-        std::ifstream ifs(manifestPath_, std::ios::binary);
-        if (!ifs.is_open()) {
-            throw std::runtime_error("Failed to open manifest for recovery: " + manifestPath_);
-        }
-        ifs.read(data.data(), static_cast<std::streamsize>(fileSize));
-        if (static_cast<size_t>(ifs.gcount()) != fileSize) {
-            throw std::runtime_error("Short read from manifest: expected " + std::to_string(fileSize) +
-                                     " bytes, got " + std::to_string(ifs.gcount()));
-        }
-    });
+    // Read the entire manifest file using DMA bulk read.
+    // dma_read_bulk handles alignment internally and returns exactly fileSize bytes.
+    auto fileBuf = co_await readFile.dma_read_bulk<char>(0, fileSize);
+    co_await readFile.close();
 
-    const char* p = data.data();
-    const char* end = p + data.size();
+    const char* p = fileBuf.get();
+    const char* end = p + fileSize;
 
     while (p + 4 <= end) {
         uint32_t recordLen = decodeFixed32(p);
@@ -421,8 +439,11 @@ seastar::future<> Manifest::recover() {
 }
 
 seastar::future<> Manifest::close() {
-    // No file handles to close — we use open/write/close per operation
-    co_return;
+    if (fileOpen_) {
+        co_await file_.flush();
+        co_await file_.close();
+        fileOpen_ = false;
+    }
 }
 
 }  // namespace timestar::index

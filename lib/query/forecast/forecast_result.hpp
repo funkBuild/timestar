@@ -228,9 +228,7 @@ struct ForecastConfig {
 
     // SARIMA parameters for seasonal forecasting
     int arOrder = 2;          // Autoregressive order (p)
-    int maOrder = 2;          // Moving average order (q)
     int seasonalArOrder = 1;  // Seasonal AR order (P)
-    int seasonalMaOrder = 1;  // Seasonal MA order (Q)
 
     // Minimum points required for forecasting
     size_t minDataPoints = 10;
@@ -357,28 +355,6 @@ struct ForecastQueryResult {
         }
         return nullptr;
     }
-};
-
-// SARIMA model state for seasonal forecasting
-struct SARIMAState {
-    // Model coefficients
-    std::vector<double> arCoeffs;  // AR coefficients
-    std::vector<double> maCoeffs;  // MA coefficients
-    std::vector<double> seasonalArCoeffs;
-    std::vector<double> seasonalMaCoeffs;
-
-    // Seasonal period
-    size_t seasonalPeriod = 0;
-
-    // Differencing state
-    double lastValue = 0.0;
-    double lastSeasonalValue = 0.0;
-
-    // Residuals for MA terms
-    std::vector<double> residuals;
-
-    // Model fit
-    double sigma = 0.0;  // Residual standard deviation
 };
 
 }  // namespace forecast

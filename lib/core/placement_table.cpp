@@ -24,8 +24,13 @@ const PlacementTable& placement() {
 
 void savePlacement(const std::string& path) {
     std::ofstream ofs(path);
-    if (ofs) {
-        ofs << placement().toJson();
+    if (!ofs) {
+        throw std::runtime_error("savePlacement: cannot open file: " + path);
+    }
+    ofs << placement().toJson();
+    ofs.flush();
+    if (!ofs.good()) {
+        throw std::runtime_error("savePlacement: write failed for file: " + path);
     }
 }
 

@@ -23,6 +23,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
@@ -71,8 +72,8 @@ void set_routes(routes& r) {
 
     r.add(operation_type::GET, url("/health"),
           new function_handler(
-              [](std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply> rep)
-                  -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+              [](std::unique_ptr<seastar::http::request>,
+                 std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
                   if (g_ready.load(std::memory_order_relaxed)) {
                       rep->set_status(seastar::http::reply::status_type::ok);
                       rep->_content = "{\"status\":\"healthy\"}";
@@ -86,10 +87,10 @@ void set_routes(routes& r) {
               },
               "json"));
 
-    r.add(operation_type::GET, url("/version"),
-          new function_handler([](const_req req) {
+    r.add(operation_type::GET, url("/version"), new function_handler([](const_req req) {
               return sstring(fmt::format(R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
-                                         timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER));
+                                         timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME,
+                                         timestar::COMPILER));
           }));
 
     // Protected endpoints — when g_authToken is non-empty, each handler wraps
@@ -118,10 +119,10 @@ void set_routes(routes& r) {
     auto* derivedQueryHandler = emplaceHandler(new timestar::HttpDerivedQueryHandler(&g_engine));
     derivedQueryHandler->registerRoutes(r, g_authToken);
 
-    r.add(operation_type::GET, url("/"),
-          new function_handler([](const_req req) {
+    r.add(operation_type::GET, url("/"), new function_handler([](const_req req) {
               return "{\"message\":\"TimeStar HTTP "
-                     "Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/measurements\",\"/"
+                     "Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/"
+                     "measurements\",\"/"
                      "tags\",\"/fields\",\"/retention\",\"/subscribe\",\"/subscriptions\"]}";
           }));
 }
@@ -353,7 +354,8 @@ int main(int argc, char** argv) {
                     g_authToken = timestar::generateToken(32);
                     timestar::http_log.info("Auth enabled — generated token: {}", timestar::maskToken(g_authToken));
                 } else {
-                    timestar::http_log.info("Auth enabled — using configured token: {}", timestar::maskToken(g_authToken));
+                    timestar::http_log.info("Auth enabled — using configured token: {}",
+                                            timestar::maskToken(g_authToken));
                 }
             } else {
                 timestar::http_log.info("Auth disabled — all endpoints are unauthenticated");

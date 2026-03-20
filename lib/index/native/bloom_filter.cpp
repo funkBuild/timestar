@@ -107,13 +107,15 @@ bool BloomFilter::mayContain(std::string_view key) const {
 }
 
 uint64_t BloomFilter::bitCount() const {
-    if (filter_.empty()) return 0;
+    if (filter_.empty())
+        return 0;
     return simd::bloomPopcount(filter_.data(), filter_.size());
 }
 
 double BloomFilter::density() const {
     size_t numBits = filter_.size() * 64;
-    if (numBits == 0) return 0.0;
+    if (numBits == 0)
+        return 0.0;
     return static_cast<double>(bitCount()) / static_cast<double>(numBits);
 }
 
@@ -143,6 +145,9 @@ BloomFilter BloomFilter::deserializeFrom(std::string_view data) {
     }
 
     int k = static_cast<uint8_t>(data[0]);
+    if (k == 0 || k > 30) {
+        return createNull();  // Invalid k from corrupted data
+    }
     uint32_t size = static_cast<uint32_t>(static_cast<uint8_t>(data[1])) |
                     (static_cast<uint32_t>(static_cast<uint8_t>(data[2])) << 8) |
                     (static_cast<uint32_t>(static_cast<uint8_t>(data[3])) << 16) |

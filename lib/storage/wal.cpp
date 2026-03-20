@@ -11,6 +11,7 @@
 #include "logging_config.hpp"
 #include "series_id.hpp"
 #include "string_encoder.hpp"
+#include "timestar_config.hpp"
 #include "tsm.hpp"
 #include "zigzag.hpp"
 
@@ -91,6 +92,9 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     }
 
     timestar::wal_log.debug("WAL file opened: {}", filename);
+
+    // Initialize WAL size limit from config (matches MemoryStore::walSizeThreshold())
+    maxWalSize_ = timestar::config().storage.wal_size_threshold;
 
     // Get current file size
     filePos = co_await walFile.size();
@@ -273,34 +277,6 @@ seastar::future<> WAL::padToAlignment() {
     _unflushed_bytes += padding;
     filePos += padding;
     currentSize += padding;
-}
-
-// Flush pending buffered bytes in the output stream
-seastar::future<> WAL::flushBlock() {
-    if (!out)
-        co_return;
-    try {
-#if TIMESTAR_LOG_INSERT_PATH
-        auto startTime = std::chrono::steady_clock::now();
-#endif
-
-        // Pad to DMA alignment before flushing to keep file sink position aligned
-        co_await padToAlignment();
-        co_await out->flush();
-        _unflushed_bytes = 0;  // reset after successful flush
-
-#if TIMESTAR_LOG_INSERT_PATH
-        auto endTime = std::chrono::steady_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-        LOG_INSERT_PATH(timestar::wal_log, debug, "WAL stream flush: pos={}, took={}ms", filePos, ms);
-        if (ms > 100) {
-            timestar::wal_log.warn("WAL flush took {}ms - potential I/O bottleneck", ms);
-        }
-#endif
-    } catch (const std::exception& e) {
-        timestar::wal_log.error("WAL flush error: {}", e.what());
-        throw;  // Rethrow to preserve WAL durability guarantees
-    }
 }
 
 template <class T>
@@ -520,13 +496,13 @@ seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
 
     LOG_INSERT_PATH(timestar::wal_log, debug, "WAL::insert - dataSize={}, currentSize={}", dataSize, currentSize);
 
-    // Respect the 16MiB WAL limit BEFORE writing
+    // Respect the WAL size limit BEFORE writing
     const size_t projectedSize = currentSize + dataSize;
-    if (projectedSize > MAX_WAL_SIZE) {
+    if (projectedSize > maxWalSize_) {
         timestar::wal_log.debug(
-            "WAL::insert - Would exceed 16MB limit (current={}, "
-            "dataSize={}, projected={}), signaling rollover needed",
-            currentSize, dataSize, projectedSize);
+            "WAL::insert - Would exceed WAL limit (current={}, "
+            "dataSize={}, projected={}, limit={}), signaling rollover needed",
+            currentSize, dataSize, projectedSize, maxWalSize_);
         co_return WALInsertResult::RolloverNeeded;
     }
 
@@ -597,11 +573,11 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
 
     // WAL limit check (under lock so currentSize is authoritative)
     const size_t projected = currentSize + totalSize;
-    if (projected > MAX_WAL_SIZE) {
+    if (projected > maxWalSize_) {
         timestar::wal_log.debug(
-            "WAL::insertBatch - Would exceed 16MB limit (current={}, total={}, "
-            "projected={}), signaling rollover",
-            currentSize, totalSize, projected);
+            "WAL::insertBatch - Would exceed WAL limit (current={}, total={}, "
+            "projected={}, limit={}), signaling rollover",
+            currentSize, totalSize, projected, maxWalSize_);
         co_return WALInsertResult::RolloverNeeded;
     }
 
@@ -919,7 +895,8 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                                 store->insertMemory(std::move(insertReq));
                             } break;
                             default:
-                                timestar::wal_log.warn("WAL recovery: unknown value type {} in entry, skipping", valueType);
+                                timestar::wal_log.warn("WAL recovery: unknown value type {} in entry, skipping",
+                                                       valueType);
                                 partialEntries++;
                                 continue;
                         }

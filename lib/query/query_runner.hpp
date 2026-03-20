@@ -17,7 +17,7 @@ private:
     WALFileManager* walFileManager;
 
     template <class T>
-    seastar::future<QueryResult<T>> queryTsm(std::string series, SeriesId128 seriesId, uint64_t startTime,
+    seastar::future<QueryResult<T>> queryTsm(const std::string& series, SeriesId128 seriesId, uint64_t startTime,
                                              uint64_t endTime);
 
 public:

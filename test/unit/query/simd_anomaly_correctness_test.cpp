@@ -128,19 +128,19 @@ void computeMovingAverage(const double* values, size_t count, size_t windowSize,
         }
     }
     for (size_t i = 0; i < count; ++i) {
+        result[i] = (windowCount > 0) ? windowSum / static_cast<double>(windowCount) : 0.0;
         size_t addIdx = i + halfWindow + 1;
         if (addIdx < count && !std::isnan(values[addIdx])) {
             windowSum += values[addIdx];
             ++windowCount;
         }
-        if (i > halfWindow) {
-            size_t removeIdx = i - halfWindow - 1;
+        if (i >= halfWindow) {
+            size_t removeIdx = i - halfWindow;
             if (!std::isnan(values[removeIdx])) {
                 windowSum -= values[removeIdx];
                 --windowCount;
             }
         }
-        result[i] = (windowCount > 0) ? windowSum / static_cast<double>(windowCount) : 0.0;
     }
 }
 

@@ -3,6 +3,10 @@
 #include <stdexcept>
 
 SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey) {
+    if (seriesKey.empty()) {
+        throw std::invalid_argument("SeriesKeyParser: empty series key");
+    }
+
     const size_t length = seriesKey.length();
 
     size_t startIndex = 0;
@@ -64,6 +68,10 @@ SeriesKeyParser::SeriesKeyParser(std::string_view seriesKey) {
                 startIndex = i + 1;
             }; break;
         }
+    }
+
+    if (insideQuote) {
+        throw std::invalid_argument("SeriesKeyParser: unclosed quote in series key");
     }
 
     field = seriesKey.substr(startIndex, length - startIndex);

@@ -180,19 +180,5 @@ struct STLComponents {
     size_t size() const { return trend.size(); }
 };
 
-// SARIMA model parameters (used by Agile algorithm)
-struct SARIMAParams {
-    // Non-seasonal parameters
-    int p = 1;  // Autoregressive order
-    int d = 1;  // Differencing order
-    int q = 1;  // Moving average order
-
-    // Seasonal parameters
-    int P = 1;  // Seasonal AR order
-    int D = 1;  // Seasonal differencing order
-    int Q = 1;  // Seasonal MA order
-    int s = 0;  // Seasonal period (0 = no seasonality)
-};
-
 }  // namespace anomaly
 }  // namespace timestar

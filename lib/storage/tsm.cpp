@@ -9,15 +9,12 @@
 #include "zigzag.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <filesystem>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <string_view>
-
-using Clock = std::chrono::high_resolution_clock;
 
 // Block header: uint8_t type + uint32_t timestampSize + uint32_t timestampBytes
 static constexpr size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t);  // 9 bytes
@@ -276,8 +273,7 @@ seastar::future<> TSM::open() {
         if (length >= 5) {
             auto hdrBuf = co_await tsmFile.dma_read_exactly<uint8_t>(0, 5);
             // Validate magic bytes "TASM"
-            if (hdrBuf.get()[0] != 'T' || hdrBuf.get()[1] != 'A' ||
-                hdrBuf.get()[2] != 'S' || hdrBuf.get()[3] != 'M') {
+            if (hdrBuf.get()[0] != 'T' || hdrBuf.get()[1] != 'A' || hdrBuf.get()[2] != 'S' || hdrBuf.get()[3] != 'M') {
                 throw std::runtime_error("Not a TSM file (bad magic): " + filePath);
             }
             fileVersion = hdrBuf.get()[4];
@@ -434,6 +430,9 @@ seastar::future<> TSM::readSparseIndex() {
         if (seriesType == TSMValueType::String && fileVersion >= 2) {
             if (indexSlice.offset + 4 <= indexSlice.length_) {
                 std::memcpy(&dictBytes, indexSlice.data + indexSlice.offset, 4);
+                if (indexSlice.offset + 4 + dictBytes > indexSlice.length_) {
+                    break;  // Corrupted dictionary size — stop parsing
+                }
                 indexSlice.offset += 4 + dictBytes;
             }
         }
@@ -479,6 +478,78 @@ seastar::future<> TSM::readSparseIndex() {
 
     timestar::tsm_log.info("Loaded sparse index for {} (tier {}): {} series, bloom filter: {} bytes", filePath, tierNum,
                            sparseIndex.size(), seriesBloomFilter.size());
+}
+
+// Shared helper: parse index blocks (and optional string dictionary) from a Slice.
+// The caller must have already read the series ID, type byte, and block count from
+// the Slice before calling this.  On return the Slice offset is advanced past all
+// block data and the optional string dictionary.
+void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint16_t blockCount) const {
+    entry.indexBlocks.reserve(blockCount);
+    for (uint16_t i = 0; i < blockCount; ++i) {
+        TSMIndexBlock block;
+        block.minTime = indexSlice.read<uint64_t>();
+        block.maxTime = indexSlice.read<uint64_t>();
+        block.offset = indexSlice.read<uint64_t>();
+        block.size = indexSlice.read<uint32_t>();
+        if (entry.seriesType == TSMValueType::Float) {
+            block.blockSum = indexSlice.read<double>();
+            block.blockMin = indexSlice.read<double>();
+            block.blockMax = indexSlice.read<double>();
+            block.blockCount = indexSlice.read<uint32_t>();
+            block.blockM2 = indexSlice.read<double>();
+            block.blockFirstValue = indexSlice.read<double>();
+            block.blockLatestValue = indexSlice.read<double>();
+            block.hasExtendedStats = true;
+        } else if (fileVersion >= 2) {
+            // V2: all non-Float types have at least blockCount
+            if (entry.seriesType == TSMValueType::Integer) {
+                // 72 bytes: 28 base + count(4) + sum(8) + min(8) + max(8) + first(8) + latest(8)
+                block.blockCount = indexSlice.read<uint32_t>();
+                int64_t intSum = indexSlice.read<int64_t>();
+                int64_t intMin = indexSlice.read<int64_t>();
+                int64_t intMax = indexSlice.read<int64_t>();
+                int64_t intFirst = indexSlice.read<int64_t>();
+                int64_t intLatest = indexSlice.read<int64_t>();
+                block.blockSum = static_cast<double>(intSum);
+                block.blockMin = static_cast<double>(intMin);
+                block.blockMax = static_cast<double>(intMax);
+                block.blockFirstValue = static_cast<double>(intFirst);
+                block.blockLatestValue = static_cast<double>(intLatest);
+                block.hasExtendedStats = true;
+            } else if (entry.seriesType == TSMValueType::Boolean) {
+                // 40 bytes: 28 base + count(4) + trueCount(4) + firstValue(1) + latestValue(1) + pad(2)
+                block.blockCount = indexSlice.read<uint32_t>();
+                block.boolTrueCount = indexSlice.read<uint32_t>();
+                block.boolFirstValue = (indexSlice.read<uint8_t>() != 0);
+                block.boolLatestValue = (indexSlice.read<uint8_t>() != 0);
+                indexSlice.offset += 2;  // skip padding
+                // Convert for aggregator compatibility
+                block.blockSum = static_cast<double>(block.boolTrueCount);
+                block.blockMin = (block.boolTrueCount < block.blockCount) ? 0.0 : 1.0;
+                block.blockMax = (block.boolTrueCount > 0) ? 1.0 : 0.0;
+                block.blockFirstValue = block.boolFirstValue ? 1.0 : 0.0;
+                block.blockLatestValue = block.boolLatestValue ? 1.0 : 0.0;
+                block.hasExtendedStats = true;
+            } else if (entry.seriesType == TSMValueType::String) {
+                // 32 bytes: 28 base + count(4)
+                block.blockCount = indexSlice.read<uint32_t>();
+                // No value stats for strings — blockCount enables COUNT pushdown
+            }
+        }
+        entry.indexBlocks.push_back(block);
+    }
+
+    // Phase 3: Parse string dictionary if present
+    if (entry.seriesType == TSMValueType::String && fileVersion >= 2 && indexSlice.offset + 4 <= indexSlice.length_) {
+        uint32_t dictSize = indexSlice.read<uint32_t>();
+        if (dictSize > 0 && indexSlice.offset + dictSize <= indexSlice.length_) {
+            auto dict = StringEncoder::deserializeDictionary(indexSlice, dictSize);
+            if (dict.valid) {
+                entry.stringDictionary = std::move(dict.entries);
+            }
+        }
+    }
 }
 
 // Lazy load full index entry for a series (single DMA read)
@@ -527,73 +598,8 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
     uint16_t blockCount = entrySlice.read<uint16_t>();
 
-    // Parse all blocks — per-type stats depend on file version
-    fullEntry.indexBlocks.reserve(blockCount);
-    for (uint16_t i = 0; i < blockCount; i++) {
-        TSMIndexBlock block;
-        block.minTime = entrySlice.read<uint64_t>();
-        block.maxTime = entrySlice.read<uint64_t>();
-        block.offset = entrySlice.read<uint64_t>();
-        block.size = entrySlice.read<uint32_t>();
-        if (fullEntry.seriesType == TSMValueType::Float) {
-            block.blockSum = entrySlice.read<double>();
-            block.blockMin = entrySlice.read<double>();
-            block.blockMax = entrySlice.read<double>();
-            block.blockCount = entrySlice.read<uint32_t>();
-            block.blockM2 = entrySlice.read<double>();
-            block.blockFirstValue = entrySlice.read<double>();
-            block.blockLatestValue = entrySlice.read<double>();
-            block.hasExtendedStats = true;
-        } else if (fileVersion >= 2) {
-            // V2: all non-Float types have at least blockCount
-            if (fullEntry.seriesType == TSMValueType::Integer) {
-                // 72 bytes: 28 base + count(4) + sum(8) + min(8) + max(8) + first(8) + latest(8)
-                block.blockCount = entrySlice.read<uint32_t>();
-                int64_t intSum = entrySlice.read<int64_t>();
-                int64_t intMin = entrySlice.read<int64_t>();
-                int64_t intMax = entrySlice.read<int64_t>();
-                int64_t intFirst = entrySlice.read<int64_t>();
-                int64_t intLatest = entrySlice.read<int64_t>();
-                block.blockSum = static_cast<double>(intSum);
-                block.blockMin = static_cast<double>(intMin);
-                block.blockMax = static_cast<double>(intMax);
-                block.blockFirstValue = static_cast<double>(intFirst);
-                block.blockLatestValue = static_cast<double>(intLatest);
-                block.hasExtendedStats = true;
-            } else if (fullEntry.seriesType == TSMValueType::Boolean) {
-                // 40 bytes: 28 base + count(4) + trueCount(4) + firstValue(1) + latestValue(1) + pad(2)
-                block.blockCount = entrySlice.read<uint32_t>();
-                block.boolTrueCount = entrySlice.read<uint32_t>();
-                block.boolFirstValue = (entrySlice.read<uint8_t>() != 0);
-                block.boolLatestValue = (entrySlice.read<uint8_t>() != 0);
-                entrySlice.offset += 2;  // skip padding
-                // Convert for aggregator compatibility
-                block.blockSum = static_cast<double>(block.boolTrueCount);
-                block.blockMin = (block.boolTrueCount < block.blockCount) ? 0.0 : 1.0;
-                block.blockMax = (block.boolTrueCount > 0) ? 1.0 : 0.0;
-                block.blockFirstValue = block.boolFirstValue ? 1.0 : 0.0;
-                block.blockLatestValue = block.boolLatestValue ? 1.0 : 0.0;
-                block.hasExtendedStats = true;
-            } else if (fullEntry.seriesType == TSMValueType::String) {
-                // 32 bytes: 28 base + count(4)
-                block.blockCount = entrySlice.read<uint32_t>();
-                // No value stats for strings — blockCount enables COUNT pushdown
-            }
-        }
-        fullEntry.indexBlocks.push_back(block);
-    }
-
-    // Phase 3: Parse string dictionary if present
-    if (fullEntry.seriesType == TSMValueType::String && fileVersion >= 2 &&
-        entrySlice.offset + 4 <= entrySlice.length_) {
-        uint32_t dictSize = entrySlice.read<uint32_t>();
-        if (dictSize > 0 && entrySlice.offset + dictSize <= entrySlice.length_) {
-            auto dict = StringEncoder::deserializeDictionary(entrySlice, dictSize);
-            if (dict.valid) {
-                fullEntry.stringDictionary = std::move(dict.entries);
-            }
-        }
-    }
+    // Parse all blocks and optional string dictionary
+    parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
 
     // Step 6: Cache it with LRU eviction.
     //
@@ -738,67 +744,8 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
             fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
             uint16_t blockCount = entrySlice.read<uint16_t>();
 
-            fullEntry.indexBlocks.reserve(blockCount);
-
-            for (uint16_t b = 0; b < blockCount; ++b) {
-                TSMIndexBlock block;
-                block.minTime = entrySlice.read<uint64_t>();
-                block.maxTime = entrySlice.read<uint64_t>();
-                block.offset = entrySlice.read<uint64_t>();
-                block.size = entrySlice.read<uint32_t>();
-                if (fullEntry.seriesType == TSMValueType::Float) {
-                    block.blockSum = entrySlice.read<double>();
-                    block.blockMin = entrySlice.read<double>();
-                    block.blockMax = entrySlice.read<double>();
-                    block.blockCount = entrySlice.read<uint32_t>();
-                    block.blockM2 = entrySlice.read<double>();
-                    block.blockFirstValue = entrySlice.read<double>();
-                    block.blockLatestValue = entrySlice.read<double>();
-                    block.hasExtendedStats = true;
-                } else if (fileVersion >= 2) {
-                    if (fullEntry.seriesType == TSMValueType::Integer) {
-                        block.blockCount = entrySlice.read<uint32_t>();
-                        int64_t intSum = entrySlice.read<int64_t>();
-                        int64_t intMin = entrySlice.read<int64_t>();
-                        int64_t intMax = entrySlice.read<int64_t>();
-                        int64_t intFirst = entrySlice.read<int64_t>();
-                        int64_t intLatest = entrySlice.read<int64_t>();
-                        block.blockSum = static_cast<double>(intSum);
-                        block.blockMin = static_cast<double>(intMin);
-                        block.blockMax = static_cast<double>(intMax);
-                        block.blockFirstValue = static_cast<double>(intFirst);
-                        block.blockLatestValue = static_cast<double>(intLatest);
-                        block.hasExtendedStats = true;
-                    } else if (fullEntry.seriesType == TSMValueType::Boolean) {
-                        block.blockCount = entrySlice.read<uint32_t>();
-                        block.boolTrueCount = entrySlice.read<uint32_t>();
-                        block.boolFirstValue = (entrySlice.read<uint8_t>() != 0);
-                        block.boolLatestValue = (entrySlice.read<uint8_t>() != 0);
-                        entrySlice.offset += 2;
-                        block.blockSum = static_cast<double>(block.boolTrueCount);
-                        block.blockMin = (block.boolTrueCount < block.blockCount) ? 0.0 : 1.0;
-                        block.blockMax = (block.boolTrueCount > 0) ? 1.0 : 0.0;
-                        block.blockFirstValue = block.boolFirstValue ? 1.0 : 0.0;
-                        block.blockLatestValue = block.boolLatestValue ? 1.0 : 0.0;
-                        block.hasExtendedStats = true;
-                    } else if (fullEntry.seriesType == TSMValueType::String) {
-                        block.blockCount = entrySlice.read<uint32_t>();
-                    }
-                }
-                fullEntry.indexBlocks.push_back(block);
-            }
-
-            // Phase 3: Parse string dictionary
-            if (fullEntry.seriesType == TSMValueType::String && fileVersion >= 2 &&
-                entrySlice.offset + 4 <= entrySlice.length_) {
-                uint32_t dictSize = entrySlice.read<uint32_t>();
-                if (dictSize > 0 && entrySlice.offset + dictSize <= entrySlice.length_) {
-                    auto dict = StringEncoder::deserializeDictionary(entrySlice, dictSize);
-                    if (dict.valid) {
-                        fullEntry.stringDictionary = std::move(dict.entries);
-                    }
-                }
-            }
+            // Parse all blocks and optional string dictionary
+            parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
 
             // Cache the entry
             size_t entryBytes = estimateEntryBytes(fullEntry);

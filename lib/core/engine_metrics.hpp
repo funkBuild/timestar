@@ -22,7 +22,6 @@ struct EngineMetrics {
     uint64_t slow_queries_total = 0;
     uint64_t deletes_total = 0;
     uint64_t wal_rollovers_total = 0;
-    uint64_t compactions_total = 0;
 
     // Seastar metrics registration (automatically deregisters on destruction)
     seastar::metrics::metric_groups _metrics;

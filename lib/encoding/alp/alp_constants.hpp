@@ -43,6 +43,5 @@ static constexpr int64_t MIN_SAFE_INT = -(1LL << 53);
 
 // Number of (exp, fac) combinations
 static constexpr size_t EXP_COUNT = 19;
-static constexpr size_t FAC_COUNT = 19;
 
 }  // namespace alp

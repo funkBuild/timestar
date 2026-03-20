@@ -1,9 +1,9 @@
 #include "http_query_handler.hpp"
-#include "http_auth.hpp"
 
 #include "aggregator.hpp"
 #include "engine.hpp"
 #include "group_key.hpp"
+#include "http_auth.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "query_parser.hpp"
@@ -228,7 +228,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
 
         // Convert to QueryRequest
         QueryRequest queryRequest;
-        auto parseStart = std::chrono::high_resolution_clock::now();
         try {
             queryRequest = parseQueryRequest(glazeRequest);
         } catch (const QueryParseException& e) {
@@ -237,8 +236,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
             rep->add_header("Content-Type", "application/json");
             co_return rep;
         }
-        auto parseEnd = std::chrono::high_resolution_clock::now();
-        double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
         // Execute query
         auto startTime = std::chrono::high_resolution_clock::now();
@@ -249,7 +246,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
         response.statistics.executionTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
         // Format response
-        auto formatStart = std::chrono::high_resolution_clock::now();
         if (response.success) {
             rep->set_status(seastar::http::reply::status_type::ok);
             rep->_content = formatQueryResponse(response);
@@ -257,8 +253,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
             rep->set_status(seastar::http::reply::status_type::internal_server_error);
             rep->_content = createErrorResponse(response.errorCode, response.errorMessage);
         }
-        auto formatEnd = std::chrono::high_resolution_clock::now();
-        double formatMs = std::chrono::duration<double, std::milli>(formatEnd - formatStart).count();
 
         rep->add_header("Content-Type", "application/json");
 
@@ -285,15 +279,15 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
 
 void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto* handler = new seastar::httpd::function_handler(
-        timestar::wrapWithAuth(authToken,
+        timestar::wrapWithAuth(
+            authToken,
             [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
                 -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleQuery(std::move(req)); }),
         "json");
 
     r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/query"), handler);
 
-    timestar::http_log.info("Registered HTTP query endpoint at /query{}",
-                            authToken.empty() ? "" : " (auth required)");
+    timestar::http_log.info("Registered HTTP query endpoint at /query{}", authToken.empty() ? "" : " (auth required)");
 }
 
 QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeReq) {
@@ -309,8 +303,10 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
     } else {
         std::string timeStr = std::get<std::string>(glazeReq.startTime);
         try {
+            if (!timeStr.empty() && timeStr[0] == '-')
+                throw std::invalid_argument("Negative timestamps are not supported");
             startTime = std::stoull(timeStr);
-        } catch (const std::exception&) {
+        } catch (const std::invalid_argument&) {
             // Fall back to date string parsing (legacy support)
             startTime = QueryParser::parseTime(timeStr);
         }
@@ -322,8 +318,10 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
     } else {
         std::string timeStr = std::get<std::string>(glazeReq.endTime);
         try {
+            if (!timeStr.empty() && timeStr[0] == '-')
+                throw std::invalid_argument("Negative timestamps are not supported");
             endTime = std::stoull(timeStr);
-        } catch (const std::exception&) {
+        } catch (const std::invalid_argument&) {
             // Fall back to date string parsing (legacy support)
             endTime = QueryParser::parseTime(timeStr);
         }
@@ -507,8 +505,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         std::vector<std::pair<unsigned, PerShardDiscovery>> discoveryResults;
         try {
             discoveryResults = co_await seastar::with_timeout(
-                discoveryDeadline,
-                seastar::when_all_succeed(discoveryFutures.begin(), discoveryFutures.end()));
+                discoveryDeadline, seastar::when_all_succeed(discoveryFutures.begin(), discoveryFutures.end()));
         } catch (seastar::timed_out_error&) {
             QueryResponse timeoutResponse;
             timeoutResponse.success = false;
@@ -941,7 +938,6 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                         series.fields[fieldName] =
                             std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
 
-                        size_t newIdx = response.series.size();
                         response.series.push_back(std::move(series));
                     }
                 }

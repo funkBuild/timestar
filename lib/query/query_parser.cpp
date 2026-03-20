@@ -131,8 +131,8 @@ uint64_t QueryParser::parseTime(const std::string& timeStr) {
     // Post-validation: timegm normalizes invalid dates (e.g., Feb 30 -> Mar 2).
     // Detect this by checking that the fields were not modified.
     if (tm.tm_mday != day || tm.tm_mon != (month - 1) || (tm.tm_year + 1900) != year) {
-        throw QueryParseException("Invalid date: day " + std::to_string(day) +
-            " is out of range for month " + std::to_string(month));
+        throw QueryParseException("Invalid date: day " + std::to_string(day) + " is out of range for month " +
+                                  std::to_string(month));
     }
 
     // Convert to nanoseconds
@@ -197,7 +197,8 @@ std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos)
             size_t tempPos = pos;
             skipWhitespace(query, tempPos);
             if (tempPos + 1 < query.length() && query[tempPos] == 'b' && query[tempPos + 1] == 'y' &&
-                (tempPos + 2 == query.length() || std::isspace(static_cast<unsigned char>(query[tempPos + 2])) || query[tempPos + 2] == '{')) {
+                (tempPos + 2 == query.length() || std::isspace(static_cast<unsigned char>(query[tempPos + 2])) ||
+                 query[tempPos + 2] == '{')) {
                 break;
             }
         }
@@ -333,10 +334,11 @@ std::map<std::string, std::string> QueryParser::parseScopes(const std::string& q
             throw QueryParseException("Empty key or value in scope: " + std::string(pair));
         }
 
-        if (scopes.count(std::string(key))) {
-            throw QueryParseException("Duplicate scope key: '" + std::string(key) + "'");
+        std::string keyStr(key);
+        if (scopes.count(keyStr)) {
+            throw QueryParseException("Duplicate scope key: '" + keyStr + "'");
         }
-        scopes[std::string(key)] = std::string(value);
+        scopes[std::move(keyStr)] = std::string(value);
         start = end + 1;
     }
 

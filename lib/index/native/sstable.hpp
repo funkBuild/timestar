@@ -173,8 +173,8 @@ public:
     private:
         SSTableReader* reader_;
         bool valid_ = false;
-        size_t blockIndex_ = 0;  // Current index entry
-        std::string blockData_;  // Step 1: owned decompressed block data
+        size_t blockIndex_ = 0;                                   // Current index entry
+        seastar::lw_shared_ptr<const std::string> blockDataPtr_;  // Keeps decompressed data alive
         std::unique_ptr<BlockReader> blockReader_;
         BlockReader::Iterator blockIter_;
         std::string key_;
@@ -202,7 +202,7 @@ public:
 
     // Concurrency semaphore: limits concurrent cache-miss block reads per shard.
     // Set by NativeIndex::open() — pointer is per-shard (thread-local in Seastar).
-    static seastar::semaphore* blockReadSemaphore_;
+    static thread_local seastar::semaphore* blockReadSemaphore_;
     static void setBlockReadSemaphore(seastar::semaphore* sem);
 
 private:
@@ -224,9 +224,10 @@ private:
     void buildSummary();
 
     // Get decompressed block data, checking cache first.
-    // On cache hit, returns the cached block string (no I/O).
-    // On cache miss, reads and decompresses from disk asynchronously.
-    seastar::future<std::string> getDecompressedBlock(size_t idx);
+    // On cache hit, returns the cached shared_ptr (zero-copy).
+    // On cache miss, reads and decompresses from disk asynchronously,
+    // wraps in a shared_ptr, caches it, and returns it.
+    seastar::future<seastar::lw_shared_ptr<const std::string>> getDecompressedBlock(size_t idx);
 
     std::string filename_;
     SSTableMetadata metadata_;

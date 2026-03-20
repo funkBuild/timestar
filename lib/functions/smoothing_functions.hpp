@@ -17,12 +17,6 @@ public:
     };
 };
 
-// Smoothing utilities namespace
-namespace smoothing_utils {
-std::vector<uint64_t> generateSmoothedTimestamps(const std::vector<uint64_t>& original, size_t window,
-                                                 SmoothingFunction::EdgeHandling edgeHandling);
-}
-
 // Simple Moving Average Function
 class SMAFunction : public IUnaryFunction {
 public:

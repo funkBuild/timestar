@@ -87,10 +87,14 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             const uint8_t bw = static_cast<uint8_t>((bh0 >> 16) & 0x7F);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
             const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
-            if (exp >= 19 || fac >= 19) throw std::runtime_error("ALP: invalid exp/fac");
-            if (bw > 64) throw std::runtime_error("ALP: invalid bit width");
-            if (block_count > 1024) throw std::runtime_error("ALP: block_count exceeds limit");
-            if (exception_count > block_count) throw std::runtime_error("ALP: exception_count exceeds block_count");
+            if (exp >= 19 || fac >= 19)
+                throw std::runtime_error("ALP: invalid exp/fac");
+            if (bw > 64)
+                throw std::runtime_error("ALP: invalid bit width");
+            if (block_count > 1024)
+                throw std::runtime_error("ALP: block_count exceeds limit");
+            if (exception_count > block_count)
+                throw std::runtime_error("ALP: exception_count exceeds block_count");
             const int64_t for_base = std::bit_cast<int64_t>(bh1);
 
             // Read first_value for delta scheme (part of block header)
@@ -118,7 +122,6 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             // Bulk read FFOR packed data into thread-local buffer, bypassing the
             // per-word readFixed state machine (~6 ops/word → single memcpy).
-            auto& scratch = getScratch();
             scratch.packed_data.resize(packed_words);
             encoded.readAlignedWords(scratch.packed_data.data(), packed_words);
 
@@ -244,11 +247,16 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             const uint8_t dict_size = static_cast<uint8_t>((bh0 >> 16) & 0xFF);
             const uint16_t exception_count = static_cast<uint16_t>((bh0 >> 32) & 0xFFFF);
             const uint16_t block_count = static_cast<uint16_t>((bh0 >> 48) & 0xFFFF);
-            if (dict_size > 8) throw std::runtime_error("ALP_RD: dict_size exceeds limit");
-            if (right_bw > 64) throw std::runtime_error("ALP_RD: invalid right bit width");
-            if (left_bw > 64) throw std::runtime_error("ALP_RD: invalid left bit width");
-            if (block_count > 1024) throw std::runtime_error("ALP_RD: block_count exceeds limit");
-            if (exception_count > block_count) throw std::runtime_error("ALP: exception_count exceeds block_count");
+            if (dict_size > 8)
+                throw std::runtime_error("ALP_RD: dict_size exceeds limit");
+            if (right_bw > 64)
+                throw std::runtime_error("ALP_RD: invalid right bit width");
+            if (left_bw > 64)
+                throw std::runtime_error("ALP_RD: invalid left bit width");
+            if (block_count > 1024)
+                throw std::runtime_error("ALP_RD: block_count exceeds limit");
+            if (exception_count > block_count)
+                throw std::runtime_error("ALP: exception_count exceeds block_count");
             const uint64_t right_for_base = bh1;
 
             // === Read Dictionary ===
@@ -284,7 +292,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 size_t left_packed_words = alp::ffor_packed_words(block_count, left_bw);
                 scratch.rd_left_packed.resize(left_packed_words);
                 encoded.readAlignedWords(scratch.rd_left_packed.data(), left_packed_words);
-                alp::ffor_unpack(scratch.rd_left_packed.data(), block_count, 0, left_bw, scratch.rd_left_indices.data());
+                alp::ffor_unpack(scratch.rd_left_packed.data(), block_count, 0, left_bw,
+                                 scratch.rd_left_indices.data());
             }
 
             // === Read Right FFOR Data ===
@@ -294,7 +303,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 size_t right_packed_words = alp::ffor_packed_words(block_count, right_bw);
                 scratch.rd_right_packed.resize(right_packed_words);
                 encoded.readAlignedWords(scratch.rd_right_packed.data(), right_packed_words);
-                alp::ffor_unpack_u64(scratch.rd_right_packed.data(), block_count, right_for_base, right_bw, scratch.rd_right_parts.data());
+                alp::ffor_unpack_u64(scratch.rd_right_packed.data(), block_count, right_for_base, right_bw,
+                                     scratch.rd_right_parts.data());
             }
 
             // === Read Exceptions ===

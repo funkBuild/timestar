@@ -89,13 +89,6 @@ public:
 private:
     seastar::sharded<Engine>* engineSharded;
 
-    struct WritePoint {
-        std::string measurement;
-        std::map<std::string, std::string> tags;
-        std::map<std::string, FieldValue> fields;
-        uint64_t timestamp;
-    };
-
     struct FieldArrays {
         std::vector<double> doubles;
         std::vector<uint8_t> bools;
@@ -194,21 +187,10 @@ private:
     using MetaOp = MetadataOp;
 
     // Parse a single write point from JSON string.
-    // defaultTimestampNs is used when the point has no explicit timestamp,
-    // avoiding a redundant now() call when the caller already captured one.
-    WritePoint parseWritePoint(const std::string& json, uint64_t defaultTimestampNs);
-
-    // Parse a single write point from an already-parsed JSON object.
-    // defaultTimestampNs is used when the point has no explicit timestamp.
-    WritePoint parseWritePoint(const json_value_t& doc, uint64_t defaultTimestampNs);
-
     // Parse a write point that may contain arrays.
     // defaultTimestampNs is used when the point has no explicit timestamp,
     // so the caller can capture now() once for an entire batch.
     MultiWritePoint parseMultiWritePoint(const json_value_t& point, uint64_t defaultTimestampNs);
-
-    // Process a single write point - determine type and insert
-    seastar::future<> processWritePoint(const WritePoint& point);
 
     // Result of processMultiWritePoint: timing info plus any metadata ops
     // that were collected locally (no shared mutable state across coroutines).

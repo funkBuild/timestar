@@ -37,7 +37,9 @@ public:
         // handle_exception to consume the result silently.
         if (prefetchFuture.has_value()) {
             std::move(prefetchFuture.value()).then_wrapped([](auto f) {
-                try { f.get(); } catch (...) {}
+                try {
+                    f.get();
+                } catch (...) {}
             });
             prefetchFuture.reset();
         }
@@ -46,8 +48,38 @@ public:
     // Non-copyable, movable
     TSMBlockIterator(const TSMBlockIterator&) = delete;
     TSMBlockIterator& operator=(const TSMBlockIterator&) = delete;
-    TSMBlockIterator(TSMBlockIterator&&) = default;
-    TSMBlockIterator& operator=(TSMBlockIterator&&) = default;
+    TSMBlockIterator(TSMBlockIterator&& other) noexcept
+        : file(std::move(other.file)),
+          seriesId(std::move(other.seriesId)),
+          blocks(std::move(other.blocks)),
+          startTime(other.startTime),
+          endTime(other.endTime),
+          currentBlockIdx(other.currentBlockIdx),
+          currentBlock(std::move(other.currentBlock)),
+          prefetchFuture(std::move(other.prefetchFuture)) {
+        other.prefetchFuture.reset();  // Prevent source destructor from touching moved-from future
+    }
+    TSMBlockIterator& operator=(TSMBlockIterator&& other) noexcept {
+        if (this != &other) {
+            if (prefetchFuture.has_value()) {
+                std::move(prefetchFuture.value()).then_wrapped([](auto f) {
+                    try {
+                        f.get();
+                    } catch (...) {}
+                });
+            }
+            file = std::move(other.file);
+            seriesId = std::move(other.seriesId);
+            blocks = std::move(other.blocks);
+            startTime = other.startTime;
+            endTime = other.endTime;
+            currentBlockIdx = other.currentBlockIdx;
+            currentBlock = std::move(other.currentBlock);
+            prefetchFuture = std::move(other.prefetchFuture);
+            other.prefetchFuture.reset();
+        }
+        return *this;
+    }
 
     // Phase 1.2: Initialize with just the index metadata (no I/O yet)
     seastar::future<> init() {

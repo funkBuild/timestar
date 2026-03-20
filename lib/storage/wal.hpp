@@ -5,10 +5,8 @@
 #include "slice_buffer.hpp"
 #include "timestar_value.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -17,9 +15,6 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/sleep.hh>
-#include <seastar/core/timer.hh>
-#include <seastar/core/with_timeout.hh>
 #include <string>
 #include <vector>
 
@@ -28,7 +23,7 @@ class MemoryStore;
 
 enum class WALType {
     Write = 0,
-    Delete,       // Reserved for future use (point-level delete); not currently written
+    Delete,  // Reserved for future use (point-level delete); not currently written
     DeleteRange,
     Close
 };
@@ -114,11 +109,8 @@ struct CompressionStats {
 
 class WAL {
 private:
-    // WAL sizing policy
-    static constexpr size_t MAX_WAL_SIZE = 16 * 1024 * 1024;  // 16 MiB per segment
-    // Stream buffer size (controls batching of small appends before a flush hits the device)
-    static constexpr size_t STREAM_BUFFER_SIZE = 1 * 1024 * 1024;  // 1 MiB
-
+    // WAL segment size limit — initialized from config in init()
+    size_t maxWalSize_ = 16 * 1024 * 1024;  // default 16 MiB, overridden by config
     // Identity & file
     unsigned int sequenceNumber;
     seastar::file walFile;
@@ -158,9 +150,6 @@ private:
     // to converge estimates toward actual encoded sizes. Per-WAL instance,
     // no synchronization needed (Seastar shard-per-core model).
     CompressionStats _compressionStats;
-
-    // Flush buffered bytes and ensure durability (fdatasync)
-    seastar::future<> flushBlock();
 
 public:
     WAL(unsigned int _sequenceNumber);

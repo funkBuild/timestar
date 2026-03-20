@@ -35,7 +35,7 @@ static ZSTD_DCtx* getSstDCtx() {
 namespace timestar::index {
 
 // --- SSTableReader static members ---
-seastar::semaphore* SSTableReader::blockReadSemaphore_ = nullptr;
+thread_local seastar::semaphore* SSTableReader::blockReadSemaphore_ = nullptr;
 
 void SSTableReader::setBlockReadSemaphore(seastar::semaphore* sem) {
     blockReadSemaphore_ = sem;
@@ -448,8 +448,8 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
             // Each entry needs at minimum 16 bytes (4 keyLen + 8 offset + 4 size).
             size_t remainingBytes = static_cast<size_t>(iend - ip);
             if (numEntries > remainingBytes / 16) {
-                throw std::runtime_error("SSTable index claims " + std::to_string(numEntries) +
-                                         " entries but only " + std::to_string(remainingBytes) + " bytes remain");
+                throw std::runtime_error("SSTable index claims " + std::to_string(numEntries) + " entries but only " +
+                                         std::to_string(remainingBytes) + " bytes remain");
             }
             reader->index_.reserve(numEntries);
             for (uint32_t i = 0; i < numEntries; ++i) {
@@ -532,18 +532,17 @@ std::string SSTableReader::decompressRawBlock(const RawBlock& raw, std::string_v
     uint32_t uncompressedSize = decodeFixed32(data);
     static constexpr uint32_t MAX_BLOCK_SIZE = 64 * 1024 * 1024;  // 64MB sanity limit
     if (uncompressedSize > MAX_BLOCK_SIZE) {
-        throw std::runtime_error("SSTable block uncompressed size too large: " +
-            std::to_string(uncompressedSize) + " bytes (max " + std::to_string(MAX_BLOCK_SIZE) + ")");
+        throw std::runtime_error("SSTable block uncompressed size too large: " + std::to_string(uncompressedSize) +
+                                 " bytes (max " + std::to_string(MAX_BLOCK_SIZE) + ")");
     }
     std::string result(uncompressedSize, '\0');
-    size_t decompSize = ZSTD_decompressDCtx(getSstDCtx(), result.data(), uncompressedSize, data + 4,
-                                            raw.size - 4 - 4);
+    size_t decompSize = ZSTD_decompressDCtx(getSstDCtx(), result.data(), uncompressedSize, data + 4, raw.size - 4 - 4);
     if (ZSTD_isError(decompSize)) {
         throw std::runtime_error(std::string("SSTable zstd decompression failed: ") + ZSTD_getErrorName(decompSize));
     }
     if (decompSize != uncompressedSize) {
         throw std::runtime_error("SSTable block decompressed size mismatch: expected " +
-            std::to_string(uncompressedSize) + ", got " + std::to_string(decompSize));
+                                 std::to_string(uncompressedSize) + ", got " + std::to_string(decompSize));
     }
     return result;
 }
@@ -600,16 +599,15 @@ size_t SSTableReader::findBlock(std::string_view key) const {
     return lo;
 }
 
-seastar::future<std::string> SSTableReader::getDecompressedBlock(size_t idx) {
+seastar::future<seastar::lw_shared_ptr<const std::string>> SSTableReader::getDecompressedBlock(size_t idx) {
     if (blockCache_) {
-        auto* cached = blockCache_->get(cacheId_, idx);
+        auto cached = blockCache_->get(cacheId_, idx);
         if (cached)
-            co_return std::string(*cached);
+            co_return cached;
         auto block = co_await decompressBlock(idx);
-        blockCache_->put(cacheId_, idx, block);
-        co_return block;
+        co_return blockCache_->put(cacheId_, idx, std::move(block));
     }
-    co_return co_await decompressBlock(idx);
+    co_return seastar::make_lw_shared<const std::string>(co_await decompressBlock(idx));
 }
 
 seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view key) {
@@ -626,8 +624,8 @@ seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view 
     size_t lo = findBlock(key);
 
     // Step 1: Decompress block on demand (Step 2: via block cache if available)
-    auto blockData = co_await getDecompressedBlock(lo);
-    BlockReader blockReader(blockData);
+    auto blockDataPtr = co_await getDecompressedBlock(lo);
+    BlockReader blockReader(*blockDataPtr);
     if (!blockReader.valid()) {
         co_return std::nullopt;
     }
@@ -653,8 +651,8 @@ seastar::future<bool> SSTableReader::contains(std::string_view key) {
 
     size_t lo = findBlock(key);
 
-    auto blockData = co_await getDecompressedBlock(lo);
-    BlockReader blockReader(blockData);
+    auto blockDataPtr = co_await getDecompressedBlock(lo);
+    BlockReader blockReader(*blockDataPtr);
     if (!blockReader.valid()) {
         co_return false;
     }
@@ -686,8 +684,8 @@ seastar::future<> SSTableReader::Iterator::loadBlock(size_t idx) {
         co_return;
     }
     blockIndex_ = idx;
-    blockData_ = co_await reader_->getDecompressedBlock(idx);
-    blockReader_ = std::make_unique<BlockReader>(blockData_);
+    blockDataPtr_ = co_await reader_->getDecompressedBlock(idx);
+    blockReader_ = std::make_unique<BlockReader>(*blockDataPtr_);
     if (!blockReader_->valid()) {
         valid_ = false;
         co_return;

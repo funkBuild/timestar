@@ -82,9 +82,6 @@ private:
 
     // Linear interpolation between two points
     double linearInterpolate(uint64_t t, uint64_t t1, double v1, uint64_t t2, double v2);
-
-    // Find the index of the largest timestamp <= target
-    size_t findLowerBound(const std::vector<uint64_t>& timestamps, uint64_t target);
 };
 
 // Utility functions for time series alignment

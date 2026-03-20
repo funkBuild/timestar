@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <regex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -62,9 +61,6 @@ public:
 private:
     // Known dangerous function names
     static const std::unordered_set<std::string> dangerousFunctionNames_;
-
-    // Dangerous patterns to detect (lazily initialized via getDangerousPatterns())
-    static const std::vector<std::regex>& getDangerousPatterns();
 
     // Maximum allowed input sizes
     static const size_t MAX_FUNCTION_NAME_LENGTH = 64;

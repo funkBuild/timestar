@@ -51,8 +51,8 @@ void SubscriptionManager::addSubscription(const Subscription& sub) {
 
     bool isLocal = (sub.handlerShard == seastar::this_shard_id());
     if (isLocal && _localSubscriptionCount >= _maxLocalSubscriptions) {
-        throw std::runtime_error("Maximum local subscription limit reached (" +
-                                 std::to_string(_maxLocalSubscriptions) + ")");
+        throw std::runtime_error("Maximum local subscription limit reached (" + std::to_string(_maxLocalSubscriptions) +
+                                 ")");
     }
 
     // Pre-compile any wildcard/regex scope patterns so that Subscription::matches()
@@ -127,28 +127,23 @@ void SubscriptionManager::deliverBatch(uint64_t subscriptionId, std::shared_ptr<
     // vector for each subscriber. Acceptable for typical workloads but could
     // be optimized with shared_ptr<const vector<...>> for high fan-out.
     auto tagged = std::make_shared<StreamingBatch>(*batch);
-    tagged->sequenceId = seqCounter++;
+    tagged->sequenceId = seqCounter;  // assign current ID (don't increment yet)
 
     const auto pointCount = tagged->points.size();
-    if (!qIt->second->push(std::move(tagged))) {
+    if (qIt->second->push(std::move(tagged))) {
+        ++seqCounter;  // only increment on successful push
+    } else {
         _droppedCounters[subscriptionId] += pointCount;
 
-        // Best-effort: push a drop-notification so the client can observe an
-        // explicit drop event rather than just a sequence-ID gap.
-        //
-        // We do NOT guard with full() before trying: when the data-batch push
-        // just failed the queue is at max capacity by definition, so a full()
-        // check would always be true and the drop note would never be sent
-        // (making that branch permanently dead code).  Instead we attempt the
-        // push directly.  If the queue is still full the drop note is silently
-        // lost, but _droppedCounters keeps the running total, so the next
-        // successful drop note will carry the fully accumulated count.
+        // Best-effort drop notification so the client sees an explicit drop event.
         auto dropNote = std::make_shared<StreamingBatch>();
         dropNote->isDrop = true;
         dropNote->droppedCount = _droppedCounters[subscriptionId];
-        dropNote->sequenceId = seqCounter++;
+        dropNote->sequenceId = seqCounter;
         dropNote->label = batch->label;
-        qIt->second->push(std::move(dropNote));
+        if (qIt->second->push(std::move(dropNote))) {
+            ++seqCounter;
+        }
     }
 }
 

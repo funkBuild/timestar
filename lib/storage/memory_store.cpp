@@ -360,11 +360,13 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
     auto start_memory_insert = std::chrono::high_resolution_clock::now();
 #endif
     for (auto& insertRequest : insertRequests) {
+        std::string key = insertRequest.seriesKey();  // capture before move
         try {
             insertMemory(std::move(insertRequest));
         } catch (const std::exception& e) {
-            timestar::memory_log.warn("insertMemory failed for series {}: {} — data is in WAL and will be recovered on restart",
-                                      insertRequest.seriesKey(), e.what());
+            timestar::memory_log.warn(
+                "insertMemory failed for series {}: {} — data is in WAL and will be recovered on restart", key,
+                e.what());
         }
     }
 #if TIMESTAR_LOG_INSERT_PATH
@@ -378,7 +380,7 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
     co_return false;
 }
 
-std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128& seriesId) {
+std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128& seriesId) const {
     // Compile-time guard: variant order must match TSMValueType enum values.
     using V = decltype(series)::mapped_type;
     static_assert(std::is_same_v<std::variant_alternative_t<0, V>, InMemorySeries<double>>);

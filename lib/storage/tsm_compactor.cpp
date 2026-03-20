@@ -1,11 +1,9 @@
 #include "tsm_compactor.hpp"
 
-#include "aggregator.hpp"           // AggregationState for downsampling
-#include "bulk_block_loader.hpp"    // Phase A: Bulk loading optimization
-#include "compaction_pipeline.hpp"  // Phase 2.1: Include prefetch manager
+#include "aggregator.hpp"         // AggregationState for downsampling
+#include "bulk_block_loader.hpp"  // Phase A: Bulk loading optimization
 #include "logger.hpp"
 #include "tsm_file_manager.hpp"
-#include "tsm_merge_specialized.hpp"  // Phase 5.1: Specialized N-way merges
 #include "tsm_writer.hpp"
 
 #include <chrono>
@@ -215,6 +213,12 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             result.compressedBlocks.push_back(std::move(block));
         }
 
+        // Track point stats for monitoring (zero-copy path)
+        for (const auto& cb : result.compressedBlocks) {
+            result.pointsRead += cb.blockCount;
+            result.pointsWritten += cb.blockCount;
+        }
+
         co_return result;
     }
 
@@ -224,7 +228,6 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     result.values.reserve(batchSize() * 10);
 
     uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
-    size_t tombstonesFiltered = 0;
     size_t ttlFiltered = 0;
 
     // Helper lambda: check tombstone + TTL for a single point, append if valid
@@ -249,7 +252,6 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 const auto& [startTime, endTime] = *it;
                 if (ts >= startTime && ts <= endTime) {
                     isTombstoned = true;
-                    tombstonesFiltered++;
                 }
             }
         }
@@ -408,9 +410,7 @@ void TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, SeriesCompaction
 }
 
 seastar::future<CompactionResult> TSMCompactor::compact(
-    const std::vector<seastar::shared_ptr<TSM>>& files,
-    uint64_t targetTier,
-    uint64_t targetSeq,
+    const std::vector<seastar::shared_ptr<TSM>>& files, uint64_t targetTier, uint64_t targetSeq,
     const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies,
     const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
     if (files.empty()) {
@@ -434,183 +434,183 @@ seastar::future<CompactionResult> TSMCompactor::compact(
     // Create temporary file for writing
     std::string tempPath = outputPath + ".tmp";
     try {
-    TSMWriter writer(tempPath);
-    // Use higher zstd compression for deeper tiers (better ratio, acceptable speed)
-    if (targetTier >= 1) {
-        writer.setCompressionLevel(3);
-    }
+        TSMWriter writer(tempPath);
+        // Use higher zstd compression for deeper tiers (better ratio, acceptable speed)
+        if (targetTier >= 1) {
+            writer.setCompressionLevel(3);
+        }
 
-    CompactionStats stats;
-    stats.filesCompacted = files.size();
-    auto startTime = std::chrono::steady_clock::now();
+        CompactionStats stats;
+        stats.filesCompacted = files.size();
+        auto startTime = std::chrono::steady_clock::now();
 
-    // Get all unique series across files
-    auto allSeries = getAllSeriesIds(files);
+        // Get all unique series across files
+        auto allSeries = getAllSeriesIds(files);
 
-    // Build per-series retention context from policies + metadata map (local to this compaction)
-    SeriesRetentionMap seriesRetention;
-    if (!retentionPolicies.empty() && !seriesMeasurementMap.empty()) {
-        uint64_t now =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count();
+        // Build per-series retention context from policies + metadata map (local to this compaction)
+        SeriesRetentionMap seriesRetention;
+        if (!retentionPolicies.empty() && !seriesMeasurementMap.empty()) {
+            uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
 
-        for (const auto& sid : allSeries) {
-            auto measIt = seriesMeasurementMap.find(sid);
-            if (measIt == seriesMeasurementMap.end())
+            for (const auto& sid : allSeries) {
+                auto measIt = seriesMeasurementMap.find(sid);
+                if (measIt == seriesMeasurementMap.end())
+                    continue;
+
+                auto policyIt = retentionPolicies.find(measIt->second);
+                if (policyIt == retentionPolicies.end())
+                    continue;
+
+                const auto& policy = policyIt->second;
+                SeriesRetentionContext ctx;
+
+                if (policy.ttlNanos > 0 && now > policy.ttlNanos) {
+                    ctx.ttlCutoff = now - policy.ttlNanos;
+                }
+
+                if (policy.downsample.has_value() && policy.downsample->afterNanos > 0 &&
+                    now > policy.downsample->afterNanos) {
+                    ctx.downsampleThreshold = now - policy.downsample->afterNanos;
+                    ctx.downsampleInterval = policy.downsample->intervalNanos;
+
+                    const auto& method = policy.downsample->method;
+                    if (method == "min")
+                        ctx.downsampleMethod = timestar::AggregationMethod::MIN;
+                    else if (method == "max")
+                        ctx.downsampleMethod = timestar::AggregationMethod::MAX;
+                    else if (method == "sum")
+                        ctx.downsampleMethod = timestar::AggregationMethod::SUM;
+                    else if (method == "latest")
+                        ctx.downsampleMethod = timestar::AggregationMethod::LATEST;
+                    else
+                        ctx.downsampleMethod = timestar::AggregationMethod::AVG;
+                }
+
+                if (ctx.ttlCutoff > 0 || ctx.downsampleThreshold > 0) {
+                    seriesRetention[sid] = ctx;
+                }
+            }
+
+            if (!seriesRetention.empty()) {
+                timestar::compactor_log.info("Compaction: {} series have retention policies applied",
+                                             seriesRetention.size());
+            }
+        }
+
+        // Phase 2.2: Group series by type for pipelined processing
+        std::vector<SeriesId128> floatSeries;
+        std::vector<SeriesId128> boolSeries;
+        std::vector<SeriesId128> stringSeries;
+        std::vector<SeriesId128> integerSeries;
+
+        for (const auto& seriesId : allSeries) {
+            // Check ALL files for series type, not just the first file.
+            // A series may only exist in files[1..N], so we must iterate
+            // until we find a file that contains this series.
+            std::optional<TSMValueType> seriesType;
+            for (const auto& file : files) {
+                seriesType = file->getSeriesType(seriesId);
+                if (seriesType.has_value()) {
+                    break;
+                }
+            }
+            if (!seriesType.has_value()) {
                 continue;
-
-            auto policyIt = retentionPolicies.find(measIt->second);
-            if (policyIt == retentionPolicies.end())
-                continue;
-
-            const auto& policy = policyIt->second;
-            SeriesRetentionContext ctx;
-
-            if (policy.ttlNanos > 0 && now > policy.ttlNanos) {
-                ctx.ttlCutoff = now - policy.ttlNanos;
             }
 
-            if (policy.downsample.has_value() && policy.downsample->afterNanos > 0 &&
-                now > policy.downsample->afterNanos) {
-                ctx.downsampleThreshold = now - policy.downsample->afterNanos;
-                ctx.downsampleInterval = policy.downsample->intervalNanos;
-
-                const auto& method = policy.downsample->method;
-                if (method == "min")
-                    ctx.downsampleMethod = timestar::AggregationMethod::MIN;
-                else if (method == "max")
-                    ctx.downsampleMethod = timestar::AggregationMethod::MAX;
-                else if (method == "sum")
-                    ctx.downsampleMethod = timestar::AggregationMethod::SUM;
-                else if (method == "latest")
-                    ctx.downsampleMethod = timestar::AggregationMethod::LATEST;
-                else
-                    ctx.downsampleMethod = timestar::AggregationMethod::AVG;
-            }
-
-            if (ctx.ttlCutoff > 0 || ctx.downsampleThreshold > 0) {
-                seriesRetention[sid] = ctx;
+            if (seriesType.value() == TSMValueType::Float) {
+                floatSeries.push_back(seriesId);
+            } else if (seriesType.value() == TSMValueType::Boolean) {
+                boolSeries.push_back(seriesId);
+            } else if (seriesType.value() == TSMValueType::String) {
+                stringSeries.push_back(seriesId);
+            } else if (seriesType.value() == TSMValueType::Integer) {
+                integerSeries.push_back(seriesId);
             }
         }
 
-        if (!seriesRetention.empty()) {
-            timestar::compactor_log.info("Compaction: {} series have retention policies applied",
-                                         seriesRetention.size());
-        }
-    }
+        // Phase 3: Parallel series processing with batching
+        // Batch size tuned for performance vs memory tradeoff
+        // Testing shows: batch_size=10 → 651ms, batch_size=20 → 541ms, batch_size=50 → 2533ms (regression)
+        const size_t SERIES_BATCH_SIZE = 20;
 
-    // Phase 2.2: Group series by type for pipelined processing
-    std::vector<SeriesId128> floatSeries;
-    std::vector<SeriesId128> boolSeries;
-    std::vector<SeriesId128> stringSeries;
-    std::vector<SeriesId128> integerSeries;
+        // Semaphore to serialize writes (TSMWriter not thread-safe)
+        seastar::semaphore writeSemaphore{1};
 
-    for (const auto& seriesId : allSeries) {
-        // Check ALL files for series type, not just the first file.
-        // A series may only exist in files[1..N], so we must iterate
-        // until we find a file that contains this series.
-        std::optional<TSMValueType> seriesType;
-        for (const auto& file : files) {
-            seriesType = file->getSeriesType(seriesId);
-            if (seriesType.has_value()) {
-                break;
+        // Helper lambda for parallel batch processing
+        auto processBatch = [&](const auto& seriesVec, auto* typePtr) -> seastar::future<> {
+            using ValueType = std::remove_pointer_t<decltype(typePtr)>;
+
+            for (size_t i = 0; i < seriesVec.size(); i += SERIES_BATCH_SIZE) {
+                size_t batchEnd = std::min(i + SERIES_BATCH_SIZE, seriesVec.size());
+
+                // Start all series in batch in parallel
+                std::vector<seastar::future<>> processFutures;
+                processFutures.reserve(batchEnd - i);
+
+                for (size_t j = i; j < batchEnd; j++) {
+                    const auto& seriesId = seriesVec[j];
+
+                    // Process series and write with serialization
+                    auto future =
+                        processSeriesForCompaction<ValueType>(seriesId, files, seriesRetention)
+                            .then([this, &writer, &writeSemaphore, &stats](SeriesCompactionData<ValueType> data) {
+                                // Serialize writes with semaphore
+                                return seastar::with_semaphore(
+                                    writeSemaphore, 1, [this, &writer, &stats, data = std::move(data)]() mutable {
+                                        writeSeriesCompactionData(writer, std::move(data), stats);
+                                    });
+                            });
+
+                    processFutures.push_back(std::move(future));
+                }
+
+                // Wait for batch to complete
+                co_await seastar::when_all_succeed(processFutures.begin(), processFutures.end());
             }
+        };
+
+        // Process all series types concurrently (writes serialized by writeSemaphore)
+        std::vector<seastar::future<>> typeFutures;
+        typeFutures.reserve(4);
+        if (!floatSeries.empty())
+            typeFutures.push_back(processBatch(floatSeries, (double*)nullptr));
+        if (!boolSeries.empty())
+            typeFutures.push_back(processBatch(boolSeries, (bool*)nullptr));
+        if (!stringSeries.empty())
+            typeFutures.push_back(processBatch(stringSeries, (std::string*)nullptr));
+        if (!integerSeries.empty())
+            typeFutures.push_back(processBatch(integerSeries, (int64_t*)nullptr));
+        co_await seastar::when_all_succeed(typeFutures.begin(), typeFutures.end());
+
+        // Finalize the file
+        writer.writeIndex();
+        co_await writer.closeDMA();
+
+        // Calculate statistics
+        auto endTime = std::chrono::steady_clock::now();
+        stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        // Atomic rename from temp to final (async to avoid blocking the reactor)
+        co_await seastar::rename_file(tempPath, outputPath);
+
+        // Fsync the parent directory to ensure the rename (directory entry update)
+        // is durable.  Without this, a crash could lose the rename even though
+        // the file data is already on disk.
+        auto slash = outputPath.rfind('/');
+        std::string dir = (slash != std::string::npos) ? outputPath.substr(0, slash) : ".";
+        try {
+            auto dirFile = co_await seastar::open_directory(dir);
+            co_await dirFile.flush();
+            co_await dirFile.close();
+        } catch (...) {
+            // Best-effort: log but don't fail the compaction
+            timestar::compactor_log.warn("Failed to fsync parent directory after compaction rename: {}", dir);
         }
-        if (!seriesType.has_value()) {
-            continue;
-        }
 
-        if (seriesType.value() == TSMValueType::Float) {
-            floatSeries.push_back(seriesId);
-        } else if (seriesType.value() == TSMValueType::Boolean) {
-            boolSeries.push_back(seriesId);
-        } else if (seriesType.value() == TSMValueType::String) {
-            stringSeries.push_back(seriesId);
-        } else if (seriesType.value() == TSMValueType::Integer) {
-            integerSeries.push_back(seriesId);
-        }
-    }
-
-    // Phase 3: Parallel series processing with batching
-    // Batch size tuned for performance vs memory tradeoff
-    // Testing shows: batch_size=10 → 651ms, batch_size=20 → 541ms, batch_size=50 → 2533ms (regression)
-    const size_t SERIES_BATCH_SIZE = 20;
-
-    // Semaphore to serialize writes (TSMWriter not thread-safe)
-    seastar::semaphore writeSemaphore{1};
-
-    // Helper lambda for parallel batch processing
-    auto processBatch = [&](const auto& seriesVec, auto* typePtr) -> seastar::future<> {
-        using ValueType = std::remove_pointer_t<decltype(typePtr)>;
-
-        for (size_t i = 0; i < seriesVec.size(); i += SERIES_BATCH_SIZE) {
-            size_t batchEnd = std::min(i + SERIES_BATCH_SIZE, seriesVec.size());
-
-            // Start all series in batch in parallel
-            std::vector<seastar::future<>> processFutures;
-            processFutures.reserve(batchEnd - i);
-
-            for (size_t j = i; j < batchEnd; j++) {
-                const auto& seriesId = seriesVec[j];
-
-                // Process series and write with serialization
-                auto future = processSeriesForCompaction<ValueType>(seriesId, files, seriesRetention)
-                                  .then([this, &writer, &writeSemaphore, &stats](SeriesCompactionData<ValueType> data) {
-                                      // Serialize writes with semaphore
-                                      return seastar::with_semaphore(
-                                          writeSemaphore, 1, [this, &writer, &stats, data = std::move(data)]() mutable {
-                                              writeSeriesCompactionData(writer, std::move(data), stats);
-                                          });
-                                  });
-
-                processFutures.push_back(std::move(future));
-            }
-
-            // Wait for batch to complete
-            co_await seastar::when_all_succeed(processFutures.begin(), processFutures.end());
-        }
-    };
-
-    // Process all series types concurrently (writes serialized by writeSemaphore)
-    std::vector<seastar::future<>> typeFutures;
-    typeFutures.reserve(4);
-    if (!floatSeries.empty())
-        typeFutures.push_back(processBatch(floatSeries, (double*)nullptr));
-    if (!boolSeries.empty())
-        typeFutures.push_back(processBatch(boolSeries, (bool*)nullptr));
-    if (!stringSeries.empty())
-        typeFutures.push_back(processBatch(stringSeries, (std::string*)nullptr));
-    if (!integerSeries.empty())
-        typeFutures.push_back(processBatch(integerSeries, (int64_t*)nullptr));
-    co_await seastar::when_all_succeed(typeFutures.begin(), typeFutures.end());
-
-    // Finalize the file
-    writer.writeIndex();
-    co_await writer.closeDMA();
-
-    // Calculate statistics
-    auto endTime = std::chrono::steady_clock::now();
-    stats.filesCompacted = files.size();
-    stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-
-    // Atomic rename from temp to final (async to avoid blocking the reactor)
-    co_await seastar::rename_file(tempPath, outputPath);
-
-    // Fsync the parent directory to ensure the rename (directory entry update)
-    // is durable.  Without this, a crash could lose the rename even though
-    // the file data is already on disk.
-    auto slash = outputPath.rfind('/');
-    std::string dir = (slash != std::string::npos) ? outputPath.substr(0, slash) : ".";
-    try {
-        auto dirFile = co_await seastar::open_directory(dir);
-        co_await dirFile.flush();
-        co_await dirFile.close();
-    } catch (...) {
-        // Best-effort: log but don't fail the compaction
-        timestar::compactor_log.warn("Failed to fsync parent directory after compaction rename: {}", dir);
-    }
-
-    co_return CompactionResult{outputPath, stats};
+        co_return CompactionResult{outputPath, stats};
     } catch (...) {
         // Clean up temp file — use blocking remove since we cannot co_await
         // inside a catch handler in C++. This is the exception path only.
@@ -674,12 +674,12 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
     // Perform compaction (passing pending retention context if any).
     // Use the plan's pre-allocated targetTier and targetSeqNum so the output
     // file path matches plan.targetPath (avoids wasting sequence IDs).
-    auto compactionResult = co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum,
-                                             _pendingRetentionPolicies, _pendingSeriesMeasurementMap);
-
-    // Clear pending retention context so subsequent compactions don't apply stale policies.
-    _pendingRetentionPolicies.clear();
-    _pendingSeriesMeasurementMap.clear();
+    // Move policies into locals so they survive across multiple executeCompaction calls
+    // (e.g., forceFullCompaction calls executeCompaction per tier).
+    auto localRetention = std::exchange(_pendingRetentionPolicies, {});
+    auto localSeriesMap = std::exchange(_pendingSeriesMeasurementMap, {});
+    auto compactionResult =
+        co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum, localRetention, localSeriesMap);
 
     if (!compactionResult.outputPath.empty()) {
         // Open the new file

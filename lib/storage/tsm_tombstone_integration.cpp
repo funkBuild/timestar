@@ -194,6 +194,14 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(const SeriesId128& series
     for (auto& block : result.blocks) {
         const auto& ts = block->timestamps;
         auto& vals = block->values;
+        // Rewind range pointer if this block starts before where we left off.
+        // Blocks are sorted by startTime but may overlap, so the two-pointer
+        // invariant (monotonically advancing ri) can break across block boundaries.
+        if (!ts.empty() && ri > 0) {
+            while (ri > 0 && ranges[ri - 1].second >= ts[0]) {
+                --ri;
+            }
+        }
         for (size_t i = 0; i < ts.size(); ++i) {
             uint64_t t = ts[i];
             // Advance range pointer past ranges that end before this timestamp

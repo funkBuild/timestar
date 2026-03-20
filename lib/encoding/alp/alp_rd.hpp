@@ -39,9 +39,6 @@ public:
 
     // Encode a block of doubles using ALP_RD scheme.
     static ALPRDBlockResult encodeBlock(const double* values, size_t count, uint8_t right_bit_count);
-
-    // Decode a block: reconstruct doubles from dictionary, left indices, right parts, and exceptions.
-    static void decodeBlock(const ALPRDBlockResult& block, size_t count, double* out);
 };
 
 }  // namespace alp

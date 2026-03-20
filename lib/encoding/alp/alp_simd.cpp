@@ -30,8 +30,7 @@ namespace hn = hwy::HWY_NAMESPACE;
 // this requires a multi-instruction sequence that GCC cannot auto-vectorize.
 // Highway handles this transparently across all ISA targets.
 // ---------------------------------------------------------------------------
-void AlpReconstructKernel(const int64_t* HWY_RESTRICT encoded, size_t count,
-                          double frac_val, double fact_val,
+void AlpReconstructKernel(const int64_t* HWY_RESTRICT encoded, size_t count, double frac_val, double fact_val,
                           double* HWY_RESTRICT out) {
     const hn::ScalableTag<double> dd;
     const hn::ScalableTag<int64_t> di;
@@ -57,51 +56,6 @@ void AlpReconstructKernel(const int64_t* HWY_RESTRICT encoded, size_t count,
     }
 }
 
-// ---------------------------------------------------------------------------
-// FFOR base addition: out[i] = in[i] + base (int64)
-// Used after bit-unpacking to add back the frame-of-reference minimum.
-// ---------------------------------------------------------------------------
-void FforAddBaseKernel(const int64_t* HWY_RESTRICT in, size_t count,
-                       int64_t base, int64_t* HWY_RESTRICT out) {
-    const hn::ScalableTag<int64_t> di;
-    const size_t N = hn::Lanes(di);
-
-    const auto base_vec = hn::Set(di, base);
-
-    size_t i = 0;
-    for (; i + N <= count; i += N) {
-        const auto vals = hn::LoadU(di, &in[i]);
-        hn::StoreU(hn::Add(vals, base_vec), di, &out[i]);
-    }
-
-    // Scalar tail
-    for (; i < count; ++i) {
-        out[i] = in[i] + base;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FFOR base addition: out[i] = in[i] + base (uint64)
-// ---------------------------------------------------------------------------
-void FforAddBaseU64Kernel(const uint64_t* HWY_RESTRICT in, size_t count,
-                          uint64_t base, uint64_t* HWY_RESTRICT out) {
-    const hn::ScalableTag<uint64_t> du;
-    const size_t N = hn::Lanes(du);
-
-    const auto base_vec = hn::Set(du, base);
-
-    size_t i = 0;
-    for (; i + N <= count; i += N) {
-        const auto vals = hn::LoadU(du, &in[i]);
-        hn::StoreU(hn::Add(vals, base_vec), du, &out[i]);
-    }
-
-    // Scalar tail
-    for (; i < count; ++i) {
-        out[i] = in[i] + base;
-    }
-}
-
 }  // namespace HWY_NAMESPACE
 }  // namespace simd
 }  // namespace alp
@@ -115,23 +69,11 @@ namespace alp {
 namespace simd {
 
 HWY_EXPORT(AlpReconstructKernel);
-HWY_EXPORT(FforAddBaseKernel);
-HWY_EXPORT(FforAddBaseU64Kernel);
 
-void alpReconstruct(const int64_t* encoded, size_t count,
-                    double frac_val, double fact_val, double* out) {
-    if (count == 0) return;
+void alpReconstruct(const int64_t* encoded, size_t count, double frac_val, double fact_val, double* out) {
+    if (count == 0)
+        return;
     HWY_DYNAMIC_DISPATCH(AlpReconstructKernel)(encoded, count, frac_val, fact_val, out);
-}
-
-void fforAddBase(const int64_t* in, size_t count, int64_t base, int64_t* out) {
-    if (count == 0) return;
-    HWY_DYNAMIC_DISPATCH(FforAddBaseKernel)(in, count, base, out);
-}
-
-void fforAddBaseU64(const uint64_t* in, size_t count, uint64_t base, uint64_t* out) {
-    if (count == 0) return;
-    HWY_DYNAMIC_DISPATCH(FforAddBaseU64Kernel)(in, count, base, out);
 }
 
 }  // namespace simd

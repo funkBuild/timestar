@@ -164,7 +164,10 @@ template <class T>
 void TSMWriter::writeSeriesDirect(TSMValueType seriesType, const SeriesId128& seriesId,
                                   std::vector<uint64_t>&& timestamps, std::vector<T>&& values) {
     // Zero-copy write - caller transfers ownership of vectors
-    // Assumes data is already properly sized (single block or caller handles splitting)
+    if (timestamps.size() != values.size()) {
+        throw std::invalid_argument("TSMWriter::writeSeriesDirect: timestamps/values size mismatch (" +
+                                    std::to_string(timestamps.size()) + " vs " + std::to_string(values.size()) + ")");
+    }
 
     if (timestamps.size() > MaxPointsPerBlock()) {
         LOG_INSERT_PATH(timestar::tsm_log, debug,
@@ -440,41 +443,6 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
 
-// Phase 2: Write compressed block bytes directly (zero-copy transfer)
-void TSMWriter::writeCompressedBlock(TSMValueType seriesType, const SeriesId128& seriesId,
-                                     seastar::temporary_buffer<uint8_t>&& compressedData, uint64_t minTime,
-                                     uint64_t maxTime) {
-    // Record the starting offset for this block
-    size_t blockStartOffset = buffer.size();
-
-    // Write the compressed block bytes directly to the buffer
-    // The block is already in TSM format (header + compressed timestamps + compressed values)
-    buffer.write_bytes(reinterpret_cast<const char*>(compressedData.get()), compressedData.size());
-
-    // Phase 4A: Find or create index entry in map
-    auto& indexEntry = indexEntries[seriesId];
-    if (indexEntry.seriesId != seriesId) {
-        // First time seeing this series, initialize
-        indexEntry.seriesId = seriesId;
-        indexEntry.seriesType = seriesType;
-    }
-
-    // Create index block metadata
-    if (compressedData.size() > std::numeric_limits<uint32_t>::max()) {
-        throw std::overflow_error("TSM compressed block size " + std::to_string(compressedData.size()) +
-                                  " exceeds uint32_t maximum (" + std::to_string(std::numeric_limits<uint32_t>::max()) +
-                                  "); block would be truncated in the index");
-    }
-
-    TSMIndexBlock indexBlock;
-    indexBlock.minTime = minTime;
-    indexBlock.maxTime = maxTime;
-    indexBlock.offset = blockStartOffset;
-    indexBlock.size = static_cast<uint32_t>(compressedData.size());
-
-    indexEntry.indexBlocks.push_back(std::move(indexBlock));
-}
-
 void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const SeriesId128& seriesId,
                                               seastar::temporary_buffer<uint8_t>&& compressedData,
                                               const TSMIndexBlock& srcBlock) {
@@ -557,8 +525,10 @@ void TSMWriter::writeIndex() {
                 auto safeToInt64 = [](double v) -> int64_t {
                     constexpr double maxSafe = static_cast<double>(std::numeric_limits<int64_t>::max());
                     constexpr double minSafe = static_cast<double>(std::numeric_limits<int64_t>::min());
-                    if (v >= maxSafe) return std::numeric_limits<int64_t>::max();
-                    if (v <= minSafe) return std::numeric_limits<int64_t>::min();
+                    if (v >= maxSafe)
+                        return std::numeric_limits<int64_t>::max();
+                    if (v <= minSafe)
+                        return std::numeric_limits<int64_t>::min();
                     return static_cast<int64_t>(v);
                 };
                 buffer.write(block.blockCount);
@@ -600,13 +570,6 @@ void TSMWriter::writeIndex() {
     buffer.write(static_cast<uint64_t>(indexStartOffset));
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Wrote index offset: {} ({:#x}), final buffer size: {}", indexStartOffset,
                     indexStartOffset, buffer.size());
-}
-
-// Phase 4A: Parallel index building (placeholder for future enhancement)
-void TSMWriter::writeIndexParallel() {
-    // For now, just call the regular writeIndex
-    // Future: parallelize serialization of index entries
-    writeIndex();
 }
 
 // fsync the parent directory to ensure a newly-created file's directory
@@ -651,7 +614,8 @@ void TSMWriter::close() {
     while (remaining > 0) {
         ssize_t written = ::write(fd, ptr, remaining);
         if (written < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             int err = errno;
             ::close(fd);
             throw std::system_error(err, std::system_category(), "TSMWriter::close: write failed for " + filename);

@@ -228,7 +228,8 @@ void ComputeAnomalyScoresKernel(const double* HWY_RESTRICT values, const double*
 
     // Fixup: NaN input values produce NaN scores; clamp to 0
     for (size_t i = 0; i < count; ++i) {
-        if (std::isnan(scores[i])) scores[i] = 0.0;
+        if (std::isnan(scores[i]))
+            scores[i] = 0.0;
     }
 }
 
@@ -447,7 +448,8 @@ void IncrementalRollingStats::recomputeFromBuffer() {
     double sum = 0.0, c = 0.0;
     size_t validCount = 0;
     for (size_t i = 0; i < windowSize_; ++i) {
-        if (std::isnan(buffer_[i])) continue;
+        if (std::isnan(buffer_[i]))
+            continue;
         double y = buffer_[i] - c;
         double t = sum + y;
         c = (t - sum) - y;
@@ -464,7 +466,8 @@ void IncrementalRollingStats::recomputeFromBuffer() {
 
     m2_ = 0.0;
     for (size_t i = 0; i < windowSize_; ++i) {
-        if (std::isnan(buffer_[i])) continue;
+        if (std::isnan(buffer_[i]))
+            continue;
         double diff = buffer_[i] - mean_;
         m2_ += diff * diff;
     }
@@ -504,23 +507,25 @@ void computeMovingAverage(const double* values, size_t count, size_t windowSize,
     }
 
     for (size_t i = 0; i < count; ++i) {
-        // Add new element entering window
+        // Compute result with CURRENT window contents before sliding
+        result[i] = (windowCount > 0) ? windowSum / static_cast<double>(windowCount) : 0.0;
+
+        // Slide window for next position:
+        // Add element entering right side
         size_t addIdx = i + halfWindow + 1;
         if (addIdx < count && !std::isnan(values[addIdx])) {
             windowSum += values[addIdx];
             ++windowCount;
         }
 
-        // Remove element leaving window
-        if (i > halfWindow) {
-            size_t removeIdx = i - halfWindow - 1;
+        // Remove element leaving left side
+        if (i >= halfWindow) {
+            size_t removeIdx = i - halfWindow;
             if (!std::isnan(values[removeIdx])) {
                 windowSum -= values[removeIdx];
                 --windowCount;
             }
         }
-
-        result[i] = (windowCount > 0) ? windowSum / static_cast<double>(windowCount) : 0.0;
     }
 }
 
