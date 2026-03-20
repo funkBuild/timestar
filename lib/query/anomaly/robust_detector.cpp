@@ -37,8 +37,7 @@ void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<d
     // Step 1: Compute median of raw residuals
     size_t sz = residuals.size();
     size_t medianIdx = sz / 2;
-    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx),
-                     residuals.end());
+    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx), residuals.end());
     double residualMedian;
     if (sz % 2 == 0 && sz >= 2) {
         double upperMedian = residuals[medianIdx];
@@ -54,8 +53,7 @@ void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<d
     }
 
     // Step 3: MAD = median of the absolute deviations
-    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx),
-                     residuals.end());
+    std::nth_element(residuals.begin(), residuals.begin() + static_cast<ptrdiff_t>(medianIdx), residuals.end());
     double mad;
     if (sz % 2 == 0 && sz >= 2) {
         double upperMedian = residuals[medianIdx];

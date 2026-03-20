@@ -63,7 +63,7 @@ void ZigZagDecodeBatch(const uint64_t* HWY_RESTRICT input, int64_t* HWY_RESTRICT
 
         // ZigZag decode: (y >> 1) ^ -(y & 1)
         auto shifted = hn::ShiftRight<1>(v);
-        auto mask = hn::And(v, one);           // y & 1
+        auto mask = hn::And(v, one);                 // y & 1
         auto negmask = hn::Sub(hn::Zero(du), mask);  // -(y & 1)  i.e. 0 or 0xFFFF...
         auto decoded = hn::Xor(shifted, negmask);
 
@@ -86,7 +86,7 @@ HWY_AFTER_NAMESPACE();
 // =============================================================================
 #if HWY_ONCE
 
-#include "zigzag_simd.hpp"
+    #include "zigzag_simd.hpp"
 
 namespace zigzag_simd {
 

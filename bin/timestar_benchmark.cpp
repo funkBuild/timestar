@@ -1,5 +1,5 @@
-#include "engine.hpp"
 #include "core/placement_table.hpp"
+#include "engine.hpp"
 #include "logger.hpp"
 #include "query_result.hpp"
 #include "timestar_value.hpp"

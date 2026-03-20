@@ -107,7 +107,7 @@ public:
     Iterator newIterator() const;
 
 private:
-    std::string_view data_;                // Raw block bytes (entries region only)
+    std::string_view data_;               // Raw block bytes (entries region only)
     const char* restartsBase_ = nullptr;  // Pointer to restart offsets (read via decodeFixed32 to avoid alignment UB)
     uint32_t restartCount_ = 0;
     size_t dataSize_ = 0;  // Size of entries region (before restarts)

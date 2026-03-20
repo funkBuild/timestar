@@ -115,7 +115,8 @@ Token ExpressionLexer::readNumber() {
     }
 
     // Decimal part
-    if (!isAtEnd() && peek() == '.' && pos_ + 1 < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_ + 1]))) {
+    if (!isAtEnd() && peek() == '.' && pos_ + 1 < input_.size() &&
+        std::isdigit(static_cast<unsigned char>(input_[pos_ + 1]))) {
         advance();  // consume '.'
         while (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
             advance();
@@ -251,7 +252,8 @@ Token ExpressionLexer::nextToken() {
 
 // ==================== ExpressionParser ====================
 
-ExpressionParser::ExpressionParser(std::string_view input) : lexer_(input), currentToken_(TokenType::END, "", 0), inputLength_(input.size()) {
+ExpressionParser::ExpressionParser(std::string_view input)
+    : lexer_(input), currentToken_(TokenType::END, "", 0), inputLength_(input.size()) {
     advance();  // Load first token
 }
 

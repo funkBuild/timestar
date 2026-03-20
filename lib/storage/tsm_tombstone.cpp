@@ -119,7 +119,8 @@ void TSMTombstone::sortAndMergeEntries() {
         // Bug #21 fix: Overflow-safe adjacency check — current.endTime + 1
         // wraps to 0 when endTime == UINT64_MAX.
         if (entry.seriesId == current.seriesId &&
-            (entry.startTime <= current.endTime || current.endTime == UINT64_MAX || entry.startTime == current.endTime + 1)) {
+            (entry.startTime <= current.endTime || current.endTime == UINT64_MAX ||
+             entry.startTime == current.endTime + 1)) {
             // Overlapping or adjacent range, merge
             current.endTime = std::max(current.endTime, entry.endTime);
         } else {
@@ -275,7 +276,9 @@ seastar::future<> TSMTombstone::load() {
 
     // Clean up file handle regardless of success/failure
     if (isOpen) {
-        try { co_await close(); } catch (...) {}
+        try {
+            co_await close();
+        } catch (...) {}
     }
 
     if (loadError) {
@@ -408,7 +411,8 @@ seastar::future<bool> TSMTombstone::addTombstone(const SeriesId128& seriesId, ui
     for (size_t i = 0; i < ranges.size(); ++i) {
         // Bug #21 fix: Overflow-safe adjacency check for UINT64_MAX boundaries
         if ((ranges[i].first <= mergedEnd || mergedEnd == UINT64_MAX || ranges[i].first == mergedEnd + 1) &&
-            (ranges[i].second >= mergedStart || (ranges[i].second != UINT64_MAX && ranges[i].second + 1 >= mergedStart))) {
+            (ranges[i].second >= mergedStart ||
+             (ranges[i].second != UINT64_MAX && ranges[i].second + 1 >= mergedStart))) {
             // Overlapping or adjacent — absorb into merged range
             mergedStart = std::min(mergedStart, ranges[i].first);
             mergedEnd = std::max(mergedEnd, ranges[i].second);

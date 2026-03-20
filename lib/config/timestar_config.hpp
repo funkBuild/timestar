@@ -138,9 +138,9 @@ const TimestarConfig& config();
 template <>
 struct glz::meta<timestar::ServerConfig> {
     using T = timestar::ServerConfig;
-    static constexpr auto value = object("port", &T::port, "log_level", &T::log_level, "data_dir", &T::data_dir,
-                                         "shutdown_timeout_seconds", &T::shutdown_timeout_seconds, "auth_enabled",
-                                         &T::auth_enabled, "auth_token", &T::auth_token);
+    static constexpr auto value =
+        object("port", &T::port, "log_level", &T::log_level, "data_dir", &T::data_dir, "shutdown_timeout_seconds",
+               &T::shutdown_timeout_seconds, "auth_enabled", &T::auth_enabled, "auth_token", &T::auth_token);
 };
 
 template <>

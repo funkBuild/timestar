@@ -112,8 +112,8 @@ seastar::future<void> FunctionPipelineExecutor::executeFunction(
                 data = std::move(result.values);
             }
         } else if (!unaryFunc) {
-            timestar::query_log.warn(
-                "Pipeline function '{}' found in registry but is not a unary function", functionName);
+            timestar::query_log.warn("Pipeline function '{}' found in registry but is not a unary function",
+                                     functionName);
         }
         co_return;
     }

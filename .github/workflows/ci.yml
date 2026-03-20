@@ -14,14 +14,26 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: false
 
-      - name: Install clang-format
-        run: pip install clang-format==22.1.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build deps image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: deps
+          load: true
+          tags: timestar-deps
+          cache-from: type=gha,scope=ci-deps
+          cache-to: type=gha,scope=ci-deps,mode=max
 
       - name: Check formatting
         run: |
-          find lib bin -name '*.cpp' -o -name '*.hpp' | \
-            xargs clang-format --dry-run --Werror
+          docker run --rm -v ${{ github.workspace }}:/src -w /src timestar-deps \
+            bash -c 'find lib bin -name "*.cpp" -o -name "*.hpp" | xargs clang-format --dry-run --Werror'
 
   build-and-test:
     name: Build & Test

@@ -328,8 +328,8 @@ private:
     void trimMeasurementBloomCache();
 
     seastar::future<> updateHLL(const std::string& measurement, uint32_t localId);
-    seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey, const std::string& tagValue,
-                                   uint32_t localId);
+    seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey,
+                                   const std::string& tagValue, uint32_t localId);
     void flushDirtyHLLs(IndexWriteBatch& batch);
     seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
@@ -343,7 +343,8 @@ private:
     seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
     seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
     void flushDirtyDayBitmaps(IndexWriteBatch& batch);
-    seastar::future<roaring::Roaring> buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay, uint32_t endDay);
+    seastar::future<roaring::Roaring> buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay,
+                                                              uint32_t endDay);
 
     // Step 7: Cache eviction — bounded by both entry count and byte budget.
     // Byte budget prevents high-cardinality bitmaps from consuming excessive memory.

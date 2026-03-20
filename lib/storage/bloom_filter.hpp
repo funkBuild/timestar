@@ -70,8 +70,7 @@ public:
     //   m = -n * ln(p) / (ln(2)^2)
     //   k = (m / n) * ln(2)
     bool compute_optimal_parameters() {
-        if (projected_element_count == 0 || false_positive_probability <= 0.0 ||
-            false_positive_probability >= 1.0) {
+        if (projected_element_count == 0 || false_positive_probability <= 0.0 || false_positive_probability >= 1.0) {
             return false;
         }
 
@@ -85,12 +84,14 @@ public:
         auto mInt = static_cast<unsigned long long>(std::ceil(m));
         mInt += (8 - (mInt % 8)) % 8;
         // Enforce a minimum of 64 bits (8 bytes)
-        if (mInt < 64) mInt = 64;
+        if (mInt < 64)
+            mInt = 64;
 
         // Optimal number of hash functions
         double k = (static_cast<double>(mInt) / n) * ln2;
         auto kInt = static_cast<unsigned int>(std::round(k));
-        if (kInt < 1) kInt = 1;
+        if (kInt < 1)
+            kInt = 1;
 
         optimal_parameters.number_of_hashes = kInt;
         optimal_parameters.table_size = mInt;
@@ -126,32 +127,26 @@ public:
     }
 
     // Insert from std::string.
-    void insert(const std::string& key) {
-        insert(reinterpret_cast<const unsigned char*>(key.data()), key.size());
-    }
+    void insert(const std::string& key) { insert(reinterpret_cast<const unsigned char*>(key.data()), key.size()); }
 
     // Insert from string_view.
-    void insert(std::string_view key) {
-        insert(reinterpret_cast<const unsigned char*>(key.data()), key.size());
-    }
+    void insert(std::string_view key) { insert(reinterpret_cast<const unsigned char*>(key.data()), key.size()); }
 
     // Insert from const char* + length.
-    void insert(const char* data, std::size_t length) {
-        insert(reinterpret_cast<const unsigned char*>(data), length);
-    }
+    void insert(const char* data, std::size_t length) { insert(reinterpret_cast<const unsigned char*>(data), length); }
 
     // Insert a POD type by its raw byte representation.
     template <typename T>
         requires(std::is_trivially_copyable_v<T> && !std::is_same_v<std::decay_t<T>, std::string> &&
-                 !std::is_same_v<std::decay_t<T>, std::string_view> &&
-                 !std::is_pointer_v<std::decay_t<T>>)
+                 !std::is_same_v<std::decay_t<T>, std::string_view> && !std::is_pointer_v<std::decay_t<T>>)
     void insert(const T& t) {
         insert(reinterpret_cast<const unsigned char*>(&t), sizeof(T));
     }
 
     // Query: returns true if the key MIGHT be in the set.
     [[nodiscard]] bool contains(const unsigned char* key, std::size_t length) const {
-        if (tableSizeBits_ == 0) return false;
+        if (tableSizeBits_ == 0)
+            return false;
         auto [h1, h2] = computeHashes(key, length);
         for (unsigned i = 0; i < numHashes_; ++i) {
             std::size_t pos = (h1 + static_cast<uint64_t>(i) * h2) % tableSizeBits_;
@@ -176,8 +171,7 @@ public:
 
     template <typename T>
         requires(std::is_trivially_copyable_v<T> && !std::is_same_v<std::decay_t<T>, std::string> &&
-                 !std::is_same_v<std::decay_t<T>, std::string_view> &&
-                 !std::is_pointer_v<std::decay_t<T>>)
+                 !std::is_same_v<std::decay_t<T>, std::string_view> && !std::is_pointer_v<std::decay_t<T>>)
     [[nodiscard]] bool contains(const T& t) const {
         return contains(reinterpret_cast<const unsigned char*>(&t), sizeof(T));
     }
@@ -198,27 +192,23 @@ public:
     // results: output array of numKeys bytes, set to 1 (may contain) or 0
     // Returns: number of keys that passed the filter (result == 1)
     // ------------------------------------------------------------------
-    size_t batchContains16(const uint8_t* keys, size_t numKeys,
-                           uint8_t* results) const {
+    size_t batchContains16(const uint8_t* keys, size_t numKeys, uint8_t* results) const {
         if (tableSizeBits_ == 0 || numKeys == 0) {
             if (results && numKeys > 0) {
                 std::memset(results, 0, numKeys);
             }
             return 0;
         }
-        return timestar::bloom::simd::batchContains16(
-            bitTable_.data(), tableSizeBits_, numHashes_,
-            static_cast<uint64_t>(seed_), keys, numKeys, results);
+        return timestar::bloom::simd::batchContains16(bitTable_.data(), tableSizeBits_, numHashes_,
+                                                      static_cast<uint64_t>(seed_), keys, numKeys, results);
     }
 
     // Convenience: batch contains for a vector/span of SeriesId128-like
     // std::array<uint8_t, 16> keys. Writes results to the output span.
-    size_t batchContains(std::span<const std::array<uint8_t, 16>> keys,
-                         std::span<uint8_t> results) const {
-        if (keys.empty() || tableSizeBits_ == 0) return 0;
-        return batchContains16(
-            reinterpret_cast<const uint8_t*>(keys.data()),
-            keys.size(), results.data());
+    size_t batchContains(std::span<const std::array<uint8_t, 16>> keys, std::span<uint8_t> results) const {
+        if (keys.empty() || tableSizeBits_ == 0)
+            return 0;
+        return batchContains16(reinterpret_cast<const uint8_t*>(keys.data()), keys.size(), results.data());
     }
 
     // Clear all bits, resetting the filter to empty.
@@ -236,21 +226,23 @@ public:
     // SIMD-accelerated population count: number of set bits in the table.
     // Useful for estimating fill ratio without scanning byte-by-byte.
     [[nodiscard]] uint64_t populationCount() const {
-        if (bitTable_.empty()) return 0;
+        if (bitTable_.empty())
+            return 0;
         return timestar::bloom::simd::popcount(bitTable_.data(), bitTable_.size());
     }
 
     // Fill ratio: fraction of bits that are set (0.0 to 1.0).
     [[nodiscard]] double fillRatio() const {
-        if (tableSizeBits_ == 0) return 0.0;
+        if (tableSizeBits_ == 0)
+            return 0.0;
         return static_cast<double>(populationCount()) / static_cast<double>(tableSizeBits_);
     }
 
     // Effective false positive probability given current fill.
     [[nodiscard]] double effective_fpp() const {
-        if (tableSizeBits_ == 0) return 1.0;
-        return std::pow(1.0 - std::exp(-1.0 * numHashes_ * insertedCount_ /
-                                       static_cast<double>(tableSizeBits_)),
+        if (tableSizeBits_ == 0)
+            return 1.0;
+        return std::pow(1.0 - std::exp(-1.0 * numHashes_ * insertedCount_ / static_cast<double>(tableSizeBits_)),
                         static_cast<double>(numHashes_));
     }
 
@@ -266,9 +258,7 @@ public:
 
     // Equality (same configuration + same bits).
     [[nodiscard]] bool operator==(const bloom_filter& o) const {
-        return tableSizeBits_ == o.tableSizeBits_ &&
-               numHashes_ == o.numHashes_ &&
-               seed_ == o.seed_ &&
+        return tableSizeBits_ == o.tableSizeBits_ && numHashes_ == o.numHashes_ && seed_ == o.seed_ &&
                bitTable_ == o.bitTable_;
     }
     [[nodiscard]] bool operator!=(const bloom_filter& o) const { return !(*this == o); }

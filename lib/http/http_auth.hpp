@@ -45,8 +45,7 @@ HttpHandlerFn wrapWithAuth(std::string_view authToken, Fn&& handler) {
     return HttpHandlerFn(
         [token = std::string(authToken), fn = std::forward<Fn>(handler)](
             std::unique_ptr<seastar::http::request> req,
-            std::unique_ptr<seastar::http::reply> rep)
-            -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
             if (auto deny = checkAuth(*req, token))
                 co_return std::move(deny);
             co_return co_await fn(std::move(req), std::move(rep));
@@ -63,9 +62,9 @@ public:
     AuthHandlerWrapper(std::unique_ptr<seastar::httpd::handler_base> inner, std::string token)
         : inner_(std::move(inner)), token_(std::move(token)) {}
 
-    seastar::future<std::unique_ptr<seastar::http::reply>> handle(
-        const seastar::sstring& path, std::unique_ptr<seastar::http::request> req,
-        std::unique_ptr<seastar::http::reply> rep) override {
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle(const seastar::sstring& path,
+                                                                  std::unique_ptr<seastar::http::request> req,
+                                                                  std::unique_ptr<seastar::http::reply> rep) override {
         if (auto deny = checkAuth(*req, token_)) {
             deny->done("json");
             co_return std::move(deny);

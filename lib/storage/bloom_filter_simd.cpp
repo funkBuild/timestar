@@ -11,8 +11,8 @@
 
 #include "bloom_filter_simd.hpp"
 
-#include "hwy/highway.h"
 #include "hwy/contrib/algo/copy-inl.h"
+#include "hwy/highway.h"
 
 #include <xxhash.h>
 
@@ -120,9 +120,8 @@ uint64_t PopcountKernel(const uint8_t* HWY_RESTRICT data, size_t count) {
 // Additionally, processing keys in batch keeps the bloom table hot in
 // L1/L2 cache, which matters when checking hundreds of series IDs against
 // a TSM file's bloom filter (the prefetchFullIndexEntries hot path).
-size_t BatchContains16Kernel(const uint8_t* HWY_RESTRICT table, size_t tableSizeBits,
-                             unsigned int numHashes, uint64_t seed,
-                             const uint8_t* HWY_RESTRICT keys, size_t numKeys,
+size_t BatchContains16Kernel(const uint8_t* HWY_RESTRICT table, size_t tableSizeBits, unsigned int numHashes,
+                             uint64_t seed, const uint8_t* HWY_RESTRICT keys, size_t numKeys,
                              uint8_t* HWY_RESTRICT results) {
     // Maximum k (number of hashes) we can handle with stack-allocated probes.
     // The bloom_parameters formula yields k ~ 7 for 1% FPP, k ~ 10 for 0.1%.
@@ -203,7 +202,8 @@ size_t BatchContains16Kernel(const uint8_t* HWY_RESTRICT table, size_t tableSize
             }
 
             results[ki] = absent ? 0 : 1;
-            if (!absent) ++passed;
+            if (!absent)
+                ++passed;
         } else {
             // Fallback: too many probes for stack buffer, use scalar
             bool found = true;
@@ -215,7 +215,8 @@ size_t BatchContains16Kernel(const uint8_t* HWY_RESTRICT table, size_t tableSize
                 }
             }
             results[ki] = found ? 1 : 0;
-            if (found) ++passed;
+            if (found)
+                ++passed;
         }
     }
 
@@ -259,10 +260,8 @@ uint64_t popcount(const uint8_t* data, size_t count) {
     return HWY_DYNAMIC_DISPATCH(PopcountKernel)(data, count);
 }
 
-size_t batchContains16(const uint8_t* table, size_t tableSizeBits,
-                       unsigned int numHashes, uint64_t seed,
-                       const uint8_t* keys, size_t numKeys,
-                       uint8_t* results) {
+size_t batchContains16(const uint8_t* table, size_t tableSizeBits, unsigned int numHashes, uint64_t seed,
+                       const uint8_t* keys, size_t numKeys, uint8_t* results) {
     return HWY_DYNAMIC_DISPATCH(BatchContains16Kernel)(table, tableSizeBits, numHashes, seed, keys, numKeys, results);
 }
 

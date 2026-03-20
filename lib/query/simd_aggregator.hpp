@@ -41,7 +41,6 @@ public:
     // Fast histogram computation for percentile calculations
     static void computeHistogram(const double* values, size_t count, double min_val, double max_val, size_t num_bins,
                                  uint32_t* histogram);
-
 };
 
 // Fallback scalar implementations for when NaN is detected in min/max

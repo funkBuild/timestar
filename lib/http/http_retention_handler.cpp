@@ -1,6 +1,6 @@
 #include "http_retention_handler.hpp"
-#include "http_auth.hpp"
 
+#include "http_auth.hpp"
 #include "http_query_handler.hpp"
 #include "logger.hpp"
 

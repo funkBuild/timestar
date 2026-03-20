@@ -34,10 +34,8 @@ uint64_t popcount(const uint8_t* data, size_t count);
 // computation itself uses xxHash's internal SIMD. The SIMD advantage here
 // is in the probe-checking phase: we gather all k probe bytes and test
 // them with a single SIMD comparison rather than k scalar branches.
-size_t batchContains16(const uint8_t* table, size_t tableSizeBits,
-                       unsigned int numHashes, uint64_t seed,
-                       const uint8_t* keys, size_t numKeys,
-                       uint8_t* results);
+size_t batchContains16(const uint8_t* table, size_t tableSizeBits, unsigned int numHashes, uint64_t seed,
+                       const uint8_t* keys, size_t numKeys, uint8_t* results);
 
 }  // namespace simd
 }  // namespace bloom

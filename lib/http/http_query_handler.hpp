@@ -102,8 +102,8 @@ public:
     // Each partial must have a unique groupKey; callers with duplicate groupKeys must use
     // the merge fallback path (mergePartialAggregationsGrouped) instead.
     // Public static for testability.
-    static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials,
-                                            AggregationMethod method, QueryResponse& response);
+    static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials, AggregationMethod method,
+                                            QueryResponse& response);
 
     // Format response as JSON (public for testing)
     // Note: field filtering is performed in executeQuery(), so by the time this

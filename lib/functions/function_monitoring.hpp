@@ -5,12 +5,11 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/timer.hh>
 #include <string>
 #include <unordered_set>
 #include <vector>
-
-#include <seastar/core/lowres_clock.hh>
-#include <seastar/core/timer.hh>
 
 namespace timestar::functions {
 

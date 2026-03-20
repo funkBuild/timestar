@@ -54,6 +54,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xfslibs-dev \
     # TimeStar deps
     libxxhash-dev \
+    # Linting (pinned to distro version — same binary in CI and local dev)
+    clang-format-18 \
+    && ln -sf /usr/bin/clang-format-18 /usr/local/bin/clang-format \
     && rm -rf /var/lib/apt/lists/*
 
 # Use GCC 14

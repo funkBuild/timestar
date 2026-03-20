@@ -1,10 +1,10 @@
 #include "http_stream_handler.hpp"
-#include "http_auth.hpp"
 
 #include "../utils/json_escape.hpp"
 #include "engine.hpp"
 #include "expression_evaluator.hpp"
 #include "expression_parser.hpp"
+#include "http_auth.hpp"
 #include "logger.hpp"
 #include "streaming_aggregator.hpp"
 #include "streaming_derived_evaluator.hpp"
@@ -439,11 +439,9 @@ void HttpStreamHandler::registerRoutes(seastar::httpd::routes& r, std::string_vi
     } else {
         std::string token(authToken);
         r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/subscribe"),
-              new timestar::AuthHandlerWrapper(
-                  std::make_unique<sse_handler>(this), token));
+              new timestar::AuthHandlerWrapper(std::make_unique<sse_handler>(this), token));
         r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/subscriptions"),
-              new timestar::AuthHandlerWrapper(
-                  std::make_unique<subscriptions_handler>(this), token));
+              new timestar::AuthHandlerWrapper(std::make_unique<subscriptions_handler>(this), token));
     }
 
     timestar::http_log.info("Registered HTTP streaming endpoints at /subscribe, /subscriptions{}",
@@ -718,7 +716,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 rep->set_status(seastar::http::reply::status_type{429});
                 rep->_content =
                     "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_SUBSCRIPTIONS\","
-                    "\"message\":\"" + jsonEscape(subscriptionError) + "\"}}";
+                    "\"message\":\"" +
+                    jsonEscape(subscriptionError) + "\"}}";
             } else {
                 rep->set_status(seastar::http::reply::status_type{400});
                 rep->_content = std::string(

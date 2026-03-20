@@ -1,5 +1,7 @@
 #pragma once
 
+#include "simd_aggregator.hpp"
+
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -12,8 +14,6 @@
 #include <variant>
 #include <vector>
 
-#include "simd_aggregator.hpp"
-
 namespace timestar::functions {
 
 // Parameter value types for function context
@@ -24,12 +24,18 @@ enum class FunctionCategory { ARITHMETIC, SMOOTHING, AGGREGATION, TRANSFORMATION
 
 inline const char* categoryToString(FunctionCategory cat) {
     switch (cat) {
-        case FunctionCategory::ARITHMETIC: return "arithmetic";
-        case FunctionCategory::SMOOTHING: return "smoothing";
-        case FunctionCategory::AGGREGATION: return "aggregation";
-        case FunctionCategory::TRANSFORMATION: return "transformation";
-        case FunctionCategory::STATISTICAL: return "statistical";
-        case FunctionCategory::OTHER: return "other";
+        case FunctionCategory::ARITHMETIC:
+            return "arithmetic";
+        case FunctionCategory::SMOOTHING:
+            return "smoothing";
+        case FunctionCategory::AGGREGATION:
+            return "aggregation";
+        case FunctionCategory::TRANSFORMATION:
+            return "transformation";
+        case FunctionCategory::STATISTICAL:
+            return "statistical";
+        case FunctionCategory::OTHER:
+            return "other";
     }
     return "unknown";
 }
@@ -57,15 +63,13 @@ public:
         : timestamps(ts),
           values(vals),
           startIndex(start),
-          count((!ts || !vals)
-                    ? 0
-                    : (cnt == 0
-                           ? (start <= std::min(ts->size(), vals->size())
-                                  ? std::min(ts->size(), vals->size()) - start
-                                  : 0)
-                           : std::min(cnt, start <= std::min(ts->size(), vals->size())
-                                              ? std::min(ts->size(), vals->size()) - start
-                                              : 0))) {}
+          count((!ts || !vals) ? 0
+                               : (cnt == 0 ? (start <= std::min(ts->size(), vals->size())
+                                                  ? std::min(ts->size(), vals->size()) - start
+                                                  : 0)
+                                           : std::min(cnt, start <= std::min(ts->size(), vals->size())
+                                                               ? std::min(ts->size(), vals->size()) - start
+                                                               : 0))) {}
 
     size_t size() const { return count; }
     bool empty() const { return count == 0 || !timestamps || !values; }

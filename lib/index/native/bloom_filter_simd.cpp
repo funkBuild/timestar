@@ -28,8 +28,7 @@ namespace hn = hwy::HWY_NAMESPACE;
 
 // Byte-level access to the uint64_t filter array in MayContainKernel assumes
 // little-endian layout (bit N maps to byte[N/8], bit_within_byte = N%8).
-static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
-              "bloom_filter_simd assumes little-endian byte order");
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "bloom_filter_simd assumes little-endian byte order");
 
 // Fast modulo replacement: maps a 32-bit value uniformly to [0, n) without division.
 // Uses the "fastrange" trick: (uint64_t(x) * n) >> 32.
@@ -52,8 +51,8 @@ static HWY_INLINE size_t fastRange(uint32_t x, size_t n) {
 // The bit-setting itself remains scalar (random scattered writes to the filter
 // array are not SIMD-friendly), but the probe position computation — which
 // involves k multiplications per hash — is the CPU bottleneck being addressed.
-void BuildBatchKernel(uint64_t* HWY_RESTRICT filter, size_t numBits, int k,
-                      const uint64_t* HWY_RESTRICT hashes, size_t numHashes) {
+void BuildBatchKernel(uint64_t* HWY_RESTRICT filter, size_t numBits, int k, const uint64_t* HWY_RESTRICT hashes,
+                      size_t numHashes) {
     // We use uint64_t lanes to compute: fastRange(h1 + i*h2, numBits)
     // = ((h1 + i*h2) as uint32_t * numBits) >> 32
     // Using 64-bit lanes: multiply the 32-bit combined hash (zero-extended to 64)
@@ -134,8 +133,7 @@ void BuildBatchKernel(uint64_t* HWY_RESTRICT filter, size_t numBits, int k,
 //
 // For k <= SIMD width (typically 16-64 on modern CPUs), this is a single
 // SIMD AND + compare + AllFalse test.
-bool MayContainKernel(const uint64_t* HWY_RESTRICT filter, size_t numBits, int k,
-                      uint32_t h1, uint32_t h2) {
+bool MayContainKernel(const uint64_t* HWY_RESTRICT filter, size_t numBits, int k, uint32_t h1, uint32_t h2) {
     static constexpr int kMaxProbes = 32;
 
     // Treat the uint64_t array as bytes for byte-level gather.
@@ -259,13 +257,11 @@ HWY_EXPORT(BuildBatchKernel);
 HWY_EXPORT(MayContainKernel);
 HWY_EXPORT(PopcountKernel);
 
-void bloomBuildBatch(uint64_t* filter, size_t numBits, int k,
-                     const uint64_t* hashes, size_t numHashes) {
+void bloomBuildBatch(uint64_t* filter, size_t numBits, int k, const uint64_t* hashes, size_t numHashes) {
     HWY_DYNAMIC_DISPATCH(BuildBatchKernel)(filter, numBits, k, hashes, numHashes);
 }
 
-bool bloomMayContain(const uint64_t* filter, size_t numBits, int k,
-                     uint32_t h1, uint32_t h2) {
+bool bloomMayContain(const uint64_t* filter, size_t numBits, int k, uint32_t h1, uint32_t h2) {
     return HWY_DYNAMIC_DISPATCH(MayContainKernel)(filter, numBits, k, h1, h2);
 }
 

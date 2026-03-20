@@ -21,15 +21,9 @@ public:
                           int priority)
         : reader_(std::move(reader)), iter_(std::move(iter)), priority_(priority) {}
 
-    seastar::future<> seek(std::string_view target) override {
-        co_await iter_->seek(target);
-    }
-    seastar::future<> seekToFirst() override {
-        co_await iter_->seekToFirst();
-    }
-    seastar::future<> next() override {
-        co_await iter_->next();
-    }
+    seastar::future<> seek(std::string_view target) override { co_await iter_->seek(target); }
+    seastar::future<> seekToFirst() override { co_await iter_->seekToFirst(); }
+    seastar::future<> next() override { co_await iter_->next(); }
 
     // Synchronous fast path — calls .get() on async futures.
     // Safe when futures are ready (cache hit) or inside seastar::async().

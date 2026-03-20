@@ -96,7 +96,8 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(con
 
         for (uint64_t t = startTime; t <= endTime; t += uinterval) {
             targetTimestamps.push_back(t);
-            if (t > UINT64_MAX - uinterval) break;
+            if (t > UINT64_MAX - uinterval)
+                break;
         }
     } else {
         std::string timestampStr = context.getParameter<std::string>("target_timestamps");
@@ -149,8 +150,8 @@ seastar::future<FunctionResult<double>> LinearInterpolationFunction::execute(con
                                    static_cast<double>(input.timestampAt(1) - input.timestampAt(0));
                     // Bug #22 fix: Cast both operands to double before subtraction
                     // to prevent unsigned underflow when targetTime < timestampAt(0)
-                    double extrapolated =
-                        input.valueAt(0) + slope * (static_cast<double>(targetTime) - static_cast<double>(input.timestampAt(0)));
+                    double extrapolated = input.valueAt(0) + slope * (static_cast<double>(targetTime) -
+                                                                      static_cast<double>(input.timestampAt(0)));
                     result.values.push_back(extrapolated);
                 } else {
                     result.values.push_back(input.valueAt(0));
@@ -279,7 +280,8 @@ seastar::future<FunctionResult<double>> SplineInterpolationFunction::execute(con
 
         for (uint64_t t = startTime; t <= endTime; t += uinterval) {
             targetTimestamps.push_back(t);
-            if (t > UINT64_MAX - uinterval) break;
+            if (t > UINT64_MAX - uinterval)
+                break;
         }
     } else {
         std::string timestampStr = context.getParameter<std::string>("target_timestamps");

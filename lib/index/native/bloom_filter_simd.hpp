@@ -27,8 +27,7 @@ inline constexpr size_t kBloomSimdThreshold = 64;
 //   k          - Number of hash functions (probe positions per key)
 //   hashes     - Array of numHashes 64-bit hash values (lower 32 = h1, upper 32 = h2)
 //   numHashes  - Number of hashes to process
-void bloomBuildBatch(uint64_t* filter, size_t numBits, int k,
-                     const uint64_t* hashes, size_t numHashes);
+void bloomBuildBatch(uint64_t* filter, size_t numBits, int k, const uint64_t* hashes, size_t numHashes);
 
 // SIMD-accelerated probe test for bloom filter mayContain().
 //
@@ -47,8 +46,7 @@ void bloomBuildBatch(uint64_t* filter, size_t numBits, int k,
 //
 // Returns: true if all k probe bits are set (key may be present),
 //          false if any probe bit is zero (key definitely absent).
-bool bloomMayContain(const uint64_t* filter, size_t numBits, int k,
-                     uint32_t h1, uint32_t h2);
+bool bloomMayContain(const uint64_t* filter, size_t numBits, int k, uint32_t h1, uint32_t h2);
 
 // SIMD-accelerated popcount: count total set bits in the filter.
 // Uses Highway PopulationCount on uint64_t lanes for maximum throughput.
