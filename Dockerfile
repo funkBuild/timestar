@@ -100,7 +100,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Only runtime shared libraries — no -dev packages, no compilers
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libboost-filesystem1.83.0 \
     libboost-program-options1.83.0 \
+    libboost-thread1.83.0 \
     libc-ares2 \
     libfmt9 \
     liblz4-1 \
