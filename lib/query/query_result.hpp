@@ -3,12 +3,12 @@
 #include "tsm_result.hpp"
 #include "util.hpp"
 
-#include <stdint.h>
-
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <queue>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -67,7 +67,14 @@ public:
         results.values.reserve(totalPoints);
         for (auto& block : singleResult.blocks) {
             results.timestamps.insert(results.timestamps.end(), block->timestamps.begin(), block->timestamps.end());
-            results.values.insert(results.values.end(), block->values.begin(), block->values.end());
+            if constexpr (std::is_same_v<T, bool>) {
+                // vector<bool> is a bitset proxy; range insert may be inefficient
+                for (size_t i = 0; i < block->values.size(); ++i) {
+                    results.values.push_back(block->values[i]);
+                }
+            } else {
+                results.values.insert(results.values.end(), block->values.begin(), block->values.end());
+            }
         }
         return results;
     }
@@ -110,7 +117,14 @@ public:
             if (block == nullptr)
                 break;
             timestamps.insert(timestamps.end(), block->timestamps.begin(), block->timestamps.end());
-            values.insert(values.end(), block->values.begin(), block->values.end());
+            if constexpr (std::is_same_v<T, bool>) {
+                // vector<bool> is a bitset proxy; range insert may be inefficient
+                for (size_t i = 0; i < block->values.size(); ++i) {
+                    values.push_back(block->values[i]);
+                }
+            } else {
+                values.insert(values.end(), block->values.begin(), block->values.end());
+            }
         }
     }
 
@@ -192,6 +206,8 @@ public:
             }
 
             // Emit the winning point
+            if (bestIdx == SIZE_MAX) [[unlikely]]
+                break;
             timestamps.push_back(bestTs);
             values.push_back(iters[bestIdx].block->valueAt(iters[bestIdx].blockOffset));
 

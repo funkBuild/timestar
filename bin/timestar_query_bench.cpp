@@ -18,7 +18,13 @@
  *
  * Usage:
  *   ./timestar_query_bench --server-host 127.0.0.1 --server-port 8086
+ *
+ *   # Compare JSON vs Protobuf:
+ *   ./timestar_query_bench --format json
+ *   ./timestar_query_bench --format protobuf
  */
+
+#include "timestar.pb.h"
 
 #include <boost/range/irange.hpp>
 
@@ -44,6 +50,8 @@
 #include <seastar/net/inet_address.hh>
 #include <string>
 #include <vector>
+
+enum class WireFormat { Json, Protobuf };
 
 using namespace seastar;
 using clk = std::chrono::steady_clock;
@@ -71,16 +79,30 @@ struct QueryDef {
     std::string name;    // human label
     std::string method;  // HTTP method (GET or POST)
     std::string path;    // URL path
-    std::string body;    // request body (empty for GET)
+    std::string body;    // request body (empty for GET) — JSON or protobuf bytes depending on format
     int iterations;      // how many times to run
+    WireFormat format = WireFormat::Json;  // wire format for this query
 };
 
-static std::vector<QueryDef> buildQuerySuite() {
+static std::vector<QueryDef> buildQuerySuite(WireFormat format = WireFormat::Json) {
     std::vector<QueryDef> qs;
 
-    // Helper to build POST /query JSON
-    auto q = [](const std::string& query, uint64_t start, uint64_t end,
-                const std::string& interval = "") -> std::string {
+    // Helper to build POST /query body in the appropriate format.
+    auto q = [format](const std::string& query, uint64_t start, uint64_t end,
+                      const std::string& interval = "") -> std::string {
+        if (format == WireFormat::Protobuf) {
+            ::timestar_pb::QueryRequest req;
+            req.set_query(query);
+            req.set_start_time(start);
+            req.set_end_time(end);
+            if (!interval.empty()) {
+                req.set_aggregation_interval(interval);
+            }
+            std::string bytes;
+            req.SerializeToString(&bytes);
+            return bytes;
+        }
+        // JSON format
         std::string json = fmt::format(R"({{"query":"{}","startTime":{},"endTime":{}}})", query, start, end);
         if (!interval.empty()) {
             // Insert aggregationInterval before closing brace
@@ -205,6 +227,11 @@ static std::vector<QueryDef> buildQuerySuite() {
     qs.push_back({"latest: tag filter (repeated)", "POST", "/query",
                   q("latest:server.metrics(temperature){host:host-03}", BASE_TS, END_TS), 50});
 
+    // Set the wire format on all entries.
+    for (auto& q : qs) {
+        q.format = format;
+    }
+
     return qs;
 }
 
@@ -263,10 +290,18 @@ static future<QueryResult> runQuery(socket_address addr, const QueryDef& def) {
     result.name = def.name;
     result.iterations = def.iterations;
 
+    const bool isProto = def.format == WireFormat::Protobuf && def.method == "POST";
+
     for (int i = 0; i < def.iterations; ++i) {
         auto req = http::request::make(sstring(def.method), sstring("localhost"), sstring(def.path));
         if (!def.body.empty()) {
-            req.write_body("json", sstring(def.body));
+            if (isProto) {
+                req.write_body("bin", sstring(def.body));
+                req.set_mime_type("application/x-protobuf");
+                req._headers["Accept"] = "application/x-protobuf";
+            } else {
+                req.write_body("json", sstring(def.body));
+            }
         }
 
         auto t0 = clk::now();
@@ -307,9 +342,18 @@ static future<QueryResult> runQuery(socket_address addr, const QueryDef& def) {
             // Parse stats from first success
             if (result.response_bytes == 0) {
                 result.response_bytes = respBody.size();
-                auto sv = std::string_view(respBody.data(), respBody.size());
-                result.point_count = extractJsonInt(sv, "\"point_count\"");
-                result.series_count = extractJsonInt(sv, "\"series_count\"");
+                if (isProto && def.method == "POST") {
+                    // Parse protobuf QueryResponse for statistics
+                    ::timestar_pb::QueryResponse pbResp;
+                    if (pbResp.ParseFromArray(respBody.data(), static_cast<int>(respBody.size()))) {
+                        result.point_count = static_cast<int>(pbResp.statistics().point_count());
+                        result.series_count = static_cast<int>(pbResp.statistics().series_count());
+                    }
+                } else {
+                    auto sv = std::string_view(respBody.data(), respBody.size());
+                    result.point_count = extractJsonInt(sv, "\"point_count\"");
+                    result.series_count = extractJsonInt(sv, "\"series_count\"");
+                }
             }
         } else {
             result.failures++;
@@ -338,7 +382,8 @@ int main(int argc, char** argv) {
     app.add_options()("server-host", bpo::value<std::string>()->default_value("127.0.0.1"), "TimeStar server host")(
         "server-port", bpo::value<uint16_t>()->default_value(8086), "TimeStar server port")(
         "warmup-iterations", bpo::value<int>()->default_value(3), "Warmup iterations per query (not timed)")(
-        "filter", bpo::value<std::string>()->default_value(""), "Run only queries whose name contains this substring");
+        "filter", bpo::value<std::string>()->default_value(""), "Run only queries whose name contains this substring")(
+        "format", bpo::value<std::string>()->default_value("json"), "Wire format: 'json' (default) or 'protobuf'");
 
     return app.run(argc, argv, [&]() -> future<> {
         auto& cfg = app.configuration();
@@ -347,6 +392,15 @@ int main(int argc, char** argv) {
         const auto port = cfg["server-port"].as<uint16_t>();
         const auto warmup = cfg["warmup-iterations"].as<int>();
         const auto filter = cfg["filter"].as<std::string>();
+        const auto formatStr = cfg["format"].as<std::string>();
+
+        WireFormat format = WireFormat::Json;
+        if (formatStr == "protobuf" || formatStr == "proto" || formatStr == "pb") {
+            format = WireFormat::Protobuf;
+        } else if (formatStr != "json") {
+            fmt::print("ERROR: unknown format '{}'. Use 'json' or 'protobuf'.\n", formatStr);
+            co_return;
+        }
 
         auto addr = socket_address(net::inet_address(host), port);
 
@@ -355,6 +409,7 @@ int main(int argc, char** argv) {
         fmt::print(" TimeStar Query Benchmark\n");
         fmt::print("{:=<80}\n", "");
         fmt::print("  Server:   {}:{}\n", host, port);
+        fmt::print("  Format:   {}\n", format == WireFormat::Protobuf ? "protobuf" : "json");
         fmt::print("  Warmup:   {} iterations per query\n", warmup);
         if (!filter.empty()) {
             fmt::print("  Filter:   \"{}\"\n", filter);
@@ -387,7 +442,7 @@ int main(int argc, char** argv) {
         }
 
         // ── Build query suite ──────────────────────────────────────
-        auto suite = buildQuerySuite();
+        auto suite = buildQuerySuite(format);
 
         // Apply filter
         if (!filter.empty()) {

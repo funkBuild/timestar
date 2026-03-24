@@ -39,7 +39,7 @@ private:
     // in-flight inserts finish but no new ones start.
     seastar::gate _insertGate;
 
-    int shardId;
+    unsigned shardId;
 
     // Back-reference to the sharded<Engine> container for cross-shard communication.
     // Used for schema broadcasts and cross-shard operations; metadata is indexed locally per-shard.

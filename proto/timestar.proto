@@ -1,0 +1,444 @@
+// TimeStar Time Series Database - Protobuf message definitions
+// Covers all 15 HTTP API endpoints for binary serialization.
+
+syntax = "proto3";
+package timestar_pb;
+
+// ============================================================================
+// Typed Arrays (packed for efficient encoding)
+// ============================================================================
+
+message DoubleArray {
+    repeated double values = 1 [packed = true];
+}
+
+message Int64Array {
+    repeated int64 values = 1 [packed = true];
+}
+
+message Uint64Array {
+    repeated uint64 values = 1 [packed = true];
+}
+
+message BoolArray {
+    repeated bool values = 1 [packed = true];
+}
+
+message StringArray {
+    repeated string values = 1;
+}
+
+message TimestampArray {
+    repeated uint64 values = 1 [packed = true];
+}
+
+// ============================================================================
+// Common
+// ============================================================================
+
+// Polymorphic field value (scalar)
+message FieldValue {
+    oneof value {
+        double double_value   = 1;
+        bool   bool_value     = 2;
+        string string_value   = 3;
+        int64  int64_value    = 4;
+    }
+}
+
+// Empty request body (for health checks, etc.)
+message Empty {}
+
+// GET /health response
+message HealthResponse {
+    string status = 1;  // "ok"
+}
+
+// Generic status response used by multiple endpoints
+message StatusResponse {
+    string status  = 1;  // "success" or "error"
+    string message = 2;
+    string code    = 3;  // Error code (e.g. "INVALID_JSON", "INVALID_QUERY")
+}
+
+// ============================================================================
+// Write API  (POST /write)
+// ============================================================================
+
+// A single field's typed array of values (matches FieldArrays in C++)
+message WriteField {
+    oneof typed_values {
+        DoubleArray double_values  = 1;
+        BoolArray   bool_values    = 2;
+        StringArray string_values  = 3;
+        Int64Array  int64_values   = 4;
+    }
+}
+
+// A single write point (may carry arrays for columnar batch writes)
+message WritePoint {
+    string                    measurement = 1;
+    map<string, string>       tags        = 2;
+    map<string, WriteField>   fields      = 3;
+    repeated uint64           timestamps  = 4 [packed = true];  // Array of timestamps (ns since epoch)
+}
+
+// Top-level write request (batch of points)
+message WriteRequest {
+    repeated WritePoint writes = 1;
+}
+
+// Write response with per-batch diagnostics
+message WriteResponse {
+    string status         = 1;  // "success", "partial", "error"
+    int64  points_written = 2;
+    int64  failed_writes  = 3;
+    repeated string errors = 4;  // Per-point error messages (partial failure)
+}
+
+// ============================================================================
+// Query API  (POST /query)
+// ============================================================================
+
+// Query request matching QueryRequest struct + HTTP JSON schema
+message QueryRequest {
+    string query                = 1;  // Query string: "avg:measurement(fields){scopes} by {tags}"
+    uint64 start_time           = 2;  // Nanoseconds since epoch
+    uint64 end_time             = 3;  // Nanoseconds since epoch
+    string aggregation_interval = 4;  // Duration string (e.g. "5m") or numeric nanoseconds
+}
+
+// Per-field time series data in a query result
+message FieldData {
+    repeated uint64 timestamps = 1 [packed = true];
+    oneof typed_values {
+        DoubleArray double_values  = 2;
+        Int64Array  int64_values   = 3;
+        BoolArray   bool_values    = 4;
+        StringArray string_values  = 5;
+    }
+}
+
+// A single series in the query response
+message SeriesResult {
+    string                     measurement = 1;
+    map<string, string>        tags        = 2;
+    map<string, FieldData>     fields      = 3;
+}
+
+// Statistics about query execution
+message QueryStatistics {
+    uint64 series_count       = 1;
+    uint64 point_count        = 2;
+    double execution_time_ms  = 3;
+    repeated int32 shards_queried = 4 [packed = true];
+    uint64 failed_series_count = 5;
+    bool   truncated          = 6;
+    string truncation_reason  = 7;
+}
+
+// Query response
+message QueryResponse {
+    string               status     = 1;  // "success" or "error"
+    repeated SeriesResult series    = 2;
+    QueryStatistics      statistics = 3;
+    string               error_code    = 4;
+    string               error_message = 5;
+}
+
+// ============================================================================
+// Delete API  (POST /delete)
+// ============================================================================
+
+// Single delete request
+message DeleteRequest {
+    string                series      = 1;  // Series key format (e.g. "temp,location=us-west.value")
+    string                measurement = 2;  // Structured format: measurement name
+    map<string, string>   tags        = 3;  // Structured format: tag filters
+    string                field       = 4;  // Single field name
+    repeated string       fields      = 5;  // Multiple field names
+    uint64                start_time  = 6;  // Nanoseconds since epoch
+    uint64                end_time    = 7;  // Nanoseconds since epoch
+}
+
+// Batch delete request
+message BatchDeleteRequest {
+    repeated DeleteRequest deletes = 1;
+}
+
+// Delete response
+message DeleteResponse {
+    string status         = 1;  // "success" or "error"
+    uint64 deleted_count  = 2;
+    uint64 total_requests = 3;
+    string error_message  = 4;
+}
+
+// ============================================================================
+// Metadata API  (GET /measurements, /tags, /fields, /cardinality)
+// ============================================================================
+
+// GET /measurements?prefix=...&limit=...&offset=...
+message MeasurementsRequest {
+    string prefix = 1;
+    uint64 limit  = 2;
+    uint64 offset = 3;
+}
+
+message MeasurementsResponse {
+    string          status       = 1;
+    repeated string measurements = 2;
+    uint64          total        = 3;  // Total count (before pagination)
+}
+
+// GET /tags?measurement=...&tag=...
+message TagsRequest {
+    string measurement = 1;
+    string tag         = 2;  // Optional: specific tag key to get values for
+}
+
+// Tag values for a single tag key
+message TagValues {
+    repeated string values = 1;
+}
+
+message TagsResponse {
+    string                       status = 1;
+    string                       measurement = 2;
+    map<string, TagValues>       tags   = 3;  // tag_key -> [values]
+}
+
+// GET /fields?measurement=...
+message FieldsRequest {
+    string              measurement = 1;
+    map<string, string> tag_filters = 2;  // Optional tag filters
+}
+
+// A single field with name and type
+message FieldInfo {
+    string name = 1;
+    string type = 2;  // "float", "bool", "string", "integer"
+}
+
+message FieldsResponse {
+    string             status      = 1;
+    string             measurement = 2;
+    repeated FieldInfo fields      = 3;
+}
+
+// GET /cardinality?measurement=...
+message CardinalityRequest {
+    string measurement = 1;
+}
+
+// Tag cardinality entry
+message TagCardinality {
+    string tag_key            = 1;
+    double estimated_count    = 2;
+}
+
+message CardinalityResponse {
+    string                     status                  = 1;
+    string                     measurement             = 2;
+    double                     estimated_series_count  = 3;
+    repeated TagCardinality    tag_cardinalities       = 4;
+}
+
+// ============================================================================
+// Retention API  (PUT/GET/DELETE /retention)
+// ============================================================================
+
+message DownsamplePolicy {
+    string after          = 1;  // Duration string, e.g. "30d"
+    uint64 after_nanos    = 2;  // Computed nanoseconds
+    string interval       = 3;  // Duration string, e.g. "5m"
+    uint64 interval_nanos = 4;  // Computed nanoseconds
+    string method         = 5;  // "avg", "min", "max", "sum", "latest"
+}
+
+message RetentionPolicy {
+    string           measurement = 1;
+    string           ttl         = 2;  // Duration string, e.g. "90d"
+    uint64           ttl_nanos   = 3;  // Computed nanoseconds
+    DownsamplePolicy downsample  = 4;  // Optional downsampling
+}
+
+// PUT /retention
+message RetentionPutRequest {
+    string           measurement = 1;
+    string           ttl         = 2;  // Duration string
+    DownsamplePolicy downsample  = 3;
+}
+
+// GET /retention?measurement=...
+message RetentionGetRequest {
+    string measurement = 1;
+}
+
+message RetentionGetResponse {
+    string          status = 1;
+    RetentionPolicy policy = 2;
+}
+
+// DELETE /retention?measurement=...
+message RetentionDeleteRequest {
+    string measurement = 1;
+}
+
+// ============================================================================
+// Streaming / Subscribe API  (POST /subscribe, GET /subscriptions)
+// ============================================================================
+
+// A single query entry in a multi-query subscription
+message StreamQueryEntry {
+    string query = 1;
+    string label = 2;
+}
+
+// POST /subscribe
+message SubscribeRequest {
+    string                    query                = 1;  // Single-query mode (backward-compatible)
+    repeated StreamQueryEntry queries              = 2;  // Multi-query mode
+    string                    formula              = 3;  // Optional expression formula
+    uint64                    start_time           = 4;  // Optional backfill start time
+    bool                      backfill             = 5;
+    string                    aggregation_interval = 6;  // Duration string (e.g. "5m")
+}
+
+// A single streaming data point
+message StreamingDataPoint {
+    string              measurement = 1;
+    string              field       = 2;
+    map<string, string> tags        = 3;
+    uint64              timestamp   = 4;
+    FieldValue          value       = 5;
+}
+
+// A batch of streaming data points
+message StreamingBatch {
+    repeated StreamingDataPoint points    = 1;
+    uint64                      sequence_id    = 2;
+    string                      label          = 3;
+    bool                        is_drop        = 4;
+    uint64                      dropped_count  = 5;
+}
+
+// Stats for a single subscription
+message SubscriptionStats {
+    uint64              id              = 1;
+    string              measurement     = 2;
+    map<string, string> scopes          = 3;
+    repeated string     fields          = 4;
+    string              label           = 5;
+    uint32              handler_shard   = 6;
+    uint64              queue_depth     = 7;
+    uint64              queue_capacity  = 8;
+    uint64              dropped_points  = 9;
+    uint64              events_sent     = 10;
+}
+
+// GET /subscriptions
+message SubscriptionsResponse {
+    string                       status        = 1;
+    repeated SubscriptionStats   subscriptions = 2;
+}
+
+// ============================================================================
+// Derived Query API  (POST /derived)
+// ============================================================================
+
+// A named sub-query within a derived query
+message DerivedSubQuery {
+    string name  = 1;  // Short name (e.g. "a", "b")
+    string query = 2;  // Query string in standard format
+}
+
+// POST /derived
+message DerivedQueryRequest {
+    repeated DerivedSubQuery queries              = 1;
+    string                   formula              = 2;  // Expression: "(a + b) / 2"
+    uint64                   start_time           = 3;
+    uint64                   end_time             = 4;
+    string                   aggregation_interval = 5;  // Duration string
+}
+
+// Statistics for derived query execution
+message DerivedQueryStatistics {
+    uint64 point_count                     = 1;
+    double execution_time_ms               = 2;
+    uint64 sub_queries_executed            = 3;
+    uint64 points_dropped_due_to_alignment = 4;
+}
+
+// Standard derived query response
+message DerivedQueryResponse {
+    string                   status     = 1;
+    repeated uint64          timestamps = 2 [packed = true];
+    repeated double          values     = 3 [packed = true];
+    string                   formula    = 4;
+    DerivedQueryStatistics   statistics = 5;
+    string                   error_code    = 6;
+    string                   error_message = 7;
+}
+
+// ============================================================================
+// Anomaly Detection Response  (returned from POST /derived with anomaly())
+// ============================================================================
+
+message AnomalySeriesPiece {
+    string          piece       = 1;  // "raw", "upper", "lower", "scores", "ratings"
+    repeated string group_tags  = 2;
+    repeated double values      = 3 [packed = true];  // NaN for missing values
+    double          alert_value = 4;
+    bool            has_alert   = 5;  // Explicit presence flag for alert_value
+}
+
+message AnomalyStatistics {
+    string algorithm        = 1;
+    double bounds           = 2;
+    string seasonality      = 3;
+    uint64 anomaly_count    = 4;
+    uint64 total_points     = 5;
+    double execution_time_ms = 6;
+}
+
+message AnomalyResponse {
+    string                        status     = 1;
+    repeated uint64               times      = 2 [packed = true];
+    repeated AnomalySeriesPiece   series     = 3;
+    AnomalyStatistics             statistics = 4;
+    string                        error_message = 5;
+}
+
+// ============================================================================
+// Forecast Response  (returned from POST /derived with forecast())
+// ============================================================================
+
+message ForecastSeriesPiece {
+    string          piece       = 1;  // "past", "forecast", "upper", "lower"
+    repeated string group_tags  = 2;
+    repeated double values      = 3 [packed = true];  // NaN for null/missing values
+}
+
+message ForecastStatistics {
+    string algorithm          = 1;
+    double deviations         = 2;
+    string seasonality        = 3;
+    double slope              = 4;
+    double intercept          = 5;
+    double r_squared          = 6;
+    double residual_std_dev   = 7;
+    uint64 historical_points  = 8;
+    uint64 forecast_points    = 9;
+    uint64 series_count       = 10;
+    double execution_time_ms  = 11;
+}
+
+message ForecastResponse {
+    string                         status              = 1;
+    repeated uint64                times               = 2 [packed = true];
+    uint64                         forecast_start_index = 3;
+    repeated ForecastSeriesPiece   series              = 4;
+    ForecastStatistics             statistics           = 5;
+    string                         error_message        = 6;
+}

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <numeric>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/loop.hh>
@@ -19,10 +20,7 @@
 // Block header: uint8_t type + uint32_t timestampSize + uint32_t timestampBytes
 static constexpr size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t);  // 9 bytes
 
-// Phase 3: Thread-local string dictionary for use during block decode.
-// Set by readSeriesBatched/readSingleBlock before decoding string blocks,
-// consumed by decodeBlock. Avoids threading dictionary through template params.
-static thread_local const std::vector<std::string>* tlStringDict = nullptr;
+// (tlStringDict removed — dictionary is now passed explicitly through the call chain)
 
 // Phase 0: Check whether a block's time range overlaps any tombstone range.
 // tombstoneRanges must be sorted by start time (as returned by getTombstoneRanges).
@@ -57,7 +55,14 @@ static bool blockOverlapsTombstones(uint64_t blockMin, uint64_t blockMax,
 
 // Decode a float block directly into thread-local scratch buffers and fold into
 // a BlockAggregator, avoiding per-block unique_ptr<TSMBlock> heap allocation.
+// TODO: The block-decode functions below (decodeBlockIntoAggregator, decodeIntegerBlockIntoAggregator,
+// decodeBoolBlockIntoAggregator, decodeBlockCountOnly, readSingleBlock, decodeBlock, decodeBlockFlat)
+// share ~600 lines of duplicated header-parsing and value-decode logic. Refactor into a shared
+// decodeBlockCore() that handles header parsing + timestamp decode, with a value-decode callback/policy.
+
 // Returns number of decoded points (0 on error or empty block).
+// NOTE: thread_local scratch is safe here because this function has no suspension
+// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
 static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
                                         timestar::BlockAggregator& aggregator) {
     if (blockSize < BLOCK_HEADER_SIZE)
@@ -86,9 +91,9 @@ static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
     if (nTimestamps == 0)
         return 0;
 
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-    if (valueByteSize > blockSize)
+    if (timestampBytes + BLOCK_HEADER_SIZE > blockSize)
         return 0;
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
     auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
     FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, valScratch);
@@ -100,6 +105,8 @@ static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
 // Decode an Integer block directly into thread-local scratch buffers and fold into
 // a BlockAggregator (as double), avoiding per-block unique_ptr<TSMBlock> heap allocation.
 // Returns number of decoded points (0 on error or empty block).
+// NOTE: thread_local scratch is safe here because this function has no suspension
+// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
 static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime,
                                                uint64_t endTime, timestar::BlockAggregator& aggregator) {
     if (blockSize < BLOCK_HEADER_SIZE)
@@ -127,9 +134,9 @@ static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blo
     if (nTimestamps == 0)
         return 0;
 
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-    if (valueByteSize > blockSize)
+    if (timestampBytes + BLOCK_HEADER_SIZE > blockSize)
         return 0;
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
     // Decode zigzag-encoded integers
     static thread_local std::vector<uint64_t> zigzagScratch;
@@ -151,6 +158,8 @@ static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blo
 
 // Decode a Boolean block directly into thread-local scratch buffers and fold into
 // a BlockAggregator (true=1.0, false=0.0).
+// NOTE: thread_local scratch is safe here because this function has no suspension
+// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
 static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime,
                                             uint64_t endTime, timestar::BlockAggregator& aggregator) {
     if (blockSize < BLOCK_HEADER_SIZE)
@@ -178,9 +187,9 @@ static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockS
     if (nTimestamps == 0)
         return 0;
 
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-    if (valueByteSize > blockSize)
+    if (timestampBytes + BLOCK_HEADER_SIZE > blockSize)
         return 0;
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
     // Decode RLE-encoded booleans
     auto valuesSlice = blockSlice.getSlice(valueByteSize);
@@ -199,6 +208,8 @@ static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockS
 
 // COUNT-only block decode: decode timestamps only, skip value decompression.
 // Folds timestamp counts into the BlockAggregator's per-bucket counters.
+// NOTE: thread_local scratch is safe here because this function has no suspension
+// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
 static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
                                    timestar::BlockAggregator& aggregator) {
     if (blockSize < BLOCK_HEADER_SIZE)
@@ -234,6 +245,9 @@ TSM::TSM(std::string _absoluteFilePath) {
     if (filenameEndIndex == std::string::npos)
         throw std::runtime_error("TSM invalid filename (no extension): " + _absoluteFilePath);
     size_t filenameStartIndex = _absoluteFilePath.find_last_of("/") + 1;
+
+    if (filenameStartIndex >= filenameEndIndex)
+        throw std::runtime_error("TSM invalid filename (empty basename): " + _absoluteFilePath);
 
     std::string filename = _absoluteFilePath.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex);
 
@@ -322,13 +336,10 @@ uint64_t TSM::rankAsInteger() {
                                   " >= 16 would overflow in (tierNum << 60)");
     }
     constexpr uint64_t maxSeqNum = (uint64_t{1} << 60) - 1;
-    uint64_t safeSeqNum = seqNum;
-    if (seqNum > maxSeqNum) {
-        timestar::tsm_log.warn(
-            "TSM::rankAsInteger: seqNum {} exceeds 60-bit limit, masking to prevent tier bit corruption", seqNum);
-        safeSeqNum = seqNum & maxSeqNum;
+    if (seqNum > maxSeqNum) [[unlikely]] {
+        throw std::overflow_error("TSM::rankAsInteger: seqNum " + std::to_string(seqNum) + " exceeds 60-bit limit");
     }
-    return (tierNum << 60) | safeSeqNum;
+    return (tierNum << 60) | seqNum;
 }
 
 // Lazy loading: read sparse index + build bloom filter
@@ -365,6 +376,9 @@ seastar::future<> TSM::readSparseIndex() {
         uint16_t blockCount = indexSlice.read<uint16_t>();
 
         // Block size depends on type and file version
+        if (type > static_cast<uint8_t>(TSMValueType::Integer)) {
+            throw std::runtime_error("TSM index corrupt: invalid type byte " + std::to_string(type));
+        }
         auto seriesType = static_cast<TSMValueType>(type);
         size_t perBlockBytes = indexBlockBytes(seriesType, fileVersion);
 
@@ -430,14 +444,27 @@ seastar::future<> TSM::readSparseIndex() {
         if (seriesType == TSMValueType::String && fileVersion >= 2) {
             if (indexSlice.offset + 4 <= indexSlice.length_) {
                 std::memcpy(&dictBytes, indexSlice.data + indexSlice.offset, 4);
+                if (dictBytes > 16 * 1024 * 1024) {
+                    throw std::runtime_error("Corrupt TSM: dictionary too large");
+                }
                 if (indexSlice.offset + 4 + dictBytes > indexSlice.length_) {
-                    break;  // Corrupted dictionary size — stop parsing
+                    // Dictionary extends past index end — can't find next entry.
+                    timestar::tsm_log.warn(
+                        "TSM sparse index: corrupt dictionary size {} at offset {} (index size {}), "
+                        "stopping parse after {} entries",
+                        dictBytes, indexSlice.offset, indexSlice.length_, sparseIndex.size());
+                    break;
                 }
                 indexSlice.offset += 4 + dictBytes;
             }
         }
 
         // Calculate total entry size (header + blocks + optional dictionary)
+        // blockBytes is bounded by uint16_t blockCount * perBlockBytes (max ~5.2M), fits in uint32_t
+        if (blockBytes > UINT32_MAX - 19) [[unlikely]] {
+            throw std::runtime_error("TSM index corrupt: blockBytes " + std::to_string(blockBytes) +
+                                     " exceeds uint32_t entry size limit");
+        }
         uint32_t entrySize = 16 + 1 + 2 + static_cast<uint32_t>(blockBytes);
         if (seriesType == TSMValueType::String && fileVersion >= 2) {
             entrySize += 4 + dictBytes;
@@ -566,10 +593,6 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         // Move to front of LRU list (most recently used)
         lruList.splice(lruList.begin(), lruList, cacheIt->second);
         auto& entry = cacheIt->second->second;
-        // Phase 3: Set thread-local dictionary for string block decoding
-        if (entry.seriesType == TSMValueType::String) {
-            tlStringDict = entry.stringDictionary.empty() ? nullptr : &entry.stringDictionary;
-        }
         co_return &entry;
     }
 
@@ -640,13 +663,7 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
 
     timestar::tsm_log.trace("Loaded full index entry for series {} ({} blocks)", seriesId.toHex(), blockCount);
 
-    // Phase 3: Set thread-local dictionary for string block decoding
-    auto& cachedEntry = lruList.front().second;
-    if (cachedEntry.seriesType == TSMValueType::String) {
-        tlStringDict = cachedEntry.stringDictionary.empty() ? nullptr : &cachedEntry.stringDictionary;
-    }
-
-    co_return &cachedEntry;
+    co_return &lruList.front().second;
 }
 
 // Bulk prefetch: identify cache misses and issue coalesced DMA reads.
@@ -772,16 +789,14 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
         co_return;  // Series not in this file
     }
 
-    // Phase 3: Set thread-local dictionary for string block decoding.
     // Copy the dictionary into a coroutine-frame-local vector so it survives
     // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
     [[maybe_unused]] std::vector<std::string> localDictCopy;
+    [[maybe_unused]] const std::vector<std::string>* localStringDict = nullptr;
     if constexpr (std::is_same_v<T, std::string>) {
         if (!indexEntry->stringDictionary.empty()) {
             localDictCopy = indexEntry->stringDictionary;
-            tlStringDict = &localDictCopy;
-        } else {
-            tlStringDict = nullptr;
+            localStringDict = &localDictCopy;
         }
     }
 
@@ -796,13 +811,14 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
     // avoiding the data race where multiple coroutines push_back concurrently
     // on the shared results.blocks vector after co_await suspension points.
     std::vector<std::unique_ptr<TSMBlock<T>>> blockSlots(blocksToScan.size());
-    size_t slotIdx = 0;
 
-    co_await seastar::parallel_for_each(blocksToScan, [&](TSMIndexBlock indexBlock) -> seastar::future<> {
-        // Capture slot index before any suspension point (safe: lambda invocations
-        // are sequential in cooperative scheduling before the first co_await)
-        size_t mySlot = slotIdx++;
-        auto block = co_await readSingleBlock<T>(indexBlock, startTime, endTime);
+    // Build index range for parallel_for_each to avoid relying on cooperative
+    // scheduling for sequential counter increments.
+    std::vector<size_t> slotIndices(blocksToScan.size());
+    std::iota(slotIndices.begin(), slotIndices.end(), 0);
+
+    co_await seastar::parallel_for_each(slotIndices, [&](size_t mySlot) -> seastar::future<> {
+        auto block = co_await readSingleBlock<T>(blocksToScan[mySlot], startTime, endTime, localStringDict);
         if (block && !block->timestamps.empty()) {
             blockSlots[mySlot] = std::move(block);
         }
@@ -845,7 +861,8 @@ std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId) {
 // Phase 1.1: Get index blocks without reading data
 // Note: This returns blocks only if already loaded in cache
 // For guaranteed results, caller should await getFullIndexEntry() first
-std::vector<TSMIndexBlock> TSM::getSeriesBlocks(const SeriesId128& seriesId) const {
+const std::vector<TSMIndexBlock>& TSM::getSeriesBlocks(const SeriesId128& seriesId) const {
+    static const std::vector<TSMIndexBlock> empty;
     // Check cache (promote to front on hit)
     auto it = fullIndexCache.find(seriesId);
     if (it != fullIndexCache.end()) {
@@ -854,7 +871,7 @@ std::vector<TSMIndexBlock> TSM::getSeriesBlocks(const SeriesId128& seriesId) con
     }
 
     // Not in cache - return empty
-    return {};
+    return empty;
 }
 
 // Phase 1.1: Read a single block and return it (not appending to results)
@@ -862,13 +879,12 @@ template <class T>
 seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
                                                                    uint64_t endTime,
                                                                    const std::vector<std::string>* stringDict) {
-    // Capture the dictionary pointer before co_await.  With the use-after-free
-    // fix applied to all callers (readSeries, readSeriesBatched, bulk_block_loader),
-    // both stringDict and tlStringDict now point to coroutine-frame-local copies
-    // rather than into the LRU cache, so a shallow pointer save is sufficient here.
+    // Capture the dictionary pointer before co_await.  All callers pass
+    // coroutine-frame-local copies that survive DMA suspensions, so a shallow
+    // pointer save is sufficient here.
     const std::vector<std::string>* localDict = nullptr;
     if constexpr (std::is_same_v<T, std::string>) {
-        localDict = stringDict ? stringDict : tlStringDict;
+        localDict = stringDict;
     }
 
     auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
@@ -909,7 +925,6 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         // Phase 3: Check if dictionary-encoded (STR2 magic)
-        // Bug #8 fix: Use localDict (captured before co_await) instead of tlStringDict
         if (StringEncoder::isDictionaryEncoded(valuesSlice) && localDict && !localDict->empty()) {
             StringEncoder::Dictionary dict;
             dict.entries = *localDict;
@@ -921,9 +936,9 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        // Reuse thread-local scratch buffer to avoid per-block heap allocation
-        static thread_local std::vector<uint64_t> rawUintScratch;
-        rawUintScratch.clear();
+        // Coroutine-local buffer — thread_local is unsafe in coroutines because
+        // another coroutine on the same thread could clear it during a co_await.
+        std::vector<uint64_t> rawUintScratch;
         IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
         blockResults->values.reserve(nTimestamps);
         size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
@@ -963,15 +978,12 @@ seastar::future<seastar::temporary_buffer<uint8_t>> TSM::readCompressedBlock(con
 }
 
 seastar::future<> TSM::scheduleDelete() {
-    // Do NOT close the file handle here — concurrent readers may still
-    // hold shared_ptr<TSM> references with in-flight DMA reads.
-    // Unix unlink is safe while the fd is open: reads continue via the
-    // open fd, inode freed when the last fd (via ~seastar::file) closes.
-
     // Delete associated tombstone file first (no-op if none exists)
     co_await deleteTombstoneFile();
 
-    // Delete the physical file using async Seastar I/O (not blocking std::filesystem::remove)
+    // Delete the physical file using async Seastar I/O.
+    // Unix unlink is safe while the fd is open: in-flight DMA reads
+    // continue via the open fd, inode freed when the last fd closes.
     try {
         co_await seastar::remove_file(filePath);
         timestar::tsm_log.info("TSM file deleted: {}", filePath);
@@ -979,7 +991,13 @@ seastar::future<> TSM::scheduleDelete() {
         timestar::tsm_log.error("Failed to delete TSM file {}: {}", filePath, e.what());
     }
 
-    co_return;
+    // Close the file handle to avoid seastar::file destructor assertion.
+    // This is safe after remove_file: the inode stays alive for any
+    // in-flight DMA reads that still hold a reference to this TSM object.
+    // Guard: close() may have already been called by the TSMFileManager shutdown path.
+    if (tsmFile) {
+        co_await tsmFile.close();
+    }
 }
 
 // Group blocks into contiguous batches for optimized I/O
@@ -1027,7 +1045,7 @@ std::vector<BlockBatch> TSM::groupContiguousBlocks(const std::vector<TSMIndexBlo
 // Extract block decoding logic for reuse
 template <class T>
 std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockSize, uint64_t startTime,
-                                              uint64_t endTime) {
+                                              uint64_t endTime, const std::vector<std::string>* stringDict) {
     // Defensive check: ensure we have at least header size
     if (blockSize < BLOCK_HEADER_SIZE) {
         timestar::tsm_log.error("Block size {} is too small for header", blockSize);
@@ -1060,14 +1078,13 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
     auto [nSkipped, nTimestamps] =
         IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
 
-    // Decode values based on type
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-
-    // Defensive check
-    if (valueByteSize > blockSize) {
-        timestar::tsm_log.error("Value byte size {} is invalid for block size {}", valueByteSize, blockSize);
+    // Decode values based on type — guard against unsigned underflow before subtraction
+    if (timestampBytes + BLOCK_HEADER_SIZE > blockSize) {
+        timestar::tsm_log.error("Timestamp bytes {} + header {} exceeds block size {}", timestampBytes,
+                                BLOCK_HEADER_SIZE, blockSize);
         return nullptr;
     }
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
     if constexpr (std::is_same_v<T, double>) {
         auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
@@ -1077,9 +1094,9 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
         BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        if (StringEncoder::isDictionaryEncoded(valuesSlice) && tlStringDict && !tlStringDict->empty()) {
+        if (StringEncoder::isDictionaryEncoded(valuesSlice) && stringDict && !stringDict->empty()) {
             StringEncoder::Dictionary dict;
-            dict.entries = *tlStringDict;
+            dict.entries = *stringDict;
             dict.valid = true;
             StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict,
                                             blockResults->values);
@@ -1088,9 +1105,9 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        // Reuse thread-local scratch buffer to avoid per-block heap allocation
-        static thread_local std::vector<uint64_t> rawUintScratch;
-        rawUintScratch.clear();
+        // Coroutine-local buffer — thread_local is unsafe in coroutines because
+        // another coroutine on the same thread could clear it during a co_await.
+        std::vector<uint64_t> rawUintScratch;
         IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
         blockResults->values.reserve(nTimestamps);
         size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
@@ -1106,7 +1123,8 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
 // Returns the number of points decoded.
 template <class T>
 static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
-                              std::vector<uint64_t>& outTimestamps, std::vector<T>& outValues) {
+                              std::vector<uint64_t>& outTimestamps, std::vector<T>& outValues,
+                              const std::vector<std::string>* stringDict = nullptr) {
     if (blockSize < BLOCK_HEADER_SIZE)
         return 0;
 
@@ -1126,9 +1144,9 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
     if (nTimestamps == 0)
         return 0;
 
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-    if (valueByteSize > blockSize)
+    if (timestampBytes + BLOCK_HEADER_SIZE > blockSize)
         return 0;
+    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
     if constexpr (std::is_same_v<T, double>) {
         auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
@@ -1138,9 +1156,9 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, outValues);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        if (StringEncoder::isDictionaryEncoded(valuesSlice) && tlStringDict && !tlStringDict->empty()) {
+        if (StringEncoder::isDictionaryEncoded(valuesSlice) && stringDict && !stringDict->empty()) {
             StringEncoder::Dictionary dict;
-            dict.entries = *tlStringDict;
+            dict.entries = *stringDict;
             dict.valid = true;
             StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict, outValues);
         } else {
@@ -1148,8 +1166,9 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        static thread_local std::vector<uint64_t> rawUintScratch;
-        rawUintScratch.clear();
+        // Coroutine-local buffer — thread_local is unsafe in coroutines because
+        // another coroutine on the same thread could clear it during a co_await.
+        std::vector<uint64_t> rawUintScratch;
         IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
         size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
         for (size_t i = nSkipped; i < end; ++i) {
@@ -1165,25 +1184,9 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
 // stored in a single TSMBlock, eliminating per-block heap allocations.
 template <class T>
 seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
-                                      TSMResult<T>& results) {
-    // Copy the dictionary into a coroutine-frame-local vector so it survives
-    // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
-    // The old code saved only a raw pointer which could dangle after eviction.
-    [[maybe_unused]] std::vector<std::string> localDictCopy;
-    if constexpr (std::is_same_v<T, std::string>) {
-        if (tlStringDict && !tlStringDict->empty()) {
-            localDictCopy = *tlStringDict;
-        }
-    }
-
+                                      TSMResult<T>& results, const std::vector<std::string>* stringDict) {
     // Single large DMA read for entire batch
     auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
-
-    // Restore tlStringDict from the local copy after co_await, so that
-    // decodeBlockFlat<std::string> sees the correct dictionary.
-    if constexpr (std::is_same_v<T, std::string>) {
-        tlStringDict = localDictCopy.empty() ? nullptr : &localDictCopy;
-    }
 
     // Decode all blocks in this batch into a single flat TSMBlock.
     // Blocks within a batch are contiguous and sorted by offset (= time order),
@@ -1193,7 +1196,7 @@ seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTim
     uint32_t bufferOffset = 0;
     for (const auto& block : batch.blocks) {
         decodeBlockFlat<T>(batchBuf.get() + bufferOffset, block.size, startTime, endTime, flatBlock->timestamps,
-                           flatBlock->values);
+                           flatBlock->values, stringDict);
         bufferOffset += block.size;
     }
 
@@ -1214,16 +1217,14 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
         co_return;  // Series not in this file
     }
 
-    // Phase 3: Set thread-local dictionary for string block decoding.
     // Copy the dictionary into a coroutine-frame-local vector so it survives
     // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
     [[maybe_unused]] std::vector<std::string> localDictCopy;
+    [[maybe_unused]] const std::vector<std::string>* localStringDict = nullptr;
     if constexpr (std::is_same_v<T, std::string>) {
         if (!indexEntry->stringDictionary.empty()) {
             localDictCopy = indexEntry->stringDictionary;
-            tlStringDict = &localDictCopy;
-        } else {
-            tlStringDict = nullptr;
+            localStringDict = &localDictCopy;
         }
     }
 
@@ -1256,7 +1257,7 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
     // Step 4: Single-batch fast path (the common case — blocks are contiguous).
     // Avoids parallel_for_each overhead and per-batch TSMResult intermediaries.
     if (batches.size() == 1) {
-        co_await readBlockBatch(batches[0], startTime, endTime, results);
+        co_await readBlockBatch(batches[0], startTime, endTime, results, localStringDict);
     } else {
         // Multiple batches: read in parallel with per-batch slot isolation.
         std::vector<TSMResult<T>> batchResults;
@@ -1268,7 +1269,7 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
 
         co_await seastar::parallel_for_each(batches, [&](const BlockBatch& batch) -> seastar::future<> {
             size_t mySlot = batchSlotIdx++;
-            co_await readBlockBatch(batch, startTime, endTime, batchResults[mySlot]);
+            co_await readBlockBatch(batch, startTime, endTime, batchResults[mySlot], localStringDict);
         });
 
         for (auto& batchResult : batchResults) {
@@ -1288,7 +1289,7 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
 // BlockAggregator, bypassing TSMResult/QueryResult materialisation.
 // Handles tombstone filtering inline.  Returns the number of points folded.
 seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-                                             timestar::BlockAggregator& aggregator) {
+                                             timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem) {
     // Get full index entry (uses bloom filter + sparse index + lazy load)
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry) {
@@ -1321,60 +1322,98 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
     if (hasTombstones()) {
         tombstoneRanges = tombstones->getTombstoneRanges(seriesId);
     }
-    const bool hasTombstoneRanges = !tombstoneRanges.empty();
 
     size_t totalPoints = 0;
 
-    // Process batches.  parallel_for_each is safe here because all shared
-    // mutable state (aggregator, totalPoints) is only touched synchronously
-    // between co_await suspension points — Seastar's cooperative scheduling
-    // guarantees at most one coroutine runs at a time on a given shard.
+    // Pre-scan all batches synchronously: handle block-stats-only blocks and
+    // build per-batch skip flags. This avoids mutating shared state (aggregator,
+    // totalPoints) inside parallel_for_each lambdas, which would be fragile if
+    // any code change introduced a co_await before the stats mutation.
     const bool countOnly = aggregator.isCountOnly();
 
-    co_await seastar::parallel_for_each(batches, [&](const BlockBatch& batch) -> seastar::future<> {
-        // Pre-scan: determine which blocks can skip decode via block stats.
-        // Cache the result to avoid re-evaluating after DMA read.
-        const size_t blockCount = batch.blocks.size();
+    // Per-batch: which blocks need decode, and which were handled via stats
+    struct BatchDecodeInfo {
+        std::vector<bool> skippedFlags;
         bool anyNeedsDecode = false;
+    };
+    std::vector<BatchDecodeInfo> batchInfo(batches.size());
 
-        // Use stack allocation for small batches (typical), heap for large
-        bool stackFlags[64];
-        std::unique_ptr<bool[]> heapFlags;
-        bool* skippedFlags;
-        if (blockCount <= 64) {
-            skippedFlags = stackFlags;
-        } else {
-            heapFlags = std::make_unique<bool[]>(blockCount);
-            skippedFlags = heapFlags.get();
-        }
+    for (size_t batchIdx = 0; batchIdx < batches.size(); ++batchIdx) {
+        const auto& batch = batches[batchIdx];
+        auto& info = batchInfo[batchIdx];
+        info.skippedFlags.resize(batch.blocks.size());
 
-        for (size_t bi = 0; bi < blockCount; ++bi) {
+        for (size_t bi = 0; bi < batch.blocks.size(); ++bi) {
             const auto& block = batch.blocks[bi];
             bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
-            // Phase 0: per-block tombstone check instead of global hasTombstoneRanges gate
             bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
             bool canSkip = !blockHasTombstones && blockFullyContained && block.blockCount > 0 &&
                            aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
-            skippedFlags[bi] = canSkip;
+            info.skippedFlags[bi] = canSkip;
             if (canSkip) {
                 aggregator.addBlockStats(block.blockSum, block.blockMin, block.blockMax, block.blockCount,
                                          block.minTime, block.maxTime, block.blockM2, block.blockFirstValue,
                                          block.blockLatestValue);
                 totalPoints += block.blockCount;
             } else {
-                anyNeedsDecode = true;
+                info.anyNeedsDecode = true;
             }
         }
+    }
 
-        if (!anyNeedsDecode) {
-            co_return;  // All blocks in this batch were handled via stats
+    // Process batches that need decode in parallel — only I/O and decode happen
+    // inside the lambda now; no shared mutable state is touched before the first co_await.
+    std::vector<size_t> batchIndices;
+    batchIndices.reserve(batches.size());
+    for (size_t i = 0; i < batches.size(); ++i) {
+        if (batchInfo[i].anyNeedsDecode)
+            batchIndices.push_back(i);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // IMPORTANT — SHARED MUTABLE STATE CONTRACT
+    //
+    // The lambdas below share mutable references to `aggregator` and
+    // `totalPoints` WITHOUT synchronisation.  This is safe ONLY because
+    // Seastar's cooperative scheduler guarantees that after the last
+    // co_await (the DMA read), all subsequent code in each lambda runs to
+    // completion without yielding.
+    //
+    // DO NOT add any co_await, seastar::maybe_yield(), or other
+    // suspension points after the "Release I/O semaphore" line inside
+    // the lambda.  Doing so would allow another lambda to run
+    // concurrently and corrupt the shared state.
+    //
+    // If you need async work during the decode/fold section, you MUST
+    // first collect results into per-batch local variables and merge them
+    // into the shared state after the parallel_for_each completes.
+    // ──────────────────────────────────────────────────────────────────────
+    co_await seastar::parallel_for_each(batchIndices, [&](size_t batchIdx) -> seastar::future<> {
+        const auto& batch = batches[batchIdx];
+        const auto& skippedFlags = batchInfo[batchIdx].skippedFlags;
+
+        // Acquire I/O semaphore before DMA read to bound concurrent disk I/O.
+        // Released after the read completes and decode/fold finishes (no DMA
+        // during decode, so the unit is held slightly longer than strictly
+        // necessary, but this keeps the code simple and prevents back-to-back
+        // DMA bursts).
+        std::optional<seastar::semaphore_units<>> ioUnits;
+        if (ioSem) {
+            ioUnits = co_await seastar::get_units(*ioSem, 1);
         }
 
         // Single DMA read for the entire batch
         auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
 
+        // Release I/O semaphore after DMA completes — decode is CPU-only
+        ioUnits.reset();
+
+        // WARNING: No co_await/maybe_yield allowed below this point —
+        // mutable shared state (aggregator, totalPoints) is accessed.
+        // Safe only because decode is synchronous in Seastar's cooperative
+        // model.  See the contract comment above parallel_for_each.
         uint32_t bufferOffset = 0;
-        for (size_t bi = 0; bi < blockCount; ++bi) {
+        for (size_t bi = 0; bi < batch.blocks.size(); ++bi) {
             const auto& block = batch.blocks[bi];
             if (skippedFlags[bi]) {
                 bufferOffset += block.size;
@@ -1732,19 +1771,24 @@ template seastar::future<> TSM::readSeriesBatched<int64_t>(const SeriesId128& se
                                                            uint64_t endTime, TSMResult<int64_t>& results);
 
 template seastar::future<> TSM::readBlockBatch<double>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
-                                                       TSMResult<double>& results);
+                                                       TSMResult<double>& results, const std::vector<std::string>*);
 template seastar::future<> TSM::readBlockBatch<bool>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
-                                                     TSMResult<bool>& results);
+                                                     TSMResult<bool>& results, const std::vector<std::string>*);
 template seastar::future<> TSM::readBlockBatch<std::string>(const BlockBatch& batch, uint64_t startTime,
-                                                            uint64_t endTime, TSMResult<std::string>& results);
+                                                            uint64_t endTime, TSMResult<std::string>& results,
+                                                            const std::vector<std::string>*);
 template seastar::future<> TSM::readBlockBatch<int64_t>(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
-                                                        TSMResult<int64_t>& results);
+                                                        TSMResult<int64_t>& results, const std::vector<std::string>*);
 
 template std::unique_ptr<TSMBlock<double>> TSM::decodeBlock<double>(Slice& blockSlice, uint32_t blockSize,
-                                                                    uint64_t startTime, uint64_t endTime);
+                                                                    uint64_t startTime, uint64_t endTime,
+                                                                    const std::vector<std::string>*);
 template std::unique_ptr<TSMBlock<bool>> TSM::decodeBlock<bool>(Slice& blockSlice, uint32_t blockSize,
-                                                                uint64_t startTime, uint64_t endTime);
+                                                                uint64_t startTime, uint64_t endTime,
+                                                                const std::vector<std::string>*);
 template std::unique_ptr<TSMBlock<std::string>> TSM::decodeBlock<std::string>(Slice& blockSlice, uint32_t blockSize,
-                                                                              uint64_t startTime, uint64_t endTime);
+                                                                              uint64_t startTime, uint64_t endTime,
+                                                                              const std::vector<std::string>*);
 template std::unique_ptr<TSMBlock<int64_t>> TSM::decodeBlock<int64_t>(Slice& blockSlice, uint32_t blockSize,
-                                                                      uint64_t startTime, uint64_t endTime);
+                                                                      uint64_t startTime, uint64_t endTime,
+                                                                      const std::vector<std::string>*);

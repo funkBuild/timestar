@@ -11,6 +11,7 @@
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/scheduling.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <vector>
 
@@ -88,4 +89,11 @@ public:
     // Start background compaction
     seastar::future<> startCompactionLoop();
     seastar::future<> stopCompactionLoop();
+
+    // Per-shard query I/O semaphore.  Gates concurrent DMA reads during
+    // query execution to prevent reactor stalls from unbounded parallel I/O.
+    // Series-level concurrency stays high (64) for CPU-bound work; only
+    // actual disk reads are throttled.  Default 16 matches typical NVMe
+    // queue depth while keeping the pipeline full.
+    seastar::semaphore queryIoSem{16};
 };

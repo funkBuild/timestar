@@ -10,7 +10,7 @@ include_directories(${CMAKE_SOURCE_DIR}/lib/functions)
 # Helper: add a single-file function test with standard settings.
 function(timestar_add_function_test TARGET_NAME SOURCE_FILE)
     add_executable(${TARGET_NAME} ${SOURCE_FILE})
-    target_link_libraries(${TARGET_NAME} PRIVATE gtest_main gmock libtimestar pthread)
+    target_link_libraries(${TARGET_NAME} PRIVATE gtest_main gmock libtimestar libtimestar_proto_conv pthread)
     target_compile_features(${TARGET_NAME} PRIVATE cxx_std_23)
     target_compile_options(${TARGET_NAME} PRIVATE -Wall -Wextra -O2 -march=native)
     gtest_discover_tests(${TARGET_NAME})
@@ -35,7 +35,7 @@ add_executable(function_tests
     test_production_monitoring.cpp
     test_pipeline_executor.cpp
 )
-target_link_libraries(function_tests PRIVATE gtest_main gmock libtimestar pthread)
+target_link_libraries(function_tests PRIVATE gtest_main gmock libtimestar libtimestar_proto_conv pthread)
 target_compile_features(function_tests PRIVATE cxx_std_23)
 target_compile_options(function_tests PRIVATE -Wall -Wextra -O2 -march=native)
 gtest_discover_tests(function_tests)

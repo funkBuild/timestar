@@ -109,10 +109,9 @@ public:
     seastar::future<std::string> getFieldType(const std::string& measurement, const std::string& field) override;
 
     seastar::future<std::set<std::string>> getAllMeasurements() override;
-    seastar::future<std::set<std::string>> getFields(const std::string& measurement) override;
-    seastar::future<std::set<std::string>> getTags(const std::string& measurement) override;
-    seastar::future<std::set<std::string>> getTagValues(const std::string& measurement,
-                                                        const std::string& tagKey) override;
+    seastar::future<std::set<std::string>> getFields(std::string measurement) override;
+    seastar::future<std::set<std::string>> getTags(std::string measurement) override;
+    seastar::future<std::set<std::string>> getTagValues(std::string measurement, std::string tagKey) override;
 
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops) override;
 

@@ -105,7 +105,7 @@ inline void ffor_pack(const int64_t* values, size_t count, int64_t base, uint8_t
     if (bw == 0 || count == 0)
         return;
 
-    if (bw == 64) {
+    if (bw >= 64) {
         for (size_t i = 0; i < count; ++i) {
             out[i] = static_cast<uint64_t>(values[i] - base);
         }
@@ -166,7 +166,7 @@ inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, u
     if (bw == 0 || count == 0)
         return;
 
-    if (bw == 64) {
+    if (bw >= 64) {
         for (size_t i = 0; i < count; ++i) {
             out[i] = values[i] - base;
         }
@@ -233,7 +233,7 @@ inline void ffor_unpack(const uint64_t* in, size_t count, int64_t base, uint8_t 
         return;
     }
 
-    if (bw == 64) {
+    if (bw >= 64) {
         for (size_t i = 0; i < count; ++i) {
             out[i] = base + static_cast<int64_t>(in[i]);
         }
@@ -297,7 +297,7 @@ inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uin
         return;
     }
 
-    if (bw == 64) {
+    if (bw >= 64) {
         for (size_t i = 0; i < count; ++i) {
             out[i] = base + in[i];
         }

@@ -50,7 +50,7 @@ struct SeriesResult;
 struct AggregationState {
     // Hard limit on the number of raw values retained per AggregationState.
     //
-    // rawValues is only needed for MEDIAN, STDDEV, and STDVAR — all other methods
+    // rawValues is only needed for MEDIAN — all other methods (STDDEV/STDVAR use Welford,
     // compute from running scalar accumulators (sum, min, max, count, etc.).
     // Without a cap, merging many shards with dense data can allocate hundreds of
     // megabytes per state: 1M doubles = ~8 MB, and a bucketed query can have many
@@ -63,6 +63,7 @@ struct AggregationState {
     static constexpr size_t RAW_VALUES_HARD_LIMIT = 1'000'000;
 
     double sum = 0.0;
+    double sumCompensation = 0.0;  // Kahan compensation term for numerically stable summation
     double min = std::numeric_limits<double>::max();
     double max = std::numeric_limits<double>::lowest();
     double latest = 0.0;                                             // Most recent value
@@ -87,17 +88,22 @@ struct AggregationState {
     bool collectRaw = false;  // Set to true only for MEDIAN queries
 
     // Add a single value to this state (incremental aggregation)
-    void addValue(double value, uint64_t timestamp = 0) {
+    void addValue(double value, uint64_t timestamp) {
         if (std::isnan(value))
             return;  // Skip NaN to avoid poisoning aggregation
-        sum += value;
+        // Kahan compensated summation for precision over millions of points
+        double y = value - sumCompensation;
+        double t = sum + y;
+        sumCompensation = (t - sum) - y;
+        sum = t;
         min = std::min(min, value);
         max = std::max(max, value);
+        // Tie-breaking: last-processed value wins at equal timestamps (non-deterministic across merge orders).
         if (timestamp >= latestTimestamp) {
             latest = value;
             latestTimestamp = timestamp;
         }
-        if (timestamp <= firstTimestamp) {
+        if (timestamp < firstTimestamp) {
             first = value;
             firstTimestamp = timestamp;
         }
@@ -124,10 +130,15 @@ struct AggregationState {
             return;
         switch (method) {
             case AggregationMethod::AVG:
-            case AggregationMethod::SUM:
-                sum += value;
+            case AggregationMethod::SUM: {
+                double y = value - sumCompensation;
+                double t = sum + y;
+                sumCompensation = (t - sum) - y;
+                sum = t;
                 count++;
+                mean = (sum + sumCompensation) / static_cast<double>(count);
                 break;
+            }
             case AggregationMethod::COUNT:
                 count++;
                 break;
@@ -152,7 +163,7 @@ struct AggregationState {
                 count++;
                 break;
             case AggregationMethod::FIRST:
-                if (timestamp <= firstTimestamp) {
+                if (timestamp < firstTimestamp) {
                     first = value;
                     firstTimestamp = timestamp;
                 }
@@ -160,7 +171,8 @@ struct AggregationState {
                 break;
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR: {
-                sum += value;
+                // Welford only needs mean/m2/count — skip sum update (not used
+                // by getValue(STDDEV/STDVAR) and avoids Kahan inconsistency).
                 count++;
                 double delta = value - mean;
                 mean += delta / count;
@@ -173,36 +185,120 @@ struct AggregationState {
                 addValue(value, timestamp);
                 break;
         }
+        // Track first/latest timestamps for all methods so getTimestamp()
+        // returns a meaningful value. LATEST/FIRST handle this in their
+        // own branches; MEDIAN falls through to addValue which tracks too.
+        if (method != AggregationMethod::LATEST && method != AggregationMethod::FIRST) {
+            if (timestamp < firstTimestamp) {
+                firstTimestamp = timestamp;
+                first = value;
+            }
+            if (timestamp >= latestTimestamp) {
+                latestTimestamp = timestamp;
+                latest = value;
+            }
+        }
     }
 
     // Full merge — includes Welford M2 and raw values (for STDDEV/MEDIAN).
     void merge(const AggregationState& other) {
-        // Parallel Welford merge BEFORE mergeCore (needs pre-merge counts)
-        if (count > 0 && other.count > 0) {
-            double delta = other.mean - mean;
-            double totalCount = static_cast<double>(count) + other.count;
-            m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / totalCount;
-            mean = (mean * count + other.mean * other.count) / totalCount;
-        } else if (other.count > 0) {
-            m2 = other.m2;
-            mean = other.mean;
-        }
+        mergeWelford(other);
         mergeCore(other);
         mergeRawValues(other);
     }
 
     void merge(AggregationState&& other) {
+        mergeWelford(other);
+        mergeCore(other);
+        mergeRawValuesMove(std::move(other));
+    }
+
+    // Method-aware merge — skips expensive Welford variance computation and raw
+    // value copying for methods that don't need them (~90% of queries).
+    void mergeForMethod(const AggregationState& other, AggregationMethod method) {
+        const bool useWelford = (method == AggregationMethod::STDDEV || method == AggregationMethod::STDVAR);
+        if (useWelford)
+            mergeWelford(other);  // computes numerically stable weighted mean
+        mergeCore(other);
+        // Update mean from sum/count only when Welford did NOT compute it.
+        // Preserving the Welford mean is critical for STDDEV/STDVAR precision.
+        if (!useWelford && count > 0)
+            mean = (sum + sumCompensation) / static_cast<double>(count);
+        if (method == AggregationMethod::MEDIAN)
+            mergeRawValues(other);
+    }
+
+    // Rvalue overload: allows callers passing std::move() to actually move
+    // raw values (for MEDIAN) instead of copying them.
+    void mergeForMethod(AggregationState&& other, AggregationMethod method) {
+        const bool useWelford = (method == AggregationMethod::STDDEV || method == AggregationMethod::STDVAR);
+        if (useWelford)
+            mergeWelford(other);
+        mergeCore(other);
+        if (!useWelford && count > 0)
+            mean = (sum + sumCompensation) / static_cast<double>(count);
+        if (method == AggregationMethod::MEDIAN)
+            mergeRawValuesMove(std::move(other));
+    }
+
+private:
+    // Parallel Welford merge for M2 and mean. MUST be called BEFORE mergeCore
+    // (which updates count) because the merge formula uses pre-merge counts.
+    void mergeWelford(const AggregationState& other) {
         if (count > 0 && other.count > 0) {
             double delta = other.mean - mean;
             double totalCount = static_cast<double>(count) + other.count;
             m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / totalCount;
-            mean = (mean * count + other.mean * other.count) / totalCount;
+            // Numerically stable weighted mean: avoids overflow of mean*count for large counts
+            mean = mean + delta * (static_cast<double>(other.count) / totalCount);
         } else if (other.count > 0) {
             m2 = other.m2;
             mean = other.mean;
         }
-        mergeCore(other);
-        // Move raw values instead of copying
+    }
+
+    // Core merge: scalar accumulators only (sum, min, max, latest, first, count).
+    // No Welford, no raw values. ~3x faster than full merge.
+    // CRITICAL: must be called AFTER Welford parallel merge (which uses pre-merge counts).
+    // NOTE: Does NOT update `mean` — callers that need an accurate mean must update it
+    // themselves. When used with mergeWelford, the Welford-computed mean must be preserved.
+    void mergeCore(const AggregationState& other) {
+        // Kahan compensated merge: fold both sums and their compensation terms.
+        double otherTotal = other.sum + other.sumCompensation;
+        double y = otherTotal - sumCompensation;
+        double t = sum + y;
+        sumCompensation = (t - sum) - y;
+        sum = t;
+        min = std::min(min, other.min);
+        max = std::max(max, other.max);
+        if (other.latestTimestamp >= latestTimestamp) {
+            latest = other.latest;
+            latestTimestamp = other.latestTimestamp;
+        }
+        if (other.firstTimestamp < firstTimestamp) {
+            first = other.first;
+            firstTimestamp = other.firstTimestamp;
+        }
+        count += other.count;
+    }
+
+    void mergeRawValues(const AggregationState& other) {
+        if (other.rawValuesSaturated) {
+            rawValuesSaturated = true;
+        }
+        if (!rawValuesSaturated) {
+            size_t available = RAW_VALUES_HARD_LIMIT - rawValues.size();
+            size_t toCopy = std::min(available, other.rawValues.size());
+            rawValues.insert(rawValues.end(), other.rawValues.begin(),
+                             other.rawValues.begin() + static_cast<std::ptrdiff_t>(toCopy));
+            if (toCopy < other.rawValues.size()) {
+                rawValuesSaturated = true;
+            }
+        }
+    }
+
+    // Move-aware raw values merge: avoids copying when the source is an rvalue.
+    void mergeRawValuesMove(AggregationState&& other) {
         if (other.rawValuesSaturated) {
             rawValuesSaturated = true;
         }
@@ -225,84 +321,30 @@ struct AggregationState {
         }
     }
 
-    // Method-aware merge — skips expensive Welford variance computation and raw
-    // value copying for methods that don't need them (~90% of queries).
-    void mergeForMethod(const AggregationState& other, AggregationMethod method) {
-        if (method == AggregationMethod::STDDEV || method == AggregationMethod::STDVAR) {
-            // Welford parallel merge BEFORE count update
-            if (count > 0 && other.count > 0) {
-                double delta = other.mean - mean;
-                double totalCount = static_cast<double>(count) + other.count;
-                m2 += other.m2 + delta * delta * (static_cast<double>(count) * other.count) / totalCount;
-                mean = (mean * count + other.mean * other.count) / totalCount;
-            } else if (other.count > 0) {
-                m2 = other.m2;
-                mean = other.mean;
-            }
-        }
-        mergeCore(other);
-        if (method == AggregationMethod::MEDIAN) {
-            mergeRawValues(other);
-        }
-    }
-
-private:
-    // Core merge: scalar accumulators only (sum, min, max, latest, first, count).
-    // No Welford, no raw values. ~3x faster than full merge.
-    void mergeCore(const AggregationState& other) {
-        sum += other.sum;
-        min = std::min(min, other.min);
-        max = std::max(max, other.max);
-        if (other.latestTimestamp >= latestTimestamp) {
-            latest = other.latest;
-            latestTimestamp = other.latestTimestamp;
-        }
-        if (other.firstTimestamp <= firstTimestamp) {
-            first = other.first;
-            firstTimestamp = other.firstTimestamp;
-        }
-        count += other.count;
-    }
-
-    void mergeRawValues(const AggregationState& other) {
-        if (other.rawValuesSaturated) {
-            rawValuesSaturated = true;
-        }
-        if (!rawValuesSaturated) {
-            size_t available = RAW_VALUES_HARD_LIMIT - rawValues.size();
-            size_t toCopy = std::min(available, other.rawValues.size());
-            rawValues.insert(rawValues.end(), other.rawValues.begin(),
-                             other.rawValues.begin() + static_cast<std::ptrdiff_t>(toCopy));
-            if (toCopy < other.rawValues.size()) {
-                rawValuesSaturated = true;
-            }
-        }
-    }
-
 public:
     // Extract final aggregated value based on method
     // Return the representative timestamp for a collapsed state.
     // LATEST uses latestTimestamp; FIRST uses firstTimestamp; others use firstTimestamp
     // as a sensible default (earliest data point in the state).
-    uint64_t getTimestamp(AggregationMethod method) const {
+    [[nodiscard]] uint64_t getTimestamp(AggregationMethod method) const {
         if (method == AggregationMethod::LATEST)
             return latestTimestamp;
         return firstTimestamp;
     }
 
-    double getValue(AggregationMethod method) const {
+    [[nodiscard]] double getValue(AggregationMethod method) const {
         if (count == 0) {
             return std::numeric_limits<double>::quiet_NaN();
         }
         switch (method) {
             case AggregationMethod::AVG:
-                return sum / count;
+                return (sum + sumCompensation) / count;
             case AggregationMethod::MIN:
                 return min;
             case AggregationMethod::MAX:
                 return max;
             case AggregationMethod::SUM:
-                return sum;
+                return sum + sumCompensation;
             case AggregationMethod::LATEST:
                 return latest;
             case AggregationMethod::COUNT:
@@ -330,12 +372,14 @@ public:
                 }
             }
             case AggregationMethod::STDDEV: {
-                // Uses Welford's M2 accumulator — O(1), no rawValues needed
-                return std::sqrt(m2 / count);
+                // Uses Welford's M2 accumulator — O(1), no rawValues needed.
+                // Guard against slightly negative m2 from floating-point error
+                // in parallel Welford merge (delta^2 cancellation).
+                return std::sqrt(std::max(0.0, m2 / count));
             }
             case AggregationMethod::STDVAR: {
-                // Uses Welford's M2 accumulator — O(1), no rawValues needed
-                return m2 / count;
+                // Uses Welford's M2 accumulator — O(1), no rawValues needed.
+                return std::max(0.0, m2 / count);
             }
             default:
                 return std::numeric_limits<double>::quiet_NaN();
@@ -473,5 +517,27 @@ public:
         const std::vector<std::pair<std::vector<uint64_t>, std::vector<double>>>& groupData, AggregationMethod method,
         uint64_t interval);
 };
+
+// Methods that can be computed via streaming fold (addValueForMethod) without
+// materialising all raw values. MEDIAN requires nth_element on the full
+// dataset so it is NOT streamable.  LATEST and FIRST are streamable because
+// they fold into AggregationState via addValueForMethod.
+[[nodiscard]] inline bool isStreamableMethod(AggregationMethod method) {
+    switch (method) {
+        case AggregationMethod::AVG:
+        case AggregationMethod::MIN:
+        case AggregationMethod::MAX:
+        case AggregationMethod::SUM:
+        case AggregationMethod::COUNT:
+        case AggregationMethod::SPREAD:
+        case AggregationMethod::STDDEV:
+        case AggregationMethod::STDVAR:
+        case AggregationMethod::LATEST:
+        case AggregationMethod::FIRST:
+            return true;
+        default:
+            return false;
+    }
+}
 
 }  // namespace timestar

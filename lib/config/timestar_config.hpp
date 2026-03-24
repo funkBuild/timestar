@@ -32,6 +32,7 @@ struct StorageConfig {
     uint32_t max_points_per_block = 3000;
     double tsm_bloom_fpr = 0.001;
     uint32_t tsm_cache_entries = 4096;
+    uint32_t wal_max_concurrent_encoders = 4;  // Max concurrent WAL encoding coroutines per shard
     CompactionConfig compaction;
 };
 
@@ -155,9 +156,10 @@ struct glz::meta<timestar::CompactionConfig> {
 template <>
 struct glz::meta<timestar::StorageConfig> {
     using T = timestar::StorageConfig;
-    static constexpr auto value = object("wal_size_threshold", &T::wal_size_threshold, "max_points_per_block",
-                                         &T::max_points_per_block, "tsm_bloom_fpr", &T::tsm_bloom_fpr,
-                                         "tsm_cache_entries", &T::tsm_cache_entries, "compaction", &T::compaction);
+    static constexpr auto value =
+        object("wal_size_threshold", &T::wal_size_threshold, "max_points_per_block", &T::max_points_per_block,
+               "tsm_bloom_fpr", &T::tsm_bloom_fpr, "tsm_cache_entries", &T::tsm_cache_entries,
+               "wal_max_concurrent_encoders", &T::wal_max_concurrent_encoders, "compaction", &T::compaction);
 };
 
 template <>

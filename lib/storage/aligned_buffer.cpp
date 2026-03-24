@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 
 template <class T>
 void AlignedBuffer::write(T value) {
     const size_t bytesToAdd = sizeof(T);
     const size_t new_size = current_size + bytesToAdd;
+    if (new_size < current_size) [[unlikely]]
+        throw std::overflow_error("AlignedBuffer::write<T> overflow");
 
     ensure_capacity(new_size);
 
@@ -19,6 +22,8 @@ void AlignedBuffer::write(T value) {
 void AlignedBuffer::write(const std::string& value) {
     const size_t bytesToAdd = value.length();
     const size_t new_size = current_size + bytesToAdd;
+    if (bytesToAdd > 0 && new_size < current_size) [[unlikely]]
+        throw std::overflow_error("AlignedBuffer::write(string) overflow");
 
     ensure_capacity(new_size);
 
@@ -29,6 +34,8 @@ void AlignedBuffer::write(const std::string& value) {
 void AlignedBuffer::write(const CompressedBuffer& value) {
     const size_t bytesToAdd = value.data.size() * sizeof(uint64_t);
     const size_t new_size = current_size + bytesToAdd;
+    if (bytesToAdd > 0 && new_size < current_size) [[unlikely]]
+        throw std::overflow_error("AlignedBuffer::write(CompressedBuffer) overflow");
 
     ensure_capacity(new_size);
 
@@ -39,6 +46,8 @@ void AlignedBuffer::write(const CompressedBuffer& value) {
 void AlignedBuffer::write(const AlignedBuffer& value) {
     const size_t bytesToAdd = value.current_size;
     const size_t new_size = current_size + bytesToAdd;
+    if (bytesToAdd > 0 && new_size < current_size) [[unlikely]]
+        throw std::overflow_error("AlignedBuffer::write(AlignedBuffer) overflow");
 
     ensure_capacity(new_size);
 

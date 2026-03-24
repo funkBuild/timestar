@@ -1,8 +1,8 @@
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
-#include "../../../lib/query/shard_query.hpp"
 #include "../../../lib/query/series_matcher.hpp"
+#include "../../../lib/query/shard_query.hpp"
 #include "../test_helpers/aggregator_test_helper.hpp"
 
 #include <gtest/gtest.h>
@@ -305,9 +305,9 @@ TEST_F(QueryE2ETest, LatestAggregationQuery) {
         // Assuming numeric values for these tests
 
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        // With no interval, aggregates by timestamp - returns all points
-        EXPECT_EQ(timestamps.size(), 10);
-        EXPECT_EQ(values.size(), 10);
+        // LATEST without interval returns the single most recent value per series
+        EXPECT_EQ(timestamps.size(), 1);
+        EXPECT_EQ(values.size(), 1);
     }
 }
 

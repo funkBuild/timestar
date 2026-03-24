@@ -15,7 +15,7 @@ class ZigZag {
     static constexpr size_t kSimdThreshold = 16;
 
 public:
-    ZigZag() {}
+    ZigZag() = delete;
 
     static std::vector<uint64_t> zigzagEncodeVector(std::span<const int64_t> input) {
         std::vector<uint64_t> output;
@@ -28,10 +28,6 @@ public:
         }
 
         return output;
-    }
-
-    static std::vector<uint64_t> zigzagEncodeVector(const std::vector<int64_t>& input) {
-        return zigzagEncodeVector(std::span<const int64_t>(input));
     }
 
     static std::vector<int64_t> zigzagDecodeVector(const std::vector<uint64_t>& input) {
@@ -51,7 +47,7 @@ public:
         return (static_cast<uint64_t>(x) << 1) ^ static_cast<uint64_t>(x >> 63);
     }
 
-    static inline int64_t zigzagDecode(uint64_t y) { return (int64_t)((y >> 1) ^ -(y & 0x1)); }
+    static inline int64_t zigzagDecode(uint64_t y) { return static_cast<int64_t>((y >> 1) ^ -(y & 0x1)); }
 
     // Encode int64 values as zigzag uint64 in-place into a pre-allocated buffer.
     // Avoids the heap allocation of zigzagEncodeVector().

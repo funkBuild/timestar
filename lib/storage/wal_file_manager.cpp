@@ -376,7 +376,7 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
                             });
                         });
                     });
-                }).handle_exception([sid, seqNum](auto ep2) {
+                }).handle_exception([this, store, sid, seqNum](auto ep2) {
                     try {
                         std::rethrow_exception(ep2);
                     } catch (const seastar::gate_closed_exception&) {
@@ -385,6 +385,16 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
                             "[BG_CONVERT] Retry also failed for store {} on shard {}: {}. "
                             "WAL preserved on disk for recovery on next startup.",
                             seqNum, sid, e2.what());
+                        // Remove the store from memoryStores to prevent unbounded
+                        // memory growth. The WAL file remains on disk for crash recovery.
+                        auto it = std::find(memoryStores.begin(), memoryStores.end(), store);
+                        if (it != memoryStores.end()) {
+                            memoryStores.erase(it);
+                            timestar::wal_log.warn(
+                                "[BG_CONVERT] Removed store {} from memoryStores on shard {} "
+                                "to prevent memory leak after conversion failure",
+                                seqNum, sid);
+                        }
                     }
                 });
             }
@@ -506,6 +516,64 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
     timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {}", store->sequenceNumber, shardId);
 }
 
+seastar::future<> WALFileManager::close() {
+    timestar::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
+
+    // Drain all in-flight background TSM conversions before closing.
+    // Guard against double-close (e.g., seastar::sharded<Engine> calling stop() twice).
+    if (!_backgroundGate.is_closed()) {
+        timestar::wal_log.info("[WAL_CLOSE] Draining {} background TSM conversions on shard {}",
+                               _backgroundGate.get_count(), shardId);
+        co_await _backgroundGate.close();
+        timestar::wal_log.info("[WAL_CLOSE] Background TSM conversions drained on shard {}", shardId);
+    }
+
+    // Inline conversion of remaining stores.  These run sequentially with
+    // co_await (not via the background gate, which is already closed) so
+    // they are safe: no concurrent background conversions can be in flight.
+    // If a conversion fails, the WAL file is preserved for crash recovery.
+    // convertWalToTsm() erases from memoryStores and calls removeWAL()
+    // internally, so we iterate a copy to avoid iterator invalidation.
+    auto snapshot = memoryStores;
+
+    for (auto& store : snapshot) {
+        if (!store)
+            continue;
+
+        if (!store->isEmpty()) {
+            // Non-empty store: flush WAL to disk, then convert to TSM.
+            try {
+                timestar::wal_log.info("[WAL_CLOSE] Flushing memory store {} to TSM on shard {}", store->sequenceNumber,
+                                       shardId);
+                co_await store->close();          // flush WAL (idempotent)
+                co_await convertWalToTsm(store);  // write TSM + erase from memoryStores + removeWAL
+                timestar::wal_log.info("[WAL_CLOSE] Successfully flushed store {} to TSM on shard {}",
+                                       store->sequenceNumber, shardId);
+            } catch (const std::exception& e) {
+                timestar::wal_log.error(
+                    "[WAL_CLOSE] Failed to flush store {} to TSM on shard {}: {} "
+                    "(WAL preserved for recovery on next startup)",
+                    store->sequenceNumber, shardId, e.what());
+                // WAL file stays on disk — startup recovery will handle it.
+            }
+        } else {
+            // Empty store: just close and remove the WAL file.
+            try {
+                timestar::wal_log.info("[WAL_CLOSE] Closing empty memory store {} on shard {}", store->sequenceNumber,
+                                       shardId);
+                co_await store->close();
+                co_await store->removeWAL();
+            } catch (const std::exception& e) {
+                timestar::wal_log.error("[WAL_CLOSE] Error closing empty store {} on shard {}: {}",
+                                        store->sequenceNumber, shardId, e.what());
+            }
+        }
+    }
+
+    memoryStores.clear();
+    timestar::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
+}
+
 std::optional<TSMValueType> WALFileManager::getSeriesType(const std::string& seriesKey) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     return getSeriesType(seriesId);
@@ -515,7 +583,7 @@ std::optional<TSMValueType> WALFileManager::getSeriesType(const SeriesId128& ser
     std::optional<TSMValueType> seriesType;
 
     for (auto const& memoryStore : memoryStores) {
-        seriesType = memoryStore.get()->getSeriesType(seriesId);
+        seriesType = memoryStore->getSeriesType(seriesId);
 
         if (seriesType.has_value())
             return seriesType;
@@ -528,16 +596,6 @@ std::optional<TSMValueType> WALFileManager::getSeriesType(const SeriesId128& ser
 seastar::future<> WALFileManager::deleteFromMemoryStores(const std::string& seriesKey, uint64_t startTime,
                                                          uint64_t endTime) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-
-    // Check if the series exists in any memory store before writing to WAL
-    bool seriesExists = false;
-    for (const auto& memStore : memoryStores) {
-        auto seriesType = memStore->getSeriesType(seriesId);
-        if (seriesType.has_value()) {
-            seriesExists = true;
-            break;
-        }
-    }
 
     // Write deletion to WAL and apply to memory stores
     // We always write to WAL to ensure deletions are persisted
@@ -554,10 +612,6 @@ seastar::future<> WALFileManager::deleteFromMemoryStores(const std::string& seri
     // This ensures tombstones are applied even if data arrives later
     for (auto& memStore : memoryStores) {
         memStore->deleteRange(seriesId, startTime, endTime);
-    }
-
-    if (!seriesExists) {
-        timestar::wal_log.debug("Series '{}' not found in memory stores but deletion recorded", seriesKey);
     }
 
     timestar::wal_log.debug("Applied deleteRange to {} memory stores", memoryStores.size());

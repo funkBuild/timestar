@@ -8,7 +8,13 @@
  * Usage:
  *   ./timestar_insert_bench --server-host 127.0.0.1 --server-port 8086 \
  *       --connections 8 --batch-size 10000 --batches 100 --hosts 10
+ *
+ *   # Compare JSON vs Protobuf:
+ *   ./timestar_insert_bench --format json     --batch-size 10000 --batches 100
+ *   ./timestar_insert_bench --format protobuf --batch-size 10000 --batches 100
  */
+
+#include "timestar.pb.h"
 
 #include <boost/range/irange.hpp>
 
@@ -38,6 +44,8 @@
 #include <seastar/net/inet_address.hh>
 #include <string>
 #include <vector>
+
+enum class WireFormat { Json, Protobuf };
 
 using namespace seastar;
 using clk = std::chrono::steady_clock;
@@ -106,6 +114,42 @@ static std::string buildPayload(uint64_t seed, int hostId, int rackId, uint64_t 
     return buf;
 }
 
+/**
+ * Build a serialized WriteRequest protobuf payload.
+ *
+ * Produces the same data as buildPayload() but in protobuf wire format.
+ * The WriteRequest contains a single WritePoint with array-format fields.
+ */
+static std::string buildPayloadProto(uint64_t seed, int hostId, int rackId, uint64_t startTs, size_t count) {
+    std::mt19937_64 rng(seed ^ (static_cast<uint64_t>(hostId) << 32) ^ startTs);
+    std::uniform_real_distribution<double> dist(0.0, 100.0);
+
+    ::timestar_pb::WriteRequest req;
+    auto* wp = req.add_writes();
+    wp->set_measurement("server.metrics");
+    (*wp->mutable_tags())[std::string("host")] = fmt::format("host-{:02d}", hostId);
+    (*wp->mutable_tags())[std::string("rack")] = fmt::format("rack-{}", rackId);
+
+    // Timestamps
+    for (size_t i = 0; i < count; ++i) {
+        wp->add_timestamps(startTs + i * MINUTE_NS);
+    }
+
+    // Fields: same 10 fields as JSON, same RNG sequence
+    for (size_t f = 0; f < FIELD_NAMES.size(); ++f) {
+        ::timestar_pb::WriteField wf;
+        auto* dv = wf.mutable_double_values();
+        for (size_t i = 0; i < count; ++i) {
+            dv->add_values(dist(rng));
+        }
+        (*wp->mutable_fields())[std::string(FIELD_NAMES[f])] = wf;
+    }
+
+    std::string bytes;
+    req.SerializeToString(&bytes);
+    return bytes;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Latency histogram
 // ──────────────────────────────────────────────────────────────────────
@@ -155,29 +199,16 @@ struct ShardResult {
 };
 
 /**
- * Each Seastar shard runs this function concurrently.
+ * Runs the insert benchmark on shard 0 only.
  *
- * It creates its own HTTP client (with `maxConn` pooled connections) and
- * fires `batchCount` requests, with up to `maxConn` in-flight at a time
- * using a semaphore.
+ * All parallelism comes from the HTTP connection pool (`maxConn` in-flight
+ * requests).  This avoids competing with the server for CPU cores when both
+ * run on the same machine.  Payloads are pre-generated before timing starts.
  */
-static future<ShardResult> runShardWorker(socket_address addr, unsigned maxConn, size_t batchSize, size_t batchCount,
-                                          int numHosts, int numRacks, uint64_t globalSeed) {
+static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, size_t batchSize, size_t batchCount,
+                                        int numHosts, int numRacks, uint64_t globalSeed,
+                                        WireFormat format = WireFormat::Json) {
     using http_client = http::experimental::client;
-
-    const unsigned thisShard = this_shard_id();
-    const unsigned shardCount = smp::count;
-
-    // Partition work: each shard handles ceil(batchCount / shardCount) batches,
-    // but we assign sequentially so shard 0 takes batches 0..k-1, shard 1 takes k..2k-1, etc.
-    const size_t perShard = (batchCount + shardCount - 1) / shardCount;
-    const size_t myStart = thisShard * perShard;
-    const size_t myEnd = std::min(myStart + perShard, batchCount);
-    const size_t myBatches = (myEnd > myStart) ? (myEnd - myStart) : 0;
-
-    if (myBatches == 0) {
-        co_return ShardResult{};
-    }
 
     // Build HTTP client with connection pool.
     auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
@@ -185,48 +216,55 @@ static future<ShardResult> runShardWorker(socket_address addr, unsigned maxConn,
 
     // Pre-generate all payloads so timing measures only server throughput.
     std::vector<std::string> payloads;
-    payloads.reserve(myBatches);
+    payloads.reserve(batchCount);
 
-    // Deterministic per-batch assignment: batch i → host/rack based on seed.
-    std::mt19937 rng(globalSeed + myStart);
+    std::mt19937 rng(globalSeed);
     std::uniform_int_distribution<int> hostDist(1, numHosts);
     std::uniform_int_distribution<int> rackDist(1, numRacks);
 
-    // Base timestamp: 1 year ago in nanoseconds (deterministic from epoch 0).
-    constexpr uint64_t BASE_TS = 1'000'000'000'000'000'000ULL;  // ~2001
+    constexpr uint64_t BASE_TS = 1'000'000'000'000'000'000ULL;
 
-    for (size_t i = 0; i < myBatches; ++i) {
+    for (size_t i = 0; i < batchCount; ++i) {
         int hid = hostDist(rng);
         int rid = rackDist(rng);
-        uint64_t startTs = BASE_TS + (myStart + i) * batchSize * MINUTE_NS;
-        payloads.push_back(buildPayload(globalSeed, hid, rid, startTs, batchSize));
+        uint64_t startTs = BASE_TS + i * batchSize * MINUTE_NS;
+        if (format == WireFormat::Protobuf) {
+            payloads.push_back(buildPayloadProto(globalSeed, hid, rid, startTs, batchSize));
+        } else {
+            payloads.push_back(buildPayload(globalSeed, hid, rid, startTs, batchSize));
+        }
     }
 
-    // Fire requests with bounded concurrency via semaphore + gate.
+    // MIME type for HTTP requests.  Seastar's write_body() maps file-extension
+    // strings to MIME types ("json" → "application/json").  For protobuf there
+    // is no built-in mapping, so we call write_body("bin", ...) and then
+    // override the Content-Type header directly via set_mime_type().
+    const bool useProto = (format == WireFormat::Protobuf);
+
     auto res = make_lw_shared<ShardResult>();
     auto sem = make_lw_shared<semaphore>(maxConn);
 
     auto wallStart = clk::now();
 
-    // Use parallel_for_each with semaphore for bounded concurrency.
-    co_await parallel_for_each(boost::irange<size_t>(0, myBatches), [&, res, sem](size_t i) -> future<> {
+    co_await parallel_for_each(boost::irange<size_t>(0, batchCount), [&, res, sem, useProto](size_t i) -> future<> {
         auto units = co_await get_units(*sem, 1);
         auto t0 = clk::now();
 
         auto req = http::request::make("POST", sstring("localhost"), sstring("/write"));
-        req.write_body("json", sstring(payloads[i]));
+        if (useProto) {
+            req.write_body("bin", sstring(payloads[i]));
+            req.set_mime_type("application/x-protobuf");
+        } else {
+            req.write_body("json", sstring(payloads[i]));
+        }
 
         try {
             bool httpOk = false;
             sstring errBody;
             co_await client->make_request(
                 std::move(req), [&httpOk, &errBody](const http::reply& rep, input_stream<char>&& body_in) -> future<> {
-                    // CRITICAL: move body into coroutine-frame-local variable.
-                    // Rvalue-ref params become dangling after first co_await
-                    // because the caller's stack frame is destroyed.
                     auto body = std::move(body_in);
                     httpOk = (static_cast<int>(rep._status) >= 200 && static_cast<int>(rep._status) < 300);
-                    // Drain body (required to reuse connection).
                     sstring acc;
                     auto buf = co_await body.read();
                     while (!buf.empty()) {
@@ -285,7 +323,8 @@ int main(int argc, char** argv) {
         "racks", bpo::value<int>()->default_value(2), "Number of simulated racks")(
         "seed", bpo::value<uint64_t>()->default_value(42), "Global PRNG seed for reproducibility")(
         "warmup", bpo::value<size_t>()->default_value(5), "Number of warmup batches (not timed)")(
-        "verify", bpo::value<bool>()->default_value(true), "Query server after insert to verify data was persisted");
+        "verify", bpo::value<bool>()->default_value(true), "Query server after insert to verify data was persisted")(
+        "format", bpo::value<std::string>()->default_value("json"), "Wire format: 'json' (default) or 'protobuf'");
 
     return app.run(argc, argv, [&]() -> future<> {
         auto& cfg = app.configuration();
@@ -300,6 +339,15 @@ int main(int argc, char** argv) {
         const auto seed = cfg["seed"].as<uint64_t>();
         const auto warmup = cfg["warmup"].as<size_t>();
         const auto verify = cfg["verify"].as<bool>();
+        const auto formatStr = cfg["format"].as<std::string>();
+
+        WireFormat format = WireFormat::Json;
+        if (formatStr == "protobuf" || formatStr == "proto" || formatStr == "pb") {
+            format = WireFormat::Protobuf;
+        } else if (formatStr != "json") {
+            fmt::print("ERROR: unknown format '{}'. Use 'json' or 'protobuf'.\n", formatStr);
+            co_return;
+        }
 
         const size_t fieldsPerRow = FIELD_NAMES.size();
         const size_t totalPoints = batches * batchSize * fieldsPerRow;
@@ -311,8 +359,8 @@ int main(int argc, char** argv) {
         fmt::print(" TimeStar C++ Insert Benchmark (Seastar HTTP client)\n");
         fmt::print("{:=<70}\n", "");
         fmt::print("  Server:         {}:{}\n", host, port);
-        fmt::print("  Shards:         {}\n", smp::count);
-        fmt::print("  Connections:    {} per shard ({} total)\n", maxConn, maxConn * smp::count);
+        fmt::print("  Format:         {}\n", format == WireFormat::Protobuf ? "protobuf" : "json");
+        fmt::print("  Connections:    {} (concurrent HTTP connections)\n", maxConn);
         fmt::print("  Batch size:     {} timestamps x {} fields = {} pts\n", batchSize, fieldsPerRow,
                    batchSize * fieldsPerRow);
         fmt::print("  Batches:        {} ({} warmup + {} timed)\n", warmup + batches, warmup, batches);
@@ -349,61 +397,28 @@ int main(int argc, char** argv) {
         // ── Warmup ──────────────────────────────────────────────────
         if (warmup > 0) {
             fmt::print("Running {} warmup batches...\n", warmup);
-            // Use seed + 1 billion so warmup data is different from timed data.
-            std::vector<future<ShardResult>> warmupFuts;
-            warmupFuts.reserve(smp::count);
-            for (unsigned s = 0; s < smp::count; ++s) {
-                warmupFuts.push_back(smp::submit_to(s, [=] {
-                    return runShardWorker(addr, maxConn, batchSize, warmup, numHosts, numRacks,
-                                          seed + 1'000'000'000ULL);
-                }));
-            }
-            for (auto& f : warmupFuts) {
-                co_await std::move(f);
-            }
+            co_await runBenchmark(addr, maxConn, batchSize, warmup, numHosts, numRacks, seed + 1'000'000'000ULL,
+                                  format);
             fmt::print("Warmup complete.\n\n");
         }
 
         // ── Timed run ───────────────────────────────────────────────
-        fmt::print("Running {} timed batches across {} shards...\n", batches, smp::count);
+        fmt::print("Running {} timed batches with {} connections...\n", batches, maxConn);
 
         auto globalStart = clk::now();
 
-        // Launch workers on each shard via submit_to (returns future on shard 0).
-        std::vector<future<ShardResult>> futs;
-        futs.reserve(smp::count);
-        for (unsigned s = 0; s < smp::count; ++s) {
-            futs.push_back(smp::submit_to(
-                s, [=] { return runShardWorker(addr, maxConn, batchSize, batches, numHosts, numRacks, seed); }));
-        }
-
-        std::vector<ShardResult> shardResults;
-        shardResults.reserve(smp::count);
-        for (auto& f : futs) {
-            shardResults.push_back(co_await std::move(f));
-        }
+        auto result = co_await runBenchmark(addr, maxConn, batchSize, batches, numHosts, numRacks, seed, format);
 
         auto globalEnd = clk::now();
         double wallSec = std::chrono::duration<double>(globalEnd - globalStart).count();
 
         // ── Aggregate ───────────────────────────────────────────────
-        LatencyStats combined;
-        size_t totalOk = 0;
-        size_t totalFail = 0;
-        size_t totalHttpErr = 0;
-        size_t totalPts = 0;
-        std::string firstError;
-
-        for (auto& sr : shardResults) {
-            totalOk += sr.requests_ok;
-            totalFail += sr.requests_fail;
-            totalHttpErr += sr.requests_http_err;
-            totalPts += sr.total_points;
-            combined.merge(std::move(sr.latency));
-            if (firstError.empty() && !sr.first_error.empty()) {
-                firstError = std::move(sr.first_error);
-            }
-        }
+        LatencyStats combined = std::move(result.latency);
+        size_t totalOk = result.requests_ok;
+        size_t totalFail = result.requests_fail;
+        size_t totalHttpErr = result.requests_http_err;
+        size_t totalPts = result.total_points;
+        std::string firstError = std::move(result.first_error);
 
         // ── Results ─────────────────────────────────────────────────
         fmt::print("\n{:=<70}\n", "");
@@ -421,21 +436,7 @@ int main(int argc, char** argv) {
         fmt::print("  Batch rate:     {:.1f} batches/sec\n", totalOk / wallSec);
 
         fmt::print("\n  Latency per batch:\n");
-        combined.print("all shards");
-
-        // Per-shard breakdown.
-        fmt::print("\n  Per-shard throughput:\n");
-        for (unsigned s = 0; s < smp::count; ++s) {
-            auto& sr = shardResults[s];
-            if (sr.requests_ok == 0 && sr.requests_fail == 0 && sr.requests_http_err == 0)
-                continue;
-            double sec = std::chrono::duration<double>(sr.wall_time).count();
-            fmt::print(
-                "    shard {:>2}: {:>8} pts in {:.2f}s = {:.0f} pts/sec"
-                "  ({} ok, {} http_err, {} fail)\n",
-                s, sr.total_points, sec, sec > 0 ? sr.total_points / sec : 0.0, sr.requests_ok, sr.requests_http_err,
-                sr.requests_fail);
-        }
+        combined.print("batch latency");
 
         // ── Verification ─────────────────────────────────────────
         if (verify && totalOk > 0) {

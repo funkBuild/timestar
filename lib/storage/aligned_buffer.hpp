@@ -70,7 +70,7 @@ struct dma_default_init_allocator {
 
 class AlignedBuffer {
 private:
-    static constexpr size_t INITIAL_CAPACITY = 4096;
+    static constexpr size_t INITIAL_CAPACITY = 256;
     static constexpr size_t GROWTH_FACTOR = 2;
 
     size_t current_size = 0;

@@ -1,9 +1,12 @@
 #include "http_write_handler.hpp"
 
+#include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "placement_table.hpp"
+#include "proto_converters.hpp"
+#include "proto_write_fast_path.hpp"
 #include "series_key.hpp"
 
 #include <boost/iterator/counting_iterator.hpp>
@@ -81,6 +84,29 @@ struct glz::meta<FastDoubleWritePoint> {
     static constexpr auto value = object("measurement", &T::measurement, "tags", &T::tags, "timestamps", &T::timestamps,
                                          "timestamp", &T::timestamp, "fields", &T::fields);
 };
+
+// File-scope shard-local cache of series IDs that have already been indexed.
+// After the first batch, subsequent writes for the same series skip the
+// cross-shard metadata RPC entirely. Shared by both JSON and protobuf write paths.
+// Two-generation approach: on overflow, previous generation is discarded and
+// current becomes previous, avoiding cliff-clearing all entries at once.
+static constexpr size_t MAX_KNOWN_SERIES_CACHE = 500'000;
+static thread_local tsl::robin_set<SeriesId128, SeriesId128::Hash> knownSeriesCurrent;
+static thread_local tsl::robin_set<SeriesId128, SeriesId128::Hash> knownSeriesPrevious;
+
+static bool knownSeriesContains(const SeriesId128& id) {
+    return knownSeriesCurrent.find(id) != knownSeriesCurrent.end() ||
+           knownSeriesPrevious.find(id) != knownSeriesPrevious.end();
+}
+
+static void knownSeriesInsert(const SeriesId128& id) {
+    if (knownSeriesCurrent.size() > MAX_KNOWN_SERIES_CACHE) [[unlikely]] {
+        // Rotate generations: discard oldest, promote current to previous
+        knownSeriesPrevious = std::move(knownSeriesCurrent);
+        knownSeriesCurrent = tsl::robin_set<SeriesId128, SeriesId128::Hash>{};
+    }
+    knownSeriesCurrent.insert(id);
+}
 
 HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {
     if (!engineSharded) {
@@ -475,7 +501,7 @@ bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t 
 }
 
 std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
-    const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs) {
+    const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs, size_t& entriesSkippedOut) {
     // Configuration constants
     static const size_t MAX_COALESCE_SIZE = 10000;  // Max values per field array
     static const size_t MIN_COALESCE_COUNT = 2;     // Min writes needed to coalesce
@@ -495,6 +521,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // A typical write point has 1-3 fields, so estimate writes * 2.
     candidates.reserve(writes_array.size() * 2);
     [[maybe_unused]] size_t totalWritesProcessed = 0;
+    size_t entriesSkipped = 0;
 
     LOG_INSERT_PATH(timestar::http_log, debug, "[COALESCE] Processing {} writes for coalescing", writes_array.size());
 
@@ -505,6 +532,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         candidate.timestamps.push_back(ts);
         candidate.timestampHashSum += ts;
         candidate.timestampHashXor ^= ts;
+        candidate.timestampHashMul = candidate.timestampHashMul * 0x9e3779b97f4a7c15ULL + ts;
         if (valueType == TSMValueType::Float) {
             candidate.doubleValues.push_back(val.as<double>());
         } else if (valueType == TSMValueType::Boolean) {
@@ -559,6 +587,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         if (existing.timestamps.size() + numValuesToAdd <= MAX_COALESCE_SIZE) {
             if (existing.valueType == TSMValueType::Integer && valueType == TSMValueType::Float) {
                 // Promote existing integer candidate to float
+                timestar::http_log.debug("Promoting integer field to float");
                 existing.doubleValues.reserve(existing.integerValues.size() + numValuesToAdd);
                 for (int64_t v : existing.integerValues) {
                     existing.doubleValues.push_back(static_cast<double>(v));
@@ -781,6 +810,8 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                         candidate.timestamps.push_back(fieldTimestamps[i]);
                         candidate.timestampHashSum += fieldTimestamps[i];
                         candidate.timestampHashXor ^= fieldTimestamps[i];
+                        candidate.timestampHashMul =
+                            candidate.timestampHashMul * 0x9e3779b97f4a7c15ULL + fieldTimestamps[i];
                         if (valueType == TSMValueType::Float) {
                             if (!elem.is_number())
                                 throw std::invalid_argument("Mixed types in field array: " + fieldName);
@@ -825,9 +856,16 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 }
             }
         } catch (const std::exception& e) {
+            ++entriesSkipped;
             LOG_INSERT_PATH(timestar::http_log, debug, "[COALESCE] Failed to parse write: {}", e.what());
             continue;
         }
+    }
+
+    entriesSkippedOut = entriesSkipped;
+    if (entriesSkipped > 0) {
+        timestar::http_log.warn("[COALESCE] Skipped {} of {} entries due to parse errors", entriesSkipped,
+                                writes_array.size());
     }
 
     // Second pass: convert candidates to MultiWritePoint objects
@@ -861,13 +899,14 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         bool timestampsCompatible = true;
 
         // Compare timestamps using pre-computed commutative hashes (O(1) per field).
-        // Two multisets with the same count, same sum, and same XOR are identical
-        // for real nanosecond timestamps (collision probability is vanishingly small).
+        // Three independent hash dimensions (sum, XOR, multiplicative) make accidental
+        // collisions astronomically unlikely for real nanosecond timestamps.
         for (size_t i = 1; i < seriesKeys.size(); i++) {
             auto& candidate = candidates[seriesKeys[i]];
             if (candidate.timestamps.size() != firstCandidate.timestamps.size() ||
                 candidate.timestampHashSum != firstCandidate.timestampHashSum ||
-                candidate.timestampHashXor != firstCandidate.timestampHashXor) {
+                candidate.timestampHashXor != firstCandidate.timestampHashXor ||
+                candidate.timestampHashMul != firstCandidate.timestampHashMul) {
                 timestampsCompatible = false;
                 break;
             }
@@ -1024,17 +1063,6 @@ bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::str
 }
 
 seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(MultiWritePoint& point) {
-    // Shard-local cache of series IDs that have already been indexed on shard 0.
-    // After the first batch, subsequent writes for the same series skip the
-    // cross-shard metadata RPC entirely, eliminating the biggest bottleneck
-    // for non-shard-0 shards. The cache persists for the lifetime of the shard.
-    static thread_local tsl::robin_set<SeriesId128, SeriesId128::Hash> knownSeriesCache;
-    // Cap cache to prevent unbounded memory growth with high-cardinality workloads
-    static constexpr size_t MAX_KNOWN_SERIES_CACHE = 500'000;
-    if (knownSeriesCache.size() > MAX_KNOWN_SERIES_CACHE) [[unlikely]] {
-        knownSeriesCache.clear();
-    }
-
     // Local metadata tracking — each coroutine gets its own copies so there
     // is no shared mutable state when multiple coroutines run concurrently.
     std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
@@ -1112,12 +1140,12 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
                 // Track metadata before potential move - deduplicate by SeriesId128 (16-byte key,
                 // fast hash via first 8 bytes) instead of the raw 60-100 byte series key string.
-                // knownSeriesCache is a shard-local persistent cache that avoids redundant
+                // knownSeries is a shard-local persistent cache that avoids redundant
                 // cross-shard metadata RPCs for series we've already indexed.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
-                            knownSeriesCache.insert(seriesId);
+                        if (!knownSeriesContains(seriesId)) {
+                            knownSeriesInsert(seriesId);
                             metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
                         }
                     }
@@ -1141,8 +1169,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
-                            knownSeriesCache.insert(seriesId);
+                        if (!knownSeriesContains(seriesId)) {
+                            knownSeriesInsert(seriesId);
                             metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
                         }
                     }
@@ -1170,8 +1198,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
-                            knownSeriesCache.insert(seriesId);
+                        if (!knownSeriesContains(seriesId)) {
+                            knownSeriesInsert(seriesId);
                             metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
                         }
                     }
@@ -1195,8 +1223,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 // Track metadata before potential move - deduplicate by SeriesId128.
                 {
                     if (seenMF.insert(seriesId).second) {
-                        if (knownSeriesCache.find(seriesId) == knownSeriesCache.end()) {
-                            knownSeriesCache.insert(seriesId);
+                        if (!knownSeriesContains(seriesId)) {
+                            knownSeriesInsert(seriesId);
                             metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
                         }
                     }
@@ -1371,12 +1399,20 @@ std::string HttpWriteHandler::createPartialFailureResponse(int64_t pointsWritten
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleWrite(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
+    auto reqFmt = timestar::http::requestFormat(*req);
+    auto resFmt = timestar::http::responseFormat(*req);
 
     try {
         // Read the complete request body — move from request to avoid copying
         std::string body;
         if (!req->content.empty()) {
             body = std::move(req->content);
+        }
+
+        // Pre-reserve body buffer from Content-Length to avoid repeated reallocations
+        // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
+        if (body.empty() && req->content_length > 0 && req->content_length <= maxWriteBodySize()) {
+            body.reserve(req->content_length);
         }
 
         // Read from stream if available, checking size incrementally
@@ -1392,28 +1428,26 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 
         if (body.size() > maxWriteBodySize()) {
             rep->set_status(seastar::http::reply::status_type::payload_too_large);
-            rep->_content = createErrorResponse("Request body too large (max " +
-                                                std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)");
-            rep->add_header("Content-Type", "application/json");
-            co_return rep;
-        }
-
-        // Validate Content-Type if explicitly set
-        {
-            auto ct = req->get_header("Content-Type");
-            std::string ctStr(ct.data(), ct.size());
-            if (!ctStr.empty() && !ctStr.starts_with("application/json")) {
-                rep->set_status(seastar::http::reply::status_type::unsupported_media_type);
-                rep->_content = createErrorResponse("Content-Type must be application/json");
-                rep->add_header("Content-Type", "application/json");
-                co_return rep;
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatWriteResponse(
+                    "error", 0, 0,
+                    {"Request body too large (max " + std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)"});
+            } else {
+                rep->_content = createErrorResponse("Request body too large (max " +
+                                                    std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)");
             }
+            timestar::http::setContentType(*rep, resFmt);
+            co_return rep;
         }
 
         if (body.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("Empty request body");
-            rep->add_header("Content-Type", "application/json");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {"Empty request body"});
+            } else {
+                rep->_content = createErrorResponse("Empty request body");
+            }
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
 
@@ -1429,6 +1463,199 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // eliminating up to N redundant now() calls in a batch of N points.
         const uint64_t defaultTimestampNs = currentNanosTimestamp();
 
+        // ─── Protobuf fast write path ───
+        // Arena-parsed, zero-intermediate-copy conversion from WriteRequest proto
+        // directly to per-shard TimeStarInsert batches. Skips the intermediate
+        // MultiWritePoint conversion and type detection heuristics.
+        if (timestar::http::isProtobuf(reqFmt)) {
+            auto fastResult = timestar::proto::parseWriteRequestFast(body.data(), body.size(), defaultTimestampNs);
+
+            // Yield after CPU-heavy proto parse to prevent reactor stalls
+            co_await seastar::coroutine::maybe_yield();
+
+            int64_t failedWrites = fastResult.failedWrites;
+            std::vector<std::string> writeErrors = std::move(fastResult.errors);
+            pointsWritten = fastResult.totalPoints;
+
+            // Group FastFieldInserts into per-shard TimeStarInsert batches
+            const size_t shardCount = seastar::smp::count;
+            std::vector<std::vector<TimeStarInsert<double>>> shardDoubleInserts(shardCount);
+            std::vector<std::vector<TimeStarInsert<bool>>> shardBoolInserts(shardCount);
+            std::vector<std::vector<TimeStarInsert<std::string>>> shardStringInserts(shardCount);
+            std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegerInserts(shardCount);
+            std::vector<MetaOp> allMetaOps;
+            std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
+
+            for (auto& ffi : fastResult.inserts) {
+                // Compute series ID once for shard routing and metadata dedup.
+                // TODO: pre-compute in parseWriteRequestFast() once libtimestar_proto_conv
+                // links series_id (requires adding xxhash dependency to that target).
+                SeriesId128 seriesId = SeriesId128::fromSeriesKey(ffi.seriesKey);
+                size_t shard = timestar::routeToCore(seriesId);
+
+                // Track metadata (deduplicate by SeriesId128)
+                if (seenMF.insert(seriesId).second) {
+                    if (!knownSeriesContains(seriesId)) {
+                        knownSeriesInsert(seriesId);
+                        TSMValueType vtype;
+                        switch (ffi.type) {
+                            case timestar::proto::FastFieldInsert::Type::DOUBLE:
+                                vtype = TSMValueType::Float;
+                                break;
+                            case timestar::proto::FastFieldInsert::Type::BOOL:
+                                vtype = TSMValueType::Boolean;
+                                break;
+                            case timestar::proto::FastFieldInsert::Type::STRING:
+                                vtype = TSMValueType::String;
+                                break;
+                            case timestar::proto::FastFieldInsert::Type::INTEGER:
+                                vtype = TSMValueType::Integer;
+                                break;
+                        }
+                        allMetaOps.push_back(MetaOp{vtype, ffi.measurement, ffi.fieldName, ffi.tags});
+                    }
+                }
+
+                // Build TimeStarInsert directly from FastFieldInsert — move vectors
+                switch (ffi.type) {
+                    case timestar::proto::FastFieldInsert::Type::DOUBLE: {
+                        TimeStarInsert<double> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                        insert.tags = std::move(ffi.tags);
+                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.values = std::move(ffi.doubleValues);
+                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                        insert.setCachedSeriesId128(seriesId);
+                        shardDoubleInserts[shard].push_back(std::move(insert));
+                        break;
+                    }
+                    case timestar::proto::FastFieldInsert::Type::BOOL: {
+                        TimeStarInsert<bool> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                        insert.tags = std::move(ffi.tags);
+                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.values.reserve(ffi.boolValues.size());
+                        for (uint8_t v : ffi.boolValues) {
+                            insert.values.push_back(v != 0);
+                        }
+                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                        insert.setCachedSeriesId128(seriesId);
+                        shardBoolInserts[shard].push_back(std::move(insert));
+                        break;
+                    }
+                    case timestar::proto::FastFieldInsert::Type::STRING: {
+                        TimeStarInsert<std::string> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                        insert.tags = std::move(ffi.tags);
+                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.values = std::move(ffi.stringValues);
+                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                        insert.setCachedSeriesId128(seriesId);
+                        shardStringInserts[shard].push_back(std::move(insert));
+                        break;
+                    }
+                    case timestar::proto::FastFieldInsert::Type::INTEGER: {
+                        TimeStarInsert<int64_t> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                        insert.tags = std::move(ffi.tags);
+                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.values = std::move(ffi.integerValues);
+                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                        insert.setCachedSeriesId128(seriesId);
+                        shardIntegerInserts[shard].push_back(std::move(insert));
+                        break;
+                    }
+                }
+            }
+
+            // Dispatch to shards in parallel
+            std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
+            shardFutures.reserve(shardCount);
+
+            for (size_t shard = 0; shard < shardCount; ++shard) {
+                if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() &&
+                    shardStringInserts[shard].empty() && shardIntegerInserts[shard].empty()) {
+                    continue;
+                }
+
+                auto doubles = std::move(shardDoubleInserts[shard]);
+                auto bools = std::move(shardBoolInserts[shard]);
+                auto strings = std::move(shardStringInserts[shard]);
+                auto integers = std::move(shardIntegerInserts[shard]);
+
+                auto doInserts = [](Engine& engine, auto doubles, auto bools, auto strings,
+                                    auto integers) mutable -> seastar::future<AggregatedTimingInfo> {
+                    AggregatedTimingInfo batchTiming;
+                    if (!doubles.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(doubles));
+                        batchTiming.aggregate(walTiming);
+                    }
+                    if (!bools.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(bools));
+                        batchTiming.aggregate(walTiming);
+                    }
+                    if (!strings.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(strings));
+                        batchTiming.aggregate(walTiming);
+                    }
+                    if (!integers.empty()) {
+                        auto walTiming = co_await engine.insertBatch(std::move(integers));
+                        batchTiming.aggregate(walTiming);
+                    }
+                    co_return batchTiming;
+                };
+
+                if (shard == seastar::this_shard_id()) {
+                    shardFutures.push_back(doInserts(engineSharded->local(), std::move(doubles), std::move(bools),
+                                                     std::move(strings), std::move(integers)));
+                } else {
+                    shardFutures.push_back(engineSharded->invoke_on(
+                        shard,
+                        [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
+                         integers =
+                             std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
+                            AggregatedTimingInfo batchTiming;
+                            if (!doubles.empty()) {
+                                auto walTiming = co_await engine.insertBatch(std::move(doubles));
+                                batchTiming.aggregate(walTiming);
+                            }
+                            if (!bools.empty()) {
+                                auto walTiming = co_await engine.insertBatch(std::move(bools));
+                                batchTiming.aggregate(walTiming);
+                            }
+                            if (!strings.empty()) {
+                                auto walTiming = co_await engine.insertBatch(std::move(strings));
+                                batchTiming.aggregate(walTiming);
+                            }
+                            if (!integers.empty()) {
+                                auto walTiming = co_await engine.insertBatch(std::move(integers));
+                                batchTiming.aggregate(walTiming);
+                            }
+                            co_return batchTiming;
+                        }));
+                }
+            }
+
+            if (!shardFutures.empty()) {
+                co_await seastar::when_all_succeed(std::move(shardFutures));
+            }
+
+            // Index metadata
+            if (!allMetaOps.empty()) {
+                co_await engineSharded->local().indexMetadataSync(std::move(allMetaOps));
+            }
+
+            rep->set_status(seastar::http::reply::status_type::ok);
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatWriteResponse(failedWrites > 0 ? "partial" : "success",
+                                                                     pointsWritten, failedWrites, writeErrors);
+            } else {
+                if (failedWrites > 0) {
+                    rep->_content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
+                } else {
+                    rep->_content = createSuccessResponse(pointsWritten);
+                }
+            }
+            timestar::http::setContentType(*rep, resFmt);
+            co_return rep;
+        }
+
         // ─── Fast path: single write with all-double fields ───
         // For large payloads (>256 bytes) that aren't batch writes, try parsing
         // directly into typed vectors, bypassing the json_value_t DOM entirely.
@@ -1437,11 +1664,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         bool fastPathHandled = false;
         if (body.size() > 256) {
             // Quick check: skip fast path for batch writes (have "writes" key).
-            // We must search the entire body, not just the first N bytes,
-            // because the "writes" key can appear at any position depending
-            // on JSON key ordering.
-            auto writesPos = body.find("\"writes\"");
-            if (writesPos == std::string::npos) {
+            // The "writes" key is a top-level JSON key, so it will appear
+            // early in the object.  Limiting the scan to the first 256 bytes
+            // avoids a full-body scan on large single-write payloads and
+            // prevents false positives from "writes" appearing inside string
+            // values deeper in the body.
+            auto writesPos = std::string_view(body).substr(0, 256).find("\"writes\"");
+            if (writesPos == std::string_view::npos) {
                 FastDoubleWritePoint fwp;
                 auto fast_err = glz::read_json(fwp, body);
                 if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
@@ -1478,7 +1707,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
             if (parse_error) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = createErrorResponse("Invalid JSON: " + std::string(glz::format_error(parse_error)));
-                rep->add_header("Content-Type", "application/json");
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
 
@@ -1493,7 +1722,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     if (!writes.is_array()) {
                         throw std::invalid_argument("'writes' field must be a JSON array");
                     }
-                    if (writes.is_array()) {
+                    {
                         auto& writes_array = writes.get<json_value_t::array_t>();
 
                         constexpr size_t MAX_BATCH_WRITES = 100000;
@@ -1502,7 +1731,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                             rep->_content =
                                 createErrorResponse("Batch too large: " + std::to_string(writes_array.size()) +
                                                     " writes exceeds maximum of " + std::to_string(MAX_BATCH_WRITES));
-                            rep->add_header("Content-Type", "application/json");
+                            timestar::http::setContentType(*rep, resFmt);
                             co_return rep;
                         }
 
@@ -1512,7 +1741,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 #if TIMESTAR_LOG_INSERT_PATH
                         auto coalesceStartTime = std::chrono::steady_clock::now();
 #endif
-                        auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs);
+                        size_t coalesceSkipped = 0;
+                        auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs, coalesceSkipped);
 #if TIMESTAR_LOG_INSERT_PATH
                         auto coalesceEndTime = std::chrono::steady_clock::now();
                         auto coalesceDuration =
@@ -1574,11 +1804,19 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                         "[METADATA] Batch: indexed {} unique series synchronously", metaOpsCount);
 #endif
 
+                        // Include coalesce-skipped entries in failure count
+                        failedWrites += static_cast<int64_t>(coalesceSkipped);
+
                         // Report partial failure if some writes failed
                         if (failedWrites > 0) {
                             rep->set_status(seastar::http::reply::status_type::ok);
-                            rep->_content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
-                            rep->add_header("Content-Type", "application/json");
+                            if (timestar::http::isProtobuf(resFmt)) {
+                                rep->_content = timestar::proto::formatWriteResponse("partial", pointsWritten,
+                                                                                     failedWrites, writeErrors);
+                            } else {
+                                rep->_content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
+                            }
+                            timestar::http::setContentType(*rep, resFmt);
                             co_return rep;
                         }
                     }
@@ -1612,29 +1850,45 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 
         // Success response
         rep->set_status(seastar::http::reply::status_type::ok);
-        rep->_content = createSuccessResponse(pointsWritten);
-        rep->add_header("Content-Type", "application/json");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("success", pointsWritten);
+        } else {
+            rep->_content = createSuccessResponse(pointsWritten);
+        }
+        timestar::http::setContentType(*rep, resFmt);
 
     } catch (const seastar::gate_closed_exception&) {
         // Insert gate closed — server is shutting down. Return 503 so clients
         // know to retry against another node or after restart.
         ++engineSharded->local().metrics().insert_errors_total;
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
-        rep->_content = createErrorResponse("Server is shutting down");
-        rep->add_header("Content-Type", "application/json");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {"Server is shutting down"});
+        } else {
+            rep->_content = createErrorResponse("Server is shutting down");
+        }
+        timestar::http::setContentType(*rep, resFmt);
     } catch (const std::invalid_argument& e) {
         // Client input validation error — 400 Bad Request
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.debug("Write validation error: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->_content = createErrorResponse(e.what());
-        rep->add_header("Content-Type", "application/json");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+        } else {
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
     } catch (const std::exception& e) {
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.error("Error handling write request: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("Internal server error");
-        rep->add_header("Content-Type", "application/json");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {"Internal server error"});
+        } else {
+            rep->_content = createErrorResponse("Internal server error");
+        }
+        timestar::http::setContentType(*rep, resFmt);
     }
 
     co_return rep;

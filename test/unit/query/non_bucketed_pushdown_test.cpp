@@ -46,7 +46,10 @@ static seastar::future<> insertKnownValues(Engine& engine, int count = 10) {
     }
     co_await engine.insert(std::move(insert));
     co_await engine.rolloverMemoryStore();
-    co_await seastar::sleep(std::chrono::milliseconds(200));
+    // Poll for background TSM conversion to complete (timeout after 5s)
+    for (int attempt = 0; attempt < 50 && engine.getTSMFileCount() == 0; ++attempt) {
+        co_await seastar::sleep(std::chrono::milliseconds(100));
+    }
 }
 
 // ===========================================================================
@@ -327,7 +330,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_FallsBackToNullopt) {
 // ===========================================================================
 TEST(BlockAggregatorFoldTest, FoldToSingleState_AccumulatesCorrectly) {
     timestar::BlockAggregator agg(0);
-    agg.setFoldToSingleState(false);
+    agg.enableFoldToSingleState();
 
     // Add points individually
     agg.addPoint(1000, 10.0);
@@ -349,7 +352,7 @@ TEST(BlockAggregatorFoldTest, FoldToSingleState_AccumulatesCorrectly) {
 
 TEST(BlockAggregatorFoldTest, FoldToSingleState_BatchAdd) {
     timestar::BlockAggregator agg(0);
-    agg.setFoldToSingleState(false);
+    agg.enableFoldToSingleState();
 
     std::vector<uint64_t> ts = {1000, 2000, 3000, 4000, 5000};
     std::vector<double> vals = {10.0, 20.0, 30.0, 40.0, 50.0};
@@ -366,9 +369,9 @@ TEST(BlockAggregatorFoldTest, FoldToSingleState_BatchAdd) {
     EXPECT_DOUBLE_EQ(state.getValue(timestar::AggregationMethod::AVG), 30.0);
 }
 
-TEST(BlockAggregatorFoldTest, FoldWithCollectRaw) {
+TEST(BlockAggregatorFoldTest, FoldDoesNotCollectRaw) {
     timestar::BlockAggregator agg(0);
-    agg.setFoldToSingleState(true);  // collectRaw = true
+    agg.enableFoldToSingleState();
 
     agg.addPoint(1000, 10.0);
     agg.addPoint(2000, 20.0);
@@ -376,8 +379,8 @@ TEST(BlockAggregatorFoldTest, FoldWithCollectRaw) {
 
     auto state = agg.takeSingleState();
     EXPECT_EQ(state.count, 3u);
-    EXPECT_TRUE(state.collectRaw);
-    EXPECT_EQ(state.rawValues.size(), 3u);
+    EXPECT_FALSE(state.collectRaw);
+    EXPECT_TRUE(state.rawValues.empty());
 }
 
 TEST(BlockAggregatorFoldTest, NonFoldModeStillWorks) {

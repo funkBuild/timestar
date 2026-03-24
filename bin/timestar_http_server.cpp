@@ -1,6 +1,7 @@
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
 #include "core/placement_table.hpp"
+#include "http/content_negotiation.hpp"
 #include "http/http_auth.hpp"
 #include "http/http_delete_handler.hpp"
 #include "http/http_derived_query_handler.hpp"
@@ -9,8 +10,10 @@
 #include "http/http_retention_handler.hpp"
 #include "http/http_stream_handler.hpp"
 #include "http/http_write_handler.hpp"
+#include "http/proto_converters.hpp"
 #include "storage/shard_rebalancer.hpp"
 #include "timestar/version.hpp"
+#include "utils/json_escape.hpp"
 #include "utils/logger.hpp"
 #include "utils/stop_signal.hpp"
 
@@ -51,7 +54,15 @@ static std::atomic<bool> g_ready{false};
 
 // Auth token — set once before server start, read by all shards via set_routes().
 // Empty string means auth is disabled (all requests pass through).
-static std::string g_authToken;
+// Uses pointer + string storage so the string is fully constructed before any
+// shard reads it (avoids relying on memory ordering of std::string internals).
+static std::string g_authTokenStorage;
+static const std::string* g_authToken = nullptr;
+
+static const std::string& authToken() {
+    static const std::string empty;
+    return g_authToken ? *g_authToken : empty;
+}
 
 void set_routes(routes& r) {
     // Per-shard handler instances. Each handler's registerRoutes() captures
@@ -72,52 +83,77 @@ void set_routes(routes& r) {
 
     r.add(operation_type::GET, url("/health"),
           new function_handler(
-              [](std::unique_ptr<seastar::http::request>,
+              [](std::unique_ptr<seastar::http::request> req,
                  std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  if (g_ready.load(std::memory_order_relaxed)) {
+                  auto resFmt = timestar::http::responseFormat(*req);
+                  if (g_ready.load(std::memory_order_acquire)) {
                       rep->set_status(seastar::http::reply::status_type::ok);
-                      rep->_content = "{\"status\":\"healthy\"}";
+                      if (timestar::http::isProtobuf(resFmt)) {
+                          rep->_content = timestar::proto::formatHealthResponse("healthy");
+                      } else {
+                          rep->_content = "{\"status\":\"healthy\"}";
+                      }
                   } else {
                       rep->set_status(seastar::http::reply::status_type::service_unavailable);
-                      rep->_content = "{\"status\":\"starting\"}";
+                      if (timestar::http::isProtobuf(resFmt)) {
+                          rep->_content = timestar::proto::formatHealthResponse("starting");
+                      } else {
+                          rep->_content = "{\"status\":\"starting\"}";
+                      }
                   }
-                  rep->add_header("Content-Type", "application/json");
+                  timestar::http::setContentType(*rep, resFmt);
                   rep->done();
                   return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
               },
               "json"));
 
-    r.add(operation_type::GET, url("/version"), new function_handler([](const_req req) {
-              return sstring(fmt::format(R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
-                                         timestar::VERSION, timestar::GIT_COMMIT, timestar::BUILD_TIME,
-                                         timestar::COMPILER));
-          }));
+    r.add(operation_type::GET, url("/version"),
+          new function_handler(
+              [](std::unique_ptr<seastar::http::request> req,
+                 std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  auto resFmt = timestar::http::responseFormat(*req);
+                  rep->set_status(seastar::http::reply::status_type::ok);
+                  if (timestar::http::isProtobuf(resFmt)) {
+                      auto versionStr = fmt::format("{} ({}) built {} with {}", timestar::VERSION, timestar::GIT_COMMIT,
+                                                    timestar::BUILD_TIME, timestar::COMPILER);
+                      rep->_content = timestar::proto::formatStatusResponse("ok", versionStr);
+                  } else {
+                      rep->_content = sstring(fmt::format(
+                          R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
+                          timestar::jsonEscape(timestar::VERSION), timestar::jsonEscape(timestar::GIT_COMMIT),
+                          timestar::jsonEscape(timestar::BUILD_TIME), timestar::jsonEscape(timestar::COMPILER)));
+                  }
+                  timestar::http::setContentType(*rep, resFmt);
+                  rep->done();
+                  return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+              },
+              "json"));
 
     // Protected endpoints — when g_authToken is non-empty, each handler wraps
     // its routes with Bearer token authentication via wrapWithAuth().
     auto* writeHandler = emplaceHandler(new HttpWriteHandler(&g_engine));
-    writeHandler->registerRoutes(r, g_authToken);
+    writeHandler->registerRoutes(r, authToken());
 
     auto* queryHandler = emplaceHandler(new timestar::HttpQueryHandler(&g_engine, nullptr));
-    queryHandler->registerRoutes(r, g_authToken);
+    queryHandler->registerRoutes(r, authToken());
 
     auto* deleteHandler = emplaceHandler(new HttpDeleteHandler(&g_engine));
-    deleteHandler->registerRoutes(r, g_authToken);
+    deleteHandler->registerRoutes(r, authToken());
 
     auto* metadataHandler = emplaceHandler(new HttpMetadataHandler(&g_engine));
-    metadataHandler->registerRoutes(r, g_authToken);
+    metadataHandler->registerRoutes(r, authToken());
 
     auto retentionHandlerPtr = std::make_shared<HttpRetentionHandler>(&g_engine);
-    retentionHandlerPtr->registerRoutes(r, g_authToken);
+    retentionHandlerPtr->registerRoutes(r, authToken());
     handlers.emplace_back(new std::shared_ptr<HttpRetentionHandler>(retentionHandlerPtr),
                           [](void* p) { delete static_cast<std::shared_ptr<HttpRetentionHandler>*>(p); });
 
     auto* streamHandler = emplaceHandler(new timestar::HttpStreamHandler(&g_engine));
-    streamHandler->registerRoutes(r, g_authToken);
+    streamHandler->registerRoutes(r, authToken());
     g_streamHandler = streamHandler;
 
     auto* derivedQueryHandler = emplaceHandler(new timestar::HttpDerivedQueryHandler(&g_engine));
-    derivedQueryHandler->registerRoutes(r, g_authToken);
+    derivedQueryHandler->registerRoutes(r, authToken());
 
     r.add(operation_type::GET, url("/"), new function_handler([](const_req req) {
               return "{\"message\":\"TimeStar HTTP "
@@ -339,7 +375,7 @@ int main(int argc, char** argv) {
             g_engine.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); }).get();
 
             timestar::http_log.info("Engine initialized successfully with background tasks");
-            g_ready.store(true, std::memory_order_relaxed);
+            g_ready.store(true, std::memory_order_release);
 
             // STEP 2: Create stop signal handler
             // Note: HTTP handlers are created per-shard inside set_routes() to avoid
@@ -349,14 +385,18 @@ int main(int argc, char** argv) {
 
             // Initialize auth token if auth is enabled
             if (timestar::config().server.auth_enabled) {
-                g_authToken = timestar::config().server.auth_token;
-                if (g_authToken.empty()) {
-                    g_authToken = timestar::generateToken(32);
-                    timestar::http_log.info("Auth enabled — generated token: {}", timestar::maskToken(g_authToken));
+                g_authTokenStorage = timestar::config().server.auth_token;
+                if (g_authTokenStorage.empty()) {
+                    g_authTokenStorage = timestar::generateToken(32);
+                    timestar::http_log.debug("Auth enabled — generated token: {}",
+                                             timestar::maskToken(g_authTokenStorage));
                 } else {
-                    timestar::http_log.info("Auth enabled — using configured token: {}",
-                                            timestar::maskToken(g_authToken));
+                    timestar::http_log.debug("Auth enabled — using configured token: {}",
+                                             timestar::maskToken(g_authTokenStorage));
                 }
+                // Publish pointer after string is fully constructed — ensures
+                // all shards see a complete string via invoke_on_all barrier.
+                g_authToken = &g_authTokenStorage;
             } else {
                 timestar::http_log.info("Auth disabled — all endpoints are unauthenticated");
             }
@@ -367,12 +407,14 @@ int main(int argc, char** argv) {
             try {
                 server->start().get();
 
-                // Limit request body size to 64MB to prevent memory exhaustion
-                // from oversized payloads. Seastar enforces this at the connection
-                // layer before buffering the full body.
-                static constexpr size_t MAX_CONTENT_LENGTH = 64 * 1024 * 1024;
+                // Limit request body size to prevent memory exhaustion from oversized payloads.
+                // Uses the larger of write/query body size limits from config.
+                // Seastar enforces this at the connection layer before buffering the full body.
+                auto maxContentLen =
+                    std::max(timestar::config().http.max_write_body_size, timestar::config().http.max_query_body_size);
                 server->server()
-                    .invoke_on_all([](httpd::http_server& s) { s.set_content_length_limit(MAX_CONTENT_LENGTH); })
+                    .invoke_on_all(
+                        [maxContentLen](httpd::http_server& s) { s.set_content_length_limit(maxContentLen); })
                     .get();
 
                 server->set_routes(set_routes).get();

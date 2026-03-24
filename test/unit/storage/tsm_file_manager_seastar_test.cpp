@@ -981,3 +981,25 @@ seastar::future<> testFMGetSeriesTypeBySeriesId128() {
 TEST_F(TSMFileManagerSeastarTest, GetSeriesTypeBySeriesId128) {
     testFMGetSeriesTypeBySeriesId128().get();
 }
+
+// ---------------------------------------------------------------------------
+// Test: addTSMFile throws on UINT64_MAX sequence number
+// ---------------------------------------------------------------------------
+seastar::future<> testFMAddTSMFileSeqOverflow(TSMFileManagerSeastarTest* self) {
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    // Create a valid TSM file
+    self->createTestTSMFile("0_1.tsm", "overflow.series", {1000}, {1.0});
+    std::string absPath = fs::canonical(fs::absolute(self->tsmDir + "/0_1.tsm")).string();
+    auto tsmFile = seastar::make_shared<TSM>(absPath);
+    co_await tsmFile->open();
+
+    // Override seqNum to UINT64_MAX to trigger overflow guard
+    tsmFile->seqNum = UINT64_MAX;
+    EXPECT_THROW(co_await mgr.addTSMFile(tsmFile), std::overflow_error);
+}
+
+TEST_F(TSMFileManagerSeastarTest, AddTSMFileSeqOverflow) {
+    testFMAddTSMFileSeqOverflow(this).get();
+}

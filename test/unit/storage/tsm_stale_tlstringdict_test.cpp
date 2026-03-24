@@ -5,13 +5,13 @@
 #include <string>
 
 // =============================================================================
-// Bug #8: Stale thread-local tlStringDict after co_await
+// Verify that the thread-local tlStringDict has been fully removed and replaced
+// with explicit dictionary parameter passing in readSingleBlock.
 //
-// In readSingleBlock, getFullIndexEntry sets tlStringDict, then a co_await
-// (dma_read_exactly) suspends the coroutine. Another coroutine on the same
-// thread could overwrite tlStringDict during suspension. The fix captures
-// the dictionary pointer into a local variable BEFORE the co_await, then
-// uses the local variable for the dictionary decode check.
+// The old code used a thread_local global `tlStringDict` which was fragile:
+// any coroutine calling decodeBlock without the right dictionary being set
+// could silently corrupt data. The fix passes the dictionary pointer
+// explicitly through the call chain.
 // =============================================================================
 
 class TlStringDictStaleTest : public ::testing::Test {
@@ -64,41 +64,36 @@ TEST_F(TlStringDictStaleTest, SourceFileLoaded) {
     ASSERT_FALSE(sourceCode.empty()) << "Could not load tsm.cpp source file";
 }
 
+TEST_F(TlStringDictStaleTest, TlStringDictRemovedFromSource) {
+    // The thread-local global tlStringDict should no longer exist in the source
+    // (comments mentioning its removal are fine, but there should be no definition)
+    auto pos = sourceCode.find("static thread_local const std::vector<std::string>* tlStringDict");
+    EXPECT_EQ(pos, std::string::npos)
+        << "tlStringDict thread-local global should be removed — dictionary is now passed explicitly";
+}
+
 TEST_F(TlStringDictStaleTest, LocalDictCapturedBeforeCoAwait) {
     std::string body = extractReadSingleBlock();
     ASSERT_FALSE(body.empty()) << "Could not find readSingleBlock function";
 
-    // Verify localDict is set before the dma_read co_await.
-    // The assignment may use the explicit stringDict parameter (preferred in
-    // the bulk-loading path) or fall back to the thread-local tlStringDict.
+    // Verify localDict is set from the explicit stringDict parameter before co_await.
     auto localDictPos = body.find("localDict = stringDict");
-    if (localDictPos == std::string::npos) {
-        localDictPos = body.find("localDict = tlStringDict");
-    }
     auto coAwaitPos = body.find("co_await tsmFile.dma_read_exactly");
     ASSERT_NE(localDictPos, std::string::npos)
-        << "readSingleBlock must set localDict (from stringDict param or tlStringDict) before co_await";
+        << "readSingleBlock must set localDict from stringDict param before co_await";
     ASSERT_NE(coAwaitPos, std::string::npos)
         << "readSingleBlock must contain a co_await dma_read_exactly call";
     EXPECT_LT(localDictPos, coAwaitPos)
         << "localDict must be set BEFORE the co_await suspension point";
 }
 
-TEST_F(TlStringDictStaleTest, TlStringDictNotReadAfterCoAwait) {
+TEST_F(TlStringDictStaleTest, TlStringDictNotUsedInReadSingleBlock) {
     std::string body = extractReadSingleBlock();
     ASSERT_FALSE(body.empty()) << "Could not find readSingleBlock function";
 
-    // Find the co_await position
-    auto coAwaitPos = body.find("co_await tsmFile.dma_read_exactly");
-    ASSERT_NE(coAwaitPos, std::string::npos);
-
-    // Everything after the co_await should NOT reference tlStringDict in code
-    // (comments mentioning tlStringDict are fine — we strip them)
-    std::string afterCoAwait = body.substr(coAwaitPos);
-
     // Strip single-line comments (// ...) before checking for tlStringDict usage
     std::string codeOnly;
-    std::istringstream stream(afterCoAwait);
+    std::istringstream stream(body);
     std::string line;
     while (std::getline(stream, line)) {
         auto commentPos = line.find("//");
@@ -110,7 +105,7 @@ TEST_F(TlStringDictStaleTest, TlStringDictNotReadAfterCoAwait) {
 
     auto tlUsage = codeOnly.find("tlStringDict");
     EXPECT_EQ(tlUsage, std::string::npos)
-        << "tlStringDict must not be read in code after co_await — use localDict instead";
+        << "tlStringDict must not appear in readSingleBlock — use stringDict/localDict instead";
 }
 
 TEST_F(TlStringDictStaleTest, LocalDictUsedForDictionaryCheck) {

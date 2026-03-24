@@ -9,7 +9,14 @@
 
 #include <optional>
 #include <seastar/core/coroutine.hh>
+#include <stdexcept>
 #include <string>
+
+// Thrown when a query references a series that does not exist in the database.
+class SeriesNotFoundException : public std::runtime_error {
+public:
+    explicit SeriesNotFoundException(const std::string& series) : std::runtime_error("Series not found: " + series) {}
+};
 
 class QueryRunner {
 private:
@@ -24,10 +31,10 @@ public:
     QueryRunner(TSMFileManager* _fileManager, WALFileManager* _walFileManager)
         : fileManager(_fileManager), walFileManager(_walFileManager) {}
 
-    seastar::future<VariantQueryResult> runQuery(std::string series, SeriesId128 seriesId, uint64_t startTime,
+    seastar::future<VariantQueryResult> runQuery(const std::string& series, SeriesId128 seriesId, uint64_t startTime,
                                                  uint64_t endTime);
     // Convenience overload: computes SeriesId128 internally
-    seastar::future<VariantQueryResult> runQuery(std::string series, uint64_t startTime, uint64_t endTime);
+    seastar::future<VariantQueryResult> runQuery(const std::string& series, uint64_t startTime, uint64_t endTime);
 
     // Pushdown aggregation: fold TSM float data directly into AggregationState,
     // bypassing the full QueryResult materialisation pipeline.

@@ -65,6 +65,9 @@ seastar::future<> TSMFileManager::init() {
 }
 
 seastar::future<> TSMFileManager::stop() {
+    // Stop compaction before closing files to prevent reads from closed handles
+    co_await stopCompactionLoop();
+
     // Close all open TSM file handles to prevent resource leaks.
     // Seastar asserts on leaked file handles in debug builds.
     for (auto& [seqNum, tsmFile] : sequencedTsmFiles) {
@@ -123,6 +126,8 @@ seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore>
     // Write to a .tmp file first, then rename atomically on success.
     // If TSMWriter::runAsync() throws, the orphaned .tmp file will be
     // cleaned up on the next startup by init() (which removes all .tmp files).
+    // Note: TSMWriter::runAsync() calls closeDMA(), which flushes the file
+    // (co_await file.flush()) before closing. No additional flush needed here.
     auto tmpFilename = filename + ".tmp";
     co_await TSMWriter::runAsync(memStore, tmpFilename);
     co_await seastar::rename_file(tmpFilename, filename);
@@ -203,6 +208,9 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
     }
 
     if (file->seqNum >= nextSequenceId) {
+        if (file->seqNum == UINT64_MAX) [[unlikely]] {
+            throw std::overflow_error("TSM sequence number exhausted");
+        }
         nextSequenceId = file->seqNum + 1;
     }
 

@@ -129,7 +129,7 @@ TEST_F(HttpErrorResponseTest, EmptyErrorMessage) {
 }
 
 TEST_F(HttpErrorResponseTest, VeryLongErrorMessage) {
-    // 10 KB error message
+    // 10 KB error message — formatError caps at 4096 chars for safety
     std::string msg(10240, 'x');
     std::string json = ResponseFormatter::formatError(msg);
 
@@ -137,8 +137,15 @@ TEST_F(HttpErrorResponseTest, VeryLongErrorMessage) {
     auto err = glz::read_json(parsed, json);
     ASSERT_FALSE(bool(err)) << "formatError() with 10KB message must produce valid JSON";
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_EQ(parsed.message, msg);
-    EXPECT_EQ(parsed.error, msg);
+    EXPECT_EQ(parsed.message.size(), 4096u);
+    EXPECT_EQ(parsed.error.size(), 4096u);
+
+    // Under-4KB messages pass through unchanged
+    std::string shortMsg(100, 'y');
+    json = ResponseFormatter::formatError(shortMsg);
+    err = glz::read_json(parsed, json);
+    ASSERT_FALSE(bool(err));
+    EXPECT_EQ(parsed.message, shortMsg);
 }
 
 TEST_F(HttpErrorResponseTest, QueryHandlerErrorResponse) {

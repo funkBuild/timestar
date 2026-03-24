@@ -5,6 +5,7 @@
 #include "simd_aggregator.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -178,6 +179,7 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
     outCounts.assign(N, K);  // Each output point aggregates K input points
 
     for (size_t s = 1; s < K; ++s) {
+        assert(partials[s]->sortedValues.size() == N);
         const double* src = partials[s]->sortedValues.data();
         double* dst = outVals.data();
 
@@ -187,9 +189,12 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
         switch (method) {
             case AggregationMethod::AVG:
             case AggregationMethod::SUM:
-            case AggregationMethod::COUNT:
                 for (size_t i = 0; i < N; ++i)
                     dst[i] += src[i];
+                break;
+            case AggregationMethod::COUNT:
+                // COUNT only needs to track the number of contributing partials
+                // per point (handled via outCounts), not accumulate values.
                 break;
             case AggregationMethod::MIN:
                 for (size_t i = 0; i < N; ++i)
@@ -209,9 +214,9 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR:
             case AggregationMethod::MEDIAN:
-                break;
+                throw std::logic_error("foldAlignedRawValues called for unsupported method");
             default:
-                break;
+                throw std::logic_error("foldAlignedRawValues called for unknown method");
         }
     }
 }
@@ -303,8 +308,7 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
 // N-way heap merge for AggregationState partials.
 // O(K*N * log K) time, single pass.
 static void nWayMergeStates(std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
-                            std::vector<AggregationState>& outStates,
-                            AggregationMethod method = AggregationMethod::AVG) {
+                            std::vector<AggregationState>& outStates, AggregationMethod method) {
     const size_t K = partials.size();
 
     size_t totalSize = 0;
@@ -449,7 +453,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                         AggregationState s;
                         s.collectRaw = needsRaw;
                         s.addValue(doubleValues[i], timestamps[i]);
-                        partial.sortedStates.push_back(s);
+                        partial.sortedStates.push_back(std::move(s));
                     }
                 } else {
                     // Multiple series in same group: O(n+m) sorted merge

@@ -37,6 +37,9 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     // Reserve capacity upfront to guarantee a single allocation for both vectors.
     // Without this, the geometric growth strategy of std::vector may trigger
     // multiple reallocations when appending large batches to near-capacity vectors.
+    if (newSize > SIZE_MAX - oldSize) {
+        throw std::runtime_error("InMemorySeries: size overflow");
+    }
     const size_t totalSize = oldSize + newSize;
     timestamps.reserve(totalSize);
     values.reserve(totalSize);
@@ -162,6 +165,8 @@ void InMemorySeries<T>::mergePaired(size_t midpoint) {
 }
 
 seastar::future<> MemoryStore::close() {
+    if (closed)
+        co_return;
     closed = true;
 
     if (wal) {
@@ -173,14 +178,14 @@ seastar::future<> MemoryStore::close() {
 seastar::future<> MemoryStore::initWAL() {
     wal = std::make_unique<WAL>(sequenceNumber);
     co_await wal->init(this, false);  // false = not recovery, create fresh WAL
-};
+}
 
 seastar::future<> MemoryStore::removeWAL() {
     if (wal) {
         co_await wal->remove();
         wal.reset();
     }
-};
+}
 
 seastar::future<> MemoryStore::initFromWAL(std::string filename) {
     WALReader reader(filename);
@@ -189,9 +194,9 @@ seastar::future<> MemoryStore::initFromWAL(std::string filename) {
     // from an existing WAL that will be converted to TSM and removed
 }
 
-seastar::future<bool> MemoryStore::isFull() {
+bool MemoryStore::isFull() const {
     if (!wal) {
-        co_return false;
+        return false;
     }
 
     // Use the larger of actual WAL size and cumulative estimated size.
@@ -199,7 +204,7 @@ seastar::future<bool> MemoryStore::isFull() {
     // so relying only on actual size may never trigger rollover.
     size_t walSize = wal->getCurrentSize();
     size_t effectiveSize = std::max(walSize, estimatedAccumulatedSize);
-    co_return effectiveSize >= walSizeThreshold();
+    return effectiveSize >= walSizeThreshold();
 }
 
 template <class T>
@@ -360,7 +365,8 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
     auto start_memory_insert = std::chrono::high_resolution_clock::now();
 #endif
     for (auto& insertRequest : insertRequests) {
-        std::string key = insertRequest.seriesKey();  // capture before move
+        // Capture key before the move — insertRequest is moved-from after insertMemory()
+        auto key = insertRequest.seriesKey();
         try {
             insertMemory(std::move(insertRequest));
         } catch (const std::exception& e) {
@@ -393,7 +399,7 @@ std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128& series
     if (it == series.end())
         return {};
 
-    return (TSMValueType)it->second.index();
+    return static_cast<TSMValueType>(it->second.index());
 }
 
 template void InMemorySeries<double>::insert(TimeStarInsert<double>&& insertRequest);

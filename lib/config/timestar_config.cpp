@@ -3,26 +3,31 @@
 #include <glaze/toml.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace timestar {
 
 // Global config pointer — set once in main() before app.run(), read from any shard.
-static const TimestarConfig* g_config = nullptr;
+// Use atomic with release/acquire to guarantee visibility across threads (ARM requires this).
+static std::atomic<const TimestarConfig*> g_config{nullptr};
 static TimestarConfig g_defaultConfig;
 
 void setGlobalConfig(const TimestarConfig& cfg) {
     static TimestarConfig stored;
     stored = cfg;
-    g_config = &stored;
+    g_config.store(&stored, std::memory_order_release);
 }
 
 const TimestarConfig& config() {
-    return g_config ? *g_config : g_defaultConfig;
+    auto* ptr = g_config.load(std::memory_order_acquire);
+    return ptr ? *ptr : g_defaultConfig;
 }
 
 std::vector<std::string> TimestarConfig::validate() const {
@@ -38,6 +43,12 @@ std::vector<std::string> TimestarConfig::validate() const {
     if (storage.max_points_per_block == 0) {
         errors.emplace_back("storage.max_points_per_block must be > 0");
     }
+    if (storage.tsm_cache_entries == 0) {
+        errors.emplace_back("storage.tsm_cache_entries must be > 0");
+    }
+    if (storage.wal_max_concurrent_encoders == 0) {
+        errors.emplace_back("storage.wal_max_concurrent_encoders must be > 0");
+    }
     if (std::isnan(storage.tsm_bloom_fpr) || std::isinf(storage.tsm_bloom_fpr) || storage.tsm_bloom_fpr <= 0.0 ||
         storage.tsm_bloom_fpr >= 1.0) {
         errors.emplace_back("storage.tsm_bloom_fpr must be in (0, 1)");
@@ -50,6 +61,12 @@ std::vector<std::string> TimestarConfig::validate() const {
         errors.emplace_back("storage.compaction.batch_size must be > 0");
     }
 
+    if (http.max_series_count == 0) {
+        errors.emplace_back("http.max_series_count must be > 0");
+    }
+    if (http.max_total_points == 0) {
+        errors.emplace_back("http.max_total_points must be > 0");
+    }
     if (http.max_write_body_size == 0) {
         errors.emplace_back("http.max_write_body_size must be > 0");
     }
@@ -60,8 +77,17 @@ std::vector<std::string> TimestarConfig::validate() const {
         errors.emplace_back("http.query_timeout_seconds must be > 0");
     }
 
-    if (index.bloom_filter_bits == 0) {
-        errors.emplace_back("index.bloom_filter_bits must be > 0");
+    if (index.bloom_filter_bits == 0 || index.bloom_filter_bits > 30) {
+        errors.emplace_back("index.bloom_filter_bits must be in [1, 30]");
+    }
+    if (index.max_open_files == 0) {
+        errors.emplace_back("index.max_open_files must be > 0");
+    }
+    if (index.max_file_size == 0) {
+        errors.emplace_back("index.max_file_size must be > 0");
+    }
+    if (index.series_cache_size == 0) {
+        errors.emplace_back("index.series_cache_size must be > 0");
     }
     if (index.block_size == 0) {
         errors.emplace_back("index.block_size must be > 0");
@@ -122,6 +148,16 @@ std::vector<std::string> TimestarConfig::validate() const {
 
 // Parse the [seastar] section from raw TOML text.
 // Glaze TOML doesn't support std::optional, so we parse this section manually.
+//
+// Limitations of this hand-rolled TOML parser:
+//   - Only handles flat key=value pairs (no nested tables, arrays, or inline tables)
+//   - No multi-line strings or literal strings (single-quoted)
+//   - Inline '#' comments inside unquoted values containing '#' will be mis-stripped
+//   - No type coercion — all values are stored as strings
+//   - No escape sequence processing inside quoted strings
+// This is acceptable because the [seastar] section only needs simple string key-value
+// pairs passed through to Seastar's command-line option parser. If richer TOML support
+// is needed, replace this with a proper TOML library (e.g., toml++).
 static SeastarConfig parseSeastarSection(const std::string& tomlContent) {
     SeastarConfig cfg;
 
@@ -161,7 +197,7 @@ static SeastarConfig parseSeastarSection(const std::string& tomlContent) {
         auto trimWs = [](std::string& s) {
             auto b = s.find_first_not_of(" \t");
             auto e = s.find_last_not_of(" \t\r\n");
-            if (b == std::string::npos) {
+            if (b == std::string::npos || e == std::string::npos || e < b) {
                 s.clear();
                 return;
             }
@@ -170,7 +206,9 @@ static SeastarConfig parseSeastarSection(const std::string& tomlContent) {
         trimWs(key);
         trimWs(value);
 
-        // Strip inline comments BEFORE removing quotes (comments can't appear inside quotes)
+        // Strip inline comments BEFORE removing quotes (comments can't appear inside quotes).
+        // Limitation: if an unquoted value contains a literal '#' (e.g. color = #FF0000),
+        // it will be incorrectly truncated. Wrap such values in double quotes to avoid this.
         auto commentPos = value.find('#');
         if (commentPos != std::string::npos) {
             // Only strip if the # is not inside quotes
@@ -274,6 +312,9 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     auto envU16 = [&](const char* name, uint16_t& field) {
         if (auto v = envStr(name)) {
             try {
+                std::string_view sv(v);
+                if (!sv.empty() && sv[0] == '-')
+                    throw std::out_of_range("negative value not allowed for unsigned field");
                 auto val = std::stoul(v);
                 if (val > std::numeric_limits<uint16_t>::max())
                     throw std::out_of_range("exceeds uint16 range");
@@ -286,6 +327,9 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     auto envU32 = [&](const char* name, uint32_t& field) {
         if (auto v = envStr(name)) {
             try {
+                std::string_view sv(v);
+                if (!sv.empty() && sv[0] == '-')
+                    throw std::out_of_range("negative value not allowed for unsigned field");
                 auto val = std::stoul(v);
                 if (val > std::numeric_limits<uint32_t>::max())
                     throw std::out_of_range("exceeds uint32 range");
@@ -298,6 +342,9 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     auto envU64 = [&](const char* name, uint64_t& field) {
         if (auto v = envStr(name)) {
             try {
+                std::string_view sv(v);
+                if (!sv.empty() && sv[0] == '-')
+                    throw std::out_of_range("negative value not allowed for unsigned field");
                 field = std::stoull(v);
             } catch (const std::exception&) {
                 throw std::runtime_error(std::string("Invalid value for ") + name + ": \"" + v + "\"");

@@ -10,13 +10,13 @@
 
 #include <tsl/robin_map.h>
 
-#include <fstream>
 #include <limits>
 #include <list>
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
+#include <seastar/core/semaphore.hh>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -195,7 +195,7 @@ public:
                                         TSMResult<T>& results);
     template <class T>
     seastar::future<> readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
-                                     TSMResult<T>& results);
+                                     TSMResult<T>& results, const std::vector<std::string>* stringDict = nullptr);
     std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
 
     // Check if a series in this file could overlap a time range using sparse
@@ -244,18 +244,15 @@ public:
     std::vector<BlockBatch> groupContiguousBlocks(const std::vector<TSMIndexBlock>& blocks) const;
     template <class T>
     std::unique_ptr<TSMBlock<T>> decodeBlock(Slice& blockSlice, uint32_t blockSize, uint64_t startTime,
-                                             uint64_t endTime);
+                                             uint64_t endTime, const std::vector<std::string>* stringDict = nullptr);
 
     // Phase 1.1: New methods for streaming block access
     // Get index blocks for a series without reading data (for lazy loading)
-    std::vector<TSMIndexBlock> getSeriesBlocks(const SeriesId128& seriesId) const;
+    const std::vector<TSMIndexBlock>& getSeriesBlocks(const SeriesId128& seriesId) const;
 
-    // Read a single block and return it (for on-demand loading)
-    // If stringDict is provided (non-null), it will be used for dictionary-encoded
-    // string block decoding instead of the thread-local tlStringDict. This avoids
-    // a race condition when multiple concurrent loadFromFile coroutines set
-    // tlStringDict from different files' getFullIndexEntry() calls — reactor
-    // preemption can cause the wrong dictionary to be visible.
+    // Read a single block and return it (for on-demand loading).
+    // For dictionary-encoded string blocks, pass the string dictionary via stringDict.
+    // The dictionary is obtained from the TSMIndexEntry returned by getFullIndexEntry().
     template <class T>
     seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
                                                                   uint64_t endTime,
@@ -316,8 +313,10 @@ public:
     // Pushdown aggregation: decode blocks and fold directly into BlockAggregator
     // instead of materialising TSMResult. Returns the number of points aggregated.
     // Works for Float, Integer, and Boolean series; returns 0 for String.
+    // Optional ioSem: when non-null, each DMA read acquires a unit to bound
+    // concurrent disk I/O across all series on this shard.
     seastar::future<size_t> aggregateSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-                                            timestar::BlockAggregator& aggregator);
+                                            timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem = nullptr);
 
     // Selective block reading for LATEST/FIRST without bucketing (interval=0).
     // Reads blocks in forward (reverse=false) or reverse (reverse=true) order,

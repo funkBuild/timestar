@@ -18,7 +18,7 @@ protected:
 
     void SetUp() override {
         std::ifstream file(WAL_FILE_MANAGER_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open()) << "Could not open wal_file_manager.hpp at: " << WAL_FILE_MANAGER_SOURCE_PATH;
+        ASSERT_TRUE(file.is_open()) << "Could not open wal_file_manager source at: " << WAL_FILE_MANAGER_SOURCE_PATH;
         sourceCode.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
         ASSERT_FALSE(sourceCode.empty());
     }
@@ -26,7 +26,7 @@ protected:
     // Extract the close() method body from the source code
     std::string getCloseMethodBody() {
         // Find the close() method signature
-        auto pos = sourceCode.find("future<> close()");
+        auto pos = sourceCode.find("WALFileManager::close()");
         EXPECT_NE(pos, std::string::npos) << "Could not find close() method";
         if (pos == std::string::npos)
             return "";

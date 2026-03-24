@@ -117,7 +117,7 @@ public:
     std::string createErrorResponse(const std::string& error);
     std::string createSuccessResponse(uint64_t deletedCount, uint64_t totalRequests);
 
-    HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {}
+    explicit HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {}
 
     seastar::future<std::unique_ptr<seastar::http::reply>> handleDelete(std::unique_ptr<seastar::http::request> req);
 

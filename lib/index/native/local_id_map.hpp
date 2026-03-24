@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -23,7 +24,9 @@ public:
         if (it != globalToLocal_.end()) {
             return it->second;
         }
-        assert(nextId_ < UINT32_MAX && "LocalIdMap: uint32_t overflow");
+        if (nextId_ >= UINT32_MAX) [[unlikely]] {
+            throw std::overflow_error("LocalIdMap: uint32_t ID space exhausted on this shard");
+        }
         uint32_t localId = nextId_++;
         globalToLocal_.emplace(globalId, localId);
         localToGlobal_.push_back(globalId);
@@ -43,10 +46,10 @@ public:
     // After restore, some slots may contain zero SeriesId128 if local IDs were lost
     // (e.g., partial WAL truncation). Callers should check isValid() or handle zero IDs.
     const SeriesId128& getGlobalId(uint32_t localId) const {
-        assert(localId < localToGlobal_.size());
-        // Defense: a zero SeriesId128 indicates a hole from incomplete restore
-        // (e.g., partial WAL truncation). Callers must handle this gracefully.
-        assert(!localToGlobal_[localId].isZero() && "getGlobalId: zero ID hole detected — local ID was never restored");
+        if (localId >= localToGlobal_.size()) [[unlikely]] {
+            static const SeriesId128 zero{};
+            return zero;
+        }
         return localToGlobal_[localId];
     }
 
@@ -82,7 +85,7 @@ public:
 
     // Restore from persisted state (used during open() recovery).
     void restore(uint32_t nextId, std::vector<std::pair<uint32_t, SeriesId128>> mappings) {
-        restoreBegin(nextId, static_cast<uint32_t>(mappings.size()));
+        restoreBegin(nextId, static_cast<uint32_t>(std::min(mappings.size(), static_cast<size_t>(UINT32_MAX))));
         for (auto& [localId, globalId] : mappings) {
             restoreEntry(localId, globalId);
         }

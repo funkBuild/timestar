@@ -2,6 +2,8 @@
 
 #include "key_encoding_simd.hpp"
 
+#include <endian.h>
+
 #include <charconv>
 #include <cstring>
 #include <stdexcept>
@@ -83,7 +85,17 @@ std::string encodeSeriesKey(const std::string& measurement, const std::map<std::
     return key;
 }
 
+// Shared validation for functions that use \0 as separator
+static void validateNoNullBytes(std::initializer_list<std::string_view> components) {
+    for (auto sv : components) {
+        if (sv.find('\0') != std::string_view::npos) {
+            throw std::invalid_argument("Key component must not contain null bytes");
+        }
+    }
+}
+
 std::string encodeMeasurementFieldsKey(const std::string& measurement) {
+    validateNoNullBytes({measurement});
     std::string key;
     key.reserve(1 + measurement.size());
     key.push_back(static_cast<char>(MEASUREMENT_FIELDS));
@@ -92,6 +104,7 @@ std::string encodeMeasurementFieldsKey(const std::string& measurement) {
 }
 
 std::string encodeMeasurementTagsKey(const std::string& measurement) {
+    validateNoNullBytes({measurement});
     std::string key;
     key.reserve(1 + measurement.size());
     key.push_back(static_cast<char>(MEASUREMENT_TAGS));
@@ -172,6 +185,7 @@ std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, cons
 }
 
 std::string encodeRetentionPolicyKey(const std::string& measurement) {
+    validateNoNullBytes({measurement});
     std::string key;
     key.reserve(1 + measurement.size());
     key.push_back(static_cast<char>(RETENTION_POLICY));
@@ -256,6 +270,9 @@ SeriesMetadata decodeSeriesMetadata(const char* rawData, size_t rawLen) {
     };
 
     metadata.measurement = std::string(nextField());
+    if (metadata.measurement.empty() && rawLen > 0) {
+        throw std::runtime_error("Truncated series metadata: empty measurement");
+    }
     metadata.field = std::string(nextField());
 
     std::string_view sizeStr = nextField();
@@ -282,10 +299,14 @@ SeriesMetadata decodeSeriesMetadata(const char* rawData, size_t rawLen) {
     return metadata;
 }
 
+// NOTE: Uses native (little-endian) byte order. Not portable across architectures
+// but consistent with the static_assert in key_encoding.hpp.
 std::string encodeStringSet(const std::set<std::string>& strings) {
     std::string result;
     result.reserve(strings.size() * (sizeof(uint32_t) + 32));
     for (const auto& str : strings) {
+        if (str.length() > UINT32_MAX) [[unlikely]]
+            throw std::overflow_error("encodeStringSet: string length exceeds uint32_t");
         uint32_t len = static_cast<uint32_t>(str.length());
         result.append(reinterpret_cast<const char*>(&len), sizeof(len));
         result.append(str.data(), len);
@@ -345,15 +366,6 @@ std::string encodeLocalIdCounterKey() {
     return std::string(1, static_cast<char>(LOCAL_ID_COUNTER));
 }
 
-// Shared validation for functions that use \0 as separator
-static void validateNoNullBytes(std::initializer_list<std::string_view> components) {
-    for (auto sv : components) {
-        if (sv.find('\0') != std::string_view::npos) {
-            throw std::invalid_argument("Key component must not contain null bytes");
-        }
-    }
-}
-
 std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue) {
     validateNoNullBytes({measurement, tagKey, tagValue});
@@ -384,17 +396,6 @@ std::string encodePostingsBitmapPrefix(const std::string& measurement, const std
 // Phase 3: Time-scoped day bitmap key encoding
 // ============================================================================
 
-std::string encodeDayBitmapKey(const std::string& measurement, uint32_t day) {
-    validateNoNullBytes({measurement});
-    std::string key;
-    key.reserve(1 + measurement.size() + 1 + 4);
-    key.push_back(static_cast<char>(TIME_SERIES_DAY));
-    key += measurement;
-    key.push_back('\0');
-    key.append(reinterpret_cast<const char*>(&day), 4);  // Little-endian on x86
-    return key;
-}
-
 std::string encodeDayBitmapPrefix(const std::string& measurement) {
     validateNoNullBytes({measurement});
     std::string prefix;
@@ -406,12 +407,13 @@ std::string encodeDayBitmapPrefix(const std::string& measurement) {
 }
 
 uint32_t decodeDayFromDayBitmapKey(std::string_view key) {
-    if (key.size() < 4) {
-        throw std::runtime_error("Invalid day bitmap key: too short");
+    // Minimum valid key: prefix(1) + measurement(>=1) + null(1) + day(4) = 7
+    if (key.size() < 7) {
+        throw std::runtime_error("Invalid day bitmap key: too short (" + std::to_string(key.size()) + " bytes)");
     }
-    uint32_t day;
-    std::memcpy(&day, key.data() + key.size() - 4, 4);
-    return day;
+    uint32_t dayBE;
+    std::memcpy(&dayBE, key.data() + key.size() - 4, 4);
+    return be32toh(dayBE);
 }
 
 // ============================================================================

@@ -93,6 +93,13 @@ HWY_AFTER_NAMESPACE();
 // =============================================================================
 #if HWY_ONCE
 
+// Block header field width guards: block_count is 11 bits (max 2047),
+// exception_count is 10 bits (max 1023 = BLOCK_SIZE/4 max).
+// If BLOCK_SIZE is ever increased, these static_asserts will fire.
+static_assert(IntegerEncoderFFOR::BLOCK_SIZE <= 2047, "BLOCK_SIZE exceeds block_count header field capacity (11 bits)");
+static_assert(IntegerEncoderFFOR::BLOCK_SIZE / 4 <= 1023,
+              "max exception_count exceeds header field capacity (10 bits)");
+
 namespace ffor_enc {
 HWY_EXPORT(ZigZagEncodeAndMinMax);
 
@@ -469,6 +476,11 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
 
             if (zz_idx < block_count && val_idx < sz) {
                 // Second value: zigzag(delta)
+                // Precondition: all input values must fit in int64_t (< 2^63).
+                // This holds for nanosecond timestamps (until year ~2262) and ZigZag-encoded
+                // int64_t values (range 0..2^63-1 for non-negative originals).
+                // Two's complement subtraction is correct even for values near INT64_MAX,
+                // as long as the delta between consecutive values fits in int64_t.
                 int64_t delta = static_cast<int64_t>(values[1]) - static_cast<int64_t>(values[0]);
                 zz = ZigZag::zigzagEncode(delta);
                 zigzag[1] = zz;
@@ -492,6 +504,9 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
             size_t vi = val_idx;
             size_t zi = zz_idx;
             while (zi < block_count && vi < sz && vi >= 2) {
+                // uint64_t -> int64_t casts and signed arithmetic: valid for nanosecond
+                // timestamps until year ~2262; signed overflow UB is avoided because
+                // consecutive timestamp deltas are small relative to int64_t range.
                 deltas[dd_count] = (static_cast<int64_t>(values[vi]) - static_cast<int64_t>(values[vi - 1])) -
                                    (static_cast<int64_t>(values[vi - 1]) - static_cast<int64_t>(values[vi - 2]));
                 ++dd_count;
@@ -510,13 +525,9 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
             zz_idx += dd_count;
         }
 
-        // Handle edge case: val_idx < 2 with remaining values in block
-        // (only possible for tiny blocks where block_count <= 2, already handled above)
+        // Scalar tail: any remaining delta-of-delta values not covered by the SIMD dispatch.
+        // val_idx is always >= 2 here (first two values handled above).
         for (; zz_idx < block_count && val_idx < sz; ++zz_idx, ++val_idx) {
-            if (val_idx < 2) {
-                --zz_idx;
-                continue;
-            }
             int64_t D = (static_cast<int64_t>(values[val_idx]) - static_cast<int64_t>(values[val_idx - 1])) -
                         (static_cast<int64_t>(values[val_idx - 1]) - static_cast<int64_t>(values[val_idx - 2]));
             uint64_t zz = ZigZag::zigzagEncode(D);

@@ -119,6 +119,7 @@ private:
         std::vector<uint64_t> timestamps;
         uint64_t timestampHashSum = 0;  // commutative sum of all timestamps
         uint64_t timestampHashXor = 0;  // commutative XOR of all timestamps
+        uint64_t timestampHashMul = 1;  // multiplicative hash of all timestamps
 
         // Value storage by type (only one will be used based on valueType)
         std::vector<double> doubleValues;
@@ -131,6 +132,7 @@ private:
             timestamps.push_back(timestamp);
             timestampHashSum += timestamp;
             timestampHashXor ^= timestamp;
+            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
             doubleValues.push_back(value);
         }
 
@@ -138,6 +140,7 @@ private:
             timestamps.push_back(timestamp);
             timestampHashSum += timestamp;
             timestampHashXor ^= timestamp;
+            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
             boolValues.push_back(value);
         }
 
@@ -145,6 +148,7 @@ private:
             timestamps.push_back(timestamp);
             timestampHashSum += timestamp;
             timestampHashXor ^= timestamp;
+            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
             stringValues.push_back(value);
         }
 
@@ -152,6 +156,7 @@ private:
             timestamps.push_back(timestamp);
             timestampHashSum += timestamp;
             timestampHashXor ^= timestamp;
+            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
             stringValues.push_back(std::move(value));
         }
 
@@ -159,6 +164,7 @@ private:
             timestamps.push_back(timestamp);
             timestampHashSum += timestamp;
             timestampHashXor ^= timestamp;
+            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
             integerValues.push_back(value);
         }
     };
@@ -215,7 +221,8 @@ private:
     // Coalesce multiple individual writes into efficient array writes.
     // defaultTimestampNs is the pre-computed current time used for any write
     // that lacks an explicit timestamp, avoiding per-write now() calls.
-    std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs);
+    std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs,
+                                                size_t& entriesSkippedOut);
 
     // Create error response JSON
     std::string createErrorResponse(const std::string& error);

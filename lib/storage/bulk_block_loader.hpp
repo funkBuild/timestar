@@ -113,8 +113,7 @@ public:
         std::vector<seastar::future<std::unique_ptr<TSMBlock<T>>>> blockFutures;
         blockFutures.reserve(relevantBlocks.size());
 
-        // Start all reads in parallel, passing the string dictionary explicitly
-        // to avoid the thread-local tlStringDict race.
+        // Start all reads in parallel, passing the string dictionary explicitly.
         for (const auto& indexBlock : relevantBlocks) {
             blockFutures.push_back(file->readSingleBlock<T>(indexBlock, startTime, endTime, stringDict));
         }
@@ -208,9 +207,13 @@ struct BulkMergeContext {
         return block->timestamps[currentPointIdx];
     }
 
-    // Get current value (no async!)
+    // Get current value (no async!). Caller must check hasMore() first.
+    // Returns by value because vector<bool> returns a proxy, not a reference.
+    // Callers copy into T anyway, so this is zero-overhead for non-string types.
     T currentValue() const {
+        assert(!exhausted && source && currentBlockIdx < source->blocks.size());
         const auto& block = source->blocks[currentBlockIdx];
+        assert(currentPointIdx < block->values.size());
         return block->values[currentPointIdx];
     }
 

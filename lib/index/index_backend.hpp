@@ -126,10 +126,9 @@ public:
 
     // Query support - get metadata for measurements
     virtual seastar::future<std::set<std::string>> getAllMeasurements() = 0;
-    virtual seastar::future<std::set<std::string>> getFields(const std::string& measurement) = 0;
-    virtual seastar::future<std::set<std::string>> getTags(const std::string& measurement) = 0;
-    virtual seastar::future<std::set<std::string>> getTagValues(const std::string& measurement,
-                                                                const std::string& tagKey) = 0;
+    virtual seastar::future<std::set<std::string>> getFields(std::string measurement) = 0;
+    virtual seastar::future<std::set<std::string>> getTags(std::string measurement) = 0;
+    virtual seastar::future<std::set<std::string>> getTagValues(std::string measurement, std::string tagKey) = 0;
 
     // Batch metadata indexing
     virtual seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops) = 0;

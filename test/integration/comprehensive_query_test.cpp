@@ -385,12 +385,15 @@ TEST_F(AsyncQueryTest, QueryWithGroupBy) {
         ASSERT_NE(deviceA, nullptr);
         ASSERT_NE(deviceB, nullptr);
 
-        // Check values
-        auto expectedA = createTestFieldData(100, 1.0);
-        auto expectedB = createTestFieldData(100, 4.0);
-
-        EXPECT_TRUE(vectorsClose(getDoubleValues(deviceA->fields["value1"].second), expectedA));
-        EXPECT_TRUE(vectorsClose(getDoubleValues(deviceB->fields["value1"].second), expectedB));
+        // Non-bucketed AVG with GROUP BY produces 1 aggregated point per group
+        // (the global average over the queried time range).
+        auto valuesA = getDoubleValues(deviceA->fields["value1"].second);
+        auto valuesB = getDoubleValues(deviceB->fields["value1"].second);
+        ASSERT_EQ(valuesA.size(), 1);
+        ASSERT_EQ(valuesB.size(), 1);
+        // AVG of createTestFieldData(100, m) = 0.1*m*(0+1+...+99)/100 = 4.95*m
+        EXPECT_NEAR(valuesA[0], 4.95 * 1.0, 0.01);
+        EXPECT_NEAR(valuesB[0], 4.95 * 4.0, 0.01);
 
         queryHandler.reset();
         engineSharded = nullptr;
@@ -418,11 +421,10 @@ TEST_F(AsyncQueryTest, BooleanDataQuery) {
         ASSERT_TRUE(series.fields.find("value") != series.fields.end());
         auto values = getDoubleValues(series.fields["value"].second);
 
-        // Latest aggregation with boolean should preserve the values
-        ASSERT_EQ(values.size(), 2);
-        // Note: booleans are stored as 1.0 and 0.0 in double format
-        EXPECT_EQ(values[0], 1.0);  // true
-        EXPECT_EQ(values[1], 0.0);  // false
+        // LATEST without interval returns the single most recent value
+        ASSERT_EQ(values.size(), 1);
+        // The latest boolean value (false at baseTime - 1s) is 0.0 in double format
+        EXPECT_EQ(values[0], 0.0);  // false (most recent)
 
         queryHandler.reset();
         engineSharded = nullptr;

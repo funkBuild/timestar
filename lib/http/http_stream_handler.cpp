@@ -1,11 +1,13 @@
 #include "http_stream_handler.hpp"
 
 #include "../utils/json_escape.hpp"
+#include "content_negotiation.hpp"
 #include "engine.hpp"
 #include "expression_evaluator.hpp"
 #include "expression_parser.hpp"
 #include "http_auth.hpp"
 #include "logger.hpp"
+#include "proto_converters.hpp"
 #include "streaming_aggregator.hpp"
 #include "streaming_derived_evaluator.hpp"
 #include "timestar_config.hpp"
@@ -461,24 +463,55 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
 
+    auto resFmt = timestar::http::responseFormat(*req);
+
     // Body size limit to prevent DoS via large payloads
     if (req->content.size() > timestar::config().http.max_query_body_size) {
         rep->set_status(seastar::http::reply::status_type::payload_too_large);
         rep->_content = R"({"status":"error","error":"Request body too large"})";
-        rep->add_header("Content-Type", "application/json");
+        timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
 
-    // Parse JSON body
+    auto reqFmt = timestar::http::requestFormat(*req);
+
+    // Parse request body (JSON or protobuf)
     GlazeSubscribeRequest glazeReq;
-    auto parseErr = glz::read_json(glazeReq, req->content);
-    if (parseErr) {
-        rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->_content =
-            "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_JSON\",\"message\":\"Failed to parse subscribe "
-            "request\"}}";
-        rep->add_header("Content-Type", "application/json");
-        co_return rep;
+
+    if (timestar::http::isProtobuf(reqFmt)) {
+        try {
+            auto parsed = timestar::proto::parseSubscribeRequest(req->content.data(), req->content.size());
+            glazeReq.query = std::move(parsed.query);
+            glazeReq.formula = std::move(parsed.formula);
+            glazeReq.backfill = parsed.backfill;
+            if (parsed.startTime > 0) {
+                glazeReq.startTime = parsed.startTime;
+            }
+            if (!parsed.aggregationInterval.empty()) {
+                glazeReq.aggregationInterval = parsed.aggregationInterval;
+            }
+            for (auto& qe : parsed.queries) {
+                glazeReq.queries.push_back(GlazeQueryEntry{std::move(qe.query), std::move(qe.label)});
+            }
+        } catch (const std::exception& e) {
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->_content =
+                "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_PROTOBUF\",\"message\":\"Failed to parse "
+                "subscribe "
+                "request\"}}";
+            timestar::http::setContentType(*rep, resFmt);
+            co_return rep;
+        }
+    } else {
+        auto parseErr = glz::read_json(glazeReq, req->content);
+        if (parseErr) {
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->_content =
+                "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_JSON\",\"message\":\"Failed to parse subscribe "
+                "request\"}}";
+            timestar::http::setContentType(*rep, resFmt);
+            co_return rep;
+        }
     }
 
     // Normalize single-query and multi-query into a unified list of QueryEntry
@@ -490,7 +523,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         rep->_content =
             "{\"status\":\"error\",\"error\":{\"code\":\"AMBIGUOUS_REQUEST\",\"message\":\"Specify either 'query' or "
             "'queries', not both\"}}";
-        rep->add_header("Content-Type", "application/json");
+        timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
 
@@ -503,7 +536,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             rep->_content =
                 "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_QUERIES\",\"message\":\"Too many queries (max "
                 "100)\"}}";
-            rep->add_header("Content-Type", "application/json");
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
         // Multi-query mode
@@ -517,7 +550,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\",\"message\":\"Query '" +
                                 jsonEscape(entry.label) + "': " + jsonEscape(e.what()) + "\"}}";
-                rep->add_header("Content-Type", "application/json");
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
             queryEntries.push_back(std::move(entry));
@@ -532,7 +565,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\",\"message\":\"" +
                             jsonEscape(e.what()) + "\"}}";
-            rep->add_header("Content-Type", "application/json");
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
         queryEntries.push_back(std::move(entry));
@@ -541,7 +574,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         rep->_content =
             "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\",\"message\":\"Either 'query' or 'queries' "
             "must be provided\"}}";
-        rep->add_header("Content-Type", "application/json");
+        timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
 
@@ -571,7 +604,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             rep->_content =
                 "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\","
                 "\"message\":\"aggregationInterval is required when formula is set\"}}";
-            rep->add_header("Content-Type", "application/json");
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
         try {
@@ -582,7 +615,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 rep->_content =
                     "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\","
                     "\"message\":\"anomalies() and forecast() are not supported in streaming subscriptions\"}}";
-                rep->add_header("Content-Type", "application/json");
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
 
@@ -599,7 +632,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                             jsonEscape(ref) +
                             "'. "
                             "Single-query subscriptions only support 'a' as the query reference.\"}}";
-                        rep->add_header("Content-Type", "application/json");
+                        timestar::http::setContentType(*rep, resFmt);
                         co_return rep;
                     }
                 }
@@ -628,7 +661,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                             "'. "
                             "Available labels: " +
                             availLabels + "\"}}";
-                        rep->add_header("Content-Type", "application/json");
+                        timestar::http::setContentType(*rep, resFmt);
                         co_return rep;
                     }
                 }
@@ -639,7 +672,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content = "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_FORMULA\",\"message\":\"" +
                             jsonEscape(e.what()) + "\"}}";
-            rep->add_header("Content-Type", "application/json");
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
     }
@@ -657,7 +690,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         rep->_content =
             "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_SUBSCRIPTIONS\","
             "\"message\":\"Maximum subscriptions per shard exceeded\"}}";
-        rep->add_header("Content-Type", "application/json");
+        timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
 
@@ -669,7 +702,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     unsigned thisShard = seastar::this_shard_id();
     unsigned shardCount = seastar::smp::count;
 
-    // Register a subscription for each query entry
+    // Register a subscription for each query entry.
+    // TODO: batch the invoke_on_all calls to reduce N scatter-gathers to 1.
     std::vector<uint64_t> allSubIds;
     for (auto& entry : queryEntries) {
         Subscription sub;
@@ -707,10 +741,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             }
             co_await _engineSharded->invoke_on_all([allSubIds, thisShard](Engine& engine) {
                 if (seastar::this_shard_id() == thisShard)
-                    return;
+                    return seastar::make_ready_future<>();
                 for (auto id : allSubIds) {
                     engine.getSubscriptionManager().removeSubscription(id);
                 }
+                return seastar::make_ready_future<>();
             });
             if (limitExceeded) {
                 rep->set_status(seastar::http::reply::status_type{429});
@@ -725,17 +760,48 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                                     "\"message\":\"") +
                                 jsonEscape(subscriptionError) + "\"}}";
             }
-            rep->add_header("Content-Type", "application/json");
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
         localMgr.registerQueue(sub.id, queuePtr);
 
-        // Register filter criteria on all other shards in parallel
-        co_await _engineSharded->invoke_on_all([sub, thisShard](Engine& engine) {
-            if (seastar::this_shard_id() == thisShard)
-                return;
-            engine.getSubscriptionManager().addSubscription(sub);
-        });
+        // Register filter criteria on all other shards in parallel.
+        // If a remote shard fails, clean up all previously registered
+        // subscriptions (local + remote) to avoid leaked state.
+        // Note: co_await cannot appear inside a catch block in C++20
+        // coroutines, so we capture the error and handle cleanup after.
+        std::string remoteRegError;
+        try {
+            co_await _engineSharded->invoke_on_all([sub, thisShard](Engine& engine) {
+                if (seastar::this_shard_id() == thisShard)
+                    return seastar::make_ready_future<>();
+                engine.getSubscriptionManager().addSubscription(sub);
+                return seastar::make_ready_future<>();
+            });
+        } catch (const std::exception& e) {
+            remoteRegError = e.what();
+        }
+        if (!remoteRegError.empty()) {
+            // Clean up all subscriptions registered so far (including this one)
+            for (auto id : allSubIds) {
+                localMgr.removeSubscription(id);
+            }
+            co_await _engineSharded->invoke_on_all([allSubIds, thisShard](Engine& engine) {
+                if (seastar::this_shard_id() == thisShard)
+                    return seastar::make_ready_future<>();
+                for (auto id : allSubIds) {
+                    engine.getSubscriptionManager().removeSubscription(id);
+                }
+                return seastar::make_ready_future<>();
+            });
+            rep->set_status(seastar::http::reply::status_type{500});
+            rep->_content =
+                "{\"status\":\"error\",\"error\":{\"code\":\"SUBSCRIPTION_REGISTRATION_FAILED\","
+                "\"message\":\"" +
+                jsonEscape(remoteRegError) + "\"}}";
+            timestar::http::setContentType(*rep, resFmt);
+            co_return rep;
+        }
     }
 
     timestar::http_log.info("[SUBSCRIBE] {} subscriptions registered on all {} shards (first id={})",
@@ -1011,6 +1077,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 }
             } catch (...) {
                 *cancelled = true;
+                // Timers (heartbeat, aggTimer) are scoped inside the try block and are
+                // destroyed (which disarms them) when the block exits via this catch.
+                // The *cancelled flag prevents any already-fired callback from acting.
                 timestar::http_log.info("[SUBSCRIBE] Subscription group disconnected (first id={})",
                                         allSubIds.empty() ? 0 : allSubIds.front());
             }
@@ -1042,6 +1111,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handleGetSubscriptions(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
 
     // Collect subscription stats from all shards in parallel
     auto allStats = co_await _engineSharded->map_reduce0(
@@ -1052,65 +1122,88 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             return acc;
         });
 
-    // Build JSON response manually
-    std::string json;
-    json.reserve(256 + allStats.size() * 256);
-    json += "{\"subscriptions\":[";
+    rep->set_status(seastar::http::reply::status_type::ok);
 
-    for (size_t i = 0; i < allStats.size(); ++i) {
-        if (i > 0)
-            json += ',';
-        const auto& s = allStats[i];
+    if (timestar::http::isProtobuf(resFmt)) {
+        // Convert to proto intermediate types
+        std::vector<timestar::proto::SubscriptionStatsData> protoStats;
+        protoStats.reserve(allStats.size());
+        for (const auto& s : allStats) {
+            timestar::proto::SubscriptionStatsData sd;
+            sd.id = s.id;
+            sd.measurement = s.measurement;
+            sd.scopes = s.scopes;
+            sd.fields = s.fields;
+            sd.label = s.label;
+            sd.handlerShard = s.handlerShard;
+            sd.queueDepth = s.queueDepth;
+            sd.queueCapacity = s.queueCapacity;
+            sd.droppedPoints = s.droppedPoints;
+            sd.eventsSent = s.eventsSent;
+            protoStats.push_back(std::move(sd));
+        }
+        rep->_content = timestar::proto::formatSubscriptionsResponse(protoStats);
+    } else {
+        // Build JSON response manually
+        std::string json;
+        json.reserve(256 + allStats.size() * 256);
+        json += "{\"subscriptions\":[";
 
-        json += "{\"id\":";
-        appendUint64(json, s.id);
-        if (!s.label.empty()) {
-            json += ",\"label\":\"";
-            jsonEscapeAppend(s.label, json);
-            json += '"';
-        }
-        json += ",\"measurement\":\"";
-        jsonEscapeAppend(s.measurement, json);
-        json += "\",\"fields\":[";
-        for (size_t f = 0; f < s.fields.size(); ++f) {
-            if (f > 0)
+        for (size_t i = 0; i < allStats.size(); ++i) {
+            if (i > 0)
                 json += ',';
-            json += '"';
-            jsonEscapeAppend(s.fields[f], json);
-            json += '"';
+            const auto& s = allStats[i];
+
+            json += "{\"id\":";
+            appendUint64(json, s.id);
+            if (!s.label.empty()) {
+                json += ",\"label\":\"";
+                jsonEscapeAppend(s.label, json);
+                json += '"';
+            }
+            json += ",\"measurement\":\"";
+            jsonEscapeAppend(s.measurement, json);
+            json += "\",\"fields\":[";
+            for (size_t f = 0; f < s.fields.size(); ++f) {
+                if (f > 0)
+                    json += ',';
+                json += '"';
+                jsonEscapeAppend(s.fields[f], json);
+                json += '"';
+            }
+            json += "],\"scopes\":{";
+            bool firstScope = true;
+            for (const auto& [k, v] : s.scopes) {
+                if (!firstScope)
+                    json += ',';
+                firstScope = false;
+                json += '"';
+                jsonEscapeAppend(k, json);
+                json += "\":\"";
+                jsonEscapeAppend(v, json);
+                json += '"';
+            }
+            json += "},\"handler_shard\":";
+            appendUint64(json, s.handlerShard);
+            json += ",\"queue_depth\":";
+            appendUint64(json, s.queueDepth);
+            json += ",\"queue_capacity\":";
+            appendUint64(json, s.queueCapacity);
+            json += ",\"dropped_points\":";
+            appendUint64(json, s.droppedPoints);
+            json += ",\"events_sent\":";
+            appendUint64(json, s.eventsSent);
+            json += '}';
         }
-        json += "],\"scopes\":{";
-        bool firstScope = true;
-        for (const auto& [k, v] : s.scopes) {
-            if (!firstScope)
-                json += ',';
-            firstScope = false;
-            json += '"';
-            jsonEscapeAppend(k, json);
-            json += "\":\"";
-            jsonEscapeAppend(v, json);
-            json += '"';
-        }
-        json += "},\"handler_shard\":";
-        appendUint64(json, s.handlerShard);
-        json += ",\"queue_depth\":";
-        appendUint64(json, s.queueDepth);
-        json += ",\"queue_capacity\":";
-        appendUint64(json, s.queueCapacity);
-        json += ",\"dropped_points\":";
-        appendUint64(json, s.droppedPoints);
-        json += ",\"events_sent\":";
-        appendUint64(json, s.eventsSent);
+
+        json += "],\"total_subscriptions\":";
+        appendUint64(json, allStats.size());
         json += '}';
+
+        rep->_content = std::move(json);
     }
 
-    json += "],\"total_subscriptions\":";
-    appendUint64(json, allStats.size());
-    json += '}';
-
-    rep->set_status(seastar::http::reply::status_type::ok);
-    rep->_content = std::move(json);
-    rep->add_header("Content-Type", "application/json");
+    timestar::http::setContentType(*rep, resFmt);
     rep->done();
     co_return rep;
 }

@@ -61,6 +61,8 @@ public:
     // Merge another HLL sketch (union = max of registers).
     // Uses SIMD-accelerated element-wise max over 16KB of uint8_t registers.
     void merge(const HyperLogLog& other) {
+        if (other.nonEmpty_)
+            nonEmpty_ = true;
         simd::hllMergeRegisters(registers_.data(), other.registers_.data(), NUM_REGISTERS);
     }
 
@@ -78,23 +80,26 @@ public:
             // to prevent UB from `1ULL << registers_[i]` in estimate() when value >= 64.
             // Uses SIMD-accelerated min across 16KB register array.
             simd::hllClampRegisters(hll.registers_.data(), SERIALIZED_SIZE, 51);
+            // Check if any register is non-zero (data was added before serialization)
+            for (size_t i = 0; i < NUM_REGISTERS; ++i) {
+                if (hll.registers_[i] != 0) {
+                    hll.nonEmpty_ = true;
+                    break;
+                }
+            }
         }
         return hll;
     }
 
-    // True if all registers are zero (no data added).
-    bool empty() const {
-        for (size_t i = 0; i < NUM_REGISTERS; ++i) {
-            if (registers_[i] != 0)
-                return false;
-        }
-        return true;
-    }
+    // True if no data has been added.
+    bool empty() const { return !nonEmpty_; }
 
 private:
+    bool nonEmpty_ = false;
     std::array<uint8_t, NUM_REGISTERS> registers_;
 
     void addHash(uint64_t h) {
+        nonEmpty_ = true;
         // Upper PRECISION bits select the register
         uint32_t idx = static_cast<uint32_t>(h >> (64 - PRECISION));
         // Remaining bits determine the leading-zero count + 1

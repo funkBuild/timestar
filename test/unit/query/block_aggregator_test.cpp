@@ -17,9 +17,9 @@ using namespace timestar;
 
 // Helper: create a BlockAggregator in fold-to-single-state mode (interval=0,
 // methodAware=true) — the primary path that exercises addBlockStats.
-static BlockAggregator makeFoldAggregator(AggregationMethod method, bool collectRaw = false) {
+static BlockAggregator makeFoldAggregator(AggregationMethod method) {
     BlockAggregator ba(0, method);
-    ba.setFoldToSingleState(collectRaw);
+    ba.enableFoldToSingleState();
     return ba;
 }
 
@@ -747,4 +747,99 @@ TEST(BlockAggregatorPrealloc, PreallocatesReasonableBucketCount) {
     EXPECT_EQ(buckets.size(), 2u);
     EXPECT_DOUBLE_EQ(buckets[0].getValue(AggregationMethod::SUM), 1.0);
     EXPECT_DOUBLE_EQ(buckets[100].getValue(AggregationMethod::SUM), 2.0);
+}
+
+// ============================================================================
+// SIMD fold paths must track firstTimestamp / latestTimestamp
+// ============================================================================
+
+// Helper: build a BlockAggregator in fold-to-single-state mode, feed it
+// enough points to hit the SIMD path (>= 8), then verify the state has
+// valid first/latest timestamps and values.
+static void verifySIMDTimestamps(AggregationMethod method) {
+    BlockAggregator ba(0, method);
+    ba.enableFoldToSingleState();
+
+    // 16 points — enough to trigger the SIMD fold path.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 16; ++i) {
+        ts.push_back(1000 + i * 100);   // 1000, 1100, ..., 2500
+        vals.push_back(10.0 + i);        // 10.0, 11.0, ..., 25.0
+    }
+
+    ba.addPoints(ts, vals);
+    auto state = ba.takeSingleState();
+
+    EXPECT_EQ(state.count, 16u);
+    // firstTimestamp must be the earliest, not UINT64_MAX default.
+    EXPECT_EQ(state.firstTimestamp, 1000u)
+        << "SIMD path for " << static_cast<int>(method)
+        << " did not set firstTimestamp";
+    EXPECT_DOUBLE_EQ(state.first, 10.0);
+    // latestTimestamp must be the latest, not 0 default.
+    EXPECT_EQ(state.latestTimestamp, 2500u)
+        << "SIMD path for " << static_cast<int>(method)
+        << " did not set latestTimestamp";
+    EXPECT_DOUBLE_EQ(state.latest, 25.0);
+}
+
+TEST(BlockAggregatorSIMD, SumTracksTimestamps) {
+    verifySIMDTimestamps(AggregationMethod::SUM);
+}
+
+TEST(BlockAggregatorSIMD, AvgTracksTimestamps) {
+    verifySIMDTimestamps(AggregationMethod::AVG);
+}
+
+TEST(BlockAggregatorSIMD, MinTracksTimestamps) {
+    verifySIMDTimestamps(AggregationMethod::MIN);
+}
+
+TEST(BlockAggregatorSIMD, MaxTracksTimestamps) {
+    verifySIMDTimestamps(AggregationMethod::MAX);
+}
+
+TEST(BlockAggregatorSIMD, CountTracksTimestamps) {
+    verifySIMDTimestamps(AggregationMethod::COUNT);
+}
+
+TEST(BlockAggregatorSIMD, SpreadTracksTimestamps) {
+    verifySIMDTimestamps(AggregationMethod::SPREAD);
+}
+
+TEST(BlockAggregatorSIMD, LatestTracksTimestamps) {
+    BlockAggregator ba(0, AggregationMethod::LATEST);
+    ba.enableFoldToSingleState();
+
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 16; ++i) {
+        ts.push_back(1000 + i * 100);
+        vals.push_back(10.0 + i);
+    }
+    ba.addPoints(ts, vals);
+    auto state = ba.takeSingleState();
+
+    EXPECT_EQ(state.count, 16u);
+    EXPECT_EQ(state.latestTimestamp, 2500u);
+    EXPECT_DOUBLE_EQ(state.latest, 25.0);
+}
+
+TEST(BlockAggregatorSIMD, FirstTracksTimestamps) {
+    BlockAggregator ba(0, AggregationMethod::FIRST);
+    ba.enableFoldToSingleState();
+
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 16; ++i) {
+        ts.push_back(1000 + i * 100);
+        vals.push_back(10.0 + i);
+    }
+    ba.addPoints(ts, vals);
+    auto state = ba.takeSingleState();
+
+    EXPECT_EQ(state.count, 16u);
+    EXPECT_EQ(state.firstTimestamp, 1000u);
+    EXPECT_DOUBLE_EQ(state.first, 10.0);
 }

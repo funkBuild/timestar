@@ -35,7 +35,7 @@ public:
 
 private:
     struct CompactionJob {
-        int inputLevel;
+        int inputLevel = 0;
         std::vector<SSTableMetadata> inputFiles;
     };
 

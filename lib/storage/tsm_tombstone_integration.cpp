@@ -55,9 +55,9 @@ bool TSM::hasSeriesInTimeRange(const SeriesId128& seriesId, uint64_t startTime, 
     // Check if series exists in cache (promote to front on hit)
     auto it = fullIndexCache.find(seriesId);
     if (it == fullIndexCache.end()) {
-        // Not in cache - could exist but not loaded yet
-        // For tombstone operations, be conservative and assume it might exist
-        return seriesBloomFilter.contains(seriesId.getRawData());
+        // Not in cache — could exist but not loaded yet.
+        // Bloom filter already passed above, so be conservative and assume it might exist.
+        return true;
     }
 
     // Promote to front of LRU list on access
@@ -281,6 +281,9 @@ seastar::future<double> TSM::estimateTombstoneCoverage() {
         }
 
         for (const auto& block : blocks) {
+            // Guard against corrupted blocks where maxTime < minTime
+            if (block.maxTime < block.minTime)
+                continue;
             uint64_t blockDuration = block.maxTime - block.minTime;
 
             if (blockDuration == 0) {
@@ -312,7 +315,7 @@ seastar::future<double> TSM::estimateTombstoneCoverage() {
         }
     }
 
-    co_return estimatedDeadBytes / static_cast<double>(fileSize);
+    co_return std::min(estimatedDeadBytes / static_cast<double>(fileSize), 1.0);
 }
 
 // Delete tombstone file after successful compaction

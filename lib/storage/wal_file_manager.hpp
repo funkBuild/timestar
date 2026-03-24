@@ -44,63 +44,7 @@ public:
     seastar::future<> insertBatch(std::vector<TimeStarInsert<T>>& insertRequests);
     seastar::future<> rolloverMemoryStore();
     seastar::future<> convertWalToTsm(seastar::shared_ptr<MemoryStore> store);
-    seastar::future<> close() {
-        timestar::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
-
-        // Drain all in-flight background TSM conversions before closing.
-        // Guard against double-close (e.g., seastar::sharded<Engine> calling stop() twice).
-        if (!_backgroundGate.is_closed()) {
-            timestar::wal_log.info("[WAL_CLOSE] Draining {} background TSM conversions on shard {}",
-                                   _backgroundGate.get_count(), shardId);
-            co_await _backgroundGate.close();
-            timestar::wal_log.info("[WAL_CLOSE] Background TSM conversions drained on shard {}", shardId);
-        }
-
-        // Inline conversion of remaining stores.  These run sequentially with
-        // co_await (not via the background gate, which is already closed) so
-        // they are safe: no concurrent background conversions can be in flight.
-        // If a conversion fails, the WAL file is preserved for crash recovery.
-        // convertWalToTsm() erases from memoryStores and calls removeWAL()
-        // internally, so we iterate a copy to avoid iterator invalidation.
-        auto snapshot = memoryStores;
-
-        for (auto& store : snapshot) {
-            if (!store)
-                continue;
-
-            if (!store->isEmpty()) {
-                // Non-empty store: flush WAL to disk, then convert to TSM.
-                try {
-                    timestar::wal_log.info("[WAL_CLOSE] Flushing memory store {} to TSM on shard {}",
-                                           store->sequenceNumber, shardId);
-                    co_await store->close();          // flush WAL (idempotent)
-                    co_await convertWalToTsm(store);  // write TSM + erase from memoryStores + removeWAL
-                    timestar::wal_log.info("[WAL_CLOSE] Successfully flushed store {} to TSM on shard {}",
-                                           store->sequenceNumber, shardId);
-                } catch (const std::exception& e) {
-                    timestar::wal_log.error(
-                        "[WAL_CLOSE] Failed to flush store {} to TSM on shard {}: {} "
-                        "(WAL preserved for recovery on next startup)",
-                        store->sequenceNumber, shardId, e.what());
-                    // WAL file stays on disk — startup recovery will handle it.
-                }
-            } else {
-                // Empty store: just close and remove the WAL file.
-                try {
-                    timestar::wal_log.info("[WAL_CLOSE] Closing empty memory store {} on shard {}",
-                                           store->sequenceNumber, shardId);
-                    co_await store->close();
-                    co_await store->removeWAL();
-                } catch (const std::exception& e) {
-                    timestar::wal_log.error("[WAL_CLOSE] Error closing empty store {} on shard {}: {}",
-                                            store->sequenceNumber, shardId, e.what());
-                }
-            }
-        }
-
-        memoryStores.clear();
-        timestar::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
-    }
+    seastar::future<> close();
     std::optional<TSMValueType> getSeriesType(const std::string& seriesKey);
     std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId);
 

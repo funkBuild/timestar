@@ -1,5 +1,6 @@
-# Collect source files from all subdirectories
-file(GLOB_RECURSE SRC_FILES
+# Collect source files from all subdirectories.
+# CONFIGURE_DEPENDS ensures cmake re-runs when files are added/removed.
+file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
     core/*.cpp
     storage/*.cpp
     encoding/*.cpp
@@ -13,6 +14,12 @@ file(GLOB_RECURSE SRC_FILES
 )
 # Exclude deprecated implementation files
 list(FILTER SRC_FILES EXCLUDE REGEX ".*/deprecated/.*")
+# Exclude proto_converters.cpp — it is built as a separate library
+# (libtimestar_proto_conv) to avoid ODR violations between proto-generated
+# classes and identically-named internal classes in the timestar namespace.
+list(FILTER SRC_FILES EXCLUDE REGEX ".*/proto_converters\\.cpp$")
+# Exclude proto_write_fast_path.cpp — also part of libtimestar_proto_conv.
+list(FILTER SRC_FILES EXCLUDE REGEX ".*/proto_write_fast_path\\.cpp$")
 
 find_package (Threads REQUIRED)
 # Seastar is added via add_subdirectory in the top-level CMakeLists.txt,
@@ -36,6 +43,7 @@ message(STATUS "Found xxHash: ${XXHASH_LIBRARY}")
 # compilation internally.
 
 add_library(libtimestar STATIC ${SRC_FILES})
+target_compile_options(libtimestar PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference -Wformat=2)
 target_link_libraries(libtimestar Threads::Threads Seastar::seastar libzstd_static glaze::glaze ${XXHASH_LIBRARY} hwy roaring)
 
 # Include both the lib directory and all subdirectories for header resolution
@@ -55,4 +63,17 @@ target_include_directories(libtimestar PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/functions
     ${XXHASH_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include
+)
+
+# Separate library for protobuf↔C++ converters.
+# Built in its own translation unit to avoid ODR violations: the proto package
+# "timestar" generates classes (QueryRequest, StreamingBatch, etc.) whose fully-
+# qualified names collide with identically-named internal C++ types.
+add_library(libtimestar_proto_conv STATIC
+    http/proto_converters.cpp
+    http/proto_write_fast_path.cpp
+)
+target_link_libraries(libtimestar_proto_conv PRIVATE timestar_proto)
+target_include_directories(libtimestar_proto_conv PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/http
 )

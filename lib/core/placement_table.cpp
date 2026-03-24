@@ -3,6 +3,7 @@
 #include <glaze/glaze.hpp>
 
 #include <fstream>
+#include <stdexcept>
 
 namespace timestar {
 
@@ -22,6 +23,8 @@ const PlacementTable& placement() {
     return g_placement ? *g_placement : g_defaultPlacement;
 }
 
+// NOTE: Uses blocking std::ofstream.  Must be called from a seastar::async
+// context (Seastar thread) or before the reactor is running.
 void savePlacement(const std::string& path) {
     std::ofstream ofs(path);
     if (!ofs) {
@@ -39,6 +42,8 @@ void savePlacement(const std::string& path) {
 // ---------------------------------------------------------------------------
 
 PlacementTable PlacementTable::buildLocal(unsigned coreCount) {
+    if (coreCount == 0)
+        throw std::invalid_argument("PlacementTable::buildLocal: coreCount must be > 0");
     PlacementTable pt;
     pt.coreCount_ = coreCount;
     // Cache power-of-2 mask for fast routing (bitwise AND vs modulo)
@@ -101,12 +106,26 @@ PlacementTable PlacementTable::fromJson(const std::string& data) {
         throw std::runtime_error("Failed to parse placement JSON");
     }
 
+    if (pj.coreCount == 0) {
+        throw std::runtime_error("PlacementTable: coreCount must be > 0");
+    }
+
+    if (pj.virtualShardCount != VIRTUAL_SHARD_COUNT) {
+        throw std::runtime_error("PlacementTable: virtualShardCount mismatch — file has " +
+                                 std::to_string(pj.virtualShardCount) + " but binary expects " +
+                                 std::to_string(VIRTUAL_SHARD_COUNT));
+    }
+
     PlacementTable pt;
     pt.coreCount_ = pj.coreCount;
     pt.coreMask_ = (pj.coreCount > 1 && (pj.coreCount & (pj.coreCount - 1)) == 0) ? (pj.coreCount - 1) : 0;
     pt.table_.fill(VShardMapping{});
     size_t count = std::min({pj.serverIds.size(), pj.coreIds.size(), static_cast<size_t>(VIRTUAL_SHARD_COUNT)});
     for (size_t i = 0; i < count; ++i) {
+        if (pj.coreIds[i] >= pj.coreCount) {
+            throw std::runtime_error("PlacementTable: coreId " + std::to_string(pj.coreIds[i]) + " >= coreCount " +
+                                     std::to_string(pj.coreCount) + " at vshard " + std::to_string(i));
+        }
         pt.table_[i].serverId = pj.serverIds[i];
         pt.table_[i].coreId = pj.coreIds[i];
     }

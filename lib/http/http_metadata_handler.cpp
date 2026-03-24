@@ -1,7 +1,9 @@
 #include "http_metadata_handler.hpp"
 
+#include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "native_index.hpp"
+#include "proto_converters.hpp"
 
 #include <glaze/glaze.hpp>
 
@@ -61,6 +63,11 @@ size_t HttpMetadataHandler::parsePaginationParam(const std::string& str, const s
                                                  size_t defaultValue) {
     if (str.empty()) {
         return defaultValue;
+    }
+    // Reject strings with leading whitespace (e.g. " -5") since stoul silently
+    // skips whitespace, which could bypass the minus-sign check below.
+    if (std::isspace(static_cast<unsigned char>(str[0]))) {
+        throw BadRequestException("Invalid " + paramName + " parameter: must not have leading whitespace");
     }
     // Reject strings that start with '-' since stoul would throw std::invalid_argument,
     // but we want a clear bad-request message.
@@ -142,6 +149,7 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r, std::string_
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleMeasurements(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
 
     try {
         timestar::http_log.debug("Processing /measurements request");
@@ -150,11 +158,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         auto measurements = co_await engineSharded->local().getAllMeasurements();
 
         // Apply filters if specified
+        // Note: prefix is only used for starts_with comparison, so null bytes or other
+        // special characters are harmless — they simply won't match any measurement name.
         std::string prefix = req->get_query_param("prefix");
         if (!prefix.empty()) {
-            auto it = std::remove_if(measurements.begin(), measurements.end(),
-                                     [&prefix](const std::string& m) { return !m.starts_with(prefix); });
-            measurements.erase(it, measurements.end());
+            std::erase_if(measurements, [&prefix](const std::string& m) { return !m.starts_with(prefix); });
         }
 
         // Apply pagination - validate parameters and return 400 on invalid input
@@ -166,45 +174,66 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             limit = parsePaginationParam(req->get_query_param("limit"), "limit", std::numeric_limits<size_t>::max());
         } catch (const BadRequestException& e) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("INVALID_PARAMETER", e.what());
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatErrorResponse(e.what(), "INVALID_PARAMETER");
+            } else {
+                rep->_content = createErrorResponse("INVALID_PARAMETER", e.what());
+            }
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
 
         size_t totalCount = measurements.size();
 
-        if (offset < measurements.size()) {
-            auto startIt = measurements.begin() + offset;
-            size_t end = (limit > measurements.size() - offset) ? measurements.size() : offset + limit;
-            auto endIt = measurements.begin() + end;
-            measurements = std::vector<std::string>(startIt, endIt);
-        } else {
+        if (offset >= measurements.size()) {
             measurements.clear();
+        } else if (offset > 0 || limit < measurements.size() - offset) {
+            size_t end = (limit > measurements.size() - offset) ? measurements.size() : offset + limit;
+            measurements = std::vector<std::string>(std::make_move_iterator(measurements.begin() + offset),
+                                                    std::make_move_iterator(measurements.begin() + end));
         }
+        // else: offset==0 && limit >= size — no copy needed
 
         // Format response
         rep->set_status(seastar::http::reply::status_type::ok);
-        rep->_content = formatMeasurementsResponse(measurements, totalCount);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatMeasurementsResponse(measurements, totalCount);
+        } else {
+            rep->_content = formatMeasurementsResponse(measurements, totalCount);
+        }
 
         timestar::http_log.debug("Returning {} measurements", measurements.size());
 
     } catch (const std::exception& e) {
         timestar::http_log.error("Error processing /measurements: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatErrorResponse("Internal server error", "INTERNAL_ERROR");
+        } else {
+            rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        }
     }
 
+    timestar::http::setContentType(*rep, resFmt);
     co_return rep;
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleTags(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
 
     try {
         std::string measurement = req->get_query_param("measurement");
         if (measurement.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content =
+                    timestar::proto::formatErrorResponse("measurement parameter is required", "MISSING_PARAMETER");
+            } else {
+                rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
+            }
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
 
@@ -212,7 +241,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto err = validateQueryParam(measurement, "Measurement name");
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    rep->_content = timestar::proto::formatErrorResponse(err, "INVALID_PARAMETER");
+                } else {
+                    rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                }
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
         }
@@ -222,7 +256,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto err = validateQueryParam(specificTag, "Tag name");
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    rep->_content = timestar::proto::formatErrorResponse(err, "INVALID_PARAMETER");
+                } else {
+                    rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                }
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
         }
@@ -256,33 +295,49 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         // Convert sets to vectors for response formatting
         std::unordered_map<std::string, std::vector<std::string>> tagsResult;
         for (const auto& [tagKey, tagValues] : allTagsResults) {
+            // tagValues is a std::set — already sorted, no need to re-sort
             tagsResult[tagKey] = std::vector<std::string>(tagValues.begin(), tagValues.end());
-            std::sort(tagsResult[tagKey].begin(), tagsResult[tagKey].end());
         }
 
         rep->set_status(seastar::http::reply::status_type::ok);
-        rep->_content = formatTagsResponse(measurement, tagsResult, specificTag);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatTagsResponse(measurement, tagsResult);
+        } else {
+            rep->_content = formatTagsResponse(measurement, tagsResult, specificTag);
+        }
 
         timestar::http_log.debug("Returning tags for measurement: {}", measurement);
 
     } catch (const std::exception& e) {
         timestar::http_log.error("Error processing /tags: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatErrorResponse("Internal server error", "INTERNAL_ERROR");
+        } else {
+            rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        }
     }
 
+    timestar::http::setContentType(*rep, resFmt);
     co_return rep;
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleFields(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
 
     try {
         std::string measurement = req->get_query_param("measurement");
         if (measurement.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content =
+                    timestar::proto::formatErrorResponse("measurement parameter is required", "MISSING_PARAMETER");
+            } else {
+                rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
+            }
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
 
@@ -290,7 +345,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto err = validateQueryParam(measurement, "Measurement name");
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    rep->_content = timestar::proto::formatErrorResponse(err, "INVALID_PARAMETER");
+                } else {
+                    rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                }
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
         }
@@ -319,9 +379,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
                         endPos = tagsParam.length();
                     std::string badSegment = tagsParam.substr(pos, endPos - pos);
                     rep->set_status(seastar::http::reply::status_type::bad_request);
-                    rep->_content =
-                        createErrorResponse("INVALID_PARAMETER", "Malformed tag filter segment '" + badSegment +
-                                                                     "': expected 'key:value' format");
+                    auto errMsg = "Malformed tag filter segment '" + badSegment + "': expected 'key:value' format";
+                    if (timestar::http::isProtobuf(resFmt)) {
+                        rep->_content = timestar::proto::formatErrorResponse(errMsg, "INVALID_PARAMETER");
+                    } else {
+                        rep->_content = createErrorResponse("INVALID_PARAMETER", errMsg);
+                    }
+                    timestar::http::setContentType(*rep, resFmt);
                     co_return rep;
                 }
 
@@ -359,28 +423,44 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         }
 
         rep->set_status(seastar::http::reply::status_type::ok);
-        rep->_content = formatFieldsResponse(measurement, fieldsWithTypes, tagFilters);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatFieldsResponse(measurement, fieldsWithTypes);
+        } else {
+            rep->_content = formatFieldsResponse(measurement, fieldsWithTypes, tagFilters);
+        }
 
         timestar::http_log.debug("Returning {} fields for measurement: {}", allFields.size(), measurement);
 
     } catch (const std::exception& e) {
         timestar::http_log.error("Error processing /fields: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatErrorResponse("Internal server error", "INTERNAL_ERROR");
+        } else {
+            rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        }
     }
 
+    timestar::http::setContentType(*rep, resFmt);
     co_return rep;
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleCardinality(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
 
     try {
         std::string measurement = req->get_query_param("measurement");
         if (measurement.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content =
+                    timestar::proto::formatErrorResponse("measurement parameter is required", "MISSING_PARAMETER");
+            } else {
+                rep->_content = createErrorResponse("MISSING_PARAMETER", "measurement parameter is required");
+            }
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
 
@@ -388,7 +468,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto err = validateQueryParam(measurement, "Measurement name");
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    rep->_content = timestar::proto::formatErrorResponse(err, "INVALID_PARAMETER");
+                } else {
+                    rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                }
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
         }
@@ -400,7 +485,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto err = validateQueryParam(tagKey, "Tag key");
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    rep->_content = timestar::proto::formatErrorResponse(err, "INVALID_PARAMETER");
+                } else {
+                    rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                }
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
         }
@@ -408,7 +498,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto err = validateQueryParam(tagValue, "Tag value");
             if (!err.empty()) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    rep->_content = timestar::proto::formatErrorResponse(err, "INVALID_PARAMETER");
+                } else {
+                    rep->_content = createErrorResponse("INVALID_PARAMETER", err);
+                }
+                timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
         }
@@ -418,8 +513,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         // Validate: both tag_key and tag_value must be provided together
         if (tagKey.empty() != tagValue.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content =
-                createErrorResponse("INVALID_PARAMETER", "Both tag_key and tag_value must be provided together");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatErrorResponse(
+                    "Both tag_key and tag_value must be provided together", "INVALID_PARAMETER");
+            } else {
+                rep->_content =
+                    createErrorResponse("INVALID_PARAMETER", "Both tag_key and tag_value must be provided together");
+            }
+            timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
 
@@ -432,7 +533,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             futures.reserve(numShards);
             for (unsigned s = 0; s < numShards; ++s) {
                 futures.push_back(engineSharded->invoke_on(s, [measurement, tagKey, tagValue](Engine& engine) {
-                    auto& idx = static_cast<timestar::index::NativeIndex&>(engine.getIndex());
+                    auto& idx = engine.getIndex();
                     return idx.estimateTagCardinality(measurement, tagKey, tagValue);
                 }));
             }
@@ -450,14 +551,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             tagCard[tagKey + ":" + tagValue] = total;
 
             rep->set_status(seastar::http::reply::status_type::ok);
-            rep->_content = formatCardinalityResponse(measurement, total, tagCard);
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatCardinalityResponse(measurement, total, tagCard);
+            } else {
+                rep->_content = formatCardinalityResponse(measurement, total, tagCard);
+            }
         } else {
             // Measurement-level cardinality plus per-tag-key cardinalities
             std::vector<seastar::future<double>> futures;
             futures.reserve(numShards);
             for (unsigned s = 0; s < numShards; ++s) {
                 futures.push_back(engineSharded->invoke_on(s, [measurement](Engine& engine) {
-                    auto& idx = static_cast<timestar::index::NativeIndex&>(engine.getIndex());
+                    auto& idx = engine.getIndex();
                     return idx.estimateMeasurementCardinality(measurement);
                 }));
             }
@@ -486,7 +591,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             }
 
             rep->set_status(seastar::http::reply::status_type::ok);
-            rep->_content = formatCardinalityResponse(measurement, totalEstimate, tagCardinalities);
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content =
+                    timestar::proto::formatCardinalityResponse(measurement, totalEstimate, tagCardinalities);
+            } else {
+                rep->_content = formatCardinalityResponse(measurement, totalEstimate, tagCardinalities);
+            }
         }
 
         timestar::http_log.debug("Returning cardinality for measurement: {}", measurement);
@@ -494,9 +604,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
     } catch (const std::exception& e) {
         timestar::http_log.error("Error processing /cardinality: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatErrorResponse("Internal server error", "INTERNAL_ERROR");
+        } else {
+            rep->_content = createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        }
     }
 
+    timestar::http::setContentType(*rep, resFmt);
     co_return rep;
 }
 
@@ -529,8 +644,8 @@ std::string HttpMetadataHandler::formatTagsResponse(
         TagValuesResponse response;
         response.measurement = measurement;
         response.tag = specificTag;
-        if (tags.find(specificTag) != tags.end()) {
-            response.values = tags.at(specificTag);
+        if (auto it = tags.find(specificTag); it != tags.end()) {
+            response.values = it->second;
         }
 
         std::string buffer;

@@ -11,8 +11,11 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/util/log.hh>
 
 namespace timestar::index {
+
+static seastar::logger compaction_log("timestar.compaction");
 
 // Adapts a synchronous SSTableReader::Iterator to the async IteratorSource interface.
 class SSTableIteratorSource : public IteratorSource {
@@ -124,15 +127,21 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
         co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey, compressionLevel);
 
     // Tombstone GC: determine if tombstones from these input files can be dropped.
-    // A tombstone (empty value) is safe to drop if ALL input SSTables were written
-    // more than tombstoneGracePeriodMs ago — no newer data can shadow it.
+    // A tombstone is ONLY safe to drop when:
+    //   1. ALL SSTables are included in this compaction (no non-input files exist
+    //      that could still contain the key the tombstone deletes), AND
+    //   2. All input files were written more than tombstoneGracePeriodMs ago.
+    // Without condition (1), dropping a tombstone during partial (L0-only) compaction
+    // allows deleted data in L1+ files to "resurrect."
     bool canDropTombstones = false;
     size_t tombstonesDropped = 0;
-    if (config_.tombstoneGracePeriodMs > 0) {
+    const bool isFullCompaction = (job.inputFiles.size() == manifest_.files().size());
+    if (isFullCompaction && config_.tombstoneGracePeriodMs > 0) {
         auto nowNs = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
                 .count());
-        uint64_t cutoffNs = nowNs - config_.tombstoneGracePeriodMs * 1'000'000;
+        uint64_t graceNs = static_cast<uint64_t>(config_.tombstoneGracePeriodMs) * 1'000'000ULL;
+        uint64_t cutoffNs = (nowNs > graceNs) ? nowNs - graceNs : 0;
         canDropTombstones = true;
         for (const auto& f : job.inputFiles) {
             if (f.writeTimestamp == 0 || f.writeTimestamp > cutoffNs) {
@@ -201,6 +210,10 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
                 co_await seastar::remove_file(path);
             }
         }
+
+        compaction_log.info("Compaction L{} -> L{}: merged {} files, {} keys written, {} tombstones dropped, {} bytes",
+                            job.inputLevel, outputLevel, job.inputFiles.size(), addCount, tombstonesDropped,
+                            bytesWritten);
     } catch (...) {
         compactionError = std::current_exception();
     }

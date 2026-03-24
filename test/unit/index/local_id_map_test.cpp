@@ -133,3 +133,27 @@ TEST_F(LocalIdMapTest, EmptyMapState) {
     EXPECT_EQ(map.size(), 0u);
     EXPECT_EQ(map.nextId(), 0u);
 }
+
+TEST_F(LocalIdMapTest, GetGlobalIdOutOfBoundsReturnsZero) {
+    LocalIdMap map;
+    // Empty map: any localId is out of bounds
+    const SeriesId128& result = map.getGlobalId(0);
+    EXPECT_TRUE(result.isZero());
+
+    const SeriesId128& result2 = map.getGlobalId(999);
+    EXPECT_TRUE(result2.isZero());
+
+    // With entries: beyond-end localId returns zero
+    map.getOrAssign(SeriesId128::fromSeriesKey("s1"));
+    map.getOrAssign(SeriesId128::fromSeriesKey("s2"));
+    EXPECT_EQ(map.size(), 2u);
+
+    const SeriesId128& valid = map.getGlobalId(0);
+    EXPECT_FALSE(valid.isZero());
+
+    const SeriesId128& oob = map.getGlobalId(2);
+    EXPECT_TRUE(oob.isZero());
+
+    const SeriesId128& oob2 = map.getGlobalId(UINT32_MAX);
+    EXPECT_TRUE(oob2.isZero());
+}

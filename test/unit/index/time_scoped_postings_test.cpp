@@ -11,18 +11,30 @@
  * - Large-scale narrow vs wide query pruning
  */
 
-#include "../../../lib/index/native/native_index.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/index/key_encoding.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 #include "../../seastar_gtest.hpp"
 
+#include <endian.h>
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
+#include <seastar/core/coroutine.hh>
 #include <string>
 
 using namespace timestar::index;
+
+// Test helper: construct a day bitmap KV key (matching the format used by NativeIndex)
+static std::string testEncodeDayBitmapKey(const std::string& measurement, uint32_t day) {
+    std::string key;
+    key.push_back(static_cast<char>(TIME_SERIES_DAY));
+    key += measurement;
+    key.push_back('\0');
+    uint32_t dayBE = htobe32(day);
+    key.append(reinterpret_cast<const char*>(&dayBE), 4);
+    return key;
+}
 namespace ke = timestar::index::keys;
 
 class TimeScopedPostingsTest : public ::testing::Test {
@@ -34,8 +46,8 @@ public:
 // Helper: create a TimeStarInsert with specific timestamps
 template <class T>
 static TimeStarInsert<T> makeInsert(const std::string& measurement, const std::string& field,
-                                     std::map<std::string, std::string> tags,
-                                     std::vector<uint64_t> timestamps, std::vector<T> values) {
+                                    std::map<std::string, std::string> tags, std::vector<uint64_t> timestamps,
+                                    std::vector<T> values) {
     TimeStarInsert<T> insert(measurement, field);
     insert.tags = std::move(tags);
     insert.timestamps = std::move(timestamps);
@@ -59,7 +71,7 @@ TEST(DayBitmapKeyEncoding, DayBucketFromNs) {
 }
 
 TEST(DayBitmapKeyEncoding, EncodeDecode) {
-    auto key = ke::encodeDayBitmapKey("cpu", 12345);
+    auto key = testEncodeDayBitmapKey("cpu", 12345);
     EXPECT_EQ(key[0], static_cast<char>(TIME_SERIES_DAY));
     EXPECT_EQ(key.substr(1, 3), "cpu");
     EXPECT_EQ(key[4], '\0');
@@ -77,8 +89,18 @@ TEST(DayBitmapKeyEncoding, PrefixScan) {
     EXPECT_EQ(prefix.size(), 1 + 7 + 1u);
 
     // Key for day 100 should start with this prefix
-    auto key = ke::encodeDayBitmapKey("weather", 100);
+    auto key = testEncodeDayBitmapKey("weather", 100);
     EXPECT_EQ(key.substr(0, prefix.size()), prefix);
+}
+
+TEST(DayBitmapKeyEncoding, DecodeTooShortKeyThrows) {
+    // Keys shorter than 7 bytes (prefix + measurement + null + day) should throw
+    EXPECT_THROW(ke::decodeDayFromDayBitmapKey(""), std::runtime_error);
+    EXPECT_THROW(ke::decodeDayFromDayBitmapKey("abc"), std::runtime_error);
+    EXPECT_THROW(ke::decodeDayFromDayBitmapKey("abcdef"), std::runtime_error);
+    // Exactly 7 bytes should succeed (minimal: prefix(1) + m(1) + null(1) + day(4))
+    std::string minimal(7, '\0');
+    EXPECT_NO_THROW(ke::decodeDayFromDayBitmapKey(minimal));
 }
 
 // ── Single-Day Insert and Query ──
@@ -89,23 +111,21 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, SingleDayInsertAndQuery) {
 
     // Insert data for day 20000 (some arbitrary day)
     uint64_t day20000_start = 20000ULL * ke::NS_PER_DAY;
-    auto insert = makeInsert<double>("cpu", "usage",
-                                      {{"host", "server-01"}},
-                                      {day20000_start, day20000_start + 1'000'000'000ULL},
-                                      {42.0, 43.0});
+    auto insert = makeInsert<double>("cpu", "usage", {{"host", "server-01"}},
+                                     {day20000_start, day20000_start + 1'000'000'000ULL}, {42.0, 43.0});
     co_await index.indexInsert(insert);
 
     // Query within the same day — should find the series
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "cpu", {{"host", "server-01"}}, {}, day20000_start, day20000_start + ke::NS_PER_DAY - 1);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("cpu", {{"host", "server-01"}}, {}, day20000_start,
+                                                                  day20000_start + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
     EXPECT_EQ((*result)[0].metadata.measurement, "cpu");
 
     // Query a completely different day — should return empty
     uint64_t day19000_start = 19000ULL * ke::NS_PER_DAY;
-    auto result2 = co_await index.findSeriesWithMetadataTimeScoped(
-        "cpu", {{"host", "server-01"}}, {}, day19000_start, day19000_start + ke::NS_PER_DAY - 1);
+    auto result2 = co_await index.findSeriesWithMetadataTimeScoped("cpu", {{"host", "server-01"}}, {}, day19000_start,
+                                                                   day19000_start + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result2.has_value());
     EXPECT_EQ(result2->size(), 0u);
 
@@ -121,36 +141,33 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MultiDayNarrowQuery) {
     uint64_t baseDay = 20000ULL * ke::NS_PER_DAY;
 
     // Series A: active on days 20000-20002
-    auto insertA = makeInsert<double>("temp", "value",
-                                       {{"location", "us-west"}},
-                                       {baseDay, baseDay + ke::NS_PER_DAY, baseDay + 2 * ke::NS_PER_DAY},
-                                       {10.0, 11.0, 12.0});
+    auto insertA =
+        makeInsert<double>("temp", "value", {{"location", "us-west"}},
+                           {baseDay, baseDay + ke::NS_PER_DAY, baseDay + 2 * ke::NS_PER_DAY}, {10.0, 11.0, 12.0});
     co_await index.indexInsert(insertA);
 
     // Series B: active only on day 20005
-    auto insertB = makeInsert<double>("temp", "value",
-                                       {{"location", "us-east"}},
-                                       {baseDay + 5 * ke::NS_PER_DAY},
-                                       {20.0});
+    auto insertB =
+        makeInsert<double>("temp", "value", {{"location", "us-east"}}, {baseDay + 5 * ke::NS_PER_DAY}, {20.0});
     co_await index.indexInsert(insertB);
 
     // Query days 20000-20002 — should only find series A
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "temp", {}, {}, baseDay, baseDay + 2 * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("temp", {}, {}, baseDay,
+                                                                  baseDay + 2 * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
     EXPECT_EQ((*result)[0].metadata.tags.at("location"), "us-west");
 
     // Query day 20005 — should only find series B
-    auto result2 = co_await index.findSeriesWithMetadataTimeScoped(
-        "temp", {}, {}, baseDay + 5 * ke::NS_PER_DAY, baseDay + 5 * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
+    auto result2 = co_await index.findSeriesWithMetadataTimeScoped("temp", {}, {}, baseDay + 5 * ke::NS_PER_DAY,
+                                                                   baseDay + 5 * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result2.has_value());
     EXPECT_EQ(result2->size(), 1u);
     EXPECT_EQ((*result2)[0].metadata.tags.at("location"), "us-east");
 
     // Query all days — should find both
-    auto result3 = co_await index.findSeriesWithMetadataTimeScoped(
-        "temp", {}, {}, baseDay, baseDay + 6 * ke::NS_PER_DAY);
+    auto result3 =
+        co_await index.findSeriesWithMetadataTimeScoped("temp", {}, {}, baseDay, baseDay + 6 * ke::NS_PER_DAY);
     EXPECT_TRUE(result3.has_value());
     EXPECT_EQ(result3->size(), 2u);
 
@@ -166,15 +183,12 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, InactiveDayReturnsEmpty) {
     uint64_t day20000 = 20000ULL * ke::NS_PER_DAY;
 
     // Insert data on day 20000
-    auto insert = makeInsert<double>("mem", "used",
-                                      {{"host", "h1"}},
-                                      {day20000 + 100},
-                                      {1024.0});
+    auto insert = makeInsert<double>("mem", "used", {{"host", "h1"}}, {day20000 + 100}, {1024.0});
     co_await index.indexInsert(insert);
 
     // Query day 20001 (no data) — should return empty (not fallback, since day bitmaps exist)
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "mem", {}, {}, (20001ULL) * ke::NS_PER_DAY, (20002ULL) * ke::NS_PER_DAY - 1);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("mem", {}, {}, (20001ULL) * ke::NS_PER_DAY,
+                                                                  (20002ULL) * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 0u);
 
@@ -203,20 +217,20 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedWithTagFilter) {
     co_await index.indexInsert(i3);
 
     // Query day 100, region=west — should only find series 1
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "net", {{"region", "west"}}, {}, day100, day100 + ke::NS_PER_DAY - 1);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("net", {{"region", "west"}}, {}, day100,
+                                                                  day100 + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
 
     // Query day 200, region=west — should only find series 3
-    auto result2 = co_await index.findSeriesWithMetadataTimeScoped(
-        "net", {{"region", "west"}}, {}, day200, day200 + ke::NS_PER_DAY - 1);
+    auto result2 = co_await index.findSeriesWithMetadataTimeScoped("net", {{"region", "west"}}, {}, day200,
+                                                                   day200 + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result2.has_value());
     EXPECT_EQ(result2->size(), 1u);
 
     // Query day 100-200, region=west — should find both west series
-    auto result3 = co_await index.findSeriesWithMetadataTimeScoped(
-        "net", {{"region", "west"}}, {}, day100, day200 + ke::NS_PER_DAY - 1);
+    auto result3 = co_await index.findSeriesWithMetadataTimeScoped("net", {{"region", "west"}}, {}, day100,
+                                                                   day200 + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result3.has_value());
     EXPECT_EQ(result3->size(), 2u);
 
@@ -248,15 +262,15 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, PersistenceAfterFlushCompactReopen) {
         co_await index.open();
 
         // Query day 500 — should find only host a
-        auto result = co_await index.findSeriesWithMetadataTimeScoped(
-            "disk", {}, {}, day500, day500 + ke::NS_PER_DAY - 1);
+        auto result =
+            co_await index.findSeriesWithMetadataTimeScoped("disk", {}, {}, day500, day500 + ke::NS_PER_DAY - 1);
         EXPECT_TRUE(result.has_value());
         EXPECT_EQ(result->size(), 1u);
         EXPECT_EQ((*result)[0].metadata.tags.at("host"), "a");
 
         // Query day 501 — should find only host b
-        auto result2 = co_await index.findSeriesWithMetadataTimeScoped(
-            "disk", {}, {}, day501, day501 + ke::NS_PER_DAY - 1);
+        auto result2 =
+            co_await index.findSeriesWithMetadataTimeScoped("disk", {}, {}, day501, day501 + ke::NS_PER_DAY - 1);
         EXPECT_TRUE(result2.has_value());
         EXPECT_EQ(result2->size(), 1u);
         EXPECT_EQ((*result2)[0].metadata.tags.at("host"), "b");
@@ -280,20 +294,19 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, BackfillMarksHistoricalDays) {
         values.push_back(static_cast<double>(d));
     }
 
-    auto insert = makeInsert<double>("backfill_metric", "value",
-                                      {{"source", "historical"}},
-                                      std::move(timestamps), std::move(values));
+    auto insert = makeInsert<double>("backfill_metric", "value", {{"source", "historical"}}, std::move(timestamps),
+                                     std::move(values));
     co_await index.indexInsert(insert);
 
     // Should be found in day range 10000-10029
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "backfill_metric", {}, {}, startDay, startDay + 30 * ke::NS_PER_DAY);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("backfill_metric", {}, {}, startDay,
+                                                                  startDay + 30 * ke::NS_PER_DAY);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
 
     // Should NOT be found in day range 11000-11001
-    auto result2 = co_await index.findSeriesWithMetadataTimeScoped(
-        "backfill_metric", {}, {}, 11000ULL * ke::NS_PER_DAY, 11001ULL * ke::NS_PER_DAY);
+    auto result2 = co_await index.findSeriesWithMetadataTimeScoped("backfill_metric", {}, {}, 11000ULL * ke::NS_PER_DAY,
+                                                                   11001ULL * ke::NS_PER_DAY);
     EXPECT_TRUE(result2.has_value());
     EXPECT_EQ(result2->size(), 0u);
 
@@ -315,8 +328,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RetentionCleanupRemovesOldDayBitmaps) {
     co_await index.indexInsert(i2);
 
     // Verify both days are queryable
-    auto before = co_await index.findSeriesWithMetadataTimeScoped(
-        "metrics", {}, {}, day100, day200 + ke::NS_PER_DAY);
+    auto before = co_await index.findSeriesWithMetadataTimeScoped("metrics", {}, {}, day100, day200 + ke::NS_PER_DAY);
     EXPECT_TRUE(before.has_value());
     EXPECT_EQ(before->size(), 2u);
 
@@ -324,14 +336,13 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RetentionCleanupRemovesOldDayBitmaps) {
     co_await index.removeExpiredDayBitmaps("metrics", 150);
 
     // Day 100 should now be empty
-    auto after100 = co_await index.findSeriesWithMetadataTimeScoped(
-        "metrics", {}, {}, day100, day100 + ke::NS_PER_DAY - 1);
+    auto after100 =
+        co_await index.findSeriesWithMetadataTimeScoped("metrics", {}, {}, day100, day100 + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(after100.has_value());
     EXPECT_EQ(after100->size(), 0u);
 
     // Day 200 should still work
-    auto after200 = co_await index.findSeriesWithMetadataTimeScoped(
-        "metrics", {}, {}, day200, day200 + ke::NS_PER_DAY);
+    auto after200 = co_await index.findSeriesWithMetadataTimeScoped("metrics", {}, {}, day200, day200 + ke::NS_PER_DAY);
     EXPECT_TRUE(after200.has_value());
     EXPECT_EQ(after200->size(), 1u);
 
@@ -349,8 +360,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, FallbackWhenNoDayBitmaps) {
 
     // Time-scoped query should fall back to non-time-scoped path and still find the series
     uint64_t someDay = 15000ULL * ke::NS_PER_DAY;
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "legacy", {}, {}, someDay, someDay + ke::NS_PER_DAY);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("legacy", {}, {}, someDay, someDay + ke::NS_PER_DAY);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
     EXPECT_EQ((*result)[0].metadata.measurement, "legacy");
@@ -375,34 +385,42 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, LargeScaleNarrowVsWide) {
     // - Series 150-199: active on days 25-29
     for (int s = 0; s < NUM_SERIES; ++s) {
         int dayStart, dayEnd;
-        if (s < 50) { dayStart = 0; dayEnd = 4; }
-        else if (s < 100) { dayStart = 5; dayEnd = 14; }
-        else if (s < 150) { dayStart = 15; dayEnd = 24; }
-        else { dayStart = 25; dayEnd = 29; }
+        if (s < 50) {
+            dayStart = 0;
+            dayEnd = 4;
+        } else if (s < 100) {
+            dayStart = 5;
+            dayEnd = 14;
+        } else if (s < 150) {
+            dayStart = 15;
+            dayEnd = 24;
+        } else {
+            dayStart = 25;
+            dayEnd = 29;
+        }
 
         std::string host = "host-" + std::to_string(s);
-        auto insert = makeInsert<double>("cluster", "load",
-                                          {{"host", host}},
-                                          {baseDay + static_cast<uint64_t>(dayStart) * ke::NS_PER_DAY + 1},
-                                          {static_cast<double>(s)});
+        auto insert = makeInsert<double>("cluster", "load", {{"host", host}},
+                                         {baseDay + static_cast<uint64_t>(dayStart) * ke::NS_PER_DAY + 1},
+                                         {static_cast<double>(s)});
         co_await index.indexInsert(insert);
     }
 
     // Narrow query: days 0-4 should only return 50 series
-    auto narrow = co_await index.findSeriesWithMetadataTimeScoped(
-        "cluster", {}, {}, baseDay, baseDay + 5 * ke::NS_PER_DAY - 1);
+    auto narrow =
+        co_await index.findSeriesWithMetadataTimeScoped("cluster", {}, {}, baseDay, baseDay + 5 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(narrow.has_value());
     EXPECT_EQ(narrow->size(), 50u);
 
     // Medium query: days 5-14 should return 50 series
-    auto medium = co_await index.findSeriesWithMetadataTimeScoped(
-        "cluster", {}, {}, baseDay + 5 * ke::NS_PER_DAY, baseDay + 15 * ke::NS_PER_DAY - 1);
+    auto medium = co_await index.findSeriesWithMetadataTimeScoped("cluster", {}, {}, baseDay + 5 * ke::NS_PER_DAY,
+                                                                  baseDay + 15 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(medium.has_value());
     EXPECT_EQ(medium->size(), 50u);
 
     // Wide query: all 30 days should return all 200 series
-    auto wide = co_await index.findSeriesWithMetadataTimeScoped(
-        "cluster", {}, {}, baseDay, baseDay + NUM_DAYS * ke::NS_PER_DAY);
+    auto wide = co_await index.findSeriesWithMetadataTimeScoped("cluster", {}, {}, baseDay,
+                                                                baseDay + NUM_DAYS * ke::NS_PER_DAY);
     EXPECT_TRUE(wide.has_value());
     EXPECT_EQ(wide->size(), static_cast<size_t>(NUM_SERIES));
 
@@ -424,8 +442,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, FieldFilterWithTimeScope) {
     co_await index.indexInsert(i2);
 
     // Query with field filter — only cpu_pct
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "sys", {}, {"cpu_pct"}, day1, day1 + ke::NS_PER_DAY);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("sys", {}, {"cpu_pct"}, day1, day1 + ke::NS_PER_DAY);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
     EXPECT_EQ((*result)[0].metadata.field, "cpu_pct");
@@ -443,34 +460,26 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MultiTagIntersectionWithTimeScope) {
     uint64_t day400 = 400ULL * ke::NS_PER_DAY;
 
     // Series: region=west, env=prod, active day 300
-    auto i1 = makeInsert<double>("api", "latency",
-                                  {{"region", "west"}, {"env", "prod"}},
-                                  {day300 + 1}, {10.0});
+    auto i1 = makeInsert<double>("api", "latency", {{"region", "west"}, {"env", "prod"}}, {day300 + 1}, {10.0});
     co_await index.indexInsert(i1);
 
     // Series: region=west, env=staging, active day 300
-    auto i2 = makeInsert<double>("api", "latency",
-                                  {{"region", "west"}, {"env", "staging"}},
-                                  {day300 + 2}, {20.0});
+    auto i2 = makeInsert<double>("api", "latency", {{"region", "west"}, {"env", "staging"}}, {day300 + 2}, {20.0});
     co_await index.indexInsert(i2);
 
     // Series: region=east, env=prod, active day 400
-    auto i3 = makeInsert<double>("api", "latency",
-                                  {{"region", "east"}, {"env", "prod"}},
-                                  {day400 + 1}, {30.0});
+    auto i3 = makeInsert<double>("api", "latency", {{"region", "east"}, {"env", "prod"}}, {day400 + 1}, {30.0});
     co_await index.indexInsert(i3);
 
     // Query day 300, region=west AND env=prod — should find exactly 1
-    auto result = co_await index.findSeriesWithMetadataTimeScoped(
-        "api", {{"region", "west"}, {"env", "prod"}}, {},
-        day300, day300 + ke::NS_PER_DAY - 1);
+    auto result = co_await index.findSeriesWithMetadataTimeScoped("api", {{"region", "west"}, {"env", "prod"}}, {},
+                                                                  day300, day300 + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
 
     // Query day 300, region=west (no env filter) — should find 2
-    auto result2 = co_await index.findSeriesWithMetadataTimeScoped(
-        "api", {{"region", "west"}}, {},
-        day300, day300 + ke::NS_PER_DAY - 1);
+    auto result2 = co_await index.findSeriesWithMetadataTimeScoped("api", {{"region", "west"}}, {}, day300,
+                                                                   day300 + ke::NS_PER_DAY - 1);
     EXPECT_TRUE(result2.has_value());
     EXPECT_EQ(result2->size(), 2u);
 

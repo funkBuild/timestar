@@ -22,22 +22,22 @@ struct ALPScratchBuffers {
     // persists across calls (no per-block heap allocation after warm-up).
     // Replaces large stack arrays (~28-46KB) that risked overflow on Seastar's
     // 128KB fiber stacks.
-    std::vector<uint64_t> packed_data{1024};
-    std::vector<int64_t> decoded_ints{1024};
-    std::vector<uint16_t> exc_positions{1024};
-    std::vector<uint64_t> exc_values{1024};
-    std::vector<uint64_t> pos_word_buf{256};
+    std::vector<uint64_t> packed_data = std::vector<uint64_t>(1024);
+    std::vector<int64_t> decoded_ints = std::vector<int64_t>(1024);
+    std::vector<uint16_t> exc_positions = std::vector<uint16_t>(1024);
+    std::vector<uint64_t> exc_values = std::vector<uint64_t>(1024);
+    std::vector<uint64_t> pos_word_buf = std::vector<uint64_t>(256);
 
     // ALP_RD scheme buffers — moved from stack (~44KB) to thread-local
     // to avoid overflow on Seastar's 128KB fiber stacks.
     std::vector<uint64_t> dictionary;
-    std::vector<int64_t> rd_left_indices{1024};
-    std::vector<uint64_t> rd_left_packed{1024};
-    std::vector<uint64_t> rd_right_parts{1024};
-    std::vector<uint64_t> rd_right_packed{1024};
-    std::vector<uint16_t> rd_exc_positions{1024};
-    std::vector<uint64_t> rd_exc_values{1024};
-    std::vector<uint64_t> rd_pos_word_buf{256};
+    std::vector<int64_t> rd_left_indices = std::vector<int64_t>(1024);
+    std::vector<uint64_t> rd_left_packed = std::vector<uint64_t>(1024);
+    std::vector<uint64_t> rd_right_parts = std::vector<uint64_t>(1024);
+    std::vector<uint64_t> rd_right_packed = std::vector<uint64_t>(1024);
+    std::vector<uint16_t> rd_exc_positions = std::vector<uint16_t>(1024);
+    std::vector<uint64_t> rd_exc_values = std::vector<uint64_t>(1024);
+    std::vector<uint64_t> rd_pos_word_buf = std::vector<uint64_t>(256);
 };
 
 static ALPScratchBuffers& getScratch() {
@@ -328,8 +328,10 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             // === Reconstruct doubles ===
             const uint8_t right_bit_count = static_cast<uint8_t>((bh0 >> 24) & 0xFF);
+            if (right_bit_count > 63)
+                throw std::runtime_error("ALP_RD: invalid right_bit_count in block header");
 
-            const uint64_t right_mask = (right_bit_count == 64) ? ~0ULL : ((1ULL << right_bit_count) - 1);
+            const uint64_t right_mask = (1ULL << right_bit_count) - 1;
 
             if (exception_count == 0) [[likely]] {
                 // Fast path: no exceptions -- tight reconstruction loop

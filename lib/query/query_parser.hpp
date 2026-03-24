@@ -58,11 +58,11 @@ public:
     // Parse query string format:
     // aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
     // Time format: dd-mm-yyyy hh:mm:ss
-    static QueryRequest parse(const std::string& queryString, const std::string& startTimeStr,
-                              const std::string& endTimeStr);
+    [[nodiscard]] static QueryRequest parse(const std::string& queryString, const std::string& startTimeStr,
+                                            const std::string& endTimeStr);
 
     // Parse just the query string (for testing)
-    static QueryRequest parseQueryString(const std::string& queryString);
+    [[nodiscard]] static QueryRequest parseQueryString(const std::string& queryString);
 
     // Parse time string to nanoseconds since epoch
     static uint64_t parseTime(const std::string& timeStr);

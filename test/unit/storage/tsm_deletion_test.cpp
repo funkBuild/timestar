@@ -157,9 +157,10 @@ TEST(TSMDeletionTest, ScheduleDeleteUnlinksFile) {
 
     std::string funcBody = src.substr(bodyStart, funcEnd - bodyStart + 1);
 
-    // The function should NOT contain tsmFile.close() — deferred close pattern
-    EXPECT_EQ(funcBody.find("tsmFile.close()"), std::string::npos)
-        << "scheduleDelete must NOT explicitly close the file handle (deferred close pattern)";
+    // The function MUST close the file handle after removing the file to
+    // prevent seastar::file destructor assertions in debug builds.
+    EXPECT_NE(funcBody.find("tsmFile.close()"), std::string::npos)
+        << "scheduleDelete must close the file handle after remove_file to avoid fd leak";
 }
 
 // ---------------------------------------------------------------------------

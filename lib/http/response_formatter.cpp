@@ -346,8 +346,11 @@ std::string ResponseFormatter::format(QueryResponse& response) {
 }
 
 std::string ResponseFormatter::formatError(const std::string& message, const std::string& code) {
+    // Cap error message to prevent unbounded allocation from exceptionally long strings
+    constexpr size_t MAX_ERROR_MSG_LEN = 4096;
+    std::string_view msg_view(message.data(), std::min(message.size(), MAX_ERROR_MSG_LEN));
     std::string buf;
-    buf.resize(message.size() * 2 + code.size() + 96);
+    buf.resize(msg_view.size() * 2 + code.size() + 96);
     size_t pos = 0;
 
     pos = appendRaw(buf, pos, R"({"status":"error")");
@@ -356,9 +359,9 @@ std::string ResponseFormatter::formatError(const std::string& message, const std
         pos = appendJsonString(buf, pos, code);
     }
     pos = appendRaw(buf, pos, R"(,"message":)");
-    pos = appendJsonString(buf, pos, message);
+    pos = appendJsonString(buf, pos, msg_view);
     pos = appendRaw(buf, pos, R"(,"error":)");
-    pos = appendJsonString(buf, pos, message);
+    pos = appendJsonString(buf, pos, msg_view);
     pos = appendChar(buf, pos, '}');
 
     buf.resize(pos);

@@ -44,7 +44,8 @@ private:
 void setGlobalPlacement(PlacementTable table);
 const PlacementTable& placement();
 
-// Persist placement table to disk
+// Persist placement table to disk.
+// Uses blocking I/O — call from seastar::async or before reactor starts.
 void savePlacement(const std::string& path);
 
 // Convenience routing

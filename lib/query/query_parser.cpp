@@ -211,6 +211,9 @@ std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos)
     if (sv.empty()) {
         throw QueryParseException("Empty measurement name");
     }
+    if (sv.find('\0') != std::string_view::npos) {
+        throw QueryParseException("Measurement name cannot contain null bytes");
+    }
     if (sv.find_first_of(" \t\n\r") != std::string_view::npos) {
         throw QueryParseException("Measurement name cannot contain whitespace: '" + std::string(sv) + "'");
     }
@@ -305,12 +308,28 @@ std::map<std::string, std::string> QueryParser::parseScopes(const std::string& q
                 }
             } else if (inSlashRegex) {
                 // Inside /regex/ — skip to closing unescaped '/'
-                if (c == '/' && (end == 0 || scopesView[end - 1] != '\\')) {
-                    inSlashRegex = false;
+                // Count consecutive backslashes preceding this character;
+                // the slash is escaped only when preceded by an odd number.
+                if (c == '/') {
+                    size_t numBackslashes = 0;
+                    for (size_t k = end; k > 0 && scopesView[k - 1] == '\\'; --k)
+                        ++numBackslashes;
+                    if (numBackslashes % 2 == 0) {
+                        inSlashRegex = false;
+                    }
                 }
             } else {
                 // In the value portion (plain or ~regex)
-                if (c == '[') {
+                // Count consecutive backslashes preceding this character;
+                // the bracket is escaped only when preceded by an odd number.
+                size_t numBackslashes = 0;
+                if (end > 0) {
+                    for (size_t k = end; k > 0 && scopesView[k - 1] == '\\'; --k)
+                        ++numBackslashes;
+                }
+                if (numBackslashes % 2 != 0) {
+                    // Escaped bracket — skip, don't adjust depth
+                } else if (c == '[') {
                     bracketDepth++;
                 } else if (c == ']' && bracketDepth > 0) {
                     bracketDepth--;

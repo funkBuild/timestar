@@ -1,5 +1,7 @@
 #include "../../lib/utils/crc32.hpp"
+
 #include <gtest/gtest.h>
+
 #include <cstring>
 #include <vector>
 
@@ -54,9 +56,10 @@ TEST(CRC32UnitTest, IncrementalUpdate) {
     std::string full = "Hello, World!";
     uint32_t fullCRC = CRC32::compute(reinterpret_cast<const uint8_t*>(full.data()), full.size());
 
-    // Compute in two parts using update
-    uint32_t partialCRC = CRC32::update(0, reinterpret_cast<const uint8_t*>(full.data()), 7);
-    uint32_t incrementalCRC = CRC32::update(partialCRC, reinterpret_cast<const uint8_t*>(full.data() + 7), 6);
+    // Compute in two parts using update (must start from INIT and finalize at the end)
+    uint32_t partialCRC = CRC32::update(CRC32::INIT, reinterpret_cast<const uint8_t*>(full.data()), 7);
+    uint32_t incrementalCRC =
+        CRC32::finalize(CRC32::update(partialCRC, reinterpret_cast<const uint8_t*>(full.data() + 7), 6));
 
     EXPECT_EQ(fullCRC, incrementalCRC);
 }
@@ -85,7 +88,8 @@ TEST(CRC32UnitTest, LargeInput) {
 TEST(CRC32UnitTest, AllAlignmentResidues) {
     // Test with sizes 1-16 to exercise all alignment residue paths
     std::vector<uint8_t> data(16);
-    for (size_t i = 0; i < 16; ++i) data[i] = static_cast<uint8_t>(i + 1);
+    for (size_t i = 0; i < 16; ++i)
+        data[i] = static_cast<uint8_t>(i + 1);
 
     uint32_t prev = 0;
     for (size_t len = 1; len <= 16; ++len) {

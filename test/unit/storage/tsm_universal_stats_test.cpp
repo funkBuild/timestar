@@ -86,7 +86,7 @@ seastar::future<> testIntegerCountPushdown(std::string filename) {
 
     // COUNT pushdown: should use block stats without decoding
     timestar::BlockAggregator aggregator(0, AggregationMethod::COUNT);
-    aggregator.setFoldToSingleState(false);
+    aggregator.enableFoldToSingleState();
     size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
     EXPECT_EQ(pts, 10u);
 
@@ -116,7 +116,7 @@ seastar::future<> testIntegerSumMinMaxPushdown(std::string filename) {
     // SUM pushdown
     {
         timestar::BlockAggregator aggregator(0, AggregationMethod::SUM);
-        aggregator.setFoldToSingleState(false);
+        aggregator.enableFoldToSingleState();
         size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
         EXPECT_EQ(pts, 5u);
         auto state = aggregator.takeSingleState();
@@ -126,7 +126,7 @@ seastar::future<> testIntegerSumMinMaxPushdown(std::string filename) {
     // MIN pushdown
     {
         timestar::BlockAggregator aggregator(0, AggregationMethod::MIN);
-        aggregator.setFoldToSingleState(false);
+        aggregator.enableFoldToSingleState();
         size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
         EXPECT_EQ(pts, 5u);
         auto state = aggregator.takeSingleState();
@@ -136,7 +136,7 @@ seastar::future<> testIntegerSumMinMaxPushdown(std::string filename) {
     // MAX pushdown
     {
         timestar::BlockAggregator aggregator(0, AggregationMethod::MAX);
-        aggregator.setFoldToSingleState(false);
+        aggregator.enableFoldToSingleState();
         size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
         EXPECT_EQ(pts, 5u);
         auto state = aggregator.takeSingleState();
@@ -214,7 +214,7 @@ seastar::future<> testBoolCountPushdown(std::string filename) {
     co_await tsm.open();
 
     timestar::BlockAggregator aggregator(0, AggregationMethod::COUNT);
-    aggregator.setFoldToSingleState(false);
+    aggregator.enableFoldToSingleState();
     size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
     EXPECT_EQ(pts, 100u);
 
@@ -277,7 +277,7 @@ seastar::future<> testStringAggregationReturnsZero(std::string filename) {
     co_await tsm.open();
 
     timestar::BlockAggregator aggregator(0, AggregationMethod::COUNT);
-    aggregator.setFoldToSingleState(false);
+    aggregator.enableFoldToSingleState();
     size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
     EXPECT_EQ(pts, 0u);  // String aggregation not supported
 
@@ -388,7 +388,7 @@ seastar::future<> testTombstonePerBlockOverlap(std::string filename) {
 
     // Run aggregation — blocks NOT covered by tombstones should still use block stats
     timestar::BlockAggregator aggregator(0, AggregationMethod::SUM);
-    aggregator.setFoldToSingleState(false);
+    aggregator.enableFoldToSingleState();
     size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
 
     // Should have aggregated all non-tombstoned blocks
@@ -437,7 +437,7 @@ seastar::future<> testMultiBlockIntegerStats(std::string filename) {
 
     // Aggregate via pushdown — should work for Integer now
     timestar::BlockAggregator aggregator(0, AggregationMethod::COUNT);
-    aggregator.setFoldToSingleState(false);
+    aggregator.enableFoldToSingleState();
     size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
     EXPECT_EQ(pts, 10000u);
 
@@ -467,7 +467,7 @@ seastar::future<> testBoolSumPushdown(std::string filename) {
 
     // SUM of booleans = trueCount
     timestar::BlockAggregator aggregator(0, AggregationMethod::SUM);
-    aggregator.setFoldToSingleState(false);
+    aggregator.enableFoldToSingleState();
     size_t pts = co_await tsm.aggregateSeries(seriesId, 0, UINT64_MAX, aggregator);
     EXPECT_EQ(pts, 10u);
     auto state = aggregator.takeSingleState();
@@ -500,7 +500,7 @@ seastar::future<> testIntegerLatestSelective(std::string filename) {
     // LATEST with maxPoints=1 should use block stats shortcut
     {
         timestar::BlockAggregator aggregator(0, AggregationMethod::LATEST);
-        aggregator.setFoldToSingleState(false);
+        aggregator.enableFoldToSingleState();
         size_t pts = co_await tsm.aggregateSeriesSelective(seriesId, 0, UINT64_MAX, aggregator, true, 1);
         EXPECT_EQ(pts, 1u);
     }
@@ -508,7 +508,7 @@ seastar::future<> testIntegerLatestSelective(std::string filename) {
     // FIRST with maxPoints=1
     {
         timestar::BlockAggregator aggregator(0, AggregationMethod::FIRST);
-        aggregator.setFoldToSingleState(false);
+        aggregator.enableFoldToSingleState();
         size_t pts = co_await tsm.aggregateSeriesSelective(seriesId, 0, UINT64_MAX, aggregator, false, 1);
         EXPECT_EQ(pts, 1u);
     }

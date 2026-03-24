@@ -158,7 +158,7 @@ TEST_F(MemoryStoreTest, NonExistentSeries) {
 TEST_F(MemoryStoreTest, EmptyStore) {
     EXPECT_TRUE(store->isEmpty());
     EXPECT_FALSE(store->isClosed());
-    // isFull() is now async, skip in sync test
+    EXPECT_FALSE(store->isFull());
 
     // Add data
     TimeStarInsert<double> insert("test", "series");

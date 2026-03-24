@@ -111,7 +111,10 @@ BestPair findBestExpFac(const double* values, size_t count) {
 uint8_t requiredBitWidth(int64_t min_val, int64_t max_val) {
     if (min_val == max_val)
         return 0;
-    uint64_t range = static_cast<uint64_t>(max_val - min_val);
+    // Use unsigned arithmetic to avoid signed overflow UB when range exceeds INT64_MAX
+    uint64_t range = static_cast<uint64_t>(max_val) - static_cast<uint64_t>(min_val);
+    if (range == 0)
+        return 0;
     return static_cast<uint8_t>(64 - __builtin_clzll(range));
 }
 

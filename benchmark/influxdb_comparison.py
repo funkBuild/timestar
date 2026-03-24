@@ -30,6 +30,14 @@ from typing import Optional
 
 import requests
 
+# Protobuf support — optional, required only when --ts-format=protobuf
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "test_api", "python"))
+    import timestar_pb2 as pb
+    HAS_PROTOBUF = True
+except ImportError:
+    HAS_PROTOBUF = False
+
 # ── Data schema (matches timestar_insert_bench.cpp) ────────────────────
 
 MEASUREMENT = "server.metrics"
@@ -312,6 +320,44 @@ def generate_batch(seed: int, host_id: int, rack_id: int,
     return lp, ts_json
 
 
+def generate_batch_protobuf(seed: int, host_id: int, rack_id: int,
+                            start_ts: int, count: int) -> bytes:
+    """
+    Returns serialized WriteRequest protobuf for the same data as generate_batch.
+    """
+    rng = random.Random(seed ^ (host_id << 32) ^ start_ts)
+
+    host_tag = f"host-{host_id:02d}"
+    rack_tag = f"rack-{rack_id}"
+
+    timestamps = []
+    field_arrays = {f: [] for f in FIELD_NAMES}
+
+    for i in range(count):
+        ts = start_ts + i * MINUTE_NS
+        timestamps.append(ts)
+        for fname in FIELD_NAMES:
+            v = rng.uniform(0.0, 100.0)
+            field_arrays[fname].append(round(v, 6))
+
+    # Build protobuf WriteRequest
+    req = pb.WriteRequest()
+    point = req.writes.add()
+    point.measurement = MEASUREMENT
+    point.tags["host"] = host_tag
+    point.tags["rack"] = rack_tag
+    for ts in timestamps:
+        point.timestamps.append(ts)
+    for fname, vals in field_arrays.items():
+        wf = pb.WriteField()
+        da = pb.DoubleArray()
+        da.values.extend(vals)
+        wf.double_values.CopyFrom(da)
+        point.fields[fname].CopyFrom(wf)
+
+    return req.SerializeToString()
+
+
 # ── Benchmark runner ───────────────────────────────────────────────────
 
 @dataclass
@@ -381,10 +427,13 @@ def run_insert_bench(target: str, batches: int, batch_size: int,
                      num_hosts: int, num_racks: int, seed: int,
                      concurrency: int,
                      ts_host: str, ts_port: int,
-                     influx_port: int) -> InsertResult:
+                     influx_port: int,
+                     ts_format: str = "json") -> InsertResult:
     """Run insert benchmark against the specified target."""
     result = InsertResult()
     pts_per_batch = batch_size * len(FIELD_NAMES)
+
+    use_protobuf = (target == "timestar" and ts_format == "protobuf")
 
     # Pre-generate all payloads
     payloads = []
@@ -393,15 +442,29 @@ def run_insert_bench(target: str, batches: int, batch_size: int,
         hid = rng.randint(1, num_hosts)
         rid = rng.randint(1, num_racks)
         start_ts = BASE_TS + b * batch_size * MINUTE_NS
-        lp, ts_json = generate_batch(seed, hid, rid, start_ts, batch_size)
-        payloads.append((lp, ts_json))
+        if use_protobuf:
+            pb_bytes = generate_batch_protobuf(seed, hid, rid, start_ts, batch_size)
+            payloads.append((None, None, pb_bytes))
+        else:
+            lp, ts_json = generate_batch(seed, hid, rid, start_ts, batch_size)
+            payloads.append((lp, ts_json, None))
+
+    # Thread-local sessions for HTTP keep-alive (one per thread)
+    import threading
+    _tls = threading.local()
+
+    def _get_session():
+        if not hasattr(_tls, 'session'):
+            _tls.session = requests.Session()
+        return _tls.session
 
     def send_one(idx):
-        lp, ts_json = payloads[idx]
+        lp, ts_json, pb_bytes = payloads[idx]
+        sess = _get_session()
         t0 = time.perf_counter()
         try:
             if target == "influxdb":
-                r = requests.post(
+                r = sess.post(
                     f"http://127.0.0.1:{influx_port}/api/v2/write"
                     f"?org={INFLUX_ORG}&bucket={INFLUX_BUCKET}&precision=ns",
                     data=lp,
@@ -413,8 +476,17 @@ def run_insert_bench(target: str, batches: int, batch_size: int,
                 )
                 ok = r.status_code == 204
                 err = "" if ok else f"HTTP {r.status_code}: {r.text[:200]}"
-            else:  # timestar
-                r = requests.post(
+            elif use_protobuf:
+                r = sess.post(
+                    f"http://{ts_host}:{ts_port}/write",
+                    data=pb_bytes,
+                    headers={"Content-Type": "application/x-protobuf"},
+                    timeout=60,
+                )
+                ok = 200 <= r.status_code < 300
+                err = "" if ok else f"HTTP {r.status_code}: {r.text[:200]}"
+            else:  # timestar json
+                r = sess.post(
                     f"http://{ts_host}:{ts_port}/write",
                     data=ts_json,
                     headers={"Content-Type": "application/json"},
@@ -936,13 +1008,35 @@ def build_query_suite(total_batches: int, batch_size: int):
 
 
 def run_query_bench_timestar(host: str, port: int, name: str,
-                             ts_req: dict, iterations: int) -> QueryBenchResult:
+                             ts_req: dict, iterations: int,
+                             ts_format: str = "json") -> QueryBenchResult:
     result = QueryBenchResult(name=name, iterations=iterations)
     url = f"http://{host}:{port}/query"
+    use_protobuf = (ts_format == "protobuf")
+    sess = requests.Session()
+
+    # Pre-build the request payload once
+    if use_protobuf:
+        qr = pb.QueryRequest()
+        qr.query = ts_req["query"]
+        qr.start_time = ts_req["startTime"]
+        qr.end_time = ts_req["endTime"]
+        if "aggregationInterval" in ts_req and ts_req["aggregationInterval"]:
+            qr.aggregation_interval = str(ts_req["aggregationInterval"])
+        request_data = qr.SerializeToString()
+        request_headers = {
+            "Content-Type": "application/x-protobuf",
+            "Accept": "application/x-protobuf",
+        }
+    else:
+        request_data = json.dumps(ts_req)
+        request_headers = {"Content-Type": "application/json"}
+
     for _ in range(iterations):
         t0 = time.perf_counter()
         try:
-            r = requests.post(url, json=ts_req, timeout=30)
+            r = sess.post(url, data=request_data, headers=request_headers,
+                          timeout=30)
             ok = 200 <= r.status_code < 300
         except Exception as e:
             result.error = str(e)
@@ -973,10 +1067,11 @@ def run_query_bench_influxdb(port: int, name: str,
         "Content-Type": "application/vnd.flux",
         "Accept": "application/csv",
     }
+    sess = requests.Session()
     for _ in range(iterations):
         t0 = time.perf_counter()
         try:
-            r = requests.post(url, data=flux_query, headers=headers, timeout=30)
+            r = sess.post(url, data=flux_query, headers=headers, timeout=30)
             ok = 200 <= r.status_code < 300
         except Exception as e:
             result.error = str(e)
@@ -1080,7 +1175,16 @@ def main():
                         help="Skip InfluxDB benchmark")
     parser.add_argument("--skip-quest", action="store_true",
                         help="Skip QuestDB benchmark")
+    parser.add_argument("--ts-format", choices=["json", "protobuf"],
+                        default="json",
+                        help="TimeStar wire format: json (default) or protobuf")
     args = parser.parse_args()
+
+    if args.ts_format == "protobuf" and not HAS_PROTOBUF:
+        print("ERROR: --ts-format=protobuf requires protobuf Python package.")
+        print("  pip install protobuf")
+        print("  cd test_api/python && bash generate_proto.sh")
+        sys.exit(1)
 
     total_points = args.batches * args.batch_size * len(FIELD_NAMES)
 
@@ -1095,6 +1199,7 @@ def main():
     print(f"  Total points:   {total_points:,}")
     print(f"  Hosts/Racks:    {args.hosts}/{args.racks}")
     print(f"  Concurrency:    {args.concurrency} threads")
+    print(f"  TS format:      {args.ts_format}")
     print(f"  Seed:           {args.seed}")
     print_separator()
     print()
@@ -1171,18 +1276,20 @@ def main():
         run_insert_bench("timestar", warmup_batches, args.batch_size,
                          args.hosts, args.racks, args.seed + 999,
                          args.concurrency, args.ts_host, args.ts_port,
-                         INFLUX_PORT)
-        run_insert_bench("influxdb", warmup_batches, args.batch_size,
-                         args.hosts, args.racks, args.seed + 999,
-                         args.concurrency, args.ts_host, args.ts_port,
-                         INFLUX_PORT)
+                         INFLUX_PORT, ts_format=args.ts_format)
+        if not args.skip_influx:
+            run_insert_bench("influxdb", warmup_batches, args.batch_size,
+                             args.hosts, args.racks, args.seed + 999,
+                             args.concurrency, args.ts_host, args.ts_port,
+                             INFLUX_PORT)
 
         print()
-        print("  Running TimeStar insert …")
+        print(f"  Running TimeStar insert ({args.ts_format}) …")
         ts_insert = run_insert_bench(
             "timestar", args.batches, args.batch_size,
             args.hosts, args.racks, args.seed,
-            args.concurrency, args.ts_host, args.ts_port, INFLUX_PORT)
+            args.concurrency, args.ts_host, args.ts_port, INFLUX_PORT,
+            ts_format=args.ts_format)
         print(f"    {ts_insert.ok}/{args.batches} OK, "
               f"{fmt_pts(ts_insert.throughput)} pts/sec, "
               f"wall={ts_insert.wall_seconds:.2f}s")
@@ -1297,7 +1404,8 @@ def main():
         # Warmup queries
         print("  Warming up (3 iterations each) …")
         for name, ts_req, flux_q, tsdb_sql, quest_sql, iters in suite:
-            run_query_bench_timestar(args.ts_host, args.ts_port, name, ts_req, 3)
+            run_query_bench_timestar(args.ts_host, args.ts_port, name, ts_req, 3,
+                                     ts_format=args.ts_format)
             if not args.skip_influx:
                 run_query_bench_influxdb(INFLUX_PORT, name, flux_q, 3)
             if not args.skip_timescale:
@@ -1335,7 +1443,8 @@ def main():
 
         for name, ts_req, flux_q, tsdb_sql, quest_sql, iters in suite:
             ts_res = run_query_bench_timestar(
-                args.ts_host, args.ts_port, name, ts_req, iters)
+                args.ts_host, args.ts_port, name, ts_req, iters,
+                ts_format=args.ts_format)
             ts_avg = ts_res.avg_ms
             ts_total_ms += ts_res.total_ms
 

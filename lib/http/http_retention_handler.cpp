@@ -1,8 +1,10 @@
 #include "http_retention_handler.hpp"
 
+#include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "http_query_handler.hpp"
 #include "logger.hpp"
+#include "proto_converters.hpp"
 
 #include <seastar/core/smp.hh>
 
@@ -31,43 +33,64 @@ std::string HttpRetentionHandler::createErrorResponse(const std::string& error) 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handlePut(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
+    auto reqFmt = timestar::http::requestFormat(*req);
+    auto resFmt = timestar::http::responseFormat(*req);
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
         reply->_content = R"({"status":"error","error":"Retention handler not initialized"})";
+        timestar::http::setContentType(*reply, resFmt);
         co_return reply;
     }
 
     // Body size limit to prevent DoS via large payloads
     if (req->content.size() > timestar::config().http.max_query_body_size) {
         reply->set_status(seastar::http::reply::status_type::payload_too_large);
-        reply->_content = R"({"status":"error","error":"Request body too large"})";
-        co_return reply;
-    }
-
-    // Validate Content-Type if explicitly set
-    {
-        auto ct = req->get_header("Content-Type");
-        std::string ctStr(ct.data(), ct.size());
-        if (!ctStr.empty() && !ctStr.starts_with("application/json")) {
-            reply->set_status(seastar::http::reply::status_type::unsupported_media_type);
-            reply->_content = R"({"status":"error","error":"Content-Type must be application/json"})";
-            co_return reply;
+        if (timestar::http::isProtobuf(resFmt)) {
+            reply->_content = timestar::proto::formatErrorResponse("Request body too large");
+        } else {
+            reply->_content = R"({"status":"error","error":"Request body too large"})";
         }
+        timestar::http::setContentType(*reply, resFmt);
+        co_return reply;
     }
 
     try {
         RetentionPolicyRequest policyReq;
-        auto err = glz::read_json(policyReq, req->content);
-        if (err) {
-            reply->set_status(seastar::http::reply::status_type::bad_request);
-            reply->_content = createErrorResponse("Invalid JSON: " + std::string(glz::format_error(err)));
-            co_return reply;
+
+        if (timestar::http::isProtobuf(reqFmt)) {
+            // Parse protobuf request
+            auto parsed = timestar::proto::parseRetentionPutRequest(req->content.data(), req->content.size());
+            policyReq.measurement = std::move(parsed.measurement);
+            policyReq.ttl = std::move(parsed.ttl);
+            if (parsed.downsample.has_value()) {
+                DownsamplePolicy ds;
+                ds.after = std::move(parsed.downsample->after);
+                ds.afterNanos = parsed.downsample->afterNanos;
+                ds.interval = std::move(parsed.downsample->interval);
+                ds.intervalNanos = parsed.downsample->intervalNanos;
+                ds.method = std::move(parsed.downsample->method);
+                policyReq.downsample = std::move(ds);
+            }
+        } else {
+            auto err = glz::read_json(policyReq, req->content);
+            if (err) {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    reply->_content =
+                        timestar::proto::formatErrorResponse("Invalid JSON: " + std::string(glz::format_error(err)));
+                } else {
+                    reply->_content = createErrorResponse("Invalid JSON: " + std::string(glz::format_error(err)));
+                }
+                timestar::http::setContentType(*reply, resFmt);
+                co_return reply;
+            }
         }
 
         if (policyReq.measurement.empty()) {
             reply->set_status(seastar::http::reply::status_type::bad_request);
             reply->_content = createErrorResponse("'measurement' is required");
+            timestar::http::setContentType(*reply, resFmt);
             co_return reply;
         }
 
@@ -76,6 +99,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             if (static_cast<unsigned char>(c) < 0x20 || c == '\x7f') {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Measurement name contains control characters");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
         }
@@ -83,6 +107,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
         if (!policyReq.ttl.has_value() && !policyReq.downsample.has_value()) {
             reply->set_status(seastar::http::reply::status_type::bad_request);
             reply->_content = createErrorResponse("At least one of 'ttl' or 'downsample' is required");
+            timestar::http::setContentType(*reply, resFmt);
             co_return reply;
         }
 
@@ -97,6 +122,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             } catch (const std::exception& e) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Invalid ttl: " + std::string(e.what()));
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
         }
@@ -107,22 +133,26 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             if (ds.after.empty()) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("downsample.after is required");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
             if (ds.interval.empty()) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("downsample.interval is required");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
             if (ds.method.empty()) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("downsample.method is required");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
             if (!isValidMethod(ds.method)) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content =
                     createErrorResponse("Invalid downsample.method: must be one of avg, min, max, sum, latest");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
 
@@ -131,6 +161,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             } catch (const std::exception& e) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Invalid downsample.after: " + std::string(e.what()));
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
             try {
@@ -138,6 +169,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             } catch (const std::exception& e) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Invalid downsample.interval: " + std::string(e.what()));
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
 
@@ -149,11 +181,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             if (policy.ttlNanos <= policy.downsample->afterNanos) {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("ttl must be greater than downsample.after");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
         }
 
         // Write to NativeIndex on shard 0
+        // NOTE: Retention policies are stored on shard 0 only. In a future multi-server
+        // deployment, this should be replicated to all shards or moved to cluster-wide config.
         co_await engineSharded->invoke_on(0, [policy](Engine& engine) -> seastar::future<> {
             co_await engine.getIndex().setRetentionPolicy(policy);
         });
@@ -165,26 +200,58 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
         });
 
         // Build response
-        auto responseObj = glz::obj{"status", "success", "policy", policy};
         reply->set_status(seastar::http::reply::status_type::ok);
-        reply->_content = glz::write_json(responseObj).value_or("{}");
+        if (timestar::http::isProtobuf(resFmt)) {
+            timestar::proto::RetentionPolicyData policyData;
+            policyData.measurement = policy.measurement;
+            policyData.ttl = policy.ttl;
+            policyData.ttlNanos = policy.ttlNanos;
+            if (policy.downsample.has_value()) {
+                timestar::proto::ParsedRetentionPutRequest::DownsampleData ds;
+                ds.after = policy.downsample->after;
+                ds.afterNanos = policy.downsample->afterNanos;
+                ds.interval = policy.downsample->interval;
+                ds.intervalNanos = policy.downsample->intervalNanos;
+                ds.method = policy.downsample->method;
+                policyData.downsample = std::move(ds);
+            }
+            reply->_content = timestar::proto::formatRetentionGetResponse(policyData);
+        } else {
+            auto responseObj = glz::obj{"status", "success", "policy", policy};
+            reply->_content = glz::write_json(responseObj).value_or("{}");
+        }
 
+    } catch (const std::runtime_error& e) {
+        // Protobuf parse errors come as runtime_error
+        reply->set_status(seastar::http::reply::status_type::bad_request);
+        if (timestar::http::isProtobuf(resFmt)) {
+            reply->_content = timestar::proto::formatErrorResponse(e.what());
+        } else {
+            reply->_content = createErrorResponse(e.what());
+        }
     } catch (const std::exception& e) {
         timestar::http_log.error("Retention PUT handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
-        reply->_content = createErrorResponse("Internal server error");
+        if (timestar::http::isProtobuf(resFmt)) {
+            reply->_content = timestar::proto::formatErrorResponse("Internal server error");
+        } else {
+            reply->_content = createErrorResponse("Internal server error");
+        }
     }
 
+    timestar::http::setContentType(*reply, resFmt);
     co_return reply;
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleGet(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
         reply->_content = R"({"status":"error","error":"Retention handler not initialized"})";
+        timestar::http::setContentType(*reply, resFmt);
         co_return reply;
     }
 
@@ -197,6 +264,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             if (static_cast<unsigned char>(c) < 0x20 || c == '\x7f') {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Measurement name contains control characters");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
         }
@@ -207,39 +275,74 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
                 0, [measurement](Engine& engine) { return engine.getIndex().getRetentionPolicy(measurement); });
 
             if (policyOpt.has_value()) {
-                auto responseObj = glz::obj{"status", "success", "policy", *policyOpt};
                 reply->set_status(seastar::http::reply::status_type::ok);
-                reply->_content = glz::write_json(responseObj).value_or("{}");
+                if (timestar::http::isProtobuf(resFmt)) {
+                    timestar::proto::RetentionPolicyData policyData;
+                    policyData.measurement = policyOpt->measurement;
+                    policyData.ttl = policyOpt->ttl;
+                    policyData.ttlNanos = policyOpt->ttlNanos;
+                    if (policyOpt->downsample.has_value()) {
+                        timestar::proto::ParsedRetentionPutRequest::DownsampleData ds;
+                        ds.after = policyOpt->downsample->after;
+                        ds.afterNanos = policyOpt->downsample->afterNanos;
+                        ds.interval = policyOpt->downsample->interval;
+                        ds.intervalNanos = policyOpt->downsample->intervalNanos;
+                        ds.method = policyOpt->downsample->method;
+                        policyData.downsample = std::move(ds);
+                    }
+                    reply->_content = timestar::proto::formatRetentionGetResponse(policyData);
+                } else {
+                    auto responseObj = glz::obj{"status", "success", "policy", *policyOpt};
+                    reply->_content = glz::write_json(responseObj).value_or("{}");
+                }
             } else {
                 reply->set_status(seastar::http::reply::status_type::not_found);
-                reply->_content = createErrorResponse("No retention policy found for measurement: " + measurement);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    reply->_content = timestar::proto::formatErrorResponse(
+                        "No retention policy found for measurement: " + measurement);
+                } else {
+                    reply->_content = createErrorResponse("No retention policy found for measurement: " + measurement);
+                }
             }
         } else {
-            // Get all policies
+            // Get all policies — for protobuf, use status response since there's no
+            // dedicated "list all policies" proto message
             auto policies = co_await engineSharded->invoke_on(
                 0, [](Engine& engine) { return engine.getIndex().getAllRetentionPolicies(); });
 
-            auto responseObj = glz::obj{"status", "success", "policies", policies};
             reply->set_status(seastar::http::reply::status_type::ok);
-            reply->_content = glz::write_json(responseObj).value_or("{}");
+            if (timestar::http::isProtobuf(resFmt)) {
+                reply->_content = timestar::proto::formatStatusResponse(
+                    "success", std::to_string(policies.size()) + " retention policies");
+            } else {
+                auto responseObj = glz::obj{"status", "success", "policies", policies};
+                reply->_content = glz::write_json(responseObj).value_or("{}");
+            }
         }
 
     } catch (const std::exception& e) {
         timestar::http_log.error("Retention GET handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
-        reply->_content = createErrorResponse("Internal server error");
+        if (timestar::http::isProtobuf(resFmt)) {
+            reply->_content = timestar::proto::formatErrorResponse("Internal server error");
+        } else {
+            reply->_content = createErrorResponse("Internal server error");
+        }
     }
 
+    timestar::http::setContentType(*reply, resFmt);
     co_return reply;
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleDelete(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
         reply->_content = R"({"status":"error","error":"Retention handler not initialized"})";
+        timestar::http::setContentType(*reply, resFmt);
         co_return reply;
     }
 
@@ -249,6 +352,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
         if (measurement.empty()) {
             reply->set_status(seastar::http::reply::status_type::bad_request);
             reply->_content = createErrorResponse("'measurement' query parameter is required");
+            timestar::http::setContentType(*reply, resFmt);
             co_return reply;
         }
 
@@ -257,6 +361,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             if (static_cast<unsigned char>(c) < 0x20 || c == '\x7f') {
                 reply->set_status(seastar::http::reply::status_type::bad_request);
                 reply->_content = createErrorResponse("Measurement name contains control characters");
+                timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
         }
@@ -271,21 +376,36 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
                 return seastar::make_ready_future<>();
             });
 
-            auto responseObj =
-                glz::obj{"status", "success", "message", "Retention policy deleted for measurement: " + measurement};
             reply->set_status(seastar::http::reply::status_type::ok);
-            reply->_content = glz::write_json(responseObj).value_or("{}");
+            if (timestar::http::isProtobuf(resFmt)) {
+                reply->_content = timestar::proto::formatStatusResponse(
+                    "success", "Retention policy deleted for measurement: " + measurement);
+            } else {
+                auto responseObj = glz::obj{"status", "success", "message",
+                                            "Retention policy deleted for measurement: " + measurement};
+                reply->_content = glz::write_json(responseObj).value_or("{}");
+            }
         } else {
             reply->set_status(seastar::http::reply::status_type::not_found);
-            reply->_content = createErrorResponse("No retention policy found for measurement: " + measurement);
+            if (timestar::http::isProtobuf(resFmt)) {
+                reply->_content =
+                    timestar::proto::formatErrorResponse("No retention policy found for measurement: " + measurement);
+            } else {
+                reply->_content = createErrorResponse("No retention policy found for measurement: " + measurement);
+            }
         }
 
     } catch (const std::exception& e) {
         timestar::http_log.error("Retention DELETE handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
-        reply->_content = createErrorResponse("Internal server error");
+        if (timestar::http::isProtobuf(resFmt)) {
+            reply->_content = timestar::proto::formatErrorResponse("Internal server error");
+        } else {
+            reply->_content = createErrorResponse("Internal server error");
+        }
     }
 
+    timestar::http::setContentType(*reply, resFmt);
     co_return reply;
 }
 

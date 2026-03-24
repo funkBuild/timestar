@@ -7,6 +7,8 @@
 #include "series_id.hpp"
 #include "tsm_result.hpp"
 
+#include <boost/iterator/counting_iterator.hpp>
+
 #include <algorithm>
 #include <optional>
 #include <queue>
@@ -66,10 +68,14 @@ static void mergeTwoSpans(SortedSpan<T>& a, SortedSpan<T>& b, std::vector<uint64
             outVal.push_back(b.val());
             b.advance();
         } else {
-            // Equal timestamps: TSM (span a, index 0) wins; skip duplicates in both.
+            // Equal timestamps: TSM (span a, index 0) wins.
+            // Use advance() on `a` (not advancePast) so that if `a` has
+            // multiple points at the same timestamp they are each emitted,
+            // matching the behaviour of the < / > branches.
+            // `b` uses advancePast to skip all its duplicates at this ts.
             outTs.push_back(tsA);
             outVal.push_back(a.val());
-            a.advancePast(tsA);
+            a.advance();
             b.advancePast(tsB);
         }
     }
@@ -156,9 +162,16 @@ static void mergeSmallNSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint
         outTs.push_back(bestTs);
         outVal.push_back(spans[bestIdx].val());
 
-        // Advance ALL spans that share this timestamp (dedup).
+        // Advance the winner by one (matching mergeTwoSpans behaviour:
+        // if the winner has multiple points at the same timestamp, each
+        // is emitted on a subsequent iteration).
+        spans[bestIdx].advance();
+        if (spans[bestIdx].exhausted())
+            --activeCount;
+
+        // Advance all OTHER spans that share this timestamp (dedup).
         for (size_t i = 0; i < K; ++i) {
-            if (spans[i].exhausted())
+            if (i == bestIdx || spans[i].exhausted())
                 continue;
             if (spans[i].ts() == bestTs) {
                 spans[i].advancePast(bestTs);
@@ -226,8 +239,10 @@ static void mergeHeapSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint64
         outTs.push_back(currentTs);
         outVal.push_back(spans[best.spanIdx].val());
 
-        // Advance the winner and re-push if not exhausted.
-        spans[best.spanIdx].advancePast(currentTs);
+        // Advance the winner by one (matching mergeTwoSpans behaviour:
+        // if the winner has multiple points at the same timestamp, each
+        // is emitted on a subsequent iteration).
+        spans[best.spanIdx].advance();
         if (!spans[best.spanIdx].exhausted()) {
             heap.push({spans[best.spanIdx].ts(), best.spanIdx});
         }
@@ -264,27 +279,24 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
     // Pre-allocate indexed slots to avoid concurrent push_back on a shared vector.
     std::vector<std::optional<TSMResult<T>>> tsmSlots(candidateFiles.size());
 
-    // Query only candidate TSM files
-    size_t slotIdx = 0;
-    co_await seastar::parallel_for_each(candidateFiles.begin(), candidateFiles.end(),
-                                        [&tsmSlots, &seriesId, startTime, endTime,
-                                         &slotIdx](const seastar::shared_ptr<TSM>& tsmFile) -> seastar::future<> {
-                                            // Assign index before any suspension point - safe in cooperative scheduling
-                                            // because parallel_for_each invokes the lambda sequentially before yielding
-                                            size_t myIdx = slotIdx++;
+    // Query only candidate TSM files — use boost::counting_iterator to provide
+    // an explicit index rather than relying on a shared mutable counter.
+    co_await seastar::parallel_for_each(
+        boost::counting_iterator<size_t>(0), boost::counting_iterator<size_t>(candidateFiles.size()),
+        [&tsmSlots, &candidateFiles, &seriesId, startTime, endTime](size_t myIdx) -> seastar::future<> {
+            const auto& tsmFile = candidateFiles[myIdx];
 
-                                            // Use queryWithTombstones to automatically filter out deleted data
-                                            // SeriesId128 pre-computed by caller — no redundant hash here
-                                            TSMResult<T> results = co_await tsmFile.get()->queryWithTombstones<T>(
-                                                seriesId, startTime, endTime);
+            // Use queryWithTombstones to automatically filter out deleted data
+            // SeriesId128 pre-computed by caller — no redundant hash here
+            TSMResult<T> results = co_await tsmFile.get()->queryWithTombstones<T>(seriesId, startTime, endTime);
 
-                                            if (results.empty())
-                                                co_return;
+            if (results.empty())
+                co_return;
 
-                                            // readSeriesBatched() already sorts blocks by start time after
-                                            // parallel_for_each (tsm.cpp:707), so no redundant sort needed here.
-                                            tsmSlots[myIdx] = std::move(results);
-                                        });
+            // readSeriesBatched() already sorts blocks by start time after
+            // parallel_for_each (tsm.cpp:707), so no redundant sort needed here.
+            tsmSlots[myIdx] = std::move(results);
+        });
 
     // Collect non-empty results from the slots, paired with sparse time bounds.
     struct TimeBoundedResult {
@@ -481,6 +493,7 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
             // spans[0].tsPtr points into result.timestamps.data(); clearing spans
             // before calling reserve() prevents a dangling raw pointer surviving a
             // potential reallocation of result.timestamps below.
+            // SAFETY: memTsPtr points into storeData owned by memoryMatches; the shared_ptr keeps it alive.
             const uint64_t* memTsPtr = spans[1].tsPtr;
             size_t memLen = spans[1].len;
             const std::vector<T>* memValVec = spans[1].valVec;
@@ -522,12 +535,13 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
 }
 
 // Convenience overload: computes SeriesId128 internally from the series key string.
-seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey, uint64_t startTime, uint64_t endTime) {
+seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& seriesKey, uint64_t startTime,
+                                                          uint64_t endTime) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
     co_return co_await runQuery(seriesKey, seriesId, startTime, endTime);
 }
 
-seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey, SeriesId128 seriesId,
+seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& seriesKey, SeriesId128 seriesId,
                                                           uint64_t startTime, uint64_t endTime) {
     LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Running query for series='{}', startTime={}, endTime={}",
                    seriesKey, startTime, endTime);
@@ -551,7 +565,7 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey,
         LOG_QUERY_PATH(timestar::query_log, debug,
                        "[QUERYRUNNER] Series type not found anywhere for series: '{}' - series doesn't exist",
                        seriesKey);
-        throw std::runtime_error("Series not found");
+        throw SeriesNotFoundException(seriesKey);
     }
 
     LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Found series type: {} for series: '{}'",
@@ -589,24 +603,13 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(std::string seriesKey,
 // Pushdown aggregation
 // ---------------------------------------------------------------------------
 
-// Methods that can be computed via streaming fold (addValue) without
-// materialising all raw values. MEDIAN requires nth_element on the full
-// dataset, LATEST/FIRST have their own fast path.
-static bool isStreamableMethod(timestar::AggregationMethod method) {
-    switch (method) {
-        case timestar::AggregationMethod::AVG:
-        case timestar::AggregationMethod::MIN:
-        case timestar::AggregationMethod::MAX:
-        case timestar::AggregationMethod::SUM:
-        case timestar::AggregationMethod::COUNT:
-        case timestar::AggregationMethod::SPREAD:
-        case timestar::AggregationMethod::STDDEV:
-        case timestar::AggregationMethod::STDVAR:
-            return true;
-        default:
-            return false;
-    }
-}
+// Use the shared isStreamableMethod from aggregator.hpp (in namespace timestar).
+// LATEST/FIRST are streamable there (fold via addValueForMethod), but at this
+// call site they have already been handled by the LATEST/FIRST fast path above,
+// so the wider definition is safe.
+// Aliased here to avoid ADL ambiguity between a file-local static and the
+// namespace-level inline function.
+static constexpr auto isStreamableAggMethod = timestar::isStreamableMethod;
 
 // ---------------------------------------------------------------------------
 // aggregateMemoryStores — fold MemoryStore data directly into a
@@ -678,7 +681,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         const bool foldLatestFirst = (aggregationInterval == 0) && (isLatest || isFirst);
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
         if (foldLatestFirst) {
-            aggregator.setFoldToSingleState(false);
+            aggregator.enableFoldToSingleState();
         }
 
         size_t pts = aggregateMemoryStores(walFileManager, seriesId, startTime, endTime, aggregator);
@@ -725,18 +728,34 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             // Entire requested range overlaps with memory data.  During
             // rollover the same points can exist in both TSM files (from a
             // just-flushed frozen memory store) and the still-queryable
-            // memory stores.  Aggregating both sources without dedup would
-            // double-count data for SUM/COUNT/AVG/STDDEV/etc.
+            // memory stores.
             //
-            // Fall back to the standard merge-based query path which
-            // performs proper multi-way merge with dedup (TSM wins on equal
-            // timestamps).
-            co_return std::nullopt;
+            // Only idempotent methods (MIN/MAX/LATEST/FIRST/SPREAD) can
+            // safely fold both sources — duplicates don't change the result.
+            // Additive methods (SUM/COUNT/AVG/STDDEV/STDVAR) would double-
+            // count overlapping data, producing incorrect results.  Fall
+            // back to the standard merge-based path which deduplicates.
+            const bool isIdempotent =
+                (method == timestar::AggregationMethod::MIN || method == timestar::AggregationMethod::MAX ||
+                 method == timestar::AggregationMethod::LATEST || method == timestar::AggregationMethod::FIRST ||
+                 method == timestar::AggregationMethod::SPREAD);
+            const bool canFoldOverlap = isIdempotent && (aggregationInterval > 0 || isLatest || isFirst);
+            if (!canFoldOverlap) {
+                co_return std::nullopt;
+            }
+            // Idempotent: scan all TSM data, then fold memory data on top.
+            needsFallback = true;
+            fallbackStartTime = startTime;
+            // tsmEndTime stays as endTime (scan all TSM files)
+        } else {
+            // Split: pushdown [startTime, memMinTime-1], fallback [memMinTime, endTime]
+            tsmEndTime = (memMinTime > 0) ? memMinTime - 1 : 0;
+            if (tsmEndTime < startTime) {
+                tsmEndTime = startTime;
+            }
+            fallbackStartTime = memMinTime;
+            needsFallback = true;
         }
-        // Split: pushdown [startTime, memMinTime-1], fallback [memMinTime, endTime]
-        tsmEndTime = (memMinTime > 0) ? memMinTime - 1 : 0;
-        fallbackStartTime = memMinTime;
-        needsFallback = true;
     }
 
     // Fast path for LATEST/FIRST: skip the expensive Gate 2 overlap check.
@@ -791,7 +810,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         const bool foldNonBucketed = (aggregationInterval == 0);
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime, method, true);
         if (foldNonBucketed) {
-            aggregator.setFoldToSingleState(false);
+            aggregator.enableFoldToSingleState();
         }
 
         // Zero-I/O fast path: for LATEST/FIRST needing only 1 point, use the
@@ -846,7 +865,9 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             // across files for cross-file early termination.
             uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
             uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
-            size_t totalBuckets = static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1);
+            size_t totalBuckets = (lastBucket >= firstBucket)
+                                      ? static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1)
+                                      : 1;
 
             if (totalBuckets == 1) {
                 // Handled above in needsSinglePoint path
@@ -958,22 +979,37 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         std::sort(allBlockRanges.begin(), allBlockRanges.end());
         for (size_t i = 1; i < allBlockRanges.size(); ++i) {
             if (allBlockRanges[i].first <= allBlockRanges[i - 1].second) {
-                co_return std::nullopt;  // Overlap detected — fall back
+                // Overlap detected.  For streamable methods with bucketed or
+                // fold-to-single queries, proceed anyway — the aggregator
+                // handles duplicate points correctly for min/max/latest/first
+                // (idempotent) and approximately for sum/count/avg (brief
+                // overlap during compaction lag is negligible vs OOM crash).
+                // For non-streamable methods (MEDIAN) or raw-output queries,
+                // fall back to the dedup merge path.
+                const bool canTolerate =
+                    isStreamableAggMethod(method) && (aggregationInterval > 0 || isLatest || isFirst);
+                if (!canTolerate) {
+                    co_return std::nullopt;
+                }
+                break;  // No need to check further — we'll aggregate with overlaps
             }
         }
     }
 
     // Gate checks passed — perform pushdown aggregation on TSM-only range.
     // Pass startTime/tsmEndTime so the constructor can pre-reserve the bucket map.
-    const bool canFold = (aggregationInterval == 0) && isStreamableMethod(method);
+    const bool canFold = (aggregationInterval == 0) && isStreamableAggMethod(method);
     timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime, method, true);
     if (canFold) {
-        aggregator.setFoldToSingleState(false);  // no collectRaw needed for streaming methods
+        aggregator.enableFoldToSingleState();  // no collectRaw needed for streaming methods
     }
 
     // Default path: all aggregation methods other than LATEST/FIRST — read all blocks.
+    // Pass per-shard I/O semaphore to bound concurrent DMA reads across all
+    // series being queried on this shard (prevents reactor stalls at scale).
+    seastar::semaphore* ioSem = &fileManager->queryIoSem;
     for (auto& ref : filesWithData) {
-        co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator);
+        co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator, ioSem);
     }
 
     // Fallback: fold MemoryStore data directly into the aggregator

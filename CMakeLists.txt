@@ -69,7 +69,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ───────────────────────────── common compile flags ──────────────────────────
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG")
 option(TIMESTAR_NATIVE_ARCH "Compile for the host CPU (-march=native)" ON)
 if(TIMESTAR_NATIVE_ARCH)
   add_compile_options(-march=native)
@@ -78,6 +78,12 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+
+# ───────────────────────────── security hardening ────────────────────────────
+add_compile_options(-fstack-protector-strong)
+add_compile_definitions($<$<NOT:$<CONFIG:Debug>>:_FORTIFY_SOURCE=2>)
+add_link_options(-Wl,-z,relro -Wl,-z,now)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ───────────────────────────── Link-Time Optimization ────────────────────────
 # Enable with -DTIMESTAR_ENABLE_LTO=ON.  LTO lets the linker eliminate dead code
@@ -122,7 +128,7 @@ include(FetchContent)
 FetchContent_Declare(
   glaze
   GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-  GIT_TAG main
+  GIT_TAG v7.2.1
   GIT_SHALLOW TRUE
 )
 
@@ -174,6 +180,11 @@ set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(glaze googlebenchmark robin-map highway roaring zstd)
+
+# ──────────────────────────── protobuf message library ────────────────────────
+# Must come after Seastar (which finds Protobuf) so the imported targets exist.
+
+add_subdirectory(proto)
 
 # ─────────────────────────────── sub‑directories ─────────────────────────────
 

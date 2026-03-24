@@ -2,6 +2,7 @@
 
 #include <zstd.h>
 
+#include <cassert>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -134,10 +135,14 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
         std::memcpy(uncompressed.data.data() + writePos, str.data(), str.size());
         writePos += str.size();
     }
+    if (writePos != uncompSize) [[unlikely]] {
+        throw std::runtime_error("String encoder: varint size mismatch (wrote " + std::to_string(writePos) +
+                                 " expected " + std::to_string(uncompSize) + ")");
+    }
     uncompressed.data.resize(writePos);
 
     // Compress with zstd — reuse thread-local buffer to avoid per-call allocation
-    size_t compressedMaxSize = ZSTD_compressBound(uncompressed.data.size());
+    size_t compressedMaxSize = ZSTD_compressBound(writePos);
     static thread_local std::vector<char> tlCompBuf;
     tlCompBuf.resize(compressedMaxSize);
     auto& compressed = tlCompBuf;
@@ -171,6 +176,10 @@ static void writeStringHeader(AlignedBuffer& buf, uint32_t uncompSize, uint32_t 
 
 AlignedBuffer StringEncoder::encode(std::span<const std::string> values, int compressionLevel) {
     AlignedBuffer result;
+    if (values.empty()) [[unlikely]] {
+        writeStringHeader(result, 0, 0, 0);
+        return result;
+    }
     auto payload = compressStrings(values, compressionLevel);
     writeStringHeader(result, payload.uncompressedSize, payload.compressedSize, payload.count);
     result.write_bytes(payload.data.data(), payload.data.size());
@@ -261,6 +270,9 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
 }
 
 void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string>& out) {
+    if (encoded.offset > encoded.length_) {
+        throw std::runtime_error("String decoder: slice offset past end");
+    }
     if (encoded.length_ - encoded.offset < 16) {
         throw std::runtime_error("Invalid encoded string buffer: too small for header");
     }
@@ -417,8 +429,9 @@ static constexpr uint32_t STR2_MAGIC = 0x53545232;  // "STR2"
 
 StringEncoder::Dictionary StringEncoder::buildDictionary(std::span<const std::string> values) {
     Dictionary dict;
-    // Use an ordered map to assign stable IDs (insertion order)
-    std::unordered_map<std::string_view, uint32_t> seen;
+    dict.entries.reserve(MAX_DICT_ENTRIES);
+    // Use owned string keys to avoid dangling string_view pointers if entries were to reallocate.
+    std::unordered_map<std::string, uint32_t> seen;
     seen.reserve(std::min(values.size(), MAX_DICT_ENTRIES + 1));
 
     size_t totalBytes = 4;  // count(4)
@@ -439,8 +452,8 @@ StringEncoder::Dictionary StringEncoder::buildDictionary(std::span<const std::st
         if (totalBytes > MAX_DICT_BYTES) {
             return dict;  // valid=false
         }
-        seen[s] = static_cast<uint32_t>(dict.entries.size());
         dict.entries.push_back(s);
+        seen[s] = static_cast<uint32_t>(dict.entries.size() - 1);
     }
     dict.totalBytes = totalBytes;
     dict.valid = true;
@@ -488,6 +501,11 @@ StringEncoder::Dictionary StringEncoder::deserializeDictionary(Slice& encoded, s
 
 AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> values, const Dictionary& dict,
                                               int compressionLevel) {
+    if (values.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("encodeDictionary: values.size() (" + std::to_string(values.size()) +
+                                 ") exceeds uint32_t max");
+    }
+
     // Build string -> ID map from dictionary
     std::unordered_map<std::string_view, uint32_t> idMap;
     idMap.reserve(dict.entries.size());
@@ -495,9 +513,10 @@ AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> value
         idMap[dict.entries[i]] = i;
     }
 
-    // Encode values as varint IDs into an uncompressed buffer
-    // Estimate: each ID is 1-3 bytes (varint), so values.size() * 3 is a safe upper bound
-    AlignedBuffer uncompressed(values.size() * 3);
+    // Encode values as varint IDs into an uncompressed buffer.
+    // A uint32_t varint is at most 5 bytes, so values.size() * 5 is the safe upper bound.
+    const size_t maxBufSize = values.size() * 5;
+    AlignedBuffer uncompressed(maxBufSize);
     size_t writePos = 0;
     for (const auto& s : values) {
         auto it = idMap.find(s);
@@ -512,6 +531,7 @@ AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> value
         }
         uncompressed.data[writePos++] = static_cast<uint8_t>(id & 0x7F);
     }
+    assert(writePos <= maxBufSize);
     uncompressed.data.resize(writePos);
 
     // Compress the ID stream with zstd
@@ -538,6 +558,9 @@ AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> value
 
 void StringEncoder::decodeDictionary(Slice& encoded, size_t count, const Dictionary& dict,
                                      std::vector<std::string>& out) {
+    if (encoded.offset > encoded.length_) {
+        throw std::runtime_error("String decoder: slice offset past end");
+    }
     if (encoded.length_ - encoded.offset < 16) {
         throw std::runtime_error("Invalid dictionary-encoded string buffer: too small for header");
     }
@@ -598,6 +621,9 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t count, const Diction
 
 void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                                      const Dictionary& dict, std::vector<std::string>& out) {
+    if (encoded.offset > encoded.length_) {
+        throw std::runtime_error("String decoder: slice offset past end");
+    }
     if (encoded.length_ - encoded.offset < 16) {
         throw std::runtime_error("Invalid dictionary-encoded string buffer: too small for header");
     }
@@ -670,7 +696,7 @@ bool StringEncoder::isDictionaryEncoded(const uint8_t* data, size_t size) {
 }
 
 bool StringEncoder::isDictionaryEncoded(Slice& slice) {
-    if (slice.length_ - slice.offset < 4)
+    if (slice.offset > slice.length_ || slice.length_ - slice.offset < 4)
         return false;
     uint32_t magic;
     std::memcpy(&magic, slice.data + slice.offset, 4);
@@ -679,6 +705,9 @@ bool StringEncoder::isDictionaryEncoded(Slice& slice) {
 
 void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                            std::vector<std::string>& out) {
+    if (encoded.offset > encoded.length_) {
+        throw std::runtime_error("String decoder: slice offset past end");
+    }
     if (encoded.length_ - encoded.offset < 16) {
         throw std::runtime_error("Invalid encoded string buffer: too small for header");
     }

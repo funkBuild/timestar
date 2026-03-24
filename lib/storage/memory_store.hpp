@@ -65,8 +65,8 @@ public:
 
     MemoryStore(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {
         timestar::memory_log.debug("Memory store {} created", sequenceNumber);
-    };
-    ~MemoryStore() { timestar::memory_log.debug("Memory store {} removed", sequenceNumber); };
+    }
+    ~MemoryStore() { timestar::memory_log.debug("Memory store {} removed", sequenceNumber); }
 
     seastar::future<> initWAL();
     seastar::future<> removeWAL();
@@ -84,7 +84,9 @@ public:
     seastar::future<bool> insertBatch(
         std::vector<TimeStarInsert<T>>& insertRequests,
         size_t preComputedBatchSize = 0);  // Batch insert - returns true if WAL needs rollover
-    seastar::future<bool> isFull();
+    bool isFull() const;
+    // Takes non-const ref because WAL::estimateInsertSize() caches the computed
+    // size in insertRequest._cachedEstimatedSize (mutable field).
     template <class T>
     bool wouldExceedThreshold(TimeStarInsert<T>& insertRequest);
     // Variant that also returns the computed estimated size to avoid

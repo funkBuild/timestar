@@ -353,6 +353,9 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestNoContentType) {
     EXPECT_EQ(result, nullptr) << "Missing Content-Type should pass validation (lenient)";
 }
 
+// Content-Type validation is now handled by the content negotiation layer
+// (timestar::http::requestFormat), which defaults unknown types to JSON for
+// backward compatibility. validateRequest() no longer rejects unknown types.
 TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentType) {
     HttpQueryHandler handler(nullptr);
 
@@ -361,11 +364,7 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentType) {
     req._headers["Content-Type"] = "text/html";
 
     auto result = handler.validateRequest(req);
-    ASSERT_NE(result, nullptr) << "text/html Content-Type should fail validation";
-
-    // Verify it returns an error mentioning content type
-    EXPECT_NE(result->_content.find("Content-Type"), std::string::npos);
-    EXPECT_NE(result->_content.find("application/json"), std::string::npos);
+    EXPECT_EQ(result, nullptr) << "Unknown Content-Type should pass validation (handled by content negotiation)";
 }
 
 TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypePlainText) {
@@ -376,8 +375,7 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypePlainText) {
     req._headers["Content-Type"] = "text/plain";
 
     auto result = handler.validateRequest(req);
-    ASSERT_NE(result, nullptr) << "text/plain Content-Type should fail validation";
-    EXPECT_NE(result->_content.find("Content-Type"), std::string::npos);
+    EXPECT_EQ(result, nullptr) << "Unknown Content-Type should pass validation (handled by content negotiation)";
 }
 
 TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypeXml) {
@@ -388,20 +386,20 @@ TEST_F(HttpQueryHandlerTest, ValidateRequestWrongContentTypeXml) {
     req._headers["Content-Type"] = "application/xml";
 
     auto result = handler.validateRequest(req);
-    ASSERT_NE(result, nullptr) << "application/xml Content-Type should fail validation";
+    EXPECT_EQ(result, nullptr) << "Unknown Content-Type should pass validation (handled by content negotiation)";
 }
 
-TEST_F(HttpQueryHandlerTest, ValidateRequestBodySizeTakesPrecedenceOverContentType) {
+TEST_F(HttpQueryHandlerTest, ValidateRequestBodySizeStillRejectsOversized) {
     HttpQueryHandler handler(nullptr);
 
     seastar::http::request req;
-    // Both oversized body AND wrong content type
+    // Oversized body with unknown content type — body size check still rejects
     req.content = std::string(HttpQueryHandler::maxQueryBodySize() + 1, 'x');
     req._headers["Content-Type"] = "text/html";
 
     auto result = handler.validateRequest(req);
     ASSERT_NE(result, nullptr);
-    // Body size check comes first, so the error should be about size
+    // Body size check rejects the request
     EXPECT_NE(result->_content.find("too large"), std::string::npos);
 }
 

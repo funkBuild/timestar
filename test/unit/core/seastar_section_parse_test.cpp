@@ -70,4 +70,19 @@ TEST_F(SeastarSectionParseTest, WhitespaceAroundEquals) {
     EXPECT_EQ(cfg.seastar.get("smp"), "4");
 }
 
+TEST_F(SeastarSectionParseTest, CarriageReturnOnlyValueTreatedAsEmpty) {
+    // A value consisting only of \r\n should be trimmed to empty and not stored.
+    // This tests the trimWs fix for the e < b unsigned underflow edge case.
+    auto cfg = loadFromContent("[seastar]\nkey = \r\n");
+    EXPECT_FALSE(cfg.seastar.has("key"))
+        << "A value of only \\r\\n should be trimmed to empty and not stored";
+}
+
+TEST_F(SeastarSectionParseTest, ValueWithTrailingCRLF) {
+    // Normal value with trailing \r\n should work
+    auto cfg = loadFromContent("[seastar]\nsmp = 4\r\n");
+    EXPECT_TRUE(cfg.seastar.has("smp"));
+    EXPECT_EQ(cfg.seastar.get("smp"), "4");
+}
+
 }  // namespace

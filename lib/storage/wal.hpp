@@ -66,44 +66,34 @@ struct CompressionStats {
     // Safety margin applied to all estimates to avoid underestimation
     static constexpr double SAFETY_MARGIN = 1.1;
 
-    void updateTimestamp(size_t rawSize, size_t encodedSize) {
+    // Core EMA update: smooths `ratio` toward the observed compression ratio,
+    // clamped to [minFloor, 1.0].  All type-specific update methods delegate here.
+    void updateRatio(double& ratio, double minFloor, size_t rawSize, size_t encodedSize) {
         if (rawSize == 0) [[unlikely]]
             return;
         double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
-        timestampRatio = std::clamp(timestampRatio * (1.0 - ALPHA) + observed * ALPHA, MIN_TIMESTAMP_RATIO, 1.0);
-        ++sampleCount;
+        ratio = std::clamp(ratio * (1.0 - ALPHA) + observed * ALPHA, minFloor, 1.0);
+    }
+
+    void updateTimestamp(size_t rawSize, size_t encodedSize) {
+        updateRatio(timestampRatio, MIN_TIMESTAMP_RATIO, rawSize, encodedSize);
+        ++sampleCount;  // Increment once per encode (timestamp is always present)
     }
 
     void updateFloat(size_t rawSize, size_t encodedSize) {
-        if (rawSize == 0) [[unlikely]]
-            return;
-        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
-        floatRatio = std::clamp(floatRatio * (1.0 - ALPHA) + observed * ALPHA, MIN_FLOAT_RATIO, 1.0);
-        ++sampleCount;
+        updateRatio(floatRatio, MIN_FLOAT_RATIO, rawSize, encodedSize);
     }
 
     void updateBool(size_t rawSize, size_t encodedSize) {
-        if (rawSize == 0) [[unlikely]]
-            return;
-        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
-        boolRatio = std::clamp(boolRatio * (1.0 - ALPHA) + observed * ALPHA, MIN_BOOL_RATIO, 1.0);
-        ++sampleCount;
+        updateRatio(boolRatio, MIN_BOOL_RATIO, rawSize, encodedSize);
     }
 
     void updateString(size_t rawSize, size_t encodedSize) {
-        if (rawSize == 0) [[unlikely]]
-            return;
-        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
-        stringRatio = std::clamp(stringRatio * (1.0 - ALPHA) + observed * ALPHA, MIN_STRING_RATIO, 1.0);
-        ++sampleCount;
+        updateRatio(stringRatio, MIN_STRING_RATIO, rawSize, encodedSize);
     }
 
     void updateInteger(size_t rawSize, size_t encodedSize) {
-        if (rawSize == 0) [[unlikely]]
-            return;
-        double observed = static_cast<double>(encodedSize) / static_cast<double>(rawSize);
-        integerRatio = std::clamp(integerRatio * (1.0 - ALPHA) + observed * ALPHA, MIN_INTEGER_RATIO, 1.0);
-        ++sampleCount;
+        updateRatio(integerRatio, MIN_INTEGER_RATIO, rawSize, encodedSize);
     }
 };
 
@@ -118,8 +108,7 @@ private:
     // Streamed, unaligned I/O (buffered internally by Seastar)
     std::optional<seastar::output_stream<char>> out;
 
-    // Position & accounting
-    uint64_t filePos = 0;
+    // Position & accounting — tracks total bytes written to the WAL segment.
     // No atomic needed: WAL is a per-shard object in Seastar's shard-per-core model,
     // only accessed from a single thread.
     size_t currentSize = 0;
@@ -139,7 +128,12 @@ private:
     // Flush controls
     bool requiresImmediateFlush = false;  // if true, flush after each write/batch
 
-    // Stream serialization to prevent concurrent access
+    // Concurrency control (split encoding from I/O for parallelism):
+    //   _encode_sem: bounds concurrent encoding coroutines (memory control).
+    //                Multiple coroutines can encode into private buffers simultaneously.
+    //   _io_sem:     serializes output_stream writes (no interleaved bytes).
+    //                Only held for the brief out->write() + optional flush.
+    seastar::semaphore _encode_sem{4};  // overridden from config in init()
     seastar::semaphore _io_sem{1};
     seastar::gate _io_gate;
 
@@ -185,8 +179,8 @@ public:
 
     // Lifecycle
     seastar::future<> close();
-    seastar::future<> finalFlush();         // ensure all data is written & durable
-    seastar::future<unsigned long> size();  // physical file size
+    seastar::future<> finalFlush();    // ensure all data is written & durable
+    seastar::future<uint64_t> size();  // physical file size
     size_t getCurrentSize() const { return currentSize; }
     seastar::future<> remove();  // remove this WAL file
 

@@ -1,9 +1,12 @@
 #include "http_derived_query_handler.hpp"
 
 #include "anomaly/anomaly_result.hpp"
+#include "content_negotiation.hpp"
 #include "forecast/forecast_result.hpp"
 #include "http_auth.hpp"
+#include "json_escape.hpp"
 #include "logger.hpp"
+#include "proto_converters.hpp"
 #include "timestar_config.hpp"
 
 #include <seastar/core/future.hh>
@@ -36,48 +39,146 @@ void HttpDerivedQueryHandler::registerRoutes(seastar::httpd::routes& r, std::str
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::handleDerivedQuery(
     std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
+    auto reqFmt = timestar::http::requestFormat(*req);
+    auto resFmt = timestar::http::responseFormat(*req);
+
     try {
         // Validate request body size
         if (req->content.size() > MAX_DERIVED_QUERY_BODY_SIZE) {
             rep->set_status(seastar::http::reply::status_type::payload_too_large);
-            rep->_content =
-                DerivedQueryExecutor::createErrorResponse("BODY_TOO_LARGE", "Request body too large (max 1MB)");
-            rep->done("application/json");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content =
+                    timestar::proto::formatDerivedQueryError("BODY_TOO_LARGE", "Request body too large (max 1MB)");
+            } else {
+                rep->_content =
+                    DerivedQueryExecutor::createErrorResponse("BODY_TOO_LARGE", "Request body too large (max 1MB)");
+            }
+            timestar::http::setContentType(*rep, resFmt);
+            rep->done();
             co_return std::move(rep);
         }
 
-        // Validate Content-Type header if explicitly set
-        auto contentType = req->get_header("Content-Type");
-        // Convert to std::string to avoid sstring::npos vs std::string::npos mismatch
-        // (Seastar sstring uses 32-bit npos, std::string uses 64-bit npos)
-        std::string contentTypeStr(contentType.data(), contentType.size());
-        if (!contentTypeStr.empty() && !contentTypeStr.starts_with("application/json")) {
-            rep->set_status(seastar::http::reply::status_type::unsupported_media_type);
-            rep->_content = DerivedQueryExecutor::createErrorResponse("UNSUPPORTED_MEDIA_TYPE",
-                                                                      "Content-Type must be application/json");
-            rep->done("application/json");
-            co_return std::move(rep);
-        }
-
-        std::string body = req->content;
+        std::string body = std::move(req->content);
 
         if (body.empty()) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = DerivedQueryExecutor::createErrorResponse("EMPTY_REQUEST", "Request body is required");
-            rep->done("application/json");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatDerivedQueryError("EMPTY_REQUEST", "Request body is required");
+            } else {
+                rep->_content = DerivedQueryExecutor::createErrorResponse("EMPTY_REQUEST", "Request body is required");
+            }
+            timestar::http::setContentType(*rep, resFmt);
+            rep->done();
             co_return std::move(rep);
         }
 
         // Create executor and run the query
         DerivedQueryExecutor executor(engine_, index_, config_);
 
+        // For protobuf input, convert to JSON for the executor
+        // (the executor has its own JSON parser — reuse it rather than duplicating logic)
+        if (timestar::http::isProtobuf(reqFmt)) {
+            auto parsed = timestar::proto::parseDerivedQueryRequest(body.data(), body.size());
+            // Build a JSON body that the executor's parseFromJson can consume
+            // Build JSON with proper escaping to prevent injection from
+            // untrusted protobuf fields (formula, query names, query strings).
+            std::string jsonBody = "{\"formula\":\"";
+            timestar::jsonEscapeAppend(parsed.formula, jsonBody);
+            jsonBody += "\",\"queries\":{";
+            bool first = true;
+            for (const auto& [name, queryStr] : parsed.queries) {
+                if (!first)
+                    jsonBody += ",";
+                first = false;
+                jsonBody += "\"";
+                timestar::jsonEscapeAppend(name, jsonBody);
+                jsonBody += "\":\"";
+                timestar::jsonEscapeAppend(queryStr, jsonBody);
+                jsonBody += "\"";
+            }
+            jsonBody += "},\"startTime\":" + std::to_string(parsed.startTime) +
+                        ",\"endTime\":" + std::to_string(parsed.endTime);
+            if (!parsed.aggregationInterval.empty()) {
+                jsonBody += ",\"aggregationInterval\":\"";
+                timestar::jsonEscapeAppend(parsed.aggregationInterval, jsonBody);
+                jsonBody += "\"";
+            }
+            jsonBody += "}";
+            body = std::move(jsonBody);
+        }
+
         try {
             // Use anomaly-aware execution that handles both regular and anomaly formulas
             auto result = co_await executor.executeFromJsonWithAnomaly(body);
 
             rep->set_status(seastar::http::reply::status_type::ok);
-            rep->_content = executor.formatResponseVariant(result);
-            rep->done("application/json");
+
+            if (timestar::http::isProtobuf(resFmt)) {
+                if (std::holds_alternative<DerivedQueryResult>(result)) {
+                    const auto& r = std::get<DerivedQueryResult>(result);
+                    timestar::proto::DerivedQueryResultData data;
+                    data.timestamps = r.timestamps;
+                    data.values = r.values;
+                    data.formula = r.formula;
+                    data.stats.pointCount = r.stats.pointCount;
+                    data.stats.executionTimeMs = r.stats.executionTimeMs;
+                    data.stats.subQueriesExecuted = r.stats.subQueriesExecuted;
+                    data.stats.pointsDroppedDueToAlignment = r.stats.pointsDroppedDueToAlignment;
+                    rep->_content = timestar::proto::formatDerivedQueryResponse(data);
+                } else if (std::holds_alternative<anomaly::AnomalyQueryResult>(result)) {
+                    const auto& r = std::get<anomaly::AnomalyQueryResult>(result);
+                    timestar::proto::AnomalyQueryResultData data;
+                    data.success = r.success;
+                    data.times = r.times;
+                    data.errorMessage = r.errorMessage;
+                    data.statistics.algorithm = r.statistics.algorithm;
+                    data.statistics.bounds = r.statistics.bounds;
+                    data.statistics.seasonality = r.statistics.seasonality;
+                    data.statistics.anomalyCount = r.statistics.anomalyCount;
+                    data.statistics.totalPoints = r.statistics.totalPoints;
+                    data.statistics.executionTimeMs = r.statistics.executionTimeMs;
+                    for (const auto& sp : r.series) {
+                        timestar::proto::AnomalySeriesPieceData piece;
+                        piece.piece = sp.piece;
+                        piece.groupTags = sp.groupTags;
+                        piece.values = sp.values;
+                        piece.alertValue = sp.alertValue;
+                        data.series.push_back(std::move(piece));
+                    }
+                    rep->_content = timestar::proto::formatAnomalyResponse(data);
+                } else if (std::holds_alternative<forecast::ForecastQueryResult>(result)) {
+                    const auto& r = std::get<forecast::ForecastQueryResult>(result);
+                    timestar::proto::ForecastQueryResultData data;
+                    data.success = r.success;
+                    data.times = r.times;
+                    data.forecastStartIndex = r.forecastStartIndex;
+                    data.errorMessage = r.errorMessage;
+                    data.statistics.algorithm = r.statistics.algorithm;
+                    data.statistics.deviations = r.statistics.deviations;
+                    data.statistics.seasonality = r.statistics.seasonality;
+                    data.statistics.slope = r.statistics.slope;
+                    data.statistics.intercept = r.statistics.intercept;
+                    data.statistics.rSquared = r.statistics.rSquared;
+                    data.statistics.residualStdDev = r.statistics.residualStdDev;
+                    data.statistics.historicalPoints = r.statistics.historicalPoints;
+                    data.statistics.forecastPoints = r.statistics.forecastPoints;
+                    data.statistics.seriesCount = r.statistics.seriesCount;
+                    data.statistics.executionTimeMs = r.statistics.executionTimeMs;
+                    for (const auto& sp : r.series) {
+                        timestar::proto::ForecastSeriesPieceData piece;
+                        piece.piece = sp.piece;
+                        piece.groupTags = sp.groupTags;
+                        piece.values = sp.values;
+                        data.series.push_back(std::move(piece));
+                    }
+                    rep->_content = timestar::proto::formatForecastResponse(data);
+                }
+            } else {
+                rep->_content = executor.formatResponseVariant(result);
+            }
+
+            timestar::http::setContentType(*rep, resFmt);
+            rep->done();
 
             // Log execution stats + slow query detection
             const auto slowMs = timestar::config().http.slow_query_threshold_ms;
@@ -112,8 +213,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
 
         } catch (const DerivedQueryException& e) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = executor.createErrorResponse("QUERY_ERROR", e.what());
-            rep->done("application/json");
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatDerivedQueryError("QUERY_ERROR", e.what());
+            } else {
+                rep->_content = executor.createErrorResponse("QUERY_ERROR", e.what());
+            }
+            timestar::http::setContentType(*rep, resFmt);
+            rep->done();
 
             http_log.warn("Derived query error: {}", e.what());
         }
@@ -122,8 +228,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
 
     } catch (const std::exception& e) {
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
-        rep->_content = DerivedQueryExecutor::createErrorResponse("INTERNAL_ERROR", "Internal server error");
-        rep->done("application/json");
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatDerivedQueryError("INTERNAL_ERROR", "Internal server error");
+        } else {
+            rep->_content = DerivedQueryExecutor::createErrorResponse("INTERNAL_ERROR", "Internal server error");
+        }
+        timestar::http::setContentType(*rep, resFmt);
+        rep->done();
 
         http_log.error("Derived query internal error: {}", e.what());
 

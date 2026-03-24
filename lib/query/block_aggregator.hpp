@@ -4,6 +4,7 @@
 #include "simd_aggregator.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <numeric>
 #include <optional>
@@ -31,7 +32,8 @@ public:
     // Maximum number of per-timestamp entries in non-bucketed mode.
     static constexpr size_t MAX_UNBUCKETED_STATES = 10'000'000;
 
-    BlockAggregator(uint64_t interval) : interval_(interval), method_(AggregationMethod::AVG), methodAware_(false) {}
+    explicit BlockAggregator(uint64_t interval)
+        : interval_(interval), method_(AggregationMethod::AVG), methodAware_(false) {}
 
     BlockAggregator(uint64_t interval, AggregationMethod method)
         : interval_(interval), method_(method), methodAware_(true) {}
@@ -45,8 +47,8 @@ public:
         : interval_(interval), method_(method), methodAware_(methodAware) {
         if (interval_ > 0 && endTime > startTime) {
             uint64_t range = endTime - startTime;
-            // Ceiling division: (range + interval - 1) / interval
-            uint64_t bucketCount = (range + interval_ - 1) / interval_;
+            // Overflow-safe ceiling division
+            uint64_t bucketCount = range / interval_ + (range % interval_ != 0 ? 1 : 0);
             if (bucketCount > MAX_PREALLOCATED_BUCKETS) {
                 bucketCount = MAX_PREALLOCATED_BUCKETS;
             }
@@ -55,8 +57,8 @@ public:
             // a direct pointer, eliminating per-point division + hash lookup.
             if (bucketCount == 1) {
                 singleBucketKey_ = (startTime / interval_) * interval_;
-                bucketStates_[singleBucketKey_];  // default-construct entry
-                singleBucketState_ = &bucketStates_[singleBucketKey_];
+                auto [it, _] = bucketStates_.emplace(singleBucketKey_, AggregationState{});
+                singleBucketState_ = &it->second;
             }
         }
     }
@@ -64,9 +66,11 @@ public:
     // Enable fold-to-single-state mode for non-bucketed streaming aggregation.
     // When active (interval_ == 0), addPoint/addPoints fold directly into a single
     // AggregationState instead of materialising raw (timestamp, value) vectors.
-    void setFoldToSingleState(bool collectRaw) {
+    // collectRaw is always false for fold mode (raw collection is only for MEDIAN,
+    // which never uses fold).
+    void enableFoldToSingleState() {
         foldToSingleState_ = true;
-        singleState_.collectRaw = collectRaw;
+        singleState_.collectRaw = false;
     }
 
     // Check if a block's stats can be used without decoding.
@@ -131,6 +135,7 @@ public:
             }
         };
 
+        assert(!singleBucketState_ || (minTime / interval_) * interval_ == singleBucketKey_);
         if (singleBucketState_) {
             doMerge(*singleBucketState_);
         } else if (interval_ == 0 && foldToSingleState_) {
@@ -254,7 +259,10 @@ public:
     size_t pointCount() const { return pointCount_; }
 
     // Move out bucket states (interval > 0).
-    std::unordered_map<uint64_t, AggregationState> takeBucketStates() { return std::move(bucketStates_); }
+    std::unordered_map<uint64_t, AggregationState> takeBucketStates() {
+        singleBucketState_ = nullptr;
+        return std::move(bucketStates_);
+    }
 
     // Move out per-timestamp data (interval == 0).
     std::vector<uint64_t> takeTimestamps() { return std::move(timestamps_); }
@@ -303,6 +311,14 @@ private:
     // SIMD batch fold: process an entire batch using vectorised reductions
     // for methods that support it (SUM/AVG/MIN/MAX/COUNT/SPREAD).
     // Falls back to scalar for LATEST/FIRST/STDDEV/MEDIAN.
+    //
+    // NOTE: The SIMD paths for AVG/SUM/MIN/MAX/COUNT/SPREAD only update the
+    // accumulators they need (sum, count, min, max). They do NOT update
+    // singleState_.m2 or singleState_.mean via Welford's algorithm — those
+    // fields are only valid when method_ is STDDEV/STDVAR, which always takes
+    // the scalar fallback path. After updating sum/count we recompute
+    // state.mean = state.sum / state.count so that any downstream code
+    // reading mean (e.g. mergeForMethod) sees a consistent value.
     void addPointsSIMDFold(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
                            AggregationState* state = nullptr) {
         addPointsSIMDFoldRange(timestamps, values, 0, timestamps.size(), state ? *state : singleState_);
@@ -335,13 +351,38 @@ private:
                         addToState(state, values[i], timestamps[i]);
                     }
                 } else {
-                    state.sum += simdSum;
+                    // Kahan compensated addition of SIMD sum to preserve precision
+                    double y = simdSum - state.sumCompensation;
+                    double t = state.sum + y;
+                    state.sumCompensation = (t - state.sum) - y;
+                    state.sum = t;
                     state.count += n;
+                    // Keep mean consistent for downstream merge operations.
+                    state.mean = (state.sum + state.sumCompensation) / static_cast<double>(state.count);
+                    // Track first/latest so getTimestamp() returns valid values.
+                    if (tdata[0] < state.firstTimestamp) {
+                        state.firstTimestamp = tdata[0];
+                        state.first = vdata[0];
+                    }
+                    if (tdata[n - 1] >= state.latestTimestamp) {
+                        state.latestTimestamp = tdata[n - 1];
+                        state.latest = vdata[n - 1];
+                    }
                 }
                 break;
             }
             case AggregationMethod::COUNT:
                 state.count += n;
+                if (n > 0) {
+                    if (tdata[0] < state.firstTimestamp) {
+                        state.firstTimestamp = tdata[0];
+                        state.first = vdata[0];
+                    }
+                    if (tdata[n - 1] >= state.latestTimestamp) {
+                        state.latestTimestamp = tdata[n - 1];
+                        state.latest = vdata[n - 1];
+                    }
+                }
                 break;
             case AggregationMethod::MIN: {
                 double simdMin = simd::SimdAggregator::calculateMin(vdata, n);
@@ -352,6 +393,14 @@ private:
                 } else {
                     state.min = std::min(state.min, simdMin);
                     state.count += n;
+                    if (tdata[0] < state.firstTimestamp) {
+                        state.firstTimestamp = tdata[0];
+                        state.first = vdata[0];
+                    }
+                    if (tdata[n - 1] >= state.latestTimestamp) {
+                        state.latestTimestamp = tdata[n - 1];
+                        state.latest = vdata[n - 1];
+                    }
                 }
                 break;
             }
@@ -364,6 +413,14 @@ private:
                 } else {
                     state.max = std::max(state.max, simdMax);
                     state.count += n;
+                    if (tdata[0] < state.firstTimestamp) {
+                        state.firstTimestamp = tdata[0];
+                        state.first = vdata[0];
+                    }
+                    if (tdata[n - 1] >= state.latestTimestamp) {
+                        state.latestTimestamp = tdata[n - 1];
+                        state.latest = vdata[n - 1];
+                    }
                 }
                 break;
             }
@@ -378,6 +435,14 @@ private:
                     state.min = std::min(state.min, simdMin);
                     state.max = std::max(state.max, simdMax);
                     state.count += n;
+                    if (tdata[0] < state.firstTimestamp) {
+                        state.firstTimestamp = tdata[0];
+                        state.first = vdata[0];
+                    }
+                    if (tdata[n - 1] >= state.latestTimestamp) {
+                        state.latestTimestamp = tdata[n - 1];
+                        state.latest = vdata[n - 1];
+                    }
                 }
                 break;
             }
@@ -392,7 +457,8 @@ private:
                 break;
             case AggregationMethod::FIRST:
                 // Monotonic timestamps: first element is the earliest.
-                if (n > 0 && tdata[0] <= state.firstTimestamp) {
+                // Use strict < to match scalar addValueForMethod behavior.
+                if (n > 0 && tdata[0] < state.firstTimestamp) {
                     state.first = vdata[0];
                     state.firstTimestamp = tdata[0];
                 }

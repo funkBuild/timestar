@@ -315,7 +315,7 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
             } catch (const seastar::gate_closed_exception&) {
                 // Shutting down — safe to discard.
             } catch (const std::exception& e) {
-                timestar::engine_log.warn("[METADATA] Schema broadcast failed: {}", e.what());
+                timestar::engine_log.error("[METADATA] Schema broadcast failed: {}", e.what());
             }
         });
     }
@@ -342,13 +342,8 @@ seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string ser
     QueryRunner runner(&tsmFileManager, &walFileManager);
     try {
         co_return co_await runner.runQuery(series, seriesId, startTime, endTime);
-    } catch (const std::runtime_error& e) {
-        std::string_view msg(e.what());
-        if (msg.find("Series not found") != std::string_view::npos ||
-            msg.find("series not found") != std::string_view::npos) {
-            co_return std::nullopt;
-        }
-        throw;
+    } catch (const SeriesNotFoundException&) {
+        co_return std::nullopt;
     }
 }
 
@@ -426,7 +421,7 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
                 timestar::BlockAggregator agg(
                     0, startTime, endTime,
                     wantFirst ? timestar::AggregationMethod::FIRST : timestar::AggregationMethod::LATEST, true);
-                agg.setFoldToSingleState(false);
+                agg.enableFoldToSingleState();
                 size_t pts =
                     co_await tsmFile->aggregateSeriesSelective(entry.seriesId, startTime, endTime, agg, !wantFirst, 1);
                 if (pts > 0) {
@@ -448,38 +443,43 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
     // --- Phase 3: Memory stores (may have newer/older data than TSM) ---
     // Iterate stores in outer loop (fewer stores than entries) for better
     // cache locality on the memory store's internal hash map.
+    // Helper lambda to check a typed memory series and update entry.value as double.
+    auto checkMemSeries = [&](const auto* series, auto& entry) {
+        if (!series || series->timestamps.empty())
+            return;
+        if (!wantFirst) {
+            // LATEST: check last element (timestamps are sorted ascending)
+            auto it = std::upper_bound(series->timestamps.begin(), series->timestamps.end(), endTime);
+            if (it == series->timestamps.begin())
+                return;
+            --it;
+            if (*it < startTime)
+                return;
+            size_t idx = static_cast<size_t>(it - series->timestamps.begin());
+            if (!entry.resolved || series->timestamps[idx] > entry.timestamp) {
+                entry.timestamp = series->timestamps[idx];
+                entry.value = static_cast<double>(series->values[idx]);
+                entry.resolved = true;
+            }
+        } else {
+            // FIRST: check first element in range
+            auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
+            if (it == series->timestamps.end() || *it > endTime)
+                return;
+            size_t idx = static_cast<size_t>(it - series->timestamps.begin());
+            if (!entry.resolved || series->timestamps[idx] < entry.timestamp) {
+                entry.timestamp = series->timestamps[idx];
+                entry.value = static_cast<double>(series->values[idx]);
+                entry.resolved = true;
+            }
+        }
+    };
+
     for (const auto& memStore : walFileManager.getMemoryStores()) {
         for (auto& entry : entries) {
-            auto* series = memStore->querySeries<double>(entry.seriesId);
-            if (!series || series->timestamps.empty())
-                continue;
-
-            if (!wantFirst) {
-                // LATEST: check last element (timestamps are sorted ascending)
-                auto it = std::upper_bound(series->timestamps.begin(), series->timestamps.end(), endTime);
-                if (it == series->timestamps.begin())
-                    continue;
-                --it;
-                if (*it < startTime)
-                    continue;
-                size_t idx = static_cast<size_t>(it - series->timestamps.begin());
-                if (!entry.resolved || series->timestamps[idx] > entry.timestamp) {
-                    entry.timestamp = series->timestamps[idx];
-                    entry.value = series->values[idx];
-                    entry.resolved = true;
-                }
-            } else {
-                // FIRST: check first element in range
-                auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
-                if (it == series->timestamps.end() || *it > endTime)
-                    continue;
-                size_t idx = static_cast<size_t>(it - series->timestamps.begin());
-                if (!entry.resolved || series->timestamps[idx] < entry.timestamp) {
-                    entry.timestamp = series->timestamps[idx];
-                    entry.value = series->values[idx];
-                    entry.resolved = true;
-                }
-            }
+            checkMemSeries(memStore->querySeries<double>(entry.seriesId), entry);
+            checkMemSeries(memStore->querySeries<int64_t>(entry.seriesId), entry);
+            checkMemSeries(memStore->querySeries<bool>(entry.seriesId), entry);
         }
     }
 }
@@ -582,32 +582,12 @@ seastar::future<std::vector<timestar::SeriesResult>> Engine::executeLocalQuery(c
         seriesResult.measurement = meta.measurement;
         seriesResult.tags = meta.tags;
 
-        // Handle different value types
+        // Handle different value types (all branches are identical)
         std::visit(
             [&](auto&& result) {
-                using T = std::decay_t<decltype(result)>;
-
-                if constexpr (std::is_same_v<T, QueryResult<double>>) {
-                    if (!result.timestamps.empty()) {
-                        seriesResult.fields[meta.field] = std::make_pair(
-                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
-                    }
-                } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
-                    if (!result.timestamps.empty()) {
-                        // vector<bool> cannot be moved efficiently (it's a bitset), but avoid element-by-element copy
-                        seriesResult.fields[meta.field] = std::make_pair(
-                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
-                    }
-                } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
-                    if (!result.timestamps.empty()) {
-                        seriesResult.fields[meta.field] = std::make_pair(
-                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
-                    }
-                } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
-                    if (!result.timestamps.empty()) {
-                        seriesResult.fields[meta.field] = std::make_pair(
-                            std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
-                    }
+                if (!result.timestamps.empty()) {
+                    seriesResult.fields[meta.field] =
+                        std::make_pair(std::move(result.timestamps), timestar::FieldValues(std::move(result.values)));
                 }
             },
             variantResult);
@@ -817,9 +797,11 @@ seastar::future<> Engine::loadAndBroadcastRetentionPolicies() {
 
     timestar::engine_log.info("[RETENTION] Loaded {} retention policies from NativeIndex", policyMap.size());
 
-    // Broadcast to all shards
-    co_await shardedRef->invoke_on_all([policyMap](Engine& engine) {
-        engine.setRetentionPolicies(policyMap);
+    // Broadcast to all shards (shared_ptr avoids N deep copies of the map)
+    auto sharedPolicies =
+        std::make_shared<const std::unordered_map<std::string, RetentionPolicy>>(std::move(policyMap));
+    co_await shardedRef->invoke_on_all([sharedPolicies](Engine& engine) {
+        engine.setRetentionPolicies(*sharedPolicies);
         return seastar::make_ready_future<>();
     });
 }
@@ -918,13 +900,13 @@ seastar::future<> Engine::sweepExpiredFiles() {
             }
 
             uint64_t cutoff = ttlCutoffs[it->second];
-            auto blocks = tsmFile->getSeriesBlocks(seriesId);
-            for (const auto& block : blocks) {
-                if (block.maxTime < cutoff) {
-                    // Block is expired (below cutoff)
-                } else {
-                    allExpired = false;
-                }
+            // Use sparse index maxTime (always in memory, no I/O) instead of
+            // getSeriesBlocks() which only returns data from the LRU cache.
+            // A cache miss would return empty blocks, leaving allExpired=true
+            // and causing premature file deletion.
+            uint64_t maxTime = tsmFile->getSeriesMaxTime(seriesId);
+            if (maxTime >= cutoff) {
+                allExpired = false;
             }
         }
 

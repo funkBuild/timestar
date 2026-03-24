@@ -1,4 +1,5 @@
 #include "../../../lib/encoding/integer/integer_encoder_ffor.hpp"
+#include "../../../lib/encoding/alp/alp_ffor.hpp"
 #include "../../../lib/storage/aligned_buffer.hpp"
 #include "../../../lib/storage/slice_buffer.hpp"
 
@@ -129,6 +130,46 @@ TEST(FFORCorruptData, ExceptionCountInflatedThrows) {
     EXPECT_THROW(
         { IntegerEncoderFFOR::decode(s, block_count, out); }, std::runtime_error)
         << "Decoder must throw when exception count exceeds block_count";
+}
+
+// --- Test: bw > 64 must not cause undefined behavior (shift UB) ---
+// The ffor_pack/unpack functions use (1ULL << bw) which is UB when bw >= 64.
+// The fix changes `bw == 64` checks to `bw >= 64`, treating any bw > 64 the
+// same as bw == 64 (full-width copy).
+TEST(FFORCorruptData, BitWidthAbove64DoesNotCrash) {
+    constexpr size_t N = 4;
+    int64_t values[N] = {100, 200, 300, 400};
+    int64_t base = 0;
+    // bw=65 would cause UB without the fix (1ULL << 65 is undefined)
+    uint64_t packed[N] = {};
+
+    // Should not crash — treated as full 64-bit copy
+    alp::ffor_pack(values, N, base, 65, packed);
+    for (size_t i = 0; i < N; ++i) {
+        EXPECT_EQ(packed[i], static_cast<uint64_t>(values[i] - base));
+    }
+
+    // Unpack should round-trip
+    int64_t unpacked[N] = {};
+    alp::ffor_unpack(packed, N, base, 65, unpacked);
+    for (size_t i = 0; i < N; ++i) {
+        EXPECT_EQ(unpacked[i], values[i]);
+    }
+
+    // Same for unsigned variant
+    uint64_t uvals[N] = {10, 20, 30, 40};
+    uint64_t ubase = 0;
+    uint64_t upacked[N] = {};
+    alp::ffor_pack_u64(uvals, N, ubase, 200, upacked);  // bw=200
+    for (size_t i = 0; i < N; ++i) {
+        EXPECT_EQ(upacked[i], uvals[i] - ubase);
+    }
+
+    uint64_t uunpacked[N] = {};
+    alp::ffor_unpack_u64(upacked, N, ubase, 200, uunpacked);
+    for (size_t i = 0; i < N; ++i) {
+        EXPECT_EQ(uunpacked[i], uvals[i]);
+    }
 }
 
 // --- Test 4: Regression -- normal encode/decode still works after the fix ---

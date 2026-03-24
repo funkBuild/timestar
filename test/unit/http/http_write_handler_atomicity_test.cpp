@@ -198,9 +198,11 @@ TEST_F(HttpWriteHandlerAtomicityTest, FastPathChecksEntireBodyForWritesKey) {
     std::string handleBody = extractFunctionBody(sourceCode, "HttpWriteHandler::handleWrite(");
     ASSERT_FALSE(handleBody.empty()) << "Could not extract handleWrite function body";
 
-    // The fast-path condition must check writesPos == std::string::npos only,
+    // The fast-path condition must check writesPos against npos only,
     // not writesPos > 64 (which was the bug).
-    EXPECT_NE(handleBody.find("writesPos == std::string::npos"), std::string::npos)
+    bool hasNposCheck = (handleBody.find("writesPos == std::string::npos") != std::string::npos) ||
+                        (handleBody.find("writesPos == std::string_view::npos") != std::string::npos);
+    EXPECT_TRUE(hasNposCheck)
         << "Fast-path must only skip batch detection when \"writes\" key is "
            "completely absent (npos), not when it appears after byte 64";
 

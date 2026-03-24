@@ -109,7 +109,11 @@ static std::string readFile(const std::string& path) {
 }
 
 TEST_F(HttpAuthWrapTest, AllHandlersPassAuthTokenInSetRoutes) {
+#ifdef HTTP_SERVER_SOURCE_PATH
+    std::string src = readFile(HTTP_SERVER_SOURCE_PATH);
+#else
     std::string src = readFile("../bin/timestar_http_server.cpp");
+#endif
     if (src.empty()) { GTEST_SKIP() << "Could not read server source"; }
 
     // Every registerRoutes call should pass g_authToken
@@ -119,10 +123,11 @@ TEST_F(HttpAuthWrapTest, AllHandlersPassAuthTokenInSetRoutes) {
     size_t pos = 0;
     while ((pos = src.find("registerRoutes(r", pos)) != std::string::npos) {
         totalCalls++;
-        // Check if g_authToken follows within the same call
-        auto closePos = src.find(')', pos);
-        auto snippet = src.substr(pos, closePos - pos);
-        if (snippet.find("g_authToken") != std::string::npos) {
+        // Check if authToken() appears within this line
+        auto eolPos = src.find('\n', pos);
+        if (eolPos == std::string::npos) eolPos = src.size();
+        auto line = src.substr(pos, eolPos - pos);
+        if (line.find("authToken()") != std::string::npos) {
             authCalls++;
         }
         pos += 15;
@@ -130,7 +135,7 @@ TEST_F(HttpAuthWrapTest, AllHandlersPassAuthTokenInSetRoutes) {
 
     EXPECT_GE(totalCalls, 7u) << "Expected at least 7 registerRoutes calls";
     EXPECT_EQ(authCalls, totalCalls)
-        << "All registerRoutes calls must pass g_authToken for auth protection";
+        << "All registerRoutes calls must pass authToken() for auth protection";
 }
 
 TEST_F(HttpAuthWrapTest, AllHandlersUseWrapWithAuthOrAuthHandlerWrapper) {
@@ -141,8 +146,12 @@ TEST_F(HttpAuthWrapTest, AllHandlersUseWrapWithAuthOrAuthHandlerWrapper) {
                                           "http_derived_query_handler.cpp"};
 
     for (const auto& file : handlers) {
+#ifdef HTTP_LIB_DIR
+        std::string src = readFile(std::string(HTTP_LIB_DIR) + "/" + file);
+#else
         std::string src = readFile("../lib/http/" + file);
-        if (src.empty()) continue;
+#endif
+        ASSERT_FALSE(src.empty()) << "Could not read " << file;
 
         bool hasWrap = src.find("wrapWithAuth") != std::string::npos;
         bool hasWrapper = src.find("AuthHandlerWrapper") != std::string::npos;

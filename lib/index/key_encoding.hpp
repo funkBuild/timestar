@@ -8,6 +8,9 @@
 #include <string>
 #include <string_view>
 
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "Key encoding assumes little-endian byte order for binary fields");
+
 namespace timestar::index::keys {
 
 // --- Key encoding functions ---
@@ -60,7 +63,6 @@ inline uint32_t dayBucketFromNs(uint64_t timestampNs) {
     return static_cast<uint32_t>(timestampNs / NS_PER_DAY);
 }
 
-std::string encodeDayBitmapKey(const std::string& measurement, uint32_t day);
 std::string encodeDayBitmapPrefix(const std::string& measurement);
 uint32_t decodeDayFromDayBitmapKey(std::string_view key);
 

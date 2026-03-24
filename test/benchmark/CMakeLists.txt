@@ -4,7 +4,7 @@ function(timestar_add_benchmark TARGET_NAME SOURCE_FILE)
     cmake_parse_arguments(BENCH "" "" "EXTRA_LIBS;EXTRA_FLAGS;EXTRA_INCLUDES" ${ARGN})
 
     add_executable(${TARGET_NAME} ${SOURCE_FILE})
-    target_link_libraries(${TARGET_NAME} PRIVATE libtimestar pthread ${BENCH_EXTRA_LIBS})
+    target_link_libraries(${TARGET_NAME} PRIVATE libtimestar libtimestar_proto_conv pthread ${BENCH_EXTRA_LIBS})
     target_include_directories(${TARGET_NAME} PRIVATE
         ${CMAKE_SOURCE_DIR}/lib/encoding
         ${CMAKE_SOURCE_DIR}/lib/storage
@@ -22,19 +22,16 @@ timestar_add_benchmark(encoder_benchmark encoder_benchmark.cpp)
 
 timestar_add_benchmark(bit_operations_benchmark bit_operations_benchmark.cpp
     EXTRA_LIBS benchmark::benchmark
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/utils
-    EXTRA_FLAGS -mavx2 -msse4.2)
+    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/utils)
 
 timestar_add_benchmark(integer_encoder_benchmark integer_encoder_benchmark.cpp)
 
-timestar_add_benchmark(integer_encoder_comparison integer_encoder_comparison.cpp
-    EXTRA_FLAGS -mavx2)
+timestar_add_benchmark(integer_encoder_comparison integer_encoder_comparison.cpp)
 
 # --- Query / aggregator benchmarks ---
 
 timestar_add_benchmark(aggregator_performance_benchmark aggregator_performance_benchmark.cpp
-    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/query ${CMAKE_SOURCE_DIR}/lib/utils
-    EXTRA_FLAGS -mavx2)
+    EXTRA_INCLUDES ${CMAKE_SOURCE_DIR}/lib/query ${CMAKE_SOURCE_DIR}/lib/utils)
 
 # --- Storage benchmarks ---
 
@@ -48,7 +45,7 @@ add_custom_target(run-compaction-bench
 )
 
 add_executable(tsm_batch_read_benchmark tsm_batch_read_benchmark.cpp)
-target_link_libraries(tsm_batch_read_benchmark PRIVATE libtimestar Seastar::seastar)
+target_link_libraries(tsm_batch_read_benchmark PRIVATE libtimestar libtimestar_proto_conv Seastar::seastar)
 target_include_directories(tsm_batch_read_benchmark PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/storage ${CMAKE_SOURCE_DIR}/lib/core ${CMAKE_SOURCE_DIR}/lib/encoding)
 target_compile_options(tsm_batch_read_benchmark PRIVATE -O3 -march=native -mtune=native)

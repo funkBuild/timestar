@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 class CompressedSlice {
@@ -62,7 +63,7 @@ public:
         : alignedStorage_(nullptr),
           data_(_data),
           length_(_byteLength / 8),
-          data(reinterpret_cast<const uint64_t*>(_data))  // may be unaligned, kept for compat
+          data(nullptr)  // DEPRECATED: always null in zero-copy mode (may be unaligned). Use loadWord() instead.
     {
         // Zero-copy mode requires the byte length to be a multiple of 8 so that
         // we don't need to worry about padding the last word.
@@ -74,6 +75,7 @@ public:
 
     template <typename T>
     T read(const int bits) {
+        static_assert(std::is_unsigned_v<T> && sizeof(T) <= 8, "T must be an unsigned integer type");
         if (bitOffset > 63) [[unlikely]] {
             offset++;
             bitOffset = 0;
@@ -214,10 +216,10 @@ public:
 
     template <class T>
     size_t length() {
-        return (length_ - offset) / sizeof(T);
+        return offset >= length_ ? 0 : (length_ - offset) / sizeof(T);
     }
 
-    size_t remaining() const { return length_ - offset; }
+    size_t remaining() const { return offset >= length_ ? 0 : length_ - offset; }
 
     std::string readString(size_t byteLength) {
         if (offset + byteLength > length_) {
@@ -231,7 +233,7 @@ public:
         return thisString;
     }
 
-    size_t bytesLeft() const { return length_ - offset; }
+    size_t bytesLeft() const { return offset >= length_ ? 0 : length_ - offset; }
 
     Slice getSlice(size_t byteLength) {
         if (offset + byteLength > length_) {

@@ -71,7 +71,7 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
             timestar::wal_log.error("WAL file {} does not exist for recovery", filename);
             throw std::runtime_error("WAL file not found for recovery");
         }
-        openFlags = seastar::open_flags::rw | seastar::open_flags::create;
+        openFlags = seastar::open_flags::rw;
         timestar::wal_log.debug("Opening WAL {} for recovery", filename);
     } else {
         // Fresh creation mode: always truncate to start with empty file
@@ -96,9 +96,20 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     // Initialize WAL size limit from config (matches MemoryStore::walSizeThreshold())
     maxWalSize_ = timestar::config().storage.wal_size_threshold;
 
+    // Initialize concurrent encoding limit from config.
+    // The semaphore starts at 4 (header default); adjust to match config.
+    auto maxEncoders = static_cast<ssize_t>(timestar::config().storage.wal_max_concurrent_encoders);
+    if (maxEncoders < 1)
+        maxEncoders = 1;
+    auto current = _encode_sem.available_units();
+    if (maxEncoders > current) {
+        _encode_sem.signal(maxEncoders - current);
+    } else if (maxEncoders < current) {
+        _encode_sem.consume(current - maxEncoders);
+    }
+
     // Get current file size
-    filePos = co_await walFile.size();
-    currentSize = filePos;
+    currentSize = co_await walFile.size();
 
     if (!isRecovery && currentSize > 0) {
         timestar::wal_log.error("Fresh WAL {} has non-zero size {} after truncate - this is unexpected", filename,
@@ -120,7 +131,7 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     auto s = co_await seastar::make_file_output_stream(walFile, opts);
     out.emplace(std::move(s));
 
-    timestar::wal_log.debug("WAL stream init: pos={}, dma_alignment={}", filePos, _dma_alignment);
+    timestar::wal_log.debug("WAL stream init: pos={}, dma_alignment={}", currentSize, _dma_alignment);
 }
 
 std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
@@ -139,7 +150,7 @@ seastar::future<> WAL::finalFlush() {
         co_await padToAlignment();
         co_await out->flush();  // drains buffers and fsyncs the sink
         _unflushed_bytes = 0;
-        timestar::wal_log.debug("WAL final flush completed, filePos={}", filePos);
+        timestar::wal_log.debug("WAL final flush completed, currentSize={}", currentSize);
     } catch (const std::exception& e) {
         timestar::wal_log.error("WAL final flush error: {}", e.what());
     }
@@ -202,9 +213,8 @@ seastar::future<> WAL::close() {
     timestar::wal_log.debug("WAL seq={} closed successfully", sequenceNumber);
 }
 
-seastar::future<unsigned long> WAL::size() {
-    auto s = co_await walFile.size();
-    co_return static_cast<unsigned long>(s);
+seastar::future<uint64_t> WAL::size() {
+    co_return co_await walFile.size();
 }
 
 seastar::future<> WAL::remove() {
@@ -275,7 +285,6 @@ seastar::future<> WAL::padToAlignment() {
     co_await out->write(pad_ptr, padding);
 
     _unflushed_bytes += padding;
-    filePos += padding;
     currentSize += padding;
 }
 
@@ -450,9 +459,9 @@ void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequ
             _compressionStats.updateString(rawValSize, encodedValSize);
         } else if constexpr (std::is_same_v<T, int64_t>) {
             const size_t rawValSize = count * sizeof(int64_t);
-            // ZigZag encode int64 → uint64 using thread-local scratch buffer, then FFOR encode
-            static thread_local std::vector<uint64_t> zigzagScratch;
-            zigzagScratch.resize(count);
+            // ZigZag encode int64 → uint64, then FFOR encode.
+            // Per-coroutine scratch (not thread_local) since encoding is concurrent.
+            std::vector<uint64_t> zigzagScratch(count);
             ZigZag::zigzagEncodeInto(insertRequest.values, zigzagScratch.data());
             IntegerEncoder::encodeInto(zigzagScratch, buffer);
             const size_t encodedValSize = buffer.size() - startPos;
@@ -465,6 +474,9 @@ void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequ
 
     // --- Backpatch header fields in-place ---
     const size_t payloadSize = buffer.size() - payloadStart;
+    if (payloadSize > UINT32_MAX - sizeof(uint32_t)) {
+        throw std::runtime_error("WAL entry too large");
+    }
     const uint32_t entryLength = static_cast<uint32_t>(sizeof(uint32_t) + payloadSize);  // CRC + payload
     buffer.writeAt(entryStart, entryLength);
 
@@ -475,28 +487,34 @@ void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequ
 
 template <class T>
 seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
-    // Hold the gate BEFORE the semaphore so that WAL::close() (which calls
-    // _io_gate.close()) will wait for coroutines queued on _io_sem rather
-    // than racing past them and closing the stream while they're pending.
+    // Hold the gate BEFORE the semaphores so that WAL::close() (which calls
+    // _io_gate.close()) will wait for coroutines queued on either semaphore
+    // rather than racing past them and closing the stream while they're pending.
     auto gate_holder = _io_gate.hold();
-    auto units = co_await seastar::get_units(_io_sem, 1);
 
-    // --- Encoding phase (under lock) ---
-    // Reuse thread-local buffer: capacity persists across inserts, eliminating
-    // per-insert heap allocation. clear() resets size but preserves capacity.
-    // Must be under the semaphore to prevent concurrent coroutines from
-    // overwriting the buffer between encoding and the stream write.
-    static thread_local AlignedBuffer buffer;
-    buffer.clear();
+    // --- Encoding phase (concurrent, bounded by _encode_sem) ---
+    // Each coroutine gets its own buffer. Up to N coroutines can encode
+    // simultaneously, overlapping CPU-bound compression work.
+    auto encode_units = co_await seastar::get_units(_encode_sem, 1);
+
+    AlignedBuffer buffer;
     buffer.reserve(estimateInsertSize(insertRequest));
-
     encodeInsertEntry(buffer, insertRequest);
-
     const size_t dataSize = buffer.size();
+
+    encode_units.return_all();  // release encoding slot early
 
     LOG_INSERT_PATH(timestar::wal_log, debug, "WAL::insert - dataSize={}, currentSize={}", dataSize, currentSize);
 
-    // Respect the WAL size limit BEFORE writing
+    // Optimistic WAL size check (avoids acquiring _io_sem when WAL is full)
+    if (currentSize + dataSize > maxWalSize_) {
+        co_return WALInsertResult::RolloverNeeded;
+    }
+
+    // --- I/O phase (serialized by _io_sem) ---
+    auto io_units = co_await seastar::get_units(_io_sem, 1);
+
+    // Definitive size check under lock (another coroutine may have written)
     const size_t projectedSize = currentSize + dataSize;
     if (projectedSize > maxWalSize_) {
         timestar::wal_log.debug(
@@ -506,19 +524,14 @@ seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
         co_return WALInsertResult::RolloverNeeded;
     }
 
-    // Stream write
     try {
-        if (out) {
-            co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), dataSize);
-        } else {
+        if (!out) {
             throw std::runtime_error("WAL output stream is null");
         }
-        // Update positions and size
-        filePos += dataSize;
+        co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), dataSize);
         currentSize += dataSize;
         _unflushed_bytes += dataSize;
 
-        // Only flush immediately if configured for immediate mode
         if (requiresImmediateFlush) {
             co_await padToAlignment();
             co_await out->flush();
@@ -541,37 +554,42 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
         co_return co_await insert(insertRequests[0]);
     }
 
-    // Hold the gate BEFORE the semaphore (see insert() for rationale).
+    // Hold the gate BEFORE the semaphores (see insert() for rationale).
     auto gate_holder = _io_gate.hold();
-    auto units = co_await seastar::get_units(_io_sem, 1);
 
-    // --- Encoding phase (under lock) ---
-    // Must be under the semaphore to prevent concurrent coroutines from
-    // overwriting the thread-local buffer between encoding and the stream write.
+    // --- Encoding phase (concurrent, bounded by _encode_sem) ---
+    auto encode_units = co_await seastar::get_units(_encode_sem, 1);
 
-    // First pass: compute total estimated size for pre-allocation
+    // Compute total estimated size for pre-allocation
     size_t estimatedTotal = 0;
     for (auto& req : insertRequests) {
         estimatedTotal += estimateInsertSize(req);
     }
 
-    // Reuse thread-local buffer (same one as insert() — safe because the
-    // semaphore guarantees only one WAL write runs at a time per shard).
-    static thread_local AlignedBuffer buffer;
-    buffer.clear();
+    // Per-coroutine buffer (not thread_local — allows concurrent encoding)
+    AlignedBuffer buffer;
     buffer.reserve(estimatedTotal);
 
-    // Second pass: encode each insert directly into the shared buffer
     for (auto& insertRequest : insertRequests) {
         encodeInsertEntry(buffer, insertRequest);
     }
 
     const size_t totalSize = buffer.size();
 
+    encode_units.return_all();  // release encoding slot early
+
     LOG_INSERT_PATH(timestar::wal_log, debug, "WAL::insertBatch - {} entries, total size={}, currentSize={}",
                     insertRequests.size(), totalSize, currentSize);
 
-    // WAL limit check (under lock so currentSize is authoritative)
+    // Optimistic WAL size check (avoids acquiring _io_sem when WAL is full)
+    if (currentSize + totalSize > maxWalSize_) {
+        co_return WALInsertResult::RolloverNeeded;
+    }
+
+    // --- I/O phase (serialized by _io_sem) ---
+    auto io_units = co_await seastar::get_units(_io_sem, 1);
+
+    // Definitive size check under lock
     const size_t projected = currentSize + totalSize;
     if (projected > maxWalSize_) {
         timestar::wal_log.debug(
@@ -585,14 +603,10 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
         if (!out) {
             throw std::runtime_error("WAL output stream is null in insertBatch");
         }
-        // Single write for the entire batch
         co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), totalSize);
-        // Only update positions atomically after the write succeeds
-        filePos += totalSize;
         currentSize += totalSize;
         _unflushed_bytes += totalSize;
 
-        // Only flush immediately if configured for immediate mode
         if (requiresImmediateFlush) {
             co_await padToAlignment();
             co_await out->flush();
@@ -615,8 +629,8 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId, uint64_t startTi
     constexpr size_t LENGTH_OFFSET = 0;
     constexpr size_t CRC_OFFSET = sizeof(uint32_t);
     constexpr size_t PAYLOAD_OFFSET = 2 * sizeof(uint32_t);
-    buffer.write((uint32_t)0);  // placeholder: entryLength
-    buffer.write((uint32_t)0);  // placeholder: CRC32
+    buffer.write(static_cast<uint32_t>(0));  // placeholder: entryLength
+    buffer.write(static_cast<uint32_t>(0));  // placeholder: CRC32
 
     // --- Payload directly into buffer ---
     // Type
@@ -651,7 +665,6 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId, uint64_t startTi
             throw std::runtime_error("WAL output stream is null in deleteRange");
         }
         co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), n);
-        filePos += n;
         currentSize += n;
         _unflushed_bytes += n;
 
@@ -1005,10 +1018,18 @@ TimeStarInsert<T> WALReader::readSeries(Slice& walSlice, const std::string& seri
         auto valuesSlice = walSlice.getSlice(valueByteSize);
         StringEncoder::decode(valuesSlice, timestampsCount, nSkipped, nTimestamps, insertReq.values);
     } else if constexpr (std::is_same_v<T, int64_t>) {
+        // NOTE: decodes all timestampsCount values then subranges — could be optimized
+        // with range-aware decode like FloatDecoder.
         auto valuesSlice = walSlice.getSlice(valueByteSize);
         std::vector<uint64_t> rawUint;
         IntegerEncoder::decode(valuesSlice, timestampsCount, rawUint);
         // ZigZag decode uint64 → int64, skipping values that correspond to filtered timestamps
+        if (nSkipped + nTimestamps > rawUint.size()) [[unlikely]] {
+            timestar::wal_log.warn(
+                "WAL recovery: decoded {} integers but expected {} (skipped {}), "
+                "entry may be truncated",
+                rawUint.size(), nSkipped + nTimestamps, nSkipped);
+        }
         insertReq.values.reserve(nTimestamps);
         for (size_t i = nSkipped; i < nSkipped + nTimestamps && i < rawUint.size(); ++i) {
             insertReq.values.push_back(ZigZag::zigzagDecode(rawUint[i]));

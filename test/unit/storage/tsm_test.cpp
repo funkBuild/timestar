@@ -288,3 +288,28 @@ TEST_F(TSMTest, RankAsIntegerOverflowTier) {
     // tierNum=16 should throw overflow_error
     EXPECT_THROW(tsm.rankAsInteger(), std::overflow_error);
 }
+
+TEST_F(TSMTest, RankAsIntegerOverflowSeqNum) {
+    // Create a valid TSM file, then override seqNum to exceed 60-bit limit
+    std::string filename = getTestFilePath("0_1.tsm");
+    {
+        TSMWriter writer(filename);
+        std::vector<uint64_t> timestamps = {1000};
+        std::vector<double> values = {1.0};
+        SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.rankseq");
+        writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
+        writer.writeIndex();
+        writer.close();
+    }
+
+    TSM tsm(filename);
+    // Override seqNum to exceed 60-bit limit
+    constexpr uint64_t maxSeqNum = (uint64_t{1} << 60) - 1;
+    tsm.seqNum = maxSeqNum + 1;
+    EXPECT_THROW(tsm.rankAsInteger(), std::overflow_error);
+
+    // Max valid seqNum should not throw
+    tsm.seqNum = maxSeqNum;
+    EXPECT_NO_THROW(tsm.rankAsInteger());
+    EXPECT_EQ(tsm.rankAsInteger(), maxSeqNum);
+}
