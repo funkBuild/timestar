@@ -161,7 +161,7 @@ seastar::future<> testTSMReadTimeRange(std::string filename) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.range");
 
     TSMResult<double> results(0);
-    co_await tsm.readSeries(seriesId, 3000, 7000, results);
+    co_await tsm.readSeries(seriesId, 3000, 7001, results);
 
     auto [timestamps, values] = results.getAllData();
     EXPECT_EQ(values.size(), 5);

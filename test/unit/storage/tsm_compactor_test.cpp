@@ -433,7 +433,7 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
 
     // Verify timestamp 5000 has value from newest file (file 3)
     TSMResult<double> result1(0);
-    co_await level1TSM->readSeries(SeriesId128::fromSeriesKey("metric.test"), 5000, 5000, result1);
+    co_await level1TSM->readSeries(SeriesId128::fromSeriesKey("metric.test"), 5000, 5001, result1);
 
     bool found5000 = false;
     for (const auto& block : result1.blocks) {
@@ -493,7 +493,7 @@ SEASTAR_TEST_F(TSMCompactorTest, MultiLevelCompactionPreservesNewerValues) {
 
     // Step 5: Verify final value at timestamp 5000
     TSMResult<double> result2(0);
-    co_await level2TSM->readSeries(SeriesId128::fromSeriesKey("metric.test"), 5000, 5000, result2);
+    co_await level2TSM->readSeries(SeriesId128::fromSeriesKey("metric.test"), 5000, 5001, result2);
 
     found5000 = false;
     for (const auto& block : result2.blocks) {

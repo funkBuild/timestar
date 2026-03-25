@@ -132,6 +132,13 @@ public:
         const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
         uint64_t aggregationInterval, timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 
+    // Multi-field batch aggregation: fold N series through TSM files and memory
+    // stores in a single pass.  Returns a vector parallel to the input, where
+    // each element is either a PushdownResult or nullopt.
+    seastar::future<std::vector<std::optional<timestar::PushdownResult>>> queryAggregatedMultiField(
+        const std::vector<std::pair<std::string, SeriesId128>>& entries, uint64_t startTime, uint64_t endTime,
+        uint64_t aggregationInterval, timestar::AggregationMethod method);
+
     // Batch LATEST/FIRST: resolve latest (or first) value for multiple series
     // in a single pass over TSM files and memory stores.  Avoids per-series
     // file snapshot, sort, and coroutine overhead.

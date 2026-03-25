@@ -69,11 +69,12 @@ struct BucketState {
             case AggregationMethod::SPREAD:
                 return max - min;
             case AggregationMethod::MEDIAN:
+            case AggregationMethod::EXACT_MEDIAN:
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR:
-                // These methods require full rawValues which streaming aggregation
-                // does not track (unbounded memory). Callers should validate the
-                // aggregation method at subscription creation time.
+                // These methods require full rawValues or t-digest state which
+                // SSE streaming aggregation does not track. Callers should validate
+                // the aggregation method at subscription creation time.
                 return std::numeric_limits<double>::quiet_NaN();
             default:
                 return sum / static_cast<double>(count);  // fallback to AVG

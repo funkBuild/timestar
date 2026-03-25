@@ -157,8 +157,8 @@ seastar::future<> test_wal_replay_preserves_partial_field_deletion() {
             TimeStarInsert<double> insertB("simple", "fieldB");
             insertB.addTag("id", "test1");
 
-            auto resultA = co_await safeQuery(engine2, insertA.seriesKey(), timestamp, timestamp);
-            auto resultB = co_await safeQuery(engine2, insertB.seriesKey(), timestamp, timestamp);
+            auto resultA = co_await safeQuery(engine2, insertA.seriesKey(), timestamp, timestamp + 1);
+            auto resultB = co_await safeQuery(engine2, insertB.seriesKey(), timestamp, timestamp + 1);
 
             // After WAL replay, fieldA should still be deleted, fieldB should still exist
             EXPECT_FALSE(variantHasData(resultA)) << "After WAL replay, fieldA should still be deleted";

@@ -65,14 +65,13 @@ struct SeriesQueryContext {
 // from O(points) to O(groups x buckets).
 
 // Returns true when a group-by query can use the streaming path.
-// MEDIAN is NOT streamable (it needs all raw values for nth_element).
+// MEDIAN and EXACT_MEDIAN are NOT streamable (both need raw values).
 // Returns true when the query can use streaming aggregation (fold per-block
 // into accumulators instead of materializing all raw data).
 //
 // Requires EITHER group-by tags OR an aggregation interval — without both,
 // the old path returns raw timestamp/value pairs which internal callers
 // (DerivedQueryExecutor, ForecastExecutor) depend on for formula evaluation.
-// MEDIAN is excluded because it needs all raw values for nth_element.
 static bool canStreamAggregation(AggregationMethod method, const std::vector<std::string>& groupByTags,
                                  uint64_t aggregationInterval) {
     if (!isStreamableMethod(method))
@@ -1423,25 +1422,40 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 // a single SeriesResult with multiple fields.  The aggregation
                 // loop above emits one SeriesResult per field; the HTTP response
                 // format groups fields under a single series entry.
+                // Consolidate series that share the same measurement+tags
+                // into a single SeriesResult with multiple fields.
+                // Uses hash-indexed lookup for O(N) instead of O(N²) flat scan.
                 {
+                    std::unordered_map<size_t, size_t> tagHashToIdx;  // hash → index in merged
+                    tagHashToIdx.reserve(response.series.size());
                     std::vector<SeriesResult> merged;
                     merged.reserve(response.series.size());
-                    // Map from (measurement, tags) → index in merged vector.
-                    // Use a flat scan; typical series counts are small (<100).
+
                     for (auto& s : response.series) {
-                        bool found = false;
-                        for (auto& m : merged) {
-                            if (m.measurement == s.measurement && m.tags == s.tags) {
+                        // Hash measurement + tags
+                        size_t h = std::hash<std::string>{}(s.measurement);
+                        for (const auto& [k, v] : s.tags) {
+                            h ^= std::hash<std::string>{}(k) * 31 + std::hash<std::string>{}(v);
+                        }
+
+                        auto [it, inserted] = tagHashToIdx.try_emplace(h, merged.size());
+                        if (!inserted) {
+                            // Verify actual equality (hash collision possible)
+                            auto& existing = merged[it->second];
+                            if (existing.measurement == s.measurement && existing.tags == s.tags) {
                                 for (auto& [fname, fdata] : s.fields) {
-                                    m.fields[std::move(fname)] = std::move(fdata);
+                                    existing.fields[std::move(fname)] = std::move(fdata);
                                 }
-                                found = true;
-                                break;
+                                continue;
                             }
+                            // Hash collision — fall through to insert as new entry
                         }
-                        if (!found) {
-                            merged.push_back(std::move(s));
+                        if (!inserted) {
+                            // Hash collision with different tags — update index to last occurrence
+                            // and insert as new entry
+                            tagHashToIdx[h] = merged.size();
                         }
+                        merged.push_back(std::move(s));
                     }
                     response.series = std::move(merged);
                 }

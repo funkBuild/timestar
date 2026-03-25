@@ -66,8 +66,8 @@ public:
     // Enable fold-to-single-state mode for non-bucketed streaming aggregation.
     // When active (interval_ == 0), addPoint/addPoints fold directly into a single
     // AggregationState instead of materialising raw (timestamp, value) vectors.
-    // collectRaw is always false for fold mode (raw collection is only for MEDIAN,
-    // which never uses fold).
+    // collectRaw is always false for fold mode (raw collection is only for
+    // EXACT_MEDIAN, which never uses fold).
     void enableFoldToSingleState() {
         foldToSingleState_ = true;
         singleState_.collectRaw = false;
@@ -81,10 +81,10 @@ public:
     bool canUseBlockStats(uint64_t blockMinTime, uint64_t blockMaxTime, bool hasExtendedStats = false) const {
         if (methodAware_) {
             switch (method_) {
-                // MEDIAN requires raw individual values to compute the middle value.
-                // This is a fundamental architectural limitation — no set of block-level
-                // statistics can replace the need for all raw values.
+                // MEDIAN (t-digest) and EXACT_MEDIAN both require individual values.
+                // Block-level stats cannot substitute for per-value processing.
                 case AggregationMethod::MEDIAN:
+                case AggregationMethod::EXACT_MEDIAN:
                     return false;
                 // STDDEV/STDVAR need Welford M2; LATEST/FIRST need actual values.
                 // These can use block stats only when extended stats are available.
@@ -195,6 +195,42 @@ public:
         } else {
             uint64_t bucket = (timestamp / interval_) * interval_;
             addToState(bucketStates_[bucket], value, timestamp);
+        }
+    }
+
+    // Add a subrange of a batch (zero-copy from MemoryStore).
+    void addPointsRange(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
+                        size_t startIdx, size_t endIdx) {
+        const size_t n = endIdx - startIdx;
+        pointCount_ += n;
+        if (n == 0) return;
+
+        if (interval_ == 0) {
+            if (foldToSingleState_) {
+                if (methodAware_ && n >= 4) {
+                    addPointsSIMDFoldRange(timestamps, values, startIdx, endIdx, singleState_);
+                } else {
+                    for (size_t i = startIdx; i < endIdx; ++i) {
+                        addToState(singleState_, values[i], timestamps[i]);
+                    }
+                }
+                return;
+            }
+            timestamps_.insert(timestamps_.end(), timestamps.begin() + startIdx, timestamps.begin() + endIdx);
+            rawValues_.insert(rawValues_.end(), values.begin() + startIdx, values.begin() + endIdx);
+        } else if (singleBucketState_) {
+            if (methodAware_ && n >= 4) {
+                addPointsSIMDFoldRange(timestamps, values, startIdx, endIdx, *singleBucketState_);
+            } else {
+                for (size_t i = startIdx; i < endIdx; ++i) {
+                    addToState(*singleBucketState_, values[i], timestamps[i]);
+                }
+            }
+        } else {
+            for (size_t i = startIdx; i < endIdx; ++i) {
+                uint64_t bucket = (timestamps[i] / interval_) * interval_;
+                addToState(bucketStates_[bucket], values[i], timestamps[i]);
+            }
         }
     }
 
@@ -465,7 +501,7 @@ private:
                 state.count += n;
                 break;
             default:
-                // STDDEV, MEDIAN, etc. — fall back to scalar per-value
+                // STDDEV, MEDIAN, EXACT_MEDIAN, etc. — fall back to scalar per-value
                 for (size_t i = begin; i < end; ++i) {
                     addToState(state, values[i], timestamps[i]);
                 }

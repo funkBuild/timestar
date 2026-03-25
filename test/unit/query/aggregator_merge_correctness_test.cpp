@@ -414,9 +414,9 @@ TEST_F(AggregatorMergeCorrectnessTest, StddevMerge_ThreePartials_WelfordMergeCor
     EXPECT_NEAR(grouped[0].points[0].value, expected, 1e-10);
 }
 
-// MEDIAN: two raw-value partials with overlapping timestamps.
-// At ts=200: values {10, 20} => median = (10+20)/2 = 15.
-// Single-value timestamps: median = that value.
+// MEDIAN (approximate via t-digest): two raw-value partials with overlapping timestamps.
+// At ts=200: values {10, 20} => approximate median ~15.
+// Single-value timestamps: t-digest returns the exact value.
 TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_RawValues_CorrectResult) {
     auto p1 = makeRawPartial("test\0value", {100, 200}, {3.0, 10.0});
     auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 7.0});
@@ -431,21 +431,46 @@ TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_RawValues_CorrectResult) {
     std::sort(pts.begin(), pts.end(),
               [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
 
-    // ts=100: single value 3.0 => median = 3.0
+    // ts=100: single value 3.0 => t-digest returns exact value
+    EXPECT_EQ(pts[0].timestamp, 100);
+    EXPECT_NEAR(pts[0].value, 3.0, 0.1);
+
+    // ts=200: values {10, 20} => t-digest approximate median ~15
+    EXPECT_EQ(pts[1].timestamp, 200);
+    EXPECT_NEAR(pts[1].value, 15.0, 1.0);
+
+    // ts=300: single value 7.0 => t-digest returns exact value
+    EXPECT_EQ(pts[2].timestamp, 300);
+    EXPECT_NEAR(pts[2].value, 7.0, 0.1);
+}
+
+// EXACT_MEDIAN: preserves the old exact behavior via rawValues.
+TEST_F(AggregatorMergeCorrectnessTest, ExactMedianMerge_RawValues_CorrectResult) {
+    auto p1 = makeRawPartial("test\0value", {100, 200}, {3.0, 10.0});
+    auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 7.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::EXACT_MEDIAN);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 3);
+
+    auto& pts = grouped[0].points;
+    std::sort(pts.begin(), pts.end(),
+              [](const AggregatedPoint& a, const AggregatedPoint& b) { return a.timestamp < b.timestamp; });
+
     EXPECT_EQ(pts[0].timestamp, 100);
     EXPECT_DOUBLE_EQ(pts[0].value, 3.0);
 
-    // ts=200: values {10, 20} => median = (10+20)/2 = 15.0
     EXPECT_EQ(pts[1].timestamp, 200);
     EXPECT_DOUBLE_EQ(pts[1].value, 15.0);
 
-    // ts=300: single value 7.0 => median = 7.0
     EXPECT_EQ(pts[2].timestamp, 300);
     EXPECT_DOUBLE_EQ(pts[2].value, 7.0);
 }
 
 // MEDIAN with odd number of merged values at a single timestamp.
-// Values at ts=500: {1, 3, 5} from three partials => median = 3.
+// Values at ts=500: {1, 3, 5} from three partials => approximate median ~3.
 TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_ThreePartials_OddCount) {
     auto p1 = makeRawPartial("test\0value", {500}, {1.0});
     auto p2 = makeRawPartial("test\0value", {500}, {5.0});
@@ -453,6 +478,20 @@ TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_ThreePartials_OddCount) {
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
     auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MEDIAN);
+
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 1);
+    EXPECT_NEAR(grouped[0].points[0].value, 3.0, 0.5);
+}
+
+// EXACT_MEDIAN: preserves exact behavior for odd count.
+TEST_F(AggregatorMergeCorrectnessTest, ExactMedianMerge_ThreePartials_OddCount) {
+    auto p1 = makeRawPartial("test\0value", {500}, {1.0});
+    auto p2 = makeRawPartial("test\0value", {500}, {5.0});
+    auto p3 = makeRawPartial("test\0value", {500}, {3.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::EXACT_MEDIAN);
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);

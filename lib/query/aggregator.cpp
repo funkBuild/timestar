@@ -214,6 +214,7 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR:
             case AggregationMethod::MEDIAN:
+            case AggregationMethod::EXACT_MEDIAN:
                 throw std::logic_error("foldAlignedRawValues called for unsupported method");
             default:
                 throw std::logic_error("foldAlignedRawValues called for unknown method");
@@ -275,6 +276,7 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR:
             case AggregationMethod::MEDIAN:
+            case AggregationMethod::EXACT_MEDIAN:
                 return existing;
             default:
                 return existing;
@@ -415,8 +417,10 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             }
 
             // PHASE 1 OPTIMIZATION: Two-phase aggregation - aggregate to states immediately
-            // Single pass, no reallocation, O(1) merge later
-            const bool needsRaw = (method == AggregationMethod::MEDIAN);
+            // Single pass, no reallocation, O(1) merge later.
+            // MEDIAN and EXACT_MEDIAN both use addValue with collectRaw=true.
+            const bool needsRaw = (method == AggregationMethod::EXACT_MEDIAN ||
+                                   method == AggregationMethod::MEDIAN);
             if (interval > 0) {
                 // Bucketed aggregation - accumulate into AggregationState per bucket
                 for (size_t i = 0; i < timestamps.size(); ++i) {
@@ -429,8 +433,6 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             } else if (method == AggregationMethod::LATEST || method == AggregationMethod::FIRST) {
                 // LATEST/FIRST without interval: fold all points into a single
                 // collapsed state — return 1 point per group, not N raw points.
-                // Without this, a "latest:metric()" query over 500K points would
-                // materialise 500K AggregationStates and return a 14MB response.
                 partial.totalPoints += timestamps.size();
                 if (!partial.collapsedState.has_value()) {
                     partial.collapsedState.emplace();
@@ -601,10 +603,12 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     }
                 }
 
-                // SPREAD/STDDEV/STDVAR/MEDIAN need full AggregationState;
+                // SPREAD/STDDEV/STDVAR/MEDIAN/EXACT_MEDIAN need full AggregationState;
                 // they cannot be folded from raw values alone.
                 bool methodCanFoldRaw = method != AggregationMethod::SPREAD && method != AggregationMethod::STDDEV &&
-                                        method != AggregationMethod::STDVAR && method != AggregationMethod::MEDIAN;
+                                        method != AggregationMethod::STDVAR &&
+                                        method != AggregationMethod::EXACT_MEDIAN &&
+                                        method != AggregationMethod::MEDIAN;
 
                 if (allRaw && methodCanFoldRaw && !groupPartials.empty()) {
                     // Fast path: merge raw (timestamp, value) vectors directly.
@@ -651,7 +655,8 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     // Fallback: some partials have AggregationStates (from the
                     // createPartialAggregations path). Convert any raw-value
                     // partials to states, then merge normally.
-                    const bool needsRaw = (method == AggregationMethod::MEDIAN);
+                    // Convert raw values to AggregationStates.
+                    const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
                     for (auto* p : groupPartials) {
                         if (!p->sortedValues.empty() && p->sortedStates.empty()) {
                             p->sortedStates.reserve(p->sortedTimestamps.size());
@@ -707,7 +712,8 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
         return {};
     }
 
-    const bool needsRaw = (method == AggregationMethod::MEDIAN);
+    const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
+    const bool useMethodAware = false;  // MEDIAN now uses rawValues like EXACT_MEDIAN
 
     if (interval > 0) {
         // Bucketed aggregation
@@ -717,7 +723,11 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
             auto& state = buckets[bucketTime];
             if (needsRaw)
                 state.collectRaw = true;
-            state.addValue(values[i], timestamps[i]);
+            if (useMethodAware) {
+                state.addValueForMethod(values[i], timestamps[i], method);
+            } else {
+                state.addValue(values[i], timestamps[i]);
+            }
         }
 
         std::vector<AggregatedPoint> result;
@@ -735,7 +745,11 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
             auto& state = states[timestamps[i]];
             if (needsRaw)
                 state.collectRaw = true;
-            state.addValue(values[i], timestamps[i]);
+            if (useMethodAware) {
+                state.addValueForMethod(values[i], timestamps[i], method);
+            } else {
+                state.addValue(values[i], timestamps[i]);
+            }
         }
 
         std::vector<AggregatedPoint> result;
@@ -757,7 +771,8 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
     }
 
     // Merge all series into one set of timestamp states
-    const bool needsRaw = (method == AggregationMethod::MEDIAN);
+    const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
+    const bool useMethodAware = false;  // MEDIAN now uses rawValues like EXACT_MEDIAN
     std::unordered_map<uint64_t, AggregationState> mergedStates;
 
     for (const auto& [timestamps, values] : groupData) {
@@ -766,7 +781,11 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
             auto& state = mergedStates[key];
             if (needsRaw)
                 state.collectRaw = true;
-            state.addValue(values[i], timestamps[i]);
+            if (useMethodAware) {
+                state.addValueForMethod(values[i], timestamps[i], method);
+            } else {
+                state.addValue(values[i], timestamps[i]);
+            }
         }
     }
 

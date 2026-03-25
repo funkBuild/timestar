@@ -458,7 +458,7 @@ SEASTAR_TEST_F(TSMStringTest, StringSeriesCompression) {
 
     // Read first half of the data (first 500 entries)
     SeriesId128 sensorStatusId = SeriesId128::fromSeriesKey("sensor.status");
-    uint64_t endTime = baseTime + 499 * 100;  // Exclude the 500th entry
+    uint64_t endTime = baseTime + 499 * 100 + 1;  // Half-open: include the 500th timestamp
     TSMResult<std::string> result(0);
     co_await tsm->readSeries(sensorStatusId, baseTime, endTime, result);
 

@@ -307,9 +307,9 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDVAR_ReturnsCorrectVariance) {
 }
 
 // ===========================================================================
-// MEDIAN falls back to nullopt (not streamable)
+// MEDIAN requires raw values — pushdown returns nullopt
 // ===========================================================================
-SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_FallsBackToNullopt) {
+SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_ReturnsNullopt) {
     Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
@@ -320,7 +320,27 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_FallsBackToNullopt) {
     auto result =
         co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MEDIAN);
 
-    EXPECT_FALSE(result.has_value()) << "MEDIAN with interval=0 should return nullopt (not streamable)";
+    // MEDIAN needs raw values for nth_element — cannot use pushdown.
+    EXPECT_FALSE(result.has_value()) << "MEDIAN should NOT use pushdown (needs raw values)";
+
+    co_await engine.stop();
+}
+
+// ===========================================================================
+// EXACT_MEDIAN falls back to nullopt (not streamable)
+// ===========================================================================
+SEASTAR_TEST_F(NonBucketedPushdownTest, EXACT_MEDIAN_FallsBackToNullopt) {
+    Engine engine;
+    co_await engine.init();
+    co_await insertKnownValues(engine, 10);
+
+    std::string seriesKey = "pushdown_test,host=h0 value";
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+
+    auto result = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0,
+                                                  timestar::AggregationMethod::EXACT_MEDIAN);
+
+    EXPECT_FALSE(result.has_value()) << "EXACT_MEDIAN with interval=0 should return nullopt (not streamable)";
 
     co_await engine.stop();
 }

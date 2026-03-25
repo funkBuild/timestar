@@ -207,7 +207,7 @@ public:
         auto it = sparseIndex.find(seriesId);
         if (it == sparseIndex.end())
             return false;
-        return it->second.minTime <= endTime && startTime <= it->second.maxTime;
+        return it->second.minTime < endTime && startTime <= it->second.maxTime;
     }
 
     // Sparse index time bound accessors (no I/O — used for LATEST/FIRST file ordering)

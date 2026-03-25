@@ -341,10 +341,11 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneIntegrationDuringCompaction) {
         co_await tsm->readSparseIndex();
         co_await tsm->loadTombstones();
 
-        // Delete the range [3000, 5000] via tombstone on file 1
+        // Delete the range [3000, 5001) via tombstone on file 1
+        // (half-open: includes point at 5000)
         if (f == 1) {
             SeriesId128 seriesId = SeriesId128::fromSeriesKey("ts.sensor");
-            co_await tsm->deleteRange(seriesId, 3000, 5000);
+            co_await tsm->deleteRange(seriesId, 3000, 5001);
         }
 
         files.push_back(tsm);
@@ -706,9 +707,9 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneMultipleFilesCompaction) {
 
         SeriesId128 sid = SeriesId128::fromSeriesKey("tomb.multi");
         if (f == 0) {
-            co_await tsm->deleteRange(sid, 1000, 2000);
+            co_await tsm->deleteRange(sid, 1000, 2001);  // half-open: includes 2000
         } else {
-            co_await tsm->deleteRange(sid, 4000, 5000);
+            co_await tsm->deleteRange(sid, 4000, 5001);  // half-open: includes 5000
         }
         files.push_back(tsm);
     }

@@ -66,7 +66,7 @@ bool TSM::hasSeriesInTimeRange(const SeriesId128& seriesId, uint64_t startTime, 
     // Check if any index blocks overlap with the time range
     const auto& indexEntry = it->second->second;
     for (const auto& block : indexEntry.indexBlocks) {
-        if (block.minTime <= endTime && block.maxTime >= startTime) {
+        if (block.minTime < endTime && block.maxTime >= startTime) {
             return true;
         }
     }
@@ -107,7 +107,7 @@ seastar::future<bool> TSM::deleteRange(const SeriesId128& seriesId, uint64_t sta
     // Check if any index blocks overlap with the deletion time range
     bool hasOverlap = false;
     for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime <= endTime && block.maxTime >= startTime) {
+        if (block.minTime < endTime && block.maxTime >= startTime) {
             hasOverlap = true;
             break;
         }

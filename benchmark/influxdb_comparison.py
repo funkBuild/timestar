@@ -5,14 +5,20 @@ InfluxDB vs TimeStar — apples-to-apples benchmark.
 Generates the SAME data as timestar_insert_bench (deterministic, same schema)
 and runs equivalent insert + query workloads against both databases.
 
-Usage:
-  # 1. Start InfluxDB (the script does this automatically via Docker)
-  # 2. Start TimeStar  (you must do this manually first)
-  #      cd build && ./bin/timestar_http_server -c 4
-  # 3. Run the benchmark
-  #      python3 benchmark/influxdb_comparison.py
+All databases run in Docker with identical resource constraints (--cpus, --memory)
+for a completely fair comparison.
 
-The script uses Python's requests library for both databases so the client
+Usage:
+  # All-Docker (fair comparison, default):
+  python3 benchmark/influxdb_comparison.py --cpus 4 --memory 8g --cleanup
+
+  # TimeStar native (unfair, for dev iteration):
+  python3 benchmark/influxdb_comparison.py --ts-native
+
+  # Skip competitors to benchmark only specific databases:
+  python3 benchmark/influxdb_comparison.py --skip-timescale --skip-quest
+
+The script uses Python's requests library for all databases so the client
 overhead is identical — the comparison measures pure server-side throughput.
 """
 
@@ -48,6 +54,77 @@ FIELD_NAMES = [
 ]
 MINUTE_NS = 60_000_000_000
 BASE_TS = 1_000_000_000_000_000_000  # ~2001-09-09 in nanos
+
+# ── TimeStar Docker management ─────────────────────────────────────────
+
+TIMESTAR_CONTAINER = "timestar-bench-timestar"
+TIMESTAR_PORT = 8086
+TIMESTAR_IMAGE = "funkbuild/timestar:latest"
+
+
+def docker_timestar_running() -> bool:
+    r = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", TIMESTAR_CONTAINER],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0 and "true" in r.stdout
+
+
+def start_timestar_docker(cpus: int, memory: str):
+    """Start TimeStar in Docker with the same resource limits as competitors."""
+    if docker_timestar_running():
+        print(f"  TimeStar container '{TIMESTAR_CONTAINER}' already running.")
+        return
+
+    # Remove stale container if exists
+    subprocess.run(["docker", "rm", "-f", TIMESTAR_CONTAINER],
+                   capture_output=True)
+
+    print(f"  Pulling {TIMESTAR_IMAGE} …")
+    subprocess.run(["docker", "pull", TIMESTAR_IMAGE],
+                   capture_output=True, check=True)
+
+    # Seastar expects uppercase memory suffix (e.g. "8G" not "8g").
+    # Docker cgroup reserves ~20% for kernel, so give Seastar 75% of the
+    # container limit to avoid "insufficient physical memory" errors.
+    mem_upper = memory.upper()
+    import re
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)(?:B?)$", mem_upper)
+    if m:
+        val = float(m.group(1))
+        seastar_memory = f"{int(val * 0.75)}{m.group(2)}"
+    else:
+        seastar_memory = mem_upper
+
+    print(f"  Starting TimeStar (cpus={cpus}, container={memory}, seastar={seastar_memory}) …")
+    subprocess.run([
+        "docker", "run", "-d",
+        "--name", TIMESTAR_CONTAINER,
+        "--cpus", str(cpus),
+        "--memory", memory,
+        "-p", f"{TIMESTAR_PORT}:8086",
+        "-e", f"TIMESTAR_SMP={cpus}",
+        "-e", f"TIMESTAR_MEMORY={seastar_memory}",
+        TIMESTAR_IMAGE,
+    ], check=True, capture_output=True)
+
+    # Wait for ready
+    print("  Waiting for TimeStar to be ready …")
+    for i in range(60):
+        try:
+            r = requests.get(f"http://127.0.0.1:{TIMESTAR_PORT}/health", timeout=2)
+            if r.status_code == 200:
+                print("  TimeStar ready.")
+                return
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError("TimeStar did not become ready in 60s")
+
+
+def stop_timestar_docker():
+    subprocess.run(["docker", "rm", "-f", TIMESTAR_CONTAINER], capture_output=True)
+
 
 # ── InfluxDB Docker management ─────────────────────────────────────────
 
@@ -421,6 +498,16 @@ class QueryBenchResult:
             return 0
         s = sorted(self.latencies_ms)
         return s[int(len(s) * 0.95)]
+
+    @property
+    def trimmed_p50_ms(self) -> float:
+        """Median after dropping top/bottom 5% — robust to compaction spikes."""
+        if len(self.latencies_ms) < 10:
+            return self.p50_ms
+        s = sorted(self.latencies_ms)
+        trim = max(1, len(s) // 20)  # 5%
+        trimmed = s[trim:-trim]
+        return trimmed[len(trimmed) // 2]
 
 
 def run_insert_bench(target: str, batches: int, batch_size: int,
@@ -827,10 +914,11 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
         f'|> last()',
         f"SELECT cpu_usage, time FROM {T} WHERE {FR} ORDER BY time DESC LIMIT 1",
         f"SELECT cpu_usage, timestamp FROM {Q} WHERE {QFR} ORDER BY timestamp DESC LIMIT 1",
-        20,
+        50,
     ))
 
     # ── 2. Avg narrow range ──────────────────────────────────────
@@ -842,10 +930,11 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {narrow_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
         f'|> mean()',
         f"SELECT AVG(cpu_usage) FROM {T} WHERE {NR}",
         f"SELECT avg(cpu_usage) FROM {Q} WHERE {QNR}",
-        20,
+        50,
     ))
 
     # ── 3. Max narrow range ──────────────────────────────────────
@@ -857,10 +946,11 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {narrow_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
         f'|> max()',
         f"SELECT MAX(cpu_usage) FROM {T} WHERE {NR}",
         f"SELECT max(cpu_usage) FROM {Q} WHERE {QNR}",
-        20,
+        50,
     ))
 
     # ── 4. Sum narrow range ──────────────────────────────────────
@@ -872,10 +962,11 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {narrow_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
         f'|> sum()',
         f"SELECT SUM(cpu_usage) FROM {T} WHERE {NR}",
         f"SELECT sum(cpu_usage) FROM {Q} WHERE {QNR}",
-        20,
+        50,
     ))
 
     # ── 5. Count narrow range ────────────────────────────────────
@@ -887,25 +978,28 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {narrow_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
         f'|> count()',
         f"SELECT COUNT(cpu_usage) FROM {T} WHERE {NR}",
         f"SELECT count() FROM {Q} WHERE {QNR}",
-        20,
+        50,
     ))
 
     # ── 6. Avg with tag filter ───────────────────────────────────
+    # Use host-02 which has data in the narrow range (batch 0 with seed=42).
     suite.append((
         "avg: host filter",
-        {"query": "avg:server.metrics(cpu_usage){host:host-01}",
+        {"query": "avg:server.metrics(cpu_usage){host:host-02}",
          "startTime": BASE_TS, "endTime": NARROW_END,
          "aggregationInterval": narrow_interval},
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {narrow_end_rfc}) '
-        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage" and r.host == "host-01") '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage" and r.host == "host-02") '
+        f'|> group() '
         f'|> mean()',
-        f"SELECT AVG(cpu_usage) FROM {T} WHERE {NR} AND host = 'host-01'",
-        f"SELECT avg(cpu_usage) FROM {Q} WHERE {QNR} AND host = 'host-01'",
-        20,
+        f"SELECT AVG(cpu_usage) FROM {T} WHERE {NR} AND host = 'host-02'",
+        f"SELECT avg(cpu_usage) FROM {Q} WHERE {QNR} AND host = 'host-02'",
+        50,
     ))
 
     # ── 7. Group by host ─────────────────────────────────────────
@@ -921,7 +1015,7 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'|> mean()',
         f"SELECT host, AVG(cpu_usage) FROM {T} WHERE {NR} GROUP BY host",
         f"SELECT host, avg(cpu_usage) FROM {Q} WHERE {QNR} GROUP BY host",
-        10,
+        50,
     ))
 
     # ── 8. Time-bucketed aggregation (1h buckets, medium range) ──
@@ -933,10 +1027,11 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {med_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
         f'|> aggregateWindow(every: 1h, fn: mean)',
         f"SELECT time_bucket('1 hour', time) AS bucket, AVG(cpu_usage) FROM {T} WHERE {MR} GROUP BY bucket ORDER BY bucket",
         f"SELECT timestamp, avg(cpu_usage) FROM {Q} WHERE {QMR} SAMPLE BY 1h ALIGN TO CALENDAR",
-        10,
+        50,
     ))
 
     # ── 9. All fields, narrow range ──────────────────────────────
@@ -948,6 +1043,7 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {narrow_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}") '
+        f'|> group(columns: ["_field"]) '
         f'|> mean()',
         f"SELECT AVG(cpu_usage), AVG(memory_usage), AVG(disk_io_read), AVG(disk_io_write), "
         f"AVG(network_in), AVG(network_out), AVG(load_avg_1m), AVG(load_avg_5m), "
@@ -955,7 +1051,7 @@ def build_query_suite(total_batches: int, batch_size: int):
         f"SELECT avg(cpu_usage), avg(memory_usage), avg(disk_io_read), avg(disk_io_write), "
         f"avg(network_in), avg(network_out), avg(load_avg_1m), avg(load_avg_5m), "
         f"avg(load_avg_15m), avg(temperature) FROM {Q} WHERE {QNR}",
-        10,
+        50,
     ))
 
     # ── 10. Full range, single field ─────────────────────────────
@@ -967,10 +1063,11 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
         f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
         f'|> mean()',
         f"SELECT AVG(cpu_usage) FROM {T} WHERE {FR}",
         f"SELECT avg(cpu_usage) FROM {Q} WHERE {QFR}",
-        5,
+        50,
     ))
 
     # ── 11. Group by host, full range ────────────────────────────
@@ -986,22 +1083,135 @@ def build_query_suite(total_batches: int, batch_size: int):
         f'|> mean()',
         f"SELECT host, AVG(cpu_usage) FROM {T} WHERE {FR} GROUP BY host",
         f"SELECT host, avg(cpu_usage) FROM {Q} WHERE {QFR} GROUP BY host",
-        5,
+        50,
     ))
 
     # ── 12. 5-min buckets, tag filter ────────────────────────────
     suite.append((
         "avg: 5m buckets, tag",
-        {"query": "avg:server.metrics(cpu_usage){host:host-05}",
+        {"query": "avg:server.metrics(cpu_usage){host:host-02}",
          "startTime": BASE_TS, "endTime": MED_END,
          "aggregationInterval": "5m"},
         f'from(bucket:"{INFLUX_BUCKET}") '
         f'|> range(start: {narrow_start_rfc}, stop: {med_end_rfc}) '
-        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage" and r.host == "host-05") '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage" and r.host == "host-02") '
+        f'|> group() '
         f'|> aggregateWindow(every: 5m, fn: mean)',
-        f"SELECT time_bucket('5 minutes', time) AS bucket, AVG(cpu_usage) FROM {T} WHERE {MR} AND host = 'host-05' GROUP BY bucket ORDER BY bucket",
-        f"SELECT timestamp, avg(cpu_usage) FROM {Q} WHERE {QMR} AND host = 'host-05' SAMPLE BY 5m ALIGN TO CALENDAR",
-        10,
+        f"SELECT time_bucket('5 minutes', time) AS bucket, AVG(cpu_usage) FROM {T} WHERE {MR} AND host = 'host-02' GROUP BY bucket ORDER BY bucket",
+        f"SELECT timestamp, avg(cpu_usage) FROM {Q} WHERE {QMR} AND host = 'host-02' SAMPLE BY 5m ALIGN TO CALENDAR",
+        50,
+    ))
+
+    # ── 13. First value ───────────────────────────────────────────
+    suite.append((
+        "first: single field",
+        {"query": "first:server.metrics(cpu_usage)",
+         "startTime": BASE_TS, "endTime": end_ts,
+         "aggregationInterval": full_interval},
+        f'from(bucket:"{INFLUX_BUCKET}") '
+        f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
+        f'|> first()',
+        f"SELECT cpu_usage, time FROM {T} WHERE {FR} ORDER BY time ASC LIMIT 1",
+        f"SELECT cpu_usage, timestamp FROM {Q} WHERE {QFR} ORDER BY timestamp ASC LIMIT 1",
+        50,
+    ))
+
+    # ── 14. Min full range ────────────────────────────────────────
+    suite.append((
+        "min: full range, 1 field",
+        {"query": "min:server.metrics(cpu_usage)",
+         "startTime": BASE_TS, "endTime": end_ts,
+         "aggregationInterval": full_interval},
+        f'from(bucket:"{INFLUX_BUCKET}") '
+        f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
+        f'|> min()',
+        f"SELECT MIN(cpu_usage) FROM {T} WHERE {FR}",
+        f"SELECT min(cpu_usage) FROM {Q} WHERE {QFR}",
+        50,
+    ))
+
+    # ── 15. Stddev full range ─────────────────────────────────────
+    suite.append((
+        "stddev: full range, 1 field",
+        {"query": "stddev:server.metrics(cpu_usage)",
+         "startTime": BASE_TS, "endTime": end_ts,
+         "aggregationInterval": full_interval},
+        f'from(bucket:"{INFLUX_BUCKET}") '
+        f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
+        f'|> stddev()',
+        f"SELECT STDDEV(cpu_usage) FROM {T} WHERE {FR}",
+        f"SELECT stddev_samp(cpu_usage) FROM {Q} WHERE {QFR}",
+        50,
+    ))
+
+    # ── 16. Spread full range ─────────────────────────────────────
+    suite.append((
+        "spread: full range, 1 field",
+        {"query": "spread:server.metrics(cpu_usage)",
+         "startTime": BASE_TS, "endTime": end_ts,
+         "aggregationInterval": full_interval},
+        f'from(bucket:"{INFLUX_BUCKET}") '
+        f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group() '
+        f'|> spread()',
+        f"SELECT MAX(cpu_usage) - MIN(cpu_usage) FROM {T} WHERE {FR}",
+        f"SELECT max(cpu_usage) - min(cpu_usage) FROM {Q} WHERE {QFR}",
+        50,
+    ))
+
+    # ── 17. Multi-tag filter (AND) ────────────────────────────────
+    suite.append((
+        "avg: multi-tag filter",
+        {"query": "avg:server.metrics(cpu_usage){host:host-01,rack:rack-1}",
+         "startTime": BASE_TS, "endTime": end_ts,
+         "aggregationInterval": full_interval},
+        f'from(bucket:"{INFLUX_BUCKET}") '
+        f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage" and r.host == "host-01" and r.rack == "rack-1") '
+        f'|> group() '
+        f'|> mean()',
+        f"SELECT AVG(cpu_usage) FROM {T} WHERE {FR} AND host = 'host-01' AND rack = 'rack-1'",
+        f"SELECT avg(cpu_usage) FROM {Q} WHERE {QFR} AND host = 'host-01' AND rack = 'rack-1'",
+        50,
+    ))
+
+    # ── 18. Group by host+rack (high cardinality) ─────────────────
+    suite.append((
+        "avg: group by host,rack",
+        {"query": "avg:server.metrics(cpu_usage) by {host,rack}",
+         "startTime": BASE_TS, "endTime": end_ts,
+         "aggregationInterval": full_interval},
+        f'from(bucket:"{INFLUX_BUCKET}") '
+        f'|> range(start: {narrow_start_rfc}, stop: {full_end_rfc}) '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group(columns: ["host", "rack"]) '
+        f'|> mean()',
+        f"SELECT host, rack, AVG(cpu_usage) FROM {T} WHERE {FR} GROUP BY host, rack",
+        f"SELECT host, rack, avg(cpu_usage) FROM {Q} WHERE {QFR} GROUP BY host, rack",
+        50,
+    ))
+
+    # ── 19. 5m buckets + group by host (double grouping) ──────────
+    suite.append((
+        "avg: 5m buckets, group by host",
+        {"query": "avg:server.metrics(cpu_usage) by {host}",
+         "startTime": BASE_TS, "endTime": MED_END,
+         "aggregationInterval": "5m"},
+        f'from(bucket:"{INFLUX_BUCKET}") '
+        f'|> range(start: {narrow_start_rfc}, stop: {med_end_rfc}) '
+        f'|> filter(fn:(r) => r._measurement == "{MEASUREMENT}" and r._field == "cpu_usage") '
+        f'|> group(columns: ["host"]) '
+        f'|> aggregateWindow(every: 5m, fn: mean)',
+        f"SELECT host, time_bucket('5 minutes', time) AS bucket, AVG(cpu_usage) FROM {T} WHERE {MR} GROUP BY host, bucket ORDER BY host, bucket",
+        f"SELECT host, timestamp, avg(cpu_usage) FROM {Q} WHERE {QMR} SAMPLE BY 5m ALIGN TO CALENDAR",
+        50,
     ))
 
     return suite
@@ -1178,6 +1388,12 @@ def main():
     parser.add_argument("--ts-format", choices=["json", "protobuf"],
                         default="json",
                         help="TimeStar wire format: json (default) or protobuf")
+    parser.add_argument("--ts-native", action="store_true",
+                        help="Run TimeStar natively instead of in Docker")
+    parser.add_argument("--ts-cmd", default=None,
+                        help="TimeStar server command for native restart-flush "
+                             "(e.g. './bin/timestar_http_server -c 4 --memory 24G --overprovisioned'). "
+                             "If not set, native mode falls back to sleep-based flush.")
     args = parser.parse_args()
 
     if args.ts_format == "protobuf" and not HAS_PROTOBUF:
@@ -1189,10 +1405,11 @@ def main():
     total_points = args.batches * args.batch_size * len(FIELD_NAMES)
 
     print_separator()
-    print(" TimeStar vs InfluxDB 2.7 vs TimescaleDB — Benchmark")
+    print(" TimeStar vs InfluxDB 2.7 vs TimescaleDB — Benchmark (all Docker)")
     print_separator()
     print(f"  CPUs:           {args.cpus}")
     print(f"  Memory:         {args.memory}")
+    print(f"  TimeStar mode:  {'Docker' if not args.ts_native else 'native'}")
     print(f"  Batches:        {args.batches}")
     print(f"  Batch size:     {args.batch_size} timestamps x {len(FIELD_NAMES)} fields "
           f"= {args.batch_size * len(FIELD_NAMES):,} pts/batch")
@@ -1205,8 +1422,16 @@ def main():
     print()
 
     # ── Start databases ──────────────────────────────────────────
+    ts_docker = not args.ts_native and not args.no_docker
+    if ts_docker:
+        # Use the Docker port for TimeStar
+        args.ts_host = "127.0.0.1"
+        args.ts_port = TIMESTAR_PORT
+
     if not args.no_docker:
         print("[1/5] Setting up databases …")
+        if ts_docker:
+            start_timestar_docker(args.cpus, args.memory)
         if not args.skip_influx:
             start_influxdb(args.cpus, args.memory)
         if not args.skip_timescale:
@@ -1215,15 +1440,21 @@ def main():
             start_questdb(args.cpus, args.memory)
         print()
 
+    mode = "Docker" if ts_docker else "native"
+    print(f"  TimeStar:       {mode}")
+
     # ── Verify targets are reachable ─────────────────────────────
     print("[2/5] Health checks …")
     try:
         r = requests.get(f"http://{args.ts_host}:{args.ts_port}/health", timeout=5)
         assert r.status_code == 200
-        print(f"  TimeStar    @ {args.ts_host}:{args.ts_port}: OK")
+        print(f"  TimeStar    @ {args.ts_host}:{args.ts_port}: OK ({mode})")
     except Exception as e:
         print(f"  TimeStar    @ {args.ts_host}:{args.ts_port}: FAILED ({e})")
-        print("  Start TimeStar first:  cd build && ./bin/timestar_http_server -c 4")
+        if ts_docker:
+            print("  Check: docker logs timestar-bench-timestar")
+        else:
+            print("  Start TimeStar first:  cd build && ./bin/timestar_http_server -c 4")
         sys.exit(1)
 
     if not args.skip_influx:
@@ -1296,9 +1527,65 @@ def main():
         if ts_insert.first_error:
             print(f"    first error: {ts_insert.first_error[:120]}")
 
-        # Wait for TimeStar background flushes (WAL→TSM conversions + compaction)
-        print("  Waiting 30s for TimeStar background flushes …")
-        time.sleep(30)
+        # Force complete WAL→TSM flush via graceful restart.
+        # Seastar's WAL-to-TSM conversion is size-triggered (16MB threshold),
+        # so small benchmarks may leave data in memory stores.  A graceful
+        # SIGTERM triggers close() which converts all remaining stores to TSM.
+        if ts_docker:
+            print("  Flushing TimeStar (restart container for WAL→TSM) …")
+            subprocess.run(["docker", "stop", TIMESTAR_CONTAINER], capture_output=True)
+            subprocess.run(["docker", "start", TIMESTAR_CONTAINER], capture_output=True)
+            print("  Waiting for TimeStar to be ready …")
+            for i in range(60):
+                try:
+                    r = requests.get(f"http://127.0.0.1:{TIMESTAR_PORT}/health", timeout=2)
+                    if r.status_code == 200:
+                        print(f"  TimeStar ready after restart ({i+1}s).")
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            else:
+                print("  WARNING: TimeStar did not restart in 60s")
+        elif not args.ts_native:
+            print("  Waiting 30s for TimeStar background flushes …")
+            time.sleep(30)
+        elif args.ts_cmd:
+            # Native mode with known command: graceful restart for WAL→TSM flush.
+            # Use killall to match exact binary name (avoids killing ourselves
+            # since our --ts-cmd arg also contains 'timestar_http_server').
+            print("  Flushing TimeStar (native restart for WAL→TSM) …")
+            subprocess.run(["killall", "-TERM", "timestar_http_server"],
+                           capture_output=True)
+            for i in range(30):
+                time.sleep(1)
+                r = subprocess.run(["killall", "-0", "timestar_http_server"],
+                                   capture_output=True)
+                if r.returncode != 0:
+                    print(f"  Server stopped after {i+1}s.")
+                    break
+            # Restart with provided command
+            import shlex
+            cmd_parts = shlex.split(args.ts_cmd)
+            subprocess.Popen(cmd_parts, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            print("  Waiting for TimeStar to be ready …")
+            for i in range(60):
+                try:
+                    r = requests.get(f"http://{args.ts_host}:{args.ts_port}/health",
+                                     timeout=2)
+                    if r.status_code == 200:
+                        print(f"  TimeStar ready after restart ({i+1}s).")
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            else:
+                print("  WARNING: TimeStar did not restart in 60s")
+        else:
+            # Native mode without --ts-cmd: fall back to sleep
+            print("  Waiting 30s for TimeStar background flushes …")
+            time.sleep(30)
 
         if not args.skip_influx:
             print("  Running InfluxDB insert …")
@@ -1396,26 +1683,180 @@ def main():
     # ── Query benchmark ─────────────────────────────────────────
     if not args.skip_query:
         print("[4/5] Query benchmark …")
-        print("  Waiting 30s for all databases to settle (compaction/WAL flush) …")
-        time.sleep(30)
+        print("  Waiting 10s for databases to settle (compaction) …")
+        time.sleep(10)
 
         suite = build_query_suite(args.batches, args.batch_size)
 
-        # Warmup queries
-        print("  Warming up (3 iterations each) …")
+        # ── Warmup: 10 iterations per query per database ─────────
+        print("  Warming up (10 iterations each) …")
         for name, ts_req, flux_q, tsdb_sql, quest_sql, iters in suite:
-            run_query_bench_timestar(args.ts_host, args.ts_port, name, ts_req, 3,
+            run_query_bench_timestar(args.ts_host, args.ts_port, name, ts_req, 10,
                                      ts_format=args.ts_format)
             if not args.skip_influx:
-                run_query_bench_influxdb(INFLUX_PORT, name, flux_q, 3)
+                run_query_bench_influxdb(INFLUX_PORT, name, flux_q, 10)
             if not args.skip_timescale:
-                run_query_bench_timescaledb(name, tsdb_sql, 3)
+                run_query_bench_timescaledb(name, tsdb_sql, 10)
             if not args.skip_quest:
-                run_query_bench_questdb(name, quest_sql, 3)
+                run_query_bench_questdb(name, quest_sql, 10)
 
+        # ── Interleaved measurement ──────────────────────────────
+        # Instead of running all N iterations of query A then query B,
+        # run round-robin: one iteration of each query across all
+        # databases, then repeat.  This ensures every query sees the
+        # same background conditions (compaction, GC, reactor load).
+        print("  Running interleaved measurements …")
+
+        # Build per-query result accumulators
+        max_iters = max(iters for _, _, _, _, _, iters in suite)
+        ts_results = {name: QueryBenchResult(name=name, iterations=iters)
+                      for name, _, _, _, _, iters in suite}
+        influx_results = {name: QueryBenchResult(name=name, iterations=iters)
+                          for name, _, _, _, _, iters in suite}
+        tsdb_results = {name: QueryBenchResult(name=name, iterations=iters)
+                        for name, _, _, _, _, iters in suite}
+        quest_results = {name: QueryBenchResult(name=name, iterations=iters)
+                         for name, _, _, _, _, iters in suite}
+
+        # Pre-build requests for each query
+        import threading
+        _tls = threading.local()
+
+        def _get_sessions():
+            if not hasattr(_tls, 'sessions'):
+                _tls.sessions = {
+                    'ts': requests.Session(),
+                    'influx': requests.Session(),
+                    'tsdb': requests.Session(),
+                    'quest': requests.Session(),
+                }
+            return _tls.sessions
+
+        ts_url = f"http://{args.ts_host}:{args.ts_port}/query"
+        influx_url = f"http://127.0.0.1:{INFLUX_PORT}/api/v2/query?org={INFLUX_ORG}"
+        influx_headers = {
+            "Authorization": f"Token {INFLUX_TOKEN}",
+            "Content-Type": "application/vnd.flux",
+            "Accept": "application/csv",
+        }
+
+        for iteration in range(max_iters):
+            if (iteration + 1) % 10 == 0:
+                print(f"    iteration {iteration + 1}/{max_iters} …")
+
+            for name, ts_req, flux_q, tsdb_sql, quest_sql, iters in suite:
+                if iteration >= iters:
+                    continue
+
+                # ── TimeStar ──
+                ts_res = ts_results[name]
+                t0 = time.perf_counter()
+                try:
+                    r = requests.post(
+                        ts_url,
+                        data=json.dumps(ts_req),
+                        headers={"Content-Type": "application/json"},
+                        timeout=30)
+                    ok = 200 <= r.status_code < 300
+                except Exception:
+                    ok = False
+                elapsed = (time.perf_counter() - t0) * 1000
+                if ok:
+                    ts_res.successes += 1
+                    ts_res.total_ms += elapsed
+                    ts_res.min_ms = min(ts_res.min_ms, elapsed)
+                    ts_res.max_ms = max(ts_res.max_ms, elapsed)
+                    ts_res.latencies_ms.append(elapsed)
+                    if ts_res.response_bytes == 0:
+                        ts_res.response_bytes = len(r.content)
+
+                # ── InfluxDB ──
+                if not args.skip_influx:
+                    ix_res = influx_results[name]
+                    t0 = time.perf_counter()
+                    try:
+                        r = requests.post(
+                            influx_url,
+                            data=flux_q,
+                            headers=influx_headers,
+                            timeout=30)
+                        ok = 200 <= r.status_code < 300
+                    except Exception:
+                        ok = False
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    if ok:
+                        ix_res.successes += 1
+                        ix_res.total_ms += elapsed
+                        ix_res.min_ms = min(ix_res.min_ms, elapsed)
+                        ix_res.max_ms = max(ix_res.max_ms, elapsed)
+                        ix_res.latencies_ms.append(elapsed)
+                        if ix_res.response_bytes == 0:
+                            ix_res.response_bytes = len(r.content)
+                    elif not ix_res.error:
+                        ix_res.error = f"HTTP {r.status_code}: {r.text[:200]}"
+
+                # ── TimescaleDB ──
+                if not args.skip_timescale:
+                    td_res = tsdb_results[name]
+                    t0 = time.perf_counter()
+                    try:
+                        import psycopg2
+                        conn = psycopg2.connect(
+                            host="127.0.0.1", port=TSDB_PORT,
+                            user=TSDB_USER, password=TSDB_PASS, dbname=TSDB_DB,
+                        )
+                        cur = conn.cursor()
+                        cur.execute(tsdb_sql)
+                        cur.fetchall()
+                        cur.close()
+                        conn.close()
+                        ok = True
+                    except Exception as e:
+                        ok = False
+                        if not td_res.error:
+                            td_res.error = str(e)[:200]
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    if ok:
+                        td_res.successes += 1
+                        td_res.total_ms += elapsed
+                        td_res.min_ms = min(td_res.min_ms, elapsed)
+                        td_res.max_ms = max(td_res.max_ms, elapsed)
+                        td_res.latencies_ms.append(elapsed)
+
+                # ── QuestDB ──
+                if not args.skip_quest:
+                    qd_res = quest_results[name]
+                    t0 = time.perf_counter()
+                    try:
+                        r = requests.get(
+                            f"http://127.0.0.1:{QUEST_HTTP_PORT}/exec",
+                            params={"query": quest_sql},
+                            timeout=60)
+                        ok = 200 <= r.status_code < 300
+                        if ok:
+                            body = r.json()
+                            if "error" in body:
+                                ok = False
+                                if not qd_res.error:
+                                    qd_res.error = body["error"][:200]
+                    except Exception as e:
+                        ok = False
+                        if not qd_res.error:
+                            qd_res.error = str(e)[:200]
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    if ok:
+                        qd_res.successes += 1
+                        qd_res.total_ms += elapsed
+                        qd_res.min_ms = min(qd_res.min_ms, elapsed)
+                        qd_res.max_ms = max(qd_res.max_ms, elapsed)
+                        qd_res.latencies_ms.append(elapsed)
+                        if qd_res.response_bytes == 0:
+                            qd_res.response_bytes = len(r.content)
+
+        # ── Display results (trimmed p50) ────────────────────────
         print()
         print_separator("-")
-        print(" QUERY RESULTS")
+        print(" QUERY RESULTS (trimmed p50 — interleaved, outliers dropped)")
         print_separator("-")
         header = f"  {'Query':<32s}  {'TimeStar':>10s}"
         if not args.skip_influx:
@@ -1442,42 +1883,33 @@ def main():
         quest_total_ms = 0
 
         for name, ts_req, flux_q, tsdb_sql, quest_sql, iters in suite:
-            ts_res = run_query_bench_timestar(
-                args.ts_host, args.ts_port, name, ts_req, iters,
-                ts_format=args.ts_format)
-            ts_avg = ts_res.avg_ms
-            ts_total_ms += ts_res.total_ms
+            ts_res = ts_results[name]
+            ts_p50 = ts_res.trimmed_p50_ms
+            ts_total_ms += ts_p50 * iters  # weight by iteration count
 
-            influx_res = None
-            influx_avg = 0
-            if not args.skip_influx:
-                influx_res = run_query_bench_influxdb(
-                    INFLUX_PORT, name, flux_q, iters)
-                influx_avg = influx_res.avg_ms
-                influx_total_ms += influx_res.total_ms
+            influx_res = influx_results[name] if not args.skip_influx else None
+            influx_p50 = influx_res.trimmed_p50_ms if influx_res else 0
+            if influx_res:
+                influx_total_ms += influx_p50 * iters
 
-            tsdb_res = None
-            tsdb_avg = 0
-            if not args.skip_timescale:
-                tsdb_res = run_query_bench_timescaledb(name, tsdb_sql, iters)
-                tsdb_avg = tsdb_res.avg_ms
-                tsdb_total_ms += tsdb_res.total_ms
+            tsdb_res = tsdb_results[name] if not args.skip_timescale else None
+            tsdb_p50 = tsdb_res.trimmed_p50_ms if tsdb_res else 0
+            if tsdb_res:
+                tsdb_total_ms += tsdb_p50 * iters
 
-            quest_res = None
-            quest_avg = 0
-            if not args.skip_quest:
-                quest_res = run_query_bench_questdb(name, quest_sql, iters)
-                quest_avg = quest_res.avg_ms
-                quest_total_ms += quest_res.total_ms
+            quest_res = quest_results[name] if not args.skip_quest else None
+            quest_p50 = quest_res.trimmed_p50_ms if quest_res else 0
+            if quest_res:
+                quest_total_ms += quest_p50 * iters
 
             # Determine winner
-            candidates = [("TimeStar", ts_avg, ts_res.successes > 0)]
+            candidates = [("TimeStar", ts_p50, ts_res.successes > 0)]
             if influx_res:
-                candidates.append(("InfluxDB", influx_avg, influx_res.successes > 0))
+                candidates.append(("InfluxDB", influx_p50, influx_res.successes > 0))
             if tsdb_res:
-                candidates.append(("Timescale", tsdb_avg, tsdb_res.successes > 0))
+                candidates.append(("Timescale", tsdb_p50, tsdb_res.successes > 0))
             if quest_res:
-                candidates.append(("QuestDB", quest_avg, quest_res.successes > 0))
+                candidates.append(("QuestDB", quest_p50, quest_res.successes > 0))
 
             valid = [(n, v) for n, v, ok in candidates if ok and v > 0]
             if valid:
@@ -1490,18 +1922,18 @@ def main():
                     else:
                         winner = "TimeStar"
                 else:
-                    ratio = ts_avg / best_val if best_val > 0 else 0
+                    ratio = ts_p50 / best_val if best_val > 0 else 0
                     winner = f"{best_name} {ratio:.1f}x"
             else:
                 winner = "N/A"
 
-            row = f"  {name:<32s}  {fmt_ms(ts_avg):>10s}"
+            row = f"  {name:<32s}  {fmt_ms(ts_p50):>10s}"
             if not args.skip_influx:
-                row += f"  {fmt_ms(influx_avg):>10s}"
+                row += f"  {fmt_ms(influx_p50):>10s}"
             if not args.skip_timescale:
-                row += f"  {fmt_ms(tsdb_avg):>10s}"
+                row += f"  {fmt_ms(tsdb_p50):>10s}"
             if not args.skip_quest:
-                row += f"  {fmt_ms(quest_avg):>10s}"
+                row += f"  {fmt_ms(quest_p50):>10s}"
             row += f"  {winner:>10s}"
             # Show first error for any failed database
             errs = []
@@ -1516,7 +1948,7 @@ def main():
             print(row)
 
         print()
-        total_row = f"  {'TOTAL':>32s}  {fmt_ms(ts_total_ms):>10s}"
+        total_row = f"  {'TOTAL (weighted)':>32s}  {fmt_ms(ts_total_ms):>10s}"
         if not args.skip_influx:
             total_row += f"  {fmt_ms(influx_total_ms):>10s}"
         if not args.skip_timescale:
@@ -1564,6 +1996,8 @@ def main():
     # ── Cleanup ─────────────────────────────────────────────────
     if args.cleanup and not args.no_docker:
         print("Cleaning up containers …")
+        if ts_docker:
+            stop_timestar_docker()
         if not args.skip_influx:
             stop_influxdb()
         if not args.skip_timescale:

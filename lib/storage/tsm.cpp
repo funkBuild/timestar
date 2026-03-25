@@ -804,7 +804,7 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
     std::vector<TSMIndexBlock> blocksToScan;
     std::copy_if(indexEntry->indexBlocks.begin(), indexEntry->indexBlocks.end(), std::back_inserter(blocksToScan),
                  [endTime, startTime](const TSMIndexBlock& indexBlock) {
-                     return indexBlock.minTime <= endTime && startTime <= indexBlock.maxTime;
+                     return indexBlock.minTime < endTime && startTime <= indexBlock.maxTime;
                  });
 
     // Pre-allocate a slot per block so each coroutine writes to its own index,
@@ -1232,7 +1232,7 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
     std::vector<TSMIndexBlock> blocksToScan;
     std::copy_if(indexEntry->indexBlocks.begin(), indexEntry->indexBlocks.end(), std::back_inserter(blocksToScan),
                  [endTime, startTime](const TSMIndexBlock& indexBlock) {
-                     return indexBlock.minTime <= endTime && startTime <= indexBlock.maxTime;
+                     return indexBlock.minTime < endTime && startTime <= indexBlock.maxTime;
                  });
 
     if (blocksToScan.empty()) {
@@ -1306,7 +1306,7 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
     // Filter blocks by time range
     std::vector<TSMIndexBlock> blocksToScan;
     for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime <= endTime && startTime <= block.maxTime) {
+        if (block.minTime < endTime && startTime <= block.maxTime) {
             blocksToScan.push_back(block);
         }
     }
@@ -1345,7 +1345,7 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
 
         for (size_t bi = 0; bi < batch.blocks.size(); ++bi) {
             const auto& block = batch.blocks[bi];
-            bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
+            bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
             bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
             bool canSkip = !blockHasTombstones && blockFullyContained && block.blockCount > 0 &&
                            aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
@@ -1529,7 +1529,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     // Filter blocks by time range
     std::vector<TSMIndexBlock> blocksToScan;
     for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime <= endTime && startTime <= block.maxTime) {
+        if (block.minTime < endTime && startTime <= block.maxTime) {
             blocksToScan.push_back(block);
         }
     }
@@ -1552,7 +1552,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
             }
             // Only use stats shortcut if the block's maxTime is within the query range.
             // If maxTime > endTime, the actual latest point within range requires reading the block.
-            if (bestBlock && bestBlock->hasExtendedStats && bestBlock->maxTime <= endTime) {
+            if (bestBlock && bestBlock->hasExtendedStats && bestBlock->maxTime < endTime) {
                 aggregator.addPoint(bestBlock->maxTime, bestBlock->blockLatestValue);
                 co_return 1;
             }
@@ -1642,7 +1642,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
     // Filter blocks by time range
     std::vector<TSMIndexBlock> blocksToScan;
     for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime <= endTime && startTime <= block.maxTime) {
+        if (block.minTime < endTime && startTime <= block.maxTime) {
             blocksToScan.push_back(block);
         }
     }
@@ -1691,7 +1691,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
         // bucket, extract the first/latest endpoint directly without DMA
         // read + decode.  This preserves 1-point-per-bucket semantics.
         // Phase 0: per-block tombstone check instead of global gate
-        bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
+        bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
         bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
         if (!blockHasTombstones && blockFullyContained && block.hasExtendedStats) {
             uint64_t bFirst = (block.minTime / interval) * interval;

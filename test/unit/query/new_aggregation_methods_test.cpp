@@ -51,6 +51,16 @@ TEST(NewAggregationMethodParserTest, ParseMedianUppercase) {
     EXPECT_EQ(req.aggregation, AggregationMethod::MEDIAN);
 }
 
+TEST(NewAggregationMethodParserTest, ParseExactMedian) {
+    QueryRequest req = QueryParser::parseQueryString("exact_median:temperature()");
+    EXPECT_EQ(req.aggregation, AggregationMethod::EXACT_MEDIAN);
+}
+
+TEST(NewAggregationMethodParserTest, ParseExactMedianUppercase) {
+    QueryRequest req = QueryParser::parseQueryString("EXACT_MEDIAN:temperature()");
+    EXPECT_EQ(req.aggregation, AggregationMethod::EXACT_MEDIAN);
+}
+
 TEST(NewAggregationMethodParserTest, ParseStddev) {
     QueryRequest req = QueryParser::parseQueryString("stddev:temperature()");
     EXPECT_EQ(req.aggregation, AggregationMethod::STDDEV);
@@ -475,15 +485,30 @@ TEST_F(NewAggMethodPipelineTest, First_WithBuckets) {
 }
 
 TEST_F(NewAggMethodPipelineTest, Median_WithBuckets) {
-    // 6 values in two 3-value buckets
+    // 6 values in two 3-value buckets (approximate via t-digest)
     uint64_t interval = 3000;
     std::vector<uint64_t> ts = {0, 1000, 2000, 3000, 4000, 5000};
-    // Bucket 1: 3, 1, 2 -> sorted: 1, 2, 3 -> median = 2
-    // Bucket 2: 9, 7, 8 -> sorted: 7, 8, 9 -> median = 8
+    // Bucket 1: 3, 1, 2 -> sorted: 1, 2, 3 -> median ~ 2
+    // Bucket 2: 9, 7, 8 -> sorted: 7, 8, 9 -> median ~ 8
     std::vector<double> vals = {3.0, 1.0, 2.0, 9.0, 7.0, 8.0};
     auto series = makeSeries("test", "value", ts, vals);
     auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::MEDIAN, interval, {});
     auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MEDIAN);
+    ASSERT_EQ(grouped.size(), 1u);
+    ASSERT_EQ(grouped[0].points.size(), 2u);
+    // T-digest is approximate; for 3 values the error is small.
+    EXPECT_NEAR(grouped[0].points[0].value, 2.0, 0.5);
+    EXPECT_NEAR(grouped[0].points[1].value, 8.0, 0.5);
+}
+
+TEST_F(NewAggMethodPipelineTest, ExactMedian_WithBuckets) {
+    // Same test but with EXACT_MEDIAN for exact results
+    uint64_t interval = 3000;
+    std::vector<uint64_t> ts = {0, 1000, 2000, 3000, 4000, 5000};
+    std::vector<double> vals = {3.0, 1.0, 2.0, 9.0, 7.0, 8.0};
+    auto series = makeSeries("test", "value", ts, vals);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::EXACT_MEDIAN, interval, {});
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::EXACT_MEDIAN);
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 2u);
     EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 2.0);

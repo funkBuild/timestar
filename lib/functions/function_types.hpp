@@ -415,7 +415,7 @@ public:
         std::vector<double> slicedValues;
 
         for (size_t i = 0; i < size(); ++i) {
-            if (timestamps_[i] >= startTime && timestamps_[i] <= endTime) {
+            if (timestamps_[i] >= startTime && timestamps_[i] < endTime) {
                 slicedTimestamps.push_back(timestamps_[i]);
                 slicedValues.push_back(values_[i]);
             }

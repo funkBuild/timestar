@@ -106,7 +106,7 @@ public:
             auto* series = memStore->template querySeries<T>(seriesId);
             if (series && !series->timestamps.empty()) {
                 auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
-                if (it != series->timestamps.end() && *it <= endTime) {
+                if (it != series->timestamps.end() && *it < endTime) {
                     return true;
                 }
             }
@@ -126,7 +126,7 @@ public:
             auto* series = memStore->template querySeries<T>(seriesId);
             if (series && !series->timestamps.empty()) {
                 auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
-                if (it != series->timestamps.end() && *it <= endTime) {
+                if (it != series->timestamps.end() && *it < endTime) {
                     uint64_t ts = *it;
                     if (!earliest.has_value() || ts < *earliest) {
                         earliest = ts;

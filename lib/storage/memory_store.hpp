@@ -9,6 +9,8 @@
 
 #include <tsl/robin_map.h>
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <variant>
@@ -16,11 +18,46 @@
 
 class WAL;
 
+// Running statistics for a float series in memory — maintained during insert.
+// Enables block-stats-like pushdown aggregation without per-point scanning
+// when the query range covers the entire series.
+//
+// Split into two phases:
+//   1. sum/min/max via SIMD (no data dependency, vectorizable)
+//   2. Welford mean/m2 via scalar (sequential dependency on mean)
+struct InMemorySeriesStats {
+    double sum = 0.0;
+    double sumCompensation = 0.0;  // Kahan compensated sum
+    double min = std::numeric_limits<double>::max();
+    double max = std::numeric_limits<double>::lowest();
+    uint64_t count = 0;
+    // Welford's online variance accumulators
+    double mean = 0.0;
+    double m2 = 0.0;
+    // First/Latest tracking
+    double firstValue = 0.0;
+    uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max();
+    double latestValue = 0.0;
+    uint64_t latestTimestamp = 0;
+
+    bool valid = false;  // false until first update
+
+    // Compensated sum accessor matching AggregationState convention
+    double compensatedSum() const { return sum + sumCompensation; }
+
+    void update(const double* values, const uint64_t* timestamps, size_t n);
+};
+
 template <class T>
 class InMemorySeries {
 public:
     std::vector<uint64_t> timestamps;
     std::vector<T> values;
+
+    // Running stats — only valid for double series, updated on each insert.
+    // Used by pushdown aggregation to skip per-point scanning when query
+    // covers the entire series time range.
+    InMemorySeriesStats stats;
 
     void insert(TimeStarInsert<T>&& insertRequest);
 

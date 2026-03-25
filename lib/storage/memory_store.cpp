@@ -2,6 +2,7 @@
 
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "simd_aggregator.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -10,11 +11,60 @@
 #include <ranges>
 #include <stdexcept>
 
+// ---------------------------------------------------------------------------
+// InMemorySeriesStats::update — maintain running aggregation stats on insert.
+//
+// Phase 1: sum/min/max via SIMD (no data dependency between iterations)
+// Phase 2: Welford mean/m2 via scalar (sequential dependency)
+// Phase 3: first/latest timestamp tracking (branch-heavy, not vectorizable)
+// ---------------------------------------------------------------------------
+void InMemorySeriesStats::update(const double* values, const uint64_t* timestamps, size_t n) {
+    if (n == 0) return;
+    valid = true;
+
+    // Phase 1: SIMD-accelerated sum/min/max for the new batch
+    double batchSum = timestar::simd::SimdAggregator::calculateSum(values, n);
+    double batchMin = timestar::simd::SimdAggregator::calculateMin(values, n);
+    double batchMax = timestar::simd::SimdAggregator::calculateMax(values, n);
+
+    // Kahan compensated accumulation of batch sum
+    double y = batchSum - sumCompensation;
+    double t = sum + y;
+    sumCompensation = (t - sum) - y;
+    sum = t;
+
+    if (batchMin < min) min = batchMin;
+    if (batchMax > max) max = batchMax;
+
+    // Phase 2: Welford online mean/m2 (must be sequential per-value)
+    for (size_t i = 0; i < n; ++i) {
+        count++;
+        double delta = values[i] - mean;
+        mean += delta / static_cast<double>(count);
+        double delta2 = values[i] - mean;
+        m2 += delta * delta2;
+    }
+
+    // Phase 3: first/latest timestamp tracking
+    // Timestamps in a batch are typically sorted, so first is at [0] and
+    // latest at [n-1]. Check all values for correctness with out-of-order data.
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t ts = timestamps[i];
+        if (ts < firstTimestamp) { firstTimestamp = ts; firstValue = values[i]; }
+        if (ts >= latestTimestamp) { latestTimestamp = ts; latestValue = values[i]; }
+    }
+}
+
 template <class T>
 void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     const auto& srcTimestamps = insertRequest.getTimestamps();
     if (srcTimestamps.empty()) [[unlikely]]
         return;
+
+    // Update running stats for double series (O(n) single pass over new data only)
+    if constexpr (std::is_same_v<T, double>) {
+        stats.update(insertRequest.values.data(), srcTimestamps.data(), srcTimestamps.size());
+    }
 
     const size_t oldSize = timestamps.size();
     const size_t newSize = srcTimestamps.size();
@@ -478,6 +528,10 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
 
             timestamps.erase(timestamps.begin() + startIdx, timestamps.begin() + endIdx);
             values.erase(values.begin() + startIdx, values.begin() + endIdx);
+
+            // Invalidate running stats after deletion — they may no longer
+            // reflect the actual data (min/max could have been in deleted range).
+            inMemorySeries.stats.valid = false;
         },
         variantSeries);
 

@@ -97,7 +97,7 @@ public:
         // Filter blocks by time range
         std::vector<TSMIndexBlock> relevantBlocks;
         for (const auto& block : indexBlocks) {
-            if (block.maxTime >= startTime && block.minTime <= endTime) {
+            if (block.maxTime >= startTime && block.minTime < endTime) {
                 relevantBlocks.push_back(block);
             }
         }

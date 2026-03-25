@@ -250,7 +250,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             if (it != tombstoneRanges.begin()) {
                 --it;
                 const auto& [startTime, endTime] = *it;
-                if (ts >= startTime && ts <= endTime) {
+                if (ts >= startTime && ts < endTime) {
                     isTombstoned = true;
                 }
             }

@@ -170,6 +170,8 @@ AggregationMethod QueryParser::parseAggregation(const std::string& method) {
         return AggregationMethod::FIRST;
     if (ciEqual(sv, "median"))
         return AggregationMethod::MEDIAN;
+    if (ciEqual(sv, "exact_median"))
+        return AggregationMethod::EXACT_MEDIAN;
     if (ciEqual(sv, "stddev"))
         return AggregationMethod::STDDEV;
     if (ciEqual(sv, "stdvar"))
@@ -178,8 +180,8 @@ AggregationMethod QueryParser::parseAggregation(const std::string& method) {
         return AggregationMethod::SPREAD;
 
     throw QueryParseException(
-        "Must be one of 'avg', 'min', 'max', 'sum', 'latest', 'count', 'first', 'median', 'stddev', 'stdvar', "
-        "'spread'");
+        "Must be one of 'avg', 'min', 'max', 'sum', 'latest', 'count', 'first', 'median', 'exact_median', 'stddev', "
+        "'stdvar', 'spread'");
 }
 
 std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos) {

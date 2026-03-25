@@ -94,7 +94,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestSelectiveReturnsSingleLatestPoint) {
     timestar::BlockAggregator aggregator(0);  // non-bucketed
 
     size_t pts =
-        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1990, aggregator, /*reverse=*/true, /*maxPoints=*/1);
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1991, aggregator, /*reverse=*/true, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     EXPECT_EQ(aggregator.pointCount(), 1u);
@@ -148,7 +148,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestSelectiveMaxPointsThree) {
     timestar::BlockAggregator aggregator(0);
 
     size_t pts =
-        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1490, aggregator, /*reverse=*/true, /*maxPoints=*/3);
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 1491, aggregator, /*reverse=*/true, /*maxPoints=*/3);
 
     EXPECT_EQ(pts, 3u);
     auto timestamps = aggregator.takeTimestamps();
@@ -192,7 +192,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, SelectiveTimeRangeFilter) {
     timestar::BlockAggregator aggregator(0);
 
     size_t pts =
-        co_await tsm->aggregateSeriesSelective(seriesId, 1500, 1700, aggregator, /*reverse=*/true, /*maxPoints=*/1);
+        co_await tsm->aggregateSeriesSelective(seriesId, 1500, 1701, aggregator, /*reverse=*/true, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();
@@ -356,7 +356,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, BucketedLatestGetsActualLatestPerBucket) {
 
     uint64_t interval = 10000;  // One bucket covers all points
     uint64_t startTime = 1000;
-    uint64_t endTime = 1090;
+    uint64_t endTime = 1091;  // half-open: includes point at 1090
     size_t totalBuckets = 1;
 
     std::unordered_set<uint64_t> filledBuckets;
@@ -599,7 +599,7 @@ SEASTAR_TEST_F(PushdownSelectiveTest, LatestSelectiveMultiBlock) {
     timestar::BlockAggregator aggregator(0);
 
     size_t pts =
-        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 50990, aggregator, /*reverse=*/true, /*maxPoints=*/1);
+        co_await tsm->aggregateSeriesSelective(seriesId, 1000, 50991, aggregator, /*reverse=*/true, /*maxPoints=*/1);
 
     EXPECT_EQ(pts, 1u);
     auto timestamps = aggregator.takeTimestamps();

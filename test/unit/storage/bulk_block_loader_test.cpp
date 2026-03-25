@@ -178,16 +178,16 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileTimeRangeFilter) {
 
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("range.sensor");
 
-    // Request only the middle portion [1200, 1500]
-    auto result = co_await BulkBlockLoader<double>::loadFromFile(tsm, seriesId, 1200, 1500);
+    // Request only the middle portion [1200, 1501)  (half-open)
+    auto result = co_await BulkBlockLoader<double>::loadFromFile(tsm, seriesId, 1200, 1501);
 
     // The block-level filtering may return the whole block that overlaps the range,
     // but the point-level filtering within readSingleBlock should trim to the range.
-    // Verify all returned timestamps are within [1200, 1500].
+    // Verify all returned timestamps are within [1200, 1501) i.e. [1200, 1500].
     for (const auto& block : result.blocks) {
         for (size_t i = 0; i < block->timestamps.size(); i++) {
             EXPECT_GE(block->timestamps.at(i), 1200) << "Timestamp below startTime";
-            EXPECT_LE(block->timestamps.at(i), 1500) << "Timestamp above endTime";
+            EXPECT_LT(block->timestamps.at(i), 1501) << "Timestamp at or above endTime";
         }
     }
 

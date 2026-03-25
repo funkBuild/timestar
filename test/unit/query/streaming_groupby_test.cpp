@@ -70,7 +70,13 @@ TEST(StreamingGroupBy, IsStreamableMethod_FIRST) {
 }
 
 TEST(StreamingGroupBy, IsStreamableMethod_MEDIAN) {
+    // MEDIAN needs raw values — not streamable.
     EXPECT_FALSE(isStreamableMethod(AggregationMethod::MEDIAN));
+}
+
+TEST(StreamingGroupBy, IsStreamableMethod_EXACT_MEDIAN) {
+    // EXACT_MEDIAN requires all raw values — not streamable.
+    EXPECT_FALSE(isStreamableMethod(AggregationMethod::EXACT_MEDIAN));
 }
 
 // ============================================================================
@@ -79,10 +85,10 @@ TEST(StreamingGroupBy, IsStreamableMethod_MEDIAN) {
 
 // Reproduce the canStreamAggregation logic inline since the static function
 // is not exported from http_query_handler.cpp.
-static bool canStreamAggregationLocal(AggregationMethod method,
-                                       const std::vector<std::string>& groupByTags,
-                                       uint64_t aggregationInterval) {
-    if (!isStreamableMethod(method)) return false;
+static bool canStreamAggregationLocal(AggregationMethod method, const std::vector<std::string>& groupByTags,
+                                      uint64_t aggregationInterval) {
+    if (!isStreamableMethod(method))
+        return false;
     return !groupByTags.empty() || aggregationInterval > 0;
 }
 
@@ -91,7 +97,13 @@ TEST(StreamingGroupBy, CanStreamAggregation_AVG_WithGroupBy) {
 }
 
 TEST(StreamingGroupBy, CanStreamAggregation_MEDIAN_WithGroupBy) {
+    // MEDIAN needs raw values — not streamable even with group-by.
     EXPECT_FALSE(canStreamAggregationLocal(AggregationMethod::MEDIAN, {"host"}, 0));
+}
+
+TEST(StreamingGroupBy, CanStreamAggregation_EXACT_MEDIAN_WithGroupBy) {
+    // EXACT_MEDIAN is not streamable.
+    EXPECT_FALSE(canStreamAggregationLocal(AggregationMethod::EXACT_MEDIAN, {"host"}, 0));
 }
 
 TEST(StreamingGroupBy, CanStreamAggregation_AVG_NoGroupByNoBucket) {
@@ -473,7 +485,7 @@ TEST(StreamingGroupBy, MergePushdownResult_BucketStates) {
     }
 
     ASSERT_EQ(groupBuckets.size(), 3u);
-    EXPECT_DOUBLE_EQ(groupBuckets[0].getValue(AggregationMethod::SUM), 40.0);     // 10 + 30
+    EXPECT_DOUBLE_EQ(groupBuckets[0].getValue(AggregationMethod::SUM), 40.0);  // 10 + 30
     EXPECT_DOUBLE_EQ(groupBuckets[1000].getValue(AggregationMethod::SUM), 20.0);
     EXPECT_DOUBLE_EQ(groupBuckets[2000].getValue(AggregationMethod::SUM), 40.0);
 }
@@ -619,8 +631,7 @@ TEST(StreamingGroupBy, WelfordMerge_LargeValueRange) {
 
 TEST(StreamingGroupBy, MultipleGroupBy_TagsSorted) {
     // Verify that group keys sort correctly with multiple group-by tags
-    std::map<std::string, std::string> tags = {
-        {"host", "server-A"}, {"dc", "us-west"}, {"rack", "r1"}};
+    std::map<std::string, std::string> tags = {{"host", "server-A"}, {"dc", "us-west"}, {"rack", "r1"}};
     std::vector<std::string> groupByTags = {"dc", "host"};
 
     auto gk = buildGroupKeyDirect("cpu", "usage", tags, groupByTags);
