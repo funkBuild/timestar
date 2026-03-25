@@ -419,8 +419,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             // PHASE 1 OPTIMIZATION: Two-phase aggregation - aggregate to states immediately
             // Single pass, no reallocation, O(1) merge later.
             // MEDIAN and EXACT_MEDIAN both use addValue with collectRaw=true.
-            const bool needsRaw = (method == AggregationMethod::EXACT_MEDIAN ||
-                                   method == AggregationMethod::MEDIAN);
+            const bool needsRaw = (method == AggregationMethod::EXACT_MEDIAN || method == AggregationMethod::MEDIAN);
             if (interval > 0) {
                 // Bucketed aggregation - accumulate into AggregationState per bucket
                 for (size_t i = 0; i < timestamps.size(); ++i) {
@@ -656,7 +655,8 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     // createPartialAggregations path). Convert any raw-value
                     // partials to states, then merge normally.
                     // Convert raw values to AggregationStates.
-                    const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
+                    const bool needsRaw =
+                        (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
                     for (auto* p : groupPartials) {
                         if (!p->sortedValues.empty() && p->sortedStates.empty()) {
                             p->sortedStates.reserve(p->sortedTimestamps.size());

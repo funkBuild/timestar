@@ -19,7 +19,8 @@
 // Phase 3: first/latest timestamp tracking (branch-heavy, not vectorizable)
 // ---------------------------------------------------------------------------
 void InMemorySeriesStats::update(const double* values, const uint64_t* timestamps, size_t n) {
-    if (n == 0) return;
+    if (n == 0)
+        return;
     valid = true;
 
     // Phase 1: SIMD-accelerated sum/min/max for the new batch
@@ -33,8 +34,10 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     sumCompensation = (t - sum) - y;
     sum = t;
 
-    if (batchMin < min) min = batchMin;
-    if (batchMax > max) max = batchMax;
+    if (batchMin < min)
+        min = batchMin;
+    if (batchMax > max)
+        max = batchMax;
 
     // Phase 2: Welford online mean/m2 (must be sequential per-value)
     for (size_t i = 0; i < n; ++i) {
@@ -50,8 +53,14 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     // latest at [n-1]. Check all values for correctness with out-of-order data.
     for (size_t i = 0; i < n; ++i) {
         uint64_t ts = timestamps[i];
-        if (ts < firstTimestamp) { firstTimestamp = ts; firstValue = values[i]; }
-        if (ts >= latestTimestamp) { latestTimestamp = ts; latestValue = values[i]; }
+        if (ts < firstTimestamp) {
+            firstTimestamp = ts;
+            firstValue = values[i];
+        }
+        if (ts >= latestTimestamp) {
+            latestTimestamp = ts;
+            latestValue = values[i];
+        }
     }
 }
 

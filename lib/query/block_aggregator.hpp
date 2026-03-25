@@ -199,11 +199,12 @@ public:
     }
 
     // Add a subrange of a batch (zero-copy from MemoryStore).
-    void addPointsRange(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
-                        size_t startIdx, size_t endIdx) {
+    void addPointsRange(const std::vector<uint64_t>& timestamps, const std::vector<double>& values, size_t startIdx,
+                        size_t endIdx) {
         const size_t n = endIdx - startIdx;
         pointCount_ += n;
-        if (n == 0) return;
+        if (n == 0)
+            return;
 
         if (interval_ == 0) {
             if (foldToSingleState_) {

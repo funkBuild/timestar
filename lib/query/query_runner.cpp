@@ -632,18 +632,18 @@ static size_t aggregateMemoryStoresTyped(WALFileManager* walFileManager, const S
         if constexpr (std::is_same_v<T, double>) {
             if (storeData.stats.valid && storeData.stats.count > 0) {
                 // Check if query range fully covers this series' time range
-                bool queryCoversAll = (startTime <= storeData.stats.firstTimestamp &&
-                                       endTime > storeData.stats.latestTimestamp);
+                bool queryCoversAll =
+                    (startTime <= storeData.stats.firstTimestamp && endTime > storeData.stats.latestTimestamp);
                 if (queryCoversAll && storeData.stats.count <= UINT32_MAX &&
-                    aggregator.canUseBlockStats(storeData.stats.firstTimestamp,
-                                                storeData.stats.latestTimestamp, true)) {
+                    aggregator.canUseBlockStats(storeData.stats.firstTimestamp, storeData.stats.latestTimestamp,
+                                                true)) {
                     // Use pre-computed stats — O(1) instead of O(n).
                     // Pass compensated sum for numerical stability.
-                    aggregator.addBlockStats(
-                        storeData.stats.compensatedSum(), storeData.stats.min, storeData.stats.max,
-                        static_cast<uint32_t>(storeData.stats.count),
-                        storeData.stats.firstTimestamp, storeData.stats.latestTimestamp,
-                        storeData.stats.m2, storeData.stats.firstValue, storeData.stats.latestValue);
+                    aggregator.addBlockStats(storeData.stats.compensatedSum(), storeData.stats.min, storeData.stats.max,
+                                             static_cast<uint32_t>(storeData.stats.count),
+                                             storeData.stats.firstTimestamp, storeData.stats.latestTimestamp,
+                                             storeData.stats.m2, storeData.stats.firstValue,
+                                             storeData.stats.latestValue);
                     totalPoints += storeData.stats.count;
                     continue;
                 }
@@ -750,7 +750,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             memMinTimeOpt = memMinInt;
         } else {
             auto memMinBool = walFileManager->getEarliestMemoryTimestamp<bool>(seriesId, startTime, endTime);
-            if (memMinBool) memMinTimeOpt = memMinBool;
+            if (memMinBool)
+                memMinTimeOpt = memMinBool;
         }
     }
 
@@ -1108,8 +1109,8 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
     // Per-series state: tracks which fields are eligible for pushdown and
     // their individual memory-split boundaries.
     struct PerSeriesState {
-        bool eligible = true;         // false if this field failed a gate check
-        uint64_t tsmEndTime = 0;      // upper bound for TSM-only pushdown range
+        bool eligible = true;     // false if this field failed a gate check
+        uint64_t tsmEndTime = 0;  // upper bound for TSM-only pushdown range
         uint64_t fallbackStartTime = 0;
         bool needsFallback = false;
         timestar::BlockAggregator* aggregator = nullptr;
@@ -1122,7 +1123,8 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
         for (size_t i = 0; i < N; ++i) {
             const auto& [seriesKey, seriesId] = seriesEntries[i];
             const bool foldLatestFirst = (aggregationInterval == 0) && (isLatest || isFirst);
-            aggregators[i] = std::make_unique<timestar::BlockAggregator>(aggregationInterval, startTime, endTime, method, true);
+            aggregators[i] =
+                std::make_unique<timestar::BlockAggregator>(aggregationInterval, startTime, endTime, method, true);
             if (foldLatestFirst) {
                 aggregators[i]->enableFoldToSingleState();
             }
@@ -1161,7 +1163,8 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
                 memMinTimeOpt = memMinInt;
             } else {
                 auto memMinBool = walFileManager->getEarliestMemoryTimestamp<bool>(seriesId, startTime, endTime);
-                if (memMinBool) memMinTimeOpt = memMinBool;
+                if (memMinBool)
+                    memMinTimeOpt = memMinBool;
             }
         }
 
@@ -1191,19 +1194,21 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
     }
 
     // --- Snapshot TSM files once for all series ---
-    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
-        fileManager->getSequencedTsmFiles().begin(), fileManager->getSequencedTsmFiles().end());
+    std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(fileManager->getSequencedTsmFiles().begin(),
+                                                                            fileManager->getSequencedTsmFiles().end());
 
     // --- LATEST/FIRST fast path: skip Gate 2 overlap check ---
     if (isLatest || isFirst) {
         // For each eligible series, create aggregator + process all TSM files
         for (size_t i = 0; i < N; ++i) {
-            if (!state[i].eligible) continue;
+            if (!state[i].eligible)
+                continue;
             const auto& [seriesKey, seriesId] = seriesEntries[i];
             auto& s = state[i];
 
             const bool foldNonBucketed = (aggregationInterval == 0);
-            aggregators[i] = std::make_unique<timestar::BlockAggregator>(aggregationInterval, startTime, s.tsmEndTime, method, true);
+            aggregators[i] =
+                std::make_unique<timestar::BlockAggregator>(aggregationInterval, startTime, s.tsmEndTime, method, true);
             if (foldNonBucketed) {
                 aggregators[i]->enableFoldToSingleState();
             }
@@ -1213,14 +1218,16 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
         // Iterate files once, process all eligible series in each file
         for (const auto& [rank, tsmFile] : seqFilesSnap) {
             for (size_t i = 0; i < N; ++i) {
-                if (!state[i].eligible || !state[i].aggregator) continue;
+                if (!state[i].eligible || !state[i].aggregator)
+                    continue;
                 const auto& [seriesKey, seriesId] = seriesEntries[i];
                 auto& s = state[i];
 
                 if (!tsmFile->seriesMayOverlapTime(seriesId, startTime, s.tsmEndTime))
                     continue;
                 auto type = tsmFile->getSeriesType(seriesId);
-                if (!type.has_value()) continue;
+                if (!type.has_value())
+                    continue;
                 if (*type == TSMValueType::String) {
                     s.eligible = false;
                     continue;
@@ -1239,13 +1246,15 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
 
                 // Fallback: selective DMA read
                 bool reverse = isLatest;
-                co_await tsmFile->aggregateSeriesSelective(seriesId, startTime, s.tsmEndTime, *s.aggregator, reverse, 1);
+                co_await tsmFile->aggregateSeriesSelective(seriesId, startTime, s.tsmEndTime, *s.aggregator, reverse,
+                                                           1);
             }
         }
 
         // Fold memory store data + build results
         for (size_t i = 0; i < N; ++i) {
-            if (!state[i].eligible || !state[i].aggregator) continue;
+            if (!state[i].eligible || !state[i].aggregator)
+                continue;
             const auto& [seriesKey, seriesId] = seriesEntries[i];
             auto& s = state[i];
 
@@ -1253,7 +1262,8 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
                 aggregateMemoryStores(walFileManager, seriesId, s.fallbackStartTime, endTime, *s.aggregator);
             }
 
-            if (s.aggregator->pointCount() == 0) continue;
+            if (s.aggregator->pointCount() == 0)
+                continue;
 
             timestar::PushdownResult result;
             result.totalPoints = s.aggregator->pointCount();
@@ -1275,20 +1285,23 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
         for (const auto& [rank, tsmFile] : seqFilesSnap) {
             bool anyEligible = false;
             for (size_t i = 0; i < N; ++i) {
-                if (!state[i].eligible) continue;
+                if (!state[i].eligible)
+                    continue;
                 if (tsmFile->seriesMayOverlapTime(seriesEntries[i].second, startTime, state[i].tsmEndTime)) {
                     anyEligible = true;
                     break;
                 }
             }
-            if (anyEligible) gate2Candidates.push_back(tsmFile);
+            if (anyEligible)
+                gate2Candidates.push_back(tsmFile);
         }
         if (gate2Candidates.size() > 1) {
             // Prefetch all eligible series in all candidate files
             std::vector<SeriesId128> allIds;
             allIds.reserve(N);
             for (size_t i = 0; i < N; ++i) {
-                if (state[i].eligible) allIds.push_back(seriesEntries[i].second);
+                if (state[i].eligible)
+                    allIds.push_back(seriesEntries[i].second);
             }
             co_await seastar::parallel_for_each(gate2Candidates, [&allIds](seastar::shared_ptr<TSM>& f) {
                 return f->prefetchFullIndexEntries(allIds);
@@ -1309,7 +1322,8 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
     std::vector<PerSeriesGate2> gate2(N);
 
     for (size_t i = 0; i < N; ++i) {
-        if (!state[i].eligible) continue;
+        if (!state[i].eligible)
+            continue;
         const auto& seriesId = seriesEntries[i].second;
         auto& s = state[i];
         auto& g2 = gate2[i];
@@ -1321,7 +1335,8 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
                 continue;
 
             auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);
-            if (!indexEntry) continue;
+            if (!indexEntry)
+                continue;
 
             if (indexEntry->seriesType == TSMValueType::String) {
                 g2.passed = false;
@@ -1371,10 +1386,12 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
 
     // Create aggregators for eligible series
     for (size_t i = 0; i < N; ++i) {
-        if (!state[i].eligible) continue;
+        if (!state[i].eligible)
+            continue;
         auto& s = state[i];
         const bool canFold = (aggregationInterval == 0) && isStreamableAggMethod(method);
-        aggregators[i] = std::make_unique<timestar::BlockAggregator>(aggregationInterval, startTime, s.tsmEndTime, method, true);
+        aggregators[i] =
+            std::make_unique<timestar::BlockAggregator>(aggregationInterval, startTime, s.tsmEndTime, method, true);
         if (canFold) {
             aggregators[i]->enableFoldToSingleState();
         }
@@ -1385,7 +1402,8 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
     seastar::semaphore* ioSem = &fileManager->queryIoSem;
     for (const auto& [rank, tsmFile] : seqFilesSnap) {
         for (size_t i = 0; i < N; ++i) {
-            if (!state[i].eligible || !state[i].aggregator) continue;
+            if (!state[i].eligible || !state[i].aggregator)
+                continue;
 
             // Check if this file has data for this series
             bool found = false;
@@ -1395,15 +1413,18 @@ seastar::future<std::vector<std::optional<timestar::PushdownResult>>> QueryRunne
                     break;
                 }
             }
-            if (!found) continue;
+            if (!found)
+                continue;
 
-            co_await tsmFile->aggregateSeries(seriesEntries[i].second, startTime, state[i].tsmEndTime, *state[i].aggregator, ioSem);
+            co_await tsmFile->aggregateSeries(seriesEntries[i].second, startTime, state[i].tsmEndTime,
+                                              *state[i].aggregator, ioSem);
         }
     }
 
     // --- Fold memory store data + build results ---
     for (size_t i = 0; i < N; ++i) {
-        if (!state[i].eligible || !state[i].aggregator) continue;
+        if (!state[i].eligible || !state[i].aggregator)
+            continue;
         const auto& [seriesKey, seriesId] = seriesEntries[i];
         auto& s = state[i];
 
