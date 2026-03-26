@@ -55,5 +55,9 @@ jobs:
             funkbuild/timestar:${{ steps.version.outputs.major_minor }}
             funkbuild/timestar:${{ steps.version.outputs.major }}
             funkbuild/timestar:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scope the cache to avoid cross-contamination with CI builds.
+          # Use no-cache for the runtime stage to ensure apt packages are
+          # always fresh (prevents stale layer reuse that can drop packages).
+          cache-from: type=gha,scope=docker-publish
+          cache-to: type=gha,scope=docker-publish,mode=max
+          no-cache-filter: runtime
