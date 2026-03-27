@@ -10,9 +10,9 @@
 #include "timestar.pb.h"
 
 // Compression encoders for Approach B compressed proto fields
+#include "../encoding/bool_encoder_rle.hpp"
 #include "../encoding/float_encoder.hpp"
 #include "../encoding/integer_encoder.hpp"
-#include "../encoding/bool_encoder_rle.hpp"
 #include "../encoding/string_encoder.hpp"
 
 #include <climits>
@@ -83,7 +83,8 @@ std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size) {
                     } else {
                         const auto& vals = dv.values();
                         fa.doubles.reserve(vals.size());
-                        for (double v : vals) fa.doubles.push_back(v);
+                        for (double v : vals)
+                            fa.doubles.push_back(v);
                     }
                     break;
                 }
@@ -96,11 +97,13 @@ std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size) {
                         std::vector<bool> boolVec;
                         BoolEncoderRLE::decode(bSlice, 0, mwp.timestamps.size(), boolVec);
                         fa.bools.reserve(boolVec.size());
-                        for (bool b : boolVec) fa.bools.push_back(b ? 1 : 0);
+                        for (bool b : boolVec)
+                            fa.bools.push_back(b ? 1 : 0);
                     } else {
                         const auto& vals = bv.values();
                         fa.bools.reserve(vals.size());
-                        for (bool v : vals) fa.bools.push_back(v ? 1 : 0);
+                        for (bool v : vals)
+                            fa.bools.push_back(v ? 1 : 0);
                     }
                     break;
                 }
@@ -115,7 +118,8 @@ std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size) {
                     } else {
                         const auto& vals = sv.values();
                         fa.strings.reserve(vals.size());
-                        for (const auto& v : vals) fa.strings.push_back(v);
+                        for (const auto& v : vals)
+                            fa.strings.push_back(v);
                     }
                     break;
                 }
@@ -135,7 +139,8 @@ std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size) {
                     } else {
                         const auto& vals = iv.values();
                         fa.integers.reserve(vals.size());
-                        for (int64_t v : vals) fa.integers.push_back(v);
+                        for (int64_t v : vals)
+                            fa.integers.push_back(v);
                     }
                     break;
                 }
