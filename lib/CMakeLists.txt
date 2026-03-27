@@ -76,4 +76,8 @@ add_library(libtimestar_proto_conv STATIC
 target_link_libraries(libtimestar_proto_conv PRIVATE timestar_proto)
 target_include_directories(libtimestar_proto_conv PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/http
+    ${CMAKE_CURRENT_SOURCE_DIR}/encoding
+    ${CMAKE_CURRENT_SOURCE_DIR}/storage
+    ${CMAKE_CURRENT_SOURCE_DIR}/encoding/integer
+    ${CMAKE_CURRENT_SOURCE_DIR}/encoding/alp
 )

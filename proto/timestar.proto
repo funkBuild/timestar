@@ -1,5 +1,14 @@
 // TimeStar Time Series Database - Protobuf message definitions
 // Covers all 15 HTTP API endpoints for binary serialization.
+//
+// Compressed field convention (Approach B):
+//   Each bulk-data array has a parallel `bytes compressed_*` field.
+//   When the compressed field is non-empty it takes priority; the
+//   repeated packed field MUST be left empty.  Compression codecs:
+//     - FFOR:  delta-of-delta + ZigZag + Frame-of-Reference bit-packing
+//     - ALP:   Adaptive Lossless floating-Point (SIGMOD 2024)
+//     - RLE:   Run-Length Encoding with LEB128 varint lengths
+//     - ZSTD:  zstd block compression with optional dictionary encoding
 
 syntax = "proto3";
 package timestar_pb;
@@ -10,26 +19,33 @@ package timestar_pb;
 
 message DoubleArray {
     repeated double values = 1 [packed = true];
+    bytes compressed_alp   = 2;  // ALP-compressed doubles
 }
 
 message Int64Array {
-    repeated int64 values = 1 [packed = true];
+    repeated int64 values  = 1 [packed = true];
+    bytes compressed_ffor  = 2;  // ZigZag + FFOR compressed
 }
 
 message Uint64Array {
     repeated uint64 values = 1 [packed = true];
+    bytes compressed_ffor  = 2;  // FFOR compressed
 }
 
 message BoolArray {
-    repeated bool values = 1 [packed = true];
+    repeated bool values   = 1 [packed = true];
+    bytes compressed_rle   = 2;  // RLE compressed
 }
 
 message StringArray {
     repeated string values = 1;
+    bytes compressed_zstd  = 2;  // zstd + dictionary compressed
+    uint32 count           = 3;  // original string count (needed for zstd decode)
 }
 
 message TimestampArray {
     repeated uint64 values = 1 [packed = true];
+    bytes compressed_ffor  = 2;  // Delta-of-delta + ZigZag + FFOR
 }
 
 // ============================================================================
@@ -77,10 +93,11 @@ message WriteField {
 
 // A single write point (may carry arrays for columnar batch writes)
 message WritePoint {
-    string                    measurement = 1;
-    map<string, string>       tags        = 2;
-    map<string, WriteField>   fields      = 3;
-    repeated uint64           timestamps  = 4 [packed = true];  // Array of timestamps (ns since epoch)
+    string                    measurement            = 1;
+    map<string, string>       tags                   = 2;
+    map<string, WriteField>   fields                 = 3;
+    repeated uint64           timestamps             = 4 [packed = true];
+    bytes                     compressed_timestamps  = 5;  // FFOR compressed timestamps
 }
 
 // Top-level write request (batch of points)
@@ -110,13 +127,14 @@ message QueryRequest {
 
 // Per-field time series data in a query result
 message FieldData {
-    repeated uint64 timestamps = 1 [packed = true];
+    repeated uint64 timestamps            = 1 [packed = true];
     oneof typed_values {
         DoubleArray double_values  = 2;
         Int64Array  int64_values   = 3;
         BoolArray   bool_values    = 4;
         StringArray string_values  = 5;
     }
+    bytes           compressed_timestamps = 6;  // FFOR compressed timestamps
 }
 
 // A single series in the query response
@@ -372,13 +390,15 @@ message DerivedQueryStatistics {
 
 // Standard derived query response
 message DerivedQueryResponse {
-    string                   status     = 1;
-    repeated uint64          timestamps = 2 [packed = true];
-    repeated double          values     = 3 [packed = true];
-    string                   formula    = 4;
-    DerivedQueryStatistics   statistics = 5;
-    string                   error_code    = 6;
-    string                   error_message = 7;
+    string                   status                  = 1;
+    repeated uint64          timestamps              = 2 [packed = true];
+    repeated double          values                  = 3 [packed = true];
+    string                   formula                 = 4;
+    DerivedQueryStatistics   statistics              = 5;
+    string                   error_code              = 6;
+    string                   error_message           = 7;
+    bytes                    compressed_timestamps   = 8;   // FFOR compressed
+    bytes                    compressed_values       = 9;   // ALP compressed
 }
 
 // ============================================================================
@@ -386,11 +406,12 @@ message DerivedQueryResponse {
 // ============================================================================
 
 message AnomalySeriesPiece {
-    string          piece       = 1;  // "raw", "upper", "lower", "scores", "ratings"
-    repeated string group_tags  = 2;
-    repeated double values      = 3 [packed = true];  // NaN for missing values
-    double          alert_value = 4;
-    bool            has_alert   = 5;  // Explicit presence flag for alert_value
+    string          piece             = 1;  // "raw", "upper", "lower", "scores", "ratings"
+    repeated string group_tags        = 2;
+    repeated double values            = 3 [packed = true];  // NaN for missing values
+    double          alert_value       = 4;
+    bool            has_alert         = 5;  // Explicit presence flag for alert_value
+    bytes           compressed_values = 6;  // ALP compressed
 }
 
 message AnomalyStatistics {
@@ -403,11 +424,12 @@ message AnomalyStatistics {
 }
 
 message AnomalyResponse {
-    string                        status     = 1;
-    repeated uint64               times      = 2 [packed = true];
-    repeated AnomalySeriesPiece   series     = 3;
-    AnomalyStatistics             statistics = 4;
-    string                        error_message = 5;
+    string                        status              = 1;
+    repeated uint64               times               = 2 [packed = true];
+    repeated AnomalySeriesPiece   series              = 3;
+    AnomalyStatistics             statistics           = 4;
+    string                        error_message        = 5;
+    bytes                         compressed_times     = 6;  // FFOR compressed
 }
 
 // ============================================================================
@@ -415,9 +437,10 @@ message AnomalyResponse {
 // ============================================================================
 
 message ForecastSeriesPiece {
-    string          piece       = 1;  // "past", "forecast", "upper", "lower"
-    repeated string group_tags  = 2;
-    repeated double values      = 3 [packed = true];  // NaN for null/missing values
+    string          piece             = 1;  // "past", "forecast", "upper", "lower"
+    repeated string group_tags        = 2;
+    repeated double values            = 3 [packed = true];  // NaN for null/missing values
+    bytes           compressed_values = 4;  // ALP compressed
 }
 
 message ForecastStatistics {
@@ -441,4 +464,5 @@ message ForecastResponse {
     repeated ForecastSeriesPiece   series              = 4;
     ForecastStatistics             statistics           = 5;
     string                         error_message        = 6;
+    bytes                          compressed_times     = 7;  // FFOR compressed
 }

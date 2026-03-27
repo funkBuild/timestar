@@ -216,7 +216,7 @@ add_executable(timestar_proto_conv_test
     unit/http/proto_converter_test.cpp
     unit/http/proto_write_fast_path_test.cpp
 )
-target_link_libraries(timestar_proto_conv_test libtimestar_proto_conv timestar_proto gtest gtest_main)
+target_link_libraries(timestar_proto_conv_test libtimestar_proto_conv libtimestar timestar_proto gtest gtest_main)
 target_include_directories(timestar_proto_conv_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/http

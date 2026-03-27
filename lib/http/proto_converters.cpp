@@ -9,6 +9,12 @@
 
 #include "timestar.pb.h"
 
+// Compression encoders for Approach B compressed proto fields
+#include "../encoding/float_encoder.hpp"
+#include "../encoding/integer_encoder.hpp"
+#include "../encoding/bool_encoder_rle.hpp"
+#include "../encoding/string_encoder.hpp"
+
 #include <climits>
 #include <stdexcept>
 
@@ -49,9 +55,19 @@ std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size) {
             mwp.tags[k] = v;
         }
 
-        mwp.timestamps.reserve(wp.timestamps_size());
-        for (int i = 0; i < wp.timestamps_size(); ++i) {
-            mwp.timestamps.push_back(wp.timestamps(i));
+        // Check for compressed timestamps first (Approach B)
+        if (!wp.compressed_timestamps().empty()) {
+            const auto& ct = wp.compressed_timestamps();
+            Slice tsSlice(reinterpret_cast<const uint8_t*>(ct.data()), ct.size());
+            // Upper bound: compressed data can't encode more values than bytes/2
+            // (minimum 16 bytes per block header). The decoder stops at slice end.
+            size_t maxCount = ct.size() / 2 + 1024;
+            IntegerEncoder::decode(tsSlice, static_cast<unsigned int>(maxCount), mwp.timestamps);
+        } else {
+            mwp.timestamps.reserve(wp.timestamps_size());
+            for (int i = 0; i < wp.timestamps_size(); ++i) {
+                mwp.timestamps.push_back(wp.timestamps(i));
+            }
         }
 
         for (const auto& [fieldName, writeField] : wp.fields()) {
@@ -59,37 +75,67 @@ std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size) {
             switch (writeField.typed_values_case()) {
                 case ::timestar_pb::WriteField::kDoubleValues: {
                     fa.type = FieldArrays::DOUBLE;
-                    const auto& vals = writeField.double_values().values();
-                    fa.doubles.reserve(vals.size());
-                    for (double v : vals) {
-                        fa.doubles.push_back(v);
+                    const auto& dv = writeField.double_values();
+                    if (!dv.compressed_alp().empty()) {
+                        const auto& c = dv.compressed_alp();
+                        CompressedSlice cs(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                        FloatDecoder::decode(cs, 0, mwp.timestamps.size(), fa.doubles);
+                    } else {
+                        const auto& vals = dv.values();
+                        fa.doubles.reserve(vals.size());
+                        for (double v : vals) fa.doubles.push_back(v);
                     }
                     break;
                 }
                 case ::timestar_pb::WriteField::kBoolValues: {
                     fa.type = FieldArrays::BOOL;
-                    const auto& vals = writeField.bool_values().values();
-                    fa.bools.reserve(vals.size());
-                    for (bool v : vals) {
-                        fa.bools.push_back(v ? 1 : 0);
+                    const auto& bv = writeField.bool_values();
+                    if (!bv.compressed_rle().empty()) {
+                        const auto& c = bv.compressed_rle();
+                        Slice bSlice(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                        std::vector<bool> boolVec;
+                        BoolEncoderRLE::decode(bSlice, 0, mwp.timestamps.size(), boolVec);
+                        fa.bools.reserve(boolVec.size());
+                        for (bool b : boolVec) fa.bools.push_back(b ? 1 : 0);
+                    } else {
+                        const auto& vals = bv.values();
+                        fa.bools.reserve(vals.size());
+                        for (bool v : vals) fa.bools.push_back(v ? 1 : 0);
                     }
                     break;
                 }
                 case ::timestar_pb::WriteField::kStringValues: {
                     fa.type = FieldArrays::STRING;
-                    const auto& vals = writeField.string_values().values();
-                    fa.strings.reserve(vals.size());
-                    for (const auto& v : vals) {
-                        fa.strings.push_back(v);
+                    const auto& sv = writeField.string_values();
+                    if (!sv.compressed_zstd().empty()) {
+                        const auto& c = sv.compressed_zstd();
+                        Slice sSlice(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                        size_t count = sv.count() > 0 ? sv.count() : mwp.timestamps.size();
+                        StringEncoder::decode(sSlice, count, fa.strings);
+                    } else {
+                        const auto& vals = sv.values();
+                        fa.strings.reserve(vals.size());
+                        for (const auto& v : vals) fa.strings.push_back(v);
                     }
                     break;
                 }
                 case ::timestar_pb::WriteField::kInt64Values: {
                     fa.type = FieldArrays::INTEGER;
-                    const auto& vals = writeField.int64_values().values();
-                    fa.integers.reserve(vals.size());
-                    for (int64_t v : vals) {
-                        fa.integers.push_back(v);
+                    const auto& iv = writeField.int64_values();
+                    if (!iv.compressed_ffor().empty()) {
+                        const auto& c = iv.compressed_ffor();
+                        Slice iSlice(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                        std::vector<uint64_t> decoded;
+                        IntegerEncoder::decode(iSlice, mwp.timestamps.size(), decoded);
+                        fa.integers.reserve(decoded.size());
+                        // Reverse zigzag: the encoder zigzag'd int64 -> uint64 before FFOR
+                        for (auto v : decoded) {
+                            fa.integers.push_back(static_cast<int64_t>((v >> 1) ^ -(v & 1)));
+                        }
+                    } else {
+                        const auto& vals = iv.values();
+                        fa.integers.reserve(vals.size());
+                        for (int64_t v : vals) fa.integers.push_back(v);
                     }
                     break;
                 }
@@ -163,32 +209,41 @@ std::string formatQueryResponse(QueryResponseData& response) {
             auto& [timestamps, values] = fieldData;
             ::timestar_pb::FieldData fd;
 
-            for (uint64_t ts : timestamps) {
-                fd.add_timestamps(ts);
+            // Compress timestamps with FFOR
+            if (!timestamps.empty()) {
+                auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(timestamps));
+                fd.set_compressed_timestamps(tsEncoded.data.data(), tsEncoded.size());
             }
 
+            // Compress values with type-appropriate codec
             std::visit(
                 [&fd](auto& vec) {
                     using T = std::decay_t<decltype(vec)>;
                     if constexpr (std::is_same_v<T, std::vector<double>>) {
-                        auto* da = fd.mutable_double_values();
-                        for (double v : vec) {
-                            da->add_values(v);
+                        if (!vec.empty()) {
+                            auto encoded = FloatEncoder::encode(std::span<const double>(vec));
+                            fd.mutable_double_values()->set_compressed_alp(encoded.data.data(), encoded.dataByteSize());
                         }
                     } else if constexpr (std::is_same_v<T, std::vector<bool>>) {
-                        auto* ba = fd.mutable_bool_values();
-                        for (bool v : vec) {
-                            ba->add_values(v);
+                        if (!vec.empty()) {
+                            auto encoded = BoolEncoderRLE::encode(vec);
+                            fd.mutable_bool_values()->set_compressed_rle(encoded.data.data(), encoded.size());
                         }
                     } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
-                        auto* sa = fd.mutable_string_values();
-                        for (const auto& v : vec) {
-                            sa->add_values(v);
+                        if (!vec.empty()) {
+                            auto encoded = StringEncoder::encode(std::span<const std::string>(vec));
+                            fd.mutable_string_values()->set_compressed_zstd(encoded.data.data(), encoded.size());
+                            fd.mutable_string_values()->set_count(static_cast<uint32_t>(vec.size()));
                         }
                     } else if constexpr (std::is_same_v<T, std::vector<int64_t>>) {
-                        auto* ia = fd.mutable_int64_values();
-                        for (int64_t v : vec) {
-                            ia->add_values(v);
+                        if (!vec.empty()) {
+                            // ZigZag encode then FFOR
+                            std::vector<uint64_t> zz(vec.size());
+                            for (size_t i = 0; i < vec.size(); ++i) {
+                                zz[i] = (static_cast<uint64_t>(vec[i]) << 1) ^ static_cast<uint64_t>(vec[i] >> 63);
+                            }
+                            auto encoded = IntegerEncoder::encode(std::span<const uint64_t>(zz));
+                            fd.mutable_int64_values()->set_compressed_ffor(encoded.data.data(), encoded.size());
                         }
                     }
                 },
@@ -567,11 +622,15 @@ std::string formatDerivedQueryResponse(const DerivedQueryResultData& result) {
     resp.set_status("success");
     resp.set_formula(result.formula);
 
-    for (uint64_t ts : result.timestamps) {
-        resp.add_timestamps(ts);
+    // Compress timestamps with FFOR
+    if (!result.timestamps.empty()) {
+        auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(result.timestamps));
+        resp.set_compressed_timestamps(tsEncoded.data.data(), tsEncoded.size());
     }
-    for (double v : result.values) {
-        resp.add_values(v);
+    // Compress values with ALP
+    if (!result.values.empty()) {
+        auto vEncoded = FloatEncoder::encode(std::span<const double>(result.values));
+        resp.set_compressed_values(vEncoded.data.data(), vEncoded.dataByteSize());
     }
 
     auto* stats = resp.mutable_statistics();
@@ -593,8 +652,10 @@ std::string formatAnomalyResponse(const AnomalyQueryResultData& result) {
         resp.set_error_message(result.errorMessage);
     }
 
-    for (uint64_t ts : result.times) {
-        resp.add_times(ts);
+    // Compress times with FFOR
+    if (!result.times.empty()) {
+        auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(result.times));
+        resp.set_compressed_times(tsEncoded.data.data(), tsEncoded.size());
     }
 
     for (const auto& piece : result.series) {
@@ -605,8 +666,10 @@ std::string formatAnomalyResponse(const AnomalyQueryResultData& result) {
             pbPiece->add_group_tags(gt);
         }
 
-        for (double v : piece.values) {
-            pbPiece->add_values(v);
+        // Compress values with ALP
+        if (!piece.values.empty()) {
+            auto vEncoded = FloatEncoder::encode(std::span<const double>(piece.values));
+            pbPiece->set_compressed_values(vEncoded.data.data(), vEncoded.dataByteSize());
         }
 
         if (piece.alertValue.has_value()) {
@@ -638,8 +701,10 @@ std::string formatForecastResponse(const ForecastQueryResultData& result) {
         resp.set_error_message(result.errorMessage);
     }
 
-    for (uint64_t ts : result.times) {
-        resp.add_times(ts);
+    // Compress times with FFOR
+    if (!result.times.empty()) {
+        auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(result.times));
+        resp.set_compressed_times(tsEncoded.data.data(), tsEncoded.size());
     }
 
     resp.set_forecast_start_index(result.forecastStartIndex);
@@ -652,8 +717,15 @@ std::string formatForecastResponse(const ForecastQueryResultData& result) {
             pbPiece->add_group_tags(gt);
         }
 
+        // Materialize optional<double> as doubles (NaN for missing) then compress
+        std::vector<double> raw_values;
+        raw_values.reserve(piece.values.size());
         for (const auto& v : piece.values) {
-            pbPiece->add_values(v.has_value() ? *v : std::numeric_limits<double>::quiet_NaN());
+            raw_values.push_back(v.has_value() ? *v : std::numeric_limits<double>::quiet_NaN());
+        }
+        if (!raw_values.empty()) {
+            auto vEncoded = FloatEncoder::encode(std::span<const double>(raw_values));
+            pbPiece->set_compressed_values(vEncoded.data.data(), vEncoded.dataByteSize());
         }
     }
 
