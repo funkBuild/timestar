@@ -29,10 +29,14 @@ class Slice;
 enum class TSMValueType { Float = 0, Boolean, String, Integer };
 
 struct TSMIndexBlock {
+    // Field order groups all 8-byte members first, then 4-byte, then 1-byte, to
+    // minimise alignment padding (104 -> 88 bytes). This struct is in-memory only
+    // and cached per-block in the TSM full-index LRU; the on-disk format writes
+    // each field individually (see tsm_writer writeIndexBlock), so member order
+    // here is independent of the serialized layout.
     uint64_t minTime;
     uint64_t maxTime;
     uint64_t offset;
-    uint32_t size;
     // Block-level statistics (all types in V2; Float-only in V1)
     // For Float: native double values.
     // For Integer: int64 values stored as double (lossless up to 2^53).
@@ -41,16 +45,18 @@ struct TSMIndexBlock {
     double blockSum = 0.0;
     double blockMin = std::numeric_limits<double>::max();
     double blockMax = std::numeric_limits<double>::lowest();
-    uint32_t blockCount = 0;  // 0 means stats not available
     // Extended statistics (Float/Integer in V2)
     double blockM2 = 0.0;           // Welford's M2 accumulator for STDDEV/STDVAR (Float only)
     double blockFirstValue = 0.0;   // Value at earliest timestamp (for FIRST)
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
+    // 4-byte fields grouped together
+    uint32_t size;
+    uint32_t blockCount = 0;     // 0 means stats not available
+    uint32_t boolTrueCount = 0;  // Number of true values in block (Boolean)
+    // 1-byte fields grouped together
     bool hasExtendedStats = false;  // true when first/latest are populated
-    // Boolean-specific stats (V2)
-    uint32_t boolTrueCount = 0;    // Number of true values in block
-    bool boolFirstValue = false;   // Value at earliest timestamp
-    bool boolLatestValue = false;  // Value at latest timestamp
+    bool boolFirstValue = false;    // Value at earliest timestamp (Boolean)
+    bool boolLatestValue = false;   // Value at latest timestamp (Boolean)
 };
 
 // Batch of contiguous blocks for optimized I/O

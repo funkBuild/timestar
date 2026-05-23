@@ -61,11 +61,11 @@ TEST_F(TSMBatchOverflowTest, SmallContiguousBlocksGrouped) {
 TEST_F(TSMBatchOverflowTest, NonContiguousBlocksSplitBatches) {
     std::vector<TSMIndexBlock> blocks;
     // Block 0 at offset 0, size 1000
-    blocks.push_back({0, 999, 0, 1000});
+    blocks.push_back({.minTime = 0, .maxTime = 999, .offset = 0, .size = 1000});
     // Block 1 at offset 2000 (gap of 1000 bytes), size 1000
-    blocks.push_back({1000, 1999, 2000, 1000});
+    blocks.push_back({.minTime = 1000, .maxTime = 1999, .offset = 2000, .size = 1000});
     // Block 2 contiguous with block 1 (offset 3000), size 500
-    blocks.push_back({2000, 2999, 3000, 500});
+    blocks.push_back({.minTime = 2000, .maxTime = 2999, .offset = 3000, .size = 500});
 
     auto batches = tsm.groupContiguousBlocks(blocks);
     ASSERT_EQ(batches.size(), 2u);
@@ -124,9 +124,9 @@ TEST_F(TSMBatchOverflowTest, Uint32OverflowCorrectlySplitsBatches) {
     std::vector<TSMIndexBlock> blocks;
 
     // Block 0 at offset 0
-    blocks.push_back({0, 999, 0, largeBlockSize});
+    blocks.push_back({.minTime = 0, .maxTime = 999, .offset = 0, .size = largeBlockSize});
     // Block 1 contiguous at offset = largeBlockSize
-    blocks.push_back({1000, 1999, static_cast<uint64_t>(largeBlockSize), largeBlockSize});
+    blocks.push_back({.minTime = 1000, .maxTime = 1999, .offset = static_cast<uint64_t>(largeBlockSize), .size = largeBlockSize});
 
     auto batches = tsm.groupContiguousBlocks(blocks);
 
@@ -198,8 +198,8 @@ TEST_F(TSMBatchOverflowTest, SpecificWraparoundValuesDetected) {
     ASSERT_GT(correctSum, 16u * 1024u * 1024u) << "Test assumption: uint64_t sum should exceed 16MB";
 
     std::vector<TSMIndexBlock> blocks;
-    blocks.push_back({0, 999, 0, sizeA});
-    blocks.push_back({1000, 1999, static_cast<uint64_t>(sizeA), sizeB});
+    blocks.push_back({.minTime = 0, .maxTime = 999, .offset = 0, .size = sizeA});
+    blocks.push_back({.minTime = 1000, .maxTime = 1999, .offset = static_cast<uint64_t>(sizeA), .size = sizeB});
 
     auto batches = tsm.groupContiguousBlocks(blocks);
 

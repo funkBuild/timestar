@@ -119,8 +119,19 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
     buffer.write(encodedTimestamps);                   // uint8_t x N bytes, compressed timestamps
 
     if constexpr (std::is_same_v<T, double>) {
-        CompressedBuffer encodedFloats = FloatEncoder::encode(values);
-        buffer.write(encodedFloats);
+        // Encode directly into the output buffer. The previous code routed through
+        // FloatEncoder::encode() -> CompressedBuffer, which itself calls encodeInto
+        // into a temporary AlignedBuffer and then copies word-by-word into the
+        // CompressedBuffer, which buffer.write() then copies a third time. encodeInto
+        // writes once. We then zero-pad to an 8-byte boundary so the on-disk value
+        // region stays byte-identical to the old CompressedBuffer (vector<uint64_t>)
+        // layout — preserving format compatibility and the zero-copy CompressedSlice
+        // word-read invariant on decode.
+        size_t beforeSize = buffer.size();
+        FloatEncoder::encodeInto(values, buffer);
+        size_t pad = (8 - ((buffer.size() - beforeSize) % 8)) % 8;
+        for (size_t i = 0; i < pad; ++i)
+            buffer.write(static_cast<uint8_t>(0));
     } else if constexpr (std::is_same_v<T, bool>) {
         // vector<bool> path: caller passes spans constructed from a temporary vector<bool>
         // BoolEncoderRLE needs a vector, so reconstruct one from the span
