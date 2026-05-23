@@ -53,20 +53,30 @@ static bool blockOverlapsTombstones(uint64_t blockMin, uint64_t blockMax,
     return false;
 }
 
-// Decode a float block directly into thread-local scratch buffers and fold into
-// a BlockAggregator, avoiding per-block unique_ptr<TSMBlock> heap allocation.
-// TODO: The block-decode functions below (decodeBlockIntoAggregator, decodeIntegerBlockIntoAggregator,
-// decodeBoolBlockIntoAggregator, decodeBlockCountOnly, readSingleBlock, decodeBlock, decodeBlockFlat)
-// share ~600 lines of duplicated header-parsing and value-decode logic. Refactor into a shared
-// decodeBlockCore() that handles header parsing + timestamp decode, with a value-decode callback/policy.
+// Block-into-aggregator decode helpers. All four (Float, Integer, Boolean,
+// COUNT-only) share an identical prologue: parse the 9-byte block header,
+// time-filtered decode of timestamps into a thread-local scratch buffer.
+// Only the value path differs.
+//
+// NOTE: thread_local scratch is safe in these functions because none of
+// them suspend (no co_await). Adding any co_await would require switching
+// to coroutine-local buffers.
 
-// Returns number of decoded points (0 on error or empty block).
-// NOTE: thread_local scratch is safe here because this function has no suspension
-// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
-static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
-                                        timestar::BlockAggregator& aggregator) {
+struct BlockHeaderInfo {
+    size_t valueOffset;    // byte offset within `data` where values start
+    size_t valueByteSize;  // value-region length in bytes
+    size_t nSkipped;       // points filtered out before startTime
+    size_t nTimestamps;    // decoded timestamps now in tsScratch
+};
+
+// Parse the block header and decode timestamps (filtered by [startTime, endTime))
+// into `tsScratchOut` (cleared and reserved before decode). Returns nullopt on
+// malformed header. nTimestamps==0 is a valid result (no timestamps in range).
+static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8_t* data, uint32_t blockSize,
+                                                                     uint64_t startTime, uint64_t endTime,
+                                                                     std::vector<uint64_t>& tsScratchOut) {
     if (blockSize < BLOCK_HEADER_SIZE)
-        return 0;
+        return std::nullopt;
 
     Slice blockSlice(data, blockSize);
     auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
@@ -75,80 +85,57 @@ static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize,
     uint32_t timestampBytes = headerSlice.read<uint32_t>();
 
     if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
-        return 0;
+        return std::nullopt;
 
-    // Reuse thread-local scratch buffers to avoid per-block allocation
-    static thread_local std::vector<uint64_t> tsScratch;
-    static thread_local std::vector<double> valScratch;
-    tsScratch.clear();
-    valScratch.clear();
-    tsScratch.reserve(timestampSize);
+    tsScratchOut.clear();
+    tsScratchOut.reserve(timestampSize);
 
     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
     auto [nSkipped, nTimestamps] =
-        IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
-
-    if (nTimestamps == 0)
-        return 0;
+        IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratchOut, startTime, endTime);
 
     if (timestampBytes + BLOCK_HEADER_SIZE > blockSize)
-        return 0;
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
+        return std::nullopt;
+    const size_t valueOffset = BLOCK_HEADER_SIZE + timestampBytes;
+    const size_t valueByteSize = blockSize - valueOffset;
 
-    auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
-    FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, valScratch);
+    return BlockHeaderInfo{valueOffset, valueByteSize, nSkipped, nTimestamps};
+}
+
+static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
+                                        timestar::BlockAggregator& aggregator) {
+    static thread_local std::vector<uint64_t> tsScratch;
+    static thread_local std::vector<double> valScratch;
+    auto hdr = parseHeaderAndDecodeTimestamps(data, blockSize, startTime, endTime, tsScratch);
+    if (!hdr || hdr->nTimestamps == 0)
+        return 0;
+
+    valScratch.clear();
+    CompressedSlice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
+    FloatDecoder::decode(valuesSlice, hdr->nSkipped, hdr->nTimestamps, valScratch);
 
     aggregator.addPoints(tsScratch, valScratch);
     return tsScratch.size();
 }
 
-// Decode an Integer block directly into thread-local scratch buffers and fold into
-// a BlockAggregator (as double), avoiding per-block unique_ptr<TSMBlock> heap allocation.
-// Returns number of decoded points (0 on error or empty block).
-// NOTE: thread_local scratch is safe here because this function has no suspension
-// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
 static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime,
                                                uint64_t endTime, timestar::BlockAggregator& aggregator) {
-    if (blockSize < BLOCK_HEADER_SIZE)
-        return 0;
-
-    Slice blockSlice(data, blockSize);
-    auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
-    [[maybe_unused]] uint8_t blockType = headerSlice.read<uint8_t>();
-    uint32_t timestampSize = headerSlice.read<uint32_t>();
-    uint32_t timestampBytes = headerSlice.read<uint32_t>();
-
-    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
-        return 0;
-
     static thread_local std::vector<uint64_t> tsScratch;
     static thread_local std::vector<double> valScratch;
-    tsScratch.clear();
-    valScratch.clear();
-    tsScratch.reserve(timestampSize);
-
-    auto timestampsSlice = blockSlice.getSlice(timestampBytes);
-    auto [nSkipped, nTimestamps] =
-        IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
-
-    if (nTimestamps == 0)
+    auto hdr = parseHeaderAndDecodeTimestamps(data, blockSize, startTime, endTime, tsScratch);
+    if (!hdr || hdr->nTimestamps == 0)
         return 0;
 
-    if (timestampBytes + BLOCK_HEADER_SIZE > blockSize)
-        return 0;
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-
-    // Decode zigzag-encoded integers
+    // Decode zigzag-encoded integers into scratch, then convert to double for the aggregator.
     static thread_local std::vector<uint64_t> zigzagScratch;
     zigzagScratch.clear();
-    zigzagScratch.reserve(nSkipped + nTimestamps);
+    zigzagScratch.reserve(hdr->nSkipped + hdr->nTimestamps);
+    Slice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
+    IntegerEncoder::decode(valuesSlice, hdr->nSkipped + hdr->nTimestamps, zigzagScratch);
 
-    auto valuesSlice = blockSlice.getSlice(valueByteSize);
-    IntegerEncoder::decode(valuesSlice, nSkipped + nTimestamps, zigzagScratch);
-
-    // Convert zigzag int64 to double for the aggregator
-    valScratch.reserve(nTimestamps);
-    for (size_t i = nSkipped; i < zigzagScratch.size(); ++i) {
+    valScratch.clear();
+    valScratch.reserve(hdr->nTimestamps);
+    for (size_t i = hdr->nSkipped; i < zigzagScratch.size(); ++i) {
         valScratch.push_back(static_cast<double>(ZigZag::zigzagDecode(zigzagScratch[i])));
     }
 
@@ -156,48 +143,20 @@ static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blo
     return tsScratch.size();
 }
 
-// Decode a Boolean block directly into thread-local scratch buffers and fold into
-// a BlockAggregator (true=1.0, false=0.0).
-// NOTE: thread_local scratch is safe here because this function has no suspension
-// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
 static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime,
                                             uint64_t endTime, timestar::BlockAggregator& aggregator) {
-    if (blockSize < BLOCK_HEADER_SIZE)
-        return 0;
-
-    Slice blockSlice(data, blockSize);
-    auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
-    [[maybe_unused]] uint8_t blockType = headerSlice.read<uint8_t>();
-    uint32_t timestampSize = headerSlice.read<uint32_t>();
-    uint32_t timestampBytes = headerSlice.read<uint32_t>();
-
-    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
-        return 0;
-
     static thread_local std::vector<uint64_t> tsScratch;
     static thread_local std::vector<double> valScratch;
-    tsScratch.clear();
-    valScratch.clear();
-    tsScratch.reserve(timestampSize);
-
-    auto timestampsSlice = blockSlice.getSlice(timestampBytes);
-    auto [nSkipped, nTimestamps] =
-        IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
-
-    if (nTimestamps == 0)
+    auto hdr = parseHeaderAndDecodeTimestamps(data, blockSize, startTime, endTime, tsScratch);
+    if (!hdr || hdr->nTimestamps == 0)
         return 0;
 
-    if (timestampBytes + BLOCK_HEADER_SIZE > blockSize)
-        return 0;
-    size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
-
-    // Decode RLE-encoded booleans
-    auto valuesSlice = blockSlice.getSlice(valueByteSize);
     std::vector<bool> boolValues;
-    BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, boolValues);
+    Slice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
+    BoolEncoderRLE::decode(valuesSlice, hdr->nSkipped, hdr->nTimestamps, boolValues);
 
-    // Convert bools to double (1.0/0.0)
-    valScratch.reserve(nTimestamps);
+    valScratch.clear();
+    valScratch.reserve(hdr->nTimestamps);
     for (size_t i = 0; i < boolValues.size(); ++i) {
         valScratch.push_back(boolValues[i] ? 1.0 : 0.0);
     }
@@ -207,35 +166,13 @@ static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockS
 }
 
 // COUNT-only block decode: decode timestamps only, skip value decompression.
-// Folds timestamp counts into the BlockAggregator's per-bucket counters.
-// NOTE: thread_local scratch is safe here because this function has no suspension
-// points (no co_await). Adding any co_await would require switching to coroutine-local buffers.
 static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
                                    timestar::BlockAggregator& aggregator) {
-    if (blockSize < BLOCK_HEADER_SIZE)
-        return 0;
-
-    Slice blockSlice(data, blockSize);
-    auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
-    [[maybe_unused]] uint8_t blockType = headerSlice.read<uint8_t>();
-    uint32_t timestampSize = headerSlice.read<uint32_t>();
-    uint32_t timestampBytes = headerSlice.read<uint32_t>();
-
-    if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
-        return 0;
-
     static thread_local std::vector<uint64_t> tsScratch;
-    tsScratch.clear();
-    tsScratch.reserve(timestampSize);
-
-    auto timestampsSlice = blockSlice.getSlice(timestampBytes);
-    auto [nSkipped, nTimestamps] =
-        IntegerEncoder::decode(timestampsSlice, timestampSize, tsScratch, startTime, endTime);
-
-    if (nTimestamps == 0)
+    auto hdr = parseHeaderAndDecodeTimestamps(data, blockSize, startTime, endTime, tsScratch);
+    if (!hdr || hdr->nTimestamps == 0)
         return 0;
 
-    // Skip value decode entirely — only count timestamps per bucket
     aggregator.addTimestampsOnly(tsScratch);
     return tsScratch.size();
 }

@@ -190,23 +190,26 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
     }
 }
 
-// N-way heap merge for raw-value partials with mismatched timestamps.
-// O(K*N * log K) time, O(K*N) space (single output allocation).
-static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
-                               std::vector<uint64_t>& outTs, std::vector<double>& outVals,
-                               std::vector<size_t>& outCounts) {
+// Core N-way heap merge over PartialAggregationResult partials.
+//
+// `init(partial, pos)` is invoked the first time a new timestamp is seen,
+// and should produce the initial Item for that timestamp.
+// `fold(item, partial, pos)` is invoked for every subsequent duplicate
+// timestamp and should mutate `item` to absorb the duplicate.
+//
+// Pulls per-partial elements off a min-heap ordered by timestamp; same
+// semantics as the unrolled nWayMerge* variants below.
+template <class Item, class Init, class Fold>
+static void nWayHeapMerge(const std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
+                          std::vector<Item>& outItems, Init init, Fold fold) {
     const size_t K = partials.size();
 
-    // Pre-calculate total output size for single allocation
     size_t totalSize = 0;
     for (const auto* p : partials)
         totalSize += p->sortedTimestamps.size();
-
     outTs.reserve(totalSize);
-    outVals.reserve(totalSize);
-    outCounts.reserve(totalSize);
+    outItems.reserve(totalSize);
 
-    // Min-heap entry: (timestamp, partialIndex, positionInPartial)
     struct HeapEntry {
         uint64_t ts;
         size_t partialIdx;
@@ -214,19 +217,39 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
         bool operator>(const HeapEntry& o) const { return ts > o.ts; }
     };
 
-    std::vector<HeapEntry> heapVec;
-    heapVec.reserve(K);
-    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap(std::greater<HeapEntry>{},
-                                                                                         std::move(heapVec));
-
-    // Seed heap with first element from each partial
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
     for (size_t i = 0; i < K; ++i) {
         if (!partials[i]->sortedTimestamps.empty()) {
             heap.push({partials[i]->sortedTimestamps[0], i, 0});
         }
     }
 
-    auto foldDuplicate = [&](double existing, double incoming) -> double {
+    while (!heap.empty()) {
+        auto [ts, pIdx, pos] = heap.top();
+        heap.pop();
+
+        if (!outTs.empty() && outTs.back() == ts) {
+            fold(outItems.back(), *partials[pIdx], pos);
+        } else {
+            outTs.push_back(ts);
+            outItems.push_back(init(*partials[pIdx], pos));
+        }
+
+        const size_t nextPos = pos + 1;
+        if (nextPos < partials[pIdx]->sortedTimestamps.size()) {
+            heap.push({partials[pIdx]->sortedTimestamps[nextPos], pIdx, nextPos});
+        }
+    }
+}
+
+// N-way heap merge for raw-value partials with mismatched timestamps.
+// On duplicate timestamps the value is folded per `method`; outCounts tracks
+// how many partials contributed at each output timestamp.
+static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
+                               std::vector<uint64_t>& outTs, std::vector<double>& outVals,
+                               std::vector<size_t>& outCounts) {
+    outCounts.reserve(outTs.capacity());
+    auto foldDuplicate = [method](double existing, double incoming) -> double {
         switch (method) {
             case AggregationMethod::AVG:
             case AggregationMethod::SUM:
@@ -238,87 +261,46 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
                 return std::max(existing, incoming);
             case AggregationMethod::LATEST:
             case AggregationMethod::FIRST:
-                return existing;
-            // These methods require full AggregationState; should not reach here.
             case AggregationMethod::SPREAD:
             case AggregationMethod::STDDEV:
             case AggregationMethod::STDVAR:
             case AggregationMethod::MEDIAN:
             case AggregationMethod::EXACT_MEDIAN:
+                // These either preserve the existing value (LATEST/FIRST) or
+                // require AggregationState and shouldn't have reached this path
+                // (the latter group). Behaviour preserved from the original
+                // unrolled implementation.
                 return existing;
             default:
                 return existing;
         }
     };
-
-    while (!heap.empty()) {
-        auto [ts, pIdx, pos] = heap.top();
-        heap.pop();
-
-        double val = partials[pIdx]->sortedValues[pos];
-
-        // Fold duplicate timestamps
-        if (!outTs.empty() && outTs.back() == ts) {
-            outVals.back() = foldDuplicate(outVals.back(), val);
-            outCounts.back()++;
-        } else {
-            outTs.push_back(ts);
-            outVals.push_back(val);
+    nWayHeapMerge<double>(
+        partials, outTs, outVals,
+        [&](const PartialAggregationResult& p, size_t pos) {
             outCounts.push_back(1);
-        }
-
-        // Advance this partial's cursor
-        size_t nextPos = pos + 1;
-        if (nextPos < partials[pIdx]->sortedTimestamps.size()) {
-            heap.push({partials[pIdx]->sortedTimestamps[nextPos], pIdx, nextPos});
-        }
-    }
+            return p.sortedValues[pos];
+        },
+        [&](double& item, const PartialAggregationResult& p, size_t pos) {
+            item = foldDuplicate(item, p.sortedValues[pos]);
+            outCounts.back()++;
+        });
 }
 
 // N-way heap merge for AggregationState partials.
-// O(K*N * log K) time, single pass.
 static void nWayMergeStates(std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
                             std::vector<AggregationState>& outStates, AggregationMethod method) {
-    const size_t K = partials.size();
-
-    size_t totalSize = 0;
-    for (const auto* p : partials)
-        totalSize += p->sortedTimestamps.size();
-
-    outTs.reserve(totalSize);
-    outStates.reserve(totalSize);
-
-    struct HeapEntry {
-        uint64_t ts;
-        size_t partialIdx;
-        size_t pos;
-        bool operator>(const HeapEntry& o) const { return ts > o.ts; }
-    };
-
-    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
-
-    for (size_t i = 0; i < K; ++i) {
-        if (!partials[i]->sortedTimestamps.empty()) {
-            heap.push({partials[i]->sortedTimestamps[0], i, 0});
-        }
-    }
-
-    while (!heap.empty()) {
-        auto [ts, pIdx, pos] = heap.top();
-        heap.pop();
-
-        if (!outTs.empty() && outTs.back() == ts) {
-            outStates.back().mergeForMethod(std::move(partials[pIdx]->sortedStates[pos]), method);
-        } else {
-            outTs.push_back(ts);
-            outStates.push_back(std::move(partials[pIdx]->sortedStates[pos]));
-        }
-
-        size_t nextPos = pos + 1;
-        if (nextPos < partials[pIdx]->sortedTimestamps.size()) {
-            heap.push({partials[pIdx]->sortedTimestamps[nextPos], pIdx, nextPos});
-        }
-    }
+    nWayHeapMerge<AggregationState>(
+        partials, outTs, outStates,
+        [](const PartialAggregationResult& p, size_t pos) {
+            // The original implementation moved out of partials[pIdx]->sortedStates[pos];
+            // const_cast preserves that semantic (callers don't reuse the partials
+            // after merge).
+            return std::move(const_cast<PartialAggregationResult&>(p).sortedStates[pos]);
+        },
+        [method](AggregationState& item, const PartialAggregationResult& p, size_t pos) {
+            item.mergeForMethod(std::move(const_cast<PartialAggregationResult&>(p).sortedStates[pos]), method);
+        });
 }
 
 std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
