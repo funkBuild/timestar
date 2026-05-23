@@ -167,6 +167,11 @@ private:
         }
     };
 
+    // Move a coalesce candidate's typed value vector into a FieldArrays, setting
+    // the matching type tag. Shared by the three coalesce-emit sites in
+    // coalesceWrites(). The candidate's value vectors are dead afterward.
+    static FieldArrays candidateToFieldArrays(CoalesceCandidate& candidate);
+
     // Structure to collect timing information across all operations
     struct AggregatedTimingInfo {
         std::chrono::microseconds totalCompressionTime = std::chrono::microseconds(0);
@@ -189,6 +194,24 @@ private:
     // Helper struct for metadata operations (deduplication across batch).
     // Aliases MetadataOp from index_backend.hpp for batch indexing compatibility.
     using MetaOp = MetadataOp;
+
+    // Insert each non-empty typed batch into `engine`, aggregating WAL timing.
+    // Shared body of the per-shard insert dispatch (JSON + protobuf paths).
+    static seastar::future<AggregatedTimingInfo> insertAllTypes(Engine& engine,
+                                                                std::vector<TimeStarInsert<double>> doubles,
+                                                                std::vector<TimeStarInsert<bool>> bools,
+                                                                std::vector<TimeStarInsert<std::string>> strings,
+                                                                std::vector<TimeStarInsert<int64_t>> integers);
+
+    // Dispatch a shard's grouped typed inserts: a direct local call when `shard`
+    // is the current shard (avoids the cross-shard message queue — the hot-path
+    // fast path), otherwise invoke_on. Used by both write paths.
+    static seastar::future<AggregatedTimingInfo> dispatchShardInserts(seastar::sharded<Engine>* engineSharded,
+                                                                      unsigned shard,
+                                                                      std::vector<TimeStarInsert<double>> doubles,
+                                                                      std::vector<TimeStarInsert<bool>> bools,
+                                                                      std::vector<TimeStarInsert<std::string>> strings,
+                                                                      std::vector<TimeStarInsert<int64_t>> integers);
 
     // Parse a single write point from JSON string.
     // Parse a write point that may contain arrays.

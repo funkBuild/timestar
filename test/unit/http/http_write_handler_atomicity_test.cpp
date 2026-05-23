@@ -93,9 +93,12 @@ TEST_F(HttpWriteHandlerAtomicityTest, BatchPathDataBeforeMetadata) {
     }
     std::string batchBody = sourceCode.substr(funcStart, pos - funcStart);
 
-    // Should contain insertBatch (data insertion)
-    EXPECT_NE(batchBody.find("insertBatch"), std::string::npos)
-        << "processMultiWritePoint should call insertBatch for data insertion";
+    // Should perform data insertion. The per-shard insert dispatch (and the
+    // Engine::insertBatch calls) was extracted into the dispatchShardInserts()
+    // helper; accept either the helper call or a direct insertBatch.
+    EXPECT_TRUE(batchBody.find("dispatchShardInserts") != std::string::npos ||
+                batchBody.find("insertBatch") != std::string::npos)
+        << "processMultiWritePoint should dispatch data inserts (dispatchShardInserts/insertBatch)";
 
     // Should NOT directly call indexMetadata - metadata is deferred to caller
     EXPECT_EQ(batchBody.find("indexMetadata"), std::string::npos)

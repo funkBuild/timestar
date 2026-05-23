@@ -500,6 +500,57 @@ bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t 
     return true;
 }
 
+seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::insertAllTypes(
+    Engine& engine, std::vector<TimeStarInsert<double>> doubles, std::vector<TimeStarInsert<bool>> bools,
+    std::vector<TimeStarInsert<std::string>> strings, std::vector<TimeStarInsert<int64_t>> integers) {
+    AggregatedTimingInfo batchTiming;
+    if (!doubles.empty())
+        batchTiming.aggregate(co_await engine.insertBatch(std::move(doubles)));
+    if (!bools.empty())
+        batchTiming.aggregate(co_await engine.insertBatch(std::move(bools)));
+    if (!strings.empty())
+        batchTiming.aggregate(co_await engine.insertBatch(std::move(strings)));
+    if (!integers.empty())
+        batchTiming.aggregate(co_await engine.insertBatch(std::move(integers)));
+    co_return batchTiming;
+}
+
+seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::dispatchShardInserts(
+    seastar::sharded<Engine>* engineSharded, unsigned shard, std::vector<TimeStarInsert<double>> doubles,
+    std::vector<TimeStarInsert<bool>> bools, std::vector<TimeStarInsert<std::string>> strings,
+    std::vector<TimeStarInsert<int64_t>> integers) {
+    // Local shard: direct call, avoiding cross-shard message-queue overhead.
+    if (shard == seastar::this_shard_id()) {
+        return insertAllTypes(engineSharded->local(), std::move(doubles), std::move(bools), std::move(strings),
+                              std::move(integers));
+    }
+    // Remote shard: copy the (moved-in) batches across via invoke_on.
+    return engineSharded->invoke_on(
+        shard, [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
+                integers = std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
+            return insertAllTypes(engine, std::move(doubles), std::move(bools), std::move(strings),
+                                  std::move(integers));
+        });
+}
+
+HttpWriteHandler::FieldArrays HttpWriteHandler::candidateToFieldArrays(CoalesceCandidate& candidate) {
+    FieldArrays fa;
+    fa.type = (candidate.valueType == TSMValueType::Float)     ? FieldArrays::DOUBLE
+              : (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL
+              : (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER
+                                                               : FieldArrays::STRING;
+    if (candidate.valueType == TSMValueType::Float) {
+        fa.doubles = std::move(candidate.doubleValues);
+    } else if (candidate.valueType == TSMValueType::Boolean) {
+        fa.bools = std::move(candidate.boolValues);
+    } else if (candidate.valueType == TSMValueType::Integer) {
+        fa.integers = std::move(candidate.integerValues);
+    } else {
+        fa.strings = std::move(candidate.stringValues);
+    }
+    return fa;
+}
+
 std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs, size_t& entriesSkippedOut) {
     // Configuration constants
@@ -926,23 +977,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 mwp.tags = *candidate.sharedTags;
                 mwp.timestamps = std::move(candidate.timestamps);
 
-                FieldArrays fa;
-                fa.type = (candidate.valueType == TSMValueType::Float)     ? FieldArrays::DOUBLE
-                          : (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL
-                          : (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER
-                                                                           : FieldArrays::STRING;
-
-                if (candidate.valueType == TSMValueType::Float) {
-                    fa.doubles = std::move(candidate.doubleValues);
-                } else if (candidate.valueType == TSMValueType::Boolean) {
-                    fa.bools = std::move(candidate.boolValues);
-                } else if (candidate.valueType == TSMValueType::Integer) {
-                    fa.integers = std::move(candidate.integerValues);
-                } else {
-                    fa.strings = std::move(candidate.stringValues);
-                }
-
-                mwp.fields[candidate.fieldName] = std::move(fa);
+                mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
                 result.push_back(std::move(mwp));
                 processedSeriesKeys.insert(seriesKey);
             }
@@ -960,24 +995,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         for (const auto& seriesKey : seriesKeys) {
             auto& candidate = candidates[seriesKey];
 
-            FieldArrays fa;
-            fa.type = (candidate.valueType == TSMValueType::Float)     ? FieldArrays::DOUBLE
-                      : (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL
-                      : (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER
-                                                                       : FieldArrays::STRING;
-
-            // Simple assignment without complex sorting
-            if (candidate.valueType == TSMValueType::Float) {
-                fa.doubles = std::move(candidate.doubleValues);
-            } else if (candidate.valueType == TSMValueType::Boolean) {
-                fa.bools = std::move(candidate.boolValues);
-            } else if (candidate.valueType == TSMValueType::Integer) {
-                fa.integers = std::move(candidate.integerValues);
-            } else {
-                fa.strings = std::move(candidate.stringValues);
-            }
-
-            mwp.fields[candidate.fieldName] = std::move(fa);
+            mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
             processedSeriesKeys.insert(seriesKey);  // Mark this series as processed
         }
 
@@ -1000,23 +1018,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         mwp.tags = *candidate.sharedTags;
         mwp.timestamps = std::move(candidate.timestamps);
 
-        FieldArrays fa;
-        fa.type = (candidate.valueType == TSMValueType::Float)     ? FieldArrays::DOUBLE
-                  : (candidate.valueType == TSMValueType::Boolean) ? FieldArrays::BOOL
-                  : (candidate.valueType == TSMValueType::Integer) ? FieldArrays::INTEGER
-                                                                   : FieldArrays::STRING;
-
-        if (candidate.valueType == TSMValueType::Float) {
-            fa.doubles = std::move(candidate.doubleValues);
-        } else if (candidate.valueType == TSMValueType::Boolean) {
-            fa.bools = std::move(candidate.boolValues);
-        } else if (candidate.valueType == TSMValueType::Integer) {
-            fa.integers = std::move(candidate.integerValues);
-        } else {
-            fa.strings = std::move(candidate.stringValues);
-        }
-
-        mwp.fields[candidate.fieldName] = std::move(fa);
+        mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
         result.push_back(std::move(mwp));
     }
 
@@ -1271,69 +1273,8 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
         auto strings = std::move(shardStringInserts[shard]);
         auto integers = std::move(shardIntegerInserts[shard]);
 
-        // Lambda that inserts all types into the given engine
-        auto doInserts = [](Engine& engine, auto doubles, auto bools, auto strings,
-                            auto integers) mutable -> seastar::future<AggregatedTimingInfo> {
-            AggregatedTimingInfo batchTiming;
-
-            if (!doubles.empty()) {
-                auto walTiming = co_await engine.insertBatch(std::move(doubles));
-                batchTiming.aggregate(walTiming);
-            }
-
-            if (!bools.empty()) {
-                auto walTiming = co_await engine.insertBatch(std::move(bools));
-                batchTiming.aggregate(walTiming);
-            }
-
-            if (!strings.empty()) {
-                auto walTiming = co_await engine.insertBatch(std::move(strings));
-                batchTiming.aggregate(walTiming);
-            }
-
-            if (!integers.empty()) {
-                auto walTiming = co_await engine.insertBatch(std::move(integers));
-                batchTiming.aggregate(walTiming);
-            }
-
-            co_return batchTiming;
-        };
-
-        // Local shard: call engine directly, avoiding cross-shard message queue overhead
-        if (shard == seastar::this_shard_id()) {
-            shardFutures.push_back(doInserts(engineSharded->local(), std::move(doubles), std::move(bools),
-                                             std::move(strings), std::move(integers)));
-        } else {
-            // Remote shard: use invoke_on
-            shardFutures.push_back(engineSharded->invoke_on(
-                shard,
-                [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
-                 integers = std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
-                    AggregatedTimingInfo batchTiming;
-
-                    if (!doubles.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(doubles));
-                        batchTiming.aggregate(walTiming);
-                    }
-
-                    if (!bools.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(bools));
-                        batchTiming.aggregate(walTiming);
-                    }
-
-                    if (!strings.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(strings));
-                        batchTiming.aggregate(walTiming);
-                    }
-
-                    if (!integers.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(integers));
-                        batchTiming.aggregate(walTiming);
-                    }
-
-                    co_return batchTiming;
-                }));
-        }
+        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(doubles), std::move(bools),
+                                                    std::move(strings), std::move(integers)));
     }
 
     // Wait for all shard operations to complete in parallel
@@ -1579,57 +1520,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                 auto strings = std::move(shardStringInserts[shard]);
                 auto integers = std::move(shardIntegerInserts[shard]);
 
-                auto doInserts = [](Engine& engine, auto doubles, auto bools, auto strings,
-                                    auto integers) mutable -> seastar::future<AggregatedTimingInfo> {
-                    AggregatedTimingInfo batchTiming;
-                    if (!doubles.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(doubles));
-                        batchTiming.aggregate(walTiming);
-                    }
-                    if (!bools.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(bools));
-                        batchTiming.aggregate(walTiming);
-                    }
-                    if (!strings.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(strings));
-                        batchTiming.aggregate(walTiming);
-                    }
-                    if (!integers.empty()) {
-                        auto walTiming = co_await engine.insertBatch(std::move(integers));
-                        batchTiming.aggregate(walTiming);
-                    }
-                    co_return batchTiming;
-                };
-
-                if (shard == seastar::this_shard_id()) {
-                    shardFutures.push_back(doInserts(engineSharded->local(), std::move(doubles), std::move(bools),
-                                                     std::move(strings), std::move(integers)));
-                } else {
-                    shardFutures.push_back(engineSharded->invoke_on(
-                        shard,
-                        [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
-                         integers =
-                             std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
-                            AggregatedTimingInfo batchTiming;
-                            if (!doubles.empty()) {
-                                auto walTiming = co_await engine.insertBatch(std::move(doubles));
-                                batchTiming.aggregate(walTiming);
-                            }
-                            if (!bools.empty()) {
-                                auto walTiming = co_await engine.insertBatch(std::move(bools));
-                                batchTiming.aggregate(walTiming);
-                            }
-                            if (!strings.empty()) {
-                                auto walTiming = co_await engine.insertBatch(std::move(strings));
-                                batchTiming.aggregate(walTiming);
-                            }
-                            if (!integers.empty()) {
-                                auto walTiming = co_await engine.insertBatch(std::move(integers));
-                                batchTiming.aggregate(walTiming);
-                            }
-                            co_return batchTiming;
-                        }));
-                }
+                shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(doubles),
+                                                            std::move(bools), std::move(strings),
+                                                            std::move(integers)));
             }
 
             if (!shardFutures.empty()) {

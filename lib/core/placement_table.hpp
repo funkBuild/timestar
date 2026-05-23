@@ -27,8 +27,16 @@ public:
     // Virtual shard number (for serialization / Phase 6)
     static uint16_t vshardForHash(size_t hash) { return static_cast<uint16_t>(hash & VIRTUAL_SHARD_MASK); }
 
-    // Access the mapping table
-    const VShardMapping& mapping(uint16_t vshard) const { return table_[vshard]; }
+    // Virtual-shard -> mapping. Single-server round-robin (serverId 0,
+    // coreId = vshard % coreCount), derived on the fly. Previously this was a
+    // materialised std::array<VShardMapping, 4096> (16 KB/shard) that the hot
+    // router (coreForHash) never read — it routes by hash % coreCount directly.
+    // Deriving here drops the dead 16 KB while preserving the (round-robin)
+    // mapping semantics and JSON format. Phase 6 (per-vshard serverId) would
+    // reintroduce a stored table behind this same accessor.
+    VShardMapping mapping(uint16_t vshard) const {
+        return VShardMapping{0, coreCount_ ? static_cast<uint16_t>(vshard % coreCount_) : uint16_t{0}};
+    }
 
     // JSON serialization
     std::string toJson() const;
@@ -37,7 +45,6 @@ public:
 private:
     unsigned coreCount_ = 0;
     unsigned coreMask_ = 0;  // (coreCount_ - 1) when power-of-2, else 0
-    std::array<VShardMapping, VIRTUAL_SHARD_COUNT> table_{};
 };
 
 // Global singleton — set once before app.run(), read from any shard.

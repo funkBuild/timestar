@@ -48,10 +48,6 @@ PlacementTable PlacementTable::buildLocal(unsigned coreCount) {
     pt.coreCount_ = coreCount;
     // Cache power-of-2 mask for fast routing (bitwise AND vs modulo)
     pt.coreMask_ = (coreCount > 1 && (coreCount & (coreCount - 1)) == 0) ? (coreCount - 1) : 0;
-    for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
-        pt.table_[i].serverId = 0;
-        pt.table_[i].coreId = coreCount > 0 ? static_cast<uint16_t>(i % coreCount) : 0;
-    }
     return pt;
 }
 
@@ -87,14 +83,16 @@ struct glz::meta<PlacementJson> {
 namespace timestar {
 
 std::string PlacementTable::toJson() const {
+    // Serialize the derived round-robin mapping (matches mapping()). The full
+    // per-vshard arrays are retained in the JSON format for forward-compat with
+    // Phase 6 (per-vshard serverId), even though they are currently derivable.
     PlacementJson pj;
     pj.coreCount = coreCount_;
     pj.virtualShardCount = VIRTUAL_SHARD_COUNT;
-    pj.serverIds.resize(VIRTUAL_SHARD_COUNT);
+    pj.serverIds.assign(VIRTUAL_SHARD_COUNT, 0);
     pj.coreIds.resize(VIRTUAL_SHARD_COUNT);
     for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
-        pj.serverIds[i] = table_[i].serverId;
-        pj.coreIds[i] = table_[i].coreId;
+        pj.coreIds[i] = mapping(i).coreId;
     }
     return glz::write_json(pj).value_or("{}");
 }
@@ -119,15 +117,14 @@ PlacementTable PlacementTable::fromJson(const std::string& data) {
     PlacementTable pt;
     pt.coreCount_ = pj.coreCount;
     pt.coreMask_ = (pj.coreCount > 1 && (pj.coreCount & (pj.coreCount - 1)) == 0) ? (pj.coreCount - 1) : 0;
-    pt.table_.fill(VShardMapping{});
+    // Validate the on-disk coreIds are in range (routing derives the mapping
+    // from coreCount, so the per-vshard arrays are not stored — see mapping()).
     size_t count = std::min({pj.serverIds.size(), pj.coreIds.size(), static_cast<size_t>(VIRTUAL_SHARD_COUNT)});
     for (size_t i = 0; i < count; ++i) {
         if (pj.coreIds[i] >= pj.coreCount) {
             throw std::runtime_error("PlacementTable: coreId " + std::to_string(pj.coreIds[i]) + " >= coreCount " +
                                      std::to_string(pj.coreCount) + " at vshard " + std::to_string(i));
         }
-        pt.table_[i].serverId = pj.serverIds[i];
-        pt.table_[i].coreId = pj.coreIds[i];
     }
     return pt;
 }
