@@ -9,10 +9,12 @@
 // IMPORTANT: The proto package is "timestar", generating classes in ::timestar::,
 // which collides with the project's own ::timestar:: namespace.  To avoid ODR
 // violations, this header does NOT include timestar.pb.h and does NOT include
-// any internal headers that define conflicting types (e.g. QueryResponse,
-// StreamingBatch, SubscriptionStats).  Instead, all converter parameters use
-// lightweight intermediate structs defined here that can be trivially constructed
-// from either side.
+// any internal headers that define conflicting CLASS types (e.g. QueryResponse,
+// StreamingBatch, SubscriptionStats).  Type aliases and POD structs that do
+// not share names with proto-generated classes (e.g. lib/core/field_values.hpp,
+// which only defines FieldArrays + a std::variant alias) are safe to include.
+
+#include "field_values.hpp"
 
 #include <climits>
 #include <cstddef>
@@ -36,14 +38,10 @@ namespace timestar::proto {
 // Intermediate types for converters (no proto/internal header dependency)
 // ============================================================================
 
-// Mirrors HttpWriteHandler::FieldArrays
-struct FieldArrays {
-    std::vector<double> doubles;
-    std::vector<uint8_t> bools;
-    std::vector<std::string> strings;
-    std::vector<int64_t> integers;
-    enum Type { DOUBLE, BOOL, STRING, INTEGER } type;
-};
+// FieldArrays and FieldValues are the canonical timestar:: types — re-exported
+// into timestar::proto so existing qualified call sites continue to resolve.
+using ::timestar::FieldArrays;
+using ::timestar::FieldValues;
 
 // Mirrors HttpWriteHandler::MultiWritePoint
 struct MultiWritePoint {
@@ -52,10 +50,6 @@ struct MultiWritePoint {
     std::map<std::string, FieldArrays> fields;
     std::vector<uint64_t> timestamps;
 };
-
-// Variant for per-field typed values
-using FieldValues =
-    std::variant<std::vector<double>, std::vector<bool>, std::vector<std::string>, std::vector<int64_t>>;
 
 // Mirrors timestar::SeriesResult
 struct SeriesResultData {

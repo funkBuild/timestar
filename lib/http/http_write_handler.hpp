@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine.hpp"
+#include "field_values.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
@@ -86,16 +87,13 @@ public:
     // Field value variant for flexible JSON parsing (public for validation API)
     using FieldValue = std::variant<double, bool, std::string, int64_t>;
 
+    // Canonical FieldArrays lives in lib/core/field_values.hpp (shared with
+    // query handler and proto converters). Re-export under the private-name
+    // alias so existing FieldArrays references in this header / .cpp resolve.
+    using FieldArrays = timestar::FieldArrays;
+
 private:
     seastar::sharded<Engine>* engineSharded;
-
-    struct FieldArrays {
-        std::vector<double> doubles;
-        std::vector<uint8_t> bools;
-        std::vector<std::string> strings;
-        std::vector<int64_t> integers;
-        enum Type { DOUBLE, BOOL, STRING, INTEGER } type;
-    };
 
     struct MultiWritePoint {
         std::string measurement;

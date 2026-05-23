@@ -57,6 +57,7 @@ target_include_directories(libtimestar PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/index
     ${CMAKE_CURRENT_SOURCE_DIR}/index/native
     ${CMAKE_CURRENT_SOURCE_DIR}/http
+    ${CMAKE_CURRENT_SOURCE_DIR}/cluster
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/retention
     ${CMAKE_CURRENT_SOURCE_DIR}/config
@@ -76,6 +77,7 @@ add_library(libtimestar_proto_conv STATIC
 target_link_libraries(libtimestar_proto_conv PRIVATE timestar_proto)
 target_include_directories(libtimestar_proto_conv PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/http
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/encoding
     ${CMAKE_CURRENT_SOURCE_DIR}/storage
     ${CMAKE_CURRENT_SOURCE_DIR}/encoding/integer

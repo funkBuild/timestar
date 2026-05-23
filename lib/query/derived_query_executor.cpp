@@ -284,7 +284,7 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
 seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std::string& name,
                                                                       const QueryRequest& query) {
     // Create a query handler to execute the sub-query
-    HttpQueryHandler handler(engine_, index_);
+    HttpQueryHandler handler(engine_);
 
     auto response = co_await handler.executeQuery(query);
 

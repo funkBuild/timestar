@@ -5,6 +5,7 @@
 #include "logger.hpp"
 #include "placement_table.hpp"
 #include "proto_converters.hpp"
+#include "scatter_gather.hpp"
 #include "series_key.hpp"
 
 #include <seastar/core/smp.hh>
@@ -398,28 +399,24 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
 
             auto sharedReq = std::make_shared<const Engine::DeleteRequest>(std::move(engineReq));
 
-            // Scatter to every shard, collect into one ShardResult.
-            std::vector<seastar::future<Engine::DeleteResult>> scatterFutures;
-            for (unsigned s = 0; s < seastar::smp::count; ++s) {
-                scatterFutures.push_back(
-                    engineSharded->invoke_on(s, [sharedReq](Engine& engine) -> seastar::future<Engine::DeleteResult> {
+            // Scatter to every shard, fold per-shard DeleteResults into one ShardResult.
+            allFutures.push_back(
+                timestar::cluster::scatterAll(
+                    *engineSharded,
+                    [sharedReq](Engine& engine) -> seastar::future<Engine::DeleteResult> {
                         co_return co_await engine.deleteByPattern(*sharedReq);
+                    })
+                    .then([](std::vector<Engine::DeleteResult> results) -> ShardResult {
+                        uint64_t deleted = 0;
+                        std::vector<std::string> names;
+                        for (auto& r : results) {
+                            deleted += r.seriesDeleted;
+                            for (auto& s : r.deletedSeries) {
+                                names.push_back(std::move(s));
+                            }
+                        }
+                        return ShardResult{deleted, std::move(names)};
                     }));
-            }
-
-            // Wrap the scatter-gather into a single ShardResult future.
-            allFutures.push_back(seastar::when_all_succeed(scatterFutures.begin(), scatterFutures.end())
-                                     .then([](std::vector<Engine::DeleteResult> results) -> ShardResult {
-                                         uint64_t deleted = 0;
-                                         std::vector<std::string> names;
-                                         for (auto& r : results) {
-                                             deleted += r.seriesDeleted;
-                                             for (auto& s : r.deletedSeries) {
-                                                 names.push_back(std::move(s));
-                                             }
-                                         }
-                                         return ShardResult{deleted, std::move(names)};
-                                     }));
         }
 
         // --- Await all parallel work and merge results ---

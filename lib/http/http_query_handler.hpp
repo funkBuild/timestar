@@ -12,9 +12,10 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/http/function_handlers.hh>
+#include "field_values.hpp"
+
 #include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
-#include <variant>
 
 // Forward declaration
 class Engine;
@@ -26,10 +27,6 @@ namespace timestar {
 
 // Forward declaration for finalizeSingleShardPartials
 struct PartialAggregationResult;
-
-// Variant type for field values - can be double, bool, string, or int64
-using FieldValues =
-    std::variant<std::vector<double>, std::vector<bool>, std::vector<std::string>, std::vector<int64_t>>;
 
 struct SeriesResult {
     std::string measurement;
