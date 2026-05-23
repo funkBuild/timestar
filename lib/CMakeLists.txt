@@ -44,6 +44,10 @@ message(STATUS "Found xxHash: ${XXHASH_LIBRARY}")
 
 add_library(libtimestar STATIC ${SRC_FILES})
 target_compile_options(libtimestar PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference -Wformat=2)
+
+# Precompiled header: parse the heavy Seastar-core + common-STL headers once
+# instead of in every TU. See lib/pch.hpp for what's in (and deliberately out).
+target_precompile_headers(libtimestar PRIVATE pch.hpp)
 target_link_libraries(libtimestar Threads::Threads Seastar::seastar libzstd_static glaze::glaze ${XXHASH_LIBRARY} hwy roaring)
 
 # Include both the lib directory and all subdirectories for header resolution

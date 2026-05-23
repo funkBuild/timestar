@@ -103,6 +103,17 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ──────────────── compatibility floor for vendored dependencies ──────────────
+# Some bundled/fetched dependencies (e.g. Tessil/robin-map) still declare
+# `cmake_minimum_required(VERSION <3.5)`, which CMake ≥ 4.0 rejects outright.
+# Raise the effective policy floor to 3.5 so those subprojects configure
+# without requiring a manual -DCMAKE_POLICY_VERSION_MINIMUM=3.5 on the command
+# line. Only affects subprojects that ask for less than 3.5; ours stays at 3.20.
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING
+      "Minimum CMake policy version for legacy vendored dependencies")
+endif()
+
 # ───────────────────────────── build external Seastar ─────────────────────────
 
 add_subdirectory(external/seastar)
