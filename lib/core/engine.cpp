@@ -621,14 +621,10 @@ seastar::future<bool> Engine::deleteRangeImpl(std::string seriesKey, uint64_t st
     // Compute SeriesId128 once for all lookups (avoids redundant XXH3 hashes)
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    // Check if the series exists in memory stores BEFORE deleting
-    bool existsInMemory = false;
-    if (walFileManager.queryMemoryStores<double>(seriesId).has_value() ||
-        walFileManager.queryMemoryStores<bool>(seriesId).has_value() ||
-        walFileManager.queryMemoryStores<std::string>(seriesId).has_value() ||
-        walFileManager.queryMemoryStores<int64_t>(seriesId).has_value()) {
-        existsInMemory = true;
-    }
+    // Check if the series exists in memory stores BEFORE deleting.
+    // getSeriesType is type-agnostic and scans the memory stores once, replacing
+    // the previous four type-templated queryMemoryStores<T> passes.
+    bool existsInMemory = walFileManager.getSeriesType(seriesId).has_value();
 
     // Delete from memory stores and write to WAL
     co_await walFileManager.deleteFromMemoryStores(seriesKey, startTime, endTime);
