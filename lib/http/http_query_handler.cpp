@@ -13,6 +13,7 @@
 #include "query_runner.hpp"
 #include "response_formatter.hpp"
 #include "series_key.hpp"
+#include "series_matcher.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -745,6 +746,20 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
         if (shardCount == 0)
             shardCount = 1;
 
+        // Split scopes into exact-match (drives the postings-bitmap intersect in
+        // the index) and pattern (wildcard / ~regex / /regex/) scopes. Pattern
+        // scopes cannot be looked up as literal bitmap keys — doing so returns
+        // zero series — so they are applied as a post-filter on resolved series
+        // metadata via SeriesMatcher. The index discovery only sees exactScopes.
+        std::map<std::string, std::string> exactScopes;
+        std::map<std::string, std::string> patternScopes;
+        for (const auto& [k, v] : request.scopes) {
+            if (SeriesMatcher::classifyScope(v) == ScopeMatchType::EXACT)
+                exactScopes.emplace(k, v);
+            else
+                patternScopes.emplace(k, v);
+        }
+
         // Fan out discovery to all shards in parallel
         std::vector<seastar::future<std::pair<unsigned, PerShardDiscovery>>> discoveryFutures;
         discoveryFutures.reserve(shardCount);
@@ -752,7 +767,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             auto f =
                 engineSharded
                     ->invoke_on(s,
-                                [measurement = request.measurement, scopes = request.scopes, fields = request.fields,
+                                [measurement = request.measurement, scopes = exactScopes,
+                                 patternScopes = patternScopes, fields = request.fields,
                                  startTime = request.startTime, endTime = request.endTime,
                                  maxSeries = maxSeriesCount()](Engine& engine) -> seastar::future<PerShardDiscovery> {
                                     auto& index = engine.getIndex();
@@ -796,6 +812,11 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                     result.contexts.reserve(swmPtr->size());
 
                                     for (const auto& swm : *swmPtr) {
+                                        // Apply wildcard/regex scopes that the bitmap intersect could not.
+                                        if (!patternScopes.empty() &&
+                                            !SeriesMatcher::matches(swm.metadata.tags, patternScopes)) {
+                                            continue;
+                                        }
                                         SeriesQueryContext ctx;
                                         ctx.seriesKey = buildSeriesKey(swm.metadata.measurement, swm.metadata.tags,
                                                                        swm.metadata.field);

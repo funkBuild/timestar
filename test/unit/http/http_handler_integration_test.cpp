@@ -439,6 +439,71 @@ TEST_F(HttpHandlerIntegrationTest, WriteMultipleSeriesThenQuery) {
         .get();
 }
 
+// Regression: wildcard/regex query SCOPES must filter series, not be treated as
+// literal tag values. Before the fix, {host:server-*} produced a postings-bitmap
+// lookup for the literal value "server-*" (which never exists) and returned zero
+// series. This exercises the actual query path (handleQuery), which earlier tests
+// never did for wildcard scopes — they called SeriesMatcher::matches() directly.
+TEST_F(HttpHandlerIntegrationTest, WriteThenQueryWithWildcardScope) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        auto writeReq = makeWriteRequest(R"({
+            "writes": [
+                {"measurement": "wc_metric", "tags": {"host": "server-01"}, "fields": {"value": 1.0}, "timestamp": 1000000000},
+                {"measurement": "wc_metric", "tags": {"host": "server-02"}, "fields": {"value": 2.0}, "timestamp": 1000000000},
+                {"measurement": "wc_metric", "tags": {"host": "web-01"},    "fields": {"value": 9.0}, "timestamp": 1000000000}
+            ]
+        })");
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep)) << "Write failed: " << writeRep->_content;
+
+        // Exact-scope control: {host:server-01} returns exactly one series.
+        {
+            auto req = makeQueryRequest("max:wc_metric(value){host:server-01} by {host}", 0, 2000000000);
+            auto rep = queryHandler.handleQuery(std::move(req)).get();
+            ASSERT_TRUE(isOk(*rep)) << "Exact query failed: " << rep->_content;
+            glz::generic parsed;
+            ASSERT_FALSE(glz::read_json(parsed, rep->_content));
+            auto& stats = parsed.get<glz::generic::object_t>()["statistics"].get<glz::generic::object_t>();
+            EXPECT_EQ(stats["series_count"].get<double>(), 1.0) << rep->_content;
+        }
+
+        // Wildcard scope: {host:server-*} must match server-01 and server-02 only.
+        {
+            auto req = makeQueryRequest("max:wc_metric(value){host:server-*} by {host}", 0, 2000000000);
+            auto rep = queryHandler.handleQuery(std::move(req)).get();
+            ASSERT_TRUE(isOk(*rep)) << "Wildcard query failed: " << rep->_content;
+            glz::generic parsed;
+            ASSERT_FALSE(glz::read_json(parsed, rep->_content));
+            auto& obj = parsed.get<glz::generic::object_t>();
+            auto& stats = obj["statistics"].get<glz::generic::object_t>();
+            EXPECT_EQ(stats["series_count"].get<double>(), 2.0)
+                << "wildcard scope {host:server-*} should match server-01 and server-02: " << rep->_content;
+
+            // Verify the matched hosts are the server-* ones, not web-01.
+            // The response emits group tags as a "groupTags" array of "key=value" strings.
+            std::set<std::string> hosts;
+            for (auto& s : obj["series"].get<glz::generic::array_t>()) {
+                auto& gt = s.get<glz::generic::object_t>()["groupTags"].get<glz::generic::array_t>();
+                for (auto& kv : gt) {
+                    const std::string& pair = kv.get<std::string>();
+                    if (pair.rfind("host=", 0) == 0)
+                        hosts.insert(pair.substr(5));
+                }
+            }
+            EXPECT_TRUE(hosts.count("server-01") && hosts.count("server-02")) << rep->_content;
+            EXPECT_FALSE(hosts.count("web-01")) << "web-01 must not match server-*: " << rep->_content;
+        }
+    })
+        .join()
+        .get();
+}
+
 TEST_F(HttpHandlerIntegrationTest, WriteThenQueryWithTimeFilter) {
     seastar::thread([] {
         ScopedShardedEngine eng;
