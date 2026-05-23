@@ -2448,20 +2448,10 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
     fieldTypeCacheKey.push_back('\0');
     fieldTypeCacheKey += insert.field;
     if (knownFieldTypes_.find(fieldTypeCacheKey) == knownFieldTypes_.end()) {
-        std::string typeStr;
-        if constexpr (std::is_same_v<T, double>) {
-            typeStr = "float";
-        } else if constexpr (std::is_same_v<T, bool>) {
-            typeStr = "boolean";
-        } else if constexpr (std::is_same_v<T, std::string>) {
-            typeStr = "string";
-        } else if constexpr (std::is_same_v<T, int64_t>) {
-            typeStr = "integer";
-        }
-        if (!typeStr.empty()) {
-            co_await setFieldType(insert.measurement, insert.field, typeStr);
-            knownFieldTypes_.insert(fieldTypeCacheKey);
-        }
+        // Single source of truth for the type name (matches indexMetadataBatch).
+        co_await setFieldType(insert.measurement, insert.field,
+                              std::string(timestar::valueTypeName(timestar::valueTypeOf<T>())));
+        knownFieldTypes_.insert(fieldTypeCacheKey);
     }
 
     co_return seriesId;

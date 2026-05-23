@@ -70,6 +70,26 @@ struct ValueTypeCpp<TSMValueType::Integer> {
 template <TSMValueType T>
 using value_type_cpp_t = typename ValueTypeCpp<T>::type;
 
+// Inverse mapping: C++ type -> TSMValueType (compile-time).
+template <class T>
+constexpr TSMValueType valueTypeOf();
+template <>
+constexpr TSMValueType valueTypeOf<double>() {
+    return TSMValueType::Float;
+}
+template <>
+constexpr TSMValueType valueTypeOf<bool>() {
+    return TSMValueType::Boolean;
+}
+template <>
+constexpr TSMValueType valueTypeOf<std::string>() {
+    return TSMValueType::String;
+}
+template <>
+constexpr TSMValueType valueTypeOf<int64_t>() {
+    return TSMValueType::Integer;
+}
+
 // Invoke `f.template operator()<T>()` (or `f.operator()<T>()` via a C++23
 // generic lambda) for the C++ type matching the runtime TSMValueType.
 // Forwards the callable's return value. Throws on unknown enum values.

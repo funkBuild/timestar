@@ -18,6 +18,10 @@ static constexpr uint32_t MAX_UNCOMPRESSED_SIZE = 256 * 1024 * 1024;
 // Previously each function declared its own, consuming 6x memory. Safe because
 // Seastar is single-threaded per shard and no function holds a reference across calls.
 static thread_local std::vector<uint8_t> tlDecompBuf;
+// zstd compression output staging, shared by compressStrings() and
+// encodeDictionary() (never live simultaneously — a block is either raw or
+// dict-encoded). Previously two separate function-local thread_locals.
+static thread_local std::vector<char> tlCompBuf;
 
 // Validate zstd decompression result: check for errors and size mismatch.
 // A truncated or corrupted compressed stream may decompress fewer bytes than
@@ -143,7 +147,6 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
 
     // Compress with zstd — reuse thread-local buffer to avoid per-call allocation
     size_t compressedMaxSize = ZSTD_compressBound(writePos);
-    static thread_local std::vector<char> tlCompBuf;
     tlCompBuf.resize(compressedMaxSize);
     auto& compressed = tlCompBuf;
     size_t compressedSize = ZSTD_compressCCtx(getThreadCCtx(), compressed.data(), compressedMaxSize,
@@ -536,7 +539,6 @@ AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> value
 
     // Compress the ID stream with zstd
     size_t compressedMaxSize = ZSTD_compressBound(writePos);
-    static thread_local std::vector<char> tlCompBuf;
     tlCompBuf.resize(compressedMaxSize);
     size_t compressedSize =
         ZSTD_compressCCtx(getThreadCCtx(), tlCompBuf.data(), compressedMaxSize,
