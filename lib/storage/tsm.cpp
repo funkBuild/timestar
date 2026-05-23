@@ -835,10 +835,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         // Phase 3: Check if dictionary-encoded (STR2 magic)
         if (StringEncoder::isDictionaryEncoded(valuesSlice) && localDict && !localDict->empty()) {
-            StringEncoder::Dictionary dict;
-            dict.entries = *localDict;
-            dict.valid = true;
-            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict,
+            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *localDict,
                                             blockResults->values);
         } else {
             StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
@@ -1004,10 +1001,7 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         if (StringEncoder::isDictionaryEncoded(valuesSlice) && stringDict && !stringDict->empty()) {
-            StringEncoder::Dictionary dict;
-            dict.entries = *stringDict;
-            dict.valid = true;
-            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict,
+            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *stringDict,
                                             blockResults->values);
         } else {
             StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
@@ -1066,10 +1060,7 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         if (StringEncoder::isDictionaryEncoded(valuesSlice) && stringDict && !stringDict->empty()) {
-            StringEncoder::Dictionary dict;
-            dict.entries = *stringDict;
-            dict.valid = true;
-            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, dict, outValues);
+            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *stringDict, outValues);
         } else {
             StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
         }

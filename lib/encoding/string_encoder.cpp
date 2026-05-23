@@ -622,7 +622,7 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t count, const Diction
 }
 
 void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                                     const Dictionary& dict, std::vector<std::string>& out) {
+                                     const std::vector<std::string>& dictEntries, std::vector<std::string>& out) {
     if (encoded.offset > encoded.length_) {
         throw std::runtime_error("String decoder: slice offset past end");
     }
@@ -675,13 +675,13 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t s
     size_t produced = 0;
     for (size_t i = 0; i < totalCount && idSlice.offset < idSlice.length_; ++i) {
         uint32_t id = readVarInt(idSlice);
-        if (id >= dict.entries.size()) {
+        if (id >= dictEntries.size()) {
             throw std::runtime_error("Dictionary ID out of range");
         }
         if (i < skipCount)
             continue;
         if (produced < limitCount) {
-            out.push_back(dict.entries[id]);
+            out.push_back(dictEntries[id]);
             produced++;
         } else {
             break;

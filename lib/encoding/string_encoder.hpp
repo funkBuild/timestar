@@ -93,9 +93,11 @@ public:
     // Decode dictionary-encoded block: decompress IDs, look up dictionary.
     static void decodeDictionary(Slice& encoded, size_t count, const Dictionary& dict, std::vector<std::string>& out);
 
-    // Decode dictionary-encoded block with skip/limit support.
+    // Decode dictionary-encoded block with skip/limit support. Takes the
+    // dictionary entries by const-ref (no per-block copy) — callers decoding
+    // many blocks of one series reuse the same dictionary vector.
     static void decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                                 const Dictionary& dict, std::vector<std::string>& out);
+                                 const std::vector<std::string>& dictEntries, std::vector<std::string>& out);
 
     // Check if a block is dictionary-encoded by peeking at the magic bytes.
     static bool isDictionaryEncoded(const uint8_t* data, size_t size);
