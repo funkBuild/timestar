@@ -70,7 +70,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ───────────────────────────── common compile flags ──────────────────────────
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG")
-option(TIMESTAR_NATIVE_ARCH "Compile for the host CPU (-march=native)" ON)
+# Default OFF for portability: -march=native bakes in the build host's
+# instruction set, so a binary built on a newer CPU SIGILLs on an older one —
+# a hazard for any distributed/deployed build. The SIMD hot paths go through
+# Google Highway, which selects the optimal kernel at runtime regardless of
+# this flag, so -march=native only affects scalar autovectorization. Opt in
+# with -DTIMESTAR_NATIVE_ARCH=ON for a CPU-pinned local/bench build.
+option(TIMESTAR_NATIVE_ARCH "Compile for the host CPU (-march=native)" OFF)
 if(TIMESTAR_NATIVE_ARCH)
   add_compile_options(-march=native)
 endif()
