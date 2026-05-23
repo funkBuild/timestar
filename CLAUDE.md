@@ -144,7 +144,7 @@ The codebase is organized around these key abstractions:
    - `float_encoder` - Float compression using ALP (Adaptive Lossless floating-Point)
    - `bool_encoder` - Boolean value compression
    - `string_encoder` - String compression using zstd with variable-length prefixes
-   - `tsxor_encoder` - Timestamp compression using XOR
+   - Timestamps share the integer FFOR path (Simple8b family)
 
 6. **Query Runner** (`lib/query/query_runner.hpp/cpp`) - Executes queries across TSM files and memory stores
    - Merges results from multiple sources

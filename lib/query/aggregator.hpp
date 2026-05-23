@@ -5,7 +5,6 @@
 // docs/nan_policy.md for the full cross-subsystem policy.
 
 #include "query_parser.hpp"
-#include "tdigest.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -87,11 +86,6 @@ struct AggregationState {
     mutable std::vector<double> rawValues;
     bool rawValuesSaturated = false;
     bool collectRaw = false;  // Set to true only for EXACT_MEDIAN queries
-
-    // T-Digest for approximate MEDIAN computation.  ~200 centroids (~3.2KB),
-    // mergeable across shards in O(centroids) time, ~0.01% relative error.
-    // Used by the default MEDIAN method; EXACT_MEDIAN falls back to rawValues.
-    std::optional<TDigest> tdigest;
 
     // Add a single value to this state (incremental aggregation)
     void addValue(double value, uint64_t timestamp) {
@@ -188,9 +182,8 @@ struct AggregationState {
             }
             case AggregationMethod::MEDIAN:
             case AggregationMethod::EXACT_MEDIAN:
-                // Both MEDIAN variants accumulate raw values for per-shard processing.
-                // rawValues + nth_element is faster than per-value t-digest.add().
-                // T-digest is used only at merge time for cross-shard aggregation.
+                // Both MEDIAN variants accumulate raw values for per-shard processing;
+                // rawValues + nth_element is the chosen exact path.
                 addValue(value, timestamp);
                 break;
             default:
@@ -295,16 +288,6 @@ private:
         count += other.count;
     }
 
-    // Merge t-digest from another state (for approximate MEDIAN).
-    void mergeTDigest(const AggregationState& other) {
-        if (other.tdigest.has_value()) {
-            if (!tdigest.has_value()) {
-                tdigest.emplace();
-            }
-            tdigest->merge(*other.tdigest);
-        }
-    }
-
     void mergeRawValues(const AggregationState& other) {
         if (other.rawValuesSaturated) {
             rawValuesSaturated = true;
@@ -378,8 +361,7 @@ public:
                 return max - min;
             case AggregationMethod::MEDIAN:
             case AggregationMethod::EXACT_MEDIAN: {
-                // Both use rawValues + nth_element.  T-digest is retained for
-                // future cross-shard merge optimization but not used here.
+                // Both use rawValues + nth_element for the exact median.
                 if (rawValues.empty() || rawValuesSaturated) {
                     return std::numeric_limits<double>::quiet_NaN();
                 }
@@ -515,16 +497,6 @@ public:
     // Merge partial aggregations with metadata preserved (reduce phase)
     static std::vector<GroupedAggregationResult> mergePartialAggregationsGrouped(
         std::vector<PartialAggregationResult>& partialResults, AggregationMethod method);
-
-    // ========================================================================
-    // UTILITY FUNCTIONS
-    // ========================================================================
-
-    // Core aggregation functions (made public for use by optimized implementations)
-    static double calculateAvg(const std::vector<double>& values);
-    static double calculateMin(const std::vector<double>& values);
-    static double calculateMax(const std::vector<double>& values);
-    static double calculateSum(const std::vector<double>& values);
 
     // ========================================================================
     // LEGACY COMPATIBILITY

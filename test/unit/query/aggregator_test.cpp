@@ -352,26 +352,6 @@ TEST(AggregationStateTest, SingleZeroNotNaN) {
     EXPECT_DOUBLE_EQ(state.getValue(AggregationMethod::MAX), 0.0);
 }
 
-// ============================================================================
-// Aggregator::calculateSum/Avg - Empty vector returns NaN
-// ============================================================================
-
-TEST(AggregationStateTest, CalculateSumEmptyReturnsNaN) {
-    std::vector<double> empty;
-    EXPECT_TRUE(std::isnan(Aggregator::calculateSum(empty)));
-}
-
-TEST(AggregationStateTest, CalculateAvgEmptyReturnsNaN) {
-    std::vector<double> empty;
-    EXPECT_TRUE(std::isnan(Aggregator::calculateAvg(empty)));
-}
-
-TEST(AggregationStateTest, CalculateMinEmptyReturnsNaN) {
-    std::vector<double> empty;
-    EXPECT_TRUE(std::isnan(Aggregator::calculateMin(empty)));
-}
-
-TEST(AggregationStateTest, CalculateMaxEmptyReturnsNaN) {
-    std::vector<double> empty;
-    EXPECT_TRUE(std::isnan(Aggregator::calculateMax(empty)));
-}
+// Note: previously this file also exercised Aggregator::calculate{Sum,Avg,Min,Max}
+// thin wrappers around SimdAggregator. The wrappers were removed; the underlying
+// SimdAggregator empty-input NaN behavior is covered in simd_aggregator_correctness_test.

@@ -182,35 +182,6 @@ TEST_F(TSMTombstoneTest, FilterTombstoned) {
     EXPECT_EQ(filteredVals2, values);
 }
 
-// Test merging tombstone files
-TEST_F(TSMTombstoneTest, MergeTombstones) {
-    auto tombstone1 = std::make_unique<TSMTombstone>(tombstonePath);
-    auto tombstone2 = std::make_unique<TSMTombstone>(testDir + "/other.tombstone");
-
-    // Add to first tombstone
-    tombstone1->addTombstone(series1, 1000, 2000).get();
-    tombstone1->addTombstone(series2, 3000, 4000).get();
-
-    // Add to second tombstone
-    tombstone2->addTombstone(series1, 5000, 6000).get();
-    tombstone2->addTombstone(series3, 7000, 8000).get();
-
-    // Merge
-    tombstone1->merge(*tombstone2);
-
-    // Check merged results
-    EXPECT_EQ(tombstone1->getEntryCount(), 4);
-    EXPECT_EQ(tombstone1->getSeriesCount(), 3);
-
-    // Verify all ranges present
-    auto ranges1 = tombstone1->getTombstoneRanges(series1);
-    EXPECT_EQ(ranges1.size(), 2);
-
-    auto ranges3 = tombstone1->getTombstoneRanges(series3);
-    EXPECT_EQ(ranges3.size(), 1);
-    EXPECT_EQ(ranges3[0].first, 7000);
-}
-
 // Test overlapping and adjacent range merging
 TEST_F(TSMTombstoneTest, MergeOverlappingRanges) {
     auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);

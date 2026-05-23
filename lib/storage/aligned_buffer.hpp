@@ -126,26 +126,6 @@ public:
         current_size = new_size;
     }
 
-    // Read 8 bytes as uint64_t using memcpy to avoid strict aliasing violation
-    uint64_t read64(size_t offset) const {
-        if (offset + sizeof(uint64_t) > current_size) {
-            throw std::runtime_error("AlignedBuffer::read64 out of bounds: offset=" + std::to_string(offset) +
-                                     " size=" + std::to_string(current_size));
-        }
-        uint64_t val;
-        std::memcpy(&val, data.data() + offset, sizeof(uint64_t));
-        return val;
-    }
-
-    // Read a single byte
-    uint8_t read8(size_t offset) const {
-        if (offset >= current_size) {
-            throw std::runtime_error("AlignedBuffer::read8 out of bounds: offset=" + std::to_string(offset) +
-                                     " size=" + std::to_string(current_size));
-        }
-        return data[offset];
-    }
-
     // Write a value at a specific offset (for backpatching headers).
     // The target region must already be within the buffer's logical size.
     template <class T>

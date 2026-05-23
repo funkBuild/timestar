@@ -16,38 +16,6 @@
 namespace timestar {
 
 // ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-double Aggregator::calculateAvg(const std::vector<double>& values) {
-    if (values.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    return simd::SimdAggregator::calculateAvg(values.data(), values.size());
-}
-
-double Aggregator::calculateMin(const std::vector<double>& values) {
-    if (values.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    return simd::SimdAggregator::calculateMin(values.data(), values.size());
-}
-
-double Aggregator::calculateMax(const std::vector<double>& values) {
-    if (values.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    return simd::SimdAggregator::calculateMax(values.data(), values.size());
-}
-
-double Aggregator::calculateSum(const std::vector<double>& values) {
-    if (values.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    return simd::SimdAggregator::calculateSum(values.data(), values.size());
-}
-
-// ============================================================================
 // DISTRIBUTED AGGREGATION
 // ============================================================================
 
@@ -713,7 +681,6 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
     }
 
     const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
-    const bool useMethodAware = false;  // MEDIAN now uses rawValues like EXACT_MEDIAN
 
     if (interval > 0) {
         // Bucketed aggregation
@@ -723,11 +690,7 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
             auto& state = buckets[bucketTime];
             if (needsRaw)
                 state.collectRaw = true;
-            if (useMethodAware) {
-                state.addValueForMethod(values[i], timestamps[i], method);
-            } else {
-                state.addValue(values[i], timestamps[i]);
-            }
+            state.addValue(values[i], timestamps[i]);
         }
 
         std::vector<AggregatedPoint> result;
@@ -745,11 +708,7 @@ std::vector<AggregatedPoint> Aggregator::aggregate(const std::vector<uint64_t>& 
             auto& state = states[timestamps[i]];
             if (needsRaw)
                 state.collectRaw = true;
-            if (useMethodAware) {
-                state.addValueForMethod(values[i], timestamps[i], method);
-            } else {
-                state.addValue(values[i], timestamps[i]);
-            }
+            state.addValue(values[i], timestamps[i]);
         }
 
         std::vector<AggregatedPoint> result;
@@ -772,7 +731,6 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
 
     // Merge all series into one set of timestamp states
     const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
-    const bool useMethodAware = false;  // MEDIAN now uses rawValues like EXACT_MEDIAN
     std::unordered_map<uint64_t, AggregationState> mergedStates;
 
     for (const auto& [timestamps, values] : groupData) {
@@ -781,11 +739,7 @@ std::vector<AggregatedPoint> Aggregator::aggregateMultiple(
             auto& state = mergedStates[key];
             if (needsRaw)
                 state.collectRaw = true;
-            if (useMethodAware) {
-                state.addValueForMethod(values[i], timestamps[i], method);
-            } else {
-                state.addValue(values[i], timestamps[i]);
-            }
+            state.addValue(values[i], timestamps[i]);
         }
     }
 

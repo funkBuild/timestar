@@ -48,14 +48,6 @@ public:
     void writeBlock(TSMValueType seriesType, const SeriesId128& seriesId, std::span<const uint64_t> timestamps,
                     std::span<const T> values, TSMIndexEntry& indexEntry);
 
-    // Phase 3.2: Move semantics overloads for zero-copy writes
-    template <class T>
-    void writeSeriesDirect(TSMValueType seriesType, const SeriesId128& seriesId, std::vector<uint64_t>&& timestamps,
-                           std::vector<T>&& values);
-    template <class T>
-    void writeBlockDirect(TSMValueType seriesType, const SeriesId128& seriesId, std::vector<uint64_t>&& timestamps,
-                          std::vector<T>&& values, TSMIndexEntry& indexEntry);
-
     // Write compressed block carrying forward block stats from source file (zero-copy compaction)
     void writeCompressedBlockWithStats(TSMValueType seriesType, const SeriesId128& seriesId,
                                        seastar::temporary_buffer<uint8_t>&& compressedData,

@@ -1540,32 +1540,33 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     // Fast path: for LATEST/FIRST with maxPoints=1 and extended stats,
     // use the block-level latestValue/firstValue directly from the index entry.
     // This avoids reading any data blocks from disk — pure metadata lookup.
-    // Only valid when the block's extreme timestamp falls within the query range.
-    if (maxPoints == 1 && !hasTombstones()) {
-        if (reverse) {
-            // LATEST: find the block with the highest maxTime that's within range
-            const TSMIndexBlock* bestBlock = nullptr;
-            for (const auto& block : blocksToScan) {
-                if (!bestBlock || block.maxTime > bestBlock->maxTime) {
-                    bestBlock = &block;
+    // indexBlocks are sorted by minTime ascending in the writer, and blocksToScan
+    // preserves that order, so LATEST → back(), FIRST → front().
+    if (maxPoints == 1) {
+        const TSMIndexBlock& bestBlock = reverse ? blocksToScan.back() : blocksToScan.front();
+        const bool boundaryInRange =
+            reverse ? (bestBlock.maxTime < endTime) : (bestBlock.minTime >= startTime);
+        if (bestBlock.hasExtendedStats && boundaryInRange) {
+            const uint64_t boundaryTs = reverse ? bestBlock.maxTime : bestBlock.minTime;
+            // hasTombstones() is a cheap file-level guard; only consult per-series
+            // ranges when the file has any tombstones at all. The boundary value is
+            // only invalid if the exact boundary timestamp falls inside a tombstone.
+            bool boundaryDeleted = false;
+            if (hasTombstones()) {
+                auto ranges = tombstones->getTombstoneRanges(seriesId);
+                for (const auto& r : ranges) {
+                    if (r.first > boundaryTs)
+                        break;  // ranges sorted by start
+                    if (boundaryTs <= r.second) {
+                        boundaryDeleted = true;
+                        break;
+                    }
                 }
             }
-            // Only use stats shortcut if the block's maxTime is within the query range.
-            // If maxTime > endTime, the actual latest point within range requires reading the block.
-            if (bestBlock && bestBlock->hasExtendedStats && bestBlock->maxTime < endTime) {
-                aggregator.addPoint(bestBlock->maxTime, bestBlock->blockLatestValue);
-                co_return 1;
-            }
-        } else {
-            // FIRST: find the block with the lowest minTime that's within range
-            const TSMIndexBlock* bestBlock = nullptr;
-            for (const auto& block : blocksToScan) {
-                if (!bestBlock || block.minTime < bestBlock->minTime) {
-                    bestBlock = &block;
-                }
-            }
-            if (bestBlock && bestBlock->hasExtendedStats && bestBlock->minTime >= startTime) {
-                aggregator.addPoint(bestBlock->minTime, bestBlock->blockFirstValue);
+            if (!boundaryDeleted) {
+                const double boundaryVal =
+                    reverse ? bestBlock.blockLatestValue : bestBlock.blockFirstValue;
+                aggregator.addPoint(boundaryTs, boundaryVal);
                 co_return 1;
             }
         }

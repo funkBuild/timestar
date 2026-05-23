@@ -26,8 +26,6 @@ std::string encodeSeriesMetadataKey(const SeriesId128& seriesId);
 std::string encodeFieldTypeKey(const std::string& measurement, const std::string& field);
 std::string encodeMeasurementSeriesKey(const std::string& measurement, const SeriesId128& seriesId);
 std::string encodeMeasurementSeriesPrefix(const std::string& measurement);
-std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, const std::string& field,
-                                            const SeriesId128& seriesId);
 std::string encodeRetentionPolicyKey(const std::string& measurement);
 
 // --- Value encoding/decoding ---

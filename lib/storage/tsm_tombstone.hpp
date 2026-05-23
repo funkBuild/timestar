@@ -114,9 +114,6 @@ public:
                                                                       const std::vector<uint64_t>& timestamps,
                                                                       const std::vector<T>& values) const;
 
-    // Merge with another tombstone file (used during compaction)
-    void merge(const TSMTombstone& other);
-
     // Remove tombstones that are no longer needed after compaction
     void compact(uint64_t minTime, uint64_t maxTime);
 
@@ -124,14 +121,6 @@ public:
     size_t getEntryCount() const { return entries.size(); }
     size_t getSeriesCount() const { return seriesRanges.size(); }
     uint64_t getFileSize() const;
-
-    // Testing helpers
-    const std::vector<TombstoneEntry>& getEntries() const { return entries; }
-    void clearEntries() {
-        entries.clear();
-        seriesRanges.clear();
-        isDirty = true;
-    }
 };
 
 // Template implementation for filtering

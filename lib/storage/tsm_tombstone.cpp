@@ -533,20 +533,6 @@ std::set<SeriesId128> TSMTombstone::getTombstonedSeries() const {
     return series;
 }
 
-void TSMTombstone::merge(const TSMTombstone& other) {
-    // Add all entries from other tombstone
-    for (const auto& entry : other.entries) {
-        entries.push_back(entry);
-    }
-
-    // Mark as dirty and rebuild index on next sort
-    isDirty = true;
-
-    // Rebuild index immediately for queries
-    sortAndMergeEntries();
-    rebuildIndex();
-}
-
 void TSMTombstone::compact(uint64_t minTime, uint64_t maxTime) {
     std::vector<TombstoneEntry> retained;
 

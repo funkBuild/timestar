@@ -168,22 +168,6 @@ std::string encodeMeasurementSeriesPrefix(const std::string& measurement) {
     return prefix;
 }
 
-std::string encodeMeasurementFieldSeriesKey(const std::string& measurement, const std::string& field,
-                                            const SeriesId128& seriesId) {
-    if (measurement.find('\0') != std::string::npos || field.find('\0') != std::string::npos) {
-        throw std::invalid_argument("Key component must not contain null bytes");
-    }
-    std::string key;
-    key.reserve(1 + measurement.size() + 1 + field.size() + 1 + 16);
-    key.push_back(static_cast<char>(MEASUREMENT_FIELD_SERIES));
-    key += measurement;
-    key.push_back('\0');
-    key += field;
-    key.push_back('\0');
-    seriesId.appendTo(key);
-    return key;
-}
-
 std::string encodeRetentionPolicyKey(const std::string& measurement) {
     validateNoNullBytes({measurement});
     std::string key;

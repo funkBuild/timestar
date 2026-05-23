@@ -60,7 +60,6 @@ struct QueryResponse {
 class HttpQueryHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
-    seastar::sharded<timestar::index::NativeIndex>* indexSharded;
 
 public:
     // Security limits to prevent DoS attacks
@@ -75,9 +74,7 @@ public:
         return std::chrono::seconds(timestar::config().http.query_timeout_seconds);
     }
 
-    explicit HttpQueryHandler(seastar::sharded<Engine>* engine,
-                              seastar::sharded<timestar::index::NativeIndex>* index = nullptr)
-        : engineSharded(engine), indexSharded(index) {}
+    explicit HttpQueryHandler(seastar::sharded<Engine>* engine) : engineSharded(engine) {}
 
     // Validate request body size and content type (public for testing).
     // Returns a reply with an error if validation fails, or nullptr if valid.

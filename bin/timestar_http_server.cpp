@@ -54,14 +54,17 @@ static std::atomic<bool> g_ready{false};
 
 // Auth token — set once before server start, read by all shards via set_routes().
 // Empty string means auth is disabled (all requests pass through).
-// Uses pointer + string storage so the string is fully constructed before any
-// shard reads it (avoids relying on memory ordering of std::string internals).
+// Atomic pointer publication: the storage string is fully constructed before
+// the pointer is stored with release ordering, and authToken() loads with
+// acquire ordering — so other shards observing a non-null pointer also
+// observe the completed storage initialization.
 static std::string g_authTokenStorage;
-static const std::string* g_authToken = nullptr;
+static std::atomic<const std::string*> g_authToken{nullptr};
 
 static const std::string& authToken() {
     static const std::string empty;
-    return g_authToken ? *g_authToken : empty;
+    auto* p = g_authToken.load(std::memory_order_acquire);
+    return p ? *p : empty;
 }
 
 void set_routes(routes& r) {
@@ -134,7 +137,7 @@ void set_routes(routes& r) {
     auto* writeHandler = emplaceHandler(new HttpWriteHandler(&g_engine));
     writeHandler->registerRoutes(r, authToken());
 
-    auto* queryHandler = emplaceHandler(new timestar::HttpQueryHandler(&g_engine, nullptr));
+    auto* queryHandler = emplaceHandler(new timestar::HttpQueryHandler(&g_engine));
     queryHandler->registerRoutes(r, authToken());
 
     auto* deleteHandler = emplaceHandler(new HttpDeleteHandler(&g_engine));
@@ -394,9 +397,10 @@ int main(int argc, char** argv) {
                     timestar::http_log.debug("Auth enabled — using configured token: {}",
                                              timestar::maskToken(g_authTokenStorage));
                 }
-                // Publish pointer after string is fully constructed — ensures
-                // all shards see a complete string via invoke_on_all barrier.
-                g_authToken = &g_authTokenStorage;
+                // Release-store pointer after storage is fully constructed; any
+                // shard that subsequently acquire-loads this pointer in authToken()
+                // will see the completed string.
+                g_authToken.store(&g_authTokenStorage, std::memory_order_release);
             } else {
                 timestar::http_log.info("Auth disabled — all endpoints are unauthenticated");
             }

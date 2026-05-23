@@ -37,7 +37,7 @@ enum IndexKeyType : uint8_t {
     FIELD_TYPE = 0x09,                // measurement+field -> field type (float, bool, string, integer)
     MEASUREMENT_SERIES = 0x0A,        // measurement+\0+series_id -> (empty) for fast measurement->series lookup
     RETENTION_POLICY = 0x0B,          // measurement -> JSON retention policy
-    MEASUREMENT_FIELD_SERIES = 0x0C,  // measurement+\0+field+\0+series_id -> (empty) for single-field lookup
+    // 0x0C was MEASUREMENT_FIELD_SERIES — removed in cleanup; never read.
 
     // Phase 2: Roaring bitmap postings
     LOCAL_ID_FORWARD = 0x10,  // localId (4B LE) -> SeriesId128 (16B)

@@ -24,7 +24,7 @@
 namespace ke = timestar::index::keys;
 
 // Tombstone sentinel: a single null byte distinguishes SSTable tombstones from
-// legitimate empty-value marker entries (MEASUREMENT_SERIES, MEASUREMENT_FIELD_SERIES).
+// legitimate empty-value marker entries (e.g. MEASUREMENT_SERIES).
 static constexpr std::string_view SSTABLE_TOMBSTONE{"\0", 1};
 
 static bool isSstableTombstone(std::string_view value) {
@@ -688,9 +688,6 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
 
     // Measurement series index
     batch.put(ke::encodeMeasurementSeriesKey(measurement, seriesId), "");
-
-    // Measurement field series index
-    batch.put(ke::encodeMeasurementFieldSeriesKey(measurement, field, seriesId), "");
 
     // Phase 2: Assign local ID (forward mapping persisted in batch on flush)
     uint32_t localId = localIdMap_.getOrAssign(seriesId);

@@ -707,8 +707,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
     }
 
     try {
-        LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Checking pointers - engineSharded: {}, indexSharded: {}",
-                       static_cast<const void*>(engineSharded), static_cast<const void*>(indexSharded));
+        LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Checking pointer - engineSharded: {}",
+                       static_cast<const void*>(engineSharded));
 
         if (!engineSharded) {
             LOG_QUERY_PATH(timestar::http_log, error, "[QUERY] engineSharded is NULL!");
@@ -1426,36 +1426,37 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                 // into a single SeriesResult with multiple fields.
                 // Uses hash-indexed lookup for O(N) instead of O(N²) flat scan.
                 {
-                    std::unordered_map<size_t, size_t> tagHashToIdx;  // hash → index in merged
+                    // Multimap from (measurement+tags) hash to candidate indices in `merged`.
+                    // Same hash with different tag-sets must coexist; without this, a hash
+                    // collision overwrote the bucket and subsequent merges for the first
+                    // tag-set would miss its existing entry.
+                    std::unordered_multimap<size_t, size_t> tagHashToIdx;
                     tagHashToIdx.reserve(response.series.size());
                     std::vector<SeriesResult> merged;
                     merged.reserve(response.series.size());
 
                     for (auto& s : response.series) {
-                        // Hash measurement + tags
                         size_t h = std::hash<std::string>{}(s.measurement);
                         for (const auto& [k, v] : s.tags) {
                             h ^= std::hash<std::string>{}(k) * 31 + std::hash<std::string>{}(v);
                         }
 
-                        auto [it, inserted] = tagHashToIdx.try_emplace(h, merged.size());
-                        if (!inserted) {
-                            // Verify actual equality (hash collision possible)
+                        bool mergedIn = false;
+                        auto [lo, hi] = tagHashToIdx.equal_range(h);
+                        for (auto it = lo; it != hi; ++it) {
                             auto& existing = merged[it->second];
                             if (existing.measurement == s.measurement && existing.tags == s.tags) {
                                 for (auto& [fname, fdata] : s.fields) {
                                     existing.fields[std::move(fname)] = std::move(fdata);
                                 }
-                                continue;
+                                mergedIn = true;
+                                break;
                             }
-                            // Hash collision — fall through to insert as new entry
                         }
-                        if (!inserted) {
-                            // Hash collision with different tags — update index to last occurrence
-                            // and insert as new entry
-                            tagHashToIdx[h] = merged.size();
+                        if (!mergedIn) {
+                            tagHashToIdx.emplace(h, merged.size());
+                            merged.push_back(std::move(s));
                         }
-                        merged.push_back(std::move(s));
                     }
                     response.series = std::move(merged);
                 }
