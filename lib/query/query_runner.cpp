@@ -6,6 +6,7 @@
 #include "query_result.hpp"
 #include "series_id.hpp"
 #include "tsm_result.hpp"
+#include "value_type_dispatch.hpp"
 
 #include <boost/iterator/counting_iterator.hpp>
 
@@ -571,30 +572,13 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& ser
     LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Found series type: {} for series: '{}'",
                    static_cast<int>(seriesType.value()), seriesKey);
 
-    VariantQueryResult results;
-
-    switch (seriesType.value()) {
-        case TSMValueType::Boolean:
-            LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying boolean series: '{}'", seriesKey);
-            results = co_await queryTsm<bool>(seriesKey, seriesId, startTime, endTime);
-            break;
-        case TSMValueType::Float:
-            LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying float series: '{}'", seriesKey);
-            results = co_await queryTsm<double>(seriesKey, seriesId, startTime, endTime);
-            break;
-        case TSMValueType::String:
-            LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying string series: '{}'", seriesKey);
-            results = co_await queryTsm<std::string>(seriesKey, seriesId, startTime, endTime);
-            break;
-        case TSMValueType::Integer:
-            LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying integer series: '{}'", seriesKey);
-            results = co_await queryTsm<int64_t>(seriesKey, seriesId, startTime, endTime);
-            break;
-        default:
-            LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Unknown series type {} for series: '{}'",
-                           static_cast<int>(seriesType.value()), seriesKey);
-            throw std::runtime_error("Unknown series type");
-    }
+    VariantQueryResult results = co_await timestar::dispatchValueType(
+        seriesType.value(), [&]<class T>() -> seastar::future<VariantQueryResult> {
+            LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying series '{}' (type tag {})", seriesKey,
+                           static_cast<int>(seriesType.value()));
+            VariantQueryResult r = co_await queryTsm<T>(seriesKey, seriesId, startTime, endTime);
+            co_return r;
+        });
 
     co_return std::move(results);
 };

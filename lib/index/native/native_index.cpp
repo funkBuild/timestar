@@ -1,8 +1,9 @@
 #include "native_index.hpp"
 
 #include "../key_encoding.hpp"
-#include "series_key.hpp"  // for buildSeriesKey
-#include "tsm.hpp"         // for TSMValueType definition
+#include "series_key.hpp"            // for buildSeriesKey
+#include "tsm.hpp"                   // for TSMValueType definition
+#include "value_type_dispatch.hpp"   // for valueTypeName
 
 #include <glaze/glaze.hpp>
 
@@ -1032,27 +1033,10 @@ seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>&
         co_return;
 
     for (const auto& op : ops) {
-        std::string typeStr;
-        switch (op.valueType) {
-            case TSMValueType::Float:
-                typeStr = "float";
-                break;
-            case TSMValueType::Boolean:
-                typeStr = "boolean";
-                break;
-            case TSMValueType::String:
-                typeStr = "string";
-                break;
-            case TSMValueType::Integer:
-                typeStr = "integer";
-                break;
-            default:
-                break;
-        }
-
         co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
+        auto typeStr = timestar::valueTypeName(op.valueType);
         if (!typeStr.empty()) {
-            co_await setFieldType(op.measurement, op.fieldName, typeStr);
+            co_await setFieldType(op.measurement, op.fieldName, std::string(typeStr));
         }
     }
 }

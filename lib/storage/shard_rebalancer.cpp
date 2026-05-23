@@ -6,6 +6,7 @@
 #include "series_id.hpp"
 #include "tsm.hpp"
 #include "tsm_writer.hpp"
+#include "value_type_dispatch.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -388,32 +389,11 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsig
                             splitStore->series[seriesId] = std::move(series);
                         };
 
-                        switch (*typeOpt) {
-                            case ::TSMValueType::Float: {
-                                auto result = co_await tsm->queryWithTombstones<double>(
-                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
-                                extractData(result);
-                                break;
-                            }
-                            case ::TSMValueType::Boolean: {
-                                auto result = co_await tsm->queryWithTombstones<bool>(
-                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
-                                extractData(result);
-                                break;
-                            }
-                            case ::TSMValueType::String: {
-                                auto result = co_await tsm->queryWithTombstones<std::string>(
-                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
-                                extractData(result);
-                                break;
-                            }
-                            case ::TSMValueType::Integer: {
-                                auto result = co_await tsm->queryWithTombstones<int64_t>(
-                                    seriesId, 0, std::numeric_limits<uint64_t>::max());
-                                extractData(result);
-                                break;
-                            }
-                        }
+                        co_await timestar::dispatchValueType(*typeOpt, [&]<class T>() -> seastar::future<> {
+                            auto result = co_await tsm->queryWithTombstones<T>(
+                                seriesId, 0, std::numeric_limits<uint64_t>::max());
+                            extractData(result);
+                        });
                     }
 
                     if (!splitStore->isEmpty()) {

@@ -8,6 +8,7 @@
 #include "series_id.hpp"
 #include "string_encoder.hpp"
 #include "tsm.hpp"
+#include "value_type_dispatch.hpp"
 #include "zigzag.hpp"
 
 #include <fcntl.h>
@@ -655,40 +656,13 @@ void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStor
         SeriesId128 seriesId = seriesKey;
 
         try {
-            switch (seriesType) {
-                case TSMValueType::Float: {
-                    auto& series = std::get<InMemorySeries<double>>(memStore);
-                    series.sort();
-                    LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing float series '{}' with {} points",
-                                    seriesKey.toHex(), series.timestamps.size());
-                    writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
-                } break;
-                case TSMValueType::Boolean: {
-                    auto& series = std::get<InMemorySeries<bool>>(memStore);
-                    series.sort();
-                    LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing bool series '{}' with {} points",
-                                    seriesKey.toHex(), series.timestamps.size());
-                    writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
-                } break;
-                case TSMValueType::String: {
-                    auto& series = std::get<InMemorySeries<std::string>>(memStore);
-                    series.sort();
-                    LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing string series '{}' with {} points",
-                                    seriesKey.toHex(), series.timestamps.size());
-                    writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
-                } break;
-                case TSMValueType::Integer: {
-                    auto& series = std::get<InMemorySeries<int64_t>>(memStore);
-                    series.sort();
-                    LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing integer series '{}' with {} points",
-                                    seriesKey.toHex(), series.timestamps.size());
-                    writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
-                } break;
-                default:
-                    timestar::tsm_log.warn("Skipping series '{}' with unknown type {}", seriesKey.toHex(),
-                                           static_cast<int>(seriesType));
-                    break;
-            }
+            timestar::dispatchValueType(seriesType, [&]<class T>() {
+                auto& series = std::get<InMemorySeries<T>>(memStore);
+                series.sort();
+                LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing series '{}' (type {}) with {} points",
+                                seriesKey.toHex(), static_cast<int>(seriesType), series.timestamps.size());
+                writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+            });
         } catch (const std::bad_alloc& e) {
             timestar::tsm_log.error("BAD_ALLOC when processing series '{}' with {} points", seriesKey.toHex(),
                                     seriesPoints);

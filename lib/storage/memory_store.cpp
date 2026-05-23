@@ -4,6 +4,7 @@
 #include "logging_config.hpp"
 #include "simd_aggregator.hpp"
 #include "util.hpp"
+#include "value_type_dispatch.hpp"  // TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES
 
 #include <algorithm>
 #include <chrono>
@@ -461,51 +462,25 @@ std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128& series
     return static_cast<TSMValueType>(it->second.index());
 }
 
-template void InMemorySeries<double>::insert(TimeStarInsert<double>&& insertRequest);
-template void InMemorySeries<double>::sortPaired(size_t, size_t);
-template void InMemorySeries<double>::mergePaired(size_t);
-template void InMemorySeries<bool>::insert(TimeStarInsert<bool>&& insertRequest);
-template void InMemorySeries<bool>::sortPaired(size_t, size_t);
-template void InMemorySeries<bool>::mergePaired(size_t);
-template void InMemorySeries<std::string>::insert(TimeStarInsert<std::string>&& insertRequest);
-template void InMemorySeries<std::string>::sortPaired(size_t, size_t);
-template void InMemorySeries<std::string>::mergePaired(size_t);
-template void InMemorySeries<int64_t>::insert(TimeStarInsert<int64_t>&& insertRequest);
-template void InMemorySeries<int64_t>::sortPaired(size_t, size_t);
-template void InMemorySeries<int64_t>::mergePaired(size_t);
+// Explicit template instantiations for every TimeStar value type.
+// The macro fans out (double, bool, std::string, int64_t) — see
+// value_type_dispatch.hpp.
+#define INST_INMEM(T)                                              \
+    template void InMemorySeries<T>::insert(TimeStarInsert<T>&&);  \
+    template void InMemorySeries<T>::sortPaired(size_t, size_t);   \
+    template void InMemorySeries<T>::mergePaired(size_t);
+TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_INMEM)
+#undef INST_INMEM
 
-template seastar::future<bool> MemoryStore::insert<double>(TimeStarInsert<double>& insertRequest);
-template seastar::future<bool> MemoryStore::insert<bool>(TimeStarInsert<bool>& insertRequest);
-template seastar::future<bool> MemoryStore::insert<std::string>(TimeStarInsert<std::string>& insertRequest);
-template seastar::future<bool> MemoryStore::insert<int64_t>(TimeStarInsert<int64_t>& insertRequest);
-template seastar::future<bool> MemoryStore::insertBatch<double>(std::vector<TimeStarInsert<double>>& insertRequests,
-                                                                size_t preComputedBatchSize);
-template seastar::future<bool> MemoryStore::insertBatch<bool>(std::vector<TimeStarInsert<bool>>& insertRequests,
-                                                              size_t preComputedBatchSize);
-template seastar::future<bool> MemoryStore::insertBatch<std::string>(
-    std::vector<TimeStarInsert<std::string>>& insertRequests, size_t preComputedBatchSize);
-template seastar::future<bool> MemoryStore::insertBatch<int64_t>(std::vector<TimeStarInsert<int64_t>>& insertRequests,
-                                                                 size_t preComputedBatchSize);
-template void MemoryStore::insertMemory<double>(TimeStarInsert<double>&& insertRequest);
-template void MemoryStore::insertMemory<bool>(TimeStarInsert<bool>&& insertRequest);
-template void MemoryStore::insertMemory<std::string>(TimeStarInsert<std::string>&& insertRequest);
-template void MemoryStore::insertMemory<int64_t>(TimeStarInsert<int64_t>&& insertRequest);
-template bool MemoryStore::wouldExceedThreshold<double>(TimeStarInsert<double>& insertRequest);
-template bool MemoryStore::wouldExceedThreshold<bool>(TimeStarInsert<bool>& insertRequest);
-template bool MemoryStore::wouldExceedThreshold<std::string>(TimeStarInsert<std::string>& insertRequest);
-template bool MemoryStore::wouldExceedThreshold<int64_t>(TimeStarInsert<int64_t>& insertRequest);
-template bool MemoryStore::wouldExceedThreshold<double>(TimeStarInsert<double>& insertRequest,
-                                                        size_t& outEstimatedSize);
-template bool MemoryStore::wouldExceedThreshold<bool>(TimeStarInsert<bool>& insertRequest, size_t& outEstimatedSize);
-template bool MemoryStore::wouldExceedThreshold<std::string>(TimeStarInsert<std::string>& insertRequest,
-                                                             size_t& outEstimatedSize);
-template bool MemoryStore::wouldExceedThreshold<int64_t>(TimeStarInsert<int64_t>& insertRequest,
-                                                         size_t& outEstimatedSize);
-template bool MemoryStore::wouldBatchExceedThreshold<double>(std::vector<TimeStarInsert<double>>& insertRequests);
-template bool MemoryStore::wouldBatchExceedThreshold<bool>(std::vector<TimeStarInsert<bool>>& insertRequests);
-template bool MemoryStore::wouldBatchExceedThreshold<std::string>(
-    std::vector<TimeStarInsert<std::string>>& insertRequests);
-template bool MemoryStore::wouldBatchExceedThreshold<int64_t>(std::vector<TimeStarInsert<int64_t>>& insertRequests);
+#define INST_STORE(T)                                                                                      \
+    template seastar::future<bool> MemoryStore::insert<T>(TimeStarInsert<T>&);                             \
+    template seastar::future<bool> MemoryStore::insertBatch<T>(std::vector<TimeStarInsert<T>>&, size_t);   \
+    template void MemoryStore::insertMemory<T>(TimeStarInsert<T>&&);                                       \
+    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&);                                \
+    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&, size_t&);                       \
+    template bool MemoryStore::wouldBatchExceedThreshold<T>(std::vector<TimeStarInsert<T>>&);
+TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_STORE)
+#undef INST_STORE
 
 void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
     timestar::memory_log.debug("Deleting range for series {} from {} to {}", seriesId.toHex(), startTime, endTime);
