@@ -151,7 +151,7 @@ TEST_F(HttpErrorResponseTest, VeryLongErrorMessage) {
 TEST_F(HttpErrorResponseTest, QueryHandlerErrorResponse) {
     // HttpQueryHandler::createErrorResponse delegates to ResponseFormatter::formatError,
     // but verify the handler can be constructed with nullptr and called.
-    HttpQueryHandler handler(nullptr, nullptr);
+    HttpQueryHandler handler(nullptr);
     std::string json = handler.createErrorResponse("INVALID_QUERY", "missing measurement");
 
     ErrorResponseParsed parsed;

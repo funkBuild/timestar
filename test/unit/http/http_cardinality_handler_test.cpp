@@ -310,9 +310,15 @@ TEST_F(CardinalityHandlerSourceTest, HandleCardinalityScatterGatherAcrossShards)
     std::string body = extractFunctionBody("HttpMetadataHandler::handleCardinality");
     ASSERT_FALSE(body.empty());
 
-    // Must scatter-gather across shards (invoke_on or when_all)
-    EXPECT_NE(body.find("invoke_on"), std::string::npos)
-        << "handleCardinality must scatter-gather across shards via invoke_on";
-    EXPECT_NE(body.find("when_all_succeed"), std::string::npos)
-        << "handleCardinality must await all shard results with when_all_succeed";
+    // Must scatter-gather across shards. The fan-out now goes through the
+    // timestar::cluster::scatter* helpers (lib/cluster/scatter_gather.hpp),
+    // which internally use invoke_on + when_all_succeed, rather than an inline
+    // invoke_on loop in this function.
+    const bool scattersViaHelper = body.find("scatterAndSum") != std::string::npos ||
+                                   body.find("scatterAll") != std::string::npos ||
+                                   body.find("scatterAndConcat") != std::string::npos;
+    const bool scattersInline =
+        body.find("invoke_on") != std::string::npos && body.find("when_all_succeed") != std::string::npos;
+    EXPECT_TRUE(scattersViaHelper || scattersInline)
+        << "handleCardinality must scatter-gather across shards (via cluster::scatter* helper or inline invoke_on)";
 }

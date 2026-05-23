@@ -4,13 +4,16 @@
 #include <string>
 
 // =============================================================================
-// Source-inspection test: handleCardinality invoke_on lambda capture safety
+// Source-inspection test: handleCardinality shard-dispatch lambda capture safety
 //
 // BUG: handleCardinality captured local variables by reference in lambdas
-// passed to invoke_on(). Seastar's invoke_on copies the lambda to a remote
-// shard where the references dangle.
+// dispatched to a remote shard. Seastar copies the lambda to the remote shard
+// where any captured references dangle.
 //
-// FIX: Capture measurement, tagKey, tagValue by value.
+// FIX: Capture measurement, tagKey, tagValue by value. The shard fan-out now
+// goes through timestar::cluster::scatterAndSum (lib/cluster/scatter_gather.hpp)
+// rather than an inline invoke_on loop, but the by-value capture requirement is
+// identical — the lambda still crosses to a remote shard.
 // =============================================================================
 
 class HttpMetadataHandlerCaptureTest : public ::testing::Test {};
@@ -24,21 +27,24 @@ TEST_F(HttpMetadataHandlerCaptureTest, InvokeOnLambdasCaptureByValue) {
     std::string src = readFile("../lib/http/http_metadata_handler.cpp");
     ASSERT_FALSE(src.empty()) << "Could not read http_metadata_handler.cpp";
 
-    // The two invoke_on lambdas in handleCardinality must NOT capture by reference.
-    // Verify no &measurement, &tagKey, &tagValue captures exist in invoke_on contexts.
+    // Shard-dispatch lambdas must NOT capture measurement/tagKey/tagValue by
+    // reference, regardless of whether dispatch is an inline invoke_on or the
+    // cluster::scatter* helper. A by-reference capture of these locals dangles
+    // once the lambda is copied to a remote shard.
     //
-    // Safe captures: [measurement, tagKey, tagValue] (by value)
-    // Unsafe captures: [&measurement, &tagKey, &tagValue] (by reference — dangling on remote shard)
+    // Safe: [measurement, tagKey, tagValue] (by value)
+    // Unsafe: [&measurement, ...] / [&tagKey, ...] / [&tagValue, ...] / [&, ...]
+    EXPECT_EQ(src.find("[&measurement"), std::string::npos)
+        << "shard-dispatch lambda must not capture measurement by reference";
+    EXPECT_EQ(src.find("[&tagKey"), std::string::npos)
+        << "shard-dispatch lambda must not capture tagKey by reference";
+    EXPECT_EQ(src.find("[&tagValue"), std::string::npos)
+        << "shard-dispatch lambda must not capture tagValue by reference";
 
-    // Check that no dangerous by-reference captures remain
-    EXPECT_EQ(src.find("invoke_on(s, [&measurement"), std::string::npos)
-        << "invoke_on lambda must not capture measurement by reference";
-    EXPECT_EQ(src.find("invoke_on(s, [&tagKey"), std::string::npos)
-        << "invoke_on lambda must not capture tagKey by reference";
-    EXPECT_EQ(src.find("invoke_on(s, [&tagValue"), std::string::npos)
-        << "invoke_on lambda must not capture tagValue by reference";
-
-    // Verify by-value captures are present (positive check)
-    EXPECT_NE(src.find("invoke_on(s, [measurement"), std::string::npos)
-        << "invoke_on lambda should capture measurement by value";
+    // Verify the by-value capture is present (positive check). The fan-out
+    // helper takes a lambda capturing these locals by value.
+    EXPECT_NE(src.find("[measurement, tagKey, tagValue]"), std::string::npos)
+        << "tag-cardinality shard lambda should capture measurement/tagKey/tagValue by value";
+    EXPECT_NE(src.find("[measurement]"), std::string::npos)
+        << "measurement-cardinality shard lambda should capture measurement by value";
 }
