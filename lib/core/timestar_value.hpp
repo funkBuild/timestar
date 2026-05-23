@@ -2,6 +2,7 @@
 
 #include "line_parser.hpp"
 #include "series_id.hpp"
+#include "series_key.hpp"
 
 #include <map>
 #include <memory>
@@ -139,30 +140,13 @@ public:
     */
 
     const std::string& seriesKey() const {
-        // measurement, tag set, field key
-        // h2o_level, location=santa_monica, host=my-host-1 h2o_feet
+        // Format: "measurement,tag1=val1,tag2=val2 field"
+        // Example: "h2o_level,location=santa_monica,host=my-host-1 h2o_feet"
         if (!_seriesKeyCache) {
-            const auto& effectiveTags = getTags();
-            // Pre-compute total size and reserve to avoid reallocations
-            size_t totalSize = measurement.size() + 1 + field.size();  // +1 for space
-            for (const auto& [key, value] : effectiveTags) {
-                totalSize += 1 + key.size() + 1 + value.size();  // ,key=value
-            }
-            _seriesKey.clear();
-            _seriesKey.reserve(totalSize);
-            _seriesKey = measurement;
-            for (const auto& [key, value] : effectiveTags) {
-                _seriesKey += ',';
-                _seriesKey += key;
-                _seriesKey += '=';
-                _seriesKey += value;
-            }
-            _seriesKey += ' ';
-            _seriesKey += field;
+            _seriesKey = timestar::buildSeriesKey(measurement, getTags(), field);
             _seriesKeyCache = true;
             _seriesId128Cache = false;
         }
-
         return _seriesKey;
     }
 

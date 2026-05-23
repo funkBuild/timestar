@@ -30,30 +30,9 @@ namespace timestar::proto {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-// Build a series key from measurement + sorted tags + field.
-// Format: "measurement,tag1=val1,tag2=val2 fieldName"
-// std::map is already sorted, so iteration order is stable.
-static std::string buildSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
-                                  const std::string& fieldName) {
-    // Pre-compute total size to avoid reallocations
-    size_t totalSize = measurement.size() + 1 + fieldName.size();  // +1 for space
-    for (const auto& [k, v] : tags) {
-        totalSize += 1 + k.size() + 1 + v.size();  // ",key=value"
-    }
-
-    std::string key;
-    key.reserve(totalSize);
-    key = measurement;
-    for (const auto& [k, v] : tags) {
-        key += ',';
-        key += k;
-        key += '=';
-        key += v;
-    }
-    key += ' ';
-    key += fieldName;
-    return key;
-}
+// Series-key construction uses the canonical timestar::buildSeriesKey
+// from lib/utils/series_key.hpp (identical implementation; previously
+// duplicated here as a file-local static).
 
 // Fast name validation — same rules as HttpWriteHandler::validateName.
 // Returns true if valid, false otherwise.
