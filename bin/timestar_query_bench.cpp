@@ -51,10 +51,12 @@
 #include <string>
 #include <vector>
 
-enum class WireFormat { Json, Protobuf };
+#include "bench_common.hpp"
 
 using namespace seastar;
-using clk = std::chrono::steady_clock;
+using timestar::bench::clk;
+using timestar::bench::percentile;
+using timestar::bench::WireFormat;
 
 // Time range matching the insert benchmark's data.
 // The insert bench uses BASE_TS = 1'000'000'000'000'000'000 (~2001-09-09)
@@ -475,18 +477,14 @@ int main(int argc, char** argv) {
             if (res.successes > 0) {
                 double avg = res.total_ms / res.successes;
 
-                // Compute p50, p95, p99
+                // Compute p50, p95 via the shared percentile helper.
                 auto sorted = res.latencies_ms;
                 std::sort(sorted.begin(), sorted.end());
-                auto pct = [&](double p) -> double {
-                    size_t idx = static_cast<size_t>(p * (sorted.size() - 1));
-                    return sorted[idx];
-                };
 
                 fmt::print(
                     "avg={:.2f}ms  min={:.2f}  p50={:.2f}  p95={:.2f}  "
                     "max={:.2f}ms",
-                    avg, res.min_ms, pct(0.50), pct(0.95), res.max_ms);
+                    avg, res.min_ms, percentile(sorted, 0.50), percentile(sorted, 0.95), res.max_ms);
 
                 if (res.point_count >= 0) {
                     fmt::print("  pts={}", res.point_count);

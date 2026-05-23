@@ -45,10 +45,12 @@
 #include <string>
 #include <vector>
 
-enum class WireFormat { Json, Protobuf };
+#include "bench_common.hpp"
 
 using namespace seastar;
-using clk = std::chrono::steady_clock;
+using timestar::bench::clk;
+using timestar::bench::LatencyStats;
+using timestar::bench::WireFormat;
 
 // ──────────────────────────────────────────────────────────────────────
 // Deterministic data generation
@@ -154,35 +156,7 @@ static std::string buildPayloadProto(uint64_t seed, int hostId, int rackId, uint
 // Latency histogram
 // ──────────────────────────────────────────────────────────────────────
 
-struct LatencyStats {
-    std::vector<double> samples_ms;
-
-    void add(clk::duration d) {
-        double ms = std::chrono::duration<double, std::milli>(d).count();
-        samples_ms.push_back(ms);
-    }
-
-    void merge(LatencyStats&& other) {
-        samples_ms.insert(samples_ms.end(), std::make_move_iterator(other.samples_ms.begin()),
-                          std::make_move_iterator(other.samples_ms.end()));
-    }
-
-    void print(const char* label) const {
-        if (samples_ms.empty())
-            return;
-        auto sorted = samples_ms;  // copy for sorting
-        std::sort(sorted.begin(), sorted.end());
-        auto pct = [&](double p) {
-            size_t idx = static_cast<size_t>(p * (sorted.size() - 1));
-            return sorted[idx];
-        };
-        double sum = std::accumulate(sorted.begin(), sorted.end(), 0.0);
-        fmt::print(
-            "  {:<22s}  min={:>8.2f}  avg={:>8.2f}  med={:>8.2f}"
-            "  p95={:>8.2f}  p99={:>8.2f}  max={:>8.2f}  (ms, n={})\n",
-            label, sorted.front(), sum / sorted.size(), pct(0.50), pct(0.95), pct(0.99), sorted.back(), sorted.size());
-    }
-};
+// LatencyStats lives in bench_common.hpp (shared with timestar_query_bench).
 
 // ──────────────────────────────────────────────────────────────────────
 // Per-shard worker
