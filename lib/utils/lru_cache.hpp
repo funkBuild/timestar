@@ -62,6 +62,9 @@ public:
         }
     }
 
+    // Non-promoting existence check (does not affect LRU order).
+    bool contains(const Key& key) const { return map_.find(key) != map_.end(); }
+
     bool erase(const Key& key) {
         auto it = map_.find(key);
         if (it == map_.end())

@@ -528,13 +528,9 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         co_return nullptr;
     }
 
-    // Step 2: Check cache (promote to front on hit)
-    auto cacheIt = fullIndexCache.find(seriesId);
-    if (cacheIt != fullIndexCache.end()) {
-        // Move to front of LRU list (most recently used)
-        lruList.splice(lruList.begin(), lruList, cacheIt->second);
-        auto& entry = cacheIt->second->second;
-        co_return &entry;
+    // Step 2: Check cache (promotes to front on hit)
+    if (auto* cached = fullIndexCache.get(seriesId)) {
+        co_return cached;
     }
 
     // Step 3: Sparse index lookup
@@ -579,32 +575,18 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     // there is no co_await between them — the Seastar reactor cannot schedule
     // another task between these two lines, making the check-then-mutate
     // sequence effectively atomic within a shard.
-    {
-        auto existingIt = fullIndexCache.find(seriesId);
-        if (existingIt != fullIndexCache.end()) {
-            // Another coroutine beat us to it while we were suspended on DMA I/O.
-            // Promote to front of LRU and return the already-cached entry.
-            lruList.splice(lruList.begin(), lruList, existingIt->second);
-            co_return &existingIt->second->second;
-        }
+    if (auto* existing = fullIndexCache.get(seriesId)) {
+        // Another coroutine beat us to it while we were suspended on DMA I/O.
+        co_return existing;
     }
 
-    size_t entryBytes = estimateEntryBytes(fullEntry);
-    // Evict LRU entries until under byte budget
-    while (!lruList.empty() && fullIndexCacheBytes + entryBytes > maxCacheBytes()) {
-        auto& lruEntry = lruList.back();
-        fullIndexCacheBytes -= estimateEntryBytes(lruEntry.second);
-        fullIndexCache.erase(lruEntry.first);
-        lruList.pop_back();
-    }
-    // Insert at front of LRU list (most recently used)
-    lruList.emplace_front(seriesId, std::move(fullEntry));
-    fullIndexCache[seriesId] = lruList.begin();
-    fullIndexCacheBytes += entryBytes;
+    // Insert (LRUCache evicts to stay under the byte budget) and return the
+    // stable pointer into the cache node.
+    fullIndexCache.put(seriesId, std::move(fullEntry));
 
     timestar::tsm_log.trace("Loaded full index entry for series {} ({} blocks)", seriesId.toHex(), blockCount);
 
-    co_return &lruList.front().second;
+    co_return fullIndexCache.get(seriesId);
 }
 
 // Bulk prefetch: identify cache misses and issue coalesced DMA reads.
@@ -622,7 +604,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
     toFetch.reserve(seriesIds.size());
 
     for (const auto& seriesId : seriesIds) {
-        if (fullIndexCache.find(seriesId) != fullIndexCache.end())
+        if (fullIndexCache.contains(seriesId))
             continue;
         if (!seriesBloomFilter.contains(seriesId.getRawData()))
             continue;
@@ -685,7 +667,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
 
         for (const auto* entry : group.entries) {
             // Skip if another coroutine cached it while we were reading
-            if (fullIndexCache.find(entry->id) != fullIndexCache.end())
+            if (fullIndexCache.contains(entry->id))
                 continue;
 
             uint64_t localOffset = entry->offset - group.startOffset;
@@ -705,17 +687,8 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
             // Parse all blocks and optional string dictionary
             parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
 
-            // Cache the entry
-            size_t entryBytes = estimateEntryBytes(fullEntry);
-            while (!lruList.empty() && fullIndexCacheBytes + entryBytes > maxCacheBytes()) {
-                auto& lruEntry = lruList.back();
-                fullIndexCacheBytes -= estimateEntryBytes(lruEntry.second);
-                fullIndexCache.erase(lruEntry.first);
-                lruList.pop_back();
-            }
-            lruList.emplace_front(entry->id, std::move(fullEntry));
-            fullIndexCache[entry->id] = lruList.begin();
-            fullIndexCacheBytes += entryBytes;
+            // Cache the entry (LRUCache evicts to stay under the byte budget)
+            fullIndexCache.put(entry->id, std::move(fullEntry));
         }
     }
 }
@@ -783,11 +756,8 @@ std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId) {
     }
 
     // Check full index cache (populated after getFullIndexEntry is called)
-    auto it = fullIndexCache.find(seriesId);
-    if (it != fullIndexCache.end()) {
-        // Promote to front of LRU list on access
-        lruList.splice(lruList.begin(), lruList, it->second);
-        return it->second->second.seriesType;
+    if (auto* cached = fullIndexCache.get(seriesId)) {
+        return cached->seriesType;
     }
 
     // Fall back to sparse index which stores the type from the initial index parse
@@ -804,11 +774,9 @@ std::optional<TSMValueType> TSM::getSeriesType(const SeriesId128& seriesId) {
 // For guaranteed results, caller should await getFullIndexEntry() first
 const std::vector<TSMIndexBlock>& TSM::getSeriesBlocks(const SeriesId128& seriesId) const {
     static const std::vector<TSMIndexBlock> empty;
-    // Check cache (promote to front on hit)
-    auto it = fullIndexCache.find(seriesId);
-    if (it != fullIndexCache.end()) {
-        lruList.splice(lruList.begin(), lruList, it->second);
-        return it->second->second.indexBlocks;
+    // Check cache (promotes to front on hit)
+    if (auto* cached = fullIndexCache.get(seriesId)) {
+        return cached->indexBlocks;
     }
 
     // Not in cache - return empty

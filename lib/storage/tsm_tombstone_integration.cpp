@@ -52,20 +52,16 @@ bool TSM::hasSeriesInTimeRange(const SeriesId128& seriesId, uint64_t startTime, 
         return false;
     }
 
-    // Check if series exists in cache (promote to front on hit)
-    auto it = fullIndexCache.find(seriesId);
-    if (it == fullIndexCache.end()) {
+    // Check if series exists in cache (promotes to front on hit)
+    auto* cached = fullIndexCache.get(seriesId);
+    if (cached == nullptr) {
         // Not in cache — could exist but not loaded yet.
         // Bloom filter already passed above, so be conservative and assume it might exist.
         return true;
     }
 
-    // Promote to front of LRU list on access
-    lruList.splice(lruList.begin(), lruList, it->second);
-
     // Check if any index blocks overlap with the time range
-    const auto& indexEntry = it->second->second;
-    for (const auto& block : indexEntry.indexBlocks) {
+    for (const auto& block : cached->indexBlocks) {
         if (block.minTime < endTime && block.maxTime >= startTime) {
             return true;
         }

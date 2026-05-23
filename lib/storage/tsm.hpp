@@ -2,6 +2,7 @@
 
 #include "block_aggregator.hpp"
 #include "bloom_filter.hpp"
+#include "lru_cache.hpp"
 #include "query_result.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
@@ -98,6 +99,22 @@ struct TSMIndexEntry {
     std::vector<std::string> stringDictionary;
 };
 
+namespace timestar {
+// Heap-size estimate for the byte-budgeted full-index LRU cache. Counts the
+// index-block array and any string-dictionary strings (the generic LRUCache
+// adds its own list-node/map overhead on top).
+template <>
+struct CacheSizeEstimator<::TSMIndexEntry> {
+    static size_t estimate(const ::TSMIndexEntry& entry) {
+        size_t bytes = sizeof(::TSMIndexEntry) + entry.indexBlocks.size() * sizeof(::TSMIndexBlock);
+        for (const auto& s : entry.stringDictionary) {
+            bytes += sizeof(std::string) + s.capacity();
+        }
+        return bytes;
+    }
+};
+}  // namespace timestar
+
 // TSM file format version.
 // V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
 // V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
@@ -143,26 +160,17 @@ private:
 
     // Full index cache with byte-budgeted LRU eviction for hot series.
     // Budget limits total memory instead of entry count, preventing large series
-    // (many blocks) from consuming disproportionate memory.
-    using LRUList = std::list<std::pair<SeriesId128, TSMIndexEntry>>;
-    mutable LRUList lruList;
-    mutable std::unordered_map<SeriesId128, LRUList::iterator, SeriesId128::Hash> fullIndexCache;
-    mutable size_t fullIndexCacheBytes = 0;
+    // (many blocks) from consuming disproportionate memory. Backed by the generic
+    // byte-budgeted LRUCache (previously a hand-rolled list+map+byte-counter with
+    // a duplicated, O(blocks)-per-eviction loop; LRUCache stores per-entry size
+    // for O(1) eviction).
+    mutable timestar::LRUCache<SeriesId128, TSMIndexEntry, SeriesId128::Hash> fullIndexCache{maxCacheBytes()};
 
     // Shared helper: parse index blocks (and optional string dictionary) from a Slice
     // into a TSMIndexEntry.  The Slice must be positioned just after the series type
     // and block-count fields have already been read.  On return the Slice offset is
     // advanced past all block data and the optional string dictionary.
     void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint16_t blockCount) const;
-
-    static size_t estimateEntryBytes(const TSMIndexEntry& entry) {
-        size_t bytes = sizeof(TSMIndexEntry) + entry.indexBlocks.size() * sizeof(TSMIndexBlock) +
-                       sizeof(std::pair<SeriesId128, TSMIndexEntry>);  // list node overhead
-        for (const auto& s : entry.stringDictionary) {
-            bytes += sizeof(std::string) + s.capacity();
-        }
-        return bytes;
-    }
 
     // Configuration for bloom filter and cache (read from TOML config)
     static double bloomFpr() { return timestar::config().storage.tsm_bloom_fpr; }
