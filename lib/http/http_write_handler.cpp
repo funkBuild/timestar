@@ -621,9 +621,11 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                                      seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
                                      const std::string& fieldName, TSMValueType valueType, size_t numValuesToAdd,
                                      const std::string& groupKey) -> CoalesceCandidate& {
-        auto it = candidates.find(seriesKey);
-        if (it == candidates.end()) {
-            CoalesceCandidate& c = candidates[seriesKey];
+        // Single hash/probe: try_emplace default-constructs the candidate only when the
+        // key is new, replacing the previous find() + operator[] double lookup.
+        auto [it, inserted] = candidates.try_emplace(seriesKey);
+        if (inserted) {
+            CoalesceCandidate& c = it.value();
             initCandidate(c, seriesKey, measurement, std::move(tags), fieldName, valueType, groupKey);
             return c;
         }
@@ -742,13 +744,13 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
                 for (const auto& [tagKey, tagValue] : tagsObj) {
                     if (tagValue.is_string()) {
-                        auto err = validateName(tagKey, "Tag key '" + tagKey + "'");
-                        if (!err.empty())
-                            throw std::invalid_argument(err);
+                        // Guard with the allocation-free predicates; build the error-context
+                        // string only on the rare invalid path (matches parseMultiWritePoint).
+                        if (!isValidName(tagKey)) [[unlikely]]
+                            throw std::invalid_argument(validateName(tagKey, "Tag key '" + tagKey + "'"));
                         auto val = tagValue.get<std::string>();
-                        err = validateTagValue(val, "Tag value for '" + tagKey + "'");
-                        if (!err.empty())
-                            throw std::invalid_argument(err);
+                        if (!isValidTagValue(val)) [[unlikely]]
+                            throw std::invalid_argument(validateTagValue(val, "Tag value for '" + tagKey + "'"));
                         localTags[tagKey] = std::move(val);
                     }
                 }
@@ -782,12 +784,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
             auto& fieldsObj = fieldsIt->second.get<json_value_t::object_t>();
             for (const auto& [fieldName, fieldValue] : fieldsObj) {
-                // Validate field name
-                {
-                    auto err = validateName(fieldName, "Field name '" + fieldName + "'");
-                    if (!err.empty())
-                        throw std::invalid_argument(err);
-                }
+                // Validate field name (guard with the allocation-free predicate; build the
+                // error context only on the invalid path).
+                if (!isValidName(fieldName)) [[unlikely]]
+                    throw std::invalid_argument(validateName(fieldName, "Field name '" + fieldName + "'"));
 
                 // Build series key
                 std::string seriesKey;

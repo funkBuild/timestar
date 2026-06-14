@@ -459,9 +459,12 @@ void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequ
             _compressionStats.updateString(rawValSize, encodedValSize);
         } else if constexpr (std::is_same_v<T, int64_t>) {
             const size_t rawValSize = count * sizeof(int64_t);
-            // ZigZag encode int64 → uint64, then FFOR encode.
-            // Per-coroutine scratch (not thread_local) since encoding is concurrent.
-            std::vector<uint64_t> zigzagScratch(count);
+            // ZigZag encode int64 → uint64, then FFOR encode. encodeInsertEntry() is a
+            // synchronous (non-coroutine) function and Seastar is single-threaded per
+            // shard, so thread-local scratch cannot be interleaved — reuse it to avoid a
+            // per-entry heap alloc + value-init that zigzagEncodeInto fully overwrites.
+            static thread_local std::vector<uint64_t> zigzagScratch;
+            zigzagScratch.resize(count);
             ZigZag::zigzagEncodeInto(insertRequest.values, zigzagScratch.data());
             IntegerEncoder::encodeInto(zigzagScratch, buffer);
             const size_t encodedValSize = buffer.size() - startPos;
