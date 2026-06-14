@@ -425,8 +425,11 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
     auto start_memory_insert = std::chrono::high_resolution_clock::now();
 #endif
     for (auto& insertRequest : insertRequests) {
-        // Capture key before the move — insertRequest is moved-from after insertMemory()
-        auto key = insertRequest.seriesKey();
+        // Bind the cached key by const-ref: insertMemory() moves out only values and
+        // timestamps, never _seriesKey, and insertRequest stays a live lvalue, so the
+        // reference is valid in the catch block (the only reader). Avoids a per-point
+        // string copy on the happy path.
+        const std::string& key = insertRequest.seriesKey();
         try {
             insertMemory(std::move(insertRequest));
         } catch (const std::exception& e) {

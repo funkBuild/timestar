@@ -86,11 +86,13 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
             std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
             std::vector<bool> blockValues(values.begin() + offset, values.begin() + end);
             size_t blockStartOffset = buffer.size();
-            AlignedBuffer encodedTimestamps = IntegerEncoder::encode(tsSpan);
             buffer.write((uint8_t)seriesType);
             buffer.write((uint32_t)blockSize);
-            buffer.write((uint32_t)encodedTimestamps.size());
-            buffer.write(encodedTimestamps);
+            // Encode timestamps directly into the output buffer (see writeBlock).
+            const size_t tsLenOffset = buffer.size();
+            buffer.write((uint32_t)0);  // placeholder: compressed timestamp byte length
+            const size_t tsBytes = IntegerEncoder::encodeInto(tsSpan, buffer);
+            buffer.writeAt<uint32_t>(tsLenOffset, (uint32_t)tsBytes);
             BoolEncoderRLE::encodeInto(blockValues, buffer);
 
             writeIndexBlock(tsSpan, values, offset, blockSize, indexEntry, blockStartOffset);
@@ -111,12 +113,17 @@ template <class T>
 void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId, std::span<const uint64_t> timestamps,
                            std::span<const T> values, TSMIndexEntry& indexEntry) {
     size_t blockStartOffset = buffer.size();
-    AlignedBuffer encodedTimestamps = IntegerEncoder::encode(timestamps);
 
-    buffer.write((uint8_t)seriesType);                 // uint8_t fieldType
-    buffer.write((uint32_t)timestamps.size());         // uint32_t timestamp entries count
-    buffer.write((uint32_t)encodedTimestamps.size());  // uint32_t timestamp partition length in bytes
-    buffer.write(encodedTimestamps);                   // uint8_t x N bytes, compressed timestamps
+    buffer.write((uint8_t)seriesType);          // uint8_t fieldType
+    buffer.write((uint32_t)timestamps.size());  // uint32_t timestamp entries count
+    // Encode timestamps straight into the output buffer instead of allocating a
+    // fresh 4KB-page-aligned AlignedBuffer and copying it in a second time. Reserve a
+    // 4-byte length slot, encode in place, then back-patch the byte length. encode()
+    // and encodeInto() share encodeImpl(), so the on-disk bytes are identical.
+    const size_t tsLenOffset = buffer.size();
+    buffer.write((uint32_t)0);  // placeholder: compressed timestamp partition length in bytes
+    const size_t tsBytes = IntegerEncoder::encodeInto(timestamps, buffer);
+    buffer.writeAt<uint32_t>(tsLenOffset, (uint32_t)tsBytes);
 
     if constexpr (std::is_same_v<T, double>) {
         // Encode directly into the output buffer. The previous code routed through
@@ -154,8 +161,11 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         static thread_local std::vector<uint64_t> zigzagScratch;
         zigzagScratch.resize(values.size());
         ZigZag::zigzagEncodeInto(values, zigzagScratch.data());
-        AlignedBuffer encodedIntegers = IntegerEncoder::encode(zigzagScratch);
-        buffer.write(encodedIntegers);
+        // Encode straight into the output buffer (no temp AlignedBuffer + second copy).
+        // The int64 value region carries no length prefix — its extent is the block
+        // size minus the header+timestamp bytes — so encodeInto's bytes are identical
+        // to the previous encode()+write().
+        IntegerEncoder::encodeInto(zigzagScratch, buffer);
     } else {
         static_assert(sizeof(T) == 0, "Unsupported TSM value type");
     }
@@ -401,9 +411,11 @@ void TSMWriter::writeIndex() {
 
     // Iterate directly - already sorted by SeriesId128
     for (auto const& [seriesId, indexEntry] : indexEntries) {
-        // Write SeriesId128 as 16 bytes (no length prefix needed since it's fixed size)
-        std::string seriesIdBytes = indexEntry.seriesId.toBytes();
-        buffer.write(seriesIdBytes);
+        // Write SeriesId128 as 16 bytes (no length prefix needed since it's fixed size).
+        // write_bytes straight from the raw 16-byte array avoids the per-series
+        // std::string that toBytes() would allocate.
+        const auto& seriesIdRaw = indexEntry.seriesId.getRawData();
+        buffer.write_bytes(reinterpret_cast<const char*>(seriesIdRaw.data()), seriesIdRaw.size());
 
         // Block type
         buffer.write((uint8_t)indexEntry.seriesType);  // uint8_t fieldType

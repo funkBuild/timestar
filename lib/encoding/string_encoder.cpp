@@ -22,6 +22,10 @@ static thread_local std::vector<uint8_t> tlDecompBuf;
 // encodeDictionary() (never live simultaneously — a block is either raw or
 // dict-encoded). Previously two separate function-local thread_locals.
 static thread_local std::vector<char> tlCompBuf;
+// Uncompressed varint-prefixed input staging for compressStrings(). Reused across
+// calls to avoid a fresh 4KB-page-aligned AlignedBuffer per encode; zstd reads a
+// raw pointer, so no DMA alignment is required.
+static thread_local std::vector<uint8_t> tlUncompBuf;
 
 // Validate zstd decompression result: check for errors and size mismatch.
 // A truncated or corrupted compressed stream may decompress fewer bytes than
@@ -126,32 +130,33 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
                                   " exceeds uint32_t maximum");
     }
 
-    // Build uncompressed buffer (varint-prefixed strings)
-    AlignedBuffer uncompressed(uncompSize);
+    // Build uncompressed buffer (varint-prefixed strings) into reused thread-local
+    // staging instead of a fresh page-aligned AlignedBuffer per call.
+    std::vector<uint8_t>& uncompressed = tlUncompBuf;
+    uncompressed.resize(uncompSize);
     size_t writePos = 0;
     for (const auto& str : values) {
         uint32_t len = static_cast<uint32_t>(str.size());
         while (len >= 0x80) {
-            uncompressed.data[writePos++] = static_cast<uint8_t>((len & 0x7F) | 0x80);
+            uncompressed[writePos++] = static_cast<uint8_t>((len & 0x7F) | 0x80);
             len >>= 7;
         }
-        uncompressed.data[writePos++] = static_cast<uint8_t>(len & 0x7F);
-        std::memcpy(uncompressed.data.data() + writePos, str.data(), str.size());
+        uncompressed[writePos++] = static_cast<uint8_t>(len & 0x7F);
+        std::memcpy(uncompressed.data() + writePos, str.data(), str.size());
         writePos += str.size();
     }
     if (writePos != uncompSize) [[unlikely]] {
         throw std::runtime_error("String encoder: varint size mismatch (wrote " + std::to_string(writePos) +
                                  " expected " + std::to_string(uncompSize) + ")");
     }
-    uncompressed.data.resize(writePos);
 
     // Compress with zstd — reuse thread-local buffer to avoid per-call allocation
     size_t compressedMaxSize = ZSTD_compressBound(writePos);
     tlCompBuf.resize(compressedMaxSize);
     auto& compressed = tlCompBuf;
     size_t compressedSize = ZSTD_compressCCtx(getThreadCCtx(), compressed.data(), compressedMaxSize,
-                                              reinterpret_cast<const char*>(uncompressed.data.data()),
-                                              uncompressed.data.size(), compressionLevel);
+                                              reinterpret_cast<const char*>(uncompressed.data()), writePos,
+                                              compressionLevel);
     if (ZSTD_isError(compressedSize)) {
         throw std::runtime_error(std::string("String encoder: zstd compression failed: ") +
                                  ZSTD_getErrorName(compressedSize));
@@ -164,7 +169,7 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
     // Copy instead of move — `compressed` is a reference to thread-local `tlCompBuf`,
     // and moving it would leave the thread-local empty, defeating its reuse purpose.
     return {std::vector<char>(compressed.begin(), compressed.begin() + compressedSize),
-            static_cast<uint32_t>(uncompressed.data.size()), static_cast<uint32_t>(compressedSize),
+            static_cast<uint32_t>(writePos), static_cast<uint32_t>(compressedSize),
             static_cast<uint32_t>(values.size())};
 }
 
