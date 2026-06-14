@@ -1347,20 +1347,19 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                     if (blockResult && !blockResult->timestamps.empty()) {
                         const auto& ts = blockResult->timestamps;
                         const auto& vals = blockResult->values;
+                        // Decoded timestamps are ascending and tombstoneRanges are sorted +
+                        // non-overlapping, so a monotonic cursor replaces the per-point
+                        // std::upper_bound: O(N + T) instead of O(N log T).
+                        size_t ri = 0;
+                        const size_t nr = tombstoneRanges.size();
                         for (size_t i = 0; i < ts.size(); ++i) {
                             uint64_t t = ts[i];
-                            auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                            std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                            bool isTombstoned = false;
-                            if (rangeIt != tombstoneRanges.begin()) {
-                                --rangeIt;
-                                if (t >= rangeIt->first && t <= rangeIt->second)
-                                    isTombstoned = true;
-                            }
-                            if (!isTombstoned) {
-                                aggregator.addPoint(t, vals[i]);
-                                totalPoints++;
-                            }
+                            while (ri < nr && tombstoneRanges[ri].second < t)
+                                ++ri;
+                            if (ri < nr && t >= tombstoneRanges[ri].first)
+                                continue;  // tombstoned
+                            aggregator.addPoint(t, vals[i]);
+                            totalPoints++;
                         }
                     }
                 } else if (seriesType == TSMValueType::Integer) {
@@ -1368,20 +1367,17 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                     if (blockResult && !blockResult->timestamps.empty()) {
                         const auto& ts = blockResult->timestamps;
                         const auto& vals = blockResult->values;
+                        // Monotonic cursor (see Float path above): O(N + T) not O(N log T).
+                        size_t ri = 0;
+                        const size_t nr = tombstoneRanges.size();
                         for (size_t i = 0; i < ts.size(); ++i) {
                             uint64_t t = ts[i];
-                            auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                            std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                            bool isTombstoned = false;
-                            if (rangeIt != tombstoneRanges.begin()) {
-                                --rangeIt;
-                                if (t >= rangeIt->first && t <= rangeIt->second)
-                                    isTombstoned = true;
-                            }
-                            if (!isTombstoned) {
-                                aggregator.addPoint(t, static_cast<double>(vals[i]));
-                                totalPoints++;
-                            }
+                            while (ri < nr && tombstoneRanges[ri].second < t)
+                                ++ri;
+                            if (ri < nr && t >= tombstoneRanges[ri].first)
+                                continue;  // tombstoned
+                            aggregator.addPoint(t, static_cast<double>(vals[i]));
+                            totalPoints++;
                         }
                     }
                 } else {
@@ -1390,20 +1386,17 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                     if (blockResult && !blockResult->timestamps.empty()) {
                         const auto& ts = blockResult->timestamps;
                         const auto& vals = blockResult->values;
+                        // Monotonic cursor (see Float path above): O(N + T) not O(N log T).
+                        size_t ri = 0;
+                        const size_t nr = tombstoneRanges.size();
                         for (size_t i = 0; i < ts.size(); ++i) {
                             uint64_t t = ts[i];
-                            auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                            std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                            bool isTombstoned = false;
-                            if (rangeIt != tombstoneRanges.begin()) {
-                                --rangeIt;
-                                if (t >= rangeIt->first && t <= rangeIt->second)
-                                    isTombstoned = true;
-                            }
-                            if (!isTombstoned) {
-                                aggregator.addPoint(t, vals[i] ? 1.0 : 0.0);
-                                totalPoints++;
-                            }
+                            while (ri < nr && tombstoneRanges[ri].second < t)
+                                ++ri;
+                            if (ri < nr && t >= tombstoneRanges[ri].first)
+                                continue;  // tombstoned
+                            aggregator.addPoint(t, vals[i] ? 1.0 : 0.0);
+                            totalPoints++;
                         }
                     }
                 }
