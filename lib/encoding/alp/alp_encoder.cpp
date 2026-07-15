@@ -140,24 +140,16 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     CompressedBuffer buffer;
     const size_t numBytes = aligned.size();
     if (numBytes > 0) {
-        // Copy AlignedBuffer's raw bytes into CompressedBuffer as 64-bit words.
-        const size_t fullWords = numBytes / 8;
-        const size_t tailBytes = numBytes % 8;
-        buffer.reserve(fullWords + (tailBytes > 0 ? 1 : 0));
-
-        const uint8_t* src = aligned.data.data();
-        for (size_t i = 0; i < fullWords; ++i) {
-            uint64_t word;
-            std::memcpy(&word, src + i * 8, 8);
-            buffer.write<64>(word);
-        }
-        if (tailBytes > 0) {
-            uint64_t word = 0;
-            std::memcpy(&word, src + fullWords * 8, tailBytes);
-            buffer.write(word, static_cast<int>(tailBytes * 8));
-        }
+        // Bulk-copy AlignedBuffer's raw bytes into the word vector in one
+        // memcpy (zero-padded tail word). The old word-by-word write<64>()
+        // loop cost ~5ms per 1M values — comparable to the encode itself.
+        // CompressedBuffer::size() derives from data.size(), and consumers
+        // read via CompressedSlice / serialize the bytes, so filling `data`
+        // directly is equivalent.
+        const size_t totalWords = (numBytes + 7) / 8;
+        buffer.data.assign(totalWords, 0);
+        std::memcpy(buffer.data.data(), aligned.data.data(), numBytes);
     }
-    buffer.shrink_to_fit();
     return buffer;
 }
 
