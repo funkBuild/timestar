@@ -1370,27 +1370,29 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     auto resFmt = timestar::http::responseFormat(*req);
 
     try {
-        // Read the complete request body — move from request to avoid copying
-        std::string body;
+        // Parse directly from the request's body buffer. `req->content` is a
+        // seastar::sstring; assigning it into a std::string is a cross-type
+        // COPY of the entire body (the std::move is inert), ~2MB per bench
+        // request. A view is zero-copy: `req` outlives this coroutine and
+        // sstring data is null-terminated (required by Glaze's default opts).
+        std::string bodyStorage;  // owns data only on the streaming branch
+        std::string_view body;
         if (!req->content.empty()) {
-            body = std::move(req->content);
-        }
-
-        // Pre-reserve body buffer from Content-Length to avoid repeated reallocations
-        // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
-        if (body.empty() && req->content_length > 0 && req->content_length <= maxWriteBodySize()) {
-            body.reserve(req->content_length);
-        }
-
-        // Read from stream if available, checking size incrementally
-        if (req->content_stream) {
+            body = std::string_view(req->content.data(), req->content.size());
+        } else if (req->content_stream) {
+            // Pre-reserve from Content-Length to avoid repeated reallocations
+            // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
+            if (req->content_length > 0 && req->content_length <= maxWriteBodySize()) {
+                bodyStorage.reserve(req->content_length);
+            }
             while (!req->content_stream->eof()) {
                 auto data = co_await req->content_stream->read();
-                body.append(data.get(), data.size());
-                if (body.size() > maxWriteBodySize()) {
+                bodyStorage.append(data.get(), data.size());
+                if (bodyStorage.size() > maxWriteBodySize()) {
                     break;
                 }
             }
+            body = bodyStorage;
         }
 
         if (body.size() > maxWriteBodySize()) {
