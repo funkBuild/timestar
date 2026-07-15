@@ -439,6 +439,16 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         if (targetTier >= 1) {
             writer.setCompressionLevel(3);
         }
+        // Pre-reserve the output buffer: compacted output is bounded by the sum
+        // of the input file sizes (dedup/tombstones only shrink it). Avoids
+        // repeated geometric-doubling reallocs of the whole-file buffer.
+        {
+            uint64_t inputBytes = 0;
+            for (const auto& file : files) {
+                inputBytes += file->getFileSize();
+            }
+            writer.reserveBuffer(inputBytes);
+        }
 
         CompactionStats stats;
         stats.filesCompacted = files.size();

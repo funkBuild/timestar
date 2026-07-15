@@ -53,6 +53,22 @@ static bool blockOverlapsTombstones(uint64_t blockMin, uint64_t blockMax,
     return false;
 }
 
+// Select the index blocks overlapping [startTime, endTime) as a contiguous
+// range.  Index blocks are sorted by minTime with non-decreasing maxTime
+// (the writer emits each series' blocks sequentially in time order, and the
+// compactor's zero-copy path requires sorted non-overlapping blocks; its
+// merge path re-encodes fully sorted data), so the set of blocks matching
+// (minTime < endTime && startTime <= maxTime) is contiguous: two binary
+// searches replace the previous O(blocks) copy_if scan.
+static std::span<const TSMIndexBlock> overlappingBlockRange(const std::vector<TSMIndexBlock>& blocks,
+                                                            uint64_t startTime, uint64_t endTime) {
+    auto first = std::partition_point(blocks.begin(), blocks.end(),
+                                      [startTime](const TSMIndexBlock& b) { return b.maxTime < startTime; });
+    auto last = std::partition_point(first, blocks.end(),
+                                     [endTime](const TSMIndexBlock& b) { return b.minTime < endTime; });
+    return {first, last};
+}
+
 // Block-into-aggregator decode helpers. All four (Float, Integer, Boolean,
 // COUNT-only) share an identical prologue: parse the 9-byte block header,
 // time-filtered decode of timestamps into a thread-local scratch buffer.
@@ -510,7 +526,7 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
         if (dictSize > 0 && indexSlice.offset + dictSize <= indexSlice.length_) {
             auto dict = StringEncoder::deserializeDictionary(indexSlice, dictSize);
             if (dict.valid) {
-                entry.stringDictionary = std::move(dict.entries);
+                entry.stringDictionary = std::make_shared<const std::vector<std::string>>(std::move(dict.entries));
             }
         }
     }
@@ -577,12 +593,13 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     }
 
     // Insert (LRUCache evicts to stay under the byte budget) and return the
-    // stable pointer into the cache node.
-    fullIndexCache.put(seriesId, std::move(fullEntry));
+    // stable pointer into the cache node (put() returns it directly — no
+    // second hash lookup).
+    auto* inserted = fullIndexCache.put(seriesId, std::move(fullEntry));
 
     timestar::tsm_log.trace("Loaded full index entry for series {} ({} blocks)", seriesId.toHex(), blockCount);
 
-    co_return fullIndexCache.get(seriesId);
+    co_return inserted;
 }
 
 // Bulk prefetch: identify cache misses and issue coalesced DMA reads.
@@ -699,23 +716,23 @@ seastar::future<> TSM::readSeries(const SeriesId128& seriesId, uint64_t startTim
         co_return;  // Series not in this file
     }
 
-    // Copy the dictionary into a coroutine-frame-local vector so it survives
-    // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
-    [[maybe_unused]] std::vector<std::string> localDictCopy;
+    // Take a refcount on the shared dictionary so it survives LRU cache
+    // evictions across co_await DMA suspensions (use-after-free fix) — no
+    // deep copy of the strings.
+    [[maybe_unused]] std::shared_ptr<const std::vector<std::string>> localDictRef;
     [[maybe_unused]] const std::vector<std::string>* localStringDict = nullptr;
     if constexpr (std::is_same_v<T, std::string>) {
-        if (!indexEntry->stringDictionary.empty()) {
-            localDictCopy = indexEntry->stringDictionary;
-            localStringDict = &localDictCopy;
+        if (indexEntry->stringDictionary && !indexEntry->stringDictionary->empty()) {
+            localDictRef = indexEntry->stringDictionary;
+            localStringDict = localDictRef.get();
         }
     }
 
-    // Filter blocks by time range
-    std::vector<TSMIndexBlock> blocksToScan;
-    std::copy_if(indexEntry->indexBlocks.begin(), indexEntry->indexBlocks.end(), std::back_inserter(blocksToScan),
-                 [endTime, startTime](const TSMIndexBlock& indexBlock) {
-                     return indexBlock.minTime < endTime && startTime <= indexBlock.maxTime;
-                 });
+    // Filter blocks by time range (contiguous range via binary search), copied
+    // into a frame-local vector because the cache entry can be evicted across
+    // the co_await suspensions below.
+    auto overlapRange = overlappingBlockRange(indexEntry->indexBlocks, startTime, endTime);
+    std::vector<TSMIndexBlock> blocksToScan(overlapRange.begin(), overlapRange.end());
 
     // Pre-allocate a slot per block so each coroutine writes to its own index,
     // avoiding the data race where multiple coroutines push_back concurrently
@@ -909,8 +926,10 @@ seastar::future<> TSM::scheduleDelete() {
     }
 }
 
-// Group blocks into contiguous batches for optimized I/O
-std::vector<BlockBatch> TSM::groupContiguousBlocks(const std::vector<TSMIndexBlock>& blocks) const {
+// Group blocks into contiguous batches for optimized I/O.
+// Batches are consecutive runs of the input, so each batch holds a zero-copy
+// span into `blocks` instead of copying the 88-byte index structs.
+std::vector<BlockBatch> TSM::groupContiguousBlocks(std::span<const TSMIndexBlock> blocks) const {
     std::vector<BlockBatch> batches;
     if (blocks.empty()) {
         return batches;
@@ -919,32 +938,29 @@ std::vector<BlockBatch> TSM::groupContiguousBlocks(const std::vector<TSMIndexBlo
     // Maximum batch size to avoid excessive memory usage (16MB)
     constexpr uint64_t MAX_BATCH_SIZE = 16 * 1024 * 1024;
 
-    BlockBatch currentBatch;
-    currentBatch.startOffset = blocks[0].offset;
-    currentBatch.totalSize = blocks[0].size;
-    currentBatch.blocks.push_back(blocks[0]);
+    size_t batchStart = 0;
+    uint64_t startOffset = blocks[0].offset;
+    uint64_t totalSize = blocks[0].size;
 
     for (size_t i = 1; i < blocks.size(); ++i) {
-        uint64_t expectedOffset = currentBatch.startOffset + currentBatch.totalSize;
-        uint64_t newBatchSize = currentBatch.totalSize + blocks[i].size;
+        uint64_t expectedOffset = startOffset + totalSize;
+        uint64_t newBatchSize = totalSize + blocks[i].size;
 
         // Check if contiguous and within size limit
         if (blocks[i].offset == expectedOffset && newBatchSize <= MAX_BATCH_SIZE) {
-            // Contiguous and fits - add to current batch
-            currentBatch.blocks.push_back(blocks[i]);
-            currentBatch.totalSize += blocks[i].size;
+            // Contiguous and fits - extend the current batch
+            totalSize = newBatchSize;
         } else {
             // Gap detected or size limit - finalize current batch and start new one
-            batches.push_back(std::move(currentBatch));
-            currentBatch = BlockBatch();
-            currentBatch.startOffset = blocks[i].offset;
-            currentBatch.totalSize = blocks[i].size;
-            currentBatch.blocks.push_back(blocks[i]);
+            batches.push_back({startOffset, totalSize, blocks.subspan(batchStart, i - batchStart)});
+            batchStart = i;
+            startOffset = blocks[i].offset;
+            totalSize = blocks[i].size;
         }
     }
 
     // Don't forget the last batch
-    batches.push_back(std::move(currentBatch));
+    batches.push_back({startOffset, totalSize, blocks.subspan(batchStart)});
 
     timestar::tsm_log.debug("Grouped {} blocks into {} batches", blocks.size(), batches.size());
 
@@ -1125,23 +1141,23 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
         co_return;  // Series not in this file
     }
 
-    // Copy the dictionary into a coroutine-frame-local vector so it survives
-    // LRU cache evictions across co_await DMA suspensions (use-after-free fix).
-    [[maybe_unused]] std::vector<std::string> localDictCopy;
+    // Take a refcount on the shared dictionary so it survives LRU cache
+    // evictions across co_await DMA suspensions (use-after-free fix) — no
+    // deep copy of the strings.
+    [[maybe_unused]] std::shared_ptr<const std::vector<std::string>> localDictRef;
     [[maybe_unused]] const std::vector<std::string>* localStringDict = nullptr;
     if constexpr (std::is_same_v<T, std::string>) {
-        if (!indexEntry->stringDictionary.empty()) {
-            localDictCopy = indexEntry->stringDictionary;
-            localStringDict = &localDictCopy;
+        if (indexEntry->stringDictionary && !indexEntry->stringDictionary->empty()) {
+            localDictRef = indexEntry->stringDictionary;
+            localStringDict = localDictRef.get();
         }
     }
 
-    // Step 1: Filter blocks by time range
-    std::vector<TSMIndexBlock> blocksToScan;
-    std::copy_if(indexEntry->indexBlocks.begin(), indexEntry->indexBlocks.end(), std::back_inserter(blocksToScan),
-                 [endTime, startTime](const TSMIndexBlock& indexBlock) {
-                     return indexBlock.minTime < endTime && startTime <= indexBlock.maxTime;
-                 });
+    // Step 1: Filter blocks by time range (contiguous range via binary search),
+    // copied into a frame-local vector because the cache entry can be evicted
+    // across the co_await suspensions below.
+    auto overlapRange = overlappingBlockRange(indexEntry->indexBlocks, startTime, endTime);
+    std::vector<TSMIndexBlock> blocksToScan(overlapRange.begin(), overlapRange.end());
 
     if (blocksToScan.empty()) {
         co_return;
@@ -1211,13 +1227,11 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
 
     const auto seriesType = indexEntry->seriesType;
 
-    // Filter blocks by time range
-    std::vector<TSMIndexBlock> blocksToScan;
-    for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime < endTime && startTime <= block.maxTime) {
-            blocksToScan.push_back(block);
-        }
-    }
+    // Filter blocks by time range (contiguous range via binary search).
+    // The span into the cache entry is only read synchronously below (stats
+    // pre-scan runs before any co_await); blocks that still need decoding are
+    // copied into the frame-local decodeBlocks vector before suspension.
+    auto blocksToScan = overlappingBlockRange(indexEntry->indexBlocks, startTime, endTime);
     if (blocksToScan.empty()) {
         co_return 0;
     }
@@ -1423,13 +1437,11 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
 
     const auto seriesType = indexEntry->seriesType;
 
-    // Filter blocks by time range
-    std::vector<TSMIndexBlock> blocksToScan;
-    for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime < endTime && startTime <= block.maxTime) {
-            blocksToScan.push_back(block);
-        }
-    }
+    // Filter blocks by time range (contiguous range via binary search), copied
+    // into a frame-local vector because the cache entry can be evicted across
+    // co_await suspensions below.
+    auto overlapRange = overlappingBlockRange(indexEntry->indexBlocks, startTime, endTime);
+    std::vector<TSMIndexBlock> blocksToScan(overlapRange.begin(), overlapRange.end());
     if (blocksToScan.empty()) {
         co_return 0;
     }
@@ -1479,21 +1491,33 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     size_t totalPoints = 0;
     size_t count = blocksToScan.size();
 
+    // Direction-aware monotonic tombstone cursor.  Points are visited in
+    // strictly monotonic time order across blocks (ascending forward,
+    // descending in reverse) and tombstoneRanges are sorted by start and
+    // non-overlapping, so the cursor advances O(N + T) total instead of a
+    // per-point std::upper_bound (O(N log T)).
+    size_t riFwd = 0;
+    ptrdiff_t riRev = static_cast<ptrdiff_t>(tombstoneRanges.size()) - 1;
+    auto isTombstoned = [&](uint64_t t) {
+        if (!reverse) {
+            const size_t nr = tombstoneRanges.size();
+            while (riFwd < nr && tombstoneRanges[riFwd].second < t)
+                ++riFwd;
+            return riFwd < nr && t >= tombstoneRanges[riFwd].first;
+        }
+        while (riRev >= 0 && tombstoneRanges[riRev].first > t)
+            --riRev;
+        return riRev >= 0 && t <= tombstoneRanges[riRev].second;
+    };
+
     // Helper lambda: iterate decoded points, optionally filtering tombstones, in fwd/rev order.
     auto processPoints = [&](const std::vector<uint64_t>& ts, const auto& vals, auto toDouble) {
         size_t pointCount = ts.size();
         for (size_t pi = 0; pi < pointCount && totalPoints < maxPoints; ++pi) {
             size_t j = reverse ? (pointCount - 1 - pi) : pi;
             uint64_t t = ts[j];
-            if (hasTombstoneRanges) {
-                auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
-                                                std::make_pair(t, std::numeric_limits<uint64_t>::max()));
-                if (rangeIt != tombstoneRanges.begin()) {
-                    --rangeIt;
-                    if (t >= rangeIt->first && t <= rangeIt->second)
-                        continue;
-                }
-            }
+            if (hasTombstoneRanges && isTombstoned(t))
+                continue;
             aggregator.addPoint(t, toDouble(vals[j]));
             totalPoints++;
         }
@@ -1537,13 +1561,11 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
 
     const auto seriesType = indexEntry->seriesType;
 
-    // Filter blocks by time range
-    std::vector<TSMIndexBlock> blocksToScan;
-    for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime < endTime && startTime <= block.maxTime) {
-            blocksToScan.push_back(block);
-        }
-    }
+    // Filter blocks by time range (contiguous range via binary search), copied
+    // into a frame-local vector because the cache entry can be evicted across
+    // co_await suspensions below.
+    auto overlapRange = overlappingBlockRange(indexEntry->indexBlocks, startTime, endTime);
+    std::vector<TSMIndexBlock> blocksToScan(overlapRange.begin(), overlapRange.end());
     if (blocksToScan.empty()) {
         co_return 0;
     }

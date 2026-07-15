@@ -492,3 +492,81 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R6_StatsPushdownIOAmplification) {
 
     co_await engine.stop();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  R7: Dictionary-encoded string series read path
+//
+//  Low-cardinality string series (≤50 unique values) are dictionary-encoded
+//  at flush.  Each readSeries/readSeriesBatched call previously deep-copied
+//  the dictionary (N string allocations); now it takes a shared_ptr refcount.
+//  Narrow-range queries make the per-call fixed overhead visible; full-range
+//  queries exercise dictionary decode throughput.
+// ═══════════════════════════════════════════════════════════════════════════
+
+SEASTAR_TEST_F(TsmReadPathBenchmark, R7_StringDictReadPath) {
+    fmt::print("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    fmt::print("║  R7: Dictionary-Encoded String Series Read Path                 ║\n");
+    fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
+
+    Engine engine;
+    co_await engine.init();
+
+    constexpr size_t NUM_POINTS = 100'000;
+    constexpr uint64_t T0 = 1'000'000'000ULL;
+    constexpr uint64_t STEP = 10'000'000'000ULL;  // 10s
+
+    // 40 unique values → dictionary-encoded (limits: 50 entries / 4KB)
+    {
+        constexpr size_t CHUNK = 20'000;
+        for (size_t off = 0; off < NUM_POINTS; off += CHUNK) {
+            TimeStarInsert<std::string> insert("applog", "status");
+            insert.addTag("hostname", "host_0");
+            for (size_t p = off; p < off + CHUNK && p < NUM_POINTS; p++) {
+                insert.addValue(T0 + p * STEP, fmt::format("status_code_{:02d}", p % 40));
+            }
+            co_await engine.insert(std::move(insert));
+        }
+        co_await engine.rolloverMemoryStore();
+        co_await seastar::sleep(std::chrono::milliseconds(500));
+    }
+
+    std::string seriesKey = "applog,hostname=host_0 status";
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+
+    // Narrow range: 200 points from the middle (fixed per-call overhead dominates)
+    const uint64_t nStart = T0 + 50'000 * STEP;
+    const uint64_t nEnd = nStart + 200 * STEP;
+
+    for (int i = 0; i < 3; i++) {
+        auto r = co_await engine.query(seriesKey, seriesId, nStart, nEnd);
+        EXPECT_TRUE(r.has_value());
+    }
+
+    BenchStats narrowStats;
+    for (int i = 0; i < 20; i++) {
+        auto t0 = clk::now();
+        auto result = co_await engine.query(seriesKey, seriesId, nStart, nEnd);
+        narrowStats.add(clk::now() - t0);
+        EXPECT_TRUE(result.has_value());
+        if (result.has_value()) {
+            auto& qr = std::get<QueryResult<std::string>>(*result);
+            EXPECT_EQ(qr.timestamps.size(), 200u);
+        }
+    }
+    narrowStats.print("String dict narrow range (200 pts)");
+
+    BenchStats fullStats;
+    for (int i = 0; i < 10; i++) {
+        auto t0 = clk::now();
+        auto result = co_await engine.query(seriesKey, seriesId, 0, UINT64_MAX);
+        fullStats.add(clk::now() - t0);
+        EXPECT_TRUE(result.has_value());
+        if (result.has_value()) {
+            auto& qr = std::get<QueryResult<std::string>>(*result);
+            EXPECT_EQ(qr.timestamps.size(), NUM_POINTS);
+        }
+    }
+    fullStats.print("String dict full range (100k pts)");
+
+    co_await engine.stop();
+}

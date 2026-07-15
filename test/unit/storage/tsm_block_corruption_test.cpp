@@ -305,7 +305,7 @@ seastar::future<> testReadSingleBlockStringHappyPath(std::string filename) {
 
     TSMIndexBlock indexBlock = entry->indexBlocks[0];
     const std::vector<std::string>* stringDict =
-        entry->stringDictionary.empty() ? nullptr : &entry->stringDictionary;
+        (entry->stringDictionary && !entry->stringDictionary->empty()) ? entry->stringDictionary.get() : nullptr;
     auto block = co_await tsm.readSingleBlock<std::string>(indexBlock, 0, UINT64_MAX, stringDict);
 
     EXPECT_NE(block, nullptr);

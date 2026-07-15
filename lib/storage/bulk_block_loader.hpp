@@ -76,16 +76,15 @@ public:
             co_return result;  // Series not in this file
         }
 
-        // Copy the string dictionary into a coroutine-frame-local vector so
-        // it survives LRU cache evictions across co_await DMA suspensions
-        // (use-after-free fix). The old code saved only a raw pointer into the
-        // cache entry which could dangle after eviction.
-        [[maybe_unused]] std::vector<std::string> localDictCopy;
+        // Take a refcount on the shared dictionary so it survives LRU cache
+        // evictions across co_await DMA suspensions (use-after-free fix) — no
+        // deep copy of the strings.
+        [[maybe_unused]] std::shared_ptr<const std::vector<std::string>> localDictRef;
         const std::vector<std::string>* stringDict = nullptr;
         if constexpr (std::is_same_v<T, std::string>) {
-            if (!indexEntry->stringDictionary.empty()) {
-                localDictCopy = indexEntry->stringDictionary;
-                stringDict = &localDictCopy;
+            if (indexEntry->stringDictionary && !indexEntry->stringDictionary->empty()) {
+                localDictRef = indexEntry->stringDictionary;
+                stringDict = localDictRef.get();
             }
         }
 

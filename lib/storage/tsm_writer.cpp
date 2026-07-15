@@ -61,7 +61,8 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
     if constexpr (std::is_same_v<T, std::string>) {
         stringDict = StringEncoder::buildDictionary(values);
         if (stringDict.valid) {
-            indexEntry.stringDictionary = stringDict.entries;
+            indexEntry.stringDictionary =
+                std::make_shared<const std::vector<std::string>>(std::move(stringDict.entries));
         }
     }
 
@@ -147,9 +148,9 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         // encodeInto/encodeDictionaryInto write header + compressed bytes straight into
         // the output buffer — no intermediate AlignedBuffer + copy per block. The bytes
         // are identical to the old encode()+write() path.
-        if (!indexEntry.stringDictionary.empty()) {
+        if (indexEntry.stringDictionary && !indexEntry.stringDictionary->empty()) {
             StringEncoder::Dictionary dict;
-            dict.entries = indexEntry.stringDictionary;
+            dict.entries = *indexEntry.stringDictionary;
             dict.valid = true;
             StringEncoder::encodeDictionaryInto(values, dict, buffer, compressionLevel_);
         } else {
@@ -547,9 +548,9 @@ void TSMWriter::writeIndex() {
         // Format: dictSize(4) + dictData(dictSize bytes)
         // dictSize == 0 means no dictionary (raw encoding used).
         if (indexEntry.seriesType == TSMValueType::String) {
-            if (!indexEntry.stringDictionary.empty()) {
+            if (indexEntry.stringDictionary && !indexEntry.stringDictionary->empty()) {
                 StringEncoder::Dictionary dict;
-                dict.entries = indexEntry.stringDictionary;
+                dict.entries = *indexEntry.stringDictionary;
                 dict.valid = true;
                 AlignedBuffer serialized = StringEncoder::serializeDictionary(dict);
                 buffer.write(static_cast<uint32_t>(serialized.size()));
@@ -736,6 +737,21 @@ seastar::future<> TSMWriter::closeDMA() {
 }
 
 void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStore> store) {
+    // Pre-reserve the output buffer from the store's point count. Without
+    // this, an ~8MB file accretes through ~11 geometric-doubling reallocs of
+    // the page-aligned buffer, each a full copy (~2x the file size memcpy'd).
+    // ~9 bytes/point covers encoded timestamps+values for numeric series
+    // (strings may still grow the buffer, which falls back to doubling), plus
+    // per-series index overhead. Over-reservation is short-lived and bounded
+    // well below the raw memstore footprint (16+ bytes/point).
+    {
+        size_t totalPoints = 0;
+        for (auto it = store.get()->series.begin(); it != store.get()->series.end(); ++it) {
+            totalPoints += std::visit([](const auto& s) { return s.timestamps.size(); }, it.value());
+        }
+        writer.buffer.reserve(4096 + totalPoints * 9 + store.get()->series.size() * 160);
+    }
+
     for (auto it = store.get()->series.begin(); it != store.get()->series.end(); ++it) {
         const auto& seriesKey = it->first;
         auto& memStore = it.value();

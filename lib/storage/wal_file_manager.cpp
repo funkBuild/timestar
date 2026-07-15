@@ -429,13 +429,17 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
     timestar::wal_log.info("[CONVERT_WAL_TO_TSM] Starting conversion of WAL {} to TSM on shard {}",
                            store->sequenceNumber, shardId);
 
-    // Count total data points in memory store for debugging
-    size_t totalPoints = 0;
+    // Diagnostic stats for the conversion path. The full pass walks every
+    // series (and every string byte for string series) plus unconditional
+    // info-level logging — that is pure overhead inside the rollover path, so
+    // it is compiled in only with TIMESTAR_LOG_INSERT_PATH=1.
     size_t totalSeries = store->series.size();
-    size_t totalMemoryEstimate = 0;
-    size_t largestSeriesPoints = 0;
-    std::string largestSeriesKey;
+    [[maybe_unused]] size_t totalPoints = 0;
+    [[maybe_unused]] size_t totalMemoryEstimate = 0;
+    [[maybe_unused]] size_t largestSeriesPoints = 0;
+    [[maybe_unused]] std::string largestSeriesKey;
 
+#if TIMESTAR_LOG_INSERT_PATH
     for (const auto& [key, series] : store->series) {
         size_t seriesPoints = std::visit([](const auto& s) { return s.timestamps.size(); }, series);
         totalPoints += seriesPoints;
@@ -484,6 +488,7 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
         store->sequenceNumber, shardId, totalSeries, totalPoints, totalMemoryEstimate / (1024 * 1024));
     timestar::wal_log.info("[LARGEST_SERIES] Largest series: '{}' with {} points", largestSeriesKey,
                            largestSeriesPoints);
+#endif  // TIMESTAR_LOG_INSERT_PATH
 
     try {
         timestar::wal_log.debug(
@@ -498,10 +503,15 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
             "[BAD_ALLOC] Memory allocation failed when writing TSM "
             "for store {} on shard {}",
             store->sequenceNumber, shardId);
+#if TIMESTAR_LOG_INSERT_PATH
         timestar::wal_log.error(
             "[BAD_ALLOC] Stats: {} series, {} points, ~{} MB "
             "estimated, largest series: '{}' ({} points)",
             totalSeries, totalPoints, totalMemoryEstimate / (1024 * 1024), largestSeriesKey, largestSeriesPoints);
+#else
+        timestar::wal_log.error("[BAD_ALLOC] Stats: {} series (detailed stats require TIMESTAR_LOG_INSERT_PATH=1)",
+                                totalSeries);
+#endif
 
         timestar::wal_log.error(
             "[SYSTEM_MEMORY] System may be low on memory - bad_alloc during TSM write "
