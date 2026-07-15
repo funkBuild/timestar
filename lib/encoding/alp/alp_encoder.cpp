@@ -4,6 +4,7 @@
 #include "alp_constants.hpp"
 #include "alp_ffor.hpp"
 #include "alp_rd.hpp"
+#include "alp_simd.hpp"
 
 #include <algorithm>
 #include <array>
@@ -258,6 +259,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         std::vector<uint64_t> exc_values;
         std::vector<uint64_t> packed;
 
+        // Single-pass masked SIMD scale loop: only for fac == 0 (integer
+        // divide by 10^fac has no matching SIMD equivalent) and only on
+        // targets with native i64<->f64 conversion (AVX-512 DQ).
+        const bool use_simd_scale = (fac == 0) && alp::simd::alpScaleSimdAvailable();
+
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
             const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
@@ -271,26 +277,36 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             int64_t max_val = std::numeric_limits<int64_t>::min();
             int64_t first_value = 0;  // absolute value of first non-exception (for delta)
 
-            for (size_t i = 0; i < block_count; ++i) {
-                double v = values[block_start + i];
-                bool is_special = std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v));  // -0.0
+            if (use_simd_scale) {
+                exc_positions.resize(block_count);
+                exc_values.resize(block_count);
+                const size_t n_exc =
+                    alp::simd::alpScaleF0(values.data() + block_start, block_count, alp::FACT_ARR[exp],
+                                          encoded.data(), &min_val, &max_val, exc_positions.data(), exc_values.data());
+                exc_positions.resize(n_exc);
+                exc_values.resize(n_exc);
+            } else {
+                for (size_t i = 0; i < block_count; ++i) {
+                    double v = values[block_start + i];
+                    bool is_special = std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v));  // -0.0
 
-                if (!is_special) {
-                    auto result = scaleValue(v, exp, fac);
-                    if (result.exact) {
-                        encoded[i] = result.encoded;
-                        if (result.encoded < min_val)
-                            min_val = result.encoded;
-                        if (result.encoded > max_val)
-                            max_val = result.encoded;
-                        continue;
+                    if (!is_special) {
+                        auto result = scaleValue(v, exp, fac);
+                        if (result.exact) {
+                            encoded[i] = result.encoded;
+                            if (result.encoded < min_val)
+                                min_val = result.encoded;
+                            if (result.encoded > max_val)
+                                max_val = result.encoded;
+                            continue;
+                        }
                     }
-                }
 
-                // Exception: store as raw bits
-                exc_positions.push_back(static_cast<uint16_t>(i));
-                exc_values.push_back(std::bit_cast<uint64_t>(v));
-                encoded[i] = 0;  // placeholder (will use base after FFOR)
+                    // Exception: store as raw bits
+                    exc_positions.push_back(static_cast<uint16_t>(i));
+                    exc_values.push_back(std::bit_cast<uint64_t>(v));
+                    encoded[i] = 0;  // placeholder (will use base after FFOR)
+                }
             }
 
             // === Delta + Zigzag Transform (SCHEME_ALP_DELTA only) ===
@@ -408,12 +424,13 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         std::vector<int64_t> left_as_i64(alp::ALP_VECTOR_SIZE);
         std::vector<uint64_t> left_packed;
         std::vector<uint64_t> right_packed;
+        alp::ALPRDBlockResult rd;  // reused across blocks (vector capacity retained)
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
             const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
 
-            auto rd = alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count);
+            alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count, rd);
             const uint16_t exception_count = static_cast<uint16_t>(rd.exception_positions.size());
 
             // === Block Header (2 x uint64_t) ===

@@ -38,7 +38,9 @@ public:
     static uint8_t findBestSplit(const double* values, size_t count);
 
     // Encode a block of doubles using ALP_RD scheme.
-    static ALPRDBlockResult encodeBlock(const double* values, size_t count, uint8_t right_bit_count);
+    // Fills `result` in place (all fields overwritten); callers should hoist
+    // the result object out of block loops so vector capacity is reused.
+    static void encodeBlock(const double* values, size_t count, uint8_t right_bit_count, ALPRDBlockResult& result);
 };
 
 }  // namespace alp
