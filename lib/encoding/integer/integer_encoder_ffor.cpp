@@ -603,58 +603,43 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
 
         while (total_decoded < timestampSize && encoded.remaining() >= 16) {
             const size_t block_count = decodeBlockInto(encoded, blockBuf);
+
+            // The stream decodes in whole FFOR groups, so the final group may
+            // contain more entries than requested (callers may request fewer
+            // values than were encoded, e.g. after a time-cut). Clamp emission
+            // so the output never exceeds timestampSize.
+            const size_t emit_count = std::min(block_count, timestampSize - total_decoded);
             total_decoded += block_count;
 
             size_t local_i = 0;
 
-            // Handle value[0]: raw timestamp
-            if (global_idx == 0 && local_i < block_count) {
+            // Handle value[0]: raw timestamp (already in place in blockBuf)
+            if (global_idx == 0 && local_i < emit_count) {
                 last_decoded = blockBuf[0];
-                values.push_back(last_decoded);
                 local_i = 1;
                 global_idx = 1;
             }
 
             // Handle value[1]: zigzag(delta)
-            if (global_idx == 1 && local_i < block_count) {
+            if (global_idx == 1 && local_i < emit_count) {
                 delta = ZigZag::zigzagDecode(blockBuf[local_i]);
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
+                blockBuf[local_i] = last_decoded;
                 local_i++;
                 global_idx = 2;
             }
 
-            // Main unrolled-by-4 loop: no time checks, just reconstruct + push_back
-            for (; local_i + 3 < block_count; local_i += 4) {
-                int64_t dd0 = ZigZag::zigzagDecode(blockBuf[local_i]);
-                int64_t dd1 = ZigZag::zigzagDecode(blockBuf[local_i + 1]);
-                int64_t dd2 = ZigZag::zigzagDecode(blockBuf[local_i + 2]);
-                int64_t dd3 = ZigZag::zigzagDecode(blockBuf[local_i + 3]);
-
-                delta += dd0;
+            // Reconstruct in place in the L1-resident stack buffer: delta/
+            // last_decoded stay in registers and there is no per-point vector
+            // push_back (capacity check + end-pointer round-trip through memory).
+            for (; local_i < emit_count; ++local_i) {
+                delta += ZigZag::zigzagDecode(blockBuf[local_i]);
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-
-                delta += dd1;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-
-                delta += dd2;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-
-                delta += dd3;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
+                blockBuf[local_i] = last_decoded;
             }
 
-            // Scalar tail
-            for (; local_i < block_count; ++local_i) {
-                int64_t dd = ZigZag::zigzagDecode(blockBuf[local_i]);
-                delta += dd;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-            }
+            // Single bulk append per group (memcpy) instead of per-point push_back.
+            values.insert(values.end(), blockBuf, blockBuf + emit_count);
         }
 
         nAdded = values.size() - current_size;

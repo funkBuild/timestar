@@ -482,12 +482,14 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
             }
 
             // Merge all partial states for each bucket; try_emplace avoids
-            // default-constructing a state when the bucket already exists
-            for (const auto* partial : groupPartials) {
-                for (const auto& [bucketTime, state] : partial->bucketStates) {
-                    auto [it, inserted] = mergedStates.try_emplace(bucketTime, state);
+            // default-constructing a state when the bucket already exists.
+            // Partials are consumed here, so states are moved rather than
+            // copied — for MEDIAN this avoids deep-copying rawValues per bucket.
+            for (auto* partial : groupPartials) {
+                for (auto& [bucketTime, state] : partial->bucketStates) {
+                    auto [it, inserted] = mergedStates.try_emplace(bucketTime, std::move(state));
                     if (!inserted) {
-                        it->second.mergeForMethod(state, method);
+                        it->second.mergeForMethod(std::move(state), method);
                     }
                 }
             }

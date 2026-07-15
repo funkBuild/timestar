@@ -136,7 +136,9 @@ struct AggregationState {
                 sumCompensation = (t - sum) - y;
                 sum = t;
                 count++;
-                mean = (sum + sumCompensation) / static_cast<double>(count);
+                // `mean` is intentionally NOT updated here: getValue(AVG) reads
+                // sum/count, and mergeForMethod recomputes mean after merging.
+                // Welford's mean is only needed for STDDEV/STDVAR (own case below).
                 break;
             }
             case AggregationMethod::COUNT:

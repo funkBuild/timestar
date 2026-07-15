@@ -517,3 +517,69 @@ TEST_F(SimdAggregatorCorrectnessTest, ConsistencyCheck_VarianceNonNegative) {
         EXPECT_GE(var, 0.0) << "Negative variance (" << var << ") for n=" << n;
     }
 }
+
+// ── NaN-skipping min/max semantics (fused single-pass kernels) ──────────────
+// The SIMD min/max kernels mask NaN lanes to the identity element; results
+// must match the scalar NaN-skipping fallbacks in every case.
+
+TEST_F(SimdAggregatorCorrectnessTest, Min_InteriorNaN) {
+    // NaN in the middle of the SIMD body must be skipped, not propagated.
+    std::vector<double> values(64, 5.0);
+    values[17] = std::numeric_limits<double>::quiet_NaN();
+    values[40] = 1.5;
+    EXPECT_DOUBLE_EQ(SimdAggregator::calculateMin(values.data(), values.size()), 1.5);
+    EXPECT_DOUBLE_EQ(scalar::calculateMin(values.data(), values.size()), 1.5);
+}
+
+TEST_F(SimdAggregatorCorrectnessTest, Max_InteriorNaN) {
+    std::vector<double> values(64, 5.0);
+    values[3] = std::numeric_limits<double>::quiet_NaN();
+    values[63] = std::numeric_limits<double>::quiet_NaN();  // NaN in scalar tail
+    values[33] = 9.75;
+    EXPECT_DOUBLE_EQ(SimdAggregator::calculateMax(values.data(), values.size()), 9.75);
+    EXPECT_DOUBLE_EQ(scalar::calculateMax(values.data(), values.size()), 9.75);
+}
+
+TEST_F(SimdAggregatorCorrectnessTest, MinMax_LeadingNaN) {
+    std::vector<double> values(50, std::numeric_limits<double>::quiet_NaN());
+    for (size_t i = 25; i < 50; ++i)
+        values[i] = static_cast<double>(i);
+    EXPECT_DOUBLE_EQ(SimdAggregator::calculateMin(values.data(), values.size()), 25.0);
+    EXPECT_DOUBLE_EQ(SimdAggregator::calculateMax(values.data(), values.size()), 49.0);
+}
+
+TEST_F(SimdAggregatorCorrectnessTest, MinMax_AllNaN) {
+    std::vector<double> values(37, std::numeric_limits<double>::quiet_NaN());
+    EXPECT_TRUE(std::isnan(SimdAggregator::calculateMin(values.data(), values.size())));
+    EXPECT_TRUE(std::isnan(SimdAggregator::calculateMax(values.data(), values.size())));
+}
+
+TEST_F(SimdAggregatorCorrectnessTest, Min_GenuinePositiveInfinity) {
+    // All values +inf: min is +inf (must not be misreported as NaN).
+    std::vector<double> values(20, std::numeric_limits<double>::infinity());
+    EXPECT_EQ(SimdAggregator::calculateMin(values.data(), values.size()),
+              std::numeric_limits<double>::infinity());
+    // +inf mixed with finite values: min is the finite value.
+    values[7] = 3.0;
+    EXPECT_DOUBLE_EQ(SimdAggregator::calculateMin(values.data(), values.size()), 3.0);
+}
+
+TEST_F(SimdAggregatorCorrectnessTest, Max_GenuineNegativeInfinity) {
+    std::vector<double> values(20, -std::numeric_limits<double>::infinity());
+    EXPECT_EQ(SimdAggregator::calculateMax(values.data(), values.size()),
+              -std::numeric_limits<double>::infinity());
+    values[13] = -42.0;
+    EXPECT_DOUBLE_EQ(SimdAggregator::calculateMax(values.data(), values.size()), -42.0);
+}
+
+TEST_F(SimdAggregatorCorrectnessTest, MinMax_NaNWithInfinity) {
+    // NaN + genuine ±inf together: NaN skipped, inf preserved.
+    std::vector<double> values(32, 1.0);
+    values[5] = std::numeric_limits<double>::quiet_NaN();
+    values[10] = -std::numeric_limits<double>::infinity();
+    values[20] = std::numeric_limits<double>::infinity();
+    EXPECT_EQ(SimdAggregator::calculateMin(values.data(), values.size()),
+              -std::numeric_limits<double>::infinity());
+    EXPECT_EQ(SimdAggregator::calculateMax(values.data(), values.size()),
+              std::numeric_limits<double>::infinity());
+}

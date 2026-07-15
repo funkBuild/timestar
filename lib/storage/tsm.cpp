@@ -135,7 +135,11 @@ static size_t decodeIntegerBlockIntoAggregator(const uint8_t* data, uint32_t blo
 
     valScratch.clear();
     valScratch.reserve(hdr->nTimestamps);
-    for (size_t i = hdr->nSkipped; i < zigzagScratch.size(); ++i) {
+    // The value decoder decodes whole FFOR groups, so zigzagScratch may hold up
+    // to a full group beyond nSkipped+nTimestamps; bound the loop so values stay
+    // in sync with the decoded timestamps.
+    const size_t valueEnd = std::min(hdr->nSkipped + hdr->nTimestamps, zigzagScratch.size());
+    for (size_t i = hdr->nSkipped; i < valueEnd; ++i) {
         valScratch.push_back(static_cast<double>(ZigZag::zigzagDecode(zigzagScratch[i])));
     }
 
@@ -796,6 +800,13 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         localDict = stringDict;
     }
 
+    // Fully-contained block: every point passes the time filter, so decode with
+    // sentinel bounds to hit the branch-free timestamp fast path (same results).
+    if (indexBlock.minTime >= startTime && indexBlock.maxTime < endTime) {
+        startTime = 0;
+        endTime = UINT64_MAX;
+    }
+
     auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
@@ -1095,8 +1106,13 @@ seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTim
 
     uint32_t bufferOffset = 0;
     for (const auto& block : batch.blocks) {
-        decodeBlockFlat<T>(batchBuf.get() + bufferOffset, block.size, startTime, endTime, flatBlock->timestamps,
-                           flatBlock->values, stringDict);
+        // Fully-contained blocks (index bounds prove every point passes the time
+        // filter) decode with sentinel bounds — hits the branch-free timestamp
+        // decode fast path with identical results.
+        const bool fullyContained = block.minTime >= startTime && block.maxTime < endTime;
+        decodeBlockFlat<T>(batchBuf.get() + bufferOffset, block.size, fullyContained ? 0 : startTime,
+                           fullyContained ? UINT64_MAX : endTime, flatBlock->timestamps, flatBlock->values,
+                           stringDict);
         bufferOffset += block.size;
     }
 
@@ -1323,20 +1339,27 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
             // Phase 0: per-block tombstone check instead of global gate
             bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
             if (!blockHasTombstones) {
-                // Fast path: no tombstones for this block — decode into scratch buffers and fold
+                // Fast path: no tombstones for this block — decode into scratch buffers and fold.
+                // Fully-contained blocks (index bounds prove every point passes the time
+                // filter) use sentinel bounds to hit the branch-free timestamp decode
+                // fast path — result-identical, but skips 2 compares per point.
+                const bool fullyContained = block.minTime >= startTime && block.maxTime < endTime;
+                const uint64_t decodeStart = fullyContained ? 0 : startTime;
+                const uint64_t decodeEnd = fullyContained ? UINT64_MAX : endTime;
                 size_t n;
                 if (countOnly) {
-                    n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, startTime, endTime, aggregator);
+                    n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
+                                             aggregator);
                 } else if (seriesType == TSMValueType::Float) {
-                    n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
+                    n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
                                                   aggregator);
                 } else if (seriesType == TSMValueType::Integer) {
-                    n = decodeIntegerBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
-                                                         aggregator);
+                    n = decodeIntegerBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart,
+                                                         decodeEnd, aggregator);
                 } else {
                     // Boolean
-                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, startTime, endTime,
-                                                      aggregator);
+                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart,
+                                                      decodeEnd, aggregator);
                 }
                 totalPoints += n;
             } else {

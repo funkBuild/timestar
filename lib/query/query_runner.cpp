@@ -467,9 +467,16 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
         const auto& s = spans[0];
         result.timestamps.assign(s.tsPtr, s.tsPtr + s.len);
         result.values.clear();
-        result.values.reserve(s.len);
-        for (size_t i = 0; i < s.len; ++i) {
-            result.values.push_back((*s.valVec)[s.baseIdx + i]);
+        if constexpr (std::is_same_v<T, bool>) {
+            // vector<bool> bit proxies: element-wise copy.
+            result.values.reserve(s.len);
+            for (size_t i = 0; i < s.len; ++i) {
+                result.values.push_back((*s.valVec)[s.baseIdx + i]);
+            }
+        } else {
+            // Contiguous types: ranged insert compiles to memcpy.
+            result.values.insert(result.values.end(), s.valVec->begin() + s.baseIdx,
+                                 s.valVec->begin() + s.baseIdx + s.len);
         }
         co_return std::move(result);
     }
@@ -504,10 +511,16 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
             result.timestamps.reserve(totalPoints);
             result.values.reserve(totalPoints);
             result.timestamps.insert(result.timestamps.end(), memTsPtr, memTsPtr + memLen);
-            // Use index-based copy for values (vector<bool> compatibility).
             const auto& memVals = *memValVec;
-            for (size_t i = 0; i < memLen; ++i) {
-                result.values.push_back(memVals[memBaseIdx + i]);
+            if constexpr (std::is_same_v<T, bool>) {
+                // vector<bool> bit proxies: element-wise copy.
+                for (size_t i = 0; i < memLen; ++i) {
+                    result.values.push_back(memVals[memBaseIdx + i]);
+                }
+            } else {
+                // Contiguous types: ranged insert compiles to memcpy.
+                result.values.insert(result.values.end(), memVals.begin() + memBaseIdx,
+                                     memVals.begin() + memBaseIdx + memLen);
             }
             co_return std::move(result);
         }
