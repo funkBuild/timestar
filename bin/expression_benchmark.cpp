@@ -10,6 +10,7 @@
 //            --benchmark_display_aggregates_only=true
 
 #include "expression_evaluator.hpp"
+#include "expression_parser.hpp"
 #include "topk_filter.hpp"
 
 #include <benchmark/benchmark.h>
@@ -214,6 +215,44 @@ static void BM_bottomk(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(NUM_GROUPS * GROUP_N));
 }
 BENCHMARK(BM_bottomk);
+
+// ═══════════════════ end-to-end formula benchmarks ═══════════════════════════
+//
+// Parse + evaluate a formula through ExpressionParser + ExpressionEvaluator,
+// exactly as the derived-query path does. Gates for QUERY_REF leaf-copy and
+// scalar-literal dispatch optimizations.
+
+static void BM_formula_ratio(benchmark::State& state) {
+    // (a - b) / (a + b): two leaf refs of each query — measures leaf-copy cost.
+    timestar::ExpressionParser parser("(a - b) / (a + b)");
+    auto ast = parser.parse();
+    timestar::ExpressionEvaluator::QueryResultMap results;
+    results["a"] = g_series;
+    results["b"] = g_series2;
+    for (auto _ : state) {
+        timestar::ExpressionEvaluator evaluator;
+        auto result = evaluator.evaluate(*ast, results);
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(g_series.size()));
+}
+BENCHMARK(BM_formula_ratio);
+
+static void BM_formula_scalar(benchmark::State& state) {
+    // a * 2 + b / 4 - 1: scalar literals — measures constant-series materialization.
+    timestar::ExpressionParser parser("a * 2 + b / 4 - 1");
+    auto ast = parser.parse();
+    timestar::ExpressionEvaluator::QueryResultMap results;
+    results["a"] = g_series;
+    results["b"] = g_series2;
+    for (auto _ : state) {
+        timestar::ExpressionEvaluator evaluator;
+        auto result = evaluator.evaluate(*ast, results);
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(g_series.size()));
+}
+BENCHMARK(BM_formula_scalar);
 
 // ─────────────────────────────── main ────────────────────────────────────────
 

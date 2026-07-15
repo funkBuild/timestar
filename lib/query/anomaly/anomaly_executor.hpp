@@ -27,8 +27,10 @@ public:
                                     const AnomalyConfig& config);
 
 private:
-    // Add series pieces to result
-    void addSeriesPieces(AnomalyQueryResult& result, const std::vector<double>& rawValues, const AnomalyOutput& output,
+    // Add series pieces to result. Takes the AnomalyOutput by rvalue reference
+    // and moves its vectors into the result pieces (the output is discarded by
+    // all callers). rawValues is still copied — the caller keeps ownership.
+    void addSeriesPieces(AnomalyQueryResult& result, const std::vector<double>& rawValues, AnomalyOutput&& output,
                          const std::vector<std::string>& groupTags, size_t queryIndex);
 
     // Compute alert value (maximum anomaly score)

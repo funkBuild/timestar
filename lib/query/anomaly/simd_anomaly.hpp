@@ -105,6 +105,12 @@ void computeBounds(const double* predictions,
                    double bounds,        // number of standard deviations
                    double* upper, double* lower, size_t count);
 
+// Scalar-scale overload: uniform scale (e.g. a single robust sigma for the
+// whole series). Avoids materializing an N-sized constant scale vector.
+// upper[i] = predictions[i] + bounds * scale
+// lower[i] = predictions[i] - bounds * scale
+void computeBounds(const double* predictions, double scale, double bounds, double* upper, double* lower, size_t count);
+
 // Compute anomaly scores in one pass
 // score[i] = max(0, (value - upper)) + max(0, (lower - value))
 // NOTE: NaN values in input produce NaN scores. As defense-in-depth, this

@@ -108,8 +108,8 @@ std::vector<double> STLDecomposition::movingAverage(const std::vector<double>& v
     return result;
 }
 
-std::vector<double> STLDecomposition::loess(const std::vector<double>& x, const std::vector<double>& y,
-                                            size_t windowSize, const std::vector<double>& weights) {
+std::vector<double> STLDecomposition::loess(const std::vector<double>& y, size_t windowSize,
+                                            const std::vector<double>& weights) {
     size_t n = y.size();
     if (n == 0)
         return {};
@@ -224,7 +224,7 @@ std::vector<double> STLDecomposition::computeSeasonalMeans(const std::vector<dou
     return result;
 }
 
-STLComponents STLDecomposition::decompose(const std::vector<double>& values, const STLConfig& config) {
+STLComponents STLDecomposition::decompose(std::span<const double> values, const STLConfig& config) {
     STLComponents components;
     size_t n = values.size();
 
@@ -263,7 +263,7 @@ STLComponents STLDecomposition::decompose(const std::vector<double>& values, con
     }
 
     // Initialize deseasonalized series
-    std::vector<double> deseasonalized = values;
+    std::vector<double> deseasonalized(values.begin(), values.end());
     std::vector<double> robustnessWeights;
 
     size_t iterations = config.robust ? config.robustIterations + 1 : 1;
@@ -275,10 +275,7 @@ STLComponents STLDecomposition::decompose(const std::vector<double>& values, con
             trend.resize(n);
             simd::computeMovingAverage(deseasonalized.data(), n, trendWindow, trend.data());
         } else {
-            std::vector<double> x(n);
-            for (size_t i = 0; i < n; ++i)
-                x[i] = static_cast<double>(i);
-            trend = loess(x, deseasonalized, trendWindow, robustnessWeights);
+            trend = loess(deseasonalized, trendWindow, robustnessWeights);
         }
 
         // Step 2: Detrend to get seasonal + residual (SIMD)
@@ -289,25 +286,24 @@ STLComponents STLDecomposition::decompose(const std::vector<double>& values, con
         std::vector<double> seasonal = computeSeasonalMeans(detrended, period);
 
         // Step 4: Smooth the seasonal component
-        std::vector<double> x(n);
-        for (size_t i = 0; i < n; ++i)
-            x[i] = static_cast<double>(i);
-        seasonal = loess(x, seasonal, seasonalWindow, robustnessWeights);
+        seasonal = loess(seasonal, seasonalWindow, robustnessWeights);
 
         // Step 5: Deseasonalize for next iteration (SIMD)
         simd::vectorSubtract(values.data(), seasonal.data(), deseasonalized.data(), n);
-
-        // Store components
-        components.trend = trend;
-        components.seasonal = seasonal;
 
         // Compute residuals using SIMD: residual = values - trend - seasonal
         std::vector<double> trendPlusSeasonal(n);
         simd::vectorAdd(trend.data(), seasonal.data(), trendPlusSeasonal.data(), n);
         simd::vectorSubtract(values.data(), trendPlusSeasonal.data(), components.residual.data(), n);
 
-        // Update robustness weights for next iteration
-        if (config.robust && iter < iterations - 1) {
+        if (iter + 1 == iterations) {
+            // Final iteration: move the surviving components instead of
+            // copying them on every pass (earlier iterations only need the
+            // residual for robustness weights).
+            components.trend = std::move(trend);
+            components.seasonal = std::move(seasonal);
+        } else if (config.robust) {
+            // Update robustness weights for next iteration
             robustnessWeights = computeRobustnessWeights(components.residual, config.robustThreshold);
         }
     }

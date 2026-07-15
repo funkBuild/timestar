@@ -684,6 +684,41 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         return c;
     };
 
+    // One-entry series memo (N4): batches are typically grouped by series, so
+    // consecutive writes usually share the same measurement+tags. When the
+    // current write's measurement and tags DOM match the previous write's, the
+    // series-key prefix and shared tag map are reused, skipping tag map
+    // construction, validation, prefix building, and the shared_ptr allocation.
+    bool memoValid = false;
+    std::string_view memoMeasurement;                        // views into writes_array (stable for the loop)
+    const json_value_t::object_t* memoTagsObj = nullptr;     // nullptr == no/empty tags object
+    std::string seriesKeyPrefix;                             // hoisted: reused capacity across writes
+    std::shared_ptr<const std::map<std::string, std::string>> sharedTags;
+
+    // DOM-to-DOM tag-object equality (string-valued tags only; any non-string
+    // tag value falls back to the slow path).
+    auto sameTagsObj = [](const json_value_t::object_t* a, const json_value_t::object_t* b) -> bool {
+        const size_t na = a ? a->size() : 0;
+        const size_t nb = b ? b->size() : 0;
+        if (na != nb)
+            return false;
+        if (na == 0)
+            return true;
+        auto ia = a->begin();
+        auto ib = b->begin();
+        for (; ia != a->end(); ++ia, ++ib) {
+            if (ia->first != ib->first)
+                return false;
+            if (!ia->second.is_string() || !ib->second.is_string())
+                return false;  // conservative: force slow path
+            if (ia->second.get<std::string>() != ib->second.get<std::string>())
+                return false;
+        }
+        return true;
+    };
+
+    std::string seriesKey;  // hoisted: reused capacity across fields/writes
+
     // Parse writes directly from JSON objects for better performance
     for (const auto& write : writes_array) {
         totalWritesProcessed++;
@@ -698,7 +733,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             auto measurementIt = writeObj.find("measurement");
             if (measurementIt == writeObj.end() || !measurementIt->second.is_string())
                 continue;
-            std::string measurement = measurementIt->second.get<std::string>();
+            const std::string& measurement = measurementIt->second.get<std::string>();
 
             // Validate measurement name
             {
@@ -742,49 +777,67 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 timestamps.push_back(defaultTimestampNs);
             }
 
-            // Extract tags into a local map, validate, then wrap in a
-            // lw_shared_ptr so all CoalesceCandidates from this write point
-            // share a single allocation (pointer copy instead of map copy).
-            std::map<std::string, std::string> localTags;
-            auto tagsIt = writeObj.find("tags");
-            if (tagsIt != writeObj.end() && tagsIt->second.is_object()) {
-                auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
-                for (const auto& [tagKey, tagValue] : tagsObj) {
-                    if (tagValue.is_string()) {
-                        // Guard with the allocation-free predicates; build the error-context
-                        // string only on the rare invalid path (matches parseMultiWritePoint).
-                        if (!isValidName(tagKey)) [[unlikely]]
-                            throw std::invalid_argument(validateName(tagKey, "Tag key '" + tagKey + "'"));
-                        auto val = tagValue.get<std::string>();
-                        if (!isValidTagValue(val)) [[unlikely]]
-                            throw std::invalid_argument(validateTagValue(val, "Tag value for '" + tagKey + "'"));
-                        localTags[tagKey] = std::move(val);
+            // Locate the tags DOM object (nullptr when absent / not an object).
+            const json_value_t::object_t* tagsObjPtr = nullptr;
+            {
+                auto tagsIt = writeObj.find("tags");
+                if (tagsIt != writeObj.end() && tagsIt->second.is_object()) {
+                    tagsObjPtr = &tagsIt->second.get<json_value_t::object_t>();
+                }
+            }
+
+            // Memo hit: same measurement + identical tags as the previous
+            // write — reuse seriesKeyPrefix and sharedTags as-is.
+            const bool memoHit = memoValid && memoMeasurement == measurement && sameTagsObj(tagsObjPtr, memoTagsObj);
+            if (!memoHit) {
+                memoValid = false;  // invalidate while rebuilding
+
+                // Extract tags into a local map, validate, then wrap in a
+                // shared_ptr so all CoalesceCandidates from this write point
+                // share a single allocation (pointer copy instead of map copy).
+                std::map<std::string, std::string> localTags;
+                if (tagsObjPtr != nullptr) {
+                    for (const auto& [tagKey, tagValue] : *tagsObjPtr) {
+                        if (tagValue.is_string()) {
+                            // Guard with the allocation-free predicates; build the error-context
+                            // string only on the rare invalid path (matches parseMultiWritePoint).
+                            if (!isValidName(tagKey)) [[unlikely]]
+                                throw std::invalid_argument(validateName(tagKey, "Tag key '" + tagKey + "'"));
+                            auto val = tagValue.get<std::string>();
+                            if (!isValidTagValue(val)) [[unlikely]]
+                                throw std::invalid_argument(validateTagValue(val, "Tag value for '" + tagKey + "'"));
+                            localTags[tagKey] = std::move(val);
+                        }
                     }
                 }
-            }
 
-            // Pre-build measurement+tags prefix for series key construction (once per write point)
-            std::string seriesKeyPrefix;
-            {
-                size_t prefixSize = measurement.length();
-                for (const auto& [tagKey, tagValue] : localTags) {
-                    prefixSize += 1 + tagKey.size() + 1 + tagValue.size();  // ",key=value"
+                // Pre-build measurement+tags prefix for series key construction (once per write point)
+                {
+                    size_t prefixSize = measurement.length();
+                    for (const auto& [tagKey, tagValue] : localTags) {
+                        prefixSize += 1 + tagKey.size() + 1 + tagValue.size();  // ",key=value"
+                    }
+                    seriesKeyPrefix.reserve(prefixSize);
                 }
-                seriesKeyPrefix.reserve(prefixSize);
-            }
-            seriesKeyPrefix = measurement;
-            for (const auto& [tagKey, tagValue] : localTags) {
-                seriesKeyPrefix += ",";
-                seriesKeyPrefix += tagKey;
-                seriesKeyPrefix += "=";
-                seriesKeyPrefix += tagValue;
-            }
+                seriesKeyPrefix = measurement;
+                for (const auto& [tagKey, tagValue] : localTags) {
+                    seriesKeyPrefix += ",";
+                    seriesKeyPrefix += tagKey;
+                    seriesKeyPrefix += "=";
+                    seriesKeyPrefix += tagValue;
+                }
 
-            // Create the shared tag map once per write point. All fields from
-            // this write point will share this single allocation via shared_ptr,
-            // and the same allocation flows through MultiWritePoint into the
-            // TimeStarInserts (which may cross shard boundaries).
-            auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(localTags));
+                // Create the shared tag map once per write point. All fields from
+                // this write point will share this single allocation via shared_ptr,
+                // and the same allocation flows through MultiWritePoint into the
+                // TimeStarInserts (which may cross shard boundaries).
+                sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(localTags));
+
+                // Prefix + tags fully built: record the memo for the next write.
+                memoMeasurement = measurement;
+                memoTagsObj = tagsObjPtr;
+                memoValid = true;
+            }
 
             // Extract fields and process each field - handles both scalar and array values
             auto fieldsIt = writeObj.find("fields");
@@ -798,8 +851,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 if (!isValidName(fieldName)) [[unlikely]]
                     throw std::invalid_argument(validateName(fieldName, "Field name '" + fieldName + "'"));
 
-                // Build series key
-                std::string seriesKey;
+                // Build series key (hoisted buffer: capacity reused across fields)
                 seriesKey.reserve(seriesKeyPrefix.length() + fieldName.length() + 1);
                 seriesKey = seriesKeyPrefix;
                 seriesKey += " ";

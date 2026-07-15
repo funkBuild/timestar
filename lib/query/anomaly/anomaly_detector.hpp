@@ -12,11 +12,24 @@
 namespace timestar {
 namespace anomaly {
 
-// Input data for anomaly detection
+// Input data for anomaly detection (owning; convenient for tests/callers
+// that build inputs incrementally)
 struct AnomalyInput {
     std::vector<uint64_t> timestamps;
     std::vector<double> values;
     std::vector<std::string> groupTags;  // For multi-series support
+
+    bool empty() const { return values.empty(); }
+    size_t size() const { return values.size(); }
+};
+
+// Non-owning view over anomaly-detection input. Detectors only read the
+// data, so the hot path (AnomalyExecutor) borrows the caller's vectors
+// instead of copying them. The referenced data must outlive the detect()
+// call.
+struct AnomalyInputView {
+    std::span<const uint64_t> timestamps;
+    std::span<const double> values;
 
     bool empty() const { return values.empty(); }
     size_t size() const { return values.size(); }
@@ -41,7 +54,12 @@ public:
 
     // Detect anomalies in the input data
     // Returns bounds and scores for each point
-    virtual AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) = 0;
+    virtual AnomalyOutput detect(const AnomalyInputView& input, const AnomalyConfig& config) = 0;
+
+    // Convenience adapter for owning inputs (tests, ad-hoc callers).
+    AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) {
+        return detect(AnomalyInputView{input.timestamps, input.values}, config);
+    }
 
     // Get the algorithm name
     virtual std::string algorithmName() const = 0;
@@ -51,7 +69,7 @@ public:
 
 protected:
     // Estimate data interval from timestamps (in nanoseconds)
-    static uint64_t estimateInterval(const std::vector<uint64_t>& timestamps) {
+    static uint64_t estimateInterval(std::span<const uint64_t> timestamps) {
         if (timestamps.size() < 2) {
             return 60000000000ULL;  // Default 1 minute
         }

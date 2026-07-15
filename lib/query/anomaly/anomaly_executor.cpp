@@ -18,9 +18,9 @@ double AnomalyExecutor::computeAlertValue(const std::vector<double>& scores) {
 }
 
 void AnomalyExecutor::addSeriesPieces(AnomalyQueryResult& result, const std::vector<double>& rawValues,
-                                      const AnomalyOutput& output, const std::vector<std::string>& groupTags,
+                                      AnomalyOutput&& output, const std::vector<std::string>& groupTags,
                                       size_t queryIndex) {
-    // Raw values piece
+    // Raw values piece (copied — the caller keeps ownership of rawValues)
     {
         AnomalySeriesPiece piece;
         piece.piece = "raw";
@@ -35,7 +35,7 @@ void AnomalyExecutor::addSeriesPieces(AnomalyQueryResult& result, const std::vec
         AnomalySeriesPiece piece;
         piece.piece = "upper";
         piece.groupTags = groupTags;
-        piece.values = output.upper;
+        piece.values = std::move(output.upper);
         piece.queryIndex = queryIndex;
         result.series.push_back(std::move(piece));
     }
@@ -45,7 +45,7 @@ void AnomalyExecutor::addSeriesPieces(AnomalyQueryResult& result, const std::vec
         AnomalySeriesPiece piece;
         piece.piece = "lower";
         piece.groupTags = groupTags;
-        piece.values = output.lower;
+        piece.values = std::move(output.lower);
         piece.queryIndex = queryIndex;
         result.series.push_back(std::move(piece));
     }
@@ -55,8 +55,8 @@ void AnomalyExecutor::addSeriesPieces(AnomalyQueryResult& result, const std::vec
         AnomalySeriesPiece piece;
         piece.piece = "scores";
         piece.groupTags = groupTags;
-        piece.values = output.scores;
-        piece.alertValue = computeAlertValue(output.scores);
+        piece.alertValue = computeAlertValue(output.scores);  // before the move
+        piece.values = std::move(output.scores);
         piece.queryIndex = queryIndex;
         result.series.push_back(std::move(piece));
     }
@@ -66,7 +66,7 @@ void AnomalyExecutor::addSeriesPieces(AnomalyQueryResult& result, const std::vec
         AnomalySeriesPiece piece;
         piece.piece = "predictions";
         piece.groupTags = groupTags;
-        piece.values = output.predictions;
+        piece.values = std::move(output.predictions);
         piece.queryIndex = queryIndex;
         result.series.push_back(std::move(piece));
     }
@@ -87,18 +87,16 @@ AnomalyQueryResult AnomalyExecutor::execute(const std::vector<uint64_t>& timesta
     // Create detector based on algorithm
     auto detector = createDetector(config.algorithm);
 
-    // Prepare input
-    AnomalyInput input;
-    input.timestamps = timestamps;
-    input.values = values;
-    input.groupTags = groupTags;
+    // Prepare input view — detectors only read, so borrow the caller's
+    // vectors instead of copying them (O(1) instead of two O(N) copies).
+    AnomalyInputView input{timestamps, values};
 
     try {
         // Run detection
         AnomalyOutput output = detector->detect(input, config);
 
-        // Add series pieces to result
-        addSeriesPieces(result, values, output, groupTags, 0);
+        // Add series pieces to result (moves the output vectors)
+        addSeriesPieces(result, values, std::move(output), groupTags, 0);
 
         // Fill statistics
         result.statistics.algorithm = algorithmToString(config.algorithm);
@@ -148,10 +146,9 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(const std::vector<uint64_t>& sh
     size_t totalPoints = 0;
 
     try {
-        // Reuse a single AnomalyInput across iterations to avoid copying
-        // sharedTimestamps N times. Timestamps are assigned once; values and
-        // groupTags are swapped in and out each iteration.
-        AnomalyInput input;
+        // Borrow the shared timestamps once; per-series values are borrowed
+        // each iteration — no O(N) copies into the detector input.
+        AnomalyInputView input;
         input.timestamps = sharedTimestamps;
 
         // Process each series
@@ -163,15 +160,15 @@ AnomalyQueryResult AnomalyExecutor::executeMulti(const std::vector<uint64_t>& sh
                 continue;
 
             input.values = values;
-            input.groupTags = groupTags;
 
             // Run detection
             AnomalyOutput output = detector->detect(input, config);
 
-            // Add series pieces to result
-            addSeriesPieces(result, values, output, groupTags, i);
-
             totalAnomalies += output.anomalyCount;
+
+            // Add series pieces to result (moves the output vectors)
+            addSeriesPieces(result, values, std::move(output), groupTags, i);
+
             totalPoints += values.size();
         }
 

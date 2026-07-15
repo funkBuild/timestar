@@ -13,7 +13,8 @@ class AgileDetector : public AnomalyDetector {
 public:
     AgileDetector() = default;
 
-    AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) override;
+    using AnomalyDetector::detect;
+    AnomalyOutput detect(const AnomalyInputView& input, const AnomalyConfig& config) override;
 
     std::string algorithmName() const override { return "agile"; }
 
@@ -34,7 +35,7 @@ private:
     };
 
     // Initialize Holt-Winters state
-    HoltWintersState initializeState(const std::vector<double>& values, size_t seasonalPeriod);
+    HoltWintersState initializeState(std::span<const double> values, size_t seasonalPeriod);
 
     // Update state and predict next value
     double predictAndUpdate(HoltWintersState& state, double actualValue, size_t seasonalIndex, size_t seasonalPeriod);

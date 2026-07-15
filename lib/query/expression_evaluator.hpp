@@ -65,6 +65,12 @@ struct AlignedSeries {
     AlignedSeries operator*(double scalar) const;
     AlignedSeries operator/(double scalar) const;
 
+    // Scalar-left / IEEE variants (used by the evaluator's scalar-literal fast
+    // path; bit-identical to element-wise ops against a constant series):
+    AlignedSeries rsub(double scalar) const;      // scalar - values[i]
+    AlignedSeries rdiv(double scalar) const;      // scalar / values[i] (IEEE: /0 -> Inf/NaN)
+    AlignedSeries div_ieee(double scalar) const;  // values[i] / scalar (IEEE, no throw, true divide)
+
     // Unary operations
     AlignedSeries negate() const;
     AlignedSeries abs() const;
@@ -172,7 +178,34 @@ private:
     static constexpr int MAX_EVAL_DEPTH = 100;
     int evalDepth_ = 0;
 
-    AlignedSeries evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults);
+    // Borrowed-or-owned evaluation result. QUERY_REF leaves borrow the series
+    // straight from the QueryResultMap (no O(N) values copy); computed nodes
+    // own their result. Borrowed pointers reference the caller-owned map, which
+    // outlives the entire evaluation.
+    class EvalResult {
+    public:
+        explicit EvalResult(const AlignedSeries* borrowed) : borrowed_(borrowed) {}
+        explicit EvalResult(AlignedSeries&& owned) : owned_(std::move(owned)) {}
+
+        EvalResult(EvalResult&&) = default;
+        EvalResult& operator=(EvalResult&&) = default;
+
+        const AlignedSeries& get() const { return borrowed_ ? *borrowed_ : owned_; }
+
+        // Convert to an owned AlignedSeries (copies only when borrowed).
+        AlignedSeries intoOwned() && { return borrowed_ ? *borrowed_ : std::move(owned_); }
+
+    private:
+        const AlignedSeries* borrowed_ = nullptr;
+        AlignedSeries owned_;
+    };
+
+    EvalResult evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults);
+
+    // Timestamp-vector pairs already verified element-equal by a binary op.
+    // Avoids repeated O(N) deep compares when the same two source series
+    // appear multiple times in one formula (e.g. "(a - b) / (a + b)").
+    std::vector<std::pair<const void*, const void*>> verifiedAlignedPairs_;
 
     const AlignedSeries& evaluateQueryRef(const QueryRef& ref, const QueryResultMap& queryResults);
 

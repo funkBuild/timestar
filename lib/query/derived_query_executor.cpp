@@ -292,11 +292,11 @@ seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std:
         throw DerivedQueryException("Sub-query '" + name + "' failed: " + response.errorMessage);
     }
 
-    co_return convertQueryResponse(name, query, response.series);
+    co_return convertQueryResponse(name, query, std::move(response.series));
 }
 
 SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& name, const QueryRequest& query,
-                                                          const std::vector<SeriesResult>& results) {
+                                                          std::vector<SeriesResult>&& results) {
     SubQueryResult subResult;
     subResult.queryName = name;
     subResult.measurement = query.measurement;
@@ -311,23 +311,24 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& nam
                                     "Add more specific scope filters to narrow the result.");
     }
 
-    const auto& series = results[0];
-    subResult.tags = series.tags;
+    auto& series = results[0];
+    subResult.tags = std::move(series.tags);
 
     // Get the first field (or the requested field)
     std::string fieldName = query.fields.empty() ? "" : query.fields[0];
 
-    for (const auto& [fname, fieldData] : series.fields) {
+    for (auto& [fname, fieldData] : series.fields) {
         if (!fieldName.empty() && fname != fieldName) {
             continue;
         }
 
         subResult.field = fname;
-        subResult.timestamps = fieldData.first;
+        subResult.timestamps = std::move(fieldData.first);
 
-        // Extract values (must be numeric for derived metrics)
+        // Extract values (must be numeric for derived metrics) — moved, the
+        // response is locally owned and discarded after conversion.
         if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
-            subResult.values = std::get<std::vector<double>>(fieldData.second);
+            subResult.values = std::move(std::get<std::vector<double>>(fieldData.second));
         } else if (std::holds_alternative<std::vector<bool>>(fieldData.second)) {
             const auto& boolVals = std::get<std::vector<bool>>(fieldData.second);
             subResult.values.reserve(boolVals.size());

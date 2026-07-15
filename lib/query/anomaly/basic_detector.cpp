@@ -7,12 +7,12 @@
 namespace timestar {
 namespace anomaly {
 
-AnomalyOutput BasicDetector::detect(const AnomalyInput& input, const AnomalyConfig& config) {
+AnomalyOutput BasicDetector::detect(const AnomalyInputView& input, const AnomalyConfig& config) {
     // Use optimized path for all cases
     return detectOptimized(input, config);
 }
 
-AnomalyOutput BasicDetector::detectOptimized(const AnomalyInput& input, const AnomalyConfig& config) {
+AnomalyOutput BasicDetector::detectOptimized(const AnomalyInputView& input, const AnomalyConfig& config) {
     AnomalyOutput output;
 
     if (input.empty()) {

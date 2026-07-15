@@ -128,6 +128,36 @@ AlignedSeries AlignedSeries::operator/(double scalar) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
+AlignedSeries AlignedSeries::rsub(double scalar) const {
+    // scalar - values[i]; compiler auto-vectorizes this loop.
+    std::vector<double> result(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        result[i] = scalar - values[i];
+    }
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::rdiv(double scalar) const {
+    // scalar / values[i]; IEEE semantics (x/0 -> +/-Inf, 0/0 -> NaN) match the
+    // series-series division path, so this is a drop-in for scalar literals.
+    std::vector<double> result(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        result[i] = scalar / values[i];
+    }
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::div_ieee(double scalar) const {
+    // values[i] / scalar with true division (bit-identical to the series-series
+    // path against a constant series). Unlike operator/(double), does not throw
+    // on scalar == 0 and does not use the reciprocal-multiply shortcut.
+    std::vector<double> result(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        result[i] = values[i] / scalar;
+    }
+    return AlignedSeries(timestamps, std::move(result));
+}
+
 AlignedSeries AlignedSeries::negate() const {
     std::vector<double> result(values.size());
     if (values.size() >= kSimdMinSize) {
@@ -1401,10 +1431,11 @@ AlignedSeries ExpressionEvaluator::evaluate(const ExpressionNode& expr, const Qu
         throw EvaluationException("No query results provided for evaluation");
     }
 
-    return evaluateNode(expr, queryResults);
+    return evaluateNode(expr, queryResults).intoOwned();
 }
 
-AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults) {
+ExpressionEvaluator::EvalResult ExpressionEvaluator::evaluateNode(const ExpressionNode& node,
+                                                                  const QueryResultMap& queryResults) {
     if (++evalDepth_ > MAX_EVAL_DEPTH) {
         --evalDepth_;
         throw EvaluationException("Expression evaluation depth exceeded limit of " + std::to_string(MAX_EVAL_DEPTH));
@@ -1416,22 +1447,23 @@ AlignedSeries ExpressionEvaluator::evaluateNode(const ExpressionNode& node, cons
 
     switch (node.type) {
         case ExprNodeType::QUERY_REF:
-            return evaluateQueryRef(node.asQueryRef(), queryResults);
+            // Borrow directly from the QueryResultMap — no O(N) values copy.
+            return EvalResult(&evaluateQueryRef(node.asQueryRef(), queryResults));
 
         case ExprNodeType::SCALAR:
-            return evaluateScalar(node.asScalar(), queryResults);
+            return EvalResult(evaluateScalar(node.asScalar(), queryResults));
 
         case ExprNodeType::BINARY_OP:
-            return evaluateBinaryOp(node.asBinaryOp(), queryResults);
+            return EvalResult(evaluateBinaryOp(node.asBinaryOp(), queryResults));
 
         case ExprNodeType::UNARY_OP:
-            return evaluateUnaryOp(node.asUnaryOp(), queryResults);
+            return EvalResult(evaluateUnaryOp(node.asUnaryOp(), queryResults));
 
         case ExprNodeType::FUNCTION_CALL:
-            return evaluateFunctionCall(node.asFunctionCall(), queryResults);
+            return EvalResult(evaluateFunctionCall(node.asFunctionCall(), queryResults));
 
         case ExprNodeType::TIME_SHIFT_FUNCTION:
-            return evaluateTimeShiftFunction(node.asTimeShiftFunction(), queryResults);
+            return EvalResult(evaluateTimeShiftFunction(node.asTimeShiftFunction(), queryResults));
 
         case ExprNodeType::ANOMALY_FUNCTION:
             throw EvaluationException("anomalies() is not yet implemented");
@@ -1458,19 +1490,54 @@ AlignedSeries ExpressionEvaluator::evaluateScalar(const ScalarValue& scalar, con
 }
 
 AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op, const QueryResultMap& queryResults) {
-    auto left = evaluateNode(*op.left, queryResults);
-    auto right = evaluateNode(*op.right, queryResults);
+    // Scalar-literal fast path: dispatch to AlignedSeries scalar ops instead of
+    // materializing a full constant series and running the series-series path.
+    // Results are bit-identical to the general path (true division, no
+    // reciprocal shortcut). Only taken when exactly one side is a literal.
+    const bool leftScalar = op.left->type == ExprNodeType::SCALAR;
+    const bool rightScalar = op.right->type == ExprNodeType::SCALAR;
+    if (leftScalar != rightScalar) {
+        const double scalar = (leftScalar ? *op.left : *op.right).asScalar().value;
+        auto seriesEval = evaluateNode(leftScalar ? *op.right : *op.left, queryResults);
+        const AlignedSeries& series = seriesEval.get();
+        switch (op.op) {
+            case BinaryOpType::ADD:
+                return series + scalar;
+            case BinaryOpType::SUBTRACT:
+                return rightScalar ? series - scalar : series.rsub(scalar);
+            case BinaryOpType::MULTIPLY:
+                return series * scalar;
+            case BinaryOpType::DIVIDE:
+                return rightScalar ? series.div_ieee(scalar) : series.rdiv(scalar);
+            default:
+                throw EvaluationException("Unknown binary operator");
+        }
+    }
+
+    auto leftEval = evaluateNode(*op.left, queryResults);
+    auto rightEval = evaluateNode(*op.right, queryResults);
+    const AlignedSeries& left = leftEval.get();
+    const AlignedSeries& right = rightEval.get();
 
     // Verify timestamp alignment for meaningful element-wise operations.
     // When timestamps differ (e.g., a - time_shift(a, '7d')), element-wise
     // arithmetic produces meaningless results since left[i] and right[i]
     // correspond to completely different time points.
     if (left.timestamps && right.timestamps && left.timestamps != right.timestamps) {
-        // Different timestamp pointers — check if values actually match
-        if (*left.timestamps != *right.timestamps) {
-            throw EvaluationException(
-                "Binary operation requires aligned timestamps. "
-                "Use time_shift with explicit alignment or apply functions separately.");
+        // Different timestamp pointers — check if values actually match.
+        // Memoize verified pairs so the deep O(N) compare runs at most once
+        // per source-series pair within a single evaluation.
+        const void* lp = left.timestamps.get();
+        const void* rp = right.timestamps.get();
+        auto key = (lp < rp) ? std::make_pair(lp, rp) : std::make_pair(rp, lp);
+        if (std::find(verifiedAlignedPairs_.begin(), verifiedAlignedPairs_.end(), key) ==
+            verifiedAlignedPairs_.end()) {
+            if (*left.timestamps != *right.timestamps) {
+                throw EvaluationException(
+                    "Binary operation requires aligned timestamps. "
+                    "Use time_shift with explicit alignment or apply functions separately.");
+            }
+            verifiedAlignedPairs_.push_back(key);
         }
     }
 
@@ -1489,7 +1556,8 @@ AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op, const Qu
 }
 
 AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op, const QueryResultMap& queryResults) {
-    auto operand = evaluateNode(*op.operand, queryResults);
+    auto operandEval = evaluateNode(*op.operand, queryResults);
+    const AlignedSeries& operand = operandEval.get();
 
     switch (op.op) {
         case UnaryOpType::NEGATE:
@@ -1570,37 +1638,37 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("min() requires exactly 2 arguments");
             }
-            auto a = evaluateNode(*call.args[0], queryResults);
-            auto b = evaluateNode(*call.args[1], queryResults);
-            return AlignedSeries::min(a, b);
+            auto aEval = evaluateNode(*call.args[0], queryResults);
+            auto bEval = evaluateNode(*call.args[1], queryResults);
+            return AlignedSeries::min(aEval.get(), bEval.get());
         }
 
         case FunctionType::MAX: {
             if (call.args.size() != 2) {
                 throw EvaluationException("max() requires exactly 2 arguments");
             }
-            auto a = evaluateNode(*call.args[0], queryResults);
-            auto b = evaluateNode(*call.args[1], queryResults);
-            return AlignedSeries::max(a, b);
+            auto aEval = evaluateNode(*call.args[0], queryResults);
+            auto bEval = evaluateNode(*call.args[1], queryResults);
+            return AlignedSeries::max(aEval.get(), bEval.get());
         }
 
         case FunctionType::POW: {
             if (call.args.size() != 2) {
                 throw EvaluationException("pow() requires exactly 2 arguments");
             }
-            auto base = evaluateNode(*call.args[0], queryResults);
-            auto exp = evaluateNode(*call.args[1], queryResults);
-            return AlignedSeries::pow(base, exp);
+            auto baseEval = evaluateNode(*call.args[0], queryResults);
+            auto expEval = evaluateNode(*call.args[1], queryResults);
+            return AlignedSeries::pow(baseEval.get(), expEval.get());
         }
 
         case FunctionType::CLAMP: {
             if (call.args.size() != 3) {
                 throw EvaluationException("clamp() requires exactly 3 arguments");
             }
-            auto val = evaluateNode(*call.args[0], queryResults);
-            auto minVal = evaluateNode(*call.args[1], queryResults);
-            auto maxVal = evaluateNode(*call.args[2], queryResults);
-            return AlignedSeries::clamp(val, minVal, maxVal);
+            auto valEval = evaluateNode(*call.args[0], queryResults);
+            auto minEval = evaluateNode(*call.args[1], queryResults);
+            auto maxEval = evaluateNode(*call.args[2], queryResults);
+            return AlignedSeries::clamp(valEval.get(), minEval.get(), maxEval.get());
         }
 
         // Transform functions with scalar argument
@@ -1610,8 +1678,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("clamp_min() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("clamp_min() second argument must be a non-empty scalar");
             }
@@ -1622,8 +1692,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("clamp_max() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("clamp_max() second argument must be a non-empty scalar");
             }
@@ -1634,8 +1706,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("cutoff_min() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("cutoff_min() second argument must be a non-empty scalar");
             }
@@ -1646,8 +1720,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("cutoff_max() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("cutoff_max() second argument must be a non-empty scalar");
             }
@@ -1658,8 +1734,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("per_minute() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("per_minute() second argument must be a non-empty scalar");
             }
@@ -1670,8 +1748,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("per_hour() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("per_hour() second argument must be a non-empty scalar");
             }
@@ -1683,8 +1763,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("rolling_avg() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("rolling_avg() second argument must be a non-empty scalar");
             }
@@ -1699,8 +1781,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("rolling_min() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("rolling_min() second argument must be a non-empty scalar");
             }
@@ -1715,8 +1799,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("rolling_max() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("rolling_max() second argument must be a non-empty scalar");
             }
@@ -1731,8 +1817,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("rolling_stddev() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("rolling_stddev() second argument must be a non-empty scalar");
             }
@@ -1747,8 +1835,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("rolling_sum() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("rolling_sum() second argument must be a non-empty scalar");
             }
@@ -1763,8 +1853,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("rolling_median() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("rolling_median() second argument must be a non-empty scalar");
             }
@@ -1780,9 +1872,12 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 3) {
                 throw EvaluationException("rolling_percentile() requires exactly 3 arguments (series, N, p)");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto nSeries = evaluateNode(*call.args[1], queryResults);
-            auto pSeries = evaluateNode(*call.args[2], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto nEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& nSeries = nEval.get();
+            auto pEval = evaluateNode(*call.args[2], queryResults);
+            const AlignedSeries& pSeries = pEval.get();
             if (nSeries.empty() || pSeries.empty()) {
                 throw EvaluationException("rolling_percentile() N and p arguments must be non-empty scalars");
             }
@@ -1801,8 +1896,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("fill_value() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("fill_value() second argument must be a non-empty scalar");
             }
@@ -1813,8 +1910,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("ema() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("ema() second argument must be a non-empty scalar");
             }
@@ -1829,8 +1928,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("gaussian_smooth() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("gaussian_smooth() second argument must be a non-empty scalar");
             }
@@ -1845,9 +1946,12 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 3) {
                 throw EvaluationException("holt_winters() requires exactly 3 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto alphaSeries = evaluateNode(*call.args[1], queryResults);
-            auto betaSeries = evaluateNode(*call.args[2], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto alphaEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& alphaSeries = alphaEval.get();
+            auto betaEval = evaluateNode(*call.args[2], queryResults);
+            const AlignedSeries& betaSeries = betaEval.get();
             if (alphaSeries.empty()) {
                 throw EvaluationException("holt_winters() alpha (second argument) must be a non-empty scalar");
             }
@@ -1869,8 +1973,10 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("zscore() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& series = seriesEval.get();
+            auto scalarEval = evaluateNode(*call.args[1], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 throw EvaluationException("zscore() second argument must be a non-empty scalar");
             }
@@ -1885,9 +1991,9 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (call.args.size() != 2) {
                 throw EvaluationException("as_percent() requires exactly 2 arguments");
             }
-            auto series = evaluateNode(*call.args[0], queryResults);
-            auto total = evaluateNode(*call.args[1], queryResults);
-            return AlignedSeries::as_percent(series, total);
+            auto seriesEval = evaluateNode(*call.args[0], queryResults);
+            auto totalEval = evaluateNode(*call.args[1], queryResults);
+            return AlignedSeries::as_percent(seriesEval.get(), totalEval.get());
         }
 
         // topk/bottomk in single-series context: N scalar, then series reference.
@@ -1900,7 +2006,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 const char* fname = (call.func == FunctionType::TOPK) ? "topk" : "bottomk";
                 throw EvaluationException(std::string(fname) + "() requires exactly 2 arguments");
             }
-            auto scalarSeries = evaluateNode(*call.args[0], queryResults);
+            auto scalarEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& scalarSeries = scalarEval.get();
             if (scalarSeries.empty()) {
                 const char* fname = (call.func == FunctionType::TOPK) ? "topk" : "bottomk";
                 throw EvaluationException(std::string(fname) + "() first argument (N) must be a non-empty scalar");
@@ -1910,13 +2017,13 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 const char* fname = (call.func == FunctionType::TOPK) ? "topk" : "bottomk";
                 throw EvaluationException(std::string(fname) + "() N must be non-negative");
             }
-            auto series = evaluateNode(*call.args[1], queryResults);
+            auto seriesEval = evaluateNode(*call.args[1], queryResults);
             // In single-series context there is exactly one "group".
             // If N >= 1, the group is kept; if N == 0, return an empty series.
             if (N == 0) {
                 return AlignedSeries(std::vector<uint64_t>{}, std::vector<double>{});
             }
-            return series;  // N >= 1: single group is always kept
+            return std::move(seriesEval).intoOwned();  // N >= 1: single group is always kept
         }
 
             // ---- Cross-series aggregation (variadic, element-wise) ----
@@ -1933,15 +2040,20 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 throw EvaluationException("avg_of_series() requires at least 1 argument");
             }
             // Evaluate all series arguments
-            std::vector<AlignedSeries> series;
-            series.reserve(call.args.size());
+            std::vector<EvalResult> seriesEvals;
+            seriesEvals.reserve(call.args.size());
             for (const auto& arg : call.args) {
-                series.push_back(evaluateNode(*arg, queryResults));
+                seriesEvals.push_back(evaluateNode(*arg, queryResults));
+            }
+            std::vector<const AlignedSeries*> series;
+            series.reserve(seriesEvals.size());
+            for (const auto& ev : seriesEvals) {
+                series.push_back(&ev.get());
             }
             // Verify sizes match
-            size_t n = series[0].size();
+            size_t n = series[0]->size();
             for (size_t i = 1; i < series.size(); ++i) {
-                if (series[i].size() != n) {
+                if (series[i]->size() != n) {
                     throw EvaluationException("avg_of_series(): all series must have the same length");
                 }
             }
@@ -1951,29 +2063,34 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 double sum = 0.0;
                 size_t cnt = 0;
                 for (const auto& s : series) {
-                    if (!std::isnan(s.values[i])) {
-                        sum += s.values[i];
+                    if (!std::isnan(s->values[i])) {
+                        sum += s->values[i];
                         ++cnt;
                     }
                 }
                 if (cnt > 0)
                     result[i] = sum / static_cast<double>(cnt);
             }
-            return AlignedSeries(series[0].timestamps, std::move(result));
+            return AlignedSeries(series[0]->timestamps, std::move(result));
         }
 
         case FunctionType::SUM_OF_SERIES: {
             if (call.args.empty()) {
                 throw EvaluationException("sum_of_series() requires at least 1 argument");
             }
-            std::vector<AlignedSeries> series;
-            series.reserve(call.args.size());
+            std::vector<EvalResult> seriesEvals;
+            seriesEvals.reserve(call.args.size());
             for (const auto& arg : call.args) {
-                series.push_back(evaluateNode(*arg, queryResults));
+                seriesEvals.push_back(evaluateNode(*arg, queryResults));
             }
-            size_t n = series[0].size();
+            std::vector<const AlignedSeries*> series;
+            series.reserve(seriesEvals.size());
+            for (const auto& ev : seriesEvals) {
+                series.push_back(&ev.get());
+            }
+            size_t n = series[0]->size();
             for (size_t i = 1; i < series.size(); ++i) {
-                if (series[i].size() != n) {
+                if (series[i]->size() != n) {
                     throw EvaluationException("sum_of_series(): all series must have the same length");
                 }
             }
@@ -1983,29 +2100,34 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 double sum = 0.0;
                 size_t cnt = 0;
                 for (const auto& s : series) {
-                    if (!std::isnan(s.values[i])) {
-                        sum += s.values[i];
+                    if (!std::isnan(s->values[i])) {
+                        sum += s->values[i];
                         ++cnt;
                     }
                 }
                 if (cnt > 0)
                     result[i] = sum;
             }
-            return AlignedSeries(series[0].timestamps, std::move(result));
+            return AlignedSeries(series[0]->timestamps, std::move(result));
         }
 
         case FunctionType::MIN_OF_SERIES: {
             if (call.args.empty()) {
                 throw EvaluationException("min_of_series() requires at least 1 argument");
             }
-            std::vector<AlignedSeries> series;
-            series.reserve(call.args.size());
+            std::vector<EvalResult> seriesEvals;
+            seriesEvals.reserve(call.args.size());
             for (const auto& arg : call.args) {
-                series.push_back(evaluateNode(*arg, queryResults));
+                seriesEvals.push_back(evaluateNode(*arg, queryResults));
             }
-            size_t n = series[0].size();
+            std::vector<const AlignedSeries*> series;
+            series.reserve(seriesEvals.size());
+            for (const auto& ev : seriesEvals) {
+                series.push_back(&ev.get());
+            }
+            size_t n = series[0]->size();
             for (size_t i = 1; i < series.size(); ++i) {
-                if (series[i].size() != n) {
+                if (series[i]->size() != n) {
                     throw EvaluationException("min_of_series(): all series must have the same length");
                 }
             }
@@ -2016,9 +2138,9 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 double minVal = inf;
                 bool found = false;
                 for (const auto& s : series) {
-                    if (!std::isnan(s.values[i])) {
-                        if (!found || s.values[i] < minVal) {
-                            minVal = s.values[i];
+                    if (!std::isnan(s->values[i])) {
+                        if (!found || s->values[i] < minVal) {
+                            minVal = s->values[i];
                             found = true;
                         }
                     }
@@ -2026,21 +2148,26 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 if (found)
                     result[i] = minVal;
             }
-            return AlignedSeries(series[0].timestamps, std::move(result));
+            return AlignedSeries(series[0]->timestamps, std::move(result));
         }
 
         case FunctionType::MAX_OF_SERIES: {
             if (call.args.empty()) {
                 throw EvaluationException("max_of_series() requires at least 1 argument");
             }
-            std::vector<AlignedSeries> series;
-            series.reserve(call.args.size());
+            std::vector<EvalResult> seriesEvals;
+            seriesEvals.reserve(call.args.size());
             for (const auto& arg : call.args) {
-                series.push_back(evaluateNode(*arg, queryResults));
+                seriesEvals.push_back(evaluateNode(*arg, queryResults));
             }
-            size_t n = series[0].size();
+            std::vector<const AlignedSeries*> series;
+            series.reserve(seriesEvals.size());
+            for (const auto& ev : seriesEvals) {
+                series.push_back(&ev.get());
+            }
+            size_t n = series[0]->size();
             for (size_t i = 1; i < series.size(); ++i) {
-                if (series[i].size() != n) {
+                if (series[i]->size() != n) {
                     throw EvaluationException("max_of_series(): all series must have the same length");
                 }
             }
@@ -2051,9 +2178,9 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 double maxVal = ninf;
                 bool found = false;
                 for (const auto& s : series) {
-                    if (!std::isnan(s.values[i])) {
-                        if (!found || s.values[i] > maxVal) {
-                            maxVal = s.values[i];
+                    if (!std::isnan(s->values[i])) {
+                        if (!found || s->values[i] > maxVal) {
+                            maxVal = s->values[i];
                             found = true;
                         }
                     }
@@ -2061,7 +2188,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 if (found)
                     result[i] = maxVal;
             }
-            return AlignedSeries(series[0].timestamps, std::move(result));
+            return AlignedSeries(series[0]->timestamps, std::move(result));
         }
 
         case FunctionType::PERCENTILE_OF_SERIES: {
@@ -2073,7 +2200,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                     "(p, series...)");
             }
             // Evaluate p (first arg, expected to be a scalar or scalar series)
-            auto pSeries = evaluateNode(*call.args[0], queryResults);
+            auto pEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& pSeries = pEval.get();
             if (pSeries.empty()) {
                 throw EvaluationException("percentile_of_series() first argument (p) must be a non-empty scalar");
             }
@@ -2083,14 +2211,19 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             }
 
             // Evaluate the series arguments
-            std::vector<AlignedSeries> series;
-            series.reserve(call.args.size() - 1);
+            std::vector<EvalResult> seriesEvals;
+            seriesEvals.reserve(call.args.size() - 1);
             for (size_t a = 1; a < call.args.size(); ++a) {
-                series.push_back(evaluateNode(*call.args[a], queryResults));
+                seriesEvals.push_back(evaluateNode(*call.args[a], queryResults));
             }
-            size_t n = series[0].size();
+            std::vector<const AlignedSeries*> series;
+            series.reserve(seriesEvals.size());
+            for (const auto& ev : seriesEvals) {
+                series.push_back(&ev.get());
+            }
+            size_t n = series[0]->size();
             for (size_t i = 1; i < series.size(); ++i) {
-                if (series[i].size() != n) {
+                if (series[i]->size() != n) {
                     throw EvaluationException("percentile_of_series(): all series must have the same length");
                 }
             }
@@ -2103,8 +2236,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             for (size_t i = 0; i < n; ++i) {
                 tmp.clear();
                 for (const auto& s : series) {
-                    if (!std::isnan(s.values[i])) {
-                        tmp.push_back(s.values[i]);
+                    if (!std::isnan(s->values[i])) {
+                        tmp.push_back(s->values[i]);
                     }
                 }
                 if (tmp.empty())
@@ -2122,21 +2255,26 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                     result[i] = tmp[lo] * (1.0 - frac) + tmp[hi] * frac;
                 }
             }
-            return AlignedSeries(series[0].timestamps, std::move(result));
+            return AlignedSeries(series[0]->timestamps, std::move(result));
         }
 
         case FunctionType::COUNT_OF_SERIES: {
             if (call.args.empty()) {
                 throw EvaluationException("count_of_series() requires at least 1 argument");
             }
-            std::vector<AlignedSeries> series;
-            series.reserve(call.args.size());
+            std::vector<EvalResult> seriesEvals;
+            seriesEvals.reserve(call.args.size());
             for (const auto& arg : call.args) {
-                series.push_back(evaluateNode(*arg, queryResults));
+                seriesEvals.push_back(evaluateNode(*arg, queryResults));
             }
-            size_t n = series[0].size();
+            std::vector<const AlignedSeries*> series;
+            series.reserve(seriesEvals.size());
+            for (const auto& ev : seriesEvals) {
+                series.push_back(&ev.get());
+            }
+            size_t n = series[0]->size();
             for (size_t i = 1; i < series.size(); ++i) {
-                if (series[i].size() != n) {
+                if (series[i]->size() != n) {
                     throw EvaluationException("count_of_series(): all series must have the same length");
                 }
             }
@@ -2145,26 +2283,31 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             std::vector<double> result(n, 0.0);
             for (const auto& s : series) {
                 for (size_t i = 0; i < n; ++i) {
-                    if (!std::isnan(s.values[i])) {
+                    if (!std::isnan(s->values[i])) {
                         result[i] += 1.0;
                     }
                 }
             }
-            return AlignedSeries(series[0].timestamps, std::move(result));
+            return AlignedSeries(series[0]->timestamps, std::move(result));
         }
 
         case FunctionType::STDDEV_OF_SERIES: {
             if (call.args.empty()) {
                 throw EvaluationException("stddev_of_series() requires at least 1 argument");
             }
-            std::vector<AlignedSeries> series;
-            series.reserve(call.args.size());
+            std::vector<EvalResult> seriesEvals;
+            seriesEvals.reserve(call.args.size());
             for (const auto& arg : call.args) {
-                series.push_back(evaluateNode(*arg, queryResults));
+                seriesEvals.push_back(evaluateNode(*arg, queryResults));
             }
-            size_t n = series[0].size();
+            std::vector<const AlignedSeries*> series;
+            series.reserve(seriesEvals.size());
+            for (const auto& ev : seriesEvals) {
+                series.push_back(&ev.get());
+            }
+            size_t n = series[0]->size();
             for (size_t i = 1; i < series.size(); ++i) {
-                if (series[i].size() != n) {
+                if (series[i]->size() != n) {
                     throw EvaluationException("stddev_of_series(): all series must have the same length");
                 }
             }
@@ -2176,8 +2319,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 double sum = 0.0;
                 size_t count = 0;
                 for (const auto& s : series) {
-                    if (!std::isnan(s.values[i])) {
-                        sum += s.values[i];
+                    if (!std::isnan(s->values[i])) {
+                        sum += s->values[i];
                         ++count;
                     }
                 }
@@ -2186,14 +2329,14 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 const double mean = sum / static_cast<double>(count);
                 double m2 = 0.0;
                 for (const auto& s : series) {
-                    if (!std::isnan(s.values[i])) {
-                        const double d = s.values[i] - mean;
+                    if (!std::isnan(s->values[i])) {
+                        const double d = s->values[i] - mean;
                         m2 += d * d;
                     }
                 }
                 result[i] = std::sqrt(m2 / static_cast<double>(count));
             }
-            return AlignedSeries(series[0].timestamps, std::move(result));
+            return AlignedSeries(series[0]->timestamps, std::move(result));
         }
 
         case FunctionType::HISTOGRAM_QUANTILE: {
@@ -2215,7 +2358,8 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                     "histogram_quantile() expects p, (le, bucket) pairs, and the +Inf bucket "
                     "(even argument count >= 4)");
             }
-            auto pSeries = evaluateNode(*call.args[0], queryResults);
+            auto pEval = evaluateNode(*call.args[0], queryResults);
+            const AlignedSeries& pSeries = pEval.get();
             if (pSeries.empty()) {
                 throw EvaluationException("histogram_quantile() first argument (p) must be a non-empty scalar");
             }
@@ -2228,10 +2372,11 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             // Decode (bound, bucket) pairs + trailing +Inf bucket.
             const size_t numFinite = (call.args.size() - 2) / 2;
             std::vector<double> bounds(numFinite);
-            std::vector<AlignedSeries> buckets;
+            std::vector<EvalResult> buckets;
             buckets.reserve(numFinite + 1);
             for (size_t k = 0; k < numFinite; ++k) {
-                auto boundSeries = evaluateNode(*call.args[1 + 2 * k], queryResults);
+                auto boundEval = evaluateNode(*call.args[1 + 2 * k], queryResults);
+                const AlignedSeries& boundSeries = boundEval.get();
                 if (boundSeries.empty()) {
                     throw EvaluationException("histogram_quantile() bucket bound must be a non-empty scalar");
                 }
@@ -2246,9 +2391,9 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             }
             buckets.push_back(evaluateNode(*call.args.back(), queryResults));  // +Inf bucket
 
-            const size_t n = buckets[0].size();
+            const size_t n = buckets[0].get().size();
             for (size_t k = 1; k < buckets.size(); ++k) {
-                if (buckets[k].size() != n) {
+                if (buckets[k].get().size() != n) {
                     throw EvaluationException("histogram_quantile(): all bucket series must have the same length");
                 }
             }
@@ -2260,7 +2405,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 // Gather cumulative counts; any NaN bucket invalidates this point.
                 bool valid = true;
                 for (size_t k = 0; k < buckets.size(); ++k) {
-                    counts[k] = buckets[k].values[i];
+                    counts[k] = buckets[k].get().values[i];
                     if (std::isnan(counts[k])) {
                         valid = false;
                         break;
@@ -2303,7 +2448,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                     result[i] = lower + (upper - lower) * (rank - prevCount) / bucketCount;
                 }
             }
-            return AlignedSeries(buckets[0].timestamps, std::move(result));
+            return AlignedSeries(buckets[0].get().timestamps, std::move(result));
         }
 
         default:

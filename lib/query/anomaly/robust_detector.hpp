@@ -14,16 +14,18 @@ class RobustDetector : public AnomalyDetector {
 public:
     RobustDetector() = default;
 
-    AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) override;
+    using AnomalyDetector::detect;
+    AnomalyOutput detect(const AnomalyInputView& input, const AnomalyConfig& config) override;
 
     std::string algorithmName() const override { return "robust"; }
 
     bool supportsSeasonality() const override { return true; }
 
 private:
-    // Compute bounds based on residual distribution
-    void computeBounds(const STLComponents& stl, const std::vector<double>& values, double bounds,
-                       std::vector<double>& upper, std::vector<double>& lower);
+    // Compute bounds based on residual distribution.
+    // 'expected' is the precomputed trend+seasonal series (also the predictions).
+    void computeBounds(const STLComponents& stl, std::span<const double> values, const std::vector<double>& expected,
+                       double bounds, std::vector<double>& upper, std::vector<double>& lower);
 };
 
 }  // namespace anomaly
