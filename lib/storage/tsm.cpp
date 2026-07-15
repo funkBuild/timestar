@@ -1230,9 +1230,6 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
         co_return 0;
     }
 
-    // Group into contiguous batches for efficient I/O
-    auto batches = groupContiguousBlocks(blocksToScan);
-
     // Pre-fetch tombstone ranges once (empty vector if no tombstones)
     std::vector<std::pair<uint64_t, uint64_t>> tombstoneRanges;
     if (hasTombstones()) {
@@ -1241,49 +1238,44 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
 
     size_t totalPoints = 0;
 
-    // Pre-scan all batches synchronously: handle block-stats-only blocks and
-    // build per-batch skip flags. This avoids mutating shared state (aggregator,
-    // totalPoints) inside parallel_for_each lambdas, which would be fragile if
-    // any code change introduced a co_await before the stats mutation.
+    // Stats pre-scan BEFORE batching: blocks answered by block stats never
+    // reach the batch builder, so their bytes are never DMA-read. (Batching
+    // first and skipping at decode time would still read the whole contiguous
+    // batch — with O_DIRECT files that is real disk I/O, up to ~1000x
+    // amplification when only boundary blocks of a range need decoding.)
+    // This pre-scan is synchronous, so the aggregator/totalPoints mutations
+    // stay outside the parallel_for_each lambdas below.
     const bool countOnly = aggregator.isCountOnly();
 
-    // Per-batch: which blocks need decode, and which were handled via stats
-    struct BatchDecodeInfo {
-        std::vector<bool> skippedFlags;
-        bool anyNeedsDecode = false;
-    };
-    std::vector<BatchDecodeInfo> batchInfo(batches.size());
-
-    for (size_t batchIdx = 0; batchIdx < batches.size(); ++batchIdx) {
-        const auto& batch = batches[batchIdx];
-        auto& info = batchInfo[batchIdx];
-        info.skippedFlags.resize(batch.blocks.size());
-
-        for (size_t bi = 0; bi < batch.blocks.size(); ++bi) {
-            const auto& block = batch.blocks[bi];
-            bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
-            bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
-            bool canSkip = !blockHasTombstones && blockFullyContained && block.blockCount > 0 &&
-                           aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
-            info.skippedFlags[bi] = canSkip;
-            if (canSkip) {
-                aggregator.addBlockStats(block.blockSum, block.blockMin, block.blockMax, block.blockCount,
-                                         block.minTime, block.maxTime, block.blockM2, block.blockFirstValue,
-                                         block.blockLatestValue);
-                totalPoints += block.blockCount;
-            } else {
-                info.anyNeedsDecode = true;
-            }
+    std::vector<TSMIndexBlock> decodeBlocks;
+    decodeBlocks.reserve(blocksToScan.size());
+    for (const auto& block : blocksToScan) {
+        bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
+        bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
+        bool canSkip = !blockHasTombstones && blockFullyContained && block.blockCount > 0 &&
+                       aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
+        if (canSkip) {
+            aggregator.addBlockStats(block.blockSum, block.blockMin, block.blockMax, block.blockCount, block.minTime,
+                                     block.maxTime, block.blockM2, block.blockFirstValue, block.blockLatestValue);
+            totalPoints += block.blockCount;
+        } else {
+            decodeBlocks.push_back(block);
         }
     }
 
-    // Process batches that need decode in parallel — only I/O and decode happen
-    // inside the lambda now; no shared mutable state is touched before the first co_await.
+    if (decodeBlocks.empty()) {
+        co_return totalPoints;
+    }
+
+    // Group the blocks that still need decoding into contiguous batches for
+    // efficient I/O. Stats-skipped interior blocks become gaps, so boundary
+    // blocks get their own small reads instead of dragging the whole range in.
+    auto batches = groupContiguousBlocks(decodeBlocks);
+
     std::vector<size_t> batchIndices;
     batchIndices.reserve(batches.size());
     for (size_t i = 0; i < batches.size(); ++i) {
-        if (batchInfo[i].anyNeedsDecode)
-            batchIndices.push_back(i);
+        batchIndices.push_back(i);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1306,7 +1298,6 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
     // ──────────────────────────────────────────────────────────────────────
     co_await seastar::parallel_for_each(batchIndices, [&](size_t batchIdx) -> seastar::future<> {
         const auto& batch = batches[batchIdx];
-        const auto& skippedFlags = batchInfo[batchIdx].skippedFlags;
 
         // Acquire I/O semaphore before DMA read to bound concurrent disk I/O.
         // Released after the read completes and decode/fold finishes (no DMA
@@ -1331,10 +1322,8 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
         uint32_t bufferOffset = 0;
         for (size_t bi = 0; bi < batch.blocks.size(); ++bi) {
             const auto& block = batch.blocks[bi];
-            if (skippedFlags[bi]) {
-                bufferOffset += block.size;
-                continue;
-            }
+            // Every block in the batch needs decoding (stats-answered blocks
+            // were removed before batching and their bytes were never read).
 
             // Phase 0: per-block tombstone check instead of global gate
             bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
@@ -1628,26 +1617,39 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
             }
         }
 
-        // Helper lambda for bucketed point processing with tombstone filtering
+        // Helper lambda for bucketed point processing with tombstone filtering.
+        // Timestamps are monotonic within a block, so once a bucket is resolved
+        // (filled here, or found already filled), its remaining points are
+        // skipped with two comparisons instead of a hash lookup per point.
+        // The tombstone binary search runs only for candidate points (first
+        // unresolved point of a bucket), not for every decoded point.
         auto processBucketedPoints = [&](const std::vector<uint64_t>& ts, auto toDouble) {
             size_t pointCount = ts.size();
+            uint64_t skipLo = 1, skipHi = 0;  // empty interval: [skipLo, skipHi)
             for (size_t pi = 0; pi < pointCount; ++pi) {
                 size_t j = reverse ? (pointCount - 1 - pi) : pi;
                 uint64_t t = ts[j];
+                if (t >= skipLo && t < skipHi)
+                    continue;  // same bucket as the last resolved one
+                uint64_t bucketKey = (t / interval) * interval;
+                if (filledBuckets.find(bucketKey) != filledBuckets.end()) {
+                    skipLo = bucketKey;
+                    skipHi = bucketKey + interval;
+                    continue;
+                }
                 if (hasTombstoneRanges) {
                     auto rangeIt = std::upper_bound(tombstoneRanges.begin(), tombstoneRanges.end(),
                                                     std::make_pair(t, std::numeric_limits<uint64_t>::max()));
                     if (rangeIt != tombstoneRanges.begin()) {
                         --rangeIt;
                         if (t >= rangeIt->first && t <= rangeIt->second)
-                            continue;
+                            continue;  // tombstoned candidate: try next point in bucket
                     }
                 }
-                uint64_t bucketKey = (t / interval) * interval;
-                if (filledBuckets.find(bucketKey) != filledBuckets.end())
-                    continue;
                 aggregator.addPoint(t, toDouble(j));
                 filledBuckets.insert(bucketKey);
+                skipLo = bucketKey;
+                skipHi = bucketKey + interval;
                 totalPoints++;
             }
         };

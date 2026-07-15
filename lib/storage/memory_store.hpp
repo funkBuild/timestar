@@ -157,6 +157,35 @@ public:
         return nullptr;
     }
 
+    // Earliest timestamp in [startTime, endTime) for a series of ANY
+    // aggregatable type — one hash lookup, visiting the type variant, instead
+    // of one querySeries<T> probe per candidate type.  String series return
+    // nullopt (they are not numerically aggregatable).
+    std::optional<uint64_t> earliestTimestampInRange(const SeriesId128& seriesId, uint64_t startTime,
+                                                     uint64_t endTime) const {
+        auto it = series.find(seriesId);
+        if (it == series.end()) {
+            return std::nullopt;
+        }
+        return std::visit(
+            [&](const auto& s) -> std::optional<uint64_t> {
+                using SeriesType = std::decay_t<decltype(s)>;
+                if constexpr (std::is_same_v<SeriesType, InMemorySeries<std::string>>) {
+                    return std::nullopt;
+                } else {
+                    if (s.timestamps.empty()) {
+                        return std::nullopt;
+                    }
+                    auto lo = std::lower_bound(s.timestamps.begin(), s.timestamps.end(), startTime);
+                    if (lo != s.timestamps.end() && *lo < endTime) {
+                        return *lo;
+                    }
+                    return std::nullopt;
+                }
+            },
+            it->second);
+    }
+
     // Delete data in a time range for a series
     void deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
 };

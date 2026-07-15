@@ -353,8 +353,7 @@ seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated
                                                                                  uint64_t aggregationInterval,
                                                                                  timestar::AggregationMethod method) {
     QueryRunner runner(&tsmFileManager, &walFileManager);
-    co_return co_await runner.queryTsmAggregated(std::string(seriesKey), seriesId, startTime, endTime,
-                                                 aggregationInterval, method);
+    co_return co_await runner.queryTsmAggregated(seriesId, startTime, endTime, aggregationInterval, method);
 }
 
 seastar::future<std::vector<std::optional<timestar::PushdownResult>>> Engine::queryAggregatedMultiField(
