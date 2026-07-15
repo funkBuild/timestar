@@ -323,6 +323,7 @@ bool ExpressionParser::isFunction(const std::string& name) const {
         "rolling_sum", "rolling_median",                 // rolling window (continued)
         "rolling_percentile",                            // rolling window percentile
         "count_of_series", "stddev_of_series",           // cross-series (continued)
+        "histogram_quantile",                            // quantile from cumulative buckets
         "diff", "monotonic_diff", "default_zero",        // unary transform
         "count_nonzero", "count_not_null",               // unary aggregating
         "rate", "irate", "increase",                     // counter-rate functions
@@ -518,6 +519,8 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
         return FunctionType::COUNT_OF_SERIES;
     if (name == "stddev_of_series")
         return FunctionType::STDDEV_OF_SERIES;
+    if (name == "histogram_quantile")
+        return FunctionType::HISTOGRAM_QUANTILE;
     return std::nullopt;
 }
 
@@ -861,7 +864,16 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
             multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES ||
             multiFunc.value() == FunctionType::COUNT_OF_SERIES || multiFunc.value() == FunctionType::STDDEV_OF_SERIES;
 
-        if (isVariadic) {
+        if (multiFunc.value() == FunctionType::HISTOGRAM_QUANTILE) {
+            // histogram_quantile(p, le_1, b_1, ..., le_n, b_n, b_inf):
+            // p + n (bound, bucket) pairs + the +Inf bucket -> even count >= 4.
+            if (args.size() < 4 || args.size() % 2 != 0) {
+                throw ExpressionParseException(
+                    "Function 'histogram_quantile' expects p, at least one (le, bucket) pair, and the +Inf bucket "
+                    "(an even argument count >= 4), got " +
+                    std::to_string(args.size()));
+            }
+        } else if (isVariadic) {
             size_t minArgs = (multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES) ? 2 : 1;
             if (args.size() < minArgs) {
                 throw ExpressionParseException("Function '" + name + "' requires at least " + std::to_string(minArgs) +

@@ -123,7 +123,9 @@ enum class FunctionType {
     MAX_OF_SERIES,         // max_of_series(a, b, ...) - element-wise maximum across series args
     PERCENTILE_OF_SERIES,  // percentile_of_series(p, a, b, ...) - p-th percentile across series args
     COUNT_OF_SERIES,       // count_of_series(a, b, ...) - element-wise count of non-NaN across series args
-    STDDEV_OF_SERIES       // stddev_of_series(a, b, ...) - element-wise population stddev across series args
+    STDDEV_OF_SERIES,      // stddev_of_series(a, b, ...) - element-wise population stddev across series args
+    // Histogram quantile from cumulative bucket series (PromQL-style)
+    HISTOGRAM_QUANTILE  // histogram_quantile(p, le_1, b_1, ..., le_n, b_n, b_inf)
 };
 
 // Binary operation node
@@ -506,6 +508,8 @@ inline const char* functionToString(FunctionType func) {
             return "count_of_series";
         case FunctionType::STDDEV_OF_SERIES:
             return "stddev_of_series";
+        case FunctionType::HISTOGRAM_QUANTILE:
+            return "histogram_quantile";
         default:
             return "?";
     }

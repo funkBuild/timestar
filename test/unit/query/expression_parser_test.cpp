@@ -799,3 +799,11 @@ TEST_F(ExpressionParserTest, ParseNewRollingAndCrossSeriesFunctions) {
         EXPECT_EQ(parser.parse()->asFunctionCall().func, FunctionType::STDDEV_OF_SERIES);
     }
 }
+
+TEST_F(ExpressionParserTest, ParseHistogramQuantile) {
+    ExpressionParser parser("histogram_quantile(95, 100, a, 500, b, inf_b)");
+    auto ast = parser.parse();
+    EXPECT_EQ(ast->type, ExprNodeType::FUNCTION_CALL);
+    EXPECT_EQ(ast->asFunctionCall().func, FunctionType::HISTOGRAM_QUANTILE);
+    EXPECT_EQ(ast->asFunctionCall().args.size(), 6u);
+}

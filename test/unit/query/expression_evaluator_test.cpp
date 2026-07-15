@@ -2974,3 +2974,103 @@ TEST_F(ExpressionEvaluatorTest, CountAndStddevOfSeries) {
         EXPECT_DOUBLE_EQ(sd.values[2], 0.0);
     }
 }
+
+// ==================== histogram_quantile ====================
+
+class HistogramQuantileTest : public ExpressionEvaluatorTest {
+protected:
+    // Cumulative buckets at 3 timestamps:
+    //   t0: le100=10, le500=60, le1000=90, +Inf=100
+    //   t1: le100=0,  le500=0,  le1000=0,  +Inf=0    (empty histogram)
+    //   t2: le100=40, le500=30, le1000=80, +Inf=100  (non-monotonic scrape artifact)
+    ExpressionEvaluator::QueryResultMap makeBuckets() {
+        ExpressionEvaluator::QueryResultMap r;
+        r["b100"] = makeSeries({1000, 2000, 3000}, {10.0, 0.0, 40.0});
+        r["b500"] = makeSeries({1000, 2000, 3000}, {60.0, 0.0, 30.0});
+        r["b1000"] = makeSeries({1000, 2000, 3000}, {90.0, 0.0, 80.0});
+        r["binf"] = makeSeries({1000, 2000, 3000}, {100.0, 0.0, 100.0});
+        return r;
+    }
+
+    AlignedSeries run(const std::string& formula, ExpressionEvaluator::QueryResultMap& results) {
+        ExpressionParser parser(formula);
+        return evaluator.evaluate(*parser.parse(), results);
+    }
+};
+
+TEST_F(HistogramQuantileTest, MedianInterpolatesWithinBucket) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // rank = 0.5*100 = 50 -> bucket (100, 500]: lower=100, prev=10, width=50
+    // 100 + 400 * (50-10)/50 = 420
+    EXPECT_NEAR(q.values[0], 420.0, 1e-9);
+}
+
+TEST_F(HistogramQuantileTest, QuantileInFirstBucketInterpolatesFromZero) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(5, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // rank = 5 -> first bucket: 0 + 100 * 5/10 = 50
+    EXPECT_NEAR(q.values[0], 50.0, 1e-9);
+}
+
+TEST_F(HistogramQuantileTest, RankBeyondFiniteBucketsReturnsHighestBound) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(95, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // rank = 95 > 90 (last finite cumulative) -> +Inf bucket -> 1000
+    EXPECT_DOUBLE_EQ(q.values[0], 1000.0);
+}
+
+TEST_F(HistogramQuantileTest, EmptyHistogramIsNaN) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_TRUE(std::isnan(q.values[1]));  // t1: total == 0
+}
+
+TEST_F(HistogramQuantileTest, NonMonotonicCountsAreClamped) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // t2 raw: 40, 30, 80, 100 -> clamped: 40, 40, 80, 100; rank = 50
+    // -> bucket (500, 1000]: lower=500, prev=40, width=40
+    // 500 + 500 * (50-40)/40 = 625
+    EXPECT_NEAR(q.values[2], 625.0, 1e-9);
+}
+
+TEST_F(HistogramQuantileTest, ExtremesAndNaNPropagation) {
+    auto results = makeBuckets();
+    auto q0 = run("histogram_quantile(0, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_DOUBLE_EQ(q0.values[0], 0.0);  // rank 0 -> start of first bucket
+    auto q100 = run("histogram_quantile(100, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_DOUBLE_EQ(q100.values[0], 1000.0);  // rank == total -> +Inf region boundary
+
+    // NaN in any bucket at a timestamp -> NaN output there
+    results["b500"] = makeSeries({1000, 2000, 3000}, {60.0, 0.0, std::numeric_limits<double>::quiet_NaN()});
+    auto qn = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_FALSE(std::isnan(qn.values[0]));
+    EXPECT_TRUE(std::isnan(qn.values[2]));
+}
+
+TEST_F(HistogramQuantileTest, ValidationErrors) {
+    auto results = makeBuckets();
+    // p out of range
+    EXPECT_THROW(run("histogram_quantile(101, 100, b100, 500, b500, 1000, b1000, binf)", results),
+                 EvaluationException);
+    // bounds not strictly ascending
+    EXPECT_THROW(run("histogram_quantile(50, 500, b500, 100, b100, 1000, b1000, binf)", results),
+                 EvaluationException);
+    // odd argument count is a parse error
+    EXPECT_THROW(ExpressionParser("histogram_quantile(50, 100, b100, binf, extra)").parse(),
+                 ExpressionParseException);
+    // too few arguments is a parse error
+    EXPECT_THROW(ExpressionParser("histogram_quantile(50, binf)").parse(), ExpressionParseException);
+}
+
+TEST_F(HistogramQuantileTest, SingleBucketPlusInf) {
+    ExpressionEvaluator::QueryResultMap results;
+    results["b"] = makeSeries({1000}, {80.0});
+    results["binf"] = makeSeries({1000}, {100.0});
+    auto q = run("histogram_quantile(40, 250, b, binf)", results);
+    // rank = 40 -> only bucket: 0 + 250 * 40/80 = 125
+    EXPECT_NEAR(q.values[0], 125.0, 1e-9);
+    auto q90 = run("histogram_quantile(90, 250, b, binf)", results);
+    EXPECT_DOUBLE_EQ(q90.values[0], 250.0);  // beyond finite buckets
+}

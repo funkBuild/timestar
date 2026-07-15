@@ -2196,6 +2196,116 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             return AlignedSeries(series[0].timestamps, std::move(result));
         }
 
+        case FunctionType::HISTOGRAM_QUANTILE: {
+            // histogram_quantile(p, le_1, b_1, ..., le_n, b_n, b_inf)
+            //
+            // PromQL-style quantile estimation from cumulative histogram
+            // buckets.  Each b_k is a series of cumulative counts of
+            // observations <= le_k; b_inf is the +Inf bucket (total count).
+            // Bounds are scalar literals, strictly ascending and finite.
+            //
+            // Per timestamp: counts are clamped to monotonic non-decreasing
+            // (scrape/rollup artifacts), rank = (p/100) * total locates the
+            // target bucket, and the quantile is linearly interpolated within
+            // it.  The first bucket interpolates from 0 when its bound is
+            // positive; a rank falling in the +Inf bucket returns the highest
+            // finite bound; total <= 0 or a NaN bucket value yields NaN.
+            if (call.args.size() < 4 || call.args.size() % 2 != 0) {
+                throw EvaluationException(
+                    "histogram_quantile() expects p, (le, bucket) pairs, and the +Inf bucket "
+                    "(even argument count >= 4)");
+            }
+            auto pSeries = evaluateNode(*call.args[0], queryResults);
+            if (pSeries.empty()) {
+                throw EvaluationException("histogram_quantile() first argument (p) must be a non-empty scalar");
+            }
+            const double p = pSeries.values[0];
+            if (p < 0.0 || p > 100.0) {
+                throw EvaluationException("histogram_quantile() p must be in [0, 100], got " + std::to_string(p));
+            }
+            const double phi = p / 100.0;
+
+            // Decode (bound, bucket) pairs + trailing +Inf bucket.
+            const size_t numFinite = (call.args.size() - 2) / 2;
+            std::vector<double> bounds(numFinite);
+            std::vector<AlignedSeries> buckets;
+            buckets.reserve(numFinite + 1);
+            for (size_t k = 0; k < numFinite; ++k) {
+                auto boundSeries = evaluateNode(*call.args[1 + 2 * k], queryResults);
+                if (boundSeries.empty()) {
+                    throw EvaluationException("histogram_quantile() bucket bound must be a non-empty scalar");
+                }
+                bounds[k] = boundSeries.values[0];
+                if (!std::isfinite(bounds[k])) {
+                    throw EvaluationException("histogram_quantile() bucket bounds must be finite");
+                }
+                if (k > 0 && bounds[k] <= bounds[k - 1]) {
+                    throw EvaluationException("histogram_quantile() bucket bounds must be strictly ascending");
+                }
+                buckets.push_back(evaluateNode(*call.args[2 + 2 * k], queryResults));
+            }
+            buckets.push_back(evaluateNode(*call.args.back(), queryResults));  // +Inf bucket
+
+            const size_t n = buckets[0].size();
+            for (size_t k = 1; k < buckets.size(); ++k) {
+                if (buckets[k].size() != n) {
+                    throw EvaluationException("histogram_quantile(): all bucket series must have the same length");
+                }
+            }
+
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            std::vector<double> result(n, nan);
+            std::vector<double> counts(buckets.size());
+            for (size_t i = 0; i < n; ++i) {
+                // Gather cumulative counts; any NaN bucket invalidates this point.
+                bool valid = true;
+                for (size_t k = 0; k < buckets.size(); ++k) {
+                    counts[k] = buckets[k].values[i];
+                    if (std::isnan(counts[k])) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) {
+                    continue;
+                }
+                // Clamp to monotonic non-decreasing (PromQL tolerance for
+                // scrape artifacts / float noise in rollups).
+                for (size_t k = 1; k < counts.size(); ++k) {
+                    if (counts[k] < counts[k - 1]) {
+                        counts[k] = counts[k - 1];
+                    }
+                }
+                const double total = counts.back();
+                if (!(total > 0.0)) {
+                    continue;  // empty histogram: NaN
+                }
+                const double rank = phi * total;
+
+                // First finite bucket whose cumulative count reaches the rank.
+                size_t k = 0;
+                while (k < numFinite && counts[k] < rank) {
+                    ++k;
+                }
+                if (k == numFinite) {
+                    // Rank falls in the +Inf bucket: the quantile is beyond
+                    // the highest finite bound — return that bound (PromQL).
+                    result[i] = bounds[numFinite - 1];
+                    continue;
+                }
+                const double upper = bounds[k];
+                const double lower = (k == 0) ? (upper > 0.0 ? 0.0 : upper) : bounds[k - 1];
+                const double prevCount = (k == 0) ? 0.0 : counts[k - 1];
+                const double bucketCount = counts[k] - prevCount;
+                if (bucketCount <= 0.0) {
+                    result[i] = upper;
+                } else {
+                    result[i] = lower + (upper - lower) * (rank - prevCount) / bucketCount;
+                }
+            }
+            return AlignedSeries(buckets[0].timestamps, std::move(result));
+        }
+
         default:
             throw EvaluationException("Unknown function type");
     }
