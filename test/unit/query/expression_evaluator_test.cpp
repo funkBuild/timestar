@@ -2586,3 +2586,112 @@ TEST_F(ExpressionEvaluatorTest, AsPercentParserRoundTripScalar) {
     EXPECT_DOUBLE_EQ(result.values[1], 2.0);
     EXPECT_DOUBLE_EQ(result.values[2], 3.0);
 }
+
+// ==================== fill_spline ====================
+
+TEST_F(ExpressionEvaluatorTest, FillSplineReproducesQuadratic) {
+    // A natural cubic spline through samples of a smooth function should
+    // fill interior gaps far more accurately than linear interpolation.
+    // Sample y = x^2 at x = 0..10 (t = 1000*x), knock out x=4,5,6.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (int x = 0; x <= 10; ++x) {
+        ts.push_back(1000 * static_cast<uint64_t>(x + 1));
+        double v = static_cast<double>(x) * static_cast<double>(x);
+        vals.push_back((x >= 4 && x <= 6) ? std::numeric_limits<double>::quiet_NaN() : v);
+    }
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto filled = s.fill_spline();
+
+    // Exact values: 16, 25, 36.  Natural spline won't be exact but must be
+    // close (quadratic curvature well within cubic's reach); linear would
+    // give 22, 31, 40 (errors of 6, 6, 4).
+    EXPECT_NEAR(filled.values[4], 16.0, 1.5);
+    EXPECT_NEAR(filled.values[5], 25.0, 1.5);
+    EXPECT_NEAR(filled.values[6], 36.0, 1.5);
+    // Known values untouched
+    EXPECT_DOUBLE_EQ(filled.values[3], 9.0);
+    EXPECT_DOUBLE_EQ(filled.values[7], 49.0);
+}
+
+TEST_F(ExpressionEvaluatorTest, FillSplineLeadingTrailingStayNaN) {
+    auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000},
+                        {std::numeric_limits<double>::quiet_NaN(), 1.0, std::numeric_limits<double>::quiet_NaN(), 3.0,
+                         5.0, std::numeric_limits<double>::quiet_NaN()});
+    auto filled = s.fill_spline();
+    EXPECT_TRUE(std::isnan(filled.values[0]));  // leading stays NaN
+    EXPECT_FALSE(std::isnan(filled.values[2]));  // interior filled
+    EXPECT_TRUE(std::isnan(filled.values[5]));  // trailing stays NaN
+}
+
+TEST_F(ExpressionEvaluatorTest, FillSplineFewKnotsFallsBackToLinear) {
+    // Only 2 knots: degenerates to linear interpolation.
+    auto s = makeSeries({1000, 2000, 3000}, {0.0, std::numeric_limits<double>::quiet_NaN(), 10.0});
+    auto filled = s.fill_spline();
+    EXPECT_DOUBLE_EQ(filled.values[1], 5.0);
+}
+
+TEST_F(ExpressionEvaluatorTest, FillSplineNoNaNsIsIdentity) {
+    auto s = makeSeries({1000, 2000, 3000, 4000}, {1.0, 2.0, 3.0, 4.0});
+    auto filled = s.fill_spline();
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_DOUBLE_EQ(filled.values[i], s.values[i]);
+    }
+}
+
+// ==================== gaussian_smooth ====================
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothPreservesConstant) {
+    // Smoothing a constant series must return the same constant everywhere,
+    // including boundaries (renormalization keeps weights summing to 1).
+    std::vector<uint64_t> ts;
+    std::vector<double> vals(50, 7.5);
+    for (size_t i = 0; i < 50; ++i)
+        ts.push_back(1000 * (i + 1));
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto smoothed = s.gaussian_smooth(2.0);
+    for (size_t i = 0; i < 50; ++i) {
+        EXPECT_NEAR(smoothed.values[i], 7.5, 1e-9) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothReducesNoiseKeepsMean) {
+    // Alternating +/- noise around 10: smoothing with sigma=3 must pull
+    // interior values close to 10.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 100; ++i) {
+        ts.push_back(1000 * (i + 1));
+        vals.push_back(10.0 + ((i % 2 == 0) ? 1.0 : -1.0));
+    }
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto smoothed = s.gaussian_smooth(3.0);
+    for (size_t i = 20; i < 80; ++i) {
+        EXPECT_NEAR(smoothed.values[i], 10.0, 0.05) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothSkipsNaN) {
+    // A NaN input is excluded from neighbors' windows (renormalized), and
+    // the NaN position itself gets a smoothed estimate from its neighbors.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals(21, 5.0);
+    for (size_t i = 0; i < 21; ++i)
+        ts.push_back(1000 * (i + 1));
+    vals[10] = std::numeric_limits<double>::quiet_NaN();
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto smoothed = s.gaussian_smooth(1.5);
+    for (size_t i = 0; i < 21; ++i) {
+        EXPECT_NEAR(smoothed.values[i], 5.0, 1e-9) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothAllNaNStaysNaN) {
+    auto s = makeSeries({1000, 2000, 3000},
+                        {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::quiet_NaN()});
+    auto smoothed = s.gaussian_smooth(1.0);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_TRUE(std::isnan(smoothed.values[i]));
+    }
+}

@@ -61,6 +61,7 @@ enum class UnaryOpType {
     FILL_FORWARD,   // fill_forward(a) - last observation carried forward (LOCF); leading NaNs stay NaN
     FILL_BACKWARD,  // fill_backward(a) - next observation carried backward (NOCB); trailing NaNs stay NaN
     FILL_LINEAR,    // fill_linear(a) - linear interpolation between known values; leading/trailing NaN runs stay NaN
+    FILL_SPLINE,    // fill_spline(a) - natural cubic spline through known values; leading/trailing NaN runs stay NaN
     // Accumulation functions
     CUMSUM,    // cumsum(a) - running cumulative sum; NaN treated as 0 (skip-NaN)
     INTEGRAL,  // integral(a) - definite integral using trapezoidal rule; NaN trapezoids contribute 0
@@ -90,6 +91,8 @@ enum class FunctionType {
     FILL_VALUE,  // fill_value(series, v) - replace every NaN with constant v
     // Exponential moving average
     EMA,  // ema(series, alpha_or_span) - exponential moving average
+    // Gaussian kernel smoothing
+    GAUSSIAN_SMOOTH,  // gaussian_smooth(series, sigma) - Gaussian kernel convolution; NaN-aware renormalization
     // Double exponential smoothing (Holt's linear method)
     HOLT_WINTERS,  // holt_winters(series, alpha, beta) - trend-aware exponential smoother
     // Rolling z-score normalization
@@ -389,6 +392,8 @@ inline const char* unaryOpToString(UnaryOpType op) {
             return "fill_backward";
         case UnaryOpType::FILL_LINEAR:
             return "fill_linear";
+        case UnaryOpType::FILL_SPLINE:
+            return "fill_spline";
         case UnaryOpType::CUMSUM:
             return "cumsum";
         case UnaryOpType::INTEGRAL:
@@ -434,6 +439,8 @@ inline const char* functionToString(FunctionType func) {
             return "fill_value";
         case FunctionType::EMA:
             return "ema";
+        case FunctionType::GAUSSIAN_SMOOTH:
+            return "gaussian_smooth";
         case FunctionType::HOLT_WINTERS:
             return "holt_winters";
         case FunctionType::ZSCORE:

@@ -320,6 +320,8 @@ bool ExpressionParser::isFunction(const std::string& name) const {
         "count_nonzero", "count_not_null",               // unary aggregating
         "rate", "irate", "increase",                     // counter-rate functions
         "fill_forward", "fill_backward", "fill_linear",  // gap-fill (unary)
+        "fill_spline",                                   // cubic-spline gap-fill (unary)
+        "gaussian_smooth",                               // Gaussian kernel smoothing
         "cumsum", "integral",                            // accumulation (unary)
         "normalize",                                     // normalization (unary)
         "min", "max", "pow", "clamp",                    // multi-arg math
@@ -399,6 +401,8 @@ std::optional<UnaryOpType> ExpressionParser::getUnaryFunction(const std::string&
         return UnaryOpType::FILL_BACKWARD;
     if (name == "fill_linear")
         return UnaryOpType::FILL_LINEAR;
+    if (name == "fill_spline")
+        return UnaryOpType::FILL_SPLINE;
     // Accumulation functions
     if (name == "cumsum")
         return UnaryOpType::CUMSUM;
@@ -448,6 +452,9 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
     // Exponential moving average
     if (name == "ema")
         return FunctionType::EMA;
+    // Gaussian kernel smoothing
+    if (name == "gaussian_smooth")
+        return FunctionType::GAUSSIAN_SMOOTH;
     // Double exponential smoothing (Holt's linear method)
     if (name == "holt_winters")
         return FunctionType::HOLT_WINTERS;

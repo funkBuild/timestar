@@ -90,7 +90,10 @@ struct AlignedSeries {
     AlignedSeries fill_forward() const;   // LOCF: replace NaN with previous non-NaN; leading NaNs stay NaN
     AlignedSeries fill_backward() const;  // NOCB: replace NaN with next non-NaN; trailing NaNs stay NaN
     AlignedSeries fill_linear() const;    // Linear interpolation using timestamps; leading/trailing NaN runs stay NaN
+    AlignedSeries fill_spline() const;    // Natural cubic spline through known values; leading/trailing NaN stay NaN
     AlignedSeries fill_value(double v) const;  // Replace every NaN with constant v
+    // Gaussian kernel smoothing (radius ceil(3*sigma)); NaN-aware renormalization
+    AlignedSeries gaussian_smooth(double sigma) const;
 
     // Accumulation functions
     AlignedSeries cumsum() const;    // Running cumulative sum; NaN treated as 0 (skip-NaN)

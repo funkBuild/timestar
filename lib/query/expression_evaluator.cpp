@@ -2,6 +2,7 @@
 
 #include "anomaly/simd_anomaly.hpp"
 #include "forecast/forecast_result.hpp"
+#include "simd_aggregator.hpp"
 #include "transform/transform_functions_simd.hpp"
 
 #include <cmath>
@@ -425,6 +426,148 @@ AlignedSeries AlignedSeries::fill_linear() const {
             }
         }
         i = j;
+    }
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::fill_spline() const {
+    // Natural cubic spline interpolation through the known (non-NaN) points.
+    // Semantics match fill_linear: only interior NaN runs are filled;
+    // leading/trailing NaN runs stay NaN.  Fewer than 3 knots degenerates to
+    // linear interpolation (a spline needs >= 3 points to bend).
+    const size_t n = values.size();
+    const auto& ts = *timestamps;
+
+    // Collect knots (indices of finite values).
+    std::vector<size_t> knotIdx;
+    knotIdx.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isnan(values[i])) {
+            knotIdx.push_back(i);
+        }
+    }
+    const size_t k = knotIdx.size();
+    if (k < 3 || k == n) {
+        // Not enough knots for a cubic, or nothing to fill.
+        return k == n ? *this : fill_linear();
+    }
+
+    // Knot coordinates.  Timestamps are nanoseconds (~1e18), beyond double's
+    // 2^53 integer range — normalize to milliseconds relative to the first
+    // knot so intervals stay exactly representable.
+    const uint64_t tBase = ts[knotIdx[0]];
+    std::vector<double> x(k), yv(k);
+    for (size_t i = 0; i < k; ++i) {
+        x[i] = static_cast<double>(ts[knotIdx[i]] - tBase) * 1e-6;
+        yv[i] = values[knotIdx[i]];
+    }
+
+    // Solve for second derivatives m[] of the natural cubic spline via the
+    // Thomas algorithm on the standard tridiagonal system (O(k)).
+    std::vector<double> m(k, 0.0);   // second derivatives; natural: m[0]=m[k-1]=0
+    std::vector<double> cp(k, 0.0);  // scratch: modified superdiagonal
+    std::vector<double> dp(k, 0.0);  // scratch: modified rhs
+    for (size_t i = 1; i + 1 < k; ++i) {
+        double h0 = x[i] - x[i - 1];
+        double h1 = x[i + 1] - x[i];
+        if (h0 <= 0.0 || h1 <= 0.0) {
+            // Duplicate/non-increasing knot timestamps — spline undefined;
+            // fall back to linear which handles dt==0.
+            return fill_linear();
+        }
+        double diag = 2.0 * (h0 + h1);
+        double rhs = 6.0 * ((yv[i + 1] - yv[i]) / h1 - (yv[i] - yv[i - 1]) / h0);
+        double lower = h0;
+        double denom = diag - lower * cp[i - 1];
+        cp[i] = h1 / denom;
+        dp[i] = (rhs - lower * dp[i - 1]) / denom;
+    }
+    for (size_t i = k - 2; i >= 1; --i) {
+        m[i] = dp[i] - cp[i] * m[i + 1];
+    }
+
+    // Evaluate the spline at interior NaN positions.  Both the NaN positions
+    // and the knots are in timestamp order, so a single cursor suffices.
+    std::vector<double> result(values);
+    size_t seg = 0;  // knot segment cursor: interval [knotIdx[seg], knotIdx[seg+1]]
+    for (size_t i = knotIdx.front() + 1; i < knotIdx.back(); ++i) {
+        if (!std::isnan(result[i])) {
+            continue;
+        }
+        while (seg + 2 < k && knotIdx[seg + 1] < i) {
+            ++seg;
+        }
+        const double h = x[seg + 1] - x[seg];
+        const double t = static_cast<double>(ts[i] - tBase) * 1e-6;
+        const double a = (x[seg + 1] - t) / h;
+        const double b = (t - x[seg]) / h;
+        result[i] = a * yv[seg] + b * yv[seg + 1] +
+                    ((a * a * a - a) * m[seg] + (b * b * b - b) * m[seg + 1]) * (h * h) / 6.0;
+    }
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::gaussian_smooth(double sigma) const {
+    // Gaussian kernel convolution with NaN-aware renormalization.
+    // Kernel radius = ceil(3*sigma) (covers 99.7% of the Gaussian mass).
+    // Interior windows with no NaN use a precomputed normalized kernel and a
+    // SIMD dot product; boundary/NaN windows renormalize over the valid taps.
+    // An all-NaN window yields NaN.
+    const size_t n = values.size();
+    if (n == 0) {
+        return AlignedSeries(timestamps, {});
+    }
+
+    const int half = static_cast<int>(std::ceil(3.0 * sigma));
+    const int kernelSize = 2 * half + 1;
+
+    // Precompute normalized kernel.
+    std::vector<double> kernel(static_cast<size_t>(kernelSize));
+    double kernelSum = 0.0;
+    const double inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    for (int j = 0; j < kernelSize; ++j) {
+        const double xj = static_cast<double>(j - half);
+        kernel[static_cast<size_t>(j)] = std::exp(-(xj * xj) * inv2s2);
+        kernelSum += kernel[static_cast<size_t>(j)];
+    }
+    for (double& kv : kernel) {
+        kv /= kernelSum;
+    }
+
+    // NaN prefix counts: nanPrefix[i] = number of NaNs in values[0..i).
+    // Lets each window check "any NaN in range" in O(1), so the common
+    // NaN-free interior case takes the branch-free dot-product fast path.
+    std::vector<uint32_t> nanPrefix(n + 1, 0);
+    for (size_t i = 0; i < n; ++i) {
+        nanPrefix[i + 1] = nanPrefix[i] + (std::isnan(values[i]) ? 1u : 0u);
+    }
+
+    std::vector<double> result(n);
+    const int ni = static_cast<int>(n);
+    for (int i = 0; i < ni; ++i) {
+        const int lo = i - half;
+        const int hi = i + half;  // inclusive
+        if (lo >= 0 && hi < ni && nanPrefix[static_cast<size_t>(hi) + 1] == nanPrefix[static_cast<size_t>(lo)]) {
+            // Full window, no NaN: normalized kernel applies directly.
+            result[static_cast<size_t>(i)] =
+                simd::SimdAggregator::dotProduct(kernel.data(), values.data() + lo, static_cast<size_t>(kernelSize));
+            continue;
+        }
+        // Boundary or NaN-containing window: accumulate valid taps, renormalize.
+        double smoothed = 0.0;
+        double weightSum = 0.0;
+        const int jLo = std::max(lo, 0);
+        const int jHi = std::min(hi, ni - 1);
+        for (int j = jLo; j <= jHi; ++j) {
+            const double v = values[static_cast<size_t>(j)];
+            if (!std::isnan(v)) {
+                const double w = kernel[static_cast<size_t>(j - lo)];
+                smoothed += v * w;
+                weightSum += w;
+            }
+        }
+        result[static_cast<size_t>(i)] =
+            (weightSum > 0.0) ? smoothed / weightSum : std::numeric_limits<double>::quiet_NaN();
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -1185,6 +1328,8 @@ AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op, const Quer
             return operand.fill_backward();
         case UnaryOpType::FILL_LINEAR:
             return operand.fill_linear();
+        case UnaryOpType::FILL_SPLINE:
+            return operand.fill_spline();
         // Accumulation functions
         case UnaryOpType::CUMSUM:
             return operand.cumsum();
@@ -1403,6 +1548,22 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 throw EvaluationException("ema() parameter must be positive (alpha in (0,1] or span > 1)");
             }
             return series.ema(param);
+        }
+
+        case FunctionType::GAUSSIAN_SMOOTH: {
+            if (call.args.size() != 2) {
+                throw EvaluationException("gaussian_smooth() requires exactly 2 arguments");
+            }
+            auto series = evaluateNode(*call.args[0], queryResults);
+            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            if (scalarSeries.empty()) {
+                throw EvaluationException("gaussian_smooth() second argument must be a non-empty scalar");
+            }
+            double sigma = scalarSeries.values[0];
+            if (!(sigma > 0.0) || sigma > 1e6) {
+                throw EvaluationException("gaussian_smooth() sigma must be in (0, 1e6]");
+            }
+            return series.gaussian_smooth(sigma);
         }
 
         case FunctionType::HOLT_WINTERS: {

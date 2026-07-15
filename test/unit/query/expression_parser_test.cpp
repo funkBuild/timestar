@@ -745,3 +745,18 @@ TEST_F(ExpressionParserTest, FunctionArgLimit_OneOverLimit_Throws) {
     ExpressionParser parser(expr);
     EXPECT_THROW(parser.parse(), ExpressionParseException);
 }
+
+TEST_F(ExpressionParserTest, ParseFillSpline) {
+    ExpressionParser parser("fill_spline(a)");
+    auto ast = parser.parse();
+    EXPECT_EQ(ast->type, ExprNodeType::UNARY_OP);
+    EXPECT_EQ(ast->asUnaryOp().op, UnaryOpType::FILL_SPLINE);
+    EXPECT_EQ(ast->toString(), "fill_spline(a)");
+}
+
+TEST_F(ExpressionParserTest, ParseGaussianSmooth) {
+    ExpressionParser parser("gaussian_smooth(a, 2.5)");
+    auto ast = parser.parse();
+    EXPECT_EQ(ast->type, ExprNodeType::FUNCTION_CALL);
+    EXPECT_EQ(ast->asFunctionCall().func, FunctionType::GAUSSIAN_SMOOTH);
+}
