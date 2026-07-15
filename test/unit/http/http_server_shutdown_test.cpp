@@ -22,7 +22,11 @@ static std::string readFile(const std::string& path) {
 }
 
 TEST_F(HttpServerShutdownTest, TimeoutPathCallsExitNotReturn) {
+#ifdef HTTP_SERVER_SOURCE_PATH
+    std::string src = readFile(HTTP_SERVER_SOURCE_PATH);
+#else
     std::string src = readFile("../bin/timestar_http_server.cpp");
+#endif
     ASSERT_FALSE(src.empty()) << "Could not read timestar_http_server.cpp";
 
     // After catching timed_out_error, the code must call _Exit (or _exit)
