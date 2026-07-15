@@ -9,6 +9,7 @@
 
 #include <tsl/robin_map.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -63,7 +64,15 @@ public:
 
     // Sort all timestamps and values together. Convenience wrapper for sortPaired()
     // over the entire range, used by TSM writer before flushing to disk.
-    void sort() { sortPaired(0, timestamps.size()); }
+    // The insert path maintains sortedness (is_sorted fast paths + suffix
+    // sort + merge), so at flush time the data is almost always already
+    // sorted — an O(N) sequential check avoids the O(N log N) index sort
+    // plus full gather/copy-back permutation.
+    void sort() {
+        if (!std::ranges::is_sorted(timestamps)) [[unlikely]] {
+            sortPaired(0, timestamps.size());
+        }
+    }
 
     // Sort a subrange [from, to) of timestamps and values together using index-based
     // permutation. Only allocates temporary storage proportional to the subrange size,

@@ -16,6 +16,10 @@ public:
     // SIMD-optimized sum calculation
     // ~4x faster than scalar for large arrays
     static double calculateSum(const double* values, size_t count);
+    // Fused single-pass sum + NaN-skipping min/max (one memory pass instead
+    // of three kernel calls). Sum propagates NaN like calculateSum; min/max
+    // skip NaN like calculateMin/calculateMax.
+    static void calculateSumMinMax(const double* values, size_t count, double& outSum, double& outMin, double& outMax);
 
     // SIMD-optimized average calculation
     static double calculateAvg(const double* values, size_t count);

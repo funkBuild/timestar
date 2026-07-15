@@ -8,7 +8,10 @@
 #include "series_id.hpp"
 #include "string_encoder.hpp"
 #include "tsm.hpp"
+#include "../query/simd_aggregator.hpp"
 #include "value_type_dispatch.hpp"
+
+#include <cassert>
 #include "zigzag.hpp"
 
 #include <fcntl.h>
@@ -186,7 +189,13 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     if (timestamps.empty()) {
         return;  // No data to index
     }
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
 
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
@@ -196,8 +205,8 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
     // V2: set blockCount for all types (enables COUNT pushdown for String)
@@ -211,7 +220,13 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     if (timestamps.empty()) {
         return;
     }
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
 
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
@@ -221,8 +236,8 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
 
@@ -237,33 +252,48 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     double bmin = std::numeric_limits<double>::max();
     double bmax = std::numeric_limits<double>::lowest();
     size_t validCount = 0;
-    for (size_t i = 0; i < n; ++i) {
-        double v = values[i];
-        if (std::isnan(v))
-            continue;
-        ++validCount;
-        sum += v;
-        if (v < bmin)
-            bmin = v;
-        if (v > bmax)
-            bmax = v;
-    }
-    // If all values are NaN, use sentinel values indicating no valid stats.
-    if (validCount == 0) {
-        sum = 0.0;
-        bmin = std::numeric_limits<double>::quiet_NaN();
-        bmax = std::numeric_limits<double>::quiet_NaN();
-    }
-    // Second pass: M2 = Σ(xi - mean)² — single division for mean, no per-element division.
-    // Only computed over non-NaN values.
     double m2 = 0.0;
-    if (validCount > 0) {
-        double mean = sum / static_cast<double>(validCount);
+
+    // Fast path: TSM block data is NaN-free by invariant (NaN filtered during
+    // write), so a fused SIMD sum/min/max pass + a SIMD variance pass replace
+    // the two branchy scalar loops. A NaN sum detects invariant violations and
+    // falls back to the NaN-skipping scalar path below.
+    timestar::simd::SimdAggregator::calculateSumMinMax(values.data(), n, sum, bmin, bmax);
+    if (!std::isnan(sum)) [[likely]] {
+        validCount = n;
+        const double mean = sum / static_cast<double>(n);
+        // calculateVariance returns population variance (M2/n)
+        m2 = timestar::simd::SimdAggregator::calculateVariance(values.data(), n, mean) * static_cast<double>(n);
+    } else {
+        sum = 0.0;
+        bmin = std::numeric_limits<double>::max();
+        bmax = std::numeric_limits<double>::lowest();
         for (size_t i = 0; i < n; ++i) {
-            if (std::isnan(values[i]))
+            double v = values[i];
+            if (std::isnan(v))
                 continue;
-            double delta = values[i] - mean;
-            m2 += delta * delta;
+            ++validCount;
+            sum += v;
+            if (v < bmin)
+                bmin = v;
+            if (v > bmax)
+                bmax = v;
+        }
+        // If all values are NaN, use sentinel values indicating no valid stats.
+        if (validCount == 0) {
+            sum = 0.0;
+            bmin = std::numeric_limits<double>::quiet_NaN();
+            bmax = std::numeric_limits<double>::quiet_NaN();
+        }
+        // M2 = Σ(xi - mean)² over non-NaN values.
+        if (validCount > 0) {
+            double mean = sum / static_cast<double>(validCount);
+            for (size_t i = 0; i < n; ++i) {
+                if (std::isnan(values[i]))
+                    continue;
+                double delta = values[i] - mean;
+                m2 += delta * delta;
+            }
         }
     }
     indexBlock.blockSum = sum;
@@ -271,9 +301,10 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.blockMax = bmax;
     indexBlock.blockCount = static_cast<uint32_t>(n);
     indexBlock.blockM2 = m2;
-    // firstValue/latestValue: values at min/max timestamp positions
-    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
-    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    // firstValue/latestValue: values at min/max timestamp positions.
+    // Sorted timestamps: first = index 0, latest = index n-1.
+    size_t firstIdx = 0;
+    size_t latestIdx = timestamps.size() - 1;
     indexBlock.blockFirstValue = values[firstIdx];
     indexBlock.blockLatestValue = values[latestIdx];
     indexBlock.hasExtendedStats = true;
@@ -286,15 +317,21 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
                                 TSMIndexEntry& indexEntry, size_t blockStartOffset) {
     if (timestamps.empty())
         return;
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size exceeds uint32_t maximum");
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
 
@@ -315,9 +352,9 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.blockMax = static_cast<double>(bmax);
     indexBlock.blockCount = static_cast<uint32_t>(n);
 
-    // first/latest at min/max timestamp positions
-    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
-    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    // first/latest at min/max timestamp positions (sorted: endpoints)
+    size_t firstIdx = 0;
+    size_t latestIdx = timestamps.size() - 1;
     indexBlock.blockFirstValue = static_cast<double>(values[firstIdx]);
     indexBlock.blockLatestValue = static_cast<double>(values[latestIdx]);
     indexBlock.hasExtendedStats = true;
@@ -330,15 +367,21 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
                                 size_t valCount, TSMIndexEntry& indexEntry, size_t blockStartOffset) {
     if (timestamps.empty())
         return;
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size exceeds uint32_t maximum");
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
     indexBlock.blockCount = static_cast<uint32_t>(valCount);
@@ -353,9 +396,9 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
     indexBlock.blockMin = (trueCount < indexBlock.blockCount) ? 0.0 : 1.0;
     indexBlock.blockMax = (trueCount > 0) ? 1.0 : 0.0;
 
-    // first/latest at min/max timestamp positions
-    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
-    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    // first/latest at min/max timestamp positions (sorted: endpoints)
+    size_t firstIdx = 0;
+    size_t latestIdx = timestamps.size() - 1;
     indexBlock.boolFirstValue = values[valOffset + firstIdx];
     indexBlock.boolLatestValue = values[valOffset + latestIdx];
     indexBlock.blockFirstValue = indexBlock.boolFirstValue ? 1.0 : 0.0;

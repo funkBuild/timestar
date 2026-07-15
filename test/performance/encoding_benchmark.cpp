@@ -12,6 +12,7 @@
 #include "../test_helpers.hpp"
 
 #include "crc32.hpp"
+#include "float_encoder.hpp"
 #include "string_encoder.hpp"
 #include "aligned_buffer.hpp"
 
@@ -123,4 +124,60 @@ TEST_F(EncodingBenchmark, E2_CRC32Throughput) {
         volatile uint32_t vsink = sink;
         (void)vsink;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  E3: ALP float encode throughput (the dominant TSM flush cost)
+//
+//  IMPORTANT: uses LOW-PRECISION (rounded) data so the ALP *scale* path is
+//  exercised. Full-precision random doubles go 100% exception -> ALP_RD and
+//  never touch the scale path (see June 2026 review notes).
+//  Also includes a decode round-trip correctness check: encode changes must
+//  remain bit-exact.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_F(EncodingBenchmark, E3_AlpFloatEncodeThroughput) {
+    fmt::print("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    fmt::print("║  E3: ALP Float Encode Throughput (clean low-precision data)     ║\n");
+    fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
+
+    constexpr size_t N = 1'000'000;
+    std::mt19937_64 rng(99);
+    std::uniform_real_distribution<double> dist(0.0, 1000.0);
+
+    // Two-decimal sensor-style data: clean ALP (scale path)
+    std::vector<double> clean(N);
+    for (auto& v : clean)
+        v = std::round(dist(rng) * 100.0) / 100.0;
+    // Full-precision data: 100% exceptions (ALP_RD path)
+    std::vector<double> dirty(N);
+    for (auto& v : dirty)
+        v = dist(rng);
+
+    auto bench = [&](const char* label, const std::vector<double>& data) {
+        // Warm-up + correctness: encode/decode round trip must be bit-exact
+        auto encoded = FloatEncoder::encode(data);
+        const size_t encodedBytes = encoded.data.size() * sizeof(uint64_t);
+        {
+            std::vector<double> decoded;
+            CompressedSlice slice(reinterpret_cast<const uint8_t*>(encoded.data.data()), encodedBytes);
+            FloatDecoder::decode(slice, 0, data.size(), decoded);
+            ASSERT_EQ(decoded.size(), data.size());
+            for (size_t i = 0; i < data.size(); i += 997) {
+                ASSERT_EQ(decoded[i], data[i]) << label << " round-trip mismatch at " << i;
+            }
+        }
+        double best = 1e100;
+        for (int r = 0; r < 5; ++r) {
+            auto t0 = clk::now();
+            auto enc = FloatEncoder::encode(data);
+            double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            best = std::min(best, ms);
+        }
+        fmt::print("  {:28s} best={:7.2f} ms  ({:6.1f} M vals/s, ratio {:.2f}:1)\n", label, best, N / best / 1000.0,
+                   (N * 8.0) / static_cast<double>(encodedBytes));
+    };
+
+    bench("clean 2-decimal (ALP scale)", clean);
+    bench("full-precision (ALP_RD)", dirty);
 }

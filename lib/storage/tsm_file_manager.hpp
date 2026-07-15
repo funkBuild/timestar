@@ -85,6 +85,8 @@ public:
         _compactionGroup = sg;
         _compactionGroupSet = true;
     }
+    bool hasCompactionGroup() const { return _compactionGroupSet; }
+    seastar::scheduling_group compactionGroup() const { return _compactionGroup; }
 
     // Start background compaction
     seastar::future<> startCompactionLoop();

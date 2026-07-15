@@ -6,6 +6,7 @@
 #include "alp_rd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -62,8 +63,10 @@ BestPair findBestExpFac(const double* values, size_t count) {
     BestPair best;
     best.exceptions = sample_size + 1;
 
-    // Build sample indices (evenly spaced)
-    std::vector<size_t> sample_indices(sample_size);
+    // Build sample indices (evenly spaced) in a stack buffer — no heap
+    // allocation per call (this runs once per TSM block / WAL entry).
+    static_assert(alp::ALP_SAMPLE_SIZE <= 256, "sample stack buffer sized for ALP_SAMPLE_SIZE");
+    std::array<size_t, 256> sample_indices;
     if (sample_size == count) {
         for (size_t i = 0; i < count; ++i)
             sample_indices[i] = i;
@@ -78,16 +81,22 @@ BestPair findBestExpFac(const double* values, size_t count) {
         for (uint8_t fac = 0; fac <= exp; ++fac) {
             size_t exceptions = 0;
 
-            for (size_t idx : sample_indices) {
-                double v = values[idx];
+            for (size_t s = 0; s < sample_size; ++s) {
+                double v = values[sample_indices[s]];
                 // Skip special values - they'll always be exceptions
                 if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v))) {
                     exceptions++;
-                    continue;
+                } else {
+                    auto result = scaleValue(v, exp, fac);
+                    if (!result.exact) {
+                        exceptions++;
+                    }
                 }
-                auto result = scaleValue(v, exp, fac);
-                if (!result.exact) {
-                    exceptions++;
+                // Early abandon: this candidate already lost — for
+                // exception-heavy data (the ALP_RD-bound case) this cuts the
+                // 190-candidate × 256-sample search by orders of magnitude.
+                if (exceptions >= best.exceptions) {
+                    break;
                 }
             }
 

@@ -12,6 +12,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/with_scheduling_group.hh>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -351,6 +352,15 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
         (void)seastar::try_with_gate(_backgroundGate, [this, store = previousStore] {
             return seastar::get_units(_conversionSemaphore, 1).then([this, store](auto units) {
                 return store->close().then([this, store, units = std::move(units)]() mutable {
+                    // Run the CPU-heavy encode + multi-MB DMA write in the
+                    // low-priority compaction scheduling group so background
+                    // flush does not compete head-on with foreground inserts
+                    // (the direct cause of warm-phase throughput degradation).
+                    if (tsmFileManager != nullptr && tsmFileManager->hasCompactionGroup()) {
+                        return seastar::with_scheduling_group(tsmFileManager->compactionGroup(),
+                                                              [this, store] { return convertWalToTsm(store); })
+                            .finally([units = std::move(units)] {});
+                    }
                     return convertWalToTsm(store).finally([units = std::move(units)] {});
                 });
             });
