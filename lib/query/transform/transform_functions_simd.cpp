@@ -13,7 +13,13 @@
 
 #include "hwy/highway.h"
 
+// Contrib math (hn::Exp) — a -inl header with its own per-target guards,
+// safe to include after highway.h in a foreach_target file.
+#include "hwy/contrib/math/math-inl.h"
+
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 HWY_BEFORE_NAMESPACE();
 namespace timestar {
@@ -269,6 +275,160 @@ void MultiplyInplace(double* values, double factor, size_t count) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 12. Exp -- element-wise e^x (Highway contrib math; NaN propagates)
+// ---------------------------------------------------------------------------
+void Exp(const double* in, double* out, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &in[i]);
+        // Contrib-math Exp is a polynomial approximation that does not
+        // propagate NaN — mask NaN lanes back in explicitly.
+        auto r = hn::Exp(d, v);
+        hn::StoreU(hn::IfThenElse(hn::IsNaN(v), v, r), d, &out[i]);
+    }
+    for (; i < count; ++i)
+        out[i] = std::exp(in[i]);
+}
+
+// ---------------------------------------------------------------------------
+// 13. RoundHalfAway -- round to nearest, halves away from zero (std::round
+//     semantics; Highway's Round is round-to-even). copysign(floor(|x|+0.5), x).
+//     NaN propagates through Abs/Add/Floor/CopySign.
+// ---------------------------------------------------------------------------
+void RoundHalfAway(const double* in, double* out, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto half = hn::Set(d, 0.5);
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &in[i]);
+        auto r = hn::Floor(hn::Add(hn::Abs(v), half));
+        hn::StoreU(hn::CopySign(r, v), d, &out[i]);
+    }
+    for (; i < count; ++i)
+        out[i] = std::round(in[i]);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Sign -- -1 / 0 / +1; NaN passes through (compares are false for NaN,
+//     so the final else-branch returns the original NaN).
+// ---------------------------------------------------------------------------
+void Sign(const double* in, double* out, size_t count) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto one = hn::Set(d, 1.0);
+    const auto negOne = hn::Set(d, -1.0);
+    const auto zero = hn::Zero(d);
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &in[i]);
+        auto r = hn::IfThenElse(hn::Gt(v, zero), one, hn::IfThenElse(hn::Lt(v, zero), negOne, v));
+        hn::StoreU(r, d, &out[i]);
+    }
+    for (; i < count; ++i) {
+        double v = in[i];
+        out[i] = std::isnan(v) ? v : (v > 0.0 ? 1.0 : (v < 0.0 ? -1.0 : 0.0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. Deriv -- per-second first derivative from sorted nanosecond timestamps.
+//     out[i] = (v[i]-v[i-1]) * 1e9 / (ts[i]-ts[i-1]); NaN operands propagate
+//     through the subtraction; dt <= 0 (duplicate timestamps) masked to NaN.
+//     Caller handles out[0].
+// ---------------------------------------------------------------------------
+void Deriv(const double* v, const uint64_t* ts, double* out, size_t count) {
+    const hn::ScalableTag<double> d;
+    const hn::ScalableTag<uint64_t> du;
+    const size_t N = hn::Lanes(d);
+    const auto nsToS = hn::Set(d, 1e9);
+    const auto zero = hn::Zero(d);
+    const auto nan = hn::Set(d, std::numeric_limits<double>::quiet_NaN());
+    size_t i = 1;
+    for (; i + N <= count; i += N) {
+        auto cur = hn::LoadU(d, &v[i]);
+        auto prev = hn::LoadU(d, &v[i - 1]);
+        // Timestamps are sorted, so the u64 difference cannot wrap.
+        auto dtNs = hn::Sub(hn::LoadU(du, &ts[i]), hn::LoadU(du, &ts[i - 1]));
+        auto dt = hn::ConvertTo(d, dtNs);
+        auto r = hn::Div(hn::Mul(hn::Sub(cur, prev), nsToS), dt);
+        // dt == 0 (duplicate timestamps): 0/0 or x/0 -> mask to NaN explicitly.
+        hn::StoreU(hn::IfThenElse(hn::Gt(dt, zero), r, nan), d, &out[i]);
+    }
+    for (; i < count; ++i) {
+        double dtNs = static_cast<double>(ts[i] - ts[i - 1]);
+        out[i] = (ts[i] > ts[i - 1]) ? (v[i] - v[i - 1]) * 1e9 / dtNs : std::numeric_limits<double>::quiet_NaN();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 16. MeanStddevSkipNaN -- NaN-masked sum+count pass, then masked M2 pass.
+// ---------------------------------------------------------------------------
+size_t MeanStddevSkipNaN(const double* in, size_t count, double* outMean, double* outStddev) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    auto sumV = hn::Zero(d);
+    size_t valid = 0;
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &in[i]);
+        auto notNan = hn::Not(hn::IsNaN(v));
+        sumV = hn::Add(sumV, hn::IfThenElseZero(notNan, v));
+        valid += hn::CountTrue(d, notNan);
+    }
+    double sum = hn::ReduceSum(d, sumV);
+    for (; i < count; ++i) {
+        if (!std::isnan(in[i])) {
+            sum += in[i];
+            ++valid;
+        }
+    }
+    if (valid == 0) {
+        *outMean = *outStddev = 0.0;
+        return 0;
+    }
+    const double mean = sum / static_cast<double>(valid);
+
+    const auto meanV = hn::Set(d, mean);
+    auto m2V = hn::Zero(d);
+    i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &in[i]);
+        auto diff = hn::IfThenElseZero(hn::Not(hn::IsNaN(v)), hn::Sub(v, meanV));
+        m2V = hn::MulAdd(diff, diff, m2V);
+    }
+    double m2 = hn::ReduceSum(d, m2V);
+    for (; i < count; ++i) {
+        if (!std::isnan(in[i])) {
+            double diff = in[i] - mean;
+            m2 += diff * diff;
+        }
+    }
+    *outMean = mean;
+    *outStddev = std::sqrt(m2 / static_cast<double>(valid));
+    return valid;
+}
+
+// ---------------------------------------------------------------------------
+// 17. ScaleShift -- out = (v - sub) * mul; NaN passes through the arithmetic.
+// ---------------------------------------------------------------------------
+void ScaleShift(const double* in, double* out, size_t count, double sub, double mul) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto subV = hn::Set(d, sub);
+    const auto mulV = hn::Set(d, mul);
+    size_t i = 0;
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &in[i]);
+        hn::StoreU(hn::Mul(hn::Sub(v, subV), mulV), d, &out[i]);
+    }
+    for (; i < count; ++i)
+        out[i] = (in[i] - sub) * mul;
+}
+
 }  // namespace HWY_NAMESPACE
 }  // namespace simd
 }  // namespace transform
@@ -292,6 +452,59 @@ HWY_EXPORT(CutoffMax);
 HWY_EXPORT(Diff);
 HWY_EXPORT(MonotonicDiff);
 HWY_EXPORT(MultiplyInplace);
+HWY_EXPORT(Exp);
+HWY_EXPORT(RoundHalfAway);
+HWY_EXPORT(Sign);
+HWY_EXPORT(Deriv);
+HWY_EXPORT(MeanStddevSkipNaN);
+HWY_EXPORT(ScaleShift);
+
+std::vector<double> exp(const std::vector<double>& values) {
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::exp(values);
+    std::vector<double> result(values.size());
+    HWY_DYNAMIC_DISPATCH(Exp)(values.data(), result.data(), values.size());
+    return result;
+}
+
+std::vector<double> round(const std::vector<double>& values) {
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::round(values);
+    std::vector<double> result(values.size());
+    HWY_DYNAMIC_DISPATCH(RoundHalfAway)(values.data(), result.data(), values.size());
+    return result;
+}
+
+std::vector<double> sign(const std::vector<double>& values) {
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::sign(values);
+    std::vector<double> result(values.size());
+    HWY_DYNAMIC_DISPATCH(Sign)(values.data(), result.data(), values.size());
+    return result;
+}
+
+std::vector<double> deriv(const std::vector<double>& values, const std::vector<uint64_t>& timestamps) {
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::deriv(values, timestamps);
+    std::vector<double> result(values.size());
+    result[0] = std::numeric_limits<double>::quiet_NaN();
+    HWY_DYNAMIC_DISPATCH(Deriv)(values.data(), timestamps.data(), result.data(), values.size());
+    return result;
+}
+
+size_t mean_stddev_skipnan(const std::vector<double>& values, double& mean, double& stddev) {
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::mean_stddev_skipnan(values, mean, stddev);
+    return HWY_DYNAMIC_DISPATCH(MeanStddevSkipNaN)(values.data(), values.size(), &mean, &stddev);
+}
+
+std::vector<double> scale_shift(const std::vector<double>& values, double sub, double mul) {
+    if (values.size() < SIMD_MIN_SIZE)
+        return scalar::scale_shift(values, sub, mul);
+    std::vector<double> result(values.size());
+    HWY_DYNAMIC_DISPATCH(ScaleShift)(values.data(), result.data(), values.size(), sub, mul);
+    return result;
+}
 
 std::vector<double> abs(const std::vector<double>& values) {
     if (values.size() < SIMD_MIN_SIZE)

@@ -66,7 +66,19 @@ enum class UnaryOpType {
     CUMSUM,    // cumsum(a) - running cumulative sum; NaN treated as 0 (skip-NaN)
     INTEGRAL,  // integral(a) - definite integral using trapezoidal rule; NaN trapezoids contribute 0
     // Normalization
-    NORMALIZE  // normalize(a) - rescale values to [0, 1]; constant series → all 0.0; NaN passthrough
+    NORMALIZE,  // normalize(a) - rescale values to [0, 1]; constant series → all 0.0; NaN passthrough
+    STANDARDIZE,  // standardize(a) - global z-score (x-mean)/stddev over non-NaN; constant → 0; NaN passthrough
+    // Element-wise math (continued)
+    EXP,    // exp(a) - e^x; NaN passthrough
+    ROUND,  // round(a) - nearest integer, halves away from zero; NaN passthrough
+    SIGN,   // sign(a) - -1/0/+1; NaN passthrough
+    // Gauge derivative / range summaries
+    DERIV,   // deriv(a) - per-second first derivative (negatives allowed, unlike rate)
+    DELTA,   // delta(a) - last non-NaN minus first non-NaN (returns scalar series)
+    IDELTA,  // idelta(a) - difference of the last two non-NaN values (returns scalar series)
+    // Change diagnostics
+    CHANGES,  // changes(a) - count of value changes between consecutive non-NaN points (scalar series)
+    RESETS    // resets(a) - count of decreases between consecutive non-NaN points (scalar series)
 };
 
 // Function types for multi-argument functions
@@ -87,6 +99,9 @@ enum class FunctionType {
     ROLLING_MIN,     // rolling_min(series, N) - N-point rolling minimum
     ROLLING_MAX,     // rolling_max(series, N) - N-point rolling maximum
     ROLLING_STDDEV,  // rolling_stddev(series, N) - N-point rolling population stddev
+    ROLLING_SUM,     // rolling_sum(series, N) - N-point rolling sum
+    ROLLING_MEDIAN,  // rolling_median(series, N) - N-point rolling median (robust smoother)
+    ROLLING_PERCENTILE,  // rolling_percentile(series, N, p) - N-point rolling p-th percentile
     // Gap-fill with constant scalar
     FILL_VALUE,  // fill_value(series, v) - replace every NaN with constant v
     // Exponential moving average
@@ -105,8 +120,10 @@ enum class FunctionType {
     AVG_OF_SERIES,        // avg_of_series(a, b, ...) - element-wise mean across series args
     SUM_OF_SERIES,        // sum_of_series(a, b, ...) - element-wise sum across series args
     MIN_OF_SERIES,        // min_of_series(a, b, ...) - element-wise minimum across series args
-    MAX_OF_SERIES,        // max_of_series(a, b, ...) - element-wise maximum across series args
-    PERCENTILE_OF_SERIES  // percentile_of_series(p, a, b, ...) - p-th percentile across series args
+    MAX_OF_SERIES,         // max_of_series(a, b, ...) - element-wise maximum across series args
+    PERCENTILE_OF_SERIES,  // percentile_of_series(p, a, b, ...) - p-th percentile across series args
+    COUNT_OF_SERIES,       // count_of_series(a, b, ...) - element-wise count of non-NaN across series args
+    STDDEV_OF_SERIES       // stddev_of_series(a, b, ...) - element-wise population stddev across series args
 };
 
 // Binary operation node
@@ -400,6 +417,24 @@ inline const char* unaryOpToString(UnaryOpType op) {
             return "integral";
         case UnaryOpType::NORMALIZE:
             return "normalize";
+        case UnaryOpType::STANDARDIZE:
+            return "standardize";
+        case UnaryOpType::EXP:
+            return "exp";
+        case UnaryOpType::ROUND:
+            return "round";
+        case UnaryOpType::SIGN:
+            return "sign";
+        case UnaryOpType::DERIV:
+            return "deriv";
+        case UnaryOpType::DELTA:
+            return "delta";
+        case UnaryOpType::IDELTA:
+            return "idelta";
+        case UnaryOpType::CHANGES:
+            return "changes";
+        case UnaryOpType::RESETS:
+            return "resets";
         default:
             return "?";
     }
@@ -435,6 +470,12 @@ inline const char* functionToString(FunctionType func) {
             return "rolling_max";
         case FunctionType::ROLLING_STDDEV:
             return "rolling_stddev";
+        case FunctionType::ROLLING_SUM:
+            return "rolling_sum";
+        case FunctionType::ROLLING_MEDIAN:
+            return "rolling_median";
+        case FunctionType::ROLLING_PERCENTILE:
+            return "rolling_percentile";
         case FunctionType::FILL_VALUE:
             return "fill_value";
         case FunctionType::EMA:
@@ -461,6 +502,10 @@ inline const char* functionToString(FunctionType func) {
             return "max_of_series";
         case FunctionType::PERCENTILE_OF_SERIES:
             return "percentile_of_series";
+        case FunctionType::COUNT_OF_SERIES:
+            return "count_of_series";
+        case FunctionType::STDDEV_OF_SERIES:
+            return "stddev_of_series";
         default:
             return "?";
     }

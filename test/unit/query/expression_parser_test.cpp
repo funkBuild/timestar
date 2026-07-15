@@ -760,3 +760,42 @@ TEST_F(ExpressionParserTest, ParseGaussianSmooth) {
     EXPECT_EQ(ast->type, ExprNodeType::FUNCTION_CALL);
     EXPECT_EQ(ast->asFunctionCall().func, FunctionType::GAUSSIAN_SMOOTH);
 }
+
+TEST_F(ExpressionParserTest, ParseNewUnaryFunctions) {
+    const std::pair<const char*, UnaryOpType> cases[] = {
+        {"exp(a)", UnaryOpType::EXP},         {"round(a)", UnaryOpType::ROUND},
+        {"sign(a)", UnaryOpType::SIGN},       {"deriv(a)", UnaryOpType::DERIV},
+        {"delta(a)", UnaryOpType::DELTA},     {"idelta(a)", UnaryOpType::IDELTA},
+        {"changes(a)", UnaryOpType::CHANGES}, {"resets(a)", UnaryOpType::RESETS},
+        {"standardize(a)", UnaryOpType::STANDARDIZE},
+    };
+    for (const auto& [expr, op] : cases) {
+        ExpressionParser parser(expr);
+        auto ast = parser.parse();
+        EXPECT_EQ(ast->type, ExprNodeType::UNARY_OP) << expr;
+        EXPECT_EQ(ast->asUnaryOp().op, op) << expr;
+    }
+}
+
+TEST_F(ExpressionParserTest, ParseNewRollingAndCrossSeriesFunctions) {
+    {
+        ExpressionParser parser("rolling_sum(a, 10)");
+        EXPECT_EQ(parser.parse()->asFunctionCall().func, FunctionType::ROLLING_SUM);
+    }
+    {
+        ExpressionParser parser("rolling_median(a, 15)");
+        EXPECT_EQ(parser.parse()->asFunctionCall().func, FunctionType::ROLLING_MEDIAN);
+    }
+    {
+        ExpressionParser parser("rolling_percentile(a, 60, 95)");
+        EXPECT_EQ(parser.parse()->asFunctionCall().func, FunctionType::ROLLING_PERCENTILE);
+    }
+    {
+        ExpressionParser parser("count_of_series(a, b)");
+        EXPECT_EQ(parser.parse()->asFunctionCall().func, FunctionType::COUNT_OF_SERIES);
+    }
+    {
+        ExpressionParser parser("stddev_of_series(a, b)");
+        EXPECT_EQ(parser.parse()->asFunctionCall().func, FunctionType::STDDEV_OF_SERIES);
+    }
+}

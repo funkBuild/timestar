@@ -130,6 +130,80 @@ inline void multiply_inplace(std::vector<double>& values, double factor) {
     }
 }
 
+inline std::vector<double> exp(const std::vector<double>& values) {
+    std::vector<double> result(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        result[i] = std::exp(values[i]);  // exp(NaN) = NaN
+    }
+    return result;
+}
+
+inline std::vector<double> round(const std::vector<double>& values) {
+    std::vector<double> result(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        result[i] = std::round(values[i]);  // half away from zero; round(NaN) = NaN
+    }
+    return result;
+}
+
+inline std::vector<double> sign(const std::vector<double>& values) {
+    std::vector<double> result(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        double v = values[i];
+        result[i] = std::isnan(v) ? v : (v > 0.0 ? 1.0 : (v < 0.0 ? -1.0 : 0.0));
+    }
+    return result;
+}
+
+// Per-second first derivative: out[i] = (v[i]-v[i-1]) / ((ts[i]-ts[i-1]) in seconds).
+// out[0] = NaN; NaN operands or non-increasing timestamps yield NaN.
+inline std::vector<double> deriv(const std::vector<double>& values, const std::vector<uint64_t>& ts) {
+    std::vector<double> result(values.size(), std::nan(""));
+    for (size_t i = 1; i < values.size(); ++i) {
+        double dtNs = static_cast<double>(ts[i] - ts[i - 1]);
+        if (ts[i] > ts[i - 1] && !std::isnan(values[i]) && !std::isnan(values[i - 1])) {
+            result[i] = (values[i] - values[i - 1]) * 1e9 / dtNs;
+        }
+    }
+    return result;
+}
+
+// NaN-skipping mean and population stddev in two passes.
+// Returns the count of non-NaN values (0 => mean/stddev are meaningless).
+inline size_t mean_stddev_skipnan(const std::vector<double>& values, double& mean, double& stddev) {
+    double sum = 0.0;
+    size_t count = 0;
+    for (double v : values) {
+        if (!std::isnan(v)) {
+            sum += v;
+            ++count;
+        }
+    }
+    if (count == 0) {
+        mean = stddev = 0.0;
+        return 0;
+    }
+    mean = sum / static_cast<double>(count);
+    double m2 = 0.0;
+    for (double v : values) {
+        if (!std::isnan(v)) {
+            double d = v - mean;
+            m2 += d * d;
+        }
+    }
+    stddev = std::sqrt(m2 / static_cast<double>(count));
+    return count;
+}
+
+// out[i] = (v[i] - sub) * mul; NaN passes through naturally.
+inline std::vector<double> scale_shift(const std::vector<double>& values, double sub, double mul) {
+    std::vector<double> result(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        result[i] = (values[i] - sub) * mul;
+    }
+    return result;
+}
+
 }  // namespace scalar
 
 // ============================================================================
@@ -155,6 +229,12 @@ std::vector<double> cutoff_max(const std::vector<double>& values, double thresho
 std::vector<double> diff(const std::vector<double>& values);
 std::vector<double> monotonic_diff(const std::vector<double>& values);
 void multiply_inplace(std::vector<double>& values, double factor);
+std::vector<double> exp(const std::vector<double>& values);
+std::vector<double> round(const std::vector<double>& values);
+std::vector<double> sign(const std::vector<double>& values);
+std::vector<double> deriv(const std::vector<double>& values, const std::vector<uint64_t>& timestamps);
+size_t mean_stddev_skipnan(const std::vector<double>& values, double& mean, double& stddev);
+std::vector<double> scale_shift(const std::vector<double>& values, double sub, double mul);
 
 }  // namespace simd
 }  // namespace transform

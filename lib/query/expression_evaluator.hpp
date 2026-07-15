@@ -73,6 +73,9 @@ struct AlignedSeries {
     AlignedSeries sqrt() const;
     AlignedSeries ceil() const;
     AlignedSeries floor() const;
+    AlignedSeries exp() const;         // e^x (SIMD); NaN passthrough
+    AlignedSeries round_nearest() const;  // Nearest integer, halves away from zero (SIMD); NaN passthrough
+    AlignedSeries sign() const;        // -1/0/+1 (SIMD); NaN passthrough
 
     // Transform functions (unary)
     AlignedSeries diff() const;            // Difference between consecutive points
@@ -85,6 +88,12 @@ struct AlignedSeries {
     AlignedSeries rate() const;      // Per-second rate; handles counter resets; first point NaN
     AlignedSeries irate() const;     // Instantaneous rate using last two points (constant series)
     AlignedSeries increase() const;  // Total increase over the series (sum of positive diffs, scalar)
+    // Gauge derivative / range summaries
+    AlignedSeries deriv() const;    // Per-second first derivative (SIMD); negatives allowed; first point NaN
+    AlignedSeries delta() const;    // Last non-NaN minus first non-NaN (constant series; NaN if no data)
+    AlignedSeries idelta() const;   // Difference of last two non-NaN values (constant series)
+    AlignedSeries changes() const;  // Count of value changes between consecutive non-NaN points (constant series)
+    AlignedSeries resets() const;   // Count of decreases between consecutive non-NaN points (constant series)
 
     // Gap-fill / interpolation functions
     AlignedSeries fill_forward() const;   // LOCF: replace NaN with previous non-NaN; leading NaNs stay NaN
@@ -101,6 +110,7 @@ struct AlignedSeries {
 
     // Normalization
     AlignedSeries normalize() const;  // Rescale to [0,1]; constant or single-point → 0.0; NaN passthrough
+    AlignedSeries standardize() const;  // Global z-score (SIMD); constant series → 0.0; NaN passthrough
 
     // Binary functions
     static AlignedSeries min(const AlignedSeries& a, const AlignedSeries& b);
@@ -125,6 +135,9 @@ struct AlignedSeries {
     AlignedSeries rolling_min(int N) const;     // N-point rolling minimum
     AlignedSeries rolling_max(int N) const;     // N-point rolling maximum
     AlignedSeries rolling_stddev(int N) const;  // N-point rolling population stddev (ddof=0)
+    AlignedSeries rolling_sum(int N) const;     // N-point rolling sum (Kahan-compensated)
+    AlignedSeries rolling_median(int N) const;  // N-point rolling median (sorted sliding window)
+    AlignedSeries rolling_percentile(int N, double p) const;  // N-point rolling p-th percentile, p in [0,100]
     AlignedSeries zscore(int N) const;          // N-point rolling z-score: (v - mean) / stddev; 0 if stddev==0
 
     // Exponential moving average

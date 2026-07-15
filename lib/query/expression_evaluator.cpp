@@ -186,6 +186,18 @@ AlignedSeries AlignedSeries::floor() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
+AlignedSeries AlignedSeries::exp() const {
+    return AlignedSeries(timestamps, transform::simd::exp(values));
+}
+
+AlignedSeries AlignedSeries::round_nearest() const {
+    return AlignedSeries(timestamps, transform::simd::round(values));
+}
+
+AlignedSeries AlignedSeries::sign() const {
+    return AlignedSeries(timestamps, transform::simd::sign(values));
+}
+
 AlignedSeries AlignedSeries::min(const AlignedSeries& a, const AlignedSeries& b) {
     checkSameSize(a, b, "min");
     std::vector<double> result(a.values.size());
@@ -351,6 +363,89 @@ AlignedSeries AlignedSeries::increase() const {
     }
     // Return as a constant scalar series
     std::vector<double> result(values.size(), total);
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+// ==================== Gauge Derivative / Range Summaries ====================
+
+AlignedSeries AlignedSeries::deriv() const {
+    if (values.empty()) {
+        return AlignedSeries(timestamps, {});
+    }
+    return AlignedSeries(timestamps, transform::simd::deriv(values, *timestamps));
+}
+
+AlignedSeries AlignedSeries::delta() const {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    double first = nan, last = nan;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!std::isnan(values[i])) {
+            first = values[i];
+            break;
+        }
+    }
+    for (size_t i = values.size(); i-- > 0;) {
+        if (!std::isnan(values[i])) {
+            last = values[i];
+            break;
+        }
+    }
+    const double d = (std::isnan(first)) ? nan : last - first;
+    std::vector<double> result(values.size(), d);
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::idelta() const {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    double last = nan, prev = nan;
+    for (size_t i = values.size(); i-- > 0;) {
+        if (!std::isnan(values[i])) {
+            if (std::isnan(last)) {
+                last = values[i];
+            } else {
+                prev = values[i];
+                break;
+            }
+        }
+    }
+    const double d = (std::isnan(last) || std::isnan(prev)) ? nan : last - prev;
+    std::vector<double> result(values.size(), d);
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::changes() const {
+    // Count of value changes between consecutive non-NaN observations
+    // (NaN gaps are skipped, not counted as changes).
+    size_t count = 0;
+    double prev = std::numeric_limits<double>::quiet_NaN();
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (std::isnan(values[i])) {
+            continue;
+        }
+        if (!std::isnan(prev) && values[i] != prev) {
+            ++count;
+        }
+        prev = values[i];
+    }
+    std::vector<double> result(values.size(), static_cast<double>(count));
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::resets() const {
+    // Count of decreases between consecutive non-NaN observations
+    // (counter resets for monotonically-increasing counters).
+    size_t count = 0;
+    double prev = std::numeric_limits<double>::quiet_NaN();
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (std::isnan(values[i])) {
+            continue;
+        }
+        if (!std::isnan(prev) && values[i] < prev) {
+            ++count;
+        }
+        prev = values[i];
+    }
+    std::vector<double> result(values.size(), static_cast<double>(count));
     return AlignedSeries(timestamps, std::move(result));
 }
 
@@ -664,6 +759,23 @@ AlignedSeries AlignedSeries::normalize() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
+AlignedSeries AlignedSeries::standardize() const {
+    // Global z-score: (x - mean) / stddev over all non-NaN values.
+    // SIMD: one masked sum+count pass, one masked M2 pass, one scale-shift pass.
+    // Constant series (stddev == 0) → all zeros; NaN passes through.
+    double mean = 0.0, stddev = 0.0;
+    size_t valid = transform::simd::mean_stddev_skipnan(values, mean, stddev);
+    if (valid == 0) {
+        return AlignedSeries(timestamps, std::vector<double>(values));  // all-NaN stays all-NaN
+    }
+    if (stddev == 0.0) {
+        // Constant series: zeros for finite values, NaN passthrough.
+        // (v - mean) * 0.0 achieves exactly that: 0 for finite, NaN for NaN.
+        return AlignedSeries(timestamps, transform::simd::scale_shift(values, mean, 0.0));
+    }
+    return AlignedSeries(timestamps, transform::simd::scale_shift(values, mean, 1.0 / stddev));
+}
+
 // ==================== Percent of Total ====================
 
 AlignedSeries AlignedSeries::as_percent(const AlignedSeries& series, const AlignedSeries& total) {
@@ -877,6 +989,97 @@ AlignedSeries AlignedSeries::rolling_max(int N) const {
         throw EvaluationException("rolling_max() window size N must be a positive integer");
     }
     return rolling_monotone(*this, N, std::greater<double>{});
+}
+
+AlignedSeries AlignedSeries::rolling_sum(int N) const {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    if (N <= 0) {
+        throw EvaluationException("rolling_sum() window size N must be a positive integer");
+    }
+    std::vector<double> result(values.size(), nan);
+    if (values.empty()) {
+        return AlignedSeries(timestamps, std::move(result));
+    }
+
+    // Kahan-compensated sliding window (same engine as rolling_avg, no divide)
+    double running_sum = 0.0;
+    double comp = 0.0;
+    int valid_count = 0;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!std::isnan(values[i])) {
+            double y = values[i] - comp;
+            double t = running_sum + y;
+            comp = (t - running_sum) - y;
+            running_sum = t;
+            valid_count++;
+        }
+        if (i >= static_cast<size_t>(N)) {
+            if (!std::isnan(values[i - N])) {
+                double y = -values[i - N] - comp;
+                double t = running_sum + y;
+                comp = (t - running_sum) - y;
+                running_sum = t;
+                valid_count--;
+            }
+        }
+        if (i + 1 >= static_cast<size_t>(N)) {
+            result[i] = (valid_count > 0) ? running_sum : nan;
+        }
+    }
+    return AlignedSeries(timestamps, std::move(result));
+}
+
+// Shared sliding sorted-window quantile engine for rolling_median /
+// rolling_percentile.  Maintains the window's non-NaN values in a sorted
+// vector: insert/evict are O(W) memmoves via lower_bound, which beats
+// tree/heap structures for practical window sizes (contiguous memory, no
+// per-node allocation).  Quantile uses the same linear-interpolation
+// convention as percentile_of_series.
+static AlignedSeries rollingQuantileImpl(const AlignedSeries& s, int N, double p, const char* fname) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    if (N <= 0) {
+        throw EvaluationException(std::string(fname) + "() window size N must be a positive integer");
+    }
+    std::vector<double> result(s.values.size(), nan);
+    if (s.values.empty()) {
+        return AlignedSeries(s.timestamps, std::move(result));
+    }
+
+    const auto& v = s.values;
+    std::vector<double> window;  // sorted non-NaN values currently in the window
+    window.reserve(static_cast<size_t>(N));
+
+    const double frac = p / 100.0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (!std::isnan(v[i])) {
+            auto it = std::lower_bound(window.begin(), window.end(), v[i]);
+            window.insert(it, v[i]);
+        }
+        if (i >= static_cast<size_t>(N) && !std::isnan(v[i - N])) {
+            auto it = std::lower_bound(window.begin(), window.end(), v[i - N]);
+            window.erase(it);  // guaranteed present
+        }
+        if (i + 1 >= static_cast<size_t>(N) && !window.empty()) {
+            const double idx = frac * static_cast<double>(window.size() - 1);
+            const size_t lo = static_cast<size_t>(std::floor(idx));
+            const size_t hi = lo + 1;
+            if (hi >= window.size()) {
+                result[i] = window.back();
+            } else {
+                const double w = idx - static_cast<double>(lo);
+                result[i] = window[lo] * (1.0 - w) + window[hi] * w;
+            }
+        }
+    }
+    return AlignedSeries(s.timestamps, std::move(result));
+}
+
+AlignedSeries AlignedSeries::rolling_median(int N) const {
+    return rollingQuantileImpl(*this, N, 50.0, "rolling_median");
+}
+
+AlignedSeries AlignedSeries::rolling_percentile(int N, double p) const {
+    return rollingQuantileImpl(*this, N, p, "rolling_percentile");
 }
 
 AlignedSeries AlignedSeries::rolling_stddev(int N) const {
@@ -1338,6 +1541,24 @@ AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op, const Quer
         // Normalization
         case UnaryOpType::NORMALIZE:
             return operand.normalize();
+        case UnaryOpType::STANDARDIZE:
+            return operand.standardize();
+        case UnaryOpType::EXP:
+            return operand.exp();
+        case UnaryOpType::ROUND:
+            return operand.round_nearest();
+        case UnaryOpType::SIGN:
+            return operand.sign();
+        case UnaryOpType::DERIV:
+            return operand.deriv();
+        case UnaryOpType::DELTA:
+            return operand.delta();
+        case UnaryOpType::IDELTA:
+            return operand.idelta();
+        case UnaryOpType::CHANGES:
+            return operand.changes();
+        case UnaryOpType::RESETS:
+            return operand.resets();
         default:
             throw EvaluationException("Unknown unary operator");
     }
@@ -1520,6 +1741,60 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                 throw EvaluationException("rolling_stddev() window size N must be a positive integer");
             }
             return series.rolling_stddev(N);
+        }
+
+        case FunctionType::ROLLING_SUM: {
+            if (call.args.size() != 2) {
+                throw EvaluationException("rolling_sum() requires exactly 2 arguments");
+            }
+            auto series = evaluateNode(*call.args[0], queryResults);
+            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            if (scalarSeries.empty()) {
+                throw EvaluationException("rolling_sum() second argument must be a non-empty scalar");
+            }
+            int N = static_cast<int>(scalarSeries.values[0]);
+            if (N <= 0) {
+                throw EvaluationException("rolling_sum() window size N must be a positive integer");
+            }
+            return series.rolling_sum(N);
+        }
+
+        case FunctionType::ROLLING_MEDIAN: {
+            if (call.args.size() != 2) {
+                throw EvaluationException("rolling_median() requires exactly 2 arguments");
+            }
+            auto series = evaluateNode(*call.args[0], queryResults);
+            auto scalarSeries = evaluateNode(*call.args[1], queryResults);
+            if (scalarSeries.empty()) {
+                throw EvaluationException("rolling_median() second argument must be a non-empty scalar");
+            }
+            int N = static_cast<int>(scalarSeries.values[0]);
+            if (N <= 0) {
+                throw EvaluationException("rolling_median() window size N must be a positive integer");
+            }
+            return series.rolling_median(N);
+        }
+
+        case FunctionType::ROLLING_PERCENTILE: {
+            // Syntax: rolling_percentile(series, N, p)
+            if (call.args.size() != 3) {
+                throw EvaluationException("rolling_percentile() requires exactly 3 arguments (series, N, p)");
+            }
+            auto series = evaluateNode(*call.args[0], queryResults);
+            auto nSeries = evaluateNode(*call.args[1], queryResults);
+            auto pSeries = evaluateNode(*call.args[2], queryResults);
+            if (nSeries.empty() || pSeries.empty()) {
+                throw EvaluationException("rolling_percentile() N and p arguments must be non-empty scalars");
+            }
+            int N = static_cast<int>(nSeries.values[0]);
+            if (N <= 0) {
+                throw EvaluationException("rolling_percentile() window size N must be a positive integer");
+            }
+            double p = pSeries.values[0];
+            if (p < 0.0 || p > 100.0) {
+                throw EvaluationException("rolling_percentile() p must be in [0, 100], got " + std::to_string(p));
+            }
+            return series.rolling_percentile(N, p);
         }
 
         case FunctionType::FILL_VALUE: {
@@ -1846,6 +2121,77 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
                     double frac = idx - static_cast<double>(lo);
                     result[i] = tmp[lo] * (1.0 - frac) + tmp[hi] * frac;
                 }
+            }
+            return AlignedSeries(series[0].timestamps, std::move(result));
+        }
+
+        case FunctionType::COUNT_OF_SERIES: {
+            if (call.args.empty()) {
+                throw EvaluationException("count_of_series() requires at least 1 argument");
+            }
+            std::vector<AlignedSeries> series;
+            series.reserve(call.args.size());
+            for (const auto& arg : call.args) {
+                series.push_back(evaluateNode(*arg, queryResults));
+            }
+            size_t n = series[0].size();
+            for (size_t i = 1; i < series.size(); ++i) {
+                if (series[i].size() != n) {
+                    throw EvaluationException("count_of_series(): all series must have the same length");
+                }
+            }
+            // Count of non-NaN values at each index; 0 when nothing reports
+            // ("how many hosts are reporting" wants 0, not NaN).
+            std::vector<double> result(n, 0.0);
+            for (const auto& s : series) {
+                for (size_t i = 0; i < n; ++i) {
+                    if (!std::isnan(s.values[i])) {
+                        result[i] += 1.0;
+                    }
+                }
+            }
+            return AlignedSeries(series[0].timestamps, std::move(result));
+        }
+
+        case FunctionType::STDDEV_OF_SERIES: {
+            if (call.args.empty()) {
+                throw EvaluationException("stddev_of_series() requires at least 1 argument");
+            }
+            std::vector<AlignedSeries> series;
+            series.reserve(call.args.size());
+            for (const auto& arg : call.args) {
+                series.push_back(evaluateNode(*arg, queryResults));
+            }
+            size_t n = series[0].size();
+            for (size_t i = 1; i < series.size(); ++i) {
+                if (series[i].size() != n) {
+                    throw EvaluationException("stddev_of_series(): all series must have the same length");
+                }
+            }
+            // Population stddev across non-NaN values at each index.
+            // No values → NaN; a single value → 0 (PromQL convention).
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            std::vector<double> result(n, nan);
+            for (size_t i = 0; i < n; ++i) {
+                double sum = 0.0;
+                size_t count = 0;
+                for (const auto& s : series) {
+                    if (!std::isnan(s.values[i])) {
+                        sum += s.values[i];
+                        ++count;
+                    }
+                }
+                if (count == 0)
+                    continue;
+                const double mean = sum / static_cast<double>(count);
+                double m2 = 0.0;
+                for (const auto& s : series) {
+                    if (!std::isnan(s.values[i])) {
+                        const double d = s.values[i] - mean;
+                        m2 += d * d;
+                    }
+                }
+                result[i] = std::sqrt(m2 / static_cast<double>(count));
             }
             return AlignedSeries(series[0].timestamps, std::move(result));
         }

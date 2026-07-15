@@ -316,6 +316,13 @@ std::optional<BinaryOpType> ExpressionParser::getBinaryOp() const {
 bool ExpressionParser::isFunction(const std::string& name) const {
     static const std::set<std::string> functions = {
         "abs", "log", "log10", "sqrt", "ceil", "floor",  // unary math
+        "exp", "round", "sign",                          // unary math (continued)
+        "deriv", "delta", "idelta",                      // gauge derivative / range summaries
+        "changes", "resets",                             // change diagnostics
+        "standardize",                                   // global z-score normalization
+        "rolling_sum", "rolling_median",                 // rolling window (continued)
+        "rolling_percentile",                            // rolling window percentile
+        "count_of_series", "stddev_of_series",           // cross-series (continued)
         "diff", "monotonic_diff", "default_zero",        // unary transform
         "count_nonzero", "count_not_null",               // unary aggregating
         "rate", "irate", "increase",                     // counter-rate functions
@@ -411,6 +418,27 @@ std::optional<UnaryOpType> ExpressionParser::getUnaryFunction(const std::string&
     // Normalization
     if (name == "normalize")
         return UnaryOpType::NORMALIZE;
+    if (name == "standardize")
+        return UnaryOpType::STANDARDIZE;
+    // Element-wise math (continued)
+    if (name == "exp")
+        return UnaryOpType::EXP;
+    if (name == "round")
+        return UnaryOpType::ROUND;
+    if (name == "sign")
+        return UnaryOpType::SIGN;
+    // Gauge derivative / range summaries
+    if (name == "deriv")
+        return UnaryOpType::DERIV;
+    if (name == "delta")
+        return UnaryOpType::DELTA;
+    if (name == "idelta")
+        return UnaryOpType::IDELTA;
+    // Change diagnostics
+    if (name == "changes")
+        return UnaryOpType::CHANGES;
+    if (name == "resets")
+        return UnaryOpType::RESETS;
     return std::nullopt;
 }
 
@@ -446,6 +474,12 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
         return FunctionType::ROLLING_MAX;
     if (name == "rolling_stddev")
         return FunctionType::ROLLING_STDDEV;
+    if (name == "rolling_sum")
+        return FunctionType::ROLLING_SUM;
+    if (name == "rolling_median")
+        return FunctionType::ROLLING_MEDIAN;
+    if (name == "rolling_percentile")
+        return FunctionType::ROLLING_PERCENTILE;
     // Gap-fill with constant scalar
     if (name == "fill_value")
         return FunctionType::FILL_VALUE;
@@ -480,6 +514,10 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
         return FunctionType::MAX_OF_SERIES;
     if (name == "percentile_of_series")
         return FunctionType::PERCENTILE_OF_SERIES;
+    if (name == "count_of_series")
+        return FunctionType::COUNT_OF_SERIES;
+    if (name == "stddev_of_series")
+        return FunctionType::STDDEV_OF_SERIES;
     return std::nullopt;
 }
 
@@ -820,7 +858,8 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
         bool isVariadic =
             multiFunc.value() == FunctionType::AVG_OF_SERIES || multiFunc.value() == FunctionType::SUM_OF_SERIES ||
             multiFunc.value() == FunctionType::MIN_OF_SERIES || multiFunc.value() == FunctionType::MAX_OF_SERIES ||
-            multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES;
+            multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES ||
+            multiFunc.value() == FunctionType::COUNT_OF_SERIES || multiFunc.value() == FunctionType::STDDEV_OF_SERIES;
 
         if (isVariadic) {
             size_t minArgs = (multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES) ? 2 : 1;
@@ -831,7 +870,8 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
         } else {
             // Fixed argument count
             size_t expected = 2;
-            if (multiFunc.value() == FunctionType::CLAMP || multiFunc.value() == FunctionType::HOLT_WINTERS) {
+            if (multiFunc.value() == FunctionType::CLAMP || multiFunc.value() == FunctionType::HOLT_WINTERS ||
+                multiFunc.value() == FunctionType::ROLLING_PERCENTILE) {
                 expected = 3;
             }
             if (args.size() != expected) {
