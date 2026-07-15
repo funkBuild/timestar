@@ -1,6 +1,7 @@
 #include "seasonal_forecaster.hpp"
 
 #include "../anomaly/simd_anomaly.hpp"
+#include "forecast_simd.hpp"
 #include "periodicity_detector.hpp"
 #include "stl_decomposition.hpp"
 
@@ -91,13 +92,9 @@ double SeasonalForecaster::autoCorrelation(const std::vector<double>& y, double 
     }
 
     const size_t n = y.size();
-    const size_t count = n - lag;
-    double sum = 0.0;
 
-    // Scalar fallback
-    for (size_t i = 0; i < count; ++i) {
-        sum += (y[i] - mean) * (y[i + lag] - mean);
-    }
+    // Highway SIMD lagged deviation dot product (4-accumulator FMA).
+    double sum = forecast::simd::laggedDeviationDot(y.data(), n, lag, mean);
 
     // Normalize by sum of squared deviations: (n-1)*variance when using
     // sample variance, so that ACF(0) = 1.0 (standard textbook definition).
@@ -407,24 +404,31 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
 
     double mean = anomaly::simd::vectorMean(y.data(), y.size());
 
-    // Store last values for inverse differencing
-    std::vector<double> originalY = y;
+    // Store last value for inverse differencing.  originalY is only populated
+    // (via move, not copy) when seasonal differencing actually replaces y.
+    std::vector<double> originalY;
     double lastY = y.back();
 
     // Apply seasonal differencing if period detected
     bool usedSeasonalDiff = false;
     if (seasonalPeriod > 0 && seasonalPeriod < y.size() / 2) {
-        y = seasonalDifference(y, seasonalPeriod);
+        auto diffed = seasonalDifference(y, seasonalPeriod);
+        originalY = std::move(y);
+        y = std::move(diffed);
         usedSeasonalDiff = true;
         if (!y.empty()) {
             mean = anomaly::simd::vectorMean(y.data(), y.size());
         }
     }
 
-    // Apply regular differencing (d=1)
-    std::vector<double> lastDiffed;
+    // Apply regular differencing (d=1).  Only the last pre-difference value is
+    // needed for inversion — capture it as a scalar instead of copying the
+    // whole series.
+    double lastBeforeRegularDiff = lastY;
+    bool usedRegularDiff = false;
     if (y.size() > 1) {
-        lastDiffed = y;
+        lastBeforeRegularDiff = y.back();
+        usedRegularDiff = true;
         y = regularDifference(y);
         if (!y.empty()) {
             mean = anomaly::simd::vectorMean(y.data(), y.size());
@@ -484,7 +488,7 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
     }
 
     // Inverse regular differencing
-    double lastBeforeDiff = lastDiffed.empty() ? lastY : lastDiffed.back();
+    double lastBeforeDiff = usedRegularDiff ? lastBeforeRegularDiff : lastY;
     std::vector<double> undiffed = inverseRegularDifference(diffForecasts, lastBeforeDiff, nForecast);
 
     // Inverse seasonal differencing
@@ -492,7 +496,7 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
     if (usedSeasonalDiff && seasonalPeriod > 0) {
         finalForecasts = inverseSeasonalDifference(undiffed, originalY, seasonalPeriod, nForecast);
     } else {
-        finalForecasts = undiffed;
+        finalForecasts = std::move(undiffed);
     }
 
     // Compute prediction intervals

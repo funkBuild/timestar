@@ -1,6 +1,7 @@
 #include "periodicity_detector.hpp"
 
 #include "../anomaly/simd_anomaly.hpp"
+#include "forecast_simd.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -265,14 +266,8 @@ double PeriodicityDetector::autoCorrelation(const std::vector<double>& y, size_t
         return 0.0;
     }
 
-    // Compute autocovariance at lag
-    const size_t count = n - lag;
-    double autocovariance = 0.0;
-
-    // Scalar fallback
-    for (size_t i = 0; i < count; ++i) {
-        autocovariance += (y[i] - mean) * (y[i + lag] - mean);
-    }
+    // Compute autocovariance at lag — Highway SIMD lagged deviation dot product
+    double autocovariance = forecast::simd::laggedDeviationDot(py, n, lag, mean);
 
     // Normalize by variance (sum of squared diffs, not sample variance)
     return autocovariance / variance;

@@ -1,6 +1,7 @@
 #include "stl_decomposition.hpp"
 
 #include "../anomaly/simd_anomaly.hpp"
+#include "forecast_simd.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -178,9 +179,16 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(const std::vector<double>& 
     const bool hasWeights = !weights.empty();
     std::vector<double> result(n);
 
-    // ================================================================
-    // Scalar fallback (original implementation)
-    // ================================================================
+    // Fused Highway SIMD window pass: tricube weights + robustness weights +
+    // five weighted-regression sums in one in-register pipeline per window
+    // (see forecast_simd.cpp).  Replaces the raw-AVX2 3-phase pipeline that
+    // was dropped (scalar fallback promoted) in the Highway migration.
+    //
+    // NOTE on robustness weights: they multiply unconditionally, so a zero
+    // weight eliminates the point — standard LOESS robustness semantics,
+    // matching the historical SIMD path.  (The interim scalar code kept the
+    // plain tricube weight when weights[j] <= 0, letting hard-rejected
+    // outliers regain full influence in robust iterations.)
     for (size_t i = 0; i < n; ++i) {
         // Sliding window centered on i
         size_t start, end;
@@ -202,39 +210,21 @@ std::vector<double> STLDecomposer::loessEvenlySpaced(const std::vector<double>& 
         if (maxDist <= 0.0)
             maxDist = 1.0;
 
-        // Weighted linear regression centered at i
-        double sumW = 0.0, sumWX = 0.0, sumWY = 0.0;
-        double sumWXX = 0.0, sumWXY = 0.0;
+        const double baseX = static_cast<double>(start) - static_cast<double>(i);
+        auto sums = forecast::simd::loessWindowSums(y.data() + start, hasWeights ? weights.data() + start : nullptr,
+                                                    end - start, baseX, 1.0 / maxDist);
 
-        for (size_t j = start; j < end; ++j) {
-            double dist = (j >= i) ? static_cast<double>(j - i) : static_cast<double>(i - j);
-            double w = tricube(dist / maxDist);
-
-            if (hasWeights && weights[j] > 0.0) {
-                w *= weights[j];
-            }
-
-            if (w > 0.0) {
-                double xj = static_cast<double>(j) - static_cast<double>(i);
-                sumW += w;
-                sumWX += w * xj;
-                sumWY += w * y[j];
-                sumWXX += w * xj * xj;
-                sumWXY += w * xj * y[j];
-            }
-        }
-
-        if (sumW <= 0.0) {
+        if (sums.w <= 0.0) {
             result[i] = y[i];
             continue;
         }
 
-        double denom = sumW * sumWXX - sumWX * sumWX;
+        double denom = sums.w * sums.wxx - sums.wx * sums.wx;
         if (std::abs(denom) < 1e-10) {
-            result[i] = sumWY / sumW;
+            result[i] = sums.wy / sums.w;
         } else {
             // Intercept of locally weighted regression centered at i
-            result[i] = (sumWXX * sumWY - sumWX * sumWXY) / denom;
+            result[i] = (sums.wxx * sums.wy - sums.wx * sums.wxy) / denom;
         }
     }
 
@@ -439,7 +429,9 @@ STLResult STLDecomposer::decompose(const std::vector<double>& y, size_t period, 
     std::vector<double> trend(n, 0.0);
     std::vector<double> seasonal(n, 0.0);
     std::vector<double> residual(n, 0.0);
-    std::vector<double> robustnessWeights(n, 1.0);
+    // Empty until the first robust outer iteration computes real weights —
+    // an all-1.0 vector would force the weighted LOESS path for no effect.
+    std::vector<double> robustnessWeights;
 
     if (!robust) {
         outerIterations = 1;
@@ -531,11 +523,10 @@ MSTLResult STLDecomposer::decomposeMultiple(const std::vector<double>& y, std::v
             return result;
         }
 
-        // Store this seasonal component
-        seasonals.push_back(stlResult.seasonal);
-
-        // Remove this seasonal from remainder (SIMD-accelerated)
+        // Remove this seasonal from remainder (SIMD-accelerated), then move
+        // the component into storage (it is dead in stlResult afterwards).
         anomaly::simd::vectorSubtract(remainder.data(), stlResult.seasonal.data(), remainder.data(), n);
+        seasonals.push_back(std::move(stlResult.seasonal));
     }
 
     // Final decomposition of remainder to get trend
@@ -546,10 +537,10 @@ MSTLResult STLDecomposer::decomposeMultiple(const std::vector<double>& y, std::v
         return result;
     }
 
-    result.trend = finalResult.trend;
+    result.trend = std::move(finalResult.trend);
     result.seasonals = std::move(seasonals);
     result.periods = std::move(periods);
-    result.residual = finalResult.residual;
+    result.residual = std::move(finalResult.residual);
     result.success = true;
 
     return result;
