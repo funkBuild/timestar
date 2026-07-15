@@ -1067,35 +1067,22 @@ bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::str
     return true;
 }
 
-seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(MultiWritePoint& point) {
-    // Local metadata tracking — each coroutine gets its own copies so there
-    // is no shared mutable state when multiple coroutines run concurrently.
-    std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
-    std::vector<MetaOp> metaOps;
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_total = std::chrono::high_resolution_clock::now();
-#endif
-
+void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAccumulator& acc) {
     // No artificial batch splitting -- the WAL enforces its own 16 MiB per-segment
     // limit (MAX_WAL_SIZE) and will signal rollover if a single insert exceeds it.
     // Splitting here only adds redundant copies and sequential cross-shard roundtrips.
 
-    // Group inserts by shard to reduce cross-shard operations and process them in batches
-    LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Processing MultiWritePoint: {} timestamps × {} fields",
+    LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Accumulating MultiWritePoint: {} timestamps × {} fields",
                     point.timestamps.size(), point.fields.size());
 
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_grouping = std::chrono::high_resolution_clock::now();
-#endif
-
-    // NEW APPROACH: Keep arrays intact - create ONE TimeStarInsert per field with ALL timestamps/values
-    // Group by (shard, type) to batch properly
-    // Use pre-sized vectors instead of std::map since shard IDs are small integers [0, smp::count)
-    const size_t shardCount = seastar::smp::count;
-    std::vector<std::vector<TimeStarInsert<double>>> shardDoubleInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<bool>>> shardBoolInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<std::string>>> shardStringInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegerInserts(shardCount);
+    // Keep arrays intact - create ONE TimeStarInsert per field with ALL timestamps/values,
+    // grouped by (shard, type) into the request-level accumulator vectors.
+    std::vector<std::vector<TimeStarInsert<double>>>& shardDoubleInserts = acc.shardDoubles;
+    std::vector<std::vector<TimeStarInsert<bool>>>& shardBoolInserts = acc.shardBools;
+    std::vector<std::vector<TimeStarInsert<std::string>>>& shardStringInserts = acc.shardStrings;
+    std::vector<std::vector<TimeStarInsert<int64_t>>>& shardIntegerInserts = acc.shardIntegers;
+    std::unordered_set<SeriesId128, SeriesId128::Hash>& seenMF = acc.seenMF;
+    std::vector<MetaOp>& metaOps = acc.metaOps;
 
     // Process each field - create ONE insert with ALL timestamps and values.
     // Use shared_ptr for tags and timestamps so that all field inserts from
@@ -1269,18 +1256,25 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 break;
             }
         }
+
+        // Reached only when a non-empty insert was pushed for this field
+        // (empty-value fields `continue` inside the switch). Points routed to
+        // this shard: one per timestamp for this field — matches the
+        // request-level accounting of timestamps × fields per MultiWritePoint.
+        acc.shardPoints[shard] += static_cast<int64_t>(sharedTimestamps->size());
     }
 
+    // Metadata ops accumulate in `acc` for request-level deduplication and indexing
+}
+
+seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(MultiWritePoint& point) {
 #if TIMESTAR_LOG_INSERT_PATH
-    auto end_grouping = std::chrono::high_resolution_clock::now();
-    auto grouping_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_grouping - start_grouping);
+    auto start_total = std::chrono::high_resolution_clock::now();
 #endif
 
-    // Metadata ops are returned to the caller for batch-level deduplication and indexing
-
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_batch_ops = std::chrono::high_resolution_clock::now();
-#endif
+    const size_t shardCount = seastar::smp::count;
+    BatchAccumulator acc(shardCount);
+    accumulateMultiWritePoint(point, acc);
 
     // Dispatch to all shards in parallel - inserts are already batched per field with all timestamps
     std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
@@ -1288,19 +1282,14 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
     for (size_t shard = 0; shard < shardCount; ++shard) {
         // Skip shards with no work
-        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() && shardStringInserts[shard].empty() &&
-            shardIntegerInserts[shard].empty()) {
+        if (acc.shardEmpty(shard)) {
             continue;
         }
 
-        // Move this shard's inserts directly from the pre-sized vectors
-        auto doubles = std::move(shardDoubleInserts[shard]);
-        auto bools = std::move(shardBoolInserts[shard]);
-        auto strings = std::move(shardStringInserts[shard]);
-        auto integers = std::move(shardIntegerInserts[shard]);
-
-        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(doubles), std::move(bools),
-                                                    std::move(strings), std::move(integers)));
+        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(acc.shardDoubles[shard]),
+                                                    std::move(acc.shardBools[shard]),
+                                                    std::move(acc.shardStrings[shard]),
+                                                    std::move(acc.shardIntegers[shard])));
     }
 
     // Wait for all shard operations to complete in parallel
@@ -1313,17 +1302,13 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     }
 
 #if TIMESTAR_LOG_INSERT_PATH
-    auto end_batch_ops = std::chrono::high_resolution_clock::now();
-    auto batch_ops_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_batch_ops - start_batch_ops);
     auto end_total = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
-
-    LOG_INSERT_PATH(timestar::http_log, info,
-                    "[PERF] [HTTP] processMultiWritePoint breakdown - Total: {}μs, Grouping: {}μs, BatchOps: {}μs",
-                    total_duration.count(), grouping_duration.count(), batch_ops_duration.count());
+    LOG_INSERT_PATH(timestar::http_log, info, "[PERF] [HTTP] processMultiWritePoint total: {}μs",
+                    total_duration.count());
 #endif
 
-    co_return WriteResult{std::move(aggregatedTiming), std::move(metaOps)};
+    co_return WriteResult{std::move(aggregatedTiming), std::move(acc.metaOps)};
 }
 
 std::string HttpWriteHandler::createErrorResponse(const std::string& error) {
@@ -1679,52 +1664,72 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                         writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
 #endif
 
-                        // Pre-compute per-MWP point counts so we can subtract on failure.
-                        std::vector<int64_t> perMwpPoints;
-                        perMwpPoints.reserve(coalescedWrites.size());
-                        for (const auto& mwp : coalescedWrites) {
-                            auto pts =
-                                static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
-                            pointsWritten += pts;
-                            perMwpPoints.push_back(pts);
-                            std::string error;
-                            if (!validateArraySizes(mwp, error)) {
-                                throw std::invalid_argument(error);
+                        // Validate all MWPs up-front (before any dispatch), then accumulate
+                        // the ENTIRE request into one set of per-shard typed insert vectors.
+                        // This replaces the previous one-coroutine-per-MultiWritePoint fan-out
+                        // (M × shards cross-shard round trips and M WAL cycles per request)
+                        // with a single dispatch per active shard.
+                        const size_t shardCount = seastar::smp::count;
+                        BatchAccumulator acc(shardCount);
+                        {
+                            size_t accumulated = 0;
+                            for (auto& mwp : coalescedWrites) {
+                                std::string error;
+                                if (!validateArraySizes(mwp, error)) {
+                                    throw std::invalid_argument(error);
+                                }
+                                pointsWritten += static_cast<int64_t>(mwp.timestamps.size()) *
+                                                 static_cast<int64_t>(mwp.fields.size());
+                                accumulateMultiWritePoint(mwp, acc);
+                                // Yield periodically so accumulating a large batch does not
+                                // stall the reactor (accumulation itself never suspends).
+                                if ((++accumulated & 63u) == 0) {
+                                    co_await seastar::coroutine::maybe_yield();
+                                }
                             }
                         }
 
-                        std::vector<seastar::future<WriteResult>> mwpFutures;
-                        mwpFutures.reserve(coalescedWrites.size());
-                        for (auto& mwp : coalescedWrites) {
-                            mwpFutures.push_back(processMultiWritePoint(mwp));
+                        // Single dispatch per active shard for the whole request.
+                        std::vector<unsigned> activeShards;
+                        std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
+                        activeShards.reserve(shardCount);
+                        shardFutures.reserve(shardCount);
+                        for (unsigned shard = 0; shard < shardCount; ++shard) {
+                            if (acc.shardEmpty(shard)) {
+                                continue;
+                            }
+                            activeShards.push_back(shard);
+                            shardFutures.push_back(dispatchShardInserts(
+                                engineSharded, shard, std::move(acc.shardDoubles[shard]),
+                                std::move(acc.shardBools[shard]), std::move(acc.shardStrings[shard]),
+                                std::move(acc.shardIntegers[shard])));
                         }
 
-                        auto mwpResults = co_await seastar::when_all(mwpFutures.begin(), mwpFutures.end());
+                        auto shardResults = co_await seastar::when_all(shardFutures.begin(), shardFutures.end());
 
-                        std::vector<MetaOp> metaOps;
-                        metaOps.reserve(coalescedWrites.size() * 2);
+                        // Failure attribution is per-shard: if a shard's insert future
+                        // failed, all points routed to that shard count as failed.
                         int64_t failedWrites = 0;
                         std::vector<std::string> writeErrors;
-                        for (size_t i = 0; i < mwpResults.size(); ++i) {
+                        for (size_t i = 0; i < shardResults.size(); ++i) {
                             try {
-                                auto writeResult = mwpResults[i].get();
-                                metaOps.insert(metaOps.end(), std::make_move_iterator(writeResult.metaOps.begin()),
-                                               std::make_move_iterator(writeResult.metaOps.end()));
+                                shardResults[i].get();
                             } catch (const std::exception& e) {
-                                timestar::http_log.error("Error processing write: {}", e.what());
-                                pointsWritten -= perMwpPoints[i];
-                                ++failedWrites;
+                                const unsigned shard = activeShards[i];
+                                timestar::http_log.error("Error inserting batch on shard {}: {}", shard, e.what());
+                                pointsWritten -= acc.shardPoints[shard];
+                                failedWrites += acc.shardPoints[shard];
                                 if (writeErrors.size() < 10) {
-                                    writeErrors.emplace_back(e.what());
+                                    writeErrors.emplace_back("shard " + std::to_string(shard) + ": " + e.what());
                                 }
                             }
                         }
 
 #if TIMESTAR_LOG_INSERT_PATH
-                        size_t metaOpsCount = metaOps.size();
+                        size_t metaOpsCount = acc.metaOps.size();
 #endif
-                        if (!metaOps.empty()) {
-                            co_await engineSharded->local().indexMetadataSync(std::move(metaOps));
+                        if (!acc.metaOps.empty()) {
+                            co_await engineSharded->local().indexMetadataSync(std::move(acc.metaOps));
                         }
 #if TIMESTAR_LOG_INSERT_PATH
                         LOG_INSERT_PATH(timestar::http_log, info,

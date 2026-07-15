@@ -138,15 +138,18 @@ static std::string extractFunctionBody(const std::string& sourceCode, const std:
 // Previously, processMultiWritePoint failures were caught and logged but
 // pointsWritten was never decremented, causing the response to report
 // more points written than actually persisted (silent data loss).
+// The batch path now accumulates the whole request into per-shard batches
+// and dispatches once per shard, so failure attribution is per-shard:
+// a failed shard future decrements pointsWritten by the points routed to it.
 TEST_F(HttpWriteHandlerAtomicityTest, BatchFailuresDecrementPointsWritten) {
     std::string handleBody = extractFunctionBody(sourceCode, "HttpWriteHandler::handleWrite(");
     ASSERT_FALSE(handleBody.empty()) << "Could not extract handleWrite function body";
 
-    // The batch result loop must subtract failed points from pointsWritten.
-    // Look for the decrement in the catch block of the mwpResults loop.
-    EXPECT_NE(handleBody.find("pointsWritten -= perMwpPoints["), std::string::npos)
+    // The shard-result loop must subtract failed points from pointsWritten.
+    // Look for the decrement in the catch block of the shardResults loop.
+    EXPECT_NE(handleBody.find("pointsWritten -= acc.shardPoints["), std::string::npos)
         << "Batch write catch block must decrement pointsWritten by the "
-           "per-MWP point count when a write fails";
+           "per-shard point count when a shard insert fails";
 
     // There should be a failedWrites counter
     EXPECT_NE(handleBody.find("failedWrites"), std::string::npos)
