@@ -4,8 +4,10 @@
 #include "alp_constants.hpp"
 #include "alp_ffor.hpp"
 #include "alp_rd.hpp"
+#include "alp_simd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -62,8 +64,10 @@ BestPair findBestExpFac(const double* values, size_t count) {
     BestPair best;
     best.exceptions = sample_size + 1;
 
-    // Build sample indices (evenly spaced)
-    std::vector<size_t> sample_indices(sample_size);
+    // Build sample indices (evenly spaced) in a stack buffer — no heap
+    // allocation per call (this runs once per TSM block / WAL entry).
+    static_assert(alp::ALP_SAMPLE_SIZE <= 256, "sample stack buffer sized for ALP_SAMPLE_SIZE");
+    std::array<size_t, 256> sample_indices;
     if (sample_size == count) {
         for (size_t i = 0; i < count; ++i)
             sample_indices[i] = i;
@@ -78,16 +82,22 @@ BestPair findBestExpFac(const double* values, size_t count) {
         for (uint8_t fac = 0; fac <= exp; ++fac) {
             size_t exceptions = 0;
 
-            for (size_t idx : sample_indices) {
-                double v = values[idx];
+            for (size_t s = 0; s < sample_size; ++s) {
+                double v = values[sample_indices[s]];
                 // Skip special values - they'll always be exceptions
                 if (std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v))) {
                     exceptions++;
-                    continue;
+                } else {
+                    auto result = scaleValue(v, exp, fac);
+                    if (!result.exact) {
+                        exceptions++;
+                    }
                 }
-                auto result = scaleValue(v, exp, fac);
-                if (!result.exact) {
-                    exceptions++;
+                // Early abandon: this candidate already lost — for
+                // exception-heavy data (the ALP_RD-bound case) this cuts the
+                // 190-candidate × 256-sample search by orders of magnitude.
+                if (exceptions >= best.exceptions) {
+                    break;
                 }
             }
 
@@ -130,24 +140,24 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
     CompressedBuffer buffer;
     const size_t numBytes = aligned.size();
     if (numBytes > 0) {
-        // Copy AlignedBuffer's raw bytes into CompressedBuffer as 64-bit words.
+        // Bulk-copy AlignedBuffer's raw bytes into the word vector in one
+        // memcpy (zero-padded tail word). The old word-by-word write<64>()
+        // loop cost ~5ms per 1M values — comparable to the encode itself.
+        // Range-assign copies the full words in a single pass with no
+        // preparatory zero-fill (assign(n, 0) memset several MB per call);
+        // only a partial tail word needs explicit zero padding.
+        // CompressedBuffer::size() derives from data.size(), and consumers
+        // read via CompressedSlice / serialize the bytes, so filling `data`
+        // directly is equivalent.
         const size_t fullWords = numBytes / 8;
-        const size_t tailBytes = numBytes % 8;
-        buffer.reserve(fullWords + (tailBytes > 0 ? 1 : 0));
-
-        const uint8_t* src = aligned.data.data();
-        for (size_t i = 0; i < fullWords; ++i) {
-            uint64_t word;
-            std::memcpy(&word, src + i * 8, 8);
-            buffer.write<64>(word);
-        }
-        if (tailBytes > 0) {
-            uint64_t word = 0;
-            std::memcpy(&word, src + fullWords * 8, tailBytes);
-            buffer.write(word, static_cast<int>(tailBytes * 8));
+        const uint64_t* words = reinterpret_cast<const uint64_t*>(aligned.data.data());
+        buffer.data.assign(words, words + fullWords);
+        if (numBytes % 8 != 0) {
+            uint64_t last = 0;
+            std::memcpy(&last, aligned.data.data() + fullWords * 8, numBytes % 8);
+            buffer.data.push_back(last);
         }
     }
-    buffer.shrink_to_fit();
     return buffer;
 }
 
@@ -249,6 +259,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         std::vector<uint64_t> exc_values;
         std::vector<uint64_t> packed;
 
+        // Single-pass masked SIMD scale loop: only for fac == 0 (integer
+        // divide by 10^fac has no matching SIMD equivalent) and only on
+        // targets with native i64<->f64 conversion (AVX-512 DQ).
+        const bool use_simd_scale = (fac == 0) && alp::simd::alpScaleSimdAvailable();
+
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
             const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
@@ -262,26 +277,36 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             int64_t max_val = std::numeric_limits<int64_t>::min();
             int64_t first_value = 0;  // absolute value of first non-exception (for delta)
 
-            for (size_t i = 0; i < block_count; ++i) {
-                double v = values[block_start + i];
-                bool is_special = std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v));  // -0.0
+            if (use_simd_scale) {
+                exc_positions.resize(block_count);
+                exc_values.resize(block_count);
+                const size_t n_exc =
+                    alp::simd::alpScaleF0(values.data() + block_start, block_count, alp::FACT_ARR[exp],
+                                          encoded.data(), &min_val, &max_val, exc_positions.data(), exc_values.data());
+                exc_positions.resize(n_exc);
+                exc_values.resize(n_exc);
+            } else {
+                for (size_t i = 0; i < block_count; ++i) {
+                    double v = values[block_start + i];
+                    bool is_special = std::isnan(v) || std::isinf(v) || (v == 0.0 && std::signbit(v));  // -0.0
 
-                if (!is_special) {
-                    auto result = scaleValue(v, exp, fac);
-                    if (result.exact) {
-                        encoded[i] = result.encoded;
-                        if (result.encoded < min_val)
-                            min_val = result.encoded;
-                        if (result.encoded > max_val)
-                            max_val = result.encoded;
-                        continue;
+                    if (!is_special) {
+                        auto result = scaleValue(v, exp, fac);
+                        if (result.exact) {
+                            encoded[i] = result.encoded;
+                            if (result.encoded < min_val)
+                                min_val = result.encoded;
+                            if (result.encoded > max_val)
+                                max_val = result.encoded;
+                            continue;
+                        }
                     }
-                }
 
-                // Exception: store as raw bits
-                exc_positions.push_back(static_cast<uint16_t>(i));
-                exc_values.push_back(std::bit_cast<uint64_t>(v));
-                encoded[i] = 0;  // placeholder (will use base after FFOR)
+                    // Exception: store as raw bits
+                    exc_positions.push_back(static_cast<uint16_t>(i));
+                    exc_values.push_back(std::bit_cast<uint64_t>(v));
+                    encoded[i] = 0;  // placeholder (will use base after FFOR)
+                }
             }
 
             // === Delta + Zigzag Transform (SCHEME_ALP_DELTA only) ===
@@ -365,9 +390,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             }
 
             // === FFOR Data ===
+            // ffor_pack writes every output word, so resize() (a no-op after the
+            // first block) replaces the per-block zero-fill assign().
             size_t packed_words = alp::ffor_packed_words(block_count, bw);
             if (packed_words > 0) {
-                packed.assign(packed_words, 0);
+                packed.resize(packed_words);
                 alp::ffor_pack(encoded.data(), block_count, min_val, bw, packed.data());
                 target.write_array(packed.data(), packed_words);
             }
@@ -396,15 +423,15 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         uint8_t right_bit_count = alp::ALPRD::findBestSplit(values.data(), total_values);
 
         // Scratch buffers hoisted out of the block loop
-        std::vector<int64_t> left_as_i64(alp::ALP_VECTOR_SIZE);
         std::vector<uint64_t> left_packed;
         std::vector<uint64_t> right_packed;
+        alp::ALPRDBlockResult rd;  // reused across blocks (vector capacity retained)
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * alp::ALP_VECTOR_SIZE;
             const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
 
-            auto rd = alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count);
+            alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count, rd);
             const uint16_t exception_count = static_cast<uint16_t>(rd.exception_positions.size());
 
             // === Block Header (2 x uint64_t) ===
@@ -423,21 +450,21 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             }
 
             // === Left Indices (FFOR packed) ===
+            // ffor_pack_u8 packs straight from the uint8 dictionary indices —
+            // no widen-to-int64 pass. The packers write every output word, so
+            // resize() (a no-op after the first block) replaces the per-block
+            // zero-fill assign().
             if (rd.left_bw > 0) {
-                left_as_i64.resize(block_count);
-                for (size_t i = 0; i < block_count; ++i) {
-                    left_as_i64[i] = static_cast<int64_t>(rd.left_indices[i]);
-                }
                 size_t left_packed_words = alp::ffor_packed_words(block_count, rd.left_bw);
-                left_packed.assign(left_packed_words, 0);
-                alp::ffor_pack(left_as_i64.data(), block_count, 0, rd.left_bw, left_packed.data());
+                left_packed.resize(left_packed_words);
+                alp::ffor_pack_u8(rd.left_indices.data(), block_count, rd.left_bw, left_packed.data());
                 target.write_array(left_packed.data(), left_packed_words);
             }
 
             // === Right FFOR Data ===
             if (rd.right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
-                right_packed.assign(right_packed_words, 0);
+                right_packed.resize(right_packed_words);
                 alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base, rd.right_bw,
                                    right_packed.data());
                 target.write_array(right_packed.data(), right_packed_words);

@@ -555,6 +555,18 @@ void computeBounds(const double* predictions, const double* scale, double bounds
     HWY_DYNAMIC_DISPATCH(ComputeBoundsKernel)(predictions, scale, bounds, upper, lower, count);
 }
 
+void computeBounds(const double* predictions, double scale, double bounds, double* upper, double* lower,
+                   size_t count) {
+    // margin is uniform: bounds * scale computed once, matching the per-lane
+    // Mul(bounds, scale[i]) of the vector overload bit-for-bit for constant
+    // scale vectors. The plain loop auto-vectorizes.
+    const double margin = bounds * scale;
+    for (size_t i = 0; i < count; ++i) {
+        upper[i] = predictions[i] + margin;
+        lower[i] = predictions[i] - margin;
+    }
+}
+
 void computeAnomalyScores(const double* values, const double* upper, const double* lower, double* scores,
                           size_t count) {
     HWY_DYNAMIC_DISPATCH(ComputeAnomalyScoresKernel)(values, upper, lower, scores, count);

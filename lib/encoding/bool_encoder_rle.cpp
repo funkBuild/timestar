@@ -269,3 +269,55 @@ void BoolEncoderRLE::decode(Slice& encoded, size_t nToSkip, size_t length, std::
                                  " values, expected " + std::to_string(out.size() - basePos));
     }
 }
+
+void BoolEncoderRLE::decodeToDouble(Slice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
+    if (length == 0) [[unlikely]]
+        return;
+
+    bool currentValue = encoded.read<uint8_t>() != 0;
+
+    // Track leftover from a run that straddles the skip/emit boundary.
+    size_t leftover = 0;
+
+    // Phase 1: Skip nToSkip values by consuming runs without emitting.
+    while (nToSkip > 0 && encoded.bytesLeft() > 0) {
+        uint64_t runLen = readVarint(encoded);
+        if (runLen <= nToSkip) {
+            nToSkip -= runLen;
+            currentValue = !currentValue;
+        } else {
+            leftover = static_cast<size_t>(runLen) - nToSkip;
+            nToSkip = 0;
+        }
+    }
+
+    // Pre-size the output vector, then bulk-fill 1.0/0.0 per run.
+    const size_t basePos = out.size();
+    out.resize(basePos + length);
+    double* __restrict__ dst = out.data() + basePos;
+    size_t writePos = 0;
+
+    // Phase 2a: Emit leftover from the straddling run (if any).
+    if (leftover > 0) {
+        const size_t toEmit = std::min(leftover, length);
+        std::fill_n(dst + writePos, toEmit, currentValue ? 1.0 : 0.0);
+        writePos += toEmit;
+        length -= toEmit;
+        currentValue = !currentValue;
+    }
+
+    // Phase 2b: Emit remaining runs using bulk fill.
+    while (length > 0 && encoded.bytesLeft() > 0) {
+        uint64_t runLen = readVarint(encoded);
+        const size_t toEmit = std::min(static_cast<size_t>(runLen), length);
+        std::fill_n(dst + writePos, toEmit, currentValue ? 1.0 : 0.0);
+        writePos += toEmit;
+        length -= toEmit;
+        currentValue = !currentValue;
+    }
+
+    if (length != 0) {
+        throw std::runtime_error("BoolEncoderRLE::decodeToDouble: emitted " + std::to_string(writePos) +
+                                 " values, expected " + std::to_string(out.size() - basePos));
+    }
+}

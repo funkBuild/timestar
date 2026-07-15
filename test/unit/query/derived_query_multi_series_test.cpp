@@ -35,10 +35,13 @@ protected:
         return sr;
     }
 
-    // Expose the private convertQueryResponse for testing via friend access
+    // Expose the private convertQueryResponse for testing via friend access.
+    // convertQueryResponse consumes its input (rvalue ref); copy here so the
+    // tests can keep passing lvalues.
     SubQueryResult callConvert(DerivedQueryExecutor& executor, const std::string& name, const QueryRequest& query,
                                const std::vector<SeriesResult>& results) {
-        return executor.convertQueryResponse(name, query, results);
+        auto owned = results;
+        return executor.convertQueryResponse(name, query, std::move(owned));
     }
 };
 

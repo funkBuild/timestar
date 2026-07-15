@@ -237,8 +237,22 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
                     using T = std::decay_t<decltype(result)>;
                     if constexpr (std::is_same_v<T, QueryResult<double>>) {
                         group->totalPoints += result.timestamps.size();
-                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                            foldPoint(*group, result.timestamps[i], result.values[i]);
+                        // Batch fold through BlockAggregator: sorted-run bucket
+                        // batching + SIMD reductions instead of per-point
+                        // division + hash lookup + method switch. Only streamable
+                        // methods reach this function (gated by the caller), so
+                        // BlockAggregator's fold semantics match foldPoint's.
+                        if (aggregationInterval > 0) {
+                            BlockAggregator agg(aggregationInterval, startTime, endTime, aggregation, true);
+                            agg.addPoints(result.timestamps, result.values);
+                            for (auto& [bucketTs, state] : agg.takeBucketStates()) {
+                                group->bucketStates[bucketTs].mergeForMethod(std::move(state), aggregation);
+                            }
+                        } else {
+                            BlockAggregator agg(0, aggregation);
+                            agg.enableFoldToSingleState();
+                            agg.addPoints(result.timestamps, result.values);
+                            group->collapsedState.mergeForMethod(agg.takeSingleState(), aggregation);
                         }
                     } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
                         group->totalPoints += result.timestamps.size();
@@ -1102,11 +1116,9 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                                         }
                                                     } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
                                                         if (!result.timestamps.empty()) {
-                                                            std::vector<bool> boolValues(result.values.begin(),
-                                                                                         result.values.end());
-                                                            seriesResult.fields[ctx.field] =
-                                                                std::make_pair(std::move(result.timestamps),
-                                                                               FieldValues(std::move(boolValues)));
+                                                            seriesResult.fields[ctx.field] = std::make_pair(
+                                                                std::move(result.timestamps),
+                                                                FieldValues(std::move(result.values)));
                                                         }
                                                     } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
                                                         if (!result.timestamps.empty()) {

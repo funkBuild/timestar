@@ -15,7 +15,10 @@
 namespace timestar::bench {
 
 // Wire format selected by the --format flag.
-enum class WireFormat { Json, Protobuf };
+// Json      — single array-format write point per request (fast path).
+// JsonBatch — {"writes":[...]} batch of scalar write points (DOM batch path).
+// Protobuf  — serialized WriteRequest proto.
+enum class WireFormat { Json, JsonBatch, Protobuf };
 
 // Monotonic clock used for all latency timing.
 using clk = std::chrono::steady_clock;

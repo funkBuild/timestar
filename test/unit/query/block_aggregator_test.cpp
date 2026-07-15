@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <limits>
+#include <random>
 #include <vector>
 
 using namespace timestar;
@@ -842,4 +843,79 @@ TEST(BlockAggregatorSIMD, FirstTracksTimestamps) {
     EXPECT_EQ(state.count, 16u);
     EXPECT_EQ(state.firstTimestamp, 1000u);
     EXPECT_DOUBLE_EQ(state.first, 10.0);
+}
+
+// ── STDDEV/STDVAR SIMD two-pass fold vs scalar Welford ──────────────────────
+// The SIMD batch fold computes batch mean + M2 and merges via Chan's parallel
+// formula; results must match the per-point Welford path to high precision.
+
+TEST(BlockAggregatorSIMD, StddevMatchesScalarWelford) {
+    std::mt19937_64 rng(2026);
+    std::uniform_real_distribution<double> dist(-50.0, 150.0);
+
+    constexpr size_t N = 10000;
+    constexpr size_t BATCH = 997;  // deliberately not a lane multiple
+    std::vector<uint64_t> ts(N);
+    std::vector<double> vals(N);
+    for (size_t i = 0; i < N; ++i) {
+        ts[i] = 1'000'000 + i * 1000;
+        vals[i] = dist(rng);
+    }
+
+    // SIMD path: batched addPointsRange (methodAware, n >= 4)
+    BlockAggregator simdAgg(0, AggregationMethod::STDDEV);
+    simdAgg.enableFoldToSingleState();
+    for (size_t off = 0; off < N; off += BATCH) {
+        size_t end = std::min(off + BATCH, N);
+        simdAgg.addPointsRange(ts, vals, off, end);
+    }
+    auto simdState = simdAgg.takeSingleState();
+
+    // Scalar path: per-point Welford via addValueForMethod
+    timestar::AggregationState scalarState;
+    for (size_t i = 0; i < N; ++i) {
+        scalarState.addValueForMethod(vals[i], ts[i], AggregationMethod::STDDEV);
+    }
+
+    const double simdStddev = simdState.getValue(AggregationMethod::STDDEV);
+    const double scalarStddev = scalarState.getValue(AggregationMethod::STDDEV);
+    EXPECT_EQ(simdState.count, scalarState.count);
+    EXPECT_NEAR(simdStddev, scalarStddev, scalarStddev * 1e-10);
+
+    const double simdVar = simdState.getValue(AggregationMethod::STDVAR);
+    const double scalarVar = scalarState.getValue(AggregationMethod::STDVAR);
+    EXPECT_NEAR(simdVar, scalarVar, scalarVar * 1e-10);
+}
+
+TEST(BlockAggregatorSIMD, StddevBucketedMatchesScalar) {
+    // Multi-bucket STDDEV: run batching + SIMD fold per bucket segment.
+    constexpr uint64_t INTERVAL = 10'000;
+    constexpr size_t N = 1000;
+    std::vector<uint64_t> ts(N);
+    std::vector<double> vals(N);
+    for (size_t i = 0; i < N; ++i) {
+        ts[i] = i * 100;  // 100 points per bucket
+        vals[i] = static_cast<double>((i * 37) % 101);
+    }
+
+    BlockAggregator simdAgg(INTERVAL, 0, N * 100, AggregationMethod::STDDEV, true);
+    simdAgg.addPoints(ts, vals);
+    auto simdStates = simdAgg.takeBucketStates();
+
+    // Scalar reference
+    std::unordered_map<uint64_t, timestar::AggregationState> refStates;
+    for (size_t i = 0; i < N; ++i) {
+        uint64_t bucket = (ts[i] / INTERVAL) * INTERVAL;
+        refStates[bucket].addValueForMethod(vals[i], ts[i], AggregationMethod::STDDEV);
+    }
+
+    ASSERT_EQ(simdStates.size(), refStates.size());
+    for (auto& [bucket, refState] : refStates) {
+        auto it = simdStates.find(bucket);
+        ASSERT_NE(it, simdStates.end()) << "missing bucket " << bucket;
+        const double refV = refState.getValue(AggregationMethod::STDDEV);
+        EXPECT_NEAR(it->second.getValue(AggregationMethod::STDDEV), refV, std::max(refV * 1e-10, 1e-12))
+            << "bucket " << bucket;
+        EXPECT_EQ(it->second.count, refState.count);
+    }
 }

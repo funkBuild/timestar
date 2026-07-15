@@ -88,6 +88,16 @@ public:
     seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement, std::map<std::string, std::string> tags,
                                                      std::string field) override;
 
+    // Fast overload for callers that already know the series ID (write handler
+    // pre-computes it for shard routing). Skips buildSeriesKey + rehash, and
+    // takes the components by const reference so the common already-indexed
+    // path performs no map/string copies; components are copied only on the
+    // new-series branch. `knownId` MUST equal
+    // SeriesId128::fromSeriesKey(buildSeriesKey(measurement, tags, field)).
+    seastar::future<SeriesId128> getOrCreateSeriesId(SeriesId128 knownId, const std::string& measurement,
+                                                     const std::map<std::string, std::string>& tags,
+                                                     const std::string& field);
+
     seastar::future<std::optional<SeriesId128>> getSeriesId(const std::string& measurement,
                                                             const std::map<std::string, std::string>& tags,
                                                             const std::string& field) override;
@@ -114,6 +124,15 @@ public:
     seastar::future<std::set<std::string>> getTagValues(std::string measurement, std::string tagKey) override;
 
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops) override;
+
+    // Day-bitmap recording for time-scoped discovery (0x0D postings).
+    // recordInsertDays: exact days from a batch's timestamps (data-shard path).
+    // recordDaySpan: [minTs, maxTs] day-span superset (first batch of a new
+    // series, driven by MetadataOp). Both no-op when the LocalId is absent.
+    seastar::future<> recordInsertDays(const std::string& measurement, const SeriesId128& seriesId,
+                                       const std::vector<uint64_t>& timestamps);
+    seastar::future<> recordDaySpan(const std::string& measurement, const SeriesId128& seriesId, uint64_t minTs,
+                                    uint64_t maxTs);
 
     // --- Series discovery ---
     seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> findSeries(

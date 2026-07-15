@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 // =============================================================================
 // SIMD kernels (compiled once per target ISA by foreach_target)
@@ -28,20 +29,31 @@ namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
 // SIMD-optimized sum: accumulate doubles in vector lanes, then horizontal reduce.
+// Unrolled ×4 with independent accumulators to hide FP add latency (a single
+// loop-carried accumulator limits throughput to 1/latency of the add unit).
 double CalculateSum(const double* values, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
 
-    auto sum_vec = hn::Zero(d);
+    auto sum0 = hn::Zero(d);
+    auto sum1 = hn::Zero(d);
+    auto sum2 = hn::Zero(d);
+    auto sum3 = hn::Zero(d);
     size_t i = 0;
 
-    // Main SIMD loop
+    for (; i + 4 * N <= count; i += 4 * N) {
+        sum0 = hn::Add(sum0, hn::LoadU(d, &values[i]));
+        sum1 = hn::Add(sum1, hn::LoadU(d, &values[i + N]));
+        sum2 = hn::Add(sum2, hn::LoadU(d, &values[i + 2 * N]));
+        sum3 = hn::Add(sum3, hn::LoadU(d, &values[i + 3 * N]));
+    }
+    sum0 = hn::Add(hn::Add(sum0, sum1), hn::Add(sum2, sum3));
+
     for (; i + N <= count; i += N) {
-        auto vals = hn::LoadU(d, &values[i]);
-        sum_vec = hn::Add(sum_vec, vals);
+        sum0 = hn::Add(sum0, hn::LoadU(d, &values[i]));
     }
 
-    double sum = hn::ReduceSum(d, sum_vec);
+    double sum = hn::ReduceSum(d, sum0);
 
     // Scalar tail
     for (; i < count; ++i) {
@@ -51,54 +63,147 @@ double CalculateSum(const double* values, size_t count) {
     return sum;
 }
 
-// SIMD-optimized minimum: parallel min reduction across vector lanes.
-// Caller must ensure no NaN values are present (NaN handling is done at dispatch level).
-double CalculateMin(const double* values, size_t count) {
+// SIMD-optimized minimum, NaN-skipping in a single fused pass: NaN lanes are
+// replaced with +inf (the identity for min) so no separate NaN pre-scan is
+// needed. If the result is +inf the input was all-NaN (or genuinely all +inf);
+// the dispatch level resolves that ambiguity via the scalar path.
+double CalculateMinSkipNaN(const double* values, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
+    const auto identity = hn::Set(d, std::numeric_limits<double>::infinity());
 
-    auto min_vec = hn::Set(d, values[0]);
+    auto min0 = identity;
+    auto min1 = identity;
+    auto min2 = identity;
+    auto min3 = identity;
     size_t i = 0;
 
-    // Main SIMD loop
+    for (; i + 4 * N <= count; i += 4 * N) {
+        auto v0 = hn::LoadU(d, &values[i]);
+        auto v1 = hn::LoadU(d, &values[i + N]);
+        auto v2 = hn::LoadU(d, &values[i + 2 * N]);
+        auto v3 = hn::LoadU(d, &values[i + 3 * N]);
+        min0 = hn::Min(min0, hn::IfThenElse(hn::IsNaN(v0), identity, v0));
+        min1 = hn::Min(min1, hn::IfThenElse(hn::IsNaN(v1), identity, v1));
+        min2 = hn::Min(min2, hn::IfThenElse(hn::IsNaN(v2), identity, v2));
+        min3 = hn::Min(min3, hn::IfThenElse(hn::IsNaN(v3), identity, v3));
+    }
+    min0 = hn::Min(hn::Min(min0, min1), hn::Min(min2, min3));
+
     for (; i + N <= count; i += N) {
-        auto vals = hn::LoadU(d, &values[i]);
-        min_vec = hn::Min(min_vec, vals);
+        auto v = hn::LoadU(d, &values[i]);
+        min0 = hn::Min(min0, hn::IfThenElse(hn::IsNaN(v), identity, v));
     }
 
-    double min_val = hn::ReduceMin(d, min_vec);
+    double min_val = hn::ReduceMin(d, min0);
 
-    // Scalar tail
+    // Scalar tail (NaN-skipping)
     for (; i < count; ++i) {
-        min_val = std::min(min_val, values[i]);
+        if (!std::isnan(values[i]) && values[i] < min_val) {
+            min_val = values[i];
+        }
     }
 
     return min_val;
 }
 
-// SIMD-optimized maximum: parallel max reduction across vector lanes.
-// Caller must ensure no NaN values are present (NaN handling is done at dispatch level).
-double CalculateMax(const double* values, size_t count) {
+// SIMD-optimized maximum, NaN-skipping in a single fused pass (see CalculateMinSkipNaN).
+// NaN lanes are replaced with -inf (the identity for max).
+double CalculateMaxSkipNaN(const double* values, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
+    const auto identity = hn::Set(d, -std::numeric_limits<double>::infinity());
 
-    auto max_vec = hn::Set(d, values[0]);
+    auto max0 = identity;
+    auto max1 = identity;
+    auto max2 = identity;
+    auto max3 = identity;
     size_t i = 0;
 
-    // Main SIMD loop
+    for (; i + 4 * N <= count; i += 4 * N) {
+        auto v0 = hn::LoadU(d, &values[i]);
+        auto v1 = hn::LoadU(d, &values[i + N]);
+        auto v2 = hn::LoadU(d, &values[i + 2 * N]);
+        auto v3 = hn::LoadU(d, &values[i + 3 * N]);
+        max0 = hn::Max(max0, hn::IfThenElse(hn::IsNaN(v0), identity, v0));
+        max1 = hn::Max(max1, hn::IfThenElse(hn::IsNaN(v1), identity, v1));
+        max2 = hn::Max(max2, hn::IfThenElse(hn::IsNaN(v2), identity, v2));
+        max3 = hn::Max(max3, hn::IfThenElse(hn::IsNaN(v3), identity, v3));
+    }
+    max0 = hn::Max(hn::Max(max0, max1), hn::Max(max2, max3));
+
     for (; i + N <= count; i += N) {
-        auto vals = hn::LoadU(d, &values[i]);
-        max_vec = hn::Max(max_vec, vals);
+        auto v = hn::LoadU(d, &values[i]);
+        max0 = hn::Max(max0, hn::IfThenElse(hn::IsNaN(v), identity, v));
     }
 
-    double max_val = hn::ReduceMax(d, max_vec);
+    double max_val = hn::ReduceMax(d, max0);
 
-    // Scalar tail
+    // Scalar tail (NaN-skipping)
     for (; i < count; ++i) {
-        max_val = std::max(max_val, values[i]);
+        if (!std::isnan(values[i]) && values[i] > max_val) {
+            max_val = values[i];
+        }
     }
 
     return max_val;
+}
+
+// Fused single-pass sum + NaN-skipping min/max.
+// Sum is a plain add (NaN propagates into the sum, matching calculateSum);
+// min/max mask NaN lanes to their identities (matching the SkipNaN kernels).
+// One memory pass instead of three.
+void CalculateSumMinMax(const double* values, size_t count, double* outSum, double* outMin, double* outMax) {
+    const hn::ScalableTag<double> d;
+    const size_t N = hn::Lanes(d);
+    const auto posInf = hn::Set(d, std::numeric_limits<double>::infinity());
+    const auto negInf = hn::Set(d, -std::numeric_limits<double>::infinity());
+
+    auto sum0 = hn::Zero(d);
+    auto sum1 = hn::Zero(d);
+    auto min0 = posInf;
+    auto max0 = negInf;
+
+    size_t i = 0;
+    for (; i + 2 * N <= count; i += 2 * N) {
+        auto v0 = hn::LoadU(d, &values[i]);
+        auto v1 = hn::LoadU(d, &values[i + N]);
+        sum0 = hn::Add(sum0, v0);
+        sum1 = hn::Add(sum1, v1);
+        auto nn0 = hn::IsNaN(v0);
+        auto nn1 = hn::IsNaN(v1);
+        min0 = hn::Min(min0, hn::IfThenElse(nn0, posInf, v0));
+        min0 = hn::Min(min0, hn::IfThenElse(nn1, posInf, v1));
+        max0 = hn::Max(max0, hn::IfThenElse(nn0, negInf, v0));
+        max0 = hn::Max(max0, hn::IfThenElse(nn1, negInf, v1));
+    }
+    sum0 = hn::Add(sum0, sum1);
+    for (; i + N <= count; i += N) {
+        auto v = hn::LoadU(d, &values[i]);
+        sum0 = hn::Add(sum0, v);
+        auto nn = hn::IsNaN(v);
+        min0 = hn::Min(min0, hn::IfThenElse(nn, posInf, v));
+        max0 = hn::Max(max0, hn::IfThenElse(nn, negInf, v));
+    }
+
+    double sum = hn::ReduceSum(d, sum0);
+    double mn = hn::ReduceMin(d, min0);
+    double mx = hn::ReduceMax(d, max0);
+
+    for (; i < count; ++i) {
+        double v = values[i];
+        sum += v;
+        if (!std::isnan(v)) {
+            if (v < mn)
+                mn = v;
+            if (v > mx)
+                mx = v;
+        }
+    }
+
+    *outSum = sum;
+    *outMin = mn;
+    *outMax = mx;
 }
 
 // SIMD-optimized variance: sum of squared differences from mean.
@@ -216,25 +321,12 @@ namespace timestar {
 namespace simd {
 
 HWY_EXPORT(CalculateSum);
-HWY_EXPORT(CalculateMin);
-HWY_EXPORT(CalculateMax);
+HWY_EXPORT(CalculateSumMinMax);
+HWY_EXPORT(CalculateMinSkipNaN);
+HWY_EXPORT(CalculateMaxSkipNaN);
 HWY_EXPORT(CalculateVariance);
 HWY_EXPORT(DotProduct);
 HWY_EXPORT(ComputeHistogram);
-
-// Quick scan for any NaN in the input array.
-// Used to guard SIMD min/max paths whose intrinsics have undefined NaN behavior.
-// NOTE: This linear NaN scan adds a full pass before SIMD min/max. A fused
-// approach using hn::IsNaN inside the min/max kernel would halve memory traffic.
-// Kept separate for clarity; profiling shows this is not a bottleneck for typical
-// block sizes (<3000 points).
-static bool containsNaN(const double* values, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        if (HWY_UNLIKELY(std::isnan(values[i])))
-            return true;
-    }
-    return false;
-}
 
 // --- SimdAggregator static method implementations (dispatch via Highway) ---
 
@@ -242,6 +334,26 @@ double SimdAggregator::calculateSum(const double* values, size_t count) {
     if (count == 0)
         return std::numeric_limits<double>::quiet_NaN();
     return HWY_DYNAMIC_DISPATCH(CalculateSum)(values, count);
+}
+
+void SimdAggregator::calculateSumMinMax(const double* values, size_t count, double& outSum, double& outMin,
+                                        double& outMax) {
+    if (count == 0) {
+        outSum = 0.0;
+        outMin = std::numeric_limits<double>::quiet_NaN();
+        outMax = std::numeric_limits<double>::quiet_NaN();
+        return;
+    }
+    HWY_DYNAMIC_DISPATCH(CalculateSumMinMax)(values, count, &outSum, &outMin, &outMax);
+    // All-NaN input leaves min/max at their ±inf identities — normalize to
+    // NaN to match calculateMin/calculateMax semantics. Genuine all-±inf data
+    // resolves identically through the scalar helpers.
+    if (HWY_UNLIKELY(outMin == std::numeric_limits<double>::infinity())) {
+        outMin = scalar::calculateMin(values, count);
+    }
+    if (HWY_UNLIKELY(outMax == -std::numeric_limits<double>::infinity())) {
+        outMax = scalar::calculateMax(values, count);
+    }
 }
 
 double SimdAggregator::calculateAvg(const double* values, size_t count) {
@@ -254,26 +366,28 @@ double SimdAggregator::calculateMin(const double* values, size_t count) {
     if (count == 0)
         return std::numeric_limits<double>::quiet_NaN();
 
-    // SIMD min has undefined behavior with NaN inputs.
-    // If any NaN is present, fall through to the scalar path which correctly skips NaN.
-    if (HWY_UNLIKELY(containsNaN(values, count))) {
+    // Fused single-pass kernel: NaN lanes are masked to +inf (min identity),
+    // so no separate NaN pre-scan is needed. A +inf result is ambiguous
+    // (all-NaN input vs genuine +inf values) — resolve via the scalar path,
+    // which returns NaN for all-NaN input.
+    double result = HWY_DYNAMIC_DISPATCH(CalculateMinSkipNaN)(values, count);
+    if (HWY_UNLIKELY(result == std::numeric_limits<double>::infinity())) {
         return scalar::calculateMin(values, count);
     }
-
-    return HWY_DYNAMIC_DISPATCH(CalculateMin)(values, count);
+    return result;
 }
 
 double SimdAggregator::calculateMax(const double* values, size_t count) {
     if (count == 0)
         return std::numeric_limits<double>::quiet_NaN();
 
-    // SIMD max has undefined behavior with NaN inputs.
-    // If any NaN is present, fall through to the scalar path which correctly skips NaN.
-    if (HWY_UNLIKELY(containsNaN(values, count))) {
+    // Fused single-pass kernel: NaN lanes are masked to -inf (max identity).
+    // A -inf result is ambiguous (all-NaN vs genuine -inf) — resolve via scalar.
+    double result = HWY_DYNAMIC_DISPATCH(CalculateMaxSkipNaN)(values, count);
+    if (HWY_UNLIKELY(result == -std::numeric_limits<double>::infinity())) {
         return scalar::calculateMax(values, count);
     }
-
-    return HWY_DYNAMIC_DISPATCH(CalculateMax)(values, count);
+    return result;
 }
 
 double SimdAggregator::calculateVariance(const double* values, size_t count, double mean) {

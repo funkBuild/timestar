@@ -359,7 +359,11 @@ TEST_F(HttpWriteHandlerTest, NumericEdgeCases) {
 // Regression: after findOrCreateCandidate, the local valueType must be synced
 // with candidate.valueType to handle Integer->Float promotion for array fields.
 TEST_F(HttpWriteHandlerTest, CoalesceArrayIntToFloatPromotionFixPresent) {
+#ifdef HTTP_WRITE_HANDLER_SOURCE_PATH
+    std::ifstream src(HTTP_WRITE_HANDLER_SOURCE_PATH);
+#else
     std::ifstream src("../lib/http/http_write_handler.cpp");
+#endif
     ASSERT_TRUE(src.is_open()) << "Could not open http_write_handler.cpp for source inspection";
     std::string content((std::istreambuf_iterator<char>(src)), std::istreambuf_iterator<char>());
 

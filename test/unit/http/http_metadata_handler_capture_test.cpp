@@ -24,7 +24,11 @@ static std::string readFile(const std::string& path) {
 }
 
 TEST_F(HttpMetadataHandlerCaptureTest, InvokeOnLambdasCaptureByValue) {
+#ifdef HTTP_METADATA_HANDLER_SOURCE_PATH
+    std::string src = readFile(HTTP_METADATA_HANDLER_SOURCE_PATH);
+#else
     std::string src = readFile("../lib/http/http_metadata_handler.cpp");
+#endif
     ASSERT_FALSE(src.empty()) << "Could not read http_metadata_handler.cpp";
 
     // Shard-dispatch lambdas must NOT capture measurement/tagKey/tagValue by

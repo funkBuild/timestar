@@ -17,8 +17,11 @@ private:
     static uint32_t readVarInt(Slice& slice);
 
     // Shared encode implementation: validates, builds varint-prefixed buffer, compresses.
+    // The compressed bytes are left in a thread-local staging buffer; `dataOut`
+    // points at them. Callers must copy them out before the next encode call on
+    // this thread. This avoids a per-block heap allocation + copy of the payload.
     struct CompressedPayload {
-        std::vector<char> data;
+        const char* data;
         uint32_t uncompressedSize;
         uint32_t compressedSize;
         uint32_t count;
@@ -89,6 +92,11 @@ public:
     // Data: zstd-compressed varint IDs
     static AlignedBuffer encodeDictionary(std::span<const std::string> values, const Dictionary& dict,
                                           int compressionLevel = 1);
+
+    // Encode dictionary block directly into an existing AlignedBuffer (no
+    // intermediate result buffer + copy). Returns bytes written to target.
+    static size_t encodeDictionaryInto(std::span<const std::string> values, const Dictionary& dict,
+                                       AlignedBuffer& target, int compressionLevel = 1);
 
     // Decode dictionary-encoded block: decompress IDs, look up dictionary.
     static void decodeDictionary(Slice& encoded, size_t count, const Dictionary& dict, std::vector<std::string>& out);

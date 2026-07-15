@@ -41,6 +41,12 @@ public:
     // Call before writing any series. Default is 1 (fast).
     void setCompressionLevel(int level) { compressionLevel_ = level; }
 
+    // Pre-reserve the output buffer when the approximate final size is known
+    // (e.g. compaction: sum of input file sizes). Avoids repeated
+    // geometric-doubling reallocs of the page-aligned buffer, each of which
+    // copies the entire accumulated file.
+    void reserveBuffer(size_t bytes) { buffer.reserve(bytes); }
+
     template <class T>
     void writeSeries(TSMValueType seriesType, const SeriesId128& seriesId, const std::vector<uint64_t>& timestamps,
                      const std::vector<T>& values);

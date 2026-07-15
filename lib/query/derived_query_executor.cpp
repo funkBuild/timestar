@@ -292,11 +292,11 @@ seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std:
         throw DerivedQueryException("Sub-query '" + name + "' failed: " + response.errorMessage);
     }
 
-    co_return convertQueryResponse(name, query, response.series);
+    co_return convertQueryResponse(name, query, std::move(response.series));
 }
 
 SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& name, const QueryRequest& query,
-                                                          const std::vector<SeriesResult>& results) {
+                                                          std::vector<SeriesResult>&& results) {
     SubQueryResult subResult;
     subResult.queryName = name;
     subResult.measurement = query.measurement;
@@ -311,23 +311,24 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& nam
                                     "Add more specific scope filters to narrow the result.");
     }
 
-    const auto& series = results[0];
-    subResult.tags = series.tags;
+    auto& series = results[0];
+    subResult.tags = std::move(series.tags);
 
     // Get the first field (or the requested field)
     std::string fieldName = query.fields.empty() ? "" : query.fields[0];
 
-    for (const auto& [fname, fieldData] : series.fields) {
+    for (auto& [fname, fieldData] : series.fields) {
         if (!fieldName.empty() && fname != fieldName) {
             continue;
         }
 
         subResult.field = fname;
-        subResult.timestamps = fieldData.first;
+        subResult.timestamps = std::move(fieldData.first);
 
-        // Extract values (must be numeric for derived metrics)
+        // Extract values (must be numeric for derived metrics) — moved, the
+        // response is locally owned and discarded after conversion.
         if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
-            subResult.values = std::get<std::vector<double>>(fieldData.second);
+            subResult.values = std::move(std::get<std::vector<double>>(fieldData.second));
         } else if (std::holds_alternative<std::vector<bool>>(fieldData.second)) {
             const auto& boolVals = std::get<std::vector<bool>>(fieldData.second);
             subResult.values.reserve(boolVals.size());
@@ -593,29 +594,26 @@ seastar::future<forecast::ForecastQueryResult> DerivedQueryExecutor::executeFore
         }
     }
 
-    // Filter data based on history parameter if specified
-    std::vector<uint64_t> filteredTimestamps = subResult.timestamps;
-    std::vector<double> filteredValues = subResult.values;
+    // Filter data based on history parameter if specified.  subResult's
+    // timestamps/values are dead after this block, so take them by move
+    // (previously two unconditional full copies per forecast query) and
+    // trim in place; the cutoff search is a binary search on sorted data.
+    std::vector<uint64_t> filteredTimestamps = std::move(subResult.timestamps);
+    std::vector<double> filteredValues = std::move(subResult.values);
 
-    if (config.historyDurationNs > 0 && !subResult.timestamps.empty()) {
+    if (config.historyDurationNs > 0 && !filteredTimestamps.empty()) {
         // Find the cutoff time (last timestamp - history duration)
-        uint64_t lastTimestamp = subResult.timestamps.back();
+        uint64_t lastTimestamp = filteredTimestamps.back();
         uint64_t cutoffTime = lastTimestamp > config.historyDurationNs ? lastTimestamp - config.historyDurationNs : 0;
 
-        // Find the first index where timestamp >= cutoffTime
-        size_t startIdx = 0;
-        for (size_t i = 0; i < subResult.timestamps.size(); ++i) {
-            if (subResult.timestamps[i] >= cutoffTime) {
-                startIdx = i;
-                break;
-            }
-        }
+        // First index where timestamp >= cutoffTime (timestamps are sorted)
+        auto cutIt = std::lower_bound(filteredTimestamps.begin(), filteredTimestamps.end(), cutoffTime);
+        size_t startIdx = static_cast<size_t>(cutIt - filteredTimestamps.begin());
 
-        // Filter the data
-        if (startIdx > 0 && startIdx < subResult.timestamps.size()) {
-            filteredTimestamps =
-                std::vector<uint64_t>(subResult.timestamps.begin() + startIdx, subResult.timestamps.end());
-            filteredValues = std::vector<double>(subResult.values.begin() + startIdx, subResult.values.end());
+        if (startIdx > 0 && startIdx < filteredTimestamps.size()) {
+            filteredTimestamps.erase(filteredTimestamps.begin(),
+                                     filteredTimestamps.begin() + static_cast<ptrdiff_t>(startIdx));
+            filteredValues.erase(filteredValues.begin(), filteredValues.begin() + static_cast<ptrdiff_t>(startIdx));
         }
     }
 

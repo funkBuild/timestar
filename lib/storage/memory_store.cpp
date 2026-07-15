@@ -24,10 +24,10 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
         return;
     valid = true;
 
-    // Phase 1: SIMD-accelerated sum/min/max for the new batch
-    double batchSum = timestar::simd::SimdAggregator::calculateSum(values, n);
-    double batchMin = timestar::simd::SimdAggregator::calculateMin(values, n);
-    double batchMax = timestar::simd::SimdAggregator::calculateMax(values, n);
+    // Phase 1: FUSED SIMD sum/min/max — one memory pass instead of three
+    // separate kernel calls.
+    double batchSum, batchMin, batchMax;
+    timestar::simd::SimdAggregator::calculateSumMinMax(values, n, batchSum, batchMin, batchMax);
 
     // Kahan compensated accumulation of batch sum
     double y = batchSum - sumCompensation;
@@ -40,27 +40,51 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     if (batchMax > max)
         max = batchMax;
 
-    // Phase 2: Welford online mean/m2 (must be sequential per-value)
-    for (size_t i = 0; i < n; ++i) {
-        count++;
-        double delta = values[i] - mean;
-        mean += delta / static_cast<double>(count);
-        double delta2 = values[i] - mean;
-        m2 += delta * delta2;
+    // Phase 2: batch mean/M2 via SIMD two-pass + Chan's parallel merge.
+    // Replaces the per-value Welford loop, whose `mean += delta / count`
+    // put a hardware divide on a loop-carried dependency chain (~20 cy/pt).
+    // Two-pass batch variance is numerically as good as sequential Welford.
+    {
+        const double batchMean = batchSum / static_cast<double>(n);
+        // calculateVariance returns population variance (M2/n)
+        const double batchM2 =
+            timestar::simd::SimdAggregator::calculateVariance(values, n, batchMean) * static_cast<double>(n);
+        if (count == 0) {
+            mean = batchMean;
+            m2 = batchM2;
+        } else {
+            const double delta = batchMean - mean;
+            const double totalCount = static_cast<double>(count) + static_cast<double>(n);
+            m2 += batchM2 + delta * delta * (static_cast<double>(count) * static_cast<double>(n)) / totalCount;
+            mean += delta * (static_cast<double>(n) / totalCount);
+        }
+        count += n;
     }
 
-    // Phase 3: first/latest timestamp tracking
-    // Timestamps in a batch are typically sorted, so first is at [0] and
-    // latest at [n-1]. Check all values for correctness with out-of-order data.
-    for (size_t i = 0; i < n; ++i) {
-        uint64_t ts = timestamps[i];
-        if (ts < firstTimestamp) {
-            firstTimestamp = ts;
-            firstValue = values[i];
+    // Phase 3: first/latest timestamp tracking.
+    // Batches are almost always sorted (chronological ingest), so the
+    // endpoints suffice; the sortedness scan is a single predictable
+    // compare per element vs. the two-branch tracking loop.
+    if (std::is_sorted(timestamps, timestamps + n)) [[likely]] {
+        if (timestamps[0] < firstTimestamp) {
+            firstTimestamp = timestamps[0];
+            firstValue = values[0];
         }
-        if (ts >= latestTimestamp) {
-            latestTimestamp = ts;
-            latestValue = values[i];
+        if (timestamps[n - 1] >= latestTimestamp) {
+            latestTimestamp = timestamps[n - 1];
+            latestValue = values[n - 1];
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t ts = timestamps[i];
+            if (ts < firstTimestamp) {
+                firstTimestamp = ts;
+                firstValue = values[i];
+            }
+            if (ts >= latestTimestamp) {
+                latestTimestamp = ts;
+                latestValue = values[i];
+            }
         }
     }
 }
@@ -94,15 +118,19 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
         return;
     }
 
-    // Reserve capacity upfront to guarantee a single allocation for both vectors.
-    // Without this, the geometric growth strategy of std::vector may trigger
-    // multiple reallocations when appending large batches to near-capacity vectors.
     if (newSize > SIZE_MAX - oldSize) {
         throw std::runtime_error("InMemorySeries: size overflow");
     }
     const size_t totalSize = oldSize + newSize;
-    timestamps.reserve(totalSize);
-    values.reserve(totalSize);
+    // Grow geometrically when more capacity is needed. An exact-size reserve
+    // here would leave capacity == size after every append, forcing the NEXT
+    // append to realloc and memcpy the entire series — O(L) copied bytes per
+    // batch instead of amortized O(1).
+    if (timestamps.capacity() < totalSize) {
+        const size_t growCap = std::max(totalSize, oldSize * 2);
+        timestamps.reserve(growCap);
+        values.reserve(growCap);
+    }
 
     // Append new data. insert() with iterators is optimized by the STL to
     // perform a single memcpy/memmove for trivially copyable types (uint64_t, double, bool).

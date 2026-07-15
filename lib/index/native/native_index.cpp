@@ -664,7 +664,14 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
     // ensuring index metadata lookups match data lookups without recomputation.
     std::string seriesKey = timestar::buildSeriesKey(measurement, tags, field);
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+    co_return co_await getOrCreateSeriesId(seriesId, measurement, tags, field);
+}
 
+// Fast overload: caller supplies the pre-computed series ID, so the common
+// already-indexed path does zero string building / hashing / map copying.
+seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 seriesId, const std::string& measurement,
+                                                              const std::map<std::string, std::string>& tags,
+                                                              const std::string& field) {
     // Fast path: already indexed (no string allocation needed)
     if (seriesCacheContains(seriesId)) {
         co_return seriesId;
@@ -1033,10 +1040,58 @@ seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>&
         co_return;
 
     for (const auto& op : ops) {
-        co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
+        // Use the pre-computed series ID when the producer supplied one (write
+        // handler always does) — skips buildSeriesKey + rehash + map copy.
+        SeriesId128 seriesId =
+            !op.seriesId.isZero()
+                ? co_await getOrCreateSeriesId(op.seriesId, op.measurement, op.tags, op.fieldName)
+                : co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
         auto typeStr = timestar::valueTypeName(op.valueType);
         if (!typeStr.empty()) {
             co_await setFieldType(op.measurement, op.fieldName, std::string(typeStr));
+        }
+        // First-batch day coverage: the data-shard batch path can only record
+        // days once the LocalId exists, which happens here. Recording the full
+        // [minTs, maxTs] day span is a safe superset (extra days reduce pruning;
+        // MISSING days would wrongly exclude the series from time-scoped queries).
+        if (op.maxTs >= op.minTs && op.maxTs > 0) {
+            co_await recordDaySpan(op.measurement, seriesId, op.minTs, op.maxTs);
+        }
+    }
+}
+
+seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, const SeriesId128& seriesId,
+                                             uint64_t minTs, uint64_t maxTs) {
+    auto localIdOpt = localIdMap_.getLocalId(seriesId);
+    if (!localIdOpt.has_value())
+        co_return;
+    const uint32_t localId = *localIdOpt;
+    const uint32_t firstDay = ke::dayBucketFromNs(minTs);
+    const uint32_t lastDay = ke::dayBucketFromNs(maxTs);
+    std::string dayCacheKey;
+    for (uint32_t day = firstDay; day <= lastDay; ++day) {
+        buildDayBitmapCacheKey(dayCacheKey, measurement, day);
+        (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
+    }
+}
+
+seastar::future<> NativeIndex::recordInsertDays(const std::string& measurement, const SeriesId128& seriesId,
+                                                const std::vector<uint64_t>& timestamps) {
+    // Exact per-day recording for the batch insert path (mirrors indexInsert's
+    // day loop). Skips silently when the series has no LocalId yet — the
+    // first-batch case is covered by the MetadataOp day-span path above.
+    auto localIdOpt = localIdMap_.getLocalId(seriesId);
+    if (!localIdOpt.has_value())
+        co_return;
+    const uint32_t localId = *localIdOpt;
+    std::string dayCacheKey;
+    uint32_t lastDay = UINT32_MAX;
+    for (uint64_t ts : timestamps) {
+        uint32_t day = ke::dayBucketFromNs(ts);
+        if (day != lastDay) {
+            buildDayBitmapCacheKey(dayCacheKey, measurement, day);
+            (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
+            lastDay = day;
         }
     }
 }
@@ -2424,7 +2479,10 @@ seastar::future<double> NativeIndex::estimateTagCardinality(const std::string& m
 
 template <class T>
 seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& insert) {
-    SeriesId128 seriesId = co_await getOrCreateSeriesId(insert.measurement, insert.getTags(), insert.field);
+    // insert.seriesId128() is cached by the write handler, so this avoids the
+    // buildSeriesKey + rehash and the tag-map copy of the by-value overload.
+    SeriesId128 seriesId = co_await getOrCreateSeriesId(insert.seriesId128(), insert.measurement, insert.getTags(),
+                                                        insert.field);
 
     // Phase 3: Record day bitmaps for time-scoped discovery
     auto localIdOpt = localIdMap_.getLocalId(seriesId);

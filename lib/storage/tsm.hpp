@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
+#include <span>
 #include <seastar/core/file.hh>
 #include <seastar/core/semaphore.hh>
 #include <string>
@@ -60,13 +61,14 @@ struct TSMIndexBlock {
     bool boolLatestValue = false;   // Value at latest timestamp (Boolean)
 };
 
-// Batch of contiguous blocks for optimized I/O
+// Batch of contiguous blocks for optimized I/O.
+// `blocks` is a zero-copy view into the caller's block vector (batches are
+// always consecutive runs of the input), so the input passed to
+// groupContiguousBlocks() must outlive the returned batches.
 struct BlockBatch {
-    uint64_t startOffset;               // Offset of first block in batch
-    uint64_t totalSize;                 // Sum of all block sizes (uint64_t to avoid overflow)
-    std::vector<TSMIndexBlock> blocks;  // Blocks in this batch
-
-    BlockBatch() : startOffset(0), totalSize(0) {}
+    uint64_t startOffset = 0;                // Offset of first block in batch
+    uint64_t totalSize = 0;                  // Sum of all block sizes (uint64_t to avoid overflow)
+    std::span<const TSMIndexBlock> blocks;   // Blocks in this batch (view, not owned)
 };
 
 // Sparse index entry for lazy loading
@@ -95,8 +97,11 @@ struct TSMIndexEntry {
     TSMValueType seriesType;
     std::vector<TSMIndexBlock> indexBlocks;
     // String dictionary (Phase 3): populated for dictionary-encoded String series.
-    // When non-empty, string blocks use varint IDs referencing this dictionary.
-    std::vector<std::string> stringDictionary;
+    // When non-null, string blocks use varint IDs referencing this dictionary.
+    // Shared + immutable: readers bump the refcount (keeps the dictionary alive
+    // across co_await suspensions even if the LRU entry is evicted) instead of
+    // deep-copying every string per read call.
+    std::shared_ptr<const std::vector<std::string>> stringDictionary;
 };
 
 namespace timestar {
@@ -107,8 +112,10 @@ template <>
 struct CacheSizeEstimator<::TSMIndexEntry> {
     static size_t estimate(const ::TSMIndexEntry& entry) {
         size_t bytes = sizeof(::TSMIndexEntry) + entry.indexBlocks.size() * sizeof(::TSMIndexBlock);
-        for (const auto& s : entry.stringDictionary) {
-            bytes += sizeof(std::string) + s.capacity();
+        if (entry.stringDictionary) {
+            for (const auto& s : *entry.stringDictionary) {
+                bytes += sizeof(std::string) + s.capacity();
+            }
         }
         return bytes;
     }
@@ -254,8 +261,9 @@ public:
         return PointResult{it->second.minTime, it->second.firstValue};
     }
 
-    // Block batching utilities
-    std::vector<BlockBatch> groupContiguousBlocks(const std::vector<TSMIndexBlock>& blocks) const;
+    // Block batching utilities.  Returned batches are zero-copy views into
+    // `blocks`, which must therefore outlive them.
+    std::vector<BlockBatch> groupContiguousBlocks(std::span<const TSMIndexBlock> blocks) const;
     template <class T>
     std::unique_ptr<TSMBlock<T>> decodeBlock(Slice& blockSlice, uint32_t blockSize, uint64_t startTime,
                                              uint64_t endTime, const std::vector<std::string>* stringDict = nullptr);

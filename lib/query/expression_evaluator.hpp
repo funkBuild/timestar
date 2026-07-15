@@ -65,6 +65,12 @@ struct AlignedSeries {
     AlignedSeries operator*(double scalar) const;
     AlignedSeries operator/(double scalar) const;
 
+    // Scalar-left / IEEE variants (used by the evaluator's scalar-literal fast
+    // path; bit-identical to element-wise ops against a constant series):
+    AlignedSeries rsub(double scalar) const;      // scalar - values[i]
+    AlignedSeries rdiv(double scalar) const;      // scalar / values[i] (IEEE: /0 -> Inf/NaN)
+    AlignedSeries div_ieee(double scalar) const;  // values[i] / scalar (IEEE, no throw, true divide)
+
     // Unary operations
     AlignedSeries negate() const;
     AlignedSeries abs() const;
@@ -73,6 +79,9 @@ struct AlignedSeries {
     AlignedSeries sqrt() const;
     AlignedSeries ceil() const;
     AlignedSeries floor() const;
+    AlignedSeries exp() const;         // e^x (SIMD); NaN passthrough
+    AlignedSeries round_nearest() const;  // Nearest integer, halves away from zero (SIMD); NaN passthrough
+    AlignedSeries sign() const;        // -1/0/+1 (SIMD); NaN passthrough
 
     // Transform functions (unary)
     AlignedSeries diff() const;            // Difference between consecutive points
@@ -85,12 +94,21 @@ struct AlignedSeries {
     AlignedSeries rate() const;      // Per-second rate; handles counter resets; first point NaN
     AlignedSeries irate() const;     // Instantaneous rate using last two points (constant series)
     AlignedSeries increase() const;  // Total increase over the series (sum of positive diffs, scalar)
+    // Gauge derivative / range summaries
+    AlignedSeries deriv() const;    // Per-second first derivative (SIMD); negatives allowed; first point NaN
+    AlignedSeries delta() const;    // Last non-NaN minus first non-NaN (constant series; NaN if no data)
+    AlignedSeries idelta() const;   // Difference of last two non-NaN values (constant series)
+    AlignedSeries changes() const;  // Count of value changes between consecutive non-NaN points (constant series)
+    AlignedSeries resets() const;   // Count of decreases between consecutive non-NaN points (constant series)
 
     // Gap-fill / interpolation functions
     AlignedSeries fill_forward() const;   // LOCF: replace NaN with previous non-NaN; leading NaNs stay NaN
     AlignedSeries fill_backward() const;  // NOCB: replace NaN with next non-NaN; trailing NaNs stay NaN
     AlignedSeries fill_linear() const;    // Linear interpolation using timestamps; leading/trailing NaN runs stay NaN
+    AlignedSeries fill_spline() const;    // Natural cubic spline through known values; leading/trailing NaN stay NaN
     AlignedSeries fill_value(double v) const;  // Replace every NaN with constant v
+    // Gaussian kernel smoothing (radius ceil(3*sigma)); NaN-aware renormalization
+    AlignedSeries gaussian_smooth(double sigma) const;
 
     // Accumulation functions
     AlignedSeries cumsum() const;    // Running cumulative sum; NaN treated as 0 (skip-NaN)
@@ -98,6 +116,7 @@ struct AlignedSeries {
 
     // Normalization
     AlignedSeries normalize() const;  // Rescale to [0,1]; constant or single-point → 0.0; NaN passthrough
+    AlignedSeries standardize() const;  // Global z-score (SIMD); constant series → 0.0; NaN passthrough
 
     // Binary functions
     static AlignedSeries min(const AlignedSeries& a, const AlignedSeries& b);
@@ -122,6 +141,9 @@ struct AlignedSeries {
     AlignedSeries rolling_min(int N) const;     // N-point rolling minimum
     AlignedSeries rolling_max(int N) const;     // N-point rolling maximum
     AlignedSeries rolling_stddev(int N) const;  // N-point rolling population stddev (ddof=0)
+    AlignedSeries rolling_sum(int N) const;     // N-point rolling sum (Kahan-compensated)
+    AlignedSeries rolling_median(int N) const;  // N-point rolling median (sorted sliding window)
+    AlignedSeries rolling_percentile(int N, double p) const;  // N-point rolling p-th percentile, p in [0,100]
     AlignedSeries zscore(int N) const;          // N-point rolling z-score: (v - mean) / stddev; 0 if stddev==0
 
     // Exponential moving average
@@ -156,7 +178,34 @@ private:
     static constexpr int MAX_EVAL_DEPTH = 100;
     int evalDepth_ = 0;
 
-    AlignedSeries evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults);
+    // Borrowed-or-owned evaluation result. QUERY_REF leaves borrow the series
+    // straight from the QueryResultMap (no O(N) values copy); computed nodes
+    // own their result. Borrowed pointers reference the caller-owned map, which
+    // outlives the entire evaluation.
+    class EvalResult {
+    public:
+        explicit EvalResult(const AlignedSeries* borrowed) : borrowed_(borrowed) {}
+        explicit EvalResult(AlignedSeries&& owned) : owned_(std::move(owned)) {}
+
+        EvalResult(EvalResult&&) = default;
+        EvalResult& operator=(EvalResult&&) = default;
+
+        const AlignedSeries& get() const { return borrowed_ ? *borrowed_ : owned_; }
+
+        // Convert to an owned AlignedSeries (copies only when borrowed).
+        AlignedSeries intoOwned() && { return borrowed_ ? *borrowed_ : std::move(owned_); }
+
+    private:
+        const AlignedSeries* borrowed_ = nullptr;
+        AlignedSeries owned_;
+    };
+
+    EvalResult evaluateNode(const ExpressionNode& node, const QueryResultMap& queryResults);
+
+    // Timestamp-vector pairs already verified element-equal by a binary op.
+    // Avoids repeated O(N) deep compares when the same two source series
+    // appear multiple times in one formula (e.g. "(a - b) / (a + b)").
+    std::vector<std::pair<const void*, const void*>> verifiedAlignedPairs_;
 
     const AlignedSeries& evaluateQueryRef(const QueryRef& ref, const QueryResultMap& queryResults);
 

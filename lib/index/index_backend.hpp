@@ -23,6 +23,18 @@ struct MetadataOp {
     std::string measurement;
     std::string fieldName;
     std::map<std::string, std::string> tags;
+    // Timestamp range of the insert that created this op. Used to record
+    // day bitmaps for the FIRST batch of a new series (whose LocalId does
+    // not exist yet when the data-shard batch path tries to record days).
+    // 0/0 = unknown (day recording skipped).
+    uint64_t minTs = 0;
+    uint64_t maxTs = 0;
+    // Pre-computed series ID (hash of measurement+tags+field). Populated by
+    // the write handler where the ID is already known, so downstream shard
+    // routing and getOrCreateSeriesId can skip rebuilding + rehashing the
+    // series key. Zero (default) = unknown; consumers must fall back to
+    // computing it from the components.
+    SeriesId128 seriesId;
 };
 
 enum IndexKeyType : uint8_t {

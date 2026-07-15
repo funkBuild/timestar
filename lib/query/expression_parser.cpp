@@ -316,10 +316,20 @@ std::optional<BinaryOpType> ExpressionParser::getBinaryOp() const {
 bool ExpressionParser::isFunction(const std::string& name) const {
     static const std::set<std::string> functions = {
         "abs", "log", "log10", "sqrt", "ceil", "floor",  // unary math
+        "exp", "round", "sign",                          // unary math (continued)
+        "deriv", "delta", "idelta",                      // gauge derivative / range summaries
+        "changes", "resets",                             // change diagnostics
+        "standardize",                                   // global z-score normalization
+        "rolling_sum", "rolling_median",                 // rolling window (continued)
+        "rolling_percentile",                            // rolling window percentile
+        "count_of_series", "stddev_of_series",           // cross-series (continued)
+        "histogram_quantile",                            // quantile from cumulative buckets
         "diff", "monotonic_diff", "default_zero",        // unary transform
         "count_nonzero", "count_not_null",               // unary aggregating
         "rate", "irate", "increase",                     // counter-rate functions
         "fill_forward", "fill_backward", "fill_linear",  // gap-fill (unary)
+        "fill_spline",                                   // cubic-spline gap-fill (unary)
+        "gaussian_smooth",                               // Gaussian kernel smoothing
         "cumsum", "integral",                            // accumulation (unary)
         "normalize",                                     // normalization (unary)
         "min", "max", "pow", "clamp",                    // multi-arg math
@@ -399,6 +409,8 @@ std::optional<UnaryOpType> ExpressionParser::getUnaryFunction(const std::string&
         return UnaryOpType::FILL_BACKWARD;
     if (name == "fill_linear")
         return UnaryOpType::FILL_LINEAR;
+    if (name == "fill_spline")
+        return UnaryOpType::FILL_SPLINE;
     // Accumulation functions
     if (name == "cumsum")
         return UnaryOpType::CUMSUM;
@@ -407,6 +419,27 @@ std::optional<UnaryOpType> ExpressionParser::getUnaryFunction(const std::string&
     // Normalization
     if (name == "normalize")
         return UnaryOpType::NORMALIZE;
+    if (name == "standardize")
+        return UnaryOpType::STANDARDIZE;
+    // Element-wise math (continued)
+    if (name == "exp")
+        return UnaryOpType::EXP;
+    if (name == "round")
+        return UnaryOpType::ROUND;
+    if (name == "sign")
+        return UnaryOpType::SIGN;
+    // Gauge derivative / range summaries
+    if (name == "deriv")
+        return UnaryOpType::DERIV;
+    if (name == "delta")
+        return UnaryOpType::DELTA;
+    if (name == "idelta")
+        return UnaryOpType::IDELTA;
+    // Change diagnostics
+    if (name == "changes")
+        return UnaryOpType::CHANGES;
+    if (name == "resets")
+        return UnaryOpType::RESETS;
     return std::nullopt;
 }
 
@@ -442,12 +475,21 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
         return FunctionType::ROLLING_MAX;
     if (name == "rolling_stddev")
         return FunctionType::ROLLING_STDDEV;
+    if (name == "rolling_sum")
+        return FunctionType::ROLLING_SUM;
+    if (name == "rolling_median")
+        return FunctionType::ROLLING_MEDIAN;
+    if (name == "rolling_percentile")
+        return FunctionType::ROLLING_PERCENTILE;
     // Gap-fill with constant scalar
     if (name == "fill_value")
         return FunctionType::FILL_VALUE;
     // Exponential moving average
     if (name == "ema")
         return FunctionType::EMA;
+    // Gaussian kernel smoothing
+    if (name == "gaussian_smooth")
+        return FunctionType::GAUSSIAN_SMOOTH;
     // Double exponential smoothing (Holt's linear method)
     if (name == "holt_winters")
         return FunctionType::HOLT_WINTERS;
@@ -473,6 +515,12 @@ std::optional<FunctionType> ExpressionParser::getMultiArgFunction(const std::str
         return FunctionType::MAX_OF_SERIES;
     if (name == "percentile_of_series")
         return FunctionType::PERCENTILE_OF_SERIES;
+    if (name == "count_of_series")
+        return FunctionType::COUNT_OF_SERIES;
+    if (name == "stddev_of_series")
+        return FunctionType::STDDEV_OF_SERIES;
+    if (name == "histogram_quantile")
+        return FunctionType::HISTOGRAM_QUANTILE;
     return std::nullopt;
 }
 
@@ -813,9 +861,19 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
         bool isVariadic =
             multiFunc.value() == FunctionType::AVG_OF_SERIES || multiFunc.value() == FunctionType::SUM_OF_SERIES ||
             multiFunc.value() == FunctionType::MIN_OF_SERIES || multiFunc.value() == FunctionType::MAX_OF_SERIES ||
-            multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES;
+            multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES ||
+            multiFunc.value() == FunctionType::COUNT_OF_SERIES || multiFunc.value() == FunctionType::STDDEV_OF_SERIES;
 
-        if (isVariadic) {
+        if (multiFunc.value() == FunctionType::HISTOGRAM_QUANTILE) {
+            // histogram_quantile(p, le_1, b_1, ..., le_n, b_n, b_inf):
+            // p + n (bound, bucket) pairs + the +Inf bucket -> even count >= 4.
+            if (args.size() < 4 || args.size() % 2 != 0) {
+                throw ExpressionParseException(
+                    "Function 'histogram_quantile' expects p, at least one (le, bucket) pair, and the +Inf bucket "
+                    "(an even argument count >= 4), got " +
+                    std::to_string(args.size()));
+            }
+        } else if (isVariadic) {
             size_t minArgs = (multiFunc.value() == FunctionType::PERCENTILE_OF_SERIES) ? 2 : 1;
             if (args.size() < minArgs) {
                 throw ExpressionParseException("Function '" + name + "' requires at least " + std::to_string(minArgs) +
@@ -824,7 +882,8 @@ std::unique_ptr<ExpressionNode> ExpressionParser::parseFunctionCall(const std::s
         } else {
             // Fixed argument count
             size_t expected = 2;
-            if (multiFunc.value() == FunctionType::CLAMP || multiFunc.value() == FunctionType::HOLT_WINTERS) {
+            if (multiFunc.value() == FunctionType::CLAMP || multiFunc.value() == FunctionType::HOLT_WINTERS ||
+                multiFunc.value() == FunctionType::ROLLING_PERCENTILE) {
                 expected = 3;
             }
             if (args.size() != expected) {

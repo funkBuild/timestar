@@ -138,26 +138,31 @@ inline void ffor_pack(const int64_t* values, size_t count, int64_t base, uint8_t
     }
 
     // Generic fallback for non-power-of-2 bit-widths.
-    // Values may span word boundaries, requiring the spanning check.
-    const size_t n_words = ffor_packed_words(count, bw);
-    std::memset(out, 0, n_words * sizeof(uint64_t));
-
+    // Register-accumulator bit stream: each output word is written exactly once
+    // (no pre-memset, no per-value read-modify-write to memory). Produces the
+    // identical little-endian-within-word bit layout as the historical
+    // bit_pos-based version.
     const uint64_t mask = (1ULL << bw) - 1;
-    size_t bit_pos = 0;
+    uint64_t acc = 0;
+    unsigned acc_bits = 0;
+    size_t w = 0;
 
     for (size_t i = 0; i < count; ++i) {
         const uint64_t delta = static_cast<uint64_t>(values[i] - base) & mask;
-        const size_t word_idx = bit_pos >> 6;   // bit_pos / 64
-        const unsigned bit_idx = bit_pos & 63;  // bit_pos % 64
-
-        out[word_idx] |= delta << bit_idx;
-
-        // Handle value spanning two words
-        if (bit_idx + bw > 64) {
-            out[word_idx + 1] |= delta >> (64 - bit_idx);
+        acc |= delta << acc_bits;
+        if (acc_bits + bw >= 64) {
+            out[w++] = acc;
+            // bits of `delta` already emitted; acc_bits > 0 here (bw < 64),
+            // so the shift amount is in [1, 63] — no UB.
+            const unsigned consumed = 64 - acc_bits;
+            acc = (consumed < bw) ? (delta >> consumed) : 0;
+            acc_bits = acc_bits + bw - 64;
+        } else {
+            acc_bits += bw;
         }
-
-        bit_pos += bw;
+    }
+    if (acc_bits > 0) {
+        out[w] = acc;
     }
 }
 
@@ -199,24 +204,56 @@ inline void ffor_pack_u64(const uint64_t* values, size_t count, uint64_t base, u
     }
 
     // Generic fallback for non-power-of-2 bit-widths.
-    const size_t n_words = ffor_packed_words(count, bw);
-    std::memset(out, 0, n_words * sizeof(uint64_t));
-
+    // Register-accumulator bit stream (see ffor_pack): one write per word,
+    // no pre-memset, identical bit layout.
     const uint64_t mask = (1ULL << bw) - 1;
-    size_t bit_pos = 0;
+    uint64_t acc = 0;
+    unsigned acc_bits = 0;
+    size_t w = 0;
 
     for (size_t i = 0; i < count; ++i) {
         const uint64_t delta = (values[i] - base) & mask;
-        const size_t word_idx = bit_pos >> 6;
-        const unsigned bit_idx = bit_pos & 63;
-
-        out[word_idx] |= delta << bit_idx;
-
-        if (bit_idx + bw > 64) {
-            out[word_idx + 1] |= delta >> (64 - bit_idx);
+        acc |= delta << acc_bits;
+        if (acc_bits + bw >= 64) {
+            out[w++] = acc;
+            const unsigned consumed = 64 - acc_bits;  // in [1, 63]: bw < 64 forces acc_bits > 0 here
+            acc = (consumed < bw) ? (delta >> consumed) : 0;
+            acc_bits = acc_bits + bw - 64;
+        } else {
+            acc_bits += bw;
         }
+    }
+    if (acc_bits > 0) {
+        out[w] = acc;
+    }
+}
 
-        bit_pos += bw;
+// Pack small unsigned values (dictionary indices, bw <= 8) straight from a
+// uint8_t array — avoids the caller widening to int64 first. No FOR base.
+// Same bit layout as ffor_pack(values_as_i64, count, 0, bw, out).
+inline void ffor_pack_u8(const uint8_t* values, size_t count, uint8_t bw, uint64_t* out) {
+    if (bw == 0 || count == 0)
+        return;
+
+    const uint64_t mask = (1ULL << bw) - 1;
+    uint64_t acc = 0;
+    unsigned acc_bits = 0;
+    size_t w = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        const uint64_t delta = static_cast<uint64_t>(values[i]) & mask;
+        acc |= delta << acc_bits;
+        if (acc_bits + bw >= 64) {
+            out[w++] = acc;
+            const unsigned consumed = 64 - acc_bits;  // in [1, 63]: bw <= 8 forces acc_bits > 0 here
+            acc = (consumed < bw) ? (delta >> consumed) : 0;
+            acc_bits = acc_bits + bw - 64;
+        } else {
+            acc_bits += bw;
+        }
+    }
+    if (acc_bits > 0) {
+        out[w] = acc;
     }
 }
 

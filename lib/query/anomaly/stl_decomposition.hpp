@@ -4,6 +4,7 @@
 #include "simd_anomaly.hpp"
 
 #include <cstddef>
+#include <span>
 #include <vector>
 
 namespace timestar {
@@ -31,11 +32,12 @@ struct STLConfig {
 class STLDecomposition {
 public:
     // Decompose time series into seasonal, trend, and residual components
-    static STLComponents decompose(const std::vector<double>& values, const STLConfig& config);
+    static STLComponents decompose(std::span<const double> values, const STLConfig& config);
 
 private:
-    // LOESS (Locally Estimated Scatterplot Smoothing) smoother
-    static std::vector<double> loess(const std::vector<double>& x, const std::vector<double>& y, size_t windowSize,
+    // LOESS (Locally Estimated Scatterplot Smoothing) smoother.
+    // The x coordinates are implicitly the indices 0..n-1 of y.
+    static std::vector<double> loess(const std::vector<double>& y, size_t windowSize,
                                      const std::vector<double>& weights = {});
 
     // Simple moving average for trend extraction

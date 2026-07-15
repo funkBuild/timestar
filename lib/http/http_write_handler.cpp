@@ -240,13 +240,15 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     }
     mwp.measurement = measurementIt->second.get<std::string>();
 
-    // Extract tags
+    // Extract tags into a local map, then wrap once in the shared_ptr that all
+    // downstream consumers (fields, TimeStarInserts) will share.
+    std::map<std::string, std::string> localTags;
     auto tagsIt = obj.find("tags");
     if (tagsIt != obj.end() && tagsIt->second.is_object()) {
         auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
         for (const auto& [tagKey, tagValue] : tagsObj) {
             if (tagValue.is_string()) {
-                mwp.tags[tagKey] = tagValue.get<std::string>();
+                localTags[tagKey] = tagValue.get<std::string>();
             }
         }
     }
@@ -259,7 +261,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             if (!err.empty())
                 throw std::invalid_argument(err);
         }
-        for (const auto& [key, value] : mwp.tags) {
+        for (const auto& [key, value] : localTags) {
             if (!isValidName(key)) {
                 auto err = validateName(key, "Tag key '" + key + "'");
                 if (!err.empty())
@@ -272,6 +274,8 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             }
         }
     }
+
+    mwp.tags = std::make_shared<const std::map<std::string, std::string>>(std::move(localTags));
 
     // Parse fields - handle both scalars and arrays
     auto fieldsIt = obj.find("fields");
@@ -453,15 +457,15 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
 bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t defaultTimestampNs,
                                             MultiWritePoint& mwp) {
     mwp.measurement = std::move(fwp.measurement);
-    mwp.tags = std::move(fwp.tags);
 
     // Validate names
     if (!isValidName(mwp.measurement))
         return false;
-    for (const auto& [key, value] : mwp.tags) {
+    for (const auto& [key, value] : fwp.tags) {
         if (!isValidName(key) || !isValidTagValue(value))
             return false;
     }
+    mwp.tags = std::make_shared<const std::map<std::string, std::string>>(std::move(fwp.tags));
 
     // Move fields as DOUBLE type
     for (auto& [fieldName, values] : fwp.fields) {
@@ -570,7 +574,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     tsl::robin_map<std::string, CoalesceCandidate> candidates;
     // Pre-allocate for the expected number of unique series keys.
     // A typical write point has 1-3 fields, so estimate writes * 2.
-    candidates.reserve(writes_array.size() * 2);
+    // Cap the reservation: robin_map at load factor 0.5 with ~330-byte slots
+    // would zero ~22MB for a 10K-write batch, yet unique series are almost
+    // always far fewer than writes. Beyond the cap the map grows naturally.
+    candidates.reserve(std::min(writes_array.size() * 2, size_t(1024)));
     [[maybe_unused]] size_t totalWritesProcessed = 0;
     size_t entriesSkipped = 0;
 
@@ -600,10 +607,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     };
 
     // Helper lambda: initialize a new CoalesceCandidate with metadata.
-    // Takes a lw_shared_ptr to the tag map so that all candidates from the
+    // Takes a shared_ptr to the tag map so that all candidates from the
     // same write point share a single allocation (O(1) pointer copy).
     auto initCandidate = [](CoalesceCandidate& candidate, const std::string& seriesKey, const std::string& measurement,
-                            seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
+                            std::shared_ptr<const std::map<std::string, std::string>> tags,
                             const std::string& fieldName, TSMValueType valueType, const std::string& groupKey) {
         candidate.seriesKey = seriesKey;
         candidate.groupKey = groupKey;
@@ -615,10 +622,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
     // Helper lambda: find or create a candidate, handling type mismatch and overflow
     // by creating disambiguated keys. Returns a reference to the target candidate.
-    // Takes lw_shared_ptr<const map> by value so the shared tag map is propagated
+    // Takes shared_ptr<const map> by value so the shared tag map is propagated
     // without copying the underlying map data.
     auto findOrCreateCandidate = [&](const std::string& seriesKey, const std::string& measurement,
-                                     seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
+                                     std::shared_ptr<const std::map<std::string, std::string>> tags,
                                      const std::string& fieldName, TSMValueType valueType, size_t numValuesToAdd,
                                      const std::string& groupKey) -> CoalesceCandidate& {
         // Single hash/probe: try_emplace default-constructs the candidate only when the
@@ -677,6 +684,41 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         return c;
     };
 
+    // One-entry series memo (N4): batches are typically grouped by series, so
+    // consecutive writes usually share the same measurement+tags. When the
+    // current write's measurement and tags DOM match the previous write's, the
+    // series-key prefix and shared tag map are reused, skipping tag map
+    // construction, validation, prefix building, and the shared_ptr allocation.
+    bool memoValid = false;
+    std::string_view memoMeasurement;                        // views into writes_array (stable for the loop)
+    const json_value_t::object_t* memoTagsObj = nullptr;     // nullptr == no/empty tags object
+    std::string seriesKeyPrefix;                             // hoisted: reused capacity across writes
+    std::shared_ptr<const std::map<std::string, std::string>> sharedTags;
+
+    // DOM-to-DOM tag-object equality (string-valued tags only; any non-string
+    // tag value falls back to the slow path).
+    auto sameTagsObj = [](const json_value_t::object_t* a, const json_value_t::object_t* b) -> bool {
+        const size_t na = a ? a->size() : 0;
+        const size_t nb = b ? b->size() : 0;
+        if (na != nb)
+            return false;
+        if (na == 0)
+            return true;
+        auto ia = a->begin();
+        auto ib = b->begin();
+        for (; ia != a->end(); ++ia, ++ib) {
+            if (ia->first != ib->first)
+                return false;
+            if (!ia->second.is_string() || !ib->second.is_string())
+                return false;  // conservative: force slow path
+            if (ia->second.get<std::string>() != ib->second.get<std::string>())
+                return false;
+        }
+        return true;
+    };
+
+    std::string seriesKey;  // hoisted: reused capacity across fields/writes
+
     // Parse writes directly from JSON objects for better performance
     for (const auto& write : writes_array) {
         totalWritesProcessed++;
@@ -691,7 +733,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             auto measurementIt = writeObj.find("measurement");
             if (measurementIt == writeObj.end() || !measurementIt->second.is_string())
                 continue;
-            std::string measurement = measurementIt->second.get<std::string>();
+            const std::string& measurement = measurementIt->second.get<std::string>();
 
             // Validate measurement name
             {
@@ -735,47 +777,67 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 timestamps.push_back(defaultTimestampNs);
             }
 
-            // Extract tags into a local map, validate, then wrap in a
-            // lw_shared_ptr so all CoalesceCandidates from this write point
-            // share a single allocation (pointer copy instead of map copy).
-            std::map<std::string, std::string> localTags;
-            auto tagsIt = writeObj.find("tags");
-            if (tagsIt != writeObj.end() && tagsIt->second.is_object()) {
-                auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
-                for (const auto& [tagKey, tagValue] : tagsObj) {
-                    if (tagValue.is_string()) {
-                        // Guard with the allocation-free predicates; build the error-context
-                        // string only on the rare invalid path (matches parseMultiWritePoint).
-                        if (!isValidName(tagKey)) [[unlikely]]
-                            throw std::invalid_argument(validateName(tagKey, "Tag key '" + tagKey + "'"));
-                        auto val = tagValue.get<std::string>();
-                        if (!isValidTagValue(val)) [[unlikely]]
-                            throw std::invalid_argument(validateTagValue(val, "Tag value for '" + tagKey + "'"));
-                        localTags[tagKey] = std::move(val);
+            // Locate the tags DOM object (nullptr when absent / not an object).
+            const json_value_t::object_t* tagsObjPtr = nullptr;
+            {
+                auto tagsIt = writeObj.find("tags");
+                if (tagsIt != writeObj.end() && tagsIt->second.is_object()) {
+                    tagsObjPtr = &tagsIt->second.get<json_value_t::object_t>();
+                }
+            }
+
+            // Memo hit: same measurement + identical tags as the previous
+            // write — reuse seriesKeyPrefix and sharedTags as-is.
+            const bool memoHit = memoValid && memoMeasurement == measurement && sameTagsObj(tagsObjPtr, memoTagsObj);
+            if (!memoHit) {
+                memoValid = false;  // invalidate while rebuilding
+
+                // Extract tags into a local map, validate, then wrap in a
+                // shared_ptr so all CoalesceCandidates from this write point
+                // share a single allocation (pointer copy instead of map copy).
+                std::map<std::string, std::string> localTags;
+                if (tagsObjPtr != nullptr) {
+                    for (const auto& [tagKey, tagValue] : *tagsObjPtr) {
+                        if (tagValue.is_string()) {
+                            // Guard with the allocation-free predicates; build the error-context
+                            // string only on the rare invalid path (matches parseMultiWritePoint).
+                            if (!isValidName(tagKey)) [[unlikely]]
+                                throw std::invalid_argument(validateName(tagKey, "Tag key '" + tagKey + "'"));
+                            auto val = tagValue.get<std::string>();
+                            if (!isValidTagValue(val)) [[unlikely]]
+                                throw std::invalid_argument(validateTagValue(val, "Tag value for '" + tagKey + "'"));
+                            localTags[tagKey] = std::move(val);
+                        }
                     }
                 }
-            }
 
-            // Pre-build measurement+tags prefix for series key construction (once per write point)
-            std::string seriesKeyPrefix;
-            {
-                size_t prefixSize = measurement.length();
-                for (const auto& [tagKey, tagValue] : localTags) {
-                    prefixSize += 1 + tagKey.size() + 1 + tagValue.size();  // ",key=value"
+                // Pre-build measurement+tags prefix for series key construction (once per write point)
+                {
+                    size_t prefixSize = measurement.length();
+                    for (const auto& [tagKey, tagValue] : localTags) {
+                        prefixSize += 1 + tagKey.size() + 1 + tagValue.size();  // ",key=value"
+                    }
+                    seriesKeyPrefix.reserve(prefixSize);
                 }
-                seriesKeyPrefix.reserve(prefixSize);
-            }
-            seriesKeyPrefix = measurement;
-            for (const auto& [tagKey, tagValue] : localTags) {
-                seriesKeyPrefix += ",";
-                seriesKeyPrefix += tagKey;
-                seriesKeyPrefix += "=";
-                seriesKeyPrefix += tagValue;
-            }
+                seriesKeyPrefix = measurement;
+                for (const auto& [tagKey, tagValue] : localTags) {
+                    seriesKeyPrefix += ",";
+                    seriesKeyPrefix += tagKey;
+                    seriesKeyPrefix += "=";
+                    seriesKeyPrefix += tagValue;
+                }
 
-            // Create the shared tag map once per write point. All fields from
-            // this write point will share this single allocation via lw_shared_ptr.
-            auto sharedTags = seastar::make_lw_shared<const std::map<std::string, std::string>>(std::move(localTags));
+                // Create the shared tag map once per write point. All fields from
+                // this write point will share this single allocation via shared_ptr,
+                // and the same allocation flows through MultiWritePoint into the
+                // TimeStarInserts (which may cross shard boundaries).
+                sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(localTags));
+
+                // Prefix + tags fully built: record the memo for the next write.
+                memoMeasurement = measurement;
+                memoTagsObj = tagsObjPtr;
+                memoValid = true;
+            }
 
             // Extract fields and process each field - handles both scalar and array values
             auto fieldsIt = writeObj.find("fields");
@@ -789,8 +851,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
                 if (!isValidName(fieldName)) [[unlikely]]
                     throw std::invalid_argument(validateName(fieldName, "Field name '" + fieldName + "'"));
 
-                // Build series key
-                std::string seriesKey;
+                // Build series key (hoisted buffer: capacity reused across fields)
                 seriesKey.reserve(seriesKeyPrefix.length() + fieldName.length() + 1);
                 seriesKey = seriesKeyPrefix;
                 seriesKey += " ";
@@ -974,7 +1035,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
                 MultiWritePoint mwp;
                 mwp.measurement = candidate.measurement;
-                mwp.tags = *candidate.sharedTags;
+                mwp.tags = candidate.sharedTags;  // pointer copy, not map copy
                 mwp.timestamps = std::move(candidate.timestamps);
 
                 mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
@@ -986,7 +1047,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
         MultiWritePoint mwp;
         mwp.measurement = firstCandidate.measurement;
-        mwp.tags = *firstCandidate.sharedTags;
+        mwp.tags = firstCandidate.sharedTags;  // pointer copy, not map copy
         mwp.timestamps = std::move(firstCandidate.timestamps);
 
         // NOTE: Don't sort timestamps here because field arrays are in the same original order
@@ -1015,7 +1076,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
         MultiWritePoint mwp;
         mwp.measurement = candidate.measurement;
-        mwp.tags = *candidate.sharedTags;
+        mwp.tags = candidate.sharedTags;  // pointer copy, not map copy
         mwp.timestamps = std::move(candidate.timestamps);
 
         mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
@@ -1064,43 +1125,48 @@ bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::str
     return true;
 }
 
-seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(MultiWritePoint& point) {
-    // Local metadata tracking — each coroutine gets its own copies so there
-    // is no shared mutable state when multiple coroutines run concurrently.
-    std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
-    std::vector<MetaOp> metaOps;
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_total = std::chrono::high_resolution_clock::now();
-#endif
-
+void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAccumulator& acc) {
     // No artificial batch splitting -- the WAL enforces its own 16 MiB per-segment
     // limit (MAX_WAL_SIZE) and will signal rollover if a single insert exceeds it.
     // Splitting here only adds redundant copies and sequential cross-shard roundtrips.
 
-    // Group inserts by shard to reduce cross-shard operations and process them in batches
-    LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Processing MultiWritePoint: {} timestamps × {} fields",
+    LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Accumulating MultiWritePoint: {} timestamps × {} fields",
                     point.timestamps.size(), point.fields.size());
 
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_grouping = std::chrono::high_resolution_clock::now();
-#endif
-
-    // NEW APPROACH: Keep arrays intact - create ONE TimeStarInsert per field with ALL timestamps/values
-    // Group by (shard, type) to batch properly
-    // Use pre-sized vectors instead of std::map since shard IDs are small integers [0, smp::count)
-    const size_t shardCount = seastar::smp::count;
-    std::vector<std::vector<TimeStarInsert<double>>> shardDoubleInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<bool>>> shardBoolInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<std::string>>> shardStringInserts(shardCount);
-    std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegerInserts(shardCount);
+    // Keep arrays intact - create ONE TimeStarInsert per field with ALL timestamps/values,
+    // grouped by (shard, type) into the request-level accumulator vectors.
+    std::vector<std::vector<TimeStarInsert<double>>>& shardDoubleInserts = acc.shardDoubles;
+    std::vector<std::vector<TimeStarInsert<bool>>>& shardBoolInserts = acc.shardBools;
+    std::vector<std::vector<TimeStarInsert<std::string>>>& shardStringInserts = acc.shardStrings;
+    std::vector<std::vector<TimeStarInsert<int64_t>>>& shardIntegerInserts = acc.shardIntegers;
+    std::unordered_set<SeriesId128, SeriesId128::Hash>& seenMF = acc.seenMF;
+    std::vector<MetaOp>& metaOps = acc.metaOps;
 
     // Process each field - create ONE insert with ALL timestamps and values.
     // Use shared_ptr for tags and timestamps so that all field inserts from
     // the same multi-field point share a single allocation instead of making
     // N-1 copies (for N fields). This is safe across Seastar shard boundaries
-    // because shared_ptr uses atomic refcounting.
-    auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(point.tags));
+    // because shared_ptr uses atomic refcounting. The tag map is already
+    // shared: producers wrap it once and we just take the pointer (no deep
+    // copy + re-wrap per point).
+    auto sharedTags = point.tags ? std::move(point.tags)
+                                 : std::make_shared<const std::map<std::string, std::string>>();
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
+
+    // Timestamp range for MetadataOp day-bitmap coverage (first batch of a
+    // new series). Computed lazily — metaOps are only emitted for unknown
+    // series, so the common all-known path never pays the minmax scan.
+    uint64_t mwpMinTs = 0, mwpMaxTs = 0;
+    bool mwpTsRangeComputed = false;
+    auto tsRange = [&]() -> std::pair<uint64_t, uint64_t> {
+        if (!mwpTsRangeComputed && !sharedTimestamps->empty()) {
+            auto [mn, mx] = std::minmax_element(sharedTimestamps->begin(), sharedTimestamps->end());
+            mwpMinTs = *mn;
+            mwpMaxTs = *mx;
+            mwpTsRangeComputed = true;
+        }
+        return {mwpMinTs, mwpMaxTs};
+    };
 
     // Pre-build the measurement+tags prefix once for series key construction
     std::string seriesKeyPrefix;
@@ -1148,7 +1214,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1173,7 +1242,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1202,7 +1274,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1227,7 +1302,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1243,18 +1321,25 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                 break;
             }
         }
+
+        // Reached only when a non-empty insert was pushed for this field
+        // (empty-value fields `continue` inside the switch). Points routed to
+        // this shard: one per timestamp for this field — matches the
+        // request-level accounting of timestamps × fields per MultiWritePoint.
+        acc.shardPoints[shard] += static_cast<int64_t>(sharedTimestamps->size());
     }
 
+    // Metadata ops accumulate in `acc` for request-level deduplication and indexing
+}
+
+seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWritePoint(MultiWritePoint& point) {
 #if TIMESTAR_LOG_INSERT_PATH
-    auto end_grouping = std::chrono::high_resolution_clock::now();
-    auto grouping_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_grouping - start_grouping);
+    auto start_total = std::chrono::high_resolution_clock::now();
 #endif
 
-    // Metadata ops are returned to the caller for batch-level deduplication and indexing
-
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_batch_ops = std::chrono::high_resolution_clock::now();
-#endif
+    const size_t shardCount = seastar::smp::count;
+    BatchAccumulator acc(shardCount);
+    accumulateMultiWritePoint(point, acc);
 
     // Dispatch to all shards in parallel - inserts are already batched per field with all timestamps
     std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
@@ -1262,19 +1347,14 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 
     for (size_t shard = 0; shard < shardCount; ++shard) {
         // Skip shards with no work
-        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() && shardStringInserts[shard].empty() &&
-            shardIntegerInserts[shard].empty()) {
+        if (acc.shardEmpty(shard)) {
             continue;
         }
 
-        // Move this shard's inserts directly from the pre-sized vectors
-        auto doubles = std::move(shardDoubleInserts[shard]);
-        auto bools = std::move(shardBoolInserts[shard]);
-        auto strings = std::move(shardStringInserts[shard]);
-        auto integers = std::move(shardIntegerInserts[shard]);
-
-        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(doubles), std::move(bools),
-                                                    std::move(strings), std::move(integers)));
+        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(acc.shardDoubles[shard]),
+                                                    std::move(acc.shardBools[shard]),
+                                                    std::move(acc.shardStrings[shard]),
+                                                    std::move(acc.shardIntegers[shard])));
     }
 
     // Wait for all shard operations to complete in parallel
@@ -1287,17 +1367,13 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     }
 
 #if TIMESTAR_LOG_INSERT_PATH
-    auto end_batch_ops = std::chrono::high_resolution_clock::now();
-    auto batch_ops_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_batch_ops - start_batch_ops);
     auto end_total = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total);
-
-    LOG_INSERT_PATH(timestar::http_log, info,
-                    "[PERF] [HTTP] processMultiWritePoint breakdown - Total: {}μs, Grouping: {}μs, BatchOps: {}μs",
-                    total_duration.count(), grouping_duration.count(), batch_ops_duration.count());
+    LOG_INSERT_PATH(timestar::http_log, info, "[PERF] [HTTP] processMultiWritePoint total: {}μs",
+                    total_duration.count());
 #endif
 
-    co_return WriteResult{std::move(aggregatedTiming), std::move(metaOps)};
+    co_return WriteResult{std::move(aggregatedTiming), std::move(acc.metaOps)};
 }
 
 std::string HttpWriteHandler::createErrorResponse(const std::string& error) {
@@ -1344,27 +1420,29 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     auto resFmt = timestar::http::responseFormat(*req);
 
     try {
-        // Read the complete request body — move from request to avoid copying
-        std::string body;
+        // Parse directly from the request's body buffer. `req->content` is a
+        // seastar::sstring; assigning it into a std::string is a cross-type
+        // COPY of the entire body (the std::move is inert), ~2MB per bench
+        // request. A view is zero-copy: `req` outlives this coroutine and
+        // sstring data is null-terminated (required by Glaze's default opts).
+        std::string bodyStorage;  // owns data only on the streaming branch
+        std::string_view body;
         if (!req->content.empty()) {
-            body = std::move(req->content);
-        }
-
-        // Pre-reserve body buffer from Content-Length to avoid repeated reallocations
-        // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
-        if (body.empty() && req->content_length > 0 && req->content_length <= maxWriteBodySize()) {
-            body.reserve(req->content_length);
-        }
-
-        // Read from stream if available, checking size incrementally
-        if (req->content_stream) {
+            body = std::string_view(req->content.data(), req->content.size());
+        } else if (req->content_stream) {
+            // Pre-reserve from Content-Length to avoid repeated reallocations
+            // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
+            if (req->content_length > 0 && req->content_length <= maxWriteBodySize()) {
+                bodyStorage.reserve(req->content_length);
+            }
             while (!req->content_stream->eof()) {
                 auto data = co_await req->content_stream->read();
-                body.append(data.get(), data.size());
-                if (body.size() > maxWriteBodySize()) {
+                bodyStorage.append(data.get(), data.size());
+                if (bodyStorage.size() > maxWriteBodySize()) {
                     break;
                 }
             }
+            body = bodyStorage;
         }
 
         if (body.size() > maxWriteBodySize()) {
@@ -1453,16 +1531,25 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                 vtype = TSMValueType::Integer;
                                 break;
                         }
-                        allMetaOps.push_back(MetaOp{vtype, ffi.measurement, ffi.fieldName, ffi.tags});
+                        uint64_t mnTs = 0, mxTs = 0;
+                        if (ffi.timestamps && !ffi.timestamps->empty()) {
+                            auto [mnIt, mxIt] = std::minmax_element(ffi.timestamps->begin(), ffi.timestamps->end());
+                            mnTs = *mnIt;
+                            mxTs = *mxIt;
+                        }
+                        allMetaOps.push_back(
+                            MetaOp{vtype, ffi.measurement, ffi.fieldName, *ffi.tags, mnTs, mxTs, seriesId});
                     }
                 }
 
-                // Build TimeStarInsert directly from FastFieldInsert — move vectors
+                // Build TimeStarInsert directly from FastFieldInsert — move value
+                // vectors, share tags/timestamps by refcounted pointer (same as
+                // the JSON path's setSharedTags/setSharedTimestamps).
                 switch (ffi.type) {
                     case timestar::proto::FastFieldInsert::Type::DOUBLE: {
                         TimeStarInsert<double> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values = std::move(ffi.doubleValues);
                         insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                         insert.setCachedSeriesId128(seriesId);
@@ -1471,8 +1558,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     }
                     case timestar::proto::FastFieldInsert::Type::BOOL: {
                         TimeStarInsert<bool> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values.reserve(ffi.boolValues.size());
                         for (uint8_t v : ffi.boolValues) {
                             insert.values.push_back(v != 0);
@@ -1484,8 +1571,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     }
                     case timestar::proto::FastFieldInsert::Type::STRING: {
                         TimeStarInsert<std::string> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values = std::move(ffi.stringValues);
                         insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                         insert.setCachedSeriesId128(seriesId);
@@ -1494,8 +1581,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     }
                     case timestar::proto::FastFieldInsert::Type::INTEGER: {
                         TimeStarInsert<int64_t> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values = std::move(ffi.integerValues);
                         insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                         insert.setCachedSeriesId128(seriesId);
@@ -1645,52 +1732,72 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                         writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
 #endif
 
-                        // Pre-compute per-MWP point counts so we can subtract on failure.
-                        std::vector<int64_t> perMwpPoints;
-                        perMwpPoints.reserve(coalescedWrites.size());
-                        for (const auto& mwp : coalescedWrites) {
-                            auto pts =
-                                static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
-                            pointsWritten += pts;
-                            perMwpPoints.push_back(pts);
-                            std::string error;
-                            if (!validateArraySizes(mwp, error)) {
-                                throw std::invalid_argument(error);
+                        // Validate all MWPs up-front (before any dispatch), then accumulate
+                        // the ENTIRE request into one set of per-shard typed insert vectors.
+                        // This replaces the previous one-coroutine-per-MultiWritePoint fan-out
+                        // (M × shards cross-shard round trips and M WAL cycles per request)
+                        // with a single dispatch per active shard.
+                        const size_t shardCount = seastar::smp::count;
+                        BatchAccumulator acc(shardCount);
+                        {
+                            size_t accumulated = 0;
+                            for (auto& mwp : coalescedWrites) {
+                                std::string error;
+                                if (!validateArraySizes(mwp, error)) {
+                                    throw std::invalid_argument(error);
+                                }
+                                pointsWritten += static_cast<int64_t>(mwp.timestamps.size()) *
+                                                 static_cast<int64_t>(mwp.fields.size());
+                                accumulateMultiWritePoint(mwp, acc);
+                                // Yield periodically so accumulating a large batch does not
+                                // stall the reactor (accumulation itself never suspends).
+                                if ((++accumulated & 63u) == 0) {
+                                    co_await seastar::coroutine::maybe_yield();
+                                }
                             }
                         }
 
-                        std::vector<seastar::future<WriteResult>> mwpFutures;
-                        mwpFutures.reserve(coalescedWrites.size());
-                        for (auto& mwp : coalescedWrites) {
-                            mwpFutures.push_back(processMultiWritePoint(mwp));
+                        // Single dispatch per active shard for the whole request.
+                        std::vector<unsigned> activeShards;
+                        std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
+                        activeShards.reserve(shardCount);
+                        shardFutures.reserve(shardCount);
+                        for (unsigned shard = 0; shard < shardCount; ++shard) {
+                            if (acc.shardEmpty(shard)) {
+                                continue;
+                            }
+                            activeShards.push_back(shard);
+                            shardFutures.push_back(dispatchShardInserts(
+                                engineSharded, shard, std::move(acc.shardDoubles[shard]),
+                                std::move(acc.shardBools[shard]), std::move(acc.shardStrings[shard]),
+                                std::move(acc.shardIntegers[shard])));
                         }
 
-                        auto mwpResults = co_await seastar::when_all(mwpFutures.begin(), mwpFutures.end());
+                        auto shardResults = co_await seastar::when_all(shardFutures.begin(), shardFutures.end());
 
-                        std::vector<MetaOp> metaOps;
-                        metaOps.reserve(coalescedWrites.size() * 2);
+                        // Failure attribution is per-shard: if a shard's insert future
+                        // failed, all points routed to that shard count as failed.
                         int64_t failedWrites = 0;
                         std::vector<std::string> writeErrors;
-                        for (size_t i = 0; i < mwpResults.size(); ++i) {
+                        for (size_t i = 0; i < shardResults.size(); ++i) {
                             try {
-                                auto writeResult = mwpResults[i].get();
-                                metaOps.insert(metaOps.end(), std::make_move_iterator(writeResult.metaOps.begin()),
-                                               std::make_move_iterator(writeResult.metaOps.end()));
+                                shardResults[i].get();
                             } catch (const std::exception& e) {
-                                timestar::http_log.error("Error processing write: {}", e.what());
-                                pointsWritten -= perMwpPoints[i];
-                                ++failedWrites;
+                                const unsigned shard = activeShards[i];
+                                timestar::http_log.error("Error inserting batch on shard {}: {}", shard, e.what());
+                                pointsWritten -= acc.shardPoints[shard];
+                                failedWrites += acc.shardPoints[shard];
                                 if (writeErrors.size() < 10) {
-                                    writeErrors.emplace_back(e.what());
+                                    writeErrors.emplace_back("shard " + std::to_string(shard) + ": " + e.what());
                                 }
                             }
                         }
 
 #if TIMESTAR_LOG_INSERT_PATH
-                        size_t metaOpsCount = metaOps.size();
+                        size_t metaOpsCount = acc.metaOps.size();
 #endif
-                        if (!metaOps.empty()) {
-                            co_await engineSharded->local().indexMetadataSync(std::move(metaOps));
+                        if (!acc.metaOps.empty()) {
+                            co_await engineSharded->local().indexMetadataSync(std::move(acc.metaOps));
                         }
 #if TIMESTAR_LOG_INSERT_PATH
                         LOG_INSERT_PATH(timestar::http_log, info,

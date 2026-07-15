@@ -21,6 +21,7 @@
 #include <seastar/http/httpd.hh>
 #include <seastar/http/json_path.hh>
 #include <string>
+#include <unordered_set>
 #include <variant>
 
 /*
@@ -97,7 +98,13 @@ private:
 
     struct MultiWritePoint {
         std::string measurement;
-        std::map<std::string, std::string> tags;
+        // Shared (refcounted, immutable) tag map. std::shared_ptr (atomic
+        // refcount) because the same allocation flows into TimeStarInsert's
+        // shared tags and crosses Seastar shard boundaries. Producers
+        // (parseMultiWritePoint, buildMWPFromFastPath, coalesceWrites) always
+        // set it, so consumers can share the pointer instead of deep-copying
+        // the map per point.
+        std::shared_ptr<const std::map<std::string, std::string>> tags;
         std::map<std::string, FieldArrays> fields;  // Field name -> array of values
         std::vector<uint64_t> timestamps;           // Array of timestamps
     };
@@ -109,9 +116,10 @@ private:
         std::string measurement;
         // Shared (refcounted) tag map to avoid redundant copies when multiple
         // fields from the same write point each create a CoalesceCandidate.
-        // Uses lw_shared_ptr (non-atomic refcount) because all candidates
-        // live on the HTTP handler shard -- no cross-shard sharing needed.
-        seastar::lw_shared_ptr<const std::map<std::string, std::string>> sharedTags;
+        // Uses std::shared_ptr (atomic refcount) so the SAME allocation can be
+        // handed to MultiWritePoint::tags and onward to TimeStarInsert's shared
+        // tags (which cross Seastar shard boundaries) without a deep copy.
+        std::shared_ptr<const std::map<std::string, std::string>> sharedTags;
         std::string fieldName;
         TSMValueType valueType;
         std::vector<uint64_t> timestamps;
@@ -225,6 +233,38 @@ private:
         AggregatedTimingInfo timing;
         std::vector<MetaOp> metaOps;
     };
+
+    // Request-level accumulator for grouped shard dispatch. Holds ONE set of
+    // per-shard typed insert vectors shared by all MultiWritePoints in a
+    // request, plus the metadata dedup set and per-shard point counts for
+    // failure attribution. Consolidating a whole batch here means at most one
+    // cross-shard dispatch per shard per request instead of one per
+    // MultiWritePoint.
+    struct BatchAccumulator {
+        std::vector<std::vector<TimeStarInsert<double>>> shardDoubles;
+        std::vector<std::vector<TimeStarInsert<bool>>> shardBools;
+        std::vector<std::vector<TimeStarInsert<std::string>>> shardStrings;
+        std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegers;
+        std::vector<int64_t> shardPoints;  // points routed to each shard (for failure attribution)
+        std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
+        std::vector<MetaOp> metaOps;
+
+        explicit BatchAccumulator(size_t shardCount)
+            : shardDoubles(shardCount), shardBools(shardCount), shardStrings(shardCount), shardIntegers(shardCount),
+              shardPoints(shardCount, 0) {}
+
+        bool shardEmpty(size_t shard) const {
+            return shardDoubles[shard].empty() && shardBools[shard].empty() && shardStrings[shard].empty() &&
+                   shardIntegers[shard].empty();
+        }
+    };
+
+    // Accumulate one MultiWritePoint's per-field inserts into the shared
+    // per-shard vectors of `acc` (no dispatch, no suspension). Metadata ops
+    // for previously-unseen series are appended to acc.metaOps; acc.seenMF
+    // deduplicates across all MultiWritePoints of the request. The point's
+    // tags/timestamps/values are moved out.
+    static void accumulateMultiWritePoint(MultiWritePoint& point, BatchAccumulator& acc);
 
     // Process a multi-point write with arrays.
     // Returns timing info and locally-collected metadata ops.

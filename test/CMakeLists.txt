@@ -26,7 +26,6 @@ list(FILTER UNIT_HTTP_TESTS EXCLUDE REGEX ".*/proto_write_fast_path_test\\.cpp$"
 list(FILTER UNIT_HTTP_TESTS EXCLUDE REGEX ".*/protobuf_integration_test\\.cpp$")
 file(GLOB_RECURSE UNIT_CORE_TESTS CONFIGURE_DEPENDS unit/core/*.cpp)
 file(GLOB_RECURSE UNIT_RETENTION_TESTS CONFIGURE_DEPENDS unit/retention/*.cpp)
-file(GLOB_RECURSE UNIT_FUNCTIONS_TESTS CONFIGURE_DEPENDS unit/functions/*.cpp)
 file(GLOB_RECURSE UNIT_UTILS_TESTS CONFIGURE_DEPENDS unit/utils/*.cpp)
 file(GLOB_RECURSE INTEGRATION_TESTS CONFIGURE_DEPENDS integration/*.cpp)
 file(GLOB_RECURSE E2E_TESTS CONFIGURE_DEPENDS e2e/*.cpp)
@@ -57,7 +56,6 @@ set(TEST_SRCS
     ${UNIT_HTTP_TESTS}
     ${UNIT_CORE_TESTS}
     ${UNIT_RETENTION_TESTS}
-    ${UNIT_FUNCTIONS_TESTS}
     ${UNIT_UTILS_TESTS}
     ${INTEGRATION_TESTS}
     ${E2E_TESTS}
@@ -93,10 +91,6 @@ set(SOURCE_INSPECTION_DEFS
     TSM_WRITER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_writer.cpp"
     SSTABLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/sstable.cpp"
     BOOL_ENCODER_RLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/bool_encoder_rle.cpp"
-    FUNCTION_MONITORING_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_monitoring.cpp"
-    FUNCTION_HTTP_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_http_handler.cpp"
-    INTERPOLATION_FUNCTIONS_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/interpolation_functions.cpp"
-    FUNCTION_TYPES_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/functions/function_types.hpp"
     SIMD_AGGREGATOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/simd_aggregator.cpp"
     TSM_COMPACTOR_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_compactor.hpp"
     STRING_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/string_encoder.cpp"
@@ -128,7 +122,6 @@ set(UNIT_TEST_SRCS
     ${UNIT_HTTP_TESTS}
     ${UNIT_CORE_TESTS}
     ${UNIT_RETENTION_TESTS}
-    ${UNIT_FUNCTIONS_TESTS}
     ${UNIT_UTILS_TESTS}
 )
 add_executable(timestar_unit_test ${UNIT_TEST_SRCS})
@@ -241,4 +234,3 @@ gtest_discover_tests(timestar_proto_integration_test)
 
 # Include subdirectories with standalone tests
 add_subdirectory(benchmark)
-add_subdirectory(functions)

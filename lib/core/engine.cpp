@@ -232,6 +232,15 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
 #endif
     co_await walFileManager.insertBatch(insertRequests);
 
+    // Record day bitmaps for time-scoped discovery (0x0D postings). The batch
+    // path previously never recorded them, so batch-only series were wrongly
+    // pruned from time-scoped queries once any day bitmap existed for the
+    // measurement. Skips per series when the LocalId doesn't exist yet (first
+    // batch of a new series — covered by the MetadataOp day-span path).
+    for (const auto& req : insertRequests) {
+        co_await index.recordInsertDays(req.measurement, req.seriesId128(), req.getTimestamps());
+    }
+
     // Create timing info
     WALTimingInfo walTiming;
 #if TIMESTAR_LOG_INSERT_PATH
@@ -274,11 +283,14 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
     std::vector<std::vector<MetadataOp>> opsByShard(shardCount);
 
     for (auto& op : metaOps) {
-        // Use the same hash as the write handler to ensure metadata lands on the
-        // same shard as the data. buildSeriesKey + fromSeriesKey is the canonical path.
-        std::string seriesKey = timestar::buildSeriesKey(op.measurement, op.tags, op.fieldName);
-        SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-        unsigned targetShard = timestar::routeToCore(seriesId);
+        // The write handler pre-computes op.seriesId with the same hash used for
+        // data routing, so metadata lands on the same shard as the data without
+        // rebuilding + rehashing the series key here. Fall back to the canonical
+        // buildSeriesKey + fromSeriesKey path only if a producer left it unset.
+        if (op.seriesId.isZero()) [[unlikely]] {
+            op.seriesId = SeriesId128::fromSeriesKey(timestar::buildSeriesKey(op.measurement, op.tags, op.fieldName));
+        }
+        unsigned targetShard = timestar::routeToCore(op.seriesId);
         opsByShard[targetShard].push_back(std::move(op));
     }
 
@@ -353,8 +365,7 @@ seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated
                                                                                  uint64_t aggregationInterval,
                                                                                  timestar::AggregationMethod method) {
     QueryRunner runner(&tsmFileManager, &walFileManager);
-    co_return co_await runner.queryTsmAggregated(std::string(seriesKey), seriesId, startTime, endTime,
-                                                 aggregationInterval, method);
+    co_return co_await runner.queryTsmAggregated(seriesId, startTime, endTime, aggregationInterval, method);
 }
 
 seastar::future<std::vector<std::optional<timestar::PushdownResult>>> Engine::queryAggregatedMultiField(

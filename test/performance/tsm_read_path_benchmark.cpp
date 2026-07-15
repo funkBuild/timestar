@@ -406,3 +406,167 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R3_IntegerPushdownAggregation) {
 
     co_await engine.stop();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  R6: Stats-pushdown I/O amplification
+//
+//  One large float series in a single TSM file (~1000 contiguous blocks).
+//  The query range starts/ends mid-block, so only the two boundary blocks
+//  need decoding — every interior block is answered by block stats.
+//  Because batches are (currently) formed BEFORE the stats pre-scan, the
+//  single contiguous batch containing the whole series is DMA-read in full
+//  even though ~99.8% of the bytes are never decoded. Seastar uses O_DIRECT,
+//  so skipped reads are real: the gate measures wall time of the aggregation.
+// ═══════════════════════════════════════════════════════════════════════════
+
+SEASTAR_TEST_F(TsmReadPathBenchmark, R6_StatsPushdownIOAmplification) {
+    fmt::print("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    fmt::print("║  R6: Stats-Pushdown I/O Amplification (boundary-block decode)   ║\n");
+    fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
+
+    Engine engine;
+    co_await engine.init();
+
+    // 1M points, one series, one file -> ~1000 contiguous blocks.
+    // Full-precision random values force ALP_RD (fat blocks, ~8B/pt).
+    constexpr size_t NUM_POINTS = 1'000'000;
+    constexpr uint64_t T0 = 1'000'000'000ULL;
+    constexpr uint64_t STEP = 10'000'000'000ULL;  // 10s
+
+    {
+        std::mt19937_64 rng(123);
+        std::uniform_real_distribution<double> dist(0.0, 100.0);
+        constexpr size_t CHUNK = 100'000;
+        for (size_t off = 0; off < NUM_POINTS; off += CHUNK) {
+            TimeStarInsert<double> insert("bigcpu", "usage");
+            insert.addTag("hostname", "host_0");
+            for (size_t p = off; p < off + CHUNK && p < NUM_POINTS; p++) {
+                insert.addValue(T0 + p * STEP, dist(rng));
+            }
+            co_await engine.insert(std::move(insert));
+        }
+        co_await engine.rolloverMemoryStore();
+        co_await seastar::sleep(std::chrono::milliseconds(500));
+    }
+
+    std::string seriesKey = "bigcpu,hostname=host_0 usage";
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+
+    // Range cuts mid-block on both ends: interior blocks are fully contained
+    // (stats-answered), only the 2 boundary blocks need decode.
+    const uint64_t qStart = T0 + 500 * STEP;
+    const uint64_t qEnd = T0 + (NUM_POINTS - 500) * STEP;
+
+    // Warm up index caches (not data: dma reads are O_DIRECT, uncached)
+    for (int i = 0; i < 3; i++) {
+        co_await engine.queryAggregated(seriesKey, seriesId, qStart, qEnd, 0,
+                                        timestar::AggregationMethod::AVG);
+    }
+
+    BenchStats aggStats;
+    size_t hits = 0;
+    for (int i = 0; i < 15; i++) {
+        auto t0 = clk::now();
+        auto result = co_await engine.queryAggregated(seriesKey, seriesId, qStart, qEnd, 0,
+                                                      timestar::AggregationMethod::AVG);
+        aggStats.add(clk::now() - t0);
+        if (result.has_value()) hits++;
+    }
+    aggStats.print("AVG fold, mid-block range (2 decode blocks)");
+    fmt::print("  Pushdown hits: {}/15\n", hits);
+    EXPECT_GT(hits, 0u);
+
+    // Reference: full-range fold (0 decode blocks — all stats, no DMA at all)
+    BenchStats fullStats;
+    for (int i = 0; i < 15; i++) {
+        auto t0 = clk::now();
+        auto result = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0,
+                                                      timestar::AggregationMethod::AVG);
+        fullStats.add(clk::now() - t0);
+        (void)result;
+    }
+    fullStats.print("AVG fold, full range (0 decode blocks)");
+
+    fmt::print("\n  Mid-block-range overhead vs zero-decode: {:.2f}x\n",
+               aggStats.avg() / std::max(fullStats.avg(), 1.0));
+
+    co_await engine.stop();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  R7: Dictionary-encoded string series read path
+//
+//  Low-cardinality string series (≤50 unique values) are dictionary-encoded
+//  at flush.  Each readSeries/readSeriesBatched call previously deep-copied
+//  the dictionary (N string allocations); now it takes a shared_ptr refcount.
+//  Narrow-range queries make the per-call fixed overhead visible; full-range
+//  queries exercise dictionary decode throughput.
+// ═══════════════════════════════════════════════════════════════════════════
+
+SEASTAR_TEST_F(TsmReadPathBenchmark, R7_StringDictReadPath) {
+    fmt::print("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    fmt::print("║  R7: Dictionary-Encoded String Series Read Path                 ║\n");
+    fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
+
+    Engine engine;
+    co_await engine.init();
+
+    constexpr size_t NUM_POINTS = 100'000;
+    constexpr uint64_t T0 = 1'000'000'000ULL;
+    constexpr uint64_t STEP = 10'000'000'000ULL;  // 10s
+
+    // 40 unique values → dictionary-encoded (limits: 50 entries / 4KB)
+    {
+        constexpr size_t CHUNK = 20'000;
+        for (size_t off = 0; off < NUM_POINTS; off += CHUNK) {
+            TimeStarInsert<std::string> insert("applog", "status");
+            insert.addTag("hostname", "host_0");
+            for (size_t p = off; p < off + CHUNK && p < NUM_POINTS; p++) {
+                insert.addValue(T0 + p * STEP, fmt::format("status_code_{:02d}", p % 40));
+            }
+            co_await engine.insert(std::move(insert));
+        }
+        co_await engine.rolloverMemoryStore();
+        co_await seastar::sleep(std::chrono::milliseconds(500));
+    }
+
+    std::string seriesKey = "applog,hostname=host_0 status";
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
+
+    // Narrow range: 200 points from the middle (fixed per-call overhead dominates)
+    const uint64_t nStart = T0 + 50'000 * STEP;
+    const uint64_t nEnd = nStart + 200 * STEP;
+
+    for (int i = 0; i < 3; i++) {
+        auto r = co_await engine.query(seriesKey, seriesId, nStart, nEnd);
+        EXPECT_TRUE(r.has_value());
+    }
+
+    BenchStats narrowStats;
+    for (int i = 0; i < 20; i++) {
+        auto t0 = clk::now();
+        auto result = co_await engine.query(seriesKey, seriesId, nStart, nEnd);
+        narrowStats.add(clk::now() - t0);
+        EXPECT_TRUE(result.has_value());
+        if (result.has_value()) {
+            auto& qr = std::get<QueryResult<std::string>>(*result);
+            EXPECT_EQ(qr.timestamps.size(), 200u);
+        }
+    }
+    narrowStats.print("String dict narrow range (200 pts)");
+
+    BenchStats fullStats;
+    for (int i = 0; i < 10; i++) {
+        auto t0 = clk::now();
+        auto result = co_await engine.query(seriesKey, seriesId, 0, UINT64_MAX);
+        fullStats.add(clk::now() - t0);
+        EXPECT_TRUE(result.has_value());
+        if (result.has_value()) {
+            auto& qr = std::get<QueryResult<std::string>>(*result);
+            EXPECT_EQ(qr.timestamps.size(), NUM_POINTS);
+        }
+    }
+    fullStats.print("String dict full range (100k pts)");
+
+    co_await engine.stop();
+}

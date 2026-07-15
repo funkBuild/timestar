@@ -26,8 +26,10 @@ void StreamingAggregator::addPoint(const StreamingDataPoint& pt) {
 
     // Fast path: consecutive points for the same series+field+bucket.
     // Avoids constructing a SeriesFieldKey (string/map copies) entirely.
+    // Pointer identity short-circuits the deep TagMap comparison: consecutive
+    // points from the same series typically share the same tags shared_ptr.
     if (_cachedState && bucket == _cachedBucket && pt.measurement == _cachedKey->measurement &&
-        pt.field == _cachedKey->field && *pt.tags == *_cachedKey->tags) {
+        pt.field == _cachedKey->field && (pt.tags == _cachedKey->tags || *pt.tags == *_cachedKey->tags)) {
         addValue(*_cachedState);
         return;
     }

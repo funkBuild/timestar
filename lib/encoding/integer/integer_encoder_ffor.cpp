@@ -32,29 +32,40 @@ namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
-// ZigZag-encode a block of int64_t deltas into uint64_t output, and
-// simultaneously track unsigned min/max across all output values.
-// `deltas` are pre-computed delta-of-delta values (sequential dependency,
-// computed scalar by the caller).  Handles any count (including tail elements
-// that don't fill a full vector).
-void ZigZagEncodeAndMinMax(const int64_t* HWY_RESTRICT deltas, uint64_t* HWY_RESTRICT out, size_t count,
-                           uint64_t* HWY_RESTRICT min_out, uint64_t* HWY_RESTRICT max_out) {
+// Fused delta-of-delta + ZigZag encode + unsigned min/max tracking.
+//
+// The delta-of-delta is a 3-point stencil with NO sequential dependency:
+//   dod[i] = v[i+2] - 2*v[i+1] + v[i]        (base points at values[start-2])
+// so it vectorizes with three unaligned loads per iteration.  This removes
+// the scalar delta pass + 8KB scratch round-trip the encoder used to do.
+//
+// Arithmetic is performed on uint64_t lanes: two's-complement wrap-around
+// subtraction produces bit-identical results to the signed formulation.
+// `base` must have count+2 readable elements; out must not alias base.
+void DoDZigZagEncodeAndMinMax(const uint64_t* HWY_RESTRICT base, uint64_t* HWY_RESTRICT out, size_t count,
+                              uint64_t* HWY_RESTRICT min_out, uint64_t* HWY_RESTRICT max_out) {
     const hn::ScalableTag<int64_t> di;
     const hn::ScalableTag<uint64_t> du;
-    const size_t N = hn::Lanes(di);
+    const size_t N = hn::Lanes(du);
 
     auto vmin = hn::Set(du, *min_out);
     auto vmax = hn::Set(du, *max_out);
 
     size_t i = 0;
     for (; i + N <= count; i += N) {
-        // Load signed deltas
-        auto v = hn::LoadU(di, &deltas[i]);
+        // 3-point stencil loads (unaligned; overlapping windows of base)
+        auto v0 = hn::LoadU(du, &base[i]);
+        auto v1 = hn::LoadU(du, &base[i + 1]);
+        auto v2 = hn::LoadU(du, &base[i + 2]);
+
+        // dod = (v2 - v1) - (v1 - v0)  — wrap-around == signed two's complement
+        auto dod = hn::Sub(hn::Sub(v2, v1), hn::Sub(v1, v0));
 
         // ZigZag encode: (x << 1) ^ (x >> 63)
         // ShiftRight on signed int64_t is arithmetic (sign-extending) in Highway.
-        auto shifted = hn::ShiftLeft<1>(v);
-        auto sign = hn::ShiftRight<63>(v);
+        auto x = hn::BitCast(di, dod);
+        auto shifted = hn::ShiftLeft<1>(x);
+        auto sign = hn::ShiftRight<63>(x);
         auto zz = hn::BitCast(du, hn::Xor(shifted, sign));
 
         // Store zigzag-encoded values
@@ -71,7 +82,8 @@ void ZigZagEncodeAndMinMax(const int64_t* HWY_RESTRICT deltas, uint64_t* HWY_RES
 
     // Scalar tail: process remaining elements that don't fill a full vector
     for (; i < count; ++i) {
-        int64_t x = deltas[i];
+        int64_t x = (static_cast<int64_t>(base[i + 2]) - static_cast<int64_t>(base[i + 1])) -
+                    (static_cast<int64_t>(base[i + 1]) - static_cast<int64_t>(base[i]));
         uint64_t zz = (static_cast<uint64_t>(x) << 1) ^ static_cast<uint64_t>(x >> 63);
         out[i] = zz;
         if (zz < cur_min)
@@ -101,13 +113,13 @@ static_assert(IntegerEncoderFFOR::BLOCK_SIZE / 4 <= 1023,
               "max exception_count exceeds header field capacity (10 bits)");
 
 namespace ffor_enc {
-HWY_EXPORT(ZigZagEncodeAndMinMax);
+HWY_EXPORT(DoDZigZagEncodeAndMinMax);
 
 // Wrapper callable from outside ffor_enc namespace (HWY_DYNAMIC_DISPATCH
 // must resolve the dispatch table in the same namespace as HWY_EXPORT).
-inline void dispatchZigZagEncodeAndMinMax(const int64_t* deltas, uint64_t* out, size_t count, uint64_t* min_out,
-                                          uint64_t* max_out) {
-    HWY_DYNAMIC_DISPATCH(ZigZagEncodeAndMinMax)(deltas, out, count, min_out, max_out);
+inline void dispatchDoDZigZagEncodeAndMinMax(const uint64_t* base, uint64_t* out, size_t count, uint64_t* min_out,
+                                             uint64_t* max_out) {
+    HWY_DYNAMIC_DISPATCH(DoDZigZagEncodeAndMinMax)(base, out, count, min_out, max_out);
 }
 }  // namespace ffor_enc
 
@@ -125,8 +137,6 @@ struct FFORScratchBuffers {
     std::vector<uint16_t> exc_positions;  // up to BLOCK_SIZE/4
     std::vector<uint64_t> exc_values;     // up to BLOCK_SIZE/4
 
-    // Scratch for scalar delta-of-delta values before SIMD zigzag encode
-    std::vector<int64_t> deltas;  // up to BLOCK_SIZE (1024)
 
     // Decode path: no scratch buffers needed - decode uses a stack-allocated
     // block buffer (8KB) that stays hot in L1 cache.
@@ -136,7 +146,6 @@ struct FFORScratchBuffers {
         clean.reserve(1024);
         exc_positions.reserve(256);
         exc_values.reserve(256);
-        deltas.reserve(1024);
     }
 };
 
@@ -255,12 +264,13 @@ void encodeBlock(const uint64_t* values, size_t count, AlignedBuffer& buf, uint6
         // 5a. Write header with exc_count=0
         writeBlockHeader(buf, static_cast<uint16_t>(count), best_bw, /*exc_count=*/0, min_val);
 
-        // 6a. FFOR pack directly from input values (no clean array needed)
+        // 6a. FFOR pack directly from input values (no clean array needed).
+        // ffor_pack_u64 writes every output word (register-accumulator stream),
+        // so the destination needs no pre-zeroing.
         size_t packed_words = alp::ffor_packed_words(count, best_bw);
         if (packed_words > 0) {
             size_t packed_bytes = packed_words * sizeof(uint64_t);
             uint8_t* dest = buf.grow_uninit(packed_bytes);
-            std::memset(dest, 0, packed_bytes);  // ffor_pack_u64 ORs into the buffer
             alp::ffor_pack_u64(values, count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
         }
         return;
@@ -297,12 +307,12 @@ void encodeBlock(const uint64_t* values, size_t count, AlignedBuffer& buf, uint6
     // 6b. Write block header (with actual exception count)
     writeBlockHeader(buf, static_cast<uint16_t>(count), best_bw, actual_exc, min_val);
 
-    // 7b. FFOR pack from clean array
+    // 7b. FFOR pack from clean array (ffor_pack_u64 writes every output word —
+    // no pre-zeroing needed)
     size_t packed_words = alp::ffor_packed_words(count, best_bw);
     if (packed_words > 0) {
         size_t packed_bytes = packed_words * sizeof(uint64_t);
         uint8_t* dest = buf.grow_uninit(packed_bytes);
-        std::memset(dest, 0, packed_bytes);  // ffor_pack_u64 ORs into the buffer
         alp::ffor_pack_u64(clean.data(), count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
     }
 
@@ -441,9 +451,7 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
 
     auto& scratch = getScratch();
     auto& zigzag = scratch.zigzag;
-    auto& deltas = scratch.deltas;
     zigzag.resize(BS);  // ensure capacity; only reallocates on first call
-    deltas.resize(BS);  // scratch for delta-of-delta values
 
     // Estimate: header + base + worst-case packed data per block
     buf.reserve(buf.size() + num_blocks * (16 + BS * 8));
@@ -494,32 +502,20 @@ void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
         }
 
         // Remaining values in this block: zigzag(delta-of-delta).
-        // Phase 1: Compute delta-of-delta values into the scratch buffer (scalar,
-        //          sequential memory dependency prevents SIMD here).
-        // Phase 2: ZigZag-encode and track min/max via Highway SIMD dispatch.
-
-        // Count how many delta-of-delta values we'll compute this block
+        // The delta-of-delta is a 3-point stencil (no sequential dependency), so
+        // it fuses with the zigzag + min/max Highway kernel — one pass over the
+        // input, no scalar delta pre-pass and no scratch round-trip.
         size_t dd_count = 0;
-        {
-            size_t vi = val_idx;
-            size_t zi = zz_idx;
-            while (zi < block_count && vi < sz && vi >= 2) {
-                // uint64_t -> int64_t casts and signed arithmetic: valid for nanosecond
-                // timestamps until year ~2262; signed overflow UB is avoided because
-                // consecutive timestamp deltas are small relative to int64_t range.
-                deltas[dd_count] = (static_cast<int64_t>(values[vi]) - static_cast<int64_t>(values[vi - 1])) -
-                                   (static_cast<int64_t>(values[vi - 1]) - static_cast<int64_t>(values[vi - 2]));
-                ++dd_count;
-                ++vi;
-                ++zi;
-            }
+        if (val_idx >= 2 && zz_idx < block_count && val_idx < sz) {
+            dd_count = std::min(block_count - zz_idx, sz - val_idx);
         }
 
         if (dd_count > 0) {
-            // Highway SIMD dispatch: zigzag-encode deltas[] into zigzag[zz_idx..],
-            // updating block_min/block_max along the way.  The kernel handles
-            // both the SIMD main loop and scalar tail internally.
-            ffor_enc::dispatchZigZagEncodeAndMinMax(deltas.data(), &zigzag[zz_idx], dd_count, &block_min, &block_max);
+            // uint64_t wrap-around arithmetic inside the kernel is bit-identical
+            // to the signed delta-of-delta formulation (two's complement); valid
+            // for nanosecond timestamps until year ~2262.
+            ffor_enc::dispatchDoDZigZagEncodeAndMinMax(&values[val_idx - 2], &zigzag[zz_idx], dd_count, &block_min,
+                                                       &block_max);
 
             val_idx += dd_count;
             zz_idx += dd_count;
@@ -603,58 +599,43 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
 
         while (total_decoded < timestampSize && encoded.remaining() >= 16) {
             const size_t block_count = decodeBlockInto(encoded, blockBuf);
+
+            // The stream decodes in whole FFOR groups, so the final group may
+            // contain more entries than requested (callers may request fewer
+            // values than were encoded, e.g. after a time-cut). Clamp emission
+            // so the output never exceeds timestampSize.
+            const size_t emit_count = std::min(block_count, timestampSize - total_decoded);
             total_decoded += block_count;
 
             size_t local_i = 0;
 
-            // Handle value[0]: raw timestamp
-            if (global_idx == 0 && local_i < block_count) {
+            // Handle value[0]: raw timestamp (already in place in blockBuf)
+            if (global_idx == 0 && local_i < emit_count) {
                 last_decoded = blockBuf[0];
-                values.push_back(last_decoded);
                 local_i = 1;
                 global_idx = 1;
             }
 
             // Handle value[1]: zigzag(delta)
-            if (global_idx == 1 && local_i < block_count) {
+            if (global_idx == 1 && local_i < emit_count) {
                 delta = ZigZag::zigzagDecode(blockBuf[local_i]);
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
+                blockBuf[local_i] = last_decoded;
                 local_i++;
                 global_idx = 2;
             }
 
-            // Main unrolled-by-4 loop: no time checks, just reconstruct + push_back
-            for (; local_i + 3 < block_count; local_i += 4) {
-                int64_t dd0 = ZigZag::zigzagDecode(blockBuf[local_i]);
-                int64_t dd1 = ZigZag::zigzagDecode(blockBuf[local_i + 1]);
-                int64_t dd2 = ZigZag::zigzagDecode(blockBuf[local_i + 2]);
-                int64_t dd3 = ZigZag::zigzagDecode(blockBuf[local_i + 3]);
-
-                delta += dd0;
+            // Reconstruct in place in the L1-resident stack buffer: delta/
+            // last_decoded stay in registers and there is no per-point vector
+            // push_back (capacity check + end-pointer round-trip through memory).
+            for (; local_i < emit_count; ++local_i) {
+                delta += ZigZag::zigzagDecode(blockBuf[local_i]);
                 last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-
-                delta += dd1;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-
-                delta += dd2;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-
-                delta += dd3;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
+                blockBuf[local_i] = last_decoded;
             }
 
-            // Scalar tail
-            for (; local_i < block_count; ++local_i) {
-                int64_t dd = ZigZag::zigzagDecode(blockBuf[local_i]);
-                delta += dd;
-                last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
-                values.push_back(last_decoded);
-            }
+            // Single bulk append per group (memcpy) instead of per-point push_back.
+            values.insert(values.end(), blockBuf, blockBuf + emit_count);
         }
 
         nAdded = values.size() - current_size;

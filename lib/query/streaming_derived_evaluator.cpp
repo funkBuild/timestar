@@ -5,7 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <set>
+#include <utility>
+#include <vector>
 
 namespace timestar {
 
@@ -56,11 +57,14 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
     //
     // Collect all timestamps across all queries (union), then for each
     // query build values at those timestamps (carry-forward for missing).
-    std::set<uint64_t> allTimestamps;
-    std::map<std::string, std::map<uint64_t, double>> queryTimestampValues;
+    // Buckets arrive (near-)sorted, so flat vectors + sort/unique + a
+    // two-pointer merge replace the per-point std::set/std::map node churn.
+    std::vector<uint64_t> sortedTimestamps;
+    std::map<std::string, std::vector<std::pair<uint64_t, double>>> queryPoints;
 
     for (const auto& [label, batch] : perQueryBatches) {
-        auto& tsMap = queryTimestampValues[label];
+        auto& pts = queryPoints[label];
+        pts.reserve(batch.points.size());
         for (const auto& pt : batch.points) {
             double val = std::visit(
                 [](const auto& v) -> double {
@@ -75,24 +79,39 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
                         return std::numeric_limits<double>::quiet_NaN();  // string: not numeric
                 },
                 pt.value);
-            // If multiple points at same timestamp (different series/fields),
-            // keep the last one seen
-            tsMap[pt.timestamp] = val;
-            allTimestamps.insert(pt.timestamp);
+            pts.emplace_back(pt.timestamp, val);
+        }
+        // Stable sort preserves batch order among equal timestamps so the
+        // last-seen value wins (multiple series/fields at the same bucket),
+        // matching the previous map-overwrite semantics.
+        std::stable_sort(pts.begin(), pts.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        // In-place dedupe keeping the last value per timestamp.
+        size_t w = 0;
+        for (size_t r = 0; r < pts.size(); ++r) {
+            if (w > 0 && pts[w - 1].first == pts[r].first) {
+                pts[w - 1].second = pts[r].second;
+            } else {
+                pts[w++] = pts[r];
+            }
+        }
+        pts.resize(w);
+        for (const auto& [ts, _v] : pts) {
+            sortedTimestamps.push_back(ts);
         }
     }
 
-    if (allTimestamps.empty()) {
+    if (sortedTimestamps.empty()) {
         return result;
     }
 
+    // Timestamp union across all queries.
+    std::sort(sortedTimestamps.begin(), sortedTimestamps.end());
+    sortedTimestamps.erase(std::unique(sortedTimestamps.begin(), sortedTimestamps.end()), sortedTimestamps.end());
+
     // The latest timestamp across all queries serves as the "current time"
     // reference for staleness checks.
-    uint64_t latestTs = *allTimestamps.rbegin();
-
-    // Build aligned series for each query using timestamp union.
-    // For timestamps where a query has no data, use carry-forward.
-    std::vector<uint64_t> sortedTimestamps(allTimestamps.begin(), allTimestamps.end());
+    uint64_t latestTs = sortedTimestamps.back();
 
     // Share a single timestamp vector across all query series (avoids N copies)
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(sortedTimestamps);
@@ -125,12 +144,17 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
             // else: too stale — leave as NaN so formula produces NaN for this bucket
         }
 
-        auto& tsMap = queryTimestampValues[label];
+        static const std::vector<std::pair<uint64_t, double>> kNoPoints;
+        auto qIt = queryPoints.find(label);
+        const auto& pts = (qIt != queryPoints.end()) ? qIt->second : kNoPoints;
 
+        // Two-pointer merge: pts is a sorted, deduped subset of the sorted
+        // timestamp union, so a single cursor suffices.
+        size_t pi = 0;
         for (uint64_t ts : sortedTimestamps) {
-            auto it = tsMap.find(ts);
-            if (it != tsMap.end()) {
-                lastVal = it->second;
+            if (pi < pts.size() && pts[pi].first == ts) {
+                lastVal = pts[pi].second;
+                ++pi;
                 values.push_back(lastVal);
                 _lastValueTimestamps[label] = ts;  // record real data timestamp
             } else {

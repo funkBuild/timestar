@@ -35,8 +35,10 @@ public:
         return &it->second->value;
     }
 
-    // Insert or update; evicts LRU entries until under budget
-    void put(const Key& key, Value value) {
+    // Insert or update; evicts LRU entries until under budget.
+    // Returns a stable pointer to the inserted/updated value (valid until the
+    // entry is evicted or erased), saving callers a second lookup.
+    Value* put(const Key& key, Value value) {
         size_t entrySize = estimateEntrySize(key, value);
 
         auto it = map_.find(key);
@@ -51,6 +53,7 @@ public:
             while (!list_.empty() && currentBytes_ > maxBytes_ && list_.size() > 1) {
                 evictOne();
             }
+            return &list_.begin()->value;
         } else {
             // Evict until we have room (but always allow at least 1 entry)
             while (!list_.empty() && currentBytes_ + entrySize > maxBytes_) {
@@ -59,6 +62,7 @@ public:
             list_.push_front({key, std::move(value), entrySize});
             map_[key] = list_.begin();
             currentBytes_ += entrySize;
+            return &list_.begin()->value;
         }
     }
 

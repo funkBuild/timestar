@@ -14,6 +14,7 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/index/key_encoding.hpp"
 #include "../../../lib/index/native/native_index.hpp"
+#include "../../../lib/storage/tsm.hpp"
 #include "../../seastar_gtest.hpp"
 
 #include <endian.h>
@@ -483,5 +484,73 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MultiTagIntersectionWithTimeScope) {
     EXPECT_TRUE(result2.has_value());
     EXPECT_EQ(result2->size(), 2u);
 
+    co_await index.close();
+}
+
+// ── Batch path day-bitmap recording (regression: batch-only series were
+// never added to day bitmaps, so once ANY day bitmap existed for a
+// measurement they were wrongly pruned from time-scoped discovery) ──
+
+SEASTAR_TEST_F(TimeScopedPostingsTest, MetadataOpDaySpanCoversFirstBatch) {
+    NativeIndex index(0);
+    co_await index.open();
+
+    uint64_t day21000 = 21000ULL * ke::NS_PER_DAY;
+
+    // Simulate the HTTP batch path: metadata arrives via indexMetadataBatch
+    // (with the insert's timestamp range), NOT via indexInsert.
+    MetadataOp op;
+    op.valueType = TSMValueType::Float;
+    op.measurement = "batchmeas";
+    op.fieldName = "v";
+    op.tags = {{"host", "h1"}};
+    op.minTs = day21000;
+    op.maxTs = day21000 + 2 * ke::NS_PER_DAY;  // spans 3 days
+    co_await index.indexMetadataBatch({op});
+
+    // Series must be discoverable on every day of the span.
+    for (int d = 0; d < 3; ++d) {
+        auto r = co_await index.findSeriesWithMetadataTimeScoped(
+            "batchmeas", {{"host", "h1"}}, {}, day21000 + d * ke::NS_PER_DAY,
+            day21000 + d * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
+        EXPECT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 1u) << "day offset " << d;
+    }
+    // And absent outside it.
+    auto rOut = co_await index.findSeriesWithMetadataTimeScoped("batchmeas", {{"host", "h1"}}, {},
+                                                                day21000 + 5 * ke::NS_PER_DAY,
+                                                                day21000 + 6 * ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(rOut.has_value());
+    EXPECT_EQ(rOut->size(), 0u);
+    co_await index.close();
+}
+
+SEASTAR_TEST_F(TimeScopedPostingsTest, RecordInsertDaysAddsLaterDays) {
+    NativeIndex index(0);
+    co_await index.open();
+
+    uint64_t day22000 = 22000ULL * ke::NS_PER_DAY;
+
+    // First batch: metadata op establishes the series + day 22000.
+    MetadataOp op;
+    op.valueType = TSMValueType::Float;
+    op.measurement = "bm2";
+    op.fieldName = "v";
+    op.tags = {{"host", "h1"}};
+    op.minTs = day22000;
+    op.maxTs = day22000;
+    co_await index.indexMetadataBatch({op});
+
+    // Later batch for a KNOWN series (no metadata op emitted): the data-shard
+    // path records its days via recordInsertDays.
+    auto seriesId = SeriesId128::fromSeriesKey(timestar::buildSeriesKey("bm2", {{"host", "h1"}}, "v"));
+    std::vector<uint64_t> ts = {day22000 + 3 * ke::NS_PER_DAY, day22000 + 3 * ke::NS_PER_DAY + 1'000'000'000ULL};
+    co_await index.recordInsertDays("bm2", seriesId, ts);
+
+    auto r = co_await index.findSeriesWithMetadataTimeScoped("bm2", {{"host", "h1"}}, {},
+                                                             day22000 + 3 * ke::NS_PER_DAY,
+                                                             day22000 + 4 * ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 1u);
     co_await index.close();
 }

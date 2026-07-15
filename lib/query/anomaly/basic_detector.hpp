@@ -15,7 +15,8 @@ class BasicDetector : public AnomalyDetector {
 public:
     BasicDetector() = default;
 
-    AnomalyOutput detect(const AnomalyInput& input, const AnomalyConfig& config) override;
+    using AnomalyDetector::detect;
+    AnomalyOutput detect(const AnomalyInputView& input, const AnomalyConfig& config) override;
 
     std::string algorithmName() const override { return "basic"; }
 
@@ -24,7 +25,7 @@ public:
 private:
     // Optimized detection using incremental rolling stats
     // Complexity: O(N) instead of O(N*W)
-    AnomalyOutput detectOptimized(const AnomalyInput& input, const AnomalyConfig& config);
+    AnomalyOutput detectOptimized(const AnomalyInputView& input, const AnomalyConfig& config);
 };
 
 }  // namespace anomaly

@@ -2586,3 +2586,491 @@ TEST_F(ExpressionEvaluatorTest, AsPercentParserRoundTripScalar) {
     EXPECT_DOUBLE_EQ(result.values[1], 2.0);
     EXPECT_DOUBLE_EQ(result.values[2], 3.0);
 }
+
+// ==================== fill_spline ====================
+
+TEST_F(ExpressionEvaluatorTest, FillSplineReproducesQuadratic) {
+    // A natural cubic spline through samples of a smooth function should
+    // fill interior gaps far more accurately than linear interpolation.
+    // Sample y = x^2 at x = 0..10 (t = 1000*x), knock out x=4,5,6.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (int x = 0; x <= 10; ++x) {
+        ts.push_back(1000 * static_cast<uint64_t>(x + 1));
+        double v = static_cast<double>(x) * static_cast<double>(x);
+        vals.push_back((x >= 4 && x <= 6) ? std::numeric_limits<double>::quiet_NaN() : v);
+    }
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto filled = s.fill_spline();
+
+    // Exact values: 16, 25, 36.  Natural spline won't be exact but must be
+    // close (quadratic curvature well within cubic's reach); linear would
+    // give 22, 31, 40 (errors of 6, 6, 4).
+    EXPECT_NEAR(filled.values[4], 16.0, 1.5);
+    EXPECT_NEAR(filled.values[5], 25.0, 1.5);
+    EXPECT_NEAR(filled.values[6], 36.0, 1.5);
+    // Known values untouched
+    EXPECT_DOUBLE_EQ(filled.values[3], 9.0);
+    EXPECT_DOUBLE_EQ(filled.values[7], 49.0);
+}
+
+TEST_F(ExpressionEvaluatorTest, FillSplineLeadingTrailingStayNaN) {
+    auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000},
+                        {std::numeric_limits<double>::quiet_NaN(), 1.0, std::numeric_limits<double>::quiet_NaN(), 3.0,
+                         5.0, std::numeric_limits<double>::quiet_NaN()});
+    auto filled = s.fill_spline();
+    EXPECT_TRUE(std::isnan(filled.values[0]));  // leading stays NaN
+    EXPECT_FALSE(std::isnan(filled.values[2]));  // interior filled
+    EXPECT_TRUE(std::isnan(filled.values[5]));  // trailing stays NaN
+}
+
+TEST_F(ExpressionEvaluatorTest, FillSplineFewKnotsFallsBackToLinear) {
+    // Only 2 knots: degenerates to linear interpolation.
+    auto s = makeSeries({1000, 2000, 3000}, {0.0, std::numeric_limits<double>::quiet_NaN(), 10.0});
+    auto filled = s.fill_spline();
+    EXPECT_DOUBLE_EQ(filled.values[1], 5.0);
+}
+
+TEST_F(ExpressionEvaluatorTest, FillSplineNoNaNsIsIdentity) {
+    auto s = makeSeries({1000, 2000, 3000, 4000}, {1.0, 2.0, 3.0, 4.0});
+    auto filled = s.fill_spline();
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_DOUBLE_EQ(filled.values[i], s.values[i]);
+    }
+}
+
+// ==================== gaussian_smooth ====================
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothPreservesConstant) {
+    // Smoothing a constant series must return the same constant everywhere,
+    // including boundaries (renormalization keeps weights summing to 1).
+    std::vector<uint64_t> ts;
+    std::vector<double> vals(50, 7.5);
+    for (size_t i = 0; i < 50; ++i)
+        ts.push_back(1000 * (i + 1));
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto smoothed = s.gaussian_smooth(2.0);
+    for (size_t i = 0; i < 50; ++i) {
+        EXPECT_NEAR(smoothed.values[i], 7.5, 1e-9) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothReducesNoiseKeepsMean) {
+    // Alternating +/- noise around 10: smoothing with sigma=3 must pull
+    // interior values close to 10.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 100; ++i) {
+        ts.push_back(1000 * (i + 1));
+        vals.push_back(10.0 + ((i % 2 == 0) ? 1.0 : -1.0));
+    }
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto smoothed = s.gaussian_smooth(3.0);
+    for (size_t i = 20; i < 80; ++i) {
+        EXPECT_NEAR(smoothed.values[i], 10.0, 0.05) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothSkipsNaN) {
+    // A NaN input is excluded from neighbors' windows (renormalized), and
+    // the NaN position itself gets a smoothed estimate from its neighbors.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals(21, 5.0);
+    for (size_t i = 0; i < 21; ++i)
+        ts.push_back(1000 * (i + 1));
+    vals[10] = std::numeric_limits<double>::quiet_NaN();
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto smoothed = s.gaussian_smooth(1.5);
+    for (size_t i = 0; i < 21; ++i) {
+        EXPECT_NEAR(smoothed.values[i], 5.0, 1e-9) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, GaussianSmoothAllNaNStaysNaN) {
+    auto s = makeSeries({1000, 2000, 3000},
+                        {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
+                         std::numeric_limits<double>::quiet_NaN()});
+    auto smoothed = s.gaussian_smooth(1.0);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_TRUE(std::isnan(smoothed.values[i]));
+    }
+}
+
+// ==================== exp / round / sign (SIMD element-wise) ====================
+
+TEST_F(ExpressionEvaluatorTest, ExpMatchesStdExp) {
+    // 32 elements: exercises the SIMD kernel (>= SIMD_MIN_SIZE), tail included.
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 33; ++i) {
+        ts.push_back(1000 * (i + 1));
+        vals.push_back(-3.0 + static_cast<double>(i) * 0.2);
+    }
+    vals[7] = std::numeric_limits<double>::quiet_NaN();
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto r = s.exp();
+    for (size_t i = 0; i < 33; ++i) {
+        if (i == 7) {
+            EXPECT_TRUE(std::isnan(r.values[i]));
+        } else {
+            EXPECT_NEAR(r.values[i], std::exp(s.values[i]), std::abs(std::exp(s.values[i])) * 1e-12) << "at " << i;
+        }
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, ExpInverseOfLog) {
+    auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000},
+                        {1.0, 2.0, 5.0, 10.0, 0.5, 100.0, 3.0, 7.0, 0.1, 42.0});
+    auto roundTrip = s.log().exp();
+    for (size_t i = 0; i < s.size(); ++i) {
+        EXPECT_NEAR(roundTrip.values[i], s.values[i], s.values[i] * 1e-12);
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, RoundHalfAwayFromZero) {
+    // std::round semantics: halves away from zero (not banker's rounding).
+    std::vector<uint64_t> ts;
+    std::vector<double> vals = {2.5,  -2.5, 2.4, -2.4, 0.5,  -0.5, 1.49999, 3.50001, 0.0,
+                                -0.0, 7.0,  1e9, 2.5,  -3.5, 4.5,  -4.5,    100.499};
+    for (size_t i = 0; i < vals.size(); ++i)
+        ts.push_back(1000 * (i + 1));
+    std::vector<double> expect;
+    for (double v : vals)
+        expect.push_back(std::round(v));
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto r = s.round_nearest();
+    for (size_t i = 0; i < expect.size(); ++i) {
+        EXPECT_DOUBLE_EQ(r.values[i], expect[i]) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, SignBasics) {
+    std::vector<uint64_t> ts;
+    std::vector<double> vals = {5.0, -3.0, 0.0, -0.0, 0.001, -1e-9, std::numeric_limits<double>::quiet_NaN(),
+                                2.0, -2.0, 7.0, -7.0, 1.0,   -1.0,  0.0,
+                                3.0, -4.0, 5.0};
+    for (size_t i = 0; i < vals.size(); ++i)
+        ts.push_back(1000 * (i + 1));
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto r = s.sign();
+    EXPECT_DOUBLE_EQ(r.values[0], 1.0);
+    EXPECT_DOUBLE_EQ(r.values[1], -1.0);
+    EXPECT_EQ(r.values[2], 0.0);
+    EXPECT_EQ(r.values[3], 0.0);  // -0.0 == 0.0
+    EXPECT_DOUBLE_EQ(r.values[4], 1.0);
+    EXPECT_DOUBLE_EQ(r.values[5], -1.0);
+    EXPECT_TRUE(std::isnan(r.values[6]));
+    EXPECT_DOUBLE_EQ(r.values[16], 1.0);
+}
+
+// ==================== deriv / delta / idelta / changes / resets ====================
+
+TEST_F(ExpressionEvaluatorTest, DerivLinearSlope) {
+    // 1s spacing (1e9 ns), values rising 2.0 per step -> deriv = 2.0/s.
+    // Falling section -> negative derivative (which rate() would clamp).
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 20; ++i) {
+        ts.push_back(1000000000ULL * (i + 1));
+        vals.push_back(i < 10 ? 2.0 * static_cast<double>(i) : 20.0 - 3.0 * static_cast<double>(i - 10));
+    }
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto r = s.deriv();
+    EXPECT_TRUE(std::isnan(r.values[0]));
+    for (size_t i = 1; i < 10; ++i) {
+        EXPECT_NEAR(r.values[i], 2.0, 1e-9) << "at " << i;
+    }
+    for (size_t i = 11; i < 20; ++i) {
+        EXPECT_NEAR(r.values[i], -3.0, 1e-9) << "at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, DerivNaNAndDuplicateTimestamps) {
+    std::vector<uint64_t> ts = {1000000000, 2000000000, 2000000000, 3000000000,
+                                4000000000, 5000000000, 6000000000, 7000000000,
+                                8000000000, 9000000000, 10000000000, 11000000000};
+    std::vector<double> vals = {1.0, 2.0, 3.0, 4.0, std::numeric_limits<double>::quiet_NaN(),
+                                6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0};
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto r = s.deriv();
+    EXPECT_TRUE(std::isnan(r.values[2]));  // duplicate timestamp: dt == 0
+    EXPECT_TRUE(std::isnan(r.values[4]));  // NaN current
+    EXPECT_TRUE(std::isnan(r.values[5]));  // NaN previous
+    EXPECT_NEAR(r.values[6], 1.0, 1e-9);
+    EXPECT_NEAR(r.values[11], 1.0, 1e-9);
+}
+
+TEST_F(ExpressionEvaluatorTest, DeltaAndIdelta) {
+    auto s = makeSeries({1000, 2000, 3000, 4000, 5000},
+                        {std::numeric_limits<double>::quiet_NaN(), 10.0, 25.0,
+                         std::numeric_limits<double>::quiet_NaN(), 17.0});
+    auto d = s.delta();
+    EXPECT_DOUBLE_EQ(d.values[0], 7.0);  // 17 - 10, NaN skipped at both ends
+    EXPECT_EQ(d.size(), s.size());
+    auto id = s.idelta();
+    EXPECT_DOUBLE_EQ(id.values[0], -8.0);  // 17 - 25 (last two non-NaN)
+
+    auto allNan = makeSeries({1000, 2000}, {std::numeric_limits<double>::quiet_NaN(),
+                                            std::numeric_limits<double>::quiet_NaN()});
+    EXPECT_TRUE(std::isnan(allNan.delta().values[0]));
+    EXPECT_TRUE(std::isnan(allNan.idelta().values[0]));
+}
+
+TEST_F(ExpressionEvaluatorTest, ChangesAndResets) {
+    auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000, 7000},
+                        {5.0, 5.0, 7.0, std::numeric_limits<double>::quiet_NaN(), 7.0, 3.0, 3.0});
+    // Non-NaN sequence: 5, 5, 7, 7, 3, 3 -> changes: 5->7 and 7->3 = 2
+    EXPECT_DOUBLE_EQ(s.changes().values[0], 2.0);
+    // Decreases: 7->3 only = 1
+    EXPECT_DOUBLE_EQ(s.resets().values[0], 1.0);
+}
+
+// ==================== standardize ====================
+
+TEST_F(ExpressionEvaluatorTest, StandardizeMeanZeroStdOne) {
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 100; ++i) {
+        ts.push_back(1000 * (i + 1));
+        vals.push_back(static_cast<double>(i % 10) * 3.0 + 5.0);
+    }
+    vals[13] = std::numeric_limits<double>::quiet_NaN();
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto r = s.standardize();
+
+    EXPECT_TRUE(std::isnan(r.values[13]));  // NaN passthrough
+    double sum = 0.0, sumSq = 0.0;
+    size_t count = 0;
+    for (double v : r.values) {
+        if (!std::isnan(v)) {
+            sum += v;
+            sumSq += v * v;
+            ++count;
+        }
+    }
+    EXPECT_NEAR(sum / count, 0.0, 1e-9);
+    EXPECT_NEAR(std::sqrt(sumSq / count), 1.0, 1e-9);
+}
+
+TEST_F(ExpressionEvaluatorTest, StandardizeConstantSeriesIsZero) {
+    std::vector<uint64_t> ts;
+    std::vector<double> vals(20, 42.0);
+    for (size_t i = 0; i < 20; ++i)
+        ts.push_back(1000 * (i + 1));
+    vals[5] = std::numeric_limits<double>::quiet_NaN();
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto r = s.standardize();
+    for (size_t i = 0; i < 20; ++i) {
+        if (i == 5) {
+            EXPECT_TRUE(std::isnan(r.values[i]));
+        } else {
+            EXPECT_DOUBLE_EQ(r.values[i], 0.0);
+        }
+    }
+}
+
+// ==================== rolling_sum / rolling_median / rolling_percentile ====================
+
+TEST_F(ExpressionEvaluatorTest, RollingSumBasics) {
+    auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000},
+                        {1.0, 2.0, 3.0, std::numeric_limits<double>::quiet_NaN(), 5.0, 6.0});
+    auto r = s.rolling_sum(3);
+    EXPECT_TRUE(std::isnan(r.values[0]));  // warmup
+    EXPECT_TRUE(std::isnan(r.values[1]));
+    EXPECT_DOUBLE_EQ(r.values[2], 6.0);   // 1+2+3
+    EXPECT_DOUBLE_EQ(r.values[3], 5.0);   // 2+3 (NaN skipped)
+    EXPECT_DOUBLE_EQ(r.values[4], 8.0);   // 3+5
+    EXPECT_DOUBLE_EQ(r.values[5], 11.0);  // 5+6
+}
+
+TEST_F(ExpressionEvaluatorTest, RollingMedianRobustToOutlier) {
+    // A single 1000x spike must not move the rolling median (it wrecks rolling_avg).
+    std::vector<uint64_t> ts;
+    std::vector<double> vals(21, 10.0);
+    for (size_t i = 0; i < 21; ++i)
+        ts.push_back(1000 * (i + 1));
+    vals[10] = 10000.0;  // outlier
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto med = s.rolling_median(5);
+    for (size_t i = 4; i < 21; ++i) {
+        EXPECT_DOUBLE_EQ(med.values[i], 10.0) << "at " << i;
+    }
+    auto avg = s.rolling_avg(5);
+    EXPECT_GT(avg.values[10], 1000.0);  // proves the outlier is in-window
+}
+
+TEST_F(ExpressionEvaluatorTest, RollingMedianEvenWindowInterpolates) {
+    auto s = makeSeries({1000, 2000, 3000, 4000}, {1.0, 2.0, 3.0, 4.0});
+    auto med = s.rolling_median(4);
+    // Window {1,2,3,4}: linear-interp median = 2.5
+    EXPECT_DOUBLE_EQ(med.values[3], 2.5);
+}
+
+TEST_F(ExpressionEvaluatorTest, RollingMedianSlidesCorrectly) {
+    auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000, 7000},
+                        {7.0, 1.0, 5.0, 3.0, 9.0, 2.0, 8.0});
+    auto med = s.rolling_median(3);
+    EXPECT_DOUBLE_EQ(med.values[2], 5.0);  // {7,1,5}
+    EXPECT_DOUBLE_EQ(med.values[3], 3.0);  // {1,5,3}
+    EXPECT_DOUBLE_EQ(med.values[4], 5.0);  // {5,3,9}
+    EXPECT_DOUBLE_EQ(med.values[5], 3.0);  // {3,9,2}
+    EXPECT_DOUBLE_EQ(med.values[6], 8.0);  // {9,2,8}
+}
+
+TEST_F(ExpressionEvaluatorTest, RollingPercentileEndpointsAndMid) {
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (size_t i = 0; i < 30; ++i) {
+        ts.push_back(1000 * (i + 1));
+        vals.push_back(static_cast<double>((i * 13) % 30));
+    }
+    auto s = makeSeries(std::move(ts), std::move(vals));
+    auto p0 = s.rolling_percentile(10, 0.0);
+    auto p100 = s.rolling_percentile(10, 100.0);
+    auto p50 = s.rolling_percentile(10, 50.0);
+    auto med = s.rolling_median(10);
+    auto rmin = s.rolling_min(10);
+    auto rmax = s.rolling_max(10);
+    for (size_t i = 9; i < 30; ++i) {
+        EXPECT_DOUBLE_EQ(p0.values[i], rmin.values[i]) << "p0 != min at " << i;
+        EXPECT_DOUBLE_EQ(p100.values[i], rmax.values[i]) << "p100 != max at " << i;
+        EXPECT_DOUBLE_EQ(p50.values[i], med.values[i]) << "p50 != median at " << i;
+    }
+}
+
+TEST_F(ExpressionEvaluatorTest, RollingWindowFunctionsRejectBadN) {
+    auto s = makeSeries({1000, 2000}, {1.0, 2.0});
+    EXPECT_THROW(s.rolling_sum(0), EvaluationException);
+    EXPECT_THROW(s.rolling_median(-1), EvaluationException);
+    EXPECT_THROW(s.rolling_percentile(0, 50.0), EvaluationException);
+}
+
+// ==================== count_of_series / stddev_of_series ====================
+// (Dispatch-level behavior is covered via the FUNCTION_CALL switch; here we
+// verify the semantics through small direct expressions.)
+
+TEST_F(ExpressionEvaluatorTest, CountAndStddevOfSeries) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    ExpressionEvaluator::QueryResultMap results;
+    results["a"] = makeSeries({1000, 2000, 3000}, {2.0, nan, 6.0});
+    results["b"] = makeSeries({1000, 2000, 3000}, {4.0, nan, 6.0});
+    results["c"] = makeSeries({1000, 2000, 3000}, {6.0, 5.0, nan});
+
+    {
+        ExpressionParser parser("count_of_series(a, b, c)");
+        auto count = evaluator.evaluate(*parser.parse(), results);
+        EXPECT_DOUBLE_EQ(count.values[0], 3.0);
+        EXPECT_DOUBLE_EQ(count.values[1], 1.0);
+        EXPECT_DOUBLE_EQ(count.values[2], 2.0);
+    }
+    {
+        ExpressionParser parser("stddev_of_series(a, b, c)");
+        auto sd = evaluator.evaluate(*parser.parse(), results);
+        // t0: {2,4,6} -> population stddev = sqrt(8/3)
+        EXPECT_NEAR(sd.values[0], std::sqrt(8.0 / 3.0), 1e-12);
+        // t1: single value -> 0
+        EXPECT_DOUBLE_EQ(sd.values[1], 0.0);
+        // t2: {6,6} -> 0
+        EXPECT_DOUBLE_EQ(sd.values[2], 0.0);
+    }
+}
+
+// ==================== histogram_quantile ====================
+
+class HistogramQuantileTest : public ExpressionEvaluatorTest {
+protected:
+    // Cumulative buckets at 3 timestamps:
+    //   t0: le100=10, le500=60, le1000=90, +Inf=100
+    //   t1: le100=0,  le500=0,  le1000=0,  +Inf=0    (empty histogram)
+    //   t2: le100=40, le500=30, le1000=80, +Inf=100  (non-monotonic scrape artifact)
+    ExpressionEvaluator::QueryResultMap makeBuckets() {
+        ExpressionEvaluator::QueryResultMap r;
+        r["b100"] = makeSeries({1000, 2000, 3000}, {10.0, 0.0, 40.0});
+        r["b500"] = makeSeries({1000, 2000, 3000}, {60.0, 0.0, 30.0});
+        r["b1000"] = makeSeries({1000, 2000, 3000}, {90.0, 0.0, 80.0});
+        r["binf"] = makeSeries({1000, 2000, 3000}, {100.0, 0.0, 100.0});
+        return r;
+    }
+
+    AlignedSeries run(const std::string& formula, ExpressionEvaluator::QueryResultMap& results) {
+        ExpressionParser parser(formula);
+        return evaluator.evaluate(*parser.parse(), results);
+    }
+};
+
+TEST_F(HistogramQuantileTest, MedianInterpolatesWithinBucket) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // rank = 0.5*100 = 50 -> bucket (100, 500]: lower=100, prev=10, width=50
+    // 100 + 400 * (50-10)/50 = 420
+    EXPECT_NEAR(q.values[0], 420.0, 1e-9);
+}
+
+TEST_F(HistogramQuantileTest, QuantileInFirstBucketInterpolatesFromZero) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(5, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // rank = 5 -> first bucket: 0 + 100 * 5/10 = 50
+    EXPECT_NEAR(q.values[0], 50.0, 1e-9);
+}
+
+TEST_F(HistogramQuantileTest, RankBeyondFiniteBucketsReturnsHighestBound) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(95, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // rank = 95 > 90 (last finite cumulative) -> +Inf bucket -> 1000
+    EXPECT_DOUBLE_EQ(q.values[0], 1000.0);
+}
+
+TEST_F(HistogramQuantileTest, EmptyHistogramIsNaN) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_TRUE(std::isnan(q.values[1]));  // t1: total == 0
+}
+
+TEST_F(HistogramQuantileTest, NonMonotonicCountsAreClamped) {
+    auto results = makeBuckets();
+    auto q = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    // t2 raw: 40, 30, 80, 100 -> clamped: 40, 40, 80, 100; rank = 50
+    // -> bucket (500, 1000]: lower=500, prev=40, width=40
+    // 500 + 500 * (50-40)/40 = 625
+    EXPECT_NEAR(q.values[2], 625.0, 1e-9);
+}
+
+TEST_F(HistogramQuantileTest, ExtremesAndNaNPropagation) {
+    auto results = makeBuckets();
+    auto q0 = run("histogram_quantile(0, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_DOUBLE_EQ(q0.values[0], 0.0);  // rank 0 -> start of first bucket
+    auto q100 = run("histogram_quantile(100, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_DOUBLE_EQ(q100.values[0], 1000.0);  // rank == total -> +Inf region boundary
+
+    // NaN in any bucket at a timestamp -> NaN output there
+    results["b500"] = makeSeries({1000, 2000, 3000}, {60.0, 0.0, std::numeric_limits<double>::quiet_NaN()});
+    auto qn = run("histogram_quantile(50, 100, b100, 500, b500, 1000, b1000, binf)", results);
+    EXPECT_FALSE(std::isnan(qn.values[0]));
+    EXPECT_TRUE(std::isnan(qn.values[2]));
+}
+
+TEST_F(HistogramQuantileTest, ValidationErrors) {
+    auto results = makeBuckets();
+    // p out of range
+    EXPECT_THROW(run("histogram_quantile(101, 100, b100, 500, b500, 1000, b1000, binf)", results),
+                 EvaluationException);
+    // bounds not strictly ascending
+    EXPECT_THROW(run("histogram_quantile(50, 500, b500, 100, b100, 1000, b1000, binf)", results),
+                 EvaluationException);
+    // odd argument count is a parse error
+    EXPECT_THROW(ExpressionParser("histogram_quantile(50, 100, b100, binf, extra)").parse(),
+                 ExpressionParseException);
+    // too few arguments is a parse error
+    EXPECT_THROW(ExpressionParser("histogram_quantile(50, binf)").parse(), ExpressionParseException);
+}
+
+TEST_F(HistogramQuantileTest, SingleBucketPlusInf) {
+    ExpressionEvaluator::QueryResultMap results;
+    results["b"] = makeSeries({1000}, {80.0});
+    results["binf"] = makeSeries({1000}, {100.0});
+    auto q = run("histogram_quantile(40, 250, b, binf)", results);
+    // rank = 40 -> only bucket: 0 + 250 * 40/80 = 125
+    EXPECT_NEAR(q.values[0], 125.0, 1e-9);
+    auto q90 = run("histogram_quantile(90, 250, b, binf)", results);
+    EXPECT_DOUBLE_EQ(q90.values[0], 250.0);  // beyond finite buckets
+}

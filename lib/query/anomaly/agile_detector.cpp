@@ -9,7 +9,7 @@
 namespace timestar {
 namespace anomaly {
 
-AgileDetector::HoltWintersState AgileDetector::initializeState(const std::vector<double>& values,
+AgileDetector::HoltWintersState AgileDetector::initializeState(std::span<const double> values,
                                                                size_t seasonalPeriod) {
     HoltWintersState state;
 
@@ -78,7 +78,7 @@ double AgileDetector::predictAndUpdate(HoltWintersState& state, double actualVal
     return prediction;
 }
 
-AnomalyOutput AgileDetector::detect(const AnomalyInput& input, const AnomalyConfig& config) {
+AnomalyOutput AgileDetector::detect(const AnomalyInputView& input, const AnomalyConfig& config) {
     AnomalyOutput output;
 
     if (input.empty()) {

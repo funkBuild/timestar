@@ -286,6 +286,19 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
         horizon = std::min(std::max<size_t>(timestamps.size() / 5, 50), size_t(2000));
     }
 
+    // Period detection runs ONCE for AUTO/MULTI and feeds both auto-windowing
+    // and the statistics record (previously two identical detectPeriods runs —
+    // each a full detrend + Hann + FFT + ACF pipeline).
+    const bool isAutoOrMulti = (config.forecastSeasonality == ForecastSeasonality::AUTO ||
+                                config.forecastSeasonality == ForecastSeasonality::MULTI);
+    std::vector<DetectedPeriod> detectedPeriods;
+    if (isAutoOrMulti && !seriesValues.empty()) {
+        PeriodicityDetector detector;
+        detectedPeriods = detector.detectPeriods(seriesValues[0], config.minPeriod,
+                                                 config.maxPeriod > 0 ? config.maxPeriod : seriesValues[0].size() / 2,
+                                                 config.maxSeasonalComponents, config.seasonalThreshold);
+    }
+
     // Auto-windowing: compute window once, apply to all series
     std::vector<uint64_t> windowedTimestamps = timestamps;
     size_t trimCount = 0;
@@ -294,7 +307,14 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
         uint64_t dataIntervalNs = (timestamps.back() - timestamps.front()) / (timestamps.size() - 1);
 
         // Use first series for period detection (all series share timestamps)
-        size_t maxPeriod = detectMaxPeriodForWindowing(seriesValues[0], dataIntervalNs, config);
+        size_t maxPeriod = 0;
+        if (isAutoOrMulti) {
+            for (const auto& p : detectedPeriods) {
+                maxPeriod = std::max(maxPeriod, p.period);
+            }
+        } else {
+            maxPeriod = detectMaxPeriodForWindowing(seriesValues[0], dataIntervalNs, config);
+        }
         size_t windowSize = computeOptimalWindowSize(timestamps.size(), maxPeriod, horizon, config);
 
         // Only trim if saving >33%
@@ -316,15 +336,9 @@ ForecastQueryResult ForecastExecutor::executeMulti(const std::vector<uint64_t>& 
     result.statistics.originalPoints = timestamps.size();
     result.statistics.windowedPoints = windowedTimestamps.size();
 
-    // Detect and record periods for AUTO/MULTI modes
-    if ((config.forecastSeasonality == ForecastSeasonality::AUTO ||
-         config.forecastSeasonality == ForecastSeasonality::MULTI) &&
-        !windowedTimestamps.empty() && !seriesValues.empty()) {
-        PeriodicityDetector detector;
-        auto detected = detector.detectPeriods(seriesValues[0], config.minPeriod,
-                                               config.maxPeriod > 0 ? config.maxPeriod : seriesValues[0].size() / 2,
-                                               config.maxSeasonalComponents, config.seasonalThreshold);
-        for (const auto& d : detected) {
+    // Record detected periods for AUTO/MULTI modes (from the single run above)
+    if (isAutoOrMulti && !windowedTimestamps.empty()) {
+        for (const auto& d : detectedPeriods) {
             result.statistics.detectedPeriods.push_back(d.period);
         }
     }

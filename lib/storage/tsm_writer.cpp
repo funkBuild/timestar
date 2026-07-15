@@ -8,7 +8,10 @@
 #include "series_id.hpp"
 #include "string_encoder.hpp"
 #include "tsm.hpp"
+#include "../query/simd_aggregator.hpp"
 #include "value_type_dispatch.hpp"
+
+#include <cassert>
 #include "zigzag.hpp"
 
 #include <fcntl.h>
@@ -58,7 +61,8 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
     if constexpr (std::is_same_v<T, std::string>) {
         stringDict = StringEncoder::buildDictionary(values);
         if (stringDict.valid) {
-            indexEntry.stringDictionary = stringDict.entries;
+            indexEntry.stringDictionary =
+                std::make_shared<const std::vector<std::string>>(std::move(stringDict.entries));
         }
     }
 
@@ -139,22 +143,18 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         size_t pad = (8 - ((buffer.size() - beforeSize) % 8)) % 8;
         for (size_t i = 0; i < pad; ++i)
             buffer.write(static_cast<uint8_t>(0));
-    } else if constexpr (std::is_same_v<T, bool>) {
-        // vector<bool> path: caller passes spans constructed from a temporary vector<bool>
-        // BoolEncoderRLE needs a vector, so reconstruct one from the span
-        std::vector<bool> boolVec(values.begin(), values.end());
-        BoolEncoderRLE::encodeInto(boolVec, buffer);
     } else if constexpr (std::is_same_v<T, std::string>) {
-        // Phase 3: Use dictionary encoding if dictionary is available on the index entry
-        if (!indexEntry.stringDictionary.empty()) {
+        // Phase 3: Use dictionary encoding if dictionary is available on the index entry.
+        // encodeInto/encodeDictionaryInto write header + compressed bytes straight into
+        // the output buffer — no intermediate AlignedBuffer + copy per block. The bytes
+        // are identical to the old encode()+write() path.
+        if (indexEntry.stringDictionary && !indexEntry.stringDictionary->empty()) {
             StringEncoder::Dictionary dict;
-            dict.entries = indexEntry.stringDictionary;
+            dict.entries = *indexEntry.stringDictionary;
             dict.valid = true;
-            AlignedBuffer encodedStrings = StringEncoder::encodeDictionary(values, dict, compressionLevel_);
-            buffer.write(encodedStrings);
+            StringEncoder::encodeDictionaryInto(values, dict, buffer, compressionLevel_);
         } else {
-            AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
-            buffer.write(encodedStrings);
+            StringEncoder::encodeInto(values, buffer, compressionLevel_);
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         // Use thread-local scratch buffer to avoid per-block heap allocation
@@ -167,6 +167,8 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         // to the previous encode()+write().
         IntegerEncoder::encodeInto(zigzagScratch, buffer);
     } else {
+        // bool never reaches writeBlock: writeSeries inlines bool encoding because
+        // vector<bool> cannot form a std::span — this static_assert guards it.
         static_assert(sizeof(T) == 0, "Unsupported TSM value type");
     }
 
@@ -186,7 +188,13 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     if (timestamps.empty()) {
         return;  // No data to index
     }
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
 
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
@@ -196,8 +204,8 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
     // V2: set blockCount for all types (enables COUNT pushdown for String)
@@ -211,7 +219,13 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     if (timestamps.empty()) {
         return;
     }
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
 
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
@@ -221,8 +235,8 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
 
@@ -237,33 +251,48 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     double bmin = std::numeric_limits<double>::max();
     double bmax = std::numeric_limits<double>::lowest();
     size_t validCount = 0;
-    for (size_t i = 0; i < n; ++i) {
-        double v = values[i];
-        if (std::isnan(v))
-            continue;
-        ++validCount;
-        sum += v;
-        if (v < bmin)
-            bmin = v;
-        if (v > bmax)
-            bmax = v;
-    }
-    // If all values are NaN, use sentinel values indicating no valid stats.
-    if (validCount == 0) {
-        sum = 0.0;
-        bmin = std::numeric_limits<double>::quiet_NaN();
-        bmax = std::numeric_limits<double>::quiet_NaN();
-    }
-    // Second pass: M2 = Σ(xi - mean)² — single division for mean, no per-element division.
-    // Only computed over non-NaN values.
     double m2 = 0.0;
-    if (validCount > 0) {
-        double mean = sum / static_cast<double>(validCount);
+
+    // Fast path: TSM block data is NaN-free by invariant (NaN filtered during
+    // write), so a fused SIMD sum/min/max pass + a SIMD variance pass replace
+    // the two branchy scalar loops. A NaN sum detects invariant violations and
+    // falls back to the NaN-skipping scalar path below.
+    timestar::simd::SimdAggregator::calculateSumMinMax(values.data(), n, sum, bmin, bmax);
+    if (!std::isnan(sum)) [[likely]] {
+        validCount = n;
+        const double mean = sum / static_cast<double>(n);
+        // calculateVariance returns population variance (M2/n)
+        m2 = timestar::simd::SimdAggregator::calculateVariance(values.data(), n, mean) * static_cast<double>(n);
+    } else {
+        sum = 0.0;
+        bmin = std::numeric_limits<double>::max();
+        bmax = std::numeric_limits<double>::lowest();
         for (size_t i = 0; i < n; ++i) {
-            if (std::isnan(values[i]))
+            double v = values[i];
+            if (std::isnan(v))
                 continue;
-            double delta = values[i] - mean;
-            m2 += delta * delta;
+            ++validCount;
+            sum += v;
+            if (v < bmin)
+                bmin = v;
+            if (v > bmax)
+                bmax = v;
+        }
+        // If all values are NaN, use sentinel values indicating no valid stats.
+        if (validCount == 0) {
+            sum = 0.0;
+            bmin = std::numeric_limits<double>::quiet_NaN();
+            bmax = std::numeric_limits<double>::quiet_NaN();
+        }
+        // M2 = Σ(xi - mean)² over non-NaN values.
+        if (validCount > 0) {
+            double mean = sum / static_cast<double>(validCount);
+            for (size_t i = 0; i < n; ++i) {
+                if (std::isnan(values[i]))
+                    continue;
+                double delta = values[i] - mean;
+                m2 += delta * delta;
+            }
         }
     }
     indexBlock.blockSum = sum;
@@ -271,9 +300,10 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.blockMax = bmax;
     indexBlock.blockCount = static_cast<uint32_t>(n);
     indexBlock.blockM2 = m2;
-    // firstValue/latestValue: values at min/max timestamp positions
-    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
-    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    // firstValue/latestValue: values at min/max timestamp positions.
+    // Sorted timestamps: first = index 0, latest = index n-1.
+    size_t firstIdx = 0;
+    size_t latestIdx = timestamps.size() - 1;
     indexBlock.blockFirstValue = values[firstIdx];
     indexBlock.blockLatestValue = values[latestIdx];
     indexBlock.hasExtendedStats = true;
@@ -286,15 +316,21 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
                                 TSMIndexEntry& indexEntry, size_t blockStartOffset) {
     if (timestamps.empty())
         return;
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size exceeds uint32_t maximum");
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
 
@@ -315,9 +351,9 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.blockMax = static_cast<double>(bmax);
     indexBlock.blockCount = static_cast<uint32_t>(n);
 
-    // first/latest at min/max timestamp positions
-    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
-    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    // first/latest at min/max timestamp positions (sorted: endpoints)
+    size_t firstIdx = 0;
+    size_t latestIdx = timestamps.size() - 1;
     indexBlock.blockFirstValue = static_cast<double>(values[firstIdx]);
     indexBlock.blockLatestValue = static_cast<double>(values[latestIdx]);
     indexBlock.hasExtendedStats = true;
@@ -330,32 +366,66 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
                                 size_t valCount, TSMIndexEntry& indexEntry, size_t blockStartOffset) {
     if (timestamps.empty())
         return;
-    const auto [minTime, maxTime] = std::minmax_element(timestamps.begin(), timestamps.end());
+    // Timestamps are sorted on every writeSeries path (writeAllSeries sorts;
+    // the compactor merges sorted runs), so min/max are the endpoints — no
+    // O(N) scan needed. minmax_element's first-min/last-max convention matches
+    // front/back exactly, including duplicate timestamps.
+    assert(std::is_sorted(timestamps.begin(), timestamps.end()));
+    const uint64_t blockMinTime = timestamps.front();
+    const uint64_t blockMaxTime = timestamps.back();
     size_t blockSize = buffer.size() - blockStartOffset;
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size exceeds uint32_t maximum");
     }
 
     TSMIndexBlock indexBlock;
-    indexBlock.minTime = *minTime;
-    indexBlock.maxTime = *maxTime;
+    indexBlock.minTime = blockMinTime;
+    indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
     indexBlock.blockCount = static_cast<uint32_t>(valCount);
 
     uint32_t trueCount = 0;
+#ifdef __GLIBCXX__
+    // libstdc++ fast path: popcount the packed words directly instead of
+    // reading one bit proxy per value (same storage access pattern as
+    // BoolEncoderRLE::encodeInto).
+    {
+        static_assert(sizeof(unsigned long) == 8, "word popcount assumes 64-bit unsigned long");
+        auto it = values.begin() + static_cast<std::ptrdiff_t>(valOffset);
+        const unsigned long* wordPtr = it._M_p;
+        const unsigned int bitOff = it._M_offset;
+        const size_t totalBits = valCount + bitOff;
+        const size_t fullWords = totalBits / 64;
+        const unsigned int tailBits = totalBits % 64;
+
+        for (size_t w = 0; w < fullWords; ++w) {
+            unsigned long word = wordPtr[w];
+            if (w == 0 && bitOff != 0)
+                word &= ~0UL << bitOff;
+            trueCount += static_cast<uint32_t>(__builtin_popcountl(word));
+        }
+        if (tailBits > 0) {
+            unsigned long word = wordPtr[fullWords] & ((1UL << tailBits) - 1UL);
+            if (fullWords == 0 && bitOff != 0)
+                word &= ~0UL << bitOff;
+            trueCount += static_cast<uint32_t>(__builtin_popcountl(word));
+        }
+    }
+#else
     for (size_t i = 0; i < valCount; ++i) {
         if (values[valOffset + i])
             trueCount++;
     }
+#endif
     indexBlock.boolTrueCount = trueCount;
     indexBlock.blockSum = static_cast<double>(trueCount);
     indexBlock.blockMin = (trueCount < indexBlock.blockCount) ? 0.0 : 1.0;
     indexBlock.blockMax = (trueCount > 0) ? 1.0 : 0.0;
 
-    // first/latest at min/max timestamp positions
-    size_t firstIdx = static_cast<size_t>(minTime - timestamps.begin());
-    size_t latestIdx = static_cast<size_t>(maxTime - timestamps.begin());
+    // first/latest at min/max timestamp positions (sorted: endpoints)
+    size_t firstIdx = 0;
+    size_t latestIdx = timestamps.size() - 1;
     indexBlock.boolFirstValue = values[valOffset + firstIdx];
     indexBlock.boolLatestValue = values[valOffset + latestIdx];
     indexBlock.blockFirstValue = indexBlock.boolFirstValue ? 1.0 : 0.0;
@@ -478,9 +548,9 @@ void TSMWriter::writeIndex() {
         // Format: dictSize(4) + dictData(dictSize bytes)
         // dictSize == 0 means no dictionary (raw encoding used).
         if (indexEntry.seriesType == TSMValueType::String) {
-            if (!indexEntry.stringDictionary.empty()) {
+            if (indexEntry.stringDictionary && !indexEntry.stringDictionary->empty()) {
                 StringEncoder::Dictionary dict;
-                dict.entries = indexEntry.stringDictionary;
+                dict.entries = *indexEntry.stringDictionary;
                 dict.valid = true;
                 AlignedBuffer serialized = StringEncoder::serializeDictionary(dict);
                 buffer.write(static_cast<uint32_t>(serialized.size()));
@@ -667,6 +737,21 @@ seastar::future<> TSMWriter::closeDMA() {
 }
 
 void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStore> store) {
+    // Pre-reserve the output buffer from the store's point count. Without
+    // this, an ~8MB file accretes through ~11 geometric-doubling reallocs of
+    // the page-aligned buffer, each a full copy (~2x the file size memcpy'd).
+    // ~9 bytes/point covers encoded timestamps+values for numeric series
+    // (strings may still grow the buffer, which falls back to doubling), plus
+    // per-series index overhead. Over-reservation is short-lived and bounded
+    // well below the raw memstore footprint (16+ bytes/point).
+    {
+        size_t totalPoints = 0;
+        for (auto it = store.get()->series.begin(); it != store.get()->series.end(); ++it) {
+            totalPoints += std::visit([](const auto& s) { return s.timestamps.size(); }, it.value());
+        }
+        writer.buffer.reserve(4096 + totalPoints * 9 + store.get()->series.size() * 160);
+    }
+
     for (auto it = store.get()->series.begin(); it != store.get()->series.end(); ++it) {
         const auto& seriesKey = it->first;
         auto& memStore = it.value();

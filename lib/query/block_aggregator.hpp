@@ -169,9 +169,19 @@ public:
         } else if (singleBucketState_) {
             singleBucketState_->count += timestamps.size();
         } else {
-            for (size_t i = 0; i < timestamps.size(); ++i) {
+            // Timestamps are monotonic within a block: batch consecutive
+            // same-bucket runs into one hash lookup + bulk count add.
+            const size_t n = timestamps.size();
+            size_t i = 0;
+            while (i < n) {
                 uint64_t bucket = (timestamps[i] / interval_) * interval_;
-                bucketStates_[bucket].count++;
+                uint64_t nextBucket = bucket + interval_;
+                size_t j = i + 1;
+                while (j < n && timestamps[j] < nextBucket) {
+                    ++j;
+                }
+                bucketStates_[bucket].count += j - i;
+                i = j;
             }
         }
     }
@@ -228,10 +238,7 @@ public:
                 }
             }
         } else {
-            for (size_t i = startIdx; i < endIdx; ++i) {
-                uint64_t bucket = (timestamps[i] / interval_) * interval_;
-                addToState(bucketStates_[bucket], values[i], timestamps[i]);
-            }
+            foldSortedMultiBucket(timestamps, values, startIdx, endIdx);
         }
     }
 
@@ -269,27 +276,7 @@ public:
                 }
             }
         } else {
-            // Multi-bucket: batch consecutive timestamps in the same bucket.
-            // Timestamps are monotonic within a block, so we compute the next
-            // bucket boundary once and compare directly — avoids division per point.
-            size_t i = 0;
-            while (i < n) {
-                uint64_t bucket = (timestamps[i] / interval_) * interval_;
-                uint64_t nextBucket = bucket + interval_;
-                size_t j = i + 1;
-                while (j < n && timestamps[j] < nextBucket) {
-                    ++j;
-                }
-                auto& state = bucketStates_[bucket];
-                if (methodAware_ && (j - i) >= 4) {
-                    addPointsSIMDFoldRange(timestamps, values, i, j, state);
-                } else {
-                    for (size_t k = i; k < j; ++k) {
-                        addToState(state, values[k], timestamps[k]);
-                    }
-                }
-                i = j;
-            }
+            foldSortedMultiBucket(timestamps, values, 0, n);
         }
     }
 
@@ -336,6 +323,33 @@ public:
     }
 
 private:
+    // Multi-bucket fold over sorted timestamps: batch consecutive timestamps in
+    // the same bucket, so each run costs one division + one hash lookup + one
+    // SIMD fold instead of per-point division/hash/switch. Timestamps are
+    // monotonic within a TSM block and within MemoryStore batches (callers
+    // binary-search them), which is the precondition for run detection.
+    void foldSortedMultiBucket(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
+                               size_t startIdx, size_t endIdx) {
+        size_t i = startIdx;
+        while (i < endIdx) {
+            uint64_t bucket = (timestamps[i] / interval_) * interval_;
+            uint64_t nextBucket = bucket + interval_;
+            size_t j = i + 1;
+            while (j < endIdx && timestamps[j] < nextBucket) {
+                ++j;
+            }
+            auto& state = bucketStates_[bucket];
+            if (methodAware_ && (j - i) >= 4) {
+                addPointsSIMDFoldRange(timestamps, values, i, j, state);
+            } else {
+                for (size_t k = i; k < j; ++k) {
+                    addToState(state, values[k], timestamps[k]);
+                }
+            }
+            i = j;
+        }
+    }
+
     // Dispatch to method-aware or generic addValue based on construction.
     void addToState(AggregationState& state, double value, uint64_t timestamp) {
         if (methodAware_) {
@@ -346,16 +360,15 @@ private:
     }
 
     // SIMD batch fold: process an entire batch using vectorised reductions
-    // for methods that support it (SUM/AVG/MIN/MAX/COUNT/SPREAD).
-    // Falls back to scalar for LATEST/FIRST/STDDEV/MEDIAN.
+    // for methods that support it (SUM/AVG/MIN/MAX/COUNT/SPREAD/STDDEV/STDVAR).
+    // Falls back to scalar for MEDIAN/EXACT_MEDIAN.
     //
     // NOTE: The SIMD paths for AVG/SUM/MIN/MAX/COUNT/SPREAD only update the
-    // accumulators they need (sum, count, min, max). They do NOT update
-    // singleState_.m2 or singleState_.mean via Welford's algorithm — those
-    // fields are only valid when method_ is STDDEV/STDVAR, which always takes
-    // the scalar fallback path. After updating sum/count we recompute
-    // state.mean = state.sum / state.count so that any downstream code
-    // reading mean (e.g. mergeForMethod) sees a consistent value.
+    // accumulators they need (sum, count, min, max). STDDEV/STDVAR maintain
+    // mean/m2 via a two-pass batch variance + Chan's parallel Welford merge.
+    // After updating sum/count we recompute state.mean = state.sum / state.count
+    // so that any downstream code reading mean (e.g. mergeForMethod) sees a
+    // consistent value.
     void addPointsSIMDFold(const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
                            AggregationState* state = nullptr) {
         addPointsSIMDFoldRange(timestamps, values, 0, timestamps.size(), state ? *state : singleState_);
@@ -501,8 +514,46 @@ private:
                 }
                 state.count += n;
                 break;
+            case AggregationMethod::STDDEV:
+            case AggregationMethod::STDVAR: {
+                // Two-pass SIMD variance: batch mean via calculateSum, then batch
+                // M2 via calculateVariance, merged with Chan's parallel Welford
+                // formula. Numerically equivalent-or-better vs per-point Welford.
+                double simdSum = simd::SimdAggregator::calculateSum(vdata, n);
+                if (std::isnan(simdSum)) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                } else {
+                    const double batchMean = simdSum / static_cast<double>(n);
+                    // calculateVariance returns population variance (M2/n).
+                    const double batchM2 =
+                        simd::SimdAggregator::calculateVariance(vdata, n, batchMean) * static_cast<double>(n);
+                    if (state.count == 0) {
+                        state.mean = batchMean;
+                        state.m2 = batchM2;
+                    } else {
+                        const double delta = batchMean - state.mean;
+                        const double totalCount = static_cast<double>(state.count) + static_cast<double>(n);
+                        state.m2 += batchM2 +
+                                    delta * delta * (static_cast<double>(state.count) * static_cast<double>(n)) /
+                                        totalCount;
+                        state.mean += delta * (static_cast<double>(n) / totalCount);
+                    }
+                    state.count += n;
+                    if (tdata[0] < state.firstTimestamp) {
+                        state.firstTimestamp = tdata[0];
+                        state.first = vdata[0];
+                    }
+                    if (tdata[n - 1] >= state.latestTimestamp) {
+                        state.latestTimestamp = tdata[n - 1];
+                        state.latest = vdata[n - 1];
+                    }
+                }
+                break;
+            }
             default:
-                // STDDEV, MEDIAN, EXACT_MEDIAN, etc. — fall back to scalar per-value
+                // MEDIAN, EXACT_MEDIAN, etc. — fall back to scalar per-value
                 for (size_t i = begin; i < end; ++i) {
                     addToState(state, values[i], timestamps[i]);
                 }

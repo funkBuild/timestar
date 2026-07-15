@@ -96,9 +96,11 @@ private:
     // Execute all sub-queries in parallel
     seastar::future<std::map<std::string, SubQueryResult>> executeAllSubQueries(const DerivedQueryRequest& request);
 
-    // Convert HTTP query handler results to SubQueryResult
+    // Convert HTTP query handler results to SubQueryResult.
+    // Takes the results by rvalue reference and moves the timestamp/value
+    // vectors out (the response is locally owned and discarded by the caller).
     SubQueryResult convertQueryResponse(const std::string& name, const QueryRequest& query,
-                                        const std::vector<SeriesResult>& results);
+                                        std::vector<SeriesResult>&& results);
 
     // Validate request before execution
     void validateRequest(const DerivedQueryRequest& request);

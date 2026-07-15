@@ -137,6 +137,21 @@ public:
         return earliest;
     }
 
+    // Type-agnostic variant: one hash lookup per store (visits the series
+    // variant) instead of one probe per candidate value type.  String series
+    // are excluded to match the semantics of probing only aggregatable types.
+    std::optional<uint64_t> getEarliestMemoryTimestampAnyType(const SeriesId128& seriesId, uint64_t startTime,
+                                                              uint64_t endTime) {
+        std::optional<uint64_t> earliest;
+        for (auto& memStore : memoryStores) {
+            auto ts = memStore->earliestTimestampInRange(seriesId, startTime, endTime);
+            if (ts && (!earliest.has_value() || *ts < *earliest)) {
+                earliest = ts;
+            }
+        }
+        return earliest;
+    }
+
     // Delete data from memory stores and write to WAL
     seastar::future<> deleteFromMemoryStores(const std::string& seriesKey, uint64_t startTime, uint64_t endTime);
 };

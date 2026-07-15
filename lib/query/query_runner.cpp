@@ -467,9 +467,16 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
         const auto& s = spans[0];
         result.timestamps.assign(s.tsPtr, s.tsPtr + s.len);
         result.values.clear();
-        result.values.reserve(s.len);
-        for (size_t i = 0; i < s.len; ++i) {
-            result.values.push_back((*s.valVec)[s.baseIdx + i]);
+        if constexpr (std::is_same_v<T, bool>) {
+            // vector<bool> bit proxies: element-wise copy.
+            result.values.reserve(s.len);
+            for (size_t i = 0; i < s.len; ++i) {
+                result.values.push_back((*s.valVec)[s.baseIdx + i]);
+            }
+        } else {
+            // Contiguous types: ranged insert compiles to memcpy.
+            result.values.insert(result.values.end(), s.valVec->begin() + s.baseIdx,
+                                 s.valVec->begin() + s.baseIdx + s.len);
         }
         co_return std::move(result);
     }
@@ -504,10 +511,16 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series,
             result.timestamps.reserve(totalPoints);
             result.values.reserve(totalPoints);
             result.timestamps.insert(result.timestamps.end(), memTsPtr, memTsPtr + memLen);
-            // Use index-based copy for values (vector<bool> compatibility).
             const auto& memVals = *memValVec;
-            for (size_t i = 0; i < memLen; ++i) {
-                result.values.push_back(memVals[memBaseIdx + i]);
+            if constexpr (std::is_same_v<T, bool>) {
+                // vector<bool> bit proxies: element-wise copy.
+                for (size_t i = 0; i < memLen; ++i) {
+                    result.values.push_back(memVals[memBaseIdx + i]);
+                }
+            } else {
+                // Contiguous types: ranged insert compiles to memcpy.
+                result.values.insert(result.values.end(), memVals.begin() + memBaseIdx,
+                                     memVals.begin() + memBaseIdx + memLen);
             }
             co_return std::move(result);
         }
@@ -671,7 +684,7 @@ static size_t aggregateMemoryStores(WALFileManager* walFileManager, const Series
 }
 
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
-    std::string seriesKey, SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
+    SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
     timestar::AggregationMethod method) {
     // Gate 0.5: MEDIAN and EXACT_MEDIAN need all raw values — cannot use
     // pushdown aggregation.  T-digest is used at merge time for cross-shard
@@ -724,20 +737,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
     // Gate 1 (split logic): Instead of rejecting entirely when memory data
     // exists, determine the split point so the TSM-only portion can still
-    // benefit from pushdown aggregation.
-    // Check float first (most common type); only check int64/bool if no float
-    // data found, since a series is always one type.
-    auto memMinTimeOpt = walFileManager->getEarliestMemoryTimestamp<double>(seriesId, startTime, endTime);
-    if (!memMinTimeOpt) {
-        auto memMinInt = walFileManager->getEarliestMemoryTimestamp<int64_t>(seriesId, startTime, endTime);
-        if (memMinInt) {
-            memMinTimeOpt = memMinInt;
-        } else {
-            auto memMinBool = walFileManager->getEarliestMemoryTimestamp<bool>(seriesId, startTime, endTime);
-            if (memMinBool)
-                memMinTimeOpt = memMinBool;
-        }
-    }
+    // benefit from pushdown aggregation.  The type-agnostic probe visits the
+    // series variant with a single hash lookup per store — for historical
+    // queries (no memory data, the common case) this replaces three per-type
+    // probe misses per store.
+    auto memMinTimeOpt = walFileManager->getEarliestMemoryTimestampAnyType(seriesId, startTime, endTime);
 
     // tsmEndTime: the upper bound for the TSM-only pushdown range.
     // fallbackStartTime: the lower bound for the fallback (TSM+memory) range.

@@ -12,6 +12,11 @@ public:
     static size_t encodeInto(const std::vector<bool>& values, AlignedBuffer& target);
     static void decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out);
 
+    // Decode straight to doubles (1.0/0.0) for the aggregation path.
+    // Appends `length` values to `out` via bulk fill per run — avoids the
+    // vector<bool> round-trip + per-bit-proxy conversion loop.
+    static void decodeToDouble(Slice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
+
 private:
     static void writeVarint(AlignedBuffer& buf, uint64_t value);
     static uint64_t readVarint(Slice& slice);

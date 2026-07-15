@@ -554,8 +554,10 @@ seastar::future<> testStringDictionaryRoundTrip(std::string filename) {
     auto* entry = co_await tsm.getFullIndexEntry(seriesId);
     EXPECT_NE(entry, nullptr);
     if (!entry) co_return;
-    EXPECT_FALSE(entry->stringDictionary.empty()) << "Low-cardinality strings should use dictionary";
-    EXPECT_EQ(entry->stringDictionary.size(), 3u);
+    EXPECT_TRUE(entry->stringDictionary != nullptr) << "Low-cardinality strings should use dictionary";
+    if (!entry->stringDictionary) co_return;
+    EXPECT_FALSE(entry->stringDictionary->empty()) << "Low-cardinality strings should use dictionary";
+    EXPECT_EQ(entry->stringDictionary->size(), 3u);
 
     // Read all data back
     TSMResult<std::string> results(0);

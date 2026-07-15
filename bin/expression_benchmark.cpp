@@ -10,6 +10,7 @@
 //            --benchmark_display_aggregates_only=true
 
 #include "expression_evaluator.hpp"
+#include "expression_parser.hpp"
 #include "topk_filter.hpp"
 
 #include <benchmark/benchmark.h>
@@ -119,6 +120,13 @@ UNARY_BM(normalize, g_series.normalize());
 UNARY_BM(rate, g_series.rate());
 UNARY_BM(irate, g_series.irate());
 UNARY_BM(increase, g_series.increase());
+UNARY_BM(exp, g_series.normalize().exp());  // normalize() first to avoid overflow to inf
+UNARY_BM(round, g_series.round_nearest());
+UNARY_BM(sign, g_series.sign());
+UNARY_BM(deriv, g_series.deriv());
+UNARY_BM(delta, g_series.delta());
+UNARY_BM(changes, g_series.changes());
+UNARY_BM(standardize, g_series.standardize());
 
 // ═══════════════════════ scalar-parameter benchmarks ═════════════════════════
 
@@ -136,6 +144,9 @@ SCALAR_BM(rolling_avg_100, g_series.rolling_avg(100));
 SCALAR_BM(rolling_min_100, g_series.rolling_min(100));
 SCALAR_BM(rolling_max_100, g_series.rolling_max(100));
 SCALAR_BM(rolling_stddev_100, g_series.rolling_stddev(100));
+SCALAR_BM(rolling_sum_100, g_series.rolling_sum(100));
+SCALAR_BM(rolling_median_101, g_series.rolling_median(101));
+SCALAR_BM(rolling_percentile_p95_100, g_series.rolling_percentile(100, 95.0));
 SCALAR_BM(ema_0_1, g_series.ema(0.1));
 SCALAR_BM(zscore_100, g_series.zscore(100));
 SCALAR_BM(holt_winters, g_series.holt_winters(0.3, 0.1));
@@ -204,6 +215,44 @@ static void BM_bottomk(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(NUM_GROUPS * GROUP_N));
 }
 BENCHMARK(BM_bottomk);
+
+// ═══════════════════ end-to-end formula benchmarks ═══════════════════════════
+//
+// Parse + evaluate a formula through ExpressionParser + ExpressionEvaluator,
+// exactly as the derived-query path does. Gates for QUERY_REF leaf-copy and
+// scalar-literal dispatch optimizations.
+
+static void BM_formula_ratio(benchmark::State& state) {
+    // (a - b) / (a + b): two leaf refs of each query — measures leaf-copy cost.
+    timestar::ExpressionParser parser("(a - b) / (a + b)");
+    auto ast = parser.parse();
+    timestar::ExpressionEvaluator::QueryResultMap results;
+    results["a"] = g_series;
+    results["b"] = g_series2;
+    for (auto _ : state) {
+        timestar::ExpressionEvaluator evaluator;
+        auto result = evaluator.evaluate(*ast, results);
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(g_series.size()));
+}
+BENCHMARK(BM_formula_ratio);
+
+static void BM_formula_scalar(benchmark::State& state) {
+    // a * 2 + b / 4 - 1: scalar literals — measures constant-series materialization.
+    timestar::ExpressionParser parser("a * 2 + b / 4 - 1");
+    auto ast = parser.parse();
+    timestar::ExpressionEvaluator::QueryResultMap results;
+    results["a"] = g_series;
+    results["b"] = g_series2;
+    for (auto _ : state) {
+        timestar::ExpressionEvaluator evaluator;
+        auto result = evaluator.evaluate(*ast, results);
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(g_series.size()));
+}
+BENCHMARK(BM_formula_scalar);
 
 // ─────────────────────────────── main ────────────────────────────────────────
 

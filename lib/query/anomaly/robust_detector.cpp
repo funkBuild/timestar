@@ -8,8 +8,9 @@
 namespace timestar {
 namespace anomaly {
 
-void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<double>& values, double bounds,
-                                   std::vector<double>& upper, std::vector<double>& lower) {
+void RobustDetector::computeBounds(const STLComponents& stl, std::span<const double> values,
+                                   const std::vector<double>& expected, double bounds, std::vector<double>& upper,
+                                   std::vector<double>& lower) {
     size_t n = values.size();
     upper.resize(n);
     lower.resize(n);
@@ -78,18 +79,13 @@ void RobustDetector::computeBounds(const STLComponents& stl, const std::vector<d
     if (sigma < 1e-10)
         sigma = 1.0;
 
-    // Compute expected values (trend + seasonal) using SIMD
-    std::vector<double> expected(n);
-    simd::vectorAdd(stl.trend.data(), stl.seasonal.data(), expected.data(), n);
-
-    // Create uniform scale vector
-    std::vector<double> scale(n, sigma);
-
-    // Compute bounds using SIMD
-    simd::computeBounds(expected.data(), scale.data(), bounds, upper.data(), lower.data(), n);
+    // Compute bounds around the precomputed expected values (trend + seasonal)
+    // using the scalar-scale overload — sigma is uniform, so no N-sized scale
+    // vector is needed.
+    simd::computeBounds(expected.data(), sigma, bounds, upper.data(), lower.data(), n);
 }
 
-AnomalyOutput RobustDetector::detect(const AnomalyInput& input, const AnomalyConfig& config) {
+AnomalyOutput RobustDetector::detect(const AnomalyInputView& input, const AnomalyConfig& config) {
     AnomalyOutput output;
 
     if (input.empty()) {
@@ -111,8 +107,10 @@ AnomalyOutput RobustDetector::detect(const AnomalyInput& input, const AnomalyCon
     output.predictions.resize(n);
     simd::vectorAdd(stl.trend.data(), stl.seasonal.data(), output.predictions.data(), n);
 
-    // Compute bounds based on residual distribution (SIMD-optimized)
-    computeBounds(stl, input.values, config.bounds, output.upper, output.lower);
+    // Compute bounds based on residual distribution (SIMD-optimized).
+    // output.predictions is the trend+seasonal series computed above — pass it
+    // as the expected values instead of recomputing trend+seasonal internally.
+    computeBounds(stl, input.values, output.predictions, config.bounds, output.upper, output.lower);
 
     // Compute anomaly scores using SIMD
     output.scores.resize(n);

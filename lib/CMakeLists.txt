@@ -10,7 +10,6 @@ file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
     utils/*.cpp
     retention/*.cpp
     config/*.cpp
-    functions/*.cpp
 )
 # Exclude deprecated implementation files
 list(FILTER SRC_FILES EXCLUDE REGEX ".*/deprecated/.*")
@@ -65,7 +64,6 @@ target_include_directories(libtimestar PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/retention
     ${CMAKE_CURRENT_SOURCE_DIR}/config
-    ${CMAKE_CURRENT_SOURCE_DIR}/functions
     ${XXHASH_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include
 )
