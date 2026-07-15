@@ -155,19 +155,11 @@ static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockS
     if (!hdr || hdr->nTimestamps == 0)
         return 0;
 
-    // Reuse a thread-local scratch vector, matching the Float/Integer sibling
-    // decoders above (this function has no co_await, so thread_local is safe).
-    // BoolEncoderRLE::decode appends from out.size(), so clear() before decoding.
-    static thread_local std::vector<bool> boolValues;
-    boolValues.clear();
-    Slice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
-    BoolEncoderRLE::decode(valuesSlice, hdr->nSkipped, hdr->nTimestamps, boolValues);
-
+    // Decode RLE runs straight to doubles (bulk fill_n per run) — no
+    // vector<bool> round-trip and no per-bit-proxy conversion loop.
     valScratch.clear();
-    valScratch.reserve(hdr->nTimestamps);
-    for (size_t i = 0; i < boolValues.size(); ++i) {
-        valScratch.push_back(boolValues[i] ? 1.0 : 0.0);
-    }
+    Slice valuesSlice(data + hdr->valueOffset, hdr->valueByteSize);
+    BoolEncoderRLE::decodeToDouble(valuesSlice, hdr->nSkipped, hdr->nTimestamps, valScratch);
 
     aggregator.addPoints(tsScratch, valScratch);
     return tsScratch.size();

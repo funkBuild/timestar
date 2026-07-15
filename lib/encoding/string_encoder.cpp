@@ -166,10 +166,11 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
                                   " exceeds uint32_t maximum");
     }
 
-    // Copy instead of move — `compressed` is a reference to thread-local `tlCompBuf`,
-    // and moving it would leave the thread-local empty, defeating its reuse purpose.
-    return {std::vector<char>(compressed.begin(), compressed.begin() + compressedSize),
-            static_cast<uint32_t>(writePos), static_cast<uint32_t>(compressedSize),
+    // Return a pointer into the thread-local `tlCompBuf` (no per-block heap
+    // allocation or payload copy — callers write the bytes straight out).
+    // Never std::move the thread-local: that would leave it empty and defeat
+    // its reuse purpose.
+    return {compressed.data(), static_cast<uint32_t>(writePos), static_cast<uint32_t>(compressedSize),
             static_cast<uint32_t>(values.size())};
 }
 
@@ -190,7 +191,7 @@ AlignedBuffer StringEncoder::encode(std::span<const std::string> values, int com
     }
     auto payload = compressStrings(values, compressionLevel);
     writeStringHeader(result, payload.uncompressedSize, payload.compressedSize, payload.count);
-    result.write_bytes(payload.data.data(), payload.data.size());
+    result.write_bytes(payload.data, payload.compressedSize);
     return result;
 }
 
@@ -204,7 +205,7 @@ size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuf
 
     auto payload = compressStrings(values, compressionLevel);
     writeStringHeader(target, payload.uncompressedSize, payload.compressedSize, payload.count);
-    target.write_bytes(payload.data.data(), payload.data.size());
+    target.write_bytes(payload.data, payload.compressedSize);
     return target.size() - startPos;
 }
 
@@ -509,10 +510,18 @@ StringEncoder::Dictionary StringEncoder::deserializeDictionary(Slice& encoded, s
 
 AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> values, const Dictionary& dict,
                                               int compressionLevel) {
+    AlignedBuffer result;
+    encodeDictionaryInto(values, dict, result, compressionLevel);
+    return result;
+}
+
+size_t StringEncoder::encodeDictionaryInto(std::span<const std::string> values, const Dictionary& dict,
+                                           AlignedBuffer& target, int compressionLevel) {
     if (values.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("encodeDictionary: values.size() (" + std::to_string(values.size()) +
                                  ") exceeds uint32_t max");
     }
+    const size_t startPos = target.size();
 
     // Build string -> ID map from dictionary
     std::unordered_map<std::string_view, uint32_t> idMap;
@@ -521,10 +530,12 @@ AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> value
         idMap[dict.entries[i]] = i;
     }
 
-    // Encode values as varint IDs into an uncompressed buffer.
+    // Encode values as varint IDs into the reused thread-local staging buffer
+    // (no fresh page-aligned AlignedBuffer per block).
     // A uint32_t varint is at most 5 bytes, so values.size() * 5 is the safe upper bound.
     const size_t maxBufSize = values.size() * 5;
-    AlignedBuffer uncompressed(maxBufSize);
+    std::vector<uint8_t>& uncompressed = tlUncompBuf;
+    uncompressed.resize(maxBufSize);
     size_t writePos = 0;
     for (const auto& s : values) {
         auto it = idMap.find(s);
@@ -534,33 +545,31 @@ AlignedBuffer StringEncoder::encodeDictionary(std::span<const std::string> value
         uint32_t id = it->second;
         // Inline varint write for speed
         while (id >= 0x80) {
-            uncompressed.data[writePos++] = static_cast<uint8_t>((id & 0x7F) | 0x80);
+            uncompressed[writePos++] = static_cast<uint8_t>((id & 0x7F) | 0x80);
             id >>= 7;
         }
-        uncompressed.data[writePos++] = static_cast<uint8_t>(id & 0x7F);
+        uncompressed[writePos++] = static_cast<uint8_t>(id & 0x7F);
     }
     assert(writePos <= maxBufSize);
-    uncompressed.data.resize(writePos);
 
     // Compress the ID stream with zstd
     size_t compressedMaxSize = ZSTD_compressBound(writePos);
     tlCompBuf.resize(compressedMaxSize);
     size_t compressedSize =
         ZSTD_compressCCtx(getThreadCCtx(), tlCompBuf.data(), compressedMaxSize,
-                          reinterpret_cast<const char*>(uncompressed.data.data()), writePos, compressionLevel);
+                          reinterpret_cast<const char*>(uncompressed.data()), writePos, compressionLevel);
     if (ZSTD_isError(compressedSize)) {
         throw std::runtime_error(std::string("String dict encoder: zstd compression failed: ") +
                                  ZSTD_getErrorName(compressedSize));
     }
 
-    // Write header + compressed data
-    AlignedBuffer result;
-    result.write(STR2_MAGIC);                             // magic
-    result.write(static_cast<uint32_t>(writePos));        // uncompressed size
-    result.write(static_cast<uint32_t>(compressedSize));  // compressed size
-    result.write(static_cast<uint32_t>(values.size()));   // count
-    result.write_bytes(tlCompBuf.data(), compressedSize);
-    return result;
+    // Write header + compressed data straight into the target buffer
+    target.write(STR2_MAGIC);                             // magic
+    target.write(static_cast<uint32_t>(writePos));        // uncompressed size
+    target.write(static_cast<uint32_t>(compressedSize));  // compressed size
+    target.write(static_cast<uint32_t>(values.size()));   // count
+    target.write_bytes(tlCompBuf.data(), compressedSize);
+    return target.size() - startPos;
 }
 
 void StringEncoder::decodeDictionary(Slice& encoded, size_t count, const Dictionary& dict,

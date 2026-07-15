@@ -142,22 +142,18 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         size_t pad = (8 - ((buffer.size() - beforeSize) % 8)) % 8;
         for (size_t i = 0; i < pad; ++i)
             buffer.write(static_cast<uint8_t>(0));
-    } else if constexpr (std::is_same_v<T, bool>) {
-        // vector<bool> path: caller passes spans constructed from a temporary vector<bool>
-        // BoolEncoderRLE needs a vector, so reconstruct one from the span
-        std::vector<bool> boolVec(values.begin(), values.end());
-        BoolEncoderRLE::encodeInto(boolVec, buffer);
     } else if constexpr (std::is_same_v<T, std::string>) {
-        // Phase 3: Use dictionary encoding if dictionary is available on the index entry
+        // Phase 3: Use dictionary encoding if dictionary is available on the index entry.
+        // encodeInto/encodeDictionaryInto write header + compressed bytes straight into
+        // the output buffer — no intermediate AlignedBuffer + copy per block. The bytes
+        // are identical to the old encode()+write() path.
         if (!indexEntry.stringDictionary.empty()) {
             StringEncoder::Dictionary dict;
             dict.entries = indexEntry.stringDictionary;
             dict.valid = true;
-            AlignedBuffer encodedStrings = StringEncoder::encodeDictionary(values, dict, compressionLevel_);
-            buffer.write(encodedStrings);
+            StringEncoder::encodeDictionaryInto(values, dict, buffer, compressionLevel_);
         } else {
-            AlignedBuffer encodedStrings = StringEncoder::encode(values, compressionLevel_);
-            buffer.write(encodedStrings);
+            StringEncoder::encodeInto(values, buffer, compressionLevel_);
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         // Use thread-local scratch buffer to avoid per-block heap allocation
@@ -170,6 +166,8 @@ void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId,
         // to the previous encode()+write().
         IntegerEncoder::encodeInto(zigzagScratch, buffer);
     } else {
+        // bool never reaches writeBlock: writeSeries inlines bool encoding because
+        // vector<bool> cannot form a std::span — this static_assert guards it.
         static_assert(sizeof(T) == 0, "Unsupported TSM value type");
     }
 
@@ -387,10 +385,38 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
     indexBlock.blockCount = static_cast<uint32_t>(valCount);
 
     uint32_t trueCount = 0;
+#ifdef __GLIBCXX__
+    // libstdc++ fast path: popcount the packed words directly instead of
+    // reading one bit proxy per value (same storage access pattern as
+    // BoolEncoderRLE::encodeInto).
+    {
+        static_assert(sizeof(unsigned long) == 8, "word popcount assumes 64-bit unsigned long");
+        auto it = values.begin() + static_cast<std::ptrdiff_t>(valOffset);
+        const unsigned long* wordPtr = it._M_p;
+        const unsigned int bitOff = it._M_offset;
+        const size_t totalBits = valCount + bitOff;
+        const size_t fullWords = totalBits / 64;
+        const unsigned int tailBits = totalBits % 64;
+
+        for (size_t w = 0; w < fullWords; ++w) {
+            unsigned long word = wordPtr[w];
+            if (w == 0 && bitOff != 0)
+                word &= ~0UL << bitOff;
+            trueCount += static_cast<uint32_t>(__builtin_popcountl(word));
+        }
+        if (tailBits > 0) {
+            unsigned long word = wordPtr[fullWords] & ((1UL << tailBits) - 1UL);
+            if (fullWords == 0 && bitOff != 0)
+                word &= ~0UL << bitOff;
+            trueCount += static_cast<uint32_t>(__builtin_popcountl(word));
+        }
+    }
+#else
     for (size_t i = 0; i < valCount; ++i) {
         if (values[valOffset + i])
             trueCount++;
     }
+#endif
     indexBlock.boolTrueCount = trueCount;
     indexBlock.blockSum = static_cast<double>(trueCount);
     indexBlock.blockMin = (trueCount < indexBlock.blockCount) ? 0.0 : 1.0;

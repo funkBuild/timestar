@@ -85,6 +85,51 @@ TEST(BoolEncoderRLEVarint, LargeRunNormalRoundtrip) {
     }
 }
 
+// decodeToDouble must agree with decode() (1.0/0.0) across skip/limit combos,
+// including runs that straddle the skip boundary.
+TEST(BoolEncoderRLEVarint, DecodeToDoubleMatchesDecodeWithSkips) {
+    std::vector<bool> original;
+    original.reserve(5000);
+    uint32_t state = 12345;
+    size_t i = 0;
+    bool cur = false;
+    while (i < 5000) {
+        state = state * 1664525u + 1013904223u;
+        size_t run = 1 + (state % 130);  // mixed short/long runs (varint multi-byte too)
+        for (size_t j = 0; j < run && i < 5000; ++j, ++i)
+            original.push_back(cur);
+        cur = !cur;
+    }
+
+    AlignedBuffer encoded = BoolEncoderRLE::encode(original);
+
+    for (size_t skip : {size_t{0}, size_t{1}, size_t{63}, size_t{64}, size_t{997}, size_t{4999}}) {
+        for (size_t len : {size_t{1}, size_t{64}, size_t{1000}, size_t{5000} - skip}) {
+            if (skip + len > original.size())
+                continue;
+            Slice s1(encoded.data.data(), encoded.size());
+            std::vector<bool> viaBits;
+            BoolEncoderRLE::decode(s1, skip, len, viaBits);
+
+            Slice s2(encoded.data.data(), encoded.size());
+            std::vector<double> direct;
+            BoolEncoderRLE::decodeToDouble(s2, skip, len, direct);
+
+            ASSERT_EQ(direct.size(), viaBits.size()) << "skip=" << skip << " len=" << len;
+            for (size_t k = 0; k < direct.size(); ++k) {
+                ASSERT_EQ(direct[k], viaBits[k] ? 1.0 : 0.0) << "skip=" << skip << " len=" << len << " k=" << k;
+            }
+        }
+    }
+
+    // Appends after existing content (decode contract)
+    std::vector<double> out{42.0};
+    Slice s(encoded.data.data(), encoded.size());
+    BoolEncoderRLE::decodeToDouble(s, 10, 20, out);
+    ASSERT_EQ(out.size(), 21u);
+    ASSERT_EQ(out[0], 42.0);
+}
+
 // Source-inspection test: verify readVarint throws instead of returning 0
 #ifndef BOOL_ENCODER_RLE_SOURCE_PATH
 TEST(BoolEncoderRLEVarint, SourceInspection_ReadVarintThrowsNotReturns0) {

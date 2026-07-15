@@ -143,12 +143,20 @@ CompressedBuffer ALPEncoder::encode(std::span<const double> values) {
         // Bulk-copy AlignedBuffer's raw bytes into the word vector in one
         // memcpy (zero-padded tail word). The old word-by-word write<64>()
         // loop cost ~5ms per 1M values — comparable to the encode itself.
+        // Range-assign copies the full words in a single pass with no
+        // preparatory zero-fill (assign(n, 0) memset several MB per call);
+        // only a partial tail word needs explicit zero padding.
         // CompressedBuffer::size() derives from data.size(), and consumers
         // read via CompressedSlice / serialize the bytes, so filling `data`
         // directly is equivalent.
-        const size_t totalWords = (numBytes + 7) / 8;
-        buffer.data.assign(totalWords, 0);
-        std::memcpy(buffer.data.data(), aligned.data.data(), numBytes);
+        const size_t fullWords = numBytes / 8;
+        const uint64_t* words = reinterpret_cast<const uint64_t*>(aligned.data.data());
+        buffer.data.assign(words, words + fullWords);
+        if (numBytes % 8 != 0) {
+            uint64_t last = 0;
+            std::memcpy(&last, aligned.data.data() + fullWords * 8, numBytes % 8);
+            buffer.data.push_back(last);
+        }
     }
     return buffer;
 }
@@ -382,9 +390,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             }
 
             // === FFOR Data ===
+            // ffor_pack writes every output word, so resize() (a no-op after the
+            // first block) replaces the per-block zero-fill assign().
             size_t packed_words = alp::ffor_packed_words(block_count, bw);
             if (packed_words > 0) {
-                packed.assign(packed_words, 0);
+                packed.resize(packed_words);
                 alp::ffor_pack(encoded.data(), block_count, min_val, bw, packed.data());
                 target.write_array(packed.data(), packed_words);
             }
@@ -413,7 +423,6 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         uint8_t right_bit_count = alp::ALPRD::findBestSplit(values.data(), total_values);
 
         // Scratch buffers hoisted out of the block loop
-        std::vector<int64_t> left_as_i64(alp::ALP_VECTOR_SIZE);
         std::vector<uint64_t> left_packed;
         std::vector<uint64_t> right_packed;
         alp::ALPRDBlockResult rd;  // reused across blocks (vector capacity retained)
@@ -441,21 +450,21 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             }
 
             // === Left Indices (FFOR packed) ===
+            // ffor_pack_u8 packs straight from the uint8 dictionary indices —
+            // no widen-to-int64 pass. The packers write every output word, so
+            // resize() (a no-op after the first block) replaces the per-block
+            // zero-fill assign().
             if (rd.left_bw > 0) {
-                left_as_i64.resize(block_count);
-                for (size_t i = 0; i < block_count; ++i) {
-                    left_as_i64[i] = static_cast<int64_t>(rd.left_indices[i]);
-                }
                 size_t left_packed_words = alp::ffor_packed_words(block_count, rd.left_bw);
-                left_packed.assign(left_packed_words, 0);
-                alp::ffor_pack(left_as_i64.data(), block_count, 0, rd.left_bw, left_packed.data());
+                left_packed.resize(left_packed_words);
+                alp::ffor_pack_u8(rd.left_indices.data(), block_count, rd.left_bw, left_packed.data());
                 target.write_array(left_packed.data(), left_packed_words);
             }
 
             // === Right FFOR Data ===
             if (rd.right_bw > 0) {
                 size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
-                right_packed.assign(right_packed_words, 0);
+                right_packed.resize(right_packed_words);
                 alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base, rd.right_bw,
                                    right_packed.data());
                 target.write_array(right_packed.data(), right_packed_words);

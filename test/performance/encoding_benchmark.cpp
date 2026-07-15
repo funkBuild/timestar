@@ -12,7 +12,9 @@
 #include "../test_helpers.hpp"
 
 #include "crc32.hpp"
+#include "bool_encoder_rle.hpp"
 #include "float_encoder.hpp"
+#include "integer_encoder.hpp"
 #include "string_encoder.hpp"
 #include "aligned_buffer.hpp"
 
@@ -180,4 +182,127 @@ TEST_F(EncodingBenchmark, E3_AlpFloatEncodeThroughput) {
 
     bench("clean 2-decimal (ALP scale)", clean);
     bench("full-precision (ALP_RD)", dirty);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  E4: Bool RLE round-trip (encode + decode-to-double aggregation shape)
+//  The decode-to-double half mirrors decodeBoolBlockIntoAggregator in tsm.cpp:
+//  decode RLE runs and produce a double[] of 1.0/0.0 for the aggregator.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_F(EncodingBenchmark, E4_BoolRleRoundTrip) {
+    fmt::print("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    fmt::print("║  E4: Bool RLE Round-Trip                                        ║\n");
+    fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
+
+    constexpr size_t N = 1'000'000;
+    std::mt19937_64 rng(7);
+    // Run-structured data: alternating runs of geometric-ish length 1..64
+    std::vector<bool> data(N);
+    {
+        bool cur = false;
+        size_t i = 0;
+        while (i < N) {
+            size_t run = 1 + (rng() % 64);
+            for (size_t j = 0; j < run && i < N; ++j, ++i)
+                data[i] = cur;
+            cur = !cur;
+        }
+    }
+
+    // Correctness: round-trip must be exact
+    AlignedBuffer encoded;
+    BoolEncoderRLE::encodeInto(data, encoded);
+    {
+        std::vector<bool> decoded;
+        Slice s(reinterpret_cast<const uint8_t*>(encoded.data.data()), encoded.size());
+        BoolEncoderRLE::decode(s, 0, N, decoded);
+        ASSERT_EQ(decoded.size(), N);
+        for (size_t i = 0; i < N; i += 997)
+            ASSERT_EQ(decoded[i], data[i]) << "round-trip mismatch at " << i;
+    }
+
+    double bestEnc = 1e100, bestOld = 1e100;
+    for (int r = 0; r < 7; ++r) {
+        auto t0 = clk::now();
+        AlignedBuffer enc;
+        BoolEncoderRLE::encodeInto(data, enc);
+        bestEnc = std::min(bestEnc, std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    }
+
+    // Old aggregator shape (see decodeBoolBlockIntoAggregator pre-optimization):
+    // decode to vector<bool>, then per-bit-proxy convert to double.
+    std::vector<double> vals;
+    std::vector<bool> boolScratch;
+    for (int r = 0; r < 7; ++r) {
+        auto t0 = clk::now();
+        Slice s(reinterpret_cast<const uint8_t*>(encoded.data.data()), encoded.size());
+        boolScratch.clear();
+        BoolEncoderRLE::decode(s, 0, N, boolScratch);
+        vals.clear();
+        vals.reserve(N);
+        for (size_t i = 0; i < boolScratch.size(); ++i)
+            vals.push_back(boolScratch[i] ? 1.0 : 0.0);
+        double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        bestOld = std::min(bestOld, ms);
+        ASSERT_EQ(vals.size(), N);
+    }
+
+    // New direct path: decodeToDouble (bulk fill_n per run)
+    double bestNew = 1e100;
+    std::vector<double> vals2;
+    for (int r = 0; r < 7; ++r) {
+        auto t0 = clk::now();
+        Slice s(reinterpret_cast<const uint8_t*>(encoded.data.data()), encoded.size());
+        vals2.clear();
+        BoolEncoderRLE::decodeToDouble(s, 0, N, vals2);
+        double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        bestNew = std::min(bestNew, ms);
+        ASSERT_EQ(vals2.size(), N);
+    }
+    // Correctness: direct path must match the via-bits path exactly
+    ASSERT_EQ(vals2, vals);
+
+    fmt::print("  encode 1M bools              best={:7.2f} ms  ({:6.1f} M vals/s)\n", bestEnc, N / bestEnc / 1000.0);
+    fmt::print("  decode->double (via bits)    best={:7.2f} ms  ({:6.1f} M vals/s)\n", bestOld, N / bestOld / 1000.0);
+    fmt::print("  decode->double (direct)      best={:7.2f} ms  ({:6.1f} M vals/s)\n", bestNew, N / bestNew / 1000.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  E5: Timestamp encode throughput (IntegerEncoder FFOR delta-of-delta)
+//  This is the per-block timestamp partition cost on every TSM flush.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_F(EncodingBenchmark, E5_TimestampEncodeThroughput) {
+    fmt::print("\n╔══════════════════════════════════════════════════════════════════╗\n");
+    fmt::print("║  E5: Timestamp Encode Throughput (FFOR delta-of-delta)          ║\n");
+    fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
+
+    constexpr size_t N = 1'000'000;
+    std::mt19937_64 rng(123);
+    std::vector<uint64_t> ts(N);
+    uint64_t t = 1'700'000'000'000'000'000ULL;
+    for (auto& v : ts) {
+        t += 1'000'000'000ULL + (rng() % 2'000'000) - 1'000'000;  // 1s interval +/- 1ms jitter
+        v = t;
+    }
+
+    // Correctness: round-trip must be exact
+    auto encoded = IntegerEncoder::encode(ts);
+    {
+        std::vector<uint64_t> decoded;
+        Slice s(reinterpret_cast<const uint8_t*>(encoded.data.data()), encoded.size());
+        IntegerEncoder::decode(s, N, decoded, 0, UINT64_MAX);
+        ASSERT_EQ(decoded.size(), N);
+        for (size_t i = 0; i < N; i += 991)
+            ASSERT_EQ(decoded[i], ts[i]) << "round-trip mismatch at " << i;
+    }
+
+    double best = 1e100;
+    for (int r = 0; r < 7; ++r) {
+        auto t0 = clk::now();
+        auto enc = IntegerEncoder::encode(ts);
+        best = std::min(best, std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    }
+    fmt::print("  encode 1M timestamps         best={:7.2f} ms  ({:6.1f} M vals/s)\n", best, N / best / 1000.0);
 }
