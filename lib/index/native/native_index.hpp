@@ -115,6 +115,15 @@ public:
 
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops) override;
 
+    // Day-bitmap recording for time-scoped discovery (0x0D postings).
+    // recordInsertDays: exact days from a batch's timestamps (data-shard path).
+    // recordDaySpan: [minTs, maxTs] day-span superset (first batch of a new
+    // series, driven by MetadataOp). Both no-op when the LocalId is absent.
+    seastar::future<> recordInsertDays(const std::string& measurement, const SeriesId128& seriesId,
+                                       const std::vector<uint64_t>& timestamps);
+    seastar::future<> recordDaySpan(const std::string& measurement, const SeriesId128& seriesId, uint64_t minTs,
+                                    uint64_t maxTs);
+
     // --- Series discovery ---
     seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> findSeries(
         const std::string& measurement, const std::map<std::string, std::string>& tagFilters = {},

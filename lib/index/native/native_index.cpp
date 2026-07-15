@@ -1033,10 +1033,53 @@ seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>&
         co_return;
 
     for (const auto& op : ops) {
-        co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
+        auto seriesId = co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
         auto typeStr = timestar::valueTypeName(op.valueType);
         if (!typeStr.empty()) {
             co_await setFieldType(op.measurement, op.fieldName, std::string(typeStr));
+        }
+        // First-batch day coverage: the data-shard batch path can only record
+        // days once the LocalId exists, which happens here. Recording the full
+        // [minTs, maxTs] day span is a safe superset (extra days reduce pruning;
+        // MISSING days would wrongly exclude the series from time-scoped queries).
+        if (op.maxTs >= op.minTs && op.maxTs > 0) {
+            co_await recordDaySpan(op.measurement, seriesId, op.minTs, op.maxTs);
+        }
+    }
+}
+
+seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, const SeriesId128& seriesId,
+                                             uint64_t minTs, uint64_t maxTs) {
+    auto localIdOpt = localIdMap_.getLocalId(seriesId);
+    if (!localIdOpt.has_value())
+        co_return;
+    const uint32_t localId = *localIdOpt;
+    const uint32_t firstDay = ke::dayBucketFromNs(minTs);
+    const uint32_t lastDay = ke::dayBucketFromNs(maxTs);
+    std::string dayCacheKey;
+    for (uint32_t day = firstDay; day <= lastDay; ++day) {
+        buildDayBitmapCacheKey(dayCacheKey, measurement, day);
+        (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
+    }
+}
+
+seastar::future<> NativeIndex::recordInsertDays(const std::string& measurement, const SeriesId128& seriesId,
+                                                const std::vector<uint64_t>& timestamps) {
+    // Exact per-day recording for the batch insert path (mirrors indexInsert's
+    // day loop). Skips silently when the series has no LocalId yet — the
+    // first-batch case is covered by the MetadataOp day-span path above.
+    auto localIdOpt = localIdMap_.getLocalId(seriesId);
+    if (!localIdOpt.has_value())
+        co_return;
+    const uint32_t localId = *localIdOpt;
+    std::string dayCacheKey;
+    uint32_t lastDay = UINT32_MAX;
+    for (uint64_t ts : timestamps) {
+        uint32_t day = ke::dayBucketFromNs(ts);
+        if (day != lastDay) {
+            buildDayBitmapCacheKey(dayCacheKey, measurement, day);
+            (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
+            lastDay = day;
         }
     }
 }

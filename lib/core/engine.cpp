@@ -232,6 +232,15 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
 #endif
     co_await walFileManager.insertBatch(insertRequests);
 
+    // Record day bitmaps for time-scoped discovery (0x0D postings). The batch
+    // path previously never recorded them, so batch-only series were wrongly
+    // pruned from time-scoped queries once any day bitmap existed for the
+    // measurement. Skips per series when the LocalId doesn't exist yet (first
+    // batch of a new series — covered by the MetadataOp day-span path).
+    for (const auto& req : insertRequests) {
+        co_await index.recordInsertDays(req.measurement, req.seriesId128(), req.getTimestamps());
+    }
+
     // Create timing info
     WALTimingInfo walTiming;
 #if TIMESTAR_LOG_INSERT_PATH

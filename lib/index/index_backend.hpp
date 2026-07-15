@@ -23,6 +23,12 @@ struct MetadataOp {
     std::string measurement;
     std::string fieldName;
     std::map<std::string, std::string> tags;
+    // Timestamp range of the insert that created this op. Used to record
+    // day bitmaps for the FIRST batch of a new series (whose LocalId does
+    // not exist yet when the data-shard batch path tries to record days).
+    // 0/0 = unknown (day recording skipped).
+    uint64_t minTs = 0;
+    uint64_t maxTs = 0;
 };
 
 enum IndexKeyType : uint8_t {

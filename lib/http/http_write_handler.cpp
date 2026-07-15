@@ -570,7 +570,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     tsl::robin_map<std::string, CoalesceCandidate> candidates;
     // Pre-allocate for the expected number of unique series keys.
     // A typical write point has 1-3 fields, so estimate writes * 2.
-    candidates.reserve(writes_array.size() * 2);
+    // Cap the reservation: robin_map at load factor 0.5 with ~330-byte slots
+    // would zero ~22MB for a 10K-write batch, yet unique series are almost
+    // always far fewer than writes. Beyond the cap the map grows naturally.
+    candidates.reserve(std::min(writes_array.size() * 2, size_t(1024)));
     [[maybe_unused]] size_t totalWritesProcessed = 0;
     size_t entriesSkipped = 0;
 
@@ -1102,6 +1105,21 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
     auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(point.tags));
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
 
+    // Timestamp range for MetadataOp day-bitmap coverage (first batch of a
+    // new series). Computed lazily — metaOps are only emitted for unknown
+    // series, so the common all-known path never pays the minmax scan.
+    uint64_t mwpMinTs = 0, mwpMaxTs = 0;
+    bool mwpTsRangeComputed = false;
+    auto tsRange = [&]() -> std::pair<uint64_t, uint64_t> {
+        if (!mwpTsRangeComputed && !sharedTimestamps->empty()) {
+            auto [mn, mx] = std::minmax_element(sharedTimestamps->begin(), sharedTimestamps->end());
+            mwpMinTs = *mn;
+            mwpMaxTs = *mx;
+            mwpTsRangeComputed = true;
+        }
+        return {mwpMinTs, mwpMaxTs};
+    };
+
     // Pre-build the measurement+tags prefix once for series key construction
     std::string seriesKeyPrefix;
     {
@@ -1148,7 +1166,9 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
                         }
                     }
                 }
@@ -1173,7 +1193,9 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
                         }
                     }
                 }
@@ -1202,7 +1224,9 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
                         }
                     }
                 }
@@ -1227,7 +1251,9 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
                     if (seenMF.insert(seriesId).second) {
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
-                            metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags});
+                            auto [mnTs, mxTs] = tsRange();
+                            metaOps.push_back(
+                                MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
                         }
                     }
                 }
@@ -1453,7 +1479,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                 vtype = TSMValueType::Integer;
                                 break;
                         }
-                        allMetaOps.push_back(MetaOp{vtype, ffi.measurement, ffi.fieldName, ffi.tags});
+                        uint64_t mnTs = 0, mxTs = 0;
+                        if (!ffi.timestamps.empty()) {
+                            auto [mnIt, mxIt] = std::minmax_element(ffi.timestamps.begin(), ffi.timestamps.end());
+                            mnTs = *mnIt;
+                            mxTs = *mxIt;
+                        }
+                        allMetaOps.push_back(MetaOp{vtype, ffi.measurement, ffi.fieldName, ffi.tags, mnTs, mxTs});
                     }
                 }
 
