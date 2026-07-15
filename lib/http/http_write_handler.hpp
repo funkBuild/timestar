@@ -98,7 +98,13 @@ private:
 
     struct MultiWritePoint {
         std::string measurement;
-        std::map<std::string, std::string> tags;
+        // Shared (refcounted, immutable) tag map. std::shared_ptr (atomic
+        // refcount) because the same allocation flows into TimeStarInsert's
+        // shared tags and crosses Seastar shard boundaries. Producers
+        // (parseMultiWritePoint, buildMWPFromFastPath, coalesceWrites) always
+        // set it, so consumers can share the pointer instead of deep-copying
+        // the map per point.
+        std::shared_ptr<const std::map<std::string, std::string>> tags;
         std::map<std::string, FieldArrays> fields;  // Field name -> array of values
         std::vector<uint64_t> timestamps;           // Array of timestamps
     };
@@ -110,9 +116,10 @@ private:
         std::string measurement;
         // Shared (refcounted) tag map to avoid redundant copies when multiple
         // fields from the same write point each create a CoalesceCandidate.
-        // Uses lw_shared_ptr (non-atomic refcount) because all candidates
-        // live on the HTTP handler shard -- no cross-shard sharing needed.
-        seastar::lw_shared_ptr<const std::map<std::string, std::string>> sharedTags;
+        // Uses std::shared_ptr (atomic refcount) so the SAME allocation can be
+        // handed to MultiWritePoint::tags and onward to TimeStarInsert's shared
+        // tags (which cross Seastar shard boundaries) without a deep copy.
+        std::shared_ptr<const std::map<std::string, std::string>> sharedTags;
         std::string fieldName;
         TSMValueType valueType;
         std::vector<uint64_t> timestamps;

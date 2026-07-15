@@ -66,10 +66,10 @@ TEST(ProtoWriteFastPath, SingleDoubleField) {
     EXPECT_EQ(ins.measurement, "cpu");
     EXPECT_EQ(ins.fieldName, "usage");
     EXPECT_EQ(ins.type, FastFieldInsert::Type::DOUBLE);
-    ASSERT_EQ(ins.tags.size(), 1u);
-    EXPECT_EQ(ins.tags.at("host"), "server01");
-    ASSERT_EQ(ins.timestamps.size(), 1u);
-    EXPECT_EQ(ins.timestamps[0], 1000000000ULL);
+    ASSERT_EQ(ins.tags->size(), 1u);
+    EXPECT_EQ(ins.tags->at("host"), "server01");
+    ASSERT_EQ(ins.timestamps->size(), 1u);
+    EXPECT_EQ((*ins.timestamps)[0], 1000000000ULL);
     ASSERT_EQ(ins.doubleValues.size(), 1u);
     EXPECT_DOUBLE_EQ(ins.doubleValues[0], 99.5);
     EXPECT_EQ(ins.seriesKey, "cpu,host=server01 usage");
@@ -177,9 +177,9 @@ TEST(ProtoWriteFastPath, MultipleFieldsPerPoint) {
     // Both inserts should have the same measurement and tags
     for (const auto& ins : result.inserts) {
         EXPECT_EQ(ins.measurement, "weather");
-        EXPECT_EQ(ins.tags.at("location"), "us-west");
-        ASSERT_EQ(ins.timestamps.size(), 1u);
-        EXPECT_EQ(ins.timestamps[0], 5000000000ULL);
+        EXPECT_EQ(ins.tags->at("location"), "us-west");
+        ASSERT_EQ(ins.timestamps->size(), 1u);
+        EXPECT_EQ((*ins.timestamps)[0], 5000000000ULL);
     }
 }
 
@@ -278,8 +278,8 @@ TEST(ProtoWriteFastPath, NoTimestampsUsesDefault) {
     auto result = parseWriteRequestFast(bytes.data(), bytes.size(), DEFAULT_TS);
 
     ASSERT_EQ(result.inserts.size(), 1u);
-    ASSERT_EQ(result.inserts[0].timestamps.size(), 1u);
-    EXPECT_EQ(result.inserts[0].timestamps[0], DEFAULT_TS);
+    ASSERT_EQ(result.inserts[0].timestamps->size(), 1u);
+    EXPECT_EQ((*result.inserts[0].timestamps)[0], DEFAULT_TS);
 }
 
 TEST(ProtoWriteFastPath, NoTimestampsMultipleValuesGeneratesSequence) {
@@ -297,10 +297,10 @@ TEST(ProtoWriteFastPath, NoTimestampsMultipleValuesGeneratesSequence) {
     auto result = parseWriteRequestFast(bytes.data(), bytes.size(), DEFAULT_TS);
 
     ASSERT_EQ(result.inserts.size(), 1u);
-    ASSERT_EQ(result.inserts[0].timestamps.size(), 3u);
-    EXPECT_EQ(result.inserts[0].timestamps[0], DEFAULT_TS);
-    EXPECT_EQ(result.inserts[0].timestamps[1], DEFAULT_TS + 1000000ULL);
-    EXPECT_EQ(result.inserts[0].timestamps[2], DEFAULT_TS + 2000000ULL);
+    ASSERT_EQ(result.inserts[0].timestamps->size(), 3u);
+    EXPECT_EQ((*result.inserts[0].timestamps)[0], DEFAULT_TS);
+    EXPECT_EQ((*result.inserts[0].timestamps)[1], DEFAULT_TS + 1000000ULL);
+    EXPECT_EQ((*result.inserts[0].timestamps)[2], DEFAULT_TS + 2000000ULL);
 }
 
 TEST(ProtoWriteFastPath, SingleTimestampReplicatedForArray) {
@@ -319,8 +319,8 @@ TEST(ProtoWriteFastPath, SingleTimestampReplicatedForArray) {
     auto result = parseWriteRequestFast(bytes.data(), bytes.size(), DEFAULT_TS);
 
     ASSERT_EQ(result.inserts.size(), 1u);
-    ASSERT_EQ(result.inserts[0].timestamps.size(), 3u);
-    for (uint64_t ts : result.inserts[0].timestamps) {
+    ASSERT_EQ(result.inserts[0].timestamps->size(), 3u);
+    for (uint64_t ts : *result.inserts[0].timestamps) {
         EXPECT_EQ(ts, 9999ULL);
     }
 }
@@ -345,9 +345,9 @@ TEST(ProtoWriteFastPath, PackedTimestampsExtracted) {
     auto result = parseWriteRequestFast(bytes.data(), bytes.size(), DEFAULT_TS);
 
     ASSERT_EQ(result.inserts.size(), 1u);
-    ASSERT_EQ(result.inserts[0].timestamps.size(), 100u);
+    ASSERT_EQ(result.inserts[0].timestamps->size(), 100u);
     for (uint64_t i = 0; i < 100; ++i) {
-        EXPECT_EQ(result.inserts[0].timestamps[i], 1000000000ULL + i * 1000000ULL);
+        EXPECT_EQ((*result.inserts[0].timestamps)[i], 1000000000ULL + i * 1000000ULL);
     }
 }
 
@@ -594,12 +594,12 @@ TEST(ProtoWriteFastPath, LargeBatchArrayWrite) {
     ASSERT_EQ(result.inserts.size(), 1u);
     EXPECT_EQ(result.totalPoints, 10000);
     ASSERT_EQ(result.inserts[0].doubleValues.size(), 10000u);
-    ASSERT_EQ(result.inserts[0].timestamps.size(), 10000u);
+    ASSERT_EQ(result.inserts[0].timestamps->size(), 10000u);
 
     // Verify data integrity after memcpy
     for (int i = 0; i < 10000; ++i) {
         EXPECT_DOUBLE_EQ(result.inserts[0].doubleValues[i], static_cast<double>(i));
-        EXPECT_EQ(result.inserts[0].timestamps[i], 1000000000ULL + static_cast<uint64_t>(i) * 1000000ULL);
+        EXPECT_EQ((*result.inserts[0].timestamps)[i], 1000000000ULL + static_cast<uint64_t>(i) * 1000000ULL);
     }
 }
 
@@ -639,8 +639,8 @@ TEST(ProtoWriteFastPath, MatchesGenericPathDoubles) {
     const auto& fi = fastResult.inserts[0];
 
     EXPECT_EQ(gp.measurement, fi.measurement);
-    EXPECT_EQ(gp.tags, fi.tags);
-    EXPECT_EQ(gp.timestamps, fi.timestamps);
+    EXPECT_EQ(gp.tags, *fi.tags);
+    EXPECT_EQ(gp.timestamps, *fi.timestamps);
 
     ASSERT_EQ(gp.fields.count("temperature"), 1u);
     const auto& gfa = gp.fields.at("temperature");
@@ -765,7 +765,7 @@ TEST(ProtoWriteFastPath, TagValueWithSpaces) {
     auto result = parseWriteRequestFast(bytes.data(), bytes.size(), DEFAULT_TS);
 
     ASSERT_EQ(result.inserts.size(), 1u);
-    EXPECT_EQ(result.inserts[0].tags.at("host"), "server with spaces");
+    EXPECT_EQ(result.inserts[0].tags->at("host"), "server with spaces");
     EXPECT_EQ(result.failedWrites, 0);
 }
 
@@ -797,9 +797,9 @@ TEST(ProtoWriteFastPath, MultipleFieldsShareTags) {
 
     ASSERT_EQ(result.inserts.size(), 2u);
     for (const auto& ins : result.inserts) {
-        EXPECT_EQ(ins.tags.size(), 2u);
-        EXPECT_EQ(ins.tags.at("host"), "srv01");
-        EXPECT_EQ(ins.tags.at("region"), "us-east");
+        EXPECT_EQ(ins.tags->size(), 2u);
+        EXPECT_EQ(ins.tags->at("host"), "srv01");
+        EXPECT_EQ(ins.tags->at("region"), "us-east");
         EXPECT_EQ(ins.measurement, "system");
     }
 }

@@ -240,13 +240,15 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     }
     mwp.measurement = measurementIt->second.get<std::string>();
 
-    // Extract tags
+    // Extract tags into a local map, then wrap once in the shared_ptr that all
+    // downstream consumers (fields, TimeStarInserts) will share.
+    std::map<std::string, std::string> localTags;
     auto tagsIt = obj.find("tags");
     if (tagsIt != obj.end() && tagsIt->second.is_object()) {
         auto& tagsObj = tagsIt->second.get<json_value_t::object_t>();
         for (const auto& [tagKey, tagValue] : tagsObj) {
             if (tagValue.is_string()) {
-                mwp.tags[tagKey] = tagValue.get<std::string>();
+                localTags[tagKey] = tagValue.get<std::string>();
             }
         }
     }
@@ -259,7 +261,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             if (!err.empty())
                 throw std::invalid_argument(err);
         }
-        for (const auto& [key, value] : mwp.tags) {
+        for (const auto& [key, value] : localTags) {
             if (!isValidName(key)) {
                 auto err = validateName(key, "Tag key '" + key + "'");
                 if (!err.empty())
@@ -272,6 +274,8 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
             }
         }
     }
+
+    mwp.tags = std::make_shared<const std::map<std::string, std::string>>(std::move(localTags));
 
     // Parse fields - handle both scalars and arrays
     auto fieldsIt = obj.find("fields");
@@ -453,15 +457,15 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
 bool HttpWriteHandler::buildMWPFromFastPath(FastDoubleWritePoint& fwp, uint64_t defaultTimestampNs,
                                             MultiWritePoint& mwp) {
     mwp.measurement = std::move(fwp.measurement);
-    mwp.tags = std::move(fwp.tags);
 
     // Validate names
     if (!isValidName(mwp.measurement))
         return false;
-    for (const auto& [key, value] : mwp.tags) {
+    for (const auto& [key, value] : fwp.tags) {
         if (!isValidName(key) || !isValidTagValue(value))
             return false;
     }
+    mwp.tags = std::make_shared<const std::map<std::string, std::string>>(std::move(fwp.tags));
 
     // Move fields as DOUBLE type
     for (auto& [fieldName, values] : fwp.fields) {
@@ -603,10 +607,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     };
 
     // Helper lambda: initialize a new CoalesceCandidate with metadata.
-    // Takes a lw_shared_ptr to the tag map so that all candidates from the
+    // Takes a shared_ptr to the tag map so that all candidates from the
     // same write point share a single allocation (O(1) pointer copy).
     auto initCandidate = [](CoalesceCandidate& candidate, const std::string& seriesKey, const std::string& measurement,
-                            seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
+                            std::shared_ptr<const std::map<std::string, std::string>> tags,
                             const std::string& fieldName, TSMValueType valueType, const std::string& groupKey) {
         candidate.seriesKey = seriesKey;
         candidate.groupKey = groupKey;
@@ -618,10 +622,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
     // Helper lambda: find or create a candidate, handling type mismatch and overflow
     // by creating disambiguated keys. Returns a reference to the target candidate.
-    // Takes lw_shared_ptr<const map> by value so the shared tag map is propagated
+    // Takes shared_ptr<const map> by value so the shared tag map is propagated
     // without copying the underlying map data.
     auto findOrCreateCandidate = [&](const std::string& seriesKey, const std::string& measurement,
-                                     seastar::lw_shared_ptr<const std::map<std::string, std::string>> tags,
+                                     std::shared_ptr<const std::map<std::string, std::string>> tags,
                                      const std::string& fieldName, TSMValueType valueType, size_t numValuesToAdd,
                                      const std::string& groupKey) -> CoalesceCandidate& {
         // Single hash/probe: try_emplace default-constructs the candidate only when the
@@ -777,8 +781,10 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
             }
 
             // Create the shared tag map once per write point. All fields from
-            // this write point will share this single allocation via lw_shared_ptr.
-            auto sharedTags = seastar::make_lw_shared<const std::map<std::string, std::string>>(std::move(localTags));
+            // this write point will share this single allocation via shared_ptr,
+            // and the same allocation flows through MultiWritePoint into the
+            // TimeStarInserts (which may cross shard boundaries).
+            auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(localTags));
 
             // Extract fields and process each field - handles both scalar and array values
             auto fieldsIt = writeObj.find("fields");
@@ -977,7 +983,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
                 MultiWritePoint mwp;
                 mwp.measurement = candidate.measurement;
-                mwp.tags = *candidate.sharedTags;
+                mwp.tags = candidate.sharedTags;  // pointer copy, not map copy
                 mwp.timestamps = std::move(candidate.timestamps);
 
                 mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
@@ -989,7 +995,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
         MultiWritePoint mwp;
         mwp.measurement = firstCandidate.measurement;
-        mwp.tags = *firstCandidate.sharedTags;
+        mwp.tags = firstCandidate.sharedTags;  // pointer copy, not map copy
         mwp.timestamps = std::move(firstCandidate.timestamps);
 
         // NOTE: Don't sort timestamps here because field arrays are in the same original order
@@ -1018,7 +1024,7 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 
         MultiWritePoint mwp;
         mwp.measurement = candidate.measurement;
-        mwp.tags = *candidate.sharedTags;
+        mwp.tags = candidate.sharedTags;  // pointer copy, not map copy
         mwp.timestamps = std::move(candidate.timestamps);
 
         mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
@@ -1088,8 +1094,11 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
     // Use shared_ptr for tags and timestamps so that all field inserts from
     // the same multi-field point share a single allocation instead of making
     // N-1 copies (for N fields). This is safe across Seastar shard boundaries
-    // because shared_ptr uses atomic refcounting.
-    auto sharedTags = std::make_shared<const std::map<std::string, std::string>>(std::move(point.tags));
+    // because shared_ptr uses atomic refcounting. The tag map is already
+    // shared: producers wrap it once and we just take the pointer (no deep
+    // copy + re-wrap per point).
+    auto sharedTags = point.tags ? std::move(point.tags)
+                                 : std::make_shared<const std::map<std::string, std::string>>();
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
 
     // Timestamp range for MetadataOp day-bitmap coverage (first batch of a
@@ -1155,7 +1164,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
                             metaOps.push_back(
-                                MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
+                                MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1182,7 +1192,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
                             metaOps.push_back(
-                                MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
+                                MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1213,7 +1224,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
                             metaOps.push_back(
-                                MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
+                                MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1240,7 +1252,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
                             metaOps.push_back(
-                                MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags, mnTs, mxTs});
+                                MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
+                                       seriesId});
                         }
                     }
                 }
@@ -1467,21 +1480,24 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                                 break;
                         }
                         uint64_t mnTs = 0, mxTs = 0;
-                        if (!ffi.timestamps.empty()) {
-                            auto [mnIt, mxIt] = std::minmax_element(ffi.timestamps.begin(), ffi.timestamps.end());
+                        if (ffi.timestamps && !ffi.timestamps->empty()) {
+                            auto [mnIt, mxIt] = std::minmax_element(ffi.timestamps->begin(), ffi.timestamps->end());
                             mnTs = *mnIt;
                             mxTs = *mxIt;
                         }
-                        allMetaOps.push_back(MetaOp{vtype, ffi.measurement, ffi.fieldName, ffi.tags, mnTs, mxTs});
+                        allMetaOps.push_back(
+                            MetaOp{vtype, ffi.measurement, ffi.fieldName, *ffi.tags, mnTs, mxTs, seriesId});
                     }
                 }
 
-                // Build TimeStarInsert directly from FastFieldInsert — move vectors
+                // Build TimeStarInsert directly from FastFieldInsert — move value
+                // vectors, share tags/timestamps by refcounted pointer (same as
+                // the JSON path's setSharedTags/setSharedTimestamps).
                 switch (ffi.type) {
                     case timestar::proto::FastFieldInsert::Type::DOUBLE: {
                         TimeStarInsert<double> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values = std::move(ffi.doubleValues);
                         insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                         insert.setCachedSeriesId128(seriesId);
@@ -1490,8 +1506,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     }
                     case timestar::proto::FastFieldInsert::Type::BOOL: {
                         TimeStarInsert<bool> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values.reserve(ffi.boolValues.size());
                         for (uint8_t v : ffi.boolValues) {
                             insert.values.push_back(v != 0);
@@ -1503,8 +1519,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     }
                     case timestar::proto::FastFieldInsert::Type::STRING: {
                         TimeStarInsert<std::string> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values = std::move(ffi.stringValues);
                         insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                         insert.setCachedSeriesId128(seriesId);
@@ -1513,8 +1529,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     }
                     case timestar::proto::FastFieldInsert::Type::INTEGER: {
                         TimeStarInsert<int64_t> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.tags = std::move(ffi.tags);
-                        insert.timestamps = std::move(ffi.timestamps);
+                        insert.setSharedTags(std::move(ffi.tags));
+                        insert.setSharedTimestamps(std::move(ffi.timestamps));
                         insert.values = std::move(ffi.integerValues);
                         insert.setCachedSeriesKey(std::move(ffi.seriesKey));
                         insert.setCachedSeriesId128(seriesId);

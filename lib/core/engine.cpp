@@ -283,11 +283,14 @@ seastar::future<> Engine::indexMetadataSync(std::vector<MetadataOp> metaOps) {
     std::vector<std::vector<MetadataOp>> opsByShard(shardCount);
 
     for (auto& op : metaOps) {
-        // Use the same hash as the write handler to ensure metadata lands on the
-        // same shard as the data. buildSeriesKey + fromSeriesKey is the canonical path.
-        std::string seriesKey = timestar::buildSeriesKey(op.measurement, op.tags, op.fieldName);
-        SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
-        unsigned targetShard = timestar::routeToCore(seriesId);
+        // The write handler pre-computes op.seriesId with the same hash used for
+        // data routing, so metadata lands on the same shard as the data without
+        // rebuilding + rehashing the series key here. Fall back to the canonical
+        // buildSeriesKey + fromSeriesKey path only if a producer left it unset.
+        if (op.seriesId.isZero()) [[unlikely]] {
+            op.seriesId = SeriesId128::fromSeriesKey(timestar::buildSeriesKey(op.measurement, op.tags, op.fieldName));
+        }
+        unsigned targetShard = timestar::routeToCore(op.seriesId);
         opsByShard[targetShard].push_back(std::move(op));
     }
 

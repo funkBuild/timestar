@@ -88,6 +88,16 @@ public:
     seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement, std::map<std::string, std::string> tags,
                                                      std::string field) override;
 
+    // Fast overload for callers that already know the series ID (write handler
+    // pre-computes it for shard routing). Skips buildSeriesKey + rehash, and
+    // takes the components by const reference so the common already-indexed
+    // path performs no map/string copies; components are copied only on the
+    // new-series branch. `knownId` MUST equal
+    // SeriesId128::fromSeriesKey(buildSeriesKey(measurement, tags, field)).
+    seastar::future<SeriesId128> getOrCreateSeriesId(SeriesId128 knownId, const std::string& measurement,
+                                                     const std::map<std::string, std::string>& tags,
+                                                     const std::string& field);
+
     seastar::future<std::optional<SeriesId128>> getSeriesId(const std::string& measurement,
                                                             const std::map<std::string, std::string>& tags,
                                                             const std::string& field) override;

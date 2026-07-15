@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,8 +30,13 @@ struct FastFieldInsert {
 
     std::string measurement;
     std::string fieldName;
-    std::map<std::string, std::string> tags;
-    std::vector<uint64_t> timestamps;
+    // Shared (refcounted, immutable) tags and timestamps: all fields of the
+    // same write point reference a single allocation instead of deep-copying
+    // per field. The handler passes these straight to TimeStarInsert's
+    // setSharedTags/setSharedTimestamps (shared_ptr crosses shard boundaries
+    // safely via atomic refcounting). Always non-null for emitted inserts.
+    std::shared_ptr<const std::map<std::string, std::string>> tags;
+    std::shared_ptr<const std::vector<uint64_t>> timestamps;
 
     // Exactly one of these is populated based on `type`
     Type type;
