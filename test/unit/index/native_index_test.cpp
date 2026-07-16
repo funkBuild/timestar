@@ -26,6 +26,48 @@ SEASTAR_TEST_F(NativeIndexTest, OpenAndClose) {
     co_await index.close();
 }
 
+SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
+    // Crash 1: write without close(). The IndexWAL destructor safety-net
+    // persists the buffered records, but nothing flushes the memtable —
+    // exactly the state a crashed process leaves behind.
+    SeriesId128 id1;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        id1 = co_await index.getOrCreateSeriesId("crash_m", {{"host", "a"}}, "f");
+        // no close() — simulated crash
+    }
+
+    // Recovery: open() must replay the WAL AND make the replayed data durable
+    // in an SSTable before the WAL can be truncated or purged.
+    SeriesId128 id2;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        auto meta = co_await index.getSeriesMetadata(id1);
+        EXPECT_TRUE(meta.has_value());
+        EXPECT_EQ(meta ? meta->measurement : "", "crash_m");
+
+        // Under the old code this write's WAL append truncated the only copy
+        // of the replayed records (they lived solely in the volatile memtable).
+        id2 = co_await index.getOrCreateSeriesId("crash_m2", {{"host", "b"}}, "f");
+        // no close() — simulated crash 2
+    }
+
+    // Both the recovered series and the post-recovery series must survive.
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        auto meta1 = co_await index.getSeriesMetadata(id1);
+        EXPECT_TRUE(meta1.has_value());
+        EXPECT_EQ(meta1 ? meta1->measurement : "", "crash_m");
+        auto meta2 = co_await index.getSeriesMetadata(id2);
+        EXPECT_TRUE(meta2.has_value());
+        EXPECT_EQ(meta2 ? meta2->measurement : "", "crash_m2");
+        co_await index.close();
+    }
+}
+
 SEASTAR_TEST_F(NativeIndexTest, CreateAndRetrieveSeries) {
     NativeIndex index(0);
     co_await index.open();

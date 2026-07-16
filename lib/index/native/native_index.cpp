@@ -103,6 +103,10 @@ NativeIndex::NativeIndex(int shardId)
       discoveryCache_(timestar::config().index.discovery_cache_bytes / std::max(1u, seastar::smp::count)) {}
 
 NativeIndex::~NativeIndex() {
+    // Stop the periodic WAL sync from firing after destruction (close() also
+    // cancels it; this covers destruction-without-close paths).
+    walSyncTimer_.cancel();
+
     // Guard against destroying the index while a background flush is still in flight.
     // The caller must co_await close() (which calls waitForFlush()) before destruction.
     // This check must fire in release builds too — the background coroutine holds a raw
@@ -148,6 +152,31 @@ seastar::future<> NativeIndex::open() {
     compCfg.rateLimitMBps = timestar::config().index.compaction_rate_limit_mbps;
     compaction_ = std::make_unique<CompactionEngine>(indexPath_, *manifest_, compCfg);
 
+    // Durability: replayed WAL records exist only in the volatile memtable at
+    // this point. Make them durable in an SSTable BEFORE the current WAL can
+    // be truncated (first append) or the older generations deleted — a crash
+    // after either would otherwise lose everything just replayed.
+    // flushMemTable() also rotates to a fresh WAL generation and deletes the
+    // consumed one once the SSTable is durable.
+    if (!memtable_->empty()) {
+        co_await flushMemTable();
+        ::native_index_log.info("Recovered MemTable flushed to SSTable before WAL reuse");
+    }
+    co_await wal_->purgeReplayedFiles();
+
+    // Bound the WAL buffering loss window: append() only buffers in user space,
+    // so periodically sync (flush + fsync) when there is unpersisted data.
+    walSyncTimer_.set_callback([this] {
+        if (walSyncGate_.is_closed()) {
+            return;
+        }
+        (void)seastar::with_gate(walSyncGate_, [this] { return wal_->sync(); })
+            .handle_exception([](std::exception_ptr ep) {
+                ::native_index_log.warn("Background WAL sync failed: {}", ep);
+            });
+    });
+    walSyncTimer_.arm_periodic(kWalSyncInterval);
+
     // Phase 2: Load or migrate LocalIdMap for roaring bitmap postings
     auto counterKey = ke::encodeLocalIdCounterKey();
     auto counterVal = co_await kvGet(counterKey);
@@ -187,6 +216,13 @@ seastar::future<> NativeIndex::open() {
 }
 
 seastar::future<> NativeIndex::close() {
+    // Stop the periodic WAL sync and drain any in-flight sync before touching
+    // the WAL below (wal_->close() flushes everything anyway).
+    walSyncTimer_.cancel();
+    if (!walSyncGate_.is_closed()) {
+        co_await walSyncGate_.close();
+    }
+
     // Wait for any in-flight background flush, then flush remaining data
     try {
         co_await waitForFlush();

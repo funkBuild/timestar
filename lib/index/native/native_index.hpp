@@ -23,8 +23,10 @@
 #include <roaring.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/timer.hh>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -217,6 +219,15 @@ private:
     std::unique_ptr<MemTable> memtable_;
     std::unique_ptr<MemTable> immutableMemtable_;   // Being flushed to SSTable in background
     std::optional<seastar::future<>> flushFuture_;  // Tracks background flush
+
+    // Periodic WAL durability sync: append() only buffers, so without this an
+    // acknowledged index write could sit in user-space memory indefinitely.
+    // The timer bounds the loss window to ~one interval; the gate drains any
+    // in-flight sync before close(). ~100ms trades one 4KB DMA write + fsync
+    // per interval (only when dirty) for crash durability.
+    static constexpr std::chrono::milliseconds kWalSyncInterval{100};
+    seastar::timer<> walSyncTimer_;
+    seastar::gate walSyncGate_;
     std::unique_ptr<IndexWAL> wal_;
     std::unique_ptr<Manifest> manifest_;
     std::unique_ptr<CompactionEngine> compaction_;

@@ -3,10 +3,12 @@
 #include "write_batch.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/semaphore.hh>
 #include <string>
 #include <vector>
 
@@ -33,11 +35,23 @@ public:
     // Open or create a WAL file in the given directory.
     static seastar::future<IndexWAL> open(std::string directory);
 
-    // Append a write batch to the WAL. Returns after the data is flushed.
+    // Append a write batch to the WAL buffer. Data is made durable by the
+    // owner's periodic sync() (bounded window), by rotate(), and by close() —
+    // NOT on every append. Callers needing immediate durability call sync().
     seastar::future<> append(const IndexWriteBatch& batch);
 
+    // Make everything appended so far durable (flush buffer + padded tail +
+    // fsync) without disturbing append state. Cheap no-op when clean.
+    seastar::future<> sync();
+
     // Replay all records into a MemTable. Used during recovery.
+    // Does NOT delete replayed files — the caller must first make the replayed
+    // data durable (flush to SSTable), then call purgeReplayedFiles().
     seastar::future<uint64_t> replay(MemTable& target);
+
+    // Delete older WAL generations consumed by replay(). Only call after the
+    // replayed data has been made durable elsewhere (e.g. SSTable flush).
+    seastar::future<> purgeReplayedFiles();
 
     // Rotate: close current WAL, start a new file.
     // Returns the path of the old WAL file (caller can delete after flush).
@@ -69,12 +83,19 @@ private:
     uint64_t dmaWritePos_ = 0;  // Physical DMA-aligned write offset
     size_t dmaAlignment_ = 4096;
 
-    // Write buffer — accumulates records, flushed on rotate()/close() or when full.
+    // Write buffer — accumulates records, flushed on sync()/rotate()/close() or when full.
     // WAL files are typically small (< 4MB before MemTable flush triggers rotation).
     // Large buffer minimizes DMA write frequency during bulk insert bursts.
     std::string buffer_;
     std::string tailBuf_;  // Partial DMA block from previous flush (avoids disk read-back)
     static constexpr size_t BUFFER_CAPACITY = 1024 * 1024;  // 1 MB
+
+    // Serializes flushBuffer/flushTail/sync/rotate/close against each other.
+    // Coroutines interleave at every co_await on the same shard; two in-flight
+    // flushes would both compute write offsets from a stale dmaWritePos_ and
+    // corrupt the log (unique_ptr keeps IndexWAL movable).
+    std::unique_ptr<seastar::semaphore> writeSem_ = std::make_unique<seastar::semaphore>(1);
+    bool needsSync_ = false;  // Set on append; cleared when a sync/rotate/close makes data durable
 
     seastar::future<> flushBuffer();
     seastar::future<> flushTail();  // Write remaining partial DMA block before close/rotate

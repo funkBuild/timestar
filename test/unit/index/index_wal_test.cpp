@@ -95,3 +95,75 @@ SEASTAR_TEST_F(IndexWALTest, EmptyReplay) {
     EXPECT_TRUE(mt.empty());
     co_await wal.close();
 }
+
+SEASTAR_TEST_F(IndexWALTest, SyncMakesAppendsDurableWithoutClose) {
+    auto wal = co_await IndexWAL::open(self->dir_);
+
+    IndexWriteBatch b;
+    b.put("crashkey", "crashval");
+    co_await wal.append(b);  // sits in the 1MB user-space buffer
+    co_await wal.sync();
+
+    // Read back with an independent instance while the writer is still open —
+    // equivalent to a crash right after sync (no close, no destructor net).
+    {
+        auto reader = co_await IndexWAL::open(self->dir_);
+        MemTable mt;
+        auto count = co_await reader.replay(mt);
+        EXPECT_EQ(count, 1u);
+        EXPECT_EQ(mt.get("crashkey").value_or(""), "crashval");
+        co_await reader.close();
+    }
+
+    // The writer must be able to continue appending after a sync: the synced
+    // partial tail block is rewritten in place by the next flush.
+    IndexWriteBatch b2;
+    b2.put("second", "2");
+    co_await wal.append(b2);
+    co_await wal.close();
+
+    auto reader2 = co_await IndexWAL::open(self->dir_);
+    MemTable mt2;
+    auto count2 = co_await reader2.replay(mt2);
+    EXPECT_EQ(count2, 2u);
+    EXPECT_EQ(*mt2.get("crashkey"), "crashval");
+    EXPECT_EQ(*mt2.get("second"), "2");
+    co_await reader2.close();
+}
+
+SEASTAR_TEST_F(IndexWALTest, ReplayKeepsOldGenerationsUntilPurge) {
+    std::string old1, old2;
+    {
+        auto wal = co_await IndexWAL::open(self->dir_);
+        IndexWriteBatch b1;
+        b1.put("k1", "v1");
+        co_await wal.append(b1);
+        old1 = co_await wal.rotate();
+
+        IndexWriteBatch b2;
+        b2.put("k2", "v2");
+        co_await wal.append(b2);
+        old2 = co_await wal.rotate();
+
+        IndexWriteBatch b3;
+        b3.put("k3", "v3");
+        co_await wal.append(b3);
+        co_await wal.close();
+    }
+
+    auto wal2 = co_await IndexWAL::open(self->dir_);
+    MemTable mt;
+    auto count = co_await wal2.replay(mt);
+    EXPECT_EQ(count, 3u);
+
+    // Replay must NOT delete the consumed generations — the replayed data is
+    // volatile until the caller flushes it to an SSTable.
+    EXPECT_TRUE(std::filesystem::exists(old1));
+    EXPECT_TRUE(std::filesystem::exists(old2));
+
+    co_await wal2.purgeReplayedFiles();
+    EXPECT_FALSE(std::filesystem::exists(old1));
+    EXPECT_FALSE(std::filesystem::exists(old2));
+
+    co_await wal2.close();
+}

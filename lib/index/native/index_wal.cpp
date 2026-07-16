@@ -133,16 +133,20 @@ IndexWAL::~IndexWAL() {
 }
 
 // Open Seastar DMA file handle for the current WAL path.
-// Truncates existing file — safe because replay() has already consumed data.
+// Truncates any existing file — safe because NativeIndex::open() flushes all
+// replayed data to an SSTable (and rotates to a fresh generation) before the
+// first append can reach here.
 seastar::future<> IndexWAL::openFile() {
     walFile_.emplace(co_await seastar::open_file_dma(
         currentPath_, seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate));
     dmaAlignment_ = walFile_->disk_write_dma_alignment();
     writePos_ = 0;
     dmaWritePos_ = 0;
-    buffer_.clear();
     buffer_.reserve(BUFFER_CAPACITY);
-    tailBuf_.clear();
+    // NOTE: buffer_ and tailBuf_ are intentionally NOT cleared — the file is
+    // opened lazily, so callers reach here with records already buffered
+    // (tailBuf_ is always empty at this point: flushTail() drains it before
+    // any rotate/close, and a fresh WAL has never produced a tail).
 }
 
 // Flush the write buffer to disk using DMA.
@@ -243,13 +247,10 @@ seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
 }
 
 seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
-    // Lazy file open — after replay() has consumed existing data
-    if (!walFile_) {
-        co_await openFile();
-    }
-
     // Serialize batch directly into the WAL buffer — no intermediate payload string.
     // Record layout: length(4) + CRC(4) + sequence(8) + payload(variable)
+    // This section is fully synchronous (no co_await), so concurrent appends
+    // cannot interleave inside it.
 
     size_t headerOffset = buffer_.size();
     // Reserve space for header: length(4) + CRC(4) + sequence(8) = 16 bytes
@@ -271,19 +272,78 @@ seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
     uint32_t crc = computeCrc32(hdr + 8, 8 + payloadSize);
     encodeFixed32(hdr + 4, crc);  // CRC at offset 4
 
-    // Flush when buffer exceeds capacity
+    // Advance the sequence BEFORE any suspension — incrementing after the
+    // flush let a concurrent append serialize a duplicate sequence number.
+    ++sequence_;
+    needsSync_ = true;
+
+    // Flush when buffer exceeds capacity (serialized against sync/rotate/close)
     if (buffer_.size() >= BUFFER_CAPACITY) {
+        auto units = co_await seastar::get_units(*writeSem_, 1);
+        if (!walFile_) {
+            co_await openFile();
+        }
         co_await flushBuffer();
     }
+}
 
-    ++sequence_;
+// Make everything appended so far durable without disturbing append state.
+// Unlike flushTail(), the padded tail block is written WITHOUT advancing
+// dmaWritePos_ or clearing tailBuf_ — the next flush simply rewrites the same
+// block in place, so appends can continue seamlessly after a sync.
+seastar::future<> IndexWAL::sync() {
+    if (!needsSync_) {
+        co_return;
+    }
+    auto units = co_await seastar::get_units(*writeSem_, 1);
+    if (!needsSync_) {  // another sync/rotate/close won the race
+        co_return;
+    }
+    // Clear the flag BEFORE flushing: an append that lands during the flush
+    // suspension re-sets it, guaranteeing the next sync picks it up even if
+    // this flush already carried its bytes.
+    needsSync_ = false;
+
+    if (!walFile_) {
+        if (buffer_.empty()) {
+            co_return;
+        }
+        co_await openFile();
+    }
+    co_await flushBuffer();  // writes aligned blocks, leaves partial tail in tailBuf_
+
+    if (!tailBuf_.empty()) {
+        const size_t tailSize = tailBuf_.size();
+        const size_t paddedSize = (tailSize + dmaAlignment_ - 1) & ~(dmaAlignment_ - 1);
+
+        auto buf = seastar::temporary_buffer<char>::aligned(dmaAlignment_, paddedSize);
+        std::memset(buf.get_write(), 0, paddedSize);
+        std::memcpy(buf.get_write(), tailBuf_.data(), tailSize);
+
+        size_t written = 0;
+        while (written < paddedSize) {
+            auto n = co_await walFile_->dma_write(dmaWritePos_ + written, buf.get() + written, paddedSize - written);
+            if (n == 0)
+                throw std::runtime_error("IndexWAL sync dma_write returned 0");
+            written += n;
+        }
+        // dmaWritePos_ and tailBuf_ intentionally untouched — the tail block
+        // will be rewritten at the same offset by the next flush.
+        co_await walFile_->truncate(writePos_);
+        co_await walFile_->flush();
+    }
 }
 
 seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
     uint64_t recordsReplayed = 0;
 
-    // Flush any buffered writes (including tail) before reading
-    if (walFile_) {
+    // Flush any buffered writes (including tail) before reading. The file is
+    // opened lazily, so records may be buffered without a file yet.
+    if (!buffer_.empty() || walFile_) {
+        auto units = co_await seastar::get_units(*writeSem_, 1);
+        if (!walFile_ && !buffer_.empty()) {
+            co_await openFile();
+        }
         co_await flushBuffer();
         co_await flushTail();
     }
@@ -297,14 +357,19 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
     // Replay the current (latest) generation
     recordsReplayed += co_await replayOneFile(currentPath_, target);
 
-    // Delete old WAL files only after ALL replays succeed — if we crash here,
-    // the next open() will find them again and replay is idempotent.
+    // NOTE: replayed files are NOT deleted here. The replayed data exists only
+    // in the volatile MemTable at this point — the caller must first make it
+    // durable (flush to SSTable), then call purgeReplayedFiles(). Deleting (or
+    // truncating) the WAL before that flush would lose everything replayed if
+    // the process crashed again.
+    co_return recordsReplayed;
+}
+
+seastar::future<> IndexWAL::purgeReplayedFiles() {
     for (const auto& oldPath : oldWalPaths_) {
         co_await deleteFile(oldPath);
     }
     oldWalPaths_.clear();
-
-    co_return recordsReplayed;
 }
 
 seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTable& target) {
@@ -368,6 +433,14 @@ seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTa
 }
 
 seastar::future<std::string> IndexWAL::rotate() {
+    auto units = co_await seastar::get_units(*writeSem_, 1);
+
+    // Materialize buffered records that never hit the flush threshold —
+    // append() opens the file lazily only when the buffer fills.
+    if (!walFile_ && !buffer_.empty()) {
+        co_await openFile();
+    }
+
     // Flush everything (including tail) and close current file
     if (walFile_) {
         co_await flushBuffer();
@@ -375,6 +448,7 @@ seastar::future<std::string> IndexWAL::rotate() {
         co_await walFile_->close();
         walFile_.reset();
     }
+    needsSync_ = false;
 
     auto oldPath = currentPath_;
     ++walGeneration_;
@@ -420,12 +494,17 @@ seastar::future<> IndexWAL::flushTail() {
 }
 
 seastar::future<> IndexWAL::close() {
+    auto units = co_await seastar::get_units(*writeSem_, 1);
+    if (!walFile_ && !buffer_.empty()) {
+        co_await openFile();
+    }
     if (walFile_) {
         co_await flushBuffer();
         co_await flushTail();
         co_await walFile_->close();
         walFile_.reset();
     }
+    needsSync_ = false;
 }
 
 }  // namespace timestar::index
