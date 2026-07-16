@@ -247,6 +247,27 @@ if(TIMESTAR_BUILD_TESTS)
   add_subdirectory(test)
 endif()
 
+# ─────────────────────────── coverage instrumentation ────────────────────────
+# Adds --coverage -O0 -g to first-party targets only (lib/ bin/ proto/ test/);
+# Seastar and the FetchContent _deps keep their normal flags.  Use via the
+# `coverage` preset (CMAKE_BUILD_TYPE=Debug, Seastar_SANITIZE=OFF) — see
+# cmake/Coverage.cmake for why Coverage is not a build type here.  test/ is
+# instrumented too so lib/ header (template/inline) code that is only
+# instantiated in test translation units still shows up in the report.
+option(TIMESTAR_COVERAGE "Instrument first-party targets for gcov coverage" OFF)
+if(TIMESTAR_COVERAGE)
+  include(cmake/Coverage.cmake)
+  set(_timestar_cov_dirs
+      ${CMAKE_CURRENT_SOURCE_DIR}/lib
+      ${CMAKE_CURRENT_SOURCE_DIR}/bin
+      ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+  if(TIMESTAR_BUILD_TESTS)
+    list(APPEND _timestar_cov_dirs ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  endif()
+  timestar_apply_coverage(${_timestar_cov_dirs})
+  unset(_timestar_cov_dirs)
+endif()
+
 # ────────────────────────────────── install ──────────────────────────────────
 # Minimal install: the server binary (installed from bin/CMakeLists.txt) plus a
 # sample configuration file. Honors CMAKE_INSTALL_PREFIX via GNUInstallDirs

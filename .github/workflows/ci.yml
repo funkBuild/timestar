@@ -109,11 +109,77 @@ jobs:
           name: test-results
           path: test-results/test-results.xml
 
+  coverage:
+    name: Coverage (gcov/gcovr)
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize submodules (shallow)
+        run: git submodule update --init --depth 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build deps image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: deps
+          load: true
+          tags: timestar-deps
+          cache-from: type=gha,scope=ci-deps
+          cache-to: type=gha,scope=ci-deps,mode=max
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-cov-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-cov-${{ runner.os }}-
+            ccache-${{ runner.os }}-
+
+      # Soft threshold: 40% line coverage for lib/ is a floor, not the goal.
+      # Ratchet policy: raise COVERAGE_FAIL_UNDER_LINE as real coverage grows
+      # (target is the project's 100% goal); never lower it to make CI green.
+      - name: Build, test, and generate coverage report
+        run: |
+          mkdir -p .ccache
+          docker run --rm \
+            -v ${{ github.workspace }}:/src \
+            -v ${{ github.workspace }}/.ccache:/ccache \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_MAXSIZE=2G \
+            -e CCACHE_COMPRESS=1 \
+            -e COVERAGE_FAIL_UNDER_LINE=40 \
+            -e COVERAGE_CMAKE_ARGS='-G Ninja -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DTIMESTAR_NATIVE_ARCH=OFF' \
+            timestar-deps \
+            bash -c 'apt-get update -qq && apt-get install -y -qq gcovr && \
+              ccache -z && cd /src && ./scripts/run_coverage.sh && ccache -s'
+
+      - name: Fix cache permissions
+        if: always()
+        run: sudo chown -R $(id -u):$(id -g) .ccache build-coverage || true
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: |
+            build-coverage/coverage-html/
+            build-coverage/coverage.xml
+
   benchmarks:
     name: Benchmark Regression Check
     runs-on: ubuntu-24.04
     needs: build-and-test
-    # Disabled: CI baseline needs updating after query engine refactor
+    # Disabled: CI baseline needs updating after query engine refactor.
+    # Superseded by local perf gates (test/timestar_perf_test).
     if: false
 
     steps:

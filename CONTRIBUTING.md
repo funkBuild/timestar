@@ -62,6 +62,40 @@ CI will reject PRs with formatting violations.
 - All tests must pass before merge
 - Target: no test regressions
 
+## Coverage
+
+Test coverage is measured with gcov/gcovr via the `coverage` CMake preset
+(`build-coverage/`, gcc: `--coverage -O0 -g`, no `-DNDEBUG`; Seastar and
+fetched third-party dependencies are not instrumented — see
+`cmake/Coverage.cmake` for details, including why `Coverage` is not a
+CMAKE_BUILD_TYPE here and why the ~10 Highway SIMD TUs stay at `-O2`).
+
+```bash
+# From the repo root: configure + build + run tests + generate reports
+./scripts/run_coverage.sh
+```
+
+Reports land in:
+
+- `build-coverage/coverage-html/index.html` — browsable per-line HTML
+- `build-coverage/coverage.xml` — Cobertura XML (consumed by CI)
+- console — per-file table + line/branch summary, filtered to `lib/`
+
+Useful knobs (env vars): `COVERAGE_GTEST_FILTER` to narrow the test run,
+`COVERAGE_SKIP_TESTS=1` to regenerate reports from existing counters,
+`COVERAGE_FAIL_UNDER_LINE=<pct>` to enforce a threshold,
+`COVERAGE_CMAKE_ARGS` for extra configure flags (CI passes ccache/Ninja here).
+
+**Current baseline (Jul 2026):** `lib/` line coverage **55.8%**, branch
+coverage **50.4%** (3175 unit tests). CI (`coverage` job in
+`.github/workflows/ci.yml`) enforces a soft floor of **40% line coverage**
+for `lib/`.
+
+**Ratchet policy:** the 40% floor is a starting point, not the target — the
+project goal is 100%. When you raise coverage meaningfully, bump
+`COVERAGE_FAIL_UNDER_LINE` in the CI job to just below the new number.
+Never lower the floor to get CI green.
+
 ## Running Benchmarks & Profiling
 
 ### Benchmark binaries

@@ -40,6 +40,18 @@
       }
     },
     {
+      "name": "coverage",
+      "displayName": "Coverage (gcov)",
+      "description": "Gcov-instrumented build for scripts/run_coverage.sh. Uses CMAKE_BUILD_TYPE=Debug + Seastar_SANITIZE=OFF (mirroring the debug preset) because Seastar rejects unknown build types; --coverage -O0 -g is applied per-target to first-party code only via TIMESTAR_COVERAGE (cmake/Coverage.cmake). No -DNDEBUG.",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-coverage",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "Seastar_SANITIZE": "OFF",
+        "TIMESTAR_COVERAGE": "ON"
+      }
+    },
+    {
       "name": "asan",
       "displayName": "ASan + UBSan",
       "description": "Sanitized debug build. Seastar needs Seastar_SANITIZE=ON so its own code is built with ASAN+UBSAN too (the whole program must be sanitized consistently), matching the -fsanitize flags applied to TimeStar code. _FORTIFY_SOURCE is only set for non-Debug configs in the top-level CMakeLists, so it does not conflict with ASAN.",
@@ -59,6 +71,7 @@
     { "name": "release", "configurePreset": "release" },
     { "name": "debug", "configurePreset": "debug" },
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "coverage", "configurePreset": "coverage" },
     { "name": "asan", "configurePreset": "asan" }
   ],
   "testPresets": [
