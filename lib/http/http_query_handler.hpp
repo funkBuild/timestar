@@ -1,5 +1,6 @@
 #pragma once
 
+#include "field_values.hpp"
 #include "native_index.hpp"
 #include "query_parser.hpp"
 #include "series_id.hpp"
@@ -10,15 +11,13 @@
 #include <chrono>
 #include <memory>
 #include <optional>
-#include <utility>
-#include <vector>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/http/function_handlers.hh>
-#include "field_values.hpp"
-
 #include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
+#include <utility>
+#include <vector>
 
 // Forward declaration
 class Engine;

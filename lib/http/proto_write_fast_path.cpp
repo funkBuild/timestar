@@ -167,8 +167,7 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
             if (tsCount > 0) {
                 std::vector<uint64_t> timestamps(static_cast<size_t>(tsCount));
                 // RepeatedField<uint64_t>::data() gives direct pointer to packed data
-                std::memcpy(timestamps.data(), wp.timestamps().data(),
-                            static_cast<size_t>(tsCount) * sizeof(uint64_t));
+                std::memcpy(timestamps.data(), wp.timestamps().data(), static_cast<size_t>(tsCount) * sizeof(uint64_t));
                 sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(timestamps));
             }
         }
@@ -230,8 +229,7 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
             // as a failed write via the fieldsProcessed check below.
             auto recordDecodeError = [&result, &fieldName](const char* what) {
                 if (result.errors.size() < 10) {
-                    result.errors.push_back("Field '" + fieldName +
-                                            "': failed to decode compressed values: " + what);
+                    result.errors.push_back("Field '" + fieldName + "': failed to decode compressed values: " + what);
                 }
             };
 
@@ -405,8 +403,7 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                 // Replicate the single timestamp; reuse the allocation across
                 // fields with the same value count.
                 if (!replicatedTs || replicatedTs->size() != valueCount) {
-                    replicatedTs =
-                        std::make_shared<const std::vector<uint64_t>>(valueCount, (*sharedTimestamps)[0]);
+                    replicatedTs = std::make_shared<const std::vector<uint64_t>>(valueCount, (*sharedTimestamps)[0]);
                 }
                 ffi.timestamps = replicatedTs;
             } else if (tsAvail == 0) {

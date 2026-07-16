@@ -137,7 +137,6 @@ struct FFORScratchBuffers {
     std::vector<uint16_t> exc_positions;  // up to kBlockSize/4
     std::vector<uint64_t> exc_values;     // up to kBlockSize/4
 
-
     // Decode path: no scratch buffers needed - decode uses a stack-allocated
     // block buffer (8KB) that stays hot in L1 cache.
 

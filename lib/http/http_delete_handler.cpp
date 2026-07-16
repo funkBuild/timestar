@@ -385,11 +385,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
 
             // Scatter to every shard, fold per-shard DeleteResults into one ShardResult.
             allFutures.push_back(
-                timestar::cluster::scatterAll(
-                    *engineSharded,
-                    [sharedReq](Engine& engine) -> seastar::future<Engine::DeleteResult> {
-                        co_return co_await engine.deleteByPattern(*sharedReq);
-                    })
+                timestar::cluster::scatterAll(*engineSharded,
+                                              [sharedReq](Engine& engine) -> seastar::future<Engine::DeleteResult> {
+                                                  co_return co_await engine.deleteByPattern(*sharedReq);
+                                              })
                     .then([](std::vector<Engine::DeleteResult> results) -> ShardResult {
                         uint64_t deleted = 0;
                         std::vector<std::string> names;

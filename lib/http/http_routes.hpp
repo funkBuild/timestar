@@ -4,7 +4,6 @@
 
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
-
 #include <string_view>
 #include <utility>
 
@@ -20,15 +19,15 @@ class JsonDefaultHandler : public seastar::httpd::handler_base {
 public:
     explicit JsonDefaultHandler(seastar::httpd::future_handler_function fn) : fn_(std::move(fn)) {}
 
-    seastar::future<std::unique_ptr<seastar::http::reply>> handle(
-        const seastar::sstring& /*path*/, std::unique_ptr<seastar::http::request> req,
-        std::unique_ptr<seastar::http::reply> rep) override {
-        return fn_(std::move(req), std::move(rep)).then([](std::unique_ptr<seastar::http::reply> rep) {
-            if (rep->_headers.find("Content-Type") == rep->_headers.end()) {
-                rep->set_mime_type("application/json");
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle(const seastar::sstring& /*path*/,
+                                                                  std::unique_ptr<seastar::http::request> req,
+                                                                  std::unique_ptr<seastar::http::reply> rep) override {
+        return fn_(std::move(req), std::move(rep)).then([](std::unique_ptr<seastar::http::reply> innerRep) {
+            if (innerRep->_headers.find("Content-Type") == innerRep->_headers.end()) {
+                innerRep->set_mime_type("application/json");
             }
-            rep->done();
-            return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+            innerRep->done();
+            return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(innerRep));
         });
     }
 

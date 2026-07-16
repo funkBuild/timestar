@@ -624,8 +624,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 entry.queryReq = QueryParser::parseQueryString(qe.query);
             } catch (const QueryParseException& e) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content =
-                    timestar::http::jsonError("Query '" + entry.label + "': " + e.what(), "INVALID_QUERY");
+                rep->_content = timestar::http::jsonError("Query '" + entry.label + "': " + e.what(), "INVALID_QUERY");
                 timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
@@ -751,8 +750,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     localMgr.setMaxLocalSubscriptions(streamCfg.max_subscriptions_per_shard);
     if (localMgr.localSubscriptionCount() + queryEntries.size() > streamCfg.max_subscriptions_per_shard) {
         rep->set_status(seastar::http::reply::status_type{429});
-        rep->_content =
-            timestar::http::jsonError("Maximum subscriptions per shard exceeded", "TOO_MANY_SUBSCRIPTIONS");
+        rep->_content = timestar::http::jsonError("Maximum subscriptions per shard exceeded", "TOO_MANY_SUBSCRIPTIONS");
         timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }

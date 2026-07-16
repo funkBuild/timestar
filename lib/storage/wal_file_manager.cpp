@@ -378,14 +378,14 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
                 // Schedule a single retry after a delay to avoid permanent memory bloat.
                 (void)seastar::try_with_gate(_backgroundGate, [this, store, sid, seqNum] {
                     return seastar::sleep(std::chrono::seconds(30)).then([this, store, sid, seqNum] {
-                        return seastar::get_units(_conversionSemaphore, 1).then([this, store, sid,
-                                                                                 seqNum](auto retryUnits) {
-                            timestar::wal_log.info("[BG_CONVERT] Retrying TSM conversion for store {} on shard {}",
-                                                   seqNum, sid);
-                            return store->close().then([this, store, units = std::move(retryUnits)]() mutable {
-                                return convertWalToTsm(store).finally([units = std::move(units)] {});
+                        return seastar::get_units(_conversionSemaphore, 1)
+                            .then([this, store, sid, seqNum](auto retryUnits) {
+                                timestar::wal_log.info("[BG_CONVERT] Retrying TSM conversion for store {} on shard {}",
+                                                       seqNum, sid);
+                                return store->close().then([this, store, units = std::move(retryUnits)]() mutable {
+                                    return convertWalToTsm(store).finally([units = std::move(units)] {});
+                                });
                             });
-                        });
                     });
                 }).handle_exception([this, store, sid, seqNum](auto ep2) {
                     try {

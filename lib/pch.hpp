@@ -16,8 +16,8 @@
 // ── Seastar async core (≈ every async TU; very expensive to parse) ──
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/log.hh>
 

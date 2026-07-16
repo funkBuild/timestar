@@ -535,9 +535,9 @@ private:
                     } else {
                         const double delta = batchMean - state.mean;
                         const double totalCount = static_cast<double>(state.count) + static_cast<double>(n);
-                        state.m2 += batchM2 +
-                                    delta * delta * (static_cast<double>(state.count) * static_cast<double>(n)) /
-                                        totalCount;
+                        state.m2 += batchM2 + delta * delta *
+                                                  (static_cast<double>(state.count) * static_cast<double>(n)) /
+                                                  totalCount;
                         state.mean += delta * (static_cast<double>(n) / totalCount);
                     }
                     state.count += n;

@@ -386,8 +386,8 @@ seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, [[may
                         };
 
                         co_await timestar::dispatchValueType(*typeOpt, [&]<class T>() -> seastar::future<> {
-                            auto result = co_await tsm->queryWithTombstones<T>(
-                                seriesId, 0, std::numeric_limits<uint64_t>::max());
+                            auto result =
+                                co_await tsm->queryWithTombstones<T>(seriesId, 0, std::numeric_limits<uint64_t>::max());
                             extractData(result);
                         });
                     }

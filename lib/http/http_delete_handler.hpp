@@ -133,8 +133,8 @@ public:
 
 // Backward-compatibility aliases: these types historically lived in the
 // global namespace. New code should use timestar::http:: directly.
-using timestar::http::GlazeDeleteRequest;   // NOLINT(misc-unused-using-decls)
-using timestar::http::HttpDeleteHandler;    // NOLINT(misc-unused-using-decls)
+using timestar::http::GlazeDeleteRequest;  // NOLINT(misc-unused-using-decls)
+using timestar::http::HttpDeleteHandler;   // NOLINT(misc-unused-using-decls)
 namespace timestar {
 using http::GlazeDeleteRequest;
 using http::HttpDeleteHandler;

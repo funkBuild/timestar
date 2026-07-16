@@ -148,8 +148,9 @@ void set_routes(routes& r) {
 
     auto retentionHandlerPtr = std::make_shared<timestar::http::HttpRetentionHandler>(&g_engine);
     retentionHandlerPtr->registerRoutes(r, authToken());
-    handlers.emplace_back(new std::shared_ptr<timestar::http::HttpRetentionHandler>(retentionHandlerPtr),
-                          [](void* p) { delete static_cast<std::shared_ptr<timestar::http::HttpRetentionHandler>*>(p); });
+    handlers.emplace_back(new std::shared_ptr<timestar::http::HttpRetentionHandler>(retentionHandlerPtr), [](void* p) {
+        delete static_cast<std::shared_ptr<timestar::http::HttpRetentionHandler>*>(p);
+    });
 
     auto* streamHandler = emplaceHandler(new timestar::http::HttpStreamHandler(&g_engine));
     streamHandler->registerRoutes(r, authToken());

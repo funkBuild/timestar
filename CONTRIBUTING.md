@@ -30,10 +30,10 @@
 
 ## Code Style
 
-The project uses `clang-format-22.1.1`. Format your code before committing:
+The project pins `clang-format` **21.1.6** (installed via `pip install clang-format==21.1.6` — the same pinned version runs in CI's Docker image, so results match exactly). Format your code before committing:
 
 ```bash
-find lib bin -name '*.cpp' -o -name '*.hpp' | xargs clang-format-22.1.1 -i
+find lib bin -name '*.cpp' -o -name '*.hpp' | xargs clang-format -i
 ```
 
 CI will reject PRs with formatting violations.
@@ -43,7 +43,7 @@ CI will reject PRs with formatting violations.
 1. Create a feature branch from `main`
 2. Make your changes with tests
 3. Ensure all tests pass: `./test/timestar_unit_test`
-4. Ensure formatting passes: `clang-format-22.1.1 --dry-run --Werror <files>`
+4. Ensure formatting passes: `clang-format --dry-run --Werror <files>` (clang-format 21.1.6)
 5. Open a PR against `main` with a clear description
 
 ## Project Structure

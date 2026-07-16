@@ -16,9 +16,9 @@
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
-#include <span>
 #include <seastar/core/file.hh>
 #include <seastar/core/semaphore.hh>
+#include <span>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -66,9 +66,9 @@ struct TSMIndexBlock {
 // always consecutive runs of the input), so the input passed to
 // groupContiguousBlocks() must outlive the returned batches.
 struct BlockBatch {
-    uint64_t startOffset = 0;                // Offset of first block in batch
-    uint64_t totalSize = 0;                  // Sum of all block sizes (uint64_t to avoid overflow)
-    std::span<const TSMIndexBlock> blocks;   // Blocks in this batch (view, not owned)
+    uint64_t startOffset = 0;               // Offset of first block in batch
+    uint64_t totalSize = 0;                 // Sum of all block sizes (uint64_t to avoid overflow)
+    std::span<const TSMIndexBlock> blocks;  // Blocks in this batch (view, not owned)
 };
 
 // Sparse index entry for lazy loading

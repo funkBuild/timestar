@@ -39,16 +39,16 @@ struct MetadataOp {
 
 enum IndexKeyType : uint8_t {
     // 0x01 retired (legacy escaped series index)
-    MEASUREMENT_FIELDS = 0x02,        // measurement -> fields set
-    MEASUREMENT_TAGS = 0x03,          // measurement -> tag keys set
-    TAG_VALUES = 0x04,                // measurement+tag_key -> values set
-    SERIES_METADATA = 0x05,           // series_id -> metadata
-    TAG_INDEX = 0x06,                 // measurement+tag_key+tag_value -> series_ids
+    MEASUREMENT_FIELDS = 0x02,  // measurement -> fields set
+    MEASUREMENT_TAGS = 0x03,    // measurement -> tag keys set
+    TAG_VALUES = 0x04,          // measurement+tag_key -> values set
+    SERIES_METADATA = 0x05,     // series_id -> metadata
+    TAG_INDEX = 0x06,           // measurement+tag_key+tag_value -> series_ids
     // 0x07 retired (GROUP_BY_INDEX — removed in Phase 3)
-    FIELD_STATS = 0x08,               // series_id+field -> stats
-    FIELD_TYPE = 0x09,                // measurement+field -> field type (float, bool, string, integer)
-    MEASUREMENT_SERIES = 0x0A,        // measurement+\0+series_id -> (empty) for fast measurement->series lookup
-    RETENTION_POLICY = 0x0B,          // measurement -> JSON retention policy
+    FIELD_STATS = 0x08,         // series_id+field -> stats
+    FIELD_TYPE = 0x09,          // measurement+field -> field type (float, bool, string, integer)
+    MEASUREMENT_SERIES = 0x0A,  // measurement+\0+series_id -> (empty) for fast measurement->series lookup
+    RETENTION_POLICY = 0x0B,    // measurement -> JSON retention policy
     // 0x0C was MEASUREMENT_FIELD_SERIES — removed in cleanup; never read.
 
     // Phase 2: Roaring bitmap postings
@@ -62,7 +62,7 @@ enum IndexKeyType : uint8_t {
                              // -> roaring bitmap of active LocalIds
 
     // Phase 4: Cardinality estimation
-    CARDINALITY_HLL = 0x14,   // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
+    CARDINALITY_HLL = 0x14,     // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
     MEASUREMENT_BLOOM = 0x15,   // measurement\0 -> serialized bloom filter of all LocalIds
     POSTINGS_WATERMARK = 0x16,  // singleton -> localIdMap.nextId() at last bitmap flush (crash-repair bound)
 

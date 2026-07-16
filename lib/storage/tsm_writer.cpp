@@ -1,5 +1,6 @@
 #include "tsm_writer.hpp"
 
+#include "../query/simd_aggregator.hpp"
 #include "bool_encoder_rle.hpp"
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
@@ -8,10 +9,7 @@
 #include "series_id.hpp"
 #include "string_encoder.hpp"
 #include "tsm.hpp"
-#include "../query/simd_aggregator.hpp"
 #include "value_type_dispatch.hpp"
-
-#include <cassert>
 #include "zigzag.hpp"
 
 #include <fcntl.h>
@@ -19,6 +17,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -115,8 +114,7 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
 
 template <class T>
 void TSMWriter::writeBlock(TSMValueType seriesType, [[maybe_unused]] const SeriesId128& seriesId,
-                           std::span<const uint64_t> timestamps, std::span<const T> values,
-                           TSMIndexEntry& indexEntry) {
+                           std::span<const uint64_t> timestamps, std::span<const T> values, TSMIndexEntry& indexEntry) {
     size_t blockStartOffset = buffer.size();
 
     buffer.write((uint8_t)seriesType);          // uint8_t fieldType
@@ -833,4 +831,3 @@ template void TSMWriter::writeSeries<std::string>(TSMValueType seriesType, const
 template void TSMWriter::writeSeries<int64_t>(TSMValueType seriesType, const SeriesId128& seriesId,
                                               const std::vector<uint64_t>& timestamps,
                                               const std::vector<int64_t>& values);
-

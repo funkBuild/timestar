@@ -84,8 +84,7 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
         // Stable sort preserves batch order among equal timestamps so the
         // last-seen value wins (multiple series/fields at the same bucket),
         // matching the previous map-overwrite semantics.
-        std::stable_sort(pts.begin(), pts.end(),
-                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::stable_sort(pts.begin(), pts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         // In-place dedupe keeping the last value per timestamp.
         size_t w = 0;
         for (size_t r = 0; r < pts.size(); ++r) {

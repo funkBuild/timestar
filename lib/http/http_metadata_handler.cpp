@@ -497,8 +497,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             }
         } else {
             // Measurement-level cardinality plus per-tag-key cardinalities
-            double totalEstimate = co_await timestar::cluster::scatterAndSum(
-                *engineSharded, [measurement](Engine& engine) {
+            double totalEstimate =
+                co_await timestar::cluster::scatterAndSum(*engineSharded, [measurement](Engine& engine) {
                     return engine.getIndex().estimateMeasurementCardinality(measurement);
                 });
 

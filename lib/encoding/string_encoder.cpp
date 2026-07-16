@@ -154,9 +154,9 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
     size_t compressedMaxSize = ZSTD_compressBound(writePos);
     tlCompBuf.resize(compressedMaxSize);
     auto& compressed = tlCompBuf;
-    size_t compressedSize = ZSTD_compressCCtx(getThreadCCtx(), compressed.data(), compressedMaxSize,
-                                              reinterpret_cast<const char*>(uncompressed.data()), writePos,
-                                              compressionLevel);
+    size_t compressedSize =
+        ZSTD_compressCCtx(getThreadCCtx(), compressed.data(), compressedMaxSize,
+                          reinterpret_cast<const char*>(uncompressed.data()), writePos, compressionLevel);
     if (ZSTD_isError(compressedSize)) {
         throw std::runtime_error(std::string("String encoder: zstd compression failed: ") +
                                  ZSTD_getErrorName(compressedSize));

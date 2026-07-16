@@ -488,8 +488,9 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::dispat
     }
     // Remote shard: copy the (moved-in) batches across via invoke_on.
     return engineSharded->invoke_on(
-        shard, [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
-                integers = std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
+        shard,
+        [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
+         integers = std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
             return insertAllTypes(engine, std::move(doubles), std::move(bools), std::move(strings),
                                   std::move(integers));
         });
@@ -647,9 +648,9 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
     // series-key prefix and shared tag map are reused, skipping tag map
     // construction, validation, prefix building, and the shared_ptr allocation.
     bool memoValid = false;
-    std::string_view memoMeasurement;                        // views into writes_array (stable for the loop)
-    const json_value_t::object_t* memoTagsObj = nullptr;     // nullptr == no/empty tags object
-    std::string seriesKeyPrefix;                             // hoisted: reused capacity across writes
+    std::string_view memoMeasurement;                     // views into writes_array (stable for the loop)
+    const json_value_t::object_t* memoTagsObj = nullptr;  // nullptr == no/empty tags object
+    std::string seriesKeyPrefix;                          // hoisted: reused capacity across writes
     std::shared_ptr<const std::map<std::string, std::string>> sharedTags;
 
     // DOM-to-DOM tag-object equality (string-valued tags only; any non-string
@@ -1132,8 +1133,7 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
     // because shared_ptr uses atomic refcounting. The tag map is already
     // shared: producers wrap it once and we just take the pointer (no deep
     // copy + re-wrap per point).
-    auto sharedTags = point.tags ? std::move(point.tags)
-                                 : std::make_shared<const std::map<std::string, std::string>>();
+    auto sharedTags = point.tags ? std::move(point.tags) : std::make_shared<const std::map<std::string, std::string>>();
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
 
     // Timestamp range for MetadataOp day-bitmap coverage (first batch of a
@@ -1198,9 +1198,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1226,9 +1225,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1258,9 +1256,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1286,9 +1283,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1334,10 +1330,9 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
             continue;
         }
 
-        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(acc.shardDoubles[shard]),
-                                                    std::move(acc.shardBools[shard]),
-                                                    std::move(acc.shardStrings[shard]),
-                                                    std::move(acc.shardIntegers[shard])));
+        shardFutures.push_back(dispatchShardInserts(
+            engineSharded, shard, std::move(acc.shardDoubles[shard]), std::move(acc.shardBools[shard]),
+            std::move(acc.shardStrings[shard]), std::move(acc.shardIntegers[shard])));
     }
 
     // Wait for all shard operations to complete in parallel
@@ -1458,8 +1453,7 @@ seastar::future<bool> HttpWriteHandler::readWriteBody(seastar::http::request& re
 // views memory owned by the caller (req->content or bodyStorage), which
 // outlives this parent-awaited coroutine.
 seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, uint64_t defaultTimestampNs,
-                                                        timestar::http::WireFormat resFmt,
-                                                        seastar::http::reply& rep) {
+                                                        timestar::http::WireFormat resFmt, seastar::http::reply& rep) {
     auto fastResult = timestar::proto::parseWriteRequestFast(body.data(), body.size(), defaultTimestampNs);
 
     // Yield after CPU-heavy proto parse to prevent reactor stalls
@@ -1569,8 +1563,8 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
     shardFutures.reserve(shardCount);
 
     for (size_t shard = 0; shard < shardCount; ++shard) {
-        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() &&
-            shardStringInserts[shard].empty() && shardIntegerInserts[shard].empty()) {
+        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() && shardStringInserts[shard].empty() &&
+            shardIntegerInserts[shard].empty()) {
             continue;
         }
 
@@ -1717,10 +1711,9 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
             continue;
         }
         activeShards.push_back(shard);
-        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(acc.shardDoubles[shard]),
-                                                    std::move(acc.shardBools[shard]),
-                                                    std::move(acc.shardStrings[shard]),
-                                                    std::move(acc.shardIntegers[shard])));
+        shardFutures.push_back(dispatchShardInserts(
+            engineSharded, shard, std::move(acc.shardDoubles[shard]), std::move(acc.shardBools[shard]),
+            std::move(acc.shardStrings[shard]), std::move(acc.shardIntegers[shard])));
     }
 
     auto shardResults = co_await seastar::when_all(shardFutures.begin(), shardFutures.end());
@@ -1750,8 +1743,7 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
         co_await engineSharded->local().indexMetadataSync(std::move(acc.metaOps));
     }
 #if TIMESTAR_LOG_INSERT_PATH
-    LOG_INSERT_PATH(timestar::http_log, info, "[METADATA] Batch: indexed {} unique series synchronously",
-                    metaOpsCount);
+    LOG_INSERT_PATH(timestar::http_log, info, "[METADATA] Batch: indexed {} unique series synchronously", metaOpsCount);
 #endif
 
     // Include coalesce-skipped entries in failure count

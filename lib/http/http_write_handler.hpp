@@ -209,7 +209,10 @@ private:
         std::vector<MetaOp> metaOps;
 
         explicit BatchAccumulator(size_t shardCount)
-            : shardDoubles(shardCount), shardBools(shardCount), shardStrings(shardCount), shardIntegers(shardCount),
+            : shardDoubles(shardCount),
+              shardBools(shardCount),
+              shardStrings(shardCount),
+              shardIntegers(shardCount),
               shardPoints(shardCount, 0) {}
 
         bool shardEmpty(size_t shard) const {

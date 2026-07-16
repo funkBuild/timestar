@@ -24,6 +24,8 @@
  *   ./timestar_query_bench --format protobuf
  */
 
+#include "bench_common.hpp"
+
 #include "timestar.pb.h"
 
 #include <boost/range/irange.hpp>
@@ -51,8 +53,6 @@
 #include <string>
 #include <vector>
 
-#include "bench_common.hpp"
-
 using namespace seastar;
 using timestar::bench::clk;
 using timestar::bench::percentile;
@@ -78,11 +78,11 @@ static constexpr uint64_t MED_END = BASE_TS + 10000ULL * MINUTE_NS;  // ~7 days
 // ──────────────────────────────────────────────────────────────────────
 
 struct QueryDef {
-    std::string name;    // human label
-    std::string method;  // HTTP method (GET or POST)
-    std::string path;    // URL path
-    std::string body;    // request body (empty for GET) — JSON or protobuf bytes depending on format
-    int iterations;      // how many times to run
+    std::string name;                      // human label
+    std::string method;                    // HTTP method (GET or POST)
+    std::string path;                      // URL path
+    std::string body;                      // request body (empty for GET) — JSON or protobuf bytes depending on format
+    int iterations;                        // how many times to run
     WireFormat format = WireFormat::Json;  // wire format for this query
 };
 

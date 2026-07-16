@@ -66,7 +66,7 @@ enum class UnaryOpType {
     CUMSUM,    // cumsum(a) - running cumulative sum; NaN treated as 0 (skip-NaN)
     INTEGRAL,  // integral(a) - definite integral using trapezoidal rule; NaN trapezoids contribute 0
     // Normalization
-    NORMALIZE,  // normalize(a) - rescale values to [0, 1]; constant series → all 0.0; NaN passthrough
+    NORMALIZE,    // normalize(a) - rescale values to [0, 1]; constant series → all 0.0; NaN passthrough
     STANDARDIZE,  // standardize(a) - global z-score (x-mean)/stddev over non-NaN; constant → 0; NaN passthrough
     // Element-wise math (continued)
     EXP,    // exp(a) - e^x; NaN passthrough
@@ -95,12 +95,12 @@ enum class FunctionType {
     PER_MINUTE,  // per_minute(series, seconds_per_point) - rate * 60
     PER_HOUR,    // per_hour(series, seconds_per_point) - rate * 3600
     // Rolling window functions (second arg is integer window size N)
-    ROLLING_AVG,     // rolling_avg(series, N) - N-point simple moving average
-    ROLLING_MIN,     // rolling_min(series, N) - N-point rolling minimum
-    ROLLING_MAX,     // rolling_max(series, N) - N-point rolling maximum
-    ROLLING_STDDEV,  // rolling_stddev(series, N) - N-point rolling population stddev
-    ROLLING_SUM,     // rolling_sum(series, N) - N-point rolling sum
-    ROLLING_MEDIAN,  // rolling_median(series, N) - N-point rolling median (robust smoother)
+    ROLLING_AVG,         // rolling_avg(series, N) - N-point simple moving average
+    ROLLING_MIN,         // rolling_min(series, N) - N-point rolling minimum
+    ROLLING_MAX,         // rolling_max(series, N) - N-point rolling maximum
+    ROLLING_STDDEV,      // rolling_stddev(series, N) - N-point rolling population stddev
+    ROLLING_SUM,         // rolling_sum(series, N) - N-point rolling sum
+    ROLLING_MEDIAN,      // rolling_median(series, N) - N-point rolling median (robust smoother)
     ROLLING_PERCENTILE,  // rolling_percentile(series, N, p) - N-point rolling p-th percentile
     // Gap-fill with constant scalar
     FILL_VALUE,  // fill_value(series, v) - replace every NaN with constant v
@@ -117,9 +117,9 @@ enum class FunctionType {
     BOTTOMK,     // bottomk(N, series) - keep bottom-N groups by mean value
     AS_PERCENT,  // as_percent(series, total) - 100 * series / total; NaN on div-by-zero or NaN input
     // Cross-series aggregation (variadic: operate element-wise across N aligned series)
-    AVG_OF_SERIES,        // avg_of_series(a, b, ...) - element-wise mean across series args
-    SUM_OF_SERIES,        // sum_of_series(a, b, ...) - element-wise sum across series args
-    MIN_OF_SERIES,        // min_of_series(a, b, ...) - element-wise minimum across series args
+    AVG_OF_SERIES,         // avg_of_series(a, b, ...) - element-wise mean across series args
+    SUM_OF_SERIES,         // sum_of_series(a, b, ...) - element-wise sum across series args
+    MIN_OF_SERIES,         // min_of_series(a, b, ...) - element-wise minimum across series args
     MAX_OF_SERIES,         // max_of_series(a, b, ...) - element-wise maximum across series args
     PERCENTILE_OF_SERIES,  // percentile_of_series(p, a, b, ...) - p-th percentile across series args
     COUNT_OF_SERIES,       // count_of_series(a, b, ...) - element-wise count of non-NaN across series args

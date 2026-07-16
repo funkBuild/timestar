@@ -585,8 +585,8 @@ seastar::future<VariantQueryResult> QueryRunner::runQuery(const std::string& ser
     LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Found series type: {} for series: '{}'",
                    static_cast<int>(seriesType.value()), seriesKey);
 
-    VariantQueryResult results = co_await timestar::dispatchValueType(
-        seriesType.value(), [&]<class T>() -> seastar::future<VariantQueryResult> {
+    VariantQueryResult results =
+        co_await timestar::dispatchValueType(seriesType.value(), [&]<class T>() -> seastar::future<VariantQueryResult> {
             LOG_QUERY_PATH(timestar::query_log, debug, "[QUERYRUNNER] Querying series '{}' (type tag {})", seriesKey,
                            static_cast<int>(seriesType.value()));
             VariantQueryResult r = co_await queryTsm<T>(seriesKey, seriesId, startTime, endTime);

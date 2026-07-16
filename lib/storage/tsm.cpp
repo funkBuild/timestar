@@ -64,8 +64,8 @@ static std::span<const TSMIndexBlock> overlappingBlockRange(const std::vector<TS
                                                             uint64_t startTime, uint64_t endTime) {
     auto first = std::partition_point(blocks.begin(), blocks.end(),
                                       [startTime](const TSMIndexBlock& b) { return b.maxTime < startTime; });
-    auto last = std::partition_point(first, blocks.end(),
-                                     [endTime](const TSMIndexBlock& b) { return b.minTime < endTime; });
+    auto last =
+        std::partition_point(first, blocks.end(), [endTime](const TSMIndexBlock& b) { return b.minTime < endTime; });
     return {first, last};
 }
 
@@ -1119,8 +1119,7 @@ seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTim
         // decode fast path with identical results.
         const bool fullyContained = block.minTime >= startTime && block.maxTime < endTime;
         decodeBlockFlat<T>(batchBuf.get() + bufferOffset, block.size, fullyContained ? 0 : startTime,
-                           fullyContained ? UINT64_MAX : endTime, flatBlock->timestamps, flatBlock->values,
-                           stringDict);
+                           fullyContained ? UINT64_MAX : endTime, flatBlock->timestamps, flatBlock->values, stringDict);
         bufferOffset += block.size;
     }
 
@@ -1406,8 +1405,8 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                                                          decodeEnd, aggregator);
                 } else {
                     // Boolean
-                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart,
-                                                      decodeEnd, aggregator);
+                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
+                                                      aggregator);
                 }
                 totalPoints += n;
             } else {
@@ -1468,8 +1467,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     // preserves that order, so LATEST → back(), FIRST → front().
     if (maxPoints == 1) {
         const TSMIndexBlock& bestBlock = reverse ? blocksToScan.back() : blocksToScan.front();
-        const bool boundaryInRange =
-            reverse ? (bestBlock.maxTime < endTime) : (bestBlock.minTime >= startTime);
+        const bool boundaryInRange = reverse ? (bestBlock.maxTime < endTime) : (bestBlock.minTime >= startTime);
         if (bestBlock.hasExtendedStats && boundaryInRange) {
             const uint64_t boundaryTs = reverse ? bestBlock.maxTime : bestBlock.minTime;
             // hasTombstones() is a cheap file-level guard; only consult per-series
@@ -1488,8 +1486,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
                 }
             }
             if (!boundaryDeleted) {
-                const double boundaryVal =
-                    reverse ? bestBlock.blockLatestValue : bestBlock.blockFirstValue;
+                const double boundaryVal = reverse ? bestBlock.blockLatestValue : bestBlock.blockFirstValue;
                 aggregator.addPoint(boundaryTs, boundaryVal);
                 co_return 1;
             }

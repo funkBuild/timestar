@@ -630,8 +630,8 @@ AlignedSeries AlignedSeries::fillSpline() const {
         const double t = static_cast<double>(ts[i] - tBase) * 1e-6;
         const double a = (x[seg + 1] - t) / h;
         const double b = (t - x[seg]) / h;
-        result[i] = a * yv[seg] + b * yv[seg + 1] +
-                    ((a * a * a - a) * m[seg] + (b * b * b - b) * m[seg + 1]) * (h * h) / 6.0;
+        result[i] =
+            a * yv[seg] + b * yv[seg + 1] + ((a * a * a - a) * m[seg] + (b * b * b - b) * m[seg + 1]) * (h * h) / 6.0;
     }
     return AlignedSeries(timestamps, std::move(result));
 }
@@ -1536,8 +1536,7 @@ AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op, const Qu
         const void* lp = left.timestamps.get();
         const void* rp = right.timestamps.get();
         auto key = (lp < rp) ? std::make_pair(lp, rp) : std::make_pair(rp, lp);
-        if (std::find(verifiedAlignedPairs_.begin(), verifiedAlignedPairs_.end(), key) ==
-            verifiedAlignedPairs_.end()) {
+        if (std::find(verifiedAlignedPairs_.begin(), verifiedAlignedPairs_.end(), key) == verifiedAlignedPairs_.end()) {
             if (*left.timestamps != *right.timestamps) {
                 throw EvaluationException(
                     "Binary operation requires aligned timestamps. "

@@ -9,8 +9,7 @@
 namespace timestar {
 namespace anomaly {
 
-AgileDetector::HoltWintersState AgileDetector::initializeState(std::span<const double> values,
-                                                               size_t seasonalPeriod) {
+AgileDetector::HoltWintersState AgileDetector::initializeState(std::span<const double> values, size_t seasonalPeriod) {
     HoltWintersState state;
 
     // Initialize level as mean of first period using SIMD

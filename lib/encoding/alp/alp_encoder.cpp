@@ -32,7 +32,8 @@ inline ScaleResult scaleValue(double value, uint8_t exp, uint8_t fac) {
     double rounded = std::round(scaled);
 
     // Check for overflow before casting
-    if (rounded > static_cast<double>(timestar::alp::MAX_SAFE_INT) || rounded < static_cast<double>(timestar::alp::MIN_SAFE_INT)) {
+    if (rounded > static_cast<double>(timestar::alp::MAX_SAFE_INT) ||
+        rounded < static_cast<double>(timestar::alp::MIN_SAFE_INT)) {
         return {0, false};
     }
 
@@ -178,9 +179,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
 
     // Determine scheme: try ALP first, fall back to ALP_RD
     auto best = findBestExpFac(values.data(), total_values);
-    double exception_rate = static_cast<double>(best.exceptions) / std::min(total_values, timestar::alp::ALP_SAMPLE_SIZE);
+    double exception_rate =
+        static_cast<double>(best.exceptions) / std::min(total_values, timestar::alp::ALP_SAMPLE_SIZE);
 
-    uint8_t scheme = (exception_rate > timestar::alp::ALP_RD_EXCEPTION_THRESHOLD) ? timestar::alp::SCHEME_ALP_RD : timestar::alp::SCHEME_ALP;
+    uint8_t scheme = (exception_rate > timestar::alp::ALP_RD_EXCEPTION_THRESHOLD) ? timestar::alp::SCHEME_ALP_RD
+                                                                                  : timestar::alp::SCHEME_ALP;
 
     // Delta-benefit heuristic: sample first block to check if delta reduces bit width
     if (scheme == timestar::alp::SCHEME_ALP) {
@@ -266,7 +269,8 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * timestar::alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : timestar::alp::ALP_VECTOR_SIZE;
+            const size_t block_count =
+                (block == num_blocks - 1 && tail_count > 0) ? tail_count : timestar::alp::ALP_VECTOR_SIZE;
 
             // Reuse scratch buffers (resize is no-op when <= capacity)
             encoded.resize(block_count);
@@ -280,9 +284,9 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             if (use_simd_scale) {
                 exc_positions.resize(block_count);
                 exc_values.resize(block_count);
-                const size_t n_exc =
-                    timestar::alp::simd::alpScaleF0(values.data() + block_start, block_count, timestar::alp::FACT_ARR[exp],
-                                          encoded.data(), &min_val, &max_val, exc_positions.data(), exc_values.data());
+                const size_t n_exc = timestar::alp::simd::alpScaleF0(
+                    values.data() + block_start, block_count, timestar::alp::FACT_ARR[exp], encoded.data(), &min_val,
+                    &max_val, exc_positions.data(), exc_values.data());
                 exc_positions.resize(n_exc);
                 exc_values.resize(n_exc);
             } else {
@@ -429,7 +433,8 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
 
         for (size_t block = 0; block < num_blocks; ++block) {
             const size_t block_start = block * timestar::alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : timestar::alp::ALP_VECTOR_SIZE;
+            const size_t block_count =
+                (block == num_blocks - 1 && tail_count > 0) ? tail_count : timestar::alp::ALP_VECTOR_SIZE;
 
             timestar::alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count, rd);
             const uint16_t exception_count = static_cast<uint16_t>(rd.exception_positions.size());
@@ -466,7 +471,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
                 size_t right_packed_words = timestar::alp::ffor_packed_words(block_count, rd.right_bw);
                 right_packed.resize(right_packed_words);
                 timestar::alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base, rd.right_bw,
-                                   right_packed.data());
+                                             right_packed.data());
                 target.write_array(right_packed.data(), right_packed_words);
             }
 

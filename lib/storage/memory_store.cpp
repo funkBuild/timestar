@@ -479,18 +479,18 @@ std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128& series
 // Explicit template instantiations for every TimeStar value type.
 // The macro fans out (double, bool, std::string, int64_t) — see
 // value_type_dispatch.hpp.
-#define INST_INMEM(T)                                              \
-    template void InMemorySeries<T>::insert(TimeStarInsert<T>&&);  \
-    template void InMemorySeries<T>::sortPaired(size_t, size_t);   \
+#define INST_INMEM(T)                                             \
+    template void InMemorySeries<T>::insert(TimeStarInsert<T>&&); \
+    template void InMemorySeries<T>::sortPaired(size_t, size_t);  \
     template void InMemorySeries<T>::mergePaired(size_t);
 TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_INMEM)
 #undef INST_INMEM
 
-#define INST_STORE(T)                                                                                      \
-    template seastar::future<bool> MemoryStore::insert<T>(TimeStarInsert<T>&);                             \
-    template seastar::future<bool> MemoryStore::insertBatch<T>(std::vector<TimeStarInsert<T>>&, size_t);   \
-    template void MemoryStore::insertMemory<T>(TimeStarInsert<T>&&);                                       \
-    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&);                                \
+#define INST_STORE(T)                                                                                    \
+    template seastar::future<bool> MemoryStore::insert<T>(TimeStarInsert<T>&);                           \
+    template seastar::future<bool> MemoryStore::insertBatch<T>(std::vector<TimeStarInsert<T>>&, size_t); \
+    template void MemoryStore::insertMemory<T>(TimeStarInsert<T>&&);                                     \
+    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&);                              \
     template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&, size_t&);
 TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_STORE)
 #undef INST_STORE
