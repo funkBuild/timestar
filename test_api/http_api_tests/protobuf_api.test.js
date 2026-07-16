@@ -19,11 +19,9 @@
  *     if Accept is absent it echoes the request format. NOTE: axios sends a
  *     default Accept header containing application/json, so protobuf responses
  *     must be requested explicitly with Accept: application/x-protobuf.
- *   - KNOWN QUIRK: protobuf response BODIES are currently served with a
- *     Content-Type: application/json header. addJsonRoute (lib/http/http_routes.hpp)
- *     constructs seastar's function_handler with type "json", which overwrites
- *     the mime type set by timestar::http::setContentType. We therefore do not
- *     assert the response Content-Type header, only that the body decodes.
+ *   - Protobuf responses carry Content-Type: application/x-protobuf.
+ *     (JsonDefaultHandler in lib/http/http_routes.hpp defaults to JSON only
+ *     when the endpoint set no explicit type; postProto() asserts this.)
  *   - points_written counts field-points: one WritePoint with 4 fields and
  *     1 timestamp counts as 4 points.
  *   - Protobuf /query SUCCESS responses always use the Approach B compressed
@@ -96,12 +94,16 @@ function encodeQueryRequest(obj) {
   return Buffer.from(QueryRequest.encode(QueryRequest.create(obj)).finish());
 }
 
-// POST a binary body asking for a protobuf response
+// POST a binary body asking for a protobuf response.
+// Protobuf responses must carry a protobuf Content-Type (JsonDefaultHandler
+// only defaults to application/json when the endpoint set no type).
 async function postProto(url, buf) {
-  return http.post(url, buf, {
+  const res = await http.post(url, buf, {
     headers: { 'Content-Type': PB_CONTENT_TYPE, Accept: PB_CONTENT_TYPE },
     responseType: 'arraybuffer',
   });
+  expect(res.headers['content-type']).toContain('protobuf');
+  return res;
 }
 
 function decodeWriteResponse(res) {
