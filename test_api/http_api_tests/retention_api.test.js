@@ -213,12 +213,8 @@ describe('Retention API', () => {
 
       const del = await http.delete('/retention', { params: { measurement: meas } });
       expect(del.status).toBe(200);
-      // NOTE: the DELETE success body currently starts the "message" string
-      // with corrupted bytes (dangling temporary in the handler's glz::obj),
-      // which makes the body unparseable JSON (raw control characters). Only
-      // the status field is asserted, via raw text. Known server bug.
-      const delBody = typeof del.data === 'string' ? del.data : JSON.stringify(del.data);
-      expect(delBody).toContain('"status":"success"');
+      expect(del.data.status).toBe('success');
+      expect(del.data.message).toBe(`Retention policy deleted for measurement: ${meas}`);
 
       const got = await http.get('/retention', { params: { measurement: meas } });
       expect(got.status).toBe(404);

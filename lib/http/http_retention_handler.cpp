@@ -377,8 +377,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
                 reply->_content = timestar::proto::formatStatusResponse(
                     "success", "Retention policy deleted for measurement: " + measurement);
             } else {
-                auto responseObj = glz::obj{"status", "success", "message",
-                                            "Retention policy deleted for measurement: " + measurement};
+                // Materialize before glz::obj — it stores references, and a temporary
+                // string dies before write_json runs on the next line.
+                std::string deletedMsg = "Retention policy deleted for measurement: " + measurement;
+                auto responseObj = glz::obj{"status", "success", "message", deletedMsg};
                 reply->_content = glz::write_json(responseObj).value_or("{}");
             }
         } else {
