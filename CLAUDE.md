@@ -71,7 +71,7 @@ cd test_api/
 # Install dependencies (first time only)
 npm install
 
-# Run Jest test suite (46 tests)
+# Run Jest test suite (161 tests across 10 suites)
 npm test
 
 # Run standalone integration tests (8 tests)
@@ -96,8 +96,8 @@ Test files include:
 ### Expected Test Results
 
 When all tests pass, you should see:
-- **C++ Tests**: 2858+ tests across 194+ test suites, all passing
-- **Jest Tests**: 46 tests from 3 test suites, all passing
+- **C++ Tests**: 3178+ tests across 254+ test suites, all passing
+- **Jest Tests**: 161 tests from 10 test suites, all passing
 - **Standalone Tests**: 8 tests, all passing
 
 ## Key Executables

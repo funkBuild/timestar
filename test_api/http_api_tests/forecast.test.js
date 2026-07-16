@@ -5,7 +5,9 @@
 
 const http = require('http');
 
-const BASE_URL = 'http://localhost:8086';
+const HOST = process.env.TIMESTAR_HOST || 'localhost';
+const PORT = process.env.TIMESTAR_PORT || 8086;
+const BASE_URL = `http://${HOST}:${PORT}`;
 
 // Helper to make HTTP requests
 function httpRequest(method, path, body = null) {
