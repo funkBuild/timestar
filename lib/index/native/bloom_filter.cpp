@@ -76,6 +76,10 @@ void BloomFilter::build() {
 }
 
 bool BloomFilter::mayContain(std::string_view key) const {
+    return mayContainHash(XXH3_64bits(key.data(), key.size()));
+}
+
+bool BloomFilter::mayContainHash(uint64_t hash) const {
     if (isNull_)
         return true;
     if (filter_.empty())
@@ -83,9 +87,8 @@ bool BloomFilter::mayContain(std::string_view key) const {
 
     size_t numBits = filter_.size() * 64;
 
-    uint64_t h = XXH3_64bits(key.data(), key.size());
-    uint32_t h1 = static_cast<uint32_t>(h);
-    uint32_t h2 = static_cast<uint32_t>(h >> 32);
+    uint32_t h1 = static_cast<uint32_t>(hash);
+    uint32_t h2 = static_cast<uint32_t>(hash >> 32);
 
     // SIMD path: gather all k probe bytes and test with single SIMD AND+compare.
     // This replaces k sequential getBit() calls (each with a conditional branch

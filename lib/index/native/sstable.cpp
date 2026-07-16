@@ -2,6 +2,7 @@
 
 #include "crc32.hpp"
 
+#include <xxhash.h>
 #include <zstd.h>
 
 #include <chrono>
@@ -642,6 +643,10 @@ seastar::future<seastar::lw_shared_ptr<const std::string>> SSTableReader::getDec
 }
 
 seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view key) {
+    return get(key, XXH3_64bits(key.data(), key.size()));
+}
+
+seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view key, uint64_t keyHash) {
     if (index_.empty()) {
         co_return std::nullopt;
     }
@@ -653,7 +658,7 @@ seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view 
     }
 
     // Bloom filter check
-    if (!bloom_.mayContain(key)) {
+    if (!bloom_.mayContainHash(keyHash)) {
         co_return std::nullopt;
     }
 

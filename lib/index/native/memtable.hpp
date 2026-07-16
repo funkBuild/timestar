@@ -31,6 +31,11 @@ public:
     // Use isTombstone() to distinguish "not present" from "deleted".
     std::optional<std::string_view> get(std::string_view key) const;
 
+    // Single-traversal lookup that distinguishes absent / tombstone / live.
+    // outValue is filled only for Live and only when non-null.
+    enum class ProbeResult { Absent, Tombstone, Live };
+    ProbeResult probe(std::string_view key, std::string* outValue = nullptr) const;
+
     // Insert a tombstone for the key (marks it as deleted).
     void remove(std::string_view key);
 

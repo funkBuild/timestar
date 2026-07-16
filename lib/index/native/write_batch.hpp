@@ -22,8 +22,10 @@ public:
         std::string value;  // Empty for Delete
     };
 
-    void put(std::string_view key, std::string_view value);
-    void remove(std::string_view key);
+    // By-value: prvalue/moved arguments (e.g. encode*() results) are moved
+    // into the batch instead of copied; lvalues and literals copy as before.
+    void put(std::string key, std::string value);
+    void remove(std::string key);
     void clear();
     void reserve(size_t n) { ops_.reserve(n); }
 

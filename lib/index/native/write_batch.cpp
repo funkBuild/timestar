@@ -7,14 +7,14 @@
 
 namespace timestar::index {
 
-void IndexWriteBatch::put(std::string_view key, std::string_view value) {
+void IndexWriteBatch::put(std::string key, std::string value) {
     approxSize_ += key.size() + value.size() + sizeof(Op);
-    ops_.push_back({OpType::Put, std::string(key), std::string(value)});
+    ops_.push_back({OpType::Put, std::move(key), std::move(value)});
 }
 
-void IndexWriteBatch::remove(std::string_view key) {
+void IndexWriteBatch::remove(std::string key) {
     approxSize_ += key.size() + sizeof(Op);
-    ops_.push_back({OpType::Delete, std::string(key), {}});
+    ops_.push_back({OpType::Delete, std::move(key), {}});
 }
 
 void IndexWriteBatch::clear() {
@@ -109,10 +109,10 @@ IndexWriteBatch IndexWriteBatch::deserializeFrom(std::string_view data) {
             p += 4;
             if (p + valLen > end)
                 throw std::runtime_error("WriteBatch: truncated at value data");
-            batch.put(key, std::string_view(p, valLen));
+            batch.put(std::move(key), std::string(p, valLen));
             p += valLen;
         } else {
-            batch.remove(key);
+            batch.remove(std::move(key));
         }
     }
 

@@ -43,6 +43,20 @@ void MemTable::remove(std::string_view key) {
     }
 }
 
+MemTable::ProbeResult MemTable::probe(std::string_view key, std::string* outValue) const {
+    auto it = entries_.find(key);
+    if (it == entries_.end()) {
+        return ProbeResult::Absent;
+    }
+    if (!it->second) {
+        return ProbeResult::Tombstone;
+    }
+    if (outValue) {
+        *outValue = *it->second;
+    }
+    return ProbeResult::Live;
+}
+
 bool MemTable::isTombstone(std::string_view key) const {
     auto it = entries_.find(key);
     return it != entries_.end() && !it->second;

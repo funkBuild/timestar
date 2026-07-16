@@ -8,13 +8,11 @@ namespace timestar::index {
 MergeIterator::MergeIterator(std::vector<std::unique_ptr<IteratorSource>> sources) : sources_(std::move(sources)) {}
 
 bool MergeIterator::heapLess(size_t a, size_t b) const {
-    auto& sa = sources_[heap_[a].sourceIndex];
-    auto& sb = sources_[heap_[b].sourceIndex];
-    // Sort by key first, then by priority (lower = newer = preferred)
-    int cmp = sa->key().compare(sb->key());
+    // Sort by cached key first, then by priority (lower = newer = preferred)
+    int cmp = heap_[a].key.compare(heap_[b].key);
     if (cmp != 0)
         return cmp < 0;
-    return sa->priority() < sb->priority();
+    return sources_[heap_[a].sourceIndex]->priority() < sources_[heap_[b].sourceIndex]->priority();
 }
 
 void MergeIterator::siftDown(size_t i) {
@@ -50,7 +48,7 @@ void MergeIterator::rebuildHeap() {
     heap_.clear();
     for (size_t i = 0; i < sources_.size(); ++i) {
         if (sources_[i]->valid()) {
-            heap_.push_back({i});
+            heap_.push_back({i, sources_[i]->key()});
         }
     }
     // Build min-heap
@@ -82,13 +80,14 @@ seastar::future<> MergeIterator::next() {
     // Advance all sources that are positioned at the current key
     // (skip duplicates from lower-priority sources)
     while (!heap_.empty()) {
-        auto& top = sources_[heap_[0].sourceIndex];
-        if (top->key() != currentKey_)
+        if (heap_[0].key != currentKey_)
             break;
+        auto& top = sources_[heap_[0].sourceIndex];
 
         // Advance this source
         co_await top->next();
         if (top->valid()) {
+            heap_[0].key = top->key();  // refresh cached key after advance
             siftDown(0);
         } else {
             // Remove from heap: swap with last, pop, sift down
@@ -109,18 +108,19 @@ seastar::future<> MergeIterator::findNext() {
         auto& winner = sources_[heap_[0].sourceIndex];
         if (!winner->isTombstone()) {
             // Live entry — set current and return
-            currentKey_.assign(winner->key().data(), winner->key().size());
+            currentKey_.assign(heap_[0].key.data(), heap_[0].key.size());
             currentValue_ = winner->value();
             valid_ = true;
             co_return;
         }
 
         // Tombstone: skip all sources at this key
-        std::string tombstoneKey(winner->key());
-        while (!heap_.empty() && sources_[heap_[0].sourceIndex]->key() == tombstoneKey) {
+        std::string tombstoneKey(heap_[0].key);
+        while (!heap_.empty() && heap_[0].key == tombstoneKey) {
             auto& src = sources_[heap_[0].sourceIndex];
             co_await src->next();
             if (src->valid()) {
+                heap_[0].key = src->key();  // refresh cached key after advance
                 siftDown(0);
             } else {
                 heap_[0] = heap_.back();

@@ -31,6 +31,10 @@ public:
     // false if the key is definitely NOT in the set.
     bool mayContain(std::string_view key) const;
 
+    // Same query with a pre-computed XXH3_64bits hash of the key — lets callers
+    // probing many filters with the same key hash it once.
+    bool mayContainHash(uint64_t hash) const;
+
     // Number of keys added.
     size_t keyCount() const { return numKeys_; }
 

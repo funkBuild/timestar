@@ -48,18 +48,23 @@ public:
 
     bool valid() const { return valid_; }
     std::string_view key() const { return currentKey_; }
+    // Zero-copy view into the winning source's value (block pinned by the
+    // source iterator). Valid only until the next call to next()/seek().
     std::string_view value() const { return currentValue_; }
 
 private:
     struct HeapEntry {
         size_t sourceIndex;
+        // Cached view of sources_[sourceIndex]->key() — avoids two virtual
+        // calls per heap comparison. Refreshed whenever the source advances.
+        std::string_view key;
     };
 
     std::vector<std::unique_ptr<IteratorSource>> sources_;
     std::vector<HeapEntry> heap_;
     bool valid_ = false;
-    std::string currentKey_;
-    std::string currentValue_;  // Owned copy — prevents dangling when sources advance
+    std::string currentKey_;  // Owned — next() compares against it after advancing sources
+    std::string_view currentValue_;
 
     // Rebuild heap from all valid sources
     void rebuildHeap();

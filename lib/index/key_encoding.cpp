@@ -226,8 +226,12 @@ SeriesMetadata decodeSeriesMetadata(const char* rawData, size_t rawLen) {
 // NOTE: Uses native (little-endian) byte order. Not portable across architectures
 // but consistent with the static_assert in key_encoding.hpp.
 std::string encodeStringSet(const std::set<std::string>& strings) {
+    size_t totalSize = 0;
+    for (const auto& str : strings) {
+        totalSize += sizeof(uint32_t) + str.size();
+    }
     std::string result;
-    result.reserve(strings.size() * (sizeof(uint32_t) + 32));
+    result.reserve(totalSize);
     for (const auto& str : strings) {
         if (str.length() > UINT32_MAX) [[unlikely]]
             throw std::overflow_error("encodeStringSet: string length exceeds uint32_t");
@@ -287,7 +291,7 @@ std::string encodeLocalIdForwardKey(uint32_t localId) {
     std::string key;
     key.reserve(5);
     key.push_back(static_cast<char>(LOCAL_ID_FORWARD));
-    key.append(encodeLocalId(localId));
+    key.append(reinterpret_cast<const char*>(&localId), 4);  // Little-endian on x86 (see encodeLocalId)
     return key;
 }
 

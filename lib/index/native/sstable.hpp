@@ -152,6 +152,10 @@ public:
     // Reads compressed block from disk on demand (cached if block cache provided).
     seastar::future<std::optional<std::string>> get(std::string_view key);
 
+    // Overload with a pre-computed XXH3_64bits key hash for the bloom probe —
+    // callers checking many SSTables for the same key hash it once.
+    seastar::future<std::optional<std::string>> get(std::string_view key, uint64_t keyHash);
+
     // Range iteration.
     class Iterator {
     public:
