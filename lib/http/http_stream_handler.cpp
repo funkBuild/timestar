@@ -24,7 +24,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/with_timeout.hh>
 
-namespace timestar {
+namespace timestar::http {
 
 // --- JSON parsing for subscribe requests ---
 
@@ -42,23 +42,23 @@ struct GlazeSubscribeRequest {
     std::optional<std::variant<uint64_t, std::string>> aggregationInterval;
 };
 
-}  // namespace timestar
+}  // namespace timestar::http
 
 template <>
-struct glz::meta<timestar::GlazeQueryEntry> {
-    using T = timestar::GlazeQueryEntry;
+struct glz::meta<timestar::http::GlazeQueryEntry> {
+    using T = timestar::http::GlazeQueryEntry;
     static constexpr auto value = object("query", &T::query, "label", &T::label);
 };
 
 template <>
-struct glz::meta<timestar::GlazeSubscribeRequest> {
-    using T = timestar::GlazeSubscribeRequest;
+struct glz::meta<timestar::http::GlazeSubscribeRequest> {
+    using T = timestar::http::GlazeSubscribeRequest;
     static constexpr auto value =
         object("query", &T::query, "queries", &T::queries, "formula", &T::formula, "startTime", &T::startTime,
                "backfill", &T::backfill, "aggregationInterval", &T::aggregationInterval);
 };
 
-namespace timestar {
+namespace timestar::http {
 
 // --- Parse startTime variant to nanosecond timestamp ---
 
@@ -526,9 +526,9 @@ void HttpStreamHandler::registerRoutes(seastar::httpd::routes& r, std::string_vi
     } else {
         std::string token(authToken);
         r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/subscribe"),
-              new timestar::AuthHandlerWrapper(std::make_unique<sse_handler>(this), token));
+              new AuthHandlerWrapper(std::make_unique<sse_handler>(this), token));
         r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/subscriptions"),
-              new timestar::AuthHandlerWrapper(std::make_unique<subscriptions_handler>(this), token));
+              new AuthHandlerWrapper(std::make_unique<subscriptions_handler>(this), token));
     }
 
     timestar::http_log.info("Registered HTTP streaming endpoints at /subscribe, /subscriptions{}",
@@ -1278,4 +1278,4 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     co_return rep;
 }
 
-}  // namespace timestar
+}  // namespace timestar::http

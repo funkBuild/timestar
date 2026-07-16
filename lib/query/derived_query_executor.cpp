@@ -196,7 +196,7 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::executeFromJson(const 
 
     // Parse aggregation interval if provided
     if (!glazeReq.aggregationInterval.empty()) {
-        request.aggregationInterval = HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
+        request.aggregationInterval = http::HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
     }
 
     // Parse each query string
@@ -280,7 +280,7 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
 seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std::string& name,
                                                                       const QueryRequest& query) {
     // Create a query handler to execute the sub-query
-    HttpQueryHandler handler(engine_);
+    http::HttpQueryHandler handler(engine_);
 
     auto response = co_await handler.executeQuery(query);
 
@@ -421,7 +421,7 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeFromJson
 
     // Parse aggregation interval if provided
     if (!glazeReq.aggregationInterval.empty()) {
-        request.aggregationInterval = HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
+        request.aggregationInterval = http::HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
     }
 
     // Parse each query string

@@ -28,19 +28,14 @@ using namespace seastar;
 using namespace httpd;
 using timestar::buildSeriesKey;
 
+namespace timestar::http {
+
 // Glaze-compatible structures for JSON parsing
 struct GlazeWritePoint {
     std::string measurement;
     std::map<std::string, std::string> tags;
     json_value_t fields;  // Use u64 mode for integer precision
     std::optional<uint64_t> timestamp;
-};
-
-template <>
-struct glz::meta<GlazeWritePoint> {
-    using T = GlazeWritePoint;
-    static constexpr auto value =
-        object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields, "timestamp", &T::timestamp);
 };
 
 // Fast-path struct for the common case: single write with all double fields.
@@ -55,12 +50,23 @@ struct FastDoubleWritePoint {
     std::map<std::string, std::vector<double>> fields;
 };
 
+}  // namespace timestar::http
+
 template <>
-struct glz::meta<FastDoubleWritePoint> {
-    using T = FastDoubleWritePoint;
+struct glz::meta<timestar::http::GlazeWritePoint> {
+    using T = timestar::http::GlazeWritePoint;
+    static constexpr auto value =
+        object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields, "timestamp", &T::timestamp);
+};
+
+template <>
+struct glz::meta<timestar::http::FastDoubleWritePoint> {
+    using T = timestar::http::FastDoubleWritePoint;
     static constexpr auto value = object("measurement", &T::measurement, "tags", &T::tags, "timestamps", &T::timestamps,
                                          "timestamp", &T::timestamp, "fields", &T::fields);
 };
+
+namespace timestar::http {
 
 // File-scope shard-local cache of series IDs that have already been indexed.
 // After the first batch, subsequent writes for the same series skip the
@@ -1916,7 +1922,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 }
 
 void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    // addJsonRoute applies timestar::wrapWithAuth per route.
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
     timestar::http::addJsonRoute(
         r, seastar::httpd::operation_type::POST, "/write", authToken,
         [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
@@ -1924,3 +1930,5 @@ void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r, std::string_vie
 
     timestar::http_log.info("Registered HTTP write endpoint at /write{}", authToken.empty() ? "" : " (auth required)");
 }
+
+}  // namespace timestar::http

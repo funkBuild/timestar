@@ -7,7 +7,7 @@
 #include <seastar/http/httpd.hh>
 #include <string>
 
-namespace timestar {
+namespace timestar::http {
 
 // Handler function type used by seastar::httpd::function_handler.
 using HttpHandlerFn = std::function<seastar::future<std::unique_ptr<seastar::http::reply>>(
@@ -73,4 +73,17 @@ public:
     }
 };
 
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: these types historically lived directly in
+// namespace timestar. New code should use timestar::http:: directly.
+namespace timestar {
+using http::AuthHandlerWrapper;
+using http::checkAuth;
+using http::constantTimeEquals;
+using http::generateToken;
+using http::HttpHandlerFn;
+using http::make401Reply;
+using http::maskToken;
+using http::wrapWithAuth;
 }  // namespace timestar

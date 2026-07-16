@@ -18,6 +18,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
+namespace timestar::http {
+
 // Response struct definitions for Glaze serialization
 struct MeasurementsResponse {
     std::vector<std::string> measurements;
@@ -103,7 +105,7 @@ HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharde
 }
 
 void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    // addJsonRoute applies timestar::wrapWithAuth per route.
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
     using op = seastar::httpd::operation_type;
 
     timestar::http::addJsonRoute(
@@ -617,3 +619,5 @@ std::string HttpMetadataHandler::formatCardinalityResponse(
     (void)glz::write_json(response, buffer);
     return buffer;
 }
+
+}  // namespace timestar::http

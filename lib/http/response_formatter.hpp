@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace timestar {
+namespace timestar::http {
 
 // High-performance JSON response formatter for query results.
 //
@@ -28,4 +28,10 @@ public:
     static std::string formatError(const std::string& message, const std::string& code = "");
 };
 
+}  // namespace timestar::http
+
+// Backward-compatibility alias: ResponseFormatter historically lived directly
+// in namespace timestar. New code should use timestar::http:: directly.
+namespace timestar {
+using http::ResponseFormatter;
 }  // namespace timestar

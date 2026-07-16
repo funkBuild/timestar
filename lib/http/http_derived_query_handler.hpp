@@ -10,7 +10,7 @@
 // Forward declarations
 class Engine;
 
-namespace timestar {
+namespace timestar::http {
 
 // HTTP handler for derived metric queries
 // Endpoint: POST /derived
@@ -33,4 +33,10 @@ private:
         std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 };
 
+}  // namespace timestar::http
+
+// Backward-compatibility alias: HttpDerivedQueryHandler historically lived
+// directly in namespace timestar. New code should use timestar::http:: directly.
+namespace timestar {
+using http::HttpDerivedQueryHandler;
 }  // namespace timestar

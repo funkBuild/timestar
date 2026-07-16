@@ -28,8 +28,12 @@ struct GlazeQueryRequest;
 
 namespace timestar {
 
-// Forward declaration for finalizeSingleShardPartials
+// Forward declaration for finalizeSingleShardPartials (defined in lib/query/aggregator.hpp)
 struct PartialAggregationResult;
+
+}  // namespace timestar
+
+namespace timestar::http {
 
 // Forward declarations for executeQuery phase types (defined in http_query_handler.cpp)
 struct SeriesQueryContext;
@@ -156,4 +160,13 @@ private:
     void logQueryCompletion(const QueryRequest& request, QueryTimingInfo& timing);
 };
 
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: these types historically lived directly in
+// namespace timestar. New code should use timestar::http:: directly.
+namespace timestar {
+using http::HttpQueryHandler;
+using http::QueryResponse;
+using http::QueryStatistics;
+using http::SeriesResult;
 }  // namespace timestar

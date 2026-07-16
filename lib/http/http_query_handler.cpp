@@ -46,7 +46,7 @@ struct glz::meta<GlazeQueryRequest> {
                                          "aggregationInterval", &T::aggregationInterval);
 };
 
-namespace timestar {
+namespace timestar::http {
 
 // Struct holding pre-parsed series metadata for per-shard query execution.
 // Includes pre-computed SeriesId128 to eliminate redundant hash computations.
@@ -604,7 +604,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
 }
 
 void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    // addJsonRoute applies timestar::wrapWithAuth per route.
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
     timestar::http::addJsonRoute(
         r, seastar::httpd::operation_type::POST, "/query", authToken,
         [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
@@ -1811,4 +1811,4 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     }
 }
 
-}  // namespace timestar
+}  // namespace timestar::http

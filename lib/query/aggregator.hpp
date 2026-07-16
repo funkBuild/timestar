@@ -42,8 +42,12 @@ struct PrehashedStringEqual {
     bool operator()(const PrehashedString& a, const PrehashedString& b) const { return a.value == b.value; }
 };
 
-// Forward declarations
+// Forward declarations (SeriesResult lives in timestar::http; keep the
+// timestar-level alias visible for existing unqualified users).
+namespace http {
 struct SeriesResult;
+}  // namespace http
+using http::SeriesResult;
 
 // Two-phase aggregation state - holds pre-aggregated values for efficient merging
 // Instead of transferring all raw values, we transfer compact state and merge O(1)

@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+namespace timestar::http {
+
 // Glaze-compatible structure for JSON parsing of delete requests.
 // Defined here (not in the .cpp) to avoid ODR violations across translation units.
 struct GlazeDeleteRequest {
@@ -28,9 +30,11 @@ struct GlazeDeleteRequest {
     std::optional<uint64_t> endTime;
 };
 
+}  // namespace timestar::http
+
 template <>
-struct glz::meta<GlazeDeleteRequest> {
-    using T = GlazeDeleteRequest;
+struct glz::meta<timestar::http::GlazeDeleteRequest> {
+    using T = timestar::http::GlazeDeleteRequest;
     static constexpr auto value =
         object("series", &T::series, "measurement", &T::measurement, "tags", &T::tags, "field", &T::field, "fields",
                &T::fields, "startTime", &T::startTime, "endTime", &T::endTime);
@@ -96,6 +100,8 @@ struct glz::meta<GlazeDeleteRequest> {
  * }
  */
 
+namespace timestar::http {
+
 class HttpDeleteHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
@@ -122,3 +128,14 @@ public:
 
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 };
+
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: these types historically lived in the
+// global namespace. New code should use timestar::http:: directly.
+using timestar::http::GlazeDeleteRequest;   // NOLINT(misc-unused-using-decls)
+using timestar::http::HttpDeleteHandler;    // NOLINT(misc-unused-using-decls)
+namespace timestar {
+using http::GlazeDeleteRequest;
+using http::HttpDeleteHandler;
+}  // namespace timestar

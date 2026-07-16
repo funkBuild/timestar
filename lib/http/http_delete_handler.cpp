@@ -29,9 +29,6 @@ struct glz::meta<GlazeBatchDelete> {
     static constexpr auto value = object("deletes", &T::deletes);
 };
 
-// Forward declaration for shared validation used by both JSON and protobuf paths.
-static void validateDeleteRequest(const HttpDeleteHandler::DeleteRequest& req);
-
 // Response structures for Glaze serialization - must be at namespace scope
 struct DeleteDetailedResponse {
     std::string status = "success";
@@ -49,6 +46,11 @@ struct glz::meta<DeleteDetailedResponse> {
         object("status", &T::status, "seriesDeleted", &T::seriesDeleted, "totalRequests", &T::totalRequests,
                "deletedSeries", &T::deletedSeries, "deletedSeriesCount", &T::deletedSeriesCount, "note", &T::note);
 };
+
+namespace timestar::http {
+
+// Forward declaration for shared validation used by both JSON and protobuf paths.
+static void validateDeleteRequest(const HttpDeleteHandler::DeleteRequest& req);
 
 HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const GlazeDeleteRequest& glazeReq) {
     DeleteRequest req;
@@ -452,7 +454,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
 }
 
 void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    // addJsonRoute applies timestar::wrapWithAuth per route.
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
     timestar::http::addJsonRoute(
         r, seastar::httpd::operation_type::POST, "/delete", authToken,
         [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
@@ -460,3 +462,5 @@ void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r, std::string_vi
 
     timestar::http_log.info("Registered DELETE endpoint at /delete{}", authToken.empty() ? "" : " (auth required)");
 }
+
+}  // namespace timestar::http

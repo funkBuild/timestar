@@ -11,7 +11,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace timestar {
+namespace timestar::http {
 
 // ──────────────────────────────────────────────────────────────────────
 // Buffer helper — direct char* writes, no per-element string::append()
@@ -351,4 +351,4 @@ std::string ResponseFormatter::formatError(const std::string& message, const std
     return timestar::http::jsonError(message, code);
 }
 
-}  // namespace timestar
+}  // namespace timestar::http

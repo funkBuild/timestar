@@ -46,7 +46,7 @@ using namespace httpd;
 seastar::sharded<Engine> g_engine;
 
 // Per-shard stream handler pointer, used to call stop() during shutdown.
-static thread_local timestar::HttpStreamHandler* g_streamHandler = nullptr;
+static thread_local timestar::http::HttpStreamHandler* g_streamHandler = nullptr;
 
 // Readiness flag — set true after all engines are initialized.
 // Used by /health for Kubernetes readiness probes.
@@ -134,28 +134,28 @@ void set_routes(routes& r) {
 
     // Protected endpoints — when g_authToken is non-empty, each handler wraps
     // its routes with Bearer token authentication via wrapWithAuth().
-    auto* writeHandler = emplaceHandler(new HttpWriteHandler(&g_engine));
+    auto* writeHandler = emplaceHandler(new timestar::http::HttpWriteHandler(&g_engine));
     writeHandler->registerRoutes(r, authToken());
 
-    auto* queryHandler = emplaceHandler(new timestar::HttpQueryHandler(&g_engine));
+    auto* queryHandler = emplaceHandler(new timestar::http::HttpQueryHandler(&g_engine));
     queryHandler->registerRoutes(r, authToken());
 
-    auto* deleteHandler = emplaceHandler(new HttpDeleteHandler(&g_engine));
+    auto* deleteHandler = emplaceHandler(new timestar::http::HttpDeleteHandler(&g_engine));
     deleteHandler->registerRoutes(r, authToken());
 
-    auto* metadataHandler = emplaceHandler(new HttpMetadataHandler(&g_engine));
+    auto* metadataHandler = emplaceHandler(new timestar::http::HttpMetadataHandler(&g_engine));
     metadataHandler->registerRoutes(r, authToken());
 
-    auto retentionHandlerPtr = std::make_shared<HttpRetentionHandler>(&g_engine);
+    auto retentionHandlerPtr = std::make_shared<timestar::http::HttpRetentionHandler>(&g_engine);
     retentionHandlerPtr->registerRoutes(r, authToken());
-    handlers.emplace_back(new std::shared_ptr<HttpRetentionHandler>(retentionHandlerPtr),
-                          [](void* p) { delete static_cast<std::shared_ptr<HttpRetentionHandler>*>(p); });
+    handlers.emplace_back(new std::shared_ptr<timestar::http::HttpRetentionHandler>(retentionHandlerPtr),
+                          [](void* p) { delete static_cast<std::shared_ptr<timestar::http::HttpRetentionHandler>*>(p); });
 
-    auto* streamHandler = emplaceHandler(new timestar::HttpStreamHandler(&g_engine));
+    auto* streamHandler = emplaceHandler(new timestar::http::HttpStreamHandler(&g_engine));
     streamHandler->registerRoutes(r, authToken());
     g_streamHandler = streamHandler;
 
-    auto* derivedQueryHandler = emplaceHandler(new timestar::HttpDerivedQueryHandler(&g_engine));
+    auto* derivedQueryHandler = emplaceHandler(new timestar::http::HttpDerivedQueryHandler(&g_engine));
     derivedQueryHandler->registerRoutes(r, authToken());
 
     r.add(operation_type::GET, url("/"), new function_handler([](const_req /*req*/) {
@@ -390,12 +390,12 @@ int main(int argc, char** argv) {
             if (timestar::config().server.auth_enabled) {
                 g_authTokenStorage = timestar::config().server.auth_token;
                 if (g_authTokenStorage.empty()) {
-                    g_authTokenStorage = timestar::generateToken(32);
+                    g_authTokenStorage = timestar::http::generateToken(32);
                     timestar::http_log.debug("Auth enabled — generated token: {}",
-                                             timestar::maskToken(g_authTokenStorage));
+                                             timestar::http::maskToken(g_authTokenStorage));
                 } else {
                     timestar::http_log.debug("Auth enabled — using configured token: {}",
-                                             timestar::maskToken(g_authTokenStorage));
+                                             timestar::http::maskToken(g_authTokenStorage));
                 }
                 // Release-store pointer after storage is fully constructed; any
                 // shard that subsequently acquire-loads this pointer in authToken()

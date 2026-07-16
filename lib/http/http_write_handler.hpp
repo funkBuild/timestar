@@ -75,6 +75,8 @@
  * }
  */
 
+namespace timestar::http {
+
 // Use glz::generic_u64 for JSON parsing to preserve uint64_t timestamp precision.
 // glz::json_t (glz::generic) uses num_mode::f64, which parses all numbers as double,
 // losing precision for nanosecond timestamps (double has only 53 bits of mantissa,
@@ -331,3 +333,12 @@ public:
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
     }
 };
+
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: HttpWriteHandler historically lived in the
+// global namespace. New code should use timestar::http:: directly.
+using timestar::http::HttpWriteHandler;  // NOLINT(misc-unused-using-decls)
+namespace timestar {
+using http::HttpWriteHandler;
+}  // namespace timestar

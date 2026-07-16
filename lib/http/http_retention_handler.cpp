@@ -13,9 +13,11 @@
 using namespace seastar;
 using namespace httpd;
 
+namespace timestar::http {
+
 uint64_t HttpRetentionHandler::parseDuration(const std::string& duration) {
     // Reuse the existing parseInterval logic from HttpQueryHandler
-    return timestar::HttpQueryHandler::parseInterval(duration);
+    return HttpQueryHandler::parseInterval(duration);
 }
 
 bool HttpRetentionHandler::isValidMethod(const std::string& method) {
@@ -409,7 +411,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
 void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto self = shared_from_this();
-    // addJsonRoute applies timestar::wrapWithAuth per route.
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
     using op = seastar::httpd::operation_type;
 
     timestar::http::addJsonRoute(
@@ -430,3 +432,5 @@ void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r, std::string
     timestar::http_log.info("Registered retention endpoints at /retention (PUT/GET/DELETE){}",
                             authToken.empty() ? "" : " (auth required)");
 }
+
+}  // namespace timestar::http

@@ -13,6 +13,8 @@
 #include <seastar/http/httpd.hh>
 #include <string>
 
+namespace timestar::http {
+
 class HttpRetentionHandler : public std::enable_shared_from_this<HttpRetentionHandler> {
 private:
     seastar::sharded<Engine>* engineSharded;
@@ -38,3 +40,12 @@ public:
 
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 };
+
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: HttpRetentionHandler historically lived in
+// the global namespace. New code should use timestar::http:: directly.
+using timestar::http::HttpRetentionHandler;  // NOLINT(misc-unused-using-decls)
+namespace timestar {
+using http::HttpRetentionHandler;
+}  // namespace timestar
