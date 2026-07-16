@@ -132,6 +132,16 @@ void setGlobalConfig(const TimestarConfig& cfg);
 // Read the global config from any shard (lock-free, set once before reactor starts).
 const TimestarConfig& config();
 
+// Normalized data root directory derived from config().server.data_dir.
+// Trailing slashes are stripped (a bare "/" is preserved); an empty value
+// normalizes to "." (the process working directory). Never empty.
+std::string dataRootPath();
+
+// Directory holding one shard's data: "<data_dir>/shard_<id>".
+// With the default data_dir of "." this returns the legacy CWD-relative
+// "shard_<id>" so existing deployments and tests are unaffected.
+std::string shardDataPath(unsigned shardId);
+
 }  // namespace timestar
 
 // Glaze metadata for TOML serialization

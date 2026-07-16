@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/prometheus.hh>
@@ -281,15 +282,22 @@ int main(int argc, char** argv) {
             timestar::http_log.info("Starting TimeStar {} ({}) built {} with {}", timestar::VERSION,
                                     timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER);
 
+            // Resolve the data root from [server] data_dir (default "." = CWD).
+            // All shard directories (shard_N), placement.json and
+            // shard_count.meta live under this directory.
+            const std::string dataRoot = timestar::dataRootPath();
+            std::filesystem::create_directories(dataRoot);
+            timestar::http_log.info("Data directory: {}", std::filesystem::absolute(dataRoot).string());
+
             // Initialize virtual shard placement table (Phase 5)
             // Must be done BEFORE the rebalancer, which uses routeToCore().
             auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
             timestar::setGlobalPlacement(std::move(pt));
-            timestar::savePlacement("placement.json");
+            timestar::savePlacement(dataRoot + "/placement.json");
 
             // STEP 0: Check for shard rebalancing (CPU count change)
             {
-                timestar::ShardRebalancer rebalancer(".");
+                timestar::ShardRebalancer rebalancer(dataRoot);
                 // Recover from any previously interrupted rebalance first
                 rebalancer.recoverIfNeeded(seastar::smp::count).get();
 
@@ -300,7 +308,7 @@ int main(int argc, char** argv) {
                     timestar::http_log.info("Shard rebalance complete");
                 } else {
                     // Persist current shard count for next startup
-                    timestar::ShardRebalancer::writeShardCountMeta(".", seastar::smp::count);
+                    timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
                 }
             }
 
@@ -356,7 +364,7 @@ int main(int argc, char** argv) {
                     .get();
 
                 // Persist shard count after successful init
-                timestar::ShardRebalancer::writeShardCountMeta(".", seastar::smp::count);
+                timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
                 timestar::http_log.info("Engine init completed on all shards");
             } catch (const std::bad_alloc& e) {
                 timestar::http_log.error("bad_alloc during Engine init: {}", e.what());

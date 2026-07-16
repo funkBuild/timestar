@@ -182,7 +182,7 @@ The build system automatically selects the appropriate compiler:
 
 ## Data Storage
 
-The database creates shard directories (`shard_0`, `shard_1`, etc.) in the build directory, each containing:
+The database creates shard directories (`shard_0`, `shard_1`, etc.) under the directory configured by the `[server] data_dir` key in `timestar.toml` (or the `TIMESTAR_DATA_DIR` environment variable). The path may be absolute or relative to the server's working directory and is created on startup if missing; the default is `"."`, i.e. the working directory (the build directory when started from there). Each shard directory contains:
 - `wal/` - Write-ahead log files
 - `tsm/` - TSM data files
 - `native_index/` - NativeIndex files (SSTable + WAL) for metadata and series lookup

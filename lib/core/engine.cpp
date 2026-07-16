@@ -59,7 +59,7 @@ seastar::future<> Engine::createDirectoryStructure() {
 }
 
 std::string Engine::basePath() {
-    return std::string("shard_" + std::to_string(shardId));
+    return timestar::shardDataPath(shardId);
 }
 
 seastar::future<> Engine::stop() {

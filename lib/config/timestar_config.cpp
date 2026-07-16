@@ -30,6 +30,33 @@ const TimestarConfig& config() {
     return ptr ? *ptr : g_defaultConfig;
 }
 
+std::string dataRootPath() {
+    std::string dir = config().server.data_dir;
+    // Strip trailing slashes, but keep a bare "/" (filesystem root) intact.
+    while (dir.size() > 1 && dir.back() == '/') {
+        dir.pop_back();
+    }
+    if (dir.empty()) {
+        dir = ".";
+    }
+    return dir;
+}
+
+std::string shardDataPath(unsigned shardId) {
+    std::string root = dataRootPath();
+    std::string shardDir = "shard_" + std::to_string(shardId);
+    if (root == ".") {
+        // Legacy behavior: paths relative to the working directory,
+        // without a "./" prefix (matches on-disk strings used before
+        // data_dir was wired through).
+        return shardDir;
+    }
+    if (root.back() == '/') {  // root == "/"
+        return root + shardDir;
+    }
+    return root + "/" + shardDir;
+}
+
 std::vector<std::string> TimestarConfig::validate() const {
     std::vector<std::string> errors;
 

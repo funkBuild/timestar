@@ -7,7 +7,6 @@
 #include "tsm_writer.hpp"
 
 #include <chrono>
-#include <cinttypes>
 #include <filesystem>
 #include <limits>
 #include <seastar/core/reactor.hh>
@@ -26,10 +25,8 @@ TSMCompactor::TSMCompactor(TSMFileManager* manager)
       compactionSemaphore(timestar::config().storage.compaction.max_concurrent) {}
 
 std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqNum) {
-    int shardId = seastar::this_shard_id();
-    char buffer[256];
-    snprintf(buffer, sizeof(buffer), "shard_%d/tsm/%" PRIu64 "_%" PRIu64 ".tsm", shardId, tier, seqNum);
-    return std::string(buffer);
+    return timestar::shardDataPath(seastar::this_shard_id()) + "/tsm/" + std::to_string(tier) + "_" +
+           std::to_string(seqNum) + ".tsm";
 }
 
 std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar::shared_ptr<TSM>>& files) {

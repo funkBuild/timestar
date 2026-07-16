@@ -166,7 +166,7 @@ NativeIndex::~NativeIndex() {
 seastar::future<> NativeIndex::open() {
     // Note: std::filesystem::absolute() depends on the process CWD at call time.
     // This is fine because open() is called during startup before any CWD change.
-    indexPath_ = std::filesystem::absolute("shard_" + std::to_string(shardId_) + "/native_index").string();
+    indexPath_ = std::filesystem::absolute(timestar::shardDataPath(shardId_) + "/native_index").string();
     co_await seastar::async([this] { std::filesystem::create_directories(indexPath_); });
 
     // Open manifest
