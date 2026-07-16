@@ -19,13 +19,14 @@ file(GLOB_RECURSE UNIT_QUERY_TESTS CONFIGURE_DEPENDS unit/query/*.cpp)
 file(GLOB_RECURSE UNIT_INDEX_TESTS CONFIGURE_DEPENDS unit/index/*.cpp)
 list(FILTER UNIT_INDEX_TESTS EXCLUDE REGEX ".*/deprecated/.*")
 file(GLOB_RECURSE UNIT_HTTP_TESTS CONFIGURE_DEPENDS unit/http/*.cpp)
-# Exclude proto_converter_test — it is built as a standalone test binary
-# to avoid ODR violations between proto-generated and internal timestar types.
-list(FILTER UNIT_HTTP_TESTS EXCLUDE REGEX ".*/proto_converter_test\\.cpp$")
-# Exclude proto_write_fast_path_test — same reason: ODR isolation.
-list(FILTER UNIT_HTTP_TESTS EXCLUDE REGEX ".*/proto_write_fast_path_test\\.cpp$")
-# Exclude protobuf_integration_test — needs explicit timestar_proto link.
-list(FILTER UNIT_HTTP_TESTS EXCLUDE REGEX ".*/protobuf_integration_test\\.cpp$")
+# NOTE: the proto tests (proto_converter_test, proto_write_fast_path_test,
+# protobuf_integration_test) were historically excluded here and built as
+# standalone binaries to avoid ODR violations when the proto package was
+# named "timestar".  The package is now "timestar_pb" (no collision with the
+# internal timestar:: namespace), so they compile into the main test binaries;
+# this is required for scripts/run_coverage.sh (which only runs
+# timestar_unit_test) to measure proto path coverage.  The main test targets
+# link timestar_proto so these TUs can include timestar.pb.h.
 file(GLOB_RECURSE UNIT_CORE_TESTS CONFIGURE_DEPENDS unit/core/*.cpp)
 file(GLOB_RECURSE UNIT_RETENTION_TESTS CONFIGURE_DEPENDS unit/retention/*.cpp)
 file(GLOB_RECURSE UNIT_UTILS_TESTS CONFIGURE_DEPENDS unit/utils/*.cpp)
@@ -103,7 +104,7 @@ set(SOURCE_INSPECTION_DEFS
 
 # Main test executable with all tests
 add_executable(timestar_test ${TEST_SRCS})
-target_link_libraries(timestar_test libtimestar libtimestar_proto_conv gtest_main)
+target_link_libraries(timestar_test libtimestar libtimestar_proto_conv timestar_proto gtest_main)
 target_include_directories(timestar_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_test PRIVATE ${SOURCE_INSPECTION_DEFS})
 
@@ -126,7 +127,7 @@ set(UNIT_TEST_SRCS
     ${UNIT_UTILS_TESTS}
 )
 add_executable(timestar_unit_test ${UNIT_TEST_SRCS})
-target_link_libraries(timestar_unit_test libtimestar libtimestar_proto_conv gtest_main)
+target_link_libraries(timestar_unit_test libtimestar libtimestar_proto_conv timestar_proto gtest_main)
 target_include_directories(timestar_unit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_unit_test PRIVATE ${SOURCE_INSPECTION_DEFS})
 gtest_discover_tests(timestar_unit_test)
@@ -203,35 +204,10 @@ add_executable(timestar_http_test
 target_link_libraries(timestar_http_test libtimestar libtimestar_proto_conv gtest_main)
 target_include_directories(timestar_http_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Proto converter tests — standalone binary that links ONLY against
-# libtimestar_proto_conv (not libtimestar) to avoid ODR violations between
-# proto-generated classes and identically-named internal classes.
-add_executable(timestar_proto_conv_test
-    unit/http/proto_converter_test.cpp
-    unit/http/proto_write_fast_path_test.cpp
-)
-target_link_libraries(timestar_proto_conv_test libtimestar_proto_conv libtimestar timestar_proto gtest gtest_main)
-target_include_directories(timestar_proto_conv_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../lib/http
-)
-gtest_discover_tests(timestar_proto_conv_test)
-
-# Protobuf integration tests — tests the full handler stack with protobuf
-# wire format.  Needs timestar_proto for constructing request messages and
-# parsing response messages.  Links both libtimestar (for handlers/engine)
-# and libtimestar_proto_conv (for converter functions).
-add_executable(timestar_proto_integration_test
-    main.cpp
-    unit/http/protobuf_integration_test.cpp
-)
-target_link_libraries(timestar_proto_integration_test
-    libtimestar libtimestar_proto_conv timestar_proto gtest gtest_main)
-target_include_directories(timestar_proto_integration_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../lib/http
-)
-gtest_discover_tests(timestar_proto_integration_test)
+# NOTE: the former standalone proto test binaries (timestar_proto_conv_test,
+# timestar_proto_integration_test) were folded into timestar_test /
+# timestar_unit_test above once the proto package rename to "timestar_pb"
+# removed the ODR hazard that motivated their isolation.
 
 # Include subdirectories with standalone tests
 add_subdirectory(benchmark)

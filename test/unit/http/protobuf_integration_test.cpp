@@ -14,6 +14,10 @@
 #include "proto_converters.hpp"
 #include "timestar.pb.h"
 
+// For decoding ALP-compressed query response values
+#include "float_encoder.hpp"
+#include "slice_buffer.hpp"
+
 #include <glaze/glaze.hpp>
 
 #include <gtest/gtest.h>
@@ -159,6 +163,15 @@ static ::timestar_pb::DeleteResponse parseProtoDeleteResponse(const std::string&
     ::timestar_pb::DeleteResponse resp;
     EXPECT_TRUE(resp.ParseFromString(bytes)) << "Failed to parse DeleteResponse proto";
     return resp;
+}
+
+// Query responses carry values in compressed_alp (Approach B); the repeated
+// packed fields are left empty and must not be indexed directly.
+static std::vector<double> decodeAlpValues(const std::string& compressed, size_t count) {
+    std::vector<double> out;
+    CompressedSlice cs(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
+    FloatDecoder::decode(cs, 0, count, out);
+    return out;
 }
 
 // ============================================================================
@@ -428,11 +441,14 @@ TEST_F(ProtobufIntegrationTest, WriteProtoQueryProtoRoundTrip) {
 
             if (series.fields().count("value") > 0) {
                 auto& fieldData = series.fields().at("value");
-                EXPECT_GE(fieldData.timestamps_size(), 1);
+                // Timestamps and values ride in the compressed fields
+                EXPECT_FALSE(fieldData.compressed_timestamps().empty());
                 EXPECT_TRUE(fieldData.has_double_values());
                 if (fieldData.has_double_values()) {
-                    EXPECT_GE(fieldData.double_values().values_size(), 1);
-                    EXPECT_NEAR(fieldData.double_values().values(0), 72.5, 0.001);
+                    ASSERT_FALSE(fieldData.double_values().compressed_alp().empty());
+                    auto vals = decodeAlpValues(fieldData.double_values().compressed_alp(), 1);
+                    ASSERT_GE(vals.size(), 1u);
+                    EXPECT_NEAR(vals[0], 72.5, 0.001);
                 }
             }
         }
@@ -577,8 +593,10 @@ TEST_F(ProtobufIntegrationTest, QueryMaxAggregationProto) {
         ASSERT_TRUE(series.fields().count("temp") > 0);
         auto& fieldData = series.fields().at("temp");
         ASSERT_TRUE(fieldData.has_double_values());
-        ASSERT_GE(fieldData.double_values().values_size(), 1);
-        EXPECT_NEAR(fieldData.double_values().values(0), 30.0, 0.001);
+        ASSERT_FALSE(fieldData.double_values().compressed_alp().empty());
+        auto vals = decodeAlpValues(fieldData.double_values().compressed_alp(), 1);
+        ASSERT_GE(vals.size(), 1u);
+        EXPECT_NEAR(vals[0], 30.0, 0.001);
     })
         .join()
         .get();
