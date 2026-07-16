@@ -21,6 +21,7 @@
 ## Architecture
 
 - [Architecture Overview](architecture.md) - Storage engine, data flow, sharding, compression
+- [Cluster Architecture](clustering.md) - Multi-machine placement, replication, queries, HA, and online rebalancing
 
 ## Operational
 
