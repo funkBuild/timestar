@@ -194,7 +194,7 @@ TEST_F(AsyncQueryTest, MinAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -233,7 +233,7 @@ TEST_F(AsyncQueryTest, MaxAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -266,7 +266,7 @@ TEST_F(AsyncQueryTest, AvgAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -298,7 +298,7 @@ TEST_F(AsyncQueryTest, QueryWithSpecificFields) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -328,7 +328,7 @@ TEST_F(AsyncQueryTest, QueryWithScopeFilter) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -359,7 +359,7 @@ TEST_F(AsyncQueryTest, QueryWithGroupBy) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -407,7 +407,7 @@ TEST_F(AsyncQueryTest, BooleanDataQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertBooleanDataSync(eng.eng);
@@ -438,7 +438,7 @@ TEST_F(AsyncQueryTest, ImageDataQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertImageDataSync(eng.eng);
@@ -473,7 +473,7 @@ TEST_F(AsyncQueryTest, TimeRangeFiltering) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -509,7 +509,7 @@ TEST_F(AsyncQueryTest, SumAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -544,7 +544,7 @@ TEST_F(AsyncQueryTest, LatestAggregationQuery) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -579,7 +579,7 @@ TEST_F(AsyncQueryTest, InvalidQueryErrors) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         // Missing aggregation method
@@ -615,7 +615,7 @@ TEST_F(AsyncQueryTest, CacheInvalidationAfterInsert) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
@@ -664,7 +664,7 @@ TEST_F(AsyncQueryTest, FieldsWithSamePrefix) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         // Insert data with field names that share prefixes
@@ -714,7 +714,7 @@ TEST_F(AsyncQueryTest, AggregationWithTimeIntervals) {
     seastar::thread([this] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
-        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng, nullptr);
+        queryHandler = std::make_unique<timestar::HttpQueryHandler>(&eng.eng);
         engineSharded = &eng.eng;
 
         insertTestDataSync(eng.eng);
