@@ -117,6 +117,7 @@ Measurement names, tag keys, tag values, and field names must not contain:
 - **503 on shutdown:** If the server is shutting down, write requests return `503 Service Unavailable` with `{"status":"error","message":"Server is shutting down"}`. Clients should retry against another node or after restart.
 - **Batch coalescing:** In batch writes (`"writes": [...]`), points that share the same series key (measurement + tags + field) are automatically coalesced into multi-point arrays. Each coalesced array is capped at 10,000 values per field; excess points remain as separate entries.
 - **Metadata indexing is asynchronous:** Series ID creation and tag indexing are dispatched as fire-and-forget background tasks after the data is durable in the WAL. The write response is returned before metadata indexing completes.
+- **Duplicate points append — no overwrite:** Writing the same measurement + tags + field + timestamp again stores an *additional* point; it does not replace the earlier value. This differs from InfluxDB's last-write-wins semantics. All duplicates are returned by queries and are counted by aggregations (`avg`/`count`/`sum` include every copy). Clients that need overwrite semantics should either delete the old point first (`POST /delete` with a time range) or make timestamps unique (e.g. nanosecond offsets). Idempotent retries of a *failed* write are safe only if the original write was not acknowledged.
 
 ## Limits
 

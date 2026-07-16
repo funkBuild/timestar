@@ -338,6 +338,7 @@ The TimeStar includes an HTTP server with a JSON-based write API for data ingest
 - **Error Handling**: Detailed JSON error responses with HTTP status codes
 - **Batch Support**: Efficient batch writes with partial failure handling
 - **Default Timestamps**: Auto-generates nanosecond timestamps if not provided
+- **Duplicate points append**: rewriting an identical measurement+tags+field+timestamp stores an additional point (NOT InfluxDB last-write-wins); aggregations count every copy — delete first or use unique timestamps for overwrite-style workflows
 
 ### Additional Endpoints
 

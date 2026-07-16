@@ -122,6 +122,10 @@ curl -X POST http://localhost:8086/write \
   }'
 ```
 
+> **Note:** rewriting an identical measurement + tags + field + timestamp appends
+> another point rather than overwriting (unlike InfluxDB's last-write-wins).
+> See [docs/api-write.md](docs/api-write.md) for details.
+
 ### Query Data
 
 ```bash
