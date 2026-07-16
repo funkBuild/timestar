@@ -705,6 +705,9 @@ file unless an external secret mechanism protects it.
 
 ### Phase 0: Baseline correctness
 
+Begin with the independently reviewable
+[storage layout foundation](clustering-starting-point.md).
+
 - Honour `server.data_dir` throughout storage.
 - Define and test durable local acknowledgement modes.
 - Fix or disable the current core-count rebalancer.
