@@ -337,8 +337,9 @@ seastar::future<> Engine::broadcastSchemaUpdate(timestar::index::SchemaUpdate up
     if (!shardedRef || update.empty())
         co_return;
     co_await shardedRef->invoke_on_all([update = std::move(update)](Engine& e) {
-        e.getIndex().applySchemaUpdate(update);
-        return seastar::make_ready_future<>();
+        // applySchemaUpdate is now a coroutine: it persists the deltas to the
+        // receiving shard's KV store (complete schema replica per shard).
+        return e.getIndex().applySchemaUpdate(update);
     });
 }
 

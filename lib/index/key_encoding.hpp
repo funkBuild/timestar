@@ -25,6 +25,11 @@ std::string encodeMeasurementSeriesKey(const std::string& measurement, const Ser
 std::string encodeMeasurementSeriesPrefix(const std::string& measurement);
 std::string encodeRetentionPolicyKey(const std::string& measurement);
 
+// Per-value tag value marker keys (replace the TAG_VALUES blob write path).
+std::string encodeTagValueMarkerKey(const std::string& measurement, const std::string& tagKey,
+                                    const std::string& tagValue);
+std::string encodeTagValueMarkerPrefix(const std::string& measurement, const std::string& tagKey);
+
 // --- Value encoding/decoding ---
 
 std::string encodeSeriesMetadata(const SeriesMetadata& metadata);

@@ -100,6 +100,32 @@ std::string encodeRetentionPolicyKey(const std::string& measurement) {
     return key;
 }
 
+std::string encodeTagValueMarkerKey(const std::string& measurement, const std::string& tagKey,
+                                    const std::string& tagValue) {
+    validateNoNullBytes({measurement, tagKey, tagValue});
+    std::string key;
+    key.reserve(1 + measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
+    key.push_back(static_cast<char>(TAG_VALUE_MARKER));
+    key += measurement;
+    key.push_back('\0');
+    key += tagKey;
+    key.push_back('\0');
+    key += tagValue;
+    return key;
+}
+
+std::string encodeTagValueMarkerPrefix(const std::string& measurement, const std::string& tagKey) {
+    validateNoNullBytes({measurement, tagKey});
+    std::string prefix;
+    prefix.reserve(1 + measurement.size() + 1 + tagKey.size() + 1);
+    prefix.push_back(static_cast<char>(TAG_VALUE_MARKER));
+    prefix += measurement;
+    prefix.push_back('\0');
+    prefix += tagKey;
+    prefix.push_back('\0');
+    return prefix;
+}
+
 std::string encodeSeriesMetadata(const SeriesMetadata& metadata) {
     if (metadata.measurement.length() > 10000 || metadata.field.length() > 10000) {
         throw std::runtime_error("SeriesMetadata has suspiciously long strings");

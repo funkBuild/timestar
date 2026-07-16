@@ -554,3 +554,68 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RecordInsertDaysAddsLaterDays) {
     EXPECT_EQ(r->size(), 1u);
     co_await index.close();
 }
+
+// ── TASK C: cached time-scoped discovery ──
+
+// Two identical day-scoped discovery calls must be served from the discovery
+// cache (same shared vector) with consistent results.
+SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedServesSharedVector) {
+    NativeIndex index(0);
+    co_await index.open();
+
+    uint64_t day23000 = 23000ULL * ke::NS_PER_DAY;
+    auto insert = makeInsert<double>("tsc_cache", "usage", {{"host", "h1"}}, {day23000, day23000 + 1'000'000'000ULL},
+                                     {1.0, 2.0});
+    co_await index.indexInsert(insert);
+
+    auto r1 = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_cache", {{"host", "h1"}}, {}, day23000,
+                                                                    day23000 + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(r1.has_value());
+    EXPECT_EQ((*r1)->size(), 1u);
+    EXPECT_EQ((*(*r1))[0].metadata.measurement, "tsc_cache");
+
+    auto r2 = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_cache", {{"host", "h1"}}, {}, day23000,
+                                                                    day23000 + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(r2.has_value());
+    EXPECT_EQ(r1.value().get(), r2.value().get()) << "identical day-scoped queries must share the cached vector";
+
+    // A different day range must NOT alias to the same cache entry.
+    auto r3 = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_cache", {{"host", "h1"}}, {},
+                                                                    day23000 + ke::NS_PER_DAY,
+                                                                    day23000 + 2 * ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(r3.has_value());
+    EXPECT_NE(r1.value().get(), r3.value().get());
+    EXPECT_EQ((*r3)->size(), 0u);
+
+    co_await index.close();
+}
+
+// When an EXISTING series first writes into a day inside a cached range, the
+// cached day-scoped result must be invalidated (addChecked → generation bump).
+SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedInvalidatedByNewDayMembership) {
+    NativeIndex index(0);
+    co_await index.open();
+
+    uint64_t day24000 = 24000ULL * ke::NS_PER_DAY;
+    auto insert = makeInsert<double>("tsc_inval", "usage", {{"host", "h1"}}, {day24000}, {1.0});
+    auto seriesId = co_await index.indexInsert(insert);
+
+    // Cache a result for a later day the series has NOT written into: empty.
+    uint64_t day24002 = day24000 + 2 * ke::NS_PER_DAY;
+    auto before = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_inval", {}, {}, day24002,
+                                                                        day24002 + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(before.has_value());
+    EXPECT_EQ((*before)->size(), 0u);
+
+    // Existing series now writes into that day (data-shard batch path).
+    co_await index.recordInsertDays("tsc_inval", seriesId, {day24002 + 1'000'000'000ULL});
+
+    // The next call must see the new day membership, not the stale cached {}.
+    auto after = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_inval", {}, {}, day24002,
+                                                                       day24002 + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(after.has_value());
+    EXPECT_EQ((*after)->size(), 1u) << "new day membership must invalidate cached day-scoped discovery";
+    EXPECT_EQ((*(*after))[0].seriesId, seriesId);
+
+    co_await index.close();
+}

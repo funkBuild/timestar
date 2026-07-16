@@ -39,12 +39,12 @@ SEASTAR_TEST_F(NativeIndexBugfixTest, ApplySchemaUpdateFieldTypeImmutable) {
     key.push_back('\0');
     key += "value";
     first.newFieldTypes[key] = "float";
-    index.applySchemaUpdate(first);
+    co_await index.applySchemaUpdate(first);
 
     // Second update: attempt to overwrite with "boolean" (lexicographically smaller)
     SchemaUpdate second;
     second.newFieldTypes[key] = "boolean";
-    index.applySchemaUpdate(second);
+    co_await index.applySchemaUpdate(second);
 
     // The type must remain "float" (first-write-wins)
     auto fieldType = co_await index.getFieldType("meas", "value");
@@ -63,7 +63,7 @@ SEASTAR_TEST_F(NativeIndexBugfixTest, ApplySchemaUpdateFieldTypeAcceptsNewKey) {
     key1.push_back('\0');
     key1 += "f1";
     u1.newFieldTypes[key1] = "float";
-    index.applySchemaUpdate(u1);
+    co_await index.applySchemaUpdate(u1);
 
     // Second, different key
     SchemaUpdate u2;
@@ -71,7 +71,7 @@ SEASTAR_TEST_F(NativeIndexBugfixTest, ApplySchemaUpdateFieldTypeAcceptsNewKey) {
     key2.push_back('\0');
     key2 += "f2";
     u2.newFieldTypes[key2] = "string";
-    index.applySchemaUpdate(u2);
+    co_await index.applySchemaUpdate(u2);
 
     auto t1 = co_await index.getFieldType("m1", "f1");
     auto t2 = co_await index.getFieldType("m1", "f2");

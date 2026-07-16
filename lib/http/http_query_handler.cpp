@@ -787,7 +787,6 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                         (endTime > startTime) && (endTime - startTime) > WIDE_RANGE_THRESHOLD;
 
                                     const std::vector<IndexBackend::SeriesWithMetadata>* swmPtr = nullptr;
-                                    std::vector<IndexBackend::SeriesWithMetadata> ownedVec;
                                     std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>> cachedPtr;
 
                                     PerShardDiscovery result;
@@ -804,7 +803,9 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                         cachedPtr = std::move(*cr);
                                         swmPtr = cachedPtr.get();
                                     } else {
-                                        auto findResult = co_await index.findSeriesWithMetadataTimeScoped(
+                                        // Day-scoped discovery is cached too (shared
+                                        // immutable vector — no per-query metadata copies).
+                                        auto findResult = co_await index.findSeriesWithMetadataTimeScopedCached(
                                             measurement, scopes, fieldFilter, startTime, endTime, maxSeries);
                                         if (!findResult.has_value()) {
                                             result.limitExceeded = true;
@@ -812,8 +813,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
                                             result.limit = findResult.error().limit;
                                             co_return result;
                                         }
-                                        ownedVec = std::move(*findResult);
-                                        swmPtr = &ownedVec;
+                                        cachedPtr = std::move(*findResult);
+                                        swmPtr = cachedPtr.get();
                                     }
 
                                     result.contexts.reserve(swmPtr->size());

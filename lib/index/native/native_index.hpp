@@ -203,14 +203,28 @@ public:
                                      const std::unordered_set<std::string>& fieldFilter, uint64_t startTimeNs,
                                      uint64_t endTimeNs, size_t maxSeries = 0);
 
+    // Cached variant of findSeriesWithMetadataTimeScoped — shares discoveryCache_
+    // with findSeriesWithMetadataCached (cache key additionally scoped by
+    // start/end day). Returns a shared immutable vector so repeated day-scoped
+    // discovery pays the metadata deep-copy once per cache fill, not per query.
+    seastar::future<std::expected<std::shared_ptr<const std::vector<SeriesWithMetadata>>, SeriesLimitExceeded>>
+    findSeriesWithMetadataTimeScopedCached(const std::string& measurement,
+                                           const std::map<std::string, std::string>& tagFilters,
+                                           const std::unordered_set<std::string>& fieldFilter, uint64_t startTimeNs,
+                                           uint64_t endTimeNs, size_t maxSeries = 0);
+
     // Phase 3: Remove day bitmaps for days before cutoffDay (retention cleanup)
     seastar::future<> removeExpiredDayBitmaps(const std::string& measurement, uint32_t cutoffDay);
 
     // Schema broadcast: index metadata and return schema changes for broadcast
     seastar::future<SchemaUpdate> indexMetadataBatchWithSchema(const std::vector<MetadataOp>& ops);
 
-    // Apply schema updates from other shards into local caches
-    void applySchemaUpdate(const SchemaUpdate& update);
+    // Apply schema updates from other shards into local caches AND persist
+    // them to this shard's KV store, making every shard a complete schema
+    // replica (fields/tags blobs via read-modify-write union; tag values via
+    // per-value TAG_VALUE_MARKER keys). Idempotent — re-applying a delta
+    // (including the origin shard's own) is a harmless union no-op.
+    seastar::future<> applySchemaUpdate(SchemaUpdate update);
 
 private:
     int shardId_;
@@ -295,7 +309,11 @@ private:
     std::unordered_map<std::string, std::set<std::string>> tagsCache_;
     // Bounded tag values cache: cleared when exceeding limit (repopulated on miss from KV).
     std::unordered_map<std::string, std::set<std::string>> tagValuesCache_;
-    static constexpr size_t MAX_TAG_VALUES_CACHE_ENTRIES = 256;
+    static constexpr size_t MAX_TAG_VALUES_CACHE_ENTRIES = 4096;
+    // Full tag-value load: union of the legacy TAG_VALUES blob (old DBs, no
+    // migration needed) and a prefix scan over TAG_VALUE_MARKER keys.
+    seastar::future<std::set<std::string>> loadTagValuesFromKv(const std::string& measurement,
+                                                               const std::string& tagKey);
     std::unordered_set<std::string> knownFieldTypes_;
     std::unordered_map<std::string, std::string> fieldTypeValues_;  // "meas\0field" → type (from local + broadcast)
     // Bounded schema caches: clear when exceeding limit (repopulated on miss from KV)
@@ -308,6 +326,11 @@ private:
     timestar::LRUCache<std::string, std::shared_ptr<const std::vector<SeriesWithMetadata>>> discoveryCache_;
     std::unordered_map<std::string, uint64_t> discoveryCacheGen_;  // Per-measurement generation counter
     uint64_t nextDiscoveryCacheGen_ = 1;
+    // Shared cache-key builder for findSeriesWithMetadataCached and the
+    // time-scoped variant (which appends a day-range suffix).
+    std::string buildDiscoveryCacheKey(const std::string& measurement,
+                                       const std::map<std::string, std::string>& tagFilters,
+                                       const std::unordered_set<std::string>& fieldFilter, size_t maxSeries);
 
     // --- Phase 2: Roaring bitmap postings ---
     LocalIdMap localIdMap_;

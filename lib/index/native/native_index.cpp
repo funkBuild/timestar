@@ -844,17 +844,18 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
         tvCacheKey += measurement;
         tvCacheKey.push_back('\0');
         tvCacheKey += tagKey;
-        // Build KV key once, reuse for both get and put
-        std::string tagValuesKvKey = ke::encodeTagValuesKey(measurement, tagKey);
         if (tagValuesCache_[tvCacheKey].empty()) {
-            auto val = co_await kvGet(tagValuesKvKey);
-            auto& tagVals = tagValuesCache_[tvCacheKey];  // re-find after co_await
-            if (val.has_value() && tagVals.empty())
-                tagVals = ke::decodeStringSet(*val);
+            auto loaded = co_await loadTagValuesFromKv(measurement, tagKey);
+            // Re-find after co_await; MERGE the loaded set (a blind assignment
+            // would clobber values added concurrently during the suspension).
+            tagValuesCache_[tvCacheKey].insert(loaded.begin(), loaded.end());
         }
         auto& tagVals = tagValuesCache_[tvCacheKey];
         if (tagVals.insert(tagValue).second) {
-            batch.put(tagValuesKvKey, ke::encodeStringSet(tagVals));
+            // Per-value marker key: O(1) append instead of re-encoding the
+            // measurement's entire value set (O(V²) write amplification).
+            // The legacy TAG_VALUES blob is no longer written; reads union it.
+            batch.put(ke::encodeTagValueMarkerKey(measurement, tagKey, tagValue), "");
             pendingSchemaUpdate_.newTagValues[tvCacheKey].insert(tagValue);
         }
     }
@@ -1000,9 +1001,14 @@ seastar::future<std::string> NativeIndex::getFieldType(const std::string& measur
 seastar::future<std::set<std::string>> NativeIndex::getAllMeasurements() {
     std::set<std::string> result;
 
-    // Include measurements from cache (populated by local indexing and schema broadcast)
-    for (const auto& [measurement, _] : fieldsCache_) {
-        result.insert(measurement);
+    // Include measurements from cache (populated by local indexing and schema
+    // broadcast). Skip empty entries: getFields() negative-caches {} for
+    // nonexistent measurements, and listing those here fabricated phantom
+    // measurements out of mere lookup typos.
+    for (const auto& [measurement, fields] : fieldsCache_) {
+        if (!fields.empty()) {
+            result.insert(measurement);
+        }
     }
 
     // Also scan KV store for measurements not yet in cache
@@ -1050,16 +1056,44 @@ seastar::future<std::set<std::string>> NativeIndex::getTagValues(std::string mea
     tvCacheKey = measurement;
     tvCacheKey.push_back('\0');
     tvCacheKey += tagKey;
-    if (auto it = tagValuesCache_.find(tvCacheKey); it != tagValuesCache_.end())
+    // Only trust non-empty cache entries: an empty set may be a transient
+    // placeholder created by getOrCreateSeriesId's operator[] mid-load.
+    if (auto it = tagValuesCache_.find(tvCacheKey); it != tagValuesCache_.end() && !it->second.empty())
         co_return it->second;
 
-    auto val = co_await kvGet(ke::encodeTagValuesKey(measurement, tagKey));
-    if (val.has_value()) {
-        auto decoded = ke::decodeStringSet(*val);
-        tagValuesCache_[tvCacheKey] = decoded;
-        co_return decoded;
+    auto loaded = co_await loadTagValuesFromKv(measurement, tagKey);
+    if (!loaded.empty()) {
+        // Re-find after co_await and MERGE — a concurrent insert may have
+        // added values to this entry during the suspension.
+        auto& entry = tagValuesCache_[tvCacheKey];
+        entry.insert(loaded.begin(), loaded.end());
+        co_return entry;
     }
+    // Nothing persisted — return whatever concurrent inserts put in the cache
+    // (usually nothing). Do NOT cache the empty result: a later full load must
+    // still be able to populate the entry.
+    if (auto it = tagValuesCache_.find(tvCacheKey); it != tagValuesCache_.end())
+        co_return it->second;
     co_return std::set<std::string>{};
+}
+
+// Union of the legacy TAG_VALUES blob (pre-marker DBs keep working without
+// migration) and the per-value TAG_VALUE_MARKER keys.
+seastar::future<std::set<std::string>> NativeIndex::loadTagValuesFromKv(const std::string& measurement,
+                                                                        const std::string& tagKey) {
+    std::set<std::string> result;
+    auto blob = co_await kvGet(ke::encodeTagValuesKey(measurement, tagKey));
+    if (blob.has_value()) {
+        result = ke::decodeStringSet(*blob);
+    }
+    std::string prefix = ke::encodeTagValueMarkerPrefix(measurement, tagKey);
+    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
+        if (key.size() > prefix.size()) {
+            result.emplace(key.substr(prefix.size()));
+        }
+        return true;
+    });
+    co_return result;
 }
 
 seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>& ops) {
@@ -1113,9 +1147,17 @@ seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, con
     const uint32_t clampedFirst = (lastDay - firstDay >= kMaxDaySpan) ? lastDay - (kMaxDaySpan - 1) : firstDay;
 
     std::string dayCacheKey;
+    bool newDayMembership = false;
     for (uint32_t day = clampedFirst; day <= lastDay; ++day) {
         buildDayBitmapCacheKey(dayCacheKey, measurement, day);
-        (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
+        // addChecked: day-scoped discovery results cached under the current
+        // generation go stale when an EXISTING series first appears in a day.
+        if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+            newDayMembership = true;
+        }
+    }
+    if (newDayMembership) {
+        invalidateDiscoveryCache(measurement);
     }
 }
 
@@ -1130,13 +1172,21 @@ seastar::future<> NativeIndex::recordInsertDays(const std::string& measurement, 
     const uint32_t localId = *localIdOpt;
     std::string dayCacheKey;
     uint32_t lastDay = UINT32_MAX;
+    bool newDayMembership = false;
     for (uint64_t ts : timestamps) {
         uint32_t day = ke::dayBucketFromNs(ts);
         if (day != lastDay) {
             buildDayBitmapCacheKey(dayCacheKey, measurement, day);
-            (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
+            // addChecked: invalidate cached day-scoped discovery when an
+            // existing series first appears in a day (see recordDaySpan).
+            if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+                newDayMembership = true;
+            }
             lastDay = day;
         }
+    }
+    if (newDayMembership) {
+        invalidateDiscoveryCache(measurement);
     }
 }
 
@@ -1330,12 +1380,13 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
     co_return results;
 }
 
-seastar::future<
-    std::expected<std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>>, SeriesLimitExceeded>>
-NativeIndex::findSeriesWithMetadataCached(const std::string& measurement,
-                                          const std::map<std::string, std::string>& tagFilters,
-                                          const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
-    // Build cache key with generation counter to avoid O(N) prefix scan on invalidation
+// Build discovery cache key with generation counter to avoid O(N) prefix scan
+// on invalidation. Shared by findSeriesWithMetadataCached and the time-scoped
+// variant (which appends a "D:start-end" day-range suffix — non-scoped keys
+// always end with "L:<num>", so the key spaces cannot collide).
+std::string NativeIndex::buildDiscoveryCacheKey(const std::string& measurement,
+                                                const std::map<std::string, std::string>& tagFilters,
+                                                const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
     uint64_t gen = discoveryCacheGen_[measurement];
     std::string cacheKey = measurement;
     cacheKey += '\0';
@@ -1359,6 +1410,15 @@ NativeIndex::findSeriesWithMetadataCached(const std::string& measurement,
     // be returned for a query with maxSeries=10 (which should enforce a lower limit).
     cacheKey += "L:";
     cacheKey += std::to_string(maxSeries);
+    return cacheKey;
+}
+
+seastar::future<
+    std::expected<std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>>, SeriesLimitExceeded>>
+NativeIndex::findSeriesWithMetadataCached(const std::string& measurement,
+                                          const std::map<std::string, std::string>& tagFilters,
+                                          const std::unordered_set<std::string>& fieldFilter, size_t maxSeries) {
+    std::string cacheKey = buildDiscoveryCacheKey(measurement, tagFilters, fieldFilter, maxSeries);
 
     auto cached = discoveryCache_.get(cacheKey);
     if (cached)
@@ -2263,6 +2323,11 @@ seastar::future<> NativeIndex::removeExpiredDayBitmaps(const std::string& measur
     }
 }
 
+// Wide-range threshold shared by the time-scoped discovery paths: beyond this
+// day span, fall back to non-time-scoped discovery to avoid O(days) bitmap
+// lookups (e.g. 7000+ KV gets for 19 years of data).
+static constexpr uint32_t MAX_DAY_SCAN = 365;
+
 seastar::future<std::expected<std::vector<IndexBackend::SeriesWithMetadata>, SeriesLimitExceeded>>
 NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
                                               const std::map<std::string, std::string>& tagFilters,
@@ -2271,10 +2336,6 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
     uint32_t startDay = ke::dayBucketFromNs(startTimeNs);
     uint32_t endDay = ke::dayBucketFromNs(endTimeNs);
 
-    // Wide range optimisation: when the day span exceeds the threshold,
-    // fall back to non-time-scoped discovery to avoid O(days) bitmap
-    // lookups (e.g. 7000+ KV gets for 19 years of data).
-    static constexpr uint32_t MAX_DAY_SCAN = 365;
     if (endDay < startDay || endDay - startDay > MAX_DAY_SCAN) {
         co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
     }
@@ -2394,6 +2455,47 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
     }
 
     co_return results;
+}
+
+seastar::future<
+    std::expected<std::shared_ptr<const std::vector<IndexBackend::SeriesWithMetadata>>, SeriesLimitExceeded>>
+NativeIndex::findSeriesWithMetadataTimeScopedCached(const std::string& measurement,
+                                                    const std::map<std::string, std::string>& tagFilters,
+                                                    const std::unordered_set<std::string>& fieldFilter,
+                                                    uint64_t startTimeNs, uint64_t endTimeNs, size_t maxSeries) {
+    uint32_t startDay = ke::dayBucketFromNs(startTimeNs);
+    uint32_t endDay = ke::dayBucketFromNs(endTimeNs);
+
+    // Wide range: the uncached path falls back to non-time-scoped discovery
+    // anyway, so serve it from the (day-agnostic) discovery cache directly.
+    if (endDay < startDay || endDay - startDay > MAX_DAY_SCAN) {
+        co_return co_await findSeriesWithMetadataCached(measurement, tagFilters, fieldFilter, maxSeries);
+    }
+
+    // Day-scoped cache key. Invalidation: the generation embedded in the key
+    // bumps on new series (invalidateDiscoveryCache) AND when an existing
+    // series first writes into a new day (addChecked in the day-bitmap
+    // recording paths) — so cached day-scoped results can never go stale.
+    std::string cacheKey = buildDiscoveryCacheKey(measurement, tagFilters, fieldFilter, maxSeries);
+    cacheKey += "D:";
+    cacheKey += std::to_string(startDay);
+    cacheKey += '-';
+    cacheKey += std::to_string(endDay);
+
+    auto cached = discoveryCache_.get(cacheKey);
+    if (cached)
+        co_return *cached;
+
+    auto result =
+        co_await findSeriesWithMetadataTimeScoped(measurement, tagFilters, fieldFilter, startTimeNs, endTimeNs,
+                                                  maxSeries);
+    if (!result.has_value()) {
+        co_return std::unexpected(result.error());
+    }
+
+    auto ptr = std::make_shared<const std::vector<SeriesWithMetadata>>(std::move(*result));
+    discoveryCache_.put(cacheKey, ptr);
+    co_return ptr;
 }
 
 // ============================================================================
@@ -2627,13 +2729,21 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
         uint32_t localId = *localIdOpt;
         std::string dayCacheKey;
         uint32_t lastDay = UINT32_MAX;
+        bool newDayMembership = false;
         for (uint64_t ts : insert.getTimestamps()) {
             uint32_t day = ke::dayBucketFromNs(ts);
             if (day != lastDay) {
                 buildDayBitmapCacheKey(dayCacheKey, insert.measurement, day);
-                (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
+                // addChecked: invalidate cached day-scoped discovery when an
+                // existing series first appears in a day (see recordDaySpan).
+                if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+                    newDayMembership = true;
+                }
                 lastDay = day;
             }
+        }
+        if (newDayMembership) {
+            invalidateDiscoveryCache(insert.measurement);
         }
     }
 
@@ -2667,16 +2777,74 @@ seastar::future<SchemaUpdate> NativeIndex::indexMetadataBatchWithSchema(const st
     co_return std::exchange(pendingSchemaUpdate_, SchemaUpdate{});
 }
 
-void NativeIndex::applySchemaUpdate(const SchemaUpdate& update) {
+// Persist broadcast schema deltas into the LOCAL shard's KV store so every
+// shard's KV becomes a complete schema replica. Without this, each shard's KV
+// only held MEASUREMENT_FIELDS/TAGS/TAG_VALUES for series it owns; once
+// trimSchemaCaches() cleared the broadcast deltas (or the process restarted),
+// /fields//tags//tag-values served from a non-owning shard returned partial
+// data. Broadcasts are idempotent unions, so the origin shard re-applying its
+// own update is harmless.
+seastar::future<> NativeIndex::applySchemaUpdate(SchemaUpdate update) {
+    IndexWriteBatch batch;
+
+    // --- Fields / tag keys: read-modify-write the schema blobs ---
+    // Stage the merged sets and encode them synchronously right before
+    // kvWriteBatch below, folding in the live caches at write time so a
+    // concurrent update applied during one of our suspensions can't be
+    // clobbered by a stale snapshot.
+    std::vector<std::pair<std::string, std::set<std::string>>> fieldBlobs;
+    fieldBlobs.reserve(update.newFields.size());
     for (const auto& [measurement, fields] : update.newFields) {
-        fieldsCache_[measurement].insert(fields.begin(), fields.end());
+        auto val = co_await kvGet(ke::encodeMeasurementFieldsKey(measurement));
+        std::set<std::string> merged = val.has_value() ? ke::decodeStringSet(*val) : std::set<std::string>{};
+        const size_t persisted = merged.size();
+        merged.insert(fields.begin(), fields.end());
+        // Re-find the cache after co_await; merge both ways so the cache
+        // entry becomes the complete union (fixes the partial-delta-masking
+        // bug where a delta-only entry satisfied reads as if complete).
+        auto& cached = fieldsCache_[measurement];
+        merged.insert(cached.begin(), cached.end());
+        cached = merged;
+        if (merged.size() != persisted) {
+            fieldBlobs.emplace_back(measurement, std::move(merged));
+        }
     }
+
+    std::vector<std::pair<std::string, std::set<std::string>>> tagBlobs;
+    tagBlobs.reserve(update.newTags.size());
     for (const auto& [measurement, tags] : update.newTags) {
-        tagsCache_[measurement].insert(tags.begin(), tags.end());
+        auto val = co_await kvGet(ke::encodeMeasurementTagsKey(measurement));
+        std::set<std::string> merged = val.has_value() ? ke::decodeStringSet(*val) : std::set<std::string>{};
+        const size_t persisted = merged.size();
+        merged.insert(tags.begin(), tags.end());
+        auto& cached = tagsCache_[measurement];  // re-find after co_await
+        merged.insert(cached.begin(), cached.end());
+        cached = merged;
+        if (merged.size() != persisted) {
+            tagBlobs.emplace_back(measurement, std::move(merged));
+        }
     }
+
+    // --- Tag values: per-value marker keys — no blob RMW needed ---
     for (const auto& [cacheKey, values] : update.newTagValues) {
-        tagValuesCache_[cacheKey].insert(values.begin(), values.end());
+        auto sep = cacheKey.find('\0');
+        if (sep == std::string::npos)
+            continue;  // malformed key — skip
+        std::string measurement = cacheKey.substr(0, sep);
+        std::string tagKey = cacheKey.substr(sep + 1);
+        for (const auto& value : values) {
+            batch.put(ke::encodeTagValueMarkerKey(measurement, tagKey, value), "");
+        }
+        // Merge into the cache ONLY when a fully-loaded entry exists. Creating
+        // a delta-only entry would satisfy getTagValues as if complete (the
+        // partial-delta-masking bug); reads load the full union from KV on
+        // demand, which now includes the markers persisted above.
+        if (auto it = tagValuesCache_.find(cacheKey); it != tagValuesCache_.end() && !it->second.empty()) {
+            it->second.insert(values.begin(), values.end());
+        }
     }
+
+    // --- Field types: in-memory caches (persisted by the owning shard) ---
     for (const auto& [cacheKey, type] : update.newFieldTypes) {
         knownFieldTypes_.insert(cacheKey);
         // Store the actual type value so getFieldType() can return it
@@ -2684,6 +2852,26 @@ void NativeIndex::applySchemaUpdate(const SchemaUpdate& update) {
         if (!fieldTypeValues_.contains(cacheKey)) {
             fieldTypeValues_[cacheKey] = type;
         }
+    }
+
+    // Encode blobs from the freshest state (staged union ∪ live cache) with no
+    // suspension between here and the synchronous memtable apply inside
+    // kvWriteBatch — later writers always persist a superset.
+    for (auto& [measurement, merged] : fieldBlobs) {
+        if (auto it = fieldsCache_.find(measurement); it != fieldsCache_.end()) {
+            merged.insert(it->second.begin(), it->second.end());
+        }
+        batch.put(ke::encodeMeasurementFieldsKey(measurement), ke::encodeStringSet(merged));
+    }
+    for (auto& [measurement, merged] : tagBlobs) {
+        if (auto it = tagsCache_.find(measurement); it != tagsCache_.end()) {
+            merged.insert(it->second.begin(), it->second.end());
+        }
+        batch.put(ke::encodeMeasurementTagsKey(measurement), ke::encodeStringSet(merged));
+    }
+
+    if (!batch.empty()) {
+        co_await kvWriteBatch(batch);
     }
 }
 

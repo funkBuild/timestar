@@ -64,6 +64,12 @@ enum IndexKeyType : uint8_t {
     CARDINALITY_HLL = 0x14,   // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
     MEASUREMENT_BLOOM = 0x15,   // measurement\0 -> serialized bloom filter of all LocalIds
     POSTINGS_WATERMARK = 0x16,  // singleton -> localIdMap.nextId() at last bitmap flush (crash-repair bound)
+
+    // Per-value tag value markers: replace the TAG_VALUES blob write path.
+    // One empty-value key per (measurement, tagKey, tagValue) — appending a new
+    // value is O(1) instead of re-encoding the whole value set (O(V²) write
+    // amplification). Read path unions these with any legacy TAG_VALUES blob.
+    TAG_VALUE_MARKER = 0x17,  // measurement+\0+tagKey+\0+tagValue -> (empty)
 };
 
 // Metadata for a time series
