@@ -8,7 +8,7 @@
 #include "timestar_value.hpp"
 #include "wal_file_manager.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <tsl/robin_map.h>
 

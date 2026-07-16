@@ -28,7 +28,7 @@
 #include "../../../lib/utils/series_key.hpp"
 #include "../../test_helpers.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

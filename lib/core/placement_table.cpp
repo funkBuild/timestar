@@ -1,6 +1,6 @@
 #include "placement_table.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <fstream>
 #include <stdexcept>

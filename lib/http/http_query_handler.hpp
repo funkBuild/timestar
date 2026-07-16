@@ -6,7 +6,7 @@
 #include "series_id.hpp"
 #include "timestar_config.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <chrono>
 #include <memory>

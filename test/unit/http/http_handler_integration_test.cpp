@@ -7,7 +7,7 @@
 // parsing/formatting), these tests spin up a real sharded Engine via
 // ScopedShardedEngine and invoke the handler coroutines directly.
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

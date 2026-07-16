@@ -22,7 +22,7 @@
 #include "../../../lib/query/query_parser.hpp"
 #include "../../../lib/retention/retention_policy.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

@@ -5,7 +5,7 @@
 #include "tsm.hpp"                  // for TSMValueType definition
 #include "value_type_dispatch.hpp"  // for valueTypeName
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <endian.h>
 #include <xxhash.h>

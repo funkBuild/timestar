@@ -1,6 +1,6 @@
 #include "../../../lib/http/http_query_handler.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

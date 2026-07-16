@@ -3,7 +3,7 @@
 #include "engine.hpp"
 #include "retention_policy.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <memory>
 #include <seastar/core/coroutine.hh>

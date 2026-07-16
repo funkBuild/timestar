@@ -7,7 +7,7 @@
 #include "http_query_handler.hpp"
 #include "logger.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <chrono>
 #include <seastar/core/when_all.hh>

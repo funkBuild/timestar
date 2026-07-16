@@ -1,6 +1,6 @@
 #pragma once
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <cstdint>
 #include <map>

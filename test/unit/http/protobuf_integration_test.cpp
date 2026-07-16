@@ -20,7 +20,7 @@
 #include "integer_encoder.hpp"
 #include "slice_buffer.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

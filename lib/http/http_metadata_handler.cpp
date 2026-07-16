@@ -9,7 +9,7 @@
 #include "proto_converters.hpp"
 #include "scatter_gather.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <algorithm>
 #include <optional>

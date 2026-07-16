@@ -13,7 +13,7 @@
 #include "streaming_derived_evaluator.hpp"
 #include "timestar_config.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <charconv>
 #include <chrono>

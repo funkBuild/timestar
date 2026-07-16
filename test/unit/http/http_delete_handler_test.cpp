@@ -1,6 +1,6 @@
 #include "../../../lib/http/http_delete_handler.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

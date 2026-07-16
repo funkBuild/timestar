@@ -3,7 +3,7 @@
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

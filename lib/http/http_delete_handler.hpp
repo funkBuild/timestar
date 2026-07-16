@@ -3,7 +3,7 @@
 #include "engine.hpp"
 #include "series_id.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <map>
 #include <memory>
