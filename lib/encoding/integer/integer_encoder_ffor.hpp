@@ -33,6 +33,10 @@ public:
 
     static size_t encodeInto(std::span<const uint64_t> values, AlignedBuffer& target);
 
+    // Decode with an optional INCLUSIVE time filter [startTime, maxTime]:
+    // values below startTime are counted in .first (nSkipped), values above
+    // maxTime terminate the decode.  Matches the memory-store query filter
+    // (endTime inclusive) so results do not depend on data placement.
     static std::pair<size_t, size_t> decode(Slice& encoded, unsigned int timestampSize, std::vector<uint64_t>& values,
                                             uint64_t startTime = 0, uint64_t maxTime = UINT64_MAX);
 };

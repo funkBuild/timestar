@@ -247,7 +247,9 @@ public:
         auto it = sparseIndex.find(seriesId);
         if (it == sparseIndex.end())
             return false;
-        return it->second.minTime < endTime && startTime <= it->second.maxTime;
+        // Inclusive endTime (matches the memory-store filter and the decode
+        // time filter): a series whose data starts exactly at endTime overlaps.
+        return it->second.minTime <= endTime && startTime <= it->second.maxTime;
     }
 
     // Sparse index time bound accessors (no I/O — used for LATEST/FIRST file ordering)

@@ -676,6 +676,129 @@ TEST(BlockAggregatorEdge, PointCountTracksAcrossAllPaths) {
 }
 
 // ============================================================================
+// Epoch-aligned bucket layout (regression: single-bucket collapse)
+//
+// Buckets are epoch-aligned: floor(ts / interval) * interval, with endTime
+// inclusive.  The constructor used to compute the bucket count as
+// ceil((endTime - startTime) / interval), which under-counted for misaligned
+// or boundary-inclusive ranges and wrongly engaged the single-bucket
+// optimisation — collapsing distinct epoch buckets into one bucket stamped
+// floor(startTime / interval).
+// ============================================================================
+
+TEST(BlockAggregatorEpochBuckets, MisalignedRangeShorterThanIntervalSpansTwoBuckets) {
+    // Range [3, 12] is 9 units with interval 10 — but overlaps epoch buckets
+    // [0,10) and [10,20).  Must NOT collapse into a single bucket.
+    BlockAggregator ba(10, 3, 12, AggregationMethod::SUM, true);
+    ba.addPoint(5, 1.0);
+    ba.addPoint(11, 2.0);
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 2u);
+    EXPECT_DOUBLE_EQ(buckets[0].getValue(AggregationMethod::SUM), 1.0);
+    EXPECT_DOUBLE_EQ(buckets[10].getValue(AggregationMethod::SUM), 2.0);
+}
+
+TEST(BlockAggregatorEpochBuckets, InclusiveEndTimeOnBucketBoundaryCountsBothBuckets) {
+    // endTime is inclusive: [0, 10] with interval 10 covers buckets 0 and 10.
+    BlockAggregator ba(10, 0, 10, AggregationMethod::AVG, true);
+    ba.addPoint(0, 1.0);
+    ba.addPoint(10, 3.0);
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 2u);
+    EXPECT_DOUBLE_EQ(buckets[0].getValue(AggregationMethod::AVG), 1.0);
+    EXPECT_DOUBLE_EQ(buckets[10].getValue(AggregationMethod::AVG), 3.0);
+}
+
+TEST(BlockAggregatorEpochBuckets, SingleBucketGuardRoutesOutOfRangePoints) {
+    // [12, 15] fits in one epoch bucket (10) — single-bucket optimisation
+    // engages.  Points fed from outside the constructed range (e.g. memory
+    // fallback data over a wider range) must land in their own epoch buckets,
+    // not the cached one.
+    BlockAggregator ba(10, 12, 15, AggregationMethod::SUM, true);
+    ba.addPoint(13, 1.0);  // in the cached bucket
+    ba.addPoint(25, 2.0);  // bucket 20
+    ba.addPoint(5, 3.0);   // bucket 0 (below the cached bucket)
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 3u);
+    EXPECT_DOUBLE_EQ(buckets[10].getValue(AggregationMethod::SUM), 1.0);
+    EXPECT_DOUBLE_EQ(buckets[20].getValue(AggregationMethod::SUM), 2.0);
+    EXPECT_DOUBLE_EQ(buckets[0].getValue(AggregationMethod::SUM), 3.0);
+}
+
+TEST(BlockAggregatorEpochBuckets, SingleBucketGuardRoutesBatchesSpanningBuckets) {
+    BlockAggregator ba(10, 12, 15, AggregationMethod::SUM, true);
+    std::vector<uint64_t> ts = {13, 14, 25, 26, 27};
+    std::vector<double> vals = {1.0, 2.0, 3.0, 4.0, 5.0};
+    ba.addPoints(ts, vals);
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 2u);
+    EXPECT_DOUBLE_EQ(buckets[10].getValue(AggregationMethod::SUM), 3.0);
+    EXPECT_DOUBLE_EQ(buckets[20].getValue(AggregationMethod::SUM), 12.0);
+    EXPECT_EQ(buckets[10].count, 2u);
+    EXPECT_EQ(buckets[20].count, 3u);
+}
+
+TEST(BlockAggregatorEpochBuckets, SingleBucketGuardRoutesRangeAdds) {
+    BlockAggregator ba(10, 12, 15, AggregationMethod::MIN, true);
+    std::vector<uint64_t> ts = {13, 21, 22, 23, 24, 29};
+    std::vector<double> vals = {7.0, 5.0, 4.0, 6.0, 8.0, 9.0};
+    ba.addPointsRange(ts, vals, 0, ts.size());
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 2u);
+    EXPECT_DOUBLE_EQ(buckets[10].getValue(AggregationMethod::MIN), 7.0);
+    EXPECT_DOUBLE_EQ(buckets[20].getValue(AggregationMethod::MIN), 4.0);
+}
+
+TEST(BlockAggregatorEpochBuckets, UnusedPreinsertedSingleBucketIsDropped) {
+    // All data lands outside the cached single bucket: the pre-inserted empty
+    // state must not surface as a bogus bucket.
+    BlockAggregator ba(10, 12, 15, AggregationMethod::SUM, true);
+    ba.addPoint(25, 2.0);
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 1u);
+    EXPECT_EQ(buckets.count(20), 1u);
+}
+
+TEST(BlockAggregatorEpochBuckets, NoDataYieldsNoBuckets) {
+    BlockAggregator ba(10, 12, 15, AggregationMethod::SUM, true);
+    auto buckets = ba.takeBucketStates();
+    EXPECT_TRUE(buckets.empty());
+}
+
+TEST(BlockAggregatorEpochBuckets, AddBlockStatsRoutesByBlockBucketNotCachedBucket) {
+    BlockAggregator ba(10, 12, 15, AggregationMethod::SUM, true);
+
+    // Block in a DIFFERENT epoch bucket than the cached single bucket: usable
+    // (fits one bucket) but must be routed to ITS bucket.
+    EXPECT_TRUE(ba.canUseBlockStats(25, 27));
+    ba.addBlockStats(9.0, 4.0, 5.0, 2, 25, 27);
+
+    // Block spanning two epoch buckets is never usable — even in single-bucket mode.
+    EXPECT_FALSE(ba.canUseBlockStats(5, 25));
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 1u);
+    EXPECT_DOUBLE_EQ(buckets[20].getValue(AggregationMethod::SUM), 9.0);
+}
+
+TEST(BlockAggregatorEpochBuckets, AddTimestampsOnlyGuardRoutesOutOfRange) {
+    BlockAggregator ba(10, 12, 15, AggregationMethod::COUNT, true);
+    std::vector<uint64_t> ts = {13, 25};
+    ba.addTimestampsOnly(ts);
+
+    auto buckets = ba.takeBucketStates();
+    ASSERT_EQ(buckets.size(), 2u);
+    EXPECT_EQ(buckets[10].count, 1u);
+    EXPECT_EQ(buckets[20].count, 1u);
+}
+
+// ============================================================================
 // sortTimestamps (non-bucketed mode)
 // ============================================================================
 

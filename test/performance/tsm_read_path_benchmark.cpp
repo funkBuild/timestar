@@ -535,7 +535,9 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R7_StringDictReadPath) {
 
     // Narrow range: 200 points from the middle (fixed per-call overhead dominates)
     const uint64_t nStart = T0 + 50'000 * STEP;
-    const uint64_t nEnd = nStart + 200 * STEP;
+    // endTime is INCLUSIVE (canonical since the epoch-bucketing fix); end one
+    // step short of the 201st point so the narrow range covers exactly 200.
+    const uint64_t nEnd = nStart + 199 * STEP;
 
     for (int i = 0; i < 3; i++) {
         auto r = co_await engine.query(seriesKey, seriesId, nStart, nEnd);

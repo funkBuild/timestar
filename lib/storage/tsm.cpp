@@ -53,19 +53,19 @@ static bool blockOverlapsTombstones(uint64_t blockMin, uint64_t blockMax,
     return false;
 }
 
-// Select the index blocks overlapping [startTime, endTime) as a contiguous
+// Select the index blocks overlapping [startTime, endTime] (inclusive) as a contiguous
 // range.  Index blocks are sorted by minTime with non-decreasing maxTime
 // (the writer emits each series' blocks sequentially in time order, and the
 // compactor's zero-copy path requires sorted non-overlapping blocks; its
 // merge path re-encodes fully sorted data), so the set of blocks matching
-// (minTime < endTime && startTime <= maxTime) is contiguous: two binary
+// (minTime <= endTime && startTime <= maxTime) is contiguous: two binary
 // searches replace the previous O(blocks) copy_if scan.
 static std::span<const TSMIndexBlock> overlappingBlockRange(const std::vector<TSMIndexBlock>& blocks,
                                                             uint64_t startTime, uint64_t endTime) {
     auto first = std::partition_point(blocks.begin(), blocks.end(),
                                       [startTime](const TSMIndexBlock& b) { return b.maxTime < startTime; });
     auto last =
-        std::partition_point(first, blocks.end(), [endTime](const TSMIndexBlock& b) { return b.minTime < endTime; });
+        std::partition_point(first, blocks.end(), [endTime](const TSMIndexBlock& b) { return b.minTime <= endTime; });
     return {first, last};
 }
 
@@ -85,7 +85,7 @@ struct BlockHeaderInfo {
     size_t nTimestamps;    // decoded timestamps now in tsScratch
 };
 
-// Parse the block header and decode timestamps (filtered by [startTime, endTime))
+// Parse the block header and decode timestamps (filtered by [startTime, endTime], inclusive)
 // into `tsScratchOut` (cleared and reserved before decode). Returns nullopt on
 // malformed header. nTimestamps==0 is a valid result (no timestamps in range).
 static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8_t* data, uint32_t blockSize,
@@ -811,7 +811,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
 
     // Fully-contained block: every point passes the time filter, so decode with
     // sentinel bounds to hit the branch-free timestamp fast path (same results).
-    if (indexBlock.minTime >= startTime && indexBlock.maxTime < endTime) {
+    if (indexBlock.minTime >= startTime && indexBlock.maxTime <= endTime) {
         startTime = 0;
         endTime = UINT64_MAX;
     }
@@ -1308,7 +1308,7 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
     std::vector<TSMIndexBlock> decodeBlocks;
     decodeBlocks.reserve(blocksToScan.size());
     for (const auto& block : blocksToScan) {
-        bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
+        bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
         bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
         bool canSkip = !blockHasTombstones && blockFullyContained && block.blockCount > 0 &&
                        aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
@@ -1390,7 +1390,7 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                 // Fully-contained blocks (index bounds prove every point passes the time
                 // filter) use sentinel bounds to hit the branch-free timestamp decode
                 // fast path — result-identical, but skips 2 compares per point.
-                const bool fullyContained = block.minTime >= startTime && block.maxTime < endTime;
+                const bool fullyContained = block.minTime >= startTime && block.maxTime <= endTime;
                 const uint64_t decodeStart = fullyContained ? 0 : startTime;
                 const uint64_t decodeEnd = fullyContained ? UINT64_MAX : endTime;
                 size_t n;
@@ -1467,7 +1467,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     // preserves that order, so LATEST → back(), FIRST → front().
     if (maxPoints == 1) {
         const TSMIndexBlock& bestBlock = reverse ? blocksToScan.back() : blocksToScan.front();
-        const bool boundaryInRange = reverse ? (bestBlock.maxTime < endTime) : (bestBlock.minTime >= startTime);
+        const bool boundaryInRange = reverse ? (bestBlock.maxTime <= endTime) : (bestBlock.minTime >= startTime);
         if (bestBlock.hasExtendedStats && boundaryInRange) {
             const uint64_t boundaryTs = reverse ? bestBlock.maxTime : bestBlock.minTime;
             // hasTombstones() is a cheap file-level guard; only consult per-series
@@ -1605,7 +1605,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
         // bucket, extract the first/latest endpoint directly without DMA
         // read + decode.  This preserves 1-point-per-bucket semantics.
         // Phase 0: per-block tombstone check instead of global gate
-        bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
+        bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
         bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
         if (!blockHasTombstones && blockFullyContained && block.hasExtendedStats) {
             uint64_t bFirst = (block.minTime / interval) * interval;

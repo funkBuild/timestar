@@ -669,7 +669,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
             last_decoded = blockBuf[0];
             if (last_decoded < minTime) {
                 nSkipped++;
-            } else if (last_decoded < maxTime) {
+            } else if (last_decoded <= maxTime) {
                 values.push_back(last_decoded);
                 nAdded++;
             } else {
@@ -685,7 +685,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
             if (last_decoded < minTime) {
                 nSkipped++;
-            } else if (last_decoded < maxTime) {
+            } else if (last_decoded <= maxTime) {
                 values.push_back(last_decoded);
                 nAdded++;
             } else {
@@ -707,7 +707,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
             if (last_decoded < minTime) {
                 nSkipped++;
-            } else if (last_decoded >= maxTime) {
+            } else if (last_decoded > maxTime) {
                 return {nSkipped, nAdded};
             } else {
                 values.push_back(last_decoded);
@@ -718,7 +718,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
             if (last_decoded < minTime) {
                 nSkipped++;
-            } else if (last_decoded >= maxTime) {
+            } else if (last_decoded > maxTime) {
                 return {nSkipped, nAdded};
             } else {
                 values.push_back(last_decoded);
@@ -729,7 +729,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
             if (last_decoded < minTime) {
                 nSkipped++;
-            } else if (last_decoded >= maxTime) {
+            } else if (last_decoded > maxTime) {
                 return {nSkipped, nAdded};
             } else {
                 values.push_back(last_decoded);
@@ -740,7 +740,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
             if (last_decoded < minTime) {
                 nSkipped++;
-            } else if (last_decoded >= maxTime) {
+            } else if (last_decoded > maxTime) {
                 return {nSkipped, nAdded};
             } else {
                 values.push_back(last_decoded);
@@ -758,7 +758,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
                 nSkipped++;
                 continue;
             }
-            if (last_decoded >= maxTime) {
+            if (last_decoded > maxTime) {
                 return {nSkipped, nAdded};
             }
             values.push_back(last_decoded);

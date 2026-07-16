@@ -609,6 +609,39 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
 }
 ```
 
+### Aggregation Result Shape (canonical semantics)
+
+The shape of a query result is a pure function of the query — it must never
+depend on where the data happens to live (memory store vs TSM), on cache
+warm-up, or on startTime alignment.
+
+**With `aggregationInterval` (> 0):**
+- Buckets are **epoch-aligned**: each point lands in bucket
+  `floor(timestamp / interval) * interval`. Bucket boundaries do NOT shift
+  with the query's startTime.
+- `endTime` is inclusive; a range that ends exactly on a bucket boundary
+  includes that boundary's bucket.
+- Empty buckets are omitted (no gap filling).
+- A misaligned range shorter than one interval can still return two buckets
+  when it crosses an epoch boundary.
+
+**Without `aggregationInterval` (interval == 0):**
+- `latest` / `first`: one collapsed value per series/group, on every path.
+- With `by {tags}` (group-by) and a streamable method (`avg`, `sum`, `min`,
+  `max`, `count`, `spread`, `stddev`, `stdvar`): the group's whole time range
+  collapses into a single aggregated value (InfluxQL-style "GROUP BY tag").
+- Otherwise (no group-by, or `median`/`exact_median`): **per-timestamp
+  aggregation across matching series** — N points, one per distinct
+  timestamp, aggregated across the series that share that timestamp
+  (raw passthrough for a single series). Internal consumers
+  (`/derived` formulas, anomaly detection, forecasting) rely on this
+  N-point shape for their no-interval sub-queries.
+
+Implementation note: the interval == 0 collapse-vs-raw choice is carried by
+the `foldNoInterval` parameter of `Engine::queryAggregated()` /
+`QueryRunner::queryTsmAggregated()`; callers derive it from the query alone
+(group-by → collapse; standard per-series path → raw).
+
 ### Query Features
 
 - **Multi-shard coordination**: Queries automatically fan out to all relevant shards

@@ -207,8 +207,12 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
             auto* group = pair.group;
 
             // --- Try pushdown path ---
+            // foldNoInterval=true: this streaming path collapses each group's
+            // whole range into a single value when interval == 0, so a
+            // per-series collapsed state is the ideal transfer shape.
             auto pushdownResult = co_await engine.queryAggregated(ctx.seriesKey, ctx.seriesId, startTime, endTime,
-                                                                  aggregationInterval, aggregation);
+                                                                  aggregationInterval, aggregation,
+                                                                  /*foldNoInterval=*/true);
 
             if (pushdownResult.has_value()) {
                 mergePushdownIntoGroup(*group, *pushdownResult);
@@ -835,8 +839,18 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                     // ---- PUSHDOWN PATH ----
                     // Try aggregating directly from TSM blocks, skipping the
                     // full TSMResult → QueryResult → SeriesResult pipeline.
-                    auto pushdownResult = co_await engine.queryAggregated(ctx.seriesKey, ctx.seriesId, startTime,
-                                                                          endTime, aggregationInterval, aggregation);
+                    //
+                    // foldNoInterval=false: this standard path handles the
+                    // no-group-by, no-interval case whose canonical response
+                    // shape is per-timestamp aggregation across series (N
+                    // points), so the pushdown must return raw sorted vectors
+                    // — never a collapsed single state.  Collapsing here used
+                    // to make the response shape depend on data placement
+                    // (memstore raw vs TSM collapsed).  LATEST/FIRST are
+                    // handled by the batch fast path above and always collapse.
+                    auto pushdownResult =
+                        co_await engine.queryAggregated(ctx.seriesKey, ctx.seriesId, startTime, endTime,
+                                                        aggregationInterval, aggregation, /*foldNoInterval=*/false);
 
                     if (pushdownResult.has_value()) {
                         // Build PartialAggregationResult directly from PushdownResult

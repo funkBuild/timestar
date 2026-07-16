@@ -685,7 +685,7 @@ static size_t aggregateMemoryStores(WALFileManager* walFileManager, const Series
 
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
     SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
-    timestar::AggregationMethod method) {
+    timestar::AggregationMethod method, bool foldNoInterval) {
     // Gate 0.5: MEDIAN and EXACT_MEDIAN need all raw values — cannot use
     // pushdown aggregation.  T-digest is used at merge time for cross-shard
     // aggregation, not during per-value accumulation (rawValues is faster).
@@ -708,11 +708,14 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // in the aggregator rather than folding to a single state, because callers
     // (e.g. DerivedQueryExecutor) may need per-point data.
     if (noTsmFiles) {
-        // LATEST/FIRST without interval: fold all MemoryStore points into a
-        // single AggregationState (returns 1 point, not N raw points).
-        const bool foldLatestFirst = (aggregationInterval == 0) && (isLatest || isFirst);
+        // Fold-to-single-state for interval == 0: always for LATEST/FIRST
+        // (they return 1 point by definition), and for other streamable
+        // methods when the caller asked for a collapsed result
+        // (foldNoInterval — group-by callers collapse per group anyway).
+        const bool foldSingle = (aggregationInterval == 0) &&
+                                (isLatest || isFirst || (foldNoInterval && isStreamableAggMethod(method)));
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
-        if (foldLatestFirst) {
+        if (foldSingle) {
             aggregator.enableFoldToSingleState();
         }
 
@@ -725,7 +728,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         result.totalPoints = aggregator.pointCount();
         if (aggregationInterval > 0) {
             result.bucketStates = aggregator.takeBucketStates();
-        } else if (foldLatestFirst) {
+        } else if (foldSingle) {
             result.aggregatedState = aggregator.takeSingleState();
         } else {
             aggregator.sortTimestamps();
@@ -835,8 +838,16 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
         // Non-bucketed LATEST/FIRST: fold TSM + MemoryStore data into a single
         // AggregationState so we return 1 point total, not N raw points.
+        //
+        // The aggregator is constructed over the FULL query range [startTime,
+        // endTime], not the TSM-only sub-range: when needsFallback is set, the
+        // memory-store fold below feeds points up to endTime into this same
+        // aggregator, and the constructor's range determines the epoch-bucket
+        // layout (single-bucket optimisation).  Constructing over the narrower
+        // TSM sub-range used to collapse memory points from later epoch
+        // buckets into the first bucket.
         const bool foldNonBucketed = (aggregationInterval == 0);
-        timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime, method, true);
+        timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
         if (foldNonBucketed) {
             aggregator.enableFoldToSingleState();
         }
@@ -1024,10 +1035,17 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         }
     }
 
-    // Gate checks passed — perform pushdown aggregation on TSM-only range.
-    // Pass startTime/tsmEndTime so the constructor can pre-reserve the bucket map.
-    const bool canFold = (aggregationInterval == 0) && isStreamableAggMethod(method);
-    timestar::BlockAggregator aggregator(aggregationInterval, startTime, tsmEndTime, method, true);
+    // Gate checks passed — perform pushdown aggregation.  The aggregator is
+    // constructed over the FULL query range [startTime, endTime] (not the
+    // TSM-only sub-range) because the memory fallback below feeds points up to
+    // endTime into it and the constructor's range determines the epoch-bucket
+    // layout; TSM reads themselves stay bounded by tsmEndTime.
+    //
+    // Fold-to-single for interval == 0 is caller-controlled (foldNoInterval):
+    // group-by callers collapse per group anyway; per-timestamp callers need
+    // the raw vectors.  The decision must never depend on data placement.
+    const bool canFold = (aggregationInterval == 0) && foldNoInterval && isStreamableAggMethod(method);
+    timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
     if (canFold) {
         aggregator.enableFoldToSingleState();  // no collectRaw needed for streaming methods
     }
