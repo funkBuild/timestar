@@ -257,29 +257,33 @@ seastar::future<> NativeIndex::open() {
     // re-record days; the time-scoped gap is bounded to the crash window.
     {
         auto wmVal = co_await kvGet(ke::encodePostingsWatermarkKey());
-        if (wmVal.has_value()) {
-            uint32_t watermark = ke::decodeLocalId(*wmVal);
-            uint32_t repaired = 0;
-            std::string bitmapCacheKey;
-            for (uint32_t id = watermark; id < localIdMap_.nextId(); ++id) {
-                if (!localIdMap_.isValid(id))
-                    continue;
-                SeriesId128 globalId = localIdMap_.getGlobalId(id);
-                auto meta = co_await getSeriesMetadata(globalId);
-                if (!meta.has_value())
-                    continue;
-                for (const auto& [tagKey, tagValue] : meta->tags) {
-                    buildBitmapCacheKey(bitmapCacheKey, meta->measurement, tagKey, tagValue);
-                    auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
-                    bitmap->add(id);
-                }
-                dirtyMeasurementBlooms_.insert(meta->measurement);
-                ++repaired;
+        // A missing watermark does NOT mean "nothing to repair": the watermark
+        // is only written by flushDirtyBitmaps(), while local IDs are persisted
+        // with each series-creation batch. A crash before the first bitmap
+        // flush/clean close leaves assigned IDs with no watermark — the crash
+        // window is then every assigned local ID, so default to 0. (Bitmap
+        // adds are idempotent, so over-repairing is safe.)
+        uint32_t watermark = wmVal.has_value() ? ke::decodeLocalId(*wmVal) : 0;
+        uint32_t repaired = 0;
+        std::string bitmapCacheKey;
+        for (uint32_t id = watermark; id < localIdMap_.nextId(); ++id) {
+            if (!localIdMap_.isValid(id))
+                continue;
+            SeriesId128 globalId = localIdMap_.getGlobalId(id);
+            auto meta = co_await getSeriesMetadata(globalId);
+            if (!meta.has_value())
+                continue;
+            for (const auto& [tagKey, tagValue] : meta->tags) {
+                buildBitmapCacheKey(bitmapCacheKey, meta->measurement, tagKey, tagValue);
+                auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
+                bitmap->add(id);
             }
-            if (repaired > 0) {
-                ::native_index_log.info("Repaired postings for {} series in crash window [{}, {})", repaired,
-                                        watermark, localIdMap_.nextId());
-            }
+            dirtyMeasurementBlooms_.insert(meta->measurement);
+            ++repaired;
+        }
+        if (repaired > 0) {
+            ::native_index_log.info("Repaired postings for {} series in crash window [{}, {})", repaired, watermark,
+                                    localIdMap_.nextId());
         }
     }
 
