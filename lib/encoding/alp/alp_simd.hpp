@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace alp {
+namespace timestar::alp {
 namespace simd {
 
 // SIMD-accelerated ALP decode reconstruction: converts int64 encoded values
@@ -36,4 +36,4 @@ size_t alpScaleF0(const double* values, size_t count, double fact_val, int64_t* 
                   int64_t* max_out, uint16_t* exc_positions, uint64_t* exc_values);
 
 }  // namespace simd
-}  // namespace alp
+}  // namespace timestar::alp

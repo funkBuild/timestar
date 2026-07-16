@@ -9,7 +9,7 @@
 #include <cstring>
 #include <vector>
 
-namespace alp {
+namespace timestar::alp {
 
 namespace {
 
@@ -308,4 +308,4 @@ void ALPRD::encodeBlock(const double* values, size_t count, uint8_t right_bit_co
     }
 }
 
-}  // namespace alp
+}  // namespace timestar::alp

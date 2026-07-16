@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace alp {
+namespace timestar::alp {
 
 // ALP magic number: "ALP\x01" as uint32
 static constexpr uint32_t ALP_MAGIC = 0x414C5001;
@@ -41,4 +41,4 @@ static constexpr int64_t MIN_SAFE_INT = -(1LL << 53);
 // Number of (exp, fac) combinations
 static constexpr size_t EXP_COUNT = 19;
 
-}  // namespace alp
+}  // namespace timestar::alp

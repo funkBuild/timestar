@@ -450,7 +450,7 @@ TEST_F(ExpressionEvaluatorTest, PerMinuteBasic) {
     // Rate = 10/s => per minute = 600/min
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL}, {100.0, 110.0, 120.0});
 
-    auto result = series.per_minute(1.0);
+    auto result = series.perMinute(1.0);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_TRUE(std::isnan(result.values[0]));  // First point has no previous
@@ -462,7 +462,7 @@ TEST_F(ExpressionEvaluatorTest, PerMinuteIdenticalTimestamps) {
     // Two points with the same timestamp: should output 0.0 (not div by zero)
     auto series = makeSeries({1000000000ULL, 1000000000ULL, 2000000000ULL}, {100.0, 110.0, 120.0});
 
-    auto result = series.per_minute(1.0);
+    auto result = series.perMinute(1.0);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -471,14 +471,14 @@ TEST_F(ExpressionEvaluatorTest, PerMinuteIdenticalTimestamps) {
 }
 
 TEST_F(ExpressionEvaluatorTest, PerMinuteZeroSecondsPerPoint) {
-    // seconds_per_point = 0 should not cause division by zero
+    // secondsPerPoint = 0 should not cause division by zero
     auto series = makeSeries({1000000000ULL, 2000000000ULL}, {100.0, 110.0});
 
-    auto result = series.per_minute(0.0);
+    auto result = series.perMinute(0.0);
 
     EXPECT_EQ(result.size(), 2);
     EXPECT_TRUE(std::isnan(result.values[0]));
-    // Should use timestamp delta (1s), not seconds_per_point
+    // Should use timestamp delta (1s), not secondsPerPoint
     EXPECT_DOUBLE_EQ(result.values[1], 600.0);
 }
 
@@ -486,7 +486,7 @@ TEST_F(ExpressionEvaluatorTest, PerMinuteAllIdenticalTimestamps) {
     // All timestamps the same: all outputs should be 0.0 (except first which is NaN)
     auto series = makeSeries({1000000000ULL, 1000000000ULL, 1000000000ULL}, {100.0, 200.0, 300.0});
 
-    auto result = series.per_minute(0.0);
+    auto result = series.perMinute(0.0);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -499,7 +499,7 @@ TEST_F(ExpressionEvaluatorTest, PerHourBasic) {
     // Rate = 1/s => per hour = 3600/hr
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL}, {10.0, 11.0, 12.0});
 
-    auto result = series.per_hour(1.0);
+    auto result = series.perHour(1.0);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -511,7 +511,7 @@ TEST_F(ExpressionEvaluatorTest, PerHourIdenticalTimestamps) {
     // Identical timestamps should output 0.0 (not div by zero)
     auto series = makeSeries({1000000000ULL, 1000000000ULL, 2000000000ULL}, {10.0, 20.0, 30.0});
 
-    auto result = series.per_hour(1.0);
+    auto result = series.perHour(1.0);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -520,10 +520,10 @@ TEST_F(ExpressionEvaluatorTest, PerHourIdenticalTimestamps) {
 }
 
 TEST_F(ExpressionEvaluatorTest, PerHourZeroSecondsPerPoint) {
-    // seconds_per_point = 0 should not cause division by zero
+    // secondsPerPoint = 0 should not cause division by zero
     auto series = makeSeries({1000000000ULL, 2000000000ULL}, {10.0, 11.0});
 
-    auto result = series.per_hour(0.0);
+    auto result = series.perHour(0.0);
 
     EXPECT_EQ(result.size(), 2);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -532,13 +532,13 @@ TEST_F(ExpressionEvaluatorTest, PerHourZeroSecondsPerPoint) {
 
 TEST_F(ExpressionEvaluatorTest, PerMinuteEmptySeries) {
     auto series = makeSeries({}, {});
-    auto result = series.per_minute(1.0);
+    auto result = series.perMinute(1.0);
     EXPECT_TRUE(result.empty());
 }
 
 TEST_F(ExpressionEvaluatorTest, PerHourEmptySeries) {
     auto series = makeSeries({}, {});
-    auto result = series.per_hour(1.0);
+    auto result = series.perHour(1.0);
     EXPECT_TRUE(result.empty());
 }
 
@@ -546,7 +546,7 @@ TEST_F(ExpressionEvaluatorTest, PerMinuteVariableIntervals) {
     // Timestamps with variable intervals
     auto series = makeSeries({0ULL, 1000000000ULL, 3000000000ULL, 4000000000ULL}, {0.0, 10.0, 30.0, 40.0});
 
-    auto result = series.per_minute(1.0);
+    auto result = series.perMinute(1.0);
 
     EXPECT_TRUE(std::isnan(result.values[0]));
     // (10-0) / 1s * 60 = 600
@@ -560,10 +560,10 @@ TEST_F(ExpressionEvaluatorTest, PerMinuteVariableIntervals) {
 // ==================== monotonic_diff consistency tests ====================
 
 TEST_F(ExpressionEvaluatorTest, MonotonicDiffCounterReset) {
-    // Verify that AlignedSeries::monotonic_diff returns current value on counter reset
+    // Verify that AlignedSeries::monotonicDiff returns current value on counter reset
     auto series = makeSeries({1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL}, {100.0, 150.0, 50.0, 80.0});
 
-    auto result = series.monotonic_diff();
+    auto result = series.monotonicDiff();
 
     EXPECT_EQ(result.size(), 4);
     EXPECT_TRUE(std::isnan(result.values[0]));  // First point, no predecessor
@@ -573,14 +573,14 @@ TEST_F(ExpressionEvaluatorTest, MonotonicDiffCounterReset) {
 }
 
 TEST_F(ExpressionEvaluatorTest, MonotonicDiffConsistentWithTransformFunctions) {
-    // Verify that the expression evaluator path (AlignedSeries::monotonic_diff)
+    // Verify that the expression evaluator path (AlignedSeries::monotonicDiff)
     // and the transform functions path produce the same results
     std::vector<uint64_t> timestamps = {1000000000ULL, 2000000000ULL, 3000000000ULL, 4000000000ULL, 5000000000ULL};
     std::vector<double> values = {10.0, 30.0, 5.0, 25.0, 15.0};
 
-    // Path 1: AlignedSeries::monotonic_diff (expression evaluator path)
+    // Path 1: AlignedSeries::monotonicDiff (expression evaluator path)
     auto series = makeSeries(timestamps, values);
-    auto evaluatorResult = series.monotonic_diff();
+    auto evaluatorResult = series.monotonicDiff();
 
     // Path 2: timestar::transform::monotonic_diff (transform functions path)
     // This delegates to simd::monotonic_diff which uses SIMD or scalar
@@ -600,7 +600,7 @@ TEST_F(ExpressionEvaluatorTest, RollingAvgNormalCase) {
     // series: [1, 2, 3, 4, 5], window=3
     // first 2 points NaN, then averages: (1+2+3)/3=2, (2+3+4)/3=3, (3+4+5)/3=4
     auto series = makeSeries({1000, 2000, 3000, 4000, 5000}, {1.0, 2.0, 3.0, 4.0, 5.0});
-    auto result = series.rolling_avg(3);
+    auto result = series.rollingAvg(3);
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -613,7 +613,7 @@ TEST_F(ExpressionEvaluatorTest, RollingAvgNormalCase) {
 TEST_F(ExpressionEvaluatorTest, RollingAvgWindowSizeOne) {
     // N=1: passthrough, every point is its own average
     auto series = makeSeries({1000, 2000, 3000}, {10.0, 20.0, 30.0});
-    auto result = series.rolling_avg(1);
+    auto result = series.rollingAvg(1);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_DOUBLE_EQ(result.values[0], 10.0);
@@ -624,7 +624,7 @@ TEST_F(ExpressionEvaluatorTest, RollingAvgWindowSizeOne) {
 TEST_F(ExpressionEvaluatorTest, RollingAvgConstantSeries) {
     // All values equal: average always equals that value
     auto series = makeConstantSeries(7.0, 6);
-    auto result = series.rolling_avg(3);
+    auto result = series.rollingAvg(3);
 
     EXPECT_EQ(result.size(), 6);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -637,7 +637,7 @@ TEST_F(ExpressionEvaluatorTest, RollingAvgConstantSeries) {
 TEST_F(ExpressionEvaluatorTest, RollingAvgWindowLargerThanSeries) {
     // N > series length: all NaN
     auto series = makeSeries({1000, 2000}, {1.0, 2.0});
-    auto result = series.rolling_avg(5);
+    auto result = series.rollingAvg(5);
 
     EXPECT_EQ(result.size(), 2);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -669,7 +669,7 @@ TEST_F(ExpressionEvaluatorTest, RollingMinNormalCase) {
     // first 2 NaN, then rolling minimums:
     //   min(3,1,4)=1, min(1,4,1)=1, min(4,1,5)=1, min(1,5,9)=1
     auto series = makeSeries({1000, 2000, 3000, 4000, 5000, 6000}, {3.0, 1.0, 4.0, 1.0, 5.0, 9.0});
-    auto result = series.rolling_min(3);
+    auto result = series.rollingMin(3);
 
     EXPECT_EQ(result.size(), 6);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -683,7 +683,7 @@ TEST_F(ExpressionEvaluatorTest, RollingMinNormalCase) {
 TEST_F(ExpressionEvaluatorTest, RollingMinWindowSizeOne) {
     // N=1: passthrough
     auto series = makeSeries({1000, 2000, 3000}, {5.0, 2.0, 8.0});
-    auto result = series.rolling_min(1);
+    auto result = series.rollingMin(1);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_DOUBLE_EQ(result.values[0], 5.0);
@@ -693,7 +693,7 @@ TEST_F(ExpressionEvaluatorTest, RollingMinWindowSizeOne) {
 
 TEST_F(ExpressionEvaluatorTest, RollingMinConstantSeries) {
     auto series = makeConstantSeries(4.0, 5);
-    auto result = series.rolling_min(3);
+    auto result = series.rollingMin(3);
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -726,7 +726,7 @@ TEST_F(ExpressionEvaluatorTest, RollingMaxNormalCase) {
     // first 2 NaN, then rolling maximums:
     //   max(3,1,4)=4, max(1,4,1)=4, max(4,1,5)=5, max(1,5,9)=9
     auto series = makeSeries({1000, 2000, 3000, 4000, 5000, 6000}, {3.0, 1.0, 4.0, 1.0, 5.0, 9.0});
-    auto result = series.rolling_max(3);
+    auto result = series.rollingMax(3);
 
     EXPECT_EQ(result.size(), 6);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -740,7 +740,7 @@ TEST_F(ExpressionEvaluatorTest, RollingMaxNormalCase) {
 TEST_F(ExpressionEvaluatorTest, RollingMaxWindowSizeOne) {
     // N=1: passthrough
     auto series = makeSeries({1000, 2000, 3000}, {5.0, 2.0, 8.0});
-    auto result = series.rolling_max(1);
+    auto result = series.rollingMax(1);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_DOUBLE_EQ(result.values[0], 5.0);
@@ -750,7 +750,7 @@ TEST_F(ExpressionEvaluatorTest, RollingMaxWindowSizeOne) {
 
 TEST_F(ExpressionEvaluatorTest, RollingMaxConstantSeries) {
     auto series = makeConstantSeries(9.0, 5);
-    auto result = series.rolling_max(3);
+    auto result = series.rollingMax(3);
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -785,7 +785,7 @@ TEST_F(ExpressionEvaluatorTest, RollingStddevNormalCase) {
     //           = (2.25+0.25+0.25+0.25)/4 = 3/4 = 0.75, stddev=sqrt(0.75)
     auto series =
         makeSeries({1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000}, {2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0});
-    auto result = series.rolling_stddev(4);
+    auto result = series.rollingStddev(4);
 
     EXPECT_EQ(result.size(), 8);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -798,7 +798,7 @@ TEST_F(ExpressionEvaluatorTest, RollingStddevNormalCase) {
 TEST_F(ExpressionEvaluatorTest, RollingStddevWindowSizeOne) {
     // N=1: stddev of a single point is always 0
     auto series = makeSeries({1000, 2000, 3000}, {3.0, 7.0, 2.0});
-    auto result = series.rolling_stddev(1);
+    auto result = series.rollingStddev(1);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_DOUBLE_EQ(result.values[0], 0.0);
@@ -809,7 +809,7 @@ TEST_F(ExpressionEvaluatorTest, RollingStddevWindowSizeOne) {
 TEST_F(ExpressionEvaluatorTest, RollingStddevConstantSeries) {
     // Constant series: stddev is always 0 for a full window
     auto series = makeConstantSeries(5.0, 6);
-    auto result = series.rolling_stddev(3);
+    auto result = series.rollingStddev(3);
 
     EXPECT_EQ(result.size(), 6);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -823,7 +823,7 @@ TEST_F(ExpressionEvaluatorTest, RollingStddevKnownValues) {
     // series: [10, 20], window=2
     // mean=(10+20)/2=15, variance=((10-15)^2+(20-15)^2)/2=(25+25)/2=25, stddev=5
     auto series = makeSeries({1000, 2000}, {10.0, 20.0});
-    auto result = series.rolling_stddev(2);
+    auto result = series.rollingStddev(2);
 
     EXPECT_EQ(result.size(), 2);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -848,7 +848,7 @@ TEST_F(ExpressionEvaluatorTest, RollingStddevViaParser) {
 TEST_F(ExpressionEvaluatorTest, RollingStddevFirstNMinusOneAreNaN) {
     // Verify that exactly N-1 leading NaN values are output for window size N=4
     auto series = makeSeries({1000, 2000, 3000, 4000, 5000}, {1.0, 2.0, 3.0, 4.0, 5.0});
-    auto result = series.rolling_stddev(4);
+    auto result = series.rollingStddev(4);
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -1271,7 +1271,7 @@ static const double kNaN = std::numeric_limits<double>::quiet_NaN();
 TEST_F(ExpressionEvaluatorTest, FillForwardBasicGap) {
     // NaN in the middle: filled with the previous real value
     auto series = makeSeries({1000, 2000, 3000, 4000, 5000}, {1.0, kNaN, kNaN, 4.0, 5.0});
-    auto result = series.fill_forward();
+    auto result = series.fillForward();
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
@@ -1284,7 +1284,7 @@ TEST_F(ExpressionEvaluatorTest, FillForwardBasicGap) {
 TEST_F(ExpressionEvaluatorTest, FillForwardNoNaNs) {
     // No NaNs: output identical to input
     auto series = makeSeries({1000, 2000, 3000}, {10.0, 20.0, 30.0});
-    auto result = series.fill_forward();
+    auto result = series.fillForward();
 
     EXPECT_DOUBLE_EQ(result.values[0], 10.0);
     EXPECT_DOUBLE_EQ(result.values[1], 20.0);
@@ -1294,7 +1294,7 @@ TEST_F(ExpressionEvaluatorTest, FillForwardNoNaNs) {
 TEST_F(ExpressionEvaluatorTest, FillForwardAllNaN) {
     // All NaN: output remains all NaN (no real value to carry)
     auto series = makeSeries({1000, 2000, 3000}, {kNaN, kNaN, kNaN});
-    auto result = series.fill_forward();
+    auto result = series.fillForward();
 
     EXPECT_EQ(result.size(), 3);
     for (size_t i = 0; i < result.size(); ++i) {
@@ -1305,7 +1305,7 @@ TEST_F(ExpressionEvaluatorTest, FillForwardAllNaN) {
 TEST_F(ExpressionEvaluatorTest, FillForwardLeadingNaNsStayNaN) {
     // Leading NaNs before any real value must stay NaN
     auto series = makeSeries({1000, 2000, 3000, 4000}, {kNaN, kNaN, 3.0, kNaN});
-    auto result = series.fill_forward();
+    auto result = series.fillForward();
 
     EXPECT_TRUE(std::isnan(result.values[0]));  // leading NaN stays
     EXPECT_TRUE(std::isnan(result.values[1]));  // leading NaN stays
@@ -1316,7 +1316,7 @@ TEST_F(ExpressionEvaluatorTest, FillForwardLeadingNaNsStayNaN) {
 TEST_F(ExpressionEvaluatorTest, FillForwardTrailingNaNsFilled) {
     // Trailing NaNs after last real value are filled by LOCF
     auto series = makeSeries({1000, 2000, 3000, 4000}, {1.0, 2.0, kNaN, kNaN});
-    auto result = series.fill_forward();
+    auto result = series.fillForward();
 
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
     EXPECT_DOUBLE_EQ(result.values[1], 2.0);
@@ -1344,7 +1344,7 @@ TEST_F(ExpressionEvaluatorTest, FillForwardViaParser) {
 TEST_F(ExpressionEvaluatorTest, FillBackwardBasicGap) {
     // NaN in the middle: filled with the next real value
     auto series = makeSeries({1000, 2000, 3000, 4000, 5000}, {1.0, kNaN, kNaN, 4.0, 5.0});
-    auto result = series.fill_backward();
+    auto result = series.fillBackward();
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
@@ -1357,7 +1357,7 @@ TEST_F(ExpressionEvaluatorTest, FillBackwardBasicGap) {
 TEST_F(ExpressionEvaluatorTest, FillBackwardNoNaNs) {
     // No NaNs: passthrough
     auto series = makeSeries({1000, 2000, 3000}, {10.0, 20.0, 30.0});
-    auto result = series.fill_backward();
+    auto result = series.fillBackward();
 
     EXPECT_DOUBLE_EQ(result.values[0], 10.0);
     EXPECT_DOUBLE_EQ(result.values[1], 20.0);
@@ -1367,7 +1367,7 @@ TEST_F(ExpressionEvaluatorTest, FillBackwardNoNaNs) {
 TEST_F(ExpressionEvaluatorTest, FillBackwardAllNaN) {
     // All NaN: remains all NaN
     auto series = makeSeries({1000, 2000, 3000}, {kNaN, kNaN, kNaN});
-    auto result = series.fill_backward();
+    auto result = series.fillBackward();
 
     EXPECT_EQ(result.size(), 3);
     for (size_t i = 0; i < result.size(); ++i) {
@@ -1378,7 +1378,7 @@ TEST_F(ExpressionEvaluatorTest, FillBackwardAllNaN) {
 TEST_F(ExpressionEvaluatorTest, FillBackwardTrailingNaNsStayNaN) {
     // Trailing NaNs after the last real value must stay NaN
     auto series = makeSeries({1000, 2000, 3000, 4000}, {kNaN, 2.0, kNaN, kNaN});
-    auto result = series.fill_backward();
+    auto result = series.fillBackward();
 
     EXPECT_DOUBLE_EQ(result.values[0], 2.0);  // look-ahead fill
     EXPECT_DOUBLE_EQ(result.values[1], 2.0);
@@ -1389,7 +1389,7 @@ TEST_F(ExpressionEvaluatorTest, FillBackwardTrailingNaNsStayNaN) {
 TEST_F(ExpressionEvaluatorTest, FillBackwardLeadingNaNsFilled) {
     // Leading NaNs before first real value are filled by backward carry
     auto series = makeSeries({1000, 2000, 3000, 4000}, {kNaN, kNaN, 3.0, 4.0});
-    auto result = series.fill_backward();
+    auto result = series.fillBackward();
 
     EXPECT_DOUBLE_EQ(result.values[0], 3.0);  // filled from index 2
     EXPECT_DOUBLE_EQ(result.values[1], 3.0);  // filled from index 2
@@ -1422,7 +1422,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearBasicGap) {
     //   index 2: (3000-1000)/4000 = 0.5  -> 0.0 + 0.5*4.0  = 2.0
     //   index 3: (4000-1000)/4000 = 0.75 -> 0.0 + 0.75*4.0 = 3.0
     auto series = makeSeries({1000, 2000, 3000, 4000, 5000}, {0.0, kNaN, kNaN, kNaN, 4.0});
-    auto result = series.fill_linear();
+    auto result = series.fillLinear();
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_DOUBLE_EQ(result.values[0], 0.0);
@@ -1435,7 +1435,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearBasicGap) {
 TEST_F(ExpressionEvaluatorTest, FillLinearNoNaNs) {
     // No NaNs: passthrough
     auto series = makeSeries({1000, 2000, 3000}, {1.0, 2.0, 3.0});
-    auto result = series.fill_linear();
+    auto result = series.fillLinear();
 
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
     EXPECT_DOUBLE_EQ(result.values[1], 2.0);
@@ -1445,7 +1445,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearNoNaNs) {
 TEST_F(ExpressionEvaluatorTest, FillLinearAllNaN) {
     // All NaN: remains all NaN (entire series is a leading+trailing run)
     auto series = makeSeries({1000, 2000, 3000}, {kNaN, kNaN, kNaN});
-    auto result = series.fill_linear();
+    auto result = series.fillLinear();
 
     EXPECT_EQ(result.size(), 3);
     for (size_t i = 0; i < result.size(); ++i) {
@@ -1456,7 +1456,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearAllNaN) {
 TEST_F(ExpressionEvaluatorTest, FillLinearLeadingNaNsStayNaN) {
     // Leading NaN run has no left anchor: stays NaN
     auto series = makeSeries({1000, 2000, 3000, 4000}, {kNaN, kNaN, 3.0, 5.0});
-    auto result = series.fill_linear();
+    auto result = series.fillLinear();
 
     EXPECT_TRUE(std::isnan(result.values[0]));
     EXPECT_TRUE(std::isnan(result.values[1]));
@@ -1467,7 +1467,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearLeadingNaNsStayNaN) {
 TEST_F(ExpressionEvaluatorTest, FillLinearTrailingNaNsStayNaN) {
     // Trailing NaN run has no right anchor: stays NaN
     auto series = makeSeries({1000, 2000, 3000, 4000}, {1.0, 3.0, kNaN, kNaN});
-    auto result = series.fill_linear();
+    auto result = series.fillLinear();
 
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
     EXPECT_DOUBLE_EQ(result.values[1], 3.0);
@@ -1482,7 +1482,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearUnevenTimestamps) {
     //   index 1: fraction = (100-0)/1000 = 0.1 -> 0.0 + 0.1*10.0 = 1.0
     //   index 2: fraction = (900-0)/1000 = 0.9 -> 0.0 + 0.9*10.0 = 9.0
     auto series = makeSeries({0, 100, 900, 1000}, {0.0, kNaN, kNaN, 10.0});
-    auto result = series.fill_linear();
+    auto result = series.fillLinear();
 
     EXPECT_EQ(result.size(), 4);
     EXPECT_DOUBLE_EQ(result.values[0], 0.0);
@@ -1498,7 +1498,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearMultipleGaps) {
     // Gap 1: index 1, t0=0/v0=0, t1=2000/v1=2.0: fraction=(1000-0)/2000=0.5 -> 1.0
     // Gap 2: index 3, t0=2000/v0=2.0, t1=4000/v1=4.0: fraction=(3000-2000)/2000=0.5 -> 3.0
     auto series = makeSeries({0, 1000, 2000, 3000, 4000}, {0.0, kNaN, 2.0, kNaN, 4.0});
-    auto result = series.fill_linear();
+    auto result = series.fillLinear();
 
     EXPECT_DOUBLE_EQ(result.values[0], 0.0);
     EXPECT_NEAR(result.values[1], 1.0, 1e-10);
@@ -1526,7 +1526,7 @@ TEST_F(ExpressionEvaluatorTest, FillLinearViaParser) {
 TEST_F(ExpressionEvaluatorTest, FillValueBasicGap) {
     // Replace every NaN with 99.0; non-NaNs unchanged
     auto series = makeSeries({1000, 2000, 3000, 4000}, {1.0, kNaN, kNaN, 4.0});
-    auto result = series.fill_value(99.0);
+    auto result = series.fillValue(99.0);
 
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
     EXPECT_DOUBLE_EQ(result.values[1], 99.0);
@@ -1537,7 +1537,7 @@ TEST_F(ExpressionEvaluatorTest, FillValueBasicGap) {
 TEST_F(ExpressionEvaluatorTest, FillValueNoNaNs) {
     // No NaNs: passthrough
     auto series = makeSeries({1000, 2000, 3000}, {1.0, 2.0, 3.0});
-    auto result = series.fill_value(0.0);
+    auto result = series.fillValue(0.0);
 
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
     EXPECT_DOUBLE_EQ(result.values[1], 2.0);
@@ -1547,7 +1547,7 @@ TEST_F(ExpressionEvaluatorTest, FillValueNoNaNs) {
 TEST_F(ExpressionEvaluatorTest, FillValueAllNaN) {
     // All NaN: all become v
     auto series = makeSeries({1000, 2000, 3000}, {kNaN, kNaN, kNaN});
-    auto result = series.fill_value(7.0);
+    auto result = series.fillValue(7.0);
 
     EXPECT_EQ(result.size(), 3);
     for (size_t i = 0; i < result.size(); ++i) {
@@ -1558,8 +1558,8 @@ TEST_F(ExpressionEvaluatorTest, FillValueAllNaN) {
 TEST_F(ExpressionEvaluatorTest, FillValueZeroEqualsDefaultZero) {
     // fill_value(s, 0) must behave identically to default_zero(s)
     auto series = makeSeries({1000, 2000, 3000, 4000}, {1.0, kNaN, 3.0, kNaN});
-    auto r_fill = series.fill_value(0.0);
-    auto r_defz = series.default_zero();
+    auto r_fill = series.fillValue(0.0);
+    auto r_defz = series.defaultZero();
 
     ASSERT_EQ(r_fill.size(), r_defz.size());
     for (size_t i = 0; i < r_fill.size(); ++i) {
@@ -1737,7 +1737,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersConstantSeriesNoTrend) {
     // i=1: level=0.3*5 + 0.7*(5+0)=5, trend=0.2*(5-5)+0.8*0=0, output[1]=5
     // ... all remain 5
     auto series = makeConstantSeries(5.0, 5);
-    auto result = series.holt_winters(0.3, 0.2);
+    auto result = series.holtWinters(0.3, 0.2);
 
     EXPECT_EQ(result.size(), 5);
     for (size_t i = 0; i < result.size(); ++i) {
@@ -1758,7 +1758,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersLinearTrendTracking) {
     //   trend = 0.8*(2.888-1.8) + 0.2*0.64 = 0.8*1.088 + 0.128 = 0.8704 + 0.128 = 0.9984
     //   output[2]=2.888
     auto series = makeRampSeries(1.0, 1.0, 5);
-    auto result = series.holt_winters(0.8, 0.8);
+    auto result = series.holtWinters(0.8, 0.8);
 
     EXPECT_EQ(result.size(), 5);
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
@@ -1782,7 +1782,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersAlpha1Beta1Identity) {
     //   output[2]=30
     // So output equals input exactly for non-NaN values
     auto series = makeSeries({1000, 2000, 3000, 4000}, {10.0, 20.0, 30.0, 40.0});
-    auto result = series.holt_winters(1.0, 1.0);
+    auto result = series.holtWinters(1.0, 1.0);
 
     EXPECT_EQ(result.size(), 4);
     EXPECT_DOUBLE_EQ(result.values[0], 10.0);
@@ -1802,7 +1802,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersNanInMiddleCarriesForward) {
     //   output[2]=20
     const double kNaN = std::numeric_limits<double>::quiet_NaN();
     auto series = makeSeries({1000, 2000, 3000}, {10.0, kNaN, 30.0});
-    auto result = series.holt_winters(0.5, 0.5);
+    auto result = series.holtWinters(0.5, 0.5);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_DOUBLE_EQ(result.values[0], 10.0);
@@ -1821,7 +1821,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersLeadingNaNsStayNaN) {
     //   output[3]=25
     const double kNaN = std::numeric_limits<double>::quiet_NaN();
     auto series = makeSeries({1000, 2000, 3000, 4000}, {kNaN, kNaN, 20.0, 30.0});
-    auto result = series.holt_winters(0.5, 0.5);
+    auto result = series.holtWinters(0.5, 0.5);
 
     EXPECT_EQ(result.size(), 4);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -1834,7 +1834,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersAllNaN) {
     // All NaN: output is all NaN
     const double kNaN = std::numeric_limits<double>::quiet_NaN();
     auto series = makeSeries({1000, 2000, 3000}, {kNaN, kNaN, kNaN});
-    auto result = series.holt_winters(0.3, 0.2);
+    auto result = series.holtWinters(0.3, 0.2);
 
     EXPECT_EQ(result.size(), 3);
     for (size_t i = 0; i < result.size(); ++i) {
@@ -1845,7 +1845,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersAllNaN) {
 TEST_F(ExpressionEvaluatorTest, HoltWintersSinglePoint) {
     // Single point: level=value, trend=0, output[0]=value
     auto series = makeSeries({1000}, {42.0});
-    auto result = series.holt_winters(0.3, 0.2);
+    auto result = series.holtWinters(0.3, 0.2);
 
     EXPECT_EQ(result.size(), 1);
     EXPECT_DOUBLE_EQ(result.values[0], 42.0);
@@ -1854,7 +1854,7 @@ TEST_F(ExpressionEvaluatorTest, HoltWintersSinglePoint) {
 TEST_F(ExpressionEvaluatorTest, HoltWintersEmptySeries) {
     // Empty series: empty output
     auto series = makeSeries({}, {});
-    auto result = series.holt_winters(0.5, 0.5);
+    auto result = series.holtWinters(0.5, 0.5);
 
     EXPECT_EQ(result.size(), 0);
 }
@@ -1891,7 +1891,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShiftForwardOneSecond) {
     // Timestamps [1000, 2000, 3000] ns, shift '+1s' = 1000000000 ns forward
     auto series = makeSeries({1000ULL, 2000ULL, 3000ULL}, {10.0, 20.0, 30.0});
     int64_t offsetNs = 1000000000LL;  // 1 second
-    auto result = series.time_shift(offsetNs);
+    auto result = series.timeShift(offsetNs);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_EQ((*result.timestamps)[0], 1000ULL + 1000000000ULL);
@@ -1909,7 +1909,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShiftBackwardOneHour) {
     auto series = makeSeries({base, base + 1000000000ULL, base + 2000000000ULL}, {1.0, 2.0, 3.0});
 
     int64_t offsetNs = -3600000000000LL;  // -1 hour
-    auto result = series.time_shift(offsetNs);
+    auto result = series.timeShift(offsetNs);
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_EQ((*result.timestamps)[0], base - 3600000000000ULL);
@@ -1925,7 +1925,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShiftSevenDays) {
     const uint64_t sevenDaysNs = 7ULL * 86400ULL * 1000000000ULL;
     auto series = makeSeries({1000000000000ULL, 2000000000000ULL}, {42.0, 99.0});
 
-    auto result = series.time_shift(static_cast<int64_t>(sevenDaysNs));
+    auto result = series.timeShift(static_cast<int64_t>(sevenDaysNs));
 
     EXPECT_EQ(result.size(), 2);
     EXPECT_EQ((*result.timestamps)[0], 1000000000000ULL + sevenDaysNs);
@@ -1938,7 +1938,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShiftThirtyMinutes) {
     // '30m' = 30 * 60 * 1e9 ns
     const uint64_t thirtyMinNs = 30ULL * 60ULL * 1000000000ULL;
     auto series = makeSeries({5000000000000ULL}, {7.5});
-    auto result = series.time_shift(static_cast<int64_t>(thirtyMinNs));
+    auto result = series.timeShift(static_cast<int64_t>(thirtyMinNs));
 
     EXPECT_EQ(result.size(), 1);
     EXPECT_EQ((*result.timestamps)[0], 5000000000000ULL + thirtyMinNs);
@@ -1949,7 +1949,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShift500ms) {
     // '500ms' = 500 * 1e6 ns
     const uint64_t fiveHundredMsNs = 500ULL * 1000000ULL;
     auto series = makeSeries({100000000ULL, 200000000ULL, 300000000ULL}, {1.1, 2.2, 3.3});
-    auto result = series.time_shift(static_cast<int64_t>(fiveHundredMsNs));
+    auto result = series.timeShift(static_cast<int64_t>(fiveHundredMsNs));
 
     EXPECT_EQ(result.size(), 3);
     EXPECT_EQ((*result.timestamps)[0], 100000000ULL + fiveHundredMsNs);
@@ -1963,7 +1963,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShift500ms) {
 TEST_F(ExpressionEvaluatorTest, TimeShiftZeroOffset) {
     // Offset of 0 ns: timestamps unchanged
     auto series = makeSeries({1000ULL, 2000ULL, 3000ULL}, {5.0, 6.0, 7.0});
-    auto result = series.time_shift(0LL);
+    auto result = series.timeShift(0LL);
 
     EXPECT_EQ((*result.timestamps)[0], 1000ULL);
     EXPECT_EQ((*result.timestamps)[1], 2000ULL);
@@ -1975,7 +1975,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShiftZeroOffset) {
 
 TEST_F(ExpressionEvaluatorTest, TimeShiftEmptySeries) {
     auto series = makeSeries({}, {});
-    auto result = series.time_shift(1000000000LL);
+    auto result = series.timeShift(1000000000LL);
     EXPECT_TRUE(result.empty());
 }
 
@@ -1983,7 +1983,7 @@ TEST_F(ExpressionEvaluatorTest, TimeShiftValuesPreservedExactly) {
     // NaN values in the series are preserved unchanged by time_shift
     const double nan = std::numeric_limits<double>::quiet_NaN();
     auto series = makeSeries({1000ULL, 2000ULL, 3000ULL}, {1.0, nan, 3.0});
-    auto result = series.time_shift(500LL);
+    auto result = series.timeShift(500LL);
 
     EXPECT_DOUBLE_EQ(result.values[0], 1.0);
     EXPECT_TRUE(std::isnan(result.values[1]));
@@ -2500,7 +2500,7 @@ TEST_F(ExpressionEvaluatorTest, AsPercentBasic) {
     // series=[50], total=[200] → [25.0]
     auto series = makeSeries({1000}, {50.0});
     auto total = makeSeries({1000}, {200.0});
-    auto result = AlignedSeries::as_percent(series, total);
+    auto result = AlignedSeries::asPercent(series, total);
 
     ASSERT_EQ(result.size(), 1);
     EXPECT_DOUBLE_EQ(result.values[0], 25.0);
@@ -2510,7 +2510,7 @@ TEST_F(ExpressionEvaluatorTest, AsPercentScalarTotal) {
     // series=[1,2,3], total=10 (scalar broadcast) → [10.0, 20.0, 30.0]
     auto series = makeSeries({1000, 2000, 3000}, {1.0, 2.0, 3.0});
     auto total = makeSeries({1000, 2000, 3000}, {10.0, 10.0, 10.0});
-    auto result = AlignedSeries::as_percent(series, total);
+    auto result = AlignedSeries::asPercent(series, total);
 
     ASSERT_EQ(result.size(), 3);
     EXPECT_DOUBLE_EQ(result.values[0], 10.0);
@@ -2522,7 +2522,7 @@ TEST_F(ExpressionEvaluatorTest, AsPercentDivisionByZero) {
     // total=0 → NaN
     auto series = makeSeries({1000}, {50.0});
     auto total = makeSeries({1000}, {0.0});
-    auto result = AlignedSeries::as_percent(series, total);
+    auto result = AlignedSeries::asPercent(series, total);
 
     ASSERT_EQ(result.size(), 1);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -2533,7 +2533,7 @@ TEST_F(ExpressionEvaluatorTest, AsPercentNaNInSeries) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     auto series = makeSeries({1000, 2000}, {nan, 50.0});
     auto total = makeSeries({1000, 2000}, {100.0, 100.0});
-    auto result = AlignedSeries::as_percent(series, total);
+    auto result = AlignedSeries::asPercent(series, total);
 
     ASSERT_EQ(result.size(), 2);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -2545,7 +2545,7 @@ TEST_F(ExpressionEvaluatorTest, AsPercentNaNInTotal) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     auto series = makeSeries({1000, 2000}, {50.0, 25.0});
     auto total = makeSeries({1000, 2000}, {nan, 100.0});
-    auto result = AlignedSeries::as_percent(series, total);
+    auto result = AlignedSeries::asPercent(series, total);
 
     ASSERT_EQ(result.size(), 2);
     EXPECT_TRUE(std::isnan(result.values[0]));
@@ -2601,7 +2601,7 @@ TEST_F(ExpressionEvaluatorTest, FillSplineReproducesQuadratic) {
         vals.push_back((x >= 4 && x <= 6) ? std::numeric_limits<double>::quiet_NaN() : v);
     }
     auto s = makeSeries(std::move(ts), std::move(vals));
-    auto filled = s.fill_spline();
+    auto filled = s.fillSpline();
 
     // Exact values: 16, 25, 36.  Natural spline won't be exact but must be
     // close (quadratic curvature well within cubic's reach); linear would
@@ -2618,7 +2618,7 @@ TEST_F(ExpressionEvaluatorTest, FillSplineLeadingTrailingStayNaN) {
     auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000},
                         {std::numeric_limits<double>::quiet_NaN(), 1.0, std::numeric_limits<double>::quiet_NaN(), 3.0,
                          5.0, std::numeric_limits<double>::quiet_NaN()});
-    auto filled = s.fill_spline();
+    auto filled = s.fillSpline();
     EXPECT_TRUE(std::isnan(filled.values[0]));  // leading stays NaN
     EXPECT_FALSE(std::isnan(filled.values[2]));  // interior filled
     EXPECT_TRUE(std::isnan(filled.values[5]));  // trailing stays NaN
@@ -2627,13 +2627,13 @@ TEST_F(ExpressionEvaluatorTest, FillSplineLeadingTrailingStayNaN) {
 TEST_F(ExpressionEvaluatorTest, FillSplineFewKnotsFallsBackToLinear) {
     // Only 2 knots: degenerates to linear interpolation.
     auto s = makeSeries({1000, 2000, 3000}, {0.0, std::numeric_limits<double>::quiet_NaN(), 10.0});
-    auto filled = s.fill_spline();
+    auto filled = s.fillSpline();
     EXPECT_DOUBLE_EQ(filled.values[1], 5.0);
 }
 
 TEST_F(ExpressionEvaluatorTest, FillSplineNoNaNsIsIdentity) {
     auto s = makeSeries({1000, 2000, 3000, 4000}, {1.0, 2.0, 3.0, 4.0});
-    auto filled = s.fill_spline();
+    auto filled = s.fillSpline();
     for (size_t i = 0; i < 4; ++i) {
         EXPECT_DOUBLE_EQ(filled.values[i], s.values[i]);
     }
@@ -2649,7 +2649,7 @@ TEST_F(ExpressionEvaluatorTest, GaussianSmoothPreservesConstant) {
     for (size_t i = 0; i < 50; ++i)
         ts.push_back(1000 * (i + 1));
     auto s = makeSeries(std::move(ts), std::move(vals));
-    auto smoothed = s.gaussian_smooth(2.0);
+    auto smoothed = s.gaussianSmooth(2.0);
     for (size_t i = 0; i < 50; ++i) {
         EXPECT_NEAR(smoothed.values[i], 7.5, 1e-9) << "at " << i;
     }
@@ -2665,7 +2665,7 @@ TEST_F(ExpressionEvaluatorTest, GaussianSmoothReducesNoiseKeepsMean) {
         vals.push_back(10.0 + ((i % 2 == 0) ? 1.0 : -1.0));
     }
     auto s = makeSeries(std::move(ts), std::move(vals));
-    auto smoothed = s.gaussian_smooth(3.0);
+    auto smoothed = s.gaussianSmooth(3.0);
     for (size_t i = 20; i < 80; ++i) {
         EXPECT_NEAR(smoothed.values[i], 10.0, 0.05) << "at " << i;
     }
@@ -2680,7 +2680,7 @@ TEST_F(ExpressionEvaluatorTest, GaussianSmoothSkipsNaN) {
         ts.push_back(1000 * (i + 1));
     vals[10] = std::numeric_limits<double>::quiet_NaN();
     auto s = makeSeries(std::move(ts), std::move(vals));
-    auto smoothed = s.gaussian_smooth(1.5);
+    auto smoothed = s.gaussianSmooth(1.5);
     for (size_t i = 0; i < 21; ++i) {
         EXPECT_NEAR(smoothed.values[i], 5.0, 1e-9) << "at " << i;
     }
@@ -2690,7 +2690,7 @@ TEST_F(ExpressionEvaluatorTest, GaussianSmoothAllNaNStaysNaN) {
     auto s = makeSeries({1000, 2000, 3000},
                         {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
                          std::numeric_limits<double>::quiet_NaN()});
-    auto smoothed = s.gaussian_smooth(1.0);
+    auto smoothed = s.gaussianSmooth(1.0);
     for (size_t i = 0; i < 3; ++i) {
         EXPECT_TRUE(std::isnan(smoothed.values[i]));
     }
@@ -2738,7 +2738,7 @@ TEST_F(ExpressionEvaluatorTest, RoundHalfAwayFromZero) {
     for (double v : vals)
         expect.push_back(std::round(v));
     auto s = makeSeries(std::move(ts), std::move(vals));
-    auto r = s.round_nearest();
+    auto r = s.roundNearest();
     for (size_t i = 0; i < expect.size(); ++i) {
         EXPECT_DOUBLE_EQ(r.values[i], expect[i]) << "at " << i;
     }
@@ -2874,7 +2874,7 @@ TEST_F(ExpressionEvaluatorTest, StandardizeConstantSeriesIsZero) {
 TEST_F(ExpressionEvaluatorTest, RollingSumBasics) {
     auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000},
                         {1.0, 2.0, 3.0, std::numeric_limits<double>::quiet_NaN(), 5.0, 6.0});
-    auto r = s.rolling_sum(3);
+    auto r = s.rollingSum(3);
     EXPECT_TRUE(std::isnan(r.values[0]));  // warmup
     EXPECT_TRUE(std::isnan(r.values[1]));
     EXPECT_DOUBLE_EQ(r.values[2], 6.0);   // 1+2+3
@@ -2891,17 +2891,17 @@ TEST_F(ExpressionEvaluatorTest, RollingMedianRobustToOutlier) {
         ts.push_back(1000 * (i + 1));
     vals[10] = 10000.0;  // outlier
     auto s = makeSeries(std::move(ts), std::move(vals));
-    auto med = s.rolling_median(5);
+    auto med = s.rollingMedian(5);
     for (size_t i = 4; i < 21; ++i) {
         EXPECT_DOUBLE_EQ(med.values[i], 10.0) << "at " << i;
     }
-    auto avg = s.rolling_avg(5);
+    auto avg = s.rollingAvg(5);
     EXPECT_GT(avg.values[10], 1000.0);  // proves the outlier is in-window
 }
 
 TEST_F(ExpressionEvaluatorTest, RollingMedianEvenWindowInterpolates) {
     auto s = makeSeries({1000, 2000, 3000, 4000}, {1.0, 2.0, 3.0, 4.0});
-    auto med = s.rolling_median(4);
+    auto med = s.rollingMedian(4);
     // Window {1,2,3,4}: linear-interp median = 2.5
     EXPECT_DOUBLE_EQ(med.values[3], 2.5);
 }
@@ -2909,7 +2909,7 @@ TEST_F(ExpressionEvaluatorTest, RollingMedianEvenWindowInterpolates) {
 TEST_F(ExpressionEvaluatorTest, RollingMedianSlidesCorrectly) {
     auto s = makeSeries({1000, 2000, 3000, 4000, 5000, 6000, 7000},
                         {7.0, 1.0, 5.0, 3.0, 9.0, 2.0, 8.0});
-    auto med = s.rolling_median(3);
+    auto med = s.rollingMedian(3);
     EXPECT_DOUBLE_EQ(med.values[2], 5.0);  // {7,1,5}
     EXPECT_DOUBLE_EQ(med.values[3], 3.0);  // {1,5,3}
     EXPECT_DOUBLE_EQ(med.values[4], 5.0);  // {5,3,9}
@@ -2925,12 +2925,12 @@ TEST_F(ExpressionEvaluatorTest, RollingPercentileEndpointsAndMid) {
         vals.push_back(static_cast<double>((i * 13) % 30));
     }
     auto s = makeSeries(std::move(ts), std::move(vals));
-    auto p0 = s.rolling_percentile(10, 0.0);
-    auto p100 = s.rolling_percentile(10, 100.0);
-    auto p50 = s.rolling_percentile(10, 50.0);
-    auto med = s.rolling_median(10);
-    auto rmin = s.rolling_min(10);
-    auto rmax = s.rolling_max(10);
+    auto p0 = s.rollingPercentile(10, 0.0);
+    auto p100 = s.rollingPercentile(10, 100.0);
+    auto p50 = s.rollingPercentile(10, 50.0);
+    auto med = s.rollingMedian(10);
+    auto rmin = s.rollingMin(10);
+    auto rmax = s.rollingMax(10);
     for (size_t i = 9; i < 30; ++i) {
         EXPECT_DOUBLE_EQ(p0.values[i], rmin.values[i]) << "p0 != min at " << i;
         EXPECT_DOUBLE_EQ(p100.values[i], rmax.values[i]) << "p100 != max at " << i;
@@ -2940,9 +2940,9 @@ TEST_F(ExpressionEvaluatorTest, RollingPercentileEndpointsAndMid) {
 
 TEST_F(ExpressionEvaluatorTest, RollingWindowFunctionsRejectBadN) {
     auto s = makeSeries({1000, 2000}, {1.0, 2.0});
-    EXPECT_THROW(s.rolling_sum(0), EvaluationException);
-    EXPECT_THROW(s.rolling_median(-1), EvaluationException);
-    EXPECT_THROW(s.rolling_percentile(0, 50.0), EvaluationException);
+    EXPECT_THROW(s.rollingSum(0), EvaluationException);
+    EXPECT_THROW(s.rollingMedian(-1), EvaluationException);
+    EXPECT_THROW(s.rollingPercentile(0, 50.0), EvaluationException);
 }
 
 // ==================== count_of_series / stddev_of_series ====================

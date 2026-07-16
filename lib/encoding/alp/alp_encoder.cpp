@@ -26,13 +26,13 @@ struct ScaleResult {
 // Verify round-trip: (encoded * 10^fac) / 10^exp == original value
 inline ScaleResult scaleValue(double value, uint8_t exp, uint8_t fac) {
     // Multiply by 10^exp
-    double scaled = value * alp::FACT_ARR[exp];
+    double scaled = value * timestar::alp::FACT_ARR[exp];
 
     // Round to nearest integer
     double rounded = std::round(scaled);
 
     // Check for overflow before casting
-    if (rounded > static_cast<double>(alp::MAX_SAFE_INT) || rounded < static_cast<double>(alp::MIN_SAFE_INT)) {
+    if (rounded > static_cast<double>(timestar::alp::MAX_SAFE_INT) || rounded < static_cast<double>(timestar::alp::MIN_SAFE_INT)) {
         return {0, false};
     }
 
@@ -40,12 +40,12 @@ inline ScaleResult scaleValue(double value, uint8_t exp, uint8_t fac) {
 
     // Apply factoring: divide by 10^fac (integer division)
     if (fac > 0) {
-        int64_t factor = static_cast<int64_t>(alp::FACT_ARR[fac]);
+        int64_t factor = static_cast<int64_t>(timestar::alp::FACT_ARR[fac]);
         encoded = encoded / factor;
     }
 
     // Verify round-trip
-    double decoded = static_cast<double>(encoded) * alp::FRAC_ARR[fac] / alp::FACT_ARR[exp];
+    double decoded = static_cast<double>(encoded) * timestar::alp::FRAC_ARR[fac] / timestar::alp::FACT_ARR[exp];
     bool exact = (decoded == value);
 
     return {encoded, exact};
@@ -59,14 +59,14 @@ struct BestPair {
 };
 
 BestPair findBestExpFac(const double* values, size_t count) {
-    const size_t sample_size = std::min(count, alp::ALP_SAMPLE_SIZE);
+    const size_t sample_size = std::min(count, timestar::alp::ALP_SAMPLE_SIZE);
 
     BestPair best;
     best.exceptions = sample_size + 1;
 
     // Build sample indices (evenly spaced) in a stack buffer — no heap
     // allocation per call (this runs once per TSM block / WAL entry).
-    static_assert(alp::ALP_SAMPLE_SIZE <= 256, "sample stack buffer sized for ALP_SAMPLE_SIZE");
+    static_assert(timestar::alp::ALP_SAMPLE_SIZE <= 256, "sample stack buffer sized for ALP_SAMPLE_SIZE");
     std::array<size_t, 256> sample_indices;
     if (sample_size == count) {
         for (size_t i = 0; i < count; ++i)
@@ -78,7 +78,7 @@ BestPair findBestExpFac(const double* values, size_t count) {
     }
 
     // exp >= fac is required (exp is the total decimal digits, fac is the integer part)
-    for (uint8_t exp = 0; exp < alp::EXP_COUNT; ++exp) {
+    for (uint8_t exp = 0; exp < timestar::alp::EXP_COUNT; ++exp) {
         for (uint8_t fac = 0; fac <= exp; ++fac) {
             size_t exceptions = 0;
 
@@ -171,20 +171,20 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
     const size_t startPos = target.size();
 
     const size_t total_values = values.size();
-    const size_t num_blocks = (total_values + alp::ALP_VECTOR_SIZE - 1) / alp::ALP_VECTOR_SIZE;
+    const size_t num_blocks = (total_values + timestar::alp::ALP_VECTOR_SIZE - 1) / timestar::alp::ALP_VECTOR_SIZE;
     if (num_blocks > UINT16_MAX)
         throw std::overflow_error("ALP: too many blocks for 16-bit header field");
-    const size_t tail_count = total_values % alp::ALP_VECTOR_SIZE;
+    const size_t tail_count = total_values % timestar::alp::ALP_VECTOR_SIZE;
 
     // Determine scheme: try ALP first, fall back to ALP_RD
     auto best = findBestExpFac(values.data(), total_values);
-    double exception_rate = static_cast<double>(best.exceptions) / std::min(total_values, alp::ALP_SAMPLE_SIZE);
+    double exception_rate = static_cast<double>(best.exceptions) / std::min(total_values, timestar::alp::ALP_SAMPLE_SIZE);
 
-    uint8_t scheme = (exception_rate > alp::ALP_RD_EXCEPTION_THRESHOLD) ? alp::SCHEME_ALP_RD : alp::SCHEME_ALP;
+    uint8_t scheme = (exception_rate > timestar::alp::ALP_RD_EXCEPTION_THRESHOLD) ? timestar::alp::SCHEME_ALP_RD : timestar::alp::SCHEME_ALP;
 
     // Delta-benefit heuristic: sample first block to check if delta reduces bit width
-    if (scheme == alp::SCHEME_ALP) {
-        const size_t sample_count = std::min(total_values, alp::ALP_VECTOR_SIZE);
+    if (scheme == timestar::alp::SCHEME_ALP) {
+        const size_t sample_count = std::min(total_values, timestar::alp::ALP_VECTOR_SIZE);
         int64_t abs_min = std::numeric_limits<int64_t>::max();
         int64_t abs_max = std::numeric_limits<int64_t>::min();
         uint64_t zz_min = UINT64_MAX;
@@ -226,12 +226,12 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             delta_bw = abs_bw;
         }
         if (delta_bw < abs_bw) {
-            scheme = alp::SCHEME_ALP_DELTA;
+            scheme = timestar::alp::SCHEME_ALP_DELTA;
         }
     }
 
     // Pre-allocate estimated space in the target buffer (rough upper bound in bytes)
-    const size_t est_bytes = (2 + num_blocks * (2 + alp::ALP_VECTOR_SIZE + 128)) * sizeof(uint64_t);
+    const size_t est_bytes = (2 + num_blocks * (2 + timestar::alp::ALP_VECTOR_SIZE + 128)) * sizeof(uint64_t);
     target.reserve(startPos + est_bytes);
 
     // === Stream Header (2 x uint64_t) ===
@@ -240,7 +240,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         throw std::overflow_error("ALP encoder: total_values " + std::to_string(total_values) +
                                   " exceeds 32-bit header capacity");
     }
-    uint64_t header0 = static_cast<uint64_t>(alp::ALP_MAGIC) | (static_cast<uint64_t>(total_values) << 32);
+    uint64_t header0 = static_cast<uint64_t>(timestar::alp::ALP_MAGIC) | (static_cast<uint64_t>(total_values) << 32);
     target.write(header0);
 
     // Word 1: [0:15] num_blocks, [16:31] tail_count, [32:39] scheme
@@ -248,13 +248,13 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
                        (static_cast<uint64_t>(scheme) << 32);
     target.write(header1);
 
-    if (scheme == alp::SCHEME_ALP || scheme == alp::SCHEME_ALP_DELTA) {
+    if (scheme == timestar::alp::SCHEME_ALP || scheme == timestar::alp::SCHEME_ALP_DELTA) {
         // === ALP Encoding (with optional delta) ===
         const uint8_t exp = best.exp;
         const uint8_t fac = best.fac;
 
         // Scratch buffers hoisted out of the block loop to avoid per-block heap allocations.
-        std::vector<int64_t> encoded(alp::ALP_VECTOR_SIZE);
+        std::vector<int64_t> encoded(timestar::alp::ALP_VECTOR_SIZE);
         std::vector<uint16_t> exc_positions;
         std::vector<uint64_t> exc_values;
         std::vector<uint64_t> packed;
@@ -262,11 +262,11 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         // Single-pass masked SIMD scale loop: only for fac == 0 (integer
         // divide by 10^fac has no matching SIMD equivalent) and only on
         // targets with native i64<->f64 conversion (AVX-512 DQ).
-        const bool use_simd_scale = (fac == 0) && alp::simd::alpScaleSimdAvailable();
+        const bool use_simd_scale = (fac == 0) && timestar::alp::simd::alpScaleSimdAvailable();
 
         for (size_t block = 0; block < num_blocks; ++block) {
-            const size_t block_start = block * alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
+            const size_t block_start = block * timestar::alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : timestar::alp::ALP_VECTOR_SIZE;
 
             // Reuse scratch buffers (resize is no-op when <= capacity)
             encoded.resize(block_count);
@@ -281,7 +281,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
                 exc_positions.resize(block_count);
                 exc_values.resize(block_count);
                 const size_t n_exc =
-                    alp::simd::alpScaleF0(values.data() + block_start, block_count, alp::FACT_ARR[exp],
+                    timestar::alp::simd::alpScaleF0(values.data() + block_start, block_count, timestar::alp::FACT_ARR[exp],
                                           encoded.data(), &min_val, &max_val, exc_positions.data(), exc_values.data());
                 exc_positions.resize(n_exc);
                 exc_values.resize(n_exc);
@@ -310,7 +310,7 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             }
 
             // === Delta + Zigzag Transform (SCHEME_ALP_DELTA only) ===
-            if (scheme == alp::SCHEME_ALP_DELTA) {
+            if (scheme == timestar::alp::SCHEME_ALP_DELTA) {
                 // Find first non-exception and save its absolute value
                 size_t exc_scan = 0;
                 size_t first_non_exc = block_count;
@@ -385,17 +385,17 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             target.write(std::bit_cast<uint64_t>(min_val));
 
             // Word 2: first_value (SCHEME_ALP_DELTA only)
-            if (scheme == alp::SCHEME_ALP_DELTA) {
+            if (scheme == timestar::alp::SCHEME_ALP_DELTA) {
                 target.write(std::bit_cast<uint64_t>(first_value));
             }
 
             // === FFOR Data ===
             // ffor_pack writes every output word, so resize() (a no-op after the
             // first block) replaces the per-block zero-fill assign().
-            size_t packed_words = alp::ffor_packed_words(block_count, bw);
+            size_t packed_words = timestar::alp::ffor_packed_words(block_count, bw);
             if (packed_words > 0) {
                 packed.resize(packed_words);
-                alp::ffor_pack(encoded.data(), block_count, min_val, bw, packed.data());
+                timestar::alp::ffor_pack(encoded.data(), block_count, min_val, bw, packed.data());
                 target.write_array(packed.data(), packed_words);
             }
 
@@ -420,18 +420,18 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
         }
     } else {
         // === ALP_RD Encoding ===
-        uint8_t right_bit_count = alp::ALPRD::findBestSplit(values.data(), total_values);
+        uint8_t right_bit_count = timestar::alp::ALPRD::findBestSplit(values.data(), total_values);
 
         // Scratch buffers hoisted out of the block loop
         std::vector<uint64_t> left_packed;
         std::vector<uint64_t> right_packed;
-        alp::ALPRDBlockResult rd;  // reused across blocks (vector capacity retained)
+        timestar::alp::ALPRDBlockResult rd;  // reused across blocks (vector capacity retained)
 
         for (size_t block = 0; block < num_blocks; ++block) {
-            const size_t block_start = block * alp::ALP_VECTOR_SIZE;
-            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : alp::ALP_VECTOR_SIZE;
+            const size_t block_start = block * timestar::alp::ALP_VECTOR_SIZE;
+            const size_t block_count = (block == num_blocks - 1 && tail_count > 0) ? tail_count : timestar::alp::ALP_VECTOR_SIZE;
 
-            alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count, rd);
+            timestar::alp::ALPRD::encodeBlock(values.data() + block_start, block_count, right_bit_count, rd);
             const uint16_t exception_count = static_cast<uint16_t>(rd.exception_positions.size());
 
             // === Block Header (2 x uint64_t) ===
@@ -455,17 +455,17 @@ size_t ALPEncoder::encodeInto(std::span<const double> values, AlignedBuffer& tar
             // resize() (a no-op after the first block) replaces the per-block
             // zero-fill assign().
             if (rd.left_bw > 0) {
-                size_t left_packed_words = alp::ffor_packed_words(block_count, rd.left_bw);
+                size_t left_packed_words = timestar::alp::ffor_packed_words(block_count, rd.left_bw);
                 left_packed.resize(left_packed_words);
-                alp::ffor_pack_u8(rd.left_indices.data(), block_count, rd.left_bw, left_packed.data());
+                timestar::alp::ffor_pack_u8(rd.left_indices.data(), block_count, rd.left_bw, left_packed.data());
                 target.write_array(left_packed.data(), left_packed_words);
             }
 
             // === Right FFOR Data ===
             if (rd.right_bw > 0) {
-                size_t right_packed_words = alp::ffor_packed_words(block_count, rd.right_bw);
+                size_t right_packed_words = timestar::alp::ffor_packed_words(block_count, rd.right_bw);
                 right_packed.resize(right_packed_words);
-                alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base, rd.right_bw,
+                timestar::alp::ffor_pack_u64(rd.right_parts.data(), block_count, rd.right_for_base, rd.right_bw,
                                    right_packed.data());
                 target.write_array(right_packed.data(), right_packed_words);
             }

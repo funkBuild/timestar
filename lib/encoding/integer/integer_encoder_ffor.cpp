@@ -196,7 +196,7 @@ inline BlockHeader readBlockHeader(Slice& s) {
             static_cast<uint16_t>((w0 >> 18) & 0x3FF), base};
 }
 
-// ---- FFOR packing helpers (delegates to alp::ffor for the heavy lifting) ----
+// ---- FFOR packing helpers (delegates to timestar::alp::ffor for the heavy lifting) ----
 
 // Encode one block of zigzag values into the AlignedBuffer.
 // min_val and max_val are pre-computed by the caller during zigzag encoding,
@@ -245,7 +245,7 @@ void encodeBlock(const uint64_t* values, size_t count, AlignedBuffer& buf, uint6
         if (exc > max_exc)
             continue;
 
-        size_t ffor_bytes = alp::ffor_packed_words(count, cand) * 8;
+        size_t ffor_bytes = timestar::alp::ffor_packed_words(count, cand) * 8;
         size_t exc_pos_bytes = (exc > 0) ? (static_cast<size_t>(exc + 3) / 4) * 8 : 0;
         size_t exc_val_bytes = static_cast<size_t>(exc) * 8;
         size_t total = HEADER_BYTES + ffor_bytes + exc_pos_bytes + exc_val_bytes;
@@ -267,11 +267,11 @@ void encodeBlock(const uint64_t* values, size_t count, AlignedBuffer& buf, uint6
         // 6a. FFOR pack directly from input values (no clean array needed).
         // ffor_pack_u64 writes every output word (register-accumulator stream),
         // so the destination needs no pre-zeroing.
-        size_t packed_words = alp::ffor_packed_words(count, best_bw);
+        size_t packed_words = timestar::alp::ffor_packed_words(count, best_bw);
         if (packed_words > 0) {
             size_t packed_bytes = packed_words * sizeof(uint64_t);
             uint8_t* dest = buf.grow_uninit(packed_bytes);
-            alp::ffor_pack_u64(values, count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
+            timestar::alp::ffor_pack_u64(values, count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
         }
         return;
     }
@@ -309,11 +309,11 @@ void encodeBlock(const uint64_t* values, size_t count, AlignedBuffer& buf, uint6
 
     // 7b. FFOR pack from clean array (ffor_pack_u64 writes every output word —
     // no pre-zeroing needed)
-    size_t packed_words = alp::ffor_packed_words(count, best_bw);
+    size_t packed_words = timestar::alp::ffor_packed_words(count, best_bw);
     if (packed_words > 0) {
         size_t packed_bytes = packed_words * sizeof(uint64_t);
         uint8_t* dest = buf.grow_uninit(packed_bytes);
-        alp::ffor_pack_u64(clean.data(), count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
+        timestar::alp::ffor_pack_u64(clean.data(), count, min_val, best_bw, reinterpret_cast<uint64_t*>(dest));
     }
 
     // 8b. Write exception positions (4 x uint16_t per uint64_t word)
@@ -366,7 +366,7 @@ size_t decodeBlockInto(Slice& s, uint64_t* out) {
         std::fill_n(out, hdr.block_count, hdr.base);
     } else {
         // Direct pointer access to packed data - skip per-word bounds checks and copy.
-        const size_t packed_words = alp::ffor_packed_words(hdr.block_count, hdr.bw);
+        const size_t packed_words = timestar::alp::ffor_packed_words(hdr.block_count, hdr.bw);
         const size_t packed_bytes = packed_words * sizeof(uint64_t);
 
         // Bounds check: ensure the packed data fits within the remaining slice.
@@ -384,7 +384,7 @@ size_t decodeBlockInto(Slice& s, uint64_t* out) {
         alignas(8) uint64_t aligned_packed[IntegerEncoderFFOR::kBlockSize];
         std::memcpy(aligned_packed, packed_ptr, packed_bytes);
 
-        alp::ffor_unpack_u64(aligned_packed, hdr.block_count, hdr.base, hdr.bw, out);
+        timestar::alp::ffor_unpack_u64(aligned_packed, hdr.block_count, hdr.base, hdr.bw, out);
     }
 
     // Patch exceptions

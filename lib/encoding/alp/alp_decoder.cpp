@@ -63,7 +63,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
     uint64_t header1 = encoded.readFixed<uint64_t, 64>();
 
     uint32_t magic = static_cast<uint32_t>(header0 & 0xFFFFFFFF);
-    if (magic != alp::ALP_MAGIC) [[unlikely]] {
+    if (magic != timestar::alp::ALP_MAGIC) [[unlikely]] {
         throw std::runtime_error("ALPDecoder: invalid magic number");
     }
 
@@ -77,7 +77,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
     size_t global_pos = 0;
 
     for (uint16_t block = 0; block < num_blocks && output_remaining > 0; ++block) {
-        if (scheme == alp::SCHEME_ALP || scheme == alp::SCHEME_ALP_DELTA) [[likely]] {
+        if (scheme == timestar::alp::SCHEME_ALP || scheme == timestar::alp::SCHEME_ALP_DELTA) [[likely]] {
             // === ALP Block Header ===
             uint64_t bh0 = encoded.readFixed<uint64_t, 64>();
             uint64_t bh1 = encoded.readFixed<uint64_t, 64>();
@@ -99,12 +99,12 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             // Read first_value for delta scheme (part of block header)
             int64_t first_value = 0;
-            if (scheme == alp::SCHEME_ALP_DELTA) {
+            if (scheme == timestar::alp::SCHEME_ALP_DELTA) {
                 first_value = std::bit_cast<int64_t>(encoded.readFixed<uint64_t, 64>());
             }
 
             // === Read FFOR Data ===
-            const size_t packed_words = alp::ffor_packed_words(block_count, bw);
+            const size_t packed_words = timestar::alp::ffor_packed_words(block_count, bw);
 
             // Fast path: if this entire sub-block is in the skip range,
             // advance the stream past the packed data and exceptions without unpacking.
@@ -127,7 +127,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             // Unpack integers into thread-local buffer (capacity persists)
             scratch.decoded_ints.resize(block_count);
-            alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw, scratch.decoded_ints.data());
+            timestar::alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw, scratch.decoded_ints.data());
 
             // Convenient aliases for the per-block data
             auto* decoded_stack = scratch.decoded_ints.data();
@@ -161,7 +161,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             }
 
             // === Prefix-Sum Reconstruction (SCHEME_ALP_DELTA only) ===
-            if (scheme == alp::SCHEME_ALP_DELTA) {
+            if (scheme == timestar::alp::SCHEME_ALP_DELTA) {
                 int64_t running = first_value;
                 size_t exc_scan = 0;
                 bool is_first = true;
@@ -186,8 +186,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             // === Convert to doubles and apply skip/limit ===
             // Cache the scaling constants (avoids repeated array lookups)
-            const double frac_val = alp::FRAC_ARR[fac];
-            const double fact_val = alp::FACT_ARR[exp];
+            const double frac_val = timestar::alp::FRAC_ARR[fac];
+            const double fact_val = timestar::alp::FACT_ARR[exp];
 
             if (exception_count == 0) [[likely]] {
                 // Fast path: no exceptions -- tight loop, no exception checking
@@ -206,7 +206,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 // SIMD-accelerated reconstruction: int64 -> double via (val * frac / fact).
                 // Highway vectorizes the int64->double conversion + mul + div, which GCC
                 // cannot auto-vectorize (the int64->double cast is the bottleneck).
-                alp::simd::alpReconstruct(&decoded[i], emit_count, frac_val, fact_val, output_ptr);
+                timestar::alp::simd::alpReconstruct(&decoded[i], emit_count, frac_val, fact_val, output_ptr);
                 output_ptr += emit_count;
 
                 output_remaining = length - static_cast<size_t>(output_ptr - (out.data() + current_size));
@@ -237,7 +237,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 }
             }
 
-        } else if (scheme == alp::SCHEME_ALP_RD) {
+        } else if (scheme == timestar::alp::SCHEME_ALP_RD) {
             // === ALP_RD Block ===
             uint64_t bh0 = encoded.readFixed<uint64_t, 64>();
             uint64_t bh1 = encoded.readFixed<uint64_t, 64>();
@@ -271,9 +271,9 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             if (global_pos + block_count <= nToSkip) {
                 size_t skip_words = 0;
                 if (left_bw > 0)
-                    skip_words += alp::ffor_packed_words(block_count, left_bw);
+                    skip_words += timestar::alp::ffor_packed_words(block_count, left_bw);
                 if (right_bw > 0)
-                    skip_words += alp::ffor_packed_words(block_count, right_bw);
+                    skip_words += timestar::alp::ffor_packed_words(block_count, right_bw);
                 if (exception_count > 0) [[unlikely]] {
                     skip_words += (exception_count * 2 + 7) / 8;
                     skip_words += exception_count;
@@ -289,10 +289,10 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             scratch.rd_left_indices.resize(block_count);
             std::fill_n(scratch.rd_left_indices.data(), block_count, int64_t{0});
             if (left_bw > 0) {
-                size_t left_packed_words = alp::ffor_packed_words(block_count, left_bw);
+                size_t left_packed_words = timestar::alp::ffor_packed_words(block_count, left_bw);
                 scratch.rd_left_packed.resize(left_packed_words);
                 encoded.readAlignedWords(scratch.rd_left_packed.data(), left_packed_words);
-                alp::ffor_unpack(scratch.rd_left_packed.data(), block_count, 0, left_bw,
+                timestar::alp::ffor_unpack(scratch.rd_left_packed.data(), block_count, 0, left_bw,
                                  scratch.rd_left_indices.data());
             }
 
@@ -300,10 +300,10 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
             scratch.rd_right_parts.resize(block_count);
             std::fill_n(scratch.rd_right_parts.data(), block_count, right_for_base);
             if (right_bw > 0) {
-                size_t right_packed_words = alp::ffor_packed_words(block_count, right_bw);
+                size_t right_packed_words = timestar::alp::ffor_packed_words(block_count, right_bw);
                 scratch.rd_right_packed.resize(right_packed_words);
                 encoded.readAlignedWords(scratch.rd_right_packed.data(), right_packed_words);
-                alp::ffor_unpack_u64(scratch.rd_right_packed.data(), block_count, right_for_base, right_bw,
+                timestar::alp::ffor_unpack_u64(scratch.rd_right_packed.data(), block_count, right_for_base, right_bw,
                                      scratch.rd_right_parts.data());
             }
 

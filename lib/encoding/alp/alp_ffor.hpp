@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace alp {
+namespace timestar::alp {
 
 // Frame-of-Reference + bit-packing for int64 values.
 // Packs (value - base) into fixed bit-width words.
@@ -385,4 +385,4 @@ inline void ffor_unpack_u64(const uint64_t* in, size_t count, uint64_t base, uin
     }
 }
 
-}  // namespace alp
+}  // namespace timestar::alp

@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace alp {
+namespace timestar::alp {
 
 // ALP_RD (Real Doubles) fallback encoder for doubles that resist decimal encoding.
 // Splits each double's 64-bit representation into:
@@ -43,4 +43,4 @@ public:
     static void encodeBlock(const double* values, size_t count, uint8_t right_bit_count, ALPRDBlockResult& result);
 };
 
-}  // namespace alp
+}  // namespace timestar::alp

@@ -332,11 +332,11 @@ TEST_F(ALPEncoderTest, FFORPackUnpackZeroBitWidth) {
     // bw=0: all values identical (equal to base)
     std::vector<int64_t> values(100, 42);
     // pack should produce 0 words
-    EXPECT_EQ(alp::ffor_packed_words(100, 0), 0u);
+    EXPECT_EQ(timestar::alp::ffor_packed_words(100, 0), 0u);
 
     // unpack should fill all with base
     std::vector<int64_t> out(100, 0);
-    alp::ffor_unpack(nullptr, 100, 42, 0, out.data());
+    timestar::alp::ffor_unpack(nullptr, 100, 42, 0, out.data());
     for (auto v : out) {
         EXPECT_EQ(v, 42);
     }
@@ -352,12 +352,12 @@ TEST_F(ALPEncoderTest, FFORPackUnpackSmallBitWidth) {
         values[i] = base + static_cast<int64_t>(i % 16);
     }
 
-    size_t n_words = alp::ffor_packed_words(count, bw);
+    size_t n_words = timestar::alp::ffor_packed_words(count, bw);
     std::vector<uint64_t> packed(n_words, 0);
-    alp::ffor_pack(values.data(), count, base, bw, packed.data());
+    timestar::alp::ffor_pack(values.data(), count, base, bw, packed.data());
 
     std::vector<int64_t> unpacked(count, 0);
-    alp::ffor_unpack(packed.data(), count, base, bw, unpacked.data());
+    timestar::alp::ffor_unpack(packed.data(), count, base, bw, unpacked.data());
 
     for (size_t i = 0; i < count; ++i) {
         EXPECT_EQ(unpacked[i], values[i]) << "Mismatch at index " << i;
@@ -375,12 +375,12 @@ TEST_F(ALPEncoderTest, FFORPackUnpackFullBitWidth) {
         v = static_cast<int64_t>(gen());
     }
 
-    size_t n_words = alp::ffor_packed_words(count, bw);
+    size_t n_words = timestar::alp::ffor_packed_words(count, bw);
     std::vector<uint64_t> packed(n_words, 0);
-    alp::ffor_pack(values.data(), count, base, bw, packed.data());
+    timestar::alp::ffor_pack(values.data(), count, base, bw, packed.data());
 
     std::vector<int64_t> unpacked(count, 0);
-    alp::ffor_unpack(packed.data(), count, base, bw, unpacked.data());
+    timestar::alp::ffor_unpack(packed.data(), count, base, bw, unpacked.data());
 
     for (size_t i = 0; i < count; ++i) {
         EXPECT_EQ(unpacked[i], values[i]) << "Mismatch at index " << i;
@@ -400,12 +400,12 @@ TEST_F(ALPEncoderTest, FFORPackUnpackOddCount) {
         v = base + dist(gen);
     }
 
-    size_t n_words = alp::ffor_packed_words(count, bw);
+    size_t n_words = timestar::alp::ffor_packed_words(count, bw);
     std::vector<uint64_t> packed(n_words, 0);
-    alp::ffor_pack(values.data(), count, base, bw, packed.data());
+    timestar::alp::ffor_pack(values.data(), count, base, bw, packed.data());
 
     std::vector<int64_t> unpacked(count, 0);
-    alp::ffor_unpack(packed.data(), count, base, bw, unpacked.data());
+    timestar::alp::ffor_unpack(packed.data(), count, base, bw, unpacked.data());
 
     for (size_t i = 0; i < count; ++i) {
         EXPECT_EQ(unpacked[i], values[i]) << "Mismatch at index " << i;
@@ -482,7 +482,7 @@ TEST_F(ALPEncoderTest, DeltaSchemeSelectedForMonotonic) {
     (void)header0;
     uint8_t scheme = static_cast<uint8_t>((header1 >> 32) & 0xFF);
 
-    EXPECT_EQ(scheme, alp::SCHEME_ALP_DELTA) << "Monotonic ramp data should select SCHEME_ALP_DELTA";
+    EXPECT_EQ(scheme, timestar::alp::SCHEME_ALP_DELTA) << "Monotonic ramp data should select SCHEME_ALP_DELTA";
 
     testRoundtrip(data);
 }
@@ -608,7 +608,7 @@ TEST_F(ALPEncoderTest, DeltaNotSelectedForRandom) {
     uint8_t scheme = static_cast<uint8_t>((header1 >> 32) & 0xFF);
 
     // Random data should use SCHEME_ALP (not delta)
-    EXPECT_EQ(scheme, alp::SCHEME_ALP) << "Random data should not select SCHEME_ALP_DELTA";
+    EXPECT_EQ(scheme, timestar::alp::SCHEME_ALP) << "Random data should not select SCHEME_ALP_DELTA";
 
     testRoundtrip(data);
 }
@@ -793,7 +793,7 @@ TEST_F(ALPEncoderTest, ALPRD_SchemeSelectedForRandomDoubles) {
     auto buffer = ALPEncoder::encode(data);
     uint8_t scheme = readSchemeFromBuffer(buffer);
 
-    EXPECT_EQ(scheme, alp::SCHEME_ALP_RD) << "Random bit-pattern doubles must select SCHEME_ALP_RD";
+    EXPECT_EQ(scheme, timestar::alp::SCHEME_ALP_RD) << "Random bit-pattern doubles must select SCHEME_ALP_RD";
 }
 
 TEST_F(ALPEncoderTest, ALPRD_RoundtripSmall) {
@@ -810,7 +810,7 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripSmall) {
     }
 
     auto buffer = ALPEncoder::encode(data);
-    EXPECT_EQ(readSchemeFromBuffer(buffer), alp::SCHEME_ALP_RD);
+    EXPECT_EQ(readSchemeFromBuffer(buffer), timestar::alp::SCHEME_ALP_RD);
     testRoundtrip(data);
 }
 
@@ -836,7 +836,7 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripExactOneBlock) {
     // Exactly ALP_VECTOR_SIZE (1024) random doubles.
     std::mt19937_64 gen(42);
     std::uniform_int_distribution<uint64_t> dist;
-    std::vector<double> data(alp::ALP_VECTOR_SIZE);
+    std::vector<double> data(timestar::alp::ALP_VECTOR_SIZE);
     for (auto& v : data) {
         uint64_t bits;
         do {
@@ -846,7 +846,7 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripExactOneBlock) {
     }
 
     auto buffer = ALPEncoder::encode(data);
-    EXPECT_EQ(readSchemeFromBuffer(buffer), alp::SCHEME_ALP_RD);
+    EXPECT_EQ(readSchemeFromBuffer(buffer), timestar::alp::SCHEME_ALP_RD);
     testRoundtrip(data);
 }
 
@@ -864,7 +864,7 @@ TEST_F(ALPEncoderTest, ALPRD_RoundtripMultiBlock) {
     }
 
     auto buffer = ALPEncoder::encode(data);
-    EXPECT_EQ(readSchemeFromBuffer(buffer), alp::SCHEME_ALP_RD);
+    EXPECT_EQ(readSchemeFromBuffer(buffer), timestar::alp::SCHEME_ALP_RD);
     testRoundtrip(data);
 }
 
@@ -872,7 +872,7 @@ TEST_F(ALPEncoderTest, ALPRD_SkipDecodeWholeBlock) {
     // Skip the entire first block, decode second block only.
     std::mt19937_64 gen(7);
     std::uniform_int_distribution<uint64_t> dist;
-    std::vector<double> data(2 * alp::ALP_VECTOR_SIZE);  // 2048 values
+    std::vector<double> data(2 * timestar::alp::ALP_VECTOR_SIZE);  // 2048 values
     for (auto& v : data) {
         uint64_t bits;
         do {
@@ -882,10 +882,10 @@ TEST_F(ALPEncoderTest, ALPRD_SkipDecodeWholeBlock) {
     }
 
     auto buffer = ALPEncoder::encode(data);
-    EXPECT_EQ(readSchemeFromBuffer(buffer), alp::SCHEME_ALP_RD);
+    EXPECT_EQ(readSchemeFromBuffer(buffer), timestar::alp::SCHEME_ALP_RD);
 
     // Skip first block exactly
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE, alp::ALP_VECTOR_SIZE);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE, timestar::alp::ALP_VECTOR_SIZE);
 }
 
 TEST_F(ALPEncoderTest, ALPRD_SkipDecodePartial) {
@@ -902,7 +902,7 @@ TEST_F(ALPEncoderTest, ALPRD_SkipDecodePartial) {
     }
 
     auto buffer = ALPEncoder::encode(data);
-    EXPECT_EQ(readSchemeFromBuffer(buffer), alp::SCHEME_ALP_RD);
+    EXPECT_EQ(readSchemeFromBuffer(buffer), timestar::alp::SCHEME_ALP_RD);
 
     testSkipDecode(data, 100, 200);   // mid first block
     testSkipDecode(data, 900, 200);   // crosses block boundary
@@ -953,9 +953,9 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
     // SCHEME_ALP_RD (1) when the encoder selects the RD path, and that
     // SCHEME_ALP (0) and SCHEME_ALP_DELTA (2) are the only other values
     // produced by the encoder (i.e. the three-way distinction is stable).
-    EXPECT_EQ(alp::SCHEME_ALP, static_cast<uint8_t>(0));
-    EXPECT_EQ(alp::SCHEME_ALP_RD, static_cast<uint8_t>(1));
-    EXPECT_EQ(alp::SCHEME_ALP_DELTA, static_cast<uint8_t>(2));
+    EXPECT_EQ(timestar::alp::SCHEME_ALP, static_cast<uint8_t>(0));
+    EXPECT_EQ(timestar::alp::SCHEME_ALP_RD, static_cast<uint8_t>(1));
+    EXPECT_EQ(timestar::alp::SCHEME_ALP_DELTA, static_cast<uint8_t>(2));
 
     // ALP_RD data
     {
@@ -969,7 +969,7 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
             } while (!std::isfinite(std::bit_cast<double>(bits)));
             v = std::bit_cast<double>(bits);
         }
-        EXPECT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_RD);
+        EXPECT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_RD);
     }
 
     // ALP data (decimal values)
@@ -978,7 +978,7 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
         for (size_t i = 0; i < data.size(); ++i)
             data[i] = static_cast<double>(i % 100) * 0.01;
         uint8_t s = readSchemeFromBuffer(ALPEncoder::encode(data));
-        EXPECT_TRUE(s == alp::SCHEME_ALP || s == alp::SCHEME_ALP_DELTA)
+        EXPECT_TRUE(s == timestar::alp::SCHEME_ALP || s == timestar::alp::SCHEME_ALP_DELTA)
             << "Decimal data should use ALP or ALP_DELTA, got " << (int)s;
     }
 
@@ -987,7 +987,7 @@ TEST_F(ALPEncoderTest, ALPRD_VerifySchemeByteInHeader) {
         std::vector<double> data(1024);
         for (size_t i = 0; i < data.size(); ++i)
             data[i] = static_cast<double>(i);
-        EXPECT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_DELTA);
+        EXPECT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_DELTA);
     }
 }
 
@@ -1121,7 +1121,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipExactlyAtBlockBoundary_ALP) {
         data[i] = 1.0 + static_cast<double>(i) * 0.001;
 
     // skip == ALP_VECTOR_SIZE: start of second block, read 100 values.
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE, 100);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE, 100);
 }
 
 // 5c. skip one past a block boundary.
@@ -1130,7 +1130,7 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipOnePastBlockBoundary_ALP) {
     for (size_t i = 0; i < data.size(); ++i)
         data[i] = 1.0 + static_cast<double>(i) * 0.001;
 
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE + 1, 100);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE + 1, 100);
 }
 
 // 6. limit extends beyond available data — decoder must clamp to remaining.
@@ -1170,10 +1170,10 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipPlusLimitAtBlockBoundary_ALP) {
         data[i] = 7.0 + static_cast<double>(i) * 0.007;
 
     // Decode exactly the first block: skip=0, limit=1024.
-    testSkipDecode(data, 0, alp::ALP_VECTOR_SIZE);
+    testSkipDecode(data, 0, timestar::alp::ALP_VECTOR_SIZE);
 
     // Decode exactly the second block: skip=1024, limit=1024.
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE, alp::ALP_VECTOR_SIZE);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE, timestar::alp::ALP_VECTOR_SIZE);
 }
 
 // 7b. Window ends exactly at a block boundary with a non-zero skip.
@@ -1230,15 +1230,15 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipToLastValue_ALPRD) {
 // 4. skip across block boundary — ALP_RD scheme (1500 values, skip=900, limit=300).
 TEST_F(ALPEncoderTest, SkipEdge_SkipAcrossBlockBoundary_ALPRD) {
     auto data = makeRDData(1500, 40);
-    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_RD);
+    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_RD);
     testSkipDecode(data, 900, 300);
 }
 
 // 5. skip exactly at block boundary — ALP_RD scheme.
 TEST_F(ALPEncoderTest, SkipEdge_SkipExactlyAtBlockBoundary_ALPRD) {
     auto data = makeRDData(2048, 50);
-    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_RD);
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE, 200);
+    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_RD);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE, 200);
 }
 
 // 6. limit beyond available — ALP_RD scheme.
@@ -1255,12 +1255,12 @@ TEST_F(ALPEncoderTest, SkipEdge_LimitBeyondAvailable_ALPRD) {
 // 7. skip+limit exactly at block boundary — ALP_RD scheme.
 TEST_F(ALPEncoderTest, SkipEdge_SkipPlusLimitAtBlockBoundary_ALPRD) {
     auto data = makeRDData(2048, 70);
-    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_RD);
+    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_RD);
 
     // Decode exactly the first block.
-    testSkipDecode(data, 0, alp::ALP_VECTOR_SIZE);
+    testSkipDecode(data, 0, timestar::alp::ALP_VECTOR_SIZE);
     // Decode exactly the second block.
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE, alp::ALP_VECTOR_SIZE);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE, timestar::alp::ALP_VECTOR_SIZE);
 }
 
 // --- ALP_DELTA scheme versions ---
@@ -1300,15 +1300,15 @@ TEST_F(ALPEncoderTest, SkipEdge_SkipToLastValue_ALPDelta) {
 // 4. skip across block boundary — ALP_DELTA scheme (1500 values, skip=900, limit=300).
 TEST_F(ALPEncoderTest, SkipEdge_SkipAcrossBlockBoundary_ALPDelta) {
     auto data = makeDeltaData(1500);
-    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_DELTA);
+    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_DELTA);
     testSkipDecode(data, 900, 300);
 }
 
 // 5. skip exactly at block boundary — ALP_DELTA scheme.
 TEST_F(ALPEncoderTest, SkipEdge_SkipExactlyAtBlockBoundary_ALPDelta) {
     auto data = makeDeltaData(2048);
-    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_DELTA);
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE, 200);
+    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_DELTA);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE, 200);
 }
 
 // 6. limit beyond available — ALP_DELTA scheme.
@@ -1325,12 +1325,12 @@ TEST_F(ALPEncoderTest, SkipEdge_LimitBeyondAvailable_ALPDelta) {
 // 7. skip+limit exactly at block boundary — ALP_DELTA scheme.
 TEST_F(ALPEncoderTest, SkipEdge_SkipPlusLimitAtBlockBoundary_ALPDelta) {
     auto data = makeDeltaData(2048);
-    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), alp::SCHEME_ALP_DELTA);
+    ASSERT_EQ(readSchemeFromBuffer(ALPEncoder::encode(data)), timestar::alp::SCHEME_ALP_DELTA);
 
     // Decode exactly the first block.
-    testSkipDecode(data, 0, alp::ALP_VECTOR_SIZE);
+    testSkipDecode(data, 0, timestar::alp::ALP_VECTOR_SIZE);
     // Decode exactly the second block.
-    testSkipDecode(data, alp::ALP_VECTOR_SIZE, alp::ALP_VECTOR_SIZE);
+    testSkipDecode(data, timestar::alp::ALP_VECTOR_SIZE, timestar::alp::ALP_VECTOR_SIZE);
 }
 
 // --- Mixed-scheme correctness: append-output mode ---
@@ -1370,19 +1370,19 @@ TEST_F(ALPEncoderTest, SkipEdge_AppendToExistingOutputVector) {
 // values across all positions that straddle a block boundary.  This
 // exercises the fast-skip path and the mixed-block output path together.
 TEST_F(ALPEncoderTest, SkipEdge_BlockBoundarySweep_ALP) {
-    const size_t N = 3 * alp::ALP_VECTOR_SIZE;  // 3072 values
+    const size_t N = 3 * timestar::alp::ALP_VECTOR_SIZE;  // 3072 values
     std::vector<double> data(N);
     for (size_t i = 0; i < N; ++i)
         data[i] = 5.0 + static_cast<double>(i) * 0.005;
 
     // Positions that straddle or land on block boundaries (1024, 2048).
     const size_t boundary_skips[] = {
-        alp::ALP_VECTOR_SIZE - 50,      // 974:  50 in block 0, 50 in block 1
-        alp::ALP_VECTOR_SIZE,           // 1024: exactly starts block 1
-        alp::ALP_VECTOR_SIZE + 1,       // 1025: one past boundary
-        2 * alp::ALP_VECTOR_SIZE - 50,  // 1998: 50 in block 1, 50 in block 2
-        2 * alp::ALP_VECTOR_SIZE,       // 2048: exactly starts block 2
-        2 * alp::ALP_VECTOR_SIZE + 1,   // 2049: one past second boundary
+        timestar::alp::ALP_VECTOR_SIZE - 50,      // 974:  50 in block 0, 50 in block 1
+        timestar::alp::ALP_VECTOR_SIZE,           // 1024: exactly starts block 1
+        timestar::alp::ALP_VECTOR_SIZE + 1,       // 1025: one past boundary
+        2 * timestar::alp::ALP_VECTOR_SIZE - 50,  // 1998: 50 in block 1, 50 in block 2
+        2 * timestar::alp::ALP_VECTOR_SIZE,       // 2048: exactly starts block 2
+        2 * timestar::alp::ALP_VECTOR_SIZE + 1,   // 2049: one past second boundary
         N - 100,                        // last 100 values
         N - 1,                          // last single value
     };

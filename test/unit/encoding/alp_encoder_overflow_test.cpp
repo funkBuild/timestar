@@ -20,7 +20,7 @@
 // Verify the math: num_blocks = ceil(total / ALP_VECTOR_SIZE) overflows at
 // UINT16_MAX * ALP_VECTOR_SIZE + 1 values.
 TEST(ALPEncoderOverflow, NumBlocksOverflowThreshold) {
-    constexpr size_t ALP_VECTOR_SIZE = alp::ALP_VECTOR_SIZE;  // 1024
+    constexpr size_t ALP_VECTOR_SIZE = timestar::alp::ALP_VECTOR_SIZE;  // 1024
     constexpr size_t maxSafe = static_cast<size_t>(UINT16_MAX) * ALP_VECTOR_SIZE;
     constexpr size_t overflow = maxSafe + 1;
 

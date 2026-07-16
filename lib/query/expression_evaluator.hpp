@@ -20,6 +20,8 @@ public:
 };
 
 // A time series that has been aligned (same timestamps across all series)
+// NOTE: the /derived DSL function names are snake_case by design (e.g. "fill_forward",
+// "rolling_avg"); the parser maps them to these camelBack C++ methods via enum dispatch.
 struct AlignedSeries {
     // Shared ownership of the timestamp buffer — O(1) copy for element-wise ops.
     std::shared_ptr<const std::vector<uint64_t>> timestamps;
@@ -69,7 +71,7 @@ struct AlignedSeries {
     // path; bit-identical to element-wise ops against a constant series):
     AlignedSeries rsub(double scalar) const;      // scalar - values[i]
     AlignedSeries rdiv(double scalar) const;      // scalar / values[i] (IEEE: /0 -> Inf/NaN)
-    AlignedSeries div_ieee(double scalar) const;  // values[i] / scalar (IEEE, no throw, true divide)
+    AlignedSeries divIeee(double scalar) const;  // values[i] / scalar (IEEE, no throw, true divide)
 
     // Unary operations
     AlignedSeries negate() const;
@@ -80,15 +82,15 @@ struct AlignedSeries {
     AlignedSeries ceil() const;
     AlignedSeries floor() const;
     AlignedSeries exp() const;         // e^x (SIMD); NaN passthrough
-    AlignedSeries round_nearest() const;  // Nearest integer, halves away from zero (SIMD); NaN passthrough
+    AlignedSeries roundNearest() const;  // Nearest integer, halves away from zero (SIMD); NaN passthrough
     AlignedSeries sign() const;        // -1/0/+1 (SIMD); NaN passthrough
 
     // Transform functions (unary)
     AlignedSeries diff() const;            // Difference between consecutive points
-    AlignedSeries monotonic_diff() const;  // Diff with counter reset handling
-    AlignedSeries default_zero() const;    // Replace NaN with 0
-    AlignedSeries count_nonzero() const;   // Count non-zero values (returns scalar series)
-    AlignedSeries count_not_null() const;  // Count non-NaN values (returns scalar series)
+    AlignedSeries monotonicDiff() const;  // Diff with counter reset handling
+    AlignedSeries defaultZero() const;    // Replace NaN with 0
+    AlignedSeries countNonzero() const;   // Count non-zero values (returns scalar series)
+    AlignedSeries countNotNull() const;  // Count non-NaN values (returns scalar series)
 
     // Counter-rate functions (require access to timestamps)
     AlignedSeries rate() const;      // Per-second rate; handles counter resets; first point NaN
@@ -102,13 +104,13 @@ struct AlignedSeries {
     AlignedSeries resets() const;   // Count of decreases between consecutive non-NaN points (constant series)
 
     // Gap-fill / interpolation functions
-    AlignedSeries fill_forward() const;   // LOCF: replace NaN with previous non-NaN; leading NaNs stay NaN
-    AlignedSeries fill_backward() const;  // NOCB: replace NaN with next non-NaN; trailing NaNs stay NaN
-    AlignedSeries fill_linear() const;    // Linear interpolation using timestamps; leading/trailing NaN runs stay NaN
-    AlignedSeries fill_spline() const;    // Natural cubic spline through known values; leading/trailing NaN stay NaN
-    AlignedSeries fill_value(double v) const;  // Replace every NaN with constant v
+    AlignedSeries fillForward() const;   // LOCF: replace NaN with previous non-NaN; leading NaNs stay NaN
+    AlignedSeries fillBackward() const;  // NOCB: replace NaN with next non-NaN; trailing NaNs stay NaN
+    AlignedSeries fillLinear() const;    // Linear interpolation using timestamps; leading/trailing NaN runs stay NaN
+    AlignedSeries fillSpline() const;    // Natural cubic spline through known values; leading/trailing NaN stay NaN
+    AlignedSeries fillValue(double v) const;  // Replace every NaN with constant v
     // Gaussian kernel smoothing (radius ceil(3*sigma)); NaN-aware renormalization
-    AlignedSeries gaussian_smooth(double sigma) const;
+    AlignedSeries gaussianSmooth(double sigma) const;
 
     // Accumulation functions
     AlignedSeries cumsum() const;    // Running cumulative sum; NaN treated as 0 (skip-NaN)
@@ -125,25 +127,25 @@ struct AlignedSeries {
     static AlignedSeries clamp(const AlignedSeries& val, const AlignedSeries& minVal, const AlignedSeries& maxVal);
 
     // Transform functions with scalar argument
-    AlignedSeries clamp_min(double minVal) const;      // Clamp values to minimum
-    AlignedSeries clamp_max(double maxVal) const;      // Clamp values to maximum
-    AlignedSeries cutoff_min(double threshold) const;  // Set values below threshold to NaN
-    AlignedSeries cutoff_max(double threshold) const;  // Set values above threshold to NaN
-    AlignedSeries rate_per(double seconds_per_point, double scale) const;
-    AlignedSeries per_minute(double seconds_per_point) const;  // Rate * 60
-    AlignedSeries per_hour(double seconds_per_point) const;    // Rate * 3600
+    AlignedSeries clampMin(double minVal) const;      // Clamp values to minimum
+    AlignedSeries clampMax(double maxVal) const;      // Clamp values to maximum
+    AlignedSeries cutoffMin(double threshold) const;  // Set values below threshold to NaN
+    AlignedSeries cutoffMax(double threshold) const;  // Set values above threshold to NaN
+    AlignedSeries ratePer(double secondsPerPoint, double scale) const;
+    AlignedSeries perMinute(double secondsPerPoint) const;  // Rate * 60
+    AlignedSeries perHour(double secondsPerPoint) const;    // Rate * 3600
 
     // Percent of total (element-wise): 100 * this[i] / total[i]; NaN on div-by-zero or NaN input
-    static AlignedSeries as_percent(const AlignedSeries& series, const AlignedSeries& total);
+    static AlignedSeries asPercent(const AlignedSeries& series, const AlignedSeries& total);
 
     // Rolling window functions (N-point window; first N-1 points output NaN)
-    AlignedSeries rolling_avg(int N) const;     // N-point simple moving average
-    AlignedSeries rolling_min(int N) const;     // N-point rolling minimum
-    AlignedSeries rolling_max(int N) const;     // N-point rolling maximum
-    AlignedSeries rolling_stddev(int N) const;  // N-point rolling population stddev (ddof=0)
-    AlignedSeries rolling_sum(int N) const;     // N-point rolling sum (Kahan-compensated)
-    AlignedSeries rolling_median(int N) const;  // N-point rolling median (sorted sliding window)
-    AlignedSeries rolling_percentile(int N, double p) const;  // N-point rolling p-th percentile, p in [0,100]
+    AlignedSeries rollingAvg(int N) const;     // N-point simple moving average
+    AlignedSeries rollingMin(int N) const;     // N-point rolling minimum
+    AlignedSeries rollingMax(int N) const;     // N-point rolling maximum
+    AlignedSeries rollingStddev(int N) const;  // N-point rolling population stddev (ddof=0)
+    AlignedSeries rollingSum(int N) const;     // N-point rolling sum (Kahan-compensated)
+    AlignedSeries rollingMedian(int N) const;  // N-point rolling median (sorted sliding window)
+    AlignedSeries rollingPercentile(int N, double p) const;  // N-point rolling p-th percentile, p in [0,100]
     AlignedSeries zscore(int N) const;          // N-point rolling z-score: (v - mean) / stddev; 0 if stddev==0
 
     // Exponential moving average
@@ -155,11 +157,11 @@ struct AlignedSeries {
     // alpha in (0,1]: level smoothing factor
     // beta  in (0,1]: trend smoothing factor
     // Leading NaN inputs remain NaN; NaN inputs inside the series carry forward level/trend
-    AlignedSeries holt_winters(double alpha, double beta) const;
+    AlignedSeries holtWinters(double alpha, double beta) const;
 
     // Timestamp shift: add offsetNs (may be negative) to every timestamp
     // Values are unchanged; timestamps are shifted by exactly offsetNs nanoseconds.
-    AlignedSeries time_shift(int64_t offsetNs) const;
+    AlignedSeries timeShift(int64_t offsetNs) const;
 };
 
 // Evaluates expression ASTs against aligned time series data

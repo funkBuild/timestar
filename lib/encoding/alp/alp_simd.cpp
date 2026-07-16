@@ -21,7 +21,7 @@
 // SIMD kernels (compiled once per target ISA by foreach_target)
 // =============================================================================
 HWY_BEFORE_NAMESPACE();
-namespace alp {
+namespace timestar::alp {
 namespace simd {
 namespace HWY_NAMESPACE {
 
@@ -171,14 +171,14 @@ size_t AlpScaleF0Kernel(const double* HWY_RESTRICT values, size_t count, double 
 
 }  // namespace HWY_NAMESPACE
 }  // namespace simd
-}  // namespace alp
+}  // namespace timestar::alp
 HWY_AFTER_NAMESPACE();
 
 // =============================================================================
 // Dispatch table + public API (compiled once)
 // =============================================================================
 #if HWY_ONCE
-namespace alp {
+namespace timestar::alp {
 namespace simd {
 
 HWY_EXPORT(AlpReconstructKernel);
@@ -205,5 +205,5 @@ size_t alpScaleF0(const double* values, size_t count, double fact_val, int64_t* 
 }
 
 }  // namespace simd
-}  // namespace alp
+}  // namespace timestar::alp
 #endif  // HWY_ONCE

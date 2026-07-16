@@ -69,7 +69,7 @@ void checkReconstruct(const std::vector<int64_t>& encoded, double frac_val, doub
     std::vector<double> simd_out(count + kGuard, kOutSentinel);
     std::vector<double> ref_out(count);
 
-    alp::simd::alpReconstruct(encoded.data(), count, frac_val, fact_val, simd_out.data());
+    timestar::alp::simd::alpReconstruct(encoded.data(), count, frac_val, fact_val, simd_out.data());
     refReconstruct(encoded.data(), count, frac_val, fact_val, ref_out.data());
 
     for (size_t i = 0; i < count; ++i) {
@@ -167,8 +167,8 @@ TEST_F(AlpSimdCorrectnessTest, ReconstructIsDeterministicAcrossCalls) {
         v = dist(rng);
 
     std::vector<double> out1(encoded.size()), out2(encoded.size());
-    alp::simd::alpReconstruct(encoded.data(), encoded.size(), 0.01, 100.0, out1.data());
-    alp::simd::alpReconstruct(encoded.data(), encoded.size(), 0.01, 100.0, out2.data());
+    timestar::alp::simd::alpReconstruct(encoded.data(), encoded.size(), 0.01, 100.0, out1.data());
+    timestar::alp::simd::alpReconstruct(encoded.data(), encoded.size(), 0.01, 100.0, out2.data());
     for (size_t i = 0; i < encoded.size(); ++i) {
         ASSERT_TRUE(bitEqual(out1[i], out2[i])) << "Non-deterministic result at i=" << i;
     }
@@ -177,17 +177,17 @@ TEST_F(AlpSimdCorrectnessTest, ReconstructIsDeterministicAcrossCalls) {
 // ==================== alpScaleSimdAvailable gate ====================
 
 TEST_F(AlpSimdCorrectnessTest, ScaleSimdAvailableGateIsConsistent) {
-    const bool first = alp::simd::alpScaleSimdAvailable();
+    const bool first = timestar::alp::simd::alpScaleSimdAvailable();
     for (int i = 0; i < 16; ++i) {
-        EXPECT_EQ(alp::simd::alpScaleSimdAvailable(), first) << "Gate flipped on call " << i + 2;
+        EXPECT_EQ(timestar::alp::simd::alpScaleSimdAvailable(), first) << "Gate flipped on call " << i + 2;
     }
     // alpReconstruct has no gate: it must be callable and correct regardless
     // of what the scale gate reports (verified above); just re-assert the
     // gate did not change as a side effect of running the kernels.
     std::vector<int64_t> enc = {1, 2, 3};
     std::vector<double> out(3);
-    alp::simd::alpReconstruct(enc.data(), enc.size(), 1.0, 10.0, out.data());
-    EXPECT_EQ(alp::simd::alpScaleSimdAvailable(), first);
+    timestar::alp::simd::alpReconstruct(enc.data(), enc.size(), 1.0, 10.0, out.data());
+    EXPECT_EQ(timestar::alp::simd::alpScaleSimdAvailable(), first);
 }
 
 // ==================== alpScaleF0 (gated) ====================
@@ -238,7 +238,7 @@ void checkScaleF0(const std::vector<double>& values, double fact_val) {
     std::vector<uint64_t> excValues(count == 0 ? 1 : count, 0);
     int64_t minVal = 0, maxVal = 0;
 
-    const size_t nExc = alp::simd::alpScaleF0(values.data(), count, fact_val, encoded.data(), &minVal, &maxVal,
+    const size_t nExc = timestar::alp::simd::alpScaleF0(values.data(), count, fact_val, encoded.data(), &minVal, &maxVal,
                                               excPositions.data(), excValues.data());
     const ScaleRef ref = refScaleF0(values, fact_val);
 
@@ -260,7 +260,7 @@ void checkScaleF0(const std::vector<double>& values, double fact_val) {
 }  // namespace
 
 TEST_F(AlpSimdCorrectnessTest, ScaleF0MatchesScalarReference) {
-    if (!alp::simd::alpScaleSimdAvailable()) {
+    if (!timestar::alp::simd::alpScaleSimdAvailable()) {
         GTEST_SKIP() << "alpScaleF0 is gated off on this target (no AVX-512 DQ)";
     }
 

@@ -109,11 +109,11 @@ UNARY_BM(sqrt, g_series.abs().sqrt());
 UNARY_BM(ceil, g_series.ceil());
 UNARY_BM(floor, g_series.floor());
 UNARY_BM(diff, g_series.diff());
-UNARY_BM(monotonic_diff, g_series.monotonic_diff());
-UNARY_BM(default_zero, g_series.default_zero());
-UNARY_BM(fill_forward, g_series.fill_forward());
-UNARY_BM(fill_backward, g_series.fill_backward());
-UNARY_BM(fill_linear, g_series.fill_linear());
+UNARY_BM(monotonic_diff, g_series.monotonicDiff());
+UNARY_BM(default_zero, g_series.defaultZero());
+UNARY_BM(fill_forward, g_series.fillForward());
+UNARY_BM(fill_backward, g_series.fillBackward());
+UNARY_BM(fill_linear, g_series.fillLinear());
 UNARY_BM(cumsum, g_series.cumsum());
 UNARY_BM(integral, g_series.integral());
 UNARY_BM(normalize, g_series.normalize());
@@ -121,7 +121,7 @@ UNARY_BM(rate, g_series.rate());
 UNARY_BM(irate, g_series.irate());
 UNARY_BM(increase, g_series.increase());
 UNARY_BM(exp, g_series.normalize().exp());  // normalize() first to avoid overflow to inf
-UNARY_BM(round, g_series.round_nearest());
+UNARY_BM(round, g_series.roundNearest());
 UNARY_BM(sign, g_series.sign());
 UNARY_BM(deriv, g_series.deriv());
 UNARY_BM(delta, g_series.delta());
@@ -140,21 +140,21 @@ UNARY_BM(standardize, g_series.standardize());
     }                                                                                                              \
     BENCHMARK(BM_##name)
 
-SCALAR_BM(rolling_avg_100, g_series.rolling_avg(100));
-SCALAR_BM(rolling_min_100, g_series.rolling_min(100));
-SCALAR_BM(rolling_max_100, g_series.rolling_max(100));
-SCALAR_BM(rolling_stddev_100, g_series.rolling_stddev(100));
-SCALAR_BM(rolling_sum_100, g_series.rolling_sum(100));
-SCALAR_BM(rolling_median_101, g_series.rolling_median(101));
-SCALAR_BM(rolling_percentile_p95_100, g_series.rolling_percentile(100, 95.0));
+SCALAR_BM(rolling_avg_100, g_series.rollingAvg(100));
+SCALAR_BM(rolling_min_100, g_series.rollingMin(100));
+SCALAR_BM(rolling_max_100, g_series.rollingMax(100));
+SCALAR_BM(rolling_stddev_100, g_series.rollingStddev(100));
+SCALAR_BM(rolling_sum_100, g_series.rollingSum(100));
+SCALAR_BM(rolling_median_101, g_series.rollingMedian(101));
+SCALAR_BM(rolling_percentile_p95_100, g_series.rollingPercentile(100, 95.0));
 SCALAR_BM(ema_0_1, g_series.ema(0.1));
 SCALAR_BM(zscore_100, g_series.zscore(100));
-SCALAR_BM(holt_winters, g_series.holt_winters(0.3, 0.1));
-SCALAR_BM(fill_value, g_series.fill_value(0.0));
-SCALAR_BM(clamp_min, g_series.clamp_min(90.0));
-SCALAR_BM(clamp_max, g_series.clamp_max(150.0));
-SCALAR_BM(per_minute, g_series.per_minute(1.0));
-SCALAR_BM(per_hour, g_series.per_hour(1.0));
+SCALAR_BM(holt_winters, g_series.holtWinters(0.3, 0.1));
+SCALAR_BM(fill_value, g_series.fillValue(0.0));
+SCALAR_BM(clamp_min, g_series.clampMin(90.0));
+SCALAR_BM(clamp_max, g_series.clampMax(150.0));
+SCALAR_BM(per_minute, g_series.perMinute(1.0));
+SCALAR_BM(per_hour, g_series.perHour(1.0));
 
 // ═══════════════════════ binary series benchmarks ════════════════════════════
 

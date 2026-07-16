@@ -144,14 +144,14 @@ TEST(FFORCorruptData, BitWidthAbove64DoesNotCrash) {
     uint64_t packed[N] = {};
 
     // Should not crash — treated as full 64-bit copy
-    alp::ffor_pack(values, N, base, 65, packed);
+    timestar::alp::ffor_pack(values, N, base, 65, packed);
     for (size_t i = 0; i < N; ++i) {
         EXPECT_EQ(packed[i], static_cast<uint64_t>(values[i] - base));
     }
 
     // Unpack should round-trip
     int64_t unpacked[N] = {};
-    alp::ffor_unpack(packed, N, base, 65, unpacked);
+    timestar::alp::ffor_unpack(packed, N, base, 65, unpacked);
     for (size_t i = 0; i < N; ++i) {
         EXPECT_EQ(unpacked[i], values[i]);
     }
@@ -160,13 +160,13 @@ TEST(FFORCorruptData, BitWidthAbove64DoesNotCrash) {
     uint64_t uvals[N] = {10, 20, 30, 40};
     uint64_t ubase = 0;
     uint64_t upacked[N] = {};
-    alp::ffor_pack_u64(uvals, N, ubase, 200, upacked);  // bw=200
+    timestar::alp::ffor_pack_u64(uvals, N, ubase, 200, upacked);  // bw=200
     for (size_t i = 0; i < N; ++i) {
         EXPECT_EQ(upacked[i], uvals[i] - ubase);
     }
 
     uint64_t uunpacked[N] = {};
-    alp::ffor_unpack_u64(upacked, N, ubase, 200, uunpacked);
+    timestar::alp::ffor_unpack_u64(upacked, N, ubase, 200, uunpacked);
     for (size_t i = 0; i < N; ++i) {
         EXPECT_EQ(uunpacked[i], uvals[i]);
     }

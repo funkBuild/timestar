@@ -147,7 +147,7 @@ AlignedSeries AlignedSeries::rdiv(double scalar) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::div_ieee(double scalar) const {
+AlignedSeries AlignedSeries::divIeee(double scalar) const {
     // values[i] / scalar with true division (bit-identical to the series-series
     // path against a constant series). Unlike operator/(double), does not throw
     // on scalar == 0 and does not use the reciprocal-multiply shortcut.
@@ -220,7 +220,7 @@ AlignedSeries AlignedSeries::exp() const {
     return AlignedSeries(timestamps, transform::simd::exp(values));
 }
 
-AlignedSeries AlignedSeries::round_nearest() const {
+AlignedSeries AlignedSeries::roundNearest() const {
     return AlignedSeries(timestamps, transform::simd::round(values));
 }
 
@@ -285,7 +285,7 @@ AlignedSeries AlignedSeries::diff() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::monotonic_diff() const {
+AlignedSeries AlignedSeries::monotonicDiff() const {
     if (values.empty()) {
         return AlignedSeries(timestamps, {});
     }
@@ -299,7 +299,7 @@ AlignedSeries AlignedSeries::monotonic_diff() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::default_zero() const {
+AlignedSeries AlignedSeries::defaultZero() const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = std::isnan(values[i]) ? 0.0 : values[i];
@@ -307,7 +307,7 @@ AlignedSeries AlignedSeries::default_zero() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::count_nonzero() const {
+AlignedSeries AlignedSeries::countNonzero() const {
     size_t count = 0;
     for (size_t i = 0; i < values.size(); ++i) {
         if (values[i] != 0.0 && !std::isnan(values[i])) {
@@ -319,7 +319,7 @@ AlignedSeries AlignedSeries::count_nonzero() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::count_not_null() const {
+AlignedSeries AlignedSeries::countNotNull() const {
     size_t count = 0;
     for (size_t i = 0; i < values.size(); ++i) {
         if (!std::isnan(values[i])) {
@@ -481,7 +481,7 @@ AlignedSeries AlignedSeries::resets() const {
 
 // ==================== Gap-Fill / Interpolation Functions ====================
 
-AlignedSeries AlignedSeries::fill_forward() const {
+AlignedSeries AlignedSeries::fillForward() const {
     std::vector<double> result(values);
     double last = std::numeric_limits<double>::quiet_NaN();
     for (size_t i = 0; i < result.size(); ++i) {
@@ -495,7 +495,7 @@ AlignedSeries AlignedSeries::fill_forward() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::fill_backward() const {
+AlignedSeries AlignedSeries::fillBackward() const {
     std::vector<double> result(values);
     double next = std::numeric_limits<double>::quiet_NaN();
     for (size_t i = result.size(); i-- > 0;) {
@@ -509,7 +509,7 @@ AlignedSeries AlignedSeries::fill_backward() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::fill_linear() const {
+AlignedSeries AlignedSeries::fillLinear() const {
     std::vector<double> result(values);
     const auto& ts = *timestamps;
     const size_t n = result.size();
@@ -555,7 +555,7 @@ AlignedSeries AlignedSeries::fill_linear() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::fill_spline() const {
+AlignedSeries AlignedSeries::fillSpline() const {
     // Natural cubic spline interpolation through the known (non-NaN) points.
     // Semantics match fill_linear: only interior NaN runs are filled;
     // leading/trailing NaN runs stay NaN.  Fewer than 3 knots degenerates to
@@ -574,7 +574,7 @@ AlignedSeries AlignedSeries::fill_spline() const {
     const size_t k = knotIdx.size();
     if (k < 3 || k == n) {
         // Not enough knots for a cubic, or nothing to fill.
-        return k == n ? *this : fill_linear();
+        return k == n ? *this : fillLinear();
     }
 
     // Knot coordinates.  Timestamps are nanoseconds (~1e18), beyond double's
@@ -598,7 +598,7 @@ AlignedSeries AlignedSeries::fill_spline() const {
         if (h0 <= 0.0 || h1 <= 0.0) {
             // Duplicate/non-increasing knot timestamps — spline undefined;
             // fall back to linear which handles dt==0.
-            return fill_linear();
+            return fillLinear();
         }
         double diag = 2.0 * (h0 + h1);
         double rhs = 6.0 * ((yv[i + 1] - yv[i]) / h1 - (yv[i] - yv[i - 1]) / h0);
@@ -632,7 +632,7 @@ AlignedSeries AlignedSeries::fill_spline() const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::gaussian_smooth(double sigma) const {
+AlignedSeries AlignedSeries::gaussianSmooth(double sigma) const {
     // Gaussian kernel convolution with NaN-aware renormalization.
     // Kernel radius = ceil(3*sigma) (covers 99.7% of the Gaussian mass).
     // Interior windows with no NaN use a precomputed normalized kernel and a
@@ -697,7 +697,7 @@ AlignedSeries AlignedSeries::gaussian_smooth(double sigma) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::fill_value(double v) const {
+AlignedSeries AlignedSeries::fillValue(double v) const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = std::isnan(values[i]) ? v : values[i];
@@ -808,7 +808,7 @@ AlignedSeries AlignedSeries::standardize() const {
 
 // ==================== Percent of Total ====================
 
-AlignedSeries AlignedSeries::as_percent(const AlignedSeries& series, const AlignedSeries& total) {
+AlignedSeries AlignedSeries::asPercent(const AlignedSeries& series, const AlignedSeries& total) {
     checkSameSize(series, total, "as_percent");
     const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<double> result(series.values.size());
@@ -824,7 +824,7 @@ AlignedSeries AlignedSeries::as_percent(const AlignedSeries& series, const Align
     return AlignedSeries(series.timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::clamp_min(double minVal) const {
+AlignedSeries AlignedSeries::clampMin(double minVal) const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = std::isnan(values[i]) ? values[i] : std::max(values[i], minVal);
@@ -832,7 +832,7 @@ AlignedSeries AlignedSeries::clamp_min(double minVal) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::clamp_max(double maxVal) const {
+AlignedSeries AlignedSeries::clampMax(double maxVal) const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = std::isnan(values[i]) ? values[i] : std::min(values[i], maxVal);
@@ -840,7 +840,7 @@ AlignedSeries AlignedSeries::clamp_max(double maxVal) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::cutoff_min(double threshold) const {
+AlignedSeries AlignedSeries::cutoffMin(double threshold) const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = (values[i] < threshold) ? std::numeric_limits<double>::quiet_NaN() : values[i];
@@ -848,7 +848,7 @@ AlignedSeries AlignedSeries::cutoff_min(double threshold) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::cutoff_max(double threshold) const {
+AlignedSeries AlignedSeries::cutoffMax(double threshold) const {
     std::vector<double> result(values.size());
     for (size_t i = 0; i < values.size(); ++i) {
         result[i] = (values[i] > threshold) ? std::numeric_limits<double>::quiet_NaN() : values[i];
@@ -856,7 +856,7 @@ AlignedSeries AlignedSeries::cutoff_max(double threshold) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::rate_per(double seconds_per_point, double scale) const {
+AlignedSeries AlignedSeries::ratePer(double secondsPerPoint, double scale) const {
     if (values.empty()) {
         return AlignedSeries(timestamps, {});
     }
@@ -875,13 +875,13 @@ AlignedSeries AlignedSeries::rate_per(double seconds_per_point, double scale) co
         }
         double dt_seconds = static_cast<double>(ts[i] - ts[i - 1]) / 1e9;
 
-        // Fall back to the provided seconds_per_point if timestamps yield zero
+        // Fall back to the provided secondsPerPoint if timestamps yield zero
         if (dt_seconds == 0.0) {
-            if (seconds_per_point == 0.0) {
+            if (secondsPerPoint == 0.0) {
                 result[i] = 0.0;
                 continue;
             }
-            dt_seconds = seconds_per_point;
+            dt_seconds = secondsPerPoint;
         }
 
         result[i] = (value_diff / dt_seconds) * scale;
@@ -889,17 +889,17 @@ AlignedSeries AlignedSeries::rate_per(double seconds_per_point, double scale) co
     return AlignedSeries(timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::per_minute(double seconds_per_point) const {
-    return rate_per(seconds_per_point, 60.0);
+AlignedSeries AlignedSeries::perMinute(double secondsPerPoint) const {
+    return ratePer(secondsPerPoint, 60.0);
 }
 
-AlignedSeries AlignedSeries::per_hour(double seconds_per_point) const {
-    return rate_per(seconds_per_point, 3600.0);
+AlignedSeries AlignedSeries::perHour(double secondsPerPoint) const {
+    return ratePer(secondsPerPoint, 3600.0);
 }
 
 // ==================== Rolling Window Functions ====================
 
-AlignedSeries AlignedSeries::rolling_avg(int N) const {
+AlignedSeries AlignedSeries::rollingAvg(int N) const {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     if (N <= 0) {
         throw EvaluationException("rolling_avg() window size N must be a positive integer");
@@ -937,7 +937,7 @@ AlignedSeries AlignedSeries::rolling_avg(int N) const {
     return AlignedSeries(timestamps, std::move(result));
 }
 
-// ==================== rolling_monotone (shared ring-buffer impl) ====================
+// ==================== rollingMonotone (shared ring-buffer impl) ====================
 //
 // O(N) amortized sliding-window min/max using a contiguous ring buffer instead of
 // std::deque.  For window size W the ring holds at most W indices, so for W=100
@@ -947,7 +947,7 @@ AlignedSeries AlignedSeries::rolling_avg(int N) const {
 // Cmp = std::less<double>{}    -> rolling_min  (ascending invariant, front is min)
 // Cmp = std::greater<double>{} -> rolling_max  (descending invariant, front is max)
 template <typename Cmp>
-static AlignedSeries rolling_monotone(const AlignedSeries& s, int N, Cmp cmp) {
+static AlignedSeries rollingMonotone(const AlignedSeries& s, int N, Cmp cmp) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<double> result(s.values.size(), nan);
     if (s.values.empty()) {
@@ -1007,21 +1007,21 @@ static AlignedSeries rolling_monotone(const AlignedSeries& s, int N, Cmp cmp) {
     return AlignedSeries(s.timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::rolling_min(int N) const {
+AlignedSeries AlignedSeries::rollingMin(int N) const {
     if (N <= 0) {
         throw EvaluationException("rolling_min() window size N must be a positive integer");
     }
-    return rolling_monotone(*this, N, std::less<double>{});
+    return rollingMonotone(*this, N, std::less<double>{});
 }
 
-AlignedSeries AlignedSeries::rolling_max(int N) const {
+AlignedSeries AlignedSeries::rollingMax(int N) const {
     if (N <= 0) {
         throw EvaluationException("rolling_max() window size N must be a positive integer");
     }
-    return rolling_monotone(*this, N, std::greater<double>{});
+    return rollingMonotone(*this, N, std::greater<double>{});
 }
 
-AlignedSeries AlignedSeries::rolling_sum(int N) const {
+AlignedSeries AlignedSeries::rollingSum(int N) const {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     if (N <= 0) {
         throw EvaluationException("rolling_sum() window size N must be a positive integer");
@@ -1104,15 +1104,15 @@ static AlignedSeries rollingQuantileImpl(const AlignedSeries& s, int N, double p
     return AlignedSeries(s.timestamps, std::move(result));
 }
 
-AlignedSeries AlignedSeries::rolling_median(int N) const {
+AlignedSeries AlignedSeries::rollingMedian(int N) const {
     return rollingQuantileImpl(*this, N, 50.0, "rolling_median");
 }
 
-AlignedSeries AlignedSeries::rolling_percentile(int N, double p) const {
+AlignedSeries AlignedSeries::rollingPercentile(int N, double p) const {
     return rollingQuantileImpl(*this, N, p, "rolling_percentile");
 }
 
-AlignedSeries AlignedSeries::rolling_stddev(int N) const {
+AlignedSeries AlignedSeries::rollingStddev(int N) const {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     if (N <= 0) {
         throw EvaluationException("rolling_stddev() window size N must be a positive integer");
@@ -1356,7 +1356,7 @@ AlignedSeries AlignedSeries::ema(double param) const {
 
 // ==================== Double Exponential Smoothing (Holt-Winters) ====================
 
-AlignedSeries AlignedSeries::holt_winters(double alpha, double beta) const {
+AlignedSeries AlignedSeries::holtWinters(double alpha, double beta) const {
     const double nan = std::numeric_limits<double>::quiet_NaN();
 
     // Clamp alpha and beta to (0, 1]
@@ -1411,7 +1411,7 @@ AlignedSeries AlignedSeries::holt_winters(double alpha, double beta) const {
 
 // ==================== Timestamp Shift ====================
 
-AlignedSeries AlignedSeries::time_shift(int64_t offsetNs) const {
+AlignedSeries AlignedSeries::timeShift(int64_t offsetNs) const {
     // Shift every timestamp by offsetNs nanoseconds; values are unchanged.
     // Must create a new shared_ptr because timestamps change.
     const auto& ts = *timestamps;
@@ -1508,7 +1508,7 @@ AlignedSeries ExpressionEvaluator::evaluateBinaryOp(const BinaryOp& op, const Qu
             case BinaryOpType::MULTIPLY:
                 return series * scalar;
             case BinaryOpType::DIVIDE:
-                return rightScalar ? series.div_ieee(scalar) : series.rdiv(scalar);
+                return rightScalar ? series.divIeee(scalar) : series.rdiv(scalar);
             default:
                 throw EvaluationException("Unknown binary operator");
         }
@@ -1578,13 +1578,13 @@ AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op, const Quer
         case UnaryOpType::DIFF:
             return operand.diff();
         case UnaryOpType::MONOTONIC_DIFF:
-            return operand.monotonic_diff();
+            return operand.monotonicDiff();
         case UnaryOpType::DEFAULT_ZERO:
-            return operand.default_zero();
+            return operand.defaultZero();
         case UnaryOpType::COUNT_NONZERO:
-            return operand.count_nonzero();
+            return operand.countNonzero();
         case UnaryOpType::COUNT_NOT_NULL:
-            return operand.count_not_null();
+            return operand.countNotNull();
         // Counter-rate functions
         case UnaryOpType::RATE:
             return operand.rate();
@@ -1594,13 +1594,13 @@ AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op, const Quer
             return operand.increase();
         // Gap-fill / interpolation functions
         case UnaryOpType::FILL_FORWARD:
-            return operand.fill_forward();
+            return operand.fillForward();
         case UnaryOpType::FILL_BACKWARD:
-            return operand.fill_backward();
+            return operand.fillBackward();
         case UnaryOpType::FILL_LINEAR:
-            return operand.fill_linear();
+            return operand.fillLinear();
         case UnaryOpType::FILL_SPLINE:
-            return operand.fill_spline();
+            return operand.fillSpline();
         // Accumulation functions
         case UnaryOpType::CUMSUM:
             return operand.cumsum();
@@ -1614,7 +1614,7 @@ AlignedSeries ExpressionEvaluator::evaluateUnaryOp(const UnaryOp& op, const Quer
         case UnaryOpType::EXP:
             return operand.exp();
         case UnaryOpType::ROUND:
-            return operand.round_nearest();
+            return operand.roundNearest();
         case UnaryOpType::SIGN:
             return operand.sign();
         case UnaryOpType::DERIV:
@@ -1685,7 +1685,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (scalarSeries.empty()) {
                 throw EvaluationException("clamp_min() second argument must be a non-empty scalar");
             }
-            return series.clamp_min(scalarSeries.values[0]);
+            return series.clampMin(scalarSeries.values[0]);
         }
 
         case FunctionType::CLAMP_MAX: {
@@ -1699,7 +1699,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (scalarSeries.empty()) {
                 throw EvaluationException("clamp_max() second argument must be a non-empty scalar");
             }
-            return series.clamp_max(scalarSeries.values[0]);
+            return series.clampMax(scalarSeries.values[0]);
         }
 
         case FunctionType::CUTOFF_MIN: {
@@ -1713,7 +1713,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (scalarSeries.empty()) {
                 throw EvaluationException("cutoff_min() second argument must be a non-empty scalar");
             }
-            return series.cutoff_min(scalarSeries.values[0]);
+            return series.cutoffMin(scalarSeries.values[0]);
         }
 
         case FunctionType::CUTOFF_MAX: {
@@ -1727,7 +1727,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (scalarSeries.empty()) {
                 throw EvaluationException("cutoff_max() second argument must be a non-empty scalar");
             }
-            return series.cutoff_max(scalarSeries.values[0]);
+            return series.cutoffMax(scalarSeries.values[0]);
         }
 
         case FunctionType::PER_MINUTE: {
@@ -1741,7 +1741,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (scalarSeries.empty()) {
                 throw EvaluationException("per_minute() second argument must be a non-empty scalar");
             }
-            return series.per_minute(scalarSeries.values[0]);
+            return series.perMinute(scalarSeries.values[0]);
         }
 
         case FunctionType::PER_HOUR: {
@@ -1755,7 +1755,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (scalarSeries.empty()) {
                 throw EvaluationException("per_hour() second argument must be a non-empty scalar");
             }
-            return series.per_hour(scalarSeries.values[0]);
+            return series.perHour(scalarSeries.values[0]);
         }
 
         // Rolling window functions: second argument is integer window size N
@@ -1774,7 +1774,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (N <= 0) {
                 throw EvaluationException("rolling_avg() window size N must be a positive integer");
             }
-            return series.rolling_avg(N);
+            return series.rollingAvg(N);
         }
 
         case FunctionType::ROLLING_MIN: {
@@ -1792,7 +1792,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (N <= 0) {
                 throw EvaluationException("rolling_min() window size N must be a positive integer");
             }
-            return series.rolling_min(N);
+            return series.rollingMin(N);
         }
 
         case FunctionType::ROLLING_MAX: {
@@ -1810,7 +1810,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (N <= 0) {
                 throw EvaluationException("rolling_max() window size N must be a positive integer");
             }
-            return series.rolling_max(N);
+            return series.rollingMax(N);
         }
 
         case FunctionType::ROLLING_STDDEV: {
@@ -1828,7 +1828,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (N <= 0) {
                 throw EvaluationException("rolling_stddev() window size N must be a positive integer");
             }
-            return series.rolling_stddev(N);
+            return series.rollingStddev(N);
         }
 
         case FunctionType::ROLLING_SUM: {
@@ -1846,7 +1846,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (N <= 0) {
                 throw EvaluationException("rolling_sum() window size N must be a positive integer");
             }
-            return series.rolling_sum(N);
+            return series.rollingSum(N);
         }
 
         case FunctionType::ROLLING_MEDIAN: {
@@ -1864,7 +1864,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (N <= 0) {
                 throw EvaluationException("rolling_median() window size N must be a positive integer");
             }
-            return series.rolling_median(N);
+            return series.rollingMedian(N);
         }
 
         case FunctionType::ROLLING_PERCENTILE: {
@@ -1889,7 +1889,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (p < 0.0 || p > 100.0) {
                 throw EvaluationException("rolling_percentile() p must be in [0, 100], got " + std::to_string(p));
             }
-            return series.rolling_percentile(N, p);
+            return series.rollingPercentile(N, p);
         }
 
         case FunctionType::FILL_VALUE: {
@@ -1903,7 +1903,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (scalarSeries.empty()) {
                 throw EvaluationException("fill_value() second argument must be a non-empty scalar");
             }
-            return series.fill_value(scalarSeries.values[0]);
+            return series.fillValue(scalarSeries.values[0]);
         }
 
         case FunctionType::EMA: {
@@ -1939,7 +1939,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (!(sigma > 0.0) || sigma > 1e6) {
                 throw EvaluationException("gaussian_smooth() sigma must be in (0, 1e6]");
             }
-            return series.gaussian_smooth(sigma);
+            return series.gaussianSmooth(sigma);
         }
 
         case FunctionType::HOLT_WINTERS: {
@@ -1966,7 +1966,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             if (beta <= 0.0 || beta > 1.0) {
                 throw EvaluationException("holt_winters() beta must be in (0, 1]");
             }
-            return series.holt_winters(alpha, beta);
+            return series.holtWinters(alpha, beta);
         }
 
         case FunctionType::ZSCORE: {
@@ -1993,7 +1993,7 @@ AlignedSeries ExpressionEvaluator::evaluateFunctionCall(const FunctionCall& call
             }
             auto seriesEval = evaluateNode(*call.args[0], queryResults);
             auto totalEval = evaluateNode(*call.args[1], queryResults);
-            return AlignedSeries::as_percent(seriesEval.get(), totalEval.get());
+            return AlignedSeries::asPercent(seriesEval.get(), totalEval.get());
         }
 
         // topk/bottomk in single-series context: N scalar, then series reference.
@@ -2501,7 +2501,7 @@ AlignedSeries ExpressionEvaluator::evaluateTimeShiftFunction(const TimeShiftFunc
 
     int64_t offsetNs = negative ? -static_cast<int64_t>(absNs) : static_cast<int64_t>(absNs);
 
-    return series.time_shift(offsetNs);
+    return series.timeShift(offsetNs);
 }
 
 }  // namespace timestar
