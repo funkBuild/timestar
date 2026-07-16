@@ -242,30 +242,37 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     // Compute block-level statistics for Float series.
     // Two-pass approach: first pass computes sum/min/max (vectorizable),
     // second pass computes M2 using the known mean (no per-element division).
-    // NaN values are skipped for stats (sum/min/max/mean/m2) but blockCount
-    // still reflects the total number of values (including NaN) since the
-    // decoder needs the full count.
+    //
+    // Canonical NaN semantics (docs/nan_policy.md): NaN = missing data. NaN
+    // values are skipped for ALL stats INCLUDING blockCount — blockCount is
+    // the number of non-NaN values so that COUNT/AVG stats pushdown matches
+    // the scalar NaN-skipping fold exactly (placement-independent results).
+    // The decoder never uses blockCount for allocation (block headers carry
+    // their own point count), and the read path detects NaN-carrying blocks
+    // by comparing blockCount against the header count (see
+    // decodeBlockCountOnly in tsm.cpp).
     const size_t n = values.size();
     double sum = 0.0;
-    double bmin = std::numeric_limits<double>::max();
-    double bmax = std::numeric_limits<double>::lowest();
+    double bmin = 0.0;
+    double bmax = 0.0;
     size_t validCount = 0;
     double m2 = 0.0;
 
-    // Fast path: TSM block data is NaN-free by invariant (NaN filtered during
-    // write), so a fused SIMD sum/min/max pass + a SIMD variance pass replace
-    // the two branchy scalar loops. A NaN sum detects invariant violations and
-    // falls back to the NaN-skipping scalar path below.
+    // Fast path: blocks are almost always free of special values, so a fused
+    // SIMD sum/min/max pass + a SIMD variance pass replace the two branchy
+    // scalar loops. A NaN sum/min/max detects NaN data (or an all-±Inf batch,
+    // whose kernel sentinel conflates with all-NaN) and falls back to the
+    // NaN-skipping scalar path below.
     timestar::simd::SimdAggregator::calculateSumMinMax(values.data(), n, sum, bmin, bmax);
-    if (!std::isnan(sum)) [[likely]] {
+    if (!std::isnan(sum) && !std::isnan(bmin) && !std::isnan(bmax)) [[likely]] {
         validCount = n;
         const double mean = sum / static_cast<double>(n);
         // calculateVariance returns population variance (M2/n)
         m2 = timestar::simd::SimdAggregator::calculateVariance(values.data(), n, mean) * static_cast<double>(n);
     } else {
         sum = 0.0;
-        bmin = std::numeric_limits<double>::max();
-        bmax = std::numeric_limits<double>::lowest();
+        bmin = std::numeric_limits<double>::infinity();
+        bmax = -std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < n; ++i) {
             double v = values[i];
             if (std::isnan(v))
@@ -277,18 +284,18 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
             if (v > bmax)
                 bmax = v;
         }
-        // If all values are NaN, use sentinel values indicating no valid stats.
+        // If all values are NaN, use sentinel values indicating no valid stats
+        // (blockCount == 0 below prevents any stats pushdown).
         if (validCount == 0) {
             sum = 0.0;
             bmin = std::numeric_limits<double>::quiet_NaN();
             bmax = std::numeric_limits<double>::quiet_NaN();
         }
-        // M2 = Σ(xi - mean)² over non-NaN values.
-        if (validCount > 0) {
+        // M2 = Σ(xi - mean)² over non-NaN values. Only meaningful when the
+        // block is NaN-free (extended stats are withheld otherwise).
+        if (validCount == n) {
             double mean = sum / static_cast<double>(validCount);
             for (size_t i = 0; i < n; ++i) {
-                if (std::isnan(values[i]))
-                    continue;
                 double delta = values[i] - mean;
                 m2 += delta * delta;
             }
@@ -297,15 +304,27 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.blockSum = sum;
     indexBlock.blockMin = bmin;
     indexBlock.blockMax = bmax;
-    indexBlock.blockCount = static_cast<uint32_t>(n);
-    indexBlock.blockM2 = m2;
-    // firstValue/latestValue: values at min/max timestamp positions.
-    // Sorted timestamps: first = index 0, latest = index n-1.
-    size_t firstIdx = 0;
-    size_t latestIdx = timestamps.size() - 1;
-    indexBlock.blockFirstValue = values[firstIdx];
-    indexBlock.blockLatestValue = values[latestIdx];
-    indexBlock.hasExtendedStats = true;
+    indexBlock.blockCount = static_cast<uint32_t>(validCount);
+    if (validCount == n) {
+        // NaN-free block: extended stats (M2/first/latest) are exact.
+        // firstValue/latestValue: values at min/max timestamp positions.
+        // Sorted timestamps: first = index 0, latest = index n-1.
+        indexBlock.blockM2 = m2;
+        indexBlock.blockFirstValue = values.front();
+        indexBlock.blockLatestValue = values.back();
+        indexBlock.hasExtendedStats = true;
+    } else {
+        // Block contains NaN: withhold extended stats so STDDEV/STDVAR/
+        // LATEST/FIRST shortcuts decode and NaN-skip per value instead of
+        // trusting endpoint values that may be NaN. SUM/AVG/MIN/MAX/COUNT
+        // pushdown stays available via the NaN-skipped base stats above.
+        // hasExtendedStats is not serialized — NaN first/latest are the
+        // on-disk sentinels the reader recovers the flag from.
+        indexBlock.blockM2 = std::numeric_limits<double>::quiet_NaN();
+        indexBlock.blockFirstValue = std::numeric_limits<double>::quiet_NaN();
+        indexBlock.blockLatestValue = std::numeric_limits<double>::quiet_NaN();
+        indexBlock.hasExtendedStats = false;
+    }
 
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }

@@ -642,6 +642,27 @@ the `foldNoInterval` parameter of `Engine::queryAggregated()` /
 `QueryRunner::queryTsmAggregated()`; callers derive it from the query alone
 (group-by → collapse; standard per-series path → raw).
 
+### Special Float Values (canonical semantics)
+
+Aggregation results are placement-independent: memory store, TSM block-stats
+pushdown, SIMD folds, and scalar folds all agree. Full policy in
+`docs/nan_policy.md`.
+
+- **NaN = missing data.** Skipped by EVERY aggregation method on EVERY path:
+  `count` counts only non-NaN values, `avg = sum-of-non-NaN / count-of-non-NaN`.
+  Raw (non-aggregated) reads return NaN verbatim (serialized as JSON `null`;
+  protobuf carries it natively). TSM float block stats (including
+  `blockCount`) are NaN-skipped at write time; blocks containing NaN carry no
+  extended stats (see `docs/tsm_format.md`).
+- **±Infinity is valid data.** Raw reads return it exactly. Aggregations let
+  it participate arithmetically: SUM/AVG propagate (`+Inf + -Inf = NaN` is
+  the correct IEEE aggregate), MIN/MAX order it, COUNT counts it. Min/max
+  identities are ±infinity, and Kahan sums reset their compensation term when
+  the sum is non-finite (otherwise Inf silently degrades to NaN).
+- **-0.0 round-trips raw reads bit-exactly** (ALP stores NaN/±Inf/-0.0 as
+  raw-bit exceptions). Aggregated results may normalize -0.0 to +0.0 (IEEE
+  addition/comparison semantics) — documented behaviour, not a bug.
+
 ### Query Features
 
 - **Multi-shard coordination**: Queries automatically fan out to all relevant shards

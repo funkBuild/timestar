@@ -14,8 +14,10 @@ namespace timestar {
 // Running aggregation state for a single time bucket of a single series+field.
 struct BucketState {
     double sum = 0.0;
-    double min = std::numeric_limits<double>::max();
-    double max = std::numeric_limits<double>::lowest();
+    // ±Inf identities so legitimate ±Inf values order correctly (see
+    // AggregationState). Emptiness is signalled by count == 0.
+    double min = std::numeric_limits<double>::infinity();
+    double max = -std::numeric_limits<double>::infinity();
     double first = 0.0;
     uint64_t firstTimestamp = std::numeric_limits<uint64_t>::max();
     double latest = 0.0;

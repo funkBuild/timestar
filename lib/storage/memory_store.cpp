@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <numeric>
 #include <ranges>
 #include <stdexcept>
@@ -25,14 +26,45 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     valid = true;
 
     // Phase 1: FUSED SIMD sum/min/max — one memory pass instead of three
-    // separate kernel calls.
+    // separate kernel calls. The fused kernel NaN-skips min/max but the sum
+    // propagates NaN, and its all-skipped sentinel collapses ±Inf results to
+    // NaN — both cases route to the scalar special-value pass below.
     double batchSum, batchMin, batchMax;
     timestar::simd::SimdAggregator::calculateSumMinMax(values, n, batchSum, batchMin, batchMax);
 
-    // Kahan compensated accumulation of batch sum
+    // Number of non-NaN values in this batch (canonical: NaN = missing data,
+    // never counted/summed — docs/nan_policy.md).
+    size_t validN = n;
+
+    if (std::isnan(batchSum) || std::isnan(batchMin) || std::isnan(batchMax)) [[unlikely]] {
+        // Special values present: NaN data (skip it), an Inf/-Inf mix (sum is
+        // genuinely NaN), or all-±Inf data (kernel sentinel conflation).
+        // Recompute scalar with NaN skipped; ±Inf participates arithmetically.
+        batchSum = 0.0;
+        batchMin = std::numeric_limits<double>::infinity();
+        batchMax = -std::numeric_limits<double>::infinity();
+        validN = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double v = values[i];
+            if (std::isnan(v))
+                continue;
+            ++validN;
+            batchSum += v;
+            if (v < batchMin)
+                batchMin = v;
+            if (v > batchMax)
+                batchMax = v;
+        }
+        if (validN == 0)
+            return;  // All-NaN batch: nothing to fold (count unchanged).
+    }
+
+    // Kahan compensated accumulation of batch sum.
+    // Non-finite guard: with a ±Inf sum the compensation term degenerates to
+    // NaN and would poison later batches (Inf results silently become NaN).
     double y = batchSum - sumCompensation;
     double t = sum + y;
-    sumCompensation = (t - sum) - y;
+    sumCompensation = std::isfinite(t) ? (t - sum) - y : 0.0;
     sum = t;
 
     if (batchMin < min)
@@ -45,27 +77,42 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     // put a hardware divide on a loop-carried dependency chain (~20 cy/pt).
     // Two-pass batch variance is numerically as good as sequential Welford.
     {
-        const double batchMean = batchSum / static_cast<double>(n);
-        // calculateVariance returns population variance (M2/n)
-        const double batchM2 =
-            timestar::simd::SimdAggregator::calculateVariance(values, n, batchMean) * static_cast<double>(n);
+        const double batchMean = batchSum / static_cast<double>(validN);
+        // calculateVariance returns population variance (M2/n).
+        // With NaN present the SIMD kernel would return NaN — compute the
+        // NaN-skipping variance scalar instead (rare path).
+        double batchM2;
+        if (validN == n) [[likely]] {
+            batchM2 = timestar::simd::SimdAggregator::calculateVariance(values, n, batchMean) * static_cast<double>(n);
+        } else {
+            batchM2 = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (std::isnan(values[i]))
+                    continue;
+                const double delta = values[i] - batchMean;
+                batchM2 += delta * delta;
+            }
+        }
         if (count == 0) {
             mean = batchMean;
             m2 = batchM2;
         } else {
             const double delta = batchMean - mean;
-            const double totalCount = static_cast<double>(count) + static_cast<double>(n);
-            m2 += batchM2 + delta * delta * (static_cast<double>(count) * static_cast<double>(n)) / totalCount;
-            mean += delta * (static_cast<double>(n) / totalCount);
+            const double totalCount = static_cast<double>(count) + static_cast<double>(validN);
+            m2 += batchM2 + delta * delta * (static_cast<double>(count) * static_cast<double>(validN)) / totalCount;
+            mean += delta * (static_cast<double>(validN) / totalCount);
         }
-        count += n;
+        count += validN;
     }
 
     // Phase 3: first/latest timestamp tracking.
     // Batches are almost always sorted (chronological ingest), so the
     // endpoints suffice; the sortedness scan is a single predictable
     // compare per element vs. the two-branch tracking loop.
-    if (std::is_sorted(timestamps, timestamps + n)) [[likely]] {
+    // When the batch contains NaN (validN < n), first/latest must be the
+    // first/last non-NaN VALUES (canonical FIRST/LATEST semantics) — take
+    // the NaN-skipping loop instead.
+    if (validN == n && std::is_sorted(timestamps, timestamps + n)) [[likely]] {
         if (timestamps[0] < firstTimestamp) {
             firstTimestamp = timestamps[0];
             firstValue = values[0];
@@ -76,6 +123,8 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
         }
     } else {
         for (size_t i = 0; i < n; ++i) {
+            if (std::isnan(values[i]))
+                continue;
             uint64_t ts = timestamps[i];
             if (ts < firstTimestamp) {
                 firstTimestamp = ts;

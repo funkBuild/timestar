@@ -29,8 +29,13 @@ class WAL;
 struct InMemorySeriesStats {
     double sum = 0.0;
     double sumCompensation = 0.0;  // Kahan compensated sum
-    double min = std::numeric_limits<double>::max();
-    double max = std::numeric_limits<double>::lowest();
+    // ±Inf identities so legitimate ±Inf values order correctly (see
+    // AggregationState). Emptiness is signalled by count == 0.
+    double min = std::numeric_limits<double>::infinity();
+    double max = -std::numeric_limits<double>::infinity();
+    // Number of non-NaN values (NaN = missing data and is never counted;
+    // docs/nan_policy.md). Matches AggregationState::count semantics so the
+    // stats pushdown is placement-independent.
     uint64_t count = 0;
     // Welford's online variance accumulators
     double mean = 0.0;

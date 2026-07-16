@@ -4,6 +4,7 @@
 #include "simd_aggregator.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <numeric>
 #include <optional>
@@ -399,6 +400,13 @@ private:
     // NOTE: The SIMD paths for AVG/SUM/MIN/MAX/COUNT/SPREAD only update the
     // accumulators they need (sum, count, min, max). STDDEV/STDVAR maintain
     // mean/m2 via a two-pass batch variance + Chan's parallel Welford merge.
+    //
+    // NaN handling (docs/nan_policy.md): every method whose OUTPUT depends on
+    // count or values detects NaN (NaN SIMD sum / NaN min/max / boundary
+    // check) and falls back to the scalar NaN-skipping fold. For MIN/MAX/
+    // SPREAD/LATEST/FIRST fast paths, interior NaN may still be included in
+    // state.count — count is not part of those methods' results (it only
+    // gates emptiness), so this is unobservable.
     // After updating sum/count we recompute state.mean = state.sum / state.count
     // so that any downstream code reading mean (e.g. mergeForMethod) sees a
     // consistent value.
@@ -413,9 +421,12 @@ private:
         const double* vdata = values.data() + begin;
         const uint64_t* tdata = timestamps.data() + begin;
 
-        // INVARIANT: Decoded TSM block data is NaN-free (NaN filtered during write).
-        // Defense-in-depth: if the first element is NaN (e.g. corrupt data), bail to
-        // the scalar path which correctly skips NaN via addValueForMethod().
+        // NaN CAN appear in decoded data (NaN is stored verbatim; canonical
+        // policy: NaN = missing, skipped by every method — docs/nan_policy.md).
+        // Cheap prefilter: if the first element is NaN, bail to the scalar
+        // path which correctly skips NaN via addValueForMethod(). Interior
+        // NaN is caught per-method below (NaN sum / NaN min/max / boundary
+        // checks) with the same scalar fallback.
         if (n > 0 && std::isnan(vdata[0])) [[unlikely]] {
             for (size_t i = begin; i < end; ++i) {
                 addToState(state, values[i], timestamps[i]);
@@ -434,10 +445,13 @@ private:
                         addToState(state, values[i], timestamps[i]);
                     }
                 } else {
-                    // Kahan compensated addition of SIMD sum to preserve precision
+                    // Kahan compensated addition of SIMD sum to preserve precision.
+                    // Non-finite guard: with a ±Inf sum the compensation term
+                    // degenerates to NaN and would poison later additions,
+                    // turning Inf results into NaN (canonical: Inf propagates).
                     double y = simdSum - state.sumCompensation;
                     double t = state.sum + y;
-                    state.sumCompensation = (t - state.sum) - y;
+                    state.sumCompensation = std::isfinite(t) ? (t - state.sum) - y : 0.0;
                     state.sum = t;
                     state.count += n;
                     // Keep mean consistent for downstream merge operations.
@@ -454,7 +468,17 @@ private:
                 }
                 break;
             }
-            case AggregationMethod::COUNT:
+            case AggregationMethod::COUNT: {
+                // COUNT counts only non-NaN values (NaN = missing data). A NaN
+                // SIMD sum means NaN is present (or an Inf/-Inf mix) — fall
+                // back to the scalar NaN-skipping fold. One fused pass; the
+                // NaN-free common case still counts in O(1) after the check.
+                if (std::isnan(simd::SimdAggregator::calculateSum(vdata, n))) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                    break;
+                }
                 state.count += n;
                 if (n > 0) {
                     if (tdata[0] < state.firstTimestamp) {
@@ -467,6 +491,7 @@ private:
                     }
                 }
                 break;
+            }
             case AggregationMethod::MIN: {
                 double simdMin = simd::SimdAggregator::calculateMin(vdata, n);
                 if (std::isnan(simdMin)) [[unlikely]] {
@@ -531,7 +556,15 @@ private:
             }
             case AggregationMethod::LATEST:
                 // Timestamps are monotonically increasing within a TSM block,
-                // so the last element is always the latest.
+                // so the last element is always the latest. If it is NaN the
+                // canonical answer is the last non-NaN value — scalar fallback
+                // (the entry prefilter above only checks vdata[0]).
+                if (n > 0 && std::isnan(vdata[n - 1])) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                    break;
+                }
                 if (n > 0 && tdata[n - 1] >= state.latestTimestamp) {
                     state.latest = vdata[n - 1];
                     state.latestTimestamp = tdata[n - 1];

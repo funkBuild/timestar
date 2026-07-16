@@ -68,8 +68,12 @@ struct AggregationState {
 
     double sum = 0.0;
     double sumCompensation = 0.0;  // Kahan compensation term for numerically stable summation
-    double min = std::numeric_limits<double>::max();
-    double max = std::numeric_limits<double>::lowest();
+    // Min/max identities are ±infinity (not DBL_MAX/DBL_LOWEST) so that
+    // legitimate ±Inf data points order correctly: min over all-(+Inf) values
+    // must be +Inf, not DBL_MAX. Emptiness is signalled by count == 0, never
+    // by the min/max sentinels.
+    double min = std::numeric_limits<double>::infinity();
+    double max = -std::numeric_limits<double>::infinity();
     double latest = 0.0;                                             // Most recent value
     uint64_t latestTimestamp = 0;                                    // Timestamp of latest value
     double first = 0.0;                                              // Earliest value
@@ -95,10 +99,16 @@ struct AggregationState {
     void addValue(double value, uint64_t timestamp) {
         if (std::isnan(value))
             return;  // Skip NaN to avoid poisoning aggregation
-        // Kahan compensated summation for precision over millions of points
+        // Kahan compensated summation for precision over millions of points.
+        // Guard: once the sum is non-finite (legitimate ±Inf data, or NaN from
+        // Inf + -Inf), the compensation term degenerates to NaN ((Inf-Inf)-y)
+        // and would silently turn every later Inf result into NaN. Reset it so
+        // Inf propagates arithmetically (canonical ±Inf semantics).
         double y = value - sumCompensation;
         double t = sum + y;
-        sumCompensation = (t - sum) - y;
+        // (t - t) == 0.0 iff t is finite (Inf/NaN yield NaN, which compares
+        // false): one subtract + compare, cheaper than std::isfinite here.
+        sumCompensation = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
         sum = t;
         min = std::min(min, value);
         max = std::max(max, value);
@@ -137,7 +147,9 @@ struct AggregationState {
             case AggregationMethod::SUM: {
                 double y = value - sumCompensation;
                 double t = sum + y;
-                sumCompensation = (t - sum) - y;
+                // Non-finite guard: see addValue() — keeps Inf sums from
+                // degenerating to NaN via a poisoned compensation term.
+                sumCompensation = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
                 sum = t;
                 count++;
                 // `mean` is intentionally NOT updated here: getValue(AVG) reads
@@ -279,7 +291,9 @@ private:
         double otherTotal = other.sum + other.sumCompensation;
         double y = otherTotal - sumCompensation;
         double t = sum + y;
-        sumCompensation = (t - sum) - y;
+        // Non-finite guard: see addValue() — keeps Inf sums from degenerating
+        // to NaN via a poisoned compensation term.
+        sumCompensation = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
         sum = t;
         min = std::min(min, other.min);
         max = std::max(max, other.max);

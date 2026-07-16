@@ -103,10 +103,25 @@ V2 adds type-specific statistics after the 28-byte base. Total block entry sizes
 | 28     | 8    | double | blockSum                                     |
 | 36     | 8    | double | blockMin                                     |
 | 44     | 8    | double | blockMax                                     |
-| 52     | 4    | uint32 | blockCount                                   |
+| 52     | 4    | uint32 | blockCount (non-NaN count, see below)        |
 | 56     | 8    | double | blockM2 (Welford accumulator for STDDEV)     |
 | 64     | 8    | double | blockFirstValue (value at earliest timestamp)|
 | 72     | 8    | double | blockLatestValue (value at latest timestamp) |
+
+Float stats semantics (canonical NaN policy, docs/nan_policy.md): all stats
+INCLUDING `blockCount` skip NaN values — `blockCount` is the number of
+**non-NaN** points, so COUNT/AVG stats pushdown matches the scalar
+NaN-skipping fold. The block header carries the true total point count for
+decoding; a `blockCount` that differs from the header count marks a
+NaN-carrying block (the COUNT-only read path uses this to force value
+decode). Blocks containing NaN are written with NaN in
+`blockM2`/`blockFirstValue`/`blockLatestValue` — NaN endpoints are the
+on-disk sentinel from which the reader derives `hasExtendedStats = false`
+(M2/first/latest withheld; the flag itself is not serialized). An all-NaN
+block has `blockCount = 0` (stats pushdown disabled). Files written before
+this rule stored the raw
+total in `blockCount`; they never mismatch the header count and keep legacy
+(NaN-counting) pushdown behaviour until rewritten by compaction.
 
 #### Integer Block Stats (offsets 28-71)
 

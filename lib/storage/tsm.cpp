@@ -83,6 +83,7 @@ struct BlockHeaderInfo {
     size_t valueByteSize;  // value-region length in bytes
     size_t nSkipped;       // points filtered out before startTime
     size_t nTimestamps;    // decoded timestamps now in tsScratch
+    size_t totalInBlock;   // total points stored in the block (pre-filter)
 };
 
 // Parse the block header and decode timestamps (filtered by [startTime, endTime], inclusive)
@@ -115,7 +116,7 @@ static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8
     const size_t valueOffset = BLOCK_HEADER_SIZE + timestampBytes;
     const size_t valueByteSize = blockSize - valueOffset;
 
-    return BlockHeaderInfo{valueOffset, valueByteSize, nSkipped, nTimestamps};
+    return BlockHeaderInfo{valueOffset, valueByteSize, nSkipped, nTimestamps, timestampSize};
 }
 
 static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
@@ -182,12 +183,26 @@ static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockS
 }
 
 // COUNT-only block decode: decode timestamps only, skip value decompression.
+//
+// NaN awareness: Float blocks can carry NaN values verbatim, and COUNT must
+// not count them (canonical: NaN = missing data — docs/nan_policy.md). The
+// index blockCount is the block's non-NaN count; when it disagrees with the
+// header's total point count, NaN is present and the values must be decoded
+// so the fold can skip it. Legacy files (blockCount written pre-NaN-fix as
+// the raw total) never mismatch and keep the fast timestamp-only path.
 static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
-                                   timestar::BlockAggregator& aggregator) {
+                                   timestar::BlockAggregator& aggregator, TSMValueType seriesType,
+                                   uint32_t statsValidCount) {
     static thread_local std::vector<uint64_t> tsScratch;
     auto hdr = parseHeaderAndDecodeTimestamps(data, blockSize, startTime, endTime, tsScratch);
     if (!hdr || hdr->nTimestamps == 0)
         return 0;
+
+    if (seriesType == TSMValueType::Float && statsValidCount != static_cast<uint32_t>(hdr->totalInBlock)) [[unlikely]] {
+        // NaN-carrying (or stats-less) Float block: full decode so the
+        // aggregator's NaN-skipping COUNT fold produces the canonical count.
+        return decodeBlockIntoAggregator(data, blockSize, startTime, endTime, aggregator);
+    }
 
     aggregator.addTimestampsOnly(tsScratch);
     return tsScratch.size();
@@ -366,7 +381,10 @@ seastar::future<> TSM::readSparseIndex() {
             if (seriesType == TSMValueType::Float) {
                 std::memcpy(&firstValue, indexSlice.data + blockStart + 64, sizeof(double));
                 std::memcpy(&latestValue, indexSlice.data + lastBlockStart + 72, sizeof(double));
-                hasExtStats = true;
+                // NaN endpoints mark NaN-carrying blocks (writer sentinel, or
+                // legacy blocks whose real endpoints were NaN): first/latest
+                // shortcuts must decode instead (see parseIndexBlocksFromSlice).
+                hasExtStats = !std::isnan(firstValue) && !std::isnan(latestValue);
             }
             // Integer (V2): first/latest as int64 at offset 56 and 64 within block
             // Layout: minTime(8) maxTime(8) offset(8) size(4) count(4) sum(8) min(8) max(8) first(8) latest(8)
@@ -480,7 +498,12 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
             block.blockM2 = indexSlice.read<double>();
             block.blockFirstValue = indexSlice.read<double>();
             block.blockLatestValue = indexSlice.read<double>();
-            block.hasExtendedStats = true;
+            // Extended stats are unusable when the endpoint values are NaN:
+            // the writer stores NaN first/latest sentinels for NaN-carrying
+            // blocks (LATEST/FIRST/STDDEV must decode and skip per value),
+            // and legacy files whose block endpoints were genuinely NaN are
+            // caught by the same predicate. See docs/nan_policy.md.
+            block.hasExtendedStats = !std::isnan(block.blockFirstValue) && !std::isnan(block.blockLatestValue);
         } else if (fileVersion >= 2) {
             // V2: all non-Float types have at least blockCount
             if (entry.seriesType == TSMValueType::Integer) {
@@ -1396,7 +1419,7 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                 size_t n;
                 if (countOnly) {
                     n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
-                                             aggregator);
+                                             aggregator, seriesType, block.blockCount);
                 } else if (seriesType == TSMValueType::Float) {
                     n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
                                                   aggregator);
