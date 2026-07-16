@@ -59,6 +59,16 @@ public:
                                        seastar::temporary_buffer<uint8_t>&& compressedData,
                                        const TSMIndexBlock& srcBlock);
 
+    // Attach a string dictionary to a series' index entry. Used by the
+    // zero-copy compaction carry: STR2 blocks copied verbatim from a source
+    // file reference dictionary IDs, so the output file's index must persist
+    // the source's dictionary or the blocks become undecodable. Call after
+    // writeCompressedBlockWithStats has created the entry for this series.
+    void setSeriesStringDictionary(const SeriesId128& seriesId,
+                                   std::shared_ptr<const std::vector<std::string>> dict) {
+        indexEntries[seriesId].stringDictionary = std::move(dict);
+    }
+
     void writeIndex();
 
     void writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEntry& indexEntry, size_t blockStartOffset);

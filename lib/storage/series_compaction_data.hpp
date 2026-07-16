@@ -31,6 +31,12 @@ struct SeriesCompactionData {
     std::vector<CompressedBlock> compressedBlocks;
     bool isZeroCopy = false;
 
+    // String series only: dictionary carried from the single source file when
+    // the zero-copy path is taken. STR2 blocks store dictionary IDs, so the
+    // output file's index entry MUST persist this dictionary — otherwise every
+    // value of the series becomes permanently undecodable after compaction.
+    std::shared_ptr<const std::vector<std::string>> stringDictionary;
+
     // Slow path data (decompressed and merged)
     std::vector<uint64_t> timestamps;
     std::vector<T> values;

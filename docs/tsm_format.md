@@ -150,6 +150,26 @@ total in `blockCount`; they never mismatch the header count and keep legacy
 |--------|------|--------|------------------|
 | 28     | 4    | uint32 | blockCount       |
 
+#### String Dictionary (String series only, after the block entries)
+
+Each String series index entry ends with `dictSize(4)` + `dictData(dictSize)`.
+`dictSize == 0` means the series' blocks use raw `STRG` encoding; a non-zero
+size means they use dictionary-ID `STR2` encoding, whose varint IDs are ONLY
+meaningful with this dictionary. **Invariant: a file containing STR2 blocks
+for a series MUST carry that series' dictionary in its index entry.**
+Compaction enforces this by carrying the dictionary through the zero-copy
+block path when the series comes from a single source file, and by decoding +
+re-encoding (fresh dictionary) when merging dictionary-bearing blocks from
+multiple sources.
+
+Historical note (bug fixed Jul 2026): compaction's zero-copy path used to
+carry STR2 blocks without their dictionary, writing `dictSize=0`. Files
+written by an affected build have permanently undecodable string blocks
+(the reader now reports "Dictionary-encoded (STR2) string block has no
+dictionary in its TSM index entry"); the dictionary bytes were never written,
+so no repair is possible — affected string data must be re-ingested. Numeric
+series in the same files are unaffected.
+
 ### V1 Backward Compatibility
 
 V1 files have stats only for Float blocks (80 bytes). All other types use the 28-byte base only. The reader selects the per-block byte size via `indexBlockBytes(type, version)`.

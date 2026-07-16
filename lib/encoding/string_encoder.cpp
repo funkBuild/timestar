@@ -27,6 +27,24 @@ static thread_local std::vector<char> tlCompBuf;
 // raw pointer, so no DMA alignment is required.
 static thread_local std::vector<uint8_t> tlUncompBuf;
 
+// Magics for the two on-disk string block formats (also defined in the
+// dictionary section below; hoisted here so the raw decoder can produce a
+// precise diagnostic when a dictionary-encoded block reaches it).
+static constexpr uint32_t STRG_MAGIC_V = 0x53545247;  // "STRG" raw zstd blocks
+static constexpr uint32_t STR2_MAGIC_V = 0x53545232;  // "STR2" dictionary-ID blocks
+
+// A STR2 block reaching the raw decoder means its TSM index entry carries no
+// string dictionary — historically caused by compaction dropping the
+// dictionary. Emit a precise error instead of a generic magic mismatch.
+[[noreturn]] static void throwBadStringMagic(uint32_t magic) {
+    if (magic == STR2_MAGIC_V) {
+        throw std::runtime_error(
+            "Dictionary-encoded (STR2) string block has no dictionary in its TSM index entry — "
+            "file written by a compaction that dropped the string dictionary (corrupt block)");
+    }
+    throw std::runtime_error("Invalid magic number in string encoding");
+}
+
 // Validate zstd decompression result: check for errors and size mismatch.
 // A truncated or corrupted compressed stream may decompress fewer bytes than
 // the header claims, leaving stale data in the reused thread-local buffer.
@@ -226,8 +244,8 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
     // Read header
     uint32_t magic;
     std::memcpy(&magic, encoded.data + encoded.offset, 4);
-    if (magic != 0x53545247) {
-        throw std::runtime_error("Invalid magic number in string encoding");
+    if (magic != STRG_MAGIC_V) {
+        throwBadStringMagic(magic);
     }
     encoded.offset += 4;
 
@@ -295,7 +313,7 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
 
 // ==================== Dictionary Encoding (Phase 3) ====================
 
-static constexpr uint32_t STR2_MAGIC = 0x53545232;  // "STR2"
+static constexpr uint32_t STR2_MAGIC = STR2_MAGIC_V;  // "STR2"
 
 StringEncoder::Dictionary StringEncoder::buildDictionary(std::span<const std::string> values) {
     Dictionary dict;
@@ -514,8 +532,8 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
     // Read header
     uint32_t magic;
     std::memcpy(&magic, encoded.data + encoded.offset, 4);
-    if (magic != 0x53545247) {
-        throw std::runtime_error("Invalid magic number in string encoding");
+    if (magic != STRG_MAGIC_V) {
+        throwBadStringMagic(magic);
     }
     encoded.offset += 4;
 
