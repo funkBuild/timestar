@@ -160,6 +160,9 @@ private:
     seastar::file tsmFile;
     uint64_t length = 0;
     uint8_t fileVersion = 1;
+    // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
+    // stay open for in-flight snapshot readers; the destructor closes it.
+    bool deferCloseOnDestroy_ = false;
 
     // Lazy loading: sparse index + bloom filter for memory efficiency
     tsl::robin_map<SeriesId128, SparseIndexEntry, SeriesId128::Hash> sparseIndex;
@@ -214,11 +217,20 @@ public:
     uint64_t seqNum;
 
     TSM(std::string _absoluteFilePath);
+    // Deferred-close support: when scheduleDelete() ran while readers may
+    // still hold snapshot references, the fd close is deferred to the
+    // destructor (fires when the last shared_ptr drops).
+    ~TSM();
+    TSM(const TSM&) = delete;
+    TSM& operator=(const TSM&) = delete;
     seastar::future<> open();
     seastar::future<> close();
     uint64_t rankAsInteger();
 
-    // Schedule async deletion — closes file and removes from disk
+    // Schedule async deletion — unlinks the file from disk.  The fd stays
+    // open until the last shared_ptr reference drops (queries that
+    // snapshotted the TSM file list before compaction removed this file may
+    // still issue DMA reads through it); the destructor then closes it.
     seastar::future<> scheduleDelete();
 
     // Lazy loading index methods

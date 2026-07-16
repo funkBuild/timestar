@@ -82,10 +82,53 @@ static bool canStreamAggregation(AggregationMethod method, const std::vector<std
     return !groupByTags.empty() || aggregationInterval > 0;
 }
 
+// ---------------------------------------------------------------------------
+// String field semantics (canonical, see CLAUDE.md "String fields in queries"):
+// strings never aggregate numerically.  Without an aggregationInterval they
+// pass through raw; with an interval they are reduced to LATEST-per-bucket
+// (bucket-start timestamps, matching the numeric bucket layout).  The
+// aggregation method named in the query is ignored for string fields.
+// ---------------------------------------------------------------------------
+
+// Reduce one raw string field (sorted ascending by timestamp) to
+// LATEST-per-bucket in place.  Bucket boundaries are epoch-aligned
+// (ts / interval * interval), identical to the numeric fold in
+// BlockAggregator / foldPoint below.
+static void bucketStringFieldLatest(std::vector<uint64_t>& timestamps, std::vector<std::string>& values,
+                                    uint64_t interval) {
+    if (interval == 0 || timestamps.empty()) {
+        return;
+    }
+    std::vector<uint64_t> outTs;
+    std::vector<std::string> outVals;
+    for (size_t i = 0; i < timestamps.size(); ++i) {
+        const uint64_t bucket = (timestamps[i] / interval) * interval;
+        if (!outTs.empty() && outTs.back() == bucket) {
+            // Same bucket: ascending input order means later value = latest.
+            outVals.back() = std::move(values[i]);
+        } else {
+            outTs.push_back(bucket);
+            outVals.push_back(std::move(values[i]));
+        }
+    }
+    timestamps = std::move(outTs);
+    values = std::move(outVals);
+}
+
+// Apply LATEST-per-bucket to every string field of a SeriesResult.
+static void bucketStringResultLatest(timestar::SeriesResult& sr, uint64_t interval) {
+    for (auto& [fieldName, fieldData] : sr.fields) {
+        if (auto* strs = std::get_if<std::vector<std::string>>(&fieldData.second)) {
+            bucketStringFieldLatest(fieldData.first, *strs, interval);
+        }
+    }
+}
+
 // Streaming group-by coroutine.  Iterates each series context, folds the
 // per-series PushdownResult into a per-group accumulator, and returns
 // PartialAggregationResults in the same format the rest of the pipeline
-// expects.
+// expects.  String series cannot fold numerically; they are appended to
+// `stringResults` raw (the caller applies the interval reduction).
 //
 // Uses direct AggregationState accumulators (not BlockAggregator) so that
 // PushdownResult states can be merged in without converting back to raw
@@ -97,7 +140,7 @@ static bool canStreamAggregation(AggregationMethod method, const std::vector<std
 static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAggregation(
     Engine& engine, std::vector<SeriesQueryContext>& contexts, const std::string& measurement, uint64_t startTime,
     uint64_t endTime, AggregationMethod aggregation, uint64_t aggregationInterval,
-    const std::vector<std::string>& groupByTags) {
+    const std::vector<std::string>& groupByTags, std::vector<timestar::SeriesResult>& stringResults) {
     // ---- Phase 1: Pre-group series by groupKey ----
     struct GroupAccumulator {
         // For bucketed queries (interval > 0): one AggregationState per bucket
@@ -269,8 +312,20 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
                         for (size_t i = 0; i < result.timestamps.size(); ++i) {
                             foldPoint(*group, result.timestamps[i], result.values[i] ? 1.0 : 0.0);
                         }
+                    } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
+                        // Strings can't aggregate numerically — pass them
+                        // through per-series (they bypass grouping, like the
+                        // standard path).  The caller reduces them to
+                        // LATEST-per-bucket when an interval is set.
+                        if (!result.timestamps.empty()) {
+                            timestar::SeriesResult sr;
+                            sr.measurement = measurement;
+                            sr.tags = ctx.tags;
+                            sr.fields[ctx.field] =
+                                std::make_pair(std::move(result.timestamps), FieldValues(std::move(result.values)));
+                            stringResults.push_back(std::move(sr));
+                        }
                     }
-                    // QueryResult<std::string> is skipped — can't numerically aggregate
                 },
                 *optResult);
         });
@@ -746,6 +801,9 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     std::vector<PartialAggregationResult> pushdownPartials;
     std::vector<timestar::SeriesResult> fallbackResults;
     fallbackResults.reserve(contexts.size());
+    // String fields bypass numeric aggregation on every path (canonical rule:
+    // raw passthrough without an interval, LATEST-per-bucket with one).
+    std::vector<timestar::SeriesResult> stringResults;
 
     const bool isLatestOrFirst = (aggregation == AggregationMethod::LATEST || aggregation == AggregationMethod::FIRST);
 
@@ -809,7 +867,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
         // memory instead of O(points).  Works for both
         // group-by and non-group-by queries.
         pushdownPartials = co_await streamingGroupByAggregation(engine, contexts, measurement, startTime, endTime,
-                                                                aggregation, aggregationInterval, groupByTags);
+                                                                aggregation, aggregationInterval, groupByTags,
+                                                                stringResults);
 
     } else {
         // ---- STANDARD PER-SERIES PATH ----
@@ -940,12 +999,12 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     }  // end of batch-vs-standard if/else
 
     // Separate non-numeric (string) fallback results from numeric.
-    // String data bypasses aggregation and is returned as-is.  Boolean fields
-    // are converted to numeric 0/1 here so the fallback path agrees with the
-    // pushdown path, which already aggregates booleans numerically — without
-    // this, the same query returned true/false or 0/1 depending on where the
-    // data happened to sit (memory vs TSM).
-    std::vector<timestar::SeriesResult> stringResults;
+    // String data bypasses aggregation (raw, or LATEST-per-bucket when an
+    // interval is set — see below).  Boolean fields are converted to numeric
+    // 0/1 here so the fallback path agrees with the pushdown path, which
+    // already aggregates booleans numerically — without this, the same query
+    // returned true/false or 0/1 depending on where the data happened to sit
+    // (memory vs TSM).
     std::vector<timestar::SeriesResult> numericResults;
     for (auto& sr : fallbackResults) {
         bool hasStringField = false;
@@ -965,6 +1024,16 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
             stringResults.push_back(std::move(sr));
         } else {
             numericResults.push_back(std::move(sr));
+        }
+    }
+
+    // Canonical string-field rule for interval queries: LATEST-per-bucket,
+    // aligned to the same epoch buckets as the numeric aggregation.  Applied
+    // uniformly to strings collected on the streaming path and the standard
+    // fallback path so the result shape does not depend on the query plan.
+    if (aggregationInterval > 0) {
+        for (auto& sr : stringResults) {
+            bucketStringResultLatest(sr, aggregationInterval);
         }
     }
 
@@ -1755,8 +1824,10 @@ uint64_t HttpQueryHandler::parseInterval(const std::string& interval) {
     } else if (unit == "d") {
         multiplier = 86400ULL * 1000000000;
     } else if (unit.empty()) {
-        throw QueryParseException("Interval '" + interval +
-                                  "' has no unit suffix. Please specify a unit (ns, us, ms, s, m, h, d)");
+        // Bare numeric interval = nanoseconds.  Keeps string-typed interval
+        // fields (protobuf QueryRequest, string JSON values) consistent with
+        // the documented JSON numeric form, which has always meant ns.
+        multiplier = 1;
     } else {
         throw QueryParseException("Unknown time unit: '" + unit + "'. Supported units: ns, us, ms, s, m, h, d");
     }

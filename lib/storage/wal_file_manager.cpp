@@ -174,9 +174,8 @@ seastar::future<> WALFileManager::insert(TimeStarInsert<T>& insertRequest) {
             // This single insert exceeds the entire 16MB WAL limit
             timestar::wal_log.error("Insert request of {} bytes exceeds maximum WAL size of {} bytes", estimatedSize,
                                     MemoryStore::walSizeThreshold());
-            throw std::runtime_error("Insert batch too large - requested " + std::to_string(estimatedSize) +
-                                     " bytes, exceeds 16MB WAL "
-                                     "limit. Please reduce batch size.");
+            throw timestar::InsertTooLargeException("Insert batch too large - requested " + std::to_string(estimatedSize) +
+                                                     " bytes, exceeds the WAL segment limit. Please reduce batch size.");
         }
     }
 
@@ -197,9 +196,8 @@ seastar::future<> WALFileManager::insert(TimeStarInsert<T>& insertRequest) {
             // The insert still doesn't fit in a fresh WAL - it's too large
             size_t estimatedSize = memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
             timestar::wal_log.error("Insert batch of {} bytes too large for fresh 16MB WAL", estimatedSize);
-            throw std::runtime_error("Insert batch too large - requested " + std::to_string(estimatedSize) +
-                                     " bytes, exceeds 16MB WAL "
-                                     "limit. Please reduce batch size.");
+            throw timestar::InsertTooLargeException("Insert batch too large - requested " + std::to_string(estimatedSize) +
+                                                     " bytes, exceeds the WAL segment limit. Please reduce batch size.");
         }
     }
 }
@@ -236,8 +234,8 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TimeStarInsert<T>>& in
                 "Batch insert request of {} bytes exceeds maximum "
                 "WAL size of {} bytes",
                 totalEstimatedSize, MemoryStore::walSizeThreshold());
-            throw std::runtime_error("Insert batch too large - requested " + std::to_string(totalEstimatedSize) +
-                                     " bytes, exceeds WAL limit. Please reduce batch size.");
+            throw timestar::InsertTooLargeException("Insert batch too large - requested " + std::to_string(totalEstimatedSize) +
+                                                     " bytes, exceeds the WAL segment limit. Please reduce batch size.");
         }
     }
 
@@ -268,8 +266,8 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TimeStarInsert<T>>& in
             // Re-use the already-computed totalEstimatedSize (each per-insert size
             // is cached in the TimeStarInsert, so no re-iteration is needed).
             timestar::wal_log.error("Batch insert of {} bytes too large for fresh WAL", totalEstimatedSize);
-            throw std::runtime_error("Insert batch too large - requested " + std::to_string(totalEstimatedSize) +
-                                     " bytes, exceeds WAL limit. Please reduce batch size.");
+            throw timestar::InsertTooLargeException("Insert batch too large - requested " + std::to_string(totalEstimatedSize) +
+                                                     " bytes, exceeds the WAL segment limit. Please reduce batch size.");
         }
     }
 

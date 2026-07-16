@@ -940,12 +940,34 @@ seastar::future<> TSM::scheduleDelete() {
         timestar::tsm_log.error("Failed to delete TSM file {}: {}", filePath, e.what());
     }
 
-    // Close the file handle to avoid seastar::file destructor assertion.
-    // This is safe after remove_file: the inode stays alive for any
-    // in-flight DMA reads that still hold a reference to this TSM object.
-    // Guard: close() may have already been called by the TSMFileManager shutdown path.
-    if (tsmFile) {
-        co_await tsmFile.close();
+    // Do NOT close the fd here.  Queries snapshot the TSM file list (as
+    // shared_ptr<TSM>) before issuing DMA reads; a query that snapshotted
+    // this file before compaction removed it can still read from it AFTER
+    // this point.  Closing the fd here made those reads fail — the query
+    // handler swallows the exception and returns an EMPTY result for the
+    // series (transient invisibility during compaction/rollover).  Instead,
+    // defer the close to the destructor: it runs when the last snapshot
+    // reference drops, i.e. when no reader can touch the fd anymore.
+    deferCloseOnDestroy_ = true;
+    co_return;
+}
+
+TSM::~TSM() {
+    if (deferCloseOnDestroy_ && tsmFile) {
+        // Fire-and-forget close of the (already unlinked) file.  No reader
+        // can exist anymore — this object is being destroyed because the
+        // last shared_ptr reference dropped.  The lambda keeps the moved
+        // file handle alive until close() resolves.
+        (void)seastar::futurize_invoke([f = std::move(tsmFile)]() mutable {
+            auto fut = f.close();
+            return fut.finally([f = std::move(f)]() mutable {});
+        }).handle_exception([path = filePath](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                timestar::tsm_log.warn("Deferred close of deleted TSM file {} failed: {}", path, e.what());
+            }
+        });
     }
 }
 

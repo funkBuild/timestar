@@ -373,6 +373,13 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
     if (entries.empty())
         co_return;
 
+    // Pin the memory stores BEFORE snapshotting the TSM file list (visibility
+    // invariant, see WALFileManager::pinMemoryStores): background WAL->TSM
+    // conversion registers the TSM file first and erases the store second, so
+    // this ordering guarantees Phase 3 still sees the data of any store whose
+    // conversion completes while Phase 2 is suspended on DMA reads.
+    const auto pinnedStores = walFileManager.pinMemoryStores();
+
     // --- Phase 1: TSM sparse index scan (zero I/O) ---
     // Snapshot TSM files once.  getSequencedTsmFiles() is ordered by (tier, seqNum);
     // reverse for LATEST (newest files first) so the first sparse hit is the best.
@@ -486,7 +493,7 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
         }
     };
 
-    for (const auto& memStore : walFileManager.getMemoryStores()) {
+    for (const auto& memStore : pinnedStores) {
         for (auto& entry : entries) {
             checkMemSeries(memStore->querySeries<double>(entry.seriesId), entry);
             checkMemSeries(memStore->querySeries<int64_t>(entry.seriesId), entry);

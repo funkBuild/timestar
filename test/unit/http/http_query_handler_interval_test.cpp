@@ -55,25 +55,23 @@ TEST_F(HttpQueryHandlerIntervalTest, ParseDecimalMinutes) {
     EXPECT_EQ(HttpQueryHandler::parseInterval("0.5m"), 30ULL * 1000000000);
 }
 
-// ---- Bare numbers require a unit suffix ----
+// ---- Bare numbers are nanoseconds ----
+// The JSON API has always accepted a NUMERIC aggregationInterval meaning
+// nanoseconds; the string form (used by the protobuf QueryRequest path and
+// string-typed JSON values) must agree, so a bare number parses as ns
+// instead of throwing "no unit suffix".
 
-TEST_F(HttpQueryHandlerIntervalTest, BareNumberThrows) {
-    EXPECT_THROW(HttpQueryHandler::parseInterval("300000000000"), QueryParseException);
+TEST_F(HttpQueryHandlerIntervalTest, BareNumberIsNanoseconds) {
+    EXPECT_EQ(HttpQueryHandler::parseInterval("300000000000"), 300000000000ULL);
 }
 
-TEST_F(HttpQueryHandlerIntervalTest, BareNumberSmallThrows) {
-    EXPECT_THROW(HttpQueryHandler::parseInterval("1"), QueryParseException);
+TEST_F(HttpQueryHandlerIntervalTest, BareNumberSmallIsNanoseconds) {
+    EXPECT_EQ(HttpQueryHandler::parseInterval("1"), 1ULL);
 }
 
-TEST_F(HttpQueryHandlerIntervalTest, BareNumberErrorMessage) {
-    try {
-        HttpQueryHandler::parseInterval("300");
-        FAIL() << "Expected QueryParseException";
-    } catch (const QueryParseException& e) {
-        std::string msg = e.what();
-        EXPECT_NE(msg.find("no unit suffix"), std::string::npos)
-            << "Error message should mention missing unit suffix, got: " << msg;
-    }
+TEST_F(HttpQueryHandlerIntervalTest, BareDecimalIsNanosecondsTruncated) {
+    // Decimal ns values truncate toward zero (sub-ns precision is meaningless)
+    EXPECT_EQ(HttpQueryHandler::parseInterval("1.5"), 1ULL);
 }
 
 // ---- Overflow saturation (clamp to UINT64_MAX) ----

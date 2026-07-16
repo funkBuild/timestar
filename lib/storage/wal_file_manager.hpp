@@ -6,12 +6,23 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <vector>
 
 class Engine;
+
+namespace timestar {
+// Thrown when a single insert/batch cannot fit in a WAL segment even after a
+// rollover.  The HTTP layer maps this to 413 Payload Too Large (a client
+// error), not a generic 500.
+class InsertTooLargeException : public std::length_error {
+public:
+    explicit InsertTooLargeException(const std::string& what) : std::length_error(what) {}
+};
+}  // namespace timestar
 
 // Pairs a raw pointer to in-memory series data with the shared_ptr that
 // keeps the owning MemoryStore alive.  Callers hold MemoryStoreMatch
@@ -83,8 +94,16 @@ public:
 
     template <class T>
     std::vector<MemoryStoreMatch<T>> queryAllMemoryStores(const SeriesId128& seriesId) {
+        return queryAllMemoryStores<T>(memoryStores, seriesId);
+    }
+
+    // Static overload operating on a caller-held (pinned) snapshot of the
+    // memory-store list.  See pinMemoryStores() for the visibility contract.
+    template <class T>
+    static std::vector<MemoryStoreMatch<T>> queryAllMemoryStores(
+        const std::vector<seastar::shared_ptr<MemoryStore>>& stores, const SeriesId128& seriesId) {
         std::vector<MemoryStoreMatch<T>> results;
-        for (auto& memStore : memoryStores) {
+        for (auto& memStore : stores) {
             auto result = memStore->querySeries<T>(seriesId);
             if (result != nullptr) {
                 results.push_back(MemoryStoreMatch<T>{memStore, result});
@@ -97,6 +116,21 @@ public:
     // all stores once instead of per-series lookups).
     const std::vector<seastar::shared_ptr<MemoryStore>>& getMemoryStores() const { return memoryStores; }
 
+    // Pin the current memory-store set for the duration of a query.
+    //
+    // VISIBILITY INVARIANT (WAL->TSM conversion): a background conversion
+    // registers the new TSM file FIRST and only then erases the retiring
+    // memory store from `memoryStores`.  A query therefore sees every point
+    // at every instant iff it (1) pins the memory stores BEFORE snapshotting
+    // the TSM file list and (2) reads only from the pinned copy afterwards.
+    // The shared_ptr copies keep retiring stores (and their series data)
+    // alive and queryable even if a conversion completes — and erases the
+    // store from the live vector — while the query is suspended on TSM I/O.
+    // Reading the LIVE vector after a co_await instead would open a window
+    // where a just-converted series is visible in NEITHER source (the TSM
+    // snapshot predates registration, the store is already gone).
+    std::vector<seastar::shared_ptr<MemoryStore>> pinMemoryStores() const { return memoryStores; }
+
     // Return the earliest timestamp across all memory stores for a given series
     // within [startTime, endTime].  Returns nullopt if no memory data in range.
     // Used by pushdown aggregation to determine the split point between the
@@ -106,8 +140,15 @@ public:
     // excluded to match the semantics of probing only aggregatable types.
     std::optional<uint64_t> getEarliestMemoryTimestampAnyType(const SeriesId128& seriesId, uint64_t startTime,
                                                               uint64_t endTime) {
+        return getEarliestMemoryTimestampAnyType(memoryStores, seriesId, startTime, endTime);
+    }
+
+    // Static overload operating on a pinned snapshot (see pinMemoryStores()).
+    static std::optional<uint64_t> getEarliestMemoryTimestampAnyType(
+        const std::vector<seastar::shared_ptr<MemoryStore>>& stores, const SeriesId128& seriesId, uint64_t startTime,
+        uint64_t endTime) {
         std::optional<uint64_t> earliest;
-        for (auto& memStore : memoryStores) {
+        for (auto& memStore : stores) {
             auto ts = memStore->earliestTimestampInRange(seriesId, startTime, endTime);
             if (ts && (!earliest.has_value() || *ts < *earliest)) {
                 earliest = ts;

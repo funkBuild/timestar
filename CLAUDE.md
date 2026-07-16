@@ -466,8 +466,32 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
      - `h` - hours
      - `d` - days
    - Decimal values supported: `"1.5s"`, `"0.5m"`
+   - Bare numeric strings (no unit suffix) are interpreted as nanoseconds —
+     `"300000000000"` == `300000000000` == `"300000000000ns"`. This applies to
+     every transport (JSON numeric, JSON string, and the protobuf QueryRequest
+     `aggregation_interval` string field), so all forms agree.
    - When specified, results are grouped into time buckets
    - Aggregation method applies within each bucket
+
+### String Fields in Queries (canonical semantics)
+
+String fields never aggregate numerically. The aggregation method named in the
+query is **ignored** for string fields; they are always included, never
+silently dropped:
+
+- **No aggregationInterval**: string fields pass through raw — every stored
+  (timestamp, value) pair in the requested range is returned unchanged. This
+  holds for every aggregation method (including `latest`/`first`, which still
+  collapse numeric fields to a single point) and for group-by queries (string
+  series are returned per-series with their full tag set; they are not merged
+  into groups).
+- **With aggregationInterval**: string fields are reduced to
+  **LATEST-per-bucket** — one value per epoch-aligned bucket
+  (`bucketStart = ts / interval * interval`, same bucket layout as numeric
+  aggregation), where the value is the one with the greatest timestamp inside
+  the bucket. Returned timestamps are bucket starts, matching numeric fields.
+- These rules are independent of data placement (memory store vs TSM) and of
+  the internal query plan (pushdown / streaming / fallback).
 
 ### Time Format
 

@@ -265,6 +265,24 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
                    "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime,
                    endTime);
 
+    // Pin the memory STORES (shared_ptr copies) BEFORE snapshotting the TSM
+    // file list.  Background WAL->TSM conversion registers the new TSM file
+    // first, then erases the retiring store from the live vector; pinning the
+    // stores first guarantees every point is visible in at least one of the
+    // two sources at every instant (a conversion that completed before this
+    // line already registered its TSM file, so the snapshot below includes
+    // it; one that completes later cannot destroy the pinned stores — the
+    // shared_ptrs keep their series maps alive and queryable).  Reading the
+    // LIVE store list after the TSM co_awaits used to open a window where a
+    // just-converted series was visible in neither source.
+    //
+    // NOTE: only the store pointers are pinned here.  The per-series lookup
+    // (raw pointers into each store's robin_map) happens AFTER the TSM I/O
+    // below — an ACTIVE store keeps accepting inserts while this coroutine is
+    // suspended, and a map rehash would invalidate any series pointer taken
+    // now.  The lookup result is then used strictly synchronously.
+    const auto pinnedStores = walFileManager->pinMemoryStores();
+
     // Snapshot the TSM file map so that compaction cannot mutate it
     // mid-iteration across co_await suspension points.
     // Pre-filter using sparse index time bounds (in-memory, no I/O) to skip
@@ -384,10 +402,15 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
         }
     }
 
-    // Query memory stores from WAL.
-    // With background TSM conversion, multiple memory stores may hold data
-    // for the same series, so we query all of them.
-    auto memoryMatches = walFileManager->queryAllMemoryStores<T>(seriesId);
+    // Look up the series in the PINNED memory stores (pinned before the TSM
+    // snapshot above — see the visibility-invariant comment there).  The
+    // lookup runs after the last co_await, so the raw series pointers below
+    // are valid for the rest of this (fully synchronous) merge.  With
+    // background TSM conversion, multiple stores may hold data for the same
+    // series, so all of them are queried.  Duplicates between a
+    // just-converted TSM file and its still-pinned source store are removed
+    // by the merge below (TSM has dedup priority on equal timestamps).
+    auto memoryMatches = WALFileManager::queryAllMemoryStores<T>(pinnedStores, seriesId);
 
     // No memory data: TSM result is already sorted and deduped, return directly.
     if (memoryMatches.empty()) {
@@ -614,10 +637,14 @@ static constexpr auto isStreamableAggMethod = timestar::isStreamableMethod;
 // Returns the number of points aggregated.
 // ---------------------------------------------------------------------------
 // Helper: fold typed memory store matches into aggregator, converting to double.
+// Operates on a PINNED memory-store snapshot (see WALFileManager::pinMemoryStores):
+// the caller pins the stores before any TSM I/O so a background WAL->TSM
+// conversion completing mid-query cannot make the data invisible.
 template <typename T>
-static size_t aggregateMemoryStoresTyped(WALFileManager* walFileManager, const SeriesId128& seriesId,
-                                         uint64_t startTime, uint64_t endTime, timestar::BlockAggregator& aggregator) {
-    auto memoryMatches = walFileManager->queryAllMemoryStores<T>(seriesId);
+static size_t aggregateMemoryStoresTyped(const std::vector<seastar::shared_ptr<MemoryStore>>& pinnedStores,
+                                         const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                         timestar::BlockAggregator& aggregator) {
+    auto memoryMatches = WALFileManager::queryAllMemoryStores<T>(pinnedStores, seriesId);
     size_t totalPoints = 0;
     for (const auto& match : memoryMatches) {
         const auto& storeData = *match.series;
@@ -669,15 +696,16 @@ static size_t aggregateMemoryStoresTyped(WALFileManager* walFileManager, const S
     return totalPoints;
 }
 
-static size_t aggregateMemoryStores(WALFileManager* walFileManager, const SeriesId128& seriesId, uint64_t startTime,
-                                    uint64_t endTime, timestar::BlockAggregator& aggregator) {
+static size_t aggregateMemoryStores(const std::vector<seastar::shared_ptr<MemoryStore>>& pinnedStores,
+                                    const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                    timestar::BlockAggregator& aggregator) {
     // Check float first (most common); a series is always one type, so skip
     // int64/bool if float already found data.
-    size_t pts = aggregateMemoryStoresTyped<double>(walFileManager, seriesId, startTime, endTime, aggregator);
+    size_t pts = aggregateMemoryStoresTyped<double>(pinnedStores, seriesId, startTime, endTime, aggregator);
     if (pts == 0) {
-        pts = aggregateMemoryStoresTyped<int64_t>(walFileManager, seriesId, startTime, endTime, aggregator);
+        pts = aggregateMemoryStoresTyped<int64_t>(pinnedStores, seriesId, startTime, endTime, aggregator);
         if (pts == 0) {
-            pts = aggregateMemoryStoresTyped<bool>(walFileManager, seriesId, startTime, endTime, aggregator);
+            pts = aggregateMemoryStoresTyped<bool>(pinnedStores, seriesId, startTime, endTime, aggregator);
         }
     }
     return pts;
@@ -692,6 +720,16 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     if (method == timestar::AggregationMethod::MEDIAN || method == timestar::AggregationMethod::EXACT_MEDIAN) {
         co_return std::nullopt;
     }
+
+    // Pin the memory stores BEFORE any read of the TSM file list.  A background
+    // WAL->TSM conversion registers its TSM file first and erases the retiring
+    // store second, so pin-memory-then-snapshot-TSM ordering guarantees the
+    // series is visible in at least one source for the whole query.  All
+    // memory probes/folds below MUST use this pinned snapshot — re-reading the
+    // live store list after a co_await would drop the data of any store whose
+    // conversion completed while this coroutine was suspended (its TSM file is
+    // excluded from the range split below, and the store itself is gone).
+    const auto pinnedStores = walFileManager->pinMemoryStores();
 
     const bool noTsmFiles = fileManager->getSequencedTsmFiles().empty();
     const bool isLatest = (method == timestar::AggregationMethod::LATEST);
@@ -719,7 +757,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             aggregator.enableFoldToSingleState();
         }
 
-        size_t pts = aggregateMemoryStores(walFileManager, seriesId, startTime, endTime, aggregator);
+        size_t pts = aggregateMemoryStores(pinnedStores, seriesId, startTime, endTime, aggregator);
         if (pts == 0) {
             co_return std::nullopt;
         }
@@ -744,7 +782,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // series variant with a single hash lookup per store — for historical
     // queries (no memory data, the common case) this replaces three per-type
     // probe misses per store.
-    auto memMinTimeOpt = walFileManager->getEarliestMemoryTimestampAnyType(seriesId, startTime, endTime);
+    auto memMinTimeOpt = WALFileManager::getEarliestMemoryTimestampAnyType(pinnedStores, seriesId, startTime, endTime);
 
     // tsmEndTime: the upper bound for the TSM-only pushdown range.
     // fallbackStartTime: the lower bound for the fallback (TSM+memory) range.
@@ -928,7 +966,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         // for the overlap range [fallbackStartTime, endTime].  This avoids
         // materialising intermediate QueryResult vectors.
         if (needsFallback) {
-            aggregateMemoryStores(walFileManager, seriesId, fallbackStartTime, endTime, aggregator);
+            aggregateMemoryStores(pinnedStores, seriesId, fallbackStartTime, endTime, aggregator);
         }
 
         timestar::PushdownResult result;
@@ -1062,7 +1100,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // for the overlap range [fallbackStartTime, endTime].  This avoids
     // materialising intermediate QueryResult vectors.
     if (needsFallback) {
-        aggregateMemoryStores(walFileManager, seriesId, fallbackStartTime, endTime, aggregator);
+        aggregateMemoryStores(pinnedStores, seriesId, fallbackStartTime, endTime, aggregator);
     }
 
     timestar::PushdownResult result;

@@ -91,6 +91,87 @@ static void knownSeriesInsert(const SeriesId128& id) {
     knownSeriesCurrent.insert(id);
 }
 
+// Remove series from the known-series cache after a FAILED metadata indexing
+// attempt.  knownSeriesInsert() runs optimistically while building MetaOps;
+// if indexMetadataSync later throws, leaving the entries cached would make a
+// RETRY of the same write silently skip metadata indexing ("succeed") while
+// the series never appears in /measurements.  A failed write must leave no
+// trace in this cache.
+static void unpoisonKnownSeries(const std::vector<MetadataOp>& ops) {
+    for (const auto& op : ops) {
+        if (!op.seriesId.isZero()) {
+            knownSeriesCurrent.erase(op.seriesId);
+            knownSeriesPrevious.erase(op.seriesId);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Identifier limits — mirror the hard limits enforced by the index encoder
+// (lib/index/key_encoding.cpp encodeSeriesMetadata).  Enforcing them up
+// front turns what used to be a 500 ("SeriesMetadata has suspiciously long
+// strings") after the data write into a clean 400 BEFORE any state changes.
+// -----------------------------------------------------------------------
+static constexpr size_t MAX_MEASUREMENT_LEN = 10000;
+static constexpr size_t MAX_FIELD_NAME_LEN = 10000;
+static constexpr size_t MAX_TAG_LEN = 1000;
+static constexpr size_t MAX_TAG_COUNT = 1000;
+
+static bool validateIdentifierLimits(const std::string& measurement, const std::map<std::string, std::string>& tags,
+                                     std::string& error) {
+    if (measurement.size() > MAX_MEASUREMENT_LEN) {
+        error = "Measurement name too long: " + std::to_string(measurement.size()) + " bytes exceeds maximum of " +
+                std::to_string(MAX_MEASUREMENT_LEN);
+        return false;
+    }
+    if (tags.size() > MAX_TAG_COUNT) {
+        error = "Too many tags: " + std::to_string(tags.size()) + " exceeds maximum of " + std::to_string(MAX_TAG_COUNT);
+        return false;
+    }
+    for (const auto& [k, v] : tags) {
+        if (k.size() > MAX_TAG_LEN || v.size() > MAX_TAG_LEN) {
+            error = "Tag key/value too long: exceeds maximum of " + std::to_string(MAX_TAG_LEN) + " bytes";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validateFieldNameLimit(const std::string& fieldName, std::string& error) {
+    if (fieldName.size() > MAX_FIELD_NAME_LEN) {
+        error = "Field name too long: " + std::to_string(fieldName.size()) + " bytes exceeds maximum of " +
+                std::to_string(MAX_FIELD_NAME_LEN);
+        return false;
+    }
+    return true;
+}
+
+// Index metadata for the given ops; on failure, remove the ops' series from
+// the known-series cache (see unpoisonKnownSeries) before rethrowing, so a
+// retry re-attempts metadata indexing instead of silently skipping it.
+static seastar::future<> syncMetadataUnpoisonOnFailure(seastar::sharded<Engine>* engineSharded,
+                                                       std::vector<MetadataOp> ops) {
+    if (ops.empty()) {
+        co_return;
+    }
+    std::vector<SeriesId128> ids;
+    ids.reserve(ops.size());
+    for (const auto& op : ops) {
+        ids.push_back(op.seriesId);
+    }
+    try {
+        co_await engineSharded->local().indexMetadataSync(std::move(ops));
+    } catch (...) {
+        for (const auto& id : ids) {
+            if (!id.isZero()) {
+                knownSeriesCurrent.erase(id);
+                knownSeriesPrevious.erase(id);
+            }
+        }
+        throw;
+    }
+}
+
 HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {
     if (!engineSharded) {
         throw std::invalid_argument("engineSharded must not be null");
@@ -1080,9 +1161,20 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 }
 
 bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::string& error) {
+    // Identifier limits first (measurement/tag lengths, tag count) — these
+    // mirror the index encoder's hard limits so oversized identifiers are
+    // rejected with a 400 BEFORE any data or metadata state changes.
+    static const std::map<std::string, std::string> kNoTags;
+    if (!validateIdentifierLimits(point.measurement, point.tags ? *point.tags : kNoTags, error)) {
+        return false;
+    }
+
     size_t expectedSize = point.timestamps.size();
 
     for (const auto& [fieldName, fieldArray] : point.fields) {
+        if (!validateFieldNameLimit(fieldName, error)) {
+            return false;
+        }
         size_t fieldSize = 0;
         switch (fieldArray.type) {
             case FieldArrays::DOUBLE:
@@ -1472,6 +1564,20 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
     std::vector<MetaOp> allMetaOps;
     std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
 
+    // Validate identifier limits for the WHOLE request up front (mirrors the
+    // JSON path's validateArraySizes) so an oversized measurement/field/tag
+    // is rejected with 400 before any data write or metadata cache mutation.
+    {
+        static const std::map<std::string, std::string> kNoTags;
+        std::string identErr;
+        for (const auto& ffi : fastResult.inserts) {
+            if (!validateIdentifierLimits(ffi.measurement, ffi.tags ? *ffi.tags : kNoTags, identErr) ||
+                !validateFieldNameLimit(ffi.fieldName, identErr)) {
+                throw std::invalid_argument(identErr);
+            }
+        }
+    }
+
     for (auto& ffi : fastResult.inserts) {
         // Compute series ID once for shard routing and metadata dedup.
         // TODO: pre-compute in parseWriteRequestFast() once libtimestar_proto_conv
@@ -1578,12 +1684,20 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
     }
 
     if (!shardFutures.empty()) {
-        co_await seastar::when_all_succeed(std::move(shardFutures));
+        try {
+            co_await seastar::when_all_succeed(std::move(shardFutures));
+        } catch (...) {
+            // Data dispatch failed before metadata was indexed — the series
+            // registered in the known-series cache during MetaOp construction
+            // must be unpoisoned so a retry re-attempts metadata indexing.
+            unpoisonKnownSeries(allMetaOps);
+            throw;
+        }
     }
 
     // Index metadata
     if (!allMetaOps.empty()) {
-        co_await engineSharded->local().indexMetadataSync(std::move(allMetaOps));
+        co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(allMetaOps));
     }
 
     rep.set_status(seastar::http::reply::status_type::ok);
@@ -1633,7 +1747,7 @@ seastar::future<bool> HttpWriteHandler::tryFastDoubleWrite(std::string_view body
                 auto writeResult = co_await processMultiWritePoint(mwp);
 
                 if (!writeResult.metaOps.empty()) {
-                    co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
+                    co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(writeResult.metaOps));
                 }
                 co_return true;
             }
@@ -1689,6 +1803,10 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
         for (auto& mwp : coalescedWrites) {
             std::string error;
             if (!validateArraySizes(mwp, error)) {
+                // Earlier MWPs in this request may already have registered
+                // their series in the known-series cache; nothing was (or
+                // will be) written or indexed, so unpoison before failing.
+                unpoisonKnownSeries(acc.metaOps);
                 throw std::invalid_argument(error);
             }
             pointsWritten += static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
@@ -1722,9 +1840,19 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
     // failed, all points routed to that shard count as failed.
     int64_t failedWrites = 0;
     std::vector<std::string> writeErrors;
+    std::optional<std::string> tooLargeError;
     for (size_t i = 0; i < shardResults.size(); ++i) {
         try {
             shardResults[i].get();
+        } catch (const timestar::InsertTooLargeException& e) {
+            const unsigned shard = activeShards[i];
+            timestar::http_log.warn("Batch too large for WAL segment on shard {}: {}", shard, e.what());
+            pointsWritten -= acc.shardPoints[shard];
+            failedWrites += acc.shardPoints[shard];
+            tooLargeError = e.what();
+            if (writeErrors.size() < 10) {
+                writeErrors.emplace_back("shard " + std::to_string(shard) + ": " + e.what());
+            }
         } catch (const std::exception& e) {
             const unsigned shard = activeShards[i];
             timestar::http_log.error("Error inserting batch on shard {}: {}", shard, e.what());
@@ -1736,11 +1864,20 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
         }
     }
 
+    // If nothing was written and the batch was simply too large for a WAL
+    // segment, surface it as a client error (413) instead of a "partial"
+    // success — let the top-level handler build the flat error response.
+    // Metadata was never indexed for this request, so unpoison the cache.
+    if (tooLargeError.has_value() && pointsWritten == 0) {
+        unpoisonKnownSeries(acc.metaOps);
+        throw timestar::InsertTooLargeException(*tooLargeError);
+    }
+
 #if TIMESTAR_LOG_INSERT_PATH
     size_t metaOpsCount = acc.metaOps.size();
 #endif
     if (!acc.metaOps.empty()) {
-        co_await engineSharded->local().indexMetadataSync(std::move(acc.metaOps));
+        co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(acc.metaOps));
     }
 #if TIMESTAR_LOG_INSERT_PATH
     LOG_INSERT_PATH(timestar::http_log, info, "[METADATA] Batch: indexed {} unique series synchronously", metaOpsCount);
@@ -1855,7 +1992,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     size_t metaOpsCount = writeResult.metaOps.size();
 #endif
                     if (!writeResult.metaOps.empty()) {
-                        co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
+                        co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(writeResult.metaOps));
                     }
 #if TIMESTAR_LOG_INSERT_PATH
                     LOG_INSERT_PATH(timestar::http_log, info,
@@ -1892,6 +2029,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.debug("Write validation error: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+        } else {
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
+    } catch (const timestar::InsertTooLargeException& e) {
+        // Request larger than a WAL segment can hold — client error, not a
+        // server fault: 413 Payload Too Large with a flat error body.
+        ++engineSharded->local().metrics().insert_errors_total;
+        timestar::http_log.debug("Write too large: {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::payload_too_large);
         if (timestar::http::isProtobuf(resFmt)) {
             rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
         } else {
