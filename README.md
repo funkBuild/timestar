@@ -63,6 +63,46 @@ cmake ..
 make -j$(nproc)
 ```
 
+#### CMake presets
+
+With CMake ≥ 3.25 you can use the bundled presets instead of the classic flow
+above (the `release` preset uses the same `build/` directory, so both flows are
+interchangeable):
+
+```bash
+cmake --preset release          # configure (build/)
+cmake --build --preset release  # build
+ctest --preset release          # run tests
+
+# Other presets: debug (build-debug/), relwithdebinfo (build-relwithdebinfo/),
+# asan (build-asan/, ASan + UBSan for both TimeStar and Seastar)
+cmake --preset debug && cmake --build --preset debug
+```
+
+#### Build options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `TIMESTAR_BUILD_TESTS` | `ON` | Build the C++ test executables (`test/`) |
+| `TIMESTAR_NATIVE_ARCH` | `OFF` | Compile for the host CPU (`-march=native`), including the benchmark targets. Off by default so binaries stay portable; SIMD hot paths use runtime dispatch via Google Highway either way |
+| `TIMESTAR_ENABLE_LTO` | `OFF` | Enable interprocedural / link-time optimization |
+| `TIMESTAR_WARNINGS_AS_ERRORS` | `OFF` | Treat compiler warnings as errors (`-Werror`); warning flags are centralized in `cmake/CompilerWarnings.cmake` |
+
+```bash
+# Example: CPU-pinned local benchmark build with warnings-as-errors
+cmake -DTIMESTAR_NATIVE_ARCH=ON -DTIMESTAR_WARNINGS_AS_ERRORS=ON ..
+```
+
+#### Install
+
+```bash
+# Installs bin/timestar_http_server and share/timestar/timestar.toml.sample.
+# --component timestar keeps embedded dependencies (glaze, roaring, zstd, ...)
+# out of the install tree; a plain `cmake --install build` also runs their
+# bundled install rules.
+cmake --install build --component timestar --prefix /usr/local
+```
+
 ### Run
 
 ```bash

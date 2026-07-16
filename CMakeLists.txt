@@ -39,6 +39,12 @@ project(timestar LANGUAGES C CXX ASM)
 # ──────────────────────────── version stamping ───────────────────────────────
 include(cmake/version.cmake)
 
+# ─────────────────────────── canonical warning flags ─────────────────────────
+# Provides timestar_set_project_warnings(<target>), applied to every
+# first-party target (libtimestar, libtimestar_proto_conv, bin/ executables).
+# Toggle -Werror with -DTIMESTAR_WARNINGS_AS_ERRORS=ON.
+include(cmake/CompilerWarnings.cmake)
+
 # ─────────────────────── sanity check on the chosen compiler ─────────────────
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -124,6 +130,22 @@ endif()
 
 add_subdirectory(external/seastar)
 
+# Consume Seastar's headers as SYSTEM includes so third-party diagnostics
+# (-Wshadow/-Wpedantic/-Wnull-dereference hits inside seastar/core/*.hh) do not
+# leak into first-party builds under our warning set. FetchContent already does
+# this for the fetched deps (CMake ≥ 3.25 marks them SYSTEM by default); this
+# mirrors that for the vendored Seastar submodule without requiring the
+# CMake 3.25 `add_subdirectory(... SYSTEM)` keyword.
+foreach(_seastar_tgt seastar seastar_testing seastar_perf_testing)
+  if(TARGET ${_seastar_tgt})
+    get_target_property(_seastar_inc ${_seastar_tgt} INTERFACE_INCLUDE_DIRECTORIES)
+    if(_seastar_inc)
+      set_target_properties(${_seastar_tgt} PROPERTIES
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_seastar_inc}")
+    endif()
+  endif()
+endforeach()
+
 # ───────────────────────────── project’s own targets ─────────────────────────
 # If we had to lower the standard for Seastar, raise it back again for the rest
 # of this repository.  GCC 13 + C++23 will still fail, so keep *everything*
@@ -188,6 +210,13 @@ FetchContent_Declare(
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+# Keep `make install` free of embedded-dependency artifacts where the deps
+# provide a toggle (gtest is handled next to its FetchContent in test/).
+# glaze/roaring/zstd/robin-map offer no such toggle; use
+# `cmake --install build --component timestar` for a TimeStar-only install.
+set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ROARING_BUILD_LTO OFF CACHE BOOL "" FORCE)
 set(ENABLE_ROARING_TESTS OFF CACHE BOOL "" FORCE)
@@ -205,6 +234,10 @@ add_subdirectory(proto)
 
 # ─────────────────────────────── sub‑directories ─────────────────────────────
 
+# GNUInstallDirs defines CMAKE_INSTALL_BINDIR / CMAKE_INSTALL_DATADIR used by
+# the install() rules in bin/ and at the bottom of this file.
+include(GNUInstallDirs)
+
 add_subdirectory(lib)
 add_subdirectory(bin)
 
@@ -213,5 +246,14 @@ if(TIMESTAR_BUILD_TESTS)
   enable_testing()
   add_subdirectory(test)
 endif()
+
+# ────────────────────────────────── install ──────────────────────────────────
+# Minimal install: the server binary (installed from bin/CMakeLists.txt) plus a
+# sample configuration file. Honors CMAKE_INSTALL_PREFIX via GNUInstallDirs
+# (included above, before the bin/ subdirectory).
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/timestar.toml
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/timestar
+        RENAME timestar.toml.sample
+        COMPONENT timestar)
 
 # End of CMakeLists.txt

@@ -6,6 +6,8 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+# Do not let the embedded googletest add itself to `make install`.
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 include(GoogleTest)

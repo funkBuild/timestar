@@ -23,3 +23,21 @@ target_link_libraries(expression_benchmark libtimestar libtimestar_proto_conv be
 # Forecast function benchmark (Google Benchmark, no Seastar)
 add_executable(forecast_benchmark forecast_benchmark.cpp)
 target_link_libraries(forecast_benchmark libtimestar libtimestar_proto_conv benchmark::benchmark)
+
+# Canonical warning flags for all first-party executables
+# (see cmake/CompilerWarnings.cmake).
+foreach(_bin_target
+        timestar_http_server
+        timestar_benchmark
+        timestar_insert_bench
+        timestar_query_bench
+        expression_benchmark
+        forecast_benchmark)
+    timestar_set_project_warnings(${_bin_target})
+endforeach()
+
+# Install the server binary (prefix-relative via GNUInstallDirs, included in
+# the top-level CMakeLists.txt).
+install(TARGETS timestar_http_server
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT timestar)

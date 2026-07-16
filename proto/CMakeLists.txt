@@ -17,7 +17,9 @@ target_compile_options(timestar_proto PRIVATE -w)
 
 # The generated .pb.h files land in ${CMAKE_CURRENT_BINARY_DIR}.
 # Export that directory so dependents can #include "timestar.pb.h".
-target_include_directories(timestar_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+# SYSTEM: the headers are generated code, so warnings in them are not
+# actionable by consumers built with the project warning set.
+target_include_directories(timestar_proto SYSTEM PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 
 # Link the protobuf runtime
 target_link_libraries(timestar_proto PUBLIC protobuf::libprotobuf)

@@ -42,7 +42,8 @@ message(STATUS "Found xxHash: ${XXHASH_LIBRARY}")
 # compilation internally.
 
 add_library(libtimestar STATIC ${SRC_FILES})
-target_compile_options(libtimestar PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference -Wformat=2)
+# Canonical warning flags — see cmake/CompilerWarnings.cmake.
+timestar_set_project_warnings(libtimestar)
 
 # Precompiled header: parse the heavy Seastar-core + common-STL headers once
 # instead of in every TU. See lib/pch.hpp for what's in (and deliberately out).
@@ -64,6 +65,10 @@ target_include_directories(libtimestar PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/retention
     ${CMAKE_CURRENT_SOURCE_DIR}/config
+)
+# Third-party headers consumed via plain paths go in as SYSTEM so their
+# diagnostics do not count against our warning set.
+target_include_directories(libtimestar SYSTEM PUBLIC
     ${XXHASH_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include
 )
@@ -76,6 +81,7 @@ add_library(libtimestar_proto_conv STATIC
     http/proto_converters.cpp
     http/proto_write_fast_path.cpp
 )
+timestar_set_project_warnings(libtimestar_proto_conv)
 target_link_libraries(libtimestar_proto_conv PRIVATE timestar_proto)
 target_include_directories(libtimestar_proto_conv PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/http

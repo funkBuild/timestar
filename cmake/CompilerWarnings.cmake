@@ -1,24 +1,44 @@
 # CompilerWarnings.cmake
-# Centralized compiler warning configuration for TimeStar
+# Centralized compiler warning configuration for TimeStar.
+#
+# timestar_set_project_warnings(<target>) applies the canonical warning set to
+# a first-party target (libtimestar, libtimestar_proto_conv, bin/ executables).
+# Third-party code is deliberately excluded: Seastar and the FetchContent deps
+# are consumed as SYSTEM includes, and the protobuf-generated timestar_proto
+# library is built with -w (we cannot fix generated code).
+#
+# Flag curation (measured with GCC 14, Jul 2026):
+# The previous "maximal" set in this file was never include()d anywhere. When
+# trialled against the codebase it produced warnings at a rate of ~490 per 5
+# translation units (i.e. thousands across the ~110-file library), almost all
+# low-value churn, so the following were dropped:
+#   -Wconversion / -Wsign-conversion  — by far the biggest offenders; size_t
+#       vs. smaller-int narrowing is pervasive and intentional in the encoder
+#       and aggregation hot paths.
+#   -Wold-style-cast  — C casts throughout bit-twiddling / SIMD glue code.
+#   -Wuseless-cast    — a handful of first-party hits that are deliberate
+#       explicitness around templated size types.
+#   -Wdouble-promotion — noisy in a float-heavy TSDB where promotion to
+#       double is often intentional (aggregation accumulators).
+# What remains is a strict superset of the old inline set from
+# lib/CMakeLists.txt (-Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference
+# -Wformat=2) and builds warning-free today, which keeps
+# TIMESTAR_WARNINGS_AS_ERRORS=ON usable in CI.
+
+option(TIMESTAR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
 function(timestar_set_project_warnings target)
-    option(TIMESTAR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
-
     set(CLANG_WARNINGS
         -Wall
         -Wextra
+        -Wpedantic
         -Wshadow
+        -Wnull-dereference
+        -Wformat=2
         -Wnon-virtual-dtor
-        -Wold-style-cast
+        -Woverloaded-virtual
         -Wcast-align
         -Wunused
-        -Woverloaded-virtual
-        -Wpedantic
-        -Wconversion
-        -Wsign-conversion
-        -Wnull-dereference
-        -Wdouble-promotion
-        -Wformat=2
         -Wimplicit-fallthrough
     )
 
@@ -28,7 +48,6 @@ function(timestar_set_project_warnings target)
         -Wduplicated-cond
         -Wduplicated-branches
         -Wlogical-op
-        -Wuseless-cast
     )
 
     if(TIMESTAR_WARNINGS_AS_ERRORS)

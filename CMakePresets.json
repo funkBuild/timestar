@@ -1,0 +1,76 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "TIMESTAR_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (default)",
+      "description": "Optimized build (-O3 -g -DNDEBUG). Uses build/ so the classic 'mkdir build && cmake ..' workflow and existing docs keep working.",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "description": "Plain debug build. Seastar_SANITIZE=OFF because Seastar's tri-state default turns ASAN+UBSAN ON for Debug builds; use the asan preset for a sanitized build.",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "Seastar_SANITIZE": "OFF"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "ASan + UBSan",
+      "description": "Sanitized debug build. Seastar needs Seastar_SANITIZE=ON so its own code is built with ASAN+UBSAN too (the whole program must be sanitized consistently), matching the -fsanitize flags applied to TimeStar code. _FORTIFY_SOURCE is only set for non-Debug configs in the top-level CMakeLists, so it does not conflict with ASAN.",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "Seastar_SANITIZE": "ON",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "asan", "configurePreset": "asan" }
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
