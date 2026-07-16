@@ -231,11 +231,9 @@ describe('Comprehensive TimeStar Query Tests', () => {
       const result = await query(`min:${testMeasurement}.moisture(){}`);
 
       expect(result.status).toBe('success');
-      // Multi-shard responses consolidate all fields into 1 series; the
-      // single-shard fast path (finalizeSingleShardPartials) still emits one
-      // series per field (3). Shape depends on shard placement — a known
-      // server inconsistency. mergeSeries() normalizes both shapes.
-      expect([1, 3]).toContain(result.series.length);
+      // All fields consolidate into one series regardless of shard placement
+      // (consolidateSeriesFields runs in both finalize paths).
+      expect(result.series.length).toBe(1);
 
       const series = mergeSeries(result.series);
       expect(series.fields.value1).toBeDefined();
@@ -256,8 +254,8 @@ describe('Comprehensive TimeStar Query Tests', () => {
       const result = await query(`max:${testMeasurement}.moisture(){}`);
 
       expect(result.status).toBe('success');
-      // 1 (consolidated) or 3 (one per field, single-shard path) — see MIN test comment
-      expect([1, 3]).toContain(result.series.length);
+      // Consolidated single series — see MIN test comment
+      expect(result.series.length).toBe(1);
 
       const series = mergeSeries(result.series);
 
@@ -275,8 +273,8 @@ describe('Comprehensive TimeStar Query Tests', () => {
       const result = await query(`avg:${testMeasurement}.moisture(){}`);
 
       expect(result.status).toBe('success');
-      // 1 (consolidated) or 3 (one per field, single-shard path) — see MIN test comment
-      expect([1, 3]).toContain(result.series.length);
+      // Consolidated single series — see MIN test comment
+      expect(result.series.length).toBe(1);
 
       const series = mergeSeries(result.series);
 
@@ -328,8 +326,8 @@ describe('Comprehensive TimeStar Query Tests', () => {
       const result = await query(`avg:${testMeasurement}.moisture(){}`);
 
       expect(result.status).toBe('success');
-      // 1 (consolidated) or 3 (one per field, single-shard path) — see MIN test comment
-      expect([1, 3]).toContain(result.series.length);
+      // Consolidated single series — see MIN test comment
+      expect(result.series.length).toBe(1);
 
       const series = mergeSeries(result.series);
       expect(Object.keys(series.fields).sort()).toEqual(['value1', 'value2', 'value3']);
@@ -397,8 +395,8 @@ describe('Comprehensive TimeStar Query Tests', () => {
 
       expect(result.status).toBe('success');
       // Scopes are no longer at top level per new format.
-      // 1 (consolidated) or 3 (one per field, single-shard path) — see MIN test comment
-      expect([1, 3]).toContain(result.series.length);
+      // Consolidated single series — see MIN test comment
+      expect(result.series.length).toBe(1);
 
       const series = mergeSeries(result.series);
 

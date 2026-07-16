@@ -939,20 +939,29 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
         }  // end of non-batch per-series loop
     }  // end of batch-vs-standard if/else
 
-    // Separate non-numeric (string/bool) fallback results from numeric.
-    // String and boolean data bypass aggregation and are returned as-is.
+    // Separate non-numeric (string) fallback results from numeric.
+    // String data bypasses aggregation and is returned as-is.  Boolean fields
+    // are converted to numeric 0/1 here so the fallback path agrees with the
+    // pushdown path, which already aggregates booleans numerically — without
+    // this, the same query returned true/false or 0/1 depending on where the
+    // data happened to sit (memory vs TSM).
     std::vector<timestar::SeriesResult> stringResults;
     std::vector<timestar::SeriesResult> numericResults;
     for (auto& sr : fallbackResults) {
-        bool hasNonNumericField = false;
-        for (const auto& [fn, fd] : sr.fields) {
-            if (std::holds_alternative<std::vector<std::string>>(fd.second) ||
-                std::holds_alternative<std::vector<bool>>(fd.second)) {
-                hasNonNumericField = true;
-                break;
+        bool hasStringField = false;
+        for (auto& [fn, fd] : sr.fields) {
+            if (std::holds_alternative<std::vector<std::string>>(fd.second)) {
+                hasStringField = true;
+            } else if (auto* boolVals = std::get_if<std::vector<bool>>(&fd.second)) {
+                std::vector<double> numeric;
+                numeric.reserve(boolVals->size());
+                for (bool b : *boolVals) {
+                    numeric.push_back(b ? 1.0 : 0.0);
+                }
+                fd.second = std::move(numeric);
             }
         }
-        if (hasNonNumericField) {
+        if (hasStringField) {
             stringResults.push_back(std::move(sr));
         } else {
             numericResults.push_back(std::move(sr));
@@ -1157,6 +1166,48 @@ seastar::future<ShardFanOutResult> HttpQueryHandler::fanOutShardQueries(
 // Fills `response` in place and returns std::nullopt on success; returns a
 // complete error QueryResponse when a limit was exceeded (the caller returns
 // it as-is).
+// Consolidate series that share the same measurement+tags into a single
+// SeriesResult with multiple fields.  The aggregation paths emit one series
+// per field; the HTTP response format groups fields under a single series
+// entry.  Called by BOTH finalize paths so the response shape does not depend
+// on which shards the series landed on.
+// Uses hash-indexed lookup for O(N) instead of O(N²) flat scan.
+void HttpQueryHandler::consolidateSeriesFields(std::vector<SeriesResult>& seriesList) {
+    // Multimap from (measurement+tags) hash to candidate indices in `merged`.
+    // Same hash with different tag-sets must coexist; without this, a hash
+    // collision overwrote the bucket and subsequent merges for the first
+    // tag-set would miss its existing entry.
+    std::unordered_multimap<size_t, size_t> tagHashToIdx;
+    tagHashToIdx.reserve(seriesList.size());
+    std::vector<SeriesResult> merged;
+    merged.reserve(seriesList.size());
+
+    for (auto& s : seriesList) {
+        size_t h = std::hash<std::string>{}(s.measurement);
+        for (const auto& [k, v] : s.tags) {
+            h ^= std::hash<std::string>{}(k) * 31 + std::hash<std::string>{}(v);
+        }
+
+        bool mergedIn = false;
+        auto [lo, hi] = tagHashToIdx.equal_range(h);
+        for (auto it = lo; it != hi; ++it) {
+            auto& existing = merged[it->second];
+            if (existing.measurement == s.measurement && existing.tags == s.tags) {
+                for (auto& [fname, fdata] : s.fields) {
+                    existing.fields[std::move(fname)] = std::move(fdata);
+                }
+                mergedIn = true;
+                break;
+            }
+        }
+        if (!mergedIn) {
+            tagHashToIdx.emplace(h, merged.size());
+            merged.push_back(std::move(s));
+        }
+    }
+    seriesList = std::move(merged);
+}
+
 std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
     const QueryRequest& request, std::pair<unsigned, ShardQueryResult>& shardResult, QueryTimingInfo& timing,
     QueryResponse& response) {
@@ -1241,6 +1292,11 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
                 response.series.push_back(std::move(series));
             }
         }
+
+        // Same consolidation as the multi-shard path: without it, the response
+        // shape depended on shard placement (multi-field series consolidated
+        // only when the fields happened to land on different shards).
+        consolidateSeriesFields(response.series);
 
         if (!requestedFieldSet.empty()) {
             for (auto& s : response.series) {
@@ -1410,44 +1466,7 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
         // a single SeriesResult with multiple fields.  The aggregation
         // loop above emits one SeriesResult per field; the HTTP response
         // format groups fields under a single series entry.
-        // Consolidate series that share the same measurement+tags
-        // into a single SeriesResult with multiple fields.
-        // Uses hash-indexed lookup for O(N) instead of O(N²) flat scan.
-        {
-            // Multimap from (measurement+tags) hash to candidate indices in `merged`.
-            // Same hash with different tag-sets must coexist; without this, a hash
-            // collision overwrote the bucket and subsequent merges for the first
-            // tag-set would miss its existing entry.
-            std::unordered_multimap<size_t, size_t> tagHashToIdx;
-            tagHashToIdx.reserve(response.series.size());
-            std::vector<SeriesResult> merged;
-            merged.reserve(response.series.size());
-
-            for (auto& s : response.series) {
-                size_t h = std::hash<std::string>{}(s.measurement);
-                for (const auto& [k, v] : s.tags) {
-                    h ^= std::hash<std::string>{}(k) * 31 + std::hash<std::string>{}(v);
-                }
-
-                bool mergedIn = false;
-                auto [lo, hi] = tagHashToIdx.equal_range(h);
-                for (auto it = lo; it != hi; ++it) {
-                    auto& existing = merged[it->second];
-                    if (existing.measurement == s.measurement && existing.tags == s.tags) {
-                        for (auto& [fname, fdata] : s.fields) {
-                            existing.fields[std::move(fname)] = std::move(fdata);
-                        }
-                        mergedIn = true;
-                        break;
-                    }
-                }
-                if (!mergedIn) {
-                    tagHashToIdx.emplace(h, merged.size());
-                    merged.push_back(std::move(s));
-                }
-            }
-            response.series = std::move(merged);
-        }
+        consolidateSeriesFields(response.series);
 
         // Filter fields: remove non-requested fields from each series, then remove empty series.
         if (!requestedFieldSet.empty()) {

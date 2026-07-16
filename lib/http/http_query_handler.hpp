@@ -147,6 +147,11 @@ private:
         const QueryRequest& request, std::vector<std::pair<unsigned, ShardQueryResult>>& shardResults,
         QueryTimingInfo& timing, QueryResponse& response);
 
+    // Merge series sharing measurement+tags into one multi-field SeriesResult.
+    // Both finalize paths must call this so the response shape does not depend
+    // on shard placement (each aggregation path emits one series per field).
+    static void consolidateSeriesFields(std::vector<SeriesResult>& series);
+
     // Phase 4: timing breakdown + slow-query logging.
     void logQueryCompletion(const QueryRequest& request, QueryTimingInfo& timing);
 };
