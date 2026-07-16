@@ -28,18 +28,6 @@ TEST_F(CompressedSliceTest, ReadFixed64ReturnsCorrectValue) {
     EXPECT_EQ(result, word);
 }
 
-TEST_F(CompressedSliceTest, ReadBitSequence) {
-    // 0x05 = 0b...0101 in the lowest bits
-    uint64_t word = 0x05;
-    auto buf = makeAlignedBuffer({word});
-    CompressedSlice slice(buf.data(), buf.size());
-
-    EXPECT_TRUE(slice.readBit());   // bit 0 = 1
-    EXPECT_FALSE(slice.readBit());  // bit 1 = 0
-    EXPECT_TRUE(slice.readBit());   // bit 2 = 1
-    EXPECT_FALSE(slice.readBit());  // bit 3 = 0
-}
-
 TEST_F(CompressedSliceTest, ReadSmallBitCounts) {
     // Store value 0b1101 = 13 in lowest 4 bits
     uint64_t word = 13;
@@ -120,22 +108,6 @@ TEST_F(CompressedSliceTest, ReadDynamic_BeyondBoundsThrows) {
     EXPECT_THROW(slice.read<uint64_t>(1), std::runtime_error);
 }
 
-// --- Bounds checking: readBit ---
-
-TEST_F(CompressedSliceTest, ReadBitBeyondBoundsThrows) {
-    // Single byte of data -> 1 word (ceiling division)
-    uint8_t byte = 0xFF;
-    CompressedSlice slice(&byte, 1);
-
-    // Read all 64 bits of the single word (1 byte + 7 padding zeros)
-    for (int i = 0; i < 64; i++) {
-        EXPECT_NO_THROW(slice.readBit());
-    }
-
-    // 65th bit should throw since there's no second word
-    EXPECT_THROW(slice.readBit(), std::runtime_error);
-}
-
 // --- Unaligned input data ---
 
 TEST_F(CompressedSliceTest, UnalignedInputDataWorks) {
@@ -186,16 +158,10 @@ TEST_F(CompressedSliceTest, SingleByteInput) {
     uint8_t byte = 0x42;
     CompressedSlice slice(&byte, 1);
 
-    // Should be able to read bit-by-bit from the single word
+    // Should be able to read the single padded word bit-by-bit worth of data
     // 0x42 = 0b01000010
-    EXPECT_FALSE(slice.readBit());  // bit 0 = 0
-    EXPECT_TRUE(slice.readBit());   // bit 1 = 1
-    EXPECT_FALSE(slice.readBit());  // bit 2 = 0
-    EXPECT_FALSE(slice.readBit());  // bit 3 = 0
-    EXPECT_FALSE(slice.readBit());  // bit 4 = 0
-    EXPECT_FALSE(slice.readBit());  // bit 5 = 0
-    EXPECT_TRUE(slice.readBit());   // bit 6 = 1
-    EXPECT_FALSE(slice.readBit());  // bit 7 = 0
+    uint64_t value = slice.read<uint64_t>(8);
+    EXPECT_EQ(value, 0x42u);
 }
 
 TEST_F(CompressedSliceTest, ThreeBytesInput) {
@@ -246,6 +212,5 @@ TEST_F(CompressedSliceTest, ZeroLengthThrowsOnRead) {
     uint8_t dummy = 0;
     CompressedSlice slice(&dummy, 0);
 
-    EXPECT_THROW(slice.readBit(), std::runtime_error);
     EXPECT_THROW(slice.read<uint64_t>(1), std::runtime_error);
 }

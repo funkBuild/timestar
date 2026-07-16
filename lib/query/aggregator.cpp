@@ -2,11 +2,9 @@
 
 #include "group_key.hpp"
 #include "http_query_handler.hpp"  // For SeriesResult
-#include "simd_aggregator.hpp"
 
 #include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <cmath>
 #include <limits>
 #include <queue>
@@ -66,49 +64,6 @@ static void mergeSortedRawInto(std::vector<uint64_t>& baseTs, std::vector<Aggreg
         s.collectRaw = needsRaw;
         s.addValue(newValues[j], newTs[j]);
         mergedStates.push_back(s);
-        j++;
-    }
-
-    baseTs = std::move(mergedTs);
-    baseStates = std::move(mergedStates);
-}
-
-// Merge two sorted (timestamps, states) vectors. Used in the reduce phase to
-// combine partial results from different shards. O(n+m) time.
-static void mergeSortedStatesInto(std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
-                                  std::vector<uint64_t>& newTs, std::vector<AggregationState>& newStates) {
-    std::vector<uint64_t> mergedTs;
-    std::vector<AggregationState> mergedStates;
-    mergedTs.reserve(baseTs.size() + newTs.size());
-    mergedStates.reserve(baseTs.size() + newTs.size());
-
-    size_t i = 0, j = 0;
-    while (i < baseTs.size() && j < newTs.size()) {
-        if (baseTs[i] < newTs[j]) {
-            mergedTs.push_back(baseTs[i]);
-            mergedStates.push_back(std::move(baseStates[i]));
-            i++;
-        } else if (baseTs[i] > newTs[j]) {
-            mergedTs.push_back(newTs[j]);
-            mergedStates.push_back(std::move(newStates[j]));
-            j++;
-        } else {
-            mergedTs.push_back(baseTs[i]);
-            AggregationState s = std::move(baseStates[i]);
-            s.merge(std::move(newStates[j]));
-            mergedStates.push_back(std::move(s));
-            i++;
-            j++;
-        }
-    }
-    while (i < baseTs.size()) {
-        mergedTs.push_back(baseTs[i]);
-        mergedStates.push_back(std::move(baseStates[i]));
-        i++;
-    }
-    while (j < newTs.size()) {
-        mergedTs.push_back(newTs[j]);
-        mergedStates.push_back(std::move(newStates[j]));
         j++;
     }
 
@@ -306,8 +261,6 @@ static void nWayMergeStates(std::vector<PartialAggregationResult*>& partials, st
 std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
     const std::vector<timestar::SeriesResult>& seriesResults, AggregationMethod method, uint64_t interval,
     const std::vector<std::string>& groupByTags) {
-    auto startTime = std::chrono::high_resolution_clock::now();
-
     // Use PrehashedString key to compute hash once and avoid redundant hashing
     std::unordered_map<PrehashedString, PartialAggregationResult, PrehashedStringHash, PrehashedStringEqual>
         partialResults;
@@ -414,14 +367,10 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
         }
     }
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    double duration = std::chrono::duration<double, std::milli>(endTime - startTime).count();
-
-    // Convert map to vector and record timing
+    // Convert map to vector
     std::vector<PartialAggregationResult> result;
     result.reserve(partialResults.size());
     for (auto& [hash, partial] : partialResults) {
-        partial.partialAggregationTimeMs = duration;
         result.push_back(std::move(partial));
     }
 

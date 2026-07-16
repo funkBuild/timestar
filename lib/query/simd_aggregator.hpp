@@ -21,9 +21,6 @@ public:
     // skip NaN like calculateMin/calculateMax.
     static void calculateSumMinMax(const double* values, size_t count, double& outSum, double& outMin, double& outMax);
 
-    // SIMD-optimized average calculation
-    static double calculateAvg(const double* values, size_t count);
-
     // SIMD-optimized minimum calculation
     // Uses parallel comparison to find min across vector lanes
     static double calculateMin(const double* values, size_t count);
@@ -34,17 +31,8 @@ public:
     // SIMD-optimized variance calculation (for stddev)
     static double calculateVariance(const double* values, size_t count, double mean);
 
-    // Batch operations for time-bucketed aggregation
-    // Process multiple buckets in parallel
-    static void calculateBucketSums(const double* values, size_t total_values, const size_t* bucket_indices,
-                                    size_t num_buckets, size_t values_per_bucket, double* bucket_sums);
-
     // SIMD-optimized dot product (useful for weighted aggregations)
     static double dotProduct(const double* a, const double* b, size_t count);
-
-    // Fast histogram computation for percentile calculations
-    static void computeHistogram(const double* values, size_t count, double min_val, double max_val, size_t num_bins,
-                                 uint32_t* histogram);
 };
 
 // Fallback scalar implementations for when NaN is detected in min/max

@@ -106,10 +106,10 @@ HWY_AFTER_NAMESPACE();
 #if HWY_ONCE
 
 // Block header field width guards: block_count is 11 bits (max 2047),
-// exception_count is 10 bits (max 1023 = BLOCK_SIZE/4 max).
-// If BLOCK_SIZE is ever increased, these static_asserts will fire.
-static_assert(IntegerEncoderFFOR::BLOCK_SIZE <= 2047, "BLOCK_SIZE exceeds block_count header field capacity (11 bits)");
-static_assert(IntegerEncoderFFOR::BLOCK_SIZE / 4 <= 1023,
+// exception_count is 10 bits (max 1023 = kBlockSize/4 max).
+// If kBlockSize is ever increased, these static_asserts will fire.
+static_assert(IntegerEncoderFFOR::kBlockSize <= 2047, "kBlockSize exceeds block_count header field capacity (11 bits)");
+static_assert(IntegerEncoderFFOR::kBlockSize / 4 <= 1023,
               "max exception_count exceeds header field capacity (10 bits)");
 
 namespace ffor_enc {
@@ -132,10 +132,10 @@ namespace {
 // capacity and subsequent calls are allocation-free.
 struct FFORScratchBuffers {
     // Encode path
-    std::vector<uint64_t> zigzag;         // up to BLOCK_SIZE (1024) - filled per-block
-    std::vector<uint64_t> clean;          // up to BLOCK_SIZE (1024)
-    std::vector<uint16_t> exc_positions;  // up to BLOCK_SIZE/4
-    std::vector<uint64_t> exc_values;     // up to BLOCK_SIZE/4
+    std::vector<uint64_t> zigzag;         // up to kBlockSize (1024) - filled per-block
+    std::vector<uint64_t> clean;          // up to kBlockSize (1024)
+    std::vector<uint16_t> exc_positions;  // up to kBlockSize/4
+    std::vector<uint64_t> exc_values;     // up to kBlockSize/4
 
 
     // Decode path: no scratch buffers needed - decode uses a stack-allocated
@@ -337,7 +337,7 @@ void encodeBlock(const uint64_t* values, size_t count, AlignedBuffer& buf, uint6
 
 // Decode one block of zigzag values from the Slice into a caller-provided buffer.
 // Writes exactly `hdr.block_count` values to `out`. Returns the block count.
-// The caller must ensure `out` has room for at least BLOCK_SIZE (1024) elements.
+// The caller must ensure `out` has room for at least kBlockSize (1024) elements.
 size_t decodeBlockInto(Slice& s, uint64_t* out) {
     auto hdr = readBlockHeader(s);
 
@@ -349,10 +349,10 @@ size_t decodeBlockInto(Slice& s, uint64_t* out) {
         throw std::runtime_error("Corrupt FFOR block: bit_width > 64 (implies max_val < min_val)");
     }
 
-    // Validate block_count: cannot exceed the buffer size (BLOCK_SIZE = 1024).
-    if (hdr.block_count > IntegerEncoderFFOR::BLOCK_SIZE) [[unlikely]] {
+    // Validate block_count: cannot exceed the buffer size (kBlockSize = 1024).
+    if (hdr.block_count > IntegerEncoderFFOR::kBlockSize) [[unlikely]] {
         throw std::runtime_error("Corrupt FFOR block: block_count (" + std::to_string(hdr.block_count) +
-                                 ") exceeds BLOCK_SIZE (" + std::to_string(IntegerEncoderFFOR::BLOCK_SIZE) + ")");
+                                 ") exceeds kBlockSize (" + std::to_string(IntegerEncoderFFOR::kBlockSize) + ")");
     }
 
     // Validate exception count: cannot exceed the number of values in the block.
@@ -380,8 +380,8 @@ size_t decodeBlockInto(Slice& s, uint64_t* out) {
         // Copy to an aligned stack buffer -- the source slice may not be 8-byte
         // aligned, and reinterpret_cast<const uint64_t*> on unaligned data
         // is UB (crashes with SIGBUS on ARM / Graviton).
-        // Max packed_words = ceil(BLOCK_SIZE * 64 / 64) = BLOCK_SIZE = 1024 (8KB stack).
-        alignas(8) uint64_t aligned_packed[IntegerEncoderFFOR::BLOCK_SIZE];
+        // Max packed_words = ceil(kBlockSize * 64 / 64) = kBlockSize = 1024 (8KB stack).
+        alignas(8) uint64_t aligned_packed[IntegerEncoderFFOR::kBlockSize];
         std::memcpy(aligned_packed, packed_ptr, packed_bytes);
 
         alp::ffor_unpack_u64(aligned_packed, hdr.block_count, hdr.base, hdr.bw, out);
@@ -445,7 +445,7 @@ size_t decodeBlockInto(Slice& s, uint64_t* out) {
 // scalar.  The zigzag encode + min/max tracking is dispatched to the best
 // available SIMD target via Highway (AVX-512, AVX2, SSE4, NEON, ...).
 void encodeImpl(std::span<const uint64_t> values, AlignedBuffer& buf) {
-    constexpr size_t BS = IntegerEncoderFFOR::BLOCK_SIZE;
+    constexpr size_t BS = IntegerEncoderFFOR::kBlockSize;
     const size_t sz = values.size();
     const size_t num_blocks = (sz + BS - 1) / BS;
 
@@ -575,7 +575,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
     //   2. No large intermediate deltaValues allocation
     //   3. Early exit when maxTime exceeded (skip remaining blocks)
 
-    constexpr size_t BS = BLOCK_SIZE;   // 1024
+    constexpr size_t BS = kBlockSize;   // 1024
     alignas(64) uint64_t blockBuf[BS];  // 8KB stack buffer - fits in L1 cache
 
     size_t nSkipped = 0, nAdded = 0;

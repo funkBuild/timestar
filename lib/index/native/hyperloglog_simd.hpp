@@ -5,11 +5,6 @@
 
 namespace timestar::index::simd {
 
-// SIMD-accelerated element-wise max of two uint8_t arrays.
-// dst[i] = max(dst[i], src[i]) for i in [0, count).
-// Uses Google Highway for portable SIMD (AVX-512, AVX2, SSE4, NEON, etc.).
-void hllMergeRegisters(uint8_t* dst, const uint8_t* src, size_t count);
-
 // SIMD-accelerated harmonic sum for HLL estimate.
 // Returns sum of 1.0 / (1 << registers[i]) for i in [0, count), plus
 // the count of zero-valued registers via *zero_count.

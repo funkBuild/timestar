@@ -60,9 +60,6 @@ public:
     // Compile-time slicing-by-8 CRC32 lookup tables (8 KB).
     static constexpr auto TABLES = detail::generateCrc32SlicingTables();
 
-    // Single-table alias for backward compatibility (table 0 = standard table).
-    static constexpr auto& TABLE = TABLES[0];
-
     // Finalize the running CRC state to produce the final checksum.
     static constexpr uint32_t finalize(uint32_t crc) { return crc ^ 0xFFFFFFFF; }
 

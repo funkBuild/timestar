@@ -28,14 +28,11 @@ public:
     // Look up a key. Returns:
     //   - std::nullopt if the key is not present OR is a tombstone
     //   - The value string if the key is present and live
-    // Use contains() to distinguish "not present" from "deleted".
+    // Use isTombstone() to distinguish "not present" from "deleted".
     std::optional<std::string_view> get(std::string_view key) const;
 
     // Insert a tombstone for the key (marks it as deleted).
     void remove(std::string_view key);
-
-    // Check if a key exists in the memtable (including tombstones).
-    bool contains(std::string_view key) const;
 
     // Check if a key is a tombstone.
     bool isTombstone(std::string_view key) const;

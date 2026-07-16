@@ -26,26 +26,6 @@ namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
-// Element-wise max of uint8_t arrays: dst[i] = max(dst[i], src[i]).
-// Processes full SIMD vectors (16/32/64 bytes) per iteration.
-void MergeRegisters(uint8_t* HWY_RESTRICT dst, const uint8_t* HWY_RESTRICT src, size_t count) {
-    const hn::ScalableTag<uint8_t> d;
-    const size_t N = hn::Lanes(d);
-
-    size_t i = 0;
-    for (; i + N <= count; i += N) {
-        auto a = hn::LoadU(d, &dst[i]);
-        auto b = hn::LoadU(d, &src[i]);
-        hn::StoreU(hn::Max(a, b), d, &dst[i]);
-    }
-
-    // Scalar tail
-    for (; i < count; ++i) {
-        if (src[i] > dst[i])
-            dst[i] = src[i];
-    }
-}
-
 // Clamp uint8_t registers: registers[i] = min(registers[i], max_val).
 void ClampRegisters(uint8_t* HWY_RESTRICT registers, size_t count, uint8_t max_val) {
     const hn::ScalableTag<uint8_t> d;
@@ -192,13 +172,8 @@ namespace timestar {
 namespace index {
 namespace simd {
 
-HWY_EXPORT(MergeRegisters);
 HWY_EXPORT(ClampRegisters);
 HWY_EXPORT(EstimateSum);
-
-void hllMergeRegisters(uint8_t* dst, const uint8_t* src, size_t count) {
-    HWY_DYNAMIC_DISPATCH(MergeRegisters)(dst, src, count);
-}
 
 void hllClampRegisters(uint8_t* registers, size_t count, uint8_t max_val) {
     HWY_DYNAMIC_DISPATCH(ClampRegisters)(registers, count, max_val);

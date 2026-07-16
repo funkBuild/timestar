@@ -97,49 +97,13 @@ public:
     // all stores once instead of per-series lookups).
     const std::vector<seastar::shared_ptr<MemoryStore>>& getMemoryStores() const { return memoryStores; }
 
-    // Check if ANY memory store has data for this series within [startTime, endTime].
-    // Returns on first match without allocating a vector.  Used by pushdown
-    // aggregation to decide whether to fall back to the full query path.
-    template <class T>
-    bool hasMemoryDataInRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
-        for (auto& memStore : memoryStores) {
-            auto* series = memStore->template querySeries<T>(seriesId);
-            if (series && !series->timestamps.empty()) {
-                auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
-                if (it != series->timestamps.end() && *it < endTime) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     // Return the earliest timestamp across all memory stores for a given series
     // within [startTime, endTime].  Returns nullopt if no memory data in range.
     // Used by pushdown aggregation to determine the split point between the
     // TSM-only portion (full pushdown) and the overlap portion (fallback).
-    template <class T>
-    std::optional<uint64_t> getEarliestMemoryTimestamp(const SeriesId128& seriesId, uint64_t startTime,
-                                                       uint64_t endTime) {
-        std::optional<uint64_t> earliest;
-        for (auto& memStore : memoryStores) {
-            auto* series = memStore->template querySeries<T>(seriesId);
-            if (series && !series->timestamps.empty()) {
-                auto it = std::lower_bound(series->timestamps.begin(), series->timestamps.end(), startTime);
-                if (it != series->timestamps.end() && *it < endTime) {
-                    uint64_t ts = *it;
-                    if (!earliest.has_value() || ts < *earliest) {
-                        earliest = ts;
-                    }
-                }
-            }
-        }
-        return earliest;
-    }
-
-    // Type-agnostic variant: one hash lookup per store (visits the series
-    // variant) instead of one probe per candidate value type.  String series
-    // are excluded to match the semantics of probing only aggregatable types.
+    // Type-agnostic: one hash lookup per store (visits the series variant)
+    // instead of one probe per candidate value type.  String series are
+    // excluded to match the semantics of probing only aggregatable types.
     std::optional<uint64_t> getEarliestMemoryTimestampAnyType(const SeriesId128& seriesId, uint64_t startTime,
                                                               uint64_t endTime) {
         std::optional<uint64_t> earliest;

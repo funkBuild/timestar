@@ -1822,9 +1822,6 @@ TEST_F(ForecastNumericalTest, ForecastSeasonalityEnumParsing) {
     EXPECT_EQ(parseForecastSeasonality("auto"), ForecastSeasonality::AUTO);
     EXPECT_EQ(parseForecastSeasonality("multi"), ForecastSeasonality::MULTI);
 
-    EXPECT_EQ(forecastSeasonalityToString(ForecastSeasonality::AUTO), "auto");
-    EXPECT_EQ(forecastSeasonalityToString(ForecastSeasonality::MULTI), "multi");
-
     EXPECT_THROW(parseForecastSeasonality("invalid"), std::invalid_argument);
 }
 

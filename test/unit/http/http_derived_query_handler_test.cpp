@@ -80,7 +80,7 @@ struct glz::meta<TestDerivedResponse> {
 class HttpDerivedQueryHandlerTest : public ::testing::Test {
 protected:
     // Executor with nullptr engine/index for testing synchronous (non-async) methods
-    DerivedQueryExecutor executor{nullptr, nullptr};
+    DerivedQueryExecutor executor{nullptr};
 };
 
 // =============================================================================
@@ -1058,11 +1058,10 @@ TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullEngineThrows) {
     EXPECT_THROW(HttpDerivedQueryHandler(nullptr), std::invalid_argument);
 }
 
-TEST_F(HttpDerivedQueryHandlerTest, ConstructWithNullIndexAccepted) {
-    // Null index is valid — the server always passes null since metadata
-    // lookups go through the engine. Verify construction does not throw.
+TEST_F(HttpDerivedQueryHandlerTest, ConstructWithValidEngineAccepted) {
+    // Verify construction with a non-null engine does not throw.
     auto* fakeEngine = reinterpret_cast<seastar::sharded<Engine>*>(uintptr_t{1});
-    EXPECT_NO_THROW(HttpDerivedQueryHandler(fakeEngine, nullptr));
+    EXPECT_NO_THROW(HttpDerivedQueryHandler{fakeEngine});
 }
 
 // =============================================================================
@@ -1077,7 +1076,7 @@ TEST_F(HttpDerivedQueryHandlerTest, ExecutorConstructWithCustomConfig) {
     DerivedQueryConfig config;
     config.maxSubQueries = 20;
 
-    EXPECT_NO_THROW(DerivedQueryExecutor(nullptr, nullptr, config));
+    EXPECT_NO_THROW(DerivedQueryExecutor(nullptr, config));
 }
 
 // =============================================================================

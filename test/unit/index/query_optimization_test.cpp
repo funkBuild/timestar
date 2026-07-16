@@ -110,32 +110,6 @@ TEST(HyperLogLogTest, SerializationRoundTrip) {
     EXPECT_DOUBLE_EQ(restored.estimate(), originalEst);
 }
 
-TEST(HyperLogLogTest, MergeUnion) {
-    HyperLogLog a, b;
-
-    // A has 0..4999, B has 5000..9999 → merged should estimate ~10000
-    for (uint32_t i = 0; i < 5000; ++i) a.add(i);
-    for (uint32_t i = 5000; i < 10000; ++i) b.add(i);
-
-    a.merge(b);
-    double est = a.estimate();
-    double error = std::abs(est - 10000.0) / 10000.0;
-    EXPECT_LT(error, 0.05) << "Merged estimate: " << est;
-}
-
-TEST(HyperLogLogTest, MergeOverlapping) {
-    HyperLogLog a, b;
-
-    // A has 0..7999, B has 5000..9999 → merged should estimate ~10000
-    for (uint32_t i = 0; i < 8000; ++i) a.add(i);
-    for (uint32_t i = 5000; i < 10000; ++i) b.add(i);
-
-    a.merge(b);
-    double est = a.estimate();
-    double error = std::abs(est - 10000.0) / 10000.0;
-    EXPECT_LT(error, 0.05) << "Merged overlapping estimate: " << est;
-}
-
 TEST(HyperLogLogTest, EmptySerializationRoundTrip) {
     HyperLogLog original;
     std::string serialized;
@@ -143,16 +117,6 @@ TEST(HyperLogLogTest, EmptySerializationRoundTrip) {
     auto restored = HyperLogLog::deserialize(serialized);
     EXPECT_TRUE(restored.empty());
     EXPECT_DOUBLE_EQ(restored.estimate(), 0.0);
-}
-
-TEST(HyperLogLogTest, MergeWithEmpty) {
-    HyperLogLog a;
-    for (uint32_t i = 0; i < 1000; ++i) a.add(i);
-    double before = a.estimate();
-
-    HyperLogLog empty;
-    a.merge(empty);
-    EXPECT_DOUBLE_EQ(a.estimate(), before);
 }
 
 // ============================================================================

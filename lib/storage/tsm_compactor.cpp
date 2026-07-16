@@ -858,26 +858,3 @@ template seastar::future<SeriesCompactionData<int64_t>> TSMCompactor::processSer
 
 template void TSMCompactor::writeSeriesCompactionData<int64_t>(TSMWriter& writer, SeriesCompactionData<int64_t>&& data,
                                                                CompactionStats& stats);
-
-// TimeBasedCompactionStrategy implementation
-bool TimeBasedCompactionStrategy::shouldCompact(uint64_t tier, size_t fileCount, size_t totalSize) const {
-    // For time-based, compact if we have old files
-    // This would need file creation time tracking
-    return fileCount >= 2;  // Simple check for now
-}
-
-std::vector<seastar::shared_ptr<TSM>> TimeBasedCompactionStrategy::selectFiles(
-    const std::vector<seastar::shared_ptr<TSM>>& availableFiles, uint64_t tier) const {
-    // Select oldest files
-    std::vector<seastar::shared_ptr<TSM>> selected = availableFiles;
-
-    // Sort by sequence number (assuming older = lower seq)
-    std::sort(selected.begin(), selected.end(), [](const auto& a, const auto& b) { return a->seqNum < b->seqNum; });
-
-    // Take first half of files
-    if (selected.size() > 2) {
-        selected.resize(selected.size() / 2);
-    }
-
-    return selected;
-}

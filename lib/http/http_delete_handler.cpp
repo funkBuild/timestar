@@ -165,18 +165,6 @@ std::string HttpDeleteHandler::createErrorResponse(const std::string& error) {
     return buffer;
 }
 
-std::string HttpDeleteHandler::createSuccessResponse(uint64_t deletedCount, uint64_t totalRequests) {
-    // Create JSON object directly
-    auto response = glz::obj{"status", "success", "deleted", deletedCount, "total", totalRequests};
-
-    std::string buffer;
-    auto ec = glz::write_json(response, buffer);
-    if (ec) {
-        return R"({"status":"error","error":"Failed to serialize success response"})";
-    }
-    return buffer;
-}
-
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handleDelete(
     std::unique_ptr<seastar::http::request> req) {
     auto reply = std::make_unique<seastar::http::reply>();

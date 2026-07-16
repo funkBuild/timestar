@@ -443,7 +443,6 @@ struct PartialAggregationResult {
 
     // Statistics
     size_t totalPoints = 0;
-    double partialAggregationTimeMs = 0.0;
 
     // Cached group key hash (computed once, reused multiple times)
     size_t groupKeyHash = 0;

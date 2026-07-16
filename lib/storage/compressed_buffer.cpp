@@ -198,21 +198,6 @@ T CompressedBuffer::readFixed() {
     return value;
 }
 
-bool CompressedBuffer::readBit() {
-    if (bitOffset > 63) {
-        offset++;
-        bitOffset = 0;
-    }
-
-    boundsCheck();
-
-    bool value = ((data[offset] >> bitOffset) & 1) == 1;
-
-    bitOffset++;
-
-    return value;
-}
-
 template void CompressedBuffer::write<6>(uint64_t value);
 template void CompressedBuffer::write<5>(uint64_t value);
 template void CompressedBuffer::write<8>(uint64_t value);

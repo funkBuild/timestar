@@ -119,7 +119,7 @@ SEASTAR_TEST_F(NativeIndexEnhancedTest, FieldStatistics) {
     SeriesId128 seriesId = co_await index.getOrCreateSeriesId(measurement, tags, "value");
 
     // Update field statistics
-    timestar::index::NativeIndex::FieldStats stats;
+    IndexFieldStats stats;
     stats.dataType = "float";
     stats.minTime = 1000000000;
     stats.maxTime = 2000000000;

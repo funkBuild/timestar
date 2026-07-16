@@ -41,31 +41,6 @@ struct glz::meta<GlazeWritePoint> {
         object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields, "timestamp", &T::timestamp);
 };
 
-struct GlazeMultiWritePoint {
-    std::string measurement;
-    std::map<std::string, std::string> tags;
-    glz::generic fields;  // Can hold arrays or scalars
-    std::optional<std::variant<uint64_t, std::vector<uint64_t>>> timestamps;
-    std::optional<uint64_t> timestamp;  // Single timestamp option
-};
-
-template <>
-struct glz::meta<GlazeMultiWritePoint> {
-    using T = GlazeMultiWritePoint;
-    static constexpr auto value = object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields,
-                                         "timestamps", &T::timestamps, "timestamp", &T::timestamp);
-};
-
-struct GlazeBatchWrite {
-    std::vector<glz::generic> writes;
-};
-
-template <>
-struct glz::meta<GlazeBatchWrite> {
-    using T = GlazeBatchWrite;
-    static constexpr auto value = object("writes", &T::writes);
-};
-
 // Fast-path struct for the common case: single write with all double fields.
 // Parses timestamps and field arrays directly into typed vectors, bypassing
 // the glz::json_t DOM entirely. This avoids ~110K json_value_t node allocations
@@ -163,30 +138,6 @@ std::string HttpWriteHandler::validateTagValue(const std::string& value, const s
     return validateStringHelper(value, context, true);
 }
 
-void HttpWriteHandler::validateWritePointNames(const std::string& measurement,
-                                               const std::map<std::string, std::string>& tags,
-                                               const std::map<std::string, FieldValue>& fields) {
-    auto err = validateName(measurement, "Measurement name");
-    if (!err.empty())
-        throw std::invalid_argument(err);
-
-    for (const auto& [key, value] : tags) {
-        // Validate first with cheap static context; only build dynamic context on error
-        err = validateName(key, "Tag key");
-        if (!err.empty()) [[unlikely]]
-            throw std::invalid_argument(err + " '" + key + "'");
-        err = validateTagValue(value, "Tag value");
-        if (!err.empty()) [[unlikely]]
-            throw std::invalid_argument(err + " for '" + key + "'");
-    }
-
-    for (const auto& [fieldName, fieldValue] : fields) {
-        err = validateName(fieldName, "Field name");
-        if (!err.empty()) [[unlikely]]
-            throw std::invalid_argument(err + " '" + fieldName + "'");
-    }
-}
-
 void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
     GlazeWritePoint glazePoint;
     auto error = glz::read_json(glazePoint, json);
@@ -225,8 +176,7 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     MultiWritePoint mwp;
 
     // Extract fields directly from the json_value_t object, avoiding a
-    // serialize-then-reparse round-trip that was previously done via
-    // glz::write_json + glz::read_json(GlazeMultiWritePoint, ...).
+    // serialize-then-reparse round-trip through an intermediate glz struct.
 
     if (!point.is_object()) {
         throw std::invalid_argument("Write point must be a JSON object");

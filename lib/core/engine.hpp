@@ -132,13 +132,6 @@ public:
         const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
         uint64_t aggregationInterval, timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
 
-    // Multi-field batch aggregation: fold N series through TSM files and memory
-    // stores in a single pass.  Returns a vector parallel to the input, where
-    // each element is either a PushdownResult or nullopt.
-    seastar::future<std::vector<std::optional<timestar::PushdownResult>>> queryAggregatedMultiField(
-        const std::vector<std::pair<std::string, SeriesId128>>& entries, uint64_t startTime, uint64_t endTime,
-        uint64_t aggregationInterval, timestar::AggregationMethod method);
-
     // Batch LATEST/FIRST: resolve latest (or first) value for multiple series
     // in a single pass over TSM files and memory stores.  Avoids per-series
     // file snapshot, sort, and coroutine overhead.
@@ -160,8 +153,6 @@ public:
     void setRetentionPolicies(std::unordered_map<std::string, RetentionPolicy> policies);
     // Get the retention policy for a measurement (local cache lookup, no I/O)
     std::optional<RetentionPolicy> getRetentionPolicy(const std::string& measurement) const;
-    // Get all retention policies (local cache)
-    const std::unordered_map<std::string, RetentionPolicy>& getRetentionPolicies() const { return _retentionPolicies; }
     // Load policies from NativeIndex on shard 0 and broadcast to all shards
     seastar::future<> loadAndBroadcastRetentionPolicies();
     // TTL background sweep (dispatched to all shards from shard 0 timer)
@@ -181,16 +172,6 @@ public:
     // Gauge accessors for metrics
     size_t getTSMFileCount() const { return tsmFileManager.getSequencedTsmFiles().size(); }
     uint64_t getCompletedCompactions() const { return tsmFileManager.getCompletedCompactions(); }
-
-    // I/O scheduling groups — use with seastar::with_scheduling_group() to
-    // prioritize query I/O over background compaction.
-    // Returns default_scheduling_group() if groups haven't been set (e.g., tests).
-    seastar::scheduling_group queryGroup() const {
-        return _schedulingGroupsCreated ? _queryGroup : seastar::default_scheduling_group();
-    }
-    seastar::scheduling_group compactionGroup() const {
-        return _schedulingGroupsCreated ? _compactionGroup : seastar::default_scheduling_group();
-    }
 
     // Set I/O scheduling groups (called from main after create_scheduling_group).
     // create_scheduling_group is a global operation, so groups must be created

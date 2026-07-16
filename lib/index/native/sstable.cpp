@@ -639,29 +639,6 @@ seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view 
     co_return std::nullopt;
 }
 
-seastar::future<bool> SSTableReader::contains(std::string_view key) {
-    // Bloom filter check
-    if (!bloom_.mayContain(key)) {
-        co_return false;
-    }
-
-    if (index_.empty()) {
-        co_return false;
-    }
-
-    size_t lo = findBlock(key);
-
-    auto blockDataPtr = co_await getDecompressedBlock(lo);
-    BlockReader blockReader(*blockDataPtr);
-    if (!blockReader.valid()) {
-        co_return false;
-    }
-
-    auto it = blockReader.newIterator();
-    it.seek(key);
-    co_return it.valid() && it.key() == key;
-}
-
 seastar::future<> SSTableReader::close() {
     // Step 2: Proactively evict this reader's blocks from the shared cache
     if (blockCache_ && cacheId_ != 0) {

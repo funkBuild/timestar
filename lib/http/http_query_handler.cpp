@@ -382,14 +382,11 @@ struct QueryTimingInfo {
     std::chrono::high_resolution_clock::time_point endTime;
 
     // Step timings
-    double parseRequestMs = 0.0;
     double findSeriesMs = 0.0;
-    double shardDistributionMs = 0.0;
     double shardQueriesMs = 0.0;
     std::vector<std::pair<unsigned, double>> perShardQueryMs;
     double resultCollectionMs = 0.0;  // time to move shard results into local vectors
     double aggregationMs = 0.0;       // time for merge + reduce + response building
-    double responseFormattingMs = 0.0;
     double totalMs = 0.0;
 
     // Statistics
@@ -402,9 +399,7 @@ struct QueryTimingInfo {
         std::stringstream ss;
         ss << std::fixed << std::setprecision(2);
         ss << "\n==================== Query Timing Breakdown ===================\n";
-        ss << "Parse Request:        " << std::setw(8) << parseRequestMs << " ms\n";
         ss << "Find Series:          " << std::setw(8) << findSeriesMs << " ms\n";
-        ss << "Shard Distribution:   " << std::setw(8) << shardDistributionMs << " ms\n";
         ss << "Shard Queries:        " << std::setw(8) << shardQueriesMs << " ms\n";
         if (!perShardQueryMs.empty()) {
             ss << "  Per-shard breakdown:\n";
@@ -414,7 +409,6 @@ struct QueryTimingInfo {
         }
         ss << "Result Collection:    " << std::setw(8) << resultCollectionMs << " ms\n";
         ss << "Aggregation:          " << std::setw(8) << aggregationMs << " ms\n";
-        ss << "Response Formatting:  " << std::setw(8) << responseFormattingMs << " ms\n";
         ss << "----------------------------------------------------------------\n";
         ss << "Total Execution:      " << std::setw(8) << totalMs << " ms\n";
         ss << "\n";
@@ -710,7 +704,6 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
 
     QueryResponse response;
     response.success = true;
-    response.scopes = request.scopes;
 
     // Initialize timing tracker
     QueryTimingInfo timing;
@@ -1567,10 +1560,9 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest
             timestar::query_log.warn(
                 "[SLOW_QUERY] {:.1f}ms (threshold {}ms) | "
                 "measurement={} series={} points={} shards={} | "
-                "discovery={:.1f}ms shard_queries={:.1f}ms aggregation={:.1f}ms format={:.1f}ms",
+                "discovery={:.1f}ms shard_queries={:.1f}ms aggregation={:.1f}ms",
                 timing.totalMs, slowThresholdMs, request.measurement, timing.seriesFound, timing.finalPointsReturned,
-                timing.shardsQueried, timing.findSeriesMs, timing.shardQueriesMs, timing.aggregationMs,
-                timing.responseFormattingMs);
+                timing.shardsQueried, timing.findSeriesMs, timing.shardQueriesMs, timing.aggregationMs);
 
             // Per-shard breakdown for slow queries (only log shards that took >50% of threshold)
             const double shardWarnMs = static_cast<double>(slowThresholdMs) / 2.0;

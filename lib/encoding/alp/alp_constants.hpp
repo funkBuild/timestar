@@ -23,9 +23,6 @@ static constexpr uint8_t SCHEME_ALP = 0;
 static constexpr uint8_t SCHEME_ALP_RD = 1;
 static constexpr uint8_t SCHEME_ALP_DELTA = 2;  // ALP with delta encoding
 
-// Maximum bit width for FFOR packing
-static constexpr uint8_t MAX_BIT_WIDTH = 64;
-
 // ALP_RD: maximum dictionary entries for left-part encoding
 static constexpr size_t ALP_RD_MAX_DICT_SIZE = 8;
 

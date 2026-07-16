@@ -58,14 +58,6 @@ public:
         return raw;
     }
 
-    // Merge another HLL sketch (union = max of registers).
-    // Uses SIMD-accelerated element-wise max over 16KB of uint8_t registers.
-    void merge(const HyperLogLog& other) {
-        if (other.nonEmpty_)
-            nonEmpty_ = true;
-        simd::hllMergeRegisters(registers_.data(), other.registers_.data(), NUM_REGISTERS);
-    }
-
     // Serialize: append 16KB register array to output.
     void serialize(std::string& out) const {
         out.append(reinterpret_cast<const char*>(registers_.data()), SERIALIZED_SIZE);

@@ -173,24 +173,6 @@ public:
         offset += count;
         // bitOffset stays 0 (aligned)
     }
-
-    bool readBit() {
-        if (bitOffset > 63) [[unlikely]] {
-            offset++;
-            bitOffset = 1;
-
-            boundsCheck(offset);
-
-            return (loadWord(offset) & 1) == 1;
-        }
-
-        boundsCheck(offset);
-
-        bool value = ((loadWord(offset) >> bitOffset) & 1) == 1;
-        bitOffset++;
-
-        return value;
-    }
 };
 
 class Slice {

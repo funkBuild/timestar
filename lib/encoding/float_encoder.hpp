@@ -6,7 +6,6 @@
 #include "alp/alp_encoder.hpp"
 
 #include <span>
-#include <string>
 #include <vector>
 
 class AlignedBuffer;
@@ -31,11 +30,6 @@ public:
      * Returns the number of bytes written to the target buffer.
      */
     static size_t encodeInto(std::span<const double> values, AlignedBuffer& target);
-
-    /**
-     * Get the name of the encoder implementation being used.
-     */
-    static std::string getImplementationName();
 };
 
 /**
@@ -47,9 +41,4 @@ public:
      * Decode compressed data back to doubles.
      */
     static void decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
-
-    /**
-     * Get the name of the decoder implementation being used.
-     */
-    static std::string getImplementationName();
 };

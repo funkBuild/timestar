@@ -161,36 +161,6 @@ TEST_F(HttpDeleteHandlerTest, CreateErrorResponseSpecialCharacters) {
 }
 
 // ---------------------------------------------------------------------------
-// createSuccessResponse tests
-// ---------------------------------------------------------------------------
-
-TEST_F(HttpDeleteHandlerTest, CreateSuccessResponse) {
-    std::string json = handler.createSuccessResponse(5, 10);
-
-    glz::generic parsed;
-    auto ec = glz::read_json(parsed, json);
-    ASSERT_FALSE(ec) << "Failed to parse success response JSON";
-
-    auto& obj = parsed.get<glz::generic::object_t>();
-    EXPECT_EQ(obj["status"].get<std::string>(), "success");
-    EXPECT_EQ(static_cast<int>(obj["deleted"].get<double>()), 5);
-    EXPECT_EQ(static_cast<int>(obj["total"].get<double>()), 10);
-}
-
-TEST_F(HttpDeleteHandlerTest, CreateSuccessResponseZeroCounts) {
-    std::string json = handler.createSuccessResponse(0, 0);
-
-    glz::generic parsed;
-    auto ec = glz::read_json(parsed, json);
-    ASSERT_FALSE(ec);
-
-    auto& obj = parsed.get<glz::generic::object_t>();
-    EXPECT_EQ(obj["status"].get<std::string>(), "success");
-    EXPECT_EQ(static_cast<int>(obj["deleted"].get<double>()), 0);
-    EXPECT_EQ(static_cast<int>(obj["total"].get<double>()), 0);
-}
-
-// ---------------------------------------------------------------------------
 // JSON round-trip: parse JSON -> parseDeleteRequest -> verify
 // ---------------------------------------------------------------------------
 

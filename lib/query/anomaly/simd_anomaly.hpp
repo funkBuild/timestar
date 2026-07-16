@@ -22,9 +22,6 @@ void vectorMultiply(const double* a, const double* b, double* result, size_t cou
 // Vector scalar multiply: result[i] = a[i] * scalar
 void vectorScalarMultiply(const double* a, double scalar, double* result, size_t count);
 
-// Fused multiply-add: result[i] = a[i] + b[i] * scalar
-void vectorFMA(const double* a, const double* b, double scalar, double* result, size_t count);
-
 // ==================== Sum and Mean ====================
 
 // SIMD-optimized sum
@@ -91,9 +88,6 @@ void computeMovingAverage(const double* values, size_t count, size_t windowSize,
 
 // SIMD-optimized weighted sum: sum(values[i] * weights[i])
 double weightedSum(const double* values, const double* weights, size_t count);
-
-// SIMD-optimized weighted mean
-double weightedMean(const double* values, const double* weights, size_t count);
 
 // ==================== Bounds Computation ====================
 

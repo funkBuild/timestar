@@ -244,20 +244,6 @@ SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
         singleTagViaFindSeries.print("findSeries (single host tag, 8 results)");
     }
 
-    // ── Phase 4c: findSeriesByTagPattern (baseline) ─────────────────────
-    fmt::print("\n── Phase 4c: findSeriesByTagPattern (baseline) ──\n");
-    {
-        LatencyStats patternStats;
-        for (int m = 0; m < NUM_MEASUREMENTS; ++m) {
-            auto t0 = clk::now();
-            auto res = co_await index.findSeriesByTagPattern(std::string(MEASUREMENTS[m]),
-                                                              "host", hostName(42));
-            patternStats.add(clk::now() - t0);
-            EXPECT_EQ(res.size(), static_cast<size_t>(FIELDS_PER_MEASUREMENT));
-        }
-        patternStats.print("findSeriesByTagPattern (single host)");
-    }
-
     // ── Phase 5: getAllSeriesForMeasurement ───────────────────────────────
     fmt::print("\n── Phase 5: getAllSeriesForMeasurement ──\n");
     {
@@ -496,7 +482,7 @@ SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
 
     // ── Summary ──────────────────────────────────────────────────────────
     fmt::print("\n── Index Statistics ──\n");
-    auto count = co_await index.getSeriesCount();
+    auto count = index.getSeriesCountSync();
     fmt::print("  Total series:       {}\n", count);
     fmt::print("  Metadata cache:     {} entries ({:.1f} MB)\n", index.getMetadataCacheSize(),
                static_cast<double>(index.getMetadataCacheBytes()) / (1024.0 * 1024.0));

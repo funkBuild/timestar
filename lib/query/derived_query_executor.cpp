@@ -5,7 +5,6 @@
 #include "engine.hpp"
 #include "http_query_handler.hpp"
 #include "logger.hpp"
-#include "native_index.hpp"
 
 #include <glaze/glaze.hpp>
 
@@ -103,9 +102,8 @@ struct glz::meta<timestar::GlazeForecastResponse> {
 
 namespace timestar {
 
-DerivedQueryExecutor::DerivedQueryExecutor(seastar::sharded<Engine>* engine,
-                                           seastar::sharded<index::NativeIndex>* index, DerivedQueryConfig config)
-    : engine_(engine), index_(index), config_(config) {}
+DerivedQueryExecutor::DerivedQueryExecutor(seastar::sharded<Engine>* engine, DerivedQueryConfig config)
+    : engine_(engine), config_(config) {}
 
 seastar::future<DerivedQueryResult> DerivedQueryExecutor::execute(const DerivedQueryRequest& request) {
     auto startTime = std::chrono::high_resolution_clock::now();

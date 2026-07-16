@@ -54,12 +54,7 @@ struct CompactionPlan {
 class TSMCompactor {
 private:
     // Compaction limits and thresholds — read from TOML config at runtime.
-    static size_t maxConcurrentCompactions() { return timestar::config().storage.compaction.max_concurrent; }
-    static size_t maxMemoryPerCompaction() { return timestar::config().storage.compaction.max_memory; }
     static size_t batchSize() { return timestar::config().storage.compaction.batch_size; }
-    static size_t tier0MinFiles() { return timestar::config().storage.compaction.tier0_min_files; }
-    static size_t tier1MinFiles() { return timestar::config().storage.compaction.tier1_min_files; }
-    static size_t tier2MinFiles() { return timestar::config().storage.compaction.tier2_min_files; }
 
     TSMFileManager* fileManager;
     std::unique_ptr<CompactionStrategy> strategy;
@@ -117,9 +112,6 @@ public:
         _pendingRetentionPolicies = policies;
         _pendingSeriesMeasurementMap = seriesMeasurementMap;
     }
-
-    // Set custom compaction strategy
-    void setStrategy(std::unique_ptr<CompactionStrategy> newStrategy) { strategy = std::move(newStrategy); }
 
     // Main compaction method - merges files and returns result with path + stats.
     // retentionPolicies: per-measurement policies for TTL/downsampling (empty = no retention).
@@ -251,23 +243,5 @@ public:
             return sourceTier + 1;
         }
         return sourceTier;
-    }
-};
-
-// Time-based compaction strategy - compact old files
-class TimeBasedCompactionStrategy : public CompactionStrategy {
-private:
-    std::chrono::hours maxAge;
-
-public:
-    explicit TimeBasedCompactionStrategy(std::chrono::hours age = std::chrono::hours(24)) : maxAge(age) {}
-
-    bool shouldCompact(uint64_t tier, size_t fileCount, size_t totalSize) const override;
-
-    std::vector<seastar::shared_ptr<TSM>> selectFiles(const std::vector<seastar::shared_ptr<TSM>>& availableFiles,
-                                                      uint64_t tier) const override;
-
-    uint64_t getTargetTier(uint64_t sourceTier, size_t fileCount) const override {
-        return std::min(sourceTier + 1, 3UL);
     }
 };

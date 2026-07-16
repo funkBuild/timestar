@@ -15,7 +15,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <limits>
 
 // =============================================================================
@@ -258,56 +257,6 @@ double DotProduct(const double* a, const double* b, size_t count) {
     return dot;
 }
 
-// SIMD-accelerated histogram bin assignment.
-// Computes bin indices in SIMD, then scatters to histogram bins in scalar
-// (scatter is inherently serial due to potential bin conflicts).
-void ComputeHistogram(const double* values, size_t count, double min_val, double scale, size_t num_bins,
-                      uint32_t* histogram) {
-    const hn::ScalableTag<double> d;
-    const size_t N = hn::Lanes(d);
-
-    auto min_vec = hn::Set(d, min_val);
-    auto scale_vec = hn::Set(d, scale);
-    auto zero_vec = hn::Zero(d);
-    auto max_bin_vec = hn::Set(d, static_cast<double>(num_bins - 1));
-
-    // Scratch buffer for storing computed bin values.
-    // Use HWY_MAX_LANES_D to support variable-width SIMD (including ARM SVE).
-    static constexpr size_t kMaxLanes = HWY_MAX_LANES_D(hn::ScalableTag<double>);
-    alignas(64) double bins[kMaxLanes];
-
-    size_t i = 0;
-
-    // Main SIMD loop
-    for (; i + N <= count; i += N) {
-        auto vals = hn::LoadU(d, &values[i]);
-        auto normalized = hn::Sub(vals, min_vec);
-        auto scaled = hn::Mul(normalized, scale_vec);
-
-        // Clamp to valid bin range [0, num_bins-1]
-        scaled = hn::Max(scaled, zero_vec);
-        scaled = hn::Min(scaled, max_bin_vec);
-
-        hn::StoreU(scaled, d, bins);
-
-        // Scalar scatter into histogram bins
-        for (size_t j = 0; j < N; ++j) {
-            int bin = static_cast<int>(bins[j]);
-            histogram[bin]++;
-        }
-    }
-
-    // Scalar tail — clamp the double BEFORE casting to int to avoid UB.
-    // (A double outside [INT_MIN, INT_MAX] has undefined behavior on int cast.)
-    const double max_bin_d = static_cast<double>(num_bins - 1);
-    for (; i < count; ++i) {
-        double bin_d = (values[i] - min_val) * scale;
-        bin_d = std::max(0.0, std::min(max_bin_d, bin_d));
-        int bin = static_cast<int>(bin_d);
-        histogram[bin]++;
-    }
-}
-
 }  // namespace HWY_NAMESPACE
 }  // namespace simd
 }  // namespace timestar
@@ -326,7 +275,6 @@ HWY_EXPORT(CalculateMinSkipNaN);
 HWY_EXPORT(CalculateMaxSkipNaN);
 HWY_EXPORT(CalculateVariance);
 HWY_EXPORT(DotProduct);
-HWY_EXPORT(ComputeHistogram);
 
 // --- SimdAggregator static method implementations (dispatch via Highway) ---
 
@@ -354,12 +302,6 @@ void SimdAggregator::calculateSumMinMax(const double* values, size_t count, doub
     if (HWY_UNLIKELY(outMax == -std::numeric_limits<double>::infinity())) {
         outMax = scalar::calculateMax(values, count);
     }
-}
-
-double SimdAggregator::calculateAvg(const double* values, size_t count) {
-    if (count == 0)
-        return std::numeric_limits<double>::quiet_NaN();
-    return calculateSum(values, count) / static_cast<double>(count);
 }
 
 double SimdAggregator::calculateMin(const double* values, size_t count) {
@@ -396,45 +338,10 @@ double SimdAggregator::calculateVariance(const double* values, size_t count, dou
     return HWY_DYNAMIC_DISPATCH(CalculateVariance)(values, count, mean);
 }
 
-void SimdAggregator::calculateBucketSums(const double* values, size_t total_values, const size_t* bucket_indices,
-                                         size_t num_buckets, size_t values_per_bucket, double* bucket_sums) {
-    for (size_t b = 0; b < num_buckets; ++b) {
-        size_t start = bucket_indices[b];
-        size_t end = (b + 1 < num_buckets) ? bucket_indices[b + 1] : start + values_per_bucket;
-        end = std::min(end, total_values);
-        size_t count = (end > start) ? end - start : 0;
-
-        if (count > 0) {
-            bucket_sums[b] = calculateSum(&values[start], count);
-        } else {
-            bucket_sums[b] = 0.0;
-        }
-    }
-}
-
 double SimdAggregator::dotProduct(const double* a, const double* b, size_t count) {
     if (count == 0)
         return 0.0;
     return HWY_DYNAMIC_DISPATCH(DotProduct)(a, b, count);
-}
-
-void SimdAggregator::computeHistogram(const double* values, size_t count, double min_val, double max_val,
-                                      size_t num_bins, uint32_t* histogram) {
-    if (count == 0 || num_bins == 0)
-        return;
-
-    // Clear histogram
-    std::memset(histogram, 0, num_bins * sizeof(uint32_t));
-
-    double range = max_val - min_val;
-    if (range <= 0) {
-        histogram[0] = static_cast<uint32_t>(std::min(count, static_cast<size_t>(UINT32_MAX)));
-        return;
-    }
-
-    double scale = (num_bins - 1) / range;
-
-    HWY_DYNAMIC_DISPATCH(ComputeHistogram)(values, count, min_val, scale, num_bins, histogram);
 }
 
 // --- Scalar fallback implementations ---

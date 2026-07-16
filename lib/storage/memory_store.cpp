@@ -349,23 +349,6 @@ bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T>& insertRequest, size_t&
 }
 
 template <class T>
-bool MemoryStore::wouldBatchExceedThreshold(std::vector<TimeStarInsert<T>>& insertRequests) {
-    if (!wal || insertRequests.empty()) {
-        return false;
-    }
-
-    size_t totalEstimatedSize = 0;
-    for (auto& insertRequest : insertRequests) {
-        totalEstimatedSize += wal->estimateInsertSize(insertRequest);
-    }
-
-    // Use the larger of actual WAL size and cumulative estimated size
-    size_t effectiveSize = std::max(wal->getCurrentSize(), estimatedAccumulatedSize);
-
-    return (effectiveSize + totalEstimatedSize) >= walSizeThreshold();
-}
-
-template <class T>
 seastar::future<bool> MemoryStore::insert(TimeStarInsert<T>& insertRequest) {
     if (closed)
         throw std::runtime_error("MemoryStore is closed");
@@ -508,8 +491,7 @@ TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_INMEM)
     template seastar::future<bool> MemoryStore::insertBatch<T>(std::vector<TimeStarInsert<T>>&, size_t);   \
     template void MemoryStore::insertMemory<T>(TimeStarInsert<T>&&);                                       \
     template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&);                                \
-    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&, size_t&);                       \
-    template bool MemoryStore::wouldBatchExceedThreshold<T>(std::vector<TimeStarInsert<T>>&);
+    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&, size_t&);
 TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_STORE)
 #undef INST_STORE
 

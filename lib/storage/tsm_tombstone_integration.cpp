@@ -45,47 +45,6 @@ seastar::future<> TSM::loadTombstones() {
     co_return;
 }
 
-// Check if series exists in the given time range
-bool TSM::hasSeriesInTimeRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) const {
-    // Check bloom filter first
-    if (!seriesBloomFilter.contains(seriesId.getRawData())) {
-        return false;
-    }
-
-    // Check if series exists in cache (promotes to front on hit)
-    auto* cached = fullIndexCache.get(seriesId);
-    if (cached == nullptr) {
-        // Not in cache — could exist but not loaded yet.
-        // Bloom filter already passed above, so be conservative and assume it might exist.
-        return true;
-    }
-
-    // Check if any index blocks overlap with the time range
-    for (const auto& block : cached->indexBlocks) {
-        if (block.minTime < endTime && block.maxTime >= startTime) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-// Check if this TSM file could potentially contain data in the given time range
-// This is more permissive than hasSeriesInTimeRange - used for delete operations
-bool TSM::couldContainTimeRange(uint64_t startTime, uint64_t endTime) const {
-    // For now, be very permissive - assume any TSM file could contain the data
-    // In a more sophisticated implementation, we could check file-level time bounds
-    // But for delete operations, it's better to be safe and create tombstones
-    // even if no current data exists (to handle future writes)
-
-    // Only reject if the time range is clearly invalid
-    if (startTime > endTime) {
-        return false;
-    }
-
-    return true;  // Accept all valid time ranges for delete operations
-}
-
 // Delete range with verification
 seastar::future<bool> TSM::deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
     // IMPORTANT: Only add tombstones if the series actually exists in this TSM file

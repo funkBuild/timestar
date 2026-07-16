@@ -202,7 +202,7 @@ TEST_F(DerivedQueryExecutorSeastarTest, TooManySubQueriesThrows) {
 
         DerivedQueryConfig config;
         config.maxSubQueries = 2;
-        DerivedQueryExecutor executor(&eng.eng, nullptr, config);
+        DerivedQueryExecutor executor(&eng.eng, config);
 
         DerivedQueryRequest request;
         request.formula = "a + b + c";

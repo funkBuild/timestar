@@ -8,9 +8,9 @@ using namespace timestar;
 
 class DerivedQueryMultiSeriesTest : public ::testing::Test {
 protected:
-    // Helper: create a DerivedQueryExecutor with null engine/index
-    // (convertQueryResponse doesn't use them)
-    DerivedQueryExecutor makeExecutor() { return DerivedQueryExecutor(nullptr, nullptr); }
+    // Helper: create a DerivedQueryExecutor with a null engine
+    // (convertQueryResponse doesn't use it)
+    DerivedQueryExecutor makeExecutor() { return DerivedQueryExecutor(nullptr); }
 
     // Helper: create a simple QueryRequest
     QueryRequest makeQuery(const std::string& measurement, const std::string& field) {

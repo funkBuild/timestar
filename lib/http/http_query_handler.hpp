@@ -50,8 +50,6 @@ struct QueryResponse {
     QueryStatistics statistics;
     std::string errorMessage;
     std::string errorCode;
-    // Store scopes from the original request for response formatting
-    std::map<std::string, std::string> scopes;
 };
 
 class HttpQueryHandler {

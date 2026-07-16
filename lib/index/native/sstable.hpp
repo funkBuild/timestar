@@ -152,10 +152,6 @@ public:
     // Reads compressed block from disk on demand (cached if block cache provided).
     seastar::future<std::optional<std::string>> get(std::string_view key);
 
-    // Step 8: Existence check without copying the value.
-    // Returns true if the key exists, false otherwise.
-    seastar::future<bool> contains(std::string_view key);
-
     // Range iteration.
     class Iterator {
     public:

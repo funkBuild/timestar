@@ -42,7 +42,6 @@ declare -a COMPACTOR_TESTS=(
     "ConcurrentReadsDuringCompaction"
     "CompactionStatistics"
     "FullCompaction"
-    "TimeBasedCompactionStrategy"
     "MixedDataTypeCompaction"
     "CompactionErrorHandling"
 )

@@ -35,25 +35,6 @@ struct SeriesBlocks {
 
     SeriesBlocks() = default;
     SeriesBlocks(const SeriesId128& id) : seriesId(id) {}
-
-    // Get point at specific position across all blocks
-    struct PointLocation {
-        size_t blockIdx;
-        size_t pointIdx;
-        bool valid;
-    };
-
-    PointLocation getPointLocation(size_t globalIndex) const {
-        size_t accumulated = 0;
-        for (size_t blockIdx = 0; blockIdx < blocks.size(); blockIdx++) {
-            size_t blockSize = blocks[blockIdx]->timestamps.size();
-            if (globalIndex < accumulated + blockSize) {
-                return {blockIdx, globalIndex - accumulated, true};
-            }
-            accumulated += blockSize;
-        }
-        return {0, 0, false};
-    }
 };
 
 // Phase A: Bulk loader for reading all blocks of a series from multiple files
@@ -288,18 +269,6 @@ public:
             return {ts0, value};
         }
     }
-
-    // Get next batch (NO ASYNC!)
-    std::vector<std::pair<uint64_t, T>> nextBatch(size_t maxPoints = 1000) {
-        std::vector<std::pair<uint64_t, T>> batch;
-        batch.reserve(maxPoints);
-
-        while (hasNext() && batch.size() < maxPoints) {
-            batch.push_back(next());
-        }
-
-        return batch;
-    }
 };
 
 // Phase B: Specialized 3-way merge (fast: min of three values)
@@ -364,18 +333,6 @@ public:
         }
 
         return {minTs, value};
-    }
-
-    // Get next batch (NO ASYNC!)
-    std::vector<std::pair<uint64_t, T>> nextBatch(size_t maxPoints = 1000) {
-        std::vector<std::pair<uint64_t, T>> batch;
-        batch.reserve(maxPoints);
-
-        while (hasNext() && batch.size() < maxPoints) {
-            batch.push_back(next());
-        }
-
-        return batch;
     }
 };
 
@@ -449,19 +406,6 @@ public:
         }
 
         return {timestamp, value};
-    }
-
-    // Get next batch (NO ASYNC!)
-    // next() already handles dedup, so just collect points.
-    std::vector<std::pair<uint64_t, T>> nextBatch(size_t maxPoints = 1000) {
-        std::vector<std::pair<uint64_t, T>> batch;
-        batch.reserve(maxPoints);
-
-        while (hasNext() && batch.size() < maxPoints) {
-            batch.push_back(next());
-        }
-
-        return batch;
     }
 };
 

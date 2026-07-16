@@ -108,12 +108,6 @@ public:
         const std::vector<SeriesId128>& seriesIds) override;
 
     // --- Measurement metadata ---
-    seastar::future<> addField(const std::string& measurement, const std::string& field) override;
-    seastar::future<> addTag(const std::string& measurement, const std::string& tagKey,
-                             const std::string& tagValue) override;
-    seastar::future<> addFieldsAndTags(const std::string& measurement, const std::string& field,
-                                       const std::map<std::string, std::string>& tags) override;
-
     seastar::future<> setFieldType(const std::string& measurement, const std::string& field,
                                    const std::string& type) override;
     seastar::future<std::string> getFieldType(const std::string& measurement, const std::string& field) override;
@@ -162,11 +156,6 @@ public:
                                                               const std::string& tagValue,
                                                               size_t maxSeries = 0) override;
 
-    seastar::future<std::vector<SeriesId128>> findSeriesByTagPattern(const std::string& measurement,
-                                                                     const std::string& tagKey,
-                                                                     const std::string& scopeValue,
-                                                                     size_t maxSeries = 0) override;
-
     seastar::future<std::map<std::string, std::vector<SeriesId128>>> getSeriesGroupedByTag(
         const std::string& measurement, const std::string& tagKey) override;
 
@@ -181,11 +170,7 @@ public:
         const std::string& measurement, size_t maxSeries = 0) override;
 
     // --- Cache management ---
-    void setMaxSeriesCacheSize(size_t maxSize) override;
-    size_t getMaxSeriesCacheSize() const override;
     size_t getSeriesCacheSize() const override;
-
-    seastar::future<> rebuildMeasurementSeriesIndex() override;
 
     // --- Retention policies ---
     seastar::future<> setRetentionPolicy(const RetentionPolicy& policy) override;
@@ -194,7 +179,6 @@ public:
     seastar::future<bool> deleteRetentionPolicy(const std::string& measurement) override;
 
     // --- Debug/maintenance ---
-    seastar::future<size_t> getSeriesCount() override;
     // Synchronous series count — safe to call from Prometheus gauge lambdas
     // (no coroutine frame, no suspension point).
     size_t getSeriesCountSync() const;
@@ -224,13 +208,6 @@ public:
 
     // Apply schema updates from other shards into local caches
     void applySchemaUpdate(const SchemaUpdate& update);
-
-    // Backward compatibility alias for code that used FieldStats
-    using FieldStats = IndexFieldStats;
-
-    // Static string set encoding helpers (backward compatibility)
-    static std::string encodeStringSet(const std::set<std::string>& strings) { return keys::encodeStringSet(strings); }
-    static std::set<std::string> decodeStringSet(const std::string& encoded) { return keys::decodeStringSet(encoded); }
 
 private:
     int shardId_;

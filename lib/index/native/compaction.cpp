@@ -28,12 +28,6 @@ public:
     seastar::future<> seekToFirst() override { co_await iter_->seekToFirst(); }
     seastar::future<> next() override { co_await iter_->next(); }
 
-    // Synchronous fast path — calls .get() on async futures.
-    // Safe when futures are ready (cache hit) or inside seastar::async().
-    void seekSync(std::string_view target) override { iter_->seek(target).get(); }
-    void seekToFirstSync() override { iter_->seekToFirst().get(); }
-    void nextSync() override { iter_->next().get(); }
-
     bool valid() const override { return iter_->valid(); }
     std::string_view key() const override { return iter_->key(); }
     std::string_view value() const override { return iter_->value(); }

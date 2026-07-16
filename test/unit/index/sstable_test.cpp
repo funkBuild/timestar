@@ -536,7 +536,7 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexNotBuiltForSmallFiles) {
 }
 
 SEASTAR_TEST_F(SSTableTest, SummaryIndexContainsCheck) {
-    // Verify contains() works correctly with summary index
+    // Verify point lookups work correctly with summary index
     auto path = self->sstPath("summary_contains.sst");
     auto writer = co_await SSTableWriter::create(path, 128);
     const int N = 8000;
@@ -548,12 +548,12 @@ SEASTAR_TEST_F(SSTableTest, SummaryIndexContainsCheck) {
     auto reader = co_await SSTableReader::open(path);
     EXPECT_GT(reader->blockCount(), 128u);
 
-    // contains() uses findBlock() internally, so this tests summary acceleration
+    // get() uses findBlock() internally, so this tests summary acceleration
     for (int i = 0; i < N; i += 200) {
-        EXPECT_TRUE(co_await reader->contains(std::format("c:{:06d}", i))) << "Missing at i=" << i;
+        EXPECT_TRUE((co_await reader->get(std::format("c:{:06d}", i))).has_value()) << "Missing at i=" << i;
     }
-    EXPECT_FALSE(co_await reader->contains("c:999999"));
-    EXPECT_FALSE(co_await reader->contains("aaa"));
+    EXPECT_FALSE((co_await reader->get("c:999999")).has_value());
+    EXPECT_FALSE((co_await reader->get("aaa")).has_value());
 
     co_await reader->close();
 }

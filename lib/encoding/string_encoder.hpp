@@ -46,7 +46,7 @@ public:
     // Returns the number of bytes written to the target buffer.
     static size_t encodeInto(std::span<const std::string> values, AlignedBuffer& target, int compressionLevel = 1);
 
-    // Decode strings from compressed buffer
+    // Decode strings from compressed buffer (test convenience — delegates to the Slice overload)
     static void decode(AlignedBuffer& encoded, size_t count, std::vector<std::string>& out);
 
     // Decode from a Slice (for TSM reading)
@@ -55,8 +55,6 @@ public:
     // Decode with skip/count support - avoids allocating strings outside the [skipCount, skipCount+limitCount) range.
     // zstd decompression still happens on the full block (no random access), but individual string
     // copies are skipped for the first skipCount entries.
-    static void decode(AlignedBuffer& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                       std::vector<std::string>& out);
     static void decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                        std::vector<std::string>& out);
 
@@ -87,19 +85,12 @@ public:
     // Deserialize a dictionary from bytes.
     static Dictionary deserializeDictionary(Slice& encoded, size_t dictSize);
 
-    // Encode strings using dictionary: replaces strings with varint IDs, then zstd-compresses.
+    // Encode strings using dictionary directly into an existing AlignedBuffer (no
+    // intermediate result buffer + copy). Returns bytes written to target.
     // Header: magic("STR2") + uncompressedSize(4) + compressedSize(4) + count(4)
     // Data: zstd-compressed varint IDs
-    static AlignedBuffer encodeDictionary(std::span<const std::string> values, const Dictionary& dict,
-                                          int compressionLevel = 1);
-
-    // Encode dictionary block directly into an existing AlignedBuffer (no
-    // intermediate result buffer + copy). Returns bytes written to target.
     static size_t encodeDictionaryInto(std::span<const std::string> values, const Dictionary& dict,
                                        AlignedBuffer& target, int compressionLevel = 1);
-
-    // Decode dictionary-encoded block: decompress IDs, look up dictionary.
-    static void decodeDictionary(Slice& encoded, size_t count, const Dictionary& dict, std::vector<std::string>& out);
 
     // Decode dictionary-encoded block with skip/limit support. Takes the
     // dictionary entries by const-ref (no per-block copy) — callers decoding
@@ -108,6 +99,5 @@ public:
                                  const std::vector<std::string>& dictEntries, std::vector<std::string>& out);
 
     // Check if a block is dictionary-encoded by peeking at the magic bytes.
-    static bool isDictionaryEncoded(const uint8_t* data, size_t size);
     static bool isDictionaryEncoded(Slice& slice);
 };

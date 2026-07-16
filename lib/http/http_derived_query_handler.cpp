@@ -15,9 +15,8 @@
 
 namespace timestar {
 
-HttpDerivedQueryHandler::HttpDerivedQueryHandler(seastar::sharded<Engine>* engine,
-                                                 seastar::sharded<index::NativeIndex>* index, DerivedQueryConfig config)
-    : engine_(engine), index_(index), config_(config) {
+HttpDerivedQueryHandler::HttpDerivedQueryHandler(seastar::sharded<Engine>* engine, DerivedQueryConfig config)
+    : engine_(engine), config_(config) {
     if (!engine_)
         throw std::invalid_argument("engine must not be null");
 }
@@ -73,7 +72,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
         }
 
         // Create executor and run the query
-        DerivedQueryExecutor executor(engine_, index_, config_);
+        DerivedQueryExecutor executor(engine_, config_);
 
         // For protobuf input, convert to JSON for the executor
         // (the executor has its own JSON parser — reuse it rather than duplicating logic)

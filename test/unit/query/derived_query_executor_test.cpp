@@ -172,7 +172,7 @@ TEST_F(DerivedQueryExecutorTest, FormatSuccessResponse) {
     result.stats.pointsDroppedDueToAlignment = 5;
 
     // Create executor with nullptr (we won't call execute)
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
     std::string json = executor.formatResponse(result);
 
     // Parse the JSON to verify structure
@@ -196,7 +196,7 @@ TEST_F(DerivedQueryExecutorTest, FormatEmptyResponse) {
     DerivedQueryResult result;
     result.formula = "empty_query";
 
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
     std::string json = executor.formatResponse(result);
 
     TestGlazeDerivedQueryResponse response;
@@ -219,7 +219,7 @@ TEST_F(DerivedQueryExecutorTest, FormatLargeResponse) {
     }
     result.stats.pointCount = 10000;
 
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
     std::string json = executor.formatResponse(result);
 
     TestGlazeDerivedQueryResponse response;
@@ -285,7 +285,7 @@ TEST_F(DerivedQueryExecutorTest, CustomConfig) {
     config.maxSubQueries = 20;
 
     // Verify construction with custom config does not throw
-    EXPECT_NO_THROW({ DerivedQueryExecutor executor(nullptr, nullptr, config); });
+    EXPECT_NO_THROW({ DerivedQueryExecutor executor(nullptr, config); });
 }
 
 // ==================== Request Validation Tests ====================

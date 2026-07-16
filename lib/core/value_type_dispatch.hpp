@@ -15,8 +15,6 @@
 //       return doSomething<T>();
 //   });
 //
-//   timestar::forEachValueType([&]<class T>() { register<T>(); });
-//
 // The dispatch order matches both `enum class TSMValueType` numeric values
 // and the variant ordering in InMemorySeries' std::variant, so that
 // `static_cast<TSMValueType>(variant.index())` round-trips.
@@ -106,17 +104,6 @@ decltype(auto) dispatchValueType(TSMValueType t, F&& f) {
             return f.template operator()<int64_t>();
     }
     throw std::runtime_error("dispatchValueType: unknown TSMValueType");
-}
-
-// Invoke `f.template operator()<T>()` once for every value type, in the
-// canonical enum order. Use for things like template instantiations,
-// per-type bookkeeping in tests, or fanning out per-type storage.
-template <class F>
-void forEachValueType(F&& f) {
-    f.template operator()<double>();
-    f.template operator()<bool>();
-    f.template operator()<std::string>();
-    f.template operator()<int64_t>();
 }
 
 }  // namespace timestar

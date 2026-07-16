@@ -368,13 +368,6 @@ seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated
     co_return co_await runner.queryTsmAggregated(seriesId, startTime, endTime, aggregationInterval, method);
 }
 
-seastar::future<std::vector<std::optional<timestar::PushdownResult>>> Engine::queryAggregatedMultiField(
-    const std::vector<std::pair<std::string, SeriesId128>>& entries, uint64_t startTime, uint64_t endTime,
-    uint64_t aggregationInterval, timestar::AggregationMethod method) {
-    QueryRunner runner(&tsmFileManager, &walFileManager);
-    co_return co_await runner.queryTsmAggregatedBatch(entries, startTime, endTime, aggregationInterval, method);
-}
-
 seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, uint64_t startTime, uint64_t endTime,
                                       bool wantFirst) {
     if (entries.empty())

@@ -45,10 +45,6 @@ std::string ShardRebalancer::shardDirOld(unsigned shard) const {
     return _dataDir + "/shard_" + std::to_string(shard) + "_old";
 }
 
-std::string ShardRebalancer::metaFilePath() const {
-    return _dataDir + "/shard_count.meta";
-}
-
 std::string ShardRebalancer::stateFilePath() const {
     return _dataDir + "/rebalance.state";
 }

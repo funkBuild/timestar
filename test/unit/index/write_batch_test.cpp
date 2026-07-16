@@ -73,9 +73,9 @@ TEST(WriteBatchTest, AtomicBatchApply) {
     EXPECT_EQ(mt.size(), 6u);
 
     // All keys should be present
-    EXPECT_TRUE(mt.contains("\x05" "series_id_bytes"));
-    EXPECT_TRUE(mt.contains("\x0A" "weather\0series_id"));
-    EXPECT_TRUE(mt.contains("\x02" "weather"));
+    EXPECT_TRUE(mt.get("\x05" "series_id_bytes").has_value());
+    EXPECT_TRUE(mt.get("\x0A" "weather\0series_id").has_value());
+    EXPECT_TRUE(mt.get("\x02" "weather").has_value());
 }
 
 // ============================================================================

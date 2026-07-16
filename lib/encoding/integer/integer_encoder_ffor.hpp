@@ -18,7 +18,7 @@
  * - Branchless, auto-vectorizable packing/unpacking loops
  * - Per-block exception mechanism handles outliers without inflating all values
  *
- * Block format (per block of up to BLOCK_SIZE values):
+ * Block format (per block of up to kBlockSize values):
  *   Word 0 (header): [0:10] block_count, [11:17] bit_width, [18:27] exception_count
  *   Word 1:          base (FOR reference = min zigzag value in block)
  *   Words 2..N:      FFOR-packed deltas (ceil(block_count * bw / 64) words)
@@ -27,7 +27,7 @@
  */
 class IntegerEncoderFFOR {
 public:
-    static constexpr size_t BLOCK_SIZE = 1024;
+    static constexpr size_t kBlockSize = 1024;
 
     static AlignedBuffer encode(std::span<const uint64_t> values);
 
@@ -35,6 +35,4 @@ public:
 
     static std::pair<size_t, size_t> decode(Slice& encoded, unsigned int timestampSize, std::vector<uint64_t>& values,
                                             uint64_t startTime = 0, uint64_t maxTime = UINT64_MAX);
-
-    static bool isAvailable() { return true; }
 };

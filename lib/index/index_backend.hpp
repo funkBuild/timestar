@@ -38,13 +38,13 @@ struct MetadataOp {
 };
 
 enum IndexKeyType : uint8_t {
-    SERIES_INDEX = 0x01,              // series_key -> series_id
+    // 0x01 retired (legacy escaped series index)
     MEASUREMENT_FIELDS = 0x02,        // measurement -> fields set
     MEASUREMENT_TAGS = 0x03,          // measurement -> tag keys set
     TAG_VALUES = 0x04,                // measurement+tag_key -> values set
     SERIES_METADATA = 0x05,           // series_id -> metadata
     TAG_INDEX = 0x06,                 // measurement+tag_key+tag_value -> series_ids
-    GROUP_BY_INDEX = 0x07,            // measurement+tag_key+tag_value -> series_ids (for group-by)
+    // 0x07 retired (GROUP_BY_INDEX — removed in Phase 3)
     FIELD_STATS = 0x08,               // series_id+field -> stats
     FIELD_TYPE = 0x09,                // measurement+field -> field type (float, bool, string, integer)
     MEASUREMENT_SERIES = 0x0A,        // measurement+\0+series_id -> (empty) for fast measurement->series lookup
@@ -53,7 +53,7 @@ enum IndexKeyType : uint8_t {
 
     // Phase 2: Roaring bitmap postings
     LOCAL_ID_FORWARD = 0x10,  // localId (4B LE) -> SeriesId128 (16B)
-    LOCAL_ID_REVERSE = 0x11,  // SeriesId128 (16B) -> localId (4B LE)
+    // 0x11 retired (LOCAL_ID_REVERSE — reverse mapping now held in-memory by LocalIdMap)
     LOCAL_ID_COUNTER = 0x12,  // singleton -> next localId counter (4B LE)
     POSTINGS_BITMAP = 0x13,   // measurement\0tagKey\0tagValue -> serialized roaring bitmap
 
@@ -122,15 +122,6 @@ public:
     virtual seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>> getSeriesMetadataBatch(
         const std::vector<SeriesId128>& seriesIds) = 0;
 
-    // Measurement metadata indexing
-    virtual seastar::future<> addField(const std::string& measurement, const std::string& field) = 0;
-    virtual seastar::future<> addTag(const std::string& measurement, const std::string& tagKey,
-                                     const std::string& tagValue) = 0;
-
-    // Batched metadata indexing
-    virtual seastar::future<> addFieldsAndTags(const std::string& measurement, const std::string& field,
-                                               const std::map<std::string, std::string>& tags) = 0;
-
     // Field type management
     virtual seastar::future<> setFieldType(const std::string& measurement, const std::string& field,
                                            const std::string& type) = 0;
@@ -176,12 +167,6 @@ public:
                                                                       const std::string& tagValue,
                                                                       size_t maxSeries = 0) = 0;
 
-    // Find series by tag pattern (wildcard or regex).
-    virtual seastar::future<std::vector<SeriesId128>> findSeriesByTagPattern(const std::string& measurement,
-                                                                             const std::string& tagKey,
-                                                                             const std::string& scopeValue,
-                                                                             size_t maxSeries = 0) = 0;
-
     // Group series by tag value for aggregations
     virtual seastar::future<std::map<std::string, std::vector<SeriesId128>>> getSeriesGroupedByTag(
         const std::string& measurement, const std::string& tagKey) = 0;
@@ -198,12 +183,7 @@ public:
         const std::string& measurement, size_t maxSeries = 0) = 0;
 
     // Series cache management.
-    virtual void setMaxSeriesCacheSize(size_t maxSize) = 0;
-    virtual size_t getMaxSeriesCacheSize() const = 0;
     virtual size_t getSeriesCacheSize() const = 0;
-
-    // Rebuild indexes (for backward compatibility / migration).
-    virtual seastar::future<> rebuildMeasurementSeriesIndex() = 0;
 
     // Retention policy CRUD
     virtual seastar::future<> setRetentionPolicy(const RetentionPolicy& policy) = 0;
@@ -212,6 +192,5 @@ public:
     virtual seastar::future<bool> deleteRetentionPolicy(const std::string& measurement) = 0;
 
     // Debug/maintenance
-    virtual seastar::future<size_t> getSeriesCount() = 0;
     virtual seastar::future<> compact() = 0;
 };

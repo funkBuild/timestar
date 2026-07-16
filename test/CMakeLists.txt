@@ -91,7 +91,6 @@ set(SOURCE_INSPECTION_DEFS
     TSM_WRITER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_writer.cpp"
     SSTABLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/sstable.cpp"
     BOOL_ENCODER_RLE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/bool_encoder_rle.cpp"
-    SIMD_AGGREGATOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/simd_aggregator.cpp"
     TSM_COMPACTOR_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm_compactor.hpp"
     STRING_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/string_encoder.cpp"
     COMPACTION_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/compaction.cpp"

@@ -46,8 +46,7 @@ class DerivedQueryExecutor {
     friend class ::DerivedQueryMultiSeriesTest;
 
 public:
-    DerivedQueryExecutor(seastar::sharded<Engine>* engine, seastar::sharded<index::NativeIndex>* index = nullptr,
-                         DerivedQueryConfig config = {});
+    DerivedQueryExecutor(seastar::sharded<Engine>* engine, DerivedQueryConfig config = {});
 
     // Execute a derived query
     seastar::future<DerivedQueryResult> execute(const DerivedQueryRequest& request);
@@ -86,7 +85,6 @@ private:
     friend class DerivedQueryCachedAstSafetyTest;  // Test access to cachedAst_
 
     seastar::sharded<Engine>* engine_;
-    seastar::sharded<index::NativeIndex>* index_;
     DerivedQueryConfig config_;
     const ExpressionNode* cachedAst_ = nullptr;  // Avoids re-parsing in executeWithAnomaly→execute
 

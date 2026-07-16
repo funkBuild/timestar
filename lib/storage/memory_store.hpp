@@ -139,8 +139,6 @@ public:
     // double-estimation in the single-insert path.
     template <class T>
     bool wouldExceedThreshold(TimeStarInsert<T>& insertRequest, size_t& outEstimatedSize);
-    template <class T>
-    bool wouldBatchExceedThreshold(std::vector<TimeStarInsert<T>>& insertRequests);
     bool isClosed() const { return closed; }
     bool isEmpty() const { return series.empty(); }
     std::optional<TSMValueType> getSeriesType(const SeriesId128& seriesId) const;

@@ -37,20 +37,6 @@ TEST_F(CompressedBufferBoundsTest, WriteAndReadFull64Bits) {
     EXPECT_EQ(value, 0xCAFEBABEDEADBEEFull);
 }
 
-TEST_F(CompressedBufferBoundsTest, WriteAndReadBits) {
-    CompressedBuffer buf;
-    // Write 0b1010 pattern as individual bits via 1-bit writes
-    buf.write(0, 1);
-    buf.write(1, 1);
-    buf.write(0, 1);
-    buf.write(1, 1);
-    buf.rewind();
-    EXPECT_FALSE(buf.readBit());
-    EXPECT_TRUE(buf.readBit());
-    EXPECT_FALSE(buf.readBit());
-    EXPECT_TRUE(buf.readBit());
-}
-
 TEST_F(CompressedBufferBoundsTest, CrossWordBoundaryRoundTrip) {
     CompressedBuffer buf;
     // Write 60 bits, then 32 bits that span the word boundary
@@ -75,12 +61,6 @@ TEST_F(CompressedBufferBoundsTest, EmptyBufferReadFixedThrows) {
     CompressedBuffer buf;
     buf.rewind();
     EXPECT_THROW((buf.readFixed<uint64_t, 64>()), std::out_of_range);
-}
-
-TEST_F(CompressedBufferBoundsTest, EmptyBufferReadBitThrows) {
-    CompressedBuffer buf;
-    buf.rewind();
-    EXPECT_THROW(buf.readBit(), std::out_of_range);
 }
 
 // --- Reading past end of buffer throws ---
@@ -109,20 +89,6 @@ TEST_F(CompressedBufferBoundsTest, ReadFixedPastEndThrows) {
 
     // Next read should throw
     EXPECT_THROW((buf.readFixed<uint64_t, 64>()), std::out_of_range);
-}
-
-TEST_F(CompressedBufferBoundsTest, ReadBitPastEndThrows) {
-    CompressedBuffer buf;
-    buf.write(0x01, 1);
-    buf.rewind();
-
-    // Read all 64 bits of the single word
-    for (int i = 0; i < 64; i++) {
-        EXPECT_NO_THROW(buf.readBit());
-    }
-
-    // 65th bit should throw
-    EXPECT_THROW(buf.readBit(), std::out_of_range);
 }
 
 // --- Cross-boundary read where second word is out of bounds ---

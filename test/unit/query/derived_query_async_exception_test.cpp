@@ -183,7 +183,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, SourceInspection_HttpHandlerHasTwoLevelCa
 TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJson_MalformedJsonThrowsDerivedQueryException) {
     // We can construct DerivedQueryExecutor with null engine/index
     // since JSON parsing happens before any engine interaction.
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
 
     const std::string badJson = "{ this is not valid json !!!";
     EXPECT_THROW(executor.executeFromJson(badJson).get(), DerivedQueryException);
@@ -195,7 +195,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJson_MalformedJsonThrowsDerive
 // A bad query string must be wrapped in DerivedQueryException before any
 // async execution begins.
 TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJson_InvalidSubQueryStringThrowsDerivedQueryException) {
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
 
     // "!!invalid!!" is not a valid query string
     const std::string json = R"json({
@@ -214,7 +214,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJson_InvalidSubQueryStringThro
 //
 // Same as test 4 but through the anomaly-aware entry point.
 TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJsonWithAnomaly_MalformedJsonThrows) {
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
 
     const std::string badJson = "{ broken";
     EXPECT_THROW(executor.executeFromJsonWithAnomaly(badJson).get(), DerivedQueryException);
@@ -222,7 +222,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJsonWithAnomaly_MalformedJsonT
 
 // Test 7: executeFromJsonWithAnomaly() with invalid sub-query string throws DerivedQueryException.
 TEST_F(DerivedQueryAsyncExceptionTest, ExecuteFromJsonWithAnomaly_InvalidSubQueryStringThrows) {
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
 
     const std::string json = R"json({
         "queries": {
@@ -571,7 +571,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, Execute_TooManySubQueriesThrowsDerivedQue
 
         DerivedQueryConfig cfg;
         cfg.maxSubQueries = 1;
-        DerivedQueryExecutor executor(&eng.eng, nullptr, cfg);
+        DerivedQueryExecutor executor(&eng.eng, cfg);
 
         DerivedQueryRequest request;
         request.formula = "a + b";
@@ -642,7 +642,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, DerivedQueryException_IsAStdException) {
 // After execute() returns an empty result (no data in time range), the HTTP
 // handler calls formatResponse(). This must succeed even with empty vectors.
 TEST_F(DerivedQueryAsyncExceptionTest, FormatResponse_EmptyResultDoesNotThrow) {
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
 
     DerivedQueryResult result;
     result.formula = "a";
@@ -656,7 +656,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, FormatResponse_EmptyResultDoesNotThrow) {
 
 // Test 24: formatAnomalyResponse() does not throw for an empty anomaly result.
 TEST_F(DerivedQueryAsyncExceptionTest, FormatAnomalyResponse_EmptyResultDoesNotThrow) {
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
 
     anomaly::AnomalyQueryResult result;
     result.success = true;
@@ -670,7 +670,7 @@ TEST_F(DerivedQueryAsyncExceptionTest, FormatAnomalyResponse_EmptyResultDoesNotT
 
 // Test 25: formatForecastResponse() does not throw for an empty forecast result.
 TEST_F(DerivedQueryAsyncExceptionTest, FormatForecastResponse_EmptyResultDoesNotThrow) {
-    DerivedQueryExecutor executor(nullptr, nullptr);
+    DerivedQueryExecutor executor(nullptr);
 
     forecast::ForecastQueryResult result;
     result.success = true;

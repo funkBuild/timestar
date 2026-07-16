@@ -179,12 +179,12 @@ SEASTAR_TEST_F(MetadataConsistencyTest, SeriesCountAccurate) {
             "metric", {{"id", std::to_string(i)}}, "value");
     }
 
-    auto count = co_await index.getSeriesCount();
+    auto count = index.getSeriesCountSync();
     EXPECT_EQ(count, 50u);
 
     // Inserting the same series again should not change count
     co_await index.getOrCreateSeriesId("metric", {{"id", "0"}}, "value");
-    count = co_await index.getSeriesCount();
+    count = index.getSeriesCountSync();
     EXPECT_EQ(count, 50u);
 
     co_await index.close();

@@ -317,12 +317,6 @@ public:
     // Delete range with verification
     seastar::future<bool> deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
 
-    // Check if series exists in time range (for verification)
-    bool hasSeriesInTimeRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) const;
-
-    // Check if TSM file could contain data in time range (more permissive, for deletes)
-    bool couldContainTimeRange(uint64_t startTime, uint64_t endTime) const;
-
     // Query with tombstone filtering
     template <class T>
     seastar::future<TSMResult<T>> queryWithTombstones(const SeriesId128& seriesId, uint64_t startTime,

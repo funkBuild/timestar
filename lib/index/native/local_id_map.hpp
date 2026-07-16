@@ -83,14 +83,6 @@ public:
         }
     }
 
-    // Restore from persisted state (used during open() recovery).
-    void restore(uint32_t nextId, std::vector<std::pair<uint32_t, SeriesId128>> mappings) {
-        restoreBegin(nextId, static_cast<uint32_t>(std::min(mappings.size(), static_cast<size_t>(UINT32_MAX))));
-        for (auto& [localId, globalId] : mappings) {
-            restoreEntry(localId, globalId);
-        }
-    }
-
 private:
     uint32_t nextId_ = 0;
     tsl::robin_map<SeriesId128, uint32_t, SeriesId128::Hash> globalToLocal_;

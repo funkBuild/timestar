@@ -127,9 +127,6 @@ struct AnomalySeriesPiece {
     // Alert value (only for "scores" piece) - maximum anomaly score
     std::optional<double> alertValue;
 
-    // Alert window end timestamp (matches Datadog format)
-    std::optional<uint64_t> alertWindowEnd;
-
     // Query index (for multi-query support)
     size_t queryIndex = 0;
 };

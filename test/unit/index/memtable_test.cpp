@@ -12,7 +12,7 @@ TEST(MemTableTest, EmptyTable) {
     EXPECT_TRUE(mt.empty());
     EXPECT_EQ(mt.size(), 0u);
     EXPECT_EQ(mt.get("key"), std::nullopt);
-    EXPECT_FALSE(mt.contains("key"));
+    EXPECT_FALSE(mt.isTombstone("key"));
 }
 
 TEST(MemTableTest, PutAndGet) {
@@ -43,14 +43,12 @@ TEST(MemTableTest, DeleteKey) {
     mt.remove("key");
 
     EXPECT_EQ(mt.get("key"), std::nullopt);
-    EXPECT_TRUE(mt.contains("key"));
     EXPECT_TRUE(mt.isTombstone("key"));
 }
 
 TEST(MemTableTest, DeleteNonExistent) {
     MemTable mt;
     mt.remove("key");
-    EXPECT_TRUE(mt.contains("key"));
     EXPECT_TRUE(mt.isTombstone("key"));
     EXPECT_EQ(mt.get("key"), std::nullopt);
 }

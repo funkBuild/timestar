@@ -1,7 +1,5 @@
 #include "key_encoding.hpp"
 
-#include "key_encoding_simd.hpp"
-
 #include <endian.h>
 
 #include <charconv>
@@ -9,81 +7,6 @@
 #include <stdexcept>
 
 namespace timestar::index::keys {
-
-// Append escaped component directly to output — no temporary string allocation.
-// Uses SIMD to scan for escape characters in 16-32 byte chunks.
-static void appendEscaped(std::string& out, const std::string& s) {
-    // SIMD scan for first escape character
-    size_t firstEscape =
-        (s.size() >= simd::kSimdThreshold) ? simd::findFirstEscapeChar(s.data(), s.size()) : [&]() -> size_t {
-        for (size_t i = 0; i < s.size(); ++i) {
-            char c = s[i];
-            if (c == '\\' || c == ',' || c == '=' || c == ' ')
-                return i;
-        }
-        return s.size();
-    }();
-
-    if (firstEscape == s.size()) {
-        // No escaping needed — fast append
-        out.append(s);
-        return;
-    }
-
-    out.reserve(out.size() + s.size() + s.size() / 4);
-    // Append the clean prefix in one shot
-    out.append(s.data(), firstEscape);
-    // Escape the rest
-    for (size_t i = firstEscape; i < s.size(); ++i) {
-        switch (s[i]) {
-            case '\\':
-                out.append("\\\\", 2);
-                break;
-            case ',':
-                out.append("\\,", 2);
-                break;
-            case '=':
-                out.append("\\=", 2);
-                break;
-            case ' ':
-                out.append("\\ ", 2);
-                break;
-            default:
-                out.push_back(s[i]);
-                break;
-        }
-    }
-}
-
-std::string escapeKeyComponent(const std::string& s) {
-    std::string out;
-    appendEscaped(out, s);
-    return out;
-}
-
-std::string encodeSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
-                            const std::string& field) {
-    size_t estimatedSize = 1 + measurement.size() + field.size() + 1;
-    for (const auto& [k, v] : tags) {
-        estimatedSize += 1 + k.size() + 1 + v.size();
-    }
-
-    std::string key;
-    key.reserve(estimatedSize + estimatedSize / 4);
-    key.push_back(static_cast<char>(SERIES_INDEX));
-    appendEscaped(key, measurement);
-
-    for (const auto& tag : tags) {
-        key.push_back(',');
-        appendEscaped(key, tag.first);
-        key.push_back('=');
-        appendEscaped(key, tag.second);
-    }
-
-    key.push_back(' ');
-    appendEscaped(key, field);
-    return key;
-}
 
 // Shared validation for functions that use \0 as separator
 static void validateNoNullBytes(std::initializer_list<std::string_view> components) {
@@ -175,18 +98,6 @@ std::string encodeRetentionPolicyKey(const std::string& measurement) {
     key.push_back(static_cast<char>(RETENTION_POLICY));
     key += measurement;
     return key;
-}
-
-std::string encodeSeriesId(const SeriesId128& seriesId) {
-    return seriesId.toBytes();
-}
-
-SeriesId128 decodeSeriesId(const std::string& encoded) {
-    return SeriesId128::fromBytes(encoded);
-}
-
-SeriesId128 decodeSeriesId(const char* data, size_t len) {
-    return SeriesId128::fromBytes(data, len);
 }
 
 std::string encodeSeriesMetadata(const SeriesMetadata& metadata) {
@@ -425,16 +336,6 @@ std::string encodeCardinalityHLLKey(const std::string& measurement, const std::s
     key += tagKey;
     key.push_back('\0');
     key += tagValue;
-    return key;
-}
-
-std::string encodeCardinalityHLLPrefix(const std::string& measurement) {
-    validateNoNullBytes({measurement});
-    std::string key;
-    key.reserve(1 + measurement.size() + 1);
-    key.push_back(static_cast<char>(CARDINALITY_HLL));
-    key += measurement;
-    key.push_back('\0');
     return key;
 }
 

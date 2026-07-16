@@ -185,7 +185,7 @@ SEASTAR_TEST_F(NativeIndexTest, SeriesCount) {
     co_await index.getOrCreateSeriesId("m1", {{"t", "v2"}}, "f1");
     co_await index.getOrCreateSeriesId("m2", {{"t", "v1"}}, "f1");
 
-    auto count = co_await index.getSeriesCount();
+    auto count = index.getSeriesCountSync();
     EXPECT_EQ(count, 3u);
 
     co_await index.close();
@@ -258,7 +258,7 @@ SEASTAR_TEST_F(NativeIndexTest, ManySeries) {
         co_await index.getOrCreateSeriesId("sensor", {{"id", std::format("s{:03d}", i)}}, "reading");
     }
 
-    auto count = co_await index.getSeriesCount();
+    auto count = index.getSeriesCountSync();
     EXPECT_EQ(count, static_cast<size_t>(N));
 
     auto allSeries = co_await index.getAllSeriesForMeasurement("sensor");
@@ -280,7 +280,7 @@ SEASTAR_TEST_F(NativeIndexTest, CompactThenQuery) {
     co_await index.compact();
 
     // Verify all data is still accessible
-    auto count = co_await index.getSeriesCount();
+    auto count = index.getSeriesCountSync();
     EXPECT_EQ(count, 50u);
 
     auto allSeries = co_await index.getAllSeriesForMeasurement("m");

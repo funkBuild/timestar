@@ -82,15 +82,12 @@ TEST_F(LocalIdMapTest, Restore) {
         ids.push_back(id);
     }
 
-    // Build restore data
-    std::vector<std::pair<uint32_t, SeriesId128>> mappings;
-    for (uint32_t i = 0; i < 50; ++i) {
-        mappings.emplace_back(i, ids[i]);
-    }
-
     // Restore into fresh map
     LocalIdMap restored;
-    restored.restore(50, std::move(mappings));
+    restored.restoreBegin(50, 50);
+    for (uint32_t i = 0; i < 50; ++i) {
+        restored.restoreEntry(i, ids[i]);
+    }
 
     EXPECT_EQ(restored.size(), 50u);
     EXPECT_EQ(restored.nextId(), 50u);

@@ -1,13 +1,28 @@
 #include "../../lib/encoding/float_encoder.hpp"
 #include "../../lib/storage/compressed_buffer.hpp"
-#include "../../lib/utils/util.hpp"
 
 #include <benchmark/benchmark.h>
 #include <immintrin.h>
 #include <x86intrin.h>
 
+#include <bit>
+#include <cassert>
 #include <random>
+#include <type_traits>
 #include <vector>
+
+// Local helpers (formerly in lib/utils/util.hpp; this benchmark is their only user).
+template <typename T>
+inline size_t getLeadingZeroBitsUnsafe(T x) {
+    assert(x != 0);
+    return static_cast<size_t>(std::countl_zero(static_cast<std::make_unsigned_t<T>>(x)));
+}
+
+template <typename T>
+inline size_t getTrailingZeroBitsUnsafe(T x) {
+    assert(x != 0);
+    return static_cast<size_t>(std::countr_zero(static_cast<std::make_unsigned_t<T>>(x)));
+}
 
 // Test data generators
 std::vector<double> generate_random_floats(size_t count, double min_val = -1000.0, double max_val = 1000.0) {

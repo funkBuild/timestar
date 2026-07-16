@@ -66,7 +66,6 @@ private:
     std::string shardDir(unsigned shard) const;
     std::string shardDirNew(unsigned shard) const;
     std::string shardDirOld(unsigned shard) const;
-    std::string metaFilePath() const;
     std::string stateFilePath() const;
 
     // State file management

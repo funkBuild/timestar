@@ -16,9 +16,6 @@ namespace timestar::index::keys {
 // --- Key encoding functions ---
 // These produce the binary keys used by NativeIndex.
 
-std::string encodeSeriesKey(const std::string& measurement, const std::map<std::string, std::string>& tags,
-                            const std::string& field);
-
 std::string encodeMeasurementFieldsKey(const std::string& measurement);
 std::string encodeMeasurementTagsKey(const std::string& measurement);
 std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey);
@@ -30,18 +27,12 @@ std::string encodeRetentionPolicyKey(const std::string& measurement);
 
 // --- Value encoding/decoding ---
 
-std::string encodeSeriesId(const SeriesId128& seriesId);
-SeriesId128 decodeSeriesId(const std::string& encoded);
-SeriesId128 decodeSeriesId(const char* data, size_t len);
-
 std::string encodeSeriesMetadata(const SeriesMetadata& metadata);
 SeriesMetadata decodeSeriesMetadata(const char* data, size_t len);
 SeriesMetadata decodeSeriesMetadata(std::string_view encoded);
 
 std::string encodeStringSet(const std::set<std::string>& strings);
 std::set<std::string> decodeStringSet(std::string_view encoded);
-
-std::string escapeKeyComponent(const std::string& input);
 
 // --- Phase 2: Local ID / Postings bitmap key encoding ---
 
@@ -69,7 +60,6 @@ uint32_t decodeDayFromDayBitmapKey(std::string_view key);
 std::string encodeCardinalityHLLKey(const std::string& measurement);
 std::string encodeCardinalityHLLKey(const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue);
-std::string encodeCardinalityHLLPrefix(const std::string& measurement);
 std::string encodeMeasurementBloomKey(const std::string& measurement);
 
 }  // namespace timestar::index::keys

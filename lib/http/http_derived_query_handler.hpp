@@ -19,15 +19,13 @@ public:
     // Security limits to prevent DoS attacks
     static constexpr size_t MAX_DERIVED_QUERY_BODY_SIZE = 1 * 1024 * 1024;  // 1MB
 
-    HttpDerivedQueryHandler(seastar::sharded<Engine>* engine, seastar::sharded<index::NativeIndex>* index = nullptr,
-                            DerivedQueryConfig config = {});
+    HttpDerivedQueryHandler(seastar::sharded<Engine>* engine, DerivedQueryConfig config = {});
 
     // Register routes with the HTTP server
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
 private:
     seastar::sharded<Engine>* engine_;
-    seastar::sharded<index::NativeIndex>* index_;
     DerivedQueryConfig config_;
 
     // Handle POST /derived request

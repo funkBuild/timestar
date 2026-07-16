@@ -17,22 +17,6 @@ static std::string readFile(const std::string& path) {
 class BugfixSourceInspectionTest : public ::testing::Test {};
 
 // ---------------------------------------------------------------------------
-// Bug 1: SIMD ComputeHistogram bins[] must not be hardcoded to 8
-// ---------------------------------------------------------------------------
-TEST_F(BugfixSourceInspectionTest, Bug1_HistogramBufferNotHardcoded8) {
-    std::string src = readFile(SIMD_AGGREGATOR_SOURCE_PATH);
-    ASSERT_FALSE(src.empty()) << "Could not read simd_aggregator.cpp";
-
-    // The old bug had: "double bins[8]"
-    EXPECT_EQ(src.find("double bins[8]"), std::string::npos)
-        << "bins[] must not be hardcoded to 8 lanes (ARM SVE overflow risk)";
-
-    // Verify the fix uses HWY_MAX_LANES_D or kMaxLanes
-    EXPECT_NE(src.find("HWY_MAX_LANES_D"), std::string::npos)
-        << "bins[] should use HWY_MAX_LANES_D for safe sizing";
-}
-
-// ---------------------------------------------------------------------------
 // Bug 2: lastCompactStats member removed, compact() returns stats directly
 // ---------------------------------------------------------------------------
 TEST_F(BugfixSourceInspectionTest, Bug2_CompactReturnsStats) {

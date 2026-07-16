@@ -85,9 +85,6 @@ public:
     // Security limit to prevent DoS attacks via large request bodies
     static size_t maxWriteBodySize() { return timestar::config().http.max_write_body_size; }
 
-    // Field value variant for flexible JSON parsing (public for validation API)
-    using FieldValue = std::variant<double, bool, std::string, int64_t>;
-
     // Canonical FieldArrays lives in lib/core/field_values.hpp (shared with
     // query handler and proto converters). Re-export under the private-name
     // alias so existing FieldArrays references in this header / .cpp resolve.
@@ -132,47 +129,6 @@ private:
         std::vector<uint8_t> boolValues;
         std::vector<std::string> stringValues;
         std::vector<int64_t> integerValues;
-
-        // Helper to add a value with timestamp
-        void addValue(uint64_t timestamp, double value) {
-            timestamps.push_back(timestamp);
-            timestampHashSum += timestamp;
-            timestampHashXor ^= timestamp;
-            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
-            doubleValues.push_back(value);
-        }
-
-        void addValue(uint64_t timestamp, bool value) {
-            timestamps.push_back(timestamp);
-            timestampHashSum += timestamp;
-            timestampHashXor ^= timestamp;
-            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
-            boolValues.push_back(value);
-        }
-
-        void addValue(uint64_t timestamp, const std::string& value) {
-            timestamps.push_back(timestamp);
-            timestampHashSum += timestamp;
-            timestampHashXor ^= timestamp;
-            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
-            stringValues.push_back(value);
-        }
-
-        void addValue(uint64_t timestamp, std::string&& value) {
-            timestamps.push_back(timestamp);
-            timestampHashSum += timestamp;
-            timestampHashXor ^= timestamp;
-            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
-            stringValues.push_back(std::move(value));
-        }
-
-        void addValue(uint64_t timestamp, int64_t value) {
-            timestamps.push_back(timestamp);
-            timestampHashSum += timestamp;
-            timestampHashXor ^= timestamp;
-            timestampHashMul = timestampHashMul * 0x9e3779b97f4a7c15ULL + timestamp;
-            integerValues.push_back(value);
-        }
     };
 
     // Move a coalesce candidate's typed value vector into a FieldArrays, setting
@@ -313,11 +269,6 @@ public:
     // since spaces don't participate in tag value key encoding.
     // Returns empty string if valid, or an error description if invalid.
     static std::string validateTagValue(const std::string& value, const std::string& context);
-
-    // Validate all names in a write point (measurement, tags, fields).
-    // Throws std::runtime_error if any name is invalid.
-    static void validateWritePointNames(const std::string& measurement, const std::map<std::string, std::string>& tags,
-                                        const std::map<std::string, FieldValue>& fields);
 
     // Parse and validate a single write point from JSON string (for testing without Seastar).
     // Throws std::runtime_error if JSON is invalid or names contain reserved characters.

@@ -43,10 +43,6 @@ void MemTable::remove(std::string_view key) {
     }
 }
 
-bool MemTable::contains(std::string_view key) const {
-    return entries_.find(key) != entries_.end();
-}
-
 bool MemTable::isTombstone(std::string_view key) const {
     auto it = entries_.find(key);
     return it != entries_.end() && !it->second;

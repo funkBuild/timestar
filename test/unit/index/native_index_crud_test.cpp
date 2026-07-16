@@ -112,7 +112,7 @@ seastar::future<> testSeriesIdGeneration() {
     EXPECT_NE(id4, id5);
 
     // Test 3: Verify series count
-    size_t count = co_await index.getSeriesCount();
+    size_t count = index.getSeriesCountSync();
     EXPECT_EQ(count, 5);
 
     co_await index.close();
@@ -358,7 +358,7 @@ seastar::future<> testFieldStatistics() {
     auto seriesId2 = co_await index.getOrCreateSeriesId("temperature", {{"location", "us-east"}}, "value");
 
     // Update field stats for first series
-    timestar::index::NativeIndex::FieldStats stats1{
+    IndexFieldStats stats1{
         "float",     // dataType
         1000000000,  // minTime
         2000000000,  // maxTime
@@ -367,7 +367,7 @@ seastar::future<> testFieldStatistics() {
     co_await index.updateFieldStats(seriesId1, "value", stats1);
 
     // Update field stats for second series
-    timestar::index::NativeIndex::FieldStats stats2{
+    IndexFieldStats stats2{
         "float",     // dataType
         1500000000,  // minTime
         2500000000,  // maxTime

@@ -44,24 +44,6 @@ inline ForecastSeasonality parseForecastSeasonality(const std::string& str) {
     throw std::invalid_argument("Unknown seasonality: " + str);
 }
 
-inline std::string forecastSeasonalityToString(ForecastSeasonality s) {
-    switch (s) {
-        case ForecastSeasonality::NONE:
-            return "none";
-        case ForecastSeasonality::HOURLY:
-            return "hourly";
-        case ForecastSeasonality::DAILY:
-            return "daily";
-        case ForecastSeasonality::WEEKLY:
-            return "weekly";
-        case ForecastSeasonality::AUTO:
-            return "auto";
-        case ForecastSeasonality::MULTI:
-            return "multi";
-    }
-    return "unknown";
-}
-
 // Convert ForecastSeasonality to period in data points
 inline size_t forecastSeasonalityToPeriod(ForecastSeasonality s, uint64_t dataIntervalNs) {
     // For AUTO/MULTI, return 0 (will be detected)

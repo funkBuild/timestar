@@ -39,11 +39,6 @@ void vectorScalarMultiply(const double* a, double scalar, double* result, size_t
         result[i] = a[i] * scalar;
 }
 
-void vectorFMA(const double* a, const double* b, double scalar, double* result, size_t count) {
-    for (size_t i = 0; i < count; ++i)
-        result[i] = a[i] + b[i] * scalar;
-}
-
 double vectorSum(const double* values, size_t count) {
     // Kahan summation for reference precision
     double sum = 0.0, c = 0.0;
@@ -245,28 +240,6 @@ TEST_F(SimdAnomalyCorrectnessTest, VectorScalarMultiply_MatchesRef) {
 
     for (size_t i = 0; i < n; i++) {
         EXPECT_DOUBLE_EQ(simdResult[i], refResult[i]) << "scalar multiply index " << i;
-    }
-}
-
-TEST_F(SimdAnomalyCorrectnessTest, VectorFMA_MatchesRef) {
-    std::mt19937_64 rng(46);
-    std::uniform_real_distribution<double> dist(-1e3, 1e3);
-
-    const size_t n = 500;
-    std::vector<double> a(n), b(n), simdResult(n), refResult(n);
-    double s = 2.71828;
-    for (size_t i = 0; i < n; i++) {
-        a[i] = dist(rng);
-        b[i] = dist(rng);
-    }
-
-    simd_ns::vectorFMA(a.data(), b.data(), s, simdResult.data(), n);
-    ref::vectorFMA(a.data(), b.data(), s, refResult.data(), n);
-
-    for (size_t i = 0; i < n; i++) {
-        // FMA may have slight differences due to fused multiply-add precision
-        double tolerance = std::abs(refResult[i]) * 1e-14 + 1e-14;
-        EXPECT_NEAR(simdResult[i], refResult[i], tolerance) << "FMA index " << i;
     }
 }
 
@@ -753,30 +726,6 @@ TEST_F(SimdAnomalyCorrectnessTest, WeightedSum_MatchesRef) {
 
 TEST_F(SimdAnomalyCorrectnessTest, WeightedSum_Empty) {
     EXPECT_DOUBLE_EQ(simd_ns::weightedSum(nullptr, nullptr, 0), 0.0);
-}
-
-TEST_F(SimdAnomalyCorrectnessTest, WeightedMean_MatchesRef) {
-    std::mt19937_64 rng(59);
-    std::uniform_real_distribution<double> dist(-100.0, 100.0);
-    std::uniform_real_distribution<double> wDist(0.1, 1.0);
-
-    std::vector<double> values(200), weights(200);
-    for (size_t i = 0; i < 200; i++) {
-        values[i] = dist(rng);
-        weights[i] = wDist(rng);
-    }
-
-    double simd = simd_ns::weightedMean(values.data(), weights.data(), 200);
-
-    double sumW = 0.0, sumVW = 0.0;
-    for (size_t i = 0; i < 200; i++) {
-        sumW += weights[i];
-        sumVW += values[i] * weights[i];
-    }
-    double scl = sumVW / sumW;
-
-    double tolerance = std::abs(scl) * 1e-9 + 1e-10;
-    EXPECT_NEAR(simd, scl, tolerance);
 }
 
 // ==================== Moving Average ====================

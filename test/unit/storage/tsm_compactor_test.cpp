@@ -723,36 +723,6 @@ SEASTAR_TEST_F(TSMCompactorTest, FullCompaction) {
     co_return;
 }
 
-// Test time-based compaction strategy
-TEST_F(TSMCompactorTest, TimeBasedCompactionStrategy) {
-    TimeBasedCompactionStrategy strategy(std::chrono::hours(1));
-
-    // Create test files
-    std::vector<seastar::shared_ptr<TSM>> files;
-    for (int i = 0; i < 6; i++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
-        auto tsm = seastar::make_shared<TSM>(filename);
-        files.push_back(tsm);
-    }
-
-    // Should compact when we have old files
-    EXPECT_TRUE(strategy.shouldCompact(0, 6, 100 * 1024 * 1024));
-
-    // Select oldest files (first half)
-    auto selected = strategy.selectFiles(files, 0);
-    EXPECT_EQ(selected.size(), 3);
-
-    // Verify oldest files are selected
-    for (size_t i = 0; i < selected.size(); i++) {
-        EXPECT_EQ(selected[i]->seqNum, i);
-    }
-
-    // Target tier should be promoted
-    EXPECT_EQ(strategy.getTargetTier(0, 3), 1);
-    EXPECT_EQ(strategy.getTargetTier(2, 3), 3);
-}
-
 // Test compaction with mixed data types
 SEASTAR_TEST_F(TSMCompactorTest, MixedDataTypeCompaction) {
     std::vector<seastar::shared_ptr<TSM>> files;

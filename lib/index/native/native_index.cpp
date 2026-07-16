@@ -59,11 +59,6 @@ public:
         return seastar::make_ready_future<>();
     }
 
-    // Synchronous fast path — no future wrapping
-    void seekSync(std::string_view target) override { iter_.seek(target); }
-    void seekToFirstSync() override { iter_.seekToFirst(); }
-    void nextSync() override { iter_.next(); }
-
     bool valid() const override { return iter_.valid(); }
     std::string_view key() const override { return iter_.key(); }
     std::string_view value() const override { return iter_.value(); }
@@ -85,12 +80,6 @@ public:
     seastar::future<> seek(std::string_view target) override { co_await iter_->seek(target); }
     seastar::future<> seekToFirst() override { co_await iter_->seekToFirst(); }
     seastar::future<> next() override { co_await iter_->next(); }
-
-    // Synchronous fast path — calls .get() on async futures.
-    // Safe only inside seastar::async() or when futures are ready (cache hit).
-    void seekSync(std::string_view target) override { iter_->seek(target).get(); }
-    void seekToFirstSync() override { iter_->seekToFirst().get(); }
-    void nextSync() override { iter_->next().get(); }
 
     bool valid() const override { return iter_->valid(); }
     std::string_view key() const override { return iter_->key(); }
@@ -340,9 +329,8 @@ seastar::future<bool> NativeIndex::kvExists(std::string_view key) {
             readers.push_back(it->second);
         }
         for (auto& reader : readers) {
-            // Use get() directly -- contains() would decompress the same block
-            // only to have get() decompress it again. get() returns nullopt on
-            // bloom-filter rejection, so the fast-path is preserved.
+            // get() returns nullopt on bloom-filter rejection, so the
+            // fast-path is preserved.
             auto result = co_await reader->get(key);
             if (result.has_value())
                 co_return !isSstableTombstone(*result);
@@ -685,8 +673,8 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     }
 
     // New series — create ALL index entries in a single batch (Stage 4).
-    // Previously this was split across getOrCreateSeriesId + addFieldsAndTags
-    // = 2-6 separate WAL writes. Now it's exactly 1.
+    // Previously this was split across getOrCreateSeriesId + a separate
+    // fields/tags indexing pass = 2-6 separate WAL writes. Now it's exactly 1.
     IndexWriteBatch batch;
     batch.reserve(4 + tags.size());  // metadata + 2 indexes + local ID forward + per-tag bitmap
 
@@ -856,76 +844,6 @@ seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>
 // ============================================================================
 // Measurement metadata
 // ============================================================================
-
-seastar::future<> NativeIndex::addField(const std::string& measurement, const std::string& field) {
-    auto& cached = fieldsCache_[measurement];
-    if (cached.count(field))
-        co_return;
-
-    // Load from storage if cache is empty
-    if (cached.empty()) {
-        auto key = ke::encodeMeasurementFieldsKey(measurement);
-        auto val = co_await kvGet(key);
-        if (val.has_value()) {
-            cached = ke::decodeStringSet(*val);
-        }
-    }
-
-    if (cached.insert(field).second) {
-        co_await kvPut(ke::encodeMeasurementFieldsKey(measurement), ke::encodeStringSet(cached));
-    }
-}
-
-seastar::future<> NativeIndex::addTag(const std::string& measurement, const std::string& tagKey,
-                                      const std::string& tagValue) {
-    // Add tag key
-    auto& tagKeys = tagsCache_[measurement];
-    if (tagKeys.empty()) {
-        auto key = ke::encodeMeasurementTagsKey(measurement);
-        auto val = co_await kvGet(key);
-        if (val.has_value()) {
-            tagKeys = ke::decodeStringSet(*val);
-        }
-    }
-
-    bool tagKeyNew = tagKeys.insert(tagKey).second;
-
-    // Add tag value — build tvCacheKey without intermediate string(1,'\0') alloc
-    std::string tvCacheKey;
-    tvCacheKey.reserve(measurement.size() + 1 + tagKey.size());
-    tvCacheKey += measurement;
-    tvCacheKey.push_back('\0');
-    tvCacheKey += tagKey;
-    auto& tagVals = tagValuesCache_[tvCacheKey];
-    std::string tagValuesKvKey = ke::encodeTagValuesKey(measurement, tagKey);
-    if (tagVals.empty()) {
-        auto val = co_await kvGet(tagValuesKvKey);
-        if (val.has_value()) {
-            tagVals = ke::decodeStringSet(*val);
-        }
-    }
-
-    bool tagValueNew = tagVals.insert(tagValue).second;
-
-    if (tagKeyNew || tagValueNew) {
-        IndexWriteBatch batch;
-        if (tagKeyNew) {
-            batch.put(ke::encodeMeasurementTagsKey(measurement), ke::encodeStringSet(tagKeys));
-        }
-        if (tagValueNew) {
-            batch.put(tagValuesKvKey, ke::encodeStringSet(tagVals));
-        }
-        co_await kvWriteBatch(batch);
-    }
-}
-
-seastar::future<> NativeIndex::addFieldsAndTags(const std::string& measurement, const std::string& field,
-                                                const std::map<std::string, std::string>& tags) {
-    co_await addField(measurement, field);
-    for (const auto& [tagKey, tagValue] : tags) {
-        co_await addTag(measurement, tagKey, tagValue);
-    }
-}
 
 seastar::future<> NativeIndex::setFieldType(const std::string& measurement, const std::string& field,
                                             const std::string& type) {
@@ -1373,17 +1291,6 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTag(const std
     co_return result;
 }
 
-seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTagPattern(const std::string& measurement,
-                                                                              const std::string& tagKey,
-                                                                              const std::string& scopeValue,
-                                                                              size_t maxSeries) {
-    // TODO: Implement wildcard/regex pattern matching. Currently delegates to
-    // exact match. The HTTP query handler handles pattern matching at the scope
-    // level via SeriesMatcher before calling this function, so the fallback is
-    // safe for current callers.
-    co_return co_await findSeriesByTag(measurement, tagKey, scopeValue, maxSeries);
-}
-
 seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::getSeriesGroupedByTag(
     const std::string& measurement, const std::string& tagKey) {
     // Phase 2: Scan POSTINGS_BITMAP prefix in KV, overlay dirty cache entries.
@@ -1582,19 +1489,8 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
 // Cache management
 // ============================================================================
 
-void NativeIndex::setMaxSeriesCacheSize(size_t maxSize) {
-    maxSeriesCacheSize_ = maxSize;
-}
-size_t NativeIndex::getMaxSeriesCacheSize() const {
-    return maxSeriesCacheSize_;
-}
 size_t NativeIndex::getSeriesCacheSize() const {
     return indexedSeriesCache_.size();
-}
-
-seastar::future<> NativeIndex::rebuildMeasurementSeriesIndex() {
-    // No-op for NativeIndex — the MEASUREMENT_SERIES index is always maintained.
-    co_return;
 }
 
 // ============================================================================
@@ -1654,16 +1550,6 @@ seastar::future<bool> NativeIndex::deleteRetentionPolicy(const std::string& meas
 // ============================================================================
 // Debug/maintenance
 // ============================================================================
-
-seastar::future<size_t> NativeIndex::getSeriesCount() {
-    size_t count = 0;
-    std::string prefix(1, static_cast<char>(SERIES_METADATA));
-    co_await kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
-        ++count;
-        return true;
-    });
-    co_return count;
-}
 
 size_t NativeIndex::getSeriesCountSync() const {
     // O(1) via LocalIdMap — no disk I/O, no .get() on futures, no reactor stall.
@@ -1759,7 +1645,23 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
     if (nullPos != std::string::npos) {
         std::string measurement = cacheKey.substr(0, nullPos);
         auto bloomIt = measurementBloomCache_.find(measurement);
-        if (bloomIt != measurementBloomCache_.end() && !bloomIt->second.isNull()) {
+        if (bloomIt == measurementBloomCache_.end()) {
+            // Lazy-load the bloom persisted by flushDirtyMeasurementBlooms in a
+            // prior session. A missing/corrupt entry is cached as a null filter
+            // (never short-circuits) so KV is probed at most once per measurement.
+            auto serialized = co_await kvGet(ke::encodeMeasurementBloomKey(measurement));
+            // Re-find after co_await: a concurrent lookup may have inserted, and
+            // robin_map rehash invalidates any earlier iterator.
+            bloomIt = measurementBloomCache_.find(measurement);
+            if (bloomIt == measurementBloomCache_.end()) {
+                bloomIt = measurementBloomCache_
+                              .emplace(measurement, serialized.has_value()
+                                                        ? BloomFilter::deserializeFrom(*serialized)
+                                                        : BloomFilter::createNull())
+                              .first;
+            }
+        }
+        if (!bloomIt->second.isNull()) {
             if (!bloomIt->second.mayContain(bitmapKvKey)) {
                 co_return nullptr;
             }

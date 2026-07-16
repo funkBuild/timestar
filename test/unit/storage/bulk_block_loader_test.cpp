@@ -6,9 +6,7 @@
 //   - Parallel block reads via when_all
 //   - 2-way, 3-way, and N-way merge correctness
 //   - Deduplication with file rank (newer wins)
-//   - Memory-efficient batch processing (nextBatch)
 //   - Time-range filtering during load
-//   - SeriesBlocks::getPointLocation
 //   - BulkMergeContext traversal
 //   - BlockMetadata overlap detection and ordering
 
@@ -340,52 +338,6 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFilesWithTimeRange) {
 }
 
 // ===========================================================================
-// 8. SeriesBlocks::getPointLocation
-// ===========================================================================
-SEASTAR_TEST_F(BulkBlockLoaderTest, SeriesBlocksGetPointLocation) {
-    // Create a file with enough points for multiple blocks
-    const int numPoints = 7500;  // 3 blocks at 3000 points each
-    std::vector<uint64_t> ts;
-    std::vector<double> vals;
-    for (int i = 0; i < numPoints; i++) {
-        ts.push_back(1000 + i);
-        vals.push_back(i * 1.0);
-    }
-
-    auto tsm = self->createTSMFile(0, 1, "location.test", ts, vals);
-    co_await tsm->open();
-    co_await tsm->readSparseIndex();
-
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey("location.test");
-    auto result = co_await BulkBlockLoader<double>::loadFromFile(tsm, seriesId);
-
-    EXPECT_GE(result.blocks.size(), 2);
-
-    // First point should be in block 0, index 0
-    auto loc0 = result.getPointLocation(0);
-    EXPECT_TRUE(loc0.valid);
-    EXPECT_EQ(loc0.blockIdx, 0);
-    EXPECT_EQ(loc0.pointIdx, 0);
-
-    // Point at the start of second block
-    size_t firstBlockSize = result.blocks[0]->timestamps.size();
-    auto loc1 = result.getPointLocation(firstBlockSize);
-    EXPECT_TRUE(loc1.valid);
-    EXPECT_EQ(loc1.blockIdx, 1);
-    EXPECT_EQ(loc1.pointIdx, 0);
-
-    // Last valid point
-    auto locLast = result.getPointLocation(result.totalPoints - 1);
-    EXPECT_TRUE(locLast.valid);
-
-    // Out of range
-    auto locInvalid = result.getPointLocation(result.totalPoints);
-    EXPECT_FALSE(locInvalid.valid);
-
-    co_return;
-}
-
-// ===========================================================================
 // 9. BulkMergeContext: traversal across blocks
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, BulkMergeContextTraversal) {
@@ -551,53 +503,6 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayOverlappingDedup) {
 }
 
 // ===========================================================================
-// 13. BulkMerger2Way: nextBatch
-// ===========================================================================
-SEASTAR_TEST_F(BulkBlockLoaderTest, Merger2WayBatchProcessing) {
-    auto tsm0 = self->createTSMFile(0, 0, "batch2.series", {1000, 2000, 3000, 4000, 5000}, {1.0, 2.0, 3.0, 4.0, 5.0});
-    co_await tsm0->open();
-    co_await tsm0->readSparseIndex();
-
-    auto tsm1 = self->createTSMFile(0, 1, "batch2.series", {6000, 7000, 8000, 9000, 10000}, {6.0, 7.0, 8.0, 9.0, 10.0});
-    co_await tsm1->open();
-    co_await tsm1->readSparseIndex();
-
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey("batch2.series");
-
-    auto blocks0 = co_await BulkBlockLoader<double>::loadFromFile(tsm0, seriesId);
-    auto blocks1 = co_await BulkBlockLoader<double>::loadFromFile(tsm1, seriesId);
-
-    std::vector<SeriesBlocks<double>> sources;
-    sources.push_back(std::move(blocks0));
-    sources.push_back(std::move(blocks1));
-
-    BulkMerger2Way<double> merger(sources);
-
-    // Get first batch of 3
-    auto batch1 = merger.nextBatch(3);
-    EXPECT_EQ(batch1.size(), 3);
-    EXPECT_EQ(batch1[0].first, 1000);
-    EXPECT_EQ(batch1[2].first, 3000);
-
-    // Get second batch of 3
-    auto batch2 = merger.nextBatch(3);
-    EXPECT_EQ(batch2.size(), 3);
-    EXPECT_EQ(batch2[0].first, 4000);
-    EXPECT_EQ(batch2[2].first, 6000);
-
-    // Get remaining
-    auto batch3 = merger.nextBatch(1000);
-    EXPECT_EQ(batch3.size(), 4);
-    EXPECT_EQ(batch3[0].first, 7000);
-    EXPECT_EQ(batch3[3].first, 10000);
-
-    // No more
-    EXPECT_FALSE(merger.hasNext());
-
-    co_return;
-}
-
-// ===========================================================================
 // 14. BulkMerger3Way: basic 3-way merge
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayBasic) {
@@ -693,50 +598,6 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayDedup) {
 }
 
 // ===========================================================================
-// 16. BulkMerger3Way: nextBatch
-// ===========================================================================
-SEASTAR_TEST_F(BulkBlockLoaderTest, Merger3WayBatchProcessing) {
-    auto tsm0 = self->createTSMFile(0, 0, "batch3.series", {1000, 2000}, {1.0, 2.0});
-    co_await tsm0->open();
-    co_await tsm0->readSparseIndex();
-
-    auto tsm1 = self->createTSMFile(0, 1, "batch3.series", {3000, 4000}, {3.0, 4.0});
-    co_await tsm1->open();
-    co_await tsm1->readSparseIndex();
-
-    auto tsm2 = self->createTSMFile(0, 2, "batch3.series", {5000, 6000}, {5.0, 6.0});
-    co_await tsm2->open();
-    co_await tsm2->readSparseIndex();
-
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey("batch3.series");
-
-    auto b0 = co_await BulkBlockLoader<double>::loadFromFile(tsm0, seriesId);
-    auto b1 = co_await BulkBlockLoader<double>::loadFromFile(tsm1, seriesId);
-    auto b2 = co_await BulkBlockLoader<double>::loadFromFile(tsm2, seriesId);
-
-    std::vector<SeriesBlocks<double>> sources;
-    sources.push_back(std::move(b0));
-    sources.push_back(std::move(b1));
-    sources.push_back(std::move(b2));
-
-    BulkMerger3Way<double> merger(sources);
-
-    auto batch = merger.nextBatch(4);
-    EXPECT_EQ(batch.size(), 4);
-    EXPECT_EQ(batch[0].first, 1000);
-    EXPECT_EQ(batch[3].first, 4000);
-
-    auto rest = merger.nextBatch(1000);
-    EXPECT_EQ(rest.size(), 2);
-    EXPECT_EQ(rest[0].first, 5000);
-    EXPECT_EQ(rest[1].first, 6000);
-
-    EXPECT_FALSE(merger.hasNext());
-
-    co_return;
-}
-
-// ===========================================================================
 // 17. BulkMerger (N-way): merge 4+ sources
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, MergerNWayFourSources) {
@@ -803,7 +664,10 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, MergerNWayDedup) {
 
     BulkMerger<double> merger(sources);
 
-    auto batch = merger.nextBatch(1000);
+    std::vector<std::pair<uint64_t, double>> batch;
+    while (merger.hasNext()) {
+        batch.push_back(merger.next());
+    }
 
     // Should have exactly 3 deduplicated points
     EXPECT_EQ(batch.size(), 3);
@@ -812,53 +676,6 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, MergerNWayDedup) {
     EXPECT_DOUBLE_EQ(batch[0].second, 30.0);  // 3 * 10.0
     EXPECT_DOUBLE_EQ(batch[1].second, 60.0);  // 3 * 20.0
     EXPECT_DOUBLE_EQ(batch[2].second, 90.0);  // 3 * 30.0
-
-    co_return;
-}
-
-// ===========================================================================
-// 19. BulkMerger (N-way): nextBatch with limit
-// ===========================================================================
-SEASTAR_TEST_F(BulkBlockLoaderTest, MergerNWayBatchLimit) {
-    std::vector<seastar::shared_ptr<TSM>> files;
-
-    for (int f = 0; f < 5; f++) {
-        std::vector<uint64_t> ts;
-        std::vector<double> vals;
-        for (int i = 0; i < 20; i++) {
-            ts.push_back(f * 1000 + i * 10);
-            vals.push_back(f * 100.0 + i);
-        }
-        auto tsm = self->createTSMFile(0, f, "nlimit.series", ts, vals);
-        co_await tsm->open();
-        co_await tsm->readSparseIndex();
-        files.push_back(tsm);
-    }
-
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey("nlimit.series");
-
-    std::vector<SeriesBlocks<double>> sources;
-    for (auto& file : files) {
-        auto blocks = co_await BulkBlockLoader<double>::loadFromFile(file, seriesId);
-        sources.push_back(std::move(blocks));
-    }
-
-    BulkMerger<double> merger(sources);
-
-    // Request only 10 points at a time
-    auto batch1 = merger.nextBatch(10);
-    EXPECT_EQ(batch1.size(), 10);
-
-    // All subsequent batches should also be capped
-    size_t total = batch1.size();
-    while (merger.hasNext()) {
-        auto batch = merger.nextBatch(10);
-        EXPECT_LE(batch.size(), 10);
-        total += batch.size();
-    }
-
-    // Total should match all unique timestamps across the 5 files
-    EXPECT_GT(total, 0);
 
     co_return;
 }
@@ -996,10 +813,8 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LargeScaleMergeIntegrity) {
 
     std::map<uint64_t, double> actualData;
     while (merger.hasNext()) {
-        auto batch = merger.nextBatch(1000);
-        for (const auto& [ts, val] : batch) {
-            actualData[ts] = val;
-        }
+        auto [ts, val] = merger.next();
+        actualData[ts] = val;
     }
 
     // Total unique timestamps: [0, 1249] = 1250

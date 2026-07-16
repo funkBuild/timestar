@@ -58,7 +58,6 @@ public:
     T readFixed();
     bool isAtEnd() const { return offset >= data.size(); }
     size_t size() const { return dataByteSize(); }
-    bool readBit();
     size_t dataByteSize() const { return data.size() * sizeof(uint64_t); }
     size_t capacity() const { return data.capacity() * sizeof(uint64_t); }
 

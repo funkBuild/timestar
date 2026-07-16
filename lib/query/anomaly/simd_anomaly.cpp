@@ -95,25 +95,6 @@ void VectorScalarMultiplyKernel(const double* HWY_RESTRICT a, double scalar, dou
     }
 }
 
-// result[i] = a[i] + b[i] * scalar  (fused multiply-add)
-void VectorFMAKernel(const double* HWY_RESTRICT a, const double* HWY_RESTRICT b, double scalar,
-                     double* HWY_RESTRICT result, size_t count) {
-    const hn::ScalableTag<double> d;
-    const size_t N = hn::Lanes(d);
-    const auto vs = hn::Set(d, scalar);
-
-    size_t i = 0;
-    for (; i + N <= count; i += N) {
-        auto va = hn::LoadU(d, &a[i]);
-        auto vb = hn::LoadU(d, &b[i]);
-        // MulAdd(b, s, a) = b * s + a
-        hn::StoreU(hn::MulAdd(vb, vs, va), d, &result[i]);
-    }
-    for (; i < count; ++i) {
-        result[i] = a[i] + b[i] * scalar;
-    }
-}
-
 // --- Reduction operations ---
 
 double VectorSumKernel(const double* HWY_RESTRICT values, size_t count) {
@@ -314,7 +295,6 @@ HWY_EXPORT(VectorSubtractKernel);
 HWY_EXPORT(VectorAddKernel);
 HWY_EXPORT(VectorMultiplyKernel);
 HWY_EXPORT(VectorScalarMultiplyKernel);
-HWY_EXPORT(VectorFMAKernel);
 HWY_EXPORT(VectorSumKernel);
 HWY_EXPORT(VectorSumSquaredDiffKernel);
 HWY_EXPORT(WeightedSumKernel);
@@ -339,10 +319,6 @@ void vectorMultiply(const double* a, const double* b, double* result, size_t cou
 
 void vectorScalarMultiply(const double* a, double scalar, double* result, size_t count) {
     HWY_DYNAMIC_DISPATCH(VectorScalarMultiplyKernel)(a, scalar, result, count);
-}
-
-void vectorFMA(const double* a, const double* b, double scalar, double* result, size_t count) {
-    HWY_DYNAMIC_DISPATCH(VectorFMAKernel)(a, b, scalar, result, count);
 }
 
 // ==================== Sum and Mean ====================
@@ -535,17 +511,6 @@ double weightedSum(const double* values, const double* weights, size_t count) {
     if (count == 0)
         return 0.0;
     return HWY_DYNAMIC_DISPATCH(WeightedSumKernel)(values, weights, count);
-}
-
-double weightedMean(const double* values, const double* weights, size_t count) {
-    if (count == 0)
-        return 0.0;
-
-    double sumW = vectorSum(weights, count);
-    if (sumW < 1e-10)
-        return 0.0;
-
-    return weightedSum(values, weights, count) / sumW;
 }
 
 // ==================== Bounds Computation ====================

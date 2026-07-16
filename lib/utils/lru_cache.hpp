@@ -79,24 +79,6 @@ public:
         return true;
     }
 
-    // Remove all entries whose key starts with the given prefix (for std::string keys)
-    size_t clearByPrefix(const std::string& prefix) {
-        size_t removed = 0;
-        for (auto it = list_.begin(); it != list_.end();) {
-            if constexpr (std::is_same_v<Key, std::string>) {
-                if (it->key.size() >= prefix.size() && std::memcmp(it->key.data(), prefix.data(), prefix.size()) == 0) {
-                    currentBytes_ -= it->entrySize;
-                    map_.erase(it->key);
-                    it = list_.erase(it);
-                    ++removed;
-                    continue;
-                }
-            }
-            ++it;
-        }
-        return removed;
-    }
-
     void clear() {
         list_.clear();
         map_.clear();
