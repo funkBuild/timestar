@@ -260,7 +260,17 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
             continue;
         }
 
-        futures.push_back(executeSubQuery(name, query).then([name](SubQueryResult result) {
+        // Propagate the request-level aggregation interval into the sub-query
+        // so it is bucketed server-side exactly like a plain /query with the
+        // same interval.  Without this, sub-queries run with interval == 0
+        // and the aggregation pushdown collapses each sub-query to a single
+        // point instead of one point per bucket.
+        QueryRequest subQuery = query;
+        if (subQuery.aggregationInterval == 0) {
+            subQuery.aggregationInterval = request.aggregationInterval;
+        }
+
+        futures.push_back(executeSubQuery(name, std::move(subQuery)).then([name](SubQueryResult result) {
             return std::make_pair(name, std::move(result));
         }));
     }
@@ -277,8 +287,7 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
     co_return resultMap;
 }
 
-seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std::string& name,
-                                                                      const QueryRequest& query) {
+seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std::string& name, QueryRequest query) {
     // Create a query handler to execute the sub-query
     http::HttpQueryHandler handler(engine_);
 

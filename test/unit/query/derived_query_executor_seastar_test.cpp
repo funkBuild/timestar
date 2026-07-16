@@ -13,11 +13,13 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <string>
@@ -765,7 +767,129 @@ TEST_F(DerivedQueryExecutorSeastarTest, ForecastEmptySubQueryReturnsEmpty) {
 }
 
 // ===========================================================================
-// 18. isAnomalyFormula / isForecastFormula static helpers
+// 18. REGRESSION: aggregationInterval must propagate to sub-queries
+//
+// Bug: DerivedQueryExecutor never copied the request-level
+// aggregationInterval into the sub-query QueryRequests, so sub-queries ran
+// with interval == 0.  On the interval-0 aggregation pushdown path (TSM
+// pushdown and its MemoryStore fold for freshly-ingested data) each
+// sub-query collapsed to a single point, while the identical plain /query
+// with the same interval returned one point per bucket.  The derived result
+// must have the same bucket count as the equivalent plain query, on every
+// storage tier.
+// ===========================================================================
+
+// Helper for the regression test: bucket count of a plain query with the
+// given interval (the reference the derived query must match).
+static size_t plainQueryBucketCount(seastar::sharded<Engine>& eng, const std::string& field, uint64_t startNs,
+                                    uint64_t endNs, uint64_t intervalNs) {
+    http::HttpQueryHandler handler(&eng);
+    QueryRequest plain;
+    plain.aggregation = AggregationMethod::AVG;
+    plain.measurement = "server.metrics";
+    plain.fields = {field};
+    plain.scopes = {{"host", "h1"}};
+    plain.startTime = startNs;
+    plain.endTime = endNs;
+    plain.aggregationInterval = intervalNs;
+    auto response = handler.executeQuery(plain).get();
+
+    EXPECT_TRUE(response.success);
+    EXPECT_EQ(response.series.size(), 1u);
+    if (response.series.size() != 1u) {
+        return 0;
+    }
+    return response.series[0].fields.at(field).first.size();
+}
+
+// Helper for the regression test: run the derived query through the JSON
+// entry point (the /derived body path) and verify bucket count and values.
+static void expectDerivedMatchesPlainBuckets(seastar::sharded<Engine>& eng, uint64_t startNs, uint64_t endNs,
+                                             uint64_t fiveMinNs, size_t plainBuckets, const char* phase) {
+    DerivedQueryExecutor executor(&eng);
+    std::string json = R"json({
+        "queries": {
+            "a": "avg:server.metrics(cpu){host:h1}",
+            "b": "avg:server.metrics(mem){host:h1}"
+        },
+        "formula": "(a + b) / 2",
+        "startTime": )json" + std::to_string(startNs) +
+                       R"json(,
+        "endTime": )json" + std::to_string(endNs) +
+                       R"json(,
+        "aggregationInterval": "5m"
+    })json";
+
+    auto result = executor.executeFromJson(json).get();
+
+    // The exact regression: derived returned 1 collapsed point instead of
+    // one point per bucket.
+    EXPECT_EQ(result.timestamps.size(), plainBuckets)
+        << phase << ": derived query bucket count must match the equivalent plain query";
+    EXPECT_EQ(result.values.size(), result.timestamps.size());
+
+    if (result.timestamps.size() == plainBuckets && plainBuckets > 0) {
+        // Bucket-start timestamps aligned to the interval grid.
+        EXPECT_EQ(result.timestamps.front(), startNs) << phase;
+        EXPECT_EQ(result.timestamps.back(), startNs + (plainBuckets - 1) * fiveMinNs) << phase;
+    }
+
+    // (a + b) / 2 = (50 + 200) / 2 = 125 in every bucket.
+    for (double v : result.values) {
+        EXPECT_NEAR(v, 125.0, 0.01) << phase;
+    }
+}
+
+TEST_F(DerivedQueryExecutorSeastarTest, AggregationIntervalBucketsFreshData) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.startWithBackground();
+
+        const uint64_t startNs = 1704067200000000000ULL;  // multiple of 5m
+        const uint64_t minuteNs = 60000000000ULL;
+        const uint64_t fiveMinNs = 300000000000ULL;
+        constexpr size_t kPointsPerPhase = 150;  // 150 minutes per phase
+
+        auto insertRange = [&](size_t firstMinute, size_t count) {
+            std::vector<std::pair<uint64_t, double>> cpuPoints;
+            std::vector<std::pair<uint64_t, double>> memPoints;
+            for (size_t i = firstMinute; i < firstMinute + count; ++i) {
+                cpuPoints.push_back({startNs + i * minuteNs, 50.0});
+                memPoints.push_back({startNs + i * minuteNs, 200.0});
+            }
+            insertFloatSeries(eng.eng, "server.metrics", "cpu", {{"host", "h1"}}, cpuPoints);
+            insertFloatSeries(eng.eng, "server.metrics", "mem", {{"host", "h1"}}, memPoints);
+        };
+
+        // ---- Phase 1: MemoryStore-only (freshly-ingested, no rollover) ----
+        insertRange(0, kPointsPerPhase);
+        uint64_t phase1End = startNs + kPointsPerPhase * minuteNs;
+
+        size_t plainBuckets = plainQueryBucketCount(eng.eng, "cpu", startNs, phase1End, fiveMinNs);
+        EXPECT_EQ(plainBuckets, kPointsPerPhase / 5) << "Plain query should return one point per 5m bucket";
+        expectDerivedMatchesPlainBuckets(eng.eng, startNs, phase1End, fiveMinNs, plainBuckets, "memory-only");
+
+        // ---- Phase 2: TSM files + fresh MemoryStore tail ----
+        // Roll the first 150 minutes over to TSM, then ingest 150 more
+        // minutes that stay in the MemoryStore.  This is the live-repro
+        // condition: sub-queries take the TSM pushdown + MemoryStore fold
+        // path, which collapsed to one point when the interval was dropped.
+        eng.eng.invoke_on_all([](Engine& engine) { return engine.rolloverMemoryStore(); }).get();
+        seastar::sleep(std::chrono::milliseconds(300)).get();  // background TSM conversion
+
+        insertRange(kPointsPerPhase, kPointsPerPhase);
+        uint64_t phase2End = startNs + 2 * kPointsPerPhase * minuteNs;
+
+        plainBuckets = plainQueryBucketCount(eng.eng, "cpu", startNs, phase2End, fiveMinNs);
+        EXPECT_EQ(plainBuckets, 2 * kPointsPerPhase / 5) << "Plain query should return one point per 5m bucket";
+        expectDerivedMatchesPlainBuckets(eng.eng, startNs, phase2End, fiveMinNs, plainBuckets, "tsm+memory");
+    })
+        .join()
+        .get();
+}
+
+// ===========================================================================
+// 19. isAnomalyFormula / isForecastFormula static helpers
 // ===========================================================================
 
 TEST_F(DerivedQueryExecutorSeastarTest, StaticFormulaDetectors) {
