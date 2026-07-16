@@ -65,6 +65,22 @@ struct glz::meta<TestGlazeDerivedQueryResponse> {
                                          "formula", &T::formula, "statistics", &T::statistics, "error", &T::error);
 };
 
+// Flat error shape shared by all HTTP handlers (see lib/http/http_error.hpp):
+//   {"status":"error","error_code":"<code>","message":"<msg>","error":"<msg>"}
+struct TestFlatErrorResponse {
+    std::string status;
+    std::string error_code;
+    std::string message;
+    std::string error;
+};
+
+template <>
+struct glz::meta<TestFlatErrorResponse> {
+    using T = TestFlatErrorResponse;
+    static constexpr auto value =
+        object("status", &T::status, "error_code", &T::error_code, "message", &T::message, "error", &T::error);
+};
+
 class DerivedQueryExecutorTest : public ::testing::Test {
 protected:
     void SetUp() override {}
@@ -235,37 +251,38 @@ TEST_F(DerivedQueryExecutorTest, FormatLargeResponse) {
 TEST_F(DerivedQueryExecutorTest, CreateErrorResponse) {
     std::string json = DerivedQueryExecutor::createErrorResponse("INVALID_FORMULA", "Division by zero");
 
-    TestGlazeDerivedQueryResponse response;
+    TestFlatErrorResponse response;
     auto parseResult = glz::read_json(response, json);
 
     EXPECT_FALSE(parseResult);
     EXPECT_EQ(response.status, "error");
-    EXPECT_EQ(response.error.code, "INVALID_FORMULA");
-    EXPECT_EQ(response.error.message, "Division by zero");
+    EXPECT_EQ(response.error_code, "INVALID_FORMULA");
+    EXPECT_EQ(response.error, "Division by zero");
+    EXPECT_EQ(response.message, "Division by zero");
 }
 
 TEST_F(DerivedQueryExecutorTest, CreateQueryParseErrorResponse) {
     std::string json = DerivedQueryExecutor::createErrorResponse("QUERY_PARSE_ERROR",
                                                                  "Error parsing query 'a': Invalid measurement name");
 
-    TestGlazeDerivedQueryResponse response;
+    TestFlatErrorResponse response;
     auto parseResult = glz::read_json(response, json);
 
     EXPECT_FALSE(parseResult);
     EXPECT_EQ(response.status, "error");
-    EXPECT_EQ(response.error.code, "QUERY_PARSE_ERROR");
-    EXPECT_TRUE(response.error.message.find("query 'a'") != std::string::npos);
+    EXPECT_EQ(response.error_code, "QUERY_PARSE_ERROR");
+    EXPECT_TRUE(response.error.find("query 'a'") != std::string::npos);
 }
 
 TEST_F(DerivedQueryExecutorTest, CreateTimeoutErrorResponse) {
     std::string json = DerivedQueryExecutor::createErrorResponse("TIMEOUT", "Query execution exceeded 30000ms timeout");
 
-    TestGlazeDerivedQueryResponse response;
+    TestFlatErrorResponse response;
     auto parseResult = glz::read_json(response, json);
 
     EXPECT_FALSE(parseResult);
     EXPECT_EQ(response.status, "error");
-    EXPECT_EQ(response.error.code, "TIMEOUT");
+    EXPECT_EQ(response.error_code, "TIMEOUT");
 }
 
 // ==================== Configuration Tests ====================

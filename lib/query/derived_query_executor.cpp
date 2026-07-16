@@ -3,6 +3,7 @@
 #include "anomaly/anomaly_executor.hpp"
 #include "anomaly/anomaly_result.hpp"
 #include "engine.hpp"
+#include "http_error.hpp"
 #include "http_query_handler.hpp"
 #include "logger.hpp"
 
@@ -230,12 +231,9 @@ std::string DerivedQueryExecutor::formatResponse(const DerivedQueryResult& resul
 }
 
 std::string DerivedQueryExecutor::createErrorResponse(const std::string& code, const std::string& message) {
-    GlazeDerivedQueryResponse response;
-    response.status = "error";
-    response.error.code = code;
-    response.error.message = message;
-
-    return glz::write_json(response).value_or("{}");
+    // Delegate to the canonical flat error shape shared by all HTTP handlers:
+    //   {"status":"error","error_code":"<code>","message":"<msg>","error":"<msg>"}
+    return timestar::http::jsonError(message, code);
 }
 
 void DerivedQueryExecutor::validateRequest(const DerivedQueryRequest& request) {

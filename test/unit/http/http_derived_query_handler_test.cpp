@@ -73,6 +73,22 @@ struct glz::meta<TestDerivedResponse> {
                                          "formula", &T::formula, "statistics", &T::statistics, "error", &T::error);
 };
 
+// Flat error shape shared by all HTTP handlers (see lib/http/http_error.hpp):
+//   {"status":"error","error_code":"<code>","message":"<msg>","error":"<msg>"}
+struct TestFlatErrorResponse {
+    std::string status;
+    std::string error_code;
+    std::string message;
+    std::string error;
+};
+
+template <>
+struct glz::meta<TestFlatErrorResponse> {
+    using T = TestFlatErrorResponse;
+    static constexpr auto value =
+        object("status", &T::status, "error_code", &T::error_code, "message", &T::message, "error", &T::error);
+};
+
 // =============================================================================
 // Test fixture
 // =============================================================================
@@ -98,73 +114,74 @@ TEST_F(HttpDerivedQueryHandlerTest, MaxBodySizeIs1MB) {
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseBasic) {
     std::string json = DerivedQueryExecutor::createErrorResponse("QUERY_ERROR", "Invalid formula syntax");
 
-    TestDerivedResponse parsed;
+    TestFlatErrorResponse parsed;
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec) << "Failed to parse error response JSON: " << glz::format_error(ec);
 
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_EQ(parsed.error.code, "QUERY_ERROR");
-    EXPECT_EQ(parsed.error.message, "Invalid formula syntax");
+    EXPECT_EQ(parsed.error_code, "QUERY_ERROR");
+    EXPECT_EQ(parsed.error, "Invalid formula syntax");
+    EXPECT_EQ(parsed.message, "Invalid formula syntax");
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseEmptyBody) {
     std::string json = DerivedQueryExecutor::createErrorResponse("EMPTY_REQUEST", "Request body is required");
 
-    TestDerivedResponse parsed;
+    TestFlatErrorResponse parsed;
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec) << "Failed to parse error response JSON: " << glz::format_error(ec);
 
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_EQ(parsed.error.code, "EMPTY_REQUEST");
-    EXPECT_EQ(parsed.error.message, "Request body is required");
+    EXPECT_EQ(parsed.error_code, "EMPTY_REQUEST");
+    EXPECT_EQ(parsed.error, "Request body is required");
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseBodyTooLarge) {
     std::string json = DerivedQueryExecutor::createErrorResponse("BODY_TOO_LARGE", "Request body too large (max 1MB)");
 
-    TestDerivedResponse parsed;
+    TestFlatErrorResponse parsed;
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec) << "Failed to parse error response JSON: " << glz::format_error(ec);
 
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_EQ(parsed.error.code, "BODY_TOO_LARGE");
-    EXPECT_EQ(parsed.error.message, "Request body too large (max 1MB)");
+    EXPECT_EQ(parsed.error_code, "BODY_TOO_LARGE");
+    EXPECT_EQ(parsed.error, "Request body too large (max 1MB)");
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseUnsupportedMediaType) {
     std::string json =
         DerivedQueryExecutor::createErrorResponse("UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json");
 
-    TestDerivedResponse parsed;
+    TestFlatErrorResponse parsed;
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec) << "Failed to parse error response JSON: " << glz::format_error(ec);
 
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_EQ(parsed.error.code, "UNSUPPORTED_MEDIA_TYPE");
-    EXPECT_EQ(parsed.error.message, "Content-Type must be application/json");
+    EXPECT_EQ(parsed.error_code, "UNSUPPORTED_MEDIA_TYPE");
+    EXPECT_EQ(parsed.error, "Content-Type must be application/json");
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseInternalError) {
     std::string json = DerivedQueryExecutor::createErrorResponse("INTERNAL_ERROR", "Unexpected error during execution");
 
-    TestDerivedResponse parsed;
+    TestFlatErrorResponse parsed;
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec) << "Failed to parse error response JSON: " << glz::format_error(ec);
 
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_EQ(parsed.error.code, "INTERNAL_ERROR");
-    EXPECT_EQ(parsed.error.message, "Unexpected error during execution");
+    EXPECT_EQ(parsed.error_code, "INTERNAL_ERROR");
+    EXPECT_EQ(parsed.error, "Unexpected error during execution");
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, CreateErrorResponseSpecialCharacters) {
     std::string json = DerivedQueryExecutor::createErrorResponse("QUERY_ERROR", "Unexpected token '<' at position 5");
 
-    TestDerivedResponse parsed;
+    TestFlatErrorResponse parsed;
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec) << "Failed to parse error response with special chars: " << glz::format_error(ec);
 
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_NE(parsed.error.message.find("<"), std::string::npos);
+    EXPECT_NE(parsed.error.find("<"), std::string::npos);
 }
 
 // =============================================================================
@@ -1087,16 +1104,14 @@ TEST_F(HttpDerivedQueryHandlerTest, ErrorResponseRoundTrip) {
     // Create error -> parse -> verify
     std::string json = DerivedQueryExecutor::createErrorResponse("PARSE_ERROR", "Missing formula field");
 
-    TestDerivedResponse parsed;
+    TestFlatErrorResponse parsed;
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec);
 
     EXPECT_EQ(parsed.status, "error");
-    EXPECT_EQ(parsed.error.code, "PARSE_ERROR");
-    EXPECT_EQ(parsed.error.message, "Missing formula field");
-    // Success response fields should be empty/default
-    EXPECT_TRUE(parsed.timestamps.empty());
-    EXPECT_TRUE(parsed.values.empty());
+    EXPECT_EQ(parsed.error_code, "PARSE_ERROR");
+    EXPECT_EQ(parsed.error, "Missing formula field");
+    EXPECT_EQ(parsed.message, "Missing formula field");
 }
 
 TEST_F(HttpDerivedQueryHandlerTest, SuccessResponseRoundTrip) {
