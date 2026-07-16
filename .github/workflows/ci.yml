@@ -85,7 +85,8 @@ jobs:
                 -DCMAKE_CXX_COMPILER=g++-14 \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-                -DTIMESTAR_NATIVE_ARCH=OFF && \
+                -DTIMESTAR_NATIVE_ARCH=OFF \
+                -DTIMESTAR_WARNINGS_AS_ERRORS=ON && \
               ninja -j$(nproc) timestar_http_server timestar_unit_test && \
               ccache -s'
 

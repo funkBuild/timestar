@@ -285,15 +285,16 @@ std::vector<double> STLDecomposer::lowPassFilter(const std::vector<double>& y, s
     if (y.empty())
         return {};
 
-    size_t n = y.size();
-
     // O(n) sliding-window moving average (replaces O(n*window) naive version)
     auto movingAverage = [](const std::vector<double>& data, size_t window) -> std::vector<double> {
         if (data.empty() || window == 0)
             return data;
 
         size_t n = data.size();
-        std::vector<double> result(n);
+        // Built with push_back (never a raw element store) — avoids a GCC
+        // false-positive -Wnull-dereference on an unconditional result[0] write.
+        std::vector<double> result;
+        result.reserve(n);
         size_t half = window / 2;
 
         // Build initial window for position 0
@@ -302,7 +303,7 @@ std::vector<double> STLDecomposer::lowPassFilter(const std::vector<double>& y, s
         for (size_t j = 0; j < end0; ++j)
             sum += data[j];
         size_t curStart = 0, curEnd = end0;
-        result[0] = sum / static_cast<double>(curEnd - curStart);
+        result.push_back(sum / static_cast<double>(curEnd - curStart));
 
         for (size_t i = 1; i < n; ++i) {
             // Expand right edge if possible
@@ -317,7 +318,7 @@ std::vector<double> STLDecomposer::lowPassFilter(const std::vector<double>& y, s
                 sum -= data[curStart];
                 ++curStart;
             }
-            result[i] = sum / static_cast<double>(curEnd - curStart);
+            result.push_back(sum / static_cast<double>(curEnd - curStart));
         }
 
         return result;

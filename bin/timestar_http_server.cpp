@@ -82,7 +82,7 @@ void set_routes(routes& r) {
     // Simple test endpoints — passed directly to r.add() which takes exclusive
     // ownership.  Must NOT also go through emplaceHandler() (double-free).
     r.add(operation_type::GET, url("/test"),
-          new function_handler([](const_req req) { return "Hello from TimeStar HTTP Server!"; }));
+          new function_handler([](const_req /*req*/) { return "Hello from TimeStar HTTP Server!"; }));
 
     r.add(operation_type::GET, url("/health"),
           new function_handler(
@@ -158,7 +158,7 @@ void set_routes(routes& r) {
     auto* derivedQueryHandler = emplaceHandler(new timestar::HttpDerivedQueryHandler(&g_engine));
     derivedQueryHandler->registerRoutes(r, authToken());
 
-    r.add(operation_type::GET, url("/"), new function_handler([](const_req req) {
+    r.add(operation_type::GET, url("/"), new function_handler([](const_req /*req*/) {
               return "{\"message\":\"TimeStar HTTP "
                      "Server\",\"endpoints\":[\"/test\",\"/health\",\"/write\",\"/query\",\"/delete\",\"/"
                      "measurements\",\"/"

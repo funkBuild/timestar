@@ -881,7 +881,9 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                     try {
                         // Read fixed 16-byte SeriesId128
                         std::string seriesIdBytes = entrySlice.readString(16);
-                        SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
+                        // Replay keys the memory store by series key string; the
+                        // decoded id only validates the entry's length field.
+                        [[maybe_unused]] SeriesId128 seriesId = SeriesId128::fromBytes(seriesIdBytes);
 
                         // Read series key string (length-prefixed)
                         uint32_t seriesKeyLen = entrySlice.read<uint32_t>();

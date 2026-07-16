@@ -259,7 +259,7 @@ static void mergeHeapSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint64
 }
 
 template <class T>
-seastar::future<QueryResult<T>> QueryRunner::queryTsm(const std::string& series, SeriesId128 seriesId,
+seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std::string& series, SeriesId128 seriesId,
                                                       uint64_t startTime, uint64_t endTime) {
     LOG_QUERY_PATH(timestar::query_log, debug,
                    "QueryRunner: Querying TSM files for series={}, startTime={}, endTime={}", series, startTime,

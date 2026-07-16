@@ -433,7 +433,7 @@ size_t PeriodicityDetector::detectBestPeriod(const std::vector<double>& y, uint6
         constexpr uint64_t NS_PER_MINUTE = 60ULL * 1'000'000'000ULL;
         constexpr uint64_t NS_PER_HOUR = 60ULL * NS_PER_MINUTE;
         constexpr uint64_t NS_PER_DAY = 24ULL * NS_PER_HOUR;
-        constexpr uint64_t NS_PER_WEEK = 7ULL * NS_PER_DAY;
+        [[maybe_unused]] constexpr uint64_t NS_PER_WEEK = 7ULL * NS_PER_DAY;  // documents the family; not used below
 
         // Prefer looking for common seasonal patterns
         // E.g., if data is sampled every hour, look for daily (24) or weekly (168) patterns

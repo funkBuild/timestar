@@ -158,8 +158,8 @@ T CompressedBuffer::read(const int bits) {
 
         boundsCheck();
 
-        const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-        value |= (data[offset] & mask) << bits_read;
+        const uint64_t tailMask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
+        value |= (data[offset] & tailMask) << bits_read;
     } else {
         bitOffset += bits;
     }
@@ -189,8 +189,8 @@ T CompressedBuffer::readFixed() {
 
         boundsCheck();
 
-        const uint64_t mask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
-        value |= (data[offset] & mask) << bits_read;
+        const uint64_t tailMask = leftover_bits == 64 ? 0xffffffffffffffff : (1ull << leftover_bits) - 1;
+        value |= (data[offset] & tailMask) << bits_read;
     } else {
         bitOffset += bits;
     }

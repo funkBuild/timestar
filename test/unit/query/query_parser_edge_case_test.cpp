@@ -59,12 +59,12 @@ TEST_F(QueryParserEdgeCaseTest, ExtremelyLongScopeList) {
 // A query that is only whitespace should throw.
 TEST_F(QueryParserEdgeCaseTest, OnlyWhitespace) {
     // After skipping whitespace, find(':') returns npos, so this throws.
-    EXPECT_THROW(QueryParser::parseQueryString("   "), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("   ")), QueryParseException);
 }
 
 // An empty string should throw.
 TEST_F(QueryParserEdgeCaseTest, EmptyString) {
-    EXPECT_THROW(QueryParser::parseQueryString(""), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("")), QueryParseException);
 }
 
 // Double colon "avg::temperature()" -- the first colon splits correctly, so
@@ -96,7 +96,7 @@ TEST_F(QueryParserEdgeCaseTest, GroupByWithoutSpaceBeforeBrace) {
 
 // Trailing characters after the group-by clause should be rejected.
 TEST_F(QueryParserEdgeCaseTest, TrailingGarbageAfterGroupBy) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:m() by {tag}garbage"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:m() by {tag}garbage")), QueryParseException);
 }
 
 // A scope value containing a colon should capture everything after the first
@@ -109,7 +109,7 @@ TEST_F(QueryParserEdgeCaseTest, ScopeValueContainsColon) {
 
 // Empty measurement name (nothing between colon and parenthesis) should throw.
 TEST_F(QueryParserEdgeCaseTest, EmptyMeasurementThrows) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:(value)"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:(value)")), QueryParseException);
 }
 
 // A trailing comma in the field list: the split loop terminates when start
@@ -150,12 +150,12 @@ TEST_F(QueryParserEdgeCaseTest, TimeFeb29LeapYear) {
 
 // An empty scope key (":value") should throw.
 TEST_F(QueryParserEdgeCaseTest, ScopeWithEmptyKeyThrows) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:m(){:value}"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:m(){:value}")), QueryParseException);
 }
 
 // An empty scope value ("key:") should throw.
 TEST_F(QueryParserEdgeCaseTest, ScopeWithEmptyValueThrows) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:m(){key:}"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:m(){key:}")), QueryParseException);
 }
 
 // Multiple scope key:value pairs should all be captured correctly.

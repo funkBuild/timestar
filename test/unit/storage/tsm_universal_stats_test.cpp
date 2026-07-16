@@ -65,7 +65,7 @@ seastar::future<> testIntegerBlockStatsRoundTrip(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, IntegerBlockStatsRoundTrip) {
-    seastar::async([&] { testIntegerBlockStatsRoundTrip(getTestFilePath("0_1.tsm")).get(); });
+    seastar::async([&] { testIntegerBlockStatsRoundTrip(getTestFilePath("0_1.tsm")).get(); }).get();
 }
 
 // Test Integer COUNT pushdown via aggregateSeries
@@ -94,7 +94,7 @@ seastar::future<> testIntegerCountPushdown(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, IntegerCountPushdown) {
-    seastar::async([&] { testIntegerCountPushdown(getTestFilePath("0_2.tsm")).get(); });
+    seastar::async([&] { testIntegerCountPushdown(getTestFilePath("0_2.tsm")).get(); }).get();
 }
 
 // Test Integer SUM/MIN/MAX pushdown
@@ -147,7 +147,7 @@ seastar::future<> testIntegerSumMinMaxPushdown(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, IntegerSumMinMaxPushdown) {
-    seastar::async([&] { testIntegerSumMinMaxPushdown(getTestFilePath("0_3.tsm")).get(); });
+    seastar::async([&] { testIntegerSumMinMaxPushdown(getTestFilePath("0_3.tsm")).get(); }).get();
 }
 
 // ==================== Phase 1: Boolean Block Stats ====================
@@ -190,7 +190,7 @@ seastar::future<> testBoolBlockStatsRoundTrip(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, BoolBlockStatsRoundTrip) {
-    seastar::async([&] { testBoolBlockStatsRoundTrip(getTestFilePath("0_4.tsm")).get(); });
+    seastar::async([&] { testBoolBlockStatsRoundTrip(getTestFilePath("0_4.tsm")).get(); }).get();
 }
 
 // Test Boolean COUNT pushdown
@@ -222,7 +222,7 @@ seastar::future<> testBoolCountPushdown(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, BoolCountPushdown) {
-    seastar::async([&] { testBoolCountPushdown(getTestFilePath("0_5.tsm")).get(); });
+    seastar::async([&] { testBoolCountPushdown(getTestFilePath("0_5.tsm")).get(); }).get();
 }
 
 // ==================== Phase 1: String Block Stats (COUNT only) ====================
@@ -257,7 +257,7 @@ seastar::future<> testStringBlockCountRoundTrip(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, StringBlockCountRoundTrip) {
-    seastar::async([&] { testStringBlockCountRoundTrip(getTestFilePath("0_6.tsm")).get(); });
+    seastar::async([&] { testStringBlockCountRoundTrip(getTestFilePath("0_6.tsm")).get(); }).get();
 }
 
 // String aggregation should return 0 (not supported)
@@ -285,7 +285,7 @@ seastar::future<> testStringAggregationReturnsZero(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, StringAggregationReturnsZero) {
-    seastar::async([&] { testStringAggregationReturnsZero(getTestFilePath("0_7.tsm")).get(); });
+    seastar::async([&] { testStringAggregationReturnsZero(getTestFilePath("0_7.tsm")).get(); }).get();
 }
 
 // ==================== Phase 1: Version V2 ====================
@@ -344,7 +344,7 @@ seastar::future<> testIntegerLatestFromSparse(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, IntegerLatestFirstFromSparse) {
-    seastar::async([&] { testIntegerLatestFromSparse(getTestFilePath("0_8.tsm")).get(); });
+    seastar::async([&] { testIntegerLatestFromSparse(getTestFilePath("0_8.tsm")).get(); }).get();
 }
 
 // ==================== Phase 0: Tombstone Per-Block Overlap ====================
@@ -400,7 +400,7 @@ seastar::future<> testTombstonePerBlockOverlap(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, TombstonePerBlockOverlap) {
-    seastar::async([&] { testTombstonePerBlockOverlap(getTestFilePath("0_9.tsm")).get(); });
+    seastar::async([&] { testTombstonePerBlockOverlap(getTestFilePath("0_9.tsm")).get(); }).get();
 }
 
 // ==================== Phase 1: Multi-block Integer stats ====================
@@ -445,7 +445,7 @@ seastar::future<> testMultiBlockIntegerStats(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, MultiBlockIntegerStats) {
-    seastar::async([&] { testMultiBlockIntegerStats(getTestFilePath("0_10.tsm")).get(); });
+    seastar::async([&] { testMultiBlockIntegerStats(getTestFilePath("0_10.tsm")).get(); }).get();
 }
 
 // ==================== Phase 1: Boolean SUM (trueCount) pushdown ====================
@@ -477,7 +477,7 @@ seastar::future<> testBoolSumPushdown(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, BoolSumPushdown) {
-    seastar::async([&] { testBoolSumPushdown(getTestFilePath("0_11.tsm")).get(); });
+    seastar::async([&] { testBoolSumPushdown(getTestFilePath("0_11.tsm")).get(); }).get();
 }
 
 // ==================== Phase 1: Integer aggregateSeriesSelective (LATEST/FIRST) ====================
@@ -517,7 +517,7 @@ seastar::future<> testIntegerLatestSelective(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, IntegerLatestFirstSelective) {
-    seastar::async([&] { testIntegerLatestSelective(getTestFilePath("0_12.tsm")).get(); });
+    seastar::async([&] { testIntegerLatestSelective(getTestFilePath("0_12.tsm")).get(); }).get();
 }
 
 // ==================== Phase 3: String Dictionary Encoding ====================
@@ -580,7 +580,7 @@ seastar::future<> testStringDictionaryRoundTrip(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, StringDictionaryRoundTrip) {
-    seastar::async([&] { testStringDictionaryRoundTrip(getTestFilePath("0_14.tsm")).get(); });
+    seastar::async([&] { testStringDictionaryRoundTrip(getTestFilePath("0_14.tsm")).get(); }).get();
 }
 
 // Test high-cardinality strings fall back to raw encoding
@@ -622,7 +622,7 @@ seastar::future<> testStringDictionaryFallback(std::string filename) {
 }
 
 TEST_F(TSMUniversalStatsTest, StringDictionaryFallback) {
-    seastar::async([&] { testStringDictionaryFallback(getTestFilePath("0_15.tsm")).get(); });
+    seastar::async([&] { testStringDictionaryFallback(getTestFilePath("0_15.tsm")).get(); }).get();
 }
 
 // Test dictionary encoder standalone

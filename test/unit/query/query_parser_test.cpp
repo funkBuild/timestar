@@ -138,39 +138,39 @@ TEST_F(QueryParserTest, ParseFullQueryWithTimeRange) {
 
 // Error cases
 TEST_F(QueryParserTest, ErrorOnEmptyQuery) {
-    EXPECT_THROW(QueryParser::parseQueryString(""), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnMissingColon) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg temperature()"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg temperature()")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnMissingMeasurement) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:()"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:()")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnInvalidAggregation) {
-    EXPECT_THROW(QueryParser::parseQueryString("invalid:temperature()"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("invalid:temperature()")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnUnclosedParenthesis) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:temperature(value"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:temperature(value")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnUnclosedBrace) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:temperature(){location:office"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:temperature(){location:office")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnInvalidScopeFormat) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:temperature(){invalid_format}"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:temperature(){invalid_format}")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnDuplicateScopeKey) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:temperature(){host:a,host:b}"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:temperature(){host:a,host:b}")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnEmptyGroupBy) {
-    EXPECT_THROW(QueryParser::parseQueryString("avg:temperature() by {}"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("avg:temperature() by {}")), QueryParseException);
 }
 
 TEST_F(QueryParserTest, ErrorOnInvalidTimeFormat) {
@@ -185,7 +185,7 @@ TEST_F(QueryParserTest, ErrorOnStartTimeAfterEndTime) {
     std::string startTime = "02-01-2024 00:00:00";
     std::string endTime = "01-01-2024 00:00:00";
 
-    EXPECT_THROW(QueryParser::parse(query, startTime, endTime), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parse(query, startTime, endTime)), QueryParseException);
 }
 
 // Complex query combinations

@@ -99,7 +99,7 @@ TEST(NewAggregationMethodParserTest, ParseCountWithScopesAndGroupBy) {
 }
 
 TEST(NewAggregationMethodParserTest, InvalidMethodStillThrows) {
-    EXPECT_THROW(QueryParser::parseQueryString("percentile:temperature()"), QueryParseException);
+    EXPECT_THROW(static_cast<void>(QueryParser::parseQueryString("percentile:temperature()")), QueryParseException);
 }
 
 // ============================================================================

@@ -210,7 +210,7 @@ void ShardRebalancer::createStagingDirs(unsigned newShardCount) {
 // Phase A: WAL file processing
 // ---------------------------------------------------------------------------
 
-seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount, unsigned newShardCount) {
+seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount, [[maybe_unused]] unsigned newShardCount) {
     for (unsigned oldShard = 0; oldShard < oldShardCount; ++oldShard) {
         std::string shardPath = shardDir(oldShard);
 
@@ -276,7 +276,7 @@ seastar::future<> ShardRebalancer::processWALFiles(unsigned oldShardCount, unsig
 // Phase B+C: TSM file analysis and move/split
 // ---------------------------------------------------------------------------
 
-seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, unsigned newShardCount) {
+seastar::future<> ShardRebalancer::processTSMFiles(unsigned oldShardCount, [[maybe_unused]] unsigned newShardCount) {
     // Track next sequence ID per new shard to avoid collisions
     std::unordered_map<unsigned, uint64_t> nextSeqPerShard;
 

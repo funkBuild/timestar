@@ -157,7 +157,7 @@ seastar::future<> TSMTombstone::load() {
         auto stat = co_await tombstoneFile.stat();
         auto fileSize = stat.st_size;
 
-        if (fileSize < TombstoneHeader::SIZE) {
+        if (static_cast<size_t>(fileSize) < TombstoneHeader::SIZE) {  // st_size is non-negative for a regular file
             // File too small to contain valid header
             throw std::runtime_error("Tombstone file too small for header");
         }
@@ -390,7 +390,7 @@ seastar::future<> TSMTombstone::remove() {
 }
 
 seastar::future<bool> TSMTombstone::addTombstone(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-                                                 TSM* tsmFile) {
+                                                 [[maybe_unused]] TSM* tsmFile) {
     // Validate time range
     if (startTime > endTime) {
         co_return false;

@@ -277,8 +277,10 @@ AlignedSeries AlignedSeries::diff() const {
     if (values.empty()) {
         return AlignedSeries(timestamps, {});
     }
-    std::vector<double> result(values.size());
-    result[0] = std::numeric_limits<double>::quiet_NaN();  // First point has no previous
+    // NaN-fill construction: element 0 keeps NaN (first point has no previous);
+    // the loop overwrites every later element. Also avoids a GCC false-positive
+    // -Wnull-dereference on an unconditional result[0] store.
+    std::vector<double> result(values.size(), std::numeric_limits<double>::quiet_NaN());
     for (size_t i = 1; i < values.size(); ++i) {
         result[i] = values[i] - values[i - 1];
     }
@@ -289,8 +291,9 @@ AlignedSeries AlignedSeries::monotonicDiff() const {
     if (values.empty()) {
         return AlignedSeries(timestamps, {});
     }
-    std::vector<double> result(values.size());
-    result[0] = std::numeric_limits<double>::quiet_NaN();  // First point has no previous
+    // NaN-fill construction: element 0 keeps NaN (first point has no previous);
+    // the loop overwrites every later element.
+    std::vector<double> result(values.size(), std::numeric_limits<double>::quiet_NaN());
     for (size_t i = 1; i < values.size(); ++i) {
         double d = values[i] - values[i - 1];
         // Counter reset handling: if diff is negative, assume counter wrapped/reset
@@ -337,8 +340,9 @@ AlignedSeries AlignedSeries::rate() const {
     if (values.empty()) {
         return AlignedSeries(timestamps, {});
     }
-    std::vector<double> result(values.size());
-    result[0] = nan;  // First point has no previous
+    // NaN-fill construction: element 0 keeps NaN (first point has no previous);
+    // the loop overwrites every later element.
+    std::vector<double> result(values.size(), nan);
     for (size_t i = 1; i < values.size(); ++i) {
         double diff = values[i] - values[i - 1];
         if (diff < 0.0)
@@ -730,9 +734,10 @@ AlignedSeries AlignedSeries::integral() const {
     const auto& ts = *timestamps;
     // Build the result values directly rather than copying the whole AlignedSeries
     // and then overwriting every element of the values vector.
+    // Zero-init construction already sets result[0] = 0.0 (no area before the
+    // first point); the loop overwrites every later element.
     std::vector<double> result(values.size());
     double area = 0.0;
-    result[0] = 0.0;
     for (size_t i = 1; i < values.size(); ++i) {
         if (ts[i] <= ts[i - 1]) {
             result[i] = area;
@@ -862,8 +867,9 @@ AlignedSeries AlignedSeries::ratePer(double secondsPerPoint, double scale) const
     }
     const auto& ts = *timestamps;
 
-    std::vector<double> result(values.size());
-    result[0] = std::numeric_limits<double>::quiet_NaN();  // First point has no previous
+    // NaN-fill construction: element 0 keeps NaN (first point has no previous);
+    // the loop overwrites every later element.
+    std::vector<double> result(values.size(), std::numeric_limits<double>::quiet_NaN());
 
     for (size_t i = 1; i < values.size(); ++i) {
         double value_diff = values[i] - values[i - 1];

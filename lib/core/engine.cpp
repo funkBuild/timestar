@@ -360,7 +360,7 @@ seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string ser
     }
 }
 
-seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated(const std::string& seriesKey,
+seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated([[maybe_unused]] const std::string& seriesKey,
                                                                                  const SeriesId128& seriesId,
                                                                                  uint64_t startTime, uint64_t endTime,
                                                                                  uint64_t aggregationInterval,
@@ -705,7 +705,7 @@ seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteReques
 
     auto filterAndBuild = [&fieldFilter](const std::vector<SeriesId128>& ids, timestar::index::NativeIndex& idx)
         -> seastar::future<std::vector<std::pair<SeriesId128, std::string>>> {
-        std::vector<std::pair<SeriesId128, std::string>> result;
+        std::vector<std::pair<SeriesId128, std::string>> matched;
         for (const auto& seriesId : ids) {
             auto metadata = co_await idx.getSeriesMetadata(seriesId);
             if (!metadata.has_value())
@@ -714,9 +714,9 @@ seastar::future<Engine::DeleteResult> Engine::deleteByPattern(const DeleteReques
                 continue;
             TimeStarInsert<double> temp(metadata->measurement, metadata->field);
             temp.tags = metadata->tags;
-            result.push_back({seriesId, temp.seriesKey()});
+            matched.push_back({seriesId, temp.seriesKey()});
         }
-        co_return result;
+        co_return matched;
     };
 
     // Metadata is local — each shard's index has only its own series

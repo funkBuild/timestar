@@ -130,7 +130,9 @@ IndexWAL::~IndexWAL() {
         }
     }
     if (walFile_) {
-        walFile_->close().handle_exception([](auto) {});
+        // Fire-and-forget by design: this is the synchronous emergency-close
+        // path; exceptions are swallowed and the handle is dropped immediately.
+        (void)walFile_->close().handle_exception([](auto) {});
         walFile_.reset();
     }
 }

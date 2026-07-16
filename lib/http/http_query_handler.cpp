@@ -977,8 +977,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                           std::make_move_iterator(pushdownPartials.begin()),
                           std::make_move_iterator(pushdownPartials.end()));
     auto partialAggEnd = std::chrono::high_resolution_clock::now();
-    double partialAggMs =
-        std::chrono::duration<double, std::milli>(partialAggEnd - partialAggStart).count();
+    [[maybe_unused]] double partialAggMs =
+        std::chrono::duration<double, std::milli>(partialAggEnd - partialAggStart).count();  // used by LOG_QUERY_PATH
 
     auto shardEnd = std::chrono::high_resolution_clock::now();
     double shardMs = std::chrono::duration<double, std::milli>(shardEnd - shardStart).count();

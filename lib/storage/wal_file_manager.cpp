@@ -350,8 +350,8 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
         // Use try_with_gate to safely track the background conversion.
         // This avoids manual enter/leave which can leak on synchronous exceptions.
         (void)seastar::try_with_gate(_backgroundGate, [this, store = previousStore] {
-            return seastar::get_units(_conversionSemaphore, 1).then([this, store](auto units) {
-                return store->close().then([this, store, units = std::move(units)]() mutable {
+            return seastar::get_units(_conversionSemaphore, 1).then([this, store](auto convUnits) {
+                return store->close().then([this, store, units = std::move(convUnits)]() mutable {
                     // Run the CPU-heavy encode + multi-MB DMA write in the
                     // low-priority compaction scheduling group so background
                     // flush does not compete head-on with foreground inserts
@@ -378,10 +378,11 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
                 // Schedule a single retry after a delay to avoid permanent memory bloat.
                 (void)seastar::try_with_gate(_backgroundGate, [this, store, sid, seqNum] {
                     return seastar::sleep(std::chrono::seconds(30)).then([this, store, sid, seqNum] {
-                        return seastar::get_units(_conversionSemaphore, 1).then([this, store, sid, seqNum](auto units) {
+                        return seastar::get_units(_conversionSemaphore, 1).then([this, store, sid,
+                                                                                 seqNum](auto retryUnits) {
                             timestar::wal_log.info("[BG_CONVERT] Retrying TSM conversion for store {} on shard {}",
                                                    seqNum, sid);
-                            return store->close().then([this, store, units = std::move(units)]() mutable {
+                            return store->close().then([this, store, units = std::move(retryUnits)]() mutable {
                                 return convertWalToTsm(store).finally([units = std::move(units)] {});
                             });
                         });

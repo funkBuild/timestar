@@ -415,7 +415,6 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     uint64_t metaStart = std::min(bloomOffset, indexOffset);
     uint64_t metaEnd = fileSize - SSTABLE_FOOTER_SIZE;
     if (metaStart < metaEnd) {
-        size_t metaSize = metaEnd - metaStart;
         size_t alignedMetaOffset = metaStart & ~(dmaAlign - 1);
         size_t alignedMetaSize = ((metaEnd - alignedMetaOffset) + dmaAlign - 1) & ~(dmaAlign - 1);
         auto metaBuf = seastar::temporary_buffer<char>::aligned(dmaAlign, alignedMetaSize);

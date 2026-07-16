@@ -114,8 +114,9 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
 }
 
 template <class T>
-void TSMWriter::writeBlock(TSMValueType seriesType, const SeriesId128& seriesId, std::span<const uint64_t> timestamps,
-                           std::span<const T> values, TSMIndexEntry& indexEntry) {
+void TSMWriter::writeBlock(TSMValueType seriesType, [[maybe_unused]] const SeriesId128& seriesId,
+                           std::span<const uint64_t> timestamps, std::span<const T> values,
+                           TSMIndexEntry& indexEntry) {
     size_t blockStartOffset = buffer.size();
 
     buffer.write((uint8_t)seriesType);          // uint8_t fieldType

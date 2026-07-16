@@ -175,11 +175,15 @@ std::vector<double> SeasonalForecaster::fitARCoefficients(const std::vector<doub
         return std::vector<double>(order, 0.0);
     }
 
-    // Compute autocorrelations r[0] to r[order]
-    std::vector<double> r(order + 1);
-    r[0] = variance;
+    // Compute autocorrelations r[0] to r[order].  Built with push_back so no
+    // raw element store exists: GCC traces a theoretical order == SIZE_MAX path
+    // through vector(order + 1) (wraps to an empty vector) into a null r[0]
+    // dereference; push_back is null-safe on every path.
+    std::vector<double> r;
+    r.reserve(order + 1);
+    r.push_back(variance);  // lag 0
     for (size_t k = 1; k <= order; ++k) {
-        r[k] = autoCorrelation(y, mean, variance, k) * variance;
+        r.push_back(autoCorrelation(y, mean, variance, k) * variance);
     }
 
     return levinsonDurbin(r, order);
@@ -198,11 +202,13 @@ std::vector<double> SeasonalForecaster::fitSeasonalARCoefficients(const std::vec
         return std::vector<double>(order, 0.0);
     }
 
-    // Compute autocorrelations at seasonal lags
-    std::vector<double> r(order + 1);
-    r[0] = variance;
+    // Compute autocorrelations at seasonal lags.  push_back form for the same
+    // reason as fitARCoefficients above (GCC -Wnull-dereference on r[0]).
+    std::vector<double> r;
+    r.reserve(order + 1);
+    r.push_back(variance);  // lag 0
     for (size_t k = 1; k <= order; ++k) {
-        r[k] = autoCorrelation(y, mean, variance, k * seasonalPeriod) * variance;
+        r.push_back(autoCorrelation(y, mean, variance, k * seasonalPeriod) * variance);
     }
 
     return levinsonDurbin(r, order);
@@ -402,7 +408,9 @@ ForecastOutput SeasonalForecaster::forecast(const ForecastInput& input, const Fo
         }
     }
 
-    double mean = anomaly::simd::vectorMean(y.data(), y.size());
+    // Tracked across the differencing steps below but currently only written;
+    // kept (annotated) because each differencing branch deliberately refreshes it.
+    [[maybe_unused]] double mean = anomaly::simd::vectorMean(y.data(), y.size());
 
     // Store last value for inverse differencing.  originalY is only populated
     // (via move, not copy) when seasonal differencing actually replaces y.
@@ -557,10 +565,6 @@ ForecastOutput SeasonalForecaster::forecastMSTL(const ForecastInput& input, cons
     output.historicalCount = n;
     output.forecastCount = nForecast;
     output.past = input.values;
-
-    // Calculate data interval
-    uint64_t dataInterval =
-        (n >= 2) ? (input.timestamps[n - 1] - input.timestamps[0]) / (n - 1) : 60000000000ULL;  // Default 1 minute
 
     // Detect multiple periods
     PeriodicityDetector detector;

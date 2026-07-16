@@ -130,7 +130,6 @@ std::vector<double> STLDecomposition::loess(const std::vector<double>& y, size_t
         // Find window bounds
         size_t start = (i > halfWindow) ? i - halfWindow : 0;
         size_t end = std::min(i + halfWindow + 1, n);
-        size_t windowCount = end - start;
 
         // Compute distances and prepare local arrays
         size_t validCount = 0;

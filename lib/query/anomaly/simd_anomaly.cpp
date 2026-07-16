@@ -208,9 +208,9 @@ void ComputeAnomalyScoresKernel(const double* HWY_RESTRICT values, const double*
     }
 
     // Fixup: NaN input values produce NaN scores; clamp to 0
-    for (size_t i = 0; i < count; ++i) {
-        if (std::isnan(scores[i]))
-            scores[i] = 0.0;
+    for (size_t k = 0; k < count; ++k) {
+        if (std::isnan(scores[k]))
+            scores[k] = 0.0;
     }
 }
 
