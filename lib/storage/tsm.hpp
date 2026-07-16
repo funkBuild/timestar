@@ -179,6 +179,25 @@ private:
     // advanced past all block data and the optional string dictionary.
     void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint16_t blockCount) const;
 
+    // Value-type dispatch for pushdown aggregation: decode one block as the
+    // series' runtime type (Float/Integer/Boolean) and hand the decoded points
+    // to `fold(timestamps, getValue)`, where getValue(j) returns the j-th value
+    // converted to double. `fold` is invoked only when the block decodes to at
+    // least one in-range point. Callers must exclude String series (no numeric
+    // pushdown). Defined in tsm.cpp; all instantiations live there.
+    //
+    // decodeBlockAndFold: synchronous decode from an in-memory slice — used by
+    // the aggregateSeries batch path, which must not suspend while folding
+    // (see the shared-mutable-state contract in aggregateSeries).
+    template <typename Fold>
+    void decodeBlockAndFold(Slice& blockSlice, TSMValueType seriesType, uint32_t blockSize, uint64_t startTime,
+                            uint64_t endTime, Fold fold);
+    // readBlockAndFold: per-block DMA read + decode — used by the selective and
+    // bucketed LATEST/FIRST paths.
+    template <typename Fold>
+    seastar::future<> readBlockAndFold(const TSMIndexBlock& block, TSMValueType seriesType, uint64_t startTime,
+                                       uint64_t endTime, Fold fold);
+
     // Configuration for bloom filter and cache (read from TOML config)
     static double bloomFpr() { return timestar::config().storage.tsm_bloom_fpr; }
     // Byte budget per TSM file (default: 4096 entries * ~200 bytes ≈ 800KB)

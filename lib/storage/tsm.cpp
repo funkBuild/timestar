@@ -1212,6 +1212,59 @@ seastar::future<> TSM::readSeriesBatched(const SeriesId128& seriesId, uint64_t s
 // Pushdown aggregation: decode float blocks and fold directly into a
 // BlockAggregator, bypassing TSMResult/QueryResult materialisation.
 // Handles tombstone filtering inline.  Returns the number of points folded.
+// Shared value-type dispatch for the aggregation paths (see tsm.hpp).
+// Synchronous flavour: decode from an in-memory slice, no suspension.
+template <typename Fold>
+void TSM::decodeBlockAndFold(Slice& blockSlice, TSMValueType seriesType, uint32_t blockSize, uint64_t startTime,
+                             uint64_t endTime, Fold fold) {
+    if (seriesType == TSMValueType::Float) {
+        auto blockResult = decodeBlock<double>(blockSlice, blockSize, startTime, endTime);
+        if (blockResult && !blockResult->timestamps.empty()) {
+            const auto& vals = blockResult->values;
+            fold(blockResult->timestamps, [&vals](size_t j) { return vals[j]; });
+        }
+    } else if (seriesType == TSMValueType::Integer) {
+        auto blockResult = decodeBlock<int64_t>(blockSlice, blockSize, startTime, endTime);
+        if (blockResult && !blockResult->timestamps.empty()) {
+            const auto& vals = blockResult->values;
+            fold(blockResult->timestamps, [&vals](size_t j) { return static_cast<double>(vals[j]); });
+        }
+    } else {
+        // Boolean
+        auto blockResult = decodeBlock<bool>(blockSlice, blockSize, startTime, endTime);
+        if (blockResult && !blockResult->timestamps.empty()) {
+            const auto& vals = blockResult->values;
+            fold(blockResult->timestamps, [&vals](size_t j) { return vals[j] ? 1.0 : 0.0; });
+        }
+    }
+}
+
+// Async flavour: per-block DMA read + decode via readSingleBlock.
+template <typename Fold>
+seastar::future<> TSM::readBlockAndFold(const TSMIndexBlock& block, TSMValueType seriesType, uint64_t startTime,
+                                        uint64_t endTime, Fold fold) {
+    if (seriesType == TSMValueType::Float) {
+        auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);
+        if (blockResult && !blockResult->timestamps.empty()) {
+            const auto& vals = blockResult->values;
+            fold(blockResult->timestamps, [&vals](size_t j) { return vals[j]; });
+        }
+    } else if (seriesType == TSMValueType::Integer) {
+        auto blockResult = co_await readSingleBlock<int64_t>(block, startTime, endTime);
+        if (blockResult && !blockResult->timestamps.empty()) {
+            const auto& vals = blockResult->values;
+            fold(blockResult->timestamps, [&vals](size_t j) { return static_cast<double>(vals[j]); });
+        }
+    } else {
+        // Boolean
+        auto blockResult = co_await readSingleBlock<bool>(block, startTime, endTime);
+        if (blockResult && !blockResult->timestamps.empty()) {
+            const auto& vals = blockResult->values;
+            fold(blockResult->timestamps, [&vals](size_t j) { return vals[j] ? 1.0 : 0.0; });
+        }
+    }
+}
+
 seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                              timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem) {
     // Get full index entry (uses bloom filter + sparse index + lazy load)
@@ -1359,65 +1412,27 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                 totalPoints += n;
             } else {
                 // Tombstone path: need per-point filtering, use full decode.
+                // The fold is synchronous (no co_await) — the shared-state
+                // contract above still holds.
                 Slice blockSlice(batchBuf.get() + bufferOffset, block.size);
-                if (seriesType == TSMValueType::Float) {
-                    auto blockResult = decodeBlock<double>(blockSlice, block.size, startTime, endTime);
-                    if (blockResult && !blockResult->timestamps.empty()) {
-                        const auto& ts = blockResult->timestamps;
-                        const auto& vals = blockResult->values;
-                        // Decoded timestamps are ascending and tombstoneRanges are sorted +
-                        // non-overlapping, so a monotonic cursor replaces the per-point
-                        // std::upper_bound: O(N + T) instead of O(N log T).
-                        size_t ri = 0;
-                        const size_t nr = tombstoneRanges.size();
-                        for (size_t i = 0; i < ts.size(); ++i) {
-                            uint64_t t = ts[i];
-                            while (ri < nr && tombstoneRanges[ri].second < t)
-                                ++ri;
-                            if (ri < nr && t >= tombstoneRanges[ri].first)
-                                continue;  // tombstoned
-                            aggregator.addPoint(t, vals[i]);
-                            totalPoints++;
-                        }
-                    }
-                } else if (seriesType == TSMValueType::Integer) {
-                    auto blockResult = decodeBlock<int64_t>(blockSlice, block.size, startTime, endTime);
-                    if (blockResult && !blockResult->timestamps.empty()) {
-                        const auto& ts = blockResult->timestamps;
-                        const auto& vals = blockResult->values;
-                        // Monotonic cursor (see Float path above): O(N + T) not O(N log T).
-                        size_t ri = 0;
-                        const size_t nr = tombstoneRanges.size();
-                        for (size_t i = 0; i < ts.size(); ++i) {
-                            uint64_t t = ts[i];
-                            while (ri < nr && tombstoneRanges[ri].second < t)
-                                ++ri;
-                            if (ri < nr && t >= tombstoneRanges[ri].first)
-                                continue;  // tombstoned
-                            aggregator.addPoint(t, static_cast<double>(vals[i]));
-                            totalPoints++;
-                        }
-                    }
-                } else {
-                    // Boolean
-                    auto blockResult = decodeBlock<bool>(blockSlice, block.size, startTime, endTime);
-                    if (blockResult && !blockResult->timestamps.empty()) {
-                        const auto& ts = blockResult->timestamps;
-                        const auto& vals = blockResult->values;
-                        // Monotonic cursor (see Float path above): O(N + T) not O(N log T).
-                        size_t ri = 0;
-                        const size_t nr = tombstoneRanges.size();
-                        for (size_t i = 0; i < ts.size(); ++i) {
-                            uint64_t t = ts[i];
-                            while (ri < nr && tombstoneRanges[ri].second < t)
-                                ++ri;
-                            if (ri < nr && t >= tombstoneRanges[ri].first)
-                                continue;  // tombstoned
-                            aggregator.addPoint(t, vals[i] ? 1.0 : 0.0);
-                            totalPoints++;
-                        }
-                    }
-                }
+                decodeBlockAndFold(blockSlice, seriesType, block.size, startTime, endTime,
+                                   [&](const std::vector<uint64_t>& ts, auto getValue) {
+                                       // Decoded timestamps are ascending and tombstoneRanges are
+                                       // sorted + non-overlapping, so a monotonic cursor replaces
+                                       // the per-point std::upper_bound: O(N + T) instead of
+                                       // O(N log T).
+                                       size_t ri = 0;
+                                       const size_t nr = tombstoneRanges.size();
+                                       for (size_t i = 0; i < ts.size(); ++i) {
+                                           uint64_t t = ts[i];
+                                           while (ri < nr && tombstoneRanges[ri].second < t)
+                                               ++ri;
+                                           if (ri < nr && t >= tombstoneRanges[ri].first)
+                                               continue;  // tombstoned
+                                           aggregator.addPoint(t, getValue(i));
+                                           totalPoints++;
+                                       }
+                                   });
             }
 
             bufferOffset += block.size;
@@ -1511,14 +1526,14 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     };
 
     // Helper lambda: iterate decoded points, optionally filtering tombstones, in fwd/rev order.
-    auto processPoints = [&](const std::vector<uint64_t>& ts, const auto& vals, auto toDouble) {
+    auto processPoints = [&](const std::vector<uint64_t>& ts, auto getValue) {
         size_t pointCount = ts.size();
         for (size_t pi = 0; pi < pointCount && totalPoints < maxPoints; ++pi) {
             size_t j = reverse ? (pointCount - 1 - pi) : pi;
             uint64_t t = ts[j];
             if (hasTombstoneRanges && isTombstoned(t))
                 continue;
-            aggregator.addPoint(t, toDouble(vals[j]));
+            aggregator.addPoint(t, getValue(j));
             totalPoints++;
         }
     };
@@ -1526,25 +1541,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     for (size_t i = 0; i < count && totalPoints < maxPoints; ++i) {
         size_t idx = reverse ? (count - 1 - i) : i;
         const auto& block = blocksToScan[idx];
-
-        if (seriesType == TSMValueType::Float) {
-            auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);
-            if (!blockResult || blockResult->timestamps.empty())
-                continue;
-            processPoints(blockResult->timestamps, blockResult->values, [](double v) { return v; });
-        } else if (seriesType == TSMValueType::Integer) {
-            auto blockResult = co_await readSingleBlock<int64_t>(block, startTime, endTime);
-            if (!blockResult || blockResult->timestamps.empty())
-                continue;
-            processPoints(blockResult->timestamps, blockResult->values,
-                          [](int64_t v) { return static_cast<double>(v); });
-        } else {
-            // Boolean
-            auto blockResult = co_await readSingleBlock<bool>(block, startTime, endTime);
-            if (!blockResult || blockResult->timestamps.empty())
-                continue;
-            processPoints(blockResult->timestamps, blockResult->values, [](bool v) { return v ? 1.0 : 0.0; });
-        }
+        co_await readBlockAndFold(block, seriesType, startTime, endTime, processPoints);
     }
 
     co_return totalPoints;
@@ -1637,7 +1634,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
         // skipped with two comparisons instead of a hash lookup per point.
         // The tombstone binary search runs only for candidate points (first
         // unresolved point of a bucket), not for every decoded point.
-        auto processBucketedPoints = [&](const std::vector<uint64_t>& ts, auto toDouble) {
+        auto processBucketedPoints = [&](const std::vector<uint64_t>& ts, auto getValue) {
             size_t pointCount = ts.size();
             uint64_t skipLo = 1, skipHi = 0;  // empty interval: [skipLo, skipHi)
             for (size_t pi = 0; pi < pointCount; ++pi) {
@@ -1660,7 +1657,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
                             continue;  // tombstoned candidate: try next point in bucket
                     }
                 }
-                aggregator.addPoint(t, toDouble(j));
+                aggregator.addPoint(t, getValue(j));
                 filledBuckets.insert(bucketKey);
                 skipLo = bucketKey;
                 skipHi = bucketKey + interval;
@@ -1668,26 +1665,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
             }
         };
 
-        if (seriesType == TSMValueType::Float) {
-            auto blockResult = co_await readSingleBlock<double>(block, startTime, endTime);
-            if (!blockResult || blockResult->timestamps.empty())
-                continue;
-            const auto& vals = blockResult->values;
-            processBucketedPoints(blockResult->timestamps, [&vals](size_t j) { return vals[j]; });
-        } else if (seriesType == TSMValueType::Integer) {
-            auto blockResult = co_await readSingleBlock<int64_t>(block, startTime, endTime);
-            if (!blockResult || blockResult->timestamps.empty())
-                continue;
-            const auto& vals = blockResult->values;
-            processBucketedPoints(blockResult->timestamps, [&vals](size_t j) { return static_cast<double>(vals[j]); });
-        } else {
-            // Boolean
-            auto blockResult = co_await readSingleBlock<bool>(block, startTime, endTime);
-            if (!blockResult || blockResult->timestamps.empty())
-                continue;
-            const auto& vals = blockResult->values;
-            processBucketedPoints(blockResult->timestamps, [&vals](size_t j) { return vals[j] ? 1.0 : 0.0; });
-        }
+        co_await readBlockAndFold(block, seriesType, startTime, endTime, processBucketedPoints);
     }
 
     co_return totalPoints;
