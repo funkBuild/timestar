@@ -2,6 +2,8 @@
 
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
+#include "http_error.hpp"
+#include "http_routes.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "placement_table.hpp"
@@ -1327,15 +1329,10 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
 }
 
 std::string HttpWriteHandler::createErrorResponse(const std::string& error) {
-    // Create JSON object directly
-    auto response = glz::obj{"status", "error", "message", error};
-
-    std::string buffer;
-    auto ec = glz::write_json(response, buffer);
-    if (ec) {
-        return R"({"status":"error","message":"Failed to serialize error response"})";
-    }
-    return buffer;
+    // Canonical error shape: the message is carried in "error" (and mirrored in
+    // "message").  Previously this handler emitted only "message", diverging
+    // from every other endpoint.
+    return timestar::http::jsonError(error);
 }
 
 std::string HttpWriteHandler::createSuccessResponse(int64_t pointsWritten) {
@@ -1345,7 +1342,7 @@ std::string HttpWriteHandler::createSuccessResponse(int64_t pointsWritten) {
     std::string buffer;
     auto ec = glz::write_json(response, buffer);
     if (ec) {
-        return R"({"status":"error","message":"Failed to serialize success response"})";
+        return timestar::http::jsonError("Failed to serialize success response");
     }
     return buffer;
 }
@@ -1358,7 +1355,7 @@ std::string HttpWriteHandler::createPartialFailureResponse(int64_t pointsWritten
     std::string buffer;
     auto ec = glz::write_json(response, buffer);
     if (ec) {
-        return R"({"status":"error","message":"Failed to serialize partial failure response"})";
+        return timestar::http::jsonError("Failed to serialize partial failure response");
     }
     return buffer;
 }
@@ -1845,14 +1842,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 }
 
 void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    auto* handler = new seastar::httpd::function_handler(
-        timestar::wrapWithAuth(
-            authToken,
-            [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleWrite(std::move(req)); }),
-        "json");
-
-    r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/write"), handler);
+    // addJsonRoute applies timestar::wrapWithAuth per route.
+    timestar::http::addJsonRoute(
+        r, seastar::httpd::operation_type::POST, "/write", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleWrite(std::move(req)); });
 
     timestar::http_log.info("Registered HTTP write endpoint at /write{}", authToken.empty() ? "" : " (auth required)");
 }

@@ -2,6 +2,8 @@
 
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
+#include "http_error.hpp"
+#include "http_routes.hpp"
 #include "logger.hpp"
 #include "placement_table.hpp"
 #include "proto_converters.hpp"
@@ -154,15 +156,7 @@ static void validateDeleteRequest(const HttpDeleteHandler::DeleteRequest& req) {
 }
 
 std::string HttpDeleteHandler::createErrorResponse(const std::string& error) {
-    // Create JSON object directly
-    auto response = glz::obj{"status", "error", "error", error};
-
-    std::string buffer;
-    auto ec = glz::write_json(response, buffer);
-    if (ec) {
-        return R"({"status":"error","error":"Failed to serialize error response"})";
-    }
-    return buffer;
+    return timestar::http::jsonError(error);
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handleDelete(
@@ -458,14 +452,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
 }
 
 void HttpDeleteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    auto* handler = new seastar::httpd::function_handler(
-        timestar::wrapWithAuth(
-            authToken,
-            [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleDelete(std::move(req)); }),
-        "json");
-
-    r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/delete"), handler);
+    // addJsonRoute applies timestar::wrapWithAuth per route.
+    timestar::http::addJsonRoute(
+        r, seastar::httpd::operation_type::POST, "/delete", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleDelete(std::move(req)); });
 
     timestar::http_log.info("Registered DELETE endpoint at /delete{}", authToken.empty() ? "" : " (auth required)");
 }

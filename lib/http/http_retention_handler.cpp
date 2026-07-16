@@ -2,7 +2,9 @@
 
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
+#include "http_error.hpp"
 #include "http_query_handler.hpp"
+#include "http_routes.hpp"
 #include "logger.hpp"
 #include "proto_converters.hpp"
 
@@ -21,13 +23,7 @@ bool HttpRetentionHandler::isValidMethod(const std::string& method) {
 }
 
 std::string HttpRetentionHandler::createErrorResponse(const std::string& error) {
-    auto response = glz::obj{"status", "error", "error", error};
-    std::string buffer;
-    auto ec = glz::write_json(response, buffer);
-    if (ec) {
-        return R"({"status":"error","error":"Failed to serialize error response"})";
-    }
-    return buffer;
+    return timestar::http::jsonError(error);
 }
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handlePut(
@@ -411,31 +407,23 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
 void HttpRetentionHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
     auto self = shared_from_this();
-    auto wrap = [&](auto fn) { return timestar::wrapWithAuth(authToken, std::move(fn)); };
+    // addJsonRoute applies timestar::wrapWithAuth per route.
+    using op = seastar::httpd::operation_type;
 
-    r.add(seastar::httpd::operation_type::PUT, seastar::httpd::url("/retention"),
-          new seastar::httpd::function_handler(
-              wrap([self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  return self->handlePut(std::move(req));
-              }),
-              "json"));
+    timestar::http::addJsonRoute(
+        r, op::PUT, "/retention", authToken,
+        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handlePut(std::move(req)); });
 
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/retention"),
-          new seastar::httpd::function_handler(
-              wrap([self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  return self->handleGet(std::move(req));
-              }),
-              "json"));
+    timestar::http::addJsonRoute(
+        r, op::GET, "/retention", authToken,
+        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handleGet(std::move(req)); });
 
-    r.add(seastar::httpd::operation_type::DELETE, seastar::httpd::url("/retention"),
-          new seastar::httpd::function_handler(
-              wrap([self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  return self->handleDelete(std::move(req));
-              }),
-              "json"));
+    timestar::http::addJsonRoute(
+        r, op::DELETE, "/retention", authToken,
+        [self](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return self->handleDelete(std::move(req)); });
 
     timestar::http_log.info("Registered retention endpoints at /retention (PUT/GET/DELETE){}",
                             authToken.empty() ? "" : " (auth required)");

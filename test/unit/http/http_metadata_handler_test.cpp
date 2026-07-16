@@ -25,12 +25,13 @@ TEST_F(HttpMetadataHandlerTest, CreateErrorResponse) {
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec) << "Failed to parse error response JSON";
 
+    // Canonical flat error shape shared by all handlers (see http_error.hpp):
+    //   {"status":"error","error_code":"...","message":"...","error":"..."}
     auto& obj = parsed.get<glz::generic::object_t>();
     EXPECT_EQ(obj["status"].get<std::string>(), "error");
-
-    auto& errorObj = obj["error"].get<glz::generic::object_t>();
-    EXPECT_EQ(errorObj["code"].get<std::string>(), "INVALID");
-    EXPECT_EQ(errorObj["message"].get<std::string>(), "bad request");
+    EXPECT_EQ(obj["error_code"].get<std::string>(), "INVALID");
+    EXPECT_EQ(obj["message"].get<std::string>(), "bad request");
+    EXPECT_EQ(obj["error"].get<std::string>(), "bad request");
 }
 
 TEST_F(HttpMetadataHandlerTest, CreateErrorResponseInternalError) {
@@ -42,10 +43,9 @@ TEST_F(HttpMetadataHandlerTest, CreateErrorResponseInternalError) {
 
     auto& obj = parsed.get<glz::generic::object_t>();
     EXPECT_EQ(obj["status"].get<std::string>(), "error");
-
-    auto& errorObj = obj["error"].get<glz::generic::object_t>();
-    EXPECT_EQ(errorObj["code"].get<std::string>(), "INTERNAL_ERROR");
-    EXPECT_EQ(errorObj["message"].get<std::string>(), "something went wrong");
+    EXPECT_EQ(obj["error_code"].get<std::string>(), "INTERNAL_ERROR");
+    EXPECT_EQ(obj["message"].get<std::string>(), "something went wrong");
+    EXPECT_EQ(obj["error"].get<std::string>(), "something went wrong");
 }
 
 // ---------------------------------------------------------------------------

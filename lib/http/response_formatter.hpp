@@ -22,7 +22,9 @@ public:
     // The response is consumed (fields may be moved from).
     static std::string format(QueryResponse& response);
 
-    // Format a JSON error response: {"status":"error","error_code":"...","message":"...","error":"..."}
+    // Format a JSON error response in the canonical shape (see http_error.hpp):
+    //   {"status":"error","error_code":"...","message":"...","error":"..."}
+    // Delegates to timestar::http::jsonError().
     static std::string formatError(const std::string& message, const std::string& code = "");
 };
 

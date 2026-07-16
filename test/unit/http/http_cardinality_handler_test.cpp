@@ -155,12 +155,12 @@ TEST_F(HttpCardinalityHandlerTest, MissingMeasurementErrorFormat) {
     auto ec = glz::read_json(parsed, json);
     ASSERT_FALSE(ec);
 
+    // Canonical flat error shape shared by all handlers (see http_error.hpp)
     auto& obj = parsed.get<glz::generic::object_t>();
     EXPECT_EQ(obj["status"].get<std::string>(), "error");
-
-    auto& errorObj = obj["error"].get<glz::generic::object_t>();
-    EXPECT_EQ(errorObj["code"].get<std::string>(), "MISSING_PARAMETER");
-    EXPECT_EQ(errorObj["message"].get<std::string>(), "measurement parameter is required");
+    EXPECT_EQ(obj["error_code"].get<std::string>(), "MISSING_PARAMETER");
+    EXPECT_EQ(obj["message"].get<std::string>(), "measurement parameter is required");
+    EXPECT_EQ(obj["error"].get<std::string>(), "measurement parameter is required");
 }
 
 TEST_F(HttpCardinalityHandlerTest, TagKeyWithoutTagValueErrorFormat) {
@@ -174,11 +174,9 @@ TEST_F(HttpCardinalityHandlerTest, TagKeyWithoutTagValueErrorFormat) {
 
     auto& obj = parsed.get<glz::generic::object_t>();
     EXPECT_EQ(obj["status"].get<std::string>(), "error");
-
-    auto& errorObj = obj["error"].get<glz::generic::object_t>();
-    EXPECT_EQ(errorObj["code"].get<std::string>(), "INVALID_PARAMETER");
-    EXPECT_EQ(errorObj["message"].get<std::string>(),
-              "Both tag_key and tag_value must be provided together");
+    EXPECT_EQ(obj["error_code"].get<std::string>(), "INVALID_PARAMETER");
+    EXPECT_EQ(obj["message"].get<std::string>(), "Both tag_key and tag_value must be provided together");
+    EXPECT_EQ(obj["error"].get<std::string>(), "Both tag_key and tag_value must be provided together");
 }
 
 TEST_F(HttpCardinalityHandlerTest, InvalidMeasurementParamErrorFormat) {
@@ -192,9 +190,7 @@ TEST_F(HttpCardinalityHandlerTest, InvalidMeasurementParamErrorFormat) {
 
     auto& obj = parsed.get<glz::generic::object_t>();
     EXPECT_EQ(obj["status"].get<std::string>(), "error");
-
-    auto& errorObj = obj["error"].get<glz::generic::object_t>();
-    EXPECT_EQ(errorObj["code"].get<std::string>(), "INVALID_PARAMETER");
+    EXPECT_EQ(obj["error_code"].get<std::string>(), "INVALID_PARAMETER");
 }
 
 // ---------------------------------------------------------------------------

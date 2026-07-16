@@ -155,7 +155,9 @@ TEST_F(HttpAuthWrapTest, AllHandlersUseWrapWithAuthOrAuthHandlerWrapper) {
 
         bool hasWrap = src.find("wrapWithAuth") != std::string::npos;
         bool hasWrapper = src.find("AuthHandlerWrapper") != std::string::npos;
-        EXPECT_TRUE(hasWrap || hasWrapper)
-            << file << " must use wrapWithAuth or AuthHandlerWrapper for auth support";
+        // addJsonRoute (http_routes.hpp) applies wrapWithAuth internally.
+        bool hasAddJsonRoute = src.find("addJsonRoute") != std::string::npos;
+        EXPECT_TRUE(hasWrap || hasWrapper || hasAddJsonRoute)
+            << file << " must use wrapWithAuth, AuthHandlerWrapper, or addJsonRoute for auth support";
     }
 }

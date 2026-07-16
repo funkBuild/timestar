@@ -2,7 +2,9 @@
 
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
+#include "http_error.hpp"
 #include "http_response.hpp"
+#include "http_routes.hpp"
 #include "native_index.hpp"
 #include "proto_converters.hpp"
 #include "scatter_gather.hpp"
@@ -17,16 +19,6 @@
 #include <unordered_map>
 
 // Response struct definitions for Glaze serialization
-struct ErrorInfo {
-    std::string code;
-    std::string message;
-};
-
-struct ErrorResponse {
-    std::string status = "error";
-    ErrorInfo error;
-};
-
 struct MeasurementsResponse {
     std::vector<std::string> measurements;
     size_t total;
@@ -111,38 +103,28 @@ HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharde
 }
 
 void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    auto wrap = [&](auto fn) { return timestar::wrapWithAuth(authToken, std::move(fn)); };
+    // addJsonRoute applies timestar::wrapWithAuth per route.
+    using op = seastar::httpd::operation_type;
 
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/measurements"),
-          new seastar::httpd::function_handler(
-              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  return handleMeasurements(std::move(req));
-              }),
-              "json"));
+    timestar::http::addJsonRoute(
+        r, op::GET, "/measurements", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleMeasurements(std::move(req)); });
 
-    r.add(
-        seastar::httpd::operation_type::GET, seastar::httpd::url("/tags"),
-        new seastar::httpd::function_handler(
-            wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                     -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleTags(std::move(req)); }),
-            "json"));
+    timestar::http::addJsonRoute(
+        r, op::GET, "/tags", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleTags(std::move(req)); });
 
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/fields"),
-          new seastar::httpd::function_handler(
-              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  return handleFields(std::move(req));
-              }),
-              "json"));
+    timestar::http::addJsonRoute(
+        r, op::GET, "/fields", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleFields(std::move(req)); });
 
-    r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/cardinality"),
-          new seastar::httpd::function_handler(
-              wrap([this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                       -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  return handleCardinality(std::move(req));
-              }),
-              "json"));
+    timestar::http::addJsonRoute(
+        r, op::GET, "/cardinality", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleCardinality(std::move(req)); });
 
     timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields, /cardinality{}",
                             authToken.empty() ? "" : " (auth required)");
@@ -560,13 +542,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
 }
 
 std::string HttpMetadataHandler::createErrorResponse(const std::string& code, const std::string& message) {
-    ErrorResponse response;
-    response.error.code = code;
-    response.error.message = message;
-
-    std::string buffer;
-    (void)glz::write_json(response, buffer);
-    return buffer;
+    // Canonical flat error shape shared by all handlers (see http_error.hpp).
+    // Previously this handler nested {"error":{"code","message"}}.
+    return timestar::http::jsonError(message, code);
 }
 
 std::string HttpMetadataHandler::formatMeasurementsResponse(const std::vector<std::string>& measurements,

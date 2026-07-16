@@ -6,6 +6,7 @@
 #include "engine.hpp"
 #include "group_key.hpp"
 #include "http_auth.hpp"
+#include "http_routes.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "proto_converters.hpp"
@@ -603,14 +604,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
 }
 
 void HttpQueryHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    auto* handler = new seastar::httpd::function_handler(
-        timestar::wrapWithAuth(
-            authToken,
-            [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
-                -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleQuery(std::move(req)); }),
-        "json");
-
-    r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/query"), handler);
+    // addJsonRoute applies timestar::wrapWithAuth per route.
+    timestar::http::addJsonRoute(
+        r, seastar::httpd::operation_type::POST, "/query", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleQuery(std::move(req)); });
 
     timestar::http_log.info("Registered HTTP query endpoint at /query{}", authToken.empty() ? "" : " (auth required)");
 }
