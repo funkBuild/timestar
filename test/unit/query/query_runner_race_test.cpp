@@ -15,6 +15,13 @@
 //
 // The fix: pre-allocate a vector of std::optional<TSMResult<T>> with one slot
 // per file, where each coroutine writes to its own indexed slot.
+//
+// KEPT as source inspection: the guarded regression is undefined behavior
+// (reference invalidation on reallocation) that cannot be triggered
+// deterministically from outside. The observable contract (queries over
+// multiple TSM files return exact, sorted, duplicate-free results under
+// concurrent inserts/rollovers) is covered behaviorally in
+// query_runner_concurrency_test.cpp.
 // =============================================================================
 
 class QueryRunnerRaceTest : public ::testing::Test {

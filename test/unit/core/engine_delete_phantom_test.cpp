@@ -1,159 +1,183 @@
-// Source-inspection tests for the deleteRangeBySeries phantom metadata bug fix.
+// Behavioral regression tests for the deleteRangeBySeries() phantom metadata bug.
 //
-// Bug: deleteRangeBySeries() called getOrCreateSeriesId() which creates
-// metadata for a series that doesn't exist. Deleting a non-existent series
-// should be a no-op, not create phantom metadata entries.
+// Bug history: deleteRangeBySeries() called getOrCreateSeriesId(), which CREATES
+// index metadata for a series that does not exist. Deleting a non-existent
+// series therefore left behind phantom metadata entries (series mapping,
+// series metadata, measurement-series index).
 //
-// Fix: Use getSeriesId() (lookup-only) instead, and return false early if the
-// series doesn't exist. Since metadata lives on shard 0, the lookup must be
-// routed to shard 0 via shardedRef when called on a non-zero shard.
+// Fix: use getSeriesId() (lookup-only) on the local index and co_return false
+// early when the series does not exist.
 //
-// These are source-inspection tests because deleteRangeBySeries is a Seastar
-// coroutine that requires the full Seastar runtime. We verify the fix by
-// reading and parsing the source code.
+// These tests drive a real Engine (real data dir, real NativeIndex) and observe
+// the externally visible contract:
+//   - deleting a non-existent series returns false
+//   - it leaves NO trace in the index (getSeriesId stays nullopt)
+//   - deleting an existing series still works and removes the data
+//
+// If getOrCreateSeriesId() were ever reintroduced in the delete path, the
+// phantom-metadata assertions below fail.
+
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../test_helpers.hpp"
 
 #include <gtest/gtest.h>
 
-#include <fstream>
-#include <sstream>
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <seastar/core/future.hh>
+#include <seastar/core/thread.hh>
 #include <string>
+#include <vector>
 
 class EngineDeletePhantomTest : public ::testing::Test {
 protected:
-    std::string sourceCode;
-
-    void SetUp() override {
-#ifdef ENGINE_SOURCE_PATH
-        std::ifstream file(ENGINE_SOURCE_PATH);
-        if (file.is_open()) {
-            std::stringstream ss;
-            ss << file.rdbuf();
-            sourceCode = ss.str();
-            return;
-        }
-#endif
-
-        std::vector<std::string> paths = {
-            "../lib/core/engine.cpp",
-            "../../lib/core/engine.cpp",
-        };
-
-        for (const auto& path : paths) {
-            std::ifstream file(path);
-            if (file.is_open()) {
-                std::stringstream ss;
-                ss << file.rdbuf();
-                sourceCode = ss.str();
-                return;
-            }
-        }
-    }
-
-    // Extract the deleteRangeBySeries function body from source
-    std::string extractDeleteRangeBySeriesFunction() const {
-        size_t start = sourceCode.find("Engine::deleteRangeBySeries");
-        if (start == std::string::npos)
-            return "";
-
-        // Find the opening brace of the function
-        size_t braceStart = sourceCode.find('{', start);
-        if (braceStart == std::string::npos)
-            return "";
-
-        // Find matching closing brace (simple brace counting)
-        int braceCount = 1;
-        size_t pos = braceStart + 1;
-        while (pos < sourceCode.size() && braceCount > 0) {
-            if (sourceCode[pos] == '{')
-                braceCount++;
-            else if (sourceCode[pos] == '}')
-                braceCount--;
-            pos++;
-        }
-
-        return sourceCode.substr(start, pos - start);
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
-// Verify that the source file was successfully loaded
-TEST_F(EngineDeletePhantomTest, SourceFileLoaded) {
-    ASSERT_FALSE(sourceCode.empty()) << "Could not load engine.cpp source file";
-    ASSERT_NE(sourceCode.find("Engine::deleteRangeBySeries"), std::string::npos)
-        << "Source file does not contain Engine::deleteRangeBySeries()";
+// ---------------------------------------------------------------------------
+// 1. Deleting a series that was never written returns false (no-op)
+// ---------------------------------------------------------------------------
+TEST_F(EngineDeletePhantomTest, DeleteNonExistentSeriesReturnsFalse) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
+
+        std::map<std::string, std::string> tags{{"location", "nowhere"}};
+        bool deleted = eng->deleteRangeBySeries("phantom_m", tags, "value", 0, UINT64_MAX).get();
+
+        EXPECT_FALSE(deleted) << "Deleting a series that was never written must be a no-op returning false";
+    })
+        .join()
+        .get();
 }
 
-// Core test: deleteRangeBySeries must NOT use getOrCreateSeriesId
-TEST_F(EngineDeletePhantomTest, DoesNotUseGetOrCreateSeriesId) {
-    std::string funcBody = extractDeleteRangeBySeriesFunction();
-    ASSERT_FALSE(funcBody.empty()) << "Could not extract deleteRangeBySeries() function body";
+// ---------------------------------------------------------------------------
+// 2. Core regression: deleting a non-existent series must NOT create phantom
+//    metadata in the index
+// ---------------------------------------------------------------------------
+TEST_F(EngineDeletePhantomTest, DeleteNonExistentSeriesCreatesNoPhantomMetadata) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
 
-    EXPECT_EQ(funcBody.find("getOrCreateSeriesId"), std::string::npos)
-        << "BUG: deleteRangeBySeries() still uses getOrCreateSeriesId(). "
-           "This creates phantom metadata entries when deleting a non-existent "
-           "series. Use getSeriesId() (lookup-only) instead.";
+        std::map<std::string, std::string> tags{{"location", "nowhere"}};
+        eng->deleteRangeBySeries("phantom_m", tags, "value", 0, UINT64_MAX).get();
+
+        // The lookup-only probe: if the delete path used getOrCreateSeriesId,
+        // this now returns a value (the phantom).
+        auto seriesIdOpt = eng->getIndex().getSeriesId("phantom_m", tags, "value").get();
+        EXPECT_FALSE(seriesIdOpt.has_value())
+            << "BUG: deleteRangeBySeries() created phantom index metadata for a "
+               "series that never existed (getOrCreateSeriesId regression)";
+
+        // The measurement must not have appeared either.
+        auto measurements = eng->getAllMeasurements().get();
+        EXPECT_EQ(std::count(measurements.begin(), measurements.end(), "phantom_m"), 0)
+            << "BUG: deleting a non-existent series registered its measurement";
+    })
+        .join()
+        .get();
 }
 
-// Core test: deleteRangeBySeries must use getSeriesId (lookup-only)
-TEST_F(EngineDeletePhantomTest, UsesGetSeriesIdLookupOnly) {
-    std::string funcBody = extractDeleteRangeBySeriesFunction();
-    ASSERT_FALSE(funcBody.empty());
+// ---------------------------------------------------------------------------
+// 3. Deleting with tags that do not match any existing series is a no-op and
+//    must not create a phantom series next to the real one
+// ---------------------------------------------------------------------------
+TEST_F(EngineDeletePhantomTest, DeleteWithWrongTagsIsNoOpAndCreatesNoPhantom) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
 
-    EXPECT_NE(funcBody.find("getSeriesId"), std::string::npos)
-        << "deleteRangeBySeries() should use getSeriesId() to look up the "
-           "series without creating it.";
+        // Real series: temp,location=us-west value
+        TimeStarInsert<double> insert("temp", "value");
+        insert.addTag("location", "us-west");
+        insert.addValue(1000, 20.0);
+        insert.addValue(2000, 21.0);
+        insert.addValue(3000, 22.0);
+        eng->insert(std::move(insert)).get();
+
+        // Delete a series with the same measurement/field but different tags.
+        std::map<std::string, std::string> wrongTags{{"location", "us-east"}};
+        bool deleted = eng->deleteRangeBySeries("temp", wrongTags, "value", 0, UINT64_MAX).get();
+        EXPECT_FALSE(deleted) << "Delete with non-matching tags must return false";
+
+        // No phantom series for the wrong tag combination.
+        auto phantomId = eng->getIndex().getSeriesId("temp", wrongTags, "value").get();
+        EXPECT_FALSE(phantomId.has_value()) << "BUG: delete with non-matching tags created a phantom series entry";
+
+        // The real series and its data are untouched.
+        std::map<std::string, std::string> realTags{{"location", "us-west"}};
+        auto realId = eng->getIndex().getSeriesId("temp", realTags, "value").get();
+        EXPECT_TRUE(realId.has_value());
+
+        auto resultOpt = eng->query("temp,location=us-west value", 0, UINT64_MAX).get();
+        ASSERT_TRUE(resultOpt.has_value());
+        auto& result = std::get<QueryResult<double>>(resultOpt.value());
+        EXPECT_EQ(result.timestamps.size(), 3u) << "Delete of a non-existent series must not touch real data";
+    })
+        .join()
+        .get();
 }
 
-// Core test: deleteRangeBySeries must handle the case where getSeriesId
-// returns std::nullopt (series doesn't exist) by returning false early
-TEST_F(EngineDeletePhantomTest, HandlesNulloptByReturningFalse) {
-    std::string funcBody = extractDeleteRangeBySeriesFunction();
-    ASSERT_FALSE(funcBody.empty());
+// ---------------------------------------------------------------------------
+// 4. Deleting an existing series still works: returns true and removes data
+// ---------------------------------------------------------------------------
+TEST_F(EngineDeletePhantomTest, DeleteExistingSeriesRemovesData) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
 
-    // Should check has_value() or !seriesIdOpt or similar
-    bool checksOptional =
-        funcBody.find("has_value") != std::string::npos || funcBody.find("!seriesId") != std::string::npos ||
-        funcBody.find("nullopt") != std::string::npos || funcBody.find("std::nullopt") != std::string::npos;
+        TimeStarInsert<double> insert("disk", "usage");
+        insert.addTag("host", "h1");
+        insert.addValue(1000, 50.0);
+        insert.addValue(2000, 55.0);
+        insert.addValue(3000, 60.0);
+        eng->insert(std::move(insert)).get();
 
-    EXPECT_TRUE(checksOptional) << "BUG: deleteRangeBySeries() does not check whether getSeriesId() "
-                                   "returned std::nullopt. If the series doesn't exist, it should "
-                                   "return false early (no-op).";
+        std::map<std::string, std::string> tags{{"host", "h1"}};
+        bool deleted = eng->deleteRangeBySeries("disk", tags, "usage", 0, UINT64_MAX).get();
+        EXPECT_TRUE(deleted) << "Deleting an existing series must return true";
 
-    // Should co_return false when series doesn't exist
-    EXPECT_NE(funcBody.find("co_return false"), std::string::npos)
-        << "deleteRangeBySeries() should co_return false when the series "
-           "doesn't exist (getSeriesId returns nullopt).";
+        // Data is gone.
+        auto resultOpt = eng->query("disk,host=h1 usage", 0, UINT64_MAX).get();
+        if (resultOpt.has_value()) {
+            auto& result = std::get<QueryResult<double>>(resultOpt.value());
+            EXPECT_EQ(result.timestamps.size(), 0u) << "All points must be deleted";
+        }
+    })
+        .join()
+        .get();
 }
 
-// Verify that the function still calls deleteRange for existing series
-TEST_F(EngineDeletePhantomTest, StillCallsDeleteRangeForExistingSeries) {
-    std::string funcBody = extractDeleteRangeBySeriesFunction();
-    ASSERT_FALSE(funcBody.empty());
+// ---------------------------------------------------------------------------
+// 5. Sub-range delete removes only the requested time window
+// ---------------------------------------------------------------------------
+TEST_F(EngineDeletePhantomTest, DeleteSubRangeKeepsPointsOutsideRange) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
 
-    EXPECT_NE(funcBody.find("deleteRange"), std::string::npos)
-        << "deleteRangeBySeries() should still call deleteRange() for "
-           "existing series that pass the existence check.";
-}
+        TimeStarInsert<double> insert("net", "bytes");
+        insert.addTag("iface", "eth0");
+        for (uint64_t ts = 1000; ts <= 5000; ts += 1000) {
+            insert.addValue(ts, static_cast<double>(ts));
+        }
+        eng->insert(std::move(insert)).get();
 
-// Verify the function still constructs the series key for deleteRange
-TEST_F(EngineDeletePhantomTest, ConstructsSeriesKeyForDeleteRange) {
-    std::string funcBody = extractDeleteRangeBySeriesFunction();
-    ASSERT_FALSE(funcBody.empty());
+        std::map<std::string, std::string> tags{{"iface", "eth0"}};
+        bool deleted = eng->deleteRangeBySeries("net", tags, "bytes", 2000, 3000).get();
+        EXPECT_TRUE(deleted);
 
-    EXPECT_NE(funcBody.find("seriesKey"), std::string::npos)
-        << "deleteRangeBySeries() should construct a series key to pass "
-           "to deleteRange().";
-}
-
-// Verify the existence check uses local index lookup.
-// With the distributed index, each shard has its own NativeIndex containing
-// metadata for its series. The getSeriesId call uses the local index directly.
-TEST_F(EngineDeletePhantomTest, RoutesMetadataCheckToShard0) {
-    std::string funcBody = extractDeleteRangeBySeriesFunction();
-    ASSERT_FALSE(funcBody.empty());
-
-    // With distributed index, deleteRangeBySeries uses local index.getSeriesId()
-    bool usesLocalIndex = funcBody.find("index.getSeriesId") != std::string::npos;
-
-    EXPECT_TRUE(usesLocalIndex) << "deleteRangeBySeries() must use the local index.getSeriesId() "
-                                   "for metadata lookup in the distributed index model.";
+        auto resultOpt = eng->query("net,iface=eth0 bytes", 0, UINT64_MAX).get();
+        ASSERT_TRUE(resultOpt.has_value());
+        auto& result = std::get<QueryResult<double>>(resultOpt.value());
+        std::vector<uint64_t> expected{1000, 4000, 5000};
+        EXPECT_EQ(result.timestamps, expected) << "Only points in [2000,3000] should be deleted";
+    })
+        .join()
+        .get();
 }
