@@ -93,10 +93,13 @@ jobs:
         run: |
           mkdir -p test-results
           docker run --rm \
+            -e CI=true \
             -v ${{ github.workspace }}:/src \
             -v ${{ github.workspace }}/test-results:/test-results \
             timestar-deps \
-            bash -c 'cd /src/build && stdbuf -o L ./test/timestar_unit_test --gtest_output=xml:/test-results/test-results.xml'
+            bash -c 'cd /src/build && stdbuf -o L ./test/timestar_unit_test -c 2 --gtest_output=xml:/test-results/test-results.xml'
+          # -c 2 pins the Seastar shard count so multi-shard tests always run
+          # (they FAIL rather than skip when CI=true and smp < 2)
 
       - name: Fix cache permissions
         if: always()

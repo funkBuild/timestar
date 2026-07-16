@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <seastar/core/coroutine.hh>
@@ -22,6 +23,17 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+// Multi-shard tests skip on developer boxes with a forced single shard, but
+// must never skip silently in CI (the runner pins -c 2, so a skip there means
+// the multi-shard paths lost coverage without anyone noticing).
+#define REQUIRE_MULTI_SHARD()                                                                 \
+    if (seastar::smp::count < 2) {                                                            \
+        if (std::getenv("CI")) {                                                              \
+            FAIL() << "Multi-shard test would be skipped in CI — run the suite with -c 2+";   \
+        }                                                                                     \
+        GTEST_SKIP() << "Need at least 2 shards for this test";                               \
+    }
 
 // ---------------------------------------------------------------------------
 // Test fixture
@@ -104,9 +116,7 @@ TEST_F(EngineMetadataTest, Shard0InsertStillIndexesMetadata) {
 // ===========================================================================
 
 TEST_F(EngineMetadataTest, NoShardedRefNoCrash) {
-    if (seastar::smp::count < 2) {
-        GTEST_SKIP() << "Need at least 2 shards for this test";
-    }
+    REQUIRE_MULTI_SHARD();
 
     seastar::thread([] {
         // Manually start without setting shardedRef to test graceful degradation.
@@ -142,9 +152,7 @@ TEST_F(EngineMetadataTest, NoShardedRefNoCrash) {
 // ===========================================================================
 
 TEST_F(EngineMetadataTest, NonZeroShardInsertIndexesMetadataWithRef) {
-    if (seastar::smp::count < 2) {
-        GTEST_SKIP() << "Need at least 2 shards for this test";
-    }
+    REQUIRE_MULTI_SHARD();
 
     seastar::thread([] {
         ScopedShardedEngine eng;
@@ -185,9 +193,7 @@ TEST_F(EngineMetadataTest, NonZeroShardInsertIndexesMetadataWithRef) {
 // ===========================================================================
 
 TEST_F(EngineMetadataTest, NonZeroShardBoolAndStringInsertIndexMetadata) {
-    if (seastar::smp::count < 2) {
-        GTEST_SKIP() << "Need at least 2 shards for this test";
-    }
+    REQUIRE_MULTI_SHARD();
 
     seastar::thread([] {
         ScopedShardedEngine eng;
@@ -234,9 +240,7 @@ TEST_F(EngineMetadataTest, NonZeroShardBoolAndStringInsertIndexMetadata) {
 // ===========================================================================
 
 TEST_F(EngineMetadataTest, IdempotentMetadataIndexing) {
-    if (seastar::smp::count < 2) {
-        GTEST_SKIP() << "Need at least 2 shards for this test";
-    }
+    REQUIRE_MULTI_SHARD();
 
     seastar::thread([] {
         ScopedShardedEngine eng;
