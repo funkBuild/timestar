@@ -14,8 +14,10 @@
 #include "proto_converters.hpp"
 #include "timestar.pb.h"
 
-// For decoding ALP-compressed query response values
+// For encoding compressed (Approach B) write requests and decoding
+// ALP/FFOR-compressed query response values
 #include "float_encoder.hpp"
+#include "integer_encoder.hpp"
 #include "slice_buffer.hpp"
 
 #include <glaze/glaze.hpp>
@@ -32,6 +34,7 @@
 #include <seastar/http/reply.hh>
 #include <seastar/http/request.hh>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -172,6 +175,42 @@ static std::vector<double> decodeAlpValues(const std::string& compressed, size_t
     CompressedSlice cs(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
     FloatDecoder::decode(cs, 0, count, out);
     return out;
+}
+
+// Query response timestamps ride in compressed_timestamps (FFOR).
+static std::vector<uint64_t> decodeFforTimestamps(const std::string& compressed) {
+    std::vector<uint64_t> out;
+    Slice slice(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
+    IntegerEncoder::decode(slice, static_cast<unsigned int>(compressed.size() / 2 + 1024), out);
+    return out;
+}
+
+// Build a WriteRequest whose timestamps AND double values ride exclusively in
+// the compressed_* fields (Approach B) — the repeated fields stay empty.
+static std::string buildCompressedProtoWriteRequest(const std::string& measurement,
+                                                    const std::map<std::string, std::string>& tags,
+                                                    const std::string& fieldName,
+                                                    const std::vector<double>& values,
+                                                    const std::vector<uint64_t>& timestamps) {
+    ::timestar_pb::WriteRequest req;
+    auto* wp = req.add_writes();
+    wp->set_measurement(measurement);
+    for (auto& [k, v] : tags) {
+        (*wp->mutable_tags())[k] = v;
+    }
+
+    auto tsEnc = IntegerEncoder::encode(std::span<const uint64_t>(timestamps));
+    wp->set_compressed_timestamps(tsEnc.data.data(), tsEnc.size());
+
+    ::timestar_pb::WriteField wf;
+    auto vEnc = FloatEncoder::encode(std::span<const double>(values));
+    wf.mutable_double_values()->set_compressed_alp(reinterpret_cast<const char*>(vEnc.data.data()),
+                                                   vEnc.dataByteSize());
+    (*wp->mutable_fields())[fieldName] = wf;
+
+    std::string bytes;
+    req.SerializeToString(&bytes);
+    return bytes;
 }
 
 // ============================================================================
@@ -1151,6 +1190,224 @@ TEST_F(ProtobufIntegrationTest, WriteMixedTypesProto) {
         EXPECT_EQ(resp.status(), "success");
         // 4 fields * 1 timestamp = 4 points
         EXPECT_GE(resp.points_written(), 4);
+    })
+        .join()
+        .get();
+}
+
+// ============================================================================
+// 10. Compressed (Approach B) writes through handleWrite
+//
+// Regression tests for the silent-data-loss bug: parseWriteRequestFast (the
+// only parser handleWrite uses for protobuf bodies) ignored all compressed_*
+// fields — compressed timestamps were replaced by generated defaults and
+// compressed values yielded valCount==0, silently skipping the field while
+// the response still reported success.
+// ============================================================================
+
+TEST_F(ProtobufIntegrationTest, WriteCompressedTimestampsAndValuesQueryableRoundTrip) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        // Timestamps and values ride ONLY in the compressed fields.
+        const std::vector<uint64_t> ts = {1000000000ULL, 2000000000ULL, 3000000000ULL};
+        const std::vector<double> values = {10.0, 20.0, 30.0};
+
+        auto writeBytes =
+            buildCompressedProtoWriteRequest("pb_compressed_rt", {{"host", "h1"}}, "value", values, ts);
+
+        auto writeReq = makeProtoWriteRequest(writeBytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        auto writeResp = parseProtoWriteResponse(writeRep->_content);
+        // Before the fix: status "success" with points_written == 0 (silent loss).
+        EXPECT_EQ(writeResp.status(), "success");
+        EXPECT_EQ(writeResp.points_written(), 3);
+        EXPECT_EQ(writeResp.failed_writes(), 0);
+
+        // The points must be queryable at the timestamps the CLIENT sent.
+        // Before the fix, the server generated default (wall-clock) timestamps,
+        // so this window would return nothing at all.
+        auto queryBytes = buildProtoQueryRequest("avg:pb_compressed_rt(value){host:h1}", 0, 4000000000ULL, "1s");
+        auto queryReq = makeProtoQueryRequest(queryBytes);
+        auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
+        ASSERT_TRUE(isOk(*queryRep));
+
+        auto queryResp = parseProtoQueryResponse(queryRep->_content);
+        EXPECT_EQ(queryResp.status(), "success");
+        ASSERT_GE(queryResp.series_size(), 1);
+
+        auto& series = queryResp.series(0);
+        EXPECT_EQ(series.measurement(), "pb_compressed_rt");
+        ASSERT_TRUE(series.fields().count("value") > 0);
+        auto& fieldData = series.fields().at("value");
+        ASSERT_FALSE(fieldData.compressed_timestamps().empty());
+        ASSERT_TRUE(fieldData.has_double_values());
+        ASSERT_FALSE(fieldData.double_values().compressed_alp().empty());
+
+        auto gotTs = decodeFforTimestamps(fieldData.compressed_timestamps());
+        auto gotVals = decodeAlpValues(fieldData.double_values().compressed_alp(), gotTs.size());
+        ASSERT_EQ(gotTs.size(), gotVals.size());
+
+        // Each written point lands in its own 1s bucket (bucket start == its
+        // timestamp) with avg == the original value.
+        std::map<uint64_t, double> byBucket;
+        for (size_t i = 0; i < gotTs.size(); ++i) {
+            byBucket[gotTs[i]] = gotVals[i];
+        }
+        for (size_t i = 0; i < ts.size(); ++i) {
+            ASSERT_TRUE(byBucket.count(ts[i]) > 0) << "missing bucket for timestamp " << ts[i];
+            EXPECT_NEAR(byBucket[ts[i]], values[i], 0.001) << "wrong value at timestamp " << ts[i];
+        }
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, WriteCompressedTimestampsPlainValuesQueryable) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        // compressed_timestamps + PLAIN double values: exercises the
+        // timestamp half of the bug in isolation.
+        const std::vector<uint64_t> ts = {1000000000ULL, 2000000000ULL, 3000000000ULL};
+
+        ::timestar_pb::WriteRequest pbReq;
+        auto* wp = pbReq.add_writes();
+        wp->set_measurement("pb_compressed_ts_only");
+        (*wp->mutable_tags())["host"] = "h1";
+        auto tsEnc = IntegerEncoder::encode(std::span<const uint64_t>(ts));
+        wp->set_compressed_timestamps(tsEnc.data.data(), tsEnc.size());
+
+        ::timestar_pb::WriteField wf;
+        wf.mutable_double_values()->add_values(5.0);
+        wf.mutable_double_values()->add_values(15.0);
+        wf.mutable_double_values()->add_values(25.0);
+        (*wp->mutable_fields())["value"] = wf;
+
+        std::string bytes;
+        pbReq.SerializeToString(&bytes);
+
+        auto writeReq = makeProtoWriteRequest(bytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        auto writeResp = parseProtoWriteResponse(writeRep->_content);
+        EXPECT_EQ(writeResp.status(), "success");
+        EXPECT_EQ(writeResp.points_written(), 3);
+
+        // Before the fix, the server generated wall-clock default timestamps,
+        // so this historical window found nothing.
+        auto queryBytes =
+            buildProtoQueryRequest("avg:pb_compressed_ts_only(value){host:h1}", 0, 4000000000ULL);
+        auto queryReq = makeProtoQueryRequest(queryBytes);
+        auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
+        ASSERT_TRUE(isOk(*queryRep));
+
+        auto queryResp = parseProtoQueryResponse(queryRep->_content);
+        EXPECT_EQ(queryResp.status(), "success");
+        ASSERT_GE(queryResp.series_size(), 1);
+        EXPECT_GE(queryResp.statistics().point_count(), 1u);
+
+        // All three points must come back at the client-sent timestamps.
+        auto& fieldData = queryResp.series(0).fields().at("value");
+        ASSERT_TRUE(fieldData.has_double_values());
+        ASSERT_FALSE(fieldData.compressed_timestamps().empty());
+        auto gotTs = decodeFforTimestamps(fieldData.compressed_timestamps());
+        auto gotVals = decodeAlpValues(fieldData.double_values().compressed_alp(), gotTs.size());
+        ASSERT_EQ(gotTs.size(), gotVals.size());
+        std::map<uint64_t, double> byTs;
+        for (size_t i = 0; i < gotTs.size(); ++i) {
+            byTs[gotTs[i]] = gotVals[i];
+        }
+        const std::vector<double> expected = {5.0, 15.0, 25.0};
+        for (size_t i = 0; i < ts.size(); ++i) {
+            ASSERT_TRUE(byTs.count(ts[i]) > 0) << "missing point at timestamp " << ts[i];
+            EXPECT_NEAR(byTs[ts[i]], expected[i], 0.001) << "wrong value at timestamp " << ts[i];
+        }
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, WriteCorruptCompressedValuesReturnsPerPointError) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler handler(&eng.eng);
+
+        ::timestar_pb::WriteRequest pbReq;
+        auto* wp = pbReq.add_writes();
+        wp->set_measurement("pb_corrupt_compressed");
+        (*wp->mutable_tags())["host"] = "h1";
+        wp->add_timestamps(1000000000ULL);
+
+        // Garbage bytes with a bad ALP magic number -> decode error
+        std::string garbage(32, '\xAB');
+        ::timestar_pb::WriteField wf;
+        wf.mutable_double_values()->set_compressed_alp(garbage.data(), garbage.size());
+        (*wp->mutable_fields())["value"] = wf;
+
+        std::string bytes;
+        pbReq.SerializeToString(&bytes);
+
+        auto req = makeProtoWriteRequest(bytes);
+        auto rep = handler.handleWrite(std::move(req)).get();
+        ASSERT_TRUE(isOk(*rep));
+
+        auto resp = parseProtoWriteResponse(rep->_content);
+        // Before the fix this reported "success" with 0 points and no errors.
+        EXPECT_EQ(resp.status(), "partial");
+        EXPECT_EQ(resp.points_written(), 0);
+        EXPECT_GE(resp.failed_writes(), 1);
+        ASSERT_GE(resp.errors_size(), 1);
+        EXPECT_NE(resp.errors(0).find("failed to decode compressed values"), std::string::npos) << resp.errors(0);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, WriteCorruptCompressedTimestampsReturnsPerPointError) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler handler(&eng.eng);
+
+        ::timestar_pb::WriteRequest pbReq;
+        auto* wp = pbReq.add_writes();
+        wp->set_measurement("pb_corrupt_ts");
+        (*wp->mutable_tags())["host"] = "h1";
+        // 4 bytes cannot hold an FFOR block header -> decode error
+        wp->set_compressed_timestamps("\x01\x02\x03\x04", 4);
+
+        ::timestar_pb::WriteField wf;
+        wf.mutable_double_values()->add_values(1.0);
+        (*wp->mutable_fields())["value"] = wf;
+
+        std::string bytes;
+        pbReq.SerializeToString(&bytes);
+
+        auto req = makeProtoWriteRequest(bytes);
+        auto rep = handler.handleWrite(std::move(req)).get();
+        ASSERT_TRUE(isOk(*rep));
+
+        auto resp = parseProtoWriteResponse(rep->_content);
+        EXPECT_EQ(resp.status(), "partial");
+        EXPECT_EQ(resp.points_written(), 0);
+        EXPECT_GE(resp.failed_writes(), 1);
+        ASSERT_GE(resp.errors_size(), 1);
+        EXPECT_NE(resp.errors(0).find("Corrupt compressed timestamps"), std::string::npos) << resp.errors(0);
     })
         .join()
         .get();
