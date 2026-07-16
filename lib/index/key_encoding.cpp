@@ -261,6 +261,10 @@ std::string encodeLocalIdCounterKey() {
     return std::string(1, static_cast<char>(LOCAL_ID_COUNTER));
 }
 
+std::string encodePostingsWatermarkKey() {
+    return std::string(1, static_cast<char>(POSTINGS_WATERMARK));
+}
+
 std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue) {
     validateNoNullBytes({measurement, tagKey, tagValue});

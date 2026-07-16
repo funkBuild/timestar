@@ -62,7 +62,8 @@ enum IndexKeyType : uint8_t {
 
     // Phase 4: Cardinality estimation
     CARDINALITY_HLL = 0x14,   // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
-    MEASUREMENT_BLOOM = 0x15  // measurement\0 -> serialized bloom filter of all LocalIds
+    MEASUREMENT_BLOOM = 0x15,   // measurement\0 -> serialized bloom filter of all LocalIds
+    POSTINGS_WATERMARK = 0x16,  // singleton -> localIdMap.nextId() at last bitmap flush (crash-repair bound)
 };
 
 // Metadata for a time series

@@ -38,6 +38,7 @@ std::set<std::string> decodeStringSet(std::string_view encoded);
 
 std::string encodeLocalIdForwardKey(uint32_t localId);
 std::string encodeLocalIdCounterKey();
+std::string encodePostingsWatermarkKey();
 std::string encodePostingsBitmapKey(const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue);
 std::string encodePostingsBitmapPrefix(const std::string& measurement, const std::string& tagKey);

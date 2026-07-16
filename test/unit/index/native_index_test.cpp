@@ -26,6 +26,44 @@ SEASTAR_TEST_F(NativeIndexTest, OpenAndClose) {
     co_await index.close();
 }
 
+SEASTAR_TEST_F(NativeIndexTest, CrashWindowPostingsRepair) {
+    // Session 1: create a series and close cleanly — postings bitmaps and the
+    // postings watermark are flushed.
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        co_await index.getOrCreateSeriesId("repair_m", {{"host", "a"}}, "f");
+        co_await index.close();
+    }
+
+    // Session 2: create a second series, then crash (no close). Its metadata
+    // and local-ID assignment are persisted with the creation batch, but its
+    // postings-bitmap membership lives only in RAM.
+    SeriesId128 idB;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        idB = co_await index.getOrCreateSeriesId("repair_m", {{"host", "b"}}, "f");
+        // no close() — simulated crash
+    }
+
+    // Session 3: open() must repair postings for the crash window — the
+    // series must be visible to tag-filtered queries again.
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        auto ids = co_await index.findSeriesByTag("repair_m", "host", "b");
+        EXPECT_EQ(ids.size(), 1u);
+        if (!ids.empty()) {
+            EXPECT_EQ(ids[0], idB);
+        }
+        // The pre-crash series must be unaffected.
+        auto idsA = co_await index.findSeriesByTag("repair_m", "host", "a");
+        EXPECT_EQ(idsA.size(), 1u);
+        co_await index.close();
+    }
+}
+
 SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
     // Crash 1: write without close(). The IndexWAL destructor safety-net
     // persists the buffered records, but nothing flushes the memtable —

@@ -76,11 +76,18 @@ public:
     }
 
     // Add a single mapping during restore (call between restoreBegin/restoreEnd).
+    // Entries beyond the restored counter GROW the map instead of being dropped:
+    // series creation persists forward mappings individually, so a crash can
+    // leave forward entries newer than the last persisted counter value.
+    // Dropping them would re-assign those local IDs to different series while
+    // persisted bitmaps still reference the old assignment.
     void restoreEntry(uint32_t localId, const SeriesId128& globalId) {
-        if (localId < nextId_) {
-            localToGlobal_[localId] = globalId;
-            globalToLocal_.emplace(globalId, localId);
+        if (localId >= nextId_) {
+            nextId_ = localId + 1;
+            localToGlobal_.resize(nextId_);
         }
+        localToGlobal_[localId] = globalId;
+        globalToLocal_.emplace(globalId, localId);
     }
 
 private:

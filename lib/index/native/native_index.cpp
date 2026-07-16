@@ -41,10 +41,13 @@ namespace timestar::index {
 // ============================================================================
 
 // Wraps MemTable::Iterator (synchronous) as IteratorSource.
+// Owns the MemTable via shared_ptr: scans suspend on SSTable block reads, and
+// the background flush destroys immutableMemtable_ when it completes — without
+// ownership the map (and this iterator) would dangle mid-scan.
 class MemTableIteratorSource : public IteratorSource {
 public:
-    explicit MemTableIteratorSource(MemTable::Iterator iter, int priority)
-        : iter_(std::move(iter)), priority_(priority) {}
+    explicit MemTableIteratorSource(std::shared_ptr<const MemTable> mt, int priority)
+        : owner_(std::move(mt)), iter_(owner_->newIterator()), priority_(priority) {}
 
     seastar::future<> seek(std::string_view target) override {
         iter_.seek(target);
@@ -66,6 +69,7 @@ public:
     int priority() const override { return priority_; }
 
 private:
+    std::shared_ptr<const MemTable> owner_;
     MemTable::Iterator iter_;
     int priority_;
 };
@@ -132,7 +136,7 @@ seastar::future<> NativeIndex::open() {
     manifest_ = std::make_unique<Manifest>(co_await Manifest::open(indexPath_));
 
     // Open WAL and replay into MemTable
-    memtable_ = std::make_unique<MemTable>();
+    memtable_ = std::make_shared<MemTable>();
     wal_ = std::make_unique<IndexWAL>(co_await IndexWAL::open(indexPath_ + "/wal"));
     auto replayed = co_await wal_->replay(*memtable_);
     if (replayed > 0) {
@@ -203,6 +207,40 @@ seastar::future<> NativeIndex::open() {
             co_await kvWriteBatch(migrationBatch);
             lastFlushedLocalId_ = localIdMap_.nextId();  // Migration persisted all IDs
             ::native_index_log.info("Phase 2 migration complete: {} local IDs assigned", localIdMap_.size());
+        }
+    }
+
+    // Crash-window postings repair: series created after the last bitmap flush
+    // have durable metadata + local IDs (persisted in their creation batch) but
+    // their postings-bitmap membership only lived in RAM. Re-add them from
+    // metadata so tag-filtered queries see them again. Day bitmaps cannot be
+    // reconstructed here (insert timestamps are unknown) — future inserts
+    // re-record days; the time-scoped gap is bounded to the crash window.
+    {
+        auto wmVal = co_await kvGet(ke::encodePostingsWatermarkKey());
+        if (wmVal.has_value()) {
+            uint32_t watermark = ke::decodeLocalId(*wmVal);
+            uint32_t repaired = 0;
+            std::string bitmapCacheKey;
+            for (uint32_t id = watermark; id < localIdMap_.nextId(); ++id) {
+                if (!localIdMap_.isValid(id))
+                    continue;
+                SeriesId128 globalId = localIdMap_.getGlobalId(id);
+                auto meta = co_await getSeriesMetadata(globalId);
+                if (!meta.has_value())
+                    continue;
+                for (const auto& [tagKey, tagValue] : meta->tags) {
+                    buildBitmapCacheKey(bitmapCacheKey, meta->measurement, tagKey, tagValue);
+                    auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
+                    bitmap->add(id);
+                }
+                dirtyMeasurementBlooms_.insert(meta->measurement);
+                ++repaired;
+            }
+            if (repaired > 0) {
+                ::native_index_log.info("Repaired postings for {} series in crash window [{}, {})", repaired,
+                                        watermark, localIdMap_.nextId());
+            }
         }
     }
 
@@ -376,25 +414,34 @@ seastar::future<bool> NativeIndex::kvExists(std::string_view key) {
     co_return false;
 }
 
+// Write ordering: apply to the memtable BEFORE the WAL append. append() can
+// suspend (threshold flush / write semaphore), and a concurrent memtable swap
+// during that suspension would otherwise pair the WAL record with the OLD
+// generation while the memtable apply landed in the NEW memtable — the old
+// WAL is deleted after flushing the old memtable, silently orphaning the
+// record. Applying first guarantees the record is covered by whichever
+// memtable's flush runs; the WAL copy is then redundant-but-idempotent on
+// replay. Callers are acked only after the append returns, so the earlier
+// read visibility is not an early ack.
 seastar::future<> NativeIndex::kvPut(const std::string& key, const std::string& value) {
     IndexWriteBatch batch;
     batch.put(key, value);
-    co_await wal_->append(batch);
     memtable_->put(key, value);
+    co_await wal_->append(batch);
     co_await maybeFlushMemTable();
 }
 
 seastar::future<> NativeIndex::kvDelete(const std::string& key) {
     IndexWriteBatch batch;
     batch.remove(key);
-    co_await wal_->append(batch);
     memtable_->remove(key);
+    co_await wal_->append(batch);
     co_await maybeFlushMemTable();
 }
 
 seastar::future<> NativeIndex::kvWriteBatch(const IndexWriteBatch& batch) {
-    co_await wal_->append(batch);
     batch.applyTo(*memtable_);
+    co_await wal_->append(batch);
     co_await maybeFlushMemTable();
 }
 
@@ -447,13 +494,16 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
         co_return;
     }
 
-    // General path: multiple sources — use MergeIterator
+    // General path: multiple sources — use MergeIterator.
+    // Sources take shared ownership of the memtables: the background flush may
+    // reset immutableMemtable_ (and a concurrent swap may replace memtable_)
+    // while this scan is suspended in an SSTable block read.
     std::vector<std::unique_ptr<IteratorSource>> sources;
-    sources.push_back(std::make_unique<MemTableIteratorSource>(memtable_->newIterator(), 0));
+    sources.push_back(std::make_unique<MemTableIteratorSource>(memtable_, 0));
 
     int nextPriority = 1;
     if (immutableMemtable_) {
-        sources.push_back(std::make_unique<MemTableIteratorSource>(immutableMemtable_->newIterator(), nextPriority));
+        sources.push_back(std::make_unique<MemTableIteratorSource>(immutableMemtable_, nextPriority));
         ++nextPriority;
     }
 
@@ -484,15 +534,31 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
 }
 
 seastar::future<> NativeIndex::waitForFlush() {
-    if (flushFuture_) {
-        co_await std::move(*flushFuture_);
-        flushFuture_.reset();
+    // Reentrant: any number of coroutines may wait on the same in-flight
+    // flush (shared_future is multi-consumer). Loop because a new flush may
+    // have been scheduled while we were suspended.
+    while (flushFuture_) {
+        auto fut = flushFuture_->get_future();
+        co_await std::move(fut);
+        if (flushFuture_ && flushFuture_->available()) {
+            flushFuture_.reset();
+        }
     }
 }
 
 seastar::future<> NativeIndex::maybeFlushMemTable() {
-    auto usage = memtable_->approximateMemoryUsage();
     auto threshold = timestar::config().index.write_buffer_size;
+    if (memtable_->approximateMemoryUsage() < threshold)
+        co_return;
+
+    // Serialize the entire check→swap→rotate→schedule region: without this,
+    // two coroutines crossing the threshold both swapped memtable_ into
+    // immutableMemtable_ — the second swap destroyed the first's unflushed
+    // memtable and its WAL was deleted after flushing the wrong data.
+    auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
+
+    // Re-check after acquiring — another coroutine may have flushed already.
+    auto usage = memtable_->approximateMemoryUsage();
     if (usage < threshold)
         co_return;
 
@@ -524,7 +590,7 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
 
     // Swap: active memtable becomes immutable, create fresh active
     immutableMemtable_ = std::move(memtable_);
-    memtable_ = std::make_unique<MemTable>();
+    memtable_ = std::make_shared<MemTable>();
 
     // Rotate WAL so new writes go to a fresh log
     auto oldWalPath = co_await wal_->rotate();
@@ -542,6 +608,10 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
 
 // Blocking flush — used by close() and compact() where we need synchronous completion.
 seastar::future<> NativeIndex::flushMemTable() {
+    // Same serialization as maybeFlushMemTable — the swap/rotate region must
+    // never run concurrently with another flush.
+    auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
+
     // Phase 2+3+4: Flush dirty bitmaps, day bitmaps, HLLs, and blooms before checking empty
     if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() ||
         !dirtyMeasurementBlooms_.empty()) {
@@ -572,7 +642,7 @@ seastar::future<> NativeIndex::flushMemTable() {
 
     // Swap to immutable
     immutableMemtable_ = std::move(memtable_);
-    memtable_ = std::make_unique<MemTable>();
+    memtable_ = std::make_shared<MemTable>();
 
     auto oldWalPath = co_await wal_->rotate();
 
@@ -721,8 +791,14 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // Measurement series index
     batch.put(ke::encodeMeasurementSeriesKey(measurement, seriesId), "");
 
-    // Phase 2: Assign local ID (forward mapping persisted in batch on flush)
+    // Phase 2: Assign local ID and persist the mapping ATOMICALLY with the
+    // series metadata. Previously the forward mapping lived only in RAM until
+    // the next bitmap flush — after a crash, the kvExists fast path above saw
+    // the metadata and returned without re-assigning, leaving the series
+    // permanently invisible to tag-filtered and time-scoped queries.
     uint32_t localId = localIdMap_.getOrAssign(seriesId);
+    batch.put(ke::encodeLocalIdForwardKey(localId), seriesId.toBytes());
+    batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localId + 1));
 
     // Phase 2: Add local ID to dirty postings bitmaps (TAG_INDEX/GROUP_BY_INDEX removed in Phase 3)
     std::string bitmapCacheKey;
@@ -741,25 +817,35 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // Mark measurement bloom for rebuild on next flush
     dirtyMeasurementBlooms_.insert(measurement);
 
+    // Schema-cache access pattern below: NEVER hold a reference into
+    // fieldsCache_/tagsCache_/tagValuesCache_ across a co_await. A concurrent
+    // write can trigger trimSchemaCaches()/trimTagValuesCache() (destroying
+    // the node → UAF) or populate the same entry (a blind assignment after
+    // resume would clobber its additions → schema entries silently lost).
+    // Re-find after every suspension and only fill still-empty sets.
+
     // --- Field metadata (was addField) ---
-    auto& fieldCache = fieldsCache_[measurement];
     // NOTE: empty() check means the cache is re-populated on every call if the set is
     // legitimately empty. This is acceptable since a measurement always has at least one field.
-    if (fieldCache.empty()) {
+    if (fieldsCache_[measurement].empty()) {
         auto val = co_await kvGet(ke::encodeMeasurementFieldsKey(measurement));
-        if (val.has_value())
+        auto& fieldCache = fieldsCache_[measurement];  // re-find after co_await
+        if (val.has_value() && fieldCache.empty())
             fieldCache = ke::decodeStringSet(*val);
     }
-    if (fieldCache.insert(field).second) {
-        batch.put(ke::encodeMeasurementFieldsKey(measurement), ke::encodeStringSet(fieldCache));
-        pendingSchemaUpdate_.newFields[measurement].insert(field);
+    {
+        auto& fieldCache = fieldsCache_[measurement];
+        if (fieldCache.insert(field).second) {
+            batch.put(ke::encodeMeasurementFieldsKey(measurement), ke::encodeStringSet(fieldCache));
+            pendingSchemaUpdate_.newFields[measurement].insert(field);
+        }
     }
 
     // --- Tag metadata (was addTag for each tag) ---
-    auto& tagKeysCache = tagsCache_[measurement];
-    if (tagKeysCache.empty()) {
+    if (tagsCache_[measurement].empty()) {
         auto val = co_await kvGet(ke::encodeMeasurementTagsKey(measurement));
-        if (val.has_value())
+        auto& tagKeysCache = tagsCache_[measurement];  // re-find after co_await
+        if (val.has_value() && tagKeysCache.empty())
             tagKeysCache = ke::decodeStringSet(*val);
     }
     // Reusable buffer for tag-values cache key
@@ -767,7 +853,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     tvCacheKey.reserve(measurement.size() + 1 + 32);
     bool tagKeysChanged = false;
     for (const auto& [tagKey, tagValue] : tags) {
-        if (tagKeysCache.insert(tagKey).second) {
+        if (tagsCache_[measurement].insert(tagKey).second) {
             tagKeysChanged = true;
             pendingSchemaUpdate_.newTags[measurement].insert(tagKey);
         }
@@ -776,14 +862,15 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
         tvCacheKey += measurement;
         tvCacheKey.push_back('\0');
         tvCacheKey += tagKey;
-        auto& tagVals = tagValuesCache_[tvCacheKey];
         // Build KV key once, reuse for both get and put
         std::string tagValuesKvKey = ke::encodeTagValuesKey(measurement, tagKey);
-        if (tagVals.empty()) {
+        if (tagValuesCache_[tvCacheKey].empty()) {
             auto val = co_await kvGet(tagValuesKvKey);
-            if (val.has_value())
+            auto& tagVals = tagValuesCache_[tvCacheKey];  // re-find after co_await
+            if (val.has_value() && tagVals.empty())
                 tagVals = ke::decodeStringSet(*val);
         }
+        auto& tagVals = tagValuesCache_[tvCacheKey];
         if (tagVals.insert(tagValue).second) {
             batch.put(tagValuesKvKey, ke::encodeStringSet(tagVals));
             pendingSchemaUpdate_.newTagValues[tvCacheKey].insert(tagValue);
@@ -791,12 +878,16 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     }
     // Write measurement-tags once after processing all tags (not per-tag)
     if (tagKeysChanged) {
-        batch.put(ke::encodeMeasurementTagsKey(measurement), ke::encodeStringSet(tagKeysCache));
+        batch.put(ke::encodeMeasurementTagsKey(measurement), ke::encodeStringSet(tagsCache_[measurement]));
     }
 
     // Single WAL write for everything
     co_await kvWriteBatch(batch);
     seriesCacheInsert(seriesId);
+
+    // The forward mapping was persisted in this batch — skip it in the next
+    // flushDirtyBitmaps pass (avoids re-putting every mapping every flush).
+    lastFlushedLocalId_ = std::max(lastFlushedLocalId_, localId + 1);
 
     // Pre-populate metadata cache — avoids decode cost on future lookups.
     // The metadata object is already constructed; move it into cache.
@@ -1205,7 +1296,10 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
         uint32_t localId = *it;
         if (!localIdMap_.isValid(localId))
             continue;
-        const SeriesId128& id = localIdMap_.getGlobalId(localId);
+        // COPY, not reference: this loop suspends at kvGet below, and a
+        // concurrent insert's getOrAssign can realloc the underlying vector,
+        // dangling any reference returned by getGlobalId.
+        SeriesId128 id = localIdMap_.getGlobalId(localId);
 
         auto cached = seriesMetadataCache_.get(id);
         const SeriesMetadata* meta = nullptr;
@@ -1633,10 +1727,17 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
     }
 
     // Batch-persist LOCAL_ID_FORWARD entries for IDs assigned since last flush
+    // (normally none — series creation persists its own mapping — but this
+    // covers IDs assigned by repair/migration paths).
     for (uint32_t id = lastFlushedLocalId_; id < localIdMap_.nextId(); ++id) {
         batch.put(ke::encodeLocalIdForwardKey(id), localIdMap_.getGlobalId(id).toBytes());
     }
     lastFlushedLocalId_ = localIdMap_.nextId();
+
+    // Advance the postings watermark: every local ID below nextId() has its
+    // bitmap membership included in this batch. On restart, open() re-adds
+    // postings only for IDs at/after the persisted watermark (crash window).
+    batch.put(ke::encodePostingsWatermarkKey(), ke::encodeLocalId(localIdMap_.nextId()));
 
     // Serialize dirty bitmaps
     std::string bitmapKey;
@@ -1705,6 +1806,18 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
     }
 
     auto val = co_await kvGet(bitmapKvKey);
+    // Re-find after co_await: a concurrent insert may have created (and
+    // dirtied) this entry during the suspension. A plain assignment would
+    // discard its adds AND clear the dirty flag — the postings update would
+    // never be flushed, permanently hiding the series. Merge instead and
+    // leave the dirty flag alone (mirrors getOrLoadBitmapForInsert).
+    auto post = bitmapCache_.find(cacheKey);
+    if (post != bitmapCache_.end()) {
+        if (val.has_value()) {
+            post.value().bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+        }
+        co_return &post.value().bitmap;
+    }
     if (val.has_value()) {
         auto& entry = bitmapCache_[cacheKey];
         entry.bitmap = roaring::Roaring::readSafe(val->data(), val->size());
@@ -1869,6 +1982,16 @@ seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const st
     kvKey.append(cacheKey);
 
     auto val = co_await kvGet(kvKey);
+    // Re-find after co_await and merge — same race as getPostingsBitmapByKey:
+    // a concurrent insert may have created a dirty entry during the suspension;
+    // assignment would drop its adds and clear the dirty flag.
+    auto post = dayBitmapCache_.find(cacheKey);
+    if (post != dayBitmapCache_.end()) {
+        if (val.has_value()) {
+            post.value().bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+        }
+        co_return &post.value().bitmap;
+    }
     if (val.has_value()) {
         auto& entry = dayBitmapCache_[cacheKey];
         entry.bitmap = roaring::Roaring::readSafe(val->data(), val->size());
@@ -1907,26 +2030,41 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
 void NativeIndex::trimBitmapCache() {
     // Check both entry count and byte budget
     bool overEntries = bitmapCache_.size() > MAX_BITMAP_CACHE_ENTRIES;
+    size_t totalBytes = 0;
     bool overBytes = false;
     if (!overEntries) {
         // Only compute total bytes if entry count is OK (avoid O(n) scan when unnecessary)
-        size_t totalBytes = 0;
         for (const auto& [key, entry] : bitmapCache_) {
             totalBytes += entry.bitmap.getSizeInBytes(false) + key.size();
-            if (totalBytes > MAX_BITMAP_CACHE_BYTES) {
-                overBytes = true;
-                break;
-            }
         }
+        overBytes = totalBytes > MAX_BITMAP_CACHE_BYTES;
     }
     if (!overEntries && !overBytes)
         return;
 
-    // Evict non-dirty entries until under both limits
+    // Evict non-dirty entries until under BOTH limits. The byte budget is
+    // enforced independently of the entry count: a few thousand huge bitmaps
+    // can blow the memory budget while staying far under the entry cap
+    // (previously the loop broke on entry count alone, making the byte budget
+    // dead code). Evicting a persisted postings entry also invalidates the
+    // measurement's bloomFullyBuilt_ claim — the next bloom rebuild must
+    // re-scan KV or it would persist a bloom missing the evicted keys
+    // (false negatives = series silently invisible).
+    const size_t entryTarget = MAX_BITMAP_CACHE_ENTRIES / 2;  // evict to 50% to avoid thrashing
+    const size_t byteTarget = MAX_BITMAP_CACHE_BYTES / 2;
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end();) {
-        if (bitmapCache_.size() <= MAX_BITMAP_CACHE_ENTRIES / 2)
-            break;  // Evict to 50% to avoid thrashing
+        bool doneEntries = !overEntries || bitmapCache_.size() <= entryTarget;
+        bool doneBytes = !overBytes || totalBytes <= byteTarget;
+        if (doneEntries && doneBytes)
+            break;
         if (!it->second.dirty) {
+            if (overBytes) {
+                totalBytes -= it->second.bitmap.getSizeInBytes(false) + it->first.size();
+            }
+            auto nullPos = it->first.find('\0');
+            if (nullPos != std::string::npos) {
+                bloomFullyBuilt_.erase(it->first.substr(0, nullPos));
+            }
             it = bitmapCache_.erase(it);
         } else {
             ++it;
@@ -1936,24 +2074,29 @@ void NativeIndex::trimBitmapCache() {
 
 void NativeIndex::trimDayBitmapCache() {
     bool overEntries = dayBitmapCache_.size() > MAX_DAY_BITMAP_CACHE_ENTRIES;
+    size_t totalBytes = 0;
     bool overBytes = false;
     if (!overEntries) {
-        size_t totalBytes = 0;
         for (const auto& [key, entry] : dayBitmapCache_) {
             totalBytes += entry.bitmap.getSizeInBytes(false) + key.size();
-            if (totalBytes > MAX_DAY_BITMAP_CACHE_BYTES) {
-                overBytes = true;
-                break;
-            }
         }
+        overBytes = totalBytes > MAX_DAY_BITMAP_CACHE_BYTES;
     }
     if (!overEntries && !overBytes)
         return;
 
+    // Enforce the byte budget independently of the entry cap (see trimBitmapCache).
+    const size_t entryTarget = MAX_DAY_BITMAP_CACHE_ENTRIES / 2;
+    const size_t byteTarget = MAX_DAY_BITMAP_CACHE_BYTES / 2;
     for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end();) {
-        if (dayBitmapCache_.size() <= MAX_DAY_BITMAP_CACHE_ENTRIES / 2)
+        bool doneEntries = !overEntries || dayBitmapCache_.size() <= entryTarget;
+        bool doneBytes = !overBytes || totalBytes <= byteTarget;
+        if (doneEntries && doneBytes)
             break;
         if (!it->second.dirty) {
+            if (overBytes) {
+                totalBytes -= it->second.bitmap.getSizeInBytes(false) + it->first.size();
+            }
             it = dayBitmapCache_.erase(it);
         } else {
             ++it;
@@ -2191,7 +2334,10 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
         uint32_t localId = *it;
         if (!localIdMap_.isValid(localId))
             continue;
-        const SeriesId128& id = localIdMap_.getGlobalId(localId);
+        // COPY, not reference: this loop suspends at kvGet below, and a
+        // concurrent insert's getOrAssign can realloc the underlying vector,
+        // dangling any reference returned by getGlobalId.
+        SeriesId128 id = localIdMap_.getGlobalId(localId);
 
         auto cached = seriesMetadataCache_.get(id);
         const SeriesMetadata* meta = nullptr;
@@ -2238,12 +2384,18 @@ seastar::future<> NativeIndex::updateHLL(const std::string& measurement, uint32_
         // Try loading from KV
         auto kvKey = ke::encodeCardinalityHLLKey(measurement);
         auto val = co_await kvGet(kvKey);
-        if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
-            hllCache_[key] = HyperLogLog::deserialize(*val);
-        } else {
-            hllCache_[key] = HyperLogLog{};
-        }
+        // Re-find after co_await: a concurrent update may have created this
+        // entry (from the same persisted base) and already added IDs —
+        // overwriting it would silently lose those adds.
         it = hllCache_.find(key);
+        if (it == hllCache_.end()) {
+            if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
+                hllCache_[key] = HyperLogLog::deserialize(*val);
+            } else {
+                hllCache_[key] = HyperLogLog{};
+            }
+            it = hllCache_.find(key);
+        }
     }
     it.value().add(localId);
     hllCacheDirty_.insert(key);
@@ -2264,12 +2416,16 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
         // Try loading from KV
         auto kvKey = ke::encodeCardinalityHLLKey(measurement, tagKey, tagValue);
         auto val = co_await kvGet(kvKey);
-        if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
-            hllCache_[key] = HyperLogLog::deserialize(*val);
-        } else {
-            hllCache_[key] = HyperLogLog{};
-        }
+        // Re-find after co_await (see updateHLL).
         it = hllCache_.find(key);
+        if (it == hllCache_.end()) {
+            if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
+                hllCache_[key] = HyperLogLog::deserialize(*val);
+            } else {
+                hllCache_[key] = HyperLogLog{};
+            }
+            it = hllCache_.find(key);
+        }
     }
     it.value().add(localId);
     hllCacheDirty_.insert(key);
@@ -2295,7 +2451,14 @@ void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
 }
 
 seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batch) {
-    for (const auto& measurement : dirtyMeasurementBlooms_) {
+    // Swap the dirty set into a local before iterating: the KV prefix scan
+    // below suspends, and a concurrent insert doing dirtyMeasurementBlooms_.
+    // insert() could rehash the set under our iterator (UAF). Marks added
+    // during the suspension land in the (now empty) member and are handled by
+    // the next flush — previously the trailing clear() silently dropped them,
+    // leaving a stale persisted bloom that hid the new tag combination.
+    auto pending = std::exchange(dirtyMeasurementBlooms_, {});
+    for (const auto& measurement : pending) {
         // Build bloom from all postings bitmap KV keys for this measurement.
         // This lets us short-circuit lookups for non-existent tag combinations.
         BloomFilter bloom(10);  // 10 bits/key → ~1% FPR
@@ -2341,7 +2504,6 @@ seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batc
         // Update cache
         measurementBloomCache_[measurement] = std::move(bloom);
     }
-    dirtyMeasurementBlooms_.clear();
 }
 
 seastar::future<double> NativeIndex::estimateMeasurementCardinality(const std::string& measurement) {
@@ -2358,6 +2520,12 @@ seastar::future<double> NativeIndex::estimateMeasurementCardinality(const std::s
     // Try loading from KV
     auto kvKey = ke::encodeCardinalityHLLKey(measurement);
     auto val = co_await kvGet(kvKey);
+    // Re-find after co_await: a concurrent updateHLL may have created (and
+    // dirtied) this entry — overwriting it with the stale KV version would
+    // lose its adds and then persist the stale sketch.
+    if (auto post = hllCache_.find(key); post != hllCache_.end()) {
+        co_return post->second.estimate();
+    }
     if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
         auto hll = HyperLogLog::deserialize(*val);
         double est = hll.estimate();
@@ -2393,6 +2561,10 @@ seastar::future<double> NativeIndex::estimateTagCardinality(const std::string& m
     // Try loading HLL from KV
     auto kvKey = ke::encodeCardinalityHLLKey(measurement, tagKey, tagValue);
     auto val = co_await kvGet(kvKey);
+    // Re-find after co_await (see estimateMeasurementCardinality).
+    if (auto post = hllCache_.find(key); post != hllCache_.end()) {
+        co_return post->second.estimate();
+    }
     if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
         auto hll = HyperLogLog::deserialize(*val);
         double est = hll.estimate();
@@ -2458,9 +2630,14 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
 // ============================================================================
 
 seastar::future<SchemaUpdate> NativeIndex::indexMetadataBatchWithSchema(const std::vector<MetadataOp>& ops) {
-    pendingSchemaUpdate_ = SchemaUpdate{};  // Clear accumulator
+    // Do NOT reset the accumulator here: concurrent calls interleave inside
+    // indexMetadataBatch, and a reset would wipe another call's accumulated
+    // schema changes before it moved them out — those deltas would never be
+    // broadcast and other shards' caches would stay incomplete until restart.
+    // The move below empties the member; whichever concurrent call moves last
+    // simply carries the remainder (schema broadcasts are idempotent unions).
     co_await indexMetadataBatch(ops);
-    co_return std::move(pendingSchemaUpdate_);
+    co_return std::exchange(pendingSchemaUpdate_, SchemaUpdate{});
 }
 
 void NativeIndex::applySchemaUpdate(const SchemaUpdate& update) {

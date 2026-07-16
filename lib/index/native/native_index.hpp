@@ -25,6 +25,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/timer.hh>
 #include <unordered_map>
@@ -216,9 +217,22 @@ private:
     std::string indexPath_;
 
     // --- LSM storage ---
-    std::unique_ptr<MemTable> memtable_;
-    std::unique_ptr<MemTable> immutableMemtable_;   // Being flushed to SSTable in background
-    std::optional<seastar::future<>> flushFuture_;  // Tracks background flush
+    // shared_ptr: kvPrefixScan sources co-own the memtables so a background
+    // flush completing (immutableMemtable_.reset()) or a concurrent swap can't
+    // destroy the map under a suspended scan.
+    std::shared_ptr<MemTable> memtable_;
+    std::shared_ptr<MemTable> immutableMemtable_;  // Being flushed to SSTable in background
+
+    // shared_future: multiple coroutines may wait on the same in-flight flush
+    // (a plain future is single-consumer — the second waiter hit a moved-from
+    // future). Guarded by flushMutex_ for the swap/rotate/schedule region.
+    std::optional<seastar::shared_future<>> flushFuture_;
+
+    // Serializes the check→swap→rotate→schedule region of maybeFlushMemTable/
+    // flushMemTable. Two coroutines crossing the threshold concurrently would
+    // both swap memtable_ into immutableMemtable_, destroying unflushed data
+    // and double-rotating the WAL.
+    seastar::semaphore flushMutex_{1};
 
     // Periodic WAL durability sync: append() only buffers, so without this an
     // acknowledged index write could sit in user-space memory indefinitely.
