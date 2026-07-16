@@ -8,13 +8,14 @@
 // the sparse index each time a TSM file is opened.  Therefore there is no
 // backward-compatibility constraint on the bit layout.
 //
-// SIMD optimizations (via Google Highway):
-// - Bitwise merge operations (AND/OR/XOR) for compaction-merge use SIMD
-//   when the table exceeds kSimdThreshold bytes.
-// - SIMD popcount for fast fill-ratio estimation via populationCount().
-// - Batch contains check (batchContains16) for checking multiple 16-byte
-//   keys (SeriesId128) with SIMD probe-bit testing — the hot path in
-//   TSM::prefetchFullIndexEntries().
+// NOTE: This filter is distinct from lib/index/native/bloom_filter.{hpp,cpp}
+// (timestar::index::BloomFilter), which is the NativeIndex SSTable bloom with
+// SIMD batch-build/probe kernels and a serialized on-disk format. The two are
+// intentionally separate: this one is header-only, unserialized, and rebuilt
+// per TSM file open; the index one has durability and hash-once (mayContainHash)
+// API constraints. A former SIMD companion (bloom_filter_simd.*) providing
+// batch-contains, popcount, and bitwise-merge kernels was removed in Jul 2026:
+// production only ever used insert()/contains()/size().
 //
 // Why individual insert()/contains() are NOT SIMD-accelerated:
 //   Each call hashes one key (xxHash already uses internal SIMD) then probes
@@ -29,17 +30,12 @@
 
 #pragma once
 
-#include "bloom_filter_simd.hpp"
-
 #include <xxhash.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -176,41 +172,6 @@ public:
         return contains(reinterpret_cast<const unsigned char*>(&t), sizeof(T));
     }
 
-    // ------------------------------------------------------------------
-    // Batch contains for 16-byte keys (SeriesId128 hot path).
-    //
-    // Checks multiple 16-byte keys against the bloom filter in one call.
-    // Uses SIMD-accelerated probe-bit testing: for each key, all k probe
-    // bytes are gathered into a SIMD register and tested with a single
-    // AND + comparison, eliminating k conditional branches per key.
-    //
-    // Additionally, processing keys in batch keeps the bloom table hot in
-    // L1/L2 cache — this matters when checking hundreds of series IDs
-    // against a TSM file's bloom filter (prefetchFullIndexEntries).
-    //
-    // keys: contiguous array of 16-byte keys (numKeys * 16 bytes total)
-    // results: output array of numKeys bytes, set to 1 (may contain) or 0
-    // Returns: number of keys that passed the filter (result == 1)
-    // ------------------------------------------------------------------
-    size_t batchContains16(const uint8_t* keys, size_t numKeys, uint8_t* results) const {
-        if (tableSizeBits_ == 0 || numKeys == 0) {
-            if (results && numKeys > 0) {
-                std::memset(results, 0, numKeys);
-            }
-            return 0;
-        }
-        return timestar::bloom::simd::batchContains16(bitTable_.data(), tableSizeBits_, numHashes_,
-                                                      static_cast<uint64_t>(seed_), keys, numKeys, results);
-    }
-
-    // Convenience: batch contains for a vector/span of SeriesId128-like
-    // std::array<uint8_t, 16> keys. Writes results to the output span.
-    size_t batchContains(std::span<const std::array<uint8_t, 16>> keys, std::span<uint8_t> results) const {
-        if (keys.empty() || tableSizeBits_ == 0)
-            return 0;
-        return batchContains16(reinterpret_cast<const uint8_t*>(keys.data()), keys.size(), results.data());
-    }
-
     // Clear all bits, resetting the filter to empty.
     void clear() {
         std::fill(bitTable_.begin(), bitTable_.end(), static_cast<unsigned char>(0));
@@ -223,21 +184,6 @@ public:
     // Number of elements inserted.
     [[nodiscard]] unsigned long long element_count() const { return insertedCount_; }
 
-    // SIMD-accelerated population count: number of set bits in the table.
-    // Useful for estimating fill ratio without scanning byte-by-byte.
-    [[nodiscard]] uint64_t populationCount() const {
-        if (bitTable_.empty())
-            return 0;
-        return timestar::bloom::simd::popcount(bitTable_.data(), bitTable_.size());
-    }
-
-    // Fill ratio: fraction of bits that are set (0.0 to 1.0).
-    [[nodiscard]] double fillRatio() const {
-        if (tableSizeBits_ == 0)
-            return 0.0;
-        return static_cast<double>(populationCount()) / static_cast<double>(tableSizeBits_);
-    }
-
     // Effective false positive probability given current fill.
     [[nodiscard]] double effective_fpp() const {
         if (tableSizeBits_ == 0)
@@ -246,7 +192,7 @@ public:
                         static_cast<double>(numHashes_));
     }
 
-    // Raw table access (for SIMD bitwise ops and potential serialization).
+    // Raw table access (for tests and potential serialization).
     [[nodiscard]] const cell_type* table() const { return bitTable_.data(); }
     [[nodiscard]] std::size_t table_size_bytes() const { return bitTable_.size(); }
 
@@ -265,49 +211,6 @@ public:
 
     // Returns true if the filter is uninitialised (zero-size).
     [[nodiscard]] bool operator!() const { return tableSizeBits_ == 0; }
-
-    // ------------------------------------------------------------------
-    // Bitwise set operations (intersection/union/difference).
-    // These use SIMD when the table is large enough.
-    // ------------------------------------------------------------------
-    bloom_filter& operator&=(const bloom_filter& f) {
-        if (tableSizeBits_ == f.tableSizeBits_ && seed_ == f.seed_) {
-            const auto n = bitTable_.size();
-            if (n >= timestar::bloom::simd::kSimdThreshold) {
-                timestar::bloom::simd::bitwiseAndInplace(bitTable_.data(), f.bitTable_.data(), n);
-            } else {
-                for (std::size_t i = 0; i < n; ++i)
-                    bitTable_[i] &= f.bitTable_[i];
-            }
-        }
-        return *this;
-    }
-
-    bloom_filter& operator|=(const bloom_filter& f) {
-        if (tableSizeBits_ == f.tableSizeBits_ && seed_ == f.seed_) {
-            const auto n = bitTable_.size();
-            if (n >= timestar::bloom::simd::kSimdThreshold) {
-                timestar::bloom::simd::bitwiseOrInplace(bitTable_.data(), f.bitTable_.data(), n);
-            } else {
-                for (std::size_t i = 0; i < n; ++i)
-                    bitTable_[i] |= f.bitTable_[i];
-            }
-        }
-        return *this;
-    }
-
-    bloom_filter& operator^=(const bloom_filter& f) {
-        if (tableSizeBits_ == f.tableSizeBits_ && seed_ == f.seed_) {
-            const auto n = bitTable_.size();
-            if (n >= timestar::bloom::simd::kSimdThreshold) {
-                timestar::bloom::simd::bitwiseXorInplace(bitTable_.data(), f.bitTable_.data(), n);
-            } else {
-                for (std::size_t i = 0; i < n; ++i)
-                    bitTable_[i] ^= f.bitTable_[i];
-            }
-        }
-        return *this;
-    }
 
 private:
     // Compute two independent 64-bit hashes using XXH3.

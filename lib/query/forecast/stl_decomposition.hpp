@@ -36,10 +36,16 @@ struct MSTLResult {
  * Based on Cleveland et al. (1990) "STL: A Seasonal-Trend Decomposition
  * Procedure Based on Loess"
  *
- * NOTE: A simpler STL implementation exists at lib/query/anomaly/stl_decomposition.hpp
- * (timestar::anomaly::STLDecomposition) for anomaly detection. This version is more
- * sophisticated with AVX2-optimized LOESS, MAD-based robustness weights, and MSTL
- * (multiple seasonalities) support for forecasting.
+ * NOTE: A simpler, deliberately separate STL implementation exists at
+ * lib/query/anomaly/stl_decomposition.hpp (timestar::anomaly::STLDecomposition):
+ * a single-pass variant (subseries means, IQR/tricube robustness) tuned for cheap
+ * residual extraction in anomaly detection. This forecast version is the full
+ * Cleveland STL — inner/outer loops, cycle-subseries LOESS, low-pass filter,
+ * MAD/bisquare robustness weights, Highway-SIMD fused LOESS window kernels
+ * (forecast_simd.hpp), and MSTL (multiple seasonalities). They share no code
+ * beyond the ~8-line tricube weight function, so they are intentionally not
+ * unified. This file has fixed-seed bit-identical benchmark baselines
+ * (bin/forecast_benchmark) — numeric changes here are behavior changes.
  */
 class STLDecomposer {
 public:

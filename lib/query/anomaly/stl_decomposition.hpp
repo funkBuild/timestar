@@ -24,11 +24,17 @@ struct STLConfig {
 // STL Decomposition using Seasonal-Trend decomposition with LOESS
 // Based on Cleveland et al. (1990) "STL: A Seasonal-Trend Decomposition Procedure Based on LOESS"
 //
-// NOTE: A second STL implementation exists at lib/query/forecast/stl_decomposition.hpp
-// (timestar::forecast::STLDecomposer). That version supports multiple seasonalities
-// (MSTL), has AVX2-optimized LOESS, and uses MAD-based robustness weights. This
-// anomaly version is simpler (IQR-based, single seasonality) and optimized for
-// anomaly detection. Both implement the same core algorithm with different trade-offs.
+// NOTE: A second, deliberately separate STL implementation exists at
+// lib/query/forecast/stl_decomposition.hpp (timestar::forecast::STLDecomposer).
+// That version is the full Cleveland STL with inner/outer loops, cycle-subseries
+// LOESS smoothing, a low-pass filter stage, MAD/bisquare robustness weights,
+// Highway-SIMD fused LOESS window kernels, and MSTL (multiple seasonalities) —
+// accuracy-oriented for forecasting. This anomaly version is a simplified
+// single-pass variant (subseries means + LOESS smoothing, IQR/tricube robustness)
+// tuned for cheap residual extraction in anomaly detection. They share no code
+// beyond the ~8-line tricube weight function, so they are intentionally not
+// unified; keep behavior changes independent (forecast has fixed-seed
+// bit-identical benchmarks/tests).
 class STLDecomposition {
 public:
     // Decompose time series into seasonal, trend, and residual components
