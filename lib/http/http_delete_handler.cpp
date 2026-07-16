@@ -193,41 +193,39 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
         std::vector<DeleteRequest> deleteRequests;
 
         if (timestar::http::isProtobuf(reqFmt)) {
-            // Parse protobuf request — try batch first, fall back to single
-            try {
-                auto parsedList = timestar::proto::parseBatchDeleteRequest(req->content.data(), req->content.size());
-                static constexpr size_t MAX_BATCH_DELETE_SIZE = 10'000;
-                if (parsedList.size() > MAX_BATCH_DELETE_SIZE) {
-                    reply->set_status(seastar::http::reply::status_type::bad_request);
-                    if (timestar::http::isProtobuf(resFmt)) {
-                        reply->_content = timestar::proto::formatDeleteResponse(
-                            "error", 0, 0,
-                            "Batch delete exceeds maximum size of " + std::to_string(MAX_BATCH_DELETE_SIZE));
-                    } else {
-                        reply->_content = createErrorResponse("Batch delete exceeds maximum size of " +
-                                                              std::to_string(MAX_BATCH_DELETE_SIZE));
-                    }
-                    timestar::http::setContentType(*reply, resFmt);
-                    co_return reply;
+            // Wire-format ambiguity: a bare DeleteRequest that uses only the
+            // structured fields (measurement=2, tags=3, field=4, fields=5,
+            // start/end_time=6/7) contains no field number that
+            // BatchDeleteRequest recognizes (its only field is deletes=1), so
+            // protobuf "successfully" parses it as a BatchDeleteRequest with
+            // ZERO entries by skipping every field as unknown.  Treating that
+            // empty parse as an authoritative batch made structured single
+            // deletes silently no-op (success, totalRequests=0, nothing
+            // deleted).  Therefore a batch parse only wins when it yields at
+            // least one entry; otherwise the body is re-parsed as a single
+            // DeleteRequest.
+            //
+            // An empty body is fully ambiguous (an empty batch, an empty
+            // single delete, and zero bytes are all wire-identical) and a
+            // delete that targets nothing is almost certainly a client bug —
+            // reject it instead of reporting a vacuous success.
+            auto rejectBadRequest = [&](const std::string& message) {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, message);
+                } else {
+                    reply->_content = createErrorResponse(message);
                 }
-                for (auto& pd : parsedList) {
-                    DeleteRequest dr;
-                    dr.seriesKey = std::move(pd.seriesKey);
-                    dr.measurement = std::move(pd.measurement);
-                    dr.tags = std::move(pd.tags);
-                    dr.field = std::move(pd.field);
-                    dr.fields = std::move(pd.fields);
-                    dr.startTime = pd.startTime;
-                    dr.endTime = pd.endTime;
-                    dr.isStructured = pd.isStructured;
-                    dr.isPattern = pd.isPattern;
-                    validateDeleteRequest(dr);
-                    deleteRequests.push_back(std::move(dr));
-                }
-            } catch (const std::exception& e) {
-                // Batch parse failed, try single delete
-                timestar::http_log.debug("Batch delete parse failed ({}), falling back to single delete", e.what());
-                auto pd = timestar::proto::parseSingleDeleteRequest(req->content.data(), req->content.size());
+                timestar::http::setContentType(*reply, resFmt);
+            };
+
+            if (req->content.empty()) {
+                rejectBadRequest("Empty delete request body: at least one delete must be specified");
+                co_return reply;
+            }
+
+            // Converts + validates a parsed request; throws on invalid input.
+            auto convertAndValidate = [](timestar::proto::ParsedDeleteRequest&& pd) {
                 DeleteRequest dr;
                 dr.seriesKey = std::move(pd.seriesKey);
                 dr.measurement = std::move(pd.measurement);
@@ -239,7 +237,56 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 dr.isStructured = pd.isStructured;
                 dr.isPattern = pd.isPattern;
                 validateDeleteRequest(dr);
-                deleteRequests.push_back(std::move(dr));
+                return dr;
+            };
+
+            static constexpr size_t MAX_BATCH_DELETE_SIZE = 10'000;
+
+            // Attempt 1: BatchDeleteRequest — authoritative only if it parses,
+            // yields at least one entry, AND every entry validates.  (A single
+            // DeleteRequest using only the `series` string can coincidentally
+            // parse as a batch whose garbage entries fail validation; such
+            // bodies must fall through to the single-delete parse below, which
+            // is also what the previous implementation did via its catch-all.)
+            std::string batchError;
+            bool parsedAsBatch = false;
+            try {
+                auto parsedList =
+                    timestar::proto::parseBatchDeleteRequest(req->content.data(), req->content.size());
+                if (!parsedList.empty()) {
+                    if (parsedList.size() > MAX_BATCH_DELETE_SIZE) {
+                        rejectBadRequest("Batch delete exceeds maximum size of " +
+                                         std::to_string(MAX_BATCH_DELETE_SIZE));
+                        co_return reply;
+                    }
+                    std::vector<DeleteRequest> batchRequests;
+                    batchRequests.reserve(parsedList.size());
+                    for (auto& pd : parsedList) {
+                        batchRequests.push_back(convertAndValidate(std::move(pd)));
+                    }
+                    deleteRequests = std::move(batchRequests);
+                    parsedAsBatch = true;
+                }
+            } catch (const std::exception& e) {
+                batchError = e.what();
+                timestar::http_log.debug("Batch delete parse failed ({}), falling back to single delete",
+                                         e.what());
+            }
+
+            // Attempt 2: single DeleteRequest (zero-entry batch, batch parse
+            // failure, or batch entries that failed validation).
+            if (!parsedAsBatch) {
+                try {
+                    deleteRequests.push_back(convertAndValidate(
+                        timestar::proto::parseSingleDeleteRequest(req->content.data(), req->content.size())));
+                } catch (const std::exception& e) {
+                    timestar::http_log.debug("Single delete parse failed: {}", e.what());
+                    // Prefer the batch-side error when there was one — it came
+                    // from a body that structurally looked like a batch.
+                    rejectBadRequest(std::string("Invalid delete request: ") +
+                                     (batchError.empty() ? e.what() : batchError.c_str()));
+                    co_return reply;
+                }
             }
         } else {
             // Parse JSON body using Glaze

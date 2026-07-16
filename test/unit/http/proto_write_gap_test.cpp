@@ -699,6 +699,120 @@ TEST(ProtoWriteFastPathCompressed, FastAndGenericParsersAgreeOnCompressedPoint) 
 }
 
 // ============================================================================
+// Compressed-timestamp count regression (silent truncation bug)
+//
+// FFOR delta-of-delta encodes regular-spaced timestamps at ~0.03 bytes/value,
+// so the old bytes/2 + 1024 decode cap truncated any point with more than
+// ~1052 one-second-spaced timestamps (2000 -> 1052, 300k -> 3380) while the
+// write still reported full SUCCESS.  Both parsers must decode the TRUE count
+// carried in the FFOR block headers, and reject (never truncate) payloads
+// exceeding kMaxCompressedPointsPerWritePoint.
+// ============================================================================
+
+namespace {
+
+// Build a WriteRequest with one point: FFOR-compressed timestamps plus one
+// FFOR-compressed int64 field with a matching value count (constant values
+// compress to almost nothing, keeping the big-count tests fast).
+std::string buildCompressedTsRequest(const std::vector<uint64_t>& ts) {
+    ::timestar_pb::WriteRequest req;
+    auto* wp = req.add_writes();
+    wp->set_measurement("gap_metric");
+    (*wp->mutable_tags())["host"] = "server-01";
+
+    auto tsEnc = IntegerEncoder::encode(std::span<const uint64_t>(ts));
+    wp->set_compressed_timestamps(tsEnc.data.data(), tsEnc.size());
+
+    // int64 value 7 zigzag-encoded (as the client encoder does) for every point
+    std::vector<uint64_t> zz(ts.size(), (7ULL << 1));
+    auto vEnc = IntegerEncoder::encode(std::span<const uint64_t>(zz));
+    ::timestar_pb::WriteField wf;
+    wf.mutable_int64_values()->set_compressed_ffor(reinterpret_cast<const char*>(vEnc.data.data()), vEnc.size());
+    (*wp->mutable_fields())["value"] = wf;
+
+    std::string bytes;
+    req.SerializeToString(&bytes);
+    return bytes;
+}
+
+}  // namespace
+
+TEST(ProtoCompressedWriteGap, CompressedTimestamps2000NotTruncated) {
+    // 2000 one-second-spaced timestamps: the old cap decoded exactly 1052.
+    auto ts = makeTimestamps(2000);
+    auto bytes = buildCompressedTsRequest(ts);
+
+    auto generic = parseWriteRequest(bytes.data(), bytes.size());
+    ASSERT_EQ(generic.size(), 1u);
+    ASSERT_EQ(generic[0].timestamps.size(), 2000u);
+    EXPECT_EQ(generic[0].timestamps, ts);
+    EXPECT_EQ(generic[0].fields.at("value").integers.size(), 2000u);
+
+    auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
+    EXPECT_EQ(fast.failedWrites, 0);
+    ASSERT_EQ(fast.inserts.size(), 1u);
+    ASSERT_EQ(fast.inserts[0].timestamps->size(), 2000u);
+    EXPECT_EQ(*fast.inserts[0].timestamps, ts);
+    EXPECT_EQ(fast.inserts[0].integerValues.size(), 2000u);
+    EXPECT_EQ(fast.totalPoints, 2000);
+}
+
+TEST(ProtoCompressedWriteGap, CompressedTimestamps300kNotTruncated) {
+    // 300k values compress to ~4.7KB; the old cap decoded exactly 3380.
+    constexpr size_t kCount = 300'000;
+    auto ts = makeTimestamps(kCount);
+    auto bytes = buildCompressedTsRequest(ts);
+
+    auto generic = parseWriteRequest(bytes.data(), bytes.size());
+    ASSERT_EQ(generic.size(), 1u);
+    ASSERT_EQ(generic[0].timestamps.size(), kCount);
+    EXPECT_EQ(generic[0].timestamps.front(), ts.front());
+    EXPECT_EQ(generic[0].timestamps.back(), ts.back());
+
+    auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
+    EXPECT_EQ(fast.failedWrites, 0);
+    ASSERT_EQ(fast.inserts.size(), 1u);
+    ASSERT_EQ(fast.inserts[0].timestamps->size(), kCount);
+    EXPECT_EQ(fast.inserts[0].timestamps->back(), ts.back());
+    EXPECT_EQ(fast.totalPoints, static_cast<int64_t>(kCount));
+}
+
+TEST(ProtoCompressedWriteGap, CompressedTimestampsAtLimitAccepted) {
+    // Exactly kMaxCompressedPointsPerWritePoint values must be accepted in full.
+    const size_t kCount = kMaxCompressedPointsPerWritePoint;
+    auto ts = makeTimestamps(kCount);
+    auto bytes = buildCompressedTsRequest(ts);
+
+    auto generic = parseWriteRequest(bytes.data(), bytes.size());
+    ASSERT_EQ(generic.size(), 1u);
+    EXPECT_EQ(generic[0].timestamps.size(), kCount);
+    EXPECT_EQ(generic[0].timestamps.back(), ts.back());
+
+    auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
+    EXPECT_EQ(fast.failedWrites, 0);
+    ASSERT_EQ(fast.inserts.size(), 1u);
+    EXPECT_EQ(fast.inserts[0].timestamps->size(), kCount);
+}
+
+TEST(ProtoCompressedWriteGap, CompressedTimestampsOverLimitRejectedNotTruncated) {
+    // One value past the limit: a loud rejection, never a stored prefix.
+    const size_t kCount = kMaxCompressedPointsPerWritePoint + 1;
+    auto ts = makeTimestamps(kCount);
+    auto bytes = buildCompressedTsRequest(ts);
+
+    // Generic parser: whole-request error.
+    EXPECT_THROW(parseWriteRequest(bytes.data(), bytes.size()), std::runtime_error);
+
+    // Fast path: clean per-point error, nothing emitted for the point.
+    auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
+    EXPECT_EQ(fast.inserts.size(), 0u);
+    EXPECT_EQ(fast.totalPoints, 0);
+    EXPECT_EQ(fast.failedWrites, 1);
+    ASSERT_GE(fast.errors.size(), 1u);
+    EXPECT_NE(fast.errors[0].find("max points per write point"), std::string::npos) << fast.errors[0];
+}
+
+// ============================================================================
 // Generic parser: unset oneof field is skipped
 // ============================================================================
 

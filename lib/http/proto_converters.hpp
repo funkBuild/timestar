@@ -183,6 +183,34 @@ struct ForecastQueryResultData {
 // Write converters
 // ============================================================================
 
+// Safety bound for decoding "Approach B" compressed_timestamps payloads.
+//
+// FFOR delta-of-delta encodes regular-spaced timestamps at well under one bit
+// per value (a single 16-byte all-zero block header covers 1024 values), so
+// the compressed byte count says almost nothing about how many values the
+// payload encodes — any byte-ratio heuristic either truncates legitimate
+// writes (the old bytes/2 + 1024 cap silently dropped everything past value
+// 1052 of a 2000-value point) or admits decompression bombs.  Instead the
+// parsers decode the TRUE count carried in the FFOR block headers, bounded by
+// this server-side limit on points per write point (matches the default
+// http.max_total_points config).  A payload that decodes past this limit is
+// rejected loudly as a per-point error — never silently truncated to a prefix.
+inline constexpr size_t kMaxCompressedPointsPerWritePoint = 10'000'000;
+
+// Decode bound to pass to IntegerEncoder::decode for a compressed payload of
+// `bytes` bytes.  Structurally, one FFOR block consumes at least 16 bytes
+// (2-word header) and emits at most 1024 values, so a payload can never
+// decode to more than bytes * 64 values; clamping to that keeps the decoder's
+// up-front vector reserve proportional to the payload size.  The +1 over the
+// point limit makes an over-limit stream decode to exactly
+// kMaxCompressedPointsPerWritePoint + 1 values, which the callers detect and
+// reject (see parseWriteRequest / parseWriteRequestFast).
+inline constexpr size_t compressedTimestampDecodeBound(size_t bytes) {
+    const size_t structuralMax = bytes * 64;  // floor(bytes / 16) blocks x 1024 values, rounded up
+    return structuralMax < kMaxCompressedPointsPerWritePoint + 1 ? structuralMax
+                                                                 : kMaxCompressedPointsPerWritePoint + 1;
+}
+
 // Parse a WriteRequest proto from raw bytes into a vector of MultiWritePoints.
 // Throws std::runtime_error on parse failure.
 std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size);

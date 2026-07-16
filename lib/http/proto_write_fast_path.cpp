@@ -16,6 +16,10 @@
 
 #include "proto_write_fast_path.hpp"
 
+// For kMaxCompressedPointsPerWritePoint / compressedTimestampDecodeBound —
+// the shared safety bound both protobuf write parsers must agree on.
+#include "proto_converters.hpp"
+
 #include "timestar.pb.h"
 
 // Compression decoders for Approach B compressed proto fields
@@ -137,9 +141,12 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
             bool tsDecodeOk = true;
             try {
                 Slice tsSlice(reinterpret_cast<const uint8_t*>(ct.data()), ct.size());
-                // Upper bound: compressed data can't encode more values than bytes/2
-                // (minimum 16 bytes per block header). The decoder stops at slice end.
-                size_t maxCount = ct.size() / 2 + 1024;
+                // Decode the TRUE value count carried in the FFOR block headers
+                // (same contract as parseWriteRequest). The bound only guards
+                // against decompression bombs; the over-limit check below turns
+                // an oversized payload into a per-point error instead of a
+                // silently truncated prefix.
+                const size_t maxCount = compressedTimestampDecodeBound(ct.size());
                 IntegerEncoder::decode(tsSlice, static_cast<unsigned int>(maxCount), timestamps);
             } catch (const std::exception& e) {
                 tsDecodeOk = false;
@@ -155,6 +162,17 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                 tsDecodeOk = false;
                 if (result.errors.size() < 10) {
                     result.errors.push_back("Corrupt compressed timestamps: decoded to zero timestamps");
+                }
+            }
+            // Over-limit: the stream encodes more points than the server allows
+            // per write point (decode stopped at limit + 1). Storing what was
+            // decoded would silently drop the rest, so reject the whole point.
+            if (tsDecodeOk && timestamps.size() > kMaxCompressedPointsPerWritePoint) {
+                tsDecodeOk = false;
+                if (result.errors.size() < 10) {
+                    result.errors.push_back("compressed_timestamps decodes to more than " +
+                                            std::to_string(kMaxCompressedPointsPerWritePoint) +
+                                            " values (max points per write point)");
                 }
             }
             if (!tsDecodeOk) {

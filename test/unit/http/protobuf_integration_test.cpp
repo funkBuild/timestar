@@ -178,10 +178,16 @@ static std::vector<double> decodeAlpValues(const std::string& compressed, size_t
 }
 
 // Query response timestamps ride in compressed_timestamps (FFOR).
+// NOTE: the decode bound must NOT be derived from the byte count — FFOR
+// encodes regular-spaced timestamps at ~0.03 bytes/value, so bytes/2-style
+// heuristics silently truncate (that heuristic was the server-side write bug
+// pinned by the CompressedTimestamps* tests below).
 static std::vector<uint64_t> decodeFforTimestamps(const std::string& compressed) {
     std::vector<uint64_t> out;
     Slice slice(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
-    IntegerEncoder::decode(slice, static_cast<unsigned int>(compressed.size() / 2 + 1024), out);
+    // 1M values is far beyond any response in this suite (the decoder stops at
+    // the true encoded count; the bound is just a decompression-bomb guard).
+    IntegerEncoder::decode(slice, 1u << 20, out);
     return out;
 }
 
@@ -1408,6 +1414,332 @@ TEST_F(ProtobufIntegrationTest, WriteCorruptCompressedTimestampsReturnsPerPointE
         EXPECT_GE(resp.failed_writes(), 1);
         ASSERT_GE(resp.errors_size(), 1);
         EXPECT_NE(resp.errors(0).find("Corrupt compressed timestamps"), std::string::npos) << resp.errors(0);
+    })
+        .join()
+        .get();
+}
+
+// ============================================================================
+// 8. Compressed-timestamp COUNT regression (silent write truncation)
+//
+// FFOR delta-of-delta encodes regular-spaced timestamps at ~0.03 bytes/value.
+// The old decode cap of bytes/2 + 1024 therefore silently truncated any point
+// with more than ~1052 one-second-spaced compressed timestamps (2000 -> 1052)
+// while reporting SUCCESS with failed_writes == 0.
+// ============================================================================
+
+TEST_F(ProtobufIntegrationTest, WriteCompressedTimestamps2000AllStoredAndQueryable) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        // 2000 one-second-spaced points, timestamps AND values compressed.
+        constexpr size_t kCount = 2000;
+        std::vector<uint64_t> ts;
+        std::vector<double> values;
+        ts.reserve(kCount);
+        values.reserve(kCount);
+        uint64_t base = 1704067200000000000ULL;  // 2024-01-01
+        for (size_t i = 0; i < kCount; ++i) {
+            ts.push_back(base + i * 1000000000ULL);
+            values.push_back(static_cast<double>(i));
+        }
+
+        auto writeBytes = buildCompressedProtoWriteRequest("pb_ts2000", {{"host", "h1"}}, "value", values, ts);
+        auto writeReq = makeProtoWriteRequest(writeBytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        auto writeResp = parseProtoWriteResponse(writeRep->_content);
+        // Before the fix: status "success", points_written == 1052 (bytes/2+1024).
+        EXPECT_EQ(writeResp.status(), "success");
+        EXPECT_EQ(writeResp.points_written(), static_cast<int64_t>(kCount));
+        EXPECT_EQ(writeResp.failed_writes(), 0);
+
+        // Every point must be stored and queryable: 1s buckets over the full
+        // window -> exactly one bucket per written point (2000 points).
+        // Under the old truncation bug only 1052 buckets would come back.
+        auto queryBytes = buildProtoQueryRequest("avg:pb_ts2000(value){host:h1}", 0,
+                                                 base + kCount * 1000000000ULL, "1s");
+        auto queryReq = makeProtoQueryRequest(queryBytes);
+        auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
+        ASSERT_TRUE(isOk(*queryRep));
+
+        auto queryResp = parseProtoQueryResponse(queryRep->_content);
+        EXPECT_EQ(queryResp.status(), "success");
+        ASSERT_GE(queryResp.series_size(), 1);
+        EXPECT_EQ(queryResp.statistics().point_count(), kCount);
+
+        auto& fieldData = queryResp.series(0).fields().at("value");
+        ASSERT_TRUE(fieldData.has_double_values());
+        auto gotTs = decodeFforTimestamps(fieldData.compressed_timestamps());
+        auto gotVals = decodeAlpValues(fieldData.double_values().compressed_alp(), gotTs.size());
+        ASSERT_EQ(gotTs.size(), kCount);
+        ASSERT_EQ(gotVals.size(), kCount);
+        EXPECT_EQ(gotTs.front(), ts.front());
+        EXPECT_EQ(gotTs.back(), ts.back());
+        EXPECT_DOUBLE_EQ(gotVals.front(), values.front());
+        EXPECT_DOUBLE_EQ(gotVals.back(), values.back());
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, WriteCompressedTimestampsOverLimitCleanPerPointError) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        // One value past the per-point limit: must be a clean per-point error,
+        // never a silently stored prefix.
+        const size_t kCount = timestar::proto::kMaxCompressedPointsPerWritePoint + 1;
+        std::vector<uint64_t> ts;
+        ts.reserve(kCount);
+        uint64_t base = 1704067200000000000ULL;
+        for (size_t i = 0; i < kCount; ++i) {
+            ts.push_back(base + i * 1000000000ULL);
+        }
+
+        ::timestar_pb::WriteRequest pbReq;
+        auto* wp = pbReq.add_writes();
+        wp->set_measurement("pb_ts_overlimit");
+        (*wp->mutable_tags())["host"] = "h1";
+        auto tsEnc = IntegerEncoder::encode(std::span<const uint64_t>(ts));
+        wp->set_compressed_timestamps(tsEnc.data.data(), tsEnc.size());
+
+        ::timestar_pb::WriteField wf;
+        wf.mutable_double_values()->add_values(1.0);
+        (*wp->mutable_fields())["value"] = wf;
+
+        std::string bytes;
+        pbReq.SerializeToString(&bytes);
+
+        auto writeReq = makeProtoWriteRequest(bytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        auto writeResp = parseProtoWriteResponse(writeRep->_content);
+        EXPECT_EQ(writeResp.status(), "partial");
+        EXPECT_EQ(writeResp.points_written(), 0);
+        EXPECT_GE(writeResp.failed_writes(), 1);
+        ASSERT_GE(writeResp.errors_size(), 1);
+        EXPECT_NE(writeResp.errors(0).find("max points per write point"), std::string::npos)
+            << writeResp.errors(0);
+
+        // Nothing may have been stored (no truncated prefix).
+        auto queryBytes = buildProtoQueryRequest("count:pb_ts_overlimit(value){host:h1}", 0, UINT64_MAX / 2);
+        auto queryReq = makeProtoQueryRequest(queryBytes);
+        auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
+        ASSERT_TRUE(isOk(*queryRep));
+        auto queryResp = parseProtoQueryResponse(queryRep->_content);
+        EXPECT_EQ(queryResp.statistics().point_count(), 0u);
+    })
+        .join()
+        .get();
+}
+
+// ============================================================================
+// 9. Structured protobuf DeleteRequest regression (silent no-op delete)
+//
+// A bare DeleteRequest that uses only structured fields (measurement=2,
+// tags=3, field=4/fields=5) has no field number in common with
+// BatchDeleteRequest (deletes=1), so it used to parse as a VALID zero-entry
+// batch and the handler reported success with total_requests == 0 while
+// deleting nothing.
+// ============================================================================
+
+TEST_F(ProtobufIntegrationTest, BareStructuredProtoDeleteActuallyDeletes) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpDeleteHandler deleteHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        auto writeBytes = buildProtoWriteRequest("pb_bare_del", {{"host", "h1"}}, {{"value", {10.0, 20.0, 30.0}}},
+                                                 {1000000000ULL, 2000000000ULL, 3000000000ULL});
+        auto writeReq = makeProtoWriteRequest(writeBytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        // Bare structured DeleteRequest (NOT wrapped in BatchDeleteRequest),
+        // targeting the specific field.
+        auto deleteBytes = buildProtoDeleteRequest("pb_bare_del", {{"host", "h1"}}, "value");
+        auto deleteReq = makeProtoDeleteRequest(deleteBytes);
+        auto deleteRep = deleteHandler.handleDelete(std::move(deleteReq)).get();
+        ASSERT_TRUE(isOk(*deleteRep));
+
+        auto deleteResp = parseProtoDeleteResponse(deleteRep->_content);
+        EXPECT_EQ(deleteResp.status(), "success");
+        // Before the fix: total_requests == 0 and deleted_count == 0.
+        EXPECT_EQ(deleteResp.total_requests(), 1u);
+        EXPECT_EQ(deleteResp.deleted_count(), 1u);
+
+        // The data must actually be gone.
+        auto queryBytes = buildProtoQueryRequest("avg:pb_bare_del(value){host:h1}", 0, 4000000000ULL);
+        auto queryReq = makeProtoQueryRequest(queryBytes);
+        auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
+        ASSERT_TRUE(isOk(*queryRep));
+        auto queryResp = parseProtoQueryResponse(queryRep->_content);
+        EXPECT_EQ(queryResp.status(), "success");
+        EXPECT_EQ(queryResp.statistics().point_count(), 0u);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, BareStructuredProtoDeletePatternAllFields) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpDeleteHandler deleteHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        auto writeBytes = buildProtoWriteRequest("pb_bare_del_pat", {{"host", "h1"}},
+                                                 {{"value", {1.0, 2.0}}, {"other", {3.0, 4.0}}},
+                                                 {1000000000ULL, 2000000000ULL});
+        auto writeReq = makeProtoWriteRequest(writeBytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        // Bare structured DeleteRequest with no field -> pattern delete of all
+        // fields of the measurement.
+        auto deleteBytes = buildProtoDeleteRequest("pb_bare_del_pat", {{"host", "h1"}});
+        auto deleteReq = makeProtoDeleteRequest(deleteBytes);
+        auto deleteRep = deleteHandler.handleDelete(std::move(deleteReq)).get();
+        ASSERT_TRUE(isOk(*deleteRep));
+
+        auto deleteResp = parseProtoDeleteResponse(deleteRep->_content);
+        EXPECT_EQ(deleteResp.status(), "success");
+        EXPECT_EQ(deleteResp.total_requests(), 1u);
+        EXPECT_GE(deleteResp.deleted_count(), 2u);  // both fields' series
+
+        auto queryBytes = buildProtoQueryRequest("avg:pb_bare_del_pat()", 0, 4000000000ULL);
+        auto queryReq = makeProtoQueryRequest(queryBytes);
+        auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
+        ASSERT_TRUE(isOk(*queryRep));
+        auto queryResp = parseProtoQueryResponse(queryRep->_content);
+        EXPECT_EQ(queryResp.statistics().point_count(), 0u);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, BatchProtoDeleteStillWorks) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpDeleteHandler deleteHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        auto writeBytes = buildProtoBatchWriteRequest({
+            {"pb_batch_del_a", {{"host", "h1"}}, {{"value", {1.0}}}, {1000000000ULL}},
+            {"pb_batch_del_b", {{"host", "h2"}}, {{"value", {2.0}}}, {1000000000ULL}},
+        });
+        auto writeReq = makeProtoWriteRequest(writeBytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        // Real BatchDeleteRequest with two structured entries.
+        ::timestar_pb::BatchDeleteRequest batch;
+        {
+            auto* d = batch.add_deletes();
+            d->set_measurement("pb_batch_del_a");
+            (*d->mutable_tags())["host"] = "h1";
+            d->set_field("value");
+        }
+        {
+            auto* d = batch.add_deletes();
+            d->set_measurement("pb_batch_del_b");
+            (*d->mutable_tags())["host"] = "h2";
+            d->set_field("value");
+        }
+        std::string deleteBytes;
+        batch.SerializeToString(&deleteBytes);
+
+        auto deleteReq = makeProtoDeleteRequest(deleteBytes);
+        auto deleteRep = deleteHandler.handleDelete(std::move(deleteReq)).get();
+        ASSERT_TRUE(isOk(*deleteRep));
+
+        auto deleteResp = parseProtoDeleteResponse(deleteRep->_content);
+        EXPECT_EQ(deleteResp.status(), "success");
+        EXPECT_EQ(deleteResp.total_requests(), 2u);
+        EXPECT_EQ(deleteResp.deleted_count(), 2u);
+
+        for (const char* m : {"pb_batch_del_a", "pb_batch_del_b"}) {
+            auto queryBytes = buildProtoQueryRequest(std::string("avg:") + m + "()", 0, 4000000000ULL);
+            auto queryReq = makeProtoQueryRequest(queryBytes);
+            auto queryRep = queryHandler.handleQuery(std::move(queryReq)).get();
+            ASSERT_TRUE(isOk(*queryRep));
+            auto queryResp = parseProtoQueryResponse(queryRep->_content);
+            EXPECT_EQ(queryResp.statistics().point_count(), 0u) << m;
+        }
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, SeriesKeyProtoDeleteStillWorks) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpDeleteHandler deleteHandler(&eng.eng);
+
+        auto writeBytes = buildProtoWriteRequest("pb_series_del", {{"host", "h1"}}, {{"value", {5.0}}},
+                                                 {1000000000ULL});
+        auto writeReq = makeProtoWriteRequest(writeBytes);
+        auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
+        ASSERT_TRUE(isOk(*writeRep));
+
+        // Bare DeleteRequest using the series-key form (field 1).
+        ::timestar_pb::DeleteRequest del;
+        del.set_series("pb_series_del,host=h1 value");
+        std::string deleteBytes;
+        del.SerializeToString(&deleteBytes);
+
+        auto deleteReq = makeProtoDeleteRequest(deleteBytes);
+        auto deleteRep = deleteHandler.handleDelete(std::move(deleteReq)).get();
+        ASSERT_TRUE(isOk(*deleteRep));
+
+        auto deleteResp = parseProtoDeleteResponse(deleteRep->_content);
+        EXPECT_EQ(deleteResp.status(), "success");
+        EXPECT_EQ(deleteResp.total_requests(), 1u);
+        EXPECT_EQ(deleteResp.deleted_count(), 1u);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(ProtobufIntegrationTest, EmptyProtoDeleteBodyRejected) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpDeleteHandler deleteHandler(&eng.eng);
+
+        // Zero bytes is wire-identical to an empty BatchDeleteRequest AND an
+        // empty DeleteRequest; a delete that targets nothing is rejected
+        // instead of reporting a vacuous success (pinned semantics).
+        auto deleteReq = makeProtoDeleteRequest("");
+        auto deleteRep = deleteHandler.handleDelete(std::move(deleteReq)).get();
+        EXPECT_EQ(deleteRep->_status, seastar::http::reply::status_type::bad_request);
+
+        auto deleteResp = parseProtoDeleteResponse(deleteRep->_content);
+        EXPECT_EQ(deleteResp.status(), "error");
+        EXPECT_EQ(deleteResp.total_requests(), 0u);
     })
         .join()
         .get();
