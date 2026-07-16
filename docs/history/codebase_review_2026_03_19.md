@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT** (review, March 19, 2026) — describes the design as planned; symbol names and details have since changed. See [docs/architecture.md](../architecture.md) for current state.
+
 # TimeStar Codebase Review - March 19, 2026
 
 ## Summary

@@ -346,6 +346,7 @@ The TimeStar includes an HTTP server with a JSON-based write API for data ingest
 - `GET /measurements` - List measurements
 - `GET /tags` - Get tag keys and values
 - `GET /fields` - Get field names and types
+- `GET /cardinality` - Estimate series cardinality for a measurement (HyperLogLog estimate; optional `tag_key`/`tag_value` pair)
 - `POST /delete` - Delete data by series, pattern, or time range
 - `POST /subscribe` - SSE streaming subscriptions
 - `GET /subscriptions` - List active subscriptions

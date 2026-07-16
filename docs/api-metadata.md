@@ -1,6 +1,6 @@
 # Metadata API
 
-Discover measurements, tags, and fields stored in the database.
+Discover measurements, tags, fields, and series cardinality stored in the database.
 
 ## List Measurements
 
@@ -96,6 +96,59 @@ curl "http://localhost:8086/fields?measurement=temperature"
 ```
 
 > **Note:** If the measurement does not exist, the endpoint returns 200 with an empty `fields` object rather than a 404 error.
+
+## Get Cardinality
+
+**Endpoint:** `GET /cardinality`
+
+Estimate the number of distinct series for a measurement, or for a specific tag key/value pair.
+
+```bash
+# Series cardinality for a measurement, plus per-tag-key distinct value counts
+curl "http://localhost:8086/cardinality?measurement=temperature"
+
+# Series cardinality for a specific tag key/value pair
+curl "http://localhost:8086/cardinality?measurement=temperature&tag_key=location&tag_value=us-west"
+```
+
+**Parameters:**
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `measurement` | string | yes | Measurement name |
+| `tag_key` | string | no | Tag key to estimate cardinality for; must be provided together with `tag_value` |
+| `tag_value` | string | no | Tag value to estimate cardinality for; must be provided together with `tag_key` |
+
+**Response (200) - measurement-level:**
+```json
+{
+  "measurement": "temperature",
+  "estimated_series_count": 1024.0,
+  "tag_cardinalities": {
+    "location": 2.0,
+    "sensor": 512.0
+  }
+}
+```
+
+Without `tag_key`/`tag_value`, `estimated_series_count` is the estimated number of series in the measurement and `tag_cardinalities` maps each tag key to its number of distinct values.
+
+**Response (200) - specific tag pair:**
+```json
+{
+  "measurement": "temperature",
+  "estimated_series_count": 512.0,
+  "tag_cardinalities": {
+    "location:us-west": 512.0
+  }
+}
+```
+
+With `tag_key` and `tag_value`, `estimated_series_count` is the estimated number of series matching that tag pair, and `tag_cardinalities` contains a single `"key:value"` entry with the same estimate.
+
+> **Note:** Series counts are **HyperLogLog estimates**, not exact counts. Each shard maintains its own HLL sketch and the per-shard estimates are summed across shards, so values are approximate (and reported as floating-point numbers). Per-tag-key distinct value counts in the measurement-level response are exact.
+
+**Errors:** `400 MISSING_PARAMETER` if `measurement` is absent; `400 INVALID_PARAMETER` if a parameter fails validation or only one of `tag_key`/`tag_value` is provided.
 
 ## Errors
 

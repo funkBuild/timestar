@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT** (plan, March 2026) — describes the design as planned; symbol names and details have since changed. See [docs/architecture.md](../architecture.md) for current state.
+
 # Seastar-Native Index: Implementation Plan
 
 **Branch:** `feature/seastar-native-index`

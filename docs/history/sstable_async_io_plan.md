@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT** (plan) — describes the design as planned; symbol names and details have since changed. See [docs/architecture.md](../architecture.md) for current state.
+
 # SSTable Async I/O Migration Plan (Revised)
 
 ## Problem

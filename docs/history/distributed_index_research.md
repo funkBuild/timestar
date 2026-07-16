@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT** (research, March 14, 2026) — describes the design as planned; symbol names and details have since changed. See [docs/architecture.md](../architecture.md) for current state.
+
 # Distributed Indexing Research: Lessons from Production Systems
 
 **Date**: March 14, 2026

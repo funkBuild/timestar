@@ -131,6 +131,7 @@ Key config sections: `[server]`, `[storage]`, `[http]`, `[index]`, `[engine]`, `
 | GET | `/measurements` | [List measurements](docs/api-metadata.md) |
 | GET | `/tags` | [Get tag keys and values](docs/api-metadata.md) |
 | GET | `/fields` | [Get field names and types](docs/api-metadata.md) |
+| GET | `/cardinality` | [Estimate series cardinality (HLL)](docs/api-metadata.md) |
 | POST | `/subscribe` | [SSE streaming subscriptions](docs/api-streaming.md) |
 | GET | `/subscriptions` | [List active subscriptions](docs/api-streaming.md) |
 | PUT/GET/DELETE | `/retention` | [Retention and downsampling policies](docs/api-retention.md) |

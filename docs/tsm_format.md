@@ -37,7 +37,7 @@ Files with version outside `[TSM_VERSION_MIN, TSM_VERSION]` (currently `[1, 2]`)
 
 ## Data Blocks
 
-Each block stores up to `max_points_per_block` (default 1000) timestamp-value pairs for a single series.
+Each block stores up to `max_points_per_block` (default 3000, configurable via `[storage]` in the TOML config) timestamp-value pairs for a single series.
 
 ### Block Header (9 bytes)
 

@@ -50,7 +50,7 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
                                     ") and values (" + std::to_string(values.size()) + ") size mismatch");
     }
     // serializes a single series into one or more blocks. After each block, append an index entry.
-    // Block size is config-driven via storage.max_points_per_block (default 1000).
+    // Block size is config-driven via storage.max_points_per_block (default 3000).
     TSMIndexEntry indexEntry;
     indexEntry.seriesId = seriesId;
     indexEntry.seriesType = seriesType;

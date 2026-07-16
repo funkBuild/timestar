@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT** (review) — describes the design as planned; symbol names and details have since changed. See [docs/architecture.md](../architecture.md) for current state.
+
 # Index Architecture & Query Usage Report
 
 ## 1. Current Architecture

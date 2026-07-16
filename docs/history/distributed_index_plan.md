@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT** (plan, March 2026) — describes the design as planned; symbol names and details have since changed. See [docs/architecture.md](../architecture.md) for current state.
+
 # Distributed Index Implementation Plan
 
 **Status**: Phases 1-5 Complete, Phase 6+ Planned

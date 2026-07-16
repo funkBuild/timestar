@@ -109,6 +109,15 @@ TEST_F(TSMSeastarTest, ReadFloatData) {
 - **Exceptions** (`std::runtime_error`) for unrecoverable errors (file I/O failures, corrupt data). Caught at HTTP handler boundaries and converted to JSON error responses.
 - **`seastar::gate_closed_exception`** is expected during shutdown; catch and ignore it.
 
+### Error Handling Policy
+
+The intended split for new and refactored code:
+
+- **`std::expected<T, E>`** for recoverable I/O and storage errors in `lib/index` (and, over time, other storage layers). The caller decides whether to retry, degrade, or propagate.
+- **Exceptions** for parse and validation errors in the HTTP and query layers. Handlers catch at the boundary and translate to JSON error responses with appropriate status codes.
+- **`std::optional`** strictly for genuine value-absence ("no such series"), never as an error channel — if the caller needs to know *why* something failed, use `std::expected`.
+- **`TSMResult` / `QueryResult`** are legacy result wrappers. Do not extend them; converge toward `std::expected` opportunistically when touching code that uses them.
+
 ## SIMD (Google Highway)
 
 SIMD files follow Highway's multi-compilation pattern. Each `.cpp` is compiled once per ISA target:

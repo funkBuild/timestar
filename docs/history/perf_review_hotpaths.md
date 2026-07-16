@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT** (review, June 2026) — describes the design as planned; symbol names and details have since changed. See [docs/architecture.md](../architecture.md) for current state.
+
 # TimeStar Performance Review — Insert & Query Hot Paths
 
 > Multi-agent review (June 2026). 16 hot-path components reviewed by focused agents; every
