@@ -295,18 +295,25 @@ void Exp(const double* in, double* out, size_t count) {
 
 // ---------------------------------------------------------------------------
 // 13. RoundHalfAway -- round to nearest, halves away from zero (std::round
-//     semantics; Highway's Round is round-to-even). copysign(floor(|x|+0.5), x).
-//     NaN propagates through Abs/Add/Floor/CopySign.
+//     semantics; Highway's Round is round-to-even). trunc(v) + copysign(
+//     |v - trunc(v)| >= 0.5 ? 1 : 0, v). The subtraction is exact (Sterbenz),
+//     unlike the former floor(|v|+0.5) form, which double-rounded: it mapped
+//     0.49999999999999994 -> 1 and shifted odd integers in [2^52, 2^53).
+//     NaN propagates (frac becomes NaN, the Ge mask is false, NaN + 0 = NaN);
+//     +/-Inf pass through (Inf - Inf = NaN in frac, add lane is 0).
 // ---------------------------------------------------------------------------
 void RoundHalfAway(const double* in, double* out, size_t count) {
     const hn::ScalableTag<double> d;
     const size_t N = hn::Lanes(d);
     const auto half = hn::Set(d, 0.5);
+    const auto one = hn::Set(d, 1.0);
     size_t i = 0;
     for (; i + N <= count; i += N) {
         auto v = hn::LoadU(d, &in[i]);
-        auto r = hn::Floor(hn::Add(hn::Abs(v), half));
-        hn::StoreU(hn::CopySign(r, v), d, &out[i]);
+        auto t = hn::Trunc(v);
+        auto frac = hn::Abs(hn::Sub(v, t));
+        auto add = hn::IfThenElseZero(hn::Ge(frac, half), one);
+        hn::StoreU(hn::Add(t, hn::CopySign(add, v)), d, &out[i]);
     }
     for (; i < count; ++i)
         out[i] = std::round(in[i]);

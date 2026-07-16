@@ -222,8 +222,9 @@ TEST_F(TransformSimdPropertyTest, ScaleShiftMatchesScalarSweep) {
 // ==================== round: half-away-from-zero semantics ====================
 
 TEST_F(TransformSimdPropertyTest, RoundMatchesScalarSweep) {
-    // Random values stay within +-1e6 and specials within +-1e15, both far
-    // below 2^52 where the floor(|x|+0.5) construction is exact.
+    // Random values stay within +-1e6 and specials within +-1e15; the
+    // double-rounding domains (near 0.5 and [2^52, 2^53)) are pinned
+    // separately in RoundDoubleRoundingDomains.
     checkUnarySweep(&simd::round, &simd::scalar::round, "round");
 }
 
@@ -244,6 +245,41 @@ TEST_F(TransformSimdPropertyTest, RoundHalfAwayTies) {
     // Signed zero must be preserved (CopySign path).
     EXPECT_TRUE(std::signbit(out[11])) << "round(-0.0) must stay -0.0";
     EXPECT_FALSE(std::signbit(out[10]));
+}
+
+TEST_F(TransformSimdPropertyTest, RoundDoubleRoundingDomains) {
+    // Regression pin for the floor(|x|+0.5) double-rounding bug: the largest
+    // double below 0.5 must round to 0 (|x|+0.5 rounds up to 1.0 in FP), and
+    // odd integers in [2^52, 2^53) must pass through unchanged (|x|+0.5 rounds
+    // to even, shifting them up by one). 16 elements so every lane width runs
+    // the SIMD body.
+    const double almostHalf = std::nextafter(0.5, 0.0);  // 0.49999999999999994
+    const double p52 = 9007199254740993.0 / 2.0;         // representative odd-mantissa range
+    std::vector<double> in = {almostHalf,
+                              -almostHalf,
+                              4503599627370497.0,   // 2^52 + 1 (odd)
+                              -4503599627370497.0,
+                              9007199254740991.0,   // 2^53 - 1 (odd)
+                              -9007199254740991.0,
+                              4503599627370496.0,   // 2^52 (even)
+                              9007199254740992.0,   // 2^53
+                              p52,
+                              -p52,
+                              0.5,
+                              -0.5,
+                              1.4999999999999998,   // largest double < 1.5
+                              -1.4999999999999998,
+                              2.5,
+                              -2.5};
+    auto out = simd::round(in);
+    ASSERT_EQ(out.size(), in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        EXPECT_EQ(out[i], std::round(in[i]))
+            << "round differs from std::round at i=" << i << " in=" << std::hexfloat << in[i];
+    }
+    EXPECT_EQ(out[0], 0.0) << "largest double below 0.5 must round to 0";
+    EXPECT_EQ(out[2], 4503599627370497.0) << "odd integer in [2^52,2^53) must be unchanged";
+    EXPECT_EQ(out[4], 9007199254740991.0) << "2^53-1 must be unchanged";
 }
 
 TEST_F(TransformSimdPropertyTest, RoundNonFinite) {

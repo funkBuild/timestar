@@ -30,7 +30,8 @@ std::unique_ptr<seastar::http::reply> checkAuth(const seastar::http::request& re
 std::unique_ptr<seastar::http::reply> make401Reply(const std::string& message);
 
 // Mask a token for safe logging: show first 4 and last 4 characters, replace
-// the middle with "***".  Tokens shorter than 12 characters are fully masked.
+// the middle with "***".  Tokens shorter than 9 characters (4 + 4 + at least
+// one masked character) are fully masked.
 // Example: "abcd1234efgh5678" -> "abcd***5678"
 std::string maskToken(std::string_view token);
 
