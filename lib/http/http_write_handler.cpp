@@ -507,16 +507,17 @@ HttpWriteHandler::FieldArrays HttpWriteHandler::candidateToFieldArrays(CoalesceC
     return fa;
 }
 
-std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
-    const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs, size_t& entriesSkippedOut) {
-    // Configuration constants
-    static const size_t MAX_COALESCE_SIZE = 10000;  // Max values per field array
-    static const size_t MIN_COALESCE_COUNT = 2;     // Min writes needed to coalesce
+// Configuration constants shared by the coalesce phases below.
+static const size_t MAX_COALESCE_SIZE = 10000;  // Max values per field array
+static const size_t MIN_COALESCE_COUNT = 2;     // Min writes needed to coalesce
 
-#if TIMESTAR_LOG_INSERT_PATH
-    auto start_coalesce = std::chrono::high_resolution_clock::now();
-#endif
-
+// First pass of coalesceWrites (candidate-grouping phase): parse writes_array
+// directly from the JSON DOM into per-series CoalesceCandidates. Writes that
+// fail to parse increment entriesSkipped; every write examined increments
+// totalWritesProcessed.
+tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandler::buildCoalesceCandidates(
+    const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs, size_t& entriesSkipped,
+    size_t& totalWritesProcessed) {
     // Fast direct parsing approach - avoid JSON string serialization.
     // Handles both scalar and array fields in a single pass, eliminating
     // the need for callers to pre-scan fields for array detection.
@@ -530,8 +531,6 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
     // would zero ~22MB for a 10K-write batch, yet unique series are almost
     // always far fewer than writes. Beyond the cap the map grows naturally.
     candidates.reserve(std::min(writes_array.size() * 2, size_t(1024)));
-    [[maybe_unused]] size_t totalWritesProcessed = 0;
-    size_t entriesSkipped = 0;
 
     LOG_INSERT_PATH(timestar::http_log, debug, "[COALESCE] Processing {} writes for coalescing", writes_array.size());
 
@@ -926,19 +925,21 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         }
     }
 
-    entriesSkippedOut = entriesSkipped;
-    if (entriesSkipped > 0) {
-        timestar::http_log.warn("[COALESCE] Skipped {} of {} entries due to parse errors", entriesSkipped,
-                                writes_array.size());
-    }
+    return candidates;
+}
 
-    // Second pass: convert candidates to MultiWritePoint objects
+// Second pass of coalesceWrites (field-array assembly phase): convert the
+// CoalesceCandidates into MultiWritePoint objects, merging candidates that
+// share a group key and compatible timestamps into multi-field points.
+// Candidates below MIN_COALESCE_COUNT are emitted individually and counted
+// in individualCount. Value vectors are moved out of the candidates.
+std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::assembleCoalescedPoints(
+    tsl::robin_map<std::string, CoalesceCandidate>& candidates, size_t& individualCount) {
     std::vector<MultiWritePoint> result;
 
     // Group by measurement+tags efficiently (only for coalescing)
     tsl::robin_map<std::string, std::vector<std::string>> grouped;  // groupKey -> seriesKeys
     tsl::robin_set<std::string> processedSeriesKeys;                // Track which candidates were coalesced
-    [[maybe_unused]] size_t individualCount = 0;
 
     for (const auto& [seriesKey, candidate] : candidates) {
         if (candidate.timestamps.size() < MIN_COALESCE_COUNT) {
@@ -1034,6 +1035,30 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
         mwp.fields[candidate.fieldName] = candidateToFieldArrays(candidate);
         result.push_back(std::move(mwp));
     }
+
+    return result;
+}
+
+std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
+    const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs, size_t& entriesSkippedOut) {
+#if TIMESTAR_LOG_INSERT_PATH
+    auto start_coalesce = std::chrono::high_resolution_clock::now();
+#endif
+
+    // Phase 1: group writes into per-series CoalesceCandidates.
+    size_t totalWritesProcessed = 0;
+    size_t entriesSkipped = 0;
+    auto candidates = buildCoalesceCandidates(writes_array, defaultTimestampNs, entriesSkipped, totalWritesProcessed);
+
+    entriesSkippedOut = entriesSkipped;
+    if (entriesSkipped > 0) {
+        timestar::http_log.warn("[COALESCE] Skipped {} of {} entries due to parse errors", entriesSkipped,
+                                writes_array.size());
+    }
+
+    // Phase 2: convert candidates to MultiWritePoint objects.
+    size_t individualCount = 0;
+    auto result = assembleCoalescedPoints(candidates, individualCount);
 
 #if TIMESTAR_LOG_INSERT_PATH
     size_t coalescedCount = result.size() - individualCount;
@@ -1360,6 +1385,387 @@ std::string HttpWriteHandler::createPartialFailureResponse(int64_t pointsWritten
     return buffer;
 }
 
+// handleWrite phase 1: read the request body and enforce size limits.
+// Parses directly from the request's body buffer. `req.content` is a
+// seastar::sstring; assigning it into a std::string is a cross-type
+// COPY of the entire body (the std::move is inert), ~2MB per bench
+// request. A view is zero-copy: `req` outlives this coroutine and
+// sstring data is null-terminated (required by Glaze's default opts).
+// On success returns true with `body` viewing the bytes (owned by
+// req.content or bodyStorage — caller locals that outlive this
+// parent-awaited coroutine). On failure (payload too large / empty body)
+// returns false with the error response fully assembled in `rep`.
+seastar::future<bool> HttpWriteHandler::readWriteBody(seastar::http::request& req, std::string& bodyStorage,
+                                                      std::string_view& body, timestar::http::WireFormat resFmt,
+                                                      seastar::http::reply& rep) {
+    if (!req.content.empty()) {
+        body = std::string_view(req.content.data(), req.content.size());
+    } else if (req.content_stream) {
+        // Pre-reserve from Content-Length to avoid repeated reallocations
+        // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
+        if (req.content_length > 0 && req.content_length <= maxWriteBodySize()) {
+            bodyStorage.reserve(req.content_length);
+        }
+        while (!req.content_stream->eof()) {
+            auto data = co_await req.content_stream->read();
+            bodyStorage.append(data.get(), data.size());
+            if (bodyStorage.size() > maxWriteBodySize()) {
+                break;
+            }
+        }
+        body = bodyStorage;
+    }
+
+    if (body.size() > maxWriteBodySize()) {
+        rep.set_status(seastar::http::reply::status_type::payload_too_large);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep._content = timestar::proto::formatWriteResponse(
+                "error", 0, 0,
+                {"Request body too large (max " + std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)"});
+        } else {
+            rep._content = createErrorResponse("Request body too large (max " +
+                                               std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)");
+        }
+        timestar::http::setContentType(rep, resFmt);
+        co_return false;
+    }
+
+    if (body.empty()) {
+        rep.set_status(seastar::http::reply::status_type::bad_request);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep._content = timestar::proto::formatWriteResponse("error", 0, 0, {"Empty request body"});
+        } else {
+            rep._content = createErrorResponse("Empty request body");
+        }
+        timestar::http::setContentType(rep, resFmt);
+        co_return false;
+    }
+
+    co_return true;
+}
+
+// handleWrite phase 2: protobuf fast write path.
+// Arena-parsed, zero-intermediate-copy conversion from WriteRequest proto
+// directly to per-shard TimeStarInsert batches. Skips the intermediate
+// MultiWritePoint conversion and type detection heuristics.
+// Fully assembles the response (success/partial/error) into `rep`. `body`
+// views memory owned by the caller (req->content or bodyStorage), which
+// outlives this parent-awaited coroutine.
+seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, uint64_t defaultTimestampNs,
+                                                        timestar::http::WireFormat resFmt,
+                                                        seastar::http::reply& rep) {
+    auto fastResult = timestar::proto::parseWriteRequestFast(body.data(), body.size(), defaultTimestampNs);
+
+    // Yield after CPU-heavy proto parse to prevent reactor stalls
+    co_await seastar::coroutine::maybe_yield();
+
+    int64_t failedWrites = fastResult.failedWrites;
+    std::vector<std::string> writeErrors = std::move(fastResult.errors);
+    int64_t pointsWritten = fastResult.totalPoints;
+
+    // Group FastFieldInserts into per-shard TimeStarInsert batches
+    const size_t shardCount = seastar::smp::count;
+    std::vector<std::vector<TimeStarInsert<double>>> shardDoubleInserts(shardCount);
+    std::vector<std::vector<TimeStarInsert<bool>>> shardBoolInserts(shardCount);
+    std::vector<std::vector<TimeStarInsert<std::string>>> shardStringInserts(shardCount);
+    std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegerInserts(shardCount);
+    std::vector<MetaOp> allMetaOps;
+    std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
+
+    for (auto& ffi : fastResult.inserts) {
+        // Compute series ID once for shard routing and metadata dedup.
+        // TODO: pre-compute in parseWriteRequestFast() once libtimestar_proto_conv
+        // links series_id (requires adding xxhash dependency to that target).
+        SeriesId128 seriesId = SeriesId128::fromSeriesKey(ffi.seriesKey);
+        size_t shard = timestar::routeToCore(seriesId);
+
+        // Track metadata (deduplicate by SeriesId128)
+        if (seenMF.insert(seriesId).second) {
+            if (!knownSeriesContains(seriesId)) {
+                knownSeriesInsert(seriesId);
+                TSMValueType vtype;
+                switch (ffi.type) {
+                    case timestar::proto::FastFieldInsert::Type::DOUBLE:
+                        vtype = TSMValueType::Float;
+                        break;
+                    case timestar::proto::FastFieldInsert::Type::BOOL:
+                        vtype = TSMValueType::Boolean;
+                        break;
+                    case timestar::proto::FastFieldInsert::Type::STRING:
+                        vtype = TSMValueType::String;
+                        break;
+                    case timestar::proto::FastFieldInsert::Type::INTEGER:
+                        vtype = TSMValueType::Integer;
+                        break;
+                }
+                uint64_t mnTs = 0, mxTs = 0;
+                if (ffi.timestamps && !ffi.timestamps->empty()) {
+                    auto [mnIt, mxIt] = std::minmax_element(ffi.timestamps->begin(), ffi.timestamps->end());
+                    mnTs = *mnIt;
+                    mxTs = *mxIt;
+                }
+                allMetaOps.push_back(MetaOp{vtype, ffi.measurement, ffi.fieldName, *ffi.tags, mnTs, mxTs, seriesId});
+            }
+        }
+
+        // Build TimeStarInsert directly from FastFieldInsert — move value
+        // vectors, share tags/timestamps by refcounted pointer (same as
+        // the JSON path's setSharedTags/setSharedTimestamps).
+        switch (ffi.type) {
+            case timestar::proto::FastFieldInsert::Type::DOUBLE: {
+                TimeStarInsert<double> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                insert.setSharedTags(std::move(ffi.tags));
+                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.values = std::move(ffi.doubleValues);
+                insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                insert.setCachedSeriesId128(seriesId);
+                shardDoubleInserts[shard].push_back(std::move(insert));
+                break;
+            }
+            case timestar::proto::FastFieldInsert::Type::BOOL: {
+                TimeStarInsert<bool> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                insert.setSharedTags(std::move(ffi.tags));
+                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.values.reserve(ffi.boolValues.size());
+                for (uint8_t v : ffi.boolValues) {
+                    insert.values.push_back(v != 0);
+                }
+                insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                insert.setCachedSeriesId128(seriesId);
+                shardBoolInserts[shard].push_back(std::move(insert));
+                break;
+            }
+            case timestar::proto::FastFieldInsert::Type::STRING: {
+                TimeStarInsert<std::string> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                insert.setSharedTags(std::move(ffi.tags));
+                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.values = std::move(ffi.stringValues);
+                insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                insert.setCachedSeriesId128(seriesId);
+                shardStringInserts[shard].push_back(std::move(insert));
+                break;
+            }
+            case timestar::proto::FastFieldInsert::Type::INTEGER: {
+                TimeStarInsert<int64_t> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
+                insert.setSharedTags(std::move(ffi.tags));
+                insert.setSharedTimestamps(std::move(ffi.timestamps));
+                insert.values = std::move(ffi.integerValues);
+                insert.setCachedSeriesKey(std::move(ffi.seriesKey));
+                insert.setCachedSeriesId128(seriesId);
+                shardIntegerInserts[shard].push_back(std::move(insert));
+                break;
+            }
+        }
+    }
+
+    // Dispatch to shards in parallel
+    std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
+    shardFutures.reserve(shardCount);
+
+    for (size_t shard = 0; shard < shardCount; ++shard) {
+        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() &&
+            shardStringInserts[shard].empty() && shardIntegerInserts[shard].empty()) {
+            continue;
+        }
+
+        auto doubles = std::move(shardDoubleInserts[shard]);
+        auto bools = std::move(shardBoolInserts[shard]);
+        auto strings = std::move(shardStringInserts[shard]);
+        auto integers = std::move(shardIntegerInserts[shard]);
+
+        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(doubles), std::move(bools),
+                                                    std::move(strings), std::move(integers)));
+    }
+
+    if (!shardFutures.empty()) {
+        co_await seastar::when_all_succeed(std::move(shardFutures));
+    }
+
+    // Index metadata
+    if (!allMetaOps.empty()) {
+        co_await engineSharded->local().indexMetadataSync(std::move(allMetaOps));
+    }
+
+    rep.set_status(seastar::http::reply::status_type::ok);
+    if (timestar::http::isProtobuf(resFmt)) {
+        rep._content = timestar::proto::formatWriteResponse(failedWrites > 0 ? "partial" : "success", pointsWritten,
+                                                            failedWrites, writeErrors);
+    } else {
+        if (failedWrites > 0) {
+            rep._content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
+        } else {
+            rep._content = createSuccessResponse(pointsWritten);
+        }
+    }
+    timestar::http::setContentType(rep, resFmt);
+    co_return;
+}
+
+// handleWrite phase 3: fast path for a single write with all-double fields.
+// Attempts to parse `body` directly into typed vectors and dispatch it,
+// returning true when handled (pointsWritten is set) and false to fall back
+// to the standard DOM path. Throws std::invalid_argument on validation errors.
+seastar::future<bool> HttpWriteHandler::tryFastDoubleWrite(std::string_view body, uint64_t defaultTimestampNs,
+                                                           int64_t& pointsWritten) {
+    // Quick check: skip fast path for batch writes (have "writes" key).
+    // The "writes" key is a top-level JSON key, so it will appear
+    // early in the object.  Limiting the scan to the first 256 bytes
+    // avoids a full-body scan on large single-write payloads and
+    // prevents false positives from "writes" appearing inside string
+    // values deeper in the body.
+    auto writesPos = std::string_view(body).substr(0, 256).find("\"writes\"");
+    if (writesPos == std::string_view::npos) {
+        FastDoubleWritePoint fwp;
+        auto fast_err = glz::read_json(fwp, body);
+        if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
+            // Fast path succeeded - yield after CPU-heavy parse
+            co_await seastar::coroutine::maybe_yield();
+
+            MultiWritePoint mwp;
+            if (buildMWPFromFastPath(fwp, defaultTimestampNs, mwp)) {
+                std::string error;
+                if (!validateArraySizes(mwp, error)) {
+                    throw std::invalid_argument(error);
+                }
+
+                pointsWritten = static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
+
+                auto writeResult = co_await processMultiWritePoint(mwp);
+
+                if (!writeResult.metaOps.empty()) {
+                    co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
+                }
+                co_return true;
+            }
+        }
+    }
+    co_return false;
+}
+
+// handleWrite phase 4: JSON batch write path ("writes" array).
+// Coalesces the batch, validates and accumulates every MultiWritePoint into
+// per-shard typed insert batches, dispatches once per active shard, and
+// attributes failures per shard. Returns true when the response (batch-too-
+// large error or partial failure) is already assembled in `rep`; returns
+// false when the caller should emit the shared success response.
+// `writes_array` and `rep` are caller locals that outlive this parent-awaited
+// coroutine. Throws std::invalid_argument on validation errors.
+seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::array_t& writes_array,
+                                                           uint64_t defaultTimestampNs, int64_t& pointsWritten,
+                                                           timestar::http::WireFormat resFmt,
+                                                           seastar::http::reply& rep) {
+    constexpr size_t MAX_BATCH_WRITES = 100000;
+    if (writes_array.size() > MAX_BATCH_WRITES) {
+        rep.set_status(seastar::http::reply::status_type::bad_request);
+        rep._content = createErrorResponse("Batch too large: " + std::to_string(writes_array.size()) +
+                                           " writes exceeds maximum of " + std::to_string(MAX_BATCH_WRITES));
+        timestar::http::setContentType(rep, resFmt);
+        co_return true;
+    }
+
+    LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Processing batch with {} writes", writes_array.size());
+
+#if TIMESTAR_LOG_INSERT_PATH
+    auto coalesceStartTime = std::chrono::steady_clock::now();
+#endif
+    size_t coalesceSkipped = 0;
+    auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs, coalesceSkipped);
+#if TIMESTAR_LOG_INSERT_PATH
+    auto coalesceEndTime = std::chrono::steady_clock::now();
+    auto coalesceDuration = std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
+    LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Coalesced {} writes into {} MultiWritePoints ({}μs)",
+                    writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
+#endif
+
+    // Validate all MWPs up-front (before any dispatch), then accumulate
+    // the ENTIRE request into one set of per-shard typed insert vectors.
+    // This replaces the previous one-coroutine-per-MultiWritePoint fan-out
+    // (M × shards cross-shard round trips and M WAL cycles per request)
+    // with a single dispatch per active shard.
+    const size_t shardCount = seastar::smp::count;
+    BatchAccumulator acc(shardCount);
+    {
+        size_t accumulated = 0;
+        for (auto& mwp : coalescedWrites) {
+            std::string error;
+            if (!validateArraySizes(mwp, error)) {
+                throw std::invalid_argument(error);
+            }
+            pointsWritten += static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
+            accumulateMultiWritePoint(mwp, acc);
+            // Yield periodically so accumulating a large batch does not
+            // stall the reactor (accumulation itself never suspends).
+            if ((++accumulated & 63u) == 0) {
+                co_await seastar::coroutine::maybe_yield();
+            }
+        }
+    }
+
+    // Single dispatch per active shard for the whole request.
+    std::vector<unsigned> activeShards;
+    std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
+    activeShards.reserve(shardCount);
+    shardFutures.reserve(shardCount);
+    for (unsigned shard = 0; shard < shardCount; ++shard) {
+        if (acc.shardEmpty(shard)) {
+            continue;
+        }
+        activeShards.push_back(shard);
+        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(acc.shardDoubles[shard]),
+                                                    std::move(acc.shardBools[shard]),
+                                                    std::move(acc.shardStrings[shard]),
+                                                    std::move(acc.shardIntegers[shard])));
+    }
+
+    auto shardResults = co_await seastar::when_all(shardFutures.begin(), shardFutures.end());
+
+    // Failure attribution is per-shard: if a shard's insert future
+    // failed, all points routed to that shard count as failed.
+    int64_t failedWrites = 0;
+    std::vector<std::string> writeErrors;
+    for (size_t i = 0; i < shardResults.size(); ++i) {
+        try {
+            shardResults[i].get();
+        } catch (const std::exception& e) {
+            const unsigned shard = activeShards[i];
+            timestar::http_log.error("Error inserting batch on shard {}: {}", shard, e.what());
+            pointsWritten -= acc.shardPoints[shard];
+            failedWrites += acc.shardPoints[shard];
+            if (writeErrors.size() < 10) {
+                writeErrors.emplace_back("shard " + std::to_string(shard) + ": " + e.what());
+            }
+        }
+    }
+
+#if TIMESTAR_LOG_INSERT_PATH
+    size_t metaOpsCount = acc.metaOps.size();
+#endif
+    if (!acc.metaOps.empty()) {
+        co_await engineSharded->local().indexMetadataSync(std::move(acc.metaOps));
+    }
+#if TIMESTAR_LOG_INSERT_PATH
+    LOG_INSERT_PATH(timestar::http_log, info, "[METADATA] Batch: indexed {} unique series synchronously",
+                    metaOpsCount);
+#endif
+
+    // Include coalesce-skipped entries in failure count
+    failedWrites += static_cast<int64_t>(coalesceSkipped);
+
+    // Report partial failure if some writes failed
+    if (failedWrites > 0) {
+        rep.set_status(seastar::http::reply::status_type::ok);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep._content = timestar::proto::formatWriteResponse("partial", pointsWritten, failedWrites, writeErrors);
+        } else {
+            rep._content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
+        }
+        timestar::http::setContentType(rep, resFmt);
+        co_return true;
+    }
+
+    co_return false;
+}
+
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleWrite(
     std::unique_ptr<seastar::http::request> req) {
     auto rep = std::make_unique<seastar::http::reply>();
@@ -1367,53 +1773,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     auto resFmt = timestar::http::responseFormat(*req);
 
     try {
-        // Parse directly from the request's body buffer. `req->content` is a
-        // seastar::sstring; assigning it into a std::string is a cross-type
-        // COPY of the entire body (the std::move is inert), ~2MB per bench
-        // request. A view is zero-copy: `req` outlives this coroutine and
-        // sstring data is null-terminated (required by Glaze's default opts).
+        // Phase 1: read the body (buffered or streamed) and enforce size
+        // limits. On failure the error response is already assembled in rep.
         std::string bodyStorage;  // owns data only on the streaming branch
         std::string_view body;
-        if (!req->content.empty()) {
-            body = std::string_view(req->content.data(), req->content.size());
-        } else if (req->content_stream) {
-            // Pre-reserve from Content-Length to avoid repeated reallocations
-            // during streaming reads. Cap at maxWriteBodySize to prevent abuse.
-            if (req->content_length > 0 && req->content_length <= maxWriteBodySize()) {
-                bodyStorage.reserve(req->content_length);
-            }
-            while (!req->content_stream->eof()) {
-                auto data = co_await req->content_stream->read();
-                bodyStorage.append(data.get(), data.size());
-                if (bodyStorage.size() > maxWriteBodySize()) {
-                    break;
-                }
-            }
-            body = bodyStorage;
-        }
-
-        if (body.size() > maxWriteBodySize()) {
-            rep->set_status(seastar::http::reply::status_type::payload_too_large);
-            if (timestar::http::isProtobuf(resFmt)) {
-                rep->_content = timestar::proto::formatWriteResponse(
-                    "error", 0, 0,
-                    {"Request body too large (max " + std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)"});
-            } else {
-                rep->_content = createErrorResponse("Request body too large (max " +
-                                                    std::to_string(maxWriteBodySize() / (1024 * 1024)) + "MB)");
-            }
-            timestar::http::setContentType(*rep, resFmt);
-            co_return rep;
-        }
-
-        if (body.empty()) {
-            rep->set_status(seastar::http::reply::status_type::bad_request);
-            if (timestar::http::isProtobuf(resFmt)) {
-                rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {"Empty request body"});
-            } else {
-                rep->_content = createErrorResponse("Empty request body");
-            }
-            timestar::http::setContentType(*rep, resFmt);
+        if (!co_await readWriteBody(*req, bodyStorage, body, resFmt, *rep)) {
             co_return rep;
         }
 
@@ -1429,157 +1793,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // eliminating up to N redundant now() calls in a batch of N points.
         const uint64_t defaultTimestampNs = currentNanosTimestamp();
 
-        // ─── Protobuf fast write path ───
-        // Arena-parsed, zero-intermediate-copy conversion from WriteRequest proto
-        // directly to per-shard TimeStarInsert batches. Skips the intermediate
-        // MultiWritePoint conversion and type detection heuristics.
+        // Phase 2 (protobuf fast path): the response — success, partial, or
+        // error — is fully assembled into rep by the phase method.
         if (timestar::http::isProtobuf(reqFmt)) {
-            auto fastResult = timestar::proto::parseWriteRequestFast(body.data(), body.size(), defaultTimestampNs);
-
-            // Yield after CPU-heavy proto parse to prevent reactor stalls
-            co_await seastar::coroutine::maybe_yield();
-
-            int64_t failedWrites = fastResult.failedWrites;
-            std::vector<std::string> writeErrors = std::move(fastResult.errors);
-            pointsWritten = fastResult.totalPoints;
-
-            // Group FastFieldInserts into per-shard TimeStarInsert batches
-            const size_t shardCount = seastar::smp::count;
-            std::vector<std::vector<TimeStarInsert<double>>> shardDoubleInserts(shardCount);
-            std::vector<std::vector<TimeStarInsert<bool>>> shardBoolInserts(shardCount);
-            std::vector<std::vector<TimeStarInsert<std::string>>> shardStringInserts(shardCount);
-            std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegerInserts(shardCount);
-            std::vector<MetaOp> allMetaOps;
-            std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
-
-            for (auto& ffi : fastResult.inserts) {
-                // Compute series ID once for shard routing and metadata dedup.
-                // TODO: pre-compute in parseWriteRequestFast() once libtimestar_proto_conv
-                // links series_id (requires adding xxhash dependency to that target).
-                SeriesId128 seriesId = SeriesId128::fromSeriesKey(ffi.seriesKey);
-                size_t shard = timestar::routeToCore(seriesId);
-
-                // Track metadata (deduplicate by SeriesId128)
-                if (seenMF.insert(seriesId).second) {
-                    if (!knownSeriesContains(seriesId)) {
-                        knownSeriesInsert(seriesId);
-                        TSMValueType vtype;
-                        switch (ffi.type) {
-                            case timestar::proto::FastFieldInsert::Type::DOUBLE:
-                                vtype = TSMValueType::Float;
-                                break;
-                            case timestar::proto::FastFieldInsert::Type::BOOL:
-                                vtype = TSMValueType::Boolean;
-                                break;
-                            case timestar::proto::FastFieldInsert::Type::STRING:
-                                vtype = TSMValueType::String;
-                                break;
-                            case timestar::proto::FastFieldInsert::Type::INTEGER:
-                                vtype = TSMValueType::Integer;
-                                break;
-                        }
-                        uint64_t mnTs = 0, mxTs = 0;
-                        if (ffi.timestamps && !ffi.timestamps->empty()) {
-                            auto [mnIt, mxIt] = std::minmax_element(ffi.timestamps->begin(), ffi.timestamps->end());
-                            mnTs = *mnIt;
-                            mxTs = *mxIt;
-                        }
-                        allMetaOps.push_back(
-                            MetaOp{vtype, ffi.measurement, ffi.fieldName, *ffi.tags, mnTs, mxTs, seriesId});
-                    }
-                }
-
-                // Build TimeStarInsert directly from FastFieldInsert — move value
-                // vectors, share tags/timestamps by refcounted pointer (same as
-                // the JSON path's setSharedTags/setSharedTimestamps).
-                switch (ffi.type) {
-                    case timestar::proto::FastFieldInsert::Type::DOUBLE: {
-                        TimeStarInsert<double> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.setSharedTags(std::move(ffi.tags));
-                        insert.setSharedTimestamps(std::move(ffi.timestamps));
-                        insert.values = std::move(ffi.doubleValues);
-                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
-                        insert.setCachedSeriesId128(seriesId);
-                        shardDoubleInserts[shard].push_back(std::move(insert));
-                        break;
-                    }
-                    case timestar::proto::FastFieldInsert::Type::BOOL: {
-                        TimeStarInsert<bool> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.setSharedTags(std::move(ffi.tags));
-                        insert.setSharedTimestamps(std::move(ffi.timestamps));
-                        insert.values.reserve(ffi.boolValues.size());
-                        for (uint8_t v : ffi.boolValues) {
-                            insert.values.push_back(v != 0);
-                        }
-                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
-                        insert.setCachedSeriesId128(seriesId);
-                        shardBoolInserts[shard].push_back(std::move(insert));
-                        break;
-                    }
-                    case timestar::proto::FastFieldInsert::Type::STRING: {
-                        TimeStarInsert<std::string> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.setSharedTags(std::move(ffi.tags));
-                        insert.setSharedTimestamps(std::move(ffi.timestamps));
-                        insert.values = std::move(ffi.stringValues);
-                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
-                        insert.setCachedSeriesId128(seriesId);
-                        shardStringInserts[shard].push_back(std::move(insert));
-                        break;
-                    }
-                    case timestar::proto::FastFieldInsert::Type::INTEGER: {
-                        TimeStarInsert<int64_t> insert(std::move(ffi.measurement), std::move(ffi.fieldName));
-                        insert.setSharedTags(std::move(ffi.tags));
-                        insert.setSharedTimestamps(std::move(ffi.timestamps));
-                        insert.values = std::move(ffi.integerValues);
-                        insert.setCachedSeriesKey(std::move(ffi.seriesKey));
-                        insert.setCachedSeriesId128(seriesId);
-                        shardIntegerInserts[shard].push_back(std::move(insert));
-                        break;
-                    }
-                }
-            }
-
-            // Dispatch to shards in parallel
-            std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
-            shardFutures.reserve(shardCount);
-
-            for (size_t shard = 0; shard < shardCount; ++shard) {
-                if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() &&
-                    shardStringInserts[shard].empty() && shardIntegerInserts[shard].empty()) {
-                    continue;
-                }
-
-                auto doubles = std::move(shardDoubleInserts[shard]);
-                auto bools = std::move(shardBoolInserts[shard]);
-                auto strings = std::move(shardStringInserts[shard]);
-                auto integers = std::move(shardIntegerInserts[shard]);
-
-                shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(doubles),
-                                                            std::move(bools), std::move(strings),
-                                                            std::move(integers)));
-            }
-
-            if (!shardFutures.empty()) {
-                co_await seastar::when_all_succeed(std::move(shardFutures));
-            }
-
-            // Index metadata
-            if (!allMetaOps.empty()) {
-                co_await engineSharded->local().indexMetadataSync(std::move(allMetaOps));
-            }
-
-            rep->set_status(seastar::http::reply::status_type::ok);
-            if (timestar::http::isProtobuf(resFmt)) {
-                rep->_content = timestar::proto::formatWriteResponse(failedWrites > 0 ? "partial" : "success",
-                                                                     pointsWritten, failedWrites, writeErrors);
-            } else {
-                if (failedWrites > 0) {
-                    rep->_content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
-                } else {
-                    rep->_content = createSuccessResponse(pointsWritten);
-                }
-            }
-            timestar::http::setContentType(*rep, resFmt);
+            co_await handleProtobufWrite(body, defaultTimestampNs, resFmt, *rep);
             co_return rep;
         }
 
@@ -1590,39 +1807,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // allocations and roughly halves the JSON parsing cost.
         bool fastPathHandled = false;
         if (body.size() > 256) {
-            // Quick check: skip fast path for batch writes (have "writes" key).
-            // The "writes" key is a top-level JSON key, so it will appear
-            // early in the object.  Limiting the scan to the first 256 bytes
-            // avoids a full-body scan on large single-write payloads and
-            // prevents false positives from "writes" appearing inside string
-            // values deeper in the body.
-            auto writesPos = std::string_view(body).substr(0, 256).find("\"writes\"");
-            if (writesPos == std::string_view::npos) {
-                FastDoubleWritePoint fwp;
-                auto fast_err = glz::read_json(fwp, body);
-                if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
-                    // Fast path succeeded - yield after CPU-heavy parse
-                    co_await seastar::coroutine::maybe_yield();
-
-                    MultiWritePoint mwp;
-                    if (buildMWPFromFastPath(fwp, defaultTimestampNs, mwp)) {
-                        std::string error;
-                        if (!validateArraySizes(mwp, error)) {
-                            throw std::invalid_argument(error);
-                        }
-
-                        pointsWritten =
-                            static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
-
-                        auto writeResult = co_await processMultiWritePoint(mwp);
-
-                        if (!writeResult.metaOps.empty()) {
-                            co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
-                        }
-                        fastPathHandled = true;
-                    }
-                }
-            }
+            fastPathHandled = co_await tryFastDoubleWrite(body, defaultTimestampNs, pointsWritten);
         }
 
         // ─── Standard DOM path (batch writes + mixed-type single writes) ───
@@ -1649,123 +1834,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     if (!writes.is_array()) {
                         throw std::invalid_argument("'writes' field must be a JSON array");
                     }
-                    {
-                        auto& writes_array = writes.get<json_value_t::array_t>();
-
-                        constexpr size_t MAX_BATCH_WRITES = 100000;
-                        if (writes_array.size() > MAX_BATCH_WRITES) {
-                            rep->set_status(seastar::http::reply::status_type::bad_request);
-                            rep->_content =
-                                createErrorResponse("Batch too large: " + std::to_string(writes_array.size()) +
-                                                    " writes exceeds maximum of " + std::to_string(MAX_BATCH_WRITES));
-                            timestar::http::setContentType(*rep, resFmt);
-                            co_return rep;
-                        }
-
-                        LOG_INSERT_PATH(timestar::http_log, info, "[BATCH] Processing batch with {} writes",
-                                        writes_array.size());
-
-#if TIMESTAR_LOG_INSERT_PATH
-                        auto coalesceStartTime = std::chrono::steady_clock::now();
-#endif
-                        size_t coalesceSkipped = 0;
-                        auto coalescedWrites = coalesceWrites(writes_array, defaultTimestampNs, coalesceSkipped);
-#if TIMESTAR_LOG_INSERT_PATH
-                        auto coalesceEndTime = std::chrono::steady_clock::now();
-                        auto coalesceDuration =
-                            std::chrono::duration_cast<std::chrono::microseconds>(coalesceEndTime - coalesceStartTime);
-                        LOG_INSERT_PATH(timestar::http_log, info,
-                                        "[BATCH] Coalesced {} writes into {} MultiWritePoints ({}μs)",
-                                        writes_array.size(), coalescedWrites.size(), coalesceDuration.count());
-#endif
-
-                        // Validate all MWPs up-front (before any dispatch), then accumulate
-                        // the ENTIRE request into one set of per-shard typed insert vectors.
-                        // This replaces the previous one-coroutine-per-MultiWritePoint fan-out
-                        // (M × shards cross-shard round trips and M WAL cycles per request)
-                        // with a single dispatch per active shard.
-                        const size_t shardCount = seastar::smp::count;
-                        BatchAccumulator acc(shardCount);
-                        {
-                            size_t accumulated = 0;
-                            for (auto& mwp : coalescedWrites) {
-                                std::string error;
-                                if (!validateArraySizes(mwp, error)) {
-                                    throw std::invalid_argument(error);
-                                }
-                                pointsWritten += static_cast<int64_t>(mwp.timestamps.size()) *
-                                                 static_cast<int64_t>(mwp.fields.size());
-                                accumulateMultiWritePoint(mwp, acc);
-                                // Yield periodically so accumulating a large batch does not
-                                // stall the reactor (accumulation itself never suspends).
-                                if ((++accumulated & 63u) == 0) {
-                                    co_await seastar::coroutine::maybe_yield();
-                                }
-                            }
-                        }
-
-                        // Single dispatch per active shard for the whole request.
-                        std::vector<unsigned> activeShards;
-                        std::vector<seastar::future<AggregatedTimingInfo>> shardFutures;
-                        activeShards.reserve(shardCount);
-                        shardFutures.reserve(shardCount);
-                        for (unsigned shard = 0; shard < shardCount; ++shard) {
-                            if (acc.shardEmpty(shard)) {
-                                continue;
-                            }
-                            activeShards.push_back(shard);
-                            shardFutures.push_back(dispatchShardInserts(
-                                engineSharded, shard, std::move(acc.shardDoubles[shard]),
-                                std::move(acc.shardBools[shard]), std::move(acc.shardStrings[shard]),
-                                std::move(acc.shardIntegers[shard])));
-                        }
-
-                        auto shardResults = co_await seastar::when_all(shardFutures.begin(), shardFutures.end());
-
-                        // Failure attribution is per-shard: if a shard's insert future
-                        // failed, all points routed to that shard count as failed.
-                        int64_t failedWrites = 0;
-                        std::vector<std::string> writeErrors;
-                        for (size_t i = 0; i < shardResults.size(); ++i) {
-                            try {
-                                shardResults[i].get();
-                            } catch (const std::exception& e) {
-                                const unsigned shard = activeShards[i];
-                                timestar::http_log.error("Error inserting batch on shard {}: {}", shard, e.what());
-                                pointsWritten -= acc.shardPoints[shard];
-                                failedWrites += acc.shardPoints[shard];
-                                if (writeErrors.size() < 10) {
-                                    writeErrors.emplace_back("shard " + std::to_string(shard) + ": " + e.what());
-                                }
-                            }
-                        }
-
-#if TIMESTAR_LOG_INSERT_PATH
-                        size_t metaOpsCount = acc.metaOps.size();
-#endif
-                        if (!acc.metaOps.empty()) {
-                            co_await engineSharded->local().indexMetadataSync(std::move(acc.metaOps));
-                        }
-#if TIMESTAR_LOG_INSERT_PATH
-                        LOG_INSERT_PATH(timestar::http_log, info,
-                                        "[METADATA] Batch: indexed {} unique series synchronously", metaOpsCount);
-#endif
-
-                        // Include coalesce-skipped entries in failure count
-                        failedWrites += static_cast<int64_t>(coalesceSkipped);
-
-                        // Report partial failure if some writes failed
-                        if (failedWrites > 0) {
-                            rep->set_status(seastar::http::reply::status_type::ok);
-                            if (timestar::http::isProtobuf(resFmt)) {
-                                rep->_content = timestar::proto::formatWriteResponse("partial", pointsWritten,
-                                                                                     failedWrites, writeErrors);
-                            } else {
-                                rep->_content = createPartialFailureResponse(pointsWritten, failedWrites, writeErrors);
-                            }
-                            timestar::http::setContentType(*rep, resFmt);
-                            co_return rep;
-                        }
+                    // Phase 4 (batch path): coalesce + accumulate + dispatch.
+                    // A `true` return means the response (batch-too-large error
+                    // or partial failure) is already assembled in rep.
+                    auto& writes_array = writes.get<json_value_t::array_t>();
+                    if (co_await processBatchWrites(writes_array, defaultTimestampNs, pointsWritten, resFmt, *rep)) {
+                        co_return rep;
                     }
                 } else {
                     MultiWritePoint mwp = parseMultiWritePoint(doc, defaultTimestampNs);

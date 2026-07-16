@@ -141,9 +141,10 @@ static std::string extractFunctionBody(const std::string& sourceCode, const std:
 // The batch path now accumulates the whole request into per-shard batches
 // and dispatches once per shard, so failure attribution is per-shard:
 // a failed shard future decrements pointsWritten by the points routed to it.
+// The batch path lives in the processBatchWrites phase method of handleWrite.
 TEST_F(HttpWriteHandlerAtomicityTest, BatchFailuresDecrementPointsWritten) {
-    std::string handleBody = extractFunctionBody(sourceCode, "HttpWriteHandler::handleWrite(");
-    ASSERT_FALSE(handleBody.empty()) << "Could not extract handleWrite function body";
+    std::string handleBody = extractFunctionBody(sourceCode, "HttpWriteHandler::processBatchWrites(");
+    ASSERT_FALSE(handleBody.empty()) << "Could not extract processBatchWrites function body";
 
     // The shard-result loop must subtract failed points from pointsWritten.
     // Look for the decrement in the catch block of the shardResults loop.
@@ -201,8 +202,9 @@ TEST_F(HttpWriteHandlerAtomicityTest, PointsWrittenCastsPreventOverflow) {
 // parse only measurement/tags/fields as a single write, silently dropping the
 // entire "writes" array.
 TEST_F(HttpWriteHandlerAtomicityTest, FastPathChecksEntireBodyForWritesKey) {
-    std::string handleBody = extractFunctionBody(sourceCode, "HttpWriteHandler::handleWrite(");
-    ASSERT_FALSE(handleBody.empty()) << "Could not extract handleWrite function body";
+    // The fast path lives in the tryFastDoubleWrite phase method of handleWrite.
+    std::string handleBody = extractFunctionBody(sourceCode, "HttpWriteHandler::tryFastDoubleWrite(");
+    ASSERT_FALSE(handleBody.empty()) << "Could not extract tryFastDoubleWrite function body";
 
     // The fast-path condition must check writesPos against npos only,
     // not writesPos > 64 (which was the bug).

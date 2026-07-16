@@ -1,5 +1,6 @@
 #pragma once
 
+#include "content_negotiation.hpp"
 #include "engine.hpp"
 #include "field_values.hpp"
 #include "series_id.hpp"
@@ -238,8 +239,53 @@ private:
     // Coalesce multiple individual writes into efficient array writes.
     // defaultTimestampNs is the pre-computed current time used for any write
     // that lacks an explicit timestamp, avoiding per-write now() calls.
+    // Orchestrates the two phases below.
     std::vector<MultiWritePoint> coalesceWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs,
                                                 size_t& entriesSkippedOut);
+
+    // coalesceWrites phase 1 (candidate grouping): parse writes_array directly
+    // from the JSON DOM into per-series CoalesceCandidates. Parse failures
+    // increment entriesSkipped; every write examined increments
+    // totalWritesProcessed.
+    static tsl::robin_map<std::string, CoalesceCandidate> buildCoalesceCandidates(
+        const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs, size_t& entriesSkipped,
+        size_t& totalWritesProcessed);
+
+    // coalesceWrites phase 2 (field-array assembly): convert candidates into
+    // MultiWritePoints, merging same-group candidates with compatible
+    // timestamps into multi-field points. Emits sub-MIN_COALESCE_COUNT
+    // candidates individually, counted in individualCount. Moves value
+    // vectors out of the candidates.
+    static std::vector<MultiWritePoint> assembleCoalescedPoints(
+        tsl::robin_map<std::string, CoalesceCandidate>& candidates, size_t& individualCount);
+
+    // ── handleWrite phase methods ──
+    // All reference parameters (req, bodyStorage, body, pointsWritten,
+    // writes_array, rep) are locals of the awaiting handleWrite frame, which
+    // stays suspended until these coroutines complete, so the references
+    // cannot dangle across suspension points.
+
+    // Phase 1: read the request body (buffered or streamed) and enforce size
+    // limits. Returns true with `body` viewing the bytes; returns false with
+    // the error response fully assembled in `rep`.
+    seastar::future<bool> readWriteBody(seastar::http::request& req, std::string& bodyStorage, std::string_view& body,
+                                        timestar::http::WireFormat resFmt, seastar::http::reply& rep);
+
+    // Phase 2: protobuf fast write path; fully assembles the response in `rep`.
+    seastar::future<> handleProtobufWrite(std::string_view body, uint64_t defaultTimestampNs,
+                                          timestar::http::WireFormat resFmt, seastar::http::reply& rep);
+
+    // Phase 3: fast path for a single write with all-double fields. Returns
+    // true when handled (pointsWritten set), false to use the DOM path.
+    seastar::future<bool> tryFastDoubleWrite(std::string_view body, uint64_t defaultTimestampNs,
+                                             int64_t& pointsWritten);
+
+    // Phase 4: JSON batch write path ("writes" array). Returns true when the
+    // response is already assembled in `rep`, false when the caller should
+    // emit the shared success response.
+    seastar::future<bool> processBatchWrites(const json_value_t::array_t& writes_array, uint64_t defaultTimestampNs,
+                                             int64_t& pointsWritten, timestar::http::WireFormat resFmt,
+                                             seastar::http::reply& rep);
 
     // Create error response JSON
     std::string createErrorResponse(const std::string& error);
