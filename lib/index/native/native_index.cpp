@@ -663,27 +663,9 @@ seastar::future<> NativeIndex::doFlushImmutableMemTable() {
     ::native_index_log.info("Flushing immutable MemTable: {} entries, {} approx bytes", immutableMemtable_->size(),
                             immutableMemtable_->approximateMemoryUsage());
 
-    // Count entries (tombstones are written as empty values to suppress older SSTable entries)
-    size_t liveCount = 0;
-    size_t tombstoneCount = 0;
-    {
-        auto countIt = immutableMemtable_->newIterator();
-        countIt.seekToFirst();
-        while (countIt.valid()) {
-            if (countIt.isTombstone())
-                ++tombstoneCount;
-            else
-                ++liveCount;
-            countIt.next();
-        }
-    }
-    ::native_index_log.info("Immutable MemTable has {} live + {} tombstone entries", liveCount, tombstoneCount);
-    if (liveCount == 0 && tombstoneCount == 0) {
-        ::native_index_log.info("Skipping SSTable flush — empty MemTable");
-        co_return;
-    }
-
-    // Write immutable MemTable to a new SSTable
+    // Write immutable MemTable to a new SSTable. (No separate counting pass —
+    // it walked the entire memtable synchronously just for a log line, and
+    // its empty-guard was unreachable behind the empty() check above.)
     uint64_t fileNum = manifest_->nextFileNumber();
     auto path = sstFilename(fileNum);
     auto writer = co_await SSTableWriter::create(path, timestar::config().index.block_size,
@@ -1113,8 +1095,25 @@ seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, con
     const uint32_t localId = *localIdOpt;
     const uint32_t firstDay = ke::dayBucketFromNs(minTs);
     const uint32_t lastDay = ke::dayBucketFromNs(maxTs);
+
+    // Bound the span: min/max come from raw client timestamps, so one batch
+    // mixing ts=0 (or a seconds-precision timestamp that decodes as 1970)
+    // with a current nanosecond timestamp would otherwise create ~20,000
+    // day bitmaps (one kvGet + a permanently persisted dirty bitmap each).
+    // The query side caps day scans at 365 days; mirror that here. An
+    // over-wide span only costs discovery precision, never correctness —
+    // day bitmaps are a superset filter.
+    constexpr uint32_t kMaxDaySpan = 366;
+    if (lastDay - firstDay >= kMaxDaySpan) {
+        ::native_index_log.warn(
+            "recordDaySpan: day span [{}, {}] for measurement '{}' exceeds {} days — "
+            "recording only the trailing window (check client timestamp precision)",
+            firstDay, lastDay, measurement, kMaxDaySpan);
+    }
+    const uint32_t clampedFirst = (lastDay - firstDay >= kMaxDaySpan) ? lastDay - (kMaxDaySpan - 1) : firstDay;
+
     std::string dayCacheKey;
-    for (uint32_t day = firstDay; day <= lastDay; ++day) {
+    for (uint32_t day = clampedFirst; day <= lastDay; ++day) {
         buildDayBitmapCacheKey(dayCacheKey, measurement, day);
         (co_await getOrLoadDayBitmapForInsert(dayCacheKey))->add(localId);
     }
@@ -1739,16 +1738,24 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
     // postings only for IDs at/after the persisted watermark (crash window).
     batch.put(ke::encodePostingsWatermarkKey(), ke::encodeLocalId(localIdMap_.nextId()));
 
-    // Serialize dirty bitmaps
+    // Serialize dirty bitmaps — iterate the dirty-key set, not the whole
+    // cache (up to 100K entries walked per flush previously).
     std::string bitmapKey;
-    for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
+    for (const auto& cacheKey : bitmapCacheDirtyKeys_) {
+        auto it = bitmapCache_.find(cacheKey);
+        if (it == bitmapCache_.end())
+            continue;
         auto& entry = it.value();
         if (!entry.dirty)
             continue;
 
         auto& bitmap = entry.bitmap;
-        if (bitmap.isEmpty())
+        if (bitmap.isEmpty()) {
+            // Nothing to persist — clear the flag so the entry is evictable
+            // (previously empty-but-dirty entries were pinned forever).
+            entry.dirty = false;
             continue;
+        }
 
         bitmap.runOptimize();
         bitmap.shrinkToFit();
@@ -1758,10 +1765,12 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
         bitmapKey.push_back(static_cast<char>(POSTINGS_BITMAP));
         bitmapKey.append(it->first);
         size_t serializedSize = bitmap.getSizeInBytes();
+        entry.approxBytes = serializedSize;
         std::string serialized(serializedSize, '\0');
         bitmap.write(serialized.data());
         batch.put(bitmapKey, serialized);
     }
+    bitmapCacheDirtyKeys_.clear();
 }
 
 seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(const std::string& cacheKey) {
@@ -1815,6 +1824,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
     if (post != bitmapCache_.end()) {
         if (val.has_value()) {
             post.value().bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+            post.value().approxBytes = val->size();
         }
         co_return &post.value().bitmap;
     }
@@ -1822,6 +1832,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
         auto& entry = bitmapCache_[cacheKey];
         entry.bitmap = roaring::Roaring::readSafe(val->data(), val->size());
         entry.dirty = false;
+        entry.approxBytes = val->size();
         co_return &entry.bitmap;
     }
 
@@ -1832,6 +1843,7 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::st
     auto it = bitmapCache_.find(cacheKey);
     if (it != bitmapCache_.end()) {
         it.value().dirty = true;
+        bitmapCacheDirtyKeys_.insert(cacheKey);
         co_return &it.value().bitmap;
     }
 
@@ -1846,6 +1858,7 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::st
     // Do NOT hold a reference across the suspension — robin_map rehash
     // would invalidate it.
     bitmapCache_[cacheKey].dirty = true;
+    bitmapCacheDirtyKeys_.insert(cacheKey);
     auto existing = co_await kvGet(bitmapKvKey);
     // Re-find after co_await (rehash may have moved entries)
     auto& entry = bitmapCache_[cacheKey];
@@ -1855,6 +1868,7 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::st
         // coroutines may have added local IDs to the pre-inserted empty bitmap.
         // A plain assignment would silently discard those concurrent adds.
         entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
+        entry.approxBytes = existing->size();
     }
     co_return &entry.bitmap;
 }
@@ -1947,6 +1961,7 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
     auto it = dayBitmapCache_.find(cacheKey);
     if (it != dayBitmapCache_.end()) {
         it.value().dirty = true;
+        dayBitmapCacheDirtyKeys_.insert(cacheKey);
         co_return &it.value().bitmap;
     }
 
@@ -1959,12 +1974,14 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
     // Pre-insert an empty bitmap before co_await so concurrent coroutines
     // can start adding local IDs immediately.
     dayBitmapCache_[cacheKey].dirty = true;
+    dayBitmapCacheDirtyKeys_.insert(cacheKey);
     auto existing = co_await kvGet(kvKey);
     // Re-find after co_await (rehash may have moved entries)
     auto& entry = dayBitmapCache_[cacheKey];
     if (existing.has_value()) {
         // Merge (OR) to preserve concurrent adds during the co_await suspension.
         entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
+        entry.approxBytes = existing->size();
     }
     co_return &entry.bitmap;
 }
@@ -1989,6 +2006,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const st
     if (post != dayBitmapCache_.end()) {
         if (val.has_value()) {
             post.value().bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+            post.value().approxBytes = val->size();
         }
         co_return &post.value().bitmap;
     }
@@ -1996,6 +2014,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const st
         auto& entry = dayBitmapCache_[cacheKey];
         entry.bitmap = roaring::Roaring::readSafe(val->data(), val->size());
         entry.dirty = false;
+        entry.approxBytes = val->size();
         co_return &entry.bitmap;
     }
 
@@ -2003,15 +2022,21 @@ seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const st
 }
 
 void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
+    // Iterate the dirty-key set, not the whole cache (see flushDirtyBitmaps).
     std::string kvKey;
-    for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
+    for (const auto& cacheKey : dayBitmapCacheDirtyKeys_) {
+        auto it = dayBitmapCache_.find(cacheKey);
+        if (it == dayBitmapCache_.end())
+            continue;
         auto& entry = it.value();
         if (!entry.dirty)
             continue;
 
         auto& bitmap = entry.bitmap;
-        if (bitmap.isEmpty())
+        if (bitmap.isEmpty()) {
+            entry.dirty = false;
             continue;
+        }
 
         bitmap.runOptimize();
         bitmap.shrinkToFit();
@@ -2021,10 +2046,12 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
         kvKey.push_back(static_cast<char>(TIME_SERIES_DAY));
         kvKey.append(it->first);
         size_t serializedSize = bitmap.getSizeInBytes();
+        entry.approxBytes = serializedSize;
         std::string serialized(serializedSize, '\0');
         bitmap.write(serialized.data());
         batch.put(kvKey, serialized);
     }
+    dayBitmapCacheDirtyKeys_.clear();
 }
 
 void NativeIndex::trimBitmapCache() {
@@ -2035,7 +2062,7 @@ void NativeIndex::trimBitmapCache() {
     if (!overEntries) {
         // Only compute total bytes if entry count is OK (avoid O(n) scan when unnecessary)
         for (const auto& [key, entry] : bitmapCache_) {
-            totalBytes += entry.bitmap.getSizeInBytes(false) + key.size();
+            totalBytes += entry.approxBytes + key.size();
         }
         overBytes = totalBytes > MAX_BITMAP_CACHE_BYTES;
     }
@@ -2059,7 +2086,7 @@ void NativeIndex::trimBitmapCache() {
             break;
         if (!it->second.dirty) {
             if (overBytes) {
-                totalBytes -= it->second.bitmap.getSizeInBytes(false) + it->first.size();
+                totalBytes -= it->second.approxBytes + it->first.size();
             }
             auto nullPos = it->first.find('\0');
             if (nullPos != std::string::npos) {
@@ -2078,7 +2105,7 @@ void NativeIndex::trimDayBitmapCache() {
     bool overBytes = false;
     if (!overEntries) {
         for (const auto& [key, entry] : dayBitmapCache_) {
-            totalBytes += entry.bitmap.getSizeInBytes(false) + key.size();
+            totalBytes += entry.approxBytes + key.size();
         }
         overBytes = totalBytes > MAX_DAY_BITMAP_CACHE_BYTES;
     }
@@ -2095,7 +2122,7 @@ void NativeIndex::trimDayBitmapCache() {
             break;
         if (!it->second.dirty) {
             if (overBytes) {
-                totalBytes -= it->second.bitmap.getSizeInBytes(false) + it->first.size();
+                totalBytes -= it->second.approxBytes + it->first.size();
             }
             it = dayBitmapCache_.erase(it);
         } else {

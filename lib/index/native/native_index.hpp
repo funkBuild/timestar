@@ -317,10 +317,17 @@ private:
     struct BitmapEntry {
         roaring::Roaring bitmap;
         bool dirty = false;  // true if modified since last flushDirtyBitmaps()
+        // Approximate serialized size, refreshed at load/flush time. Used by
+        // the trim byte budgets so they don't have to walk every bitmap's
+        // container list (getSizeInBytes) on every flush.
+        size_t approxBytes = 0;
     };
     // In-memory bitmap cache. Key: "measurement\0tagKey\0tagValue"
     // Populated lazily on first access (insert or query), flushed before memtable swap.
     tsl::robin_map<std::string, BitmapEntry> bitmapCache_;
+    // Keys of dirty entries (mirrors hllCacheDirty_): flushes iterate this
+    // set instead of walking the entire cache (up to 100K entries) per flush.
+    std::unordered_set<std::string> bitmapCacheDirtyKeys_;
 
     // Get or load a bitmap (read-only). Returns nullptr if not found anywhere.
     // Uses pre-built cache key to avoid double string construction.
@@ -358,6 +365,7 @@ private:
 
     // --- Phase 3: Time-scoped per-day bitmaps ---
     tsl::robin_map<std::string, BitmapEntry> dayBitmapCache_;
+    std::unordered_set<std::string> dayBitmapCacheDirtyKeys_;  // see bitmapCacheDirtyKeys_
 
     static void buildDayBitmapCacheKey(std::string& out, const std::string& measurement, uint32_t day);
     seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
