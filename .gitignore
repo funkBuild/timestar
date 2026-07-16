@@ -1,5 +1,5 @@
 # Build artifacts
-build/
+build*/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -13,16 +13,13 @@ bin/CMakeFiles/
 bin/cmake_install.cmake
 bin/CTestTestfile.cmake
 bin/Makefile
-bin/minimal_test
-bin/simple_benchmark
-bin/simple_http_server
-bin/tsdb
-bin/tsdb_benchmark
-bin/tsdb_http_server
-bin/tsdb_server
 test/benchmark/avx512_report
 test/benchmark/float_encoder_ultimate_benchmark
 test/benchmark/simd_encoder_test
+
+# CTest-generated files from accidental in-source configures
+test/*_include.cmake
+test/*_tests.cmake
 
 # Test outputs
 shard_*/
@@ -65,7 +62,6 @@ __pycache__/
 # Dependencies
 node_modules/
 _deps/
-external/robin-map/
 
 # Core dumps (only in repo root, not lib/core/ etc.)
 /core
@@ -74,8 +70,6 @@ external/robin-map/
 # Executables (but not in bin/)
 /*.out
 /*.exe
-/tsdb
-/tsdb_test
 
 # Benchmark result artifacts
 benchmark/*.json

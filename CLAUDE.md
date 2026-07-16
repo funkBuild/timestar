@@ -248,7 +248,7 @@ The TimeStar uses a Seastar-native NativeIndex (LSM-tree based) for metadata, wi
   - `0x09`: Field type (`measurement+field → field type`)
   - `0x0A`: Measurement series (`measurement+\0+series_id → empty, for fast lookup`)
   - `0x0B`: Retention policy (`measurement → JSON retention policy`)
-  - `0x0D`: Time-series day bitmap (`measurement+\0+day(4B LE) → roaring bitmap of active local IDs`)
+  - `0x0D`: Time-series day bitmap (`measurement+\0+day(4B BE, big-endian for lexicographic ordering) → roaring bitmap of active local IDs`)
 
 ### Features
 

@@ -58,7 +58,8 @@ enum IndexKeyType : uint8_t {
     POSTINGS_BITMAP = 0x13,   // measurement\0tagKey\0tagValue -> serialized roaring bitmap
 
     // Phase 3: Time-scoped postings
-    TIME_SERIES_DAY = 0x0D,  // measurement\0day(4B LE) -> roaring bitmap of active LocalIds
+    TIME_SERIES_DAY = 0x0D,  // measurement\0day(4B BE — big-endian for lexicographic day ordering)
+                             // -> roaring bitmap of active LocalIds
 
     // Phase 4: Cardinality estimation
     CARDINALITY_HLL = 0x14,   // measurement\0[tagKey\0tagValue] -> HLL registers (16KB)
