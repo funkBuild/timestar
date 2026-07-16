@@ -13,6 +13,12 @@ namespace timestar::index {
 // Configuration for the compaction engine.
 struct CompactionConfig {
     uint32_t level0Threshold = 4;  // Trigger L0 compaction when this many L0 files exist
+    // Simple tiered policy for L1+: when a level accumulates this many files,
+    // merge the whole level into one file at the next level. L2 compactions
+    // also fold in the existing L3 file(s) so L3 stays a single file and the
+    // compaction becomes a full compaction (enabling tombstone GC) whenever
+    // no L0/L1 files exist at that moment.
+    uint32_t levelThreshold = 8;
     int blockSize = 16384;
     int bloomBitsPerKey = 15;
     uint32_t rateLimitMBps = 0;  // Max compaction write throughput (MB/s). 0 = unlimited.

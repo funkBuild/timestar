@@ -262,6 +262,13 @@ private:
     // Step 4: Map-keyed SSTable readers for incremental refresh.
     // shared_ptr for lifetime safety across co_await in kvGet/kvExists/kvPrefixScan.
     std::map<uint64_t, std::shared_ptr<SSTableReader>> sstableReaders_;
+    // Readers removed from sstableReaders_ that in-flight scans may still hold
+    // (snapshotting the shared_ptr protects the object, but an eager close()
+    // would pull the fd out from under a suspended scan). They are close()d
+    // only once the last external reference is gone — drained on each
+    // refreshSSTables() and force-drained in close().
+    std::vector<std::shared_ptr<SSTableReader>> pendingCloseReaders_;
+    seastar::future<> drainPendingCloseReaders(bool force);
     // Step 2: Shared block cache for decompressed SSTable data blocks
     BlockCache blockCache_;
     // Concurrency limiter for SSTable cache-miss block reads (DMA I/O).

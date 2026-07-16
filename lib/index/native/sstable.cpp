@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
@@ -304,6 +305,17 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     if (err)
         std::rethrow_exception(err);
 
+    // Crash-edge hardening: fsync the parent directory so the new file's
+    // directory entry is durable before the manifest references it. Without
+    // this, a crash after the manifest fsync could leave a manifest entry
+    // pointing at a file whose directory entry was lost.
+    {
+        auto parentDir = std::filesystem::path(filename_).parent_path().string();
+        if (!parentDir.empty()) {
+            co_await seastar::sync_directory(parentDir);
+        }
+    }
+
     // Free the buffer
     pendingData_.clear();
     pendingData_.shrink_to_fit();
@@ -488,6 +500,25 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     reader->readFile_ = std::move(file);
     reader->readFileOpen_ = true;
 
+    // Populate the key range: minKey comes from the index (first key of the
+    // first block, set above); maxKey requires reading the last data block —
+    // the index only stores each block's FIRST key. One extra block read at
+    // open() enables range-based pruning in kvGet/kvExists/kvPrefixScan.
+    if (!reader->index_.empty() && reader->metadata_.maxKey.empty()) {
+        auto lastBlockData = co_await reader->decompressBlock(reader->index_.size() - 1);
+        BlockReader lastBlock(lastBlockData);
+        if (lastBlock.valid()) {
+            auto blockIt = lastBlock.newIterator();
+            blockIt.seekToFirst();
+            std::string lastKey;
+            while (blockIt.valid()) {
+                lastKey.assign(blockIt.key().data(), blockIt.key().size());
+                blockIt.next();
+            }
+            reader->metadata_.maxKey = std::move(lastKey);
+        }
+    }
+
     co_return std::move(reader);
 }
 
@@ -611,12 +642,18 @@ seastar::future<seastar::lw_shared_ptr<const std::string>> SSTableReader::getDec
 }
 
 seastar::future<std::optional<std::string>> SSTableReader::get(std::string_view key) {
-    // Bloom filter check
-    if (!bloom_.mayContain(key)) {
+    if (index_.empty()) {
         co_return std::nullopt;
     }
 
-    if (index_.empty()) {
+    // Key-range check: skip the bloom probe and block read entirely when the
+    // key falls outside [minKey, maxKey]. maxKey is populated at open().
+    if (key < metadata_.minKey || (!metadata_.maxKey.empty() && key > metadata_.maxKey)) {
+        co_return std::nullopt;
+    }
+
+    // Bloom filter check
+    if (!bloom_.mayContain(key)) {
         co_return std::nullopt;
     }
 

@@ -18,11 +18,12 @@ namespace timestar::index {
 static seastar::logger compaction_log("timestar.compaction");
 
 // Adapts a synchronous SSTableReader::Iterator to the async IteratorSource interface.
+// Borrows the reader (via its iterator) — doCompaction owns the readers so it
+// can close() them after the merge finishes (they were previously leaked open).
 class SSTableIteratorSource : public IteratorSource {
 public:
-    SSTableIteratorSource(std::unique_ptr<SSTableReader> reader, std::unique_ptr<SSTableReader::Iterator> iter,
-                          int priority)
-        : reader_(std::move(reader)), iter_(std::move(iter)), priority_(priority) {}
+    SSTableIteratorSource(std::unique_ptr<SSTableReader::Iterator> iter, int priority)
+        : iter_(std::move(iter)), priority_(priority) {}
 
     seastar::future<> seek(std::string_view target) override { co_await iter_->seek(target); }
     seastar::future<> seekToFirst() override { co_await iter_->seekToFirst(); }
@@ -37,7 +38,6 @@ public:
     int priority() const override { return priority_; }
 
 private:
-    std::unique_ptr<SSTableReader> reader_;
     std::unique_ptr<SSTableReader::Iterator> iter_;
     int priority_;
 };
@@ -54,12 +54,40 @@ std::optional<CompactionEngine::CompactionJob> CompactionEngine::pickCompaction(
     if (l0Files.size() >= config_.level0Threshold) {
         return CompactionJob{0, std::move(l0Files)};
     }
+
+    // Tiered policy for L1/L2: merge the entire level into one file at the
+    // next level once it accumulates levelThreshold files. Without this the
+    // SSTable count grows forever and every kvGet/kvPrefixScan walks all files.
+    auto l1Files = manifest_.filesAtLevel(1);
+    if (l1Files.size() >= config_.levelThreshold) {
+        return CompactionJob{1, std::move(l1Files)};
+    }
+
+    auto l2Files = manifest_.filesAtLevel(2);
+    if (l2Files.size() >= config_.levelThreshold) {
+        // Fold existing L3 output into the job so L3 stays a single file.
+        // When no L0/L1 files exist at this moment, the input set is every
+        // live file — doCompaction detects that (isFullCompaction) and can
+        // finally drop aged tombstones organically.
+        auto l3Files = manifest_.filesAtLevel(3);
+        for (auto& f : l3Files) {
+            l2Files.push_back(std::move(f));
+        }
+        return CompactionJob{2, std::move(l2Files)};
+    }
+
     return std::nullopt;
 }
 
 seastar::future<> CompactionEngine::maybeCompact() {
-    auto job = pickCompaction();
-    if (job) {
+    // Loop until no compaction is picked: a flush can cascade L0→L1, which
+    // pushes L1 over its threshold and triggers L1→L2, and so on. Rate
+    // limiting applies inside doCompaction for each job.
+    while (true) {
+        auto job = pickCompaction();
+        if (!job) {
+            break;
+        }
         co_await doCompaction(std::move(*job));
     }
 }
@@ -82,15 +110,37 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
 
     int outputLevel = job.inputLevel + 1;
 
+    // Sort inputs by file number (ascending = oldest first). File numbers are
+    // allocated monotonically, so a higher number always contains newer
+    // versions of a key — this holds even for mixed-level jobs (L2 + L3).
+    std::sort(job.inputFiles.begin(), job.inputFiles.end(),
+              [](const SSTableMetadata& a, const SSTableMetadata& b) { return a.fileNumber < b.fileNumber; });
+
     // Open all input SSTables and create iterator sources.
     // Lower priority = newer = wins. Assign decreasing priority so the LAST file
     // (newest, highest file number) gets priority 0 and wins duplicate key resolution.
+    // Readers are owned here (not by the sources) so they can be close()d after
+    // the merge — previously they were never closed, leaking one fd per input
+    // file per compaction.
+    std::vector<std::unique_ptr<SSTableReader>> inputReaders;
     std::vector<std::unique_ptr<IteratorSource>> sources;
-    int priority = static_cast<int>(job.inputFiles.size()) - 1;
-    for (const auto& fileMeta : job.inputFiles) {
-        auto reader = co_await SSTableReader::open(sstFilename(fileMeta.fileNumber));
-        auto iter = reader->newIterator();
-        sources.push_back(std::make_unique<SSTableIteratorSource>(std::move(reader), std::move(iter), priority--));
+    std::exception_ptr openError;
+    try {
+        int priority = static_cast<int>(job.inputFiles.size()) - 1;
+        for (const auto& fileMeta : job.inputFiles) {
+            auto reader = co_await SSTableReader::open(sstFilename(fileMeta.fileNumber));
+            auto iter = reader->newIterator();
+            sources.push_back(std::make_unique<SSTableIteratorSource>(std::move(iter), priority--));
+            inputReaders.push_back(std::move(reader));
+        }
+    } catch (...) {
+        openError = std::current_exception();
+    }
+    if (openError) {
+        for (auto& reader : inputReaders) {
+            co_await reader->close();
+        }
+        std::rethrow_exception(openError);
     }
 
     // Create merge iterator
@@ -99,6 +149,9 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
 
     if (!merger.valid()) {
         // All inputs were empty — remove from manifest and delete physical files
+        for (auto& reader : inputReaders) {
+            co_await reader->close();
+        }
         std::vector<uint64_t> toRemove;
         for (const auto& f : job.inputFiles)
             toRemove.push_back(f.fileNumber);
@@ -210,6 +263,12 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
                             bytesWritten);
     } catch (...) {
         compactionError = std::current_exception();
+    }
+
+    // Close input readers on both success and failure paths (fd leak otherwise).
+    // The merger's iterators are not touched after this point.
+    for (auto& reader : inputReaders) {
+        co_await reader->close();
     }
 
     // Clean up partial output file on failure

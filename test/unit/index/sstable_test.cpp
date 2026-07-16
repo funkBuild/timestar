@@ -331,6 +331,13 @@ SEASTAR_TEST_F(SSTableTest, ExtendedFooterRoundTrip) {
     EXPECT_EQ(rmeta.entryCount, static_cast<uint64_t>(N));
     EXPECT_EQ(rmeta.writeTimestamp, meta.writeTimestamp);
     EXPECT_EQ(rmeta.minKey, "key:0000");
+    // maxKey is populated at open() by reading the last data block —
+    // enables key-range pruning in kvGet/kvExists/kvPrefixScan.
+    EXPECT_EQ(rmeta.maxKey, std::format("key:{:04d}", N - 1));
+
+    // Keys outside [minKey, maxKey] must short-circuit without a block read.
+    EXPECT_FALSE((co_await reader->get("aaa")).has_value());
+    EXPECT_FALSE((co_await reader->get("zzz")).has_value());
 
     // Verify data is still readable
     auto val = co_await reader->get("key:0050");

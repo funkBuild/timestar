@@ -4,7 +4,10 @@
 
 #include <charconv>
 #include <cstring>
+#include <seastar/util/log.hh>
 #include <stdexcept>
+
+static seastar::logger key_encoding_log("timestar.key_encoding");
 
 namespace timestar::index::keys {
 
@@ -246,8 +249,13 @@ std::set<std::string> decodeStringSet(std::string_view encoded) {
         std::memcpy(&len, data + offset, sizeof(len));
         offset += sizeof(uint32_t);
 
-        if (offset + len > size)
+        if (offset + len > size) {
+            key_encoding_log.warn(
+                "decodeStringSet: truncated entry (declared length {} exceeds {} remaining bytes) — "
+                "dropping tail, {} entries decoded",
+                len, size - offset, result.size());
             break;
+        }
 
         result.emplace(data + offset, len);
         offset += len;

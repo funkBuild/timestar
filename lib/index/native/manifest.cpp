@@ -1,14 +1,19 @@
 #include "manifest.hpp"
 
+#include "crc32.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/util/log.hh>
 #include <stdexcept>
 #include <unordered_set>
 
 namespace timestar::index {
+
+static seastar::logger manifest_log("timestar.manifest");
 
 static void encodeFixed32(std::string& out, uint32_t v) {
     char buf[4];
@@ -63,16 +68,27 @@ seastar::future<Manifest> Manifest::open(std::string directory) {
     m.manifestPath_ = directory + "/MANIFEST";
 
     bool exists = co_await seastar::file_exists(m.manifestPath_);
+    bool needsRewrite = false;
     if (exists) {
         co_await m.recover();
+        // Rewrite a clean v2 snapshot when:
+        //  - the manifest is legacy (v1, no CRC framing): upgrade in place, or
+        //  - recovery stopped early (torn tail / corrupt record): discard the
+        //    unreachable garbage so future appends stay recoverable.
+        // Both use the atomic temp-file + rename path in writeSnapshot().
+        needsRewrite = !m.crcFraming_ || m.recoveryTruncated_;
     }
 
     // Open the file handle for subsequent appends (rw mode for read-modify-write).
     // If the file didn't exist, open_flags::create will create it.
     co_await m.openFileForAppend();
 
-    if (!exists) {
+    if (!exists || needsRewrite) {
+        if (exists && !m.crcFraming_) {
+            manifest_log.info("Upgrading legacy manifest to CRC-framed format (v2): {}", m.manifestPath_);
+        }
         co_await m.writeSnapshot();
+        m.recoveryTruncated_ = false;
     }
 
     co_return std::move(m);
@@ -130,6 +146,15 @@ std::string Manifest::serializeRemoveFile(uint64_t fileNumber) const {
     return record;
 }
 
+// Frame one record in the v2 format: [record_len(4)][record_crc(4)][record].
+// The CRC covers the record payload only. Appends are always v2 — open()
+// upgrades legacy manifests before any append can happen.
+void Manifest::appendRecordFrame(std::string& out, const std::string& record) {
+    encodeFixed32(out, static_cast<uint32_t>(record.size()));
+    encodeFixed32(out, CRC32::compute(record.data(), record.size()));
+    out.append(record);
+}
+
 seastar::future<> Manifest::appendFrame(const std::string& frame) {
     if (!fileOpen_) {
         co_await openFileForAppend();
@@ -180,8 +205,7 @@ seastar::future<> Manifest::appendFrame(const std::string& frame) {
 seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
     std::string record = serializeAddFile(info);
     std::string frame;
-    encodeFixed32(frame, static_cast<uint32_t>(record.size()));
-    frame.append(record);
+    appendRecordFrame(frame, record);
 
     // Persist to disk FIRST, then update in-memory state.
     co_await appendFrame(frame);
@@ -198,9 +222,7 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
     // Batch all removal records into a single write+fsync
     std::string batchFrame;
     for (uint64_t fn : fileNumbers) {
-        std::string record = serializeRemoveFile(fn);
-        encodeFixed32(batchFrame, static_cast<uint32_t>(record.size()));
-        batchFrame.append(record);
+        appendRecordFrame(batchFrame, serializeRemoveFile(fn));
     }
 
     // Persist to disk FIRST, then update in-memory state.
@@ -223,15 +245,11 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
     std::string combinedFrame;
 
     // AddFile record
-    std::string addRecord = serializeAddFile(newFile);
-    encodeFixed32(combinedFrame, static_cast<uint32_t>(addRecord.size()));
-    combinedFrame.append(addRecord);
+    appendRecordFrame(combinedFrame, serializeAddFile(newFile));
 
     // RemoveFile records
     for (uint64_t fn : removeFileNums) {
-        std::string rmRecord = serializeRemoveFile(fn);
-        encodeFixed32(combinedFrame, static_cast<uint32_t>(rmRecord.size()));
-        combinedFrame.append(rmRecord);
+        appendRecordFrame(combinedFrame, serializeRemoveFile(fn));
     }
 
     // Single write+fsync
@@ -253,9 +271,13 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
 
 seastar::future<> Manifest::writeSnapshot() {
     auto snapshot = serializeSnapshot();
+    // Snapshot files are always written in the v2 CRC-framed format:
+    // [magic][version] header followed by the CRC-framed snapshot record.
     std::string frame;
-    encodeFixed32(frame, static_cast<uint32_t>(snapshot.size()));
-    frame.append(snapshot);
+    encodeFixed32(frame, MANIFEST_MAGIC);
+    encodeFixed32(frame, MANIFEST_VERSION);
+    appendRecordFrame(frame, snapshot);
+    crcFraming_ = true;
 
     // Write atomically: write to temp file via DMA, fsync, then rename.
     auto tmpPath = manifestPath_ + ".tmp";
@@ -309,6 +331,8 @@ seastar::future<> Manifest::writeSnapshot() {
 
 seastar::future<> Manifest::recover() {
     files_.clear();
+    crcFraming_ = false;
+    recoveryTruncated_ = false;
 
     auto readFile = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::ro);
     auto fileSize = co_await readFile.size();
@@ -325,25 +349,76 @@ seastar::future<> Manifest::recover() {
     const char* p = fileBuf.get();
     const char* end = p + fileSize;
 
+    // Detect the format: v2 manifests start with a magic+version header and
+    // CRC-framed records; legacy (v1) manifests start directly with
+    // [len][record] frames and carry no checksums.
+    if (static_cast<size_t>(end - p) >= MANIFEST_HEADER_SIZE && decodeFixed32(p) == MANIFEST_MAGIC) {
+        uint32_t version = decodeFixed32(p + 4);
+        if (version != MANIFEST_VERSION) {
+            throw std::runtime_error("Manifest unsupported version " + std::to_string(version) + ": " + manifestPath_);
+        }
+        crcFraming_ = true;
+        p += MANIFEST_HEADER_SIZE;
+    }
+
+    if (crcFraming_) {
+        // v2: [record_len(4)][record_crc(4)][record]
+        while (p + 8 <= end) {
+            uint32_t recordLen = decodeFixed32(p);
+            uint32_t storedCrc = decodeFixed32(p + 4);
+            if (p + 8 + recordLen > end) {
+                recoveryTruncated_ = true;  // torn tail from a crash mid-append
+                break;
+            }
+            p += 8;
+
+            uint32_t computedCrc = CRC32::compute(p, recordLen);
+            if (computedCrc != storedCrc) {
+                // Same policy as WAL replay: stop at the first corrupt record
+                // and keep everything recovered before it. open() rewrites a
+                // clean snapshot so the corrupt tail is discarded atomically.
+                manifest_log.error(
+                    "Manifest record CRC mismatch at offset {} in {} (stored {:#x}, computed {:#x}) — "
+                    "stopping recovery, {} trailing bytes discarded",
+                    static_cast<size_t>(p - 8 - fileBuf.get()), manifestPath_, storedCrc, computedCrc,
+                    static_cast<size_t>(end - p + 8));
+                recoveryTruncated_ = true;
+                break;
+            }
+
+            applyRecord(p, p + recordLen);
+            p += recordLen;
+        }
+        if (p < end && !recoveryTruncated_) {
+            recoveryTruncated_ = true;  // trailing partial length header
+        }
+        co_return;
+    }
+
+    // Legacy v1: [record_len(4)][record], no CRC. Legacy manifests are always
+    // rewritten as v2 snapshots by open(), which also discards any torn tail.
     while (p + 4 <= end) {
         uint32_t recordLen = decodeFixed32(p);
         p += 4;
         if (p + recordLen > end)
             break;
 
-        const char* rp = p;
-        const char* rend = p + recordLen;
+        applyRecord(p, p + recordLen);
         p += recordLen;
+    }
+}
 
-        if (rp >= rend)
-            continue;
-        auto type = static_cast<RecordType>(*rp);
-        ++rp;
+// Apply one decoded record (type byte + payload) to the in-memory file set.
+void Manifest::applyRecord(const char* rp, const char* rend) {
+    if (rp >= rend)
+        return;
+    auto type = static_cast<RecordType>(*rp);
+    ++rp;
 
-        if (type == RecordType::Snapshot) {
+    if (type == RecordType::Snapshot) {
             files_.clear();
             if (rp + 12 > rend)
-                continue;
+                return;
             nextFileNumber_ = decodeFixed64(rp);
             rp += 8;
             uint32_t fileCount = decodeFixed32(rp);
@@ -390,7 +465,7 @@ seastar::future<> Manifest::recover() {
             }
         } else if (type == RecordType::AddFile) {
             if (rp + 28 > rend)
-                continue;
+                return;
             SSTableMetadata f;
             f.fileNumber = decodeFixed64(rp);
             rp += 8;
@@ -402,20 +477,20 @@ seastar::future<> Manifest::recover() {
             rp += 8;
 
             if (rp + 4 > rend)
-                continue;
+                return;
             uint32_t minKeyLen = decodeFixed32(rp);
             rp += 4;
             if (rp + minKeyLen > rend)
-                continue;
+                return;
             f.minKey.assign(rp, minKeyLen);
             rp += minKeyLen;
 
             if (rp + 4 > rend)
-                continue;
+                return;
             uint32_t maxKeyLen = decodeFixed32(rp);
             rp += 4;
             if (rp + maxKeyLen > rend)
-                continue;
+                return;
             f.maxKey.assign(rp, maxKeyLen);
             rp += maxKeyLen;
 
@@ -431,11 +506,10 @@ seastar::future<> Manifest::recover() {
                 nextFileNumber_ = fn + 1;
         } else if (type == RecordType::RemoveFile) {
             if (rp + 8 > rend)
-                continue;
+                return;
             uint64_t fn = decodeFixed64(rp);
             std::erase_if(files_, [fn](const SSTableMetadata& ff) { return ff.fileNumber == fn; });
         }
-    }
 }
 
 seastar::future<> Manifest::close() {

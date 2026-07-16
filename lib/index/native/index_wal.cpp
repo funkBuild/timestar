@@ -14,9 +14,12 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/util/log.hh>
 #include <stdexcept>
 
 namespace timestar::index {
+
+static seastar::logger index_wal_log("timestar.index_wal");
 
 // CRC32C using SSE 4.2 hardware intrinsics (Castagnoli polynomial).
 // Falls back to software table for non-x86 platforms.
@@ -139,6 +142,9 @@ IndexWAL::~IndexWAL() {
 seastar::future<> IndexWAL::openFile() {
     walFile_.emplace(co_await seastar::open_file_dma(
         currentPath_, seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate));
+    // Crash-edge hardening: make the new WAL file's directory entry durable.
+    // Cheap — this runs once per WAL generation, not per append.
+    co_await seastar::sync_directory(directory_);
     dmaAlignment_ = walFile_->disk_write_dma_alignment();
     writePos_ = 0;
     dmaWritePos_ = 0;
@@ -427,6 +433,15 @@ seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTa
         } catch (...) {
             break;
         }
+    }
+
+    // Replay stopped before consuming the whole file: torn tail from a crash
+    // mid-append (normal) or corruption (CRC mismatch / bad record). Either
+    // way the remaining bytes are discarded — say so instead of silence.
+    if (p < end) {
+        index_wal_log.warn("WAL replay of {} stopped with {} of {} bytes unconsumed ({} records replayed) — "
+                           "torn tail or corrupt record, remaining bytes discarded",
+                           path, static_cast<size_t>(end - p), data.size(), recordsReplayed);
     }
 
     co_return recordsReplayed;

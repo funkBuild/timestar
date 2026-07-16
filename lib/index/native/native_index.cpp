@@ -36,6 +36,33 @@ static seastar::logger native_index_log("timestar.native_index");
 
 namespace timestar::index {
 
+// Returns true if an SSTable whose keys span [minKey, maxKey] may contain a
+// key starting with `prefix`. Used to skip non-intersecting SSTables in
+// prefix scans. maxKey is populated by SSTableReader::open(); an empty maxKey
+// means the range is unknown and the file cannot be pruned.
+static bool rangeMayContainPrefix(const SSTableMetadata& meta, std::string_view prefix) {
+    if (prefix.empty() || meta.maxKey.empty()) {
+        return true;
+    }
+    // The smallest possible key with this prefix is the prefix itself:
+    // if even that is past maxKey, nothing in the file can match.
+    if (prefix > meta.maxKey) {
+        return false;
+    }
+    // All keys with this prefix are < nextPrefix, where nextPrefix is the
+    // prefix with its last byte incremented (trailing 0xFF bytes are dropped
+    // first; an all-0xFF prefix has no upper bound).
+    std::string next(prefix);
+    while (!next.empty() && static_cast<unsigned char>(next.back()) == 0xFF) {
+        next.pop_back();
+    }
+    if (next.empty()) {
+        return true;
+    }
+    next.back() = static_cast<char>(static_cast<unsigned char>(next.back()) + 1);
+    return next > meta.minKey;  // skip when nextPrefix <= minKey (file entirely above range)
+}
+
 // ============================================================================
 // Iterator adapters for MergeIterator (used by kvPrefixScan)
 // ============================================================================
@@ -277,6 +304,9 @@ seastar::future<> NativeIndex::close() {
     }
     sstableReaders_.clear();
 
+    // Force-close any deferred readers (no scans can be in flight at shutdown)
+    co_await drainPendingCloseReaders(true);
+
     if (wal_)
         co_await wal_->close();
     if (manifest_) {
@@ -302,16 +332,24 @@ std::string NativeIndex::sstFilename(uint64_t fileNumber) {
 // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
 // Existing readers (with warm block caches) are preserved.
 seastar::future<> NativeIndex::refreshSSTables() {
+    // Snapshot the manifest file list: the open loop below suspends on DMA
+    // I/O, and a concurrent manifest mutation could reallocate files_ under a
+    // live range-for reference.
+    auto manifestFileList = manifest_->files();
+
     // Build set of file numbers currently in the manifest
     std::set<uint64_t> manifestFiles;
-    for (const auto& fileMeta : manifest_->files()) {
+    for (const auto& fileMeta : manifestFileList) {
         manifestFiles.insert(fileMeta.fileNumber);
     }
 
-    // Close and remove readers for files no longer in the manifest
+    // Remove readers for files no longer in the manifest. Do NOT close them
+    // eagerly: in-flight scans snapshot the shared_ptr, which protects the
+    // object but not the fd — closing here would break a suspended scan's next
+    // block read. Defer the close until the last external reference is gone.
     for (auto it = sstableReaders_.begin(); it != sstableReaders_.end();) {
         if (manifestFiles.find(it->first) == manifestFiles.end()) {
-            co_await it->second->close();
+            pendingCloseReaders_.push_back(std::move(it->second));
             it = sstableReaders_.erase(it);
         } else {
             ++it;
@@ -319,7 +357,7 @@ seastar::future<> NativeIndex::refreshSSTables() {
     }
 
     // Open readers for new files not yet in the reader map
-    for (const auto& fileMeta : manifest_->files()) {
+    for (const auto& fileMeta : manifestFileList) {
         if (sstableReaders_.find(fileMeta.fileNumber) != sstableReaders_.end()) {
             continue;  // Already open
         }
@@ -328,7 +366,36 @@ seastar::future<> NativeIndex::refreshSSTables() {
             // SSTableReader::open returns unique_ptr; convert to shared_ptr for lifetime safety
             auto reader = co_await SSTableReader::open(path, &blockCache_);
             sstableReaders_[fileMeta.fileNumber] = std::shared_ptr<SSTableReader>(std::move(reader));
+        } else {
+            // Crash edge: the manifest references a file that is missing on
+            // disk. Skip it so startup can proceed, but say so LOUDLY — any
+            // keys whose newest version lived only in this file are lost.
+            ::native_index_log.error(
+                "Manifest lists SSTable file {} ({}) but it does not exist on disk — skipping "
+                "(possible data loss on shard {})",
+                fileMeta.fileNumber, path, shardId_);
         }
+    }
+
+    // Close any deferred readers whose last scan has finished.
+    co_await drainPendingCloseReaders(false);
+}
+
+// Close deferred readers once no in-flight scan holds them (use_count()==1
+// means pendingCloseReaders_ holds the only reference). With force=true (used
+// by close()) all remaining readers are closed unconditionally.
+seastar::future<> NativeIndex::drainPendingCloseReaders(bool force) {
+    std::vector<std::shared_ptr<SSTableReader>> toClose;
+    for (auto it = pendingCloseReaders_.begin(); it != pendingCloseReaders_.end();) {
+        if (force || it->use_count() == 1) {
+            toClose.push_back(std::move(*it));
+            it = pendingCloseReaders_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto& reader : toClose) {
+        co_await reader->close();
     }
 }
 
@@ -457,6 +524,9 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
     // This is the common case after compaction.
     if (memtableEmpty && immutableEmpty && sstCount == 1) {
         auto reader = sstableReaders_.begin()->second;  // shared_ptr copy
+        if (!rangeMayContainPrefix(reader->metadata(), prefix)) {
+            co_return;  // key range cannot intersect the prefix
+        }
         auto iter = reader->newIterator();
         co_await iter->seek(prefix);
         while (iter->valid()) {
@@ -514,6 +584,12 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
     readerSnapshot.reserve(sstableReaders_.size());
     int sstPriority = nextPriority + static_cast<int>(sstableReaders_.size());
     for (auto& [fileNum, reader] : sstableReaders_) {
+        // Range pruning: skip SSTables whose [minKey, maxKey] cannot intersect
+        // the prefix — avoids a block read + heap entry per excluded file.
+        if (!rangeMayContainPrefix(reader->metadata(), prefix)) {
+            --sstPriority;
+            continue;
+        }
         readerSnapshot.push_back(reader);
         sources.push_back(std::make_unique<SSTableBorrowedIteratorSource>(reader.get(), sstPriority));
         --sstPriority;
@@ -1704,8 +1780,11 @@ seastar::future<std::optional<RetentionPolicy>> NativeIndex::getRetentionPolicy(
 
     RetentionPolicy policy;
     auto ec = glz::read_json(policy, *val);
-    if (ec)
+    if (ec) {
+        ::native_index_log.warn("Failed to parse retention policy JSON for measurement '{}' — treating as no policy",
+                                measurement);
         co_return std::nullopt;
+    }
     co_return policy;
 }
 
@@ -1713,12 +1792,16 @@ seastar::future<std::vector<RetentionPolicy>> NativeIndex::getAllRetentionPolici
     std::string prefix(1, static_cast<char>(RETENTION_POLICY));
     std::vector<RetentionPolicy> result;
 
-    co_await kvPrefixScan(prefix, [&](std::string_view, std::string_view value) {
+    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) {
         RetentionPolicy policy;
         std::string valStr(value);
         auto ec = glz::read_json(policy, valStr);
         if (!ec) {
             result.push_back(std::move(policy));
+        } else {
+            // Key layout: RETENTION_POLICY prefix byte + measurement name.
+            ::native_index_log.warn("Skipping unparseable retention policy JSON for measurement '{}'",
+                                    key.size() > 1 ? key.substr(1) : key);
         }
         return true;
     });
@@ -1752,9 +1835,10 @@ seastar::future<> NativeIndex::compact() {
         co_await flushMemTable();
     }
 
-    // Close all SSTable readers before compaction (compaction deletes files)
+    // Retire all readers before compaction (compaction deletes files). Deferred
+    // close: an in-flight scan may still hold a snapshot of these readers.
     for (auto& [fileNum, reader] : sstableReaders_) {
-        co_await reader->close();
+        pendingCloseReaders_.push_back(std::move(reader));
     }
     sstableReaders_.clear();
 
