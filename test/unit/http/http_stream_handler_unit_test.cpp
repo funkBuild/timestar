@@ -24,6 +24,8 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <variant>
@@ -1097,4 +1099,69 @@ TEST_F(SSEStructuralTest, DataLineContainsValidJSONObject) {
     std::string json = event.substr(pos, endPos - pos);
     EXPECT_EQ(json.front(), '{') << "data line must start with '{'";
     EXPECT_EQ(json.back(), '}') << "data line must end with '}'";
+}
+
+// ---------------------------------------------------------------------------
+// Source-inspection tests: SSE handler regression guards (Jul 2026 fixes)
+// ---------------------------------------------------------------------------
+//
+// handleSubscribe() needs a running Seastar reactor + engine, so the four
+// e2e-verified /subscribe fixes are guarded here by inspecting the handler
+// source (same pattern as http_write_handler_test.cpp):
+//   1. Per-event flush must reach the socket (flushToSocket + connection
+//      stream extraction), not just the chunked body stream.
+//   2. Content-Type must be set to text/event-stream via set_mime_type()
+//      (write_body()'s type parameter is an extension lookup and maps
+//      "text/event-stream" to text/plain).
+//   3. Error responses must use the flat timestar::http::jsonError() shape,
+//      not the legacy nested {"error":{"code","message"}} shape.
+
+class SSEHandlerSourceInspectionTest : public ::testing::Test {
+protected:
+    static std::string readHandlerSource() {
+#ifdef HTTP_STREAM_HANDLER_SOURCE_PATH
+        std::ifstream src(HTTP_STREAM_HANDLER_SOURCE_PATH);
+#else
+        std::ifstream src("../lib/http/http_stream_handler.cpp");
+#endif
+        if (!src.is_open()) {
+            return {};
+        }
+        return std::string((std::istreambuf_iterator<char>(src)), std::istreambuf_iterator<char>());
+    }
+};
+
+TEST_F(SSEHandlerSourceInspectionTest, EventWritesFlushConnectionStreamToSocket) {
+    std::string content = readHandlerSource();
+    ASSERT_FALSE(content.empty()) << "Could not open http_stream_handler.cpp for source inspection";
+
+    // The connection-stream flush workaround must be present...
+    EXPECT_NE(content.find("extractConnectionStream"), std::string::npos)
+        << "SSE handler must extract the connection output_stream so events can be flushed to the socket";
+    // ...and every event write must use flushToSocket (body flush alone stops
+    // at the connection stream's 8 KB buffer: http_chunked_data_sink_impl
+    // inherits the no-op data_sink_impl::flush()).
+    EXPECT_NE(content.find("co_await flushToSocket(out, connOut);"), std::string::npos)
+        << "SSE event writes must flush via flushToSocket(out, connOut)";
+    EXPECT_EQ(content.find("co_await out.flush();"), std::string::npos)
+        << "co_await out.flush() alone never reaches the socket for sparse SSE events; use flushToSocket()";
+}
+
+TEST_F(SSEHandlerSourceInspectionTest, ContentTypeIsTextEventStream) {
+    std::string content = readHandlerSource();
+    ASSERT_FALSE(content.empty()) << "Could not open http_stream_handler.cpp for source inspection";
+
+    EXPECT_NE(content.find("set_mime_type(\"text/event-stream\")"), std::string::npos)
+        << "SSE reply must set Content-Type via set_mime_type(\"text/event-stream\"); write_body()'s "
+           "content-type parameter is an extension lookup and falls back to text/plain";
+}
+
+TEST_F(SSEHandlerSourceInspectionTest, ErrorResponsesUseFlatJsonErrorShape) {
+    std::string content = readHandlerSource();
+    ASSERT_FALSE(content.empty()) << "Could not open http_stream_handler.cpp for source inspection";
+
+    EXPECT_NE(content.find("timestar::http::jsonError("), std::string::npos)
+        << "/subscribe error responses must use timestar::http::jsonError()";
+    EXPECT_EQ(content.find("\\\"error\\\":{\\\"code\\\""), std::string::npos)
+        << "/subscribe must not emit the legacy nested {\"error\":{\"code\",...}} error shape";
 }

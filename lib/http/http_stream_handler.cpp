@@ -6,6 +6,7 @@
 #include "expression_evaluator.hpp"
 #include "expression_parser.hpp"
 #include "http_auth.hpp"
+#include "http_error.hpp"
 #include "logger.hpp"
 #include "proto_converters.hpp"
 #include "streaming_aggregator.hpp"
@@ -17,6 +18,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
@@ -396,9 +398,92 @@ StreamingBatch HttpStreamHandler::applyFormulaToBatch(const StreamingBatch& batc
     return result;
 }
 
+// --- SSE flush-to-socket workaround ---------------------------------------
+//
+// Seastar's streaming body writer hands us an output_stream stacked as:
+//
+//   body output_stream (32 KB buffer, trim_to_size)
+//     -> http::internal::http_chunked_data_sink_impl  (adds chunk framing)
+//       -> connection's _write_buf output_stream (8 KB buffer, batch_flushes)
+//         -> socket
+//
+// body.flush() pushes buffered bytes through the chunked sink into the
+// connection's _write_buf, but http_chunked_data_sink_impl inherits the
+// default no-op data_sink_impl::flush() (see seastar/src/http/common.cc and
+// seastar/include/seastar/core/iostream.hh), so nothing ever forces
+// _write_buf to the socket until 8 KB accumulate or the response completes.
+// For SSE this held back even the response headers and the "retry:" preamble
+// until ~8 KB of events piled up — sparse subscriptions delivered nothing.
+//
+// Seastar (pinned submodule seastar-25.05.0) exposes no supported way to
+// reach the connection stream from a body writer, so we recover it from the
+// known layout of the internal sink stack:
+//
+//   output_stream<char>          { data_sink _fd; ... }   // _fd is the first member
+//   data_sink                    { std::unique_ptr<data_sink_impl> _dsi; }  // sole member
+//   http_chunked_data_sink_impl : data_sink_impl { output_stream<char>& _out; }
+//                                 // data_sink_impl has no data members, so
+//                                 // _out is stored right after the vptr
+//
+// The recovered stream is used ONLY to call flush() strictly sequenced after
+// awaiting writes/flushes on the body stream; while the body writer runs, the
+// connection's response loop is suspended awaiting us, so no other fiber
+// touches _write_buf. If the layout ever changes, revisit this against
+// seastar/src/http/common.cc (http_chunked_data_sink_impl) — the memcpy reads
+// below are layout mirrors, not aliasing casts.
+static seastar::output_stream<char>* extractConnectionStream(const seastar::output_stream<char>& bodyStream) noexcept {
+    static_assert(sizeof(seastar::data_sink) == sizeof(void*),
+                  "seastar::data_sink layout changed; re-verify extractConnectionStream()");
+    // First pointer-sized field of the body stream: data_sink::_dsi (the impl).
+    void* implPtr = nullptr;
+    std::memcpy(&implPtr, static_cast<const void*>(&bodyStream), sizeof(void*));
+    if (implPtr == nullptr) {
+        return nullptr;
+    }
+    // http_chunked_data_sink_impl layout: [vptr][output_stream<char>& _out]
+    seastar::output_stream<char>* connectionStream = nullptr;
+    std::memcpy(&connectionStream, static_cast<const char*>(implPtr) + sizeof(void*), sizeof(void*));
+    return connectionStream;
+}
+
+// Flush an SSE event all the way to the socket: first the chunked body stream
+// (frames buffered bytes into the connection stream), then the connection
+// stream itself (whose flush actually reaches the socket; with batch_flushes
+// the write happens via the reactor's flush poller within the current task
+// quota). A write/flush failure here is how dead client connections are
+// detected — the exception propagates to the body-writer catch block, which
+// unregisters the subscriptions.
+//
+// probeConnection: the connection stream uses batch_flushes, so flush() only
+// schedules the socket write on the reactor's flush poller and reports a
+// failure on a LATER flush() call (output_stream stores the error in _ex).
+// On a dead socket the first write after the client's FIN still succeeds
+// (the RST arrives afterwards), so without probing an error would surface a
+// full heartbeat interval late. Heartbeats therefore probe: give the poller
+// a moment to perform the write, then flush again so any stored error
+// surfaces on THIS heartbeat. This keeps quiet-stream disconnect cleanup
+// within ~2 heartbeat intervals. Data-event writes skip the probe (latency
+// matters there, and heartbeats own disconnect detection).
+static seastar::future<> flushToSocket(seastar::output_stream<char>& body, seastar::output_stream<char>* conn,
+                                       bool probeConnection = false) {
+    co_await body.flush();
+    if (conn == nullptr) {
+        co_return;
+    }
+    co_await conn->flush();
+    if (probeConnection) {
+        co_await seastar::sleep(std::chrono::milliseconds(10));
+        co_await conn->flush();
+    }
+}
+
 // --- Route registration ---
 
-// Custom handler that doesn't override Content-Type after write_body
+// Custom handler for SSE replies. Calls the no-argument done() overload,
+// which only stamps the response line; the Content-Type header is set
+// explicitly via set_mime_type() in handleSubscribe (write_body()'s
+// content-type parameter is treated as a file *extension* and would map
+// "text/event-stream" to the default mime type).
 class sse_handler : public seastar::httpd::handler_base {
     HttpStreamHandler* _parent;
 
@@ -409,8 +494,8 @@ public:
                                                                   std::unique_ptr<seastar::http::request> req,
                                                                   std::unique_ptr<seastar::http::reply>) override {
         return _parent->handleSubscribe(std::move(req)).then([](std::unique_ptr<seastar::http::reply> rep) {
-            // Call done() without a type parameter to avoid overwriting
-            // the Content-Type already set by write_body
+            // done() without arguments only sets the response line and leaves
+            // the Content-Type header (set in handleSubscribe) untouched.
             rep->done();
             return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         });
@@ -468,7 +553,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     // Body size limit to prevent DoS via large payloads
     if (req->content.size() > timestar::config().http.max_query_body_size) {
         rep->set_status(seastar::http::reply::status_type::payload_too_large);
-        rep->_content = R"({"status":"error","error":"Request body too large"})";
+        rep->_content = timestar::http::jsonError("Request body too large");
         timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
@@ -495,10 +580,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             }
         } catch (const std::exception& e) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content =
-                "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_PROTOBUF\",\"message\":\"Failed to parse "
-                "subscribe "
-                "request\"}}";
+            rep->_content = timestar::http::jsonError("Failed to parse subscribe request", "INVALID_PROTOBUF");
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
@@ -506,9 +588,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         auto parseErr = glz::read_json(glazeReq, req->content);
         if (parseErr) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content =
-                "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_JSON\",\"message\":\"Failed to parse subscribe "
-                "request\"}}";
+            rep->_content = timestar::http::jsonError("Failed to parse subscribe request", "INVALID_JSON");
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
@@ -520,9 +600,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     if (!glazeReq.queries.empty() && !glazeReq.query.empty()) {
         // Both specified — reject ambiguous request
         rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->_content =
-            "{\"status\":\"error\",\"error\":{\"code\":\"AMBIGUOUS_REQUEST\",\"message\":\"Specify either 'query' or "
-            "'queries', not both\"}}";
+        rep->_content = timestar::http::jsonError("Specify either 'query' or 'queries', not both", "AMBIGUOUS_REQUEST");
         timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
@@ -533,9 +611,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         // Reject excessively large query lists to prevent resource exhaustion
         if (glazeReq.queries.size() > MAX_QUERIES_PER_SUBSCRIPTION) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content =
-                "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_QUERIES\",\"message\":\"Too many queries (max "
-                "100)\"}}";
+            rep->_content = timestar::http::jsonError("Too many queries (max 100)", "TOO_MANY_QUERIES");
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
@@ -548,8 +624,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 entry.queryReq = QueryParser::parseQueryString(qe.query);
             } catch (const QueryParseException& e) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\",\"message\":\"Query '" +
-                                jsonEscape(entry.label) + "': " + jsonEscape(e.what()) + "\"}}";
+                rep->_content =
+                    timestar::http::jsonError("Query '" + entry.label + "': " + e.what(), "INVALID_QUERY");
                 timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
@@ -563,17 +639,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             entry.queryReq = QueryParser::parseQueryString(glazeReq.query);
         } catch (const QueryParseException& e) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\",\"message\":\"" +
-                            jsonEscape(e.what()) + "\"}}";
+            rep->_content = timestar::http::jsonError(e.what(), "INVALID_QUERY");
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
         queryEntries.push_back(std::move(entry));
     } else {
         rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->_content =
-            "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\",\"message\":\"Either 'query' or 'queries' "
-            "must be provided\"}}";
+        rep->_content = timestar::http::jsonError("Either 'query' or 'queries' must be provided", "INVALID_QUERY");
         timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
@@ -602,8 +675,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
         if (aggIntervalNs == 0) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
             rep->_content =
-                "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\","
-                "\"message\":\"aggregationInterval is required when formula is set\"}}";
+                timestar::http::jsonError("aggregationInterval is required when formula is set", "INVALID_QUERY");
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
@@ -612,9 +684,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             auto ast = parser.parse();
             if (ast->type == ExprNodeType::ANOMALY_FUNCTION || ast->type == ExprNodeType::FORECAST_FUNCTION) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content =
-                    "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_QUERY\","
-                    "\"message\":\"anomalies() and forecast() are not supported in streaming subscriptions\"}}";
+                rep->_content = timestar::http::jsonError(
+                    "anomalies() and forecast() are not supported in streaming subscriptions", "INVALID_QUERY");
                 timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
@@ -626,12 +697,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 for (const auto& ref : refs) {
                     if (ref != "a") {
                         rep->set_status(seastar::http::reply::status_type::bad_request);
-                        rep->_content =
-                            "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_FORMULA\","
-                            "\"message\":\"Formula references undefined query '" +
-                            jsonEscape(ref) +
-                            "'. "
-                            "Single-query subscriptions only support 'a' as the query reference.\"}}";
+                        rep->_content = timestar::http::jsonError(
+                            "Formula references undefined query '" + ref +
+                                "'. Single-query subscriptions only support 'a' as the query reference.",
+                            "INVALID_FORMULA");
                         timestar::http::setContentType(*rep, resFmt);
                         co_return rep;
                     }
@@ -650,17 +719,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                             for (const auto& l : validLabels) {
                                 if (!s.empty())
                                     s += ", ";
-                                s += jsonEscape(l);
+                                s += l;
                             }
                             return s;
                         }();
-                        rep->_content =
-                            "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_FORMULA\","
-                            "\"message\":\"Formula references undefined query '" +
-                            jsonEscape(ref) +
-                            "'. "
-                            "Available labels: " +
-                            availLabels + "\"}}";
+                        rep->_content = timestar::http::jsonError(
+                            "Formula references undefined query '" + ref + "'. Available labels: " + availLabels,
+                            "INVALID_FORMULA");
                         timestar::http::setContentType(*rep, resFmt);
                         co_return rep;
                     }
@@ -670,8 +735,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             formulaAst = std::move(ast);
         } catch (const ExpressionParseException& e) {
             rep->set_status(seastar::http::reply::status_type::bad_request);
-            rep->_content = "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_FORMULA\",\"message\":\"" +
-                            jsonEscape(e.what()) + "\"}}";
+            rep->_content = timestar::http::jsonError(e.what(), "INVALID_FORMULA");
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
@@ -688,8 +752,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     if (localMgr.localSubscriptionCount() + queryEntries.size() > streamCfg.max_subscriptions_per_shard) {
         rep->set_status(seastar::http::reply::status_type{429});
         rep->_content =
-            "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_SUBSCRIPTIONS\","
-            "\"message\":\"Maximum subscriptions per shard exceeded\"}}";
+            timestar::http::jsonError("Maximum subscriptions per shard exceeded", "TOO_MANY_SUBSCRIPTIONS");
         timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
@@ -749,16 +812,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             });
             if (limitExceeded) {
                 rep->set_status(seastar::http::reply::status_type{429});
-                rep->_content =
-                    "{\"status\":\"error\",\"error\":{\"code\":\"TOO_MANY_SUBSCRIPTIONS\","
-                    "\"message\":\"" +
-                    jsonEscape(subscriptionError) + "\"}}";
+                rep->_content = timestar::http::jsonError(subscriptionError, "TOO_MANY_SUBSCRIPTIONS");
             } else {
                 rep->set_status(seastar::http::reply::status_type{400});
-                rep->_content = std::string(
-                                    "{\"status\":\"error\",\"error\":{\"code\":\"INVALID_SCOPE_PATTERN\","
-                                    "\"message\":\"") +
-                                jsonEscape(subscriptionError) + "\"}}";
+                rep->_content = timestar::http::jsonError(subscriptionError, "INVALID_SCOPE_PATTERN");
             }
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
@@ -795,10 +852,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 return seastar::make_ready_future<>();
             });
             rep->set_status(seastar::http::reply::status_type{500});
-            rep->_content =
-                "{\"status\":\"error\",\"error\":{\"code\":\"SUBSCRIPTION_REGISTRATION_FAILED\","
-                "\"message\":\"" +
-                jsonEscape(remoteRegError) + "\"}}";
+            rep->_content = timestar::http::jsonError(remoteRegError, "SUBSCRIPTION_REGISTRATION_FAILED");
             timestar::http::setContentType(*rep, resFmt);
             co_return rep;
         }
@@ -893,6 +947,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     // Cross-query derived mode: multi-query + formula
     bool useDerivedEvaluator = formulaAst && queryEntries.size() > 1;
 
+    // NOTE: write_body()'s content-type parameter is interpreted as a file
+    // EXTENSION (reply::set_content_type -> mime_types::extension_to_type),
+    // so "text/event-stream" silently maps to the fallback "text/plain".
+    // set_mime_type() below overwrites the Content-Type header directly with
+    // the real SSE mime type; sse_handler's no-arg done() leaves it intact.
     rep->write_body(
         "text/event-stream",
         [queuePtr, allSubIds = std::move(allSubIds), thisShard, shardCount, outputQueue = std::move(outputQueue),
@@ -900,6 +959,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
          labelAggMethods = std::move(labelAggMethods), formulaAst, useDerivedEvaluator, heartbeatSec,
          gateHolder = _connectionGate.hold()](seastar::output_stream<char>&& os) mutable -> seastar::future<> {
             auto out = std::move(os);
+
+            // Connection-level stream, needed to actually push bytes to the
+            // socket per event (see extractConnectionStream above). Never
+            // written through directly — only flushed after out.flush().
+            seastar::output_stream<char>* connOut = extractConnectionStream(out);
 
             // Cancellation flag: set true in catch block so timer callbacks
             // can guard against dereferencing queuePtr after it is destroyed.
@@ -909,7 +973,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
             try {
                 // Send initial SSE retry interval
                 co_await out.write("retry: 5000\n\n");
-                co_await out.flush();
+                co_await flushToSocket(out, connOut);
 
                 // Send backfill events first (if any)
                 uint64_t seqId = 0;
@@ -920,7 +984,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                     }
                     std::string event = HttpStreamHandler::formatSSEBackfillEvent(batch);
                     co_await out.write(event);
-                    co_await out.flush();
+                    co_await flushToSocket(out, connOut);
                 }
                 backfillBatches.clear();
 
@@ -989,7 +1053,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                         }
                         event += "}\n\n";
                         co_await out.write(event);
-                        co_await out.flush();
+                        co_await flushToSocket(out, connOut);
                         co_return;
                     }
                     if (batch.points.empty())
@@ -1019,7 +1083,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                         // sequenceId was already stamped by deliverBatch on the manager side
                         std::string event = HttpStreamHandler::formatSSEEvent(batch);
                         co_await out.write(event);
-                        co_await out.flush();
+                        co_await flushToSocket(out, connOut);
                     }
                 };
 
@@ -1038,7 +1102,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                                 aggBatch.sequenceId = seqId++;
                                 std::string event = HttpStreamHandler::formatSSEEvent(aggBatch);
                                 co_await out.write(event);
-                                co_await out.flush();
+                                co_await flushToSocket(out, connOut);
                             }
                         } else {
                             for (auto& [label, agg] : aggregators) {
@@ -1053,17 +1117,21 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                                 if (!aggBatch.points.empty()) {
                                     std::string event = HttpStreamHandler::formatSSEEvent(aggBatch);
                                     co_await out.write(event);
-                                    co_await out.flush();
+                                    co_await flushToSocket(out, connOut);
                                 }
                             }
                         }
                     }
 
-                    // Send heartbeat if timer fired (check unconditionally — busy streams need it too)
+                    // Send heartbeat if timer fired (check unconditionally — busy streams need it too).
+                    // Besides keeping intermediaries alive, the heartbeat's
+                    // write+flush is the disconnect detector for quiet streams:
+                    // a dead socket makes it throw, which exits to the catch
+                    // block below and unregisters the subscriptions.
                     if (heartbeatDue) {
                         heartbeatDue = false;
                         co_await out.write(":heartbeat\n\n");
-                        co_await out.flush();
+                        co_await flushToSocket(out, connOut, /*probeConnection=*/true);
                     }
 
                     // Wait for data
@@ -1102,6 +1170,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
 
             co_await out.close();
         });
+
+    rep->set_mime_type("text/event-stream");
 
     co_return rep;
 }
