@@ -1046,12 +1046,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             }
         } else {
             // Bucketed: iterate files in preferred order, share filledBuckets
-            // across files for cross-file early termination.
-            uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
-            uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
-            size_t totalBuckets = (lastBucket >= firstBucket)
-                                      ? static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1)
-                                      : 1;
+            // across files for cross-file early termination.  Reuses the
+            // first/last bucket computed above rather than recomputing them.
+            const size_t totalBuckets = (lastBucket >= firstBucket)
+                                            ? static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1)
+                                            : 1;
 
             if (totalBuckets == 1) {
                 // Handled above in needsSinglePoint path
