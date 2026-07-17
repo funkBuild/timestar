@@ -230,9 +230,10 @@ describe('Protobuf write API (POST /write, application/x-protobuf)', () => {
     expect(fields.count.timestamps).toEqual(expectedTs);
     expect(fields.count.values).toEqual(counts);
 
-    // Booleans are serialized as 1/0 in the JSON query response
+    // Booleans are non-numeric: a protobuf-written bool field round-trips
+    // through the JSON query response as real true/false, not 1/0.
     expect(fields.active.timestamps).toEqual(expectedTs);
-    expect(fields.active.values).toEqual([1, 0, 1]);
+    expect(fields.active.values).toEqual(actives);
 
     expect(fields.label.timestamps).toEqual(expectedTs);
     expect(fields.label.values).toEqual(labels);

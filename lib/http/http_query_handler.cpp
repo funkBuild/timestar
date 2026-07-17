@@ -83,24 +83,25 @@ static bool canStreamAggregation(AggregationMethod method, const std::vector<std
 }
 
 // ---------------------------------------------------------------------------
-// String field semantics (canonical, see CLAUDE.md "String fields in queries"):
-// strings never aggregate numerically.  Without an aggregationInterval they
-// pass through raw; with an interval they are reduced to LATEST-per-bucket
-// (bucket-start timestamps, matching the numeric bucket layout).  The
-// aggregation method named in the query is ignored for string fields.
+// Non-numeric field semantics (canonical, see CLAUDE.md "Non-numeric fields in
+// queries"): strings and booleans never aggregate numerically.  Without an
+// aggregationInterval they pass through raw; with an interval they are reduced
+// to LATEST-per-bucket (bucket-start timestamps, matching the numeric bucket
+// layout).  The aggregation method named in the query is ignored for them, and
+// values are returned in the type they were written in.
 // ---------------------------------------------------------------------------
 
-// Reduce one raw string field (sorted ascending by timestamp) to
+// Reduce one raw non-numeric field (sorted ascending by timestamp) to
 // LATEST-per-bucket in place.  Bucket boundaries are epoch-aligned
 // (ts / interval * interval), identical to the numeric fold in
 // BlockAggregator / foldPoint below.
-static void bucketStringFieldLatest(std::vector<uint64_t>& timestamps, std::vector<std::string>& values,
-                                    uint64_t interval) {
+template <typename V>
+static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::vector<V>& values, uint64_t interval) {
     if (interval == 0 || timestamps.empty()) {
         return;
     }
     std::vector<uint64_t> outTs;
-    std::vector<std::string> outVals;
+    std::vector<V> outVals;
     for (size_t i = 0; i < timestamps.size(); ++i) {
         const uint64_t bucket = (timestamps[i] / interval) * interval;
         if (!outTs.empty() && outTs.back() == bucket) {
@@ -115,11 +116,13 @@ static void bucketStringFieldLatest(std::vector<uint64_t>& timestamps, std::vect
     values = std::move(outVals);
 }
 
-// Apply LATEST-per-bucket to every string field of a SeriesResult.
-static void bucketStringResultLatest(timestar::SeriesResult& sr, uint64_t interval) {
+// Apply LATEST-per-bucket to every non-numeric field of a SeriesResult.
+static void bucketNonNumericResultLatest(timestar::SeriesResult& sr, uint64_t interval) {
     for (auto& [fieldName, fieldData] : sr.fields) {
         if (auto* strs = std::get_if<std::vector<std::string>>(&fieldData.second)) {
-            bucketStringFieldLatest(fieldData.first, *strs, interval);
+            bucketNonNumericFieldLatest(fieldData.first, *strs, interval);
+        } else if (auto* bools = std::get_if<std::vector<bool>>(&fieldData.second)) {
+            bucketNonNumericFieldLatest(fieldData.first, *bools, interval);
         }
     }
 }
@@ -127,8 +130,9 @@ static void bucketStringResultLatest(timestar::SeriesResult& sr, uint64_t interv
 // Streaming group-by coroutine.  Iterates each series context, folds the
 // per-series PushdownResult into a per-group accumulator, and returns
 // PartialAggregationResults in the same format the rest of the pipeline
-// expects.  String series cannot fold numerically; they are appended to
-// `stringResults` raw (the caller applies the interval reduction).
+// expects.  String and boolean series cannot fold numerically; they are
+// appended to `nonNumericResults` raw (the caller applies the interval
+// reduction).
 //
 // Uses direct AggregationState accumulators (not BlockAggregator) so that
 // PushdownResult states can be merged in without converting back to raw
@@ -140,7 +144,7 @@ static void bucketStringResultLatest(timestar::SeriesResult& sr, uint64_t interv
 static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAggregation(
     Engine& engine, std::vector<SeriesQueryContext>& contexts, const std::string& measurement, uint64_t startTime,
     uint64_t endTime, AggregationMethod aggregation, uint64_t aggregationInterval,
-    const std::vector<std::string>& groupByTags, std::vector<timestar::SeriesResult>& stringResults) {
+    const std::vector<std::string>& groupByTags, std::vector<timestar::SeriesResult>& nonNumericResults) {
     // ---- Phase 1: Pre-group series by groupKey ----
     struct GroupAccumulator {
         // For bucketed queries (interval > 0): one AggregationState per bucket
@@ -200,13 +204,20 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
 
     // ---- Phase 3: Helper lambdas for folding values into groups ----
 
+    // Grouping must never alter the time axis.  With no aggregationInterval,
+    // every distinct timestamp survives and values are aggregated ACROSS the
+    // series in a group at equal timestamps — identical to the no-group-by
+    // path.  Only LATEST/FIRST collapse a range by definition.
+    const bool collapseRange = (aggregationInterval == 0) && collapsesWholeRange(aggregation);
+
     // Fold a single (timestamp, value) pair into a group accumulator.
     auto foldPoint = [&](GroupAccumulator& group, uint64_t ts, double val) {
-        if (aggregationInterval > 0) {
-            uint64_t bucket = (ts / aggregationInterval) * aggregationInterval;
-            group.bucketStates[bucket].addValueForMethod(val, ts, aggregation);
-        } else {
+        if (collapseRange) {
             group.collapsedState.addValueForMethod(val, ts, aggregation);
+        } else {
+            // interval == 0 buckets per distinct timestamp.
+            const uint64_t bucket = aggregationInterval > 0 ? (ts / aggregationInterval) * aggregationInterval : ts;
+            group.bucketStates[bucket].addValueForMethod(val, ts, aggregation);
         }
     };
 
@@ -220,7 +231,7 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
                 group.bucketStates[bucketTs].mergeForMethod(state, aggregation);
             }
         } else if (pr.aggregatedState.has_value()) {
-            // Non-bucketed collapsed state: merge directly
+            // Collapsed state (LATEST/FIRST only — see collapseRange): merge directly
             group.collapsedState.mergeForMethod(*pr.aggregatedState, aggregation);
         } else if (!pr.sortedTimestamps.empty()) {
             // Raw values from pushdown: fold each value
@@ -250,12 +261,13 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
             auto* group = pair.group;
 
             // --- Try pushdown path ---
-            // foldNoInterval=true: this streaming path collapses each group's
-            // whole range into a single value when interval == 0, so a
-            // per-series collapsed state is the ideal transfer shape.
+            // foldNoInterval=false: with interval == 0 the group's time axis is
+            // preserved, so the pushdown must hand back raw sorted vectors to be
+            // folded per timestamp.  LATEST/FIRST collapse inside the runner
+            // regardless of this flag, which is exactly collapseRange's shape.
             auto pushdownResult = co_await engine.queryAggregated(ctx.seriesKey, ctx.seriesId, startTime, endTime,
                                                                   aggregationInterval, aggregation,
-                                                                  /*foldNoInterval=*/true);
+                                                                  /*foldNoInterval=*/false);
 
             if (pushdownResult.has_value()) {
                 mergePushdownIntoGroup(*group, *pushdownResult);
@@ -296,34 +308,38 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
                             for (auto& [bucketTs, state] : agg.takeBucketStates()) {
                                 group->bucketStates[bucketTs].mergeForMethod(std::move(state), aggregation);
                             }
-                        } else {
+                        } else if (collapseRange) {
                             BlockAggregator agg(0, aggregation);
                             agg.enableFoldToSingleState();
                             agg.addPoints(result.timestamps, result.values);
                             group->collapsedState.mergeForMethod(agg.takeSingleState(), aggregation);
+                        } else {
+                            // interval == 0, method keeps the time axis: one state
+                            // per distinct timestamp.  BlockAggregator's bucketed
+                            // fold needs interval > 0, so fold directly.
+                            for (size_t i = 0; i < result.timestamps.size(); ++i) {
+                                foldPoint(*group, result.timestamps[i], result.values[i]);
+                            }
                         }
                     } else if constexpr (std::is_same_v<T, QueryResult<int64_t>>) {
                         group->totalPoints += result.timestamps.size();
                         for (size_t i = 0; i < result.timestamps.size(); ++i) {
                             foldPoint(*group, result.timestamps[i], static_cast<double>(result.values[i]));
                         }
-                    } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
-                        group->totalPoints += result.timestamps.size();
-                        for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                            foldPoint(*group, result.timestamps[i], result.values[i] ? 1.0 : 0.0);
-                        }
-                    } else if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
-                        // Strings can't aggregate numerically — pass them
-                        // through per-series (they bypass grouping, like the
-                        // standard path).  The caller reduces them to
-                        // LATEST-per-bucket when an interval is set.
+                    } else if constexpr (std::is_same_v<T, QueryResult<bool>> ||
+                                         std::is_same_v<T, QueryResult<std::string>>) {
+                        // Strings and booleans can't aggregate numerically —
+                        // pass them through per-series in their written type
+                        // (they bypass grouping, like the standard path).  The
+                        // caller reduces them to LATEST-per-bucket when an
+                        // interval is set.
                         if (!result.timestamps.empty()) {
                             timestar::SeriesResult sr;
                             sr.measurement = measurement;
                             sr.tags = ctx.tags;
                             sr.fields[ctx.field] =
                                 std::make_pair(std::move(result.timestamps), FieldValues(std::move(result.values)));
-                            stringResults.push_back(std::move(sr));
+                            nonNumericResults.push_back(std::move(sr));
                         }
                     }
                 },
@@ -343,14 +359,14 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
         partial.cachedTags = std::move(groupPtr->cachedTags);
         partial.totalPoints = groupPtr->totalPoints;
 
-        if (aggregationInterval > 0) {
-            if (groupPtr->bucketStates.empty())
-                continue;  // No data for this group
-            partial.bucketStates = std::move(groupPtr->bucketStates);
-        } else {
+        if (collapseRange) {
             if (groupPtr->collapsedState.count == 0)
                 continue;  // No data for this group
             partial.collapsedState = std::move(groupPtr->collapsedState);
+        } else {
+            if (groupPtr->bucketStates.empty())
+                continue;  // No data for this group
+            partial.bucketStates = std::move(groupPtr->bucketStates);
         }
 
         results.push_back(std::move(partial));
@@ -398,13 +414,26 @@ void HttpQueryHandler::finalizeSingleShardPartials(std::vector<PartialAggregatio
                 values.push_back(state.getValue(method));
             }
         } else if (!partial.sortedValues.empty()) {
-            // Non-bucketed raw values from pushdown — zero-copy move
+            // Non-bucketed raw values from pushdown.  Each timestamp holds ONE
+            // value here, so the per-timestamp aggregate is the fold of a
+            // single-element set — which is the value itself only for methods
+            // where fold-of-one is the identity (methodCanFoldRaw).  COUNT is 1
+            // per point; SPREAD/STDDEV/STDVAR are 0 over one value, and passing
+            // the raw value through instead made this path disagree with the
+            // grouped and multi-shard paths, which fold properly.
+            timestamps = std::move(partial.sortedTimestamps);
             if (method == AggregationMethod::COUNT) {
-                timestamps = std::move(partial.sortedTimestamps);
                 values.assign(timestamps.size(), 1.0);
-            } else {
-                timestamps = std::move(partial.sortedTimestamps);
+            } else if (methodCanFoldRaw(method)) {
                 values = std::move(partial.sortedValues);
+            } else {
+                values.reserve(timestamps.size());
+                for (size_t i = 0; i < timestamps.size(); ++i) {
+                    AggregationState s;
+                    s.collectRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
+                    s.addValue(partial.sortedValues[i], timestamps[i]);
+                    values.push_back(s.getValue(method));
+                }
             }
         } else if (!partial.sortedStates.empty()) {
             // Non-bucketed states from fallback aggregation
@@ -773,7 +802,7 @@ struct SeriesDiscoveryResult {
 // Struct to hold shard query results including both aggregatable and non-aggregatable data
 struct ShardQueryResult {
     std::vector<PartialAggregationResult> partialResults;
-    std::vector<SeriesResult> stringResults;  // String fields bypass aggregation
+    std::vector<SeriesResult> nonNumericResults;  // String/bool fields bypass aggregation
     double shardMs = 0.0;
 };
 
@@ -801,18 +830,29 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     std::vector<PartialAggregationResult> pushdownPartials;
     std::vector<timestar::SeriesResult> fallbackResults;
     fallbackResults.reserve(contexts.size());
-    // String fields bypass numeric aggregation on every path (canonical rule:
-    // raw passthrough without an interval, LATEST-per-bucket with one).
-    std::vector<timestar::SeriesResult> stringResults;
+    // String and boolean fields bypass numeric aggregation on every path
+    // (canonical rule: raw passthrough without an interval, LATEST-per-bucket
+    // with one), and are returned in the type they were written in.
+    std::vector<timestar::SeriesResult> nonNumericResults;
 
-    const bool isLatestOrFirst = (aggregation == AggregationMethod::LATEST || aggregation == AggregationMethod::FIRST);
+    const bool isLatestOrFirst = collapsesWholeRange(aggregation);
 
     // ---- BATCH LATEST/FIRST FAST PATH ----
     // For non-bucketed LATEST/FIRST, resolve all series in a single
     // pass over TSM sparse indices and memory stores.  This avoids
     // per-series: file snapshot, sort, coroutine overhead, and
     // intermediate PushdownResult/BlockAggregator allocations.
-    if (isLatestOrFirst && aggregationInterval == 0) {
+    //
+    // A bucketed LATEST/FIRST can use it too, but ONLY when the whole range
+    // falls inside one epoch-aligned bucket — then "latest per bucket" and
+    // "latest in range" name the same point.  Testing `interval >= range` is
+    // NOT sufficient: a range shorter than the interval still straddles two
+    // buckets when it crosses an epoch boundary (see CLAUDE.md "Aggregation
+    // Result Shape").  The winning point is stamped with its bucket start
+    // below, matching every other interval query.
+    const bool singleBucket =
+        aggregationInterval > 0 && (startTime / aggregationInterval) == (endTime / aggregationInterval);
+    if (isLatestOrFirst && (aggregationInterval == 0 || singleBucket)) {
         const bool wantFirst = (aggregation == AggregationMethod::FIRST);
 
         // Build batch entries
@@ -842,7 +882,13 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
 
             AggregationState state;
             state.addValue(batchEntries[i].value, batchEntries[i].timestamp);
-            partial.collapsedState = std::move(state);
+            if (singleBucket) {
+                // Stamp the bucket start, not the point's own timestamp.
+                const uint64_t bucket = (batchEntries[i].timestamp / aggregationInterval) * aggregationInterval;
+                partial.bucketStates.emplace(bucket, std::move(state));
+            } else {
+                partial.collapsedState = std::move(state);
+            }
 
             pushdownPartials.push_back(std::move(partial));
         }
@@ -866,9 +912,16 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
         // materializing all raw data.  O(groups x buckets)
         // memory instead of O(points).  Works for both
         // group-by and non-group-by queries.
-        pushdownPartials =
+        //
+        // APPEND, never assign: the batch LATEST/FIRST path above may already
+        // have resolved the numeric series into pushdownPartials and left only
+        // the non-numeric ones in `contexts`.  Overwriting here silently
+        // dropped every numeric field from such a response.
+        auto streamedPartials =
             co_await streamingGroupByAggregation(engine, contexts, measurement, startTime, endTime, aggregation,
-                                                 aggregationInterval, groupByTags, stringResults);
+                                                 aggregationInterval, groupByTags, nonNumericResults);
+        pushdownPartials.insert(pushdownPartials.end(), std::make_move_iterator(streamedPartials.begin()),
+                                std::make_move_iterator(streamedPartials.end()));
 
     } else {
         // ---- STANDARD PER-SERIES PATH ----
@@ -998,42 +1051,36 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
         }  // end of non-batch per-series loop
     }  // end of batch-vs-standard if/else
 
-    // Separate non-numeric (string) fallback results from numeric.
-    // String data bypasses aggregation (raw, or LATEST-per-bucket when an
-    // interval is set — see below).  Boolean fields are converted to numeric
-    // 0/1 here so the fallback path agrees with the pushdown path, which
-    // already aggregates booleans numerically — without this, the same query
-    // returned true/false or 0/1 depending on where the data happened to sit
-    // (memory vs TSM).
+    // Separate non-numeric (string, boolean) fallback results from numeric.
+    // Non-numeric data bypasses aggregation entirely (raw, or LATEST-per-bucket
+    // when an interval is set — see below) and is returned in its written type.
+    // The pushdown paths refuse these types for the same reason, so the result
+    // does not depend on where the data happens to sit (memory vs TSM).
     std::vector<timestar::SeriesResult> numericResults;
     for (auto& sr : fallbackResults) {
-        bool hasStringField = false;
+        bool hasNonNumericField = false;
         for (auto& [fn, fd] : sr.fields) {
-            if (std::holds_alternative<std::vector<std::string>>(fd.second)) {
-                hasStringField = true;
-            } else if (auto* boolVals = std::get_if<std::vector<bool>>(&fd.second)) {
-                std::vector<double> numeric;
-                numeric.reserve(boolVals->size());
-                for (bool b : *boolVals) {
-                    numeric.push_back(b ? 1.0 : 0.0);
-                }
-                fd.second = std::move(numeric);
+            // Mirrors timestar::isNonNumericValueType at the variant level —
+            // these two must never disagree about what "non-numeric" means.
+            if (std::holds_alternative<std::vector<std::string>>(fd.second) ||
+                std::holds_alternative<std::vector<bool>>(fd.second)) {
+                hasNonNumericField = true;
             }
         }
-        if (hasStringField) {
-            stringResults.push_back(std::move(sr));
+        if (hasNonNumericField) {
+            nonNumericResults.push_back(std::move(sr));
         } else {
             numericResults.push_back(std::move(sr));
         }
     }
 
-    // Canonical string-field rule for interval queries: LATEST-per-bucket,
+    // Canonical non-numeric rule for interval queries: LATEST-per-bucket,
     // aligned to the same epoch buckets as the numeric aggregation.  Applied
-    // uniformly to strings collected on the streaming path and the standard
+    // uniformly to values collected on the streaming path and the standard
     // fallback path so the result shape does not depend on the query plan.
     if (aggregationInterval > 0) {
-        for (auto& sr : stringResults) {
-            bucketStringResultLatest(sr, aggregationInterval);
+        for (auto& sr : nonNumericResults) {
+            bucketNonNumericResultLatest(sr, aggregationInterval);
         }
     }
 
@@ -1056,7 +1103,7 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                    shardId, contexts.size(), shardMs, partialAggMs);
     ShardQueryResult sqr;
     sqr.partialResults = std::move(partialResults);
-    sqr.stringResults = std::move(stringResults);
+    sqr.nonNumericResults = std::move(nonNumericResults);
     sqr.shardMs = shardMs;
     co_return sqr;
 }
@@ -1180,6 +1227,35 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
         discoveryResult.seriesByShard[s] = std::move(perShard.contexts);
     }
 
+    // A grouping key must resolve to a real tag key, exactly as a scope key
+    // does (an unknown scope key finds no postings bitmap, hence no series).
+    // Without this, buildGroupKeyDirect matches nothing for an unrecognised
+    // key and produces the same group key as an ungrouped query, silently
+    // answering `by {devicId}` with a fleet-wide aggregate — a plausible but
+    // wrong number, with nothing in the response signalling the grouping was
+    // dropped.  Resolved against the discovered series rather than the tag
+    // index so a schema broadcast still in flight cannot turn a valid grouping
+    // into an empty result.
+    if (!discoveryResult.limitExceeded && !request.groupByTags.empty()) {
+        for (const auto& groupByTag : request.groupByTags) {
+            bool known = false;
+            for (const auto& contexts : discoveryResult.seriesByShard) {
+                for (const auto& ctx : contexts) {
+                    if (ctx.tags.contains(groupByTag)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (known)
+                    break;
+            }
+            if (!known) {
+                discoveryResult.seriesByShard.assign(shardCount, {});
+                co_return discoveryResult;
+            }
+        }
+    }
+
     co_return discoveryResult;
 }
 
@@ -1258,6 +1334,25 @@ void HttpQueryHandler::consolidateSeriesFields(std::vector<SeriesResult>& series
         for (auto it = lo; it != hi; ++it) {
             auto& existing = merged[it->second];
             if (existing.measurement == s.measurement && existing.tags == s.tags) {
+                // Merging must never DESTROY data.  A field name is not unique
+                // across a measurement's series (the index records a field's
+                // type first-writer-wins and never rejects a conflicting one),
+                // so two series sharing measurement+tags can both carry field
+                // "v" — e.g. a numeric aggregate whose group-by tags happen to
+                // equal a non-numeric series' full tag set.  Blindly assigning
+                // here dropped the first one, silently and deterministically.
+                // Keep this series separate instead; a caller seeing two
+                // entries is correct, losing a field is not.
+                bool collides = false;
+                for (const auto& [fname, fdata] : s.fields) {
+                    if (existing.fields.contains(fname)) {
+                        collides = true;
+                        break;
+                    }
+                }
+                if (collides) {
+                    continue;  // try the next candidate with this tag hash
+                }
                 for (auto& [fname, fdata] : s.fields) {
                     existing.fields[std::move(fname)] = std::move(fdata);
                 }
@@ -1284,7 +1379,10 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
     }
     timing.resultCollectionMs = 0.0;
 
-    bool aggregationReducesOutput = request.aggregationInterval > 0 || !request.groupByTags.empty();
+    // Group-by alone does NOT reduce the point count: without an
+    // aggregationInterval every distinct timestamp survives into each group, so
+    // only bucketing or a range-collapsing method (LATEST/FIRST) shrinks output.
+    bool aggregationReducesOutput = request.aggregationInterval > 0 || collapsesWholeRange(request.aggregation);
     if (!aggregationReducesOutput) {
         for (const auto& p : sqr.partialResults) {
             if (p.collapsedState.has_value()) {
@@ -1355,31 +1453,27 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
                 response.series.push_back(std::move(series));
             }
         }
-
-        // Same consolidation as the multi-shard path: without it, the response
-        // shape depended on shard placement (multi-field series consolidated
-        // only when the fields happened to land on different shards).
-        consolidateSeriesFields(response.series);
-
-        if (!requestedFieldSet.empty()) {
-            for (auto& s : response.series) {
-                std::erase_if(s.fields, [&](const auto& kv) { return !requestedFieldSet.contains(kv.first); });
-            }
-            std::erase_if(response.series, [](const SeriesResult& s) { return s.fields.empty(); });
-        }
     }
 
-    if (!sqr.stringResults.empty()) {
-        if (!requestedFieldSet.empty()) {
-            for (auto& sr : sqr.stringResults) {
-                std::erase_if(sr.fields, [&](const auto& item) { return !requestedFieldSet.contains(item.first); });
-            }
-            std::erase_if(sqr.stringResults, [](const SeriesResult& s) { return s.fields.empty(); });
+    // Non-numeric (string/bool) results arrive one field per series.  Append
+    // them BEFORE consolidating so they merge by measurement+tags like every
+    // other field: "one series per measurement+tags" is a property of the
+    // response, not of a field's type.  Appending after consolidation left a
+    // measurement's string/bool fields stranded in their own series entries.
+    for (auto& nonNumeric : sqr.nonNumericResults) {
+        response.series.push_back(std::move(nonNumeric));
+    }
+
+    // Same consolidation as the multi-shard path: without it, the response
+    // shape depended on shard placement (multi-field series consolidated
+    // only when the fields happened to land on different shards).
+    consolidateSeriesFields(response.series);
+
+    if (!requestedFieldSet.empty()) {
+        for (auto& s : response.series) {
+            std::erase_if(s.fields, [&](const auto& kv) { return !requestedFieldSet.contains(kv.first); });
         }
-        // Each string/bool result is its own series entry (one field per series)
-        for (auto& strResult : sqr.stringResults) {
-            response.series.push_back(std::move(strResult));
-        }
+        std::erase_if(response.series, [](const SeriesResult& s) { return s.fields.empty(); });
     }
 
     response.statistics.pointCount = 0;
@@ -1418,7 +1512,7 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
     auto mergeStart = std::chrono::high_resolution_clock::now();
 
     std::vector<PartialAggregationResult> allPartialResults;
-    std::vector<SeriesResult> allStringResults;
+    std::vector<SeriesResult> allNonNumericResults;
     size_t totalPartialResults = 0;
     for (const auto& sr : shardResults) {
         totalPartialResults += sr.second.partialResults.size();
@@ -1440,8 +1534,8 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
                                  std::make_move_iterator(sqr.partialResults.end()));
 
         // Collect string results (these bypass aggregation)
-        allStringResults.insert(allStringResults.end(), std::make_move_iterator(sqr.stringResults.begin()),
-                                std::make_move_iterator(sqr.stringResults.end()));
+        allNonNumericResults.insert(allNonNumericResults.end(), std::make_move_iterator(sqr.nonNumericResults.begin()),
+                                    std::make_move_iterator(sqr.nonNumericResults.end()));
     }
 
     auto mergeEnd = std::chrono::high_resolution_clock::now();
@@ -1451,11 +1545,12 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
     // the final output (merging can only reduce counts via timestamp dedup).
     // Fail fast before the expensive merge + JSON serialization phase.
     //
-    // Skip when aggregation or group-by is active: the aggregation pipeline
+    // Skip when bucketing or a range-collapsing method is active: that pipeline
     // (including pushdown) reduces output far below the raw point count, so
     // totalPointsRetrieved would be a massive overcount.  The final output
-    // limit is still enforced after aggregation (line ~884).
-    bool aggregationReducesOutput = request.aggregationInterval > 0 || !request.groupByTags.empty();
+    // limit is still enforced after aggregation (line ~884).  Group-by alone
+    // does not reduce output — without an interval every timestamp survives.
+    bool aggregationReducesOutput = request.aggregationInterval > 0 || collapsesWholeRange(request.aggregation);
     if (!aggregationReducesOutput) {
         for (const auto& p : allPartialResults) {
             if (p.collapsedState.has_value()) {
@@ -1520,39 +1615,28 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
 
             response.series.push_back(std::move(series));
         }
-
-        // Consolidate series that share the same measurement+tags into
-        // a single SeriesResult with multiple fields.  The aggregation
-        // loop above emits one SeriesResult per field; the HTTP response
-        // format groups fields under a single series entry.
-        consolidateSeriesFields(response.series);
-
-        // Filter fields: remove non-requested fields from each series, then remove empty series.
-        if (!requestedFieldSet.empty()) {
-            for (auto& s : response.series) {
-                std::erase_if(s.fields, [&](const auto& kv) { return !requestedFieldSet.contains(kv.first); });
-            }
-            std::erase_if(response.series, [](const SeriesResult& s) { return s.fields.empty(); });
-        }
     }
-    // Add string results that bypassed aggregation directly to response
-    if (!allStringResults.empty()) {
-        // Filter string results using the shared requestedFieldSet.
-        // When requestedFieldSet is empty (all fields requested), skip filtering entirely.
-        // When filtering is needed, erase non-matching fields in-place to avoid
-        // building a temporary map and copying/moving entries.
-        if (!requestedFieldSet.empty()) {
-            for (auto& sr : allStringResults) {
-                std::erase_if(sr.fields, [&](const auto& item) { return !requestedFieldSet.contains(item.first); });
-            }
-            // Remove string series with no fields after filtering
-            std::erase_if(allStringResults, [](const SeriesResult& s) { return s.fields.empty(); });
-        }
 
-        // Each string/bool result is its own series entry (one field per series)
-        for (auto& strResult : allStringResults) {
-            response.series.push_back(std::move(strResult));
+    // Non-numeric (string/bool) results bypassed aggregation and arrive one
+    // field per series.  Append them BEFORE consolidating so they merge by
+    // measurement+tags like every other field — "one series per
+    // measurement+tags" is a property of the response, not of a field's type.
+    for (auto& nonNumeric : allNonNumericResults) {
+        response.series.push_back(std::move(nonNumeric));
+    }
+
+    // Consolidate series that share the same measurement+tags into
+    // a single SeriesResult with multiple fields.  The aggregation
+    // loop above emits one SeriesResult per field; the HTTP response
+    // format groups fields under a single series entry.
+    consolidateSeriesFields(response.series);
+
+    // Filter fields: remove non-requested fields from each series, then remove empty series.
+    if (!requestedFieldSet.empty()) {
+        for (auto& s : response.series) {
+            std::erase_if(s.fields, [&](const auto& kv) { return !requestedFieldSet.contains(kv.first); });
         }
+        std::erase_if(response.series, [](const SeriesResult& s) { return s.fields.empty(); });
     }
 
     // Update statistics and enforce maxTotalPoints() (covers both numeric and string results)
@@ -1614,20 +1698,24 @@ void HttpQueryHandler::logQueryCompletion(const QueryRequest& request, QueryTimi
     }
 }
 
-seastar::future<QueryResponse> HttpQueryHandler::executeQuery(const QueryRequest& request_in) {
-    // Copy needed: aggregationInterval may be mutated for interval collapse below.
-    QueryRequest request = request_in;
+seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest request) {
+    // `request` is BY VALUE (see the header): a reference parameter would be
+    // read after every co_await while the caller's object may already be gone
+    // — the SSE backfill loop passes a loop-body local through
+    // seastar::with_timeout, which does NOT cancel the inner future, so a
+    // backfill timeout destroys it while this coroutine is still suspended.
+    // Do not "optimise" this back into a const&.
 
-    // Interval collapse for LATEST/FIRST: when the aggregation interval covers
-    // the entire query range, drop it so the non-bucketed fast path is used
-    // (sparse index zero-I/O lookup instead of bucketed block reads).
-    if (request.aggregationInterval > 0 && request.endTime > request.startTime &&
-        (request.aggregation == AggregationMethod::LATEST || request.aggregation == AggregationMethod::FIRST)) {
-        uint64_t range = request.endTime - request.startTime;
-        if (request.aggregationInterval >= range) {
-            request.aggregationInterval = 0;
-        }
-    }
+    // NOTE: LATEST/FIRST whose interval covers the whole range used to have
+    // their aggregationInterval zeroed here, to reach the non-bucketed sparse
+    // fast path.  That silently changed the ANSWER, not just the plan:
+    //   - non-numeric fields flipped from LATEST-per-bucket (one value) to raw
+    //     passthrough (every value), and
+    //   - numeric points came back stamped with their raw timestamp instead of
+    //     the bucket start every other interval query returns.
+    // The fast path is now selected inside executeShardQuery (see the
+    // singleBucket gate), which keeps the optimisation without touching the
+    // requested semantics.
 
     LOG_QUERY_PATH(timestar::http_log, info,
                    "[QUERY] Executing query - Measurement: {}, Fields: {}, Scopes: {}, Start: {}, End: {}",

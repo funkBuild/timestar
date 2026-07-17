@@ -1,9 +1,15 @@
 // Tests for non-bucketed streaming pushdown aggregation.
 //
-// When aggregationInterval == 0 and the method is "streamable" (AVG, MIN, MAX,
-// SUM, COUNT, SPREAD, STDDEV, STDVAR), queryTsmAggregated folds all TSM data
-// into a single AggregationState instead of materialising raw (timestamp, value)
-// vectors.  This avoids O(N) memory for large queries.
+// When aggregationInterval == 0, the method is "streamable" (AVG, MIN, MAX,
+// SUM, COUNT, SPREAD, STDDEV, STDVAR) and the caller passes foldNoInterval=true,
+// queryTsmAggregated folds all TSM data into a single AggregationState instead
+// of materialising raw (timestamp, value) vectors.  This avoids O(N) memory for
+// large queries.
+//
+// foldNoInterval must be passed EXPLICITLY here: it defaults to false, because
+// collapsing a range the caller never asked to collapse violates the canonical
+// shape rules (CLAUDE.md "Aggregation Result Shape") — that was the T1 defect.
+// No production caller passes true; these tests pin the capability itself.
 //
 // These tests verify:
 //   1. Correct aggregated values for each streamable method
@@ -64,7 +70,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, AVG_ReturnsCorrectAverage) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::AVG);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::AVG,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "AVG pushdown should succeed";
     if (!result.has_value()) {
@@ -96,7 +103,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MIN_ReturnsCorrectMinimum) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MIN);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MIN,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "MIN pushdown should succeed";
     if (!result.has_value()) {
@@ -127,7 +135,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MAX_ReturnsCorrectMaximum) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MAX);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MAX,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "MAX pushdown should succeed";
     if (!result.has_value()) {
@@ -158,7 +167,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, COUNT_ReturnsCorrectCount) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::COUNT);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::COUNT,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "COUNT pushdown should succeed";
     if (!result.has_value()) {
@@ -189,7 +199,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SUM_ReturnsCorrectSum) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SUM);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SUM,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "SUM pushdown should succeed";
     if (!result.has_value()) {
@@ -221,7 +232,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SPREAD_ReturnsCorrectSpread) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SPREAD);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::SPREAD,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "SPREAD pushdown should succeed";
     if (!result.has_value()) {
@@ -252,7 +264,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDDEV_ReturnsCorrectStdDev) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDDEV);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDDEV,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "STDDEV pushdown should succeed";
     if (!result.has_value()) {
@@ -286,7 +299,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDVAR_ReturnsCorrectVariance) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDVAR);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::STDVAR,
+                                        /*foldNoInterval=*/true);
 
     EXPECT_TRUE(result.has_value()) << "STDVAR pushdown should succeed";
     if (!result.has_value()) {
@@ -318,7 +332,8 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_ReturnsNullopt) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
     auto result =
-        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MEDIAN);
+        co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::MEDIAN,
+                                        /*foldNoInterval=*/true);
 
     // MEDIAN needs raw values for nth_element — cannot use pushdown.
     EXPECT_FALSE(result.has_value()) << "MEDIAN should NOT use pushdown (needs raw values)";

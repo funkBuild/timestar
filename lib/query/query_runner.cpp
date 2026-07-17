@@ -710,6 +710,25 @@ static size_t aggregateMemoryStoresTyped(const std::vector<seastar::shared_ptr<M
     return totalPoints;
 }
 
+// Non-numeric gate for memory-resident series.  A series is exactly one type
+// across every source, so the first pinned store that knows the series decides.
+// Boolean and String never aggregate arithmetically (canonical non-numeric
+// rule), so they must bypass pushdown entirely and let the caller materialise
+// them in their written type.  The TSM-resident case is gated separately, by
+// the seriesType checks on the candidate-file loops below; this covers series
+// whose data lives only in memory while other series have TSM files (where
+// those loops find no candidate for this series and would otherwise fold the
+// memory data as doubles).
+static bool seriesIsNonNumericInMemory(const std::vector<seastar::shared_ptr<MemoryStore>>& pinnedStores,
+                                       const SeriesId128& seriesId) {
+    for (const auto& store : pinnedStores) {
+        if (auto type = store->getSeriesType(seriesId)) {
+            return isNonNumericValueType(*type);
+        }
+    }
+    return false;
+}
+
 // Last-write-wins gate for memory folding: true when the series' in-range
 // data spans more than one pinned store with overlapping time bounds.  The
 // same timestamp may then exist in two stores (a rewrite across rollover
@@ -782,6 +801,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         co_return std::nullopt;
     }
 
+    // Non-numeric series (Boolean, String) never aggregate arithmetically.
+    if (seriesIsNonNumericInMemory(pinnedStores, seriesId)) {
+        co_return std::nullopt;
+    }
+
     const bool noTsmFiles = fileManager->getSequencedTsmFiles().empty();
     const bool isLatest = (method == timestar::AggregationMethod::LATEST);
     const bool isFirst = (method == timestar::AggregationMethod::FIRST);
@@ -799,8 +823,10 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     if (noTsmFiles) {
         // Fold-to-single-state for interval == 0: always for LATEST/FIRST
         // (they return 1 point by definition), and for other streamable
-        // methods when the caller asked for a collapsed result
-        // (foldNoInterval — group-by callers collapse per group anyway).
+        // methods only if the caller explicitly asked for a collapsed result
+        // (foldNoInterval, which defaults to false — no production caller
+        // sets it, since collapsing a range nobody asked to collapse breaks
+        // the canonical shape rules).
         const bool foldSingle =
             (aggregationInterval == 0) && (isLatest || isFirst || (foldNoInterval && isStreamableAggMethod(method)));
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
@@ -884,8 +910,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             auto type = tsmFile->getSeriesType(seriesId);
             if (!type.has_value())
                 continue;
-            // Float, Integer, and Boolean support pushdown aggregation; String does not.
-            if (*type == TSMValueType::String) {
+            // Float and Integer support pushdown aggregation.  String and
+            // Boolean are non-numeric: they never aggregate arithmetically, so
+            // they bypass pushdown and are returned in their written type by the
+            // caller (raw, or LATEST-per-bucket with an interval).
+            if (isNonNumericValueType(*type)) {
                 co_return std::nullopt;
             }
             candidateFiles.push_back(tsmFile);
@@ -1111,8 +1140,9 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         if (!indexEntry)
             continue;
 
-        // Float, Integer, and Boolean support pushdown; String does not.
-        if (indexEntry->seriesType == TSMValueType::String) {
+        // Float and Integer support pushdown; String and Boolean are
+        // non-numeric and never aggregate arithmetically.
+        if (isNonNumericValueType(indexEntry->seriesType)) {
             hasNonFloat = true;
             break;
         }

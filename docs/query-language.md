@@ -66,6 +66,14 @@ avg:temperature(value) by {location,sensor}
 
 Omit the `by {}` clause entirely to aggregate all matching series together.
 
+Grouping decides **which series fold together**, never how many timestamps come
+back. `by {location}` and the same query without it return the same timestamps;
+only an `aggregationInterval` (or `latest`/`first`) reduces the time axis.
+
+A grouping key that no matching series carries returns no series at all, the
+same way an unknown tag key in a scope filter does — a typo'd key yields an
+empty result rather than a silently ungrouped aggregate.
+
 ## Time Parameters
 
 These are JSON fields in the `POST /query` request body, separate from the query string itself.

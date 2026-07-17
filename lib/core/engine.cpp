@@ -370,6 +370,22 @@ seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated
                                                  foldNoInterval);
 }
 
+// True when a series is non-numeric (Boolean or String).  A series is exactly
+// one type across every source, so the first source that knows it decides;
+// memory is probed first because it is a pure hash lookup.
+static bool isNonNumericSeries(const std::vector<seastar::shared_ptr<MemoryStore>>& pinnedStores,
+                               const std::vector<seastar::shared_ptr<TSM>>& tsmFiles, const SeriesId128& seriesId) {
+    for (const auto& store : pinnedStores) {
+        if (auto type = store->getSeriesType(seriesId))
+            return isNonNumericValueType(*type);
+    }
+    for (const auto& tsmFile : tsmFiles) {
+        if (auto type = tsmFile->getSeriesType(seriesId))
+            return isNonNumericValueType(*type);
+    }
+    return false;
+}
+
 seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, uint64_t startTime, uint64_t endTime,
                                       bool wantFirst) {
     if (entries.empty())
@@ -397,8 +413,21 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
                   return a->dataRank() > b->dataRank();
               });
 
+    // Non-numeric series (Boolean, String) never aggregate arithmetically and
+    // must reach the caller in their written type, which BatchLatestEntry's
+    // double cannot represent.  Leave them unresolved so the caller routes them
+    // to the per-series path.
+    std::vector<bool> skip(entries.size(), false);
+    size_t skipCount = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (isNonNumericSeries(pinnedStores, tsmFiles, entries[i].seriesId)) {
+            skip[i] = true;
+            ++skipCount;
+        }
+    }
+
     // Track how many series are still unresolved (drives Phase 2 only).
-    size_t unresolvedCount = entries.size();
+    size_t unresolvedCount = entries.size() - skipCount;
 
     // Every file's sparse stats must be consulted — resolving an entry from
     // one file must NOT stop the scan, because an out-of-order flush can put
@@ -408,7 +437,10 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
         if (tsmFile->hasTombstones())
             continue;
 
-        for (auto& entry : entries) {
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (skip[i])
+                continue;
+            auto& entry = entries[i];
             auto pt =
                 wantFirst ? tsmFile->getFirstFromSparse(entry.seriesId) : tsmFile->getLatestFromSparse(entry.seriesId);
             if (!pt.has_value())
@@ -434,7 +466,10 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
         for (const auto& tsmFile : tsmFiles) {
             if (unresolvedCount == 0)
                 break;
-            for (auto& entry : entries) {
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (skip[i])
+                    continue;
+                auto& entry = entries[i];
                 if (entry.resolved)
                     continue;
                 if (!tsmFile->seriesMayOverlapTime(entry.seriesId, startTime, endTime))
@@ -502,10 +537,13 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
     };
 
     for (const auto& memStore : pinnedStores | std::views::reverse) {
-        for (auto& entry : entries) {
-            checkMemSeries(memStore->querySeries<double>(entry.seriesId), entry);
-            checkMemSeries(memStore->querySeries<int64_t>(entry.seriesId), entry);
-            checkMemSeries(memStore->querySeries<bool>(entry.seriesId), entry);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (skip[i])
+                continue;
+            // Bool series are always skipped above (non-numeric), so only the
+            // two numeric types are probed here.
+            checkMemSeries(memStore->querySeries<double>(entries[i].seriesId), entries[i]);
+            checkMemSeries(memStore->querySeries<int64_t>(entries[i].seriesId), entries[i]);
         }
     }
 }

@@ -473,25 +473,67 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
    - When specified, results are grouped into time buckets
    - Aggregation method applies within each bucket
 
-### String Fields in Queries (canonical semantics)
+### Non-Numeric Fields in Queries (canonical semantics)
 
-String fields never aggregate numerically. The aggregation method named in the
-query is **ignored** for string fields; they are always included, never
-silently dropped:
+**String and boolean** fields are non-numeric: they never aggregate
+numerically and are always returned in the type they were written in (booleans
+as JSON `true`/`false`, never `1`/`0`). The aggregation method named in the
+query is **ignored** for them; they are always included, never silently
+dropped:
 
-- **No aggregationInterval**: string fields pass through raw — every stored
-  (timestamp, value) pair in the requested range is returned unchanged. This
-  holds for every aggregation method (including `latest`/`first`, which still
-  collapse numeric fields to a single point) and for group-by queries (string
-  series are returned per-series with their full tag set; they are not merged
-  into groups).
-- **With aggregationInterval**: string fields are reduced to
+- **No aggregationInterval**: non-numeric fields pass through raw — every
+  stored (timestamp, value) pair in the requested range is returned unchanged.
+  This holds for every aggregation method (including `latest`/`first`, which
+  still collapse numeric fields to a single point) and for group-by queries
+  (non-numeric series are returned per-series with their full tag set; they are
+  not merged into groups).
+- **With aggregationInterval**: non-numeric fields are reduced to
   **LATEST-per-bucket** — one value per epoch-aligned bucket
   (`bucketStart = ts / interval * interval`, same bucket layout as numeric
   aggregation), where the value is the one with the greatest timestamp inside
   the bucket. Returned timestamps are bucket starts, matching numeric fields.
 - These rules are independent of data placement (memory store vs TSM) and of
-  the internal query plan (pushdown / streaming / fallback).
+  the internal query plan (pushdown / streaming / fallback). Both pushdown
+  paths refuse non-numeric series so placement cannot change the answer.
+
+Booleans were previously coerced to `1.0`/`0.0` and aggregated arithmetically,
+which also dropped their series tags (only numeric fields route through the
+aggregator, which keeps group-by tags only). They now follow the string rule
+exactly — see `test/unit/http/dynamo_equivalence_test.cpp`.
+
+`timestar::isNonNumericValueType()` (lib/storage/tsm.hpp) is the single
+definition of this rule at the `TSMValueType` level: every gate that keeps
+these types off a numeric path calls it rather than spelling out
+`String || Boolean`. Two related spellings are NOT yet unified and remain
+drift risks: the variant-level checks in `http_query_handler.cpp` (a
+`FieldValues` alternative, not a `TSMValueType`), and the `String`-only checks
+inside `TSM::aggregateSeries*` (`tsm.cpp`), which still accept Boolean and
+would fold it as `1.0`/`0.0` — safe today only because every caller gates
+first (`query_runner.cpp`, `engine.cpp`). A new caller that forgets the gate
+reintroduces bool-as-1/0.
+
+The rule holds on **every** path that returns stored values, not just
+`POST /query`:
+
+- **SSE `/subscribe` with an aggregationInterval** (`streaming_aggregator.cpp`):
+  non-numeric buckets reduce to LATEST-per-bucket in the written type, so a live
+  stream and a backfill of the same window agree. Booleans used to fold as
+  `1.0`/`0.0` (a 5m `avg` streamed `0.6` where `/query` said `true`) and strings
+  were dropped from the stream entirely unless the method was COUNT.
+- **Formula arithmetic** (`/derived`, streaming derived, SSE formulas) is
+  numeric-only, so a non-numeric operand is rejected rather than coerced:
+  `DerivedQueryExecutor` throws for booleans exactly as it always did for
+  strings, and the streaming formula paths map non-numeric to NaN (= missing,
+  see docs/nan_policy.md) via the single `timestar::streamingValueAsNumeric()`
+  helper. Coercing booleans to `1.0`/`0.0` let a formula compute over a type the
+  query path refuses to aggregate — and with an interval it silently ran on
+  LATEST-per-bucket values rather than the every-point series the author meant.
+
+Response shape is also type-independent: non-numeric results are appended
+BEFORE `consolidateSeriesFields()`, so "one series per measurement+tags" holds
+for every field type. (Under a `by {tags}` clause a non-numeric field is still
+returned per-series with its full tag set, so it does not merge into the grouped
+numeric series — grouping does not apply to it.)
 
 ### Time Format
 
@@ -639,6 +681,12 @@ The shape of a query result is a pure function of the query — it must never
 depend on where the data happens to live (memory store vs TSM), on cache
 warm-up, or on startTime alignment.
 
+The governing rule: **aggregate ACROSS SERIES at equal timestamps; never
+aggregate over time unless the caller asks.** Grouping and temporal bucketing
+are orthogonal — a `by {tags}` clause must never change the time axis. Only an
+`aggregationInterval` (or `latest`/`first`, which name a single point by
+definition) reduces the time axis.
+
 **With `aggregationInterval` (> 0):**
 - Buckets are **epoch-aligned**: each point lands in bucket
   `floor(timestamp / interval) * interval`. Bucket boundaries do NOT shift
@@ -651,20 +699,49 @@ warm-up, or on startTime alignment.
 
 **Without `aggregationInterval` (interval == 0):**
 - `latest` / `first`: one collapsed value per series/group, on every path.
-- With `by {tags}` (group-by) and a streamable method (`avg`, `sum`, `min`,
-  `max`, `count`, `spread`, `stddev`, `stdvar`): the group's whole time range
-  collapses into a single aggregated value (InfluxQL-style "GROUP BY tag").
-- Otherwise (no group-by, or `median`/`exact_median`): **per-timestamp
-  aggregation across matching series** — N points, one per distinct
-  timestamp, aggregated across the series that share that timestamp
-  (raw passthrough for a single series). Internal consumers
-  (`/derived` formulas, anomaly detection, forecasting) rely on this
-  N-point shape for their no-interval sub-queries.
+  These are the only methods that collapse a range by definition.
+- Every other method: **per-timestamp aggregation across matching series** —
+  N points, one per distinct timestamp, aggregated across the series that
+  share that timestamp (raw passthrough for a single series). This holds
+  **with or without `by {tags}`**: grouping only decides *which* series fold
+  together, never how many timestamps survive. Internal consumers (`/derived`
+  formulas, anomaly detection, forecasting) rely on this N-point shape for
+  their no-interval sub-queries.
+
+A `by {tags}` clause used to silently switch the interval == 0 default to
+"collapse the whole range to one point per group" (InfluxQL-style "GROUP BY
+tag"), so two queries differing only by a grouping clause disagreed on the time
+axis. That is fixed — pinned by
+`DynamoEquivalenceTest.GroupByDoesNotCollapseTheTimeAxis`.
+
+**Grouping never changes the VALUES either**, only which series fold together.
+A method whose fold-of-one is not the identity — `spread`/`stddev`/`stdvar` are
+0 over a single value, not the value — must be folded through an
+`AggregationState`, never short-circuited from raw values. `timestar::
+methodCanFoldRaw()` (aggregator.hpp) is the single definition of that rule;
+every site that emits raw values into a response must consult it. Skipping it
+made `spread:m(v){}` and `spread:m(v){} by {p}` disagree, and made the answer
+depend on shard fan-out (single-shard finalize vs multi-shard merge).
 
 Implementation note: the interval == 0 collapse-vs-raw choice is carried by
 the `foldNoInterval` parameter of `Engine::queryAggregated()` /
-`QueryRunner::queryTsmAggregated()`; callers derive it from the query alone
-(group-by → collapse; standard per-series path → raw).
+`QueryRunner::queryTsmAggregated()`. It **defaults to `false`** — the shape
+rules forbid collapsing a range the caller did not ask to collapse, so no
+production caller passes `true` (only `non_bucketed_pushdown_test.cpp`, which
+pins the capability itself). `latest`/`first` collapse inside the runner
+regardless of the flag, which is the only collapse the shape rules allow.
+
+`HttpQueryHandler::executeQuery()` takes its `QueryRequest` **by value**: it is
+a coroutine, and the SSE backfill loop passes a loop-body local through
+`seastar::with_timeout`, which does NOT cancel the inner future — aliasing the
+caller's request is a use-after-free once a backfill times out.
+
+**Unknown `by {tag}` keys:** a grouping key that no discovered series carries
+returns `[]`, matching the scope path (an unknown scope key finds no postings
+bitmap, hence no series). Silently ignoring it answered `by {devicId}` with a
+plausible-but-wrong fleet-wide aggregate. Validated against the discovered
+series rather than the tag index, so a schema broadcast still in flight cannot
+turn a valid grouping into an empty result.
 
 ### Special Float Values (canonical semantics)
 

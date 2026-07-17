@@ -95,7 +95,13 @@ public:
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
     // Execute query across shards
-    seastar::future<QueryResponse> executeQuery(const QueryRequest& request);
+    // Takes the request BY VALUE, not by reference: this is a coroutine, so a
+    // reference parameter is read after every suspension point while callers do
+    // not all outlive us — the SSE backfill loop passes a loop-body local
+    // through seastar::with_timeout, which by design does NOT cancel the inner
+    // future, so on a backfill timeout that local dies mid-flight.  By-value
+    // puts the copy in the parameter, before the coroutine body can suspend.
+    seastar::future<QueryResponse> executeQuery(QueryRequest request);
 
     // Parse JSON request body (public for testing)
     QueryRequest parseQueryRequest(const GlazeQueryRequest& glazeReq);

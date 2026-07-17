@@ -30,6 +30,20 @@ class Slice;
 
 enum class TSMValueType { Float = 0, Boolean, String, Integer };
 
+// Canonical definition of "non-numeric" — the single source of truth for the
+// rule in CLAUDE.md "Non-Numeric Fields in Queries": String and Boolean never
+// aggregate arithmetically.  They pass through raw without an
+// aggregationInterval, reduce to LATEST-per-bucket with one, and are always
+// returned in the type they were written in.
+//
+// Every gate that keeps these types off a numeric path MUST call this rather
+// than spell out the list, so a new value type cannot be numeric on one path
+// and non-numeric on another.  (Callers that flatten a FieldValues variant
+// rather than a TSMValueType should mirror this exactly.)
+[[nodiscard]] inline constexpr bool isNonNumericValueType(TSMValueType type) {
+    return type == TSMValueType::String || type == TSMValueType::Boolean;
+}
+
 struct TSMIndexBlock {
     // Field order groups all 8-byte members first, then 4-byte, then 1-byte, to
     // minimise alignment padding (104 -> 88 bytes). This struct is in-memory only

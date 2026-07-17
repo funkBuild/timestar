@@ -555,4 +555,41 @@ public:
     }
 }
 
+// LATEST/FIRST are the only methods whose DEFINITION collapses a time range to
+// a single point.  Every other method aggregates ACROSS SERIES at equal
+// timestamps and leaves the time axis intact unless an aggregationInterval
+// buckets it (CLAUDE.md "Aggregation Result Shape").  Adding a new method to
+// the enum therefore defaults to keeping the time axis, which is the
+// spec-correct default.
+[[nodiscard]] inline bool collapsesWholeRange(AggregationMethod method) {
+    return method == AggregationMethod::LATEST || method == AggregationMethod::FIRST;
+}
+
+// True when a method's per-timestamp value can be computed from raw
+// (timestamp, value) pairs alone, without materialising an AggregationState.
+// SPREAD/STDDEV/STDVAR are 0 over a single value — NOT the value itself — and
+// MEDIAN/EXACT_MEDIAN need the full raw set, so all of them require a real
+// AggregationState per timestamp.
+//
+// NOTE: "computable from raw", not "fold-of-one is the identity".  COUNT
+// returns true here yet folds one value to 1.0, so callers must still handle
+// COUNT explicitly before consulting this.
+//
+// Every site that short-circuits raw values into a response MUST consult this,
+// or the answer starts depending on the query plan: a per-timestamp fold that
+// passes `spread` through raw reports the value where 0 is correct, and then
+// disagrees with the grouped / multi-shard paths that fold properly.
+[[nodiscard]] inline bool methodCanFoldRaw(AggregationMethod method) {
+    switch (method) {
+        case AggregationMethod::SPREAD:
+        case AggregationMethod::STDDEV:
+        case AggregationMethod::STDVAR:
+        case AggregationMethod::MEDIAN:
+        case AggregationMethod::EXACT_MEDIAN:
+            return false;
+        default:
+            return true;
+    }
+}
+
 }  // namespace timestar

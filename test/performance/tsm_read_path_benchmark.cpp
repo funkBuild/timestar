@@ -13,7 +13,6 @@
 
 #include "../seastar_gtest.hpp"
 #include "../test_helpers.hpp"
-
 #include "engine.hpp"
 #include "query_result.hpp"
 #include "series_id.hpp"
@@ -21,14 +20,14 @@
 #include "tsm.hpp"
 #include "tsm_writer.hpp"
 
+#include <fmt/core.h>
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/sleep.hh>
 
 #include <chrono>
 #include <filesystem>
-#include <fmt/core.h>
 #include <random>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/sleep.hh>
 #include <string>
 #include <vector>
 
@@ -42,9 +41,7 @@ namespace fs = std::filesystem;
 struct BenchStats {
     std::vector<double> samples_us;
 
-    void add(clk::duration d) {
-        samples_us.push_back(std::chrono::duration<double, std::micro>(d).count());
-    }
+    void add(clk::duration d) { samples_us.push_back(std::chrono::duration<double, std::micro>(d).count()); }
 
     void print(const char* label) const {
         if (samples_us.empty()) {
@@ -54,19 +51,20 @@ struct BenchStats {
         auto sorted = samples_us;
         std::sort(sorted.begin(), sorted.end());
         double sum = 0;
-        for (double v : sorted) sum += v;
+        for (double v : sorted)
+            sum += v;
         double avg = sum / static_cast<double>(sorted.size());
-        auto pct = [&](double p) {
-            return sorted[static_cast<size_t>(p * static_cast<double>(sorted.size() - 1))];
-        };
-        fmt::print("  {:50s}  min={:8.1f}  avg={:8.1f}  p50={:8.1f}  p95={:8.1f}  max={:8.1f} µs  (n={})\n",
-                   label, sorted.front(), avg, pct(0.50), pct(0.95), sorted.back(), sorted.size());
+        auto pct = [&](double p) { return sorted[static_cast<size_t>(p * static_cast<double>(sorted.size() - 1))]; };
+        fmt::print("  {:50s}  min={:8.1f}  avg={:8.1f}  p50={:8.1f}  p95={:8.1f}  max={:8.1f} µs  (n={})\n", label,
+                   sorted.front(), avg, pct(0.50), pct(0.95), sorted.back(), sorted.size());
     }
 
     double avg() const {
-        if (samples_us.empty()) return 0;
+        if (samples_us.empty())
+            return 0;
         double s = 0;
-        for (double v : samples_us) s += v;
+        for (double v : samples_us)
+            s += v;
         return s / static_cast<double>(samples_us.size());
     }
 };
@@ -86,11 +84,10 @@ protected:
 // storage.  Creates numFiles TSM files, each containing numSeries series with
 // pointsPerFile points.  Time ranges are non-overlapping across files.
 // ---------------------------------------------------------------------------
-static seastar::future<> insertMultiFileTsm(Engine& engine, int numFiles, int numSeries,
-                                             int pointsPerFile,
-                                             const std::string& measurement = "cpu",
-                                             const std::string& field = "usage_idle") {
-    uint64_t ts = 1000000000ULL;  // 1s in nanos
+static seastar::future<> insertMultiFileTsm(Engine& engine, int numFiles, int numSeries, int pointsPerFile,
+                                            const std::string& measurement = "cpu",
+                                            const std::string& field = "usage_idle") {
+    uint64_t ts = 1000000000ULL;         // 1s in nanos
     uint64_t interval = 10000000000ULL;  // 10s between points
 
     for (int f = 0; f < numFiles; f++) {
@@ -110,10 +107,9 @@ static seastar::future<> insertMultiFileTsm(Engine& engine, int numFiles, int nu
 }
 
 // Same but for integer series
-static seastar::future<> insertMultiFileTsmInt(Engine& engine, int numFiles, int numSeries,
-                                                int pointsPerFile,
-                                                const std::string& measurement = "sensors",
-                                                const std::string& field = "count") {
+static seastar::future<> insertMultiFileTsmInt(Engine& engine, int numFiles, int numSeries, int pointsPerFile,
+                                               const std::string& measurement = "sensors",
+                                               const std::string& field = "count") {
     uint64_t ts = 1000000000ULL;
     uint64_t interval = 10000000000ULL;
 
@@ -158,7 +154,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R1_NarrowRangeQuery_ManyFiles) {
     // Each file has POINTS_PER_FILE points at 10s intervals starting from file offset
     uint64_t fileInterval = static_cast<uint64_t>(POINTS_PER_FILE) * 10000000000ULL;
     uint64_t queryStart = 1000000000ULL + 2 * fileInterval;  // Start of file 2
-    uint64_t queryEnd = queryStart + fileInterval;  // End of file 2
+    uint64_t queryEnd = queryStart + fileInterval;           // End of file 2
 
     std::string seriesKey = "cpu,hostname=host_0 usage_idle";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -379,10 +375,11 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R3_IntegerPushdownAggregation) {
     size_t pushdownHits = 0;
     for (int i = 0; i < 20; i++) {
         auto t0 = clk::now();
-        auto result = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX,
-                                                       aggregationInterval, timestar::AggregationMethod::AVG);
+        auto result = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, aggregationInterval,
+                                                      timestar::AggregationMethod::AVG);
         pushdownStats.add(clk::now() - t0);
-        if (result.has_value()) pushdownHits++;
+        if (result.has_value())
+            pushdownHits++;
     }
     pushdownStats.print("Integer AVG pushdown (if supported)");
     fmt::print("  Pushdown hits: {}/20\n", pushdownHits);
@@ -459,8 +456,8 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R6_StatsPushdownIOAmplification) {
 
     // Warm up index caches (not data: dma reads are O_DIRECT, uncached)
     for (int i = 0; i < 3; i++) {
-        co_await engine.queryAggregated(seriesKey, seriesId, qStart, qEnd, 0,
-                                        timestar::AggregationMethod::AVG);
+        co_await engine.queryAggregated(seriesKey, seriesId, qStart, qEnd, 0, timestar::AggregationMethod::AVG,
+                                        /*foldNoInterval=*/true);
     }
 
     BenchStats aggStats;
@@ -468,9 +465,10 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R6_StatsPushdownIOAmplification) {
     for (int i = 0; i < 15; i++) {
         auto t0 = clk::now();
         auto result = co_await engine.queryAggregated(seriesKey, seriesId, qStart, qEnd, 0,
-                                                      timestar::AggregationMethod::AVG);
+                                                      timestar::AggregationMethod::AVG, /*foldNoInterval=*/true);
         aggStats.add(clk::now() - t0);
-        if (result.has_value()) hits++;
+        if (result.has_value())
+            hits++;
     }
     aggStats.print("AVG fold, mid-block range (2 decode blocks)");
     fmt::print("  Pushdown hits: {}/15\n", hits);
@@ -481,7 +479,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R6_StatsPushdownIOAmplification) {
     for (int i = 0; i < 15; i++) {
         auto t0 = clk::now();
         auto result = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0,
-                                                      timestar::AggregationMethod::AVG);
+                                                      timestar::AggregationMethod::AVG, /*foldNoInterval=*/true);
         fullStats.add(clk::now() - t0);
         (void)result;
     }

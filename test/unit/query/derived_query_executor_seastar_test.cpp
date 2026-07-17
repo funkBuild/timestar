@@ -813,9 +813,11 @@ static void expectDerivedMatchesPlainBuckets(seastar::sharded<Engine>& eng, uint
             "b": "avg:server.metrics(mem){host:h1}"
         },
         "formula": "(a + b) / 2",
-        "startTime": )json" + std::to_string(startNs) +
+        "startTime": )json" +
+                       std::to_string(startNs) +
                        R"json(,
-        "endTime": )json" + std::to_string(endNs) +
+        "endTime": )json" +
+                       std::to_string(endNs) +
                        R"json(,
         "aggregationInterval": "5m"
     })json";
@@ -902,4 +904,99 @@ TEST_F(DerivedQueryExecutorSeastarTest, StaticFormulaDetectors) {
     EXPECT_TRUE(DerivedQueryExecutor::isForecastFormula("  forecast(q, 'seasonal', 3)"));
     EXPECT_FALSE(DerivedQueryExecutor::isForecastFormula("a + b"));
     EXPECT_FALSE(DerivedQueryExecutor::isForecastFormula("anomalies(a, 'basic', 2)"));
+}
+
+// ===========================================================================
+// Non-numeric sub-query fields are rejected, booleans included
+//
+// Canonical rule (CLAUDE.md "Non-Numeric Fields in Queries"): booleans are
+// non-numeric, exactly as strings are. A formula is arithmetic, so a
+// non-numeric operand is an error rather than a coercion. Booleans used to be
+// silently folded to 1.0/0.0 here while strings threw — so `a * 100` over a
+// bool field computed a plausible number over a type the query path refuses to
+// aggregate. Worse, with an aggregationInterval the sub-query has already been
+// reduced to LATEST-per-bucket, so the formula ran on latest-per-bucket values
+// rather than the every-point series its author expected.
+// ===========================================================================
+TEST_F(DerivedQueryExecutorSeastarTest, NonNumericSubQueryFieldThrows) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.startWithBackground();
+
+        const uint64_t startNs = 1704067200000000000ULL;
+        const uint64_t intervalNs = 60000000000ULL;
+
+        TimeStarInsert<bool> boolInsert("door", "open");
+        boolInsert.addTag("id", "d1");
+        for (size_t i = 0; i < 5; ++i) {
+            boolInsert.addValue(startNs + i * intervalNs, i % 2 == 0);
+        }
+        shardedInsert(eng.eng, std::move(boolInsert));
+
+        TimeStarInsert<std::string> strInsert("door", "label");
+        strInsert.addTag("id", "d1");
+        for (size_t i = 0; i < 5; ++i) {
+            strInsert.addValue(startNs + i * intervalNs, "s" + std::to_string(i));
+        }
+        shardedInsert(eng.eng, std::move(strInsert));
+
+        DerivedQueryExecutor executor(&eng.eng);
+
+        // Booleans and strings must both be rejected — same rule, same error.
+        for (const std::string& field : {"open", "label"}) {
+            DerivedQueryRequest request;
+            request.formula = "a * 100";
+            request.startTime = startNs;
+            request.endTime = startNs + 10 * intervalNs;
+
+            QueryRequest qr;
+            qr.measurement = "door";
+            qr.fields = {field};
+            qr.scopes = {{"id", "d1"}};
+            qr.startTime = startNs;
+            qr.endTime = startNs + 10 * intervalNs;
+            request.queries["a"] = qr;
+
+            EXPECT_THROW(
+                {
+                    try {
+                        executor.execute(request).get();
+                    } catch (const DerivedQueryException& e) {
+                        EXPECT_NE(std::string(e.what()).find("non-numeric"), std::string::npos)
+                            << "field=" << field << " message=" << e.what();
+                        throw;
+                    }
+                },
+                DerivedQueryException)
+                << "REGRESSION: non-numeric field '" << field << "' was accepted into formula arithmetic";
+        }
+
+        // A numeric field on the same measurement still works.
+        {
+            std::vector<std::pair<uint64_t, double>> pts;
+            for (size_t i = 0; i < 5; ++i) {
+                pts.push_back({startNs + i * intervalNs, static_cast<double>(i)});
+            }
+            insertFloatSeries(eng.eng, "door", "angle", {{"id", "d1"}}, pts);
+
+            DerivedQueryRequest request;
+            request.formula = "a * 100";
+            request.startTime = startNs;
+            request.endTime = startNs + 10 * intervalNs;
+
+            QueryRequest qr;
+            qr.measurement = "door";
+            qr.fields = {"angle"};
+            qr.scopes = {{"id", "d1"}};
+            qr.startTime = startNs;
+            qr.endTime = startNs + 10 * intervalNs;
+            request.queries["a"] = qr;
+
+            auto result = executor.execute(request).get();
+            ASSERT_EQ(result.values.size(), 5u);
+            EXPECT_DOUBLE_EQ(result.values[4], 400.0);
+        }
+    })
+        .join()
+        .get();
 }

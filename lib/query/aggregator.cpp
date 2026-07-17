@@ -332,7 +332,7 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                     state.addValue(doubleValues[i], timestamps[i]);
                     partial.totalPoints++;
                 }
-            } else if (method == AggregationMethod::LATEST || method == AggregationMethod::FIRST) {
+            } else if (collapsesWholeRange(method)) {
                 // LATEST/FIRST without interval: fold all points into a single
                 // collapsed state — return 1 point per group, not N raw points.
                 partial.totalPoints += timestamps.size();
@@ -504,13 +504,9 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 }
 
                 // SPREAD/STDDEV/STDVAR/MEDIAN/EXACT_MEDIAN need full AggregationState;
-                // they cannot be folded from raw values alone.
-                bool methodCanFoldRaw = method != AggregationMethod::SPREAD && method != AggregationMethod::STDDEV &&
-                                        method != AggregationMethod::STDVAR &&
-                                        method != AggregationMethod::EXACT_MEDIAN &&
-                                        method != AggregationMethod::MEDIAN;
-
-                if (allRaw && methodCanFoldRaw && !groupPartials.empty()) {
+                // they cannot be folded from raw values alone (see
+                // timestar::methodCanFoldRaw — the single definition of this rule).
+                if (allRaw && methodCanFoldRaw(method) && !groupPartials.empty()) {
                     // Fast path: merge raw (timestamp, value) vectors directly.
                     auto* first = groupPartials[0];
 

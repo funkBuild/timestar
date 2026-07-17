@@ -978,22 +978,38 @@ TEST_F(ApplyFormulaTest, EmptyBatchReturnsEmptyResult) {
     EXPECT_TRUE(result.points.empty());
 }
 
-TEST_F(ApplyFormulaTest, BoolValuesConvertedToDoubleForFormula) {
-    // Bool values: true->1.0, false->0.0
+TEST_F(ApplyFormulaTest, NonNumericValuesAreMissingNotCoercedForFormula) {
+    // Booleans and strings are non-numeric (CLAUDE.md "Non-Numeric Fields in
+    // Queries"), so they have no arithmetic meaning in a formula: both become
+    // NaN = missing (docs/nan_policy.md), never a coerced 1.0/0.0 and never a
+    // fabricated 0.0.  `true * 10 == 10` used to be reported here, computing
+    // arithmetic over a type the query path refuses to aggregate.
     ExpressionParser parser("a * 10");
     auto ast = parser.parse();
 
-    StreamingBatch batch;
-    StreamingDataPoint pt;
-    pt.measurement = "switch";
-    pt.field = "state";
-    pt.timestamp = 1000;
-    pt.value = true;
-    batch.points.push_back(std::move(pt));
+    auto formulaOn = [&](std::variant<double, bool, std::string, int64_t> value) {
+        StreamingBatch batch;
+        StreamingDataPoint pt;
+        pt.measurement = "switch";
+        pt.field = "state";
+        pt.timestamp = 1000;
+        pt.value = std::move(value);
+        batch.points.push_back(std::move(pt));
+        return HttpStreamHandler::applyFormulaToBatch(batch, *ast, "a");
+    };
 
-    auto result = HttpStreamHandler::applyFormulaToBatch(batch, *ast, "a");
-    ASSERT_EQ(result.points.size(), 1u);
-    EXPECT_DOUBLE_EQ(std::get<double>(result.points[0].value), 10.0);
+    for (const auto& nonNumeric :
+         std::vector<std::variant<double, bool, std::string, int64_t>>{true, false, std::string("open")}) {
+        auto result = formulaOn(nonNumeric);
+        EXPECT_TRUE(result.points.empty())
+            << "a non-numeric operand is not an operand at all: it must contribute NO point, rather "
+               "than a coerced 1.0/0.0, a fabricated 0.0, or an all-NaN phantom series";
+    }
+
+    // A numeric operand still evaluates normally.
+    auto numeric = formulaOn(2.5);
+    ASSERT_EQ(numeric.points.size(), 1u);
+    EXPECT_DOUBLE_EQ(std::get<double>(numeric.points[0].value), 25.0);
 }
 
 TEST_F(ApplyFormulaTest, Int64ValuesConvertedToDoubleForFormula) {
