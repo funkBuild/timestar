@@ -38,6 +38,15 @@ find lib bin -name '*.cpp' -o -name '*.hpp' | xargs clang-format -i
 
 CI will reject PRs with formatting violations.
 
+To catch violations before they reach CI, enable the repo's pre-push hook
+(one-time setup; it runs the exact CI formatting gate on every push):
+
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
+Bypass in an emergency with `git push --no-verify` — CI still enforces the gate.
+
 ## Pull Request Process
 
 1. Create a feature branch from `main`
