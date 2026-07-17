@@ -27,8 +27,10 @@
 #include <cmath>
 #include <filesystem>
 #include <map>
+#include <chrono>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/http/reply.hh>
@@ -322,6 +324,26 @@ protected:
     }
 
     static bool isOk(const seastar::http::reply& rep) { return rep._status == seastar::http::reply::status_type::ok; }
+
+    // Metadata indexing is asynchronous: writes are acknowledged before the
+    // index dispatch completes (docs/api-write.md), so a metadata read issued
+    // immediately after a write can race the indexer — reliably so on slow
+    // instrumented (coverage) builds. Re-fetch until `ready(resp)` holds or
+    // ~5s elapse, leaving the last response in `resp` for the caller's
+    // assertions.
+    template <typename Resp, typename FetchFn, typename ReadyFn>
+    static void pollMetadata(Resp& resp, FetchFn fetch, ReadyFn ready) {
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            auto rep = fetch();
+            ASSERT_TRUE(isOk(*rep));
+            resp.Clear();
+            ASSERT_TRUE(resp.ParseFromString(rep->_content));
+            if (ready(resp)) {
+                return;
+            }
+            seastar::sleep(std::chrono::milliseconds(100)).get();
+        }
+    }
 };
 
 // ============================================================================
@@ -912,14 +934,18 @@ TEST_F(ProtobufIntegrationTest, MeasurementsWithProtobufAccept) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
 
-        // Query measurements with protobuf Accept
-        auto metaReq = makeMetadataRequestProto();
-        auto metaRep = metaHandler.handleMeasurements(std::move(metaReq)).get();
-        ASSERT_TRUE(isOk(*metaRep));
-
-        // Parse as protobuf MeasurementsResponse
+        // Query measurements with protobuf Accept, polling past the async
+        // metadata indexing window.
         ::timestar_pb::MeasurementsResponse resp;
-        ASSERT_TRUE(resp.ParseFromString(metaRep->_content));
+        pollMetadata(
+            resp, [&] { return metaHandler.handleMeasurements(makeMetadataRequestProto()).get(); },
+            [](const ::timestar_pb::MeasurementsResponse& r) {
+                std::set<std::string> names;
+                for (int i = 0; i < r.measurements_size(); ++i) {
+                    names.insert(r.measurements(i));
+                }
+                return names.count("pb_meta_temp") > 0 && names.count("pb_meta_humid") > 0;
+            });
         EXPECT_GE(resp.measurements_size(), 2);
 
         std::set<std::string> found;
@@ -951,14 +977,14 @@ TEST_F(ProtobufIntegrationTest, TagsWithProtobufAccept) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
 
-        // Query tags with protobuf Accept
-        auto metaReq = makeMetadataRequestProto("pb_meta_tags_cpu");
-        auto metaRep = metaHandler.handleTags(std::move(metaReq)).get();
-        ASSERT_TRUE(isOk(*metaRep));
-
-        // Parse as protobuf TagsResponse
+        // Query tags with protobuf Accept, polling past the async metadata
+        // indexing window.
         ::timestar_pb::TagsResponse resp;
-        ASSERT_TRUE(resp.ParseFromString(metaRep->_content));
+        pollMetadata(
+            resp, [&] { return metaHandler.handleTags(makeMetadataRequestProto("pb_meta_tags_cpu")).get(); },
+            [](const ::timestar_pb::TagsResponse& r) {
+                return r.measurement() == "pb_meta_tags_cpu" && r.tags_size() >= 2;
+            });
         EXPECT_EQ(resp.measurement(), "pb_meta_tags_cpu");
         EXPECT_GE(resp.tags_size(), 2);  // host, dc
     })
@@ -985,14 +1011,14 @@ TEST_F(ProtobufIntegrationTest, FieldsWithProtobufAccept) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
 
-        // Query fields with protobuf Accept
-        auto metaReq = makeMetadataRequestProto("pb_meta_fields_system");
-        auto metaRep = metaHandler.handleFields(std::move(metaReq)).get();
-        ASSERT_TRUE(isOk(*metaRep));
-
-        // Parse as protobuf FieldsResponse
+        // Query fields with protobuf Accept, polling past the async metadata
+        // indexing window.
         ::timestar_pb::FieldsResponse resp;
-        ASSERT_TRUE(resp.ParseFromString(metaRep->_content));
+        pollMetadata(
+            resp, [&] { return metaHandler.handleFields(makeMetadataRequestProto("pb_meta_fields_system")).get(); },
+            [](const ::timestar_pb::FieldsResponse& r) {
+                return r.measurement() == "pb_meta_fields_system" && r.fields_size() >= 3;
+            });
         EXPECT_EQ(resp.measurement(), "pb_meta_fields_system");
         EXPECT_GE(resp.fields_size(), 3);
     })
