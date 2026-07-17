@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+
 using namespace timestar;
 
 static StreamingDataPoint makePoint(const std::string& measurement, const std::string& field,
@@ -297,4 +299,73 @@ TEST(StreamingDerivedEvalTest, CarryForwardStalenessOverflowSafety) {
                                      "10 * intervalNs overflows uint64_t to 4, making staleCutoff nearly equal to "
                                      "latestTs and wrongly expiring a fresh carry-forward value";
     EXPECT_DOUBLE_EQ(val, 40.0);  // 80 - 40 (carry-forward of "b")
+}
+
+// A non-numeric field in the same bucket must not corrupt a formula.
+//
+// StreamingAggregator emits one point per (bucket, series+field), ordered by
+// measurement/field/tags, and this evaluator keeps the LAST value per
+// timestamp. So if a string field is admitted as a placeholder (NaN or 0.0),
+// it OVERWRITES the real numeric value whenever its field name sorts after —
+// making the answer depend on lexicographic field names. Non-numeric points
+// are not operands and must be skipped outright.
+//
+// "zstatus" is deliberately chosen to sort AFTER "usage": with the bug, this
+// test fails; rename it to "astatus" and the bug hides.
+TEST(StreamingDerivedEvalTest, NonNumericFieldDoesNotPoisonFormula) {
+    ExpressionParser parser("a * 2");
+    auto ast = parser.parse();
+
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}};
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
+
+    // Numeric field, same measurement + bucket.
+    eval.addPoint("a", makePoint("dev", "usage", {}, 1'000'000'000, 10.0));
+    eval.addPoint("a", makePoint("dev", "usage", {}, 2'000'000'000, 20.0));
+
+    // Non-numeric fields whose names sort AFTER "usage".
+    StreamingDataPoint strPt;
+    strPt.measurement = "dev";
+    strPt.field = "zstatus";
+    strPt.tags = makeTags({});
+    strPt.timestamp = 1'000'000'000;
+    strPt.value = std::string("ok");
+    eval.addPoint("a", std::move(strPt));
+
+    StreamingDataPoint boolPt;
+    boolPt.measurement = "dev";
+    boolPt.field = "zactive";
+    boolPt.tags = makeTags({});
+    boolPt.timestamp = 2'000'000'000;
+    boolPt.value = true;
+    eval.addPoint("a", std::move(boolPt));
+
+    auto batch = eval.closeBuckets();
+    ASSERT_EQ(batch.points.size(), 1u);
+    const double value = std::get<double>(batch.points[0].value);
+    ASSERT_FALSE(std::isnan(value)) << "REGRESSION: a non-numeric field overwrote the numeric value "
+                                       "(field-name ordering decided the answer)";
+    // avg(10, 20) = 15 -> * 2 = 30. The string/bool contribute nothing.
+    EXPECT_DOUBLE_EQ(value, 30.0);
+}
+
+// A bucket with ONLY non-numeric points yields no formula output at all —
+// not an all-NaN series.
+TEST(StreamingDerivedEvalTest, NonNumericOnlyBucketProducesNoOutput) {
+    ExpressionParser parser("a * 2");
+    auto ast = parser.parse();
+
+    std::map<std::string, AggregationMethod> methods = {{"a", AggregationMethod::AVG}};
+    StreamingDerivedEvaluator eval(10'000'000'000ULL, methods, std::shared_ptr<ExpressionNode>(std::move(ast)));
+
+    StreamingDataPoint strPt;
+    strPt.measurement = "dev";
+    strPt.field = "status";
+    strPt.tags = makeTags({});
+    strPt.timestamp = 1'000'000'000;
+    strPt.value = std::string("ok");
+    eval.addPoint("a", std::move(strPt));
+
+    auto batch = eval.closeBuckets();
+    EXPECT_TRUE(batch.points.empty()) << "a non-numeric-only formula input must emit nothing, not NaN";
 }

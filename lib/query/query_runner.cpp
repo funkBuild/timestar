@@ -710,6 +710,25 @@ static size_t aggregateMemoryStoresTyped(const std::vector<seastar::shared_ptr<M
     return totalPoints;
 }
 
+// Non-numeric gate for memory-resident series.  A series is exactly one type
+// across every source, so the first pinned store that knows the series decides.
+// Boolean and String never aggregate arithmetically (canonical non-numeric
+// rule), so they must bypass pushdown entirely and let the caller materialise
+// them in their written type.  The TSM-resident case is gated separately, by
+// the seriesType checks on the candidate-file loops below; this covers series
+// whose data lives only in memory while other series have TSM files (where
+// those loops find no candidate for this series and would otherwise fold the
+// memory data as doubles).
+static bool seriesIsNonNumericInMemory(const std::vector<seastar::shared_ptr<MemoryStore>>& pinnedStores,
+                                       const SeriesId128& seriesId) {
+    for (const auto& store : pinnedStores) {
+        if (auto type = store->getSeriesType(seriesId)) {
+            return isNonNumericValueType(*type);
+        }
+    }
+    return false;
+}
+
 // Last-write-wins gate for memory folding: true when the series' in-range
 // data spans more than one pinned store with overlapping time bounds.  The
 // same timestamp may then exist in two stores (a rewrite across rollover
@@ -782,6 +801,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         co_return std::nullopt;
     }
 
+    // Non-numeric series (Boolean, String) never aggregate arithmetically.
+    if (seriesIsNonNumericInMemory(pinnedStores, seriesId)) {
+        co_return std::nullopt;
+    }
+
     const bool noTsmFiles = fileManager->getSequencedTsmFiles().empty();
     const bool isLatest = (method == timestar::AggregationMethod::LATEST);
     const bool isFirst = (method == timestar::AggregationMethod::FIRST);
@@ -797,12 +821,13 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // in the aggregator rather than folding to a single state, because callers
     // (e.g. DerivedQueryExecutor) may need per-point data.
     if (noTsmFiles) {
-        // Fold-to-single-state for interval == 0: always for LATEST/FIRST
-        // (they return 1 point by definition), and for other streamable
-        // methods when the caller asked for a collapsed result
-        // (foldNoInterval — group-by callers collapse per group anyway).
-        const bool foldSingle =
-            (aggregationInterval == 0) && (isLatest || isFirst || (foldNoInterval && isStreamableAggMethod(method)));
+        // Fold-to-single-state for interval == 0 ONLY when the caller
+        // explicitly asked for a collapsed result (foldNoInterval, which
+        // defaults to false — no production caller sets it, since collapsing a
+        // range nobody asked to collapse breaks the canonical shape rules).
+        // LATEST/FIRST are NOT special here: without an interval they keep
+        // every timestamp like every other method.
+        const bool foldSingle = (aggregationInterval == 0) && foldNoInterval && isStreamableAggMethod(method);
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
         if (foldSingle) {
             aggregator.enableFoldToSingleState();
@@ -865,11 +890,18 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         }
     }
 
-    // Fast path for LATEST/FIRST: skip the expensive Gate 2 overlap check.
-    // LATEST/FIRST don't aggregate across blocks (no double-counting risk),
-    // so we can filter files using getSeriesType() (bloom filter + sparse
-    // index, pure in-memory, no I/O) instead of getFullIndexEntry() (DMA read).
-    if (isLatest || isFirst) {
+    // Fast path for BUCKETED LATEST/FIRST: skip the expensive Gate 2 overlap
+    // check.  LATEST/FIRST don't aggregate across blocks (no double-counting
+    // risk), so we can filter files using getSeriesType() (bloom filter +
+    // sparse index, pure in-memory, no I/O) instead of getFullIndexEntry()
+    // (DMA read), and stop as soon as each bucket has its one point.
+    //
+    // interval == 0 deliberately does NOT come here: without an interval
+    // LATEST/FIRST no longer collapse the range — every distinct timestamp
+    // survives, exactly as for every other method (CLAUDE.md "Aggregation
+    // Result Shape").  There is no single point to seek to, so those queries
+    // fall through to the normal pushdown and return raw sorted vectors.
+    if ((isLatest || isFirst) && aggregationInterval > 0) {
         // Snapshot the TSM file map so that compaction cannot mutate it
         // mid-iteration across co_await suspension points.
         std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
@@ -884,8 +916,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             auto type = tsmFile->getSeriesType(seriesId);
             if (!type.has_value())
                 continue;
-            // Float, Integer, and Boolean support pushdown aggregation; String does not.
-            if (*type == TSMValueType::String) {
+            // Float and Integer support pushdown aggregation.  String and
+            // Boolean are non-numeric: they never aggregate arithmetically, so
+            // they bypass pushdown and are returned in their written type by the
+            // caller (raw, or LATEST-per-bucket with an interval).
+            if (isNonNumericValueType(*type)) {
                 co_return std::nullopt;
             }
             candidateFiles.push_back(tsmFile);
@@ -951,8 +986,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
                       });
         }
 
-        // Non-bucketed LATEST/FIRST: fold TSM + MemoryStore data into a single
-        // AggregationState so we return 1 point total, not N raw points.
+        // Bucketed LATEST/FIRST: fold TSM + MemoryStore data into one
+        // AggregationState per epoch-aligned bucket.
         //
         // The aggregator is constructed over the FULL query range [startTime,
         // endTime], not the TSM-only sub-range: when needsFallback is set, the
@@ -961,22 +996,17 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         // layout (single-bucket optimisation).  Constructing over the narrower
         // TSM sub-range used to collapse memory points from later epoch
         // buckets into the first bucket.
-        const bool foldNonBucketed = (aggregationInterval == 0);
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
-        if (foldNonBucketed) {
-            aggregator.enableFoldToSingleState();
-        }
 
         // Zero-I/O fast path: for LATEST/FIRST needing only 1 point, use the
         // v3 block stats cached in the sparse index. Files are already sorted
         // by time bounds, so the first candidate has the best point. No DMA
         // reads required — pure in-memory lookup.
-        bool needsSinglePoint = (aggregationInterval == 0);
-        if (!needsSinglePoint && aggregationInterval > 0) {
-            uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
-            uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
-            needsSinglePoint = (firstBucket == lastBucket);
-        }
+        // One point suffices when the whole TSM range lands in one bucket.
+        // (aggregationInterval > 0 is guaranteed by the branch gate above.)
+        const uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
+        const uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
+        const bool needsSinglePoint = (firstBucket == lastBucket);
 
         if (needsSinglePoint && !candidateFiles.empty()) {
             // Try sparse index stats first (zero I/O).
@@ -1016,12 +1046,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             }
         } else {
             // Bucketed: iterate files in preferred order, share filledBuckets
-            // across files for cross-file early termination.
-            uint64_t firstBucket = (startTime / aggregationInterval) * aggregationInterval;
-            uint64_t lastBucket = (tsmEndTime / aggregationInterval) * aggregationInterval;
-            size_t totalBuckets = (lastBucket >= firstBucket)
-                                      ? static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1)
-                                      : 1;
+            // across files for cross-file early termination.  Reuses the
+            // first/last bucket computed above rather than recomputing them.
+            const size_t totalBuckets = (lastBucket >= firstBucket)
+                                            ? static_cast<size_t>((lastBucket - firstBucket) / aggregationInterval + 1)
+                                            : 1;
 
             if (totalBuckets == 1) {
                 // Handled above in needsSinglePoint path
@@ -1048,15 +1077,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
         timestar::PushdownResult result;
         result.totalPoints = aggregator.pointCount();
-        if (aggregationInterval > 0) {
-            result.bucketStates = aggregator.takeBucketStates();
-        } else if (foldNonBucketed) {
-            result.aggregatedState = aggregator.takeSingleState();
-        } else {
-            aggregator.sortTimestamps();
-            result.sortedTimestamps = aggregator.takeTimestamps();
-            result.sortedValues = aggregator.takeValues();
-        }
+        result.bucketStates = aggregator.takeBucketStates();
 
         co_return result;
     }
@@ -1111,8 +1132,9 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         if (!indexEntry)
             continue;
 
-        // Float, Integer, and Boolean support pushdown; String does not.
-        if (indexEntry->seriesType == TSMValueType::String) {
+        // Float and Integer support pushdown; String and Boolean are
+        // non-numeric and never aggregate arithmetically.
+        if (isNonNumericValueType(indexEntry->seriesType)) {
             hasNonFloat = true;
             break;
         }

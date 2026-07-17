@@ -463,9 +463,13 @@ TEST_F(NewAggMethodPipelineTest, First_ReturnsEarliestValue) {
     std::vector<uint64_t> ts = {1000, 2000, 3000};
     std::vector<double> vals = {100.0, 200.0, 300.0};
     auto result = runPipeline(ts, vals, AggregationMethod::FIRST);
-    // FIRST without interval collapses to 1 point (the earliest value)
-    ASSERT_EQ(result.size(), 1u);
+    // FIRST without an interval does NOT collapse: it is a cross-series
+    // tie-break at each timestamp, not a reduction over time, so a single
+    // series passes through unchanged (CLAUDE.md "Aggregation Result Shape").
+    // First_WithBuckets below covers the reducing case.
+    ASSERT_EQ(result.size(), 3u);
     EXPECT_DOUBLE_EQ(result[0].value, 100.0);
+    EXPECT_DOUBLE_EQ(result[2].value, 300.0);
 }
 
 TEST_F(NewAggMethodPipelineTest, First_WithBuckets) {

@@ -128,9 +128,14 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC3_QueryAggregatedCorrectness) {
     std::string seriesKey = "test_agg,host=h0 value";
     SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
 
-    // No bucketing (aggregationInterval=0) with default AVG method: should now
-    // produce a collapsed AggregationState (streaming pushdown) instead of raw vectors.
-    auto result = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0);
+    // No bucketing (aggregationInterval=0) with AVG and an EXPLICIT
+    // foldNoInterval=true: produces a collapsed AggregationState (streaming
+    // pushdown) instead of raw vectors.  The flag must be passed explicitly —
+    // it defaults to false, because collapsing a range the caller never asked
+    // to collapse breaks the canonical shape rules (CLAUDE.md "Aggregation
+    // Result Shape").  No production caller passes true.
+    auto result = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0,
+                                                  timestar::AggregationMethod::AVG, /*foldNoInterval=*/true);
     EXPECT_TRUE(result.has_value()) << "Pushdown should work for TSM-only float data";
 
     if (result.has_value()) {
@@ -227,7 +232,16 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC5_LatestAggregation) {
 
     // Test that queryAggregated with interval=0 and default AVG method returns
     // an aggregated state that includes the latest value in its tracking.
-    auto pushdownResult = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0);
+    // foldNoInterval=true explicitly (the default is false — see RC3).
+    auto pushdownResult = co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0,
+                                                          timestar::AggregationMethod::AVG, /*foldNoInterval=*/true);
+    // EXPECT unconditionally, don't hide the check behind `if (has_value())`:
+    // that guard made this assertion silently vacuous the moment the collapsed
+    // shape stopped being produced.  (ASSERT_* cannot be used here — this is a
+    // coroutine and ASSERT expands to a bare `return`.)
+    EXPECT_TRUE(pushdownResult.has_value()) << "pushdown should apply to TSM-only float data";
+    EXPECT_TRUE(pushdownResult.has_value() && pushdownResult->aggregatedState.has_value())
+        << "foldNoInterval=true must produce a collapsed state";
     if (pushdownResult.has_value() && pushdownResult->aggregatedState.has_value()) {
         // The aggregated state should track the latest value
         double pushdownLatest = pushdownResult->aggregatedState->latest;

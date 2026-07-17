@@ -332,14 +332,15 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& nam
 
         // Extract values (must be numeric for derived metrics) — moved, the
         // response is locally owned and discarded after conversion.
+        //
+        // Booleans are NOT numeric (canonical rule, see CLAUDE.md "Non-Numeric
+        // Fields in Queries") and so are rejected here exactly as strings are.
+        // They used to be coerced to 1.0/0.0, which let a formula compute
+        // arithmetic over a type the query path refuses to aggregate — and,
+        // once an aggregationInterval was set, over LATEST-per-bucket values
+        // rather than the every-point series the formula author expected.
         if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
             subResult.values = std::move(std::get<std::vector<double>>(fieldData.second));
-        } else if (std::holds_alternative<std::vector<bool>>(fieldData.second)) {
-            const auto& boolVals = std::get<std::vector<bool>>(fieldData.second);
-            subResult.values.reserve(boolVals.size());
-            for (bool v : boolVals) {
-                subResult.values.push_back(v ? 1.0 : 0.0);
-            }
         } else if (std::holds_alternative<std::vector<int64_t>>(fieldData.second)) {
             const auto& intVals = std::get<std::vector<int64_t>>(fieldData.second);
             subResult.values.reserve(intVals.size());

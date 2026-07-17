@@ -344,24 +344,17 @@ StreamingBatch HttpStreamHandler::applyFormulaToBatch(const StreamingBatch& batc
     std::map<SeriesFieldKey, std::pair<std::vector<uint64_t>, std::vector<double>>> groups;
 
     for (const auto& pt : batch.points) {
+        // SKIP non-numeric (bool, string) points — they are not operands, so a
+        // string/bool field contributes nothing rather than an all-NaN phantom
+        // series.  Never a fabricated 0.0 and never a coerced 1.0/0.0.
+        auto numeric = streamingValueAsNumeric(pt.value);
+        if (!numeric) {
+            continue;
+        }
         SeriesFieldKey key{pt.measurement, pt.tags, pt.field};
         auto& [timestamps, values] = groups[key];
         timestamps.push_back(pt.timestamp);
-
-        double val = std::visit(
-            [](const auto& v) -> double {
-                using VT = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<VT, double>)
-                    return v;
-                else if constexpr (std::is_same_v<VT, int64_t>)
-                    return static_cast<double>(v);
-                else if constexpr (std::is_same_v<VT, bool>)
-                    return v ? 1.0 : 0.0;
-                else
-                    return 0.0;
-            },
-            pt.value);
-        values.push_back(val);
+        values.push_back(*numeric);
     }
 
     StreamingBatch result;

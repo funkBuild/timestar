@@ -66,20 +66,15 @@ StreamingBatch StreamingDerivedEvaluator::closeBuckets(uint64_t nowNs) {
         auto& pts = queryPoints[label];
         pts.reserve(batch.points.size());
         for (const auto& pt : batch.points) {
-            double val = std::visit(
-                [](const auto& v) -> double {
-                    using VT = std::decay_t<decltype(v)>;
-                    if constexpr (std::is_same_v<VT, double>)
-                        return v;
-                    else if constexpr (std::is_same_v<VT, int64_t>)
-                        return static_cast<double>(v);
-                    else if constexpr (std::is_same_v<VT, bool>)
-                        return v ? 1.0 : 0.0;
-                    else
-                        return std::numeric_limits<double>::quiet_NaN();  // string: not numeric
-                },
-                pt.value);
-            pts.emplace_back(pt.timestamp, val);
+            // SKIP non-numeric (bool, string) points — they are not operands.
+            // The dedupe below keeps the LAST value per timestamp, and batch
+            // points arrive in measurement/field/tags order, so admitting a
+            // placeholder for a string field would let it overwrite a real
+            // numeric value from another field in the same bucket purely on
+            // lexicographic field name.
+            if (auto numeric = streamingValueAsNumeric(pt.value)) {
+                pts.emplace_back(pt.timestamp, *numeric);
+            }
         }
         // Stable sort preserves batch order among equal timestamps so the
         // last-seen value wins (multiple series/fields at the same bucket),

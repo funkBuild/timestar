@@ -117,6 +117,14 @@ protected:
         return {};
     }
 
+    // Helper to extract boolean values from FieldValues variant
+    static std::vector<bool> getBoolValues(const FieldValues& fv) {
+        if (std::holds_alternative<std::vector<bool>>(fv)) {
+            return std::get<std::vector<bool>>(fv);
+        }
+        return {};
+    }
+
     // Helper to extract string values from FieldValues variant
     static std::vector<std::string> getStringValues(const FieldValues& fv) {
         if (std::holds_alternative<std::vector<std::string>>(fv)) {
@@ -385,15 +393,20 @@ TEST_F(AsyncQueryTest, QueryWithGroupBy) {
         ASSERT_NE(deviceA, nullptr);
         ASSERT_NE(deviceB, nullptr);
 
-        // Non-bucketed AVG with GROUP BY produces 1 aggregated point per group
-        // (the global average over the queried time range).
+        // Grouping never collapses the time axis: without an aggregationInterval
+        // every distinct timestamp survives into each group, exactly as it does
+        // for the same query with no `by` clause.  Only an aggregationInterval
+        // (or LATEST/FIRST) reduces the time axis.
         auto valuesA = getDoubleValues(deviceA->fields["value1"].second);
         auto valuesB = getDoubleValues(deviceB->fields["value1"].second);
-        ASSERT_EQ(valuesA.size(), 1);
-        ASSERT_EQ(valuesB.size(), 1);
-        // AVG of createTestFieldData(100, m) = 0.1*m*(0+1+...+99)/100 = 4.95*m
-        EXPECT_NEAR(valuesA[0], 4.95 * 1.0, 0.01);
-        EXPECT_NEAR(valuesB[0], 4.95 * 4.0, 0.01);
+        ASSERT_EQ(valuesA.size(), 100);
+        ASSERT_EQ(valuesB.size(), 100);
+        // Each group holds one series here, so values pass through unaggregated:
+        // createTestFieldData(100, m) is 0.1*i*m for i in [0, 100).
+        for (size_t i = 0; i < 100; ++i) {
+            EXPECT_NEAR(valuesA[i], 0.1 * static_cast<double>(i) * 1.0, 0.01) << "at i=" << i;
+            EXPECT_NEAR(valuesB[i], 0.1 * static_cast<double>(i) * 4.0, 0.01) << "at i=" << i;
+        }
 
         queryHandler.reset();
         engineSharded = nullptr;
@@ -419,12 +432,16 @@ TEST_F(AsyncQueryTest, BooleanDataQuery) {
         auto& series = result.series[0];
 
         ASSERT_TRUE(series.fields.find("value") != series.fields.end());
-        auto values = getDoubleValues(series.fields["value"].second);
 
-        // LATEST without interval returns the single most recent value
-        ASSERT_EQ(values.size(), 1);
-        // The latest boolean value (false at baseTime - 1s) is 0.0 in double format
-        EXPECT_EQ(values[0], 0.0);  // false (most recent)
+        // Booleans are non-numeric: they are never coerced into arithmetic and
+        // come back in the type they were written in, keeping their series tags.
+        // Without an interval they pass through raw, so the named aggregation
+        // (latest) is ignored and both written points are returned.
+        EXPECT_EQ(series.tags["deviceId"], "sensor");
+        auto values = getBoolValues(series.fields["value"].second);
+        ASSERT_EQ(values.size(), 2);
+        EXPECT_TRUE(values[0]);   // baseTime - 2s
+        EXPECT_FALSE(values[1]);  // baseTime - 1s
 
         queryHandler.reset();
         engineSharded = nullptr;

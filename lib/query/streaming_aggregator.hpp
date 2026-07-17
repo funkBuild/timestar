@@ -23,12 +23,30 @@ struct BucketState {
     double latest = 0.0;
     uint64_t latestTimestamp = 0;
     uint64_t count = 0;
-    bool isStringOnly = true;  // true until a numeric value is added
+
+    // Non-numeric (string, boolean) buckets never aggregate arithmetically —
+    // canonical rule, see CLAUDE.md "Non-Numeric Fields in Queries". They
+    // reduce to LATEST-per-bucket and are emitted in the type they were written
+    // in, so an SSE stream reports the same values POST /query does for the
+    // same interval.  The numeric fields above stay untouched for these.
+    bool isNonNumeric = false;
+    std::variant<double, bool, std::string, int64_t> latestNonNumeric;
+    uint64_t latestNonNumericTimestamp = 0;
+
+    void addNonNumeric(std::variant<double, bool, std::string, int64_t> val, uint64_t ts) {
+        // ts >= keeps the last-written value on ties, matching the LATEST fold
+        // and the ascending-order reduction on the query path.
+        if (!isNonNumeric || ts >= latestNonNumericTimestamp) {
+            latestNonNumeric = std::move(val);
+            latestNonNumericTimestamp = ts;
+        }
+        isNonNumeric = true;
+        ++count;
+    }
 
     void addDouble(double val, uint64_t ts) {
         if (std::isnan(val)) [[unlikely]]
             return;
-        isStringOnly = false;  // numeric value seen
         sum += val;
         if (val < min)
             min = val;
@@ -45,10 +63,7 @@ struct BucketState {
         ++count;
     }
 
-    void addInt64(int64_t val, uint64_t ts) {
-        isStringOnly = false;
-        addDouble(static_cast<double>(val), ts);
-    }
+    void addInt64(int64_t val, uint64_t ts) { addDouble(static_cast<double>(val), ts); }
 
     double computeResult(AggregationMethod method) const {
         if (count == 0)
