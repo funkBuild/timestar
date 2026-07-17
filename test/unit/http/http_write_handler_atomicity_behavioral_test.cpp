@@ -22,6 +22,7 @@
 // condition itself) remain in the source-inspection file.
 
 #include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
@@ -111,6 +112,14 @@ protected:
 // per-shard failure the accounting must attribute.
 // ---------------------------------------------------------------------------
 TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsistent) {
+    // The test needs at least one shard that is NOT the failing one, so the
+    // small series can succeed and the response is "partial" (with a single
+    // shard, every point rides the failing batch and the server correctly
+    // answers 413 instead).
+    if (seastar::smp::count < 2) {
+        GTEST_SKIP() << "requires >= 2 shards to place healthy series off the failing shard";
+    }
+
     seastar::thread([] {
         ScopedShardedEngine eng;
         eng.start();
@@ -123,6 +132,26 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
         // the owning shard's Engine::insertBatch throws before persisting.
         constexpr int kBigValues = 42;
         const std::string bigValue(1024 * 1024, 'x');
+
+        std::map<std::string, std::string> smallTags{{"host", "h1"}};
+
+        // Pick small-series measurements that provably route to a DIFFERENT
+        // shard than atomic_big. Series placement is hash-based, so with a
+        // small shard count (CI runners) fixed names can all collide onto the
+        // failing shard — turning the intended "partial" into an all-points
+        // 413 and making the test layout-dependent.
+        const unsigned bigShard = timestar::routeToCore(
+            SeriesId128::fromSeriesKey(timestar::buildSeriesKey("atomic_big", smallTags, "payload")));
+        std::vector<std::string> smallMeasurements;
+        for (int candidate = 0; smallMeasurements.size() < 3; ++candidate) {
+            ASSERT_LT(candidate, 4096) << "could not find off-shard small series names";
+            std::string name = "atomic_small" + std::to_string(candidate);
+            const unsigned shard =
+                timestar::routeToCore(SeriesId128::fromSeriesKey(timestar::buildSeriesKey(name, smallTags, "v")));
+            if (shard != bigShard) {
+                smallMeasurements.push_back(std::move(name));
+            }
+        }
 
         std::string body;
         body.reserve((kBigValues + 1) * (1024 * 1024 + 16));
@@ -141,14 +170,14 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
             body += std::to_string((i + 1) * 1000);
         }
         body += "]}";
-        // Three small, valid double points in separate series.
-        for (int i = 0; i < 3; ++i) {
-            body += R"(, {"measurement": "atomic_small)" + std::to_string(i) +
+        // Three small, valid double points in separate series on healthy shards.
+        for (const auto& name : smallMeasurements) {
+            body += R"(, {"measurement": ")" + name +
                     R"(", "tags": {"host": "h1"}, "fields": {"v": 1.5}, "timestamp": 1000})";
         }
         body += "]}";
 
-        constexpr double kTotalPoints = kBigValues + 3;  // 18 big + 3 small
+        constexpr double kTotalPoints = kBigValues + 3;  // 42 big + 3 small
 
         auto rep = handler.handleWrite(makeWriteRequest(body)).get();
         ASSERT_EQ(rep->_status, seastar::http::reply::status_type::ok) << rep->_content;
@@ -178,6 +207,13 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
                 EXPECT_EQ(std::get<QueryResult<std::string>>(resultOpt.value()).timestamps.size(), 0u)
                     << "Failed batch data must not be persisted (shard " << s << ")";
             }
+        }
+
+        // The healthy-shard series must have been persisted despite the
+        // failing shard ("partial" means the rest of the batch succeeded).
+        for (const auto& name : smallMeasurements) {
+            EXPECT_EQ(HttpWriteHandlerAtomicityBehavioralTest::totalPoints(eng.eng, name, smallTags, "v"), 1u)
+                << "Small series '" << name << "' on a healthy shard must be written";
         }
     })
         .join()
