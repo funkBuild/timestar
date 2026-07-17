@@ -11,10 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/http/reply.hh>
@@ -137,6 +139,27 @@ protected:
     }
 
     static bool isOk(const seastar::http::reply& rep) { return rep._status == seastar::http::reply::status_type::ok; }
+
+    // Metadata indexing is asynchronous: writes are acknowledged before the
+    // index dispatch completes (docs/api-write.md), so a metadata read issued
+    // immediately after a write can race the indexer — reliably so on slow
+    // instrumented (coverage) builds. Re-fetch until `ready(object)` holds or
+    // ~5s elapse, leaving the last parsed response in `out` for the caller's
+    // assertions.
+    template <typename FetchFn, typename ReadyFn>
+    static void pollMetadataJson(glz::generic& out, FetchFn fetch, ReadyFn ready) {
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            auto rep = fetch();
+            ASSERT_TRUE(isOk(*rep)) << "Metadata request failed: " << rep->_content;
+            out = glz::generic{};
+            auto ec = glz::read_json(out, rep->_content);
+            ASSERT_FALSE(ec);
+            if (ready(out.get<glz::generic::object_t>())) {
+                return;
+            }
+            seastar::sleep(std::chrono::milliseconds(100)).get();
+        }
+    }
 };
 
 // ============================================================================
@@ -818,14 +841,18 @@ TEST_F(HttpHandlerIntegrationTest, MetadataMeasurements) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep)) << "Write failed: " << writeRep->_content;
 
-        // Query measurements
-        auto metaReq = makeMetadataRequest();
-        auto metaRep = metaHandler.handleMeasurements(std::move(metaReq)).get();
-        ASSERT_TRUE(isOk(*metaRep)) << "Metadata failed: " << metaRep->_content;
-
+        // Query measurements, polling past the async metadata indexing window.
         glz::generic parsed;
-        auto ec = glz::read_json(parsed, metaRep->_content);
-        ASSERT_FALSE(ec);
+        pollMetadataJson(
+            parsed, [&] { return metaHandler.handleMeasurements(makeMetadataRequest()).get(); },
+            [](glz::generic::object_t& o) {
+                std::set<std::string> names;
+                for (auto& m : o["measurements"].get<glz::generic::array_t>()) {
+                    names.insert(m.get<std::string>());
+                }
+                return names.count("meta_meas_temp") && names.count("meta_meas_humid") &&
+                       names.count("meta_meas_press");
+            });
         auto& obj = parsed.get<glz::generic::object_t>();
 
         auto& measurements = obj["measurements"].get<glz::generic::array_t>();
@@ -872,14 +899,18 @@ TEST_F(HttpHandlerIntegrationTest, MetadataTagsForMeasurement) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
 
-        // Query tags for measurement
-        auto metaReq = makeMetadataRequest("meta_tags_cpu");
-        auto metaRep = metaHandler.handleTags(std::move(metaReq)).get();
-        ASSERT_TRUE(isOk(*metaRep)) << "Tags query failed: " << metaRep->_content;
-
+        // Query tags for measurement, polling past the async metadata
+        // indexing window.
         glz::generic parsed;
-        auto ec = glz::read_json(parsed, metaRep->_content);
-        ASSERT_FALSE(ec);
+        pollMetadataJson(
+            parsed, [&] { return metaHandler.handleTags(makeMetadataRequest("meta_tags_cpu")).get(); },
+            [](glz::generic::object_t& o) {
+                if (!o.count("tags"))
+                    return false;
+                auto& t = o["tags"].get<glz::generic::object_t>();
+                return t.count("host") && t.count("dc") && t["host"].get<glz::generic::array_t>().size() >= 2 &&
+                       t["dc"].get<glz::generic::array_t>().size() >= 2;
+            });
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["measurement"].get<std::string>(), "meta_tags_cpu");
 
@@ -926,14 +957,13 @@ TEST_F(HttpHandlerIntegrationTest, MetadataSpecificTag) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
 
-        // Query specific tag
-        auto metaReq = makeMetadataRequest("meta_spectag_cpu", "host");
-        auto metaRep = metaHandler.handleTags(std::move(metaReq)).get();
-        ASSERT_TRUE(isOk(*metaRep)) << "Specific tag query failed: " << metaRep->_content;
-
+        // Query specific tag, polling past the async metadata indexing window.
         glz::generic parsed;
-        auto ec = glz::read_json(parsed, metaRep->_content);
-        ASSERT_FALSE(ec);
+        pollMetadataJson(
+            parsed, [&] { return metaHandler.handleTags(makeMetadataRequest("meta_spectag_cpu", "host")).get(); },
+            [](glz::generic::object_t& o) {
+                return o.count("values") && o["values"].get<glz::generic::array_t>().size() >= 2;
+            });
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["measurement"].get<std::string>(), "meta_spectag_cpu");
         EXPECT_EQ(obj["tag"].get<std::string>(), "host");
@@ -974,14 +1004,16 @@ TEST_F(HttpHandlerIntegrationTest, MetadataFieldsForMeasurement) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
 
-        // Query fields
-        auto metaReq = makeMetadataRequest("meta_fields_system");
-        auto metaRep = metaHandler.handleFields(std::move(metaReq)).get();
-        ASSERT_TRUE(isOk(*metaRep)) << "Fields query failed: " << metaRep->_content;
-
+        // Query fields, polling past the async metadata indexing window.
         glz::generic parsed;
-        auto ec = glz::read_json(parsed, metaRep->_content);
-        ASSERT_FALSE(ec);
+        pollMetadataJson(
+            parsed, [&] { return metaHandler.handleFields(makeMetadataRequest("meta_fields_system")).get(); },
+            [](glz::generic::object_t& o) {
+                if (!o.count("fields"))
+                    return false;
+                auto& f = o["fields"].get<glz::generic::object_t>();
+                return f.count("cpu_usage") && f.count("memory_usage") && f.count("disk_usage");
+            });
         auto& obj = parsed.get<glz::generic::object_t>();
         EXPECT_EQ(obj["measurement"].get<std::string>(), "meta_fields_system");
 
@@ -1318,15 +1350,19 @@ TEST_F(HttpHandlerIntegrationTest, WriteQueryMetadataFullCycle) {
         auto writeRep = writeHandler.handleWrite(std::move(writeReq)).get();
         ASSERT_TRUE(isOk(*writeRep));
 
-        // Verify measurements via metadata handler
-        auto measReq = makeMetadataRequest();
-        auto measRep = metaHandler.handleMeasurements(std::move(measReq)).get();
-        ASSERT_TRUE(isOk(*measRep));
-
+        // Verify measurements via metadata handler, polling past the async
+        // metadata indexing window.
         {
             glz::generic parsed;
-            auto ec = glz::read_json(parsed, measRep->_content);
-            ASSERT_FALSE(ec);
+            pollMetadataJson(
+                parsed, [&] { return metaHandler.handleMeasurements(makeMetadataRequest()).get(); },
+                [](glz::generic::object_t& o) {
+                    std::set<std::string> names;
+                    for (auto& m : o["measurements"].get<glz::generic::array_t>()) {
+                        names.insert(m.get<std::string>());
+                    }
+                    return names.count("weather_cycle") && names.count("system_cycle");
+                });
             auto& obj = parsed.get<glz::generic::object_t>();
             auto& measurements = obj["measurements"].get<glz::generic::array_t>();
 
@@ -1339,14 +1375,16 @@ TEST_F(HttpHandlerIntegrationTest, WriteQueryMetadataFullCycle) {
         }
 
         // Verify tags for weather_cycle
-        auto tagsReq = makeMetadataRequest("weather_cycle");
-        auto tagsRep = metaHandler.handleTags(std::move(tagsReq)).get();
-        ASSERT_TRUE(isOk(*tagsRep));
-
         {
             glz::generic parsed;
-            auto ec = glz::read_json(parsed, tagsRep->_content);
-            ASSERT_FALSE(ec);
+            pollMetadataJson(
+                parsed, [&] { return metaHandler.handleTags(makeMetadataRequest("weather_cycle")).get(); },
+                [](glz::generic::object_t& o) {
+                    if (!o.count("tags"))
+                        return false;
+                    auto& t = o["tags"].get<glz::generic::object_t>();
+                    return t.count("location") && t.count("sensor");
+                });
             auto& obj = parsed.get<glz::generic::object_t>();
             auto& tags = obj["tags"].get<glz::generic::object_t>();
             EXPECT_TRUE(tags.count("location") > 0);
@@ -1354,14 +1392,16 @@ TEST_F(HttpHandlerIntegrationTest, WriteQueryMetadataFullCycle) {
         }
 
         // Verify fields for weather_cycle
-        auto fieldsReq = makeMetadataRequest("weather_cycle");
-        auto fieldsRep = metaHandler.handleFields(std::move(fieldsReq)).get();
-        ASSERT_TRUE(isOk(*fieldsRep));
-
         {
             glz::generic parsed;
-            auto ec = glz::read_json(parsed, fieldsRep->_content);
-            ASSERT_FALSE(ec);
+            pollMetadataJson(
+                parsed, [&] { return metaHandler.handleFields(makeMetadataRequest("weather_cycle")).get(); },
+                [](glz::generic::object_t& o) {
+                    if (!o.count("fields"))
+                        return false;
+                    auto& f = o["fields"].get<glz::generic::object_t>();
+                    return f.count("temperature") && f.count("humidity");
+                });
             auto& obj = parsed.get<glz::generic::object_t>();
             auto& fields = obj["fields"].get<glz::generic::object_t>();
             EXPECT_TRUE(fields.count("temperature") > 0);
