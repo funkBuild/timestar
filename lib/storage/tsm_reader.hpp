@@ -45,7 +45,8 @@ public:
     // Read series with automatic reference management
     template <class T>
     seastar::future<TSMResult<T>> readSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
-        TSMResult<T> results(tsm->rankAsInteger());
+        // Rank = duplicate-resolution priority (last-write-wins across files).
+        TSMResult<T> results(tsm->dataRank());
         co_await tsm->readSeries<T>(seriesId, startTime, endTime, results);
         co_return results;
     }

@@ -101,8 +101,9 @@ seastar::future<bool> TSM::deleteRange(const SeriesId128& seriesId, uint64_t sta
 template <class T>
 seastar::future<TSMResult<T>> TSM::queryWithTombstones(const SeriesId128& seriesId, uint64_t startTime,
                                                        uint64_t endTime) {
-    // First, perform the regular query using optimized batched reads
-    TSMResult<T> result(rankAsInteger());
+    // First, perform the regular query using optimized batched reads.
+    // Rank = duplicate-resolution priority (last-write-wins across files).
+    TSMResult<T> result(dataRank());
     co_await readSeriesBatched<T>(seriesId, startTime, endTime, result);
 
     // hasTombstones() is O(1): checks both null and entry count == 0.

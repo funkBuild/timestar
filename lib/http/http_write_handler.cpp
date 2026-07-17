@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <numeric>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -260,6 +262,109 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Optional explicit field typing.  A write point may carry
+//
+//   "field_types": {"<field>": "float" | "int" | "bool" | "string"}
+//
+// which overrides JSON token-shape type detection for the named fields.
+// Without it, the stored type is inferred from how the number is written
+// ("10" -> integer, "10.0" -> float) — a problem for serializers that emit
+// whole-number floats as integer tokens (JavaScript's JSON.stringify(10.0)
+// produces "10").  Accepted aliases: double==float, integer==int64==int,
+// boolean==bool.
+// ---------------------------------------------------------------------------
+
+static TSMValueType parseFieldTypeName(const std::string& fieldName, const std::string& typeName) {
+    if (typeName == "float" || typeName == "double")
+        return TSMValueType::Float;
+    if (typeName == "int" || typeName == "integer" || typeName == "int64")
+        return TSMValueType::Integer;
+    if (typeName == "bool" || typeName == "boolean")
+        return TSMValueType::Boolean;
+    if (typeName == "string")
+        return TSMValueType::String;
+    throw std::invalid_argument("Unknown type '" + typeName + "' in field_types for field '" + fieldName +
+                                "' (expected float, int, bool, or string)");
+}
+
+// Extract the optional "field_types" object from a write-point object.
+// Returns an empty map when the key is absent; throws on malformed input.
+static std::map<std::string, TSMValueType> extractFieldTypes(const json_value_t::object_t& obj) {
+    std::map<std::string, TSMValueType> declared;
+    auto it = obj.find("field_types");
+    if (it == obj.end()) {
+        return declared;
+    }
+    if (!it->second.is_object()) {
+        throw std::invalid_argument("'field_types' must be a JSON object mapping field names to type names");
+    }
+    for (const auto& [fieldName, typeValue] : it->second.get<json_value_t::object_t>()) {
+        if (!typeValue.is_string()) {
+            throw std::invalid_argument("field_types entry '" + fieldName + "' must be a string type name");
+        }
+        declared[fieldName] = parseFieldTypeName(fieldName, typeValue.get<std::string>());
+    }
+    return declared;
+}
+
+// Validate one JSON value against a declared type.  Numeric widening
+// (integer token -> declared float) is allowed; a declared int accepts a
+// float token only when the value is integral and fits int64.  Everything
+// else must match exactly — an explicit declaration turning into silent
+// coercion would defeat its purpose.
+static void checkDeclaredType(TSMValueType declared, const json_value_t& v, const std::string& fieldName) {
+    switch (declared) {
+        case TSMValueType::Float:
+            if (!v.is_number()) {
+                throw std::invalid_argument("Field '" + fieldName + "' is declared float but the value is not a number");
+            }
+            return;
+        case TSMValueType::Integer: {
+            if (!v.is_number()) {
+                throw std::invalid_argument("Field '" + fieldName + "' is declared int but the value is not a number");
+            }
+            if (v.holds<double>()) {
+                const double d = v.get<double>();
+                // Integral check plus int64 range: [-2^63, 2^63) in double space.
+                if (!std::isfinite(d) || d != std::trunc(d) || d < -9223372036854775808.0 ||
+                    d >= 9223372036854775808.0) {
+                    throw std::invalid_argument("Field '" + fieldName +
+                                                "' is declared int but the value is not an integral int64");
+                }
+            } else if (v.holds<uint64_t>() &&
+                       v.get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                throw std::invalid_argument("Field '" + fieldName + "' is declared int but the value overflows int64");
+            }
+            return;
+        }
+        case TSMValueType::Boolean:
+            if (!v.is_boolean()) {
+                throw std::invalid_argument("Field '" + fieldName + "' is declared bool but the value is not a boolean");
+            }
+            return;
+        case TSMValueType::String:
+            if (!v.is_string()) {
+                throw std::invalid_argument("Field '" + fieldName + "' is declared string but the value is not a string");
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+// Reject field_types entries that name no field in this point.  A typo'd
+// name silently falling back to token-shape detection would recreate the
+// exact failure mode explicit typing exists to prevent.
+static void requireDeclaredFieldsPresent(const std::map<std::string, TSMValueType>& declared,
+                                         const json_value_t::object_t& fieldsObj) {
+    for (const auto& [name, type] : declared) {
+        if (fieldsObj.find(name) == fieldsObj.end()) {
+            throw std::invalid_argument("field_types entry '" + name + "' has no matching field in 'fields'");
+        }
+    }
+}
+
 HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point,
                                                                          uint64_t defaultTimestampNs) {
     MultiWritePoint mwp;
@@ -323,6 +428,10 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     }
     auto& fields_obj = fieldsIt->second.get<json_value_t::object_t>();
 
+    // Optional explicit types override token-shape detection per field.
+    const auto declaredTypes = extractFieldTypes(obj);
+    requireDeclaredFieldsPresent(declaredTypes, fields_obj);
+
     for (auto& [fieldName, fieldValue] : fields_obj) {
         // Validate field name (fast path avoids string allocation for valid names)
         if (!isValidName(fieldName)) {
@@ -333,85 +442,109 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
 
         FieldArrays fa;
 
+        const auto declIt = declaredTypes.find(fieldName);
+        const bool hasDeclared = (declIt != declaredTypes.end());
+
+        const json_value_t::array_t* arrPtr = nullptr;
+        const json_value_t* firstValue = &fieldValue;
         if (fieldValue.is_array()) {
             auto& arr = fieldValue.get<json_value_t::array_t>();
             if (arr.empty()) {
                 throw std::invalid_argument("Field array cannot be empty: " + fieldName);
             }
+            arrPtr = &arr;
+            firstValue = &arr[0];
+        }
 
-            // Determine type from first element
-            const size_t arrSize = arr.size();
-            if (arr[0].is_number()) {
-                if (arr[0].holds<int64_t>() || arr[0].holds<uint64_t>()) {
-                    fa.type = FieldArrays::INTEGER;
-                    fa.integers.reserve(arrSize);
-                    for (auto& elem : arr) {
-                        if (elem.is_number()) {
-                            fa.integers.push_back(elem.as<int64_t>());
-                        } else {
-                            throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                        }
-                    }
-                } else {
-                    fa.type = FieldArrays::DOUBLE;
-                    fa.doubles.reserve(arrSize);
-                    for (auto& elem : arr) {
-                        if (elem.is_number()) {
-                            fa.doubles.push_back(elem.as<double>());
-                        } else {
-                            throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                        }
-                    }
-                }
-            } else if (arr[0].is_boolean()) {
+        // Effective type: declared (explicit) or detected from the first
+        // value's JSON token shape.
+        TSMValueType effectiveType;
+        if (hasDeclared) {
+            effectiveType = declIt->second;
+        } else if (firstValue->is_number()) {
+            // With generic_u64 parsing, integer JSON tokens (no decimal point)
+            // are stored as int64_t/uint64_t, while floats are stored as double.
+            effectiveType = (firstValue->holds<int64_t>() || firstValue->holds<uint64_t>()) ? TSMValueType::Integer
+                                                                                            : TSMValueType::Float;
+        } else if (firstValue->is_boolean()) {
+            effectiveType = TSMValueType::Boolean;
+        } else if (firstValue->is_string()) {
+            effectiveType = TSMValueType::String;
+        } else {
+            throw std::invalid_argument(arrPtr != nullptr ? "Unsupported field array type: " + fieldName
+                                                          : "Unsupported field type: " + fieldName);
+        }
+
+        // Append one value under the effective type. Declared types get the
+        // stricter compatibility check (integral int64 for declared int, no
+        // cross-type coercion); detected types keep the legacy per-element
+        // same-kind check.
+        auto appendValue = [&](const json_value_t& elem) {
+            if (hasDeclared) {
+                checkDeclaredType(effectiveType, elem, fieldName);
+            }
+            switch (effectiveType) {
+                case TSMValueType::Float:
+                    if (!elem.is_number())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.doubles.push_back(elem.as<double>());
+                    break;
+                case TSMValueType::Integer:
+                    if (!elem.is_number())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.integers.push_back(elem.as<int64_t>());
+                    break;
+                case TSMValueType::Boolean:
+                    if (!elem.is_boolean())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.bools.push_back(elem.get<bool>() ? 1 : 0);
+                    break;
+                case TSMValueType::String:
+                    if (!elem.is_string())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.strings.push_back(elem.get<std::string>());
+                    break;
+                default:
+                    throw std::invalid_argument("Unsupported field type: " + fieldName);
+            }
+        };
+
+        switch (effectiveType) {
+            case TSMValueType::Float:
+                fa.type = FieldArrays::DOUBLE;
+                break;
+            case TSMValueType::Integer:
+                fa.type = FieldArrays::INTEGER;
+                break;
+            case TSMValueType::Boolean:
                 fa.type = FieldArrays::BOOL;
-                fa.bools.reserve(arrSize);
-                for (auto& elem : arr) {
-                    if (elem.is_boolean()) {
-                        fa.bools.push_back(elem.get<bool>() ? 1 : 0);
-                    } else {
-                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                    }
-                }
-            } else if (arr[0].is_string()) {
+                break;
+            default:
                 fa.type = FieldArrays::STRING;
-                fa.strings.reserve(arrSize);
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected string array field '{}' with {} elements",
-                                fieldName, arr.size());
-                for (auto& elem : arr) {
-                    if (elem.is_string()) {
-                        fa.strings.push_back(elem.get<std::string>());
-                    } else {
-                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                    }
-                }
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Added {} string values to field '{}'",
-                                fa.strings.size(), fieldName);
-            } else {
-                throw std::invalid_argument("Unsupported field array type: " + fieldName);
+                break;
+        }
+
+        if (arrPtr != nullptr) {
+            const size_t arrSize = arrPtr->size();
+            switch (effectiveType) {
+                case TSMValueType::Float:
+                    fa.doubles.reserve(arrSize);
+                    break;
+                case TSMValueType::Integer:
+                    fa.integers.reserve(arrSize);
+                    break;
+                case TSMValueType::Boolean:
+                    fa.bools.reserve(arrSize);
+                    break;
+                default:
+                    fa.strings.reserve(arrSize);
+                    break;
+            }
+            for (const auto& elem : *arrPtr) {
+                appendValue(elem);
             }
         } else {
-            // Single value - convert to array of size 1
-            if (fieldValue.is_number()) {
-                if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
-                    fa.type = FieldArrays::INTEGER;
-                    fa.integers.push_back(fieldValue.as<int64_t>());
-                } else {
-                    fa.type = FieldArrays::DOUBLE;
-                    fa.doubles.push_back(fieldValue.as<double>());
-                }
-            } else if (fieldValue.is_boolean()) {
-                fa.type = FieldArrays::BOOL;
-                fa.bools.push_back(fieldValue.get<bool>() ? 1 : 0);
-            } else if (fieldValue.is_string()) {
-                fa.type = FieldArrays::STRING;
-                auto str_value = fieldValue.get<std::string>();
-                fa.strings.push_back(str_value);
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected single string field '{}' with value: '{}'",
-                                fieldName, str_value);
-            } else {
-                throw std::invalid_argument("Unsupported field type: " + fieldName);
-            }
+            appendValue(fieldValue);
         }
 
         mwp.fields[fieldName] = std::move(fa);
@@ -884,6 +1017,13 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                 continue;
 
             auto& fieldsObj = fieldsIt->second.get<json_value_t::object_t>();
+
+            // Optional explicit types override token-shape detection per field.
+            // Malformed field_types throws, so this write is skipped and counted
+            // like any other invalid batch entry.
+            const auto declaredTypes = extractFieldTypes(writeObj);
+            requireDeclaredFieldsPresent(declaredTypes, fieldsObj);
+
             for (const auto& [fieldName, fieldValue] : fieldsObj) {
                 // Validate field name (guard with the allocation-free predicate; build the
                 // error context only on the invalid path).
@@ -896,6 +1036,9 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                 seriesKey += " ";
                 seriesKey += fieldName;
 
+                const auto declTypeIt = declaredTypes.find(fieldName);
+                const bool hasDeclaredType = (declTypeIt != declaredTypes.end());
+
                 if (fieldValue.is_array()) {
                     // Array field - expand all elements into the candidate
                     auto& arr = fieldValue.get<json_value_t::array_t>();
@@ -903,9 +1046,12 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                         throw std::invalid_argument("Field array cannot be empty: " + fieldName);
                     }
 
-                    // Determine type from first element
+                    // Declared type (optional "field_types") overrides detection
+                    // from the first element's token shape.
                     TSMValueType valueType;
-                    if (arr[0].is_number()) {
+                    if (hasDeclaredType) {
+                        valueType = declTypeIt->second;
+                    } else if (arr[0].is_number()) {
                         // With generic_u64 parsing, integer JSON values (no decimal point)
                         // are stored as int64_t/uint64_t, while floats are stored as double.
                         if (arr[0].holds<int64_t>() || arr[0].holds<uint64_t>()) {
@@ -958,6 +1104,12 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                         candidate.integerValues.reserve(candidate.integerValues.size() + arr.size());
                     for (size_t i = 0; i < arr.size(); i++) {
                         auto& elem = arr[i];
+                        // Declared types get the stricter compatibility check
+                        // (validated against the DECLARED type even if the
+                        // candidate was promoted Integer->Float).
+                        if (hasDeclaredType) {
+                            checkDeclaredType(declTypeIt->second, elem, fieldName);
+                        }
                         candidate.timestamps.push_back(fieldTimestamps[i]);
                         candidate.timestampHashSum += fieldTimestamps[i];
                         candidate.timestampHashXor ^= fieldTimestamps[i];
@@ -983,9 +1135,13 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                         }
                     }
                 } else {
-                    // Scalar field - determine type and add single value
+                    // Scalar field - determine type and add single value.
+                    // Declared type (optional "field_types") overrides detection.
                     TSMValueType valueType;
-                    if (fieldValue.is_number()) {
+                    if (hasDeclaredType) {
+                        valueType = declTypeIt->second;
+                        checkDeclaredType(valueType, fieldValue, fieldName);
+                    } else if (fieldValue.is_number()) {
                         if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
                             valueType = TSMValueType::Integer;
                         } else {

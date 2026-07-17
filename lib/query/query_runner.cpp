@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <optional>
 #include <queue>
+#include <ranges>
 #include <seastar/core/distributed.hh>
 #include <unordered_set>
 
@@ -53,7 +54,13 @@ struct SortedSpan {
 };
 
 // Two-pointer merge of exactly 2 sorted spans into output vectors.
-// span[0] (TSM) has dedup priority: on equal timestamps its value wins.
+// SPAN ORDER CONTRACT (all span merges): spans are ordered oldest source
+// first — TSM at index 0, then memory stores oldest→newest.  On equal
+// timestamps the HIGHER-index span (newer source) wins, implementing
+// last-write-wins: a rewritten point in a memory store shadows the stale
+// copy in TSM / older stores.  (During rollover a just-converted TSM file
+// and its still-pinned source store hold identical copies, so either
+// winner is correct there.)
 template <class T>
 static void mergeTwoSpans(SortedSpan<T>& a, SortedSpan<T>& b, std::vector<uint64_t>& outTs, std::vector<T>& outVal) {
     while (!a.exhausted() && !b.exhausted()) {
@@ -69,15 +76,15 @@ static void mergeTwoSpans(SortedSpan<T>& a, SortedSpan<T>& b, std::vector<uint64
             outVal.push_back(b.val());
             b.advance();
         } else {
-            // Equal timestamps: TSM (span a, index 0) wins.
-            // Use advance() on `a` (not advancePast) so that if `a` has
+            // Equal timestamps: span b (higher index = newer source) wins.
+            // Use advance() on `b` (not advancePast) so that if `b` has
             // multiple points at the same timestamp they are each emitted,
             // matching the behaviour of the < / > branches.
-            // `b` uses advancePast to skip all its duplicates at this ts.
-            outTs.push_back(tsA);
-            outVal.push_back(a.val());
-            a.advance();
-            b.advancePast(tsB);
+            // `a` uses advancePast to skip all its duplicates at this ts.
+            outTs.push_back(tsB);
+            outVal.push_back(b.val());
+            b.advance();
+            a.advancePast(tsA);
         }
     }
 
@@ -102,8 +109,8 @@ static void mergeTwoSpans(SortedSpan<T>& a, SortedSpan<T>& b, std::vector<uint64
 
 // Linear-scan merge for 3-4 sorted spans.
 // On each iteration, find the span with the minimum current timestamp
-// (TSM / lower index wins ties), emit it, and advance all spans that
-// share that timestamp (dedup).
+// (higher index = newer source wins ties; see span order contract above),
+// emit it, and advance all spans that share that timestamp (dedup).
 template <class T>
 static void mergeSmallNSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint64_t>& outTs, std::vector<T>& outVal) {
     const size_t K = spans.size();
@@ -140,7 +147,8 @@ static void mergeSmallNSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint
         }
 
         // Find minimum timestamp across active spans.
-        // Lower index (TSM = 0) wins on equal timestamps.
+        // Higher index (newer source) wins on equal timestamps: `<=` lets a
+        // later span overwrite the candidate at the same timestamp.
         size_t bestIdx = SIZE_MAX;
         uint64_t bestTs = UINT64_MAX;
 
@@ -148,7 +156,7 @@ static void mergeSmallNSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint
             if (spans[i].exhausted())
                 continue;
             const uint64_t ts = spans[i].ts();
-            if (ts < bestTs) {
+            if (ts <= bestTs) {
                 bestTs = ts;
                 bestIdx = i;
             }
@@ -189,11 +197,12 @@ static void mergeHeapSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint64
     struct HeapEntry {
         uint64_t timestamp;
         size_t spanIdx;
-        // Min-heap by timestamp; lower spanIdx wins ties (TSM priority).
+        // Min-heap by timestamp; higher spanIdx (newer source) wins ties —
+        // last-write-wins, see span order contract above.
         bool operator>(const HeapEntry& other) const {
             if (timestamp != other.timestamp)
                 return timestamp > other.timestamp;
-            return spanIdx > other.spanIdx;
+            return spanIdx < other.spanIdx;
         }
     };
 
@@ -236,7 +245,7 @@ static void mergeHeapSpans(std::vector<SortedSpan<T>>& spans, std::vector<uint64
             heap.pop();
         }
 
-        // Emit from the winner (lowest spanIdx = highest priority).
+        // Emit from the winner (highest spanIdx = newest source).
         outTs.push_back(currentTs);
         outVal.push_back(spans[best.spanIdx].val());
 
@@ -409,7 +418,8 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
     // background TSM conversion, multiple stores may hold data for the same
     // series, so all of them are queried.  Duplicates between a
     // just-converted TSM file and its still-pinned source store are removed
-    // by the merge below (TSM has dedup priority on equal timestamps).
+    // by the merge below (the newer source wins on equal timestamps —
+    // last-write-wins; for rollover duplicates both copies are identical).
     auto memoryMatches = WALFileManager::queryAllMemoryStores<T>(pinnedStores, seriesId);
 
     // No memory data: TSM result is already sorted and deduped, return directly.
@@ -423,12 +433,14 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
     // Instead of appending memory data then sorting with an index permutation,
     // we merge all sorted sequences directly into a new output buffer.  Each
     // memory store's data is pre-filtered to [startTime, endTime] using binary
-    // search, then represented as a lightweight SortedSpan.  The TSM sequence
-    // (index 0) has dedup priority: on equal timestamps, TSM values are kept
-    // because they represent committed/established data.
+    // search, then represented as a lightweight SortedSpan.  Spans are ordered
+    // oldest source first (TSM at index 0, then memory stores oldest→newest);
+    // on equal timestamps the merge keeps the HIGHEST-index span's value, so
+    // the newest write wins (last-write-wins).
     // -----------------------------------------------------------------------
 
-    // Build sorted spans: TSM first (index 0), then each memory store.
+    // Build sorted spans: TSM first (index 0), then each memory store,
+    // oldest→newest.
     // SAFETY: SortedSpan holds raw pointers into memory store data.  The
     // MemoryStoreMatch values in memoryMatches keep each MemoryStore alive
     // via shared_ptr, so the underlying InMemorySeries data remains valid
@@ -453,7 +465,9 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
     // Pre-filter each memory store to [startTime, endTime] and create spans.
     // Binary search is O(log n) per store; the filtered range is a read-only
     // view with no copying.
-    for (const auto& match : memoryMatches) {
+    // memoryMatches is NEWEST-first (memoryStores[0] is the active store);
+    // iterate in reverse so span order is oldest→newest per the contract.
+    for (const auto& match : memoryMatches | std::views::reverse) {
         const auto& storeData = *match.series;
         if (storeData.timestamps.empty())
             continue;
@@ -696,6 +710,34 @@ static size_t aggregateMemoryStoresTyped(const std::vector<seastar::shared_ptr<M
     return totalPoints;
 }
 
+// Last-write-wins gate for memory folding: true when the series' in-range
+// data spans more than one pinned store with overlapping time bounds.  The
+// same timestamp may then exist in two stores (a rewrite across rollover
+// generations, or the rollover conversion window itself), and the per-store
+// folds in aggregateMemoryStores would observe both copies.  Callers must
+// fall back to the dedup merge path in that case.
+static bool pinnedStoresOverlapForSeries(const std::vector<seastar::shared_ptr<MemoryStore>>& pinnedStores,
+                                         const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    for (const auto& store : pinnedStores) {
+        if (auto bounds = store->seriesTimeBoundsInRange(seriesId, startTime, endTime)) {
+            ranges.push_back(*bounds);
+        }
+    }
+    if (ranges.size() < 2) {
+        return false;
+    }
+    std::sort(ranges.begin(), ranges.end());
+    uint64_t prevMax = ranges[0].second;
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first <= prevMax) {
+            return true;
+        }
+        prevMax = std::max(prevMax, ranges[i].second);
+    }
+    return false;
+}
+
 static size_t aggregateMemoryStores(const std::vector<seastar::shared_ptr<MemoryStore>>& pinnedStores,
                                     const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                     timestar::BlockAggregator& aggregator) {
@@ -730,6 +772,15 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // conversion completed while this coroutine was suspended (its TSM file is
     // excluded from the range split below, and the store itself is gone).
     const auto pinnedStores = walFileManager->pinMemoryStores();
+
+    // Last-write-wins gate: if the series' in-range data lives in two pinned
+    // stores with overlapping time bounds, the same timestamp may exist in
+    // both (rewrite across rollover generations); every fold below feeds each
+    // store independently and would observe both copies.  Fall back to the
+    // merge path, which dedups with newest-source priority.
+    if (pinnedStoresOverlapForSeries(pinnedStores, seriesId, startTime, endTime)) {
+        co_return std::nullopt;
+    }
 
     const bool noTsmFiles = fileManager->getSequencedTsmFiles().empty();
     const bool isLatest = (method == timestar::AggregationMethod::LATEST);
@@ -794,28 +845,15 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     if (memMinTimeOpt.has_value()) {
         uint64_t memMinTime = *memMinTimeOpt;
         if (memMinTime <= startTime || memMinTime == 0) {
-            // Entire requested range overlaps with memory data.  During
-            // rollover the same points can exist in both TSM files (from a
-            // just-flushed frozen memory store) and the still-queryable
-            // memory stores.
-            //
-            // Only idempotent methods (MIN/MAX/LATEST/FIRST/SPREAD) can
-            // safely fold both sources — duplicates don't change the result.
-            // Additive methods (SUM/COUNT/AVG/STDDEV/STDVAR) would double-
-            // count overlapping data, producing incorrect results.  Fall
-            // back to the standard merge-based path which deduplicates.
-            const bool isIdempotent =
-                (method == timestar::AggregationMethod::MIN || method == timestar::AggregationMethod::MAX ||
-                 method == timestar::AggregationMethod::LATEST || method == timestar::AggregationMethod::FIRST ||
-                 method == timestar::AggregationMethod::SPREAD);
-            const bool canFoldOverlap = isIdempotent && (aggregationInterval > 0 || isLatest || isFirst);
-            if (!canFoldOverlap) {
-                co_return std::nullopt;
-            }
-            // Idempotent: scan all TSM data, then fold memory data on top.
-            needsFallback = true;
-            fallbackStartTime = startTime;
-            // tsmEndTime stays as endTime (scan all TSM files)
+            // Entire requested range overlaps with memory data.  Under
+            // last-write-wins a memory point may be a REWRITE of a point
+            // already flushed to TSM, so folding both sources would let the
+            // stale TSM copy participate — wrong even for "idempotent"
+            // methods (an overwritten MAX would resurrect the dead value;
+            // LATEST/FIRST could return the stale copy on timestamp ties).
+            // Fall back to the merge-based path, which deduplicates with
+            // newest-source-wins priority.
+            co_return std::nullopt;
         } else {
             // Split: pushdown [startTime, memMinTime-1], fallback [memMinTime, endTime]
             tsmEndTime = (memMinTime > 0) ? memMinTime - 1 : 0;
@@ -855,6 +893,45 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
         if (candidateFiles.empty() && !needsFallback) {
             co_return std::nullopt;
+        }
+
+        // Last-write-wins gates — fall back to the dedup merge path when the
+        // early-terminating folds below could observe a stale copy:
+        //
+        // 1. TSM data inside the memory fallback range [fallbackStartTime,
+        //    endTime]: the memory-only fold would miss TSM-only points there
+        //    (out-of-order flush), and a rewritten point could fold its stale
+        //    TSM copy alongside the memory value.
+        if (needsFallback) {
+            for (const auto& [rank, tsmFile] : seqFilesSnap) {
+                if (tsmFile->seriesMayOverlapTime(seriesId, fallbackStartTime, endTime)) {
+                    co_return std::nullopt;
+                }
+            }
+        }
+        // 2. Candidate files whose series time ranges overlap each other in
+        //    [startTime, tsmEndTime]: the same timestamp may then exist in
+        //    more than one file (a rewrite of an already-flushed point), and
+        //    the first-file-wins / filledBuckets early termination below
+        //    would keep whichever copy it visits first, not the newest write.
+        if (candidateFiles.size() > 1) {
+            std::vector<std::pair<uint64_t, uint64_t>> seriesRanges;
+            seriesRanges.reserve(candidateFiles.size());
+            for (const auto& f : candidateFiles) {
+                const uint64_t lo = std::max(f->getSeriesMinTime(seriesId), startTime);
+                const uint64_t hi = std::min(f->getSeriesMaxTime(seriesId), tsmEndTime);
+                if (lo <= hi) {
+                    seriesRanges.emplace_back(lo, hi);
+                }
+            }
+            std::sort(seriesRanges.begin(), seriesRanges.end());
+            uint64_t prevMax = 0;
+            for (size_t i = 0; i < seriesRanges.size(); ++i) {
+                if (i > 0 && seriesRanges[i].first <= prevMax) {
+                    co_return std::nullopt;
+                }
+                prevMax = std::max(prevMax, seriesRanges[i].second);
+            }
         }
 
         // Sort by sparse index time bounds: use the series-level maxTime/minTime
@@ -1001,6 +1078,19 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(fileManager->getSequencedTsmFiles().begin(),
                                                                             fileManager->getSequencedTsmFiles().end());
 
+    // Last-write-wins gate: if any TSM file has series data inside the memory
+    // fallback range [fallbackStartTime, endTime], the memory-only fold below
+    // would miss TSM-only points there (out-of-order flush), and a rewritten
+    // point could fold its stale TSM copy alongside the memory value.  Fall
+    // back to the dedup merge path.
+    if (needsFallback) {
+        for (const auto& [rank, tsmFile] : seqFilesSnap) {
+            if (tsmFile->seriesMayOverlapTime(seriesId, fallbackStartTime, endTime)) {
+                co_return std::nullopt;
+            }
+        }
+    }
+
     // Pre-filter using sparse index (in-memory), then prefetch full index entries
     // in parallel for all candidate files. This overlaps DMA reads instead of
     // serializing them.
@@ -1052,24 +1142,20 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
     // Check for overlap: sort ranges by minTime and look for any
     // block whose minTime falls inside the previous block's span.
+    // Overlapping blocks mean the same timestamp may exist in more than one
+    // file — either a transient identical copy (compaction lag) or a genuine
+    // rewrite of an already-flushed point.  Under last-write-wins BOTH are
+    // disqualifying: additive methods would double-count, and even
+    // "idempotent" MIN/MAX could resurrect an overwritten value.  Fall back
+    // to the dedup merge path, which resolves duplicates newest-write-first.
     if (allBlockRanges.size() > 1) {
         std::sort(allBlockRanges.begin(), allBlockRanges.end());
-        for (size_t i = 1; i < allBlockRanges.size(); ++i) {
-            if (allBlockRanges[i].first <= allBlockRanges[i - 1].second) {
-                // Overlap detected.  For streamable methods with bucketed or
-                // fold-to-single queries, proceed anyway — the aggregator
-                // handles duplicate points correctly for min/max/latest/first
-                // (idempotent) and approximately for sum/count/avg (brief
-                // overlap during compaction lag is negligible vs OOM crash).
-                // For non-streamable methods (EXACT_MEDIAN) or raw-output queries,
-                // fall back to the dedup merge path.
-                const bool canTolerate =
-                    isStreamableAggMethod(method) && (aggregationInterval > 0 || isLatest || isFirst);
-                if (!canTolerate) {
-                    co_return std::nullopt;
-                }
-                break;  // No need to check further — we'll aggregate with overlaps
+        uint64_t prevMax = 0;
+        for (size_t i = 0; i < allBlockRanges.size(); ++i) {
+            if (i > 0 && allBlockRanges[i].first <= prevMax) {
+                co_return std::nullopt;
             }
+            prevMax = std::max(prevMax, allBlockRanges[i].second);
         }
     }
 

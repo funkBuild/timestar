@@ -45,7 +45,9 @@ public:
     static seastar::future<SeriesBlocks<T>> loadFromFile(seastar::shared_ptr<TSM> file, const SeriesId128& seriesId,
                                                          uint64_t startTime = 0, uint64_t endTime = UINT64_MAX) {
         SeriesBlocks<T> result(seriesId);
-        result.fileRank = file->rankAsInteger();
+        // fileRank is a duplicate-resolution priority (higher = newer write
+        // generation), used by the bulk mergers and compaction dedup.
+        result.fileRank = file->dataRank();
         result.source = file;
 
         // Ensure the full index entry is loaded (lazy-loads from sparse index
@@ -224,6 +226,29 @@ struct BulkMergeContext {
     bool hasMore() const { return !exhausted; }
 
     uint64_t getFileRank() const { return source->fileRank; }
+
+    // Take the LAST value of the run of points at the current timestamp and
+    // advance past the whole run.  Within one file, a later position is a
+    // later write (append order), so the last copy is the newest —
+    // last-write-wins for legacy intra-file duplicates.  Files written after
+    // ingest dedup never contain such runs, so this loop runs once.
+    T takeLastAtCurrentTs() {
+        const uint64_t ts = currentTimestamp();
+        T value = currentValue();
+        advance();
+        while (!exhausted && currentTimestamp() == ts) {
+            value = currentValue();
+            advance();
+        }
+        return value;
+    }
+
+    // Skip every point at the given timestamp (losing source of a duplicate).
+    void skipAllAt(uint64_t ts) {
+        while (!exhausted && currentTimestamp() == ts) {
+            advance();
+        }
+    }
 };
 
 // Phase B: Specialized 2-way merge (fastest: just compare two values)
@@ -247,25 +272,28 @@ public:
         return ctx0.hasMore() || ctx1.hasMore();
     }
 
-    // Get next point (NO ASYNC! NO HEAP! Just compare two values)
+    // Get next point (NO ASYNC! NO HEAP! Just compare two values).
+    // Emits exactly one point per distinct timestamp: same-source duplicate
+    // runs collapse to their last copy, cross-source duplicates resolve to
+    // the newer file (higher dataRank) — last-write-wins.
     [[gnu::always_inline]]
     inline std::pair<uint64_t, T> next() {
         uint64_t ts0 = ctx0.currentTimestamp();
         uint64_t ts1 = ctx1.currentTimestamp();
 
         if (ts0 < ts1) {
-            T value = ctx0.currentValue();
-            ctx0.advance();
-            return {ts0, value};
+            return {ts0, ctx0.takeLastAtCurrentTs()};
         } else if (ts1 < ts0) {
-            T value = ctx1.currentValue();
-            ctx1.advance();
-            return {ts1, value};
+            return {ts1, ctx1.takeLastAtCurrentTs()};
         } else {
-            // Duplicate: prefer newer file (higher rank)
-            T value = (ctx0.getFileRank() > ctx1.getFileRank()) ? ctx0.currentValue() : ctx1.currentValue();
-            ctx0.advance();
-            ctx1.advance();
+            // Duplicate: prefer newer file (higher dataRank)
+            if (ctx0.getFileRank() > ctx1.getFileRank()) {
+                T value = ctx0.takeLastAtCurrentTs();
+                ctx1.skipAllAt(ts0);
+                return {ts0, value};
+            }
+            T value = ctx1.takeLastAtCurrentTs();
+            ctx0.skipAllAt(ts0);
             return {ts0, value};
         }
     }
@@ -295,7 +323,9 @@ public:
         return ctx0.hasMore() || ctx1.hasMore() || ctx2.hasMore();
     }
 
-    // Get next point (NO ASYNC! NO HEAP! Just find min of three)
+    // Get next point (NO ASYNC! NO HEAP! Just find min of three).
+    // One point per distinct timestamp; the source with the highest dataRank
+    // wins duplicates, same-source runs collapse to their last copy (LWW).
     [[gnu::always_inline]]
     inline std::pair<uint64_t, T> next() {
         uint64_t ts0 = ctx0.currentTimestamp();
@@ -305,33 +335,29 @@ public:
         // Find minimum timestamp
         uint64_t minTs = std::min({ts0, ts1, ts2});
 
-        // Collect value from source with min timestamp (prefer highest rank on tie).
+        // Pick the winning source at minTs (highest dataRank on tie).
         // At least one source must match minTs since it's their minimum.
-        T value{};
+        BulkMergeContext<T>* winner = nullptr;
         uint64_t maxRank = 0;
-        bool found = false;
 
         if (ts0 == minTs) {
-            value = ctx0.currentValue();
+            winner = &ctx0;
             maxRank = ctx0.getFileRank();
-            found = true;
-            ctx0.advance();
         }
-        if (ts1 == minTs) {
-            if (!found || ctx1.getFileRank() > maxRank) {
-                value = ctx1.currentValue();
-                maxRank = ctx1.getFileRank();
-                found = true;
-            }
-            ctx1.advance();
+        if (ts1 == minTs && (!winner || ctx1.getFileRank() > maxRank)) {
+            winner = &ctx1;
+            maxRank = ctx1.getFileRank();
         }
-        if (ts2 == minTs) {
-            if (!found || ctx2.getFileRank() > maxRank) {
-                value = ctx2.currentValue();
-            }
-            ctx2.advance();
+        if (ts2 == minTs && (!winner || ctx2.getFileRank() > maxRank)) {
+            winner = &ctx2;
         }
 
+        T value = winner->takeLastAtCurrentTs();
+        for (auto* ctx : {&ctx0, &ctx1, &ctx2}) {
+            if (ctx != winner) {
+                ctx->skipAllAt(minTs);
+            }
+        }
         return {minTs, value};
     }
 };
@@ -376,17 +402,17 @@ public:
     bool hasNext() const { return !minHeap.empty(); }
 
     // Get next deduplicated point (NO ASYNC!)
-    // For equal timestamps, the heap orders by fileRank descending (newest first),
-    // so the first pop yields the authoritative value. Remaining duplicates are consumed.
+    // For equal timestamps, the heap orders by fileRank (dataRank) descending
+    // (newest first), so the first pop yields the authoritative source.
+    // Same-source runs collapse to their last copy; remaining sources'
+    // duplicates are consumed (last-write-wins).
     std::pair<uint64_t, T> next() {
         auto item = minHeap.top();
         minHeap.pop();
 
         auto& ctx = contexts[item.contextIndex];
         uint64_t timestamp = ctx.currentTimestamp();
-        T value = ctx.currentValue();
-
-        ctx.advance();
+        T value = ctx.takeLastAtCurrentTs();
 
         if (ctx.hasMore()) {
             minHeap.push({ctx.currentTimestamp(), item.contextIndex, ctx.getFileRank()});
@@ -398,7 +424,7 @@ public:
             minHeap.pop();
 
             auto& dupCtx = contexts[dupItem.contextIndex];
-            dupCtx.advance();
+            dupCtx.skipAllAt(timestamp);
 
             if (dupCtx.hasMore()) {
                 minHeap.push({dupCtx.currentTimestamp(), dupItem.contextIndex, dupCtx.getFileRank()});

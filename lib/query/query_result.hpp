@@ -76,7 +76,34 @@ public:
                 results.values.insert(results.values.end(), block->values.begin(), block->values.end());
             }
         }
+        results.dedupAdjacentKeepLast();
         return results;
+    }
+
+    // Advance an iterator by exactly one point.
+    // Returns true if the iterator still has data, false if exhausted.
+    static bool advanceOne(TSMIterationState& state, std::vector<TSMResult<T>>& tsmResults) {
+        state.blockOffset++;
+
+        if (state.blockOffset >= state.blockSize) {
+            // Advance to next non-empty block (skip empty blocks from
+            // time-range filtering or tombstone removal)
+            while (true) {
+                state.blockIdx++;
+                state.blockOffset = 0;
+                state.block = tsmResults[state.tsmResultIndex].getBlock(state.blockIdx);
+
+                if (state.block == nullptr)
+                    return false;  // No more blocks: source exhausted
+
+                state.blockSize = state.block->size();
+                if (state.blockSize > 0)
+                    break;  // Found a non-empty block
+            }
+        }
+
+        state.currentTimestamp = state.block->timestampAt(state.blockOffset);
+        return true;
     }
 
     // Advance an iterator past all positions with timestamp <= targetTimestamp.
@@ -84,32 +111,54 @@ public:
     static bool advanceIteratorPast(TSMIterationState& state, uint64_t targetTimestamp,
                                     std::vector<TSMResult<T>>& tsmResults) {
         while (state.block != nullptr && state.currentTimestamp <= targetTimestamp) {
-            state.blockOffset++;
-
-            if (state.blockOffset >= state.blockSize) {
-                // Advance to next non-empty block (skip empty blocks from
-                // time-range filtering or tombstone removal)
-                while (true) {
-                    state.blockIdx++;
-                    state.blockOffset = 0;
-                    state.block = tsmResults[state.tsmResultIndex].getBlock(state.blockIdx);
-
-                    if (state.block == nullptr)
-                        return false;  // No more blocks: source exhausted
-
-                    state.blockSize = state.block->size();
-                    if (state.blockSize > 0)
-                        break;  // Found a non-empty block
-                }
-            }
-
-            state.currentTimestamp = state.block->timestampAt(state.blockOffset);
+            if (!advanceOne(state, tsmResults))
+                return false;
         }
         return state.block != nullptr;
     }
 
-    // Single-source fast path: no merge or dedup needed.
-    // Just concatenate all blocks' data directly into the output.
+    // Take the LAST value of the source's run at its current timestamp and
+    // advance past the run.  Within one file, a later position is a later
+    // write (append order), so the last copy is the newest — last-write-wins
+    // for legacy intra-file duplicates.  Files written after ingest dedup
+    // never contain such runs, so the loop body normally runs zero times.
+    static T takeLastOfRun(TSMIterationState& state, std::vector<TSMResult<T>>& tsmResults) {
+        const uint64_t ts = state.currentTimestamp;
+        T value = state.block->valueAt(state.blockOffset);
+        while (advanceOne(state, tsmResults) && state.currentTimestamp == ts) {
+            value = state.block->valueAt(state.blockOffset);
+        }
+        return value;
+    }
+
+    // In-place collapse of equal-timestamp runs keeping the LAST value
+    // (last-write-wins for legacy intra-file duplicates).  Used by the
+    // single-source concatenation paths, which bypass the merge loops.
+    void dedupAdjacentKeepLast() {
+        const size_t n = timestamps.size();
+        if (n < 2)
+            return;
+        if (std::adjacent_find(timestamps.begin(), timestamps.end()) == timestamps.end()) [[likely]]
+            return;
+        size_t w = 0;
+        for (size_t r = 1; r < n; ++r) {
+            if (timestamps[r] == timestamps[w]) {
+                values[w] = std::move(values[r]);
+            } else {
+                ++w;
+                if (w != r) {
+                    timestamps[w] = timestamps[r];
+                    values[w] = std::move(values[r]);
+                }
+            }
+        }
+        ++w;
+        timestamps.resize(w);
+        values.resize(w);
+    }
+
+    // Single-source fast path: concatenate all blocks' data directly, then
+    // collapse legacy equal-timestamp runs (keep-last).
     void mergeSingleSource(TSMIterationState& state, std::vector<TSMResult<T>>& tsmResults) {
         auto& result = tsmResults[state.tsmResultIndex];
         for (size_t b = 0;; ++b) {
@@ -126,6 +175,7 @@ public:
                 values.insert(values.end(), block->values.begin(), block->values.end());
             }
         }
+        dedupAdjacentKeepLast();
     }
 
     // Two-way merge: direct comparison between two iterators, no heap overhead.
@@ -142,24 +192,22 @@ public:
             if (ts0 < ts1) {
                 // Source 0 has the smaller timestamp -- emit it and advance
                 timestamps.push_back(ts0);
-                values.push_back(s0.block->valueAt(s0.blockOffset));
-                advanceIteratorPast(s0, ts0, tsmResults);
+                values.push_back(takeLastOfRun(s0, tsmResults));
             } else if (ts1 < ts0) {
                 // Source 1 has the smaller timestamp -- emit it and advance
                 timestamps.push_back(ts1);
-                values.push_back(s1.block->valueAt(s1.blockOffset));
-                advanceIteratorPast(s1, ts1, tsmResults);
+                values.push_back(takeLastOfRun(s1, tsmResults));
             } else {
-                // Equal timestamps -- higher rank wins, advance both (dedup)
+                // Equal timestamps -- higher rank (newer data) wins, both
+                // sources advance past the timestamp (dedup, last-write-wins)
+                timestamps.push_back(ts0);
                 if (s0.rank >= s1.rank) {
-                    timestamps.push_back(ts0);
-                    values.push_back(s0.block->valueAt(s0.blockOffset));
+                    values.push_back(takeLastOfRun(s0, tsmResults));
+                    advanceIteratorPast(s1, ts1, tsmResults);
                 } else {
-                    timestamps.push_back(ts1);
-                    values.push_back(s1.block->valueAt(s1.blockOffset));
+                    values.push_back(takeLastOfRun(s1, tsmResults));
+                    advanceIteratorPast(s0, ts0, tsmResults);
                 }
-                advanceIteratorPast(s0, ts0, tsmResults);
-                advanceIteratorPast(s1, ts1, tsmResults);
             }
         }
 
@@ -167,9 +215,7 @@ public:
         auto drainRemaining = [&](TSMIterationState& s) {
             while (s.block != nullptr) {
                 timestamps.push_back(s.currentTimestamp);
-                values.push_back(s.block->valueAt(s.blockOffset));
-                const uint64_t ts = s.currentTimestamp;
-                advanceIteratorPast(s, ts, tsmResults);
+                values.push_back(takeLastOfRun(s, tsmResults));
             }
         };
 
@@ -205,14 +251,19 @@ public:
                 }
             }
 
-            // Emit the winning point
+            // Emit the winning point (last copy of the winner's run — LWW)
             if (bestIdx == SIZE_MAX) [[unlikely]]
                 break;
             timestamps.push_back(bestTs);
-            values.push_back(iters[bestIdx].block->valueAt(iters[bestIdx].blockOffset));
+            values.push_back(takeLastOfRun(iters[bestIdx], tsmResults));
+            if (iters[bestIdx].block == nullptr) {
+                --activeCount;
+            }
 
-            // Advance ALL sources that share the same timestamp (dedup).
+            // Advance all OTHER sources that share the same timestamp (dedup).
             for (size_t i = 0; i < numIters; ++i) {
+                if (i == bestIdx)
+                    continue;
                 if (iters[i].block != nullptr && iters[i].currentTimestamp == bestTs) {
                     if (!advanceIteratorPast(iters[i], bestTs, tsmResults)) {
                         --activeCount;
@@ -309,12 +360,14 @@ public:
 
             // Output the winning point. 'best' already has the highest rank for
             // this timestamp because the heap orders by (timestamp ASC, rank DESC).
+            // takeLastOfRun keeps the last copy of the winner's run (LWW) and
+            // advances past currentTs.
             auto& winnerState = blockIterState[best.iterIndex];
             timestamps.push_back(currentTs);
-            values.push_back(winnerState.block->valueAt(winnerState.blockOffset));
+            values.push_back(takeLastOfRun(winnerState, tsmResults));
 
-            // Advance the winning iterator past currentTs and re-push if it has more data
-            if (advanceIteratorPast(winnerState, currentTs, tsmResults)) {
+            // Re-push the winning iterator if it has more data
+            if (winnerState.block != nullptr) {
                 heap.push({winnerState.currentTimestamp, winnerState.rank, best.iterIndex});
             }
 

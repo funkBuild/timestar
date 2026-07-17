@@ -11,8 +11,10 @@
 #include "tsm_writer.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <ranges>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
@@ -381,30 +383,32 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
     const auto pinnedStores = walFileManager.pinMemoryStores();
 
     // --- Phase 1: TSM sparse index scan (zero I/O) ---
-    // Snapshot TSM files once.  getSequencedTsmFiles() is ordered by (tier, seqNum);
-    // reverse for LATEST (newest files first) so the first sparse hit is the best.
+    // Snapshot TSM files once, ordered by dataRank DESCENDING (newest write
+    // generation first).  On equal timestamps the strict comparisons below
+    // keep the first-visited copy, so a rewrite of a point always beats the
+    // stale copy in an older-generation file (last-write-wins).
     std::vector<seastar::shared_ptr<TSM>> tsmFiles;
     tsmFiles.reserve(tsmFileManager.getSequencedTsmFiles().size());
     for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
         tsmFiles.push_back(tsmFile);
     }
-    if (!wantFirst) {
-        std::reverse(tsmFiles.begin(), tsmFiles.end());
-    }
+    std::sort(tsmFiles.begin(), tsmFiles.end(),
+              [](const seastar::shared_ptr<TSM>& a, const seastar::shared_ptr<TSM>& b) {
+                  return a->dataRank() > b->dataRank();
+              });
 
-    // Track how many series are still unresolved for early termination.
+    // Track how many series are still unresolved (drives Phase 2 only).
     size_t unresolvedCount = entries.size();
 
+    // Every file's sparse stats must be consulted — resolving an entry from
+    // one file must NOT stop the scan, because an out-of-order flush can put
+    // the series' true latest (or first) point in any file.  The scan is pure
+    // in-memory hash lookups, so this stays zero-I/O.
     for (const auto& tsmFile : tsmFiles) {
-        if (unresolvedCount == 0)
-            break;
         if (tsmFile->hasTombstones())
             continue;
 
         for (auto& entry : entries) {
-            if (entry.resolved)
-                continue;
-
             auto pt =
                 wantFirst ? tsmFile->getFirstFromSparse(entry.seriesId) : tsmFile->getLatestFromSparse(entry.seriesId);
             if (!pt.has_value())
@@ -461,7 +465,11 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
     // --- Phase 3: Memory stores (may have newer/older data than TSM) ---
     // Iterate stores in outer loop (fewer stores than entries) for better
     // cache locality on the memory store's internal hash map.
-    // Helper lambda to check a typed memory series and update entry.value as double.
+    // Last-write-wins: memory writes are newer than any flushed copy, so on
+    // EQUAL timestamps the memory value must override the TSM value picked in
+    // Phase 1/2 (>= and <= comparisons below).  Stores are iterated
+    // oldest→newest (pinnedStores is newest-first) so that among stores the
+    // newest store's copy overrides on ties as well.
     auto checkMemSeries = [&](const auto* series, auto& entry) {
         if (!series || series->timestamps.empty())
             return;
@@ -474,7 +482,7 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
             if (*it < startTime)
                 return;
             size_t idx = static_cast<size_t>(it - series->timestamps.begin());
-            if (!entry.resolved || series->timestamps[idx] > entry.timestamp) {
+            if (!entry.resolved || series->timestamps[idx] >= entry.timestamp) {
                 entry.timestamp = series->timestamps[idx];
                 entry.value = static_cast<double>(series->values[idx]);
                 entry.resolved = true;
@@ -485,7 +493,7 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
             if (it == series->timestamps.end() || *it > endTime)
                 return;
             size_t idx = static_cast<size_t>(it - series->timestamps.begin());
-            if (!entry.resolved || series->timestamps[idx] < entry.timestamp) {
+            if (!entry.resolved || series->timestamps[idx] <= entry.timestamp) {
                 entry.timestamp = series->timestamps[idx];
                 entry.value = static_cast<double>(series->values[idx]);
                 entry.resolved = true;
@@ -493,7 +501,7 @@ seastar::future<> Engine::batchLatest(std::vector<BatchLatestEntry>& entries, ui
         }
     };
 
-    for (const auto& memStore : pinnedStores) {
+    for (const auto& memStore : pinnedStores | std::views::reverse) {
         for (auto& entry : entries) {
             checkMemSeries(memStore->querySeries<double>(entry.seriesId), entry);
             checkMemSeries(memStore->querySeries<int64_t>(entry.seriesId), entry);

@@ -84,7 +84,9 @@ private:
     std::vector<ActiveCompaction> activeCompactions;
 
     // Generate output filename for compacted file
-    std::string generateCompactedFilename(uint64_t tier, uint64_t seqNum);
+    std::string generateCompactedFilename(uint64_t tier, uint64_t seqNum, uint64_t dataSeq);
+    // Newest write generation across the input files — the output's dataSeq.
+    static uint64_t maxDataSeqOf(const std::vector<seastar::shared_ptr<TSM>>& files);
 
     // Phase 3: Process series for compaction without writing (for parallel processing)
     template <typename T>

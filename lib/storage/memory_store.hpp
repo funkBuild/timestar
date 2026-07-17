@@ -82,12 +82,26 @@ public:
     // Sort a subrange [from, to) of timestamps and values together using index-based
     // permutation. Only allocates temporary storage proportional to the subrange size,
     // not the full vector. Used for sorting unsorted suffixes before merging.
+    // Stable: equal timestamps keep their input order, so "last write in the
+    // batch" stays last and dedupSuffixKeepLast() implements last-write-wins.
     void sortPaired(size_t from, size_t to);
 
-    // Merge two individually-sorted runs [0, midpoint) and [midpoint, n) into a
-    // single sorted sequence. Uses a linear-time two-pointer merge into temporary
-    // buffers, which is O(n) vs O(n log n) for a full re-sort.
-    void mergePaired(size_t midpoint);
+    // Merge two individually-sorted, internally duplicate-free runs
+    // [0, midpoint) and [midpoint, n) into a single sorted sequence.
+    // Last-write-wins: on equal timestamps the suffix run (newer write)
+    // replaces the prefix point. Returns true if any point was overwritten,
+    // in which case running stats must be recomputed.
+    bool mergePaired(size_t midpoint);
+
+    // Collapse equal-timestamp runs in the sorted suffix [from, end), keeping
+    // the last value of each run (last write wins). Returns true if anything
+    // was removed.
+    bool dedupSuffixKeepLast(size_t from);
+
+    // Rebuild running stats from the full (sorted, deduplicated) series.
+    // Needed after an overwrite: incremental stats can't cheaply un-count a
+    // replaced value (Kahan sum, Welford M2, min/max).
+    void recomputeStats();
 };
 
 // Order of variants must match TSMValueType order
@@ -194,6 +208,30 @@ public:
                     }
                     return std::nullopt;
                 }
+            },
+            it->second);
+    }
+
+    // Clamped [first, last] timestamp bounds of this series' data within
+    // [startTime, endTime] (inclusive), or nullopt if no data in range.
+    // Used by the pushdown LWW gate to detect cross-store duplicates.
+    std::optional<std::pair<uint64_t, uint64_t>> seriesTimeBoundsInRange(const SeriesId128& seriesId,
+                                                                         uint64_t startTime, uint64_t endTime) const {
+        auto it = series.find(seriesId);
+        if (it == series.end()) {
+            return std::nullopt;
+        }
+        return std::visit(
+            [&](const auto& s) -> std::optional<std::pair<uint64_t, uint64_t>> {
+                if (s.timestamps.empty()) {
+                    return std::nullopt;
+                }
+                auto lo = std::lower_bound(s.timestamps.begin(), s.timestamps.end(), startTime);
+                auto hi = std::upper_bound(lo, s.timestamps.end(), endTime);
+                if (lo == hi) {
+                    return std::nullopt;
+                }
+                return std::make_pair(*lo, *(hi - 1));
             },
             it->second);
     }

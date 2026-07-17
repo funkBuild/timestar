@@ -24,9 +24,20 @@ TSMCompactor::TSMCompactor(TSMFileManager* manager)
       strategy(std::make_unique<LeveledCompactionStrategy>()),
       compactionSemaphore(timestar::config().storage.compaction.max_concurrent) {}
 
-std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqNum) {
+std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqNum, uint64_t dataSeq) {
+    // The `_d<dataSeq>` suffix records the newest write generation contained
+    // in the output (max of the inputs' dataSeq) so last-write-wins dedup
+    // ranks this file by its data recency, not by its (fresh) seqNum.
     return timestar::shardDataPath(seastar::this_shard_id()) + "/tsm/" + std::to_string(tier) + "_" +
-           std::to_string(seqNum) + ".tsm";
+           std::to_string(seqNum) + "_d" + std::to_string(dataSeq) + ".tsm";
+}
+
+uint64_t TSMCompactor::maxDataSeqOf(const std::vector<seastar::shared_ptr<TSM>>& files) {
+    uint64_t maxSeq = 0;
+    for (const auto& file : files) {
+        maxSeq = std::max(maxSeq, file->dataSeq);
+    }
+    return maxSeq;
 }
 
 std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar::shared_ptr<TSM>>& files) {
@@ -290,13 +301,18 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             return;
         }
 
-        // Deduplicate
+        // Deduplicate (last-write-wins). The bulk mergers already emit one
+        // point per distinct timestamp (newest source, last copy per source),
+        // so equal consecutive timestamps only occur on the sequential
+        // non-overlapping path, where the stream is a single file in append
+        // order — the LATER copy is the newer write and replaces the kept one.
         if (ts != lastTimestamp) {
             result.timestamps.push_back(ts);
             result.values.push_back(val);
             lastTimestamp = ts;
             result.pointsWritten++;
         } else {
+            result.values.back() = val;
             result.duplicatesRemoved++;
         }
     };
@@ -464,7 +480,7 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         targetSeq = fileManager->allocateSequenceId();
     }
 
-    std::string outputPath = generateCompactedFilename(targetTier, targetSeq);
+    std::string outputPath = generateCompactedFilename(targetTier, targetSeq, maxDataSeqOf(files));
 
     // Create temporary file for writing
     std::string tempPath = outputPath + ".tmp";
@@ -681,7 +697,7 @@ CompactionPlan TSMCompactor::planCompaction(uint64_t tier) {
     if (!plan.sourceFiles.empty()) {
         plan.targetTier = strategy->getTargetTier(tier, plan.sourceFiles.size());
         plan.targetSeqNum = fileManager->allocateSequenceId();
-        plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
+        plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum, maxDataSeqOf(plan.sourceFiles));
 
         // Estimate output size (rough estimate - 70% of input due to compression)
         plan.estimatedSize = 0;
@@ -815,7 +831,8 @@ seastar::future<> TSMCompactor::forceFullCompaction() {
             plan.sourceFiles = tierFiles;
             plan.targetTier = std::min(tier + 1, uint64_t{3});
             plan.targetSeqNum = fileManager->allocateSequenceId();
-            plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
+            plan.targetPath =
+                generateCompactedFilename(plan.targetTier, plan.targetSeqNum, maxDataSeqOf(plan.sourceFiles));
 
             try {
                 auto stats = co_await executeCompaction(plan);
@@ -847,7 +864,7 @@ seastar::future<CompactionStats> TSMCompactor::executeTombstoneRewrite(seastar::
     plan.sourceFiles = {file};
     plan.targetTier = file->tierNum;
     plan.targetSeqNum = fileManager->allocateSequenceId();
-    plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
+    plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum, file->dataSeq);
     plan.estimatedSize = file->getFileSize();
 
     timestar::compactor_log.info("[TOMBSTONE-REWRITE] Rewriting {} at tier {} seq {} -> seq {}", file->getFileSize(),

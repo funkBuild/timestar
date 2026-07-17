@@ -333,12 +333,12 @@ The TimeStar includes an HTTP server with a JSON-based write API for data ingest
 
 ### Features
 
-- **Type Detection**: Automatic detection of field types (float, bool, string, int)
+- **Type Detection**: Automatic detection of field types (float, bool, string, int) from the JSON token shape (`10` → int, `10.0` → float). An optional per-point `"field_types": {"<field>": "float"|"int"|"bool"|"string"}` object overrides detection — important for JS clients, whose serializers emit `10.0` as `10`. See docs/api-write.md "Explicit field types"
 - **Index Integration**: Automatic series ID generation and metadata indexing
 - **Error Handling**: Detailed JSON error responses with HTTP status codes
 - **Batch Support**: Efficient batch writes with partial failure handling
 - **Default Timestamps**: Auto-generates nanosecond timestamps if not provided
-- **Duplicate points append**: rewriting an identical measurement+tags+field+timestamp stores an additional point (NOT InfluxDB last-write-wins); aggregations count every copy — delete first or use unique timestamps for overwrite-style workflows
+- **Duplicate points overwrite (last-write-wins)**: rewriting an identical measurement+tags+field+timestamp REPLACES the earlier point (InfluxDB-compatible). Queries only ever see the newest write — raw reads return one point and aggregations count it once, regardless of placement (same batch, memory store, across flush, across TSM files, after compaction)
 
 ### Additional Endpoints
 

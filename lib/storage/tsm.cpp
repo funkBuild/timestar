@@ -219,6 +219,26 @@ TSM::TSM(std::string _absoluteFilePath) {
 
     std::string filename = _absoluteFilePath.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex);
 
+    // Optional data-sequence suffix on compaction outputs: "<tier>_<seq>_d<dataSeq>".
+    // Strip it before the tier/seq parse below; legacy files without the
+    // suffix use seqNum as their dataSeq.
+    std::optional<uint64_t> parsedDataSeq;
+    size_t dSuffixIndex = filename.find_last_of("_");
+    if (dSuffixIndex != std::string::npos && dSuffixIndex + 1 < filename.size() &&
+        filename[dSuffixIndex + 1] == 'd') {
+        try {
+            size_t consumed = 0;
+            const std::string digits = filename.substr(dSuffixIndex + 2);
+            uint64_t v = std::stoull(digits, &consumed);
+            if (!digits.empty() && consumed == digits.size()) {
+                parsedDataSeq = v;
+                filename = filename.substr(0, dSuffixIndex);
+            }
+        } catch (const std::exception&) {
+            // Not a data-seq suffix — fall through to the normal parse.
+        }
+    }
+
     size_t underscoreIndex = filename.find_last_of("_");
     if (underscoreIndex == std::string::npos)
         throw std::runtime_error("TSM invalid filename:" + filename);
@@ -226,8 +246,9 @@ TSM::TSM(std::string _absoluteFilePath) {
     try {
         tierNum = std::stoull(filename.substr(0, underscoreIndex));
         seqNum = std::stoull(filename.substr(underscoreIndex + 1));
+        dataSeq = parsedDataSeq.value_or(seqNum);
 
-        timestar::tsm_log.debug("tierNum={} seqNum={}", tierNum, seqNum);
+        timestar::tsm_log.debug("tierNum={} seqNum={} dataSeq={}", tierNum, seqNum, dataSeq);
     } catch (const std::exception&) {
         throw std::runtime_error("TSM invalid filename:" + filename);
     }
@@ -308,6 +329,20 @@ uint64_t TSM::rankAsInteger() {
         throw std::overflow_error("TSM::rankAsInteger: seqNum " + std::to_string(seqNum) + " exceeds 60-bit limit");
     }
     return (tierNum << 60) | seqNum;
+}
+
+uint64_t TSM::dataRank() {
+    if (tierNum >= 16) {
+        throw std::overflow_error("TSM::dataRank: tierNum " + std::to_string(tierNum) + " >= 16 exceeds 4-bit limit");
+    }
+    constexpr uint64_t maxDataSeq = (uint64_t{1} << 60) - 1;
+    if (dataSeq > maxDataSeq) [[unlikely]] {
+        throw std::overflow_error("TSM::dataRank: dataSeq " + std::to_string(dataSeq) + " exceeds 60-bit limit");
+    }
+    // dataSeq-dominant: write recency decides duplicate resolution; tier only
+    // breaks ties between a compacted file and an input carrying the same
+    // newest generation.
+    return (dataSeq << 4) | tierNum;
 }
 
 // Lazy loading: read sparse index + build bloom filter

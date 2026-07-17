@@ -215,6 +215,13 @@ private:
 public:
     uint64_t tierNum;
     uint64_t seqNum;
+    // Newest write generation contained in this file (last-write-wins dedup).
+    // Flush-created files: == seqNum (flush order == write order per shard).
+    // Compaction outputs: max(dataSeq) of the inputs, carried in the filename
+    // as a `_d<N>` suffix — a fresh seqNum would wrongly outrank newer
+    // tier-0 files whose data was written later.  Legacy files without the
+    // suffix fall back to seqNum.
+    uint64_t dataSeq;
 
     TSM(std::string _absoluteFilePath);
     // Deferred-close support: when scheduleDelete() ran while readers may
@@ -225,7 +232,14 @@ public:
     TSM& operator=(const TSM&) = delete;
     seastar::future<> open();
     seastar::future<> close();
+    // Unique file identity for file-manager maps and file ordering.
+    // NOT a dedup priority — use dataRank() for last-write-wins decisions.
     uint64_t rankAsInteger();
+    // Duplicate-resolution priority: on equal timestamps the file with the
+    // higher dataRank holds the newer write. dataSeq-dominant (write
+    // recency); tier breaks ties (a compacted file at the same dataSeq is a
+    // dedup superset of its inputs).
+    uint64_t dataRank();
 
     // Schedule async deletion — unlinks the file from disk.  The fd stays
     // open until the last shared_ptr reference drops (queries that

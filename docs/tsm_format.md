@@ -203,10 +203,23 @@ On open, only a sparse index is loaded (no block data):
 ## File Naming
 
 ```
-shard_{ID}/tsm/{TIER}_{SEQUENCE}.tsm
+shard_{ID}/tsm/{TIER}_{SEQUENCE}.tsm          (flush-created, tier 0)
+shard_{ID}/tsm/{TIER}_{SEQUENCE}_d{DATASEQ}.tsm   (compaction output)
 ```
 
-Ranking: `(tier << 60) | sequence`. Higher tiers and newer sequences take priority.
+Two distinct orderings are derived from the name:
+
+- **File identity** (`rankAsInteger()`): `(tier << 60) | sequence`. Unique key
+  for file-manager maps; NOT a duplicate-resolution priority.
+- **Duplicate resolution** (`dataRank()`): `(dataSeq << 4) | tier`. On equal
+  timestamps the file with the higher `dataRank` holds the newer write
+  (last-write-wins). `dataSeq` is the newest write generation contained in the
+  file: flush-created files use their own sequence (flush order == write order
+  per shard); compaction outputs inherit `max(dataSeq)` of their inputs via
+  the `_d{DATASEQ}` suffix. A freshly allocated sequence must never be used
+  for dedup ranking — it would let an old point compacted into a higher tier
+  outrank a tier-0 file holding a newer rewrite. Files without the suffix
+  (legacy, or flush-created) fall back to `dataSeq = sequence`.
 
 ## Phase 4: Index Pagination (Deferred)
 
