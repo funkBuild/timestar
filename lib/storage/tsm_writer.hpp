@@ -64,8 +64,7 @@ public:
     // file reference dictionary IDs, so the output file's index must persist
     // the source's dictionary or the blocks become undecodable. Call after
     // writeCompressedBlockWithStats has created the entry for this series.
-    void setSeriesStringDictionary(const SeriesId128& seriesId,
-                                   std::shared_ptr<const std::vector<std::string>> dict) {
+    void setSeriesStringDictionary(const SeriesId128& seriesId, std::shared_ptr<const std::vector<std::string>> dict) {
         indexEntries[seriesId].stringDictionary = std::move(dict);
     }
 

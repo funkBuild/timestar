@@ -866,9 +866,9 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
         // materializing all raw data.  O(groups x buckets)
         // memory instead of O(points).  Works for both
         // group-by and non-group-by queries.
-        pushdownPartials = co_await streamingGroupByAggregation(engine, contexts, measurement, startTime, endTime,
-                                                                aggregation, aggregationInterval, groupByTags,
-                                                                stringResults);
+        pushdownPartials =
+            co_await streamingGroupByAggregation(engine, contexts, measurement, startTime, endTime, aggregation,
+                                                 aggregationInterval, groupByTags, stringResults);
 
     } else {
         // ---- STANDARD PER-SERIES PATH ----

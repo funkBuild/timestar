@@ -249,7 +249,8 @@ public:
             }
             timestamps_.insert(timestamps_.end(), timestamps.begin() + startIdx, timestamps.begin() + endIdx);
             rawValues_.insert(rawValues_.end(), values.begin() + startIdx, values.begin() + endIdx);
-        } else if (singleBucketState_ && inSingleBucket(timestamps[startIdx]) && inSingleBucket(timestamps[endIdx - 1])) {
+        } else if (singleBucketState_ && inSingleBucket(timestamps[startIdx]) &&
+                   inSingleBucket(timestamps[endIdx - 1])) {
             if (methodAware_ && n >= 4) {
                 addPointsSIMDFoldRange(timestamps, values, startIdx, endIdx, *singleBucketState_);
             } else {

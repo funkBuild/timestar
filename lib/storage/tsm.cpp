@@ -224,8 +224,7 @@ TSM::TSM(std::string _absoluteFilePath) {
     // suffix use seqNum as their dataSeq.
     std::optional<uint64_t> parsedDataSeq;
     size_t dSuffixIndex = filename.find_last_of("_");
-    if (dSuffixIndex != std::string::npos && dSuffixIndex + 1 < filename.size() &&
-        filename[dSuffixIndex + 1] == 'd') {
+    if (dSuffixIndex != std::string::npos && dSuffixIndex + 1 < filename.size() && filename[dSuffixIndex + 1] == 'd') {
         try {
             size_t consumed = 0;
             const std::string digits = filename.substr(dSuffixIndex + 2);

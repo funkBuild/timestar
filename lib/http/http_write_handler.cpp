@@ -127,7 +127,8 @@ static bool validateIdentifierLimits(const std::string& measurement, const std::
         return false;
     }
     if (tags.size() > MAX_TAG_COUNT) {
-        error = "Too many tags: " + std::to_string(tags.size()) + " exceeds maximum of " + std::to_string(MAX_TAG_COUNT);
+        error =
+            "Too many tags: " + std::to_string(tags.size()) + " exceeds maximum of " + std::to_string(MAX_TAG_COUNT);
         return false;
     }
     for (const auto& [k, v] : tags) {
@@ -317,7 +318,8 @@ static void checkDeclaredType(TSMValueType declared, const json_value_t& v, cons
     switch (declared) {
         case TSMValueType::Float:
             if (!v.is_number()) {
-                throw std::invalid_argument("Field '" + fieldName + "' is declared float but the value is not a number");
+                throw std::invalid_argument("Field '" + fieldName +
+                                            "' is declared float but the value is not a number");
             }
             return;
         case TSMValueType::Integer: {
@@ -340,12 +342,14 @@ static void checkDeclaredType(TSMValueType declared, const json_value_t& v, cons
         }
         case TSMValueType::Boolean:
             if (!v.is_boolean()) {
-                throw std::invalid_argument("Field '" + fieldName + "' is declared bool but the value is not a boolean");
+                throw std::invalid_argument("Field '" + fieldName +
+                                            "' is declared bool but the value is not a boolean");
             }
             return;
         case TSMValueType::String:
             if (!v.is_string()) {
-                throw std::invalid_argument("Field '" + fieldName + "' is declared string but the value is not a string");
+                throw std::invalid_argument("Field '" + fieldName +
+                                            "' is declared string but the value is not a string");
             }
             return;
         default:

@@ -6,10 +6,10 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
-#include <stdexcept>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <stdexcept>
 #include <vector>
 
 class Engine;

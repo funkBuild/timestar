@@ -801,8 +801,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         // (they return 1 point by definition), and for other streamable
         // methods when the caller asked for a collapsed result
         // (foldNoInterval — group-by callers collapse per group anyway).
-        const bool foldSingle = (aggregationInterval == 0) &&
-                                (isLatest || isFirst || (foldNoInterval && isStreamableAggMethod(method)));
+        const bool foldSingle =
+            (aggregationInterval == 0) && (isLatest || isFirst || (foldNoInterval && isStreamableAggMethod(method)));
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
         if (foldSingle) {
             aggregator.enableFoldToSingleState();

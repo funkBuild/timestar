@@ -251,8 +251,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             std::string batchError;
             bool parsedAsBatch = false;
             try {
-                auto parsedList =
-                    timestar::proto::parseBatchDeleteRequest(req->content.data(), req->content.size());
+                auto parsedList = timestar::proto::parseBatchDeleteRequest(req->content.data(), req->content.size());
                 if (!parsedList.empty()) {
                     if (parsedList.size() > MAX_BATCH_DELETE_SIZE) {
                         rejectBadRequest("Batch delete exceeds maximum size of " +
@@ -269,8 +268,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 }
             } catch (const std::exception& e) {
                 batchError = e.what();
-                timestar::http_log.debug("Batch delete parse failed ({}), falling back to single delete",
-                                         e.what());
+                timestar::http_log.debug("Batch delete parse failed ({}), falling back to single delete", e.what());
             }
 
             // Attempt 2: single DeleteRequest (zero-entry batch, batch parse
