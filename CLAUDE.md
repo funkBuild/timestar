@@ -483,8 +483,7 @@ dropped:
 
 - **No aggregationInterval**: non-numeric fields pass through raw — every
   stored (timestamp, value) pair in the requested range is returned unchanged.
-  This holds for every aggregation method (including `latest`/`first`, which
-  still collapse numeric fields to a single point) and for group-by queries
+  This holds for every aggregation method and for group-by queries
   (non-numeric series are returned per-series with their full tag set; they are
   not merged into groups).
 - **With aggregationInterval**: non-numeric fields are reduced to
@@ -697,16 +696,29 @@ definition) reduces the time axis.
 - A misaligned range shorter than one interval can still return two buckets
   when it crosses an epoch boundary.
 
-**Without `aggregationInterval` (interval == 0):**
-- `latest` / `first`: one collapsed value per series/group, on every path.
-  These are the only methods that collapse a range by definition.
-- Every other method: **per-timestamp aggregation across matching series** —
-  N points, one per distinct timestamp, aggregated across the series that
-  share that timestamp (raw passthrough for a single series). This holds
-  **with or without `by {tags}`**: grouping only decides *which* series fold
-  together, never how many timestamps survive. Internal consumers (`/derived`
-  formulas, anomaly detection, forecasting) rely on this N-point shape for
-  their no-interval sub-queries.
+**Without `aggregationInterval` (interval == 0):** **per-timestamp aggregation
+across matching series** — N points, one per distinct timestamp, aggregated
+across the series that share that timestamp (raw passthrough for a single
+series). This holds **with or without `by {tags}`**: grouping only decides
+*which* series fold together, never how many timestamps survive. Internal
+consumers (`/derived` formulas, anomaly detection, forecasting) rely on this
+N-point shape for their no-interval sub-queries.
+
+**There are NO exceptions — `latest`/`first` included.** They are cross-series
+tie-breaks *at each timestamp*, not reductions over time: for a single series
+they are raw passthrough. `latest:m(v){}` returns every timestamp, and one
+point per bucket only when an `aggregationInterval` asks for it. They used to
+collapse the range, which forced callers to send a throwaway tiny interval
+purely to keep their time axis. This mirrors the engine TimeStar replaces,
+whose query layer has no temporal concept at all (a single series is copied
+through verbatim); a `latest` that collapses would flatten every state-history
+and image series to one point. Pinned by
+`DynamoEquivalenceTest.LatestAndFirstKeepEveryTimestampWithoutAnInterval`.
+
+`timestar::isLatestOrFirstMethod()` (aggregator.hpp) names the two methods that
+*select* a point rather than compute one — that is what lets a bucketed
+`latest` resolve from sparse-index stats without decoding blocks. It does NOT
+mean they collapse a range.
 
 A `by {tags}` clause used to silently switch the interval == 0 default to
 "collapse the whole range to one point per group" (InfluxQL-style "GROUP BY
@@ -728,8 +740,8 @@ the `foldNoInterval` parameter of `Engine::queryAggregated()` /
 `QueryRunner::queryTsmAggregated()`. It **defaults to `false`** — the shape
 rules forbid collapsing a range the caller did not ask to collapse, so no
 production caller passes `true` (only `non_bucketed_pushdown_test.cpp`, which
-pins the capability itself). `latest`/`first` collapse inside the runner
-regardless of the flag, which is the only collapse the shape rules allow.
+pins the capability itself). No method collapses a range at
+interval == 0 any more, `latest`/`first` included.
 
 `HttpQueryHandler::executeQuery()` takes its `QueryRequest` **by value**: it is
 a coroutine, and the SSE backfill loop passes a loop-body local through

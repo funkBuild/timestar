@@ -24,6 +24,12 @@ method:measurement(fields){scopes} by {groupKeys}
 | `stdvar` | Population variance |
 | `spread` | Range (max - min) |
 
+`latest`/`first` do **not** collapse a time range. They select across *series*
+at each timestamp, so without an `aggregationInterval` they keep every
+timestamp (for a single series they are raw passthrough); with one they select
+a point per bucket. Use an `aggregationInterval` covering the range to get a
+single most-recent value.
+
 Aggregation uses a two-phase distributed approach: each shard computes partial `AggregationState` objects that are merged centrally, reducing cross-shard data transfer.
 
 ## Fields
@@ -68,7 +74,7 @@ Omit the `by {}` clause entirely to aggregate all matching series together.
 
 Grouping decides **which series fold together**, never how many timestamps come
 back. `by {location}` and the same query without it return the same timestamps;
-only an `aggregationInterval` (or `latest`/`first`) reduces the time axis.
+only an `aggregationInterval` reduces the time axis.
 
 A grouping key that no matching series carries returns no series at all, the
 same way an unknown tag key in a scope filter does — a typo'd key yields an

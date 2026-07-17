@@ -7,15 +7,18 @@
 //     Aggregate ACROSS SERIES at equal timestamps.  Never aggregate over time.
 //     Every distinct timestamp in the range survives into the result.
 //
-// (LATEST/FIRST are the defined exceptions — they name a single point by
-// construction — and an explicit aggregationInterval is the caller opting in to
-// temporal bucketing.)
+// There are NO exceptions: an explicit aggregationInterval is the only way to
+// reduce the time axis.  `latest`/`first` are cross-series tie-breaks at each
+// timestamp — Dynamo's ResultAggregator never aggregates over time — so they
+// keep every timestamp too.
 //
 // Covered:
 //   T1  a `by` clause must not change the temporal aggregation default
 //   T2  boolean fields come back as true/false, keeping their series tags
 //   T3  booleans are non-numeric: aggregation methods do not coerce them
 //   T4  an unknown `by` tag returns [], as an unknown scope tag already does
+//   D1  `latest` keeps every timestamp without an interval (Dynamo's query
+//       layer is a per-timestamp reducer, never a range collapse)
 
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/placement_table.hpp"
@@ -379,6 +382,61 @@ TEST_F(DynamoEquivalenceTest, GroupingNeverChangesTheAnswerForAnyMethod) {
         .get();
 }
 
+// D1: `latest`/`first` do not collapse a range.
+//
+// Dynamo's query layer (result_aggregator.js) has no temporal concept at all: a
+// single series is copied through verbatim, and multiple series are reduced
+// ACROSS each other at equal timestamps. So `latest:m(v){}` is N points, not
+// one. iot-core depends on this — monitor state history and image series are
+// read with `latest` and must stay time series.
+//
+// TimeStar used to collapse here, which is why the adaptor had to send a
+// throwaway `1ms` interval on every query just to keep its time axis.
+TEST_F(DynamoEquivalenceTest, LatestAndFirstKeepEveryTimestampWithoutAnInterval) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        constexpr uint64_t kSecond = 1000ULL * kMs;
+        const std::string ts = R"([)" + std::to_string(kBase) + "," + std::to_string(kBase + kSecond) + "," +
+                               std::to_string(kBase + 2 * kSecond) + "]";
+        writeOk(writeHandler, R"({"measurement":"dyn_d1","tags":{"p":"front"},)"
+                              R"("fields":{"v":[10.0,20.0,30.0]},"timestamps":)" +
+                                  ts + "}");
+
+        const uint64_t start = kBase - kSecond;
+        const uint64_t end = kBase + 10 * kSecond;
+        const std::vector<uint64_t> expectedTs{kBase, kBase + kSecond, kBase + 2 * kSecond};
+
+        // Every method agrees on the time axis without an interval — latest and
+        // first included.  A single series is passed through unreduced.
+        for (const std::string& method : {"latest", "first", "avg", "max"}) {
+            auto series = runQuery(queryHandler, method + ":dyn_d1(v){}", start, end);
+            ASSERT_EQ(series.size(), 1u) << method;
+            EXPECT_EQ(series[0].timestamps, expectedTs)
+                << method << ": no method may collapse a range without an aggregationInterval";
+            EXPECT_EQ(numbers(series[0]), (std::vector<double>{10.0, 20.0, 30.0})) << method;
+        }
+
+        // Grouping does not change that.
+        auto grouped = runQuery(queryHandler, "latest:dyn_d1(v){} by {p}", start, end);
+        ASSERT_EQ(grouped.size(), 1u);
+        EXPECT_EQ(grouped[0].timestamps, expectedTs) << "`by` must not collapse latest either";
+
+        // An explicit interval is still the way to reduce: one 1h bucket over
+        // this range selects the latest point in it.
+        auto bucketed = runQuery(queryHandler, "latest:dyn_d1(v){}", start, end, "1h");
+        ASSERT_EQ(bucketed.size(), 1u);
+        ASSERT_EQ(bucketed[0].timestamps.size(), 1u) << "an explicit interval must still reduce";
+        EXPECT_EQ(numbers(bucketed[0]), (std::vector<double>{30.0})) << "latest in the bucket";
+    })
+        .join()
+        .get();
+}
+
 // ---------------------------------------------------------------------------
 // T2/T3: booleans are non-numeric.  They come back as true/false in the type
 // they were written in, they keep their series tags, and the named aggregation
@@ -638,11 +696,13 @@ TEST_F(DynamoEquivalenceTest, NumericFieldsSurviveAlongsideNonNumericOnBatchLate
                                   R"(":[1.0,2.0],")" + strField + R"(":["a","b"]},"timestamps":[)" +
                                   std::to_string(kBase) + "," + std::to_string(kBase + kSecond) + "]}");
 
-        // No interval + LATEST => batch fast path resolves the numeric series
-        // and leaves the string one for the streaming path, which the `by`
-        // clause engages.  That is exactly where the overwrite happened.
+        // A single-bucket LATEST engages the batch fast path, which resolves the
+        // numeric series and leaves the string one for the streaming path —
+        // exactly where the overwrite happened.  An interval is REQUIRED to
+        // reach that path now: interval == 0 no longer collapses, so LATEST
+        // takes the ordinary per-series route.
         for (const std::string& query : {"latest:" + measurement + "() by {p}", "latest:" + measurement + "()"}) {
-            auto series = runQuery(queryHandler, query, kBase - kSecond, kBase + 10 * kSecond);
+            auto series = runQuery(queryHandler, query, kBase - kSecond, kBase + 10 * kSecond, "1h");
             std::string got;
             for (const auto& d : series)
                 got += d.field + " ";
@@ -653,7 +713,7 @@ TEST_F(DynamoEquivalenceTest, NumericFieldsSurviveAlongsideNonNumericOnBatchLate
             ASSERT_NE(numeric, series.end())
                 << query << ": numeric field '" << numField << "' (shard " << targetShard
                 << ") was dropped by the non-numeric series sharing its shard — got: " << got;
-            EXPECT_EQ(numbers(*numeric), (std::vector<double>{2.0})) << "latest of " << numField;
+            EXPECT_EQ(numbers(*numeric), (std::vector<double>{2.0})) << "latest of " << numField << " in its bucket";
         }
     })
         .join()

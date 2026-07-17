@@ -555,13 +555,16 @@ public:
     }
 }
 
-// LATEST/FIRST are the only methods whose DEFINITION collapses a time range to
-// a single point.  Every other method aggregates ACROSS SERIES at equal
-// timestamps and leaves the time axis intact unless an aggregationInterval
-// buckets it (CLAUDE.md "Aggregation Result Shape").  Adding a new method to
-// the enum therefore defaults to keeping the time axis, which is the
-// spec-correct default.
-[[nodiscard]] inline bool collapsesWholeRange(AggregationMethod method) {
+// LATEST/FIRST select a single point by extreme timestamp rather than computing
+// a value over the set.  They do NOT collapse a time range: without an
+// aggregationInterval every distinct timestamp survives, exactly as for every
+// other method (CLAUDE.md "Aggregation Result Shape") — "latest" is a
+// cross-series tie-break at each timestamp, not a reduction over time.
+//
+// The distinction still matters because "one point per bucket" is what lets the
+// batch/sparse fast paths resolve a bucketed LATEST/FIRST without decoding
+// blocks.
+[[nodiscard]] inline bool isLatestOrFirstMethod(AggregationMethod method) {
     return method == AggregationMethod::LATEST || method == AggregationMethod::FIRST;
 }
 

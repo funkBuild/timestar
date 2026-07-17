@@ -48,6 +48,12 @@ method:measurement(fields){scopes} by {groupKeys}
 | `stdvar` | Population variance |
 | `spread` | Max minus min |
 
+`latest`/`first` do **not** collapse a time range. They select across *series*
+at each timestamp, so without an `aggregationInterval` they keep every
+timestamp (for a single series they are raw passthrough); with one they select
+a point per bucket. Use an `aggregationInterval` covering the range to get a
+single most-recent value.
+
 ## Field Type Handling
 
 Different field types interact with the aggregation pipeline differently. Numeric types (float, integer) are aggregated normally, while string and boolean fields bypass aggregation entirely.

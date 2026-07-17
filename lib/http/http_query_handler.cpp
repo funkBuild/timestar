@@ -147,10 +147,9 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
     const std::vector<std::string>& groupByTags, std::vector<timestar::SeriesResult>& nonNumericResults) {
     // ---- Phase 1: Pre-group series by groupKey ----
     struct GroupAccumulator {
-        // For bucketed queries (interval > 0): one AggregationState per bucket
+        // One AggregationState per bucket; with interval == 0 the "bucket" is
+        // the point's own timestamp, so every distinct timestamp survives.
         std::unordered_map<uint64_t, AggregationState> bucketStates;
-        // For non-bucketed queries (interval == 0): single collapsed state
-        AggregationState collapsedState;
         // Metadata
         std::string groupKey;
         size_t groupKeyHash = 0;
@@ -204,21 +203,16 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
 
     // ---- Phase 3: Helper lambdas for folding values into groups ----
 
-    // Grouping must never alter the time axis.  With no aggregationInterval,
-    // every distinct timestamp survives and values are aggregated ACROSS the
-    // series in a group at equal timestamps — identical to the no-group-by
-    // path.  Only LATEST/FIRST collapse a range by definition.
-    const bool collapseRange = (aggregationInterval == 0) && collapsesWholeRange(aggregation);
-
     // Fold a single (timestamp, value) pair into a group accumulator.
+    //
+    // NO method collapses a time range here: without an aggregationInterval
+    // every distinct timestamp survives, for LATEST/FIRST exactly as for
+    // avg/min/max (CLAUDE.md "Aggregation Result Shape").  Grouping decides
+    // only which series fold together at equal timestamps.
     auto foldPoint = [&](GroupAccumulator& group, uint64_t ts, double val) {
-        if (collapseRange) {
-            group.collapsedState.addValueForMethod(val, ts, aggregation);
-        } else {
-            // interval == 0 buckets per distinct timestamp.
-            const uint64_t bucket = aggregationInterval > 0 ? (ts / aggregationInterval) * aggregationInterval : ts;
-            group.bucketStates[bucket].addValueForMethod(val, ts, aggregation);
-        }
+        // interval == 0 buckets per distinct timestamp.
+        const uint64_t bucket = aggregationInterval > 0 ? (ts / aggregationInterval) * aggregationInterval : ts;
+        group.bucketStates[bucket].addValueForMethod(val, ts, aggregation);
     };
 
     // Merge a PushdownResult into a group accumulator.
@@ -230,9 +224,6 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
             for (auto& [bucketTs, state] : pr.bucketStates) {
                 group.bucketStates[bucketTs].mergeForMethod(state, aggregation);
             }
-        } else if (pr.aggregatedState.has_value()) {
-            // Collapsed state (LATEST/FIRST only — see collapseRange): merge directly
-            group.collapsedState.mergeForMethod(*pr.aggregatedState, aggregation);
         } else if (!pr.sortedTimestamps.empty()) {
             // Raw values from pushdown: fold each value
             for (size_t i = 0; i < pr.sortedTimestamps.size(); ++i) {
@@ -308,11 +299,6 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
                             for (auto& [bucketTs, state] : agg.takeBucketStates()) {
                                 group->bucketStates[bucketTs].mergeForMethod(std::move(state), aggregation);
                             }
-                        } else if (collapseRange) {
-                            BlockAggregator agg(0, aggregation);
-                            agg.enableFoldToSingleState();
-                            agg.addPoints(result.timestamps, result.values);
-                            group->collapsedState.mergeForMethod(agg.takeSingleState(), aggregation);
                         } else {
                             // interval == 0, method keeps the time axis: one state
                             // per distinct timestamp.  BlockAggregator's bucketed
@@ -359,15 +345,9 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
         partial.cachedTags = std::move(groupPtr->cachedTags);
         partial.totalPoints = groupPtr->totalPoints;
 
-        if (collapseRange) {
-            if (groupPtr->collapsedState.count == 0)
-                continue;  // No data for this group
-            partial.collapsedState = std::move(groupPtr->collapsedState);
-        } else {
-            if (groupPtr->bucketStates.empty())
-                continue;  // No data for this group
-            partial.bucketStates = std::move(groupPtr->bucketStates);
-        }
+        if (groupPtr->bucketStates.empty())
+            continue;  // No data for this group
+        partial.bucketStates = std::move(groupPtr->bucketStates);
 
         results.push_back(std::move(partial));
     }
@@ -835,7 +815,7 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     // with one), and are returned in the type they were written in.
     std::vector<timestar::SeriesResult> nonNumericResults;
 
-    const bool isLatestOrFirst = collapsesWholeRange(aggregation);
+    const bool isLatestOrFirst = isLatestOrFirstMethod(aggregation);
 
     // ---- BATCH LATEST/FIRST FAST PATH ----
     // For non-bucketed LATEST/FIRST, resolve all series in a single
@@ -843,16 +823,20 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     // per-series: file snapshot, sort, coroutine overhead, and
     // intermediate PushdownResult/BlockAggregator allocations.
     //
-    // A bucketed LATEST/FIRST can use it too, but ONLY when the whole range
-    // falls inside one epoch-aligned bucket — then "latest per bucket" and
-    // "latest in range" name the same point.  Testing `interval >= range` is
-    // NOT sufficient: a range shorter than the interval still straddles two
-    // buckets when it crosses an epoch boundary (see CLAUDE.md "Aggregation
-    // Result Shape").  The winning point is stamped with its bucket start
-    // below, matching every other interval query.
+    // ONLY for a bucketed LATEST/FIRST whose whole range falls inside one
+    // epoch-aligned bucket — then "latest per bucket" names exactly one point
+    // per series and a single sparse lookup resolves it.  Testing
+    // `interval >= range` is NOT sufficient: a range shorter than the interval
+    // still straddles two buckets when it crosses an epoch boundary (see
+    // CLAUDE.md "Aggregation Result Shape").  The winning point is stamped with
+    // its bucket start below, matching every other interval query.
+    //
+    // interval == 0 is NOT eligible: LATEST/FIRST no longer collapse a range,
+    // so there is no single point to seek to — every timestamp survives and
+    // those queries take the normal per-series path.
     const bool singleBucket =
         aggregationInterval > 0 && (startTime / aggregationInterval) == (endTime / aggregationInterval);
-    if (isLatestOrFirst && (aggregationInterval == 0 || singleBucket)) {
+    if (isLatestOrFirst && singleBucket) {
         const bool wantFirst = (aggregation == AggregationMethod::FIRST);
 
         // Build batch entries
@@ -882,13 +866,10 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
 
             AggregationState state;
             state.addValue(batchEntries[i].value, batchEntries[i].timestamp);
-            if (singleBucket) {
-                // Stamp the bucket start, not the point's own timestamp.
-                const uint64_t bucket = (batchEntries[i].timestamp / aggregationInterval) * aggregationInterval;
-                partial.bucketStates.emplace(bucket, std::move(state));
-            } else {
-                partial.collapsedState = std::move(state);
-            }
+            // Stamp the bucket start, not the point's own timestamp
+            // (aggregationInterval > 0 is guaranteed by singleBucket).
+            const uint64_t bucket = (batchEntries[i].timestamp / aggregationInterval) * aggregationInterval;
+            partial.bucketStates.emplace(bucket, std::move(state));
 
             pushdownPartials.push_back(std::move(partial));
         }
@@ -1379,10 +1360,10 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
     }
     timing.resultCollectionMs = 0.0;
 
-    // Group-by alone does NOT reduce the point count: without an
-    // aggregationInterval every distinct timestamp survives into each group, so
-    // only bucketing or a range-collapsing method (LATEST/FIRST) shrinks output.
-    bool aggregationReducesOutput = request.aggregationInterval > 0 || collapsesWholeRange(request.aggregation);
+    // Only bucketing reduces the point count.  Neither group-by nor
+    // LATEST/FIRST does: without an aggregationInterval every distinct
+    // timestamp survives, whatever the method.
+    bool aggregationReducesOutput = request.aggregationInterval > 0;
     if (!aggregationReducesOutput) {
         for (const auto& p : sqr.partialResults) {
             if (p.collapsedState.has_value()) {
@@ -1545,12 +1526,12 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
     // the final output (merging can only reduce counts via timestamp dedup).
     // Fail fast before the expensive merge + JSON serialization phase.
     //
-    // Skip when bucketing or a range-collapsing method is active: that pipeline
-    // (including pushdown) reduces output far below the raw point count, so
-    // totalPointsRetrieved would be a massive overcount.  The final output
-    // limit is still enforced after aggregation (line ~884).  Group-by alone
-    // does not reduce output — without an interval every timestamp survives.
-    bool aggregationReducesOutput = request.aggregationInterval > 0 || collapsesWholeRange(request.aggregation);
+    // Skip when bucketing is active: that pipeline (including pushdown) reduces
+    // output far below the raw point count, so totalPointsRetrieved would be a
+    // massive overcount.  The final output limit is still enforced after
+    // aggregation (line ~884).  Neither group-by nor LATEST/FIRST reduces
+    // output — without an interval every timestamp survives.
+    bool aggregationReducesOutput = request.aggregationInterval > 0;
     if (!aggregationReducesOutput) {
         for (const auto& p : allPartialResults) {
             if (p.collapsedState.has_value()) {

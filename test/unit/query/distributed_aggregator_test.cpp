@@ -430,10 +430,18 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedLATEST) {
     auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
 
     ASSERT_EQ(grouped.size(), 1);
-    // LATEST without interval collapses to 1 point (the latest across all shards)
-    EXPECT_EQ(grouped[0].points.size(), 1);
-    EXPECT_EQ(grouped[0].points[0].timestamp, 3000);
-    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 30.0);
+    // LATEST without an interval does NOT collapse: it is a cross-series
+    // tie-break at each timestamp, not a reduction over time, so all three
+    // distinct timestamps survive the cross-shard merge (CLAUDE.md
+    // "Aggregation Result Shape").  These three partials hold one point each at
+    // 1000/2000/3000, so nothing folds together and every value passes through.
+    ASSERT_EQ(grouped[0].points.size(), 3);
+    EXPECT_EQ(grouped[0].points[0].timestamp, 1000);
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 10.0);
+    EXPECT_EQ(grouped[0].points[1].timestamp, 2000);
+    EXPECT_DOUBLE_EQ(grouped[0].points[1].value, 20.0);
+    EXPECT_EQ(grouped[0].points[2].timestamp, 3000);
+    EXPECT_DOUBLE_EQ(grouped[0].points[2].value, 30.0);
 }
 
 TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedEmptyInput) {

@@ -332,17 +332,6 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                     state.addValue(doubleValues[i], timestamps[i]);
                     partial.totalPoints++;
                 }
-            } else if (collapsesWholeRange(method)) {
-                // LATEST/FIRST without interval: fold all points into a single
-                // collapsed state — return 1 point per group, not N raw points.
-                partial.totalPoints += timestamps.size();
-                if (!partial.collapsedState.has_value()) {
-                    partial.collapsedState.emplace();
-                }
-                auto& state = *partial.collapsedState;
-                for (size_t i = 0; i < timestamps.size(); ++i) {
-                    state.addValueForMethod(doubleValues[i], timestamps[i], method);
-                }
             } else {
                 // No interval - sorted vector aggregation by timestamp.
                 // Input timestamps are sorted (from queryTsm). Use sorted merge

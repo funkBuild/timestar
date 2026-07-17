@@ -170,8 +170,8 @@ TEST_F(IntervalEpochBucketingTest, MisalignedSmallWindowColdMemstore) {
         eng.startWithBackground();
         insertFivePointRepro(eng.eng, "collapse_cold");
 
-        auto got = runQuery(eng.eng, "collapse_cold", BASE + 3 * SEC, BASE + 21 * SEC, 10 * SEC,
-                            AggregationMethod::AVG);
+        auto got =
+            runQuery(eng.eng, "collapse_cold", BASE + 3 * SEC, BASE + 21 * SEC, 10 * SEC, AggregationMethod::AVG);
         expectMisalignedReproBuckets(got, "cold memstore");
     })
         .join()
@@ -205,8 +205,8 @@ TEST_F(IntervalEpochBucketingTest, MisalignedSmallWindowWarmedTsmPlusMemstore) {
         (void)runQuery(eng.eng, "collapse_warm", BASE, BASE + 21 * SEC, 10 * SEC, AggregationMethod::AVG);
         (void)runQuery(eng.eng, "collapse_warm", BASE, BASE + 60 * SEC, 10 * SEC, AggregationMethod::AVG);
 
-        auto got = runQuery(eng.eng, "collapse_warm", BASE + 3 * SEC, BASE + 21 * SEC, 10 * SEC,
-                            AggregationMethod::AVG);
+        auto got =
+            runQuery(eng.eng, "collapse_warm", BASE + 3 * SEC, BASE + 21 * SEC, 10 * SEC, AggregationMethod::AVG);
         expectMisalignedReproBuckets(got, "warmed TSM+memstore");
     })
         .join()
@@ -224,8 +224,7 @@ TEST_F(IntervalEpochBucketingTest, MisalignedSmallWindowTsmResident) {
         insertFivePointRepro(eng.eng, "collapse_tsm");
         flushToTsm(eng.eng, 1);
 
-        auto got =
-            runQuery(eng.eng, "collapse_tsm", BASE + 3 * SEC, BASE + 21 * SEC, 10 * SEC, AggregationMethod::AVG);
+        auto got = runQuery(eng.eng, "collapse_tsm", BASE + 3 * SEC, BASE + 21 * SEC, 10 * SEC, AggregationMethod::AVG);
         expectMisalignedReproBuckets(got, "TSM resident");
     })
         .join()
@@ -310,8 +309,7 @@ TEST_F(IntervalEpochBucketingTest, NoIntervalAvgShapeIsPlacementAndAlignmentInde
         expectSeries(tsmBefore, allTs, allVals, "TSM, startTime before first point");
 
         // -- split: first points in TSM, later points fresh in the memstore --
-        insertFloatSeries(eng.eng, "rawshape", "v", {{"t", "a"}},
-                          {{BASE + 25 * SEC, 60.0}, {BASE + 30 * SEC, 70.0}});
+        insertFloatSeries(eng.eng, "rawshape", "v", {{"t", "a"}}, {{BASE + 25 * SEC, 60.0}, {BASE + 30 * SEC, 70.0}});
         auto split = runQuery(eng.eng, "rawshape", BASE - SEC, BASE + 31 * SEC, 0, AggregationMethod::AVG);
         std::vector<uint64_t> splitTs = allTs;
         splitTs.push_back(BASE + 25 * SEC);
@@ -329,18 +327,35 @@ TEST_F(IntervalEpochBucketingTest, NoIntervalAvgShapeIsPlacementAndAlignmentInde
 // BUG B — no-interval LATEST collapses to exactly 1 point per series on
 // every path (memstore and TSM).
 // ===========================================================================
-TEST_F(IntervalEpochBucketingTest, NoIntervalLatestCollapsesOnEveryPath) {
+// LATEST is not special without an interval: no method aggregates over time
+// unless the caller asks (CLAUDE.md "Aggregation Result Shape").  `latest` is a
+// cross-series tie-break at each timestamp, so for a single series it is raw
+// passthrough — identical in shape to AVG above, on every placement.
+//
+// It used to collapse to one point, which is what forced callers to send a
+// throwaway tiny aggregationInterval just to keep their time axis.
+TEST_F(IntervalEpochBucketingTest, NoIntervalLatestKeepsEveryTimestampOnEveryPath) {
     seastar::thread([] {
         ScopedShardedEngine eng;
         eng.startWithBackground();
         insertFivePointRepro(eng.eng, "latestshape");
 
+        const std::vector<uint64_t> allTs = {BASE, BASE + 5 * SEC, BASE + 10 * SEC, BASE + 15 * SEC, BASE + 20 * SEC};
+        const std::vector<double> allVals = {10.0, 20.0, 30.0, 40.0, 50.0};
+
         auto memGot = runQuery(eng.eng, "latestshape", BASE, BASE + 21 * SEC, 0, AggregationMethod::LATEST);
-        expectSeries(memGot, {BASE + 20 * SEC}, {50.0}, "memstore latest");
+        expectSeries(memGot, allTs, allVals, "memstore latest");
 
         flushToTsm(eng.eng, 1);
         auto tsmGot = runQuery(eng.eng, "latestshape", BASE, BASE + 21 * SEC, 0, AggregationMethod::LATEST);
-        expectSeries(tsmGot, {BASE + 20 * SEC}, {50.0}, "TSM latest");
+        expectSeries(tsmGot, allTs, allVals, "TSM latest");
+
+        // With an interval it still selects one point per bucket: a 10s bucket
+        // over this data keeps the latest of each.
+        auto bucketed = runQuery(eng.eng, "latestshape", BASE, BASE + 21 * SEC, 10 * SEC, AggregationMethod::LATEST);
+        ASSERT_FALSE(bucketed.timestamps.empty());
+        EXPECT_LT(bucketed.timestamps.size(), allTs.size()) << "an explicit interval must still reduce";
+        EXPECT_DOUBLE_EQ(bucketed.values.back(), 50.0) << "last bucket's latest";
     })
         .join()
         .get();
