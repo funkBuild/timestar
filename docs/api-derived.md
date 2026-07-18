@@ -93,6 +93,28 @@ Formulas reference sub-queries by name and support:
 
 See [Expression Functions](expression-functions.md) for the full function list.
 
+### Sub-queries must be numeric
+
+A formula is arithmetic, so every sub-query it references must resolve to a
+numeric field (float or integer). A **string or boolean** sub-query field is
+rejected with `400`:
+
+```json
+{"status": "error", "error": {"message": "Sub-query 'a' returned non-numeric values"}}
+```
+
+This applies to `anomalies(a)` and `forecast(a)` as well — they run the same
+sub-query machinery.
+
+Booleans used to be coerced to `1.0`/`0.0` here, so `avg:door(open) * 100` was
+accepted as an "uptime %". That answer was wrong whenever an
+`aggregationInterval` was set: booleans are non-numeric (see CLAUDE.md
+"Non-Numeric Fields in Queries"), so the sub-query returns LATEST-per-bucket —
+the state at the end of each bucket — not the fraction of the bucket spent
+`true`. The formula then reported `0` or `100` where the user expected `60`.
+Rejecting is deliberate: there is currently **no** supported way to compute a
+boolean duty cycle through `/derived`.
+
 ## Request Parameters
 
 | Field | Type | Required | Description |

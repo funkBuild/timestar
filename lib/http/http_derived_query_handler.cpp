@@ -14,7 +14,7 @@
 #include <seastar/http/reply.hh>
 #include <stdexcept>
 
-namespace timestar {
+namespace timestar::http {
 
 HttpDerivedQueryHandler::HttpDerivedQueryHandler(seastar::sharded<Engine>* engine, DerivedQueryConfig config)
     : engine_(engine), config_(config) {
@@ -23,13 +23,13 @@ HttpDerivedQueryHandler::HttpDerivedQueryHandler(seastar::sharded<Engine>* engin
 }
 
 void HttpDerivedQueryHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    // addJsonRoute applies timestar::wrapWithAuth per route.
-    timestar::http::addJsonRoute(r, seastar::httpd::operation_type::POST, "/derived", authToken,
-                                 [this](std::unique_ptr<seastar::http::request> req,
-                                        std::unique_ptr<seastar::http::reply> rep)
-                                     -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                                     return handleDerivedQuery(std::move(req), std::move(rep));
-                                 });
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
+    timestar::http::addJsonRoute(
+        r, seastar::httpd::operation_type::POST, "/derived", authToken,
+        [this](std::unique_ptr<seastar::http::request> req,
+               std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            return handleDerivedQuery(std::move(req), std::move(rep));
+        });
 
     http_log.info("Registered HTTP derived query endpoint at /derived{}", authToken.empty() ? "" : " (auth required)");
 }
@@ -239,4 +239,4 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDerivedQueryHandler::
     }
 }
 
-}  // namespace timestar
+}  // namespace timestar::http

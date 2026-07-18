@@ -48,16 +48,24 @@ method:measurement(fields){scopes} by {groupKeys}
 | `stdvar` | Population variance |
 | `spread` | Max minus min |
 
+`latest`/`first` do **not** collapse a time range. They select across *series*
+at each timestamp, so without an `aggregationInterval` they keep every
+timestamp (for a single series they are raw passthrough); with one they select
+a point per bucket. Use an `aggregationInterval` covering the range to get a
+single most-recent value.
+
 ## Field Type Handling
 
-Different field types interact with the aggregation pipeline differently. Numeric types (float, integer, boolean) are aggregated normally, while string fields bypass aggregation entirely.
+Different field types interact with the aggregation pipeline differently. Numeric types (float, integer) are aggregated normally, while string and boolean fields bypass aggregation entirely.
 
 | Type | Behavior |
 |------|----------|
 | **float** | Primary numeric type; aggregated directly |
 | **integer** | Aggregated as numeric values |
-| **boolean** | Converted to doubles (`true` = `1.0`, `false` = `0.0`), then aggregated |
-| **string** | Returned raw; aggregation method is ignored |
+| **boolean** | Non-numeric; returned as `true`/`false`, aggregation method is ignored |
+| **string** | Non-numeric; returned raw, aggregation method is ignored |
+
+Non-numeric fields (string, boolean) are returned in the type they were written in and keep their series tags. Without an `aggregationInterval` they pass through raw; with one they reduce to LATEST-per-bucket (one value per epoch-aligned bucket, stamped with the bucket start). See CLAUDE.md "Non-Numeric Fields in Queries" for the canonical rule.
 
 ## Scope Filtering
 

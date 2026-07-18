@@ -14,11 +14,11 @@ void StreamingAggregator::addPoint(const StreamingDataPoint& pt) {
                     state.addDouble(val, pt.timestamp);
                 } else if constexpr (std::is_same_v<VT, int64_t>) {
                     state.addInt64(val, pt.timestamp);
-                } else if constexpr (std::is_same_v<VT, bool>) {
-                    state.addDouble(val ? 1.0 : 0.0, pt.timestamp);
-                } else if constexpr (std::is_same_v<VT, std::string>) {
-                    // String values can't be aggregated numerically; count only
-                    state.count++;
+                } else {
+                    // Non-numeric (bool, string): never aggregated
+                    // arithmetically — reduced to LATEST-per-bucket and
+                    // emitted in the written type, exactly as POST /query does.
+                    state.addNonNumeric(val, pt.timestamp);
                 }
             },
             pt.value);
@@ -65,15 +65,22 @@ StreamingBatch StreamingAggregator::closeBuckets(uint64_t nowNs) {
         for (auto& [key, state] : it->second) {
             if (state.count == 0)
                 continue;
-            if (state.isStringOnly && _method != AggregationMethod::COUNT)
-                continue;
 
             StreamingDataPoint pt;
             pt.measurement = key.measurement;
             pt.tags = key.tags;
             pt.field = key.field;
             pt.timestamp = it->first;
-            pt.value = state.computeResult(_method);
+            if (state.isNonNumeric) {
+                // The aggregation method is IGNORED for non-numeric fields (it
+                // is on the query path too, including COUNT): the bucket's
+                // latest value is returned in its written type.  These used to
+                // be dropped from the stream entirely unless the method was
+                // COUNT, so a subscription silently lost its string fields.
+                pt.value = std::move(state.latestNonNumeric);
+            } else {
+                pt.value = state.computeResult(_method);
+            }
             batch.points.push_back(std::move(pt));
         }
         eraseEnd = std::next(it);

@@ -1,15 +1,14 @@
 #include "native_index.hpp"
 
 #include "../key_encoding.hpp"
-#include "series_key.hpp"            // for buildSeriesKey
-#include "tsm.hpp"                   // for TSMValueType definition
-#include "value_type_dispatch.hpp"   // for valueTypeName
+#include "series_key.hpp"           // for buildSeriesKey
+#include "tsm.hpp"                  // for TSMValueType definition
+#include "value_type_dispatch.hpp"  // for valueTypeName
 
-#include <glaze/glaze.hpp>
-
-#include <xxhash.h>
+#include <glaze/json.hpp>
 
 #include <endian.h>
+#include <xxhash.h>
 
 #include <algorithm>
 #include <cassert>
@@ -19,9 +18,9 @@
 #include <format>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
-#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/log.hh>
 
 // Use short namespace alias for key encoding
@@ -59,8 +58,7 @@ static std::string nextPrefixBound(std::string_view prefix) {
 // prefix scans. maxKey is populated by SSTableReader::open(); an empty maxKey
 // means the range is unknown and the file cannot be pruned.
 // nextPrefix is the precomputed nextPrefixBound(prefix) (empty = unbounded).
-static bool rangeMayContainPrefix(const SSTableMetadata& meta, std::string_view prefix,
-                                  std::string_view nextPrefix) {
+static bool rangeMayContainPrefix(const SSTableMetadata& meta, std::string_view prefix, std::string_view nextPrefix) {
     if (prefix.empty() || meta.maxKey.empty()) {
         return true;
     }
@@ -168,7 +166,7 @@ NativeIndex::~NativeIndex() {
 seastar::future<> NativeIndex::open() {
     // Note: std::filesystem::absolute() depends on the process CWD at call time.
     // This is fine because open() is called during startup before any CWD change.
-    indexPath_ = std::filesystem::absolute("shard_" + std::to_string(shardId_) + "/native_index").string();
+    indexPath_ = std::filesystem::absolute(timestar::shardDataPath(shardId_) + "/native_index").string();
     co_await seastar::async([this] { std::filesystem::create_directories(indexPath_); });
 
     // Open manifest
@@ -213,10 +211,11 @@ seastar::future<> NativeIndex::open() {
         if (walSyncGate_.is_closed()) {
             return;
         }
-        (void)seastar::with_gate(walSyncGate_, [this] { return wal_->sync(); })
-            .handle_exception([](std::exception_ptr ep) {
-                ::native_index_log.warn("Background WAL sync failed: {}", ep);
-            });
+        (void)seastar::with_gate(walSyncGate_, [this] {
+            return wal_->sync();
+        }).handle_exception([](std::exception_ptr ep) {
+            ::native_index_log.warn("Background WAL sync failed: {}", ep);
+        });
     });
     walSyncTimer_.arm_periodic(kWalSyncInterval);
 
@@ -257,29 +256,33 @@ seastar::future<> NativeIndex::open() {
     // re-record days; the time-scoped gap is bounded to the crash window.
     {
         auto wmVal = co_await kvGet(ke::encodePostingsWatermarkKey());
-        if (wmVal.has_value()) {
-            uint32_t watermark = ke::decodeLocalId(*wmVal);
-            uint32_t repaired = 0;
-            std::string bitmapCacheKey;
-            for (uint32_t id = watermark; id < localIdMap_.nextId(); ++id) {
-                if (!localIdMap_.isValid(id))
-                    continue;
-                SeriesId128 globalId = localIdMap_.getGlobalId(id);
-                auto meta = co_await getSeriesMetadata(globalId);
-                if (!meta.has_value())
-                    continue;
-                for (const auto& [tagKey, tagValue] : meta->tags) {
-                    buildBitmapCacheKey(bitmapCacheKey, meta->measurement, tagKey, tagValue);
-                    auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
-                    bitmap->add(id);
-                }
-                dirtyMeasurementBlooms_.insert(meta->measurement);
-                ++repaired;
+        // A missing watermark does NOT mean "nothing to repair": the watermark
+        // is only written by flushDirtyBitmaps(), while local IDs are persisted
+        // with each series-creation batch. A crash before the first bitmap
+        // flush/clean close leaves assigned IDs with no watermark — the crash
+        // window is then every assigned local ID, so default to 0. (Bitmap
+        // adds are idempotent, so over-repairing is safe.)
+        uint32_t watermark = wmVal.has_value() ? ke::decodeLocalId(*wmVal) : 0;
+        uint32_t repaired = 0;
+        std::string bitmapCacheKey;
+        for (uint32_t id = watermark; id < localIdMap_.nextId(); ++id) {
+            if (!localIdMap_.isValid(id))
+                continue;
+            SeriesId128 globalId = localIdMap_.getGlobalId(id);
+            auto meta = co_await getSeriesMetadata(globalId);
+            if (!meta.has_value())
+                continue;
+            for (const auto& [tagKey, tagValue] : meta->tags) {
+                buildBitmapCacheKey(bitmapCacheKey, meta->measurement, tagKey, tagValue);
+                auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
+                bitmap->add(id);
             }
-            if (repaired > 0) {
-                ::native_index_log.info("Repaired postings for {} series in crash window [{}, {})", repaired,
-                                        watermark, localIdMap_.nextId());
-            }
+            dirtyMeasurementBlooms_.insert(meta->measurement);
+            ++repaired;
+        }
+        if (repaired > 0) {
+            ::native_index_log.info("Repaired postings for {} series in crash window [{}, {})", repaired, watermark,
+                                    localIdMap_.nextId());
         }
     }
 
@@ -1198,10 +1201,9 @@ seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>&
     for (const auto& op : ops) {
         // Use the pre-computed series ID when the producer supplied one (write
         // handler always does) — skips buildSeriesKey + rehash + map copy.
-        SeriesId128 seriesId =
-            !op.seriesId.isZero()
-                ? co_await getOrCreateSeriesId(op.seriesId, op.measurement, op.tags, op.fieldName)
-                : co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
+        SeriesId128 seriesId = !op.seriesId.isZero()
+                                   ? co_await getOrCreateSeriesId(op.seriesId, op.measurement, op.tags, op.fieldName)
+                                   : co_await getOrCreateSeriesId(op.measurement, op.tags, op.fieldName);
         auto typeStr = timestar::valueTypeName(op.valueType);
         if (!typeStr.empty()) {
             co_await setFieldType(op.measurement, op.fieldName, std::string(typeStr));
@@ -2019,9 +2021,8 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
             bloomIt = measurementBloomCache_.find(measurement);
             if (bloomIt == measurementBloomCache_.end()) {
                 bloomIt = measurementBloomCache_
-                              .emplace(measurement, serialized.has_value()
-                                                        ? BloomFilter::deserializeFrom(*serialized)
-                                                        : BloomFilter::createNull())
+                              .emplace(measurement, serialized.has_value() ? BloomFilter::deserializeFrom(*serialized)
+                                                                           : BloomFilter::createNull())
                               .first;
             }
         }
@@ -2649,9 +2650,8 @@ NativeIndex::findSeriesWithMetadataTimeScopedCached(const std::string& measureme
     if (cached)
         co_return *cached;
 
-    auto result =
-        co_await findSeriesWithMetadataTimeScoped(measurement, tagFilters, fieldFilter, startTimeNs, endTimeNs,
-                                                  maxSeries);
+    auto result = co_await findSeriesWithMetadataTimeScoped(measurement, tagFilters, fieldFilter, startTimeNs,
+                                                            endTimeNs, maxSeries);
     if (!result.has_value()) {
         co_return std::unexpected(result.error());
     }
@@ -2902,8 +2902,8 @@ template <class T>
 seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& insert) {
     // insert.seriesId128() is cached by the write handler, so this avoids the
     // buildSeriesKey + rehash and the tag-map copy of the by-value overload.
-    SeriesId128 seriesId = co_await getOrCreateSeriesId(insert.seriesId128(), insert.measurement, insert.getTags(),
-                                                        insert.field);
+    SeriesId128 seriesId =
+        co_await getOrCreateSeriesId(insert.seriesId128(), insert.measurement, insert.getTags(), insert.field);
 
     // Phase 3: Record day bitmaps for time-scoped discovery
     auto localIdOpt = localIdMap_.getLocalId(seriesId);

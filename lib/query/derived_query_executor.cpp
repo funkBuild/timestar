@@ -7,7 +7,7 @@
 #include "http_query_handler.hpp"
 #include "logger.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <chrono>
 #include <seastar/core/when_all.hh>
@@ -196,7 +196,7 @@ seastar::future<DerivedQueryResult> DerivedQueryExecutor::executeFromJson(const 
 
     // Parse aggregation interval if provided
     if (!glazeReq.aggregationInterval.empty()) {
-        request.aggregationInterval = HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
+        request.aggregationInterval = http::HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
     }
 
     // Parse each query string
@@ -260,7 +260,17 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
             continue;
         }
 
-        futures.push_back(executeSubQuery(name, query).then([name](SubQueryResult result) {
+        // Propagate the request-level aggregation interval into the sub-query
+        // so it is bucketed server-side exactly like a plain /query with the
+        // same interval.  Without this, sub-queries run with interval == 0
+        // and the aggregation pushdown collapses each sub-query to a single
+        // point instead of one point per bucket.
+        QueryRequest subQuery = query;
+        if (subQuery.aggregationInterval == 0) {
+            subQuery.aggregationInterval = request.aggregationInterval;
+        }
+
+        futures.push_back(executeSubQuery(name, std::move(subQuery)).then([name](SubQueryResult result) {
             return std::make_pair(name, std::move(result));
         }));
     }
@@ -277,10 +287,9 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
     co_return resultMap;
 }
 
-seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std::string& name,
-                                                                      const QueryRequest& query) {
+seastar::future<SubQueryResult> DerivedQueryExecutor::executeSubQuery(const std::string& name, QueryRequest query) {
     // Create a query handler to execute the sub-query
-    HttpQueryHandler handler(engine_);
+    http::HttpQueryHandler handler(engine_);
 
     auto response = co_await handler.executeQuery(query);
 
@@ -323,14 +332,15 @@ SubQueryResult DerivedQueryExecutor::convertQueryResponse(const std::string& nam
 
         // Extract values (must be numeric for derived metrics) — moved, the
         // response is locally owned and discarded after conversion.
+        //
+        // Booleans are NOT numeric (canonical rule, see CLAUDE.md "Non-Numeric
+        // Fields in Queries") and so are rejected here exactly as strings are.
+        // They used to be coerced to 1.0/0.0, which let a formula compute
+        // arithmetic over a type the query path refuses to aggregate — and,
+        // once an aggregationInterval was set, over LATEST-per-bucket values
+        // rather than the every-point series the formula author expected.
         if (std::holds_alternative<std::vector<double>>(fieldData.second)) {
             subResult.values = std::move(std::get<std::vector<double>>(fieldData.second));
-        } else if (std::holds_alternative<std::vector<bool>>(fieldData.second)) {
-            const auto& boolVals = std::get<std::vector<bool>>(fieldData.second);
-            subResult.values.reserve(boolVals.size());
-            for (bool v : boolVals) {
-                subResult.values.push_back(v ? 1.0 : 0.0);
-            }
         } else if (std::holds_alternative<std::vector<int64_t>>(fieldData.second)) {
             const auto& intVals = std::get<std::vector<int64_t>>(fieldData.second);
             subResult.values.reserve(intVals.size());
@@ -421,7 +431,7 @@ seastar::future<DerivedQueryResultVariant> DerivedQueryExecutor::executeFromJson
 
     // Parse aggregation interval if provided
     if (!glazeReq.aggregationInterval.empty()) {
-        request.aggregationInterval = HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
+        request.aggregationInterval = http::HttpQueryHandler::parseInterval(glazeReq.aggregationInterval);
     }
 
     // Parse each query string

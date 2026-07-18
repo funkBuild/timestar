@@ -127,7 +127,8 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
 
             // Unpack integers into thread-local buffer (capacity persists)
             scratch.decoded_ints.resize(block_count);
-            timestar::alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw, scratch.decoded_ints.data());
+            timestar::alp::ffor_unpack(scratch.packed_data.data(), block_count, for_base, bw,
+                                       scratch.decoded_ints.data());
 
             // Convenient aliases for the per-block data
             auto* decoded_stack = scratch.decoded_ints.data();
@@ -293,7 +294,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 scratch.rd_left_packed.resize(left_packed_words);
                 encoded.readAlignedWords(scratch.rd_left_packed.data(), left_packed_words);
                 timestar::alp::ffor_unpack(scratch.rd_left_packed.data(), block_count, 0, left_bw,
-                                 scratch.rd_left_indices.data());
+                                           scratch.rd_left_indices.data());
             }
 
             // === Read Right FFOR Data ===
@@ -304,7 +305,7 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
                 scratch.rd_right_packed.resize(right_packed_words);
                 encoded.readAlignedWords(scratch.rd_right_packed.data(), right_packed_words);
                 timestar::alp::ffor_unpack_u64(scratch.rd_right_packed.data(), block_count, right_for_base, right_bw,
-                                     scratch.rd_right_parts.data());
+                                               scratch.rd_right_parts.data());
             }
 
             // === Read Exceptions ===

@@ -10,16 +10,13 @@
 #include "content_negotiation.hpp"
 
 #include <seastar/http/reply.hh>
-
 #include <string>
 #include <utility>
 
 namespace timestar::http {
 
 // Write `body` to `rep` with `status` and the correct Content-Type for `fmt`.
-inline void respond(seastar::http::reply& rep,
-                    seastar::http::reply::status_type status,
-                    WireFormat fmt,
+inline void respond(seastar::http::reply& rep, seastar::http::reply::status_type status, WireFormat fmt,
                     std::string body) {
     rep.set_status(status);
     rep._content = std::move(body);

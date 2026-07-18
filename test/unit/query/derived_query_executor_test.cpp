@@ -2,7 +2,7 @@
 
 #include "derived_query.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

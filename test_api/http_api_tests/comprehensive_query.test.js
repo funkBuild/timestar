@@ -421,18 +421,19 @@ describe('Comprehensive TimeStar Query Tests', () => {
       expect(deviceIds).toEqual(['aaaaa', 'bbbbb']);
       
       // Check values for each device.
-      // Group-by without an aggregationInterval now collapses each group's
-      // whole time range into a single aggregated value (InfluxQL-style
-      // "GROUP BY tag" semantics; deliberate "collapsed state" design in
-      // http_query_handler.cpp).
-      // aaaaa: value1 = 0.1*1*i for i=0..99 -> avg = 0.1 * (0+99)/2 = 4.95
-      // bbbbb: value1 = 0.1*4*i for i=0..99 -> avg = 0.4 * (0+99)/2 = 19.8
+      // Grouping never collapses the time axis: without an aggregationInterval
+      // every distinct timestamp survives into each group, exactly as it does
+      // for the same query with no `by` clause. Each group holds one series
+      // here, so its values pass through unaggregated.
+      // aaaaa: value1 = 0.1*1*i for i=0..99
+      // bbbbb: value1 = 0.1*4*i for i=0..99
+      const expectedFor = m => Array.from({ length: 100 }, (_, i) => 0.1 * m * i);
       result.series.forEach(series => {
         const deviceId = getTagValue(series.groupTags, 'deviceId');
         if (deviceId === 'aaaaa') {
-          expect(series.fields.value1.values).toEqual(closeTo([4.95]));
+          expect(series.fields.value1.values).toEqual(closeTo(expectedFor(1)));
         } else if (deviceId === 'bbbbb') {
-          expect(series.fields.value1.values).toEqual(closeTo([19.8]));
+          expect(series.fields.value1.values).toEqual(closeTo(expectedFor(4)));
         }
       });
     });
@@ -474,18 +475,16 @@ describe('Comprehensive TimeStar Query Tests', () => {
         const series = result.series[0];
         expect(series.fields.value).toBeDefined();
 
-        // Boolean fields in aggregation queries are folded numerically by the
-        // pushdown path (booleans opted in: lib/query/query_runner.cpp
-        // "Float, Integer, and Boolean support pushdown aggregation"), so
-        // values come back as 0/1 numbers. Written data was [true, false] at
-        // t-2s and t-1s; with no aggregationInterval the per-point passthrough
-        // is [1, 0] in timestamp order.
-        // NOTE: the non-pushdown fallback path still returns true/false —
-        // path-dependent typing is a known server inconsistency.
+        // Booleans are non-numeric: the named aggregation method is ignored and
+        // values come back as real booleans, in the type they were written in.
+        // Both pushdown paths refuse boolean series, so the typing no longer
+        // depends on where the data sits (memory store vs TSM).
+        // Written data was [true, false] at t-2s and t-1s; with no
+        // aggregationInterval that passes through raw in timestamp order.
         const values = series.fields.value.values;
         expect(values.length).toBe(2);
-        values.forEach(v => expect(typeof v).toBe('number'));
-        expect(values.map(Number)).toEqual([1, 0]);
+        values.forEach(v => expect(typeof v).toBe('boolean'));
+        expect(values).toEqual([true, false]);
       }
     });
 

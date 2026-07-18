@@ -16,9 +16,9 @@
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
-#include <span>
 #include <seastar/core/file.hh>
 #include <seastar/core/semaphore.hh>
+#include <span>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -29,6 +29,20 @@
 class Slice;
 
 enum class TSMValueType { Float = 0, Boolean, String, Integer };
+
+// Canonical definition of "non-numeric" — the single source of truth for the
+// rule in CLAUDE.md "Non-Numeric Fields in Queries": String and Boolean never
+// aggregate arithmetically.  They pass through raw without an
+// aggregationInterval, reduce to LATEST-per-bucket with one, and are always
+// returned in the type they were written in.
+//
+// Every gate that keeps these types off a numeric path MUST call this rather
+// than spell out the list, so a new value type cannot be numeric on one path
+// and non-numeric on another.  (Callers that flatten a FieldValues variant
+// rather than a TSMValueType should mirror this exactly.)
+[[nodiscard]] inline constexpr bool isNonNumericValueType(TSMValueType type) {
+    return type == TSMValueType::String || type == TSMValueType::Boolean;
+}
 
 struct TSMIndexBlock {
     // Field order groups all 8-byte members first, then 4-byte, then 1-byte, to
@@ -66,9 +80,9 @@ struct TSMIndexBlock {
 // always consecutive runs of the input), so the input passed to
 // groupContiguousBlocks() must outlive the returned batches.
 struct BlockBatch {
-    uint64_t startOffset = 0;                // Offset of first block in batch
-    uint64_t totalSize = 0;                  // Sum of all block sizes (uint64_t to avoid overflow)
-    std::span<const TSMIndexBlock> blocks;   // Blocks in this batch (view, not owned)
+    uint64_t startOffset = 0;               // Offset of first block in batch
+    uint64_t totalSize = 0;                 // Sum of all block sizes (uint64_t to avoid overflow)
+    std::span<const TSMIndexBlock> blocks;  // Blocks in this batch (view, not owned)
 };
 
 // Sparse index entry for lazy loading
@@ -160,6 +174,9 @@ private:
     seastar::file tsmFile;
     uint64_t length = 0;
     uint8_t fileVersion = 1;
+    // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
+    // stay open for in-flight snapshot readers; the destructor closes it.
+    bool deferCloseOnDestroy_ = false;
 
     // Lazy loading: sparse index + bloom filter for memory efficiency
     tsl::robin_map<SeriesId128, SparseIndexEntry, SeriesId128::Hash> sparseIndex;
@@ -212,13 +229,36 @@ private:
 public:
     uint64_t tierNum;
     uint64_t seqNum;
+    // Newest write generation contained in this file (last-write-wins dedup).
+    // Flush-created files: == seqNum (flush order == write order per shard).
+    // Compaction outputs: max(dataSeq) of the inputs, carried in the filename
+    // as a `_d<N>` suffix — a fresh seqNum would wrongly outrank newer
+    // tier-0 files whose data was written later.  Legacy files without the
+    // suffix fall back to seqNum.
+    uint64_t dataSeq;
 
     TSM(std::string _absoluteFilePath);
+    // Deferred-close support: when scheduleDelete() ran while readers may
+    // still hold snapshot references, the fd close is deferred to the
+    // destructor (fires when the last shared_ptr drops).
+    ~TSM();
+    TSM(const TSM&) = delete;
+    TSM& operator=(const TSM&) = delete;
     seastar::future<> open();
     seastar::future<> close();
+    // Unique file identity for file-manager maps and file ordering.
+    // NOT a dedup priority — use dataRank() for last-write-wins decisions.
     uint64_t rankAsInteger();
+    // Duplicate-resolution priority: on equal timestamps the file with the
+    // higher dataRank holds the newer write. dataSeq-dominant (write
+    // recency); tier breaks ties (a compacted file at the same dataSeq is a
+    // dedup superset of its inputs).
+    uint64_t dataRank();
 
-    // Schedule async deletion — closes file and removes from disk
+    // Schedule async deletion — unlinks the file from disk.  The fd stays
+    // open until the last shared_ptr reference drops (queries that
+    // snapshotted the TSM file list before compaction removed this file may
+    // still issue DMA reads through it); the destructor then closes it.
     seastar::future<> scheduleDelete();
 
     // Lazy loading index methods
@@ -247,7 +287,9 @@ public:
         auto it = sparseIndex.find(seriesId);
         if (it == sparseIndex.end())
             return false;
-        return it->second.minTime < endTime && startTime <= it->second.maxTime;
+        // Inclusive endTime (matches the memory-store filter and the decode
+        // time filter): a series whose data starts exactly at endTime overlaps.
+        return it->second.minTime <= endTime && startTime <= it->second.maxTime;
     }
 
     // Sparse index time bound accessors (no I/O — used for LATEST/FIRST file ordering)

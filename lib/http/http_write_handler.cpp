@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <numeric>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -28,19 +30,14 @@ using namespace seastar;
 using namespace httpd;
 using timestar::buildSeriesKey;
 
+namespace timestar::http {
+
 // Glaze-compatible structures for JSON parsing
 struct GlazeWritePoint {
     std::string measurement;
     std::map<std::string, std::string> tags;
     json_value_t fields;  // Use u64 mode for integer precision
     std::optional<uint64_t> timestamp;
-};
-
-template <>
-struct glz::meta<GlazeWritePoint> {
-    using T = GlazeWritePoint;
-    static constexpr auto value =
-        object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields, "timestamp", &T::timestamp);
 };
 
 // Fast-path struct for the common case: single write with all double fields.
@@ -55,12 +52,23 @@ struct FastDoubleWritePoint {
     std::map<std::string, std::vector<double>> fields;
 };
 
+}  // namespace timestar::http
+
 template <>
-struct glz::meta<FastDoubleWritePoint> {
-    using T = FastDoubleWritePoint;
+struct glz::meta<timestar::http::GlazeWritePoint> {
+    using T = timestar::http::GlazeWritePoint;
+    static constexpr auto value =
+        object("measurement", &T::measurement, "tags", &T::tags, "fields", &T::fields, "timestamp", &T::timestamp);
+};
+
+template <>
+struct glz::meta<timestar::http::FastDoubleWritePoint> {
+    using T = timestar::http::FastDoubleWritePoint;
     static constexpr auto value = object("measurement", &T::measurement, "tags", &T::tags, "timestamps", &T::timestamps,
                                          "timestamp", &T::timestamp, "fields", &T::fields);
 };
+
+namespace timestar::http {
 
 // File-scope shard-local cache of series IDs that have already been indexed.
 // After the first batch, subsequent writes for the same series skip the
@@ -83,6 +91,88 @@ static void knownSeriesInsert(const SeriesId128& id) {
         knownSeriesCurrent = tsl::robin_set<SeriesId128, SeriesId128::Hash>{};
     }
     knownSeriesCurrent.insert(id);
+}
+
+// Remove series from the known-series cache after a FAILED metadata indexing
+// attempt.  knownSeriesInsert() runs optimistically while building MetaOps;
+// if indexMetadataSync later throws, leaving the entries cached would make a
+// RETRY of the same write silently skip metadata indexing ("succeed") while
+// the series never appears in /measurements.  A failed write must leave no
+// trace in this cache.
+static void unpoisonKnownSeries(const std::vector<MetadataOp>& ops) {
+    for (const auto& op : ops) {
+        if (!op.seriesId.isZero()) {
+            knownSeriesCurrent.erase(op.seriesId);
+            knownSeriesPrevious.erase(op.seriesId);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Identifier limits — mirror the hard limits enforced by the index encoder
+// (lib/index/key_encoding.cpp encodeSeriesMetadata).  Enforcing them up
+// front turns what used to be a 500 ("SeriesMetadata has suspiciously long
+// strings") after the data write into a clean 400 BEFORE any state changes.
+// -----------------------------------------------------------------------
+static constexpr size_t MAX_MEASUREMENT_LEN = 10000;
+static constexpr size_t MAX_FIELD_NAME_LEN = 10000;
+static constexpr size_t MAX_TAG_LEN = 1000;
+static constexpr size_t MAX_TAG_COUNT = 1000;
+
+static bool validateIdentifierLimits(const std::string& measurement, const std::map<std::string, std::string>& tags,
+                                     std::string& error) {
+    if (measurement.size() > MAX_MEASUREMENT_LEN) {
+        error = "Measurement name too long: " + std::to_string(measurement.size()) + " bytes exceeds maximum of " +
+                std::to_string(MAX_MEASUREMENT_LEN);
+        return false;
+    }
+    if (tags.size() > MAX_TAG_COUNT) {
+        error =
+            "Too many tags: " + std::to_string(tags.size()) + " exceeds maximum of " + std::to_string(MAX_TAG_COUNT);
+        return false;
+    }
+    for (const auto& [k, v] : tags) {
+        if (k.size() > MAX_TAG_LEN || v.size() > MAX_TAG_LEN) {
+            error = "Tag key/value too long: exceeds maximum of " + std::to_string(MAX_TAG_LEN) + " bytes";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool validateFieldNameLimit(const std::string& fieldName, std::string& error) {
+    if (fieldName.size() > MAX_FIELD_NAME_LEN) {
+        error = "Field name too long: " + std::to_string(fieldName.size()) + " bytes exceeds maximum of " +
+                std::to_string(MAX_FIELD_NAME_LEN);
+        return false;
+    }
+    return true;
+}
+
+// Index metadata for the given ops; on failure, remove the ops' series from
+// the known-series cache (see unpoisonKnownSeries) before rethrowing, so a
+// retry re-attempts metadata indexing instead of silently skipping it.
+static seastar::future<> syncMetadataUnpoisonOnFailure(seastar::sharded<Engine>* engineSharded,
+                                                       std::vector<MetadataOp> ops) {
+    if (ops.empty()) {
+        co_return;
+    }
+    std::vector<SeriesId128> ids;
+    ids.reserve(ops.size());
+    for (const auto& op : ops) {
+        ids.push_back(op.seriesId);
+    }
+    try {
+        co_await engineSharded->local().indexMetadataSync(std::move(ops));
+    } catch (...) {
+        for (const auto& id : ids) {
+            if (!id.isZero()) {
+                knownSeriesCurrent.erase(id);
+                knownSeriesPrevious.erase(id);
+            }
+        }
+        throw;
+    }
 }
 
 HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {
@@ -173,6 +263,112 @@ void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Optional explicit field typing.  A write point may carry
+//
+//   "field_types": {"<field>": "float" | "int" | "bool" | "string"}
+//
+// which overrides JSON token-shape type detection for the named fields.
+// Without it, the stored type is inferred from how the number is written
+// ("10" -> integer, "10.0" -> float) — a problem for serializers that emit
+// whole-number floats as integer tokens (JavaScript's JSON.stringify(10.0)
+// produces "10").  Accepted aliases: double==float, integer==int64==int,
+// boolean==bool.
+// ---------------------------------------------------------------------------
+
+static TSMValueType parseFieldTypeName(const std::string& fieldName, const std::string& typeName) {
+    if (typeName == "float" || typeName == "double")
+        return TSMValueType::Float;
+    if (typeName == "int" || typeName == "integer" || typeName == "int64")
+        return TSMValueType::Integer;
+    if (typeName == "bool" || typeName == "boolean")
+        return TSMValueType::Boolean;
+    if (typeName == "string")
+        return TSMValueType::String;
+    throw std::invalid_argument("Unknown type '" + typeName + "' in field_types for field '" + fieldName +
+                                "' (expected float, int, bool, or string)");
+}
+
+// Extract the optional "field_types" object from a write-point object.
+// Returns an empty map when the key is absent; throws on malformed input.
+static std::map<std::string, TSMValueType> extractFieldTypes(const json_value_t::object_t& obj) {
+    std::map<std::string, TSMValueType> declared;
+    auto it = obj.find("field_types");
+    if (it == obj.end()) {
+        return declared;
+    }
+    if (!it->second.is_object()) {
+        throw std::invalid_argument("'field_types' must be a JSON object mapping field names to type names");
+    }
+    for (const auto& [fieldName, typeValue] : it->second.get<json_value_t::object_t>()) {
+        if (!typeValue.is_string()) {
+            throw std::invalid_argument("field_types entry '" + fieldName + "' must be a string type name");
+        }
+        declared[fieldName] = parseFieldTypeName(fieldName, typeValue.get<std::string>());
+    }
+    return declared;
+}
+
+// Validate one JSON value against a declared type.  Numeric widening
+// (integer token -> declared float) is allowed; a declared int accepts a
+// float token only when the value is integral and fits int64.  Everything
+// else must match exactly — an explicit declaration turning into silent
+// coercion would defeat its purpose.
+static void checkDeclaredType(TSMValueType declared, const json_value_t& v, const std::string& fieldName) {
+    switch (declared) {
+        case TSMValueType::Float:
+            if (!v.is_number()) {
+                throw std::invalid_argument("Field '" + fieldName +
+                                            "' is declared float but the value is not a number");
+            }
+            return;
+        case TSMValueType::Integer: {
+            if (!v.is_number()) {
+                throw std::invalid_argument("Field '" + fieldName + "' is declared int but the value is not a number");
+            }
+            if (v.holds<double>()) {
+                const double d = v.get<double>();
+                // Integral check plus int64 range: [-2^63, 2^63) in double space.
+                if (!std::isfinite(d) || d != std::trunc(d) || d < -9223372036854775808.0 ||
+                    d >= 9223372036854775808.0) {
+                    throw std::invalid_argument("Field '" + fieldName +
+                                                "' is declared int but the value is not an integral int64");
+                }
+            } else if (v.holds<uint64_t>() &&
+                       v.get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                throw std::invalid_argument("Field '" + fieldName + "' is declared int but the value overflows int64");
+            }
+            return;
+        }
+        case TSMValueType::Boolean:
+            if (!v.is_boolean()) {
+                throw std::invalid_argument("Field '" + fieldName +
+                                            "' is declared bool but the value is not a boolean");
+            }
+            return;
+        case TSMValueType::String:
+            if (!v.is_string()) {
+                throw std::invalid_argument("Field '" + fieldName +
+                                            "' is declared string but the value is not a string");
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+// Reject field_types entries that name no field in this point.  A typo'd
+// name silently falling back to token-shape detection would recreate the
+// exact failure mode explicit typing exists to prevent.
+static void requireDeclaredFieldsPresent(const std::map<std::string, TSMValueType>& declared,
+                                         const json_value_t::object_t& fieldsObj) {
+    for (const auto& [name, type] : declared) {
+        if (fieldsObj.find(name) == fieldsObj.end()) {
+            throw std::invalid_argument("field_types entry '" + name + "' has no matching field in 'fields'");
+        }
+    }
+}
+
 HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const json_value_t& point,
                                                                          uint64_t defaultTimestampNs) {
     MultiWritePoint mwp;
@@ -236,6 +432,10 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
     }
     auto& fields_obj = fieldsIt->second.get<json_value_t::object_t>();
 
+    // Optional explicit types override token-shape detection per field.
+    const auto declaredTypes = extractFieldTypes(obj);
+    requireDeclaredFieldsPresent(declaredTypes, fields_obj);
+
     for (auto& [fieldName, fieldValue] : fields_obj) {
         // Validate field name (fast path avoids string allocation for valid names)
         if (!isValidName(fieldName)) {
@@ -246,85 +446,109 @@ HttpWriteHandler::MultiWritePoint HttpWriteHandler::parseMultiWritePoint(const j
 
         FieldArrays fa;
 
+        const auto declIt = declaredTypes.find(fieldName);
+        const bool hasDeclared = (declIt != declaredTypes.end());
+
+        const json_value_t::array_t* arrPtr = nullptr;
+        const json_value_t* firstValue = &fieldValue;
         if (fieldValue.is_array()) {
             auto& arr = fieldValue.get<json_value_t::array_t>();
             if (arr.empty()) {
                 throw std::invalid_argument("Field array cannot be empty: " + fieldName);
             }
+            arrPtr = &arr;
+            firstValue = &arr[0];
+        }
 
-            // Determine type from first element
-            const size_t arrSize = arr.size();
-            if (arr[0].is_number()) {
-                if (arr[0].holds<int64_t>() || arr[0].holds<uint64_t>()) {
-                    fa.type = FieldArrays::INTEGER;
-                    fa.integers.reserve(arrSize);
-                    for (auto& elem : arr) {
-                        if (elem.is_number()) {
-                            fa.integers.push_back(elem.as<int64_t>());
-                        } else {
-                            throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                        }
-                    }
-                } else {
-                    fa.type = FieldArrays::DOUBLE;
-                    fa.doubles.reserve(arrSize);
-                    for (auto& elem : arr) {
-                        if (elem.is_number()) {
-                            fa.doubles.push_back(elem.as<double>());
-                        } else {
-                            throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                        }
-                    }
-                }
-            } else if (arr[0].is_boolean()) {
+        // Effective type: declared (explicit) or detected from the first
+        // value's JSON token shape.
+        TSMValueType effectiveType;
+        if (hasDeclared) {
+            effectiveType = declIt->second;
+        } else if (firstValue->is_number()) {
+            // With generic_u64 parsing, integer JSON tokens (no decimal point)
+            // are stored as int64_t/uint64_t, while floats are stored as double.
+            effectiveType = (firstValue->holds<int64_t>() || firstValue->holds<uint64_t>()) ? TSMValueType::Integer
+                                                                                            : TSMValueType::Float;
+        } else if (firstValue->is_boolean()) {
+            effectiveType = TSMValueType::Boolean;
+        } else if (firstValue->is_string()) {
+            effectiveType = TSMValueType::String;
+        } else {
+            throw std::invalid_argument(arrPtr != nullptr ? "Unsupported field array type: " + fieldName
+                                                          : "Unsupported field type: " + fieldName);
+        }
+
+        // Append one value under the effective type. Declared types get the
+        // stricter compatibility check (integral int64 for declared int, no
+        // cross-type coercion); detected types keep the legacy per-element
+        // same-kind check.
+        auto appendValue = [&](const json_value_t& elem) {
+            if (hasDeclared) {
+                checkDeclaredType(effectiveType, elem, fieldName);
+            }
+            switch (effectiveType) {
+                case TSMValueType::Float:
+                    if (!elem.is_number())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.doubles.push_back(elem.as<double>());
+                    break;
+                case TSMValueType::Integer:
+                    if (!elem.is_number())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.integers.push_back(elem.as<int64_t>());
+                    break;
+                case TSMValueType::Boolean:
+                    if (!elem.is_boolean())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.bools.push_back(elem.get<bool>() ? 1 : 0);
+                    break;
+                case TSMValueType::String:
+                    if (!elem.is_string())
+                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
+                    fa.strings.push_back(elem.get<std::string>());
+                    break;
+                default:
+                    throw std::invalid_argument("Unsupported field type: " + fieldName);
+            }
+        };
+
+        switch (effectiveType) {
+            case TSMValueType::Float:
+                fa.type = FieldArrays::DOUBLE;
+                break;
+            case TSMValueType::Integer:
+                fa.type = FieldArrays::INTEGER;
+                break;
+            case TSMValueType::Boolean:
                 fa.type = FieldArrays::BOOL;
-                fa.bools.reserve(arrSize);
-                for (auto& elem : arr) {
-                    if (elem.is_boolean()) {
-                        fa.bools.push_back(elem.get<bool>() ? 1 : 0);
-                    } else {
-                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                    }
-                }
-            } else if (arr[0].is_string()) {
+                break;
+            default:
                 fa.type = FieldArrays::STRING;
-                fa.strings.reserve(arrSize);
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected string array field '{}' with {} elements",
-                                fieldName, arr.size());
-                for (auto& elem : arr) {
-                    if (elem.is_string()) {
-                        fa.strings.push_back(elem.get<std::string>());
-                    } else {
-                        throw std::invalid_argument("Mixed types in field array: " + fieldName);
-                    }
-                }
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Added {} string values to field '{}'",
-                                fa.strings.size(), fieldName);
-            } else {
-                throw std::invalid_argument("Unsupported field array type: " + fieldName);
+                break;
+        }
+
+        if (arrPtr != nullptr) {
+            const size_t arrSize = arrPtr->size();
+            switch (effectiveType) {
+                case TSMValueType::Float:
+                    fa.doubles.reserve(arrSize);
+                    break;
+                case TSMValueType::Integer:
+                    fa.integers.reserve(arrSize);
+                    break;
+                case TSMValueType::Boolean:
+                    fa.bools.reserve(arrSize);
+                    break;
+                default:
+                    fa.strings.reserve(arrSize);
+                    break;
+            }
+            for (const auto& elem : *arrPtr) {
+                appendValue(elem);
             }
         } else {
-            // Single value - convert to array of size 1
-            if (fieldValue.is_number()) {
-                if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
-                    fa.type = FieldArrays::INTEGER;
-                    fa.integers.push_back(fieldValue.as<int64_t>());
-                } else {
-                    fa.type = FieldArrays::DOUBLE;
-                    fa.doubles.push_back(fieldValue.as<double>());
-                }
-            } else if (fieldValue.is_boolean()) {
-                fa.type = FieldArrays::BOOL;
-                fa.bools.push_back(fieldValue.get<bool>() ? 1 : 0);
-            } else if (fieldValue.is_string()) {
-                fa.type = FieldArrays::STRING;
-                auto str_value = fieldValue.get<std::string>();
-                fa.strings.push_back(str_value);
-                LOG_INSERT_PATH(timestar::http_log, debug, "[WRITE] Detected single string field '{}' with value: '{}'",
-                                fieldName, str_value);
-            } else {
-                throw std::invalid_argument("Unsupported field type: " + fieldName);
-            }
+            appendValue(fieldValue);
         }
 
         mwp.fields[fieldName] = std::move(fa);
@@ -482,8 +706,9 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::dispat
     }
     // Remote shard: copy the (moved-in) batches across via invoke_on.
     return engineSharded->invoke_on(
-        shard, [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
-                integers = std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
+        shard,
+        [doubles = std::move(doubles), bools = std::move(bools), strings = std::move(strings),
+         integers = std::move(integers)](Engine& engine) mutable -> seastar::future<AggregatedTimingInfo> {
             return insertAllTypes(engine, std::move(doubles), std::move(bools), std::move(strings),
                                   std::move(integers));
         });
@@ -641,9 +866,9 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
     // series-key prefix and shared tag map are reused, skipping tag map
     // construction, validation, prefix building, and the shared_ptr allocation.
     bool memoValid = false;
-    std::string_view memoMeasurement;                        // views into writes_array (stable for the loop)
-    const json_value_t::object_t* memoTagsObj = nullptr;     // nullptr == no/empty tags object
-    std::string seriesKeyPrefix;                             // hoisted: reused capacity across writes
+    std::string_view memoMeasurement;                     // views into writes_array (stable for the loop)
+    const json_value_t::object_t* memoTagsObj = nullptr;  // nullptr == no/empty tags object
+    std::string seriesKeyPrefix;                          // hoisted: reused capacity across writes
     std::shared_ptr<const std::map<std::string, std::string>> sharedTags;
 
     // DOM-to-DOM tag-object equality (string-valued tags only; any non-string
@@ -796,6 +1021,13 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                 continue;
 
             auto& fieldsObj = fieldsIt->second.get<json_value_t::object_t>();
+
+            // Optional explicit types override token-shape detection per field.
+            // Malformed field_types throws, so this write is skipped and counted
+            // like any other invalid batch entry.
+            const auto declaredTypes = extractFieldTypes(writeObj);
+            requireDeclaredFieldsPresent(declaredTypes, fieldsObj);
+
             for (const auto& [fieldName, fieldValue] : fieldsObj) {
                 // Validate field name (guard with the allocation-free predicate; build the
                 // error context only on the invalid path).
@@ -808,6 +1040,9 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                 seriesKey += " ";
                 seriesKey += fieldName;
 
+                const auto declTypeIt = declaredTypes.find(fieldName);
+                const bool hasDeclaredType = (declTypeIt != declaredTypes.end());
+
                 if (fieldValue.is_array()) {
                     // Array field - expand all elements into the candidate
                     auto& arr = fieldValue.get<json_value_t::array_t>();
@@ -815,9 +1050,12 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                         throw std::invalid_argument("Field array cannot be empty: " + fieldName);
                     }
 
-                    // Determine type from first element
+                    // Declared type (optional "field_types") overrides detection
+                    // from the first element's token shape.
                     TSMValueType valueType;
-                    if (arr[0].is_number()) {
+                    if (hasDeclaredType) {
+                        valueType = declTypeIt->second;
+                    } else if (arr[0].is_number()) {
                         // With generic_u64 parsing, integer JSON values (no decimal point)
                         // are stored as int64_t/uint64_t, while floats are stored as double.
                         if (arr[0].holds<int64_t>() || arr[0].holds<uint64_t>()) {
@@ -870,6 +1108,12 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                         candidate.integerValues.reserve(candidate.integerValues.size() + arr.size());
                     for (size_t i = 0; i < arr.size(); i++) {
                         auto& elem = arr[i];
+                        // Declared types get the stricter compatibility check
+                        // (validated against the DECLARED type even if the
+                        // candidate was promoted Integer->Float).
+                        if (hasDeclaredType) {
+                            checkDeclaredType(declTypeIt->second, elem, fieldName);
+                        }
                         candidate.timestamps.push_back(fieldTimestamps[i]);
                         candidate.timestampHashSum += fieldTimestamps[i];
                         candidate.timestampHashXor ^= fieldTimestamps[i];
@@ -895,9 +1139,13 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
                         }
                     }
                 } else {
-                    // Scalar field - determine type and add single value
+                    // Scalar field - determine type and add single value.
+                    // Declared type (optional "field_types") overrides detection.
                     TSMValueType valueType;
-                    if (fieldValue.is_number()) {
+                    if (hasDeclaredType) {
+                        valueType = declTypeIt->second;
+                        checkDeclaredType(valueType, fieldValue, fieldName);
+                    } else if (fieldValue.is_number()) {
                         if (fieldValue.holds<int64_t>() || fieldValue.holds<uint64_t>()) {
                             valueType = TSMValueType::Integer;
                         } else {
@@ -1073,9 +1321,20 @@ std::vector<HttpWriteHandler::MultiWritePoint> HttpWriteHandler::coalesceWrites(
 }
 
 bool HttpWriteHandler::validateArraySizes(const MultiWritePoint& point, std::string& error) {
+    // Identifier limits first (measurement/tag lengths, tag count) — these
+    // mirror the index encoder's hard limits so oversized identifiers are
+    // rejected with a 400 BEFORE any data or metadata state changes.
+    static const std::map<std::string, std::string> kNoTags;
+    if (!validateIdentifierLimits(point.measurement, point.tags ? *point.tags : kNoTags, error)) {
+        return false;
+    }
+
     size_t expectedSize = point.timestamps.size();
 
     for (const auto& [fieldName, fieldArray] : point.fields) {
+        if (!validateFieldNameLimit(fieldName, error)) {
+            return false;
+        }
         size_t fieldSize = 0;
         switch (fieldArray.type) {
             case FieldArrays::DOUBLE:
@@ -1126,8 +1385,7 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
     // because shared_ptr uses atomic refcounting. The tag map is already
     // shared: producers wrap it once and we just take the pointer (no deep
     // copy + re-wrap per point).
-    auto sharedTags = point.tags ? std::move(point.tags)
-                                 : std::make_shared<const std::map<std::string, std::string>>();
+    auto sharedTags = point.tags ? std::move(point.tags) : std::make_shared<const std::map<std::string, std::string>>();
     auto sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(point.timestamps));
 
     // Timestamp range for MetadataOp day-bitmap coverage (first batch of a
@@ -1192,9 +1450,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::Float, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1220,9 +1477,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::Boolean, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1252,9 +1508,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::String, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1280,9 +1535,8 @@ void HttpWriteHandler::accumulateMultiWritePoint(MultiWritePoint& point, BatchAc
                         if (!knownSeriesContains(seriesId)) {
                             knownSeriesInsert(seriesId);
                             auto [mnTs, mxTs] = tsRange();
-                            metaOps.push_back(
-                                MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags, mnTs, mxTs,
-                                       seriesId});
+                            metaOps.push_back(MetaOp{TSMValueType::Integer, point.measurement, fieldName, *sharedTags,
+                                                     mnTs, mxTs, seriesId});
                         }
                     }
                 }
@@ -1328,10 +1582,9 @@ seastar::future<HttpWriteHandler::WriteResult> HttpWriteHandler::processMultiWri
             continue;
         }
 
-        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(acc.shardDoubles[shard]),
-                                                    std::move(acc.shardBools[shard]),
-                                                    std::move(acc.shardStrings[shard]),
-                                                    std::move(acc.shardIntegers[shard])));
+        shardFutures.push_back(dispatchShardInserts(
+            engineSharded, shard, std::move(acc.shardDoubles[shard]), std::move(acc.shardBools[shard]),
+            std::move(acc.shardStrings[shard]), std::move(acc.shardIntegers[shard])));
     }
 
     // Wait for all shard operations to complete in parallel
@@ -1452,8 +1705,7 @@ seastar::future<bool> HttpWriteHandler::readWriteBody(seastar::http::request& re
 // views memory owned by the caller (req->content or bodyStorage), which
 // outlives this parent-awaited coroutine.
 seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, uint64_t defaultTimestampNs,
-                                                        timestar::http::WireFormat resFmt,
-                                                        seastar::http::reply& rep) {
+                                                        timestar::http::WireFormat resFmt, seastar::http::reply& rep) {
     auto fastResult = timestar::proto::parseWriteRequestFast(body.data(), body.size(), defaultTimestampNs);
 
     // Yield after CPU-heavy proto parse to prevent reactor stalls
@@ -1471,6 +1723,20 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
     std::vector<std::vector<TimeStarInsert<int64_t>>> shardIntegerInserts(shardCount);
     std::vector<MetaOp> allMetaOps;
     std::unordered_set<SeriesId128, SeriesId128::Hash> seenMF;
+
+    // Validate identifier limits for the WHOLE request up front (mirrors the
+    // JSON path's validateArraySizes) so an oversized measurement/field/tag
+    // is rejected with 400 before any data write or metadata cache mutation.
+    {
+        static const std::map<std::string, std::string> kNoTags;
+        std::string identErr;
+        for (const auto& ffi : fastResult.inserts) {
+            if (!validateIdentifierLimits(ffi.measurement, ffi.tags ? *ffi.tags : kNoTags, identErr) ||
+                !validateFieldNameLimit(ffi.fieldName, identErr)) {
+                throw std::invalid_argument(identErr);
+            }
+        }
+    }
 
     for (auto& ffi : fastResult.inserts) {
         // Compute series ID once for shard routing and metadata dedup.
@@ -1563,8 +1829,8 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
     shardFutures.reserve(shardCount);
 
     for (size_t shard = 0; shard < shardCount; ++shard) {
-        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() &&
-            shardStringInserts[shard].empty() && shardIntegerInserts[shard].empty()) {
+        if (shardDoubleInserts[shard].empty() && shardBoolInserts[shard].empty() && shardStringInserts[shard].empty() &&
+            shardIntegerInserts[shard].empty()) {
             continue;
         }
 
@@ -1578,12 +1844,20 @@ seastar::future<> HttpWriteHandler::handleProtobufWrite(std::string_view body, u
     }
 
     if (!shardFutures.empty()) {
-        co_await seastar::when_all_succeed(std::move(shardFutures));
+        try {
+            co_await seastar::when_all_succeed(std::move(shardFutures));
+        } catch (...) {
+            // Data dispatch failed before metadata was indexed — the series
+            // registered in the known-series cache during MetaOp construction
+            // must be unpoisoned so a retry re-attempts metadata indexing.
+            unpoisonKnownSeries(allMetaOps);
+            throw;
+        }
     }
 
     // Index metadata
     if (!allMetaOps.empty()) {
-        co_await engineSharded->local().indexMetadataSync(std::move(allMetaOps));
+        co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(allMetaOps));
     }
 
     rep.set_status(seastar::http::reply::status_type::ok);
@@ -1633,7 +1907,7 @@ seastar::future<bool> HttpWriteHandler::tryFastDoubleWrite(std::string_view body
                 auto writeResult = co_await processMultiWritePoint(mwp);
 
                 if (!writeResult.metaOps.empty()) {
-                    co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
+                    co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(writeResult.metaOps));
                 }
                 co_return true;
             }
@@ -1689,6 +1963,10 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
         for (auto& mwp : coalescedWrites) {
             std::string error;
             if (!validateArraySizes(mwp, error)) {
+                // Earlier MWPs in this request may already have registered
+                // their series in the known-series cache; nothing was (or
+                // will be) written or indexed, so unpoison before failing.
+                unpoisonKnownSeries(acc.metaOps);
                 throw std::invalid_argument(error);
             }
             pointsWritten += static_cast<int64_t>(mwp.timestamps.size()) * static_cast<int64_t>(mwp.fields.size());
@@ -1711,10 +1989,9 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
             continue;
         }
         activeShards.push_back(shard);
-        shardFutures.push_back(dispatchShardInserts(engineSharded, shard, std::move(acc.shardDoubles[shard]),
-                                                    std::move(acc.shardBools[shard]),
-                                                    std::move(acc.shardStrings[shard]),
-                                                    std::move(acc.shardIntegers[shard])));
+        shardFutures.push_back(dispatchShardInserts(
+            engineSharded, shard, std::move(acc.shardDoubles[shard]), std::move(acc.shardBools[shard]),
+            std::move(acc.shardStrings[shard]), std::move(acc.shardIntegers[shard])));
     }
 
     auto shardResults = co_await seastar::when_all(shardFutures.begin(), shardFutures.end());
@@ -1723,9 +2000,19 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
     // failed, all points routed to that shard count as failed.
     int64_t failedWrites = 0;
     std::vector<std::string> writeErrors;
+    std::optional<std::string> tooLargeError;
     for (size_t i = 0; i < shardResults.size(); ++i) {
         try {
             shardResults[i].get();
+        } catch (const timestar::InsertTooLargeException& e) {
+            const unsigned shard = activeShards[i];
+            timestar::http_log.warn("Batch too large for WAL segment on shard {}: {}", shard, e.what());
+            pointsWritten -= acc.shardPoints[shard];
+            failedWrites += acc.shardPoints[shard];
+            tooLargeError = e.what();
+            if (writeErrors.size() < 10) {
+                writeErrors.emplace_back("shard " + std::to_string(shard) + ": " + e.what());
+            }
         } catch (const std::exception& e) {
             const unsigned shard = activeShards[i];
             timestar::http_log.error("Error inserting batch on shard {}: {}", shard, e.what());
@@ -1737,15 +2024,23 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
         }
     }
 
+    // If nothing was written and the batch was simply too large for a WAL
+    // segment, surface it as a client error (413) instead of a "partial"
+    // success — let the top-level handler build the flat error response.
+    // Metadata was never indexed for this request, so unpoison the cache.
+    if (tooLargeError.has_value() && pointsWritten == 0) {
+        unpoisonKnownSeries(acc.metaOps);
+        throw timestar::InsertTooLargeException(*tooLargeError);
+    }
+
 #if TIMESTAR_LOG_INSERT_PATH
     size_t metaOpsCount = acc.metaOps.size();
 #endif
     if (!acc.metaOps.empty()) {
-        co_await engineSharded->local().indexMetadataSync(std::move(acc.metaOps));
+        co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(acc.metaOps));
     }
 #if TIMESTAR_LOG_INSERT_PATH
-    LOG_INSERT_PATH(timestar::http_log, info, "[METADATA] Batch: indexed {} unique series synchronously",
-                    metaOpsCount);
+    LOG_INSERT_PATH(timestar::http_log, info, "[METADATA] Batch: indexed {} unique series synchronously", metaOpsCount);
 #endif
 
     // Include coalesce-skipped entries in failure count
@@ -1857,7 +2152,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
                     size_t metaOpsCount = writeResult.metaOps.size();
 #endif
                     if (!writeResult.metaOps.empty()) {
-                        co_await engineSharded->local().indexMetadataSync(std::move(writeResult.metaOps));
+                        co_await syncMetadataUnpoisonOnFailure(engineSharded, std::move(writeResult.metaOps));
                     }
 #if TIMESTAR_LOG_INSERT_PATH
                     LOG_INSERT_PATH(timestar::http_log, info,
@@ -1900,6 +2195,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
             rep->_content = createErrorResponse(e.what());
         }
         timestar::http::setContentType(*rep, resFmt);
+    } catch (const timestar::InsertTooLargeException& e) {
+        // Request larger than a WAL segment can hold — client error, not a
+        // server fault: 413 Payload Too Large with a flat error body.
+        ++engineSharded->local().metrics().insert_errors_total;
+        timestar::http_log.debug("Write too large: {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::payload_too_large);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+        } else {
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
     } catch (const std::exception& e) {
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.error("Error handling write request: {}", e.what());
@@ -1916,7 +2223,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 }
 
 void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    // addJsonRoute applies timestar::wrapWithAuth per route.
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
     timestar::http::addJsonRoute(
         r, seastar::httpd::operation_type::POST, "/write", authToken,
         [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
@@ -1924,3 +2231,5 @@ void HttpWriteHandler::registerRoutes(seastar::httpd::routes& r, std::string_vie
 
     timestar::http_log.info("Registered HTTP write endpoint at /write{}", authToken.empty() ? "" : " (auth required)");
 }
+
+}  // namespace timestar::http

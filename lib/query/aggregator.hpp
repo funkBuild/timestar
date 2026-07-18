@@ -42,8 +42,12 @@ struct PrehashedStringEqual {
     bool operator()(const PrehashedString& a, const PrehashedString& b) const { return a.value == b.value; }
 };
 
-// Forward declarations
+// Forward declarations (SeriesResult lives in timestar::http; keep the
+// timestar-level alias visible for existing unqualified users).
+namespace http {
 struct SeriesResult;
+}  // namespace http
+using http::SeriesResult;
 
 // Two-phase aggregation state - holds pre-aggregated values for efficient merging
 // Instead of transferring all raw values, we transfer compact state and merge O(1)
@@ -64,8 +68,12 @@ struct AggregationState {
 
     double sum = 0.0;
     double sumCompensation = 0.0;  // Kahan compensation term for numerically stable summation
-    double min = std::numeric_limits<double>::max();
-    double max = std::numeric_limits<double>::lowest();
+    // Min/max identities are ±infinity (not DBL_MAX/DBL_LOWEST) so that
+    // legitimate ±Inf data points order correctly: min over all-(+Inf) values
+    // must be +Inf, not DBL_MAX. Emptiness is signalled by count == 0, never
+    // by the min/max sentinels.
+    double min = std::numeric_limits<double>::infinity();
+    double max = -std::numeric_limits<double>::infinity();
     double latest = 0.0;                                             // Most recent value
     uint64_t latestTimestamp = 0;                                    // Timestamp of latest value
     double first = 0.0;                                              // Earliest value
@@ -91,10 +99,16 @@ struct AggregationState {
     void addValue(double value, uint64_t timestamp) {
         if (std::isnan(value))
             return;  // Skip NaN to avoid poisoning aggregation
-        // Kahan compensated summation for precision over millions of points
+        // Kahan compensated summation for precision over millions of points.
+        // Guard: once the sum is non-finite (legitimate ±Inf data, or NaN from
+        // Inf + -Inf), the compensation term degenerates to NaN ((Inf-Inf)-y)
+        // and would silently turn every later Inf result into NaN. Reset it so
+        // Inf propagates arithmetically (canonical ±Inf semantics).
         double y = value - sumCompensation;
         double t = sum + y;
-        sumCompensation = (t - sum) - y;
+        // (t - t) == 0.0 iff t is finite (Inf/NaN yield NaN, which compares
+        // false): one subtract + compare, cheaper than std::isfinite here.
+        sumCompensation = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
         sum = t;
         min = std::min(min, value);
         max = std::max(max, value);
@@ -133,7 +147,9 @@ struct AggregationState {
             case AggregationMethod::SUM: {
                 double y = value - sumCompensation;
                 double t = sum + y;
-                sumCompensation = (t - sum) - y;
+                // Non-finite guard: see addValue() — keeps Inf sums from
+                // degenerating to NaN via a poisoned compensation term.
+                sumCompensation = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
                 sum = t;
                 count++;
                 // `mean` is intentionally NOT updated here: getValue(AVG) reads
@@ -275,7 +291,9 @@ private:
         double otherTotal = other.sum + other.sumCompensation;
         double y = otherTotal - sumCompensation;
         double t = sum + y;
-        sumCompensation = (t - sum) - y;
+        // Non-finite guard: see addValue() — keeps Inf sums from degenerating
+        // to NaN via a poisoned compensation term.
+        sumCompensation = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
         sum = t;
         min = std::min(min, other.min);
         max = std::max(max, other.max);
@@ -534,6 +552,46 @@ public:
             return true;
         default:
             return false;
+    }
+}
+
+// LATEST/FIRST select a single point by extreme timestamp rather than computing
+// a value over the set.  They do NOT collapse a time range: without an
+// aggregationInterval every distinct timestamp survives, exactly as for every
+// other method (CLAUDE.md "Aggregation Result Shape") — "latest" is a
+// cross-series tie-break at each timestamp, not a reduction over time.
+//
+// The distinction still matters because "one point per bucket" is what lets the
+// batch/sparse fast paths resolve a bucketed LATEST/FIRST without decoding
+// blocks.
+[[nodiscard]] inline bool isLatestOrFirstMethod(AggregationMethod method) {
+    return method == AggregationMethod::LATEST || method == AggregationMethod::FIRST;
+}
+
+// True when a method's per-timestamp value can be computed from raw
+// (timestamp, value) pairs alone, without materialising an AggregationState.
+// SPREAD/STDDEV/STDVAR are 0 over a single value — NOT the value itself — and
+// MEDIAN/EXACT_MEDIAN need the full raw set, so all of them require a real
+// AggregationState per timestamp.
+//
+// NOTE: "computable from raw", not "fold-of-one is the identity".  COUNT
+// returns true here yet folds one value to 1.0, so callers must still handle
+// COUNT explicitly before consulting this.
+//
+// Every site that short-circuits raw values into a response MUST consult this,
+// or the answer starts depending on the query plan: a per-timestamp fold that
+// passes `spread` through raw reports the value where 0 is correct, and then
+// disagrees with the grouped / multi-shard paths that fold properly.
+[[nodiscard]] inline bool methodCanFoldRaw(AggregationMethod method) {
+    switch (method) {
+        case AggregationMethod::SPREAD:
+        case AggregationMethod::STDDEV:
+        case AggregationMethod::STDVAR:
+        case AggregationMethod::MEDIAN:
+        case AggregationMethod::EXACT_MEDIAN:
+            return false;
+        default:
+            return true;
     }
 }
 

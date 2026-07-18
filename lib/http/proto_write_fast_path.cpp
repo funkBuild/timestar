@@ -16,7 +16,20 @@
 
 #include "proto_write_fast_path.hpp"
 
+// For kMaxCompressedPointsPerWritePoint / compressedTimestampDecodeBound —
+// the shared safety bound both protobuf write parsers must agree on.
+#include "proto_converters.hpp"
+
 #include "timestar.pb.h"
+
+// Compression decoders for Approach B compressed proto fields
+// (compressed_timestamps / compressed_alp / compressed_rle /
+//  compressed_zstd / compressed_ffor). Mirrors parseWriteRequest in
+// proto_converters.cpp — both parsers must agree on the wire contract.
+#include "../encoding/bool_encoder_rle.hpp"
+#include "../encoding/float_encoder.hpp"
+#include "../encoding/integer_encoder.hpp"
+#include "../encoding/string_encoder.hpp"
 
 #include <google/protobuf/arena.h>
 
@@ -119,13 +132,62 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
         // Proto packed uint64 fields store values contiguously in memory.
         // Wrapped once in a shared_ptr so every field of this write point can
         // reference the same allocation instead of copying per field.
+        // Approach B: a non-empty compressed_timestamps field takes priority
+        // over the repeated field (FFOR compressed, same as parseWriteRequest).
         std::shared_ptr<const std::vector<uint64_t>> sharedTimestamps;
-        const int tsCount = wp.timestamps_size();
-        if (tsCount > 0) {
-            std::vector<uint64_t> timestamps(static_cast<size_t>(tsCount));
-            // RepeatedField<uint64_t>::data() gives direct pointer to packed data
-            std::memcpy(timestamps.data(), wp.timestamps().data(), static_cast<size_t>(tsCount) * sizeof(uint64_t));
+        if (!wp.compressed_timestamps().empty()) {
+            const auto& ct = wp.compressed_timestamps();
+            std::vector<uint64_t> timestamps;
+            bool tsDecodeOk = true;
+            try {
+                Slice tsSlice(reinterpret_cast<const uint8_t*>(ct.data()), ct.size());
+                // Decode the TRUE value count carried in the FFOR block headers
+                // (same contract as parseWriteRequest). The bound only guards
+                // against decompression bombs; the over-limit check below turns
+                // an oversized payload into a per-point error instead of a
+                // silently truncated prefix.
+                const size_t maxCount = compressedTimestampDecodeBound(ct.size());
+                IntegerEncoder::decode(tsSlice, static_cast<unsigned int>(maxCount), timestamps);
+            } catch (const std::exception& e) {
+                tsDecodeOk = false;
+                if (result.errors.size() < 10) {
+                    result.errors.push_back("Corrupt compressed timestamps: " + std::string(e.what()));
+                }
+            }
+            // A non-empty compressed payload must yield at least one timestamp;
+            // zero decoded values means truncated/corrupt data (the decoder
+            // silently stops on a short trailing fragment). Falling through to
+            // generated default timestamps would silently misplace the data.
+            if (tsDecodeOk && timestamps.empty()) {
+                tsDecodeOk = false;
+                if (result.errors.size() < 10) {
+                    result.errors.push_back("Corrupt compressed timestamps: decoded to zero timestamps");
+                }
+            }
+            // Over-limit: the stream encodes more points than the server allows
+            // per write point (decode stopped at limit + 1). Storing what was
+            // decoded would silently drop the rest, so reject the whole point.
+            if (tsDecodeOk && timestamps.size() > kMaxCompressedPointsPerWritePoint) {
+                tsDecodeOk = false;
+                if (result.errors.size() < 10) {
+                    result.errors.push_back("compressed_timestamps decodes to more than " +
+                                            std::to_string(kMaxCompressedPointsPerWritePoint) +
+                                            " values (max points per write point)");
+                }
+            }
+            if (!tsDecodeOk) {
+                ++result.failedWrites;
+                continue;  // skip the whole point — no usable timestamps
+            }
             sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(timestamps));
+        } else {
+            const int tsCount = wp.timestamps_size();
+            if (tsCount > 0) {
+                std::vector<uint64_t> timestamps(static_cast<size_t>(tsCount));
+                // RepeatedField<uint64_t>::data() gives direct pointer to packed data
+                std::memcpy(timestamps.data(), wp.timestamps().data(), static_cast<size_t>(tsCount) * sizeof(uint64_t));
+                sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(timestamps));
+            }
         }
 
         // Pre-build the measurement+tags prefix once per write point.
@@ -157,6 +219,10 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
         // Track per-point field count for totalPoints accounting
         int fieldsProcessed = 0;
 
+        // Value count used to size compressed-value decodes — the timestamp
+        // count, exactly like parseWriteRequest uses mwp.timestamps.size().
+        const size_t tsDecodeCount = sharedTimestamps ? sharedTimestamps->size() : 0;
+
         for (const auto& [fieldName, writeField] : wp.fields()) {
             // Validate field name
             if (!isValidName(fieldName)) {
@@ -176,10 +242,39 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
             ffi.seriesKey += ' ';
             ffi.seriesKey += fieldName;
 
-            // Branch on typed_values_case — the type is known from the proto oneof
+            // Records a per-field decode error (capped list) — the field is
+            // skipped; if every field of the point fails, the point counts
+            // as a failed write via the fieldsProcessed check below.
+            auto recordDecodeError = [&result, &fieldName](const char* what) {
+                if (result.errors.size() < 10) {
+                    result.errors.push_back("Field '" + fieldName + "': failed to decode compressed values: " + what);
+                }
+            };
+
+            // Branch on typed_values_case — the type is known from the proto oneof.
+            // Each type checks the Approach B compressed field first (non-empty
+            // compressed bytes take priority, per proto/timestar.proto); the
+            // uncompressed branches are byte-identical to the original fast path.
             switch (writeField.typed_values_case()) {
                 case ::timestar_pb::WriteField::kDoubleValues: {
-                    const auto& vals = writeField.double_values().values();
+                    const auto& dv = writeField.double_values();
+                    if (!dv.compressed_alp().empty()) {
+                        ffi.type = FastFieldInsert::Type::DOUBLE;
+                        try {
+                            const auto& c = dv.compressed_alp();
+                            CompressedSlice cs(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                            FloatDecoder::decode(cs, 0, tsDecodeCount, ffi.doubleValues);
+                        } catch (const std::exception& e) {
+                            recordDecodeError(e.what());
+                            continue;
+                        }
+                        if (ffi.doubleValues.empty()) {
+                            recordDecodeError("compressed payload decoded to zero values");
+                            continue;
+                        }
+                        break;
+                    }
+                    const auto& vals = dv.values();
                     const int valCount = vals.size();
                     if (valCount == 0)
                         continue;
@@ -191,7 +286,29 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                     break;
                 }
                 case ::timestar_pb::WriteField::kBoolValues: {
-                    const auto& vals = writeField.bool_values().values();
+                    const auto& bv = writeField.bool_values();
+                    if (!bv.compressed_rle().empty()) {
+                        ffi.type = FastFieldInsert::Type::BOOL;
+                        try {
+                            const auto& c = bv.compressed_rle();
+                            Slice bSlice(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                            std::vector<bool> boolVec;
+                            BoolEncoderRLE::decode(bSlice, 0, tsDecodeCount, boolVec);
+                            ffi.boolValues.reserve(boolVec.size());
+                            for (bool b : boolVec) {
+                                ffi.boolValues.push_back(b ? 1 : 0);
+                            }
+                        } catch (const std::exception& e) {
+                            recordDecodeError(e.what());
+                            continue;
+                        }
+                        if (ffi.boolValues.empty()) {
+                            recordDecodeError("compressed payload decoded to zero values");
+                            continue;
+                        }
+                        break;
+                    }
+                    const auto& vals = bv.values();
                     const int valCount = vals.size();
                     if (valCount == 0)
                         continue;
@@ -204,7 +321,27 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                     break;
                 }
                 case ::timestar_pb::WriteField::kStringValues: {
-                    const auto& vals = writeField.string_values().values();
+                    const auto& sv = writeField.string_values();
+                    if (!sv.compressed_zstd().empty()) {
+                        ffi.type = FastFieldInsert::Type::STRING;
+                        try {
+                            const auto& c = sv.compressed_zstd();
+                            Slice sSlice(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                            // Count rule (same as parseWriteRequest): explicit
+                            // count field wins; fall back to timestamp count.
+                            size_t count = sv.count() > 0 ? sv.count() : tsDecodeCount;
+                            StringEncoder::decode(sSlice, count, ffi.stringValues);
+                        } catch (const std::exception& e) {
+                            recordDecodeError(e.what());
+                            continue;
+                        }
+                        if (ffi.stringValues.empty()) {
+                            recordDecodeError("compressed payload decoded to zero values");
+                            continue;
+                        }
+                        break;
+                    }
+                    const auto& vals = sv.values();
                     const int valCount = vals.size();
                     if (valCount == 0)
                         continue;
@@ -217,7 +354,30 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                     break;
                 }
                 case ::timestar_pb::WriteField::kInt64Values: {
-                    const auto& vals = writeField.int64_values().values();
+                    const auto& iv = writeField.int64_values();
+                    if (!iv.compressed_ffor().empty()) {
+                        ffi.type = FastFieldInsert::Type::INTEGER;
+                        try {
+                            const auto& c = iv.compressed_ffor();
+                            Slice iSlice(reinterpret_cast<const uint8_t*>(c.data()), c.size());
+                            std::vector<uint64_t> decoded;
+                            IntegerEncoder::decode(iSlice, static_cast<unsigned int>(tsDecodeCount), decoded);
+                            ffi.integerValues.reserve(decoded.size());
+                            // Reverse zigzag: the encoder zigzag'd int64 -> uint64 before FFOR
+                            for (auto v : decoded) {
+                                ffi.integerValues.push_back(static_cast<int64_t>((v >> 1) ^ -(v & 1)));
+                            }
+                        } catch (const std::exception& e) {
+                            recordDecodeError(e.what());
+                            continue;
+                        }
+                        if (ffi.integerValues.empty()) {
+                            recordDecodeError("compressed payload decoded to zero values");
+                            continue;
+                        }
+                        break;
+                    }
+                    const auto& vals = iv.values();
                     const int valCount = vals.size();
                     if (valCount == 0)
                         continue;
@@ -261,8 +421,7 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                 // Replicate the single timestamp; reuse the allocation across
                 // fields with the same value count.
                 if (!replicatedTs || replicatedTs->size() != valueCount) {
-                    replicatedTs =
-                        std::make_shared<const std::vector<uint64_t>>(valueCount, (*sharedTimestamps)[0]);
+                    replicatedTs = std::make_shared<const std::vector<uint64_t>>(valueCount, (*sharedTimestamps)[0]);
                 }
                 ffi.timestamps = replicatedTs;
             } else if (tsAvail == 0) {

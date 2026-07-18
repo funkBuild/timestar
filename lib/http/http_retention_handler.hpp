@@ -3,7 +3,7 @@
 #include "engine.hpp"
 #include "retention_policy.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <memory>
 #include <seastar/core/coroutine.hh>
@@ -12,6 +12,8 @@
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
 #include <string>
+
+namespace timestar::http {
 
 class HttpRetentionHandler : public std::enable_shared_from_this<HttpRetentionHandler> {
 private:
@@ -38,3 +40,12 @@ public:
 
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 };
+
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: HttpRetentionHandler historically lived in
+// the global namespace. New code should use timestar::http:: directly.
+using timestar::http::HttpRetentionHandler;  // NOLINT(misc-unused-using-decls)
+namespace timestar {
+using http::HttpRetentionHandler;
+}  // namespace timestar

@@ -126,7 +126,7 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LoadFromFileSingleSeries) {
     EXPECT_EQ(result.seriesId, seriesId);
     EXPECT_FALSE(result.blocks.empty());
     EXPECT_EQ(result.totalPoints, 100);
-    EXPECT_EQ(result.fileRank, tsm->rankAsInteger());
+    EXPECT_EQ(result.fileRank, tsm->dataRank());
 
     // Verify all points are present
     size_t totalPts = 0;
@@ -843,7 +843,8 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, LargeScaleMergeIntegrity) {
 // 24. File rank is correctly propagated
 // ===========================================================================
 SEASTAR_TEST_F(BulkBlockLoaderTest, FileRankPropagation) {
-    // Tier 1, seq 5 -> rank = (1 << 60) + 5
+    // fileRank is the LWW dedup priority: dataSeq-dominant, tier tiebreak.
+    // Tier 1, seq 5 (no _d suffix -> dataSeq = seq = 5) -> rank = (5 << 4) | 1
     auto tsm = self->createTSMFile(1, 5, "rank.series", {1000, 2000}, {10.0, 20.0});
     co_await tsm->open();
     co_await tsm->readSparseIndex();
@@ -851,8 +852,9 @@ SEASTAR_TEST_F(BulkBlockLoaderTest, FileRankPropagation) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("rank.series");
     auto result = co_await BulkBlockLoader<double>::loadFromFile(tsm, seriesId);
 
-    uint64_t expectedRank = (uint64_t(1) << 60) + 5;
+    uint64_t expectedRank = (uint64_t(5) << 4) | 1;
     EXPECT_EQ(result.fileRank, expectedRank);
+    EXPECT_EQ(result.fileRank, tsm->dataRank());
 
     // BulkMergeContext should report the same rank
     BulkMergeContext<double> ctx(&result);

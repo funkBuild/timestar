@@ -15,7 +15,7 @@
 
 class Engine;
 
-namespace timestar {
+namespace timestar::http {
 
 class HttpStreamHandler {
 public:
@@ -51,4 +51,10 @@ private:
     seastar::gate _connectionGate;
 };
 
+}  // namespace timestar::http
+
+// Backward-compatibility alias: HttpStreamHandler historically lived directly
+// in namespace timestar. New code should use timestar::http:: directly.
+namespace timestar {
+using http::HttpStreamHandler;
 }  // namespace timestar

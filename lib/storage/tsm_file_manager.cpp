@@ -23,7 +23,7 @@ TSMFileManager::TSMFileManager() {
 TSMFileManager::~TSMFileManager() = default;
 
 std::string TSMFileManager::basePath() {
-    return std::string("shard_" + std::to_string(shardId) + "/tsm/");
+    return timestar::shardDataPath(shardId) + "/tsm/";
 }
 
 seastar::future<> TSMFileManager::init() {
@@ -120,8 +120,7 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
 seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore> memStore, uint64_t tier) {
     auto seqNum = nextSequenceId++;
 
-    std::string filename =
-        "shard_" + std::to_string(shardId) + "/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
+    std::string filename = basePath() + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
     // Write to a .tmp file first, then rename atomically on success.
     // If TSMWriter::runAsync() throws, the orphaned .tmp file will be

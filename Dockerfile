@@ -54,10 +54,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xfslibs-dev \
     # TimeStar deps
     libxxhash-dev \
-    # Linting (pinned to distro version — same binary in CI and local dev)
-    clang-format-18 \
-    && ln -sf /usr/bin/clang-format-18 /usr/local/bin/clang-format \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Linting: clang-format pinned via pip so CI and local dev run the SAME
+# version regardless of distro (noble's apt tops out at clang-format-18;
+# dev boxes are on 21.x). Bump this together with CONTRIBUTING.md.
+RUN pip install --break-system-packages clang-format==21.1.6
 
 # Use GCC 14
 ENV CC=gcc-14 CXX=g++-14

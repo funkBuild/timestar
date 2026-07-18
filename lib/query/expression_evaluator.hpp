@@ -69,8 +69,8 @@ struct AlignedSeries {
 
     // Scalar-left / IEEE variants (used by the evaluator's scalar-literal fast
     // path; bit-identical to element-wise ops against a constant series):
-    AlignedSeries rsub(double scalar) const;      // scalar - values[i]
-    AlignedSeries rdiv(double scalar) const;      // scalar / values[i] (IEEE: /0 -> Inf/NaN)
+    AlignedSeries rsub(double scalar) const;     // scalar - values[i]
+    AlignedSeries rdiv(double scalar) const;     // scalar / values[i] (IEEE: /0 -> Inf/NaN)
     AlignedSeries divIeee(double scalar) const;  // values[i] / scalar (IEEE, no throw, true divide)
 
     // Unary operations
@@ -81,16 +81,16 @@ struct AlignedSeries {
     AlignedSeries sqrt() const;
     AlignedSeries ceil() const;
     AlignedSeries floor() const;
-    AlignedSeries exp() const;         // e^x (SIMD); NaN passthrough
+    AlignedSeries exp() const;           // e^x (SIMD); NaN passthrough
     AlignedSeries roundNearest() const;  // Nearest integer, halves away from zero (SIMD); NaN passthrough
-    AlignedSeries sign() const;        // -1/0/+1 (SIMD); NaN passthrough
+    AlignedSeries sign() const;          // -1/0/+1 (SIMD); NaN passthrough
 
     // Transform functions (unary)
-    AlignedSeries diff() const;            // Difference between consecutive points
+    AlignedSeries diff() const;           // Difference between consecutive points
     AlignedSeries monotonicDiff() const;  // Diff with counter reset handling
     AlignedSeries defaultZero() const;    // Replace NaN with 0
     AlignedSeries countNonzero() const;   // Count non-zero values (returns scalar series)
-    AlignedSeries countNotNull() const;  // Count non-NaN values (returns scalar series)
+    AlignedSeries countNotNull() const;   // Count non-NaN values (returns scalar series)
 
     // Counter-rate functions (require access to timestamps)
     AlignedSeries rate() const;      // Per-second rate; handles counter resets; first point NaN
@@ -117,7 +117,7 @@ struct AlignedSeries {
     AlignedSeries integral() const;  // Definite integral via trapezoidal rule; NaN trapezoids contribute 0
 
     // Normalization
-    AlignedSeries normalize() const;  // Rescale to [0,1]; constant or single-point → 0.0; NaN passthrough
+    AlignedSeries normalize() const;    // Rescale to [0,1]; constant or single-point → 0.0; NaN passthrough
     AlignedSeries standardize() const;  // Global z-score (SIMD); constant series → 0.0; NaN passthrough
 
     // Binary functions
@@ -139,14 +139,14 @@ struct AlignedSeries {
     static AlignedSeries asPercent(const AlignedSeries& series, const AlignedSeries& total);
 
     // Rolling window functions (N-point window; first N-1 points output NaN)
-    AlignedSeries rollingAvg(int N) const;     // N-point simple moving average
-    AlignedSeries rollingMin(int N) const;     // N-point rolling minimum
-    AlignedSeries rollingMax(int N) const;     // N-point rolling maximum
-    AlignedSeries rollingStddev(int N) const;  // N-point rolling population stddev (ddof=0)
-    AlignedSeries rollingSum(int N) const;     // N-point rolling sum (Kahan-compensated)
-    AlignedSeries rollingMedian(int N) const;  // N-point rolling median (sorted sliding window)
+    AlignedSeries rollingAvg(int N) const;                   // N-point simple moving average
+    AlignedSeries rollingMin(int N) const;                   // N-point rolling minimum
+    AlignedSeries rollingMax(int N) const;                   // N-point rolling maximum
+    AlignedSeries rollingStddev(int N) const;                // N-point rolling population stddev (ddof=0)
+    AlignedSeries rollingSum(int N) const;                   // N-point rolling sum (Kahan-compensated)
+    AlignedSeries rollingMedian(int N) const;                // N-point rolling median (sorted sliding window)
     AlignedSeries rollingPercentile(int N, double p) const;  // N-point rolling p-th percentile, p in [0,100]
-    AlignedSeries zscore(int N) const;          // N-point rolling z-score: (v - mean) / stddev; 0 if stddev==0
+    AlignedSeries zscore(int N) const;  // N-point rolling z-score: (v - mean) / stddev; 0 if stddev==0
 
     // Exponential moving average
     // param <= 1.0: treated as alpha directly; param > 1.0: treated as span N, alpha = 2/(N+1)

@@ -32,22 +32,43 @@ If every input value is NaN, the aggregation result is NaN.
 
 ### 2. TSM block statistics (TSM writer)
 
-The TSM writer **excludes NaN** when computing per-block min, max, sum, and
-count statistics. A block whose values are all NaN will have count = 0 and
-min/max/sum = NaN.
+The TSM writer **excludes NaN** when computing per-block min, max, sum,
+count, and M2 statistics. `blockCount` is the number of **non-NaN** values —
+this is what makes COUNT/AVG stats pushdown identical to the scalar
+NaN-skipping fold (placement-independent results). Blocks containing NaN are
+written with NaN sentinels in M2/firstValue/latestValue; the reader derives
+`hasExtendedStats = false` from NaN endpoints, so STDDEV/LATEST/FIRST
+shortcuts decode and skip per value. A block whose values are all NaN has
+count = 0 (stats pushdown disabled) and min/max = NaN.
+
+The block header carries the true total point count for decoding; the
+COUNT-only read path (`decodeBlockCountOnly`) compares it against
+`blockCount` and falls back to a full value decode when they differ (i.e.
+the block carries NaN). Legacy files written before this rule stored the raw
+total in `blockCount` and keep NaN-counting pushdown behaviour until
+compaction rewrites them.
+
+The in-memory-store running stats (`InMemorySeriesStats`) follow the same
+rules: NaN is excluded from sum/min/max/count/mean/M2 and from first/latest
+value tracking.
 
 ### 3. SIMD block aggregation (BlockAggregator)
 
-The SIMD fold paths (Highway-accelerated SUM, MIN, MAX, COUNT, AVG) **assume
-NaN-free input**. This is safe because:
+Decoded block data CAN contain NaN (NaN round-trips storage verbatim; the
+write path does **not** filter it). The SIMD fold paths (Highway-accelerated
+SUM, MIN, MAX, COUNT, AVG, STDDEV) detect NaN cheaply and fall back to the
+scalar NaN-skipping fold:
 
-- TSM blocks should not contain NaN values; the write path filters them.
-- If NaN does appear (e.g., data sourced directly from a memory store before
-  flush), the scalar fallback in `calculateMin` / `calculateMax` /
-  `calculateSum` detects NaN and skips it.
+- Entry prefilter: first element NaN → scalar fold for the whole batch.
+- SUM/AVG/STDDEV/COUNT: a NaN SIMD sum (interior NaN, or an Inf/-Inf mix)
+  → scalar fold.
+- MIN/MAX/SPREAD: the NaN-skipping kernels return NaN only when no valid
+  value exists → scalar fold.
+- LATEST: NaN last element → scalar fold (FIRST is covered by the prefilter).
 
-Callers must not pass blocks known to contain NaN into the SIMD fast path
-without a preceding NaN check.
+For MIN/MAX/SPREAD/LATEST/FIRST fast paths, interior NaN may still be
+included in `state.count`; count is not part of those methods' results (it
+only gates emptiness), so this is unobservable.
 
 ### 4. Expression evaluator
 
@@ -76,11 +97,32 @@ values array as "no data for this timestamp."
 
 ---
 
+## Other IEEE-754 special values
+
+**±Infinity is valid data**, not missing data:
+
+- Raw reads return Inf exactly (the ALP encoder stores NaN/±Inf/-0.0 as
+  raw-bit exceptions — bit-exact round-trip).
+- Aggregations let Inf participate arithmetically: SUM/AVG propagate it
+  (`+Inf + -Inf = NaN` per IEEE 754 is the correct aggregate), MIN/MAX order
+  it, COUNT counts it, STDDEV/STDVAR of data containing Inf is NaN.
+- Min/max identities are ±infinity (never DBL_MAX/DBL_LOWEST) so all-(+Inf)
+  data yields min = +Inf; emptiness is signalled by count == 0.
+- Kahan-compensated sums guard the compensation term: once the running sum
+  is non-finite the term is reset to 0.0, otherwise `(Inf - Inf) - y = NaN`
+  would silently corrupt every later Inf sum into NaN.
+
+**-0.0 round-trips raw reads bit-exactly** (ALP exception path). Aggregated
+results may normalize -0.0 to +0.0 (IEEE addition: `-0.0 + (+0.0) = +0.0`;
+min/max comparisons do not distinguish the zeros). This is documented
+encoding/aggregation semantics, not a bug.
+
 ## Summary invariant
 
 > At every layer of the stack, NaN means "this data point does not exist."
 > Aggregations ignore it, expressions propagate it, and the API surfaces it
-> as `null`.
+> as `null`. ±Inf and -0.0 are real data: they round-trip storage exactly,
+> and ±Inf participates arithmetically in aggregation.
 
 ---
 

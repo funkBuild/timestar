@@ -9,7 +9,7 @@
 #include "proto_converters.hpp"
 #include "scatter_gather.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -17,6 +17,8 @@
 #include <seastar/core/when_all.hh>
 #include <stdexcept>
 #include <unordered_map>
+
+namespace timestar::http {
 
 // Response struct definitions for Glaze serialization
 struct MeasurementsResponse {
@@ -103,7 +105,7 @@ HttpMetadataHandler::HttpMetadataHandler(seastar::sharded<Engine>* _engineSharde
 }
 
 void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r, std::string_view authToken) {
-    // addJsonRoute applies timestar::wrapWithAuth per route.
+    // addJsonRoute applies timestar::http::wrapWithAuth per route.
     using op = seastar::httpd::operation_type;
 
     timestar::http::addJsonRoute(
@@ -495,8 +497,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             }
         } else {
             // Measurement-level cardinality plus per-tag-key cardinalities
-            double totalEstimate = co_await timestar::cluster::scatterAndSum(
-                *engineSharded, [measurement](Engine& engine) {
+            double totalEstimate =
+                co_await timestar::cluster::scatterAndSum(*engineSharded, [measurement](Engine& engine) {
                     return engine.getIndex().estimateMeasurementCardinality(measurement);
                 });
 
@@ -617,3 +619,5 @@ std::string HttpMetadataHandler::formatCardinalityResponse(
     (void)glz::write_json(response, buffer);
     return buffer;
 }
+
+}  // namespace timestar::http

@@ -7,7 +7,6 @@
 #include "tsm_writer.hpp"
 
 #include <chrono>
-#include <cinttypes>
 #include <filesystem>
 #include <limits>
 #include <seastar/core/reactor.hh>
@@ -25,11 +24,20 @@ TSMCompactor::TSMCompactor(TSMFileManager* manager)
       strategy(std::make_unique<LeveledCompactionStrategy>()),
       compactionSemaphore(timestar::config().storage.compaction.max_concurrent) {}
 
-std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqNum) {
-    int shardId = seastar::this_shard_id();
-    char buffer[256];
-    snprintf(buffer, sizeof(buffer), "shard_%d/tsm/%" PRIu64 "_%" PRIu64 ".tsm", shardId, tier, seqNum);
-    return std::string(buffer);
+std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqNum, uint64_t dataSeq) {
+    // The `_d<dataSeq>` suffix records the newest write generation contained
+    // in the output (max of the inputs' dataSeq) so last-write-wins dedup
+    // ranks this file by its data recency, not by its (fresh) seqNum.
+    return timestar::shardDataPath(seastar::this_shard_id()) + "/tsm/" + std::to_string(tier) + "_" +
+           std::to_string(seqNum) + "_d" + std::to_string(dataSeq) + ".tsm";
+}
+
+uint64_t TSMCompactor::maxDataSeqOf(const std::vector<seastar::shared_ptr<TSM>>& files) {
+    uint64_t maxSeq = 0;
+    for (const auto& file : files) {
+        maxSeq = std::max(maxSeq, file->dataSeq);
+    }
+    return maxSeq;
 }
 
 std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar::shared_ptr<TSM>>& files) {
@@ -183,7 +191,36 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
 
     bool hasPerPointRetention = (ttlCutoff > 0 || downsampleThreshold > 0);
 
-    if (allBlocksNonOverlapping && !blockMeta.empty() && tombstoneRanges.empty() && !hasPerPointRetention) {
+    // String dictionaries (STR2 blocks store per-file dictionary IDs): the
+    // zero-copy carry is only sound when the output file's index entry can
+    // hold ONE dictionary that resolves every carried block's IDs — i.e. all
+    // blocks come from a single source file. Dictionaries from different
+    // source files have incompatible ID→string mappings, so such series must
+    // take the slow path (decode each file with its own dictionary, re-encode
+    // with a fresh one). Previously the zero-copy path NEVER propagated the
+    // dictionary: the compacted file contained STR2 blocks with dictSize=0 in
+    // its index, making the series' values permanently undecodable ("Invalid
+    // magic number in string encoding") after their first compaction.
+    bool stringDictForcesSlowPath = false;
+    std::shared_ptr<const std::vector<std::string>> carriedStringDict;
+    if constexpr (std::is_same_v<T, std::string>) {
+        size_t dictSources = 0;
+        for (const auto& fileBlocks : allBlocks) {
+            // Cheap: loadFromFiles already populated the full-index cache.
+            auto* entry = co_await fileBlocks.source->getFullIndexEntry(seriesId);
+            if (entry && entry->stringDictionary && !entry->stringDictionary->empty()) {
+                ++dictSources;
+                carriedStringDict = entry->stringDictionary;
+            }
+        }
+        if (dictSources > 0 && allBlocks.size() > 1) {
+            stringDictForcesSlowPath = true;
+            carriedStringDict = nullptr;
+        }
+    }
+
+    if (allBlocksNonOverlapping && !stringDictForcesSlowPath && !blockMeta.empty() && tombstoneRanges.empty() &&
+        !hasPerPointRetention) {
         // ZERO-COPY PATH: Load compressed blocks in parallel
         result.isZeroCopy = true;
         result.compressedBlocks.reserve(blockMeta.size());
@@ -218,6 +255,10 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             result.pointsRead += cb.blockCount;
             result.pointsWritten += cb.blockCount;
         }
+
+        // Carry the single-source string dictionary so the output file's
+        // index entry can decode the carried STR2 blocks.
+        result.stringDictionary = std::move(carriedStringDict);
 
         co_return result;
     }
@@ -260,13 +301,18 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             return;
         }
 
-        // Deduplicate
+        // Deduplicate (last-write-wins). The bulk mergers already emit one
+        // point per distinct timestamp (newest source, last copy per source),
+        // so equal consecutive timestamps only occur on the sequential
+        // non-overlapping path, where the stream is a single file in append
+        // order — the LATER copy is the newer write and replaces the kept one.
         if (ts != lastTimestamp) {
             result.timestamps.push_back(ts);
             result.values.push_back(val);
             lastTimestamp = ts;
             result.pointsWritten++;
         } else {
+            result.values.back() = val;
             result.duplicatesRemoved++;
         }
     };
@@ -396,6 +442,11 @@ void TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, SeriesCompaction
             srcBlock.hasExtendedStats = block.hasExtendedStats;
             writer.writeCompressedBlockWithStats(data.seriesType, data.seriesId, std::move(block.data), srcBlock);
         }
+        // String series: persist the carried dictionary into the output file's
+        // index entry — the carried STR2 blocks are undecodable without it.
+        if (data.stringDictionary && !data.compressedBlocks.empty()) {
+            writer.setSeriesStringDictionary(data.seriesId, std::move(data.stringDictionary));
+        }
     } else {
         // Slow path: write decompressed data
         if (!data.timestamps.empty()) {
@@ -429,7 +480,7 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         targetSeq = fileManager->allocateSequenceId();
     }
 
-    std::string outputPath = generateCompactedFilename(targetTier, targetSeq);
+    std::string outputPath = generateCompactedFilename(targetTier, targetSeq, maxDataSeqOf(files));
 
     // Create temporary file for writing
     std::string tempPath = outputPath + ".tmp";
@@ -646,7 +697,7 @@ CompactionPlan TSMCompactor::planCompaction(uint64_t tier) {
     if (!plan.sourceFiles.empty()) {
         plan.targetTier = strategy->getTargetTier(tier, plan.sourceFiles.size());
         plan.targetSeqNum = fileManager->allocateSequenceId();
-        plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
+        plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum, maxDataSeqOf(plan.sourceFiles));
 
         // Estimate output size (rough estimate - 70% of input due to compression)
         plan.estimatedSize = 0;
@@ -780,7 +831,8 @@ seastar::future<> TSMCompactor::forceFullCompaction() {
             plan.sourceFiles = tierFiles;
             plan.targetTier = std::min(tier + 1, uint64_t{3});
             plan.targetSeqNum = fileManager->allocateSequenceId();
-            plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
+            plan.targetPath =
+                generateCompactedFilename(plan.targetTier, plan.targetSeqNum, maxDataSeqOf(plan.sourceFiles));
 
             try {
                 auto stats = co_await executeCompaction(plan);
@@ -812,7 +864,7 @@ seastar::future<CompactionStats> TSMCompactor::executeTombstoneRewrite(seastar::
     plan.sourceFiles = {file};
     plan.targetTier = file->tierNum;
     plan.targetSeqNum = fileManager->allocateSequenceId();
-    plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum);
+    plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum, file->dataSeq);
     plan.estimatedSize = file->getFileSize();
 
     timestar::compactor_log.info("[TOMBSTONE-REWRITE] Rewriting {} at tier {} seq {} -> seq {}", file->getFileSize(),

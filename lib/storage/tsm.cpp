@@ -53,19 +53,19 @@ static bool blockOverlapsTombstones(uint64_t blockMin, uint64_t blockMax,
     return false;
 }
 
-// Select the index blocks overlapping [startTime, endTime) as a contiguous
+// Select the index blocks overlapping [startTime, endTime] (inclusive) as a contiguous
 // range.  Index blocks are sorted by minTime with non-decreasing maxTime
 // (the writer emits each series' blocks sequentially in time order, and the
 // compactor's zero-copy path requires sorted non-overlapping blocks; its
 // merge path re-encodes fully sorted data), so the set of blocks matching
-// (minTime < endTime && startTime <= maxTime) is contiguous: two binary
+// (minTime <= endTime && startTime <= maxTime) is contiguous: two binary
 // searches replace the previous O(blocks) copy_if scan.
 static std::span<const TSMIndexBlock> overlappingBlockRange(const std::vector<TSMIndexBlock>& blocks,
                                                             uint64_t startTime, uint64_t endTime) {
     auto first = std::partition_point(blocks.begin(), blocks.end(),
                                       [startTime](const TSMIndexBlock& b) { return b.maxTime < startTime; });
-    auto last = std::partition_point(first, blocks.end(),
-                                     [endTime](const TSMIndexBlock& b) { return b.minTime < endTime; });
+    auto last =
+        std::partition_point(first, blocks.end(), [endTime](const TSMIndexBlock& b) { return b.minTime <= endTime; });
     return {first, last};
 }
 
@@ -83,9 +83,10 @@ struct BlockHeaderInfo {
     size_t valueByteSize;  // value-region length in bytes
     size_t nSkipped;       // points filtered out before startTime
     size_t nTimestamps;    // decoded timestamps now in tsScratch
+    size_t totalInBlock;   // total points stored in the block (pre-filter)
 };
 
-// Parse the block header and decode timestamps (filtered by [startTime, endTime))
+// Parse the block header and decode timestamps (filtered by [startTime, endTime], inclusive)
 // into `tsScratchOut` (cleared and reserved before decode). Returns nullopt on
 // malformed header. nTimestamps==0 is a valid result (no timestamps in range).
 static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8_t* data, uint32_t blockSize,
@@ -115,7 +116,7 @@ static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8
     const size_t valueOffset = BLOCK_HEADER_SIZE + timestampBytes;
     const size_t valueByteSize = blockSize - valueOffset;
 
-    return BlockHeaderInfo{valueOffset, valueByteSize, nSkipped, nTimestamps};
+    return BlockHeaderInfo{valueOffset, valueByteSize, nSkipped, nTimestamps, timestampSize};
 }
 
 static size_t decodeBlockIntoAggregator(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
@@ -182,12 +183,26 @@ static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockS
 }
 
 // COUNT-only block decode: decode timestamps only, skip value decompression.
+//
+// NaN awareness: Float blocks can carry NaN values verbatim, and COUNT must
+// not count them (canonical: NaN = missing data — docs/nan_policy.md). The
+// index blockCount is the block's non-NaN count; when it disagrees with the
+// header's total point count, NaN is present and the values must be decoded
+// so the fold can skip it. Legacy files (blockCount written pre-NaN-fix as
+// the raw total) never mismatch and keep the fast timestamp-only path.
 static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
-                                   timestar::BlockAggregator& aggregator) {
+                                   timestar::BlockAggregator& aggregator, TSMValueType seriesType,
+                                   uint32_t statsValidCount) {
     static thread_local std::vector<uint64_t> tsScratch;
     auto hdr = parseHeaderAndDecodeTimestamps(data, blockSize, startTime, endTime, tsScratch);
     if (!hdr || hdr->nTimestamps == 0)
         return 0;
+
+    if (seriesType == TSMValueType::Float && statsValidCount != static_cast<uint32_t>(hdr->totalInBlock)) [[unlikely]] {
+        // NaN-carrying (or stats-less) Float block: full decode so the
+        // aggregator's NaN-skipping COUNT fold produces the canonical count.
+        return decodeBlockIntoAggregator(data, blockSize, startTime, endTime, aggregator);
+    }
 
     aggregator.addTimestampsOnly(tsScratch);
     return tsScratch.size();
@@ -204,6 +219,25 @@ TSM::TSM(std::string _absoluteFilePath) {
 
     std::string filename = _absoluteFilePath.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex);
 
+    // Optional data-sequence suffix on compaction outputs: "<tier>_<seq>_d<dataSeq>".
+    // Strip it before the tier/seq parse below; legacy files without the
+    // suffix use seqNum as their dataSeq.
+    std::optional<uint64_t> parsedDataSeq;
+    size_t dSuffixIndex = filename.find_last_of("_");
+    if (dSuffixIndex != std::string::npos && dSuffixIndex + 1 < filename.size() && filename[dSuffixIndex + 1] == 'd') {
+        try {
+            size_t consumed = 0;
+            const std::string digits = filename.substr(dSuffixIndex + 2);
+            uint64_t v = std::stoull(digits, &consumed);
+            if (!digits.empty() && consumed == digits.size()) {
+                parsedDataSeq = v;
+                filename = filename.substr(0, dSuffixIndex);
+            }
+        } catch (const std::exception&) {
+            // Not a data-seq suffix — fall through to the normal parse.
+        }
+    }
+
     size_t underscoreIndex = filename.find_last_of("_");
     if (underscoreIndex == std::string::npos)
         throw std::runtime_error("TSM invalid filename:" + filename);
@@ -211,8 +245,9 @@ TSM::TSM(std::string _absoluteFilePath) {
     try {
         tierNum = std::stoull(filename.substr(0, underscoreIndex));
         seqNum = std::stoull(filename.substr(underscoreIndex + 1));
+        dataSeq = parsedDataSeq.value_or(seqNum);
 
-        timestar::tsm_log.debug("tierNum={} seqNum={}", tierNum, seqNum);
+        timestar::tsm_log.debug("tierNum={} seqNum={} dataSeq={}", tierNum, seqNum, dataSeq);
     } catch (const std::exception&) {
         throw std::runtime_error("TSM invalid filename:" + filename);
     }
@@ -295,6 +330,20 @@ uint64_t TSM::rankAsInteger() {
     return (tierNum << 60) | seqNum;
 }
 
+uint64_t TSM::dataRank() {
+    if (tierNum >= 16) {
+        throw std::overflow_error("TSM::dataRank: tierNum " + std::to_string(tierNum) + " >= 16 exceeds 4-bit limit");
+    }
+    constexpr uint64_t maxDataSeq = (uint64_t{1} << 60) - 1;
+    if (dataSeq > maxDataSeq) [[unlikely]] {
+        throw std::overflow_error("TSM::dataRank: dataSeq " + std::to_string(dataSeq) + " exceeds 60-bit limit");
+    }
+    // dataSeq-dominant: write recency decides duplicate resolution; tier only
+    // breaks ties between a compacted file and an input carrying the same
+    // newest generation.
+    return (dataSeq << 4) | tierNum;
+}
+
 // Lazy loading: read sparse index + build bloom filter
 seastar::future<> TSM::readSparseIndex() {
     // Read index offset (last 8 bytes of file)
@@ -366,7 +415,10 @@ seastar::future<> TSM::readSparseIndex() {
             if (seriesType == TSMValueType::Float) {
                 std::memcpy(&firstValue, indexSlice.data + blockStart + 64, sizeof(double));
                 std::memcpy(&latestValue, indexSlice.data + lastBlockStart + 72, sizeof(double));
-                hasExtStats = true;
+                // NaN endpoints mark NaN-carrying blocks (writer sentinel, or
+                // legacy blocks whose real endpoints were NaN): first/latest
+                // shortcuts must decode instead (see parseIndexBlocksFromSlice).
+                hasExtStats = !std::isnan(firstValue) && !std::isnan(latestValue);
             }
             // Integer (V2): first/latest as int64 at offset 56 and 64 within block
             // Layout: minTime(8) maxTime(8) offset(8) size(4) count(4) sum(8) min(8) max(8) first(8) latest(8)
@@ -480,7 +532,12 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
             block.blockM2 = indexSlice.read<double>();
             block.blockFirstValue = indexSlice.read<double>();
             block.blockLatestValue = indexSlice.read<double>();
-            block.hasExtendedStats = true;
+            // Extended stats are unusable when the endpoint values are NaN:
+            // the writer stores NaN first/latest sentinels for NaN-carrying
+            // blocks (LATEST/FIRST/STDDEV must decode and skip per value),
+            // and legacy files whose block endpoints were genuinely NaN are
+            // caught by the same predicate. See docs/nan_policy.md.
+            block.hasExtendedStats = !std::isnan(block.blockFirstValue) && !std::isnan(block.blockLatestValue);
         } else if (fileVersion >= 2) {
             // V2: all non-Float types have at least blockCount
             if (entry.seriesType == TSMValueType::Integer) {
@@ -811,7 +868,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
 
     // Fully-contained block: every point passes the time filter, so decode with
     // sentinel bounds to hit the branch-free timestamp fast path (same results).
-    if (indexBlock.minTime >= startTime && indexBlock.maxTime < endTime) {
+    if (indexBlock.minTime >= startTime && indexBlock.maxTime <= endTime) {
         startTime = 0;
         endTime = UINT64_MAX;
     }
@@ -917,12 +974,34 @@ seastar::future<> TSM::scheduleDelete() {
         timestar::tsm_log.error("Failed to delete TSM file {}: {}", filePath, e.what());
     }
 
-    // Close the file handle to avoid seastar::file destructor assertion.
-    // This is safe after remove_file: the inode stays alive for any
-    // in-flight DMA reads that still hold a reference to this TSM object.
-    // Guard: close() may have already been called by the TSMFileManager shutdown path.
-    if (tsmFile) {
-        co_await tsmFile.close();
+    // Do NOT close the fd here.  Queries snapshot the TSM file list (as
+    // shared_ptr<TSM>) before issuing DMA reads; a query that snapshotted
+    // this file before compaction removed it can still read from it AFTER
+    // this point.  Closing the fd here made those reads fail — the query
+    // handler swallows the exception and returns an EMPTY result for the
+    // series (transient invisibility during compaction/rollover).  Instead,
+    // defer the close to the destructor: it runs when the last snapshot
+    // reference drops, i.e. when no reader can touch the fd anymore.
+    deferCloseOnDestroy_ = true;
+    co_return;
+}
+
+TSM::~TSM() {
+    if (deferCloseOnDestroy_ && tsmFile) {
+        // Fire-and-forget close of the (already unlinked) file.  No reader
+        // can exist anymore — this object is being destroyed because the
+        // last shared_ptr reference dropped.  The lambda keeps the moved
+        // file handle alive until close() resolves.
+        (void)seastar::futurize_invoke([f = std::move(tsmFile)]() mutable {
+            auto fut = f.close();
+            return fut.finally([f = std::move(f)]() mutable {});
+        }).handle_exception([path = filePath](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                timestar::tsm_log.warn("Deferred close of deleted TSM file {} failed: {}", path, e.what());
+            }
+        });
     }
 }
 
@@ -1119,8 +1198,7 @@ seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTim
         // decode fast path with identical results.
         const bool fullyContained = block.minTime >= startTime && block.maxTime < endTime;
         decodeBlockFlat<T>(batchBuf.get() + bufferOffset, block.size, fullyContained ? 0 : startTime,
-                           fullyContained ? UINT64_MAX : endTime, flatBlock->timestamps, flatBlock->values,
-                           stringDict);
+                           fullyContained ? UINT64_MAX : endTime, flatBlock->timestamps, flatBlock->values, stringDict);
         bufferOffset += block.size;
     }
 
@@ -1309,7 +1387,7 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
     std::vector<TSMIndexBlock> decodeBlocks;
     decodeBlocks.reserve(blocksToScan.size());
     for (const auto& block : blocksToScan) {
-        bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
+        bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
         bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
         bool canSkip = !blockHasTombstones && blockFullyContained && block.blockCount > 0 &&
                        aggregator.canUseBlockStats(block.minTime, block.maxTime, block.hasExtendedStats);
@@ -1391,13 +1469,13 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                 // Fully-contained blocks (index bounds prove every point passes the time
                 // filter) use sentinel bounds to hit the branch-free timestamp decode
                 // fast path — result-identical, but skips 2 compares per point.
-                const bool fullyContained = block.minTime >= startTime && block.maxTime < endTime;
+                const bool fullyContained = block.minTime >= startTime && block.maxTime <= endTime;
                 const uint64_t decodeStart = fullyContained ? 0 : startTime;
                 const uint64_t decodeEnd = fullyContained ? UINT64_MAX : endTime;
                 size_t n;
                 if (countOnly) {
                     n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
-                                             aggregator);
+                                             aggregator, seriesType, block.blockCount);
                 } else if (seriesType == TSMValueType::Float) {
                     n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
                                                   aggregator);
@@ -1406,8 +1484,8 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
                                                          decodeEnd, aggregator);
                 } else {
                     // Boolean
-                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart,
-                                                      decodeEnd, aggregator);
+                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
+                                                      aggregator);
                 }
                 totalPoints += n;
             } else {
@@ -1468,8 +1546,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
     // preserves that order, so LATEST → back(), FIRST → front().
     if (maxPoints == 1) {
         const TSMIndexBlock& bestBlock = reverse ? blocksToScan.back() : blocksToScan.front();
-        const bool boundaryInRange =
-            reverse ? (bestBlock.maxTime < endTime) : (bestBlock.minTime >= startTime);
+        const bool boundaryInRange = reverse ? (bestBlock.maxTime <= endTime) : (bestBlock.minTime >= startTime);
         if (bestBlock.hasExtendedStats && boundaryInRange) {
             const uint64_t boundaryTs = reverse ? bestBlock.maxTime : bestBlock.minTime;
             // hasTombstones() is a cheap file-level guard; only consult per-series
@@ -1488,8 +1565,7 @@ seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesI
                 }
             }
             if (!boundaryDeleted) {
-                const double boundaryVal =
-                    reverse ? bestBlock.blockLatestValue : bestBlock.blockFirstValue;
+                const double boundaryVal = reverse ? bestBlock.blockLatestValue : bestBlock.blockFirstValue;
                 aggregator.addPoint(boundaryTs, boundaryVal);
                 co_return 1;
             }
@@ -1608,7 +1684,7 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
         // bucket, extract the first/latest endpoint directly without DMA
         // read + decode.  This preserves 1-point-per-bucket semantics.
         // Phase 0: per-block tombstone check instead of global gate
-        bool blockFullyContained = (block.minTime >= startTime && block.maxTime < endTime);
+        bool blockFullyContained = (block.minTime >= startTime && block.maxTime <= endTime);
         bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
         if (!blockHasTombstones && blockFullyContained && block.hasExtendedStats) {
             uint64_t bFirst = (block.minTime / interval) * interval;

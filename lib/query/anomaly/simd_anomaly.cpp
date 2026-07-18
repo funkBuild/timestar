@@ -520,8 +520,7 @@ void computeBounds(const double* predictions, const double* scale, double bounds
     HWY_DYNAMIC_DISPATCH(ComputeBoundsKernel)(predictions, scale, bounds, upper, lower, count);
 }
 
-void computeBounds(const double* predictions, double scale, double bounds, double* upper, double* lower,
-                   size_t count) {
+void computeBounds(const double* predictions, double scale, double bounds, double* upper, double* lower, size_t count) {
     // margin is uniform: bounds * scale computed once, matching the per-lane
     // Mul(bounds, scale[i]) of the vector overload bit-for-bit for constant
     // scale vectors. The plain loop auto-vectorizes.

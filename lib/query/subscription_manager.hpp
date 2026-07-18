@@ -5,8 +5,10 @@
 
 #include <tsl/robin_map.h>
 
+#include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <seastar/core/queue.hh>
 #include <seastar/core/sharded.hh>
@@ -30,6 +32,38 @@ struct StreamingDataPoint {
     uint64_t timestamp = 0;
     std::variant<double, bool, std::string, int64_t> value;
 };
+
+// Read a streaming point's value as a number for FORMULA ARITHMETIC, or
+// nullopt when the value is non-numeric (string, boolean) and therefore not an
+// operand at all — canonical rule, see CLAUDE.md "Non-Numeric Fields in
+// Queries".
+//
+// Returns optional rather than NaN ON PURPOSE: callers must SKIP these points,
+// not fold them in as missing data.  Both consumers key points by timestamp and
+// let the last writer win, so a NaN standing in for a string silently
+// OVERWRITES a real numeric value from another field in the same bucket — with
+// the winner decided by lexicographic field name (StreamingAggregator emits in
+// measurement/field/tags order).  A non-numeric point must never enter the
+// series in the first place.  0.0 is worse still: it fabricates a value that
+// was never written.
+//
+// Single definition on purpose: this rule was previously spelled out
+// per-call-site and had already drifted to three different answers for strings
+// (throw / 0.0 / NaN).
+[[nodiscard]] inline std::optional<double> streamingValueAsNumeric(
+    const std::variant<double, bool, std::string, int64_t>& value) {
+    return std::visit(
+        [](const auto& v) -> std::optional<double> {
+            using VT = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<VT, double>)
+                return v;
+            else if constexpr (std::is_same_v<VT, int64_t>)
+                return static_cast<double>(v);
+            else
+                return std::nullopt;  // bool, string: not an operand
+        },
+        value);
+}
 
 // A batch of data points that matched a subscription.
 struct StreamingBatch {

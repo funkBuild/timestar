@@ -8,7 +8,7 @@
 #include <sstream>
 #include <string_view>
 
-namespace timestar {
+namespace timestar::http {
 
 bool constantTimeEquals(std::string_view a, std::string_view b) {
     // Constant-time comparison: always iterate max(a.size(), b.size()) to avoid
@@ -90,4 +90,4 @@ std::string maskToken(std::string_view token) {
     return masked;
 }
 
-}  // namespace timestar
+}  // namespace timestar::http

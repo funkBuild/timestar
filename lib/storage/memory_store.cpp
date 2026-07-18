@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <numeric>
 #include <ranges>
 #include <stdexcept>
@@ -25,14 +26,45 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     valid = true;
 
     // Phase 1: FUSED SIMD sum/min/max — one memory pass instead of three
-    // separate kernel calls.
+    // separate kernel calls. The fused kernel NaN-skips min/max but the sum
+    // propagates NaN, and its all-skipped sentinel collapses ±Inf results to
+    // NaN — both cases route to the scalar special-value pass below.
     double batchSum, batchMin, batchMax;
     timestar::simd::SimdAggregator::calculateSumMinMax(values, n, batchSum, batchMin, batchMax);
 
-    // Kahan compensated accumulation of batch sum
+    // Number of non-NaN values in this batch (canonical: NaN = missing data,
+    // never counted/summed — docs/nan_policy.md).
+    size_t validN = n;
+
+    if (std::isnan(batchSum) || std::isnan(batchMin) || std::isnan(batchMax)) [[unlikely]] {
+        // Special values present: NaN data (skip it), an Inf/-Inf mix (sum is
+        // genuinely NaN), or all-±Inf data (kernel sentinel conflation).
+        // Recompute scalar with NaN skipped; ±Inf participates arithmetically.
+        batchSum = 0.0;
+        batchMin = std::numeric_limits<double>::infinity();
+        batchMax = -std::numeric_limits<double>::infinity();
+        validN = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double v = values[i];
+            if (std::isnan(v))
+                continue;
+            ++validN;
+            batchSum += v;
+            if (v < batchMin)
+                batchMin = v;
+            if (v > batchMax)
+                batchMax = v;
+        }
+        if (validN == 0)
+            return;  // All-NaN batch: nothing to fold (count unchanged).
+    }
+
+    // Kahan compensated accumulation of batch sum.
+    // Non-finite guard: with a ±Inf sum the compensation term degenerates to
+    // NaN and would poison later batches (Inf results silently become NaN).
     double y = batchSum - sumCompensation;
     double t = sum + y;
-    sumCompensation = (t - sum) - y;
+    sumCompensation = std::isfinite(t) ? (t - sum) - y : 0.0;
     sum = t;
 
     if (batchMin < min)
@@ -45,27 +77,42 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
     // put a hardware divide on a loop-carried dependency chain (~20 cy/pt).
     // Two-pass batch variance is numerically as good as sequential Welford.
     {
-        const double batchMean = batchSum / static_cast<double>(n);
-        // calculateVariance returns population variance (M2/n)
-        const double batchM2 =
-            timestar::simd::SimdAggregator::calculateVariance(values, n, batchMean) * static_cast<double>(n);
+        const double batchMean = batchSum / static_cast<double>(validN);
+        // calculateVariance returns population variance (M2/n).
+        // With NaN present the SIMD kernel would return NaN — compute the
+        // NaN-skipping variance scalar instead (rare path).
+        double batchM2;
+        if (validN == n) [[likely]] {
+            batchM2 = timestar::simd::SimdAggregator::calculateVariance(values, n, batchMean) * static_cast<double>(n);
+        } else {
+            batchM2 = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (std::isnan(values[i]))
+                    continue;
+                const double delta = values[i] - batchMean;
+                batchM2 += delta * delta;
+            }
+        }
         if (count == 0) {
             mean = batchMean;
             m2 = batchM2;
         } else {
             const double delta = batchMean - mean;
-            const double totalCount = static_cast<double>(count) + static_cast<double>(n);
-            m2 += batchM2 + delta * delta * (static_cast<double>(count) * static_cast<double>(n)) / totalCount;
-            mean += delta * (static_cast<double>(n) / totalCount);
+            const double totalCount = static_cast<double>(count) + static_cast<double>(validN);
+            m2 += batchM2 + delta * delta * (static_cast<double>(count) * static_cast<double>(validN)) / totalCount;
+            mean += delta * (static_cast<double>(validN) / totalCount);
         }
-        count += n;
+        count += validN;
     }
 
     // Phase 3: first/latest timestamp tracking.
     // Batches are almost always sorted (chronological ingest), so the
     // endpoints suffice; the sortedness scan is a single predictable
     // compare per element vs. the two-branch tracking loop.
-    if (std::is_sorted(timestamps, timestamps + n)) [[likely]] {
+    // When the batch contains NaN (validN < n), first/latest must be the
+    // first/last non-NaN VALUES (canonical FIRST/LATEST semantics) — take
+    // the NaN-skipping loop instead.
+    if (validN == n && std::is_sorted(timestamps, timestamps + n)) [[likely]] {
         if (timestamps[0] < firstTimestamp) {
             firstTimestamp = timestamps[0];
             firstValue = values[0];
@@ -76,6 +123,8 @@ void InMemorySeriesStats::update(const double* values, const uint64_t* timestamp
         }
     } else {
         for (size_t i = 0; i < n; ++i) {
+            if (std::isnan(values[i]))
+                continue;
             uint64_t ts = timestamps[i];
             if (ts < firstTimestamp) {
                 firstTimestamp = ts;
@@ -95,13 +144,14 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     if (srcTimestamps.empty()) [[unlikely]]
         return;
 
-    // Update running stats for double series (O(n) single pass over new data only)
-    if constexpr (std::is_same_v<T, double>) {
-        stats.update(insertRequest.values.data(), srcTimestamps.data(), srcTimestamps.size());
-    }
-
     const size_t oldSize = timestamps.size();
     const size_t newSize = srcTimestamps.size();
+
+    // Last-write-wins invariant: this method never leaves two points with the
+    // same timestamp in the series. Duplicates within a batch keep the last
+    // occurrence (request order); duplicates against existing data keep the
+    // incoming value. Running stats are updated with the surviving new points
+    // only, and fully recomputed when an existing point was overwritten.
 
     if (oldSize == 0) [[unlikely]] {
         // Series is empty -- take ownership of the entire vectors via move.
@@ -114,6 +164,11 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
         // check short-circuits the sort in the common case.
         if (!std::ranges::is_sorted(timestamps)) [[unlikely]] {
             sortPaired(0, timestamps.size());
+        }
+        dedupSuffixKeepLast(0);
+
+        if constexpr (std::is_same_v<T, double>) {
+            stats.update(values.data(), timestamps.data(), timestamps.size());
         }
         return;
     }
@@ -138,37 +193,76 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     values.insert(values.end(), std::make_move_iterator(insertRequest.values.begin()),
                   std::make_move_iterator(insertRequest.values.end()));
 
-    // Fast path: check if the combined data is already sorted.
-    // In typical time-series workloads, new data arrives in chronological order
-    // and the first new timestamp >= last old timestamp, making this the common case.
-    const bool boundaryOk = timestamps[oldSize] >= timestamps[oldSize - 1];
-    if (boundaryOk) [[likely]] {
-        // Boundary is fine -- check if new data itself is sorted.
-        if (std::ranges::is_sorted(std::ranges::subrange(timestamps.begin() + oldSize, timestamps.end()))) [[likely]] {
-            return;  // Everything already sorted, no work needed
-        }
-
-        // New suffix is unsorted but boundary was ok. Sort just the suffix, then
-        // re-check the boundary. If the minimum of the suffix (after sorting) is
-        // still >= old tail, we avoid a full merge.
+    // Sort the suffix if needed. In typical time-series workloads new data
+    // arrives in chronological order, so the is_sorted scan short-circuits
+    // the (stable) sort in the common case.
+    if (!std::ranges::is_sorted(std::ranges::subrange(timestamps.begin() + oldSize, timestamps.end()))) [[unlikely]] {
         sortPaired(oldSize, totalSize);
+    }
+    // Collapse duplicates within the batch: last write in request order wins.
+    dedupSuffixKeepLast(oldSize);
 
-        if (timestamps[oldSize] >= timestamps[oldSize - 1]) [[likely]] {
-            return;  // Suffix sorted and boundary still clean
-        }
-        // Fall through to merge: suffix is now sorted but boundary is violated
-        // (sorting moved a smaller timestamp to the front of the suffix).
-    } else {
-        // Boundary is violated. Sort the suffix first so we can merge two sorted runs.
-        if (!std::ranges::is_sorted(std::ranges::subrange(timestamps.begin() + oldSize, timestamps.end()))) {
-            sortPaired(oldSize, totalSize);
-        }
+    // Update running stats with the surviving new points. If the merge below
+    // overwrites existing points, stats are recomputed from scratch instead.
+    if constexpr (std::is_same_v<T, double>) {
+        stats.update(values.data() + oldSize, timestamps.data() + oldSize, timestamps.size() - oldSize);
     }
 
-    // Both [0, oldSize) and [oldSize, totalSize) are now individually sorted.
-    // Use inplace_merge on paired data to combine them in O(n) time
-    // (vs O(n log n) for a full sort).
-    mergePaired(oldSize);
+    // Fast path: strictly appending (first new timestamp is later than the
+    // old tail). Equal timestamps must NOT take this path — that's an
+    // overwrite of the old tail point, handled by the merge.
+    if (timestamps[oldSize] > timestamps[oldSize - 1]) [[likely]] {
+        return;
+    }
+
+    // Both [0, oldSize) and [oldSize, end) are sorted and internally
+    // duplicate-free. Merge in O(n); on timestamp collisions the suffix
+    // (newer write) wins.
+    const bool overwrote = mergePaired(oldSize);
+    if (overwrote) {
+        if constexpr (std::is_same_v<T, double>) {
+            recomputeStats();
+        }
+    }
+}
+
+template <class T>
+bool InMemorySeries<T>::dedupSuffixKeepLast(size_t from) {
+    const size_t n = timestamps.size();
+    if (n - from < 2)
+        return false;
+    // Fast pre-check: no adjacent equal timestamps means nothing to collapse
+    // (the suffix is sorted, so duplicates would be adjacent).
+    if (std::adjacent_find(timestamps.begin() + from, timestamps.end()) == timestamps.end()) [[likely]] {
+        return false;
+    }
+
+    // Two-pointer compaction keeping the LAST value of each equal-timestamp
+    // run. Stable sort preserved request order, so "last" == newest write.
+    size_t w = from;
+    for (size_t r = from + 1; r < n; ++r) {
+        if (timestamps[r] == timestamps[w]) {
+            values[w] = std::move(values[r]);
+        } else {
+            ++w;
+            if (w != r) {
+                timestamps[w] = timestamps[r];
+                values[w] = std::move(values[r]);
+            }
+        }
+    }
+    ++w;
+    timestamps.resize(w);
+    values.resize(w);
+    return true;
+}
+
+template <class T>
+void InMemorySeries<T>::recomputeStats() {
+    if constexpr (std::is_same_v<T, double>) {
+        stats = InMemorySeriesStats{};
+        stats.update(values.data(), timestamps.data(), timestamps.size());
+    }
 }
 
 template <class T>
@@ -182,7 +276,10 @@ void InMemorySeries<T>::sortPaired(size_t from, size_t to) {
     std::vector<size_t> indices(count);
     std::iota(indices.begin(), indices.end(), from);
 
-    std::sort(indices.begin(), indices.end(), [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
+    // Stable: equal timestamps keep request order so last-write-wins dedup
+    // can identify the newest write as the last element of each run.
+    std::stable_sort(indices.begin(), indices.end(),
+                     [this](size_t a, size_t b) { return timestamps[a] < timestamps[b]; });
 
     // Apply permutation via temporary timestamp vector. Values are applied
     // differently based on type: std::vector<bool> uses proxy references
@@ -209,31 +306,41 @@ void InMemorySeries<T>::sortPaired(size_t from, size_t to) {
 }
 
 template <class T>
-void InMemorySeries<T>::mergePaired(size_t midpoint) {
+bool InMemorySeries<T>::mergePaired(size_t midpoint) {
     const size_t n = timestamps.size();
     if (midpoint == 0 || midpoint >= n) [[unlikely]]
-        return;
+        return false;
 
     // Merge two sorted runs: [0, midpoint) and [midpoint, n).
     // We use a single-pass merge into temporary buffers. This is O(n) time
     // and O(n) space, but avoids the index indirection overhead of the old
     // approach and has better cache locality (sequential reads from both runs,
     // sequential writes to output).
+    // Both runs are internally duplicate-free; on equal timestamps the suffix
+    // run (newer write) wins and the prefix point is dropped (LWW).
     std::vector<uint64_t> mergedTs;
     std::vector<T> mergedVals;
     mergedTs.reserve(n);
     mergedVals.reserve(n);
 
+    bool overwrote = false;
     size_t i = 0, j = midpoint;
     while (i < midpoint && j < n) {
-        if (timestamps[i] <= timestamps[j]) {
+        if (timestamps[i] < timestamps[j]) {
             mergedTs.push_back(timestamps[i]);
             mergedVals.push_back(std::move(values[i]));
             ++i;
-        } else {
+        } else if (timestamps[j] < timestamps[i]) {
             mergedTs.push_back(timestamps[j]);
             mergedVals.push_back(std::move(values[j]));
             ++j;
+        } else {
+            // Equal timestamp: keep the incoming value, drop the old point.
+            mergedTs.push_back(timestamps[j]);
+            mergedVals.push_back(std::move(values[j]));
+            ++i;
+            ++j;
+            overwrote = true;
         }
     }
     // Append remaining elements from whichever run is not exhausted
@@ -250,6 +357,7 @@ void InMemorySeries<T>::mergePaired(size_t midpoint) {
 
     timestamps = std::move(mergedTs);
     values = std::move(mergedVals);
+    return overwrote;
 }
 
 seastar::future<> MemoryStore::close() {
@@ -479,18 +587,20 @@ std::optional<TSMValueType> MemoryStore::getSeriesType(const SeriesId128& series
 // Explicit template instantiations for every TimeStar value type.
 // The macro fans out (double, bool, std::string, int64_t) — see
 // value_type_dispatch.hpp.
-#define INST_INMEM(T)                                              \
-    template void InMemorySeries<T>::insert(TimeStarInsert<T>&&);  \
-    template void InMemorySeries<T>::sortPaired(size_t, size_t);   \
-    template void InMemorySeries<T>::mergePaired(size_t);
+#define INST_INMEM(T)                                             \
+    template void InMemorySeries<T>::insert(TimeStarInsert<T>&&); \
+    template void InMemorySeries<T>::sortPaired(size_t, size_t);  \
+    template bool InMemorySeries<T>::mergePaired(size_t);         \
+    template bool InMemorySeries<T>::dedupSuffixKeepLast(size_t); \
+    template void InMemorySeries<T>::recomputeStats();
 TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_INMEM)
 #undef INST_INMEM
 
-#define INST_STORE(T)                                                                                      \
-    template seastar::future<bool> MemoryStore::insert<T>(TimeStarInsert<T>&);                             \
-    template seastar::future<bool> MemoryStore::insertBatch<T>(std::vector<TimeStarInsert<T>>&, size_t);   \
-    template void MemoryStore::insertMemory<T>(TimeStarInsert<T>&&);                                       \
-    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&);                                \
+#define INST_STORE(T)                                                                                    \
+    template seastar::future<bool> MemoryStore::insert<T>(TimeStarInsert<T>&);                           \
+    template seastar::future<bool> MemoryStore::insertBatch<T>(std::vector<TimeStarInsert<T>>&, size_t); \
+    template void MemoryStore::insertMemory<T>(TimeStarInsert<T>&&);                                     \
+    template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&);                              \
     template bool MemoryStore::wouldExceedThreshold<T>(TimeStarInsert<T>&, size_t&);
 TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(INST_STORE)
 #undef INST_STORE

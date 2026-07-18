@@ -14,6 +14,8 @@
  *   ./timestar_insert_bench --format protobuf --batch-size 10000 --batches 100
  */
 
+#include "bench_common.hpp"
+
 #include "timestar.pb.h"
 
 #include <boost/range/irange.hpp>
@@ -44,8 +46,6 @@
 #include <seastar/net/inet_address.hh>
 #include <string>
 #include <vector>
-
-#include "bench_common.hpp"
 
 using namespace seastar;
 using timestar::bench::clk;
@@ -267,8 +267,7 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
     // Points per successful request: json-batch sends `batchSize` scalar
     // write points (one field each); the array formats send batchSize
     // timestamps × |FIELD_NAMES| fields.
-    const size_t pointsPerRequest =
-        (format == WireFormat::JsonBatch) ? batchSize : batchSize * FIELD_NAMES.size();
+    const size_t pointsPerRequest = (format == WireFormat::JsonBatch) ? batchSize : batchSize * FIELD_NAMES.size();
 
     // MIME type for HTTP requests.  Seastar's write_body() maps file-extension
     // strings to MIME types ("json" → "application/json").  For protobuf there

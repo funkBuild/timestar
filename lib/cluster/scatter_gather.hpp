@@ -17,12 +17,11 @@
 // keep the explicit invoke_on loop — this template covers the "same work on
 // every shard" case, which is the bulk of the duplication.
 
+#include <iterator>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
-
-#include <iterator>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -55,18 +54,17 @@ template <class Service, class PerShard>
 auto scatterAndConcat(seastar::sharded<Service>& sharded, PerShard perShard) {
     using Vec = detail::future_value_t<std::invoke_result_t<PerShard, Service&>>;
     using T = typename Vec::value_type;
-    return scatterAll(sharded, std::move(perShard))
-        .then([](std::vector<Vec> shardResults) {
-            std::vector<T> merged;
-            size_t total = 0;
-            for (auto& v : shardResults) total += v.size();
-            merged.reserve(total);
-            for (auto& v : shardResults) {
-                merged.insert(merged.end(), std::make_move_iterator(v.begin()),
-                              std::make_move_iterator(v.end()));
-            }
-            return merged;
-        });
+    return scatterAll(sharded, std::move(perShard)).then([](std::vector<Vec> shardResults) {
+        std::vector<T> merged;
+        size_t total = 0;
+        for (auto& v : shardResults)
+            total += v.size();
+        merged.reserve(total);
+        for (auto& v : shardResults) {
+            merged.insert(merged.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
+        }
+        return merged;
+    });
 }
 
 // Scatter, sum a numeric per-shard result.

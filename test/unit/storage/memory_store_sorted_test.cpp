@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <numeric>
 #include <random>
+#include <set>
 #include <vector>
 
 // Tests for InMemorySeries::insert maintaining sorted order.
@@ -228,7 +229,7 @@ TEST_F(MemoryStoreSortedTest, DuplicateTimestamps) {
     insert1.addValue(3000, 3.0);
     series.insert(std::move(insert1));
 
-    // Insert with duplicate timestamps
+    // Insert with duplicate timestamps: last write wins, no duplicate points
     TimeStarInsert<double> insert2("test", "field");
     insert2.addValue(2000, 20.0);
     insert2.addValue(3000, 30.0);
@@ -236,12 +237,17 @@ TEST_F(MemoryStoreSortedTest, DuplicateTimestamps) {
     series.insert(std::move(insert2));
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), 6);
+    ASSERT_EQ(series.timestamps.size(), 4);
 
-    // All timestamps should be in non-decreasing order (duplicates allowed)
+    // Strictly increasing (duplicates collapsed), rewritten values win
     for (size_t i = 1; i < series.timestamps.size(); ++i) {
-        EXPECT_LE(series.timestamps[i - 1], series.timestamps[i]);
+        EXPECT_LT(series.timestamps[i - 1], series.timestamps[i]);
     }
+    EXPECT_EQ(series.timestamps, (std::vector<uint64_t>{1000, 2000, 3000, 4000}));
+    EXPECT_DOUBLE_EQ(series.values[0], 1.0);
+    EXPECT_DOUBLE_EQ(series.values[1], 20.0);  // overwritten by insert2
+    EXPECT_DOUBLE_EQ(series.values[2], 30.0);  // overwritten by insert2
+    EXPECT_DOUBLE_EQ(series.values[3], 40.0);
 }
 
 // --- Test: Large random batch is correctly sorted ---
@@ -272,11 +278,14 @@ TEST_F(MemoryStoreSortedTest, MultipleRandomBatches) {
 
     std::mt19937 rng(12345);
 
-    // Insert 5 batches of 200 random points each
+    // Insert 5 batches of 200 random points each. Random timestamps collide,
+    // and equal timestamps collapse (last write wins) — track distinct count.
+    std::set<uint64_t> distinct;
     for (int batch = 0; batch < 5; ++batch) {
         std::vector<uint64_t> timestamps(200);
         for (int i = 0; i < 200; ++i) {
             timestamps[i] = rng() % 10000 + 1;
+            distinct.insert(timestamps[i]);
         }
 
         TimeStarInsert<double> insert("test", "field");
@@ -287,7 +296,11 @@ TEST_F(MemoryStoreSortedTest, MultipleRandomBatches) {
     }
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), 1000);
+    EXPECT_EQ(series.timestamps.size(), distinct.size());
+    // No duplicate timestamps survive
+    for (size_t i = 1; i < series.timestamps.size(); ++i) {
+        EXPECT_LT(series.timestamps[i - 1], series.timestamps[i]);
+    }
 }
 
 // --- Test: Boolean values stay paired after sorting ---
@@ -424,7 +437,8 @@ TEST_F(MemoryStoreSortedTest, NewBatchStartsAtExactBoundary) {
     insert1.addValue(3000, 3000.0);
     series.insert(std::move(insert1));
 
-    // New batch starts at exactly the last timestamp
+    // New batch starts at exactly the last timestamp: the rewrite of ts=3000
+    // replaces the old point (last write wins)
     TimeStarInsert<double> insert2("test", "field");
     insert2.addValue(3000, 30000.0);  // Duplicate timestamp, different value
     insert2.addValue(4000, 4000.0);
@@ -432,7 +446,9 @@ TEST_F(MemoryStoreSortedTest, NewBatchStartsAtExactBoundary) {
     series.insert(std::move(insert2));
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), 6);
+    ASSERT_EQ(series.timestamps.size(), 5);
+    EXPECT_EQ(series.timestamps[2], 3000);
+    EXPECT_DOUBLE_EQ(series.values[2], 30000.0);  // rewritten value visible
 }
 
 // --- Test: Three batches where middle batch is out of order internally ---
@@ -474,11 +490,11 @@ TEST_F(MemoryStoreSortedTest, AllSameTimestamps) {
     series.insert(std::move(insert));
 
     verifySorted(series);
-    EXPECT_EQ(series.timestamps.size(), 3);
-    // All timestamps should be 1000
-    for (auto ts : series.timestamps) {
-        EXPECT_EQ(ts, 1000);
-    }
+    // Equal timestamps collapse to a single point; the LAST value in request
+    // order wins (last-write-wins)
+    ASSERT_EQ(series.timestamps.size(), 1);
+    EXPECT_EQ(series.timestamps[0], 1000);
+    EXPECT_DOUBLE_EQ(series.values[0], 3.0);
 }
 
 // --- Test: Reverse-order data ---

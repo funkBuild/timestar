@@ -154,20 +154,25 @@ TEST_F(HttpServerShardSafetyTest, HandlersAreHeapAllocated) {
     std::string setRoutesBody = extractFunctionBody("void set_routes(");
     ASSERT_FALSE(setRoutesBody.empty()) << "Could not extract set_routes function body";
 
-    // Check for heap allocation of handlers using new
-    EXPECT_NE(setRoutesBody.find("new HttpWriteHandler"), std::string::npos)
+    // Check for heap allocation of handlers using new. Handlers live in
+    // timestar::http but may be referenced with or without qualification.
+    auto hasNewHandler = [&setRoutesBody](const std::string& handler) {
+        return setRoutesBody.find("new timestar::http::" + handler) != std::string::npos ||
+               setRoutesBody.find("new timestar::" + handler) != std::string::npos ||
+               setRoutesBody.find("new " + handler) != std::string::npos;
+    };
+
+    EXPECT_TRUE(hasNewHandler("HttpWriteHandler"))
         << "HttpWriteHandler must be heap-allocated with new inside set_routes "
         << "because registerRoutes() captures `this` in route lambdas.";
 
-    // HttpQueryHandler might be in timestar:: namespace
-    bool hasQueryHandler = setRoutesBody.find("new timestar::HttpQueryHandler") != std::string::npos ||
-                           setRoutesBody.find("new HttpQueryHandler") != std::string::npos;
-    EXPECT_TRUE(hasQueryHandler) << "HttpQueryHandler must be heap-allocated with new inside set_routes.";
+    EXPECT_TRUE(hasNewHandler("HttpQueryHandler"))
+        << "HttpQueryHandler must be heap-allocated with new inside set_routes.";
 
-    EXPECT_NE(setRoutesBody.find("new HttpDeleteHandler"), std::string::npos)
+    EXPECT_TRUE(hasNewHandler("HttpDeleteHandler"))
         << "HttpDeleteHandler must be heap-allocated with new inside set_routes.";
 
-    EXPECT_NE(setRoutesBody.find("new HttpMetadataHandler"), std::string::npos)
+    EXPECT_TRUE(hasNewHandler("HttpMetadataHandler"))
         << "HttpMetadataHandler must be heap-allocated with new inside set_routes.";
 }
 

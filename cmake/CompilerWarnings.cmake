@@ -65,7 +65,14 @@ function(timestar_set_project_warnings target)
             -Wno-error=null-dereference
             -Wno-error=uninitialized
             -Wno-error=maybe-uninitialized
-            -Wno-error=array-bounds)
+            -Wno-error=array-bounds
+            # stringop-overflow/overread: same middle-end class; gcc 14.2
+            # (CI's Ubuntu 24.04 toolchain) reports "writing N bytes into a
+            # region of size 0" inside bits/stl_algobase.h std::copy through
+            # vector-growth inlining (aggregator.cpp, http_query_handler.cpp);
+            # gcc 14.3 does not.
+            -Wno-error=stringop-overflow
+            -Wno-error=stringop-overread)
     endif()
 
     if(CMAKE_CXX_COMPILER_ID MATCHES ".*Clang")

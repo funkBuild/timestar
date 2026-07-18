@@ -1,24 +1,23 @@
 #pragma once
 
+#include "field_values.hpp"
 #include "native_index.hpp"
 #include "query_parser.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <chrono>
 #include <memory>
 #include <optional>
-#include <utility>
-#include <vector>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/http/function_handlers.hh>
-#include "field_values.hpp"
-
 #include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
+#include <utility>
+#include <vector>
 
 // Forward declaration
 class Engine;
@@ -28,8 +27,12 @@ struct GlazeQueryRequest;
 
 namespace timestar {
 
-// Forward declaration for finalizeSingleShardPartials
+// Forward declaration for finalizeSingleShardPartials (defined in lib/query/aggregator.hpp)
 struct PartialAggregationResult;
+
+}  // namespace timestar
+
+namespace timestar::http {
 
 // Forward declarations for executeQuery phase types (defined in http_query_handler.cpp)
 struct SeriesQueryContext;
@@ -92,7 +95,13 @@ public:
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
     // Execute query across shards
-    seastar::future<QueryResponse> executeQuery(const QueryRequest& request);
+    // Takes the request BY VALUE, not by reference: this is a coroutine, so a
+    // reference parameter is read after every suspension point while callers do
+    // not all outlive us — the SSE backfill loop passes a loop-body local
+    // through seastar::with_timeout, which by design does NOT cancel the inner
+    // future, so on a backfill timeout that local dies mid-flight.  By-value
+    // puts the copy in the parameter, before the coroutine body can suspend.
+    seastar::future<QueryResponse> executeQuery(QueryRequest request);
 
     // Parse JSON request body (public for testing)
     QueryRequest parseQueryRequest(const GlazeQueryRequest& glazeReq);
@@ -156,4 +165,13 @@ private:
     void logQueryCompletion(const QueryRequest& request, QueryTimingInfo& timing);
 };
 
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: these types historically lived directly in
+// namespace timestar. New code should use timestar::http:: directly.
+namespace timestar {
+using http::HttpQueryHandler;
+using http::QueryResponse;
+using http::QueryStatistics;
+using http::SeriesResult;
 }  // namespace timestar

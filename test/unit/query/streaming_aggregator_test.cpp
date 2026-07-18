@@ -230,8 +230,8 @@ TEST(StreamingAggregatorTest, PartialCloseBuckets) {
     // but bucket [1000,1999] is NOT (1000 + 1000 = 2000 > 1500).
     auto batch1 = agg.closeBuckets(1500);
     ASSERT_EQ(batch1.points.size(), 1u);
-    EXPECT_EQ(batch1.points[0].timestamp, 0u);                          // bucket start
-    EXPECT_DOUBLE_EQ(std::get<double>(batch1.points[0].value), 20.0);   // avg(10, 30)
+    EXPECT_EQ(batch1.points[0].timestamp, 0u);                         // bucket start
+    EXPECT_DOUBLE_EQ(std::get<double>(batch1.points[0].value), 20.0);  // avg(10, 30)
 
     // The aggregator should still have the in-progress bucket [1000,1999].
     EXPECT_TRUE(agg.hasData());
@@ -239,8 +239,8 @@ TEST(StreamingAggregatorTest, PartialCloseBuckets) {
     // closeBuckets(2500): bucket [1000,1999] is now complete (1000 + 1000 <= 2500).
     auto batch2 = agg.closeBuckets(2500);
     ASSERT_EQ(batch2.points.size(), 1u);
-    EXPECT_EQ(batch2.points[0].timestamp, 1000u);                       // bucket start
-    EXPECT_DOUBLE_EQ(std::get<double>(batch2.points[0].value), 60.0);   // avg(50, 70)
+    EXPECT_EQ(batch2.points[0].timestamp, 1000u);                      // bucket start
+    EXPECT_DOUBLE_EQ(std::get<double>(batch2.points[0].value), 60.0);  // avg(50, 70)
 
     // All buckets closed now.
     EXPECT_FALSE(agg.hasData());
@@ -269,7 +269,7 @@ TEST(StreamingAggregatorTest, PartialCloseRetainsInProgress) {
     auto batch3 = agg.closeBuckets(1000);
     ASSERT_EQ(batch3.points.size(), 1u);
     EXPECT_EQ(batch3.points[0].timestamp, 0u);
-    EXPECT_DOUBLE_EQ(std::get<double>(batch3.points[0].value), 20.0);   // sum(5, 15)
+    EXPECT_DOUBLE_EQ(std::get<double>(batch3.points[0].value), 20.0);  // sum(5, 15)
     EXPECT_FALSE(agg.hasData());
 }
 
@@ -501,4 +501,86 @@ TEST(StreamingFormulaTest, AggregatorThenFormula) {
 
     ASSERT_EQ(result.points.size(), 1u);
     EXPECT_DOUBLE_EQ(std::get<double>(result.points[0].value), 85.0);
+}
+
+// ---------------------------------------------------------------------------
+// Non-numeric fields on the SSE aggregation path.
+//
+// Canonical rule (CLAUDE.md "Non-Numeric Fields in Queries"): strings and
+// booleans never aggregate arithmetically.  With an aggregationInterval they
+// reduce to LATEST-per-bucket and are returned in the type they were written
+// in — identical to POST /query, so a live stream and a backfill of the same
+// window cannot disagree.
+//
+// Previously booleans were folded as 1.0/0.0 (so `avg` over a 5m bucket
+// streamed 0.6 where /query returned true) and strings were dropped from the
+// stream entirely unless the method happened to be COUNT.
+// ---------------------------------------------------------------------------
+
+static StreamingDataPoint makeValuePoint(const std::string& field, uint64_t timestamp,
+                                         std::variant<double, bool, std::string, int64_t> value) {
+    StreamingDataPoint pt;
+    pt.measurement = "dev";
+    pt.field = field;
+    pt.tags = makeTags({{"d", "d1"}});
+    pt.timestamp = timestamp;
+    pt.value = std::move(value);
+    return pt;
+}
+
+TEST(StreamingAggregatorTest, BooleansAreLatestPerBucketNotCoercedToNumbers) {
+    // The method must be ignored for a boolean field — sweep the ones whose
+    // numeric fold would otherwise produce a plausible wrong number.
+    for (auto method : {AggregationMethod::AVG, AggregationMethod::SUM, AggregationMethod::MIN, AggregationMethod::MAX,
+                        AggregationMethod::COUNT, AggregationMethod::LATEST}) {
+        StreamingAggregator agg(10'000'000'000ULL, method);
+        // 3 of 5 true in one bucket; latest (t=5s) is false.
+        agg.addPoint(makeValuePoint("active", 1'000'000'000, true));
+        agg.addPoint(makeValuePoint("active", 2'000'000'000, true));
+        agg.addPoint(makeValuePoint("active", 3'000'000'000, false));
+        agg.addPoint(makeValuePoint("active", 4'000'000'000, true));
+        agg.addPoint(makeValuePoint("active", 5'000'000'000, false));
+
+        auto batch = agg.closeBuckets();
+        ASSERT_EQ(batch.points.size(), 1u) << "method=" << static_cast<int>(method);
+        EXPECT_EQ(batch.points[0].timestamp, 0u) << "bucket start expected";
+        ASSERT_TRUE(std::holds_alternative<bool>(batch.points[0].value))
+            << "REGRESSION: boolean coerced to a number on the SSE path (method=" << static_cast<int>(method) << ")";
+        EXPECT_FALSE(std::get<bool>(batch.points[0].value)) << "LATEST value in the bucket expected";
+    }
+}
+
+TEST(StreamingAggregatorTest, StringsAreLatestPerBucketNotDropped) {
+    StreamingAggregator agg(10'000'000'000ULL, AggregationMethod::AVG);
+    agg.addPoint(makeValuePoint("label", 1'000'000'000, std::string("alpha")));
+    agg.addPoint(makeValuePoint("label", 2'000'000'000, std::string("beta")));
+
+    auto batch = agg.closeBuckets();
+    ASSERT_EQ(batch.points.size(), 1u) << "REGRESSION: string field dropped from the stream";
+    ASSERT_TRUE(std::holds_alternative<std::string>(batch.points[0].value));
+    EXPECT_EQ(std::get<std::string>(batch.points[0].value), "beta") << "LATEST value in the bucket expected";
+}
+
+TEST(StreamingAggregatorTest, NonNumericLatestIsPerBucketAndKeepsNumericFieldsWorking) {
+    StreamingAggregator agg(10'000'000'000ULL, AggregationMethod::AVG);
+    // Two buckets of a bool field, plus a numeric field that must still average.
+    agg.addPoint(makeValuePoint("active", 1'000'000'000, true));
+    agg.addPoint(makeValuePoint("active", 9'000'000'000, false));  // bucket 0 latest
+    agg.addPoint(makeValuePoint("active", 11'000'000'000, true));  // bucket 10s
+    agg.addPoint(makeValuePoint("temp", 1'000'000'000, 10.0));
+    agg.addPoint(makeValuePoint("temp", 2'000'000'000, 20.0));
+
+    auto batch = agg.closeBuckets();
+    ASSERT_EQ(batch.points.size(), 3u);
+
+    std::map<std::pair<uint64_t, std::string>, StreamingDataPoint*> byKey;
+    for (auto& p : batch.points) {
+        byKey[{p.timestamp, p.field}] = &p;
+    }
+    ASSERT_TRUE(byKey.count({0u, "active"}));
+    EXPECT_FALSE(std::get<bool>(byKey[{0u, "active"}]->value)) << "bucket 0 latest is false";
+    ASSERT_TRUE(byKey.count({10'000'000'000u, "active"}));
+    EXPECT_TRUE(std::get<bool>(byKey[{10'000'000'000u, "active"}]->value)) << "bucket 1 latest is true";
+    ASSERT_TRUE(byKey.count({0u, "temp"}));
+    EXPECT_DOUBLE_EQ(std::get<double>(byKey[{0u, "temp"}]->value), 15.0) << "numeric fields still aggregate";
 }

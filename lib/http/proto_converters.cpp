@@ -59,10 +59,17 @@ std::vector<MultiWritePoint> parseWriteRequest(const void* data, size_t size) {
         if (!wp.compressed_timestamps().empty()) {
             const auto& ct = wp.compressed_timestamps();
             Slice tsSlice(reinterpret_cast<const uint8_t*>(ct.data()), ct.size());
-            // Upper bound: compressed data can't encode more values than bytes/2
-            // (minimum 16 bytes per block header). The decoder stops at slice end.
-            size_t maxCount = ct.size() / 2 + 1024;
+            // Decode the TRUE value count carried in the FFOR block headers.
+            // The bound only guards against decompression bombs; decoding past
+            // the server point limit means the payload is oversized and must be
+            // rejected loudly — never stored as a silently truncated prefix.
+            const size_t maxCount = compressedTimestampDecodeBound(ct.size());
             IntegerEncoder::decode(tsSlice, static_cast<unsigned int>(maxCount), mwp.timestamps);
+            if (mwp.timestamps.size() > kMaxCompressedPointsPerWritePoint) {
+                throw std::runtime_error("compressed_timestamps decodes to more than " +
+                                         std::to_string(kMaxCompressedPointsPerWritePoint) +
+                                         " values (max points per write point)");
+            }
         } else {
             mwp.timestamps.reserve(wp.timestamps_size());
             for (int i = 0; i < wp.timestamps_size(); ++i) {

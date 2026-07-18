@@ -103,10 +103,25 @@ V2 adds type-specific statistics after the 28-byte base. Total block entry sizes
 | 28     | 8    | double | blockSum                                     |
 | 36     | 8    | double | blockMin                                     |
 | 44     | 8    | double | blockMax                                     |
-| 52     | 4    | uint32 | blockCount                                   |
+| 52     | 4    | uint32 | blockCount (non-NaN count, see below)        |
 | 56     | 8    | double | blockM2 (Welford accumulator for STDDEV)     |
 | 64     | 8    | double | blockFirstValue (value at earliest timestamp)|
 | 72     | 8    | double | blockLatestValue (value at latest timestamp) |
+
+Float stats semantics (canonical NaN policy, docs/nan_policy.md): all stats
+INCLUDING `blockCount` skip NaN values — `blockCount` is the number of
+**non-NaN** points, so COUNT/AVG stats pushdown matches the scalar
+NaN-skipping fold. The block header carries the true total point count for
+decoding; a `blockCount` that differs from the header count marks a
+NaN-carrying block (the COUNT-only read path uses this to force value
+decode). Blocks containing NaN are written with NaN in
+`blockM2`/`blockFirstValue`/`blockLatestValue` — NaN endpoints are the
+on-disk sentinel from which the reader derives `hasExtendedStats = false`
+(M2/first/latest withheld; the flag itself is not serialized). An all-NaN
+block has `blockCount = 0` (stats pushdown disabled). Files written before
+this rule stored the raw
+total in `blockCount`; they never mismatch the header count and keep legacy
+(NaN-counting) pushdown behaviour until rewritten by compaction.
 
 #### Integer Block Stats (offsets 28-71)
 
@@ -134,6 +149,26 @@ V2 adds type-specific statistics after the 28-byte base. Total block entry sizes
 | Offset | Size | Type   | Field            |
 |--------|------|--------|------------------|
 | 28     | 4    | uint32 | blockCount       |
+
+#### String Dictionary (String series only, after the block entries)
+
+Each String series index entry ends with `dictSize(4)` + `dictData(dictSize)`.
+`dictSize == 0` means the series' blocks use raw `STRG` encoding; a non-zero
+size means they use dictionary-ID `STR2` encoding, whose varint IDs are ONLY
+meaningful with this dictionary. **Invariant: a file containing STR2 blocks
+for a series MUST carry that series' dictionary in its index entry.**
+Compaction enforces this by carrying the dictionary through the zero-copy
+block path when the series comes from a single source file, and by decoding +
+re-encoding (fresh dictionary) when merging dictionary-bearing blocks from
+multiple sources.
+
+Historical note (bug fixed Jul 2026): compaction's zero-copy path used to
+carry STR2 blocks without their dictionary, writing `dictSize=0`. Files
+written by an affected build have permanently undecodable string blocks
+(the reader now reports "Dictionary-encoded (STR2) string block has no
+dictionary in its TSM index entry"); the dictionary bytes were never written,
+so no repair is possible — affected string data must be re-ingested. Numeric
+series in the same files are unaffected.
 
 ### V1 Backward Compatibility
 
@@ -168,10 +203,23 @@ On open, only a sparse index is loaded (no block data):
 ## File Naming
 
 ```
-shard_{ID}/tsm/{TIER}_{SEQUENCE}.tsm
+shard_{ID}/tsm/{TIER}_{SEQUENCE}.tsm          (flush-created, tier 0)
+shard_{ID}/tsm/{TIER}_{SEQUENCE}_d{DATASEQ}.tsm   (compaction output)
 ```
 
-Ranking: `(tier << 60) | sequence`. Higher tiers and newer sequences take priority.
+Two distinct orderings are derived from the name:
+
+- **File identity** (`rankAsInteger()`): `(tier << 60) | sequence`. Unique key
+  for file-manager maps; NOT a duplicate-resolution priority.
+- **Duplicate resolution** (`dataRank()`): `(dataSeq << 4) | tier`. On equal
+  timestamps the file with the higher `dataRank` holds the newer write
+  (last-write-wins). `dataSeq` is the newest write generation contained in the
+  file: flush-created files use their own sequence (flush order == write order
+  per shard); compaction outputs inherit `max(dataSeq)` of their inputs via
+  the `_d{DATASEQ}` suffix. A freshly allocated sequence must never be used
+  for dedup ranking — it would let an old point compacted into a higher tier
+  outrank a tier-0 file holding a newer rewrite. Files without the suffix
+  (legacy, or flush-created) fall back to `dataSeq = sequence`.
 
 ## Phase 4: Index Pagination (Deferred)
 

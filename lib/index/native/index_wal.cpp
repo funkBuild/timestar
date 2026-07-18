@@ -441,9 +441,10 @@ seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTa
     // mid-append (normal) or corruption (CRC mismatch / bad record). Either
     // way the remaining bytes are discarded — say so instead of silence.
     if (p < end) {
-        index_wal_log.warn("WAL replay of {} stopped with {} of {} bytes unconsumed ({} records replayed) — "
-                           "torn tail or corrupt record, remaining bytes discarded",
-                           path, static_cast<size_t>(end - p), data.size(), recordsReplayed);
+        index_wal_log.warn(
+            "WAL replay of {} stopped with {} of {} bytes unconsumed ({} records replayed) — "
+            "torn tail or corrupt record, remaining bytes discarded",
+            path, static_cast<size_t>(end - p), data.size(), recordsReplayed);
     }
 
     co_return recordsReplayed;

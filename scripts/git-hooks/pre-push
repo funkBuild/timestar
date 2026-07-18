@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# pre-push: run the CI formatting gate locally before anything leaves the
+# machine. Mirrors .github/workflows/ci.yml "Check formatting" exactly:
+#
+#   find lib bin -name "*.cpp" -o -name "*.hpp" | xargs clang-format --dry-run --Werror
+#
+# Enable with:  git config core.hooksPath scripts/git-hooks
+# Bypass once:  git push --no-verify   (CI will still enforce the gate)
+#
+# Note: this checks the WORKING TREE (like running the formatter yourself),
+# not the exact blobs being pushed — good enough as a fast local guard;
+# CI remains the authoritative gate on the pushed commits.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+PINNED_VERSION="21.1.6"  # keep in sync with Dockerfile deps stage + CONTRIBUTING.md
+
+if ! command -v clang-format >/dev/null 2>&1; then
+    echo "pre-push: clang-format not found — CI enforces formatting and will fail." >&2
+    echo "pre-push: install the pinned version:  pip install clang-format==${PINNED_VERSION}" >&2
+    exit 1
+fi
+
+version="$(clang-format --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [[ "$version" != "$PINNED_VERSION" ]]; then
+    echo "pre-push: warning: local clang-format ${version} != CI-pinned ${PINNED_VERSION};" >&2
+    echo "pre-push: results may differ from CI (pip install clang-format==${PINNED_VERSION})" >&2
+fi
+
+if ! find lib bin -name "*.cpp" -o -name "*.hpp" | xargs clang-format --dry-run --Werror 2>/dev/null; then
+    echo "" >&2
+    echo "pre-push: formatting check FAILED (same gate as CI). Offending files:" >&2
+    # Re-run without --Werror to list every violating file once.
+    find lib bin -name "*.cpp" -o -name "*.hpp" | xargs clang-format --dry-run 2>&1 |
+        grep -oE '^[^: ]+\.(cpp|hpp)' | sort -u | sed 's/^/  /' >&2
+    echo "" >&2
+    echo "pre-push: fix with:" >&2
+    echo "  find lib bin -name '*.cpp' -o -name '*.hpp' | xargs clang-format -i" >&2
+    echo "pre-push: or bypass once with: git push --no-verify" >&2
+    exit 1
+fi
+
+exit 0

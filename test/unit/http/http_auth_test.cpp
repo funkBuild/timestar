@@ -1,7 +1,7 @@
 #include "../../../lib/http/http_auth.hpp"
 #include "../../../lib/config/timestar_config.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

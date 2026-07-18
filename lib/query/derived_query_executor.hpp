@@ -88,8 +88,11 @@ private:
     DerivedQueryConfig config_;
     const ExpressionNode* cachedAst_ = nullptr;  // Avoids re-parsing in executeWithAnomaly→execute
 
-    // Execute a single sub-query
-    seastar::future<SubQueryResult> executeSubQuery(const std::string& name, const QueryRequest& query);
+    // Execute a single sub-query.  Takes the QueryRequest by value: callers
+    // may pass a temporary (e.g. with the request-level aggregation interval
+    // applied), and a by-value coroutine parameter is copied into the
+    // coroutine frame, so it cannot dangle across suspension points.
+    seastar::future<SubQueryResult> executeSubQuery(const std::string& name, QueryRequest query);
 
     // Execute all sub-queries in parallel
     seastar::future<std::map<std::string, SubQueryResult>> executeAllSubQueries(const DerivedQueryRequest& request);

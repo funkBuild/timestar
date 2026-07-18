@@ -7,6 +7,13 @@
 #include "proto_converters.hpp"
 #include "timestar.pb.h"
 
+// For decoding compressed (Approach B) response fields in format tests
+#include "bool_encoder_rle.hpp"
+#include "float_encoder.hpp"
+#include "integer_encoder.hpp"
+#include "slice_buffer.hpp"
+#include "string_encoder.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -15,6 +22,53 @@
 #include <vector>
 
 using namespace timestar::proto;
+
+// ---------------------------------------------------------------------------
+// Decode helpers for "Approach B" compressed response fields.  Since
+// 3b226b0 the format* converters emit compressed bytes fields and leave the
+// repeated packed fields empty; tests must decode to verify contents.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::vector<double> decodeAlpValues(const std::string& compressed, size_t count) {
+    std::vector<double> out;
+    CompressedSlice cs(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
+    FloatDecoder::decode(cs, 0, count, out);
+    return out;
+}
+
+std::vector<uint64_t> decodeFforU64(const std::string& compressed, size_t count) {
+    std::vector<uint64_t> out;
+    Slice s(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
+    IntegerEncoder::decode(s, static_cast<unsigned int>(count), out);
+    return out;
+}
+
+std::vector<int64_t> decodeZigZagFfor(const std::string& compressed, size_t count) {
+    std::vector<uint64_t> zz = decodeFforU64(compressed, count);
+    std::vector<int64_t> out;
+    out.reserve(zz.size());
+    for (uint64_t v : zz) {
+        out.push_back(static_cast<int64_t>((v >> 1) ^ -(v & 1)));
+    }
+    return out;
+}
+
+std::vector<bool> decodeRleBools(const std::string& compressed, size_t count) {
+    std::vector<bool> out;
+    Slice s(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
+    BoolEncoderRLE::decode(s, 0, count, out);
+    return out;
+}
+
+std::vector<std::string> decodeZstdStrings(const std::string& compressed, size_t count) {
+    std::vector<std::string> out;
+    Slice s(reinterpret_cast<const uint8_t*>(compressed.data()), compressed.size());
+    StringEncoder::decode(s, count, out);
+    return out;
+}
+
+}  // namespace
 
 // ============================================================================
 // Write converter tests
@@ -293,9 +347,14 @@ TEST(ProtoConverterQuery, FormatQueryResponseBoolValues) {
 
     const auto& fd = resp.series(0).fields().at("alive");
     ASSERT_TRUE(fd.has_bool_values());
-    ASSERT_EQ(fd.bool_values().values_size(), 2);
-    EXPECT_TRUE(fd.bool_values().values(0));
-    EXPECT_FALSE(fd.bool_values().values(1));
+    EXPECT_EQ(fd.bool_values().values_size(), 0);  // compressed only
+    ASSERT_FALSE(fd.bool_values().compressed_rle().empty());
+    auto decoded = decodeRleBools(fd.bool_values().compressed_rle(), 2);
+    ASSERT_EQ(decoded.size(), 2u);
+    EXPECT_TRUE(decoded[0]);
+    EXPECT_FALSE(decoded[1]);
+    ASSERT_FALSE(fd.compressed_timestamps().empty());
+    EXPECT_EQ(decodeFforU64(fd.compressed_timestamps(), 2), timestamps);
 }
 
 TEST(ProtoConverterQuery, FormatQueryResponseStringValues) {
@@ -318,8 +377,12 @@ TEST(ProtoConverterQuery, FormatQueryResponseStringValues) {
 
     const auto& fd = resp.series(0).fields().at("msg");
     ASSERT_TRUE(fd.has_string_values());
-    ASSERT_EQ(fd.string_values().values_size(), 1);
-    EXPECT_EQ(fd.string_values().values(0), "hello");
+    EXPECT_EQ(fd.string_values().values_size(), 0);  // compressed only
+    ASSERT_FALSE(fd.string_values().compressed_zstd().empty());
+    EXPECT_EQ(fd.string_values().count(), 1u);
+    auto decoded = decodeZstdStrings(fd.string_values().compressed_zstd(), 1);
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded[0], "hello");
 }
 
 TEST(ProtoConverterQuery, FormatQueryResponseInt64Values) {
@@ -342,9 +405,12 @@ TEST(ProtoConverterQuery, FormatQueryResponseInt64Values) {
 
     const auto& fd = resp.series(0).fields().at("count");
     ASSERT_TRUE(fd.has_int64_values());
-    ASSERT_EQ(fd.int64_values().values_size(), 2);
-    EXPECT_EQ(fd.int64_values().values(0), 42);
-    EXPECT_EQ(fd.int64_values().values(1), -100);
+    EXPECT_EQ(fd.int64_values().values_size(), 0);  // compressed only
+    ASSERT_FALSE(fd.int64_values().compressed_ffor().empty());
+    auto decoded = decodeZigZagFfor(fd.int64_values().compressed_ffor(), 2);
+    ASSERT_EQ(decoded.size(), 2u);
+    EXPECT_EQ(decoded[0], 42);
+    EXPECT_EQ(decoded[1], -100);
 }
 
 TEST(ProtoConverterQuery, FormatQueryResponseWithStatistics) {
@@ -416,9 +482,13 @@ TEST(ProtoConverterQuery, FormatQueryResponseNaNDoubles) {
     ASSERT_TRUE(resp.ParseFromString(bytes));
 
     const auto& fd = resp.series(0).fields().at("value");
-    ASSERT_EQ(fd.double_values().values_size(), 2);
-    EXPECT_TRUE(std::isnan(fd.double_values().values(0)));
-    EXPECT_DOUBLE_EQ(fd.double_values().values(1), 42.0);
+    ASSERT_TRUE(fd.has_double_values());
+    EXPECT_EQ(fd.double_values().values_size(), 0);  // compressed only
+    ASSERT_FALSE(fd.double_values().compressed_alp().empty());
+    auto decoded = decodeAlpValues(fd.double_values().compressed_alp(), 2);
+    ASSERT_EQ(decoded.size(), 2u);
+    EXPECT_TRUE(std::isnan(decoded[0]));
+    EXPECT_DOUBLE_EQ(decoded[1], 42.0);
 }
 
 // ============================================================================
@@ -1084,20 +1154,32 @@ TEST(ProtoConverterForecast, FormatForecastResponse) {
     EXPECT_EQ(resp.forecast_start_index(), 2u);
     ASSERT_EQ(resp.series_size(), 2);
 
+    // Values ride in compressed_values (ALP); the repeated field must be empty.
+    // NOTE: this previously asserted values_size() == 0 and then read
+    // values(2)/values(3) anyway — an out-of-bounds access on an empty
+    // protobuf RepeatedField that segfaulted in release builds.  Decode the
+    // compressed payload instead to verify contents (including NaN nulls).
     const auto& pastPiece = resp.series(0);
     EXPECT_EQ(pastPiece.piece(), "past");
-    // Compressed: values in compressed_values
     EXPECT_FALSE(pastPiece.compressed_values().empty());
     EXPECT_EQ(pastPiece.values_size(), 0);
-    EXPECT_TRUE(std::isnan(pastPiece.values(2)));
-    EXPECT_TRUE(std::isnan(pastPiece.values(3)));
+    auto pastValues = decodeAlpValues(pastPiece.compressed_values(), 4);
+    ASSERT_EQ(pastValues.size(), 4u);
+    EXPECT_DOUBLE_EQ(pastValues[0], 10.0);
+    EXPECT_DOUBLE_EQ(pastValues[1], 20.0);
+    EXPECT_TRUE(std::isnan(pastValues[2]));
+    EXPECT_TRUE(std::isnan(pastValues[3]));
 
     const auto& forecastPiece = resp.series(1);
     EXPECT_EQ(forecastPiece.piece(), "forecast");
-    EXPECT_TRUE(std::isnan(forecastPiece.values(0)));
-    EXPECT_TRUE(std::isnan(forecastPiece.values(1)));
-    EXPECT_DOUBLE_EQ(forecastPiece.values(2), 30.0);
-    EXPECT_DOUBLE_EQ(forecastPiece.values(3), 40.0);
+    EXPECT_FALSE(forecastPiece.compressed_values().empty());
+    EXPECT_EQ(forecastPiece.values_size(), 0);
+    auto forecastValues = decodeAlpValues(forecastPiece.compressed_values(), 4);
+    ASSERT_EQ(forecastValues.size(), 4u);
+    EXPECT_TRUE(std::isnan(forecastValues[0]));
+    EXPECT_TRUE(std::isnan(forecastValues[1]));
+    EXPECT_DOUBLE_EQ(forecastValues[2], 30.0);
+    EXPECT_DOUBLE_EQ(forecastValues[3], 40.0);
 
     const auto& stats = resp.statistics();
     EXPECT_EQ(stats.algorithm(), "linear");
@@ -1226,17 +1308,32 @@ TEST(ProtoConverterRoundTrip, QueryResponseRoundTrip) {
     EXPECT_EQ(series.measurement(), "cpu");
     EXPECT_EQ(series.tags().at("host"), "server01");
 
+    // Timestamps and values ride in the compressed fields; the repeated
+    // packed fields are left empty (Approach B wire contract).
     ASSERT_EQ(series.fields().count("usage"), 1u);
     const auto& usageFd = series.fields().at("usage");
-    EXPECT_EQ(usageFd.timestamps_size(), 3);
-    EXPECT_TRUE(usageFd.has_double_values());
-    EXPECT_EQ(usageFd.double_values().values_size(), 3);
+    EXPECT_EQ(usageFd.timestamps_size(), 0);
+    ASSERT_FALSE(usageFd.compressed_timestamps().empty());
+    EXPECT_EQ(decodeFforU64(usageFd.compressed_timestamps(), 3), ts);
+    ASSERT_TRUE(usageFd.has_double_values());
+    EXPECT_EQ(usageFd.double_values().values_size(), 0);
+    auto usageVals = decodeAlpValues(usageFd.double_values().compressed_alp(), 3);
+    ASSERT_EQ(usageVals.size(), 3u);
+    EXPECT_DOUBLE_EQ(usageVals[0], 10.0);
+    EXPECT_DOUBLE_EQ(usageVals[1], 20.0);
+    EXPECT_DOUBLE_EQ(usageVals[2], 30.0);
 
     ASSERT_EQ(series.fields().count("count"), 1u);
     const auto& countFd = series.fields().at("count");
-    EXPECT_EQ(countFd.timestamps_size(), 2);
-    EXPECT_TRUE(countFd.has_int64_values());
-    EXPECT_EQ(countFd.int64_values().values_size(), 2);
+    EXPECT_EQ(countFd.timestamps_size(), 0);
+    ASSERT_FALSE(countFd.compressed_timestamps().empty());
+    EXPECT_EQ(decodeFforU64(countFd.compressed_timestamps(), 2), ts2);
+    ASSERT_TRUE(countFd.has_int64_values());
+    EXPECT_EQ(countFd.int64_values().values_size(), 0);
+    auto countVals = decodeZigZagFfor(countFd.int64_values().compressed_ffor(), 2);
+    ASSERT_EQ(countVals.size(), 2u);
+    EXPECT_EQ(countVals[0], 1);
+    EXPECT_EQ(countVals[1], 2);
 }
 
 TEST(ProtoConverterRoundTrip, LargeWriteBatch) {

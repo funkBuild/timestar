@@ -128,9 +128,23 @@ public:
     // Pushdown aggregation: returns aggregated state directly from TSM blocks,
     // bypassing full point materialisation. Returns nullopt when pushdown is
     // inapplicable (non-float, memory store data, cross-file overlap).
+    //
+    // foldNoInterval selects the aggregationInterval == 0 result shape for
+    // streamable non-LATEST/FIRST methods: true collapses everything into a
+    // single AggregationState; false returns raw sorted (timestamp, value)
+    // vectors for per-timestamp results.  Must be derived from the query
+    // alone, never from data placement (see QueryRunner::queryTsmAggregated).
+    //
+    // Defaults to FALSE because collapsing a range that the caller did not ask
+    // to collapse violates the canonical shape rules (CLAUDE.md "Aggregation
+    // Result Shape"): without an aggregationInterval every distinct timestamp
+    // must survive, and LATEST/FIRST — the only methods that collapse by
+    // definition — do so inside the runner regardless of this flag.  Both
+    // production call sites pass false explicitly; no caller should need true.
     seastar::future<std::optional<timestar::PushdownResult>> queryAggregated(
         const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-        uint64_t aggregationInterval, timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
+        uint64_t aggregationInterval, timestar::AggregationMethod method = timestar::AggregationMethod::AVG,
+        bool foldNoInterval = false);
 
     // Batch LATEST/FIRST: resolve latest (or first) value for multiple series
     // in a single pass over TSM files and memory stores.  Avoids per-series

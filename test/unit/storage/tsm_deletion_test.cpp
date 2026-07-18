@@ -157,10 +157,25 @@ TEST(TSMDeletionTest, ScheduleDeleteUnlinksFile) {
 
     std::string funcBody = src.substr(bodyStart, funcEnd - bodyStart + 1);
 
-    // The function MUST close the file handle after removing the file to
-    // prevent seastar::file destructor assertions in debug builds.
-    EXPECT_NE(funcBody.find("tsmFile.close()"), std::string::npos)
-        << "scheduleDelete must close the file handle after remove_file to avoid fd leak";
+    // The function must NOT close the fd inline: queries that snapshotted the
+    // TSM file list before compaction removed this file may still issue DMA
+    // reads through it — an inline close made those reads fail and the query
+    // handler returned EMPTY results for the series (transient invisibility
+    // during compaction/rollover).  Instead, scheduleDelete marks the file
+    // for deferred close and the destructor closes the fd when the last
+    // shared_ptr reference (i.e. the last possible reader) drops.
+    EXPECT_EQ(funcBody.find("tsmFile.close()"), std::string::npos)
+        << "scheduleDelete must NOT close the fd inline — in-flight snapshot readers still use it; "
+           "the close is deferred to ~TSM() via deferCloseOnDestroy_";
+    EXPECT_NE(funcBody.find("deferCloseOnDestroy_"), std::string::npos)
+        << "scheduleDelete must mark the file for deferred close (deferCloseOnDestroy_ = true)";
+
+    // The destructor must perform the deferred close so the fd is not leaked.
+    auto dtorStart = src.find("TSM::~TSM()");
+    ASSERT_NE(dtorStart, std::string::npos) << "~TSM() (deferred close of deleted files) not found in tsm.cpp";
+    auto dtorBody = src.substr(dtorStart, src.find("\n}", dtorStart) - dtorStart);
+    EXPECT_NE(dtorBody.find("close()"), std::string::npos)
+        << "~TSM() must close the fd of a delete-pending file (deferred close)";
 }
 
 // ---------------------------------------------------------------------------

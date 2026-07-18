@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <string>
 
+namespace timestar::http {
+
 class HttpMetadataHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
@@ -61,3 +63,12 @@ public:
     // human-readable error description suitable for an HTTP 400 response body.
     static std::string validateQueryParam(const std::string& name, const std::string& context);
 };
+
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: HttpMetadataHandler historically lived in
+// the global namespace. New code should use timestar::http:: directly.
+using timestar::http::HttpMetadataHandler;  // NOLINT(misc-unused-using-decls)
+namespace timestar {
+using http::HttpMetadataHandler;
+}  // namespace timestar

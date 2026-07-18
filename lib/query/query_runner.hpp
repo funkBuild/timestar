@@ -40,7 +40,20 @@ public:
     // bypassing the full QueryResult materialisation pipeline.
     // Returns nullopt when pushdown is not applicable (non-float type, memory
     // store data present, or cross-TSM block time overlap).
+    //
+    // foldNoInterval controls the aggregationInterval == 0 result shape for
+    // streamable non-LATEST/FIRST methods: true folds all points into a single
+    // collapsed AggregationState; false returns raw sorted (timestamp, value)
+    // vectors so the caller can produce per-timestamp results.  The choice must
+    // be made by the caller from the QUERY alone — never from data placement —
+    // so the response shape stays deterministic (see CLAUDE.md "Aggregation
+    // Result Shape").  LATEST/FIRST always collapse regardless of this flag.
+    //
+    // Defaults to FALSE: collapsing a range the caller did not ask to collapse
+    // violates the canonical rules — grouping must never alter the time axis.
+    // Group-by callers previously passed true (they collapsed per group); that
+    // was the T1 defect and both production call sites now pass false.
     seastar::future<std::optional<timestar::PushdownResult>> queryTsmAggregated(
         SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
-        timestar::AggregationMethod method = timestar::AggregationMethod::AVG);
+        timestar::AggregationMethod method = timestar::AggregationMethod::AVG, bool foldNoInterval = false);
 };

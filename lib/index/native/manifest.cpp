@@ -416,56 +416,17 @@ void Manifest::applyRecord(const char* rp, const char* rend) {
     ++rp;
 
     if (type == RecordType::Snapshot) {
-            files_.clear();
-            if (rp + 12 > rend)
-                return;
-            nextFileNumber_ = decodeFixed64(rp);
-            rp += 8;
-            uint32_t fileCount = decodeFixed32(rp);
-            rp += 4;
+        files_.clear();
+        if (rp + 12 > rend)
+            return;
+        nextFileNumber_ = decodeFixed64(rp);
+        rp += 8;
+        uint32_t fileCount = decodeFixed32(rp);
+        rp += 4;
 
-            for (uint32_t i = 0; i < fileCount; ++i) {
-                if (rp + 28 > rend)
-                    break;
-                SSTableMetadata f;
-                f.fileNumber = decodeFixed64(rp);
-                rp += 8;
-                f.level = static_cast<int>(decodeFixed32(rp));
-                rp += 4;
-                f.fileSize = decodeFixed64(rp);
-                rp += 8;
-                f.entryCount = decodeFixed64(rp);
-                rp += 8;
-
-                if (rp + 4 > rend)
-                    break;
-                uint32_t minKeyLen = decodeFixed32(rp);
-                rp += 4;
-                if (rp + minKeyLen > rend)
-                    break;
-                f.minKey.assign(rp, minKeyLen);
-                rp += minKeyLen;
-
-                if (rp + 4 > rend)
-                    break;
-                uint32_t maxKeyLen = decodeFixed32(rp);
-                rp += 4;
-                if (rp + maxKeyLen > rend)
-                    break;
-                f.maxKey.assign(rp, maxKeyLen);
-                rp += maxKeyLen;
-
-                // writeTimestamp (present in all snapshots written by this codebase).
-                if (rp + 8 <= rend) {
-                    f.writeTimestamp = decodeFixed64(rp);
-                    rp += 8;
-                }
-
-                files_.push_back(std::move(f));
-            }
-        } else if (type == RecordType::AddFile) {
+        for (uint32_t i = 0; i < fileCount; ++i) {
             if (rp + 28 > rend)
-                return;
+                break;
             SSTableMetadata f;
             f.fileNumber = decodeFixed64(rp);
             rp += 8;
@@ -477,39 +438,78 @@ void Manifest::applyRecord(const char* rp, const char* rend) {
             rp += 8;
 
             if (rp + 4 > rend)
-                return;
+                break;
             uint32_t minKeyLen = decodeFixed32(rp);
             rp += 4;
             if (rp + minKeyLen > rend)
-                return;
+                break;
             f.minKey.assign(rp, minKeyLen);
             rp += minKeyLen;
 
             if (rp + 4 > rend)
-                return;
+                break;
             uint32_t maxKeyLen = decodeFixed32(rp);
             rp += 4;
             if (rp + maxKeyLen > rend)
-                return;
+                break;
             f.maxKey.assign(rp, maxKeyLen);
             rp += maxKeyLen;
 
-            // writeTimestamp (v2 extension, optional for backward compat)
+            // writeTimestamp (present in all snapshots written by this codebase).
             if (rp + 8 <= rend) {
                 f.writeTimestamp = decodeFixed64(rp);
                 rp += 8;
             }
 
-            uint64_t fn = f.fileNumber;
             files_.push_back(std::move(f));
-            if (fn >= nextFileNumber_)
-                nextFileNumber_ = fn + 1;
-        } else if (type == RecordType::RemoveFile) {
-            if (rp + 8 > rend)
-                return;
-            uint64_t fn = decodeFixed64(rp);
-            std::erase_if(files_, [fn](const SSTableMetadata& ff) { return ff.fileNumber == fn; });
         }
+    } else if (type == RecordType::AddFile) {
+        if (rp + 28 > rend)
+            return;
+        SSTableMetadata f;
+        f.fileNumber = decodeFixed64(rp);
+        rp += 8;
+        f.level = static_cast<int>(decodeFixed32(rp));
+        rp += 4;
+        f.fileSize = decodeFixed64(rp);
+        rp += 8;
+        f.entryCount = decodeFixed64(rp);
+        rp += 8;
+
+        if (rp + 4 > rend)
+            return;
+        uint32_t minKeyLen = decodeFixed32(rp);
+        rp += 4;
+        if (rp + minKeyLen > rend)
+            return;
+        f.minKey.assign(rp, minKeyLen);
+        rp += minKeyLen;
+
+        if (rp + 4 > rend)
+            return;
+        uint32_t maxKeyLen = decodeFixed32(rp);
+        rp += 4;
+        if (rp + maxKeyLen > rend)
+            return;
+        f.maxKey.assign(rp, maxKeyLen);
+        rp += maxKeyLen;
+
+        // writeTimestamp (v2 extension, optional for backward compat)
+        if (rp + 8 <= rend) {
+            f.writeTimestamp = decodeFixed64(rp);
+            rp += 8;
+        }
+
+        uint64_t fn = f.fileNumber;
+        files_.push_back(std::move(f));
+        if (fn >= nextFileNumber_)
+            nextFileNumber_ = fn + 1;
+    } else if (type == RecordType::RemoveFile) {
+        if (rp + 8 > rend)
+            return;
+        uint64_t fn = decodeFixed64(rp);
+        std::erase_if(files_, [fn](const SSTableMetadata& ff) { return ff.fileNumber == fn; });
+    }
 }
 
 seastar::future<> Manifest::close() {

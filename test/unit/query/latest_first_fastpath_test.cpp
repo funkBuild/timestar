@@ -1,5 +1,11 @@
 // Tests for the LATEST/FIRST fast path in queryTsmAggregated.
 //
+// NOTE: LATEST/FIRST do NOT collapse a range (CLAUDE.md "Aggregation Result
+// Shape") — without an aggregationInterval every timestamp survives, so these
+// interval == 0 queries assert raw sorted vectors and only the sparse-index
+// file filtering/ordering is under test.  The collapsing fast path applies to
+// bucketed queries.
+//
 // The fast path skips Gate 2 (the expensive overlap check that DMA-reads full
 // index entries from every TSM file) and instead uses getSeriesType() (bloom
 // filter + sparse index, pure in-memory) to filter candidate files. Files are
@@ -21,6 +27,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
@@ -85,21 +92,23 @@ SEASTAR_TEST_F(LatestFirstFastPathTest, LatestAcrossMultipleTsmFiles) {
         // File 3: timestamps 3000..3090 (10 points), values 21.0..30.0
         co_await insertAndFlushBatch(engine, "sensor", "temp", "host", "h1", 3000, 10, 10, 21.0);
 
-        // Pushdown LATEST with interval=0 should return the single latest point
+        // LATEST with interval=0 no longer collapses: every timestamp survives
+        // (CLAUDE.md "Aggregation Result Shape"), so the pushdown returns raw
+        // sorted vectors and the newest point is simply the last one.
         auto result =
             co_await engine.queryAggregated(seriesKey, seriesId, 0, UINT64_MAX, 0, timestar::AggregationMethod::LATEST);
 
         EXPECT_TRUE(result.has_value()) << "LATEST pushdown should succeed for TSM-only float data";
         if (!result.has_value())
             co_return;
-        // Non-bucketed LATEST folds to a single AggregationState
-        EXPECT_TRUE(result->aggregatedState.has_value()) << "Non-bucketed LATEST should return aggregatedState";
-        if (!result->aggregatedState.has_value())
+        EXPECT_FALSE(result->aggregatedState.has_value())
+            << "interval == 0 must NOT collapse: no method aggregates over time without an interval";
+        EXPECT_FALSE(result->sortedTimestamps.empty()) << "raw sorted vectors expected";
+        if (result->sortedTimestamps.empty())
             co_return;
-        auto& state = *result->aggregatedState;
-        EXPECT_EQ(state.latestTimestamp, 3090u);
-        EXPECT_DOUBLE_EQ(state.latest, 30.0);
-        EXPECT_EQ(state.count, 1u);
+        EXPECT_EQ(result->sortedTimestamps.back(), 3090u) << "newest point across all three files";
+        EXPECT_DOUBLE_EQ(result->sortedValues.back(), 30.0);
+        EXPECT_TRUE(std::is_sorted(result->sortedTimestamps.begin(), result->sortedTimestamps.end()));
     });
     co_return;
 }
@@ -127,13 +136,13 @@ SEASTAR_TEST_F(LatestFirstFastPathTest, FirstAcrossMultipleTsmFiles) {
         if (!result.has_value())
             co_return;
         // Non-bucketed FIRST folds to a single AggregationState
-        EXPECT_TRUE(result->aggregatedState.has_value()) << "Non-bucketed FIRST should return aggregatedState";
-        if (!result->aggregatedState.has_value())
+        EXPECT_FALSE(result->aggregatedState.has_value())
+            << "interval == 0 must NOT collapse: no method aggregates over time without an interval";
+        EXPECT_FALSE(result->sortedTimestamps.empty()) << "raw sorted vectors expected";
+        if (result->sortedTimestamps.empty())
             co_return;
-        auto& state = *result->aggregatedState;
-        EXPECT_EQ(state.firstTimestamp, 1000u);
-        EXPECT_DOUBLE_EQ(state.first, 1.0);
-        EXPECT_EQ(state.count, 1u);
+        EXPECT_EQ(result->sortedTimestamps.front(), 1000u) << "oldest point across all three files";
+        EXPECT_DOUBLE_EQ(result->sortedValues.front(), 1.0);
     });
     co_return;
 }
@@ -164,14 +173,17 @@ SEASTAR_TEST_F(LatestFirstFastPathTest, LatestSkipsTombstonedNewestFile) {
         EXPECT_TRUE(result.has_value()) << "LATEST pushdown should succeed even with tombstones";
         if (!result.has_value())
             co_return;
-        // Non-bucketed LATEST folds to a single AggregationState
-        EXPECT_TRUE(result->aggregatedState.has_value()) << "Non-bucketed LATEST should return aggregatedState";
-        if (!result->aggregatedState.has_value())
+        EXPECT_FALSE(result->aggregatedState.has_value()) << "interval == 0 must NOT collapse";
+        EXPECT_FALSE(result->sortedTimestamps.empty()) << "raw sorted vectors expected";
+        if (result->sortedTimestamps.empty())
             co_return;
-        auto& state = *result->aggregatedState;
-        // Latest non-tombstoned: t=1090, val=10.0
-        EXPECT_EQ(state.latestTimestamp, 1090u);
-        EXPECT_DOUBLE_EQ(state.latest, 10.0);
+        // Latest non-tombstoned: t=1090, val=10.0. Every deleted point must be
+        // absent, not merely excluded from the newest-point calculation.
+        EXPECT_EQ(result->sortedTimestamps.back(), 1090u);
+        EXPECT_DOUBLE_EQ(result->sortedValues.back(), 10.0);
+        for (uint64_t ts : result->sortedTimestamps) {
+            EXPECT_FALSE(ts >= 2000 && ts <= 2090) << "tombstoned point " << ts << " leaked into the result";
+        }
     });
     co_return;
 }

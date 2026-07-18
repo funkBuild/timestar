@@ -5,17 +5,19 @@
 #include <variant>
 #include <vector>
 
-// This test file verifies the ordering contract in the write handler:
-// Data must be inserted BEFORE metadata is indexed. This is the crash-safe
-// order because:
-//   - If data insert succeeds but metadata fails: data is durable, can be
-//     discovered on retry.
-//   - If metadata succeeds but data fails: we have phantom metadata pointing
-//     to nonexistent data (the old, buggy behavior).
+// This test file verifies structural properties of the write handler that
+// cannot be observed behaviorally within a unit-test budget:
+//   - Data must be inserted BEFORE metadata is indexed (crash-safe ordering:
+//     observing the crash window would require killing the process mid-write).
+//   - pointsWritten must be int64_t (overflow needs >2^31 points to observe).
+//   - The fast-path "writes"-key scan must use an npos check, not a byte-64
+//     cutoff (with the current strict fast-path parser the buggy cutoff is
+//     masked by a parse failure fallback, so it is not behaviorally visible).
 //
-// These tests are purely structural: they verify the source code ordering
-// by inspecting the file content, since the write handler requires the full
-// Seastar runtime (sharded<Engine>) which cannot be instantiated in unit tests.
+// The behaviorally observable regressions formerly asserted here (batch
+// failure accounting / partial-failure responses / late-"writes" batch
+// handling) are now covered by real handler-driving tests in
+// http_write_handler_atomicity_behavioral_test.cpp.
 
 // Read the source file at compile time would be ideal, but we use a runtime
 // approach that checks the actual source for correctness.
@@ -134,33 +136,11 @@ static std::string extractFunctionBody(const std::string& sourceCode, const std:
     return sourceCode.substr(start, pos - start);
 }
 
-// Bug 1: Batch write failures must decrement pointsWritten.
-// Previously, processMultiWritePoint failures were caught and logged but
-// pointsWritten was never decremented, causing the response to report
-// more points written than actually persisted (silent data loss).
-// The batch path now accumulates the whole request into per-shard batches
-// and dispatches once per shard, so failure attribution is per-shard:
-// a failed shard future decrements pointsWritten by the points routed to it.
-// The batch path lives in the processBatchWrites phase method of handleWrite.
-TEST_F(HttpWriteHandlerAtomicityTest, BatchFailuresDecrementPointsWritten) {
-    std::string handleBody = extractFunctionBody(sourceCode, "HttpWriteHandler::processBatchWrites(");
-    ASSERT_FALSE(handleBody.empty()) << "Could not extract processBatchWrites function body";
-
-    // The shard-result loop must subtract failed points from pointsWritten.
-    // Look for the decrement in the catch block of the shardResults loop.
-    EXPECT_NE(handleBody.find("pointsWritten -= acc.shardPoints["), std::string::npos)
-        << "Batch write catch block must decrement pointsWritten by the "
-           "per-shard point count when a shard insert fails";
-
-    // There should be a failedWrites counter
-    EXPECT_NE(handleBody.find("failedWrites"), std::string::npos)
-        << "Batch write path must track the number of failed writes";
-
-    // There should be a partial failure response when some writes fail
-    EXPECT_NE(handleBody.find("createPartialFailureResponse"), std::string::npos)
-        << "Batch write path must return a partial failure response "
-           "when some writes fail, not a success response";
-}
+// Bug 1 (batch write failures must decrement pointsWritten) is now covered
+// behaviorally in http_write_handler_atomicity_behavioral_test.cpp, which
+// drives handleWrite() with a batch containing a shard insert that fails and
+// asserts the partial response accounting (points_written + failed_writes ==
+// total points). The former source-inspection variant was removed.
 
 // Bug 2: pointsWritten must be int64_t to avoid integer overflow.
 // size_t * size_t (timestamps.size() * fields.size()) can exceed INT_MAX
@@ -221,24 +201,10 @@ TEST_F(HttpWriteHandlerAtomicityTest, FastPathChecksEntireBodyForWritesKey) {
            "after byte 64 in the JSON body";
 }
 
-// Verify the createPartialFailureResponse method exists in the source
-TEST_F(HttpWriteHandlerAtomicityTest, PartialFailureResponseMethodExists) {
-    EXPECT_NE(sourceCode.find("HttpWriteHandler::createPartialFailureResponse"), std::string::npos)
-        << "createPartialFailureResponse method must exist to report partial "
-           "batch write failures to clients";
-
-    // The partial response should include status, points_written, failed_writes, and errors
-    std::string partialBody = extractFunctionBody(sourceCode, "HttpWriteHandler::createPartialFailureResponse(");
-    ASSERT_FALSE(partialBody.empty()) << "Could not extract createPartialFailureResponse function body";
-
-    EXPECT_NE(partialBody.find("\"partial\""), std::string::npos)
-        << "Partial failure response must have status \"partial\"";
-    EXPECT_NE(partialBody.find("points_written"), std::string::npos)
-        << "Partial failure response must include points_written count";
-    EXPECT_NE(partialBody.find("failed_writes"), std::string::npos)
-        << "Partial failure response must include failed_writes count";
-    EXPECT_NE(partialBody.find("errors"), std::string::npos) << "Partial failure response must include error messages";
-}
+// The partial-failure response shape (status "partial", points_written,
+// failed_writes, errors) is now asserted behaviorally on a real handler
+// response in http_write_handler_atomicity_behavioral_test.cpp; the former
+// source-inspection variant was removed.
 
 // Verify the createSuccessResponse signature uses int64_t
 TEST_F(HttpWriteHandlerAtomicityTest, SuccessResponseUsesInt64) {

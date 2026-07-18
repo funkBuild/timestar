@@ -332,17 +332,6 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                     state.addValue(doubleValues[i], timestamps[i]);
                     partial.totalPoints++;
                 }
-            } else if (method == AggregationMethod::LATEST || method == AggregationMethod::FIRST) {
-                // LATEST/FIRST without interval: fold all points into a single
-                // collapsed state — return 1 point per group, not N raw points.
-                partial.totalPoints += timestamps.size();
-                if (!partial.collapsedState.has_value()) {
-                    partial.collapsedState.emplace();
-                }
-                auto& state = *partial.collapsedState;
-                for (size_t i = 0; i < timestamps.size(); ++i) {
-                    state.addValueForMethod(doubleValues[i], timestamps[i], method);
-                }
             } else {
                 // No interval - sorted vector aggregation by timestamp.
                 // Input timestamps are sorted (from queryTsm). Use sorted merge
@@ -504,13 +493,9 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 }
 
                 // SPREAD/STDDEV/STDVAR/MEDIAN/EXACT_MEDIAN need full AggregationState;
-                // they cannot be folded from raw values alone.
-                bool methodCanFoldRaw = method != AggregationMethod::SPREAD && method != AggregationMethod::STDDEV &&
-                                        method != AggregationMethod::STDVAR &&
-                                        method != AggregationMethod::EXACT_MEDIAN &&
-                                        method != AggregationMethod::MEDIAN;
-
-                if (allRaw && methodCanFoldRaw && !groupPartials.empty()) {
+                // they cannot be folded from raw values alone (see
+                // timestar::methodCanFoldRaw — the single definition of this rule).
+                if (allRaw && methodCanFoldRaw(method) && !groupPartials.empty()) {
                     // Fast path: merge raw (timestamp, value) vectors directly.
                     auto* first = groupPartials[0];
 

@@ -12,6 +12,11 @@
 [server]
 port = 8086
 log_level = "info"
+# Root directory for all persisted data: shard_N/ directories (WAL, TSM,
+# native_index), placement.json and shard_count.meta are created under it.
+# Absolute, or relative to the server's working directory. Created on startup
+# if it does not exist. Default: "." (the working directory).
+# data_dir = "/var/lib/timestar"
 # auth_enabled = true
 # auth_token = "my-secret-api-key"
 

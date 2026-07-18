@@ -182,7 +182,7 @@ The build system automatically selects the appropriate compiler:
 
 ## Data Storage
 
-The database creates shard directories (`shard_0`, `shard_1`, etc.) in the build directory, each containing:
+The database creates shard directories (`shard_0`, `shard_1`, etc.) under the directory configured by the `[server] data_dir` key in `timestar.toml` (or the `TIMESTAR_DATA_DIR` environment variable). The path may be absolute or relative to the server's working directory and is created on startup if missing; the default is `"."`, i.e. the working directory (the build directory when started from there). Each shard directory contains:
 - `wal/` - Write-ahead log files
 - `tsm/` - TSM data files
 - `native_index/` - NativeIndex files (SSTable + WAL) for metadata and series lookup
@@ -333,11 +333,12 @@ The TimeStar includes an HTTP server with a JSON-based write API for data ingest
 
 ### Features
 
-- **Type Detection**: Automatic detection of field types (float, bool, string, int)
+- **Type Detection**: Automatic detection of field types (float, bool, string, int) from the JSON token shape (`10` → int, `10.0` → float). An optional per-point `"field_types": {"<field>": "float"|"int"|"bool"|"string"}` object overrides detection — important for JS clients, whose serializers emit `10.0` as `10`. See docs/api-write.md "Explicit field types"
 - **Index Integration**: Automatic series ID generation and metadata indexing
 - **Error Handling**: Detailed JSON error responses with HTTP status codes
 - **Batch Support**: Efficient batch writes with partial failure handling
 - **Default Timestamps**: Auto-generates nanosecond timestamps if not provided
+- **Duplicate points overwrite (last-write-wins)**: rewriting an identical measurement+tags+field+timestamp REPLACES the earlier point (InfluxDB-compatible). Queries only ever see the newest write — raw reads return one point and aggregations count it once, regardless of placement (same batch, memory store, across flush, across TSM files, after compaction)
 
 ### Additional Endpoints
 
@@ -465,8 +466,73 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
      - `h` - hours
      - `d` - days
    - Decimal values supported: `"1.5s"`, `"0.5m"`
+   - Bare numeric strings (no unit suffix) are interpreted as nanoseconds —
+     `"300000000000"` == `300000000000` == `"300000000000ns"`. This applies to
+     every transport (JSON numeric, JSON string, and the protobuf QueryRequest
+     `aggregation_interval` string field), so all forms agree.
    - When specified, results are grouped into time buckets
    - Aggregation method applies within each bucket
+
+### Non-Numeric Fields in Queries (canonical semantics)
+
+**String and boolean** fields are non-numeric: they never aggregate
+numerically and are always returned in the type they were written in (booleans
+as JSON `true`/`false`, never `1`/`0`). The aggregation method named in the
+query is **ignored** for them; they are always included, never silently
+dropped:
+
+- **No aggregationInterval**: non-numeric fields pass through raw — every
+  stored (timestamp, value) pair in the requested range is returned unchanged.
+  This holds for every aggregation method and for group-by queries
+  (non-numeric series are returned per-series with their full tag set; they are
+  not merged into groups).
+- **With aggregationInterval**: non-numeric fields are reduced to
+  **LATEST-per-bucket** — one value per epoch-aligned bucket
+  (`bucketStart = ts / interval * interval`, same bucket layout as numeric
+  aggregation), where the value is the one with the greatest timestamp inside
+  the bucket. Returned timestamps are bucket starts, matching numeric fields.
+- These rules are independent of data placement (memory store vs TSM) and of
+  the internal query plan (pushdown / streaming / fallback). Both pushdown
+  paths refuse non-numeric series so placement cannot change the answer.
+
+Booleans were previously coerced to `1.0`/`0.0` and aggregated arithmetically,
+which also dropped their series tags (only numeric fields route through the
+aggregator, which keeps group-by tags only). They now follow the string rule
+exactly — see `test/unit/http/dynamo_equivalence_test.cpp`.
+
+`timestar::isNonNumericValueType()` (lib/storage/tsm.hpp) is the single
+definition of this rule at the `TSMValueType` level: every gate that keeps
+these types off a numeric path calls it rather than spelling out
+`String || Boolean`. Two related spellings are NOT yet unified and remain
+drift risks: the variant-level checks in `http_query_handler.cpp` (a
+`FieldValues` alternative, not a `TSMValueType`), and the `String`-only checks
+inside `TSM::aggregateSeries*` (`tsm.cpp`), which still accept Boolean and
+would fold it as `1.0`/`0.0` — safe today only because every caller gates
+first (`query_runner.cpp`, `engine.cpp`). A new caller that forgets the gate
+reintroduces bool-as-1/0.
+
+The rule holds on **every** path that returns stored values, not just
+`POST /query`:
+
+- **SSE `/subscribe` with an aggregationInterval** (`streaming_aggregator.cpp`):
+  non-numeric buckets reduce to LATEST-per-bucket in the written type, so a live
+  stream and a backfill of the same window agree. Booleans used to fold as
+  `1.0`/`0.0` (a 5m `avg` streamed `0.6` where `/query` said `true`) and strings
+  were dropped from the stream entirely unless the method was COUNT.
+- **Formula arithmetic** (`/derived`, streaming derived, SSE formulas) is
+  numeric-only, so a non-numeric operand is rejected rather than coerced:
+  `DerivedQueryExecutor` throws for booleans exactly as it always did for
+  strings, and the streaming formula paths map non-numeric to NaN (= missing,
+  see docs/nan_policy.md) via the single `timestar::streamingValueAsNumeric()`
+  helper. Coercing booleans to `1.0`/`0.0` let a formula compute over a type the
+  query path refuses to aggregate — and with an interval it silently ran on
+  LATEST-per-bucket values rather than the every-point series the author meant.
+
+Response shape is also type-independent: non-numeric results are appended
+BEFORE `consolidateSeriesFields()`, so "one series per measurement+tags" holds
+for every field type. (Under a `by {tags}` clause a non-numeric field is still
+returned per-series with its full tag set, so it does not merge into the grouped
+numeric series — grouping does not apply to it.)
 
 ### Time Format
 
@@ -607,6 +673,108 @@ aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}
   }
 }
 ```
+
+### Aggregation Result Shape (canonical semantics)
+
+The shape of a query result is a pure function of the query — it must never
+depend on where the data happens to live (memory store vs TSM), on cache
+warm-up, or on startTime alignment.
+
+The governing rule: **aggregate ACROSS SERIES at equal timestamps; never
+aggregate over time unless the caller asks.** Grouping and temporal bucketing
+are orthogonal — a `by {tags}` clause must never change the time axis. Only an
+`aggregationInterval` (or `latest`/`first`, which name a single point by
+definition) reduces the time axis.
+
+**With `aggregationInterval` (> 0):**
+- Buckets are **epoch-aligned**: each point lands in bucket
+  `floor(timestamp / interval) * interval`. Bucket boundaries do NOT shift
+  with the query's startTime.
+- `endTime` is inclusive; a range that ends exactly on a bucket boundary
+  includes that boundary's bucket.
+- Empty buckets are omitted (no gap filling).
+- A misaligned range shorter than one interval can still return two buckets
+  when it crosses an epoch boundary.
+
+**Without `aggregationInterval` (interval == 0):** **per-timestamp aggregation
+across matching series** — N points, one per distinct timestamp, aggregated
+across the series that share that timestamp (raw passthrough for a single
+series). This holds **with or without `by {tags}`**: grouping only decides
+*which* series fold together, never how many timestamps survive. Internal
+consumers (`/derived` formulas, anomaly detection, forecasting) rely on this
+N-point shape for their no-interval sub-queries.
+
+**There are NO exceptions — `latest`/`first` included.** They are cross-series
+tie-breaks *at each timestamp*, not reductions over time: for a single series
+they are raw passthrough. `latest:m(v){}` returns every timestamp, and one
+point per bucket only when an `aggregationInterval` asks for it. They used to
+collapse the range, which forced callers to send a throwaway tiny interval
+purely to keep their time axis. This mirrors the engine TimeStar replaces,
+whose query layer has no temporal concept at all (a single series is copied
+through verbatim); a `latest` that collapses would flatten every state-history
+and image series to one point. Pinned by
+`DynamoEquivalenceTest.LatestAndFirstKeepEveryTimestampWithoutAnInterval`.
+
+`timestar::isLatestOrFirstMethod()` (aggregator.hpp) names the two methods that
+*select* a point rather than compute one — that is what lets a bucketed
+`latest` resolve from sparse-index stats without decoding blocks. It does NOT
+mean they collapse a range.
+
+A `by {tags}` clause used to silently switch the interval == 0 default to
+"collapse the whole range to one point per group" (InfluxQL-style "GROUP BY
+tag"), so two queries differing only by a grouping clause disagreed on the time
+axis. That is fixed — pinned by
+`DynamoEquivalenceTest.GroupByDoesNotCollapseTheTimeAxis`.
+
+**Grouping never changes the VALUES either**, only which series fold together.
+A method whose fold-of-one is not the identity — `spread`/`stddev`/`stdvar` are
+0 over a single value, not the value — must be folded through an
+`AggregationState`, never short-circuited from raw values. `timestar::
+methodCanFoldRaw()` (aggregator.hpp) is the single definition of that rule;
+every site that emits raw values into a response must consult it. Skipping it
+made `spread:m(v){}` and `spread:m(v){} by {p}` disagree, and made the answer
+depend on shard fan-out (single-shard finalize vs multi-shard merge).
+
+Implementation note: the interval == 0 collapse-vs-raw choice is carried by
+the `foldNoInterval` parameter of `Engine::queryAggregated()` /
+`QueryRunner::queryTsmAggregated()`. It **defaults to `false`** — the shape
+rules forbid collapsing a range the caller did not ask to collapse, so no
+production caller passes `true` (only `non_bucketed_pushdown_test.cpp`, which
+pins the capability itself). No method collapses a range at
+interval == 0 any more, `latest`/`first` included.
+
+`HttpQueryHandler::executeQuery()` takes its `QueryRequest` **by value**: it is
+a coroutine, and the SSE backfill loop passes a loop-body local through
+`seastar::with_timeout`, which does NOT cancel the inner future — aliasing the
+caller's request is a use-after-free once a backfill times out.
+
+**Unknown `by {tag}` keys:** a grouping key that no discovered series carries
+returns `[]`, matching the scope path (an unknown scope key finds no postings
+bitmap, hence no series). Silently ignoring it answered `by {devicId}` with a
+plausible-but-wrong fleet-wide aggregate. Validated against the discovered
+series rather than the tag index, so a schema broadcast still in flight cannot
+turn a valid grouping into an empty result.
+
+### Special Float Values (canonical semantics)
+
+Aggregation results are placement-independent: memory store, TSM block-stats
+pushdown, SIMD folds, and scalar folds all agree. Full policy in
+`docs/nan_policy.md`.
+
+- **NaN = missing data.** Skipped by EVERY aggregation method on EVERY path:
+  `count` counts only non-NaN values, `avg = sum-of-non-NaN / count-of-non-NaN`.
+  Raw (non-aggregated) reads return NaN verbatim (serialized as JSON `null`;
+  protobuf carries it natively). TSM float block stats (including
+  `blockCount`) are NaN-skipped at write time; blocks containing NaN carry no
+  extended stats (see `docs/tsm_format.md`).
+- **±Infinity is valid data.** Raw reads return it exactly. Aggregations let
+  it participate arithmetically: SUM/AVG propagate (`+Inf + -Inf = NaN` is
+  the correct IEEE aggregate), MIN/MAX order it, COUNT counts it. Min/max
+  identities are ±infinity, and Kahan sums reset their compensation term when
+  the sum is non-finite (otherwise Inf silently degrades to NaN).
+- **-0.0 round-trips raw reads bit-exactly** (ALP stores NaN/±Inf/-0.0 as
+  raw-bit exceptions). Aggregated results may normalize -0.0 to +0.0 (IEEE
+  addition/comparison semantics) — documented behaviour, not a bug.
 
 ### Query Features
 

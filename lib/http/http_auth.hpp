@@ -7,7 +7,7 @@
 #include <seastar/http/httpd.hh>
 #include <string>
 
-namespace timestar {
+namespace timestar::http {
 
 // Handler function type used by seastar::httpd::function_handler.
 using HttpHandlerFn = std::function<seastar::future<std::unique_ptr<seastar::http::reply>>(
@@ -30,7 +30,8 @@ std::unique_ptr<seastar::http::reply> checkAuth(const seastar::http::request& re
 std::unique_ptr<seastar::http::reply> make401Reply(const std::string& message);
 
 // Mask a token for safe logging: show first 4 and last 4 characters, replace
-// the middle with "***".  Tokens shorter than 12 characters are fully masked.
+// the middle with "***".  Tokens shorter than 9 characters (4 + 4 + at least
+// one masked character) are fully masked.
 // Example: "abcd1234efgh5678" -> "abcd***5678"
 std::string maskToken(std::string_view token);
 
@@ -73,4 +74,17 @@ public:
     }
 };
 
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: these types historically lived directly in
+// namespace timestar. New code should use timestar::http:: directly.
+namespace timestar {
+using http::AuthHandlerWrapper;
+using http::checkAuth;
+using http::constantTimeEquals;
+using http::generateToken;
+using http::HttpHandlerFn;
+using http::make401Reply;
+using http::maskToken;
+using http::wrapWithAuth;
 }  // namespace timestar

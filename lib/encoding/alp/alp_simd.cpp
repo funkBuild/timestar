@@ -82,8 +82,8 @@ void AlpReconstructKernel(const int64_t* HWY_RESTRICT encoded, size_t count, dou
 // (AVX3) -- see alpScaleSimdAvailable(). On lesser ISAs the emulated
 // conversions made a June 2026 attempt 25% SLOWER than scalar.
 // ---------------------------------------------------------------------------
-size_t AlpScaleF0Kernel(const double* HWY_RESTRICT values, size_t count, double fact_val,
-                        int64_t* HWY_RESTRICT encoded, int64_t* HWY_RESTRICT min_out, int64_t* HWY_RESTRICT max_out,
+size_t AlpScaleF0Kernel(const double* HWY_RESTRICT values, size_t count, double fact_val, int64_t* HWY_RESTRICT encoded,
+                        int64_t* HWY_RESTRICT min_out, int64_t* HWY_RESTRICT max_out,
                         uint16_t* HWY_RESTRICT exc_positions, uint64_t* HWY_RESTRICT exc_values) {
     const hn::ScalableTag<double> dd;
     const hn::ScalableTag<int64_t> di;
@@ -91,7 +91,7 @@ size_t AlpScaleF0Kernel(const double* HWY_RESTRICT values, size_t count, double 
     const size_t N = hn::Lanes(dd);
 
     const auto fact_vec = hn::Set(dd, fact_val);
-    const auto frac_vec = hn::Set(dd, 1.0);  // FRAC_ARR[0]
+    const auto frac_vec = hn::Set(dd, 1.0);                 // FRAC_ARR[0]
     const auto max_safe = hn::Set(dd, 9007199254740992.0);  // 2^53 (inclusive, matches scalar)
     const auto neg_zero_bits = hn::Set(du, 0x8000000000000000ULL);
 
@@ -115,8 +115,7 @@ size_t AlpScaleF0Kernel(const double* HWY_RESTRICT values, size_t count, double 
         const auto dec = hn::Div(hn::Mul(hn::ConvertTo(dd, enc), frac_vec), fact_vec);
 
         const auto is_neg_zero = hn::RebindMask(dd, hn::Eq(hn::BitCast(du, v), neg_zero_bits));
-        const auto exact =
-            hn::AndNot(is_neg_zero, hn::And(hn::Eq(dec, v), hn::Le(hn::Abs(rounded), max_safe)));
+        const auto exact = hn::AndNot(is_neg_zero, hn::And(hn::Eq(dec, v), hn::Le(hn::Abs(rounded), max_safe)));
 
         hn::StoreU(enc, di, encoded + i);
 

@@ -4,7 +4,7 @@
 #include "simd_aggregator.hpp"
 
 #include <algorithm>
-#include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <numeric>
 #include <optional>
@@ -39,24 +39,35 @@ public:
         : interval_(interval), method_(method), methodAware_(true) {}
 
     // Constructor overload that pre-allocates the bucket map when all three
-    // parameters are known at construction time.  Bucket count is computed as
-    // ceil((endTime - startTime) / interval), capped at MAX_PREALLOCATED_BUCKETS
-    // to prevent excessive allocations for pathological inputs.
+    // parameters are known at construction time.
+    //
+    // Buckets are epoch-aligned (floor(ts / interval) * interval) and endTime
+    // is inclusive, so the bucket count is the number of epoch buckets the
+    // range [startTime, endTime] overlaps — NOT ceil(range / interval).  A
+    // misaligned range shorter than one interval can still overlap TWO epoch
+    // buckets; computing the count from the range length used to engage the
+    // single-bucket optimisation in that case and collapsed distinct epoch
+    // buckets into one (stamped floor(startTime / interval)).
     BlockAggregator(uint64_t interval, uint64_t startTime, uint64_t endTime,
                     AggregationMethod method = AggregationMethod::AVG, bool methodAware = false)
         : interval_(interval), method_(method), methodAware_(methodAware) {
-        if (interval_ > 0 && endTime > startTime) {
-            uint64_t range = endTime - startTime;
-            // Overflow-safe ceiling division
-            uint64_t bucketCount = range / interval_ + (range % interval_ != 0 ? 1 : 0);
+        if (interval_ > 0 && endTime >= startTime) {
+            const uint64_t firstBucket = (startTime / interval_) * interval_;
+            const uint64_t lastBucket = (endTime / interval_) * interval_;
+            uint64_t bucketCount = (lastBucket - firstBucket) / interval_ + 1;
             if (bucketCount > MAX_PREALLOCATED_BUCKETS) {
                 bucketCount = MAX_PREALLOCATED_BUCKETS;
             }
             bucketStates_.reserve(static_cast<size_t>(bucketCount));
             // Single-bucket optimisation: pre-insert the only bucket and cache
             // a direct pointer, eliminating per-point division + hash lookup.
+            // Valid only when the whole [startTime, endTime] range maps to a
+            // single epoch bucket; add* methods additionally verify that each
+            // point actually belongs to this bucket (see inSingleBucket()) so
+            // that bucketing stays a pure function of the data even if a
+            // caller feeds points outside the constructed range.
             if (bucketCount == 1) {
-                singleBucketKey_ = (startTime / interval_) * interval_;
+                singleBucketKey_ = firstBucket;
                 auto [it, _] = bucketStates_.emplace(singleBucketKey_, AggregationState{});
                 singleBucketState_ = &it->second;
             }
@@ -101,9 +112,12 @@ public:
         }
         if (interval_ == 0)
             return foldToSingleState_;
-        if (singleBucketState_)
-            return true;
-        // Multi-bucket: block must fit within a single bucket
+        // Block must fit within a single epoch bucket.  This applies in
+        // single-bucket mode too: a block may legitimately span a range
+        // outside the constructed [startTime, endTime] window (e.g. memory
+        // fallback data appended after a TSM-only range was used for
+        // construction), so it cannot be blindly merged into the cached
+        // single bucket.
         uint64_t minBucket = (blockMinTime / interval_) * interval_;
         uint64_t maxBucket = (blockMaxTime / interval_) * interval_;
         return minBucket == maxBucket;
@@ -135,14 +149,19 @@ public:
             }
         };
 
-        assert(!singleBucketState_ || (minTime / interval_) * interval_ == singleBucketKey_);
-        if (singleBucketState_) {
-            doMerge(*singleBucketState_);
-        } else if (interval_ == 0 && foldToSingleState_) {
+        if (interval_ == 0) {
+            // Non-bucketed fold mode (canUseBlockStats gates on foldToSingleState_)
             doMerge(singleState_);
+            return;
+        }
+        // Bucketed: block fits in a single epoch bucket (verified by
+        // canUseBlockStats).  Route by the block's own bucket — the cached
+        // single-bucket pointer is only a shortcut when the block actually
+        // belongs to that bucket.
+        uint64_t bucket = (minTime / interval_) * interval_;
+        if (singleBucketState_ && bucket == singleBucketKey_) {
+            doMerge(*singleBucketState_);
         } else {
-            // Multi-bucket: block fits in a single bucket (verified by canUseBlockStats)
-            uint64_t bucket = (minTime / interval_) * interval_;
             doMerge(bucketStates_[bucket]);
         }
     }
@@ -166,7 +185,8 @@ public:
             // Non-bucketed: store timestamps with zero values for result pipeline
             timestamps_.insert(timestamps_.end(), timestamps.begin(), timestamps.end());
             rawValues_.resize(rawValues_.size() + timestamps.size(), 0.0);
-        } else if (singleBucketState_) {
+        } else if (singleBucketState_ && !timestamps.empty() && inSingleBucket(timestamps.front()) &&
+                   inSingleBucket(timestamps.back())) {
             singleBucketState_->count += timestamps.size();
         } else {
             // Timestamps are monotonic within a block: batch consecutive
@@ -200,7 +220,7 @@ public:
             }
             timestamps_.push_back(timestamp);
             rawValues_.push_back(value);
-        } else if (singleBucketState_) {
+        } else if (singleBucketState_ && inSingleBucket(timestamp)) {
             addToState(*singleBucketState_, value, timestamp);
         } else {
             uint64_t bucket = (timestamp / interval_) * interval_;
@@ -229,7 +249,8 @@ public:
             }
             timestamps_.insert(timestamps_.end(), timestamps.begin() + startIdx, timestamps.begin() + endIdx);
             rawValues_.insert(rawValues_.end(), values.begin() + startIdx, values.begin() + endIdx);
-        } else if (singleBucketState_) {
+        } else if (singleBucketState_ && inSingleBucket(timestamps[startIdx]) &&
+                   inSingleBucket(timestamps[endIdx - 1])) {
             if (methodAware_ && n >= 4) {
                 addPointsSIMDFoldRange(timestamps, values, startIdx, endIdx, *singleBucketState_);
             } else {
@@ -265,7 +286,8 @@ public:
             // with AggregationState. States are constructed lazily at merge time.
             timestamps_.insert(timestamps_.end(), timestamps.begin(), timestamps.end());
             rawValues_.insert(rawValues_.end(), values.begin(), values.end());
-        } else if (singleBucketState_) {
+        } else if (singleBucketState_ && n > 0 && inSingleBucket(timestamps.front()) &&
+                   inSingleBucket(timestamps.back())) {
             // Single-bucket fast path: skip division + hash lookup per point.
             if (methodAware_ && n >= 4) {
                 addPointsSIMDFold(timestamps, values, singleBucketState_);
@@ -284,6 +306,13 @@ public:
 
     // Move out bucket states (interval > 0).
     std::unordered_map<uint64_t, AggregationState> takeBucketStates() {
+        // The single-bucket optimisation pre-inserts its bucket at
+        // construction; if no point actually landed in it (e.g. all data fell
+        // into other epoch buckets or there was no data at all), drop the
+        // empty state so it doesn't surface as a bogus bucket downstream.
+        if (singleBucketState_ && singleBucketState_->count == 0) {
+            bucketStates_.erase(singleBucketKey_);
+        }
         singleBucketState_ = nullptr;
         return std::move(bucketStates_);
     }
@@ -350,6 +379,12 @@ private:
         }
     }
 
+    // True when a timestamp belongs to the cached single bucket.  Unsigned
+    // wrap-around makes timestamps below singleBucketKey_ compare huge, so a
+    // single comparison covers both bounds.  Callers must only use this when
+    // singleBucketState_ is set (implies interval_ > 0).
+    bool inSingleBucket(uint64_t timestamp) const { return timestamp - singleBucketKey_ < interval_; }
+
     // Dispatch to method-aware or generic addValue based on construction.
     void addToState(AggregationState& state, double value, uint64_t timestamp) {
         if (methodAware_) {
@@ -366,6 +401,13 @@ private:
     // NOTE: The SIMD paths for AVG/SUM/MIN/MAX/COUNT/SPREAD only update the
     // accumulators they need (sum, count, min, max). STDDEV/STDVAR maintain
     // mean/m2 via a two-pass batch variance + Chan's parallel Welford merge.
+    //
+    // NaN handling (docs/nan_policy.md): every method whose OUTPUT depends on
+    // count or values detects NaN (NaN SIMD sum / NaN min/max / boundary
+    // check) and falls back to the scalar NaN-skipping fold. For MIN/MAX/
+    // SPREAD/LATEST/FIRST fast paths, interior NaN may still be included in
+    // state.count — count is not part of those methods' results (it only
+    // gates emptiness), so this is unobservable.
     // After updating sum/count we recompute state.mean = state.sum / state.count
     // so that any downstream code reading mean (e.g. mergeForMethod) sees a
     // consistent value.
@@ -380,9 +422,12 @@ private:
         const double* vdata = values.data() + begin;
         const uint64_t* tdata = timestamps.data() + begin;
 
-        // INVARIANT: Decoded TSM block data is NaN-free (NaN filtered during write).
-        // Defense-in-depth: if the first element is NaN (e.g. corrupt data), bail to
-        // the scalar path which correctly skips NaN via addValueForMethod().
+        // NaN CAN appear in decoded data (NaN is stored verbatim; canonical
+        // policy: NaN = missing, skipped by every method — docs/nan_policy.md).
+        // Cheap prefilter: if the first element is NaN, bail to the scalar
+        // path which correctly skips NaN via addValueForMethod(). Interior
+        // NaN is caught per-method below (NaN sum / NaN min/max / boundary
+        // checks) with the same scalar fallback.
         if (n > 0 && std::isnan(vdata[0])) [[unlikely]] {
             for (size_t i = begin; i < end; ++i) {
                 addToState(state, values[i], timestamps[i]);
@@ -401,10 +446,13 @@ private:
                         addToState(state, values[i], timestamps[i]);
                     }
                 } else {
-                    // Kahan compensated addition of SIMD sum to preserve precision
+                    // Kahan compensated addition of SIMD sum to preserve precision.
+                    // Non-finite guard: with a ±Inf sum the compensation term
+                    // degenerates to NaN and would poison later additions,
+                    // turning Inf results into NaN (canonical: Inf propagates).
                     double y = simdSum - state.sumCompensation;
                     double t = state.sum + y;
-                    state.sumCompensation = (t - state.sum) - y;
+                    state.sumCompensation = std::isfinite(t) ? (t - state.sum) - y : 0.0;
                     state.sum = t;
                     state.count += n;
                     // Keep mean consistent for downstream merge operations.
@@ -421,7 +469,17 @@ private:
                 }
                 break;
             }
-            case AggregationMethod::COUNT:
+            case AggregationMethod::COUNT: {
+                // COUNT counts only non-NaN values (NaN = missing data). A NaN
+                // SIMD sum means NaN is present (or an Inf/-Inf mix) — fall
+                // back to the scalar NaN-skipping fold. One fused pass; the
+                // NaN-free common case still counts in O(1) after the check.
+                if (std::isnan(simd::SimdAggregator::calculateSum(vdata, n))) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                    break;
+                }
                 state.count += n;
                 if (n > 0) {
                     if (tdata[0] < state.firstTimestamp) {
@@ -434,6 +492,7 @@ private:
                     }
                 }
                 break;
+            }
             case AggregationMethod::MIN: {
                 double simdMin = simd::SimdAggregator::calculateMin(vdata, n);
                 if (std::isnan(simdMin)) [[unlikely]] {
@@ -498,7 +557,15 @@ private:
             }
             case AggregationMethod::LATEST:
                 // Timestamps are monotonically increasing within a TSM block,
-                // so the last element is always the latest.
+                // so the last element is always the latest. If it is NaN the
+                // canonical answer is the last non-NaN value — scalar fallback
+                // (the entry prefilter above only checks vdata[0]).
+                if (n > 0 && std::isnan(vdata[n - 1])) [[unlikely]] {
+                    for (size_t i = begin; i < end; ++i) {
+                        addToState(state, values[i], timestamps[i]);
+                    }
+                    break;
+                }
                 if (n > 0 && tdata[n - 1] >= state.latestTimestamp) {
                     state.latest = vdata[n - 1];
                     state.latestTimestamp = tdata[n - 1];
@@ -535,9 +602,9 @@ private:
                     } else {
                         const double delta = batchMean - state.mean;
                         const double totalCount = static_cast<double>(state.count) + static_cast<double>(n);
-                        state.m2 += batchM2 +
-                                    delta * delta * (static_cast<double>(state.count) * static_cast<double>(n)) /
-                                        totalCount;
+                        state.m2 += batchM2 + delta * delta *
+                                                  (static_cast<double>(state.count) * static_cast<double>(n)) /
+                                                  totalCount;
                         state.mean += delta * (static_cast<double>(n) / totalCount);
                     }
                     state.count += n;
@@ -571,11 +638,11 @@ private:
     std::vector<double> rawValues_;
     // Single-bucket optimisation: cached pointer to the only bucket entry,
     // avoiding per-point integer division and hash map lookup.
-    // INVARIANT: singleBucketState_ points into bucketStates_ (std::unordered_map,
-    // node-stable for existing entries). Only valid while no insertions to
-    // bucketStates_ occur through the multi-bucket path. The single-bucket
-    // optimization (bucketCount==1) ensures this: all inserts go through
-    // singleBucketState_ directly, never through bucketStates_[key].
+    // INVARIANT: singleBucketState_ points into bucketStates_. std::unordered_map
+    // is node-based, so inserting additional buckets through the multi-bucket
+    // path (points outside [singleBucketKey_, singleBucketKey_ + interval_),
+    // see inSingleBucket()) never invalidates this pointer — rehashing moves
+    // buckets, not nodes.
     AggregationState* singleBucketState_ = nullptr;
     uint64_t singleBucketKey_ = 0;
     // Non-bucketed fold mode: single accumulated state (streaming aggregation)

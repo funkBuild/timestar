@@ -13,7 +13,7 @@
 #include "streaming_derived_evaluator.hpp"
 #include "timestar_config.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <charconv>
 #include <chrono>
@@ -24,7 +24,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/with_timeout.hh>
 
-namespace timestar {
+namespace timestar::http {
 
 // --- JSON parsing for subscribe requests ---
 
@@ -42,23 +42,23 @@ struct GlazeSubscribeRequest {
     std::optional<std::variant<uint64_t, std::string>> aggregationInterval;
 };
 
-}  // namespace timestar
+}  // namespace timestar::http
 
 template <>
-struct glz::meta<timestar::GlazeQueryEntry> {
-    using T = timestar::GlazeQueryEntry;
+struct glz::meta<timestar::http::GlazeQueryEntry> {
+    using T = timestar::http::GlazeQueryEntry;
     static constexpr auto value = object("query", &T::query, "label", &T::label);
 };
 
 template <>
-struct glz::meta<timestar::GlazeSubscribeRequest> {
-    using T = timestar::GlazeSubscribeRequest;
+struct glz::meta<timestar::http::GlazeSubscribeRequest> {
+    using T = timestar::http::GlazeSubscribeRequest;
     static constexpr auto value =
         object("query", &T::query, "queries", &T::queries, "formula", &T::formula, "startTime", &T::startTime,
                "backfill", &T::backfill, "aggregationInterval", &T::aggregationInterval);
 };
 
-namespace timestar {
+namespace timestar::http {
 
 // --- Parse startTime variant to nanosecond timestamp ---
 
@@ -344,24 +344,17 @@ StreamingBatch HttpStreamHandler::applyFormulaToBatch(const StreamingBatch& batc
     std::map<SeriesFieldKey, std::pair<std::vector<uint64_t>, std::vector<double>>> groups;
 
     for (const auto& pt : batch.points) {
+        // SKIP non-numeric (bool, string) points — they are not operands, so a
+        // string/bool field contributes nothing rather than an all-NaN phantom
+        // series.  Never a fabricated 0.0 and never a coerced 1.0/0.0.
+        auto numeric = streamingValueAsNumeric(pt.value);
+        if (!numeric) {
+            continue;
+        }
         SeriesFieldKey key{pt.measurement, pt.tags, pt.field};
         auto& [timestamps, values] = groups[key];
         timestamps.push_back(pt.timestamp);
-
-        double val = std::visit(
-            [](const auto& v) -> double {
-                using VT = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<VT, double>)
-                    return v;
-                else if constexpr (std::is_same_v<VT, int64_t>)
-                    return static_cast<double>(v);
-                else if constexpr (std::is_same_v<VT, bool>)
-                    return v ? 1.0 : 0.0;
-                else
-                    return 0.0;
-            },
-            pt.value);
-        values.push_back(val);
+        values.push_back(*numeric);
     }
 
     StreamingBatch result;
@@ -526,9 +519,9 @@ void HttpStreamHandler::registerRoutes(seastar::httpd::routes& r, std::string_vi
     } else {
         std::string token(authToken);
         r.add(seastar::httpd::operation_type::POST, seastar::httpd::url("/subscribe"),
-              new timestar::AuthHandlerWrapper(std::make_unique<sse_handler>(this), token));
+              new AuthHandlerWrapper(std::make_unique<sse_handler>(this), token));
         r.add(seastar::httpd::operation_type::GET, seastar::httpd::url("/subscriptions"),
-              new timestar::AuthHandlerWrapper(std::make_unique<subscriptions_handler>(this), token));
+              new AuthHandlerWrapper(std::make_unique<subscriptions_handler>(this), token));
     }
 
     timestar::http_log.info("Registered HTTP streaming endpoints at /subscribe, /subscriptions{}",
@@ -624,8 +617,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 entry.queryReq = QueryParser::parseQueryString(qe.query);
             } catch (const QueryParseException& e) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content =
-                    timestar::http::jsonError("Query '" + entry.label + "': " + e.what(), "INVALID_QUERY");
+                rep->_content = timestar::http::jsonError("Query '" + entry.label + "': " + e.what(), "INVALID_QUERY");
                 timestar::http::setContentType(*rep, resFmt);
                 co_return rep;
             }
@@ -751,8 +743,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     localMgr.setMaxLocalSubscriptions(streamCfg.max_subscriptions_per_shard);
     if (localMgr.localSubscriptionCount() + queryEntries.size() > streamCfg.max_subscriptions_per_shard) {
         rep->set_status(seastar::http::reply::status_type{429});
-        rep->_content =
-            timestar::http::jsonError("Maximum subscriptions per shard exceeded", "TOO_MANY_SUBSCRIPTIONS");
+        rep->_content = timestar::http::jsonError("Maximum subscriptions per shard exceeded", "TOO_MANY_SUBSCRIPTIONS");
         timestar::http::setContentType(*rep, resFmt);
         co_return rep;
     }
@@ -1278,4 +1269,4 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     co_return rep;
 }
 
-}  // namespace timestar
+}  // namespace timestar::http

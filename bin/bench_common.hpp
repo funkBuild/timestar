@@ -36,9 +36,7 @@ inline double percentile(const std::vector<double>& sortedAsc, double p) {
 struct LatencyStats {
     std::vector<double> samples_ms;
 
-    void add(clk::duration d) {
-        samples_ms.push_back(std::chrono::duration<double, std::milli>(d).count());
-    }
+    void add(clk::duration d) { samples_ms.push_back(std::chrono::duration<double, std::milli>(d).count()); }
 
     void merge(LatencyStats&& other) {
         samples_ms.insert(samples_ms.end(), std::make_move_iterator(other.samples_ms.begin()),

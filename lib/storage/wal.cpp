@@ -135,7 +135,7 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
 }
 
 std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
-    std::string path = "shard_" + std::to_string(seastar::this_shard_id()) + "/";
+    std::string path = timestar::shardDataPath(seastar::this_shard_id()) + "/";
     std::string sequenceNumStr = std::to_string(sequenceNumber);
     size_t padLen = sequenceNumStr.length() >= 10 ? 0 : 10 - sequenceNumStr.length();
     std::string filename = path + std::string(padLen, '0').append(sequenceNumStr).append(".wal");

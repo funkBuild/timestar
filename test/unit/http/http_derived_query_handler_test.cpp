@@ -4,7 +4,7 @@
 #include "../../../lib/query/derived_query_executor.hpp"
 #include "../../../lib/query/expression_parser.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
 

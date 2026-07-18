@@ -8,7 +8,7 @@
 #include "timestar_value.hpp"
 #include "wal_file_manager.hpp"
 
-#include <glaze/glaze.hpp>
+#include <glaze/json.hpp>
 
 #include <tsl/robin_map.h>
 
@@ -74,6 +74,8 @@
  *   ]
  * }
  */
+
+namespace timestar::http {
 
 // Use glz::generic_u64 for JSON parsing to preserve uint64_t timestamp precision.
 // glz::json_t (glz::generic) uses num_mode::f64, which parses all numbers as double,
@@ -207,7 +209,10 @@ private:
         std::vector<MetaOp> metaOps;
 
         explicit BatchAccumulator(size_t shardCount)
-            : shardDoubles(shardCount), shardBools(shardCount), shardStrings(shardCount), shardIntegers(shardCount),
+            : shardDoubles(shardCount),
+              shardBools(shardCount),
+              shardStrings(shardCount),
+              shardIntegers(shardCount),
               shardPoints(shardCount, 0) {}
 
         bool shardEmpty(size_t shard) const {
@@ -331,3 +336,12 @@ public:
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
     }
 };
+
+}  // namespace timestar::http
+
+// Backward-compatibility aliases: HttpWriteHandler historically lived in the
+// global namespace. New code should use timestar::http:: directly.
+using timestar::http::HttpWriteHandler;  // NOLINT(misc-unused-using-decls)
+namespace timestar {
+using http::HttpWriteHandler;
+}  // namespace timestar

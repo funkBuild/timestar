@@ -1,137 +1,176 @@
+// Behavioral tests for the WAL rollover / concurrent-insert race.
+//
+// Bug history: WALFileManager::rolloverMemoryStore() suspends at several
+// co_await points (WAL file creation, store close). If the sequence ever
+// closes or removes the current store before a fresh, initialized store is
+// installed at memoryStores[0], any insert coroutine dispatched by the
+// reactor during a suspension hits a closed store: MemoryStore::insert()
+// throws "MemoryStore is closed" and the point is lost.
+//
+// The invariant: memoryStores[0] always points to an OPEN store across every
+// suspension point of the rollover, so concurrent inserts never fail and
+// never lose data.
+//
+// These tests replace the former source-inspection variant (which asserted
+// textual ordering of make_shared/initWAL/insert/close inside
+// rolloverMemoryStore — and had gone stale: it matched the empty-store
+// cleanup close, not the conversion path). Instead we drive a real Engine
+// with interleaved coroutines: insert streams that yield between points run
+// concurrently (when_all) with rollover calls. If the rollover ordering
+// regressed, the inserts throw and/or the final read-back misses points.
+//
+// Determinism: interleaving relies only on Seastar's cooperative scheduler
+// (yield + real WAL I/O suspension points) — no sleeps, no timing dependence.
+// Correctness is verified by exact read-back of every inserted timestamp.
+
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/timestar_value.hpp"
+#include "../../seastar_gtest.hpp"
+#include "../../test_helpers.hpp"
+
 #include <gtest/gtest.h>
 
-#include <fstream>
-#include <sstream>
+#include <algorithm>
+#include <cstdint>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/when_all.hh>
+#include <seastar/util/later.hh>
 #include <string>
-
-// =============================================================================
-// Source code inspection tests for WALFileManager::rolloverMemoryStore()
-//
-// These tests verify that the rollover sequence is ordered correctly to
-// prevent a race condition where concurrent inserts can arrive (via the
-// Seastar event loop during co_await yields) and hit a closed memory store.
-//
-// Correct ordering:
-//   1. Create new MemoryStore (make_shared<MemoryStore>)
-//   2. Init new store WAL   (store->initWAL)
-//   3. Install new store    (memoryStores.insert)
-//   4. Close old store      (previousStore->close)
-//   5. Convert to TSM       (convertWalToTsm)
-//
-// The critical invariant is that memoryStores[0] always points to an open
-// store, even across co_await yield points.
-// =============================================================================
-
-// Helper: extract a method body by name from source code
-static std::string extractMethodBody(const std::string& source, const std::string& methodSignature) {
-    auto pos = source.find(methodSignature);
-    if (pos == std::string::npos)
-        return "";
-
-    // Find the opening brace of the method
-    auto bracePos = source.find('{', pos);
-    if (bracePos == std::string::npos)
-        return "";
-
-    // Track brace depth to find the end of the method
-    int depth = 1;
-    size_t i = bracePos + 1;
-    while (i < source.size() && depth > 0) {
-        if (source[i] == '{')
-            depth++;
-        else if (source[i] == '}')
-            depth--;
-        i++;
-    }
-
-    return source.substr(pos, i - pos);
-}
-
-// Helper: find the position of a pattern within a string, returning npos if
-// not found. Searches from 'startPos'.
-static size_t findPattern(const std::string& body, const std::string& pattern, size_t startPos = 0) {
-    return body.find(pattern, startPos);
-}
+#include <utility>
+#include <vector>
 
 class WALRolloverRaceTest : public ::testing::Test {
 protected:
-    std::string source;
-    std::string rolloverBody;
-
-    void SetUp() override {
-        std::ifstream file(WAL_FILE_MANAGER_CPP_SOURCE_PATH);
-        ASSERT_TRUE(file.is_open()) << "Could not open wal_file_manager.cpp at: " << WAL_FILE_MANAGER_CPP_SOURCE_PATH;
-        source.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-        ASSERT_FALSE(source.empty());
-
-        rolloverBody = extractMethodBody(source, "WALFileManager::rolloverMemoryStore()");
-        ASSERT_FALSE(rolloverBody.empty()) << "Could not extract WALFileManager::rolloverMemoryStore() body";
-    }
+    void SetUp() override { cleanTestShardDirectories(); }
+    void TearDown() override { cleanTestShardDirectories(); }
 };
 
-// Test 1: New MemoryStore creation happens BEFORE previousStore->close()
-TEST_F(WALRolloverRaceTest, NewStoreCreatedBeforeOldStoreClosed) {
-    size_t makeSharedPos = findPattern(rolloverBody, "make_shared<MemoryStore>");
-    size_t closePos = findPattern(rolloverBody, "previousStore->close()");
+namespace {
 
-    ASSERT_NE(makeSharedPos, std::string::npos) << "Could not find 'make_shared<MemoryStore>' in rolloverMemoryStore()";
-    ASSERT_NE(closePos, std::string::npos) << "Could not find 'previousStore->close()' in rolloverMemoryStore()";
-
-    EXPECT_LT(makeSharedPos, closePos) << "make_shared<MemoryStore> must appear BEFORE previousStore->close() "
-                                       << "to prevent a race window where inserts hit a closed store. "
-                                       << "The new store must be created before the old one is closed.";
+// Insert `count` single-point writes for the given series, yielding to the
+// reactor between points so rollover coroutines can interleave.
+seastar::future<> insertStream(Engine& engine, std::string measurement, uint64_t baseTs, int count) {
+    for (int i = 0; i < count; ++i) {
+        TimeStarInsert<double> insert(measurement, "value");
+        insert.addTag("src", "race");
+        uint64_t ts = baseTs + static_cast<uint64_t>(i);
+        insert.addValue(ts, static_cast<double>(ts));
+        co_await engine.insert(std::move(insert));
+        co_await seastar::yield();
+    }
 }
 
-// Test 2: initWAL on new store happens BEFORE previousStore->close()
-TEST_F(WALRolloverRaceTest, InitWALBeforeOldStoreClosed) {
-    // Find initWAL that is on the new store (not previousStore)
-    // We look for "store->initWAL" which is the new store's init
-    size_t initWalPos = findPattern(rolloverBody, "store->initWAL()");
-    size_t closePos = findPattern(rolloverBody, "previousStore->close()");
-
-    ASSERT_NE(initWalPos, std::string::npos) << "Could not find 'store->initWAL()' in rolloverMemoryStore()";
-    ASSERT_NE(closePos, std::string::npos) << "Could not find 'previousStore->close()' in rolloverMemoryStore()";
-
-    EXPECT_LT(initWalPos, closePos) << "store->initWAL() must appear BEFORE previousStore->close(). "
-                                    << "The new store must be fully initialized before the old one is "
-                                    << "closed, so it can accept inserts immediately.";
+// Trigger `count` rollovers, yielding between them.
+seastar::future<> rolloverStream(Engine& engine, int count) {
+    for (int i = 0; i < count; ++i) {
+        co_await engine.rolloverMemoryStore();
+        co_await seastar::yield();
+    }
 }
 
-// Test 3: memoryStores.insert (installing new store) happens BEFORE
-// previousStore->close()
-TEST_F(WALRolloverRaceTest, StoreInstalledBeforeOldStoreClosed) {
-    size_t insertPos = findPattern(rolloverBody, "memoryStores.insert(memoryStores.begin()");
-    size_t closePos = findPattern(rolloverBody, "previousStore->close()");
+// Read back the series and verify every expected timestamp is present exactly
+// once with the expected value (value == timestamp). Coroutine context: uses
+// EXPECT (never ASSERT) with explicit guards.
+seastar::future<> verifyCompleteReadback(Engine& engine, std::string measurement,
+                                         std::vector<std::pair<uint64_t, int>> ranges) {
+    auto resultOpt = co_await engine.query(measurement + ",src=race value", 0, UINT64_MAX);
+    EXPECT_TRUE(resultOpt.has_value()) << "Series vanished after rollover";
+    if (!resultOpt.has_value()) {
+        co_return;
+    }
+    auto& result = std::get<QueryResult<double>>(resultOpt.value());
 
-    ASSERT_NE(insertPos, std::string::npos) << "Could not find 'memoryStores.insert(memoryStores.begin()' in "
-                                            << "rolloverMemoryStore()";
-    ASSERT_NE(closePos, std::string::npos) << "Could not find 'previousStore->close()' in rolloverMemoryStore()";
+    size_t expectedCount = 0;
+    for (const auto& [base, count] : ranges) {
+        expectedCount += static_cast<size_t>(count);
+    }
 
-    EXPECT_LT(insertPos, closePos) << "memoryStores.insert() must appear BEFORE previousStore->close(). "
-                                   << "The new store must be at memoryStores[0] before the old store is "
-                                   << "closed, so any insert coroutine that runs during the co_await in "
-                                   << "close() will find an open store at memoryStores[0].";
+    // Sorted strictly ascending => no duplicates, no reordering.
+    for (size_t i = 1; i < result.timestamps.size(); ++i) {
+        EXPECT_LT(result.timestamps[i - 1], result.timestamps[i]) << "Result must be sorted and duplicate-free";
+    }
+
+    EXPECT_EQ(result.timestamps.size(), expectedCount)
+        << "Points were lost (or duplicated) by inserts racing a rollover";
+    EXPECT_EQ(result.values.size(), expectedCount);
+    if (result.timestamps.size() != expectedCount || result.values.size() != expectedCount) {
+        co_return;
+    }
+
+    // Exact content check: every inserted timestamp present, value matches.
+    size_t idx = 0;
+    std::vector<uint64_t> expected;
+    expected.reserve(expectedCount);
+    for (const auto& [base, count] : ranges) {
+        for (int i = 0; i < count; ++i) {
+            expected.push_back(base + static_cast<uint64_t>(i));
+        }
+    }
+    std::sort(expected.begin(), expected.end());
+    for (uint64_t ts : expected) {
+        EXPECT_EQ(result.timestamps[idx], ts) << "Missing or wrong timestamp at index " << idx;
+        EXPECT_DOUBLE_EQ(result.values[idx], static_cast<double>(ts));
+        ++idx;
+    }
 }
 
-// Test 4: There is no window where close() is called before
-// memoryStores.insert -- verify the full ordering:
-//   make_shared < initWAL < memoryStores.insert < previousStore->close
-TEST_F(WALRolloverRaceTest, FullOrderingIsCorrect) {
-    size_t makeSharedPos = findPattern(rolloverBody, "make_shared<MemoryStore>");
-    size_t initWalPos = findPattern(rolloverBody, "store->initWAL()");
-    size_t insertPos = findPattern(rolloverBody, "memoryStores.insert(memoryStores.begin()");
-    size_t closePos = findPattern(rolloverBody, "previousStore->close()");
+}  // namespace
 
-    ASSERT_NE(makeSharedPos, std::string::npos) << "Could not find 'make_shared<MemoryStore>'";
-    ASSERT_NE(initWalPos, std::string::npos) << "Could not find 'store->initWAL()'";
-    ASSERT_NE(insertPos, std::string::npos) << "Could not find 'memoryStores.insert(memoryStores.begin()'";
-    ASSERT_NE(closePos, std::string::npos) << "Could not find 'previousStore->close()'";
+// ---------------------------------------------------------------------------
+// 1. Inserts racing a rollover: every point must land, none may throw.
+// ---------------------------------------------------------------------------
+SEASTAR_TEST_F(WALRolloverRaceTest, InsertsDuringRolloverNeverHitClosedStore) {
+    Engine engine;
+    std::exception_ptr failure;
+    try {
+        co_await engine.init();
 
-    EXPECT_LT(makeSharedPos, initWalPos) << "make_shared<MemoryStore> must come before store->initWAL()";
-    EXPECT_LT(initWalPos, insertPos) << "store->initWAL() must come before memoryStores.insert()";
-    EXPECT_LT(insertPos, closePos) << "memoryStores.insert() must come before previousStore->close(). "
-                                   << "This ensures there is NO window where memoryStores[0] points to a "
-                                   << "closed store. Without this ordering, a concurrent insert coroutine "
-                                   << "dispatched by the event loop during a co_await yield could call "
-                                   << "insert() on a closed MemoryStore.";
+        // Seed data so the store is non-empty when the rollover starts
+        // (an empty store makes rolloverMemoryStore a no-op).
+        co_await insertStream(engine, "roll_race", 0, 10);
+
+        // Two insert streams interleaved with a stream of rollovers. Each
+        // rollover suspends on WAL file I/O; the inserts that run inside
+        // those suspension windows must always find an open store at
+        // memoryStores[0].
+        co_await seastar::when_all_succeed(insertStream(engine, "roll_race", 1000, 30),
+                                           insertStream(engine, "roll_race", 2000, 30), rolloverStream(engine, 3));
+
+        co_await verifyCompleteReadback(engine, "roll_race", {{0, 10}, {1000, 30}, {2000, 30}});
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    co_await engine.stop();
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Multiple rollover calls racing each other AND concurrent inserts.
+//    The rollover semaphore + isEmpty() re-check must serialize them; the
+//    inserts must never observe a closed or missing store.
+// ---------------------------------------------------------------------------
+SEASTAR_TEST_F(WALRolloverRaceTest, ConcurrentRolloversWithInsertsAreSafe) {
+    Engine engine;
+    std::exception_ptr failure;
+    try {
+        co_await engine.init();
+
+        co_await insertStream(engine, "roll_multi", 0, 5);
+
+        // Fire several rollovers at once (unserialised callers) while an
+        // insert stream keeps writing.
+        co_await seastar::when_all_succeed(rolloverStream(engine, 1), rolloverStream(engine, 1),
+                                           rolloverStream(engine, 1), insertStream(engine, "roll_multi", 3000, 20));
+
+        co_await verifyCompleteReadback(engine, "roll_multi", {{0, 5}, {3000, 20}});
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    co_await engine.stop();
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
 }

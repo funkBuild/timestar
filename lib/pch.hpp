@@ -8,7 +8,7 @@
 // PCH and loading it per-TU is much cheaper than re-parsing them ~25-90 times.
 //
 // Deliberately excluded:
-//   - glaze/glaze.hpp: heavy metaprogramming, but only 6 TUs use it; putting it
+//   - glaze/json.hpp: heavy metaprogramming, but only 6 TUs use it; putting it
 //     here would force the other ~80 TUs to load it for nothing.
 //   - Highway headers: the SIMD encoders re-include themselves via Highway's
 //     foreach_target mechanism and manage their own include order.
@@ -16,8 +16,8 @@
 // ── Seastar async core (≈ every async TU; very expensive to parse) ──
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/log.hh>
 

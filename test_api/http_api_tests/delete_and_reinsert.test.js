@@ -23,10 +23,10 @@ const mergeSeries = (seriesArray) => {
   return merged;
 };
 
-// Unique per-run measurement names: the server accumulates duplicate points
-// when identical measurement+tags+timestamp data is written again (no
-// overwrite-on-duplicate), so reruns against a shared server would otherwise
-// inflate point counts. Same pattern as comprehensive_query.test.js.
+// Unique per-run measurement names: reruns against a shared server would
+// otherwise see leftover points from earlier runs at OTHER timestamps.
+// (Identical timestamps overwrite — last-write-wins — but each run writes
+// with fresh "now"-based timestamps.) Same pattern as comprehensive_query.test.js.
 const runId = Math.floor(Math.random() * 1000000);
 const SENSOR_MEASUREMENT = `sensor_data_${runId}`;
 const MULTI_MEASUREMENT = `multi_sensor_${runId}`;
