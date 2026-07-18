@@ -14,31 +14,26 @@
 
 namespace fs = std::filesystem;
 
-TSMFileManager::TSMFileManager() {
-    shardId = seastar::this_shard_id();
-}
+TSMFileManager::TSMFileManager(timestar::StorageLayout layout, unsigned workerId)
+    : layout_(std::move(layout)), shardId(workerId) {}
 
 // Destructor defined here where TSMCompactor is a complete type,
 // so std::unique_ptr<TSMCompactor> can call delete.
 TSMFileManager::~TSMFileManager() = default;
 
-std::string TSMFileManager::basePath() {
-    return timestar::shardDataPath(shardId) + "/tsm/";
-}
-
 seastar::future<> TSMFileManager::init() {
     timestar::tsm_log.info("TSMFileManager init. shardId={}", shardId);
 
     // Initialize compactor
-    compactor = std::make_unique<TSMCompactor>(this);
+    compactor = std::make_unique<TSMCompactor>(layout_, shardId, this);
 
     // Scan the TSM folder for files if it exists.
     // std::filesystem calls are blocking, so run them off the reactor thread.
-    auto tsmPaths = co_await seastar::async([this] {
+    const auto tsmDirectory = layout_.tsmDir(shardId);
+    auto tsmPaths = co_await seastar::async([tsmDirectory] {
         std::vector<std::string> paths;
-        auto base = basePath();
-        if (fs::exists(base)) {
-            for (const auto& entry : fs::directory_iterator(base)) {
+        if (fs::exists(tsmDirectory)) {
+            for (const auto& entry : fs::directory_iterator(tsmDirectory)) {
                 if (endsWith(entry.path(), ".tsm")) {
                     paths.push_back(fs::canonical(fs::absolute(entry.path())).string());
                 } else if (endsWith(entry.path(), ".tmp")) {
@@ -120,31 +115,30 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
 seastar::future<> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore> memStore, uint64_t tier) {
     auto seqNum = nextSequenceId++;
 
-    std::string filename = basePath() + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
+    const auto filename = layout_.tsmFile(shardId, tier, seqNum);
 
     // Write to a .tmp file first, then rename atomically on success.
     // If TSMWriter::runAsync() throws, the orphaned .tmp file will be
     // cleaned up on the next startup by init() (which removes all .tmp files).
     // Note: TSMWriter::runAsync() calls closeDMA(), which flushes the file
     // (co_await file.flush()) before closing. No additional flush needed here.
-    auto tmpFilename = filename + ".tmp";
-    co_await TSMWriter::runAsync(memStore, tmpFilename);
-    co_await seastar::rename_file(tmpFilename, filename);
+    const auto tmpFilename = layout_.tsmTemporaryFile(shardId, tier, seqNum);
+    co_await TSMWriter::runAsync(memStore, tmpFilename.string());
+    co_await seastar::rename_file(tmpFilename.string(), filename.string());
 
     // Fsync the parent directory to ensure the rename (directory entry update)
     // is durable.  Without this, a crash could lose the rename even though
     // the file data is already on disk.
-    auto slash = filename.rfind('/');
-    std::string parentDir = (slash != std::string::npos) ? filename.substr(0, slash) : ".";
+    const auto parentDir = layout_.tsmDir(shardId);
     try {
-        auto dirFile = co_await seastar::open_directory(parentDir);
+        auto dirFile = co_await seastar::open_directory(parentDir.string());
         co_await dirFile.flush();
         co_await dirFile.close();
     } catch (...) {
-        timestar::tsm_log.warn("Failed to fsync parent directory after memstore write rename: {}", parentDir);
+        timestar::tsm_log.warn("Failed to fsync parent directory after memstore write rename: {}", parentDir.string());
     }
 
-    co_await openTsmFile(filename);
+    co_await openTsmFile(filename.string());
 
     co_await checkAndTriggerCompaction();
 }

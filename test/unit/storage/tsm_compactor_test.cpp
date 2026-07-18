@@ -20,9 +20,13 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
+#include <stdexcept>
 #include <thread>
+#include <type_traits>
 
 namespace fs = std::filesystem;
+
+static const timestar::StorageLayout kDefaultTsmTestLayout(".");
 
 class TSMCompactorTest : public ::testing::Test {
 public:
@@ -50,8 +54,8 @@ public:
         fs::create_directories(testDir + "/shard_0/tsm");
         fs::current_path(testDir);
 
-        fileManager = std::make_unique<TSMFileManager>();
-        compactor = std::make_unique<TSMCompactor>(fileManager.get());
+        fileManager = std::make_unique<TSMFileManager>(kDefaultTsmTestLayout, 0);
+        compactor = std::make_unique<TSMCompactor>(kDefaultTsmTestLayout, 0, fileManager.get());
     }
 
     void TearDown() override {
@@ -104,6 +108,44 @@ public:
         return fileSize > 0 && fileSize < 10 * 1024 * 1024;  // Less than 10MB
     }
 };
+
+SEASTAR_TEST_F(TSMCompactorTest, InjectedRootAndWorkerControlCompactionOutput) {
+    const timestar::StorageLayout layout("injected compactor layout/tenant-a");
+    constexpr unsigned workerId = 7;
+    co_await seastar::async([directory = layout.tsmDir(workerId)] { fs::create_directories(directory); });
+
+    std::vector<seastar::shared_ptr<TSM>> files;
+    for (uint64_t sequence = 1; sequence <= 2; ++sequence) {
+        const auto sourcePath = layout.tsmFile(workerId, 0, sequence);
+        TSMWriter writer(sourcePath.string());
+        const std::vector<uint64_t> timestamps{sequence * 1000};
+        const std::vector<double> values{static_cast<double>(sequence)};
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("injected.series"), timestamps, values);
+        writer.writeIndex();
+        writer.close();
+
+        auto source = seastar::make_shared<TSM>(sourcePath.string());
+        co_await source->open();
+        files.push_back(source);
+    }
+
+    TSMCompactor injectedCompactor(layout, workerId, nullptr);
+    EXPECT_THROW(co_await injectedCompactor.compact(files), std::invalid_argument);
+
+    constexpr uint64_t reservedSequence = 3;
+    auto result = co_await injectedCompactor.compact(files, 0, reservedSequence);
+    const auto expected = layout.compactedTsmFile(workerId, 0, reservedSequence, 2);
+
+    EXPECT_EQ(result.outputPath, expected.string());
+    EXPECT_TRUE(fs::is_regular_file(expected));
+    EXPECT_FALSE(fs::exists(layout.compactedTsmTemporaryFile(workerId, 0, reservedSequence, 2)));
+    EXPECT_FALSE(fs::exists("shard_7"));
+    static_assert(!std::is_constructible_v<TSMCompactor, TSMFileManager*>);
+
+    for (auto& source : files) {
+        co_await source->close();
+    }
+}
 
 // Test basic compaction of multiple files
 SEASTAR_TEST_F(TSMCompactorTest, BasicCompaction) {

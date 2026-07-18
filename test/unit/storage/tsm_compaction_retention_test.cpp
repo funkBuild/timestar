@@ -23,6 +23,8 @@
 
 namespace fs = std::filesystem;
 
+static const timestar::StorageLayout kDefaultTsmTestLayout(".");
+
 // ---------------------------------------------------------------------------
 // Helper: nanoseconds since Unix epoch at the current instant
 // ---------------------------------------------------------------------------
@@ -58,8 +60,8 @@ public:
         fs::create_directories(testDir + "/shard_0/tsm");
         fs::current_path(testDir);
 
-        fileManager = std::make_unique<TSMFileManager>();
-        compactor = std::make_unique<TSMCompactor>(fileManager.get());
+        fileManager = std::make_unique<TSMFileManager>(kDefaultTsmTestLayout, 0);
+        compactor = std::make_unique<TSMCompactor>(kDefaultTsmTestLayout, 0, fileManager.get());
     }
 
     void TearDown() override {

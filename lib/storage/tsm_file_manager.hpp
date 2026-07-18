@@ -2,6 +2,7 @@
 
 #include "aligned_buffer.hpp"
 #include "memory_store.hpp"
+#include "storage_layout.hpp"
 #include "timestar_config.hpp"
 #include "tsm.hpp"
 
@@ -23,7 +24,8 @@ private:
     static constexpr size_t MAX_TIERS = 5;
     static size_t filesPerCompaction() { return timestar::config().storage.compaction.tier0_min_files; }
 
-    int shardId;
+    const timestar::StorageLayout layout_;
+    const unsigned shardId;
     // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
     // only accessed from a single thread.
     uint64_t nextSequenceId = 0;
@@ -43,7 +45,6 @@ private:
     bool _compactionGroupSet = false;
 
     seastar::future<> openTsmFile(std::string path);
-    std::string basePath();
     seastar::future<> checkAndTriggerCompaction();
 
     std::map<uint64_t, seastar::shared_ptr<TSM>> sequencedTsmFiles;
@@ -55,7 +56,7 @@ public:
     // Direct insertion into the sequenced file map (for testing).
     void setSequencedTsmFile(uint64_t seq, seastar::shared_ptr<TSM> tsm) { sequencedTsmFiles[seq] = std::move(tsm); }
 
-    TSMFileManager();
+    TSMFileManager(timestar::StorageLayout layout, unsigned workerId);
     ~TSMFileManager();  // Defined in .cpp where TSMCompactor is complete
 
     seastar::future<> init();

@@ -14,13 +14,16 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/util/defer.hh>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
 
-TSMCompactor::TSMCompactor(TSMFileManager* manager)
-    : fileManager(manager),
+TSMCompactor::TSMCompactor(timestar::StorageLayout layout, unsigned workerId, TSMFileManager* manager)
+    : layout_(std::move(layout)),
+      shardId_(workerId),
+      fileManager(manager),
       strategy(std::make_unique<LeveledCompactionStrategy>()),
       compactionSemaphore(timestar::config().storage.compaction.max_concurrent) {}
 
@@ -28,8 +31,11 @@ std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqN
     // The `_d<dataSeq>` suffix records the newest write generation contained
     // in the output (max of the inputs' dataSeq) so last-write-wins dedup
     // ranks this file by its data recency, not by its (fresh) seqNum.
-    return timestar::shardDataPath(seastar::this_shard_id()) + "/tsm/" + std::to_string(tier) + "_" +
-           std::to_string(seqNum) + "_d" + std::to_string(dataSeq) + ".tsm";
+    return layout_.compactedTsmFile(shardId_, tier, seqNum, dataSeq).string();
+}
+
+std::string TSMCompactor::generateCompactedTemporaryFilename(uint64_t tier, uint64_t seqNum, uint64_t dataSeq) {
+    return layout_.compactedTsmTemporaryFile(shardId_, tier, seqNum, dataSeq).string();
 }
 
 uint64_t TSMCompactor::maxDataSeqOf(const std::vector<seastar::shared_ptr<TSM>>& files) {
@@ -469,21 +475,28 @@ seastar::future<CompactionResult> TSMCompactor::compact(
     }
 
     // When called without a pre-allocated plan (targetSeq == 0), compute the
-    // target tier from the input files and allocate a fresh sequence ID.
-    // This preserves backward compatibility for direct callers (e.g. tests).
+    // target tier from the input files and ask the file manager to reserve a
+    // fresh sequence ID. A standalone compactor cannot safely infer a fresh
+    // sequence from only the selected inputs: another on-disk TSM may already
+    // own that path.
     if (targetSeq == 0) {
         uint64_t maxTier = 0;
         for (const auto& file : files) {
             maxTier = std::max(maxTier, file->tierNum);
         }
         targetTier = strategy->getTargetTier(maxTier, files.size());
+        if (fileManager == nullptr) {
+            throw std::invalid_argument(
+                "standalone compaction requires an explicitly reserved nonzero target sequence");
+        }
         targetSeq = fileManager->allocateSequenceId();
     }
 
-    std::string outputPath = generateCompactedFilename(targetTier, targetSeq, maxDataSeqOf(files));
+    const auto dataSequence = maxDataSeqOf(files);
+    std::string outputPath = generateCompactedFilename(targetTier, targetSeq, dataSequence);
 
     // Create temporary file for writing
-    std::string tempPath = outputPath + ".tmp";
+    std::string tempPath = generateCompactedTemporaryFilename(targetTier, targetSeq, dataSequence);
     try {
         TSMWriter writer(tempPath);
         // Use higher zstd compression for deeper tiers (better ratio, acceptable speed)
@@ -660,8 +673,7 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         // Fsync the parent directory to ensure the rename (directory entry update)
         // is durable.  Without this, a crash could lose the rename even though
         // the file data is already on disk.
-        auto slash = outputPath.rfind('/');
-        std::string dir = (slash != std::string::npos) ? outputPath.substr(0, slash) : ".";
+        const auto dir = layout_.tsmDir(shardId_).string();
         try {
             auto dirFile = co_await seastar::open_directory(dir);
             co_await dirFile.flush();
